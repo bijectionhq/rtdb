@@ -380,3 +380,8 @@ open question "Is ReceivedTrailsUndeliveredCommits true on the server side — c
 open question "Which upstream errors, if any, should end the source rather than reopen it? Every loss reopens until real deployments show which errors recur (#5878)."
 
 open question "Is TargetDurability.NoDurableExtentMeansResnapshot true — with no block, does the target re-snapshot rather than recover incrementally from a log that outlived its storage? If it recovers incrementally, no_incremental_recovery loses transactions and the bound must be nothing-confirmable until the first block."
+
+open question "Which upstream TLS trust and identity checks belong to the PostgreSQL remote configuration?"
+    -- The native source verifies the server certificate and hostname whenever TLS is negotiated.
+    -- The JDBC default may accept a certificate without that verification.
+    -- The remote credential and trust configuration needs an explicit compatibility contract.

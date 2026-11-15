@@ -10,6 +10,70 @@ fn decimal(coefficient: i128, scale: i8) -> V {
 }
 
 #[test]
+fn pg_format_type_null_modifier_and_oid_dispatch() {
+    assert_eq!(scalar_call("format_type", &[V::I32(20), V::Null], &EvalContext::default()).unwrap(), V::Utf8("bigint".into()));
+    assert_eq!(scalar_call("format_type", &[V::Oid(1043), V::I32(24)], &EvalContext::default()).unwrap(), V::Utf8("character varying(20)".into()));
+    assert_eq!(scalar_call("format_type", &[V::Null, V::I32(-1)], &EvalContext::default()).unwrap(), V::Null);
+    assert!(scalar_call("format_type", &[V::Utf8("20".into()), V::Null], &EvalContext::default()).is_err());
+}
+
+#[test]
+fn patch_keeps_upstream_test_patch_observations() {
+    let doc = |fields: Vec<(&str, V)>| V::Struct(fields.into_iter().map(|(key, value)| (key.into(), value)).collect());
+    let a = |value: V| doc(vec![("a", value)]);
+    for (left, right, expected) in [
+        (doc(vec![]), doc(vec![]), doc(vec![])),
+        (V::Null, a(V::I64(1)), a(V::I64(1))),
+        (a(V::I64(2)), a(V::I64(1)), a(V::I64(1))),
+        (doc(vec![("a", V::I64(2)), ("b", V::I64(2))]), a(V::I64(1)), doc(vec![("a", V::I64(1)), ("b", V::I64(2))])),
+        (a(V::I64(2)), doc(vec![("a", V::I64(1)), ("b", V::I64(1))]), doc(vec![("a", V::I64(1)), ("b", V::I64(1))])),
+        (a(V::I64(2)), doc(vec![]), a(V::I64(2))),
+        (a(V::F64(2.4)), a(V::I64(1)), a(V::I64(1))),
+        (a(V::I64(1)), a(V::F64(2.4)), a(V::F64(2.4))),
+        (a(V::F64(1.0)), a(V::F64(2.4)), a(V::F64(2.4))),
+        (a(V::I64(1)), a(V::Null), a(V::I64(1))),
+        (a(V::I64(3)), a(V::Utf8("3".into())), a(V::Utf8("3".into()))),
+    ] {
+        assert_eq!(scalar_call("_patch", &[left, right], &EvalContext::default()).unwrap(), expected);
+    }
+}
+
+#[test]
+fn patch_replaces_nested_values_and_preserves_nullable_field_types() {
+    let left = V::Struct(BTreeMap::from([("nested".into(), V::Struct(BTreeMap::from([("a".into(), V::I64(1))])))]));
+    let right = V::Struct(BTreeMap::from([("nested".into(), V::Struct(BTreeMap::from([("b".into(), V::I64(2))])))]));
+    assert_eq!(scalar_call("_patch", &[left, right.clone()], &EvalContext::default()).unwrap(), right);
+    let left = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::I64)), ("keep".into(), T::Scalar(S::Bool))]));
+    let right = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::Utf8).maybe()), ("new".into(), T::Null)]));
+    let expected = T::Struct(BTreeMap::from([("a".into(), T::Scalar(S::I64).join(&T::Scalar(S::Utf8))), ("keep".into(), T::Scalar(S::Bool)), ("new".into(), T::Null)]));
+    assert_eq!(function_type("_patch", &[left, right]).unwrap(), expected);
+    assert!(function_type("_patch", &[T::Null, T::Null]).is_err());
+}
+
+#[test]
+fn fixed_timezone_spellings_normalize_like_java_zone_id() {
+    for (input, expected) in [("Z", "Z"), ("+1", "+01:00"), ("-01", "-01:00"), ("+0130", "+01:30"),
+        ("+01:30", "+01:30"), ("+013015", "+01:30:15"), ("-01:30:15", "-01:30:15"),
+        ("UTC+1", "UTC+01:00"), ("GMT-00", "GMT"), ("UT+00:30", "UT+00:30"), ("-00", "Z"),
+        ("+18:00", "+18:00"), ("Europe/Paris", "Europe/Paris"), ("UTC", "UTC")] {
+        assert_eq!(normalize_timezone(input).unwrap(), expected);
+    }
+    for invalid in ["+18:00:01", "-18:01", "+19", "+1:30", "+01:60", "+01:00:60", "UTCZ", "GMT++01", "+٠١", "not-a-zone"] {
+        assert_eq!(normalize_timezone(invalid).unwrap_err().code, "xtdb/invalid-timezone", "{invalid}");
+    }
+}
+
+#[test]
+fn fixed_timezones_apply_to_local_timestamp_casts_and_current_time() {
+    assert_eq!(parse_timestamp("1970-01-01T00:00:00", "+02:00").unwrap(), Timestamp(-7_200_000_000));
+    assert_eq!(parse_timestamp("1970-01-01T00:00:00", "GMT-01:30:15").unwrap(), Timestamp(5_415_000_000));
+    assert_eq!(parse_timestamp("1970-01-01T00:00:00", "Z").unwrap(), Timestamp(0));
+    let context = EvalContext { timezone: "UTC+02:30", ..Default::default() };
+    let value = scalar_call("localtimestamp", &[], &context).unwrap();
+    assert_eq!(value, V::Timestamp { value: context.current_time.0 + 9_000_000_000, unit: TimeUnit::Microsecond, timezone: None });
+}
+
+#[test]
 fn and_or_keep_all_nine_three_valued_truth_table_cells() {
     let values = [V::Bool(false), V::Bool(true), V::Null];
     let and = [V::Bool(false), V::Bool(false), V::Bool(false), V::Bool(false), V::Bool(true), V::Null, V::Bool(false), V::Null, V::Null];

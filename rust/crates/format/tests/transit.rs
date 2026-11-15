@@ -1,4 +1,4 @@
-use rtdb_format::transit::{TransitValue as V, decode_msgpack, encode_anomaly, encode_msgpack};
+use rtdb_format::transit::{TransitValue as V, decode_anomaly, decode_msgpack, encode_anomaly, encode_msgpack, from_json_value, to_json_value};
 use rtdb_types::Anomaly;
 
 #[test]
@@ -47,4 +47,61 @@ fn truncated_and_invalid_cache_records_are_rejected() {
     for bytes in [&[0xa2, b'^', b'0'][..], &[0xdd, 0xff, 0xff, 0xff, 0xff], &[0xd9, 5, b'a'], &[0x92, 0xc0], &[0xc0, 0xc0]] {
         assert!(decode_msgpack(bytes).is_err(), "{bytes:?}");
     }
+}
+
+#[test]
+fn nested_error_context_retains_keywords_symbols_bytes_maps_and_extension_tags() {
+    let context = V::Map(vec![(V::Keyword("details".into()), V::Array(vec![
+        V::Keyword("public/accounts".into()), V::Symbol("?_0".into()), V::Bytes(vec![0, 128, 255]),
+        V::Map(vec![(V::Keyword("id".into()), V::Integer(42)), (V::String("id".into()), V::Null)]),
+        V::Tagged { tag: "time/instant".into(), representation: Box::new(V::String("2024-01-01T00:00:00Z".into())) },
+        V::Tagged { tag: "keyword".into(), representation: Box::new(V::Integer(1)) },
+        V::Map(vec![(V::String("$transit/type".into()), V::String("keyword".into())), (V::String("value".into()), V::String("ordinary-map".into()))]),
+    ]))]);
+    let error = V::Tagged { tag: "xt/error".into(), representation: Box::new(V::Array(vec![V::Keyword("incorrect".into()), V::Null, V::String("Invalid input".into()), context])) };
+    let decoded = decode_anomaly(&encode_msgpack(&error).unwrap()).unwrap();
+    assert_eq!(decoded.code, "");
+    assert_eq!(decode_msgpack(&encode_anomaly(&decoded).unwrap()).unwrap(), error);
+}
+
+#[test]
+fn compound_map_keys_use_cmap_and_keep_cache_order() {
+    let value = V::Map(vec![
+        (V::Array(vec![V::Keyword("repeated".into())]), V::Keyword("repeated".into())),
+        (V::Tagged { tag: "xt/table".into(), representation: Box::new(V::Array(vec![V::String("public".into()), V::String("docs".into())])) }, V::Integer(1)),
+    ]);
+    let bytes = encode_msgpack(&value).unwrap();
+    assert!(bytes.windows(6).any(|slice| slice == b"~#cmap"));
+    assert_eq!(decode_msgpack(&bytes).unwrap(), value);
+    assert_eq!(from_json_value(&to_json_value(&value).unwrap()).unwrap(), value);
+}
+
+#[test]
+fn special_numbers_keep_their_class_through_error_context_json() {
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let encoded = encode_msgpack(&V::Float(value)).unwrap();
+        let decoded = decode_msgpack(&encoded).unwrap();
+        let V::Float(decoded) = from_json_value(&to_json_value(&decoded).unwrap()).unwrap() else { panic!("float type changed") };
+        if value.is_nan() { assert!(decoded.is_nan()); } else { assert_eq!(decoded, value); }
+    }
+}
+
+#[test]
+fn persisted_legacy_illegal_argument_and_runtime_error_tags_decode_as_incorrect() {
+    for tag in ["xtdb/illegal-arg", "xtdb/runtime-err"] {
+        let wire = V::Tagged { tag: tag.into(), representation: Box::new(V::Array(vec![V::Keyword("legacy/code".into()), V::String("message".into()), V::Null, V::Null])) };
+        let decoded = decode_anomaly(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(decoded, Anomaly::incorrect("legacy/code", "message"));
+    }
+}
+
+#[test]
+fn unsigned_json_context_integer_does_not_round_to_a_double() {
+    assert_eq!(from_json_value(&serde_json::json!(u64::MAX)).unwrap(), V::Tagged { tag: "n".into(), representation: Box::new(V::String(u64::MAX.to_string())) });
+}
+
+#[test]
+fn legacy_exception_info_normalizes_to_the_public_unknown_fault() {
+    let wire = V::Tagged { tag: "xtdb/exception-info".into(), representation: Box::new(V::Array(vec![V::String("old exception".into()), V::Map(vec![(V::Keyword("old/data".into()), V::Integer(42))])])) };
+    assert_eq!(decode_anomaly(&encode_msgpack(&wire).unwrap()).unwrap(), Anomaly::fault("xtdb.error/unknown", "old exception"));
 }

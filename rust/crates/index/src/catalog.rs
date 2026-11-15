@@ -51,6 +51,7 @@ impl TableMeta {
 #[derive(Clone, Debug, Default)]
 pub struct TableCatalog {
     block: Option<Arc<BlockCatalog>>,
+    _retained_catalogs: Vec<Arc<rtdb_columnar::MemoryReservation>>,
     tables: BTreeMap<TableRef, TableMeta>,
     entries: BTreeMap<TableRef, TableEntry>,
 }
@@ -62,7 +63,7 @@ impl TableCatalog {
         let actual: BTreeSet<_> = table_blocks.keys().collect();
         if expected != actual { return Err(invalid("Table blocks do not match the block's recorded registry")); }
         let tables = table_blocks.iter().map(|(table, block)| Ok((table.clone(), TableMeta::from_block(block)?))).collect::<Result<_>>()?;
-        Ok(Self { block: block.map(Arc::new), tables, entries })
+        Ok(Self { block: block.map(Arc::new), _retained_catalogs: table_blocks.values().filter_map(TableBlock::retain_charge).collect(), tables, entries })
     }
     pub fn block(&self) -> Option<&BlockCatalog> { self.block.as_deref() }
     pub fn block_index(&self) -> Option<BlockIndex> { self.block().map(BlockCatalog::block_index) }

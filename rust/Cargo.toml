@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.94.1"
 license = "MPL-2.0"
 publish = false
 repository = "https://github.com/bijectionhq/rtdb"
@@ -24,6 +24,15 @@ rtdb-query = { path = "crates/query" }
 rtdb-xtql = { path = "crates/xtql" }
 rtdb-sql = { path = "crates/sql" }
 rtdb-replication = { path = "crates/replication" }
+rtdb-tx = { path = "crates/tx" }
+rtdb-maintenance = { path = "crates/maintenance" }
+rtdb-node = { path = "crates/node" }
+rtdb-kafka = { path = "crates/kafka" }
+rtdb-s3 = { path = "crates/s3" }
+rtdb-azure = { path = "crates/azure" }
+rtdb-gcs = { path = "crates/gcs" }
+rtdb-pg-source = { path = "crates/pg-source" }
+rtdb-auth = { path = "crates/auth" }
 sqlparser = "=0.63.0"
 arrow-array = "=58.4.1"
 arrow-buffer = "=58.4.1"
@@ -32,6 +41,7 @@ arrow-schema = "=58.4.1"
 arrow-select = "=58.4.1"
 arrow-ipc = "=58.4.1"
 async-trait = "0.1"
+http = "1"
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -58,6 +68,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
+url = "2"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -1,0 +1,21 @@
+[package]
+name = "rtdb-gcs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtdb-storage = { workspace = true, features = ["remote"] }
+rtdb-types.workspace = true
+rtdb-format.workspace = true
+object_store = { workspace = true, features = ["gcp"] }
+serde.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+http.workspace = true
+google-cloud-auth = "=1.17.0"
+
+[lints]
+workspace = true

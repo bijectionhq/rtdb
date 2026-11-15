@@ -618,3 +618,12 @@ surface ReplicaLogReading {
         -- At most one leader's writes are ever confirmed per database, enforced by the term fence on consume-back rather than by anything at this boundary.
         --   Which is why the log's own obligations are stated in this module at all: the fence is nothing but readers agreeing on which term the log has reached and how far through it, so it holds exactly as far as DurableTotalOrder does and no further.
 }
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "How many already-admitted replica records may wait behind a transaction resolution that is still running?"
+    -- A higher observed term must end the old term while a caller's transaction writer is suspended.
+    -- The Rust driver retains intervening admitted records under count and byte limits until the resolution returns or the old term ends.
+    -- The admission verdict remains attached to each retained record during replay.

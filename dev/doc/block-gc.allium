@@ -344,3 +344,8 @@ surface BlockGcAdmin {
 open question "Per-table sweep enumerates ObjectStore directories per table. On a database with thousands of tables this scales linearly with table count per cycle. Earlier versions sampled at most 100 tables per cycle (randomised) — that cap is gone in the current implementation. Fine for now; revisit if table counts grow."
 
 open question "Block GC has no replica-log coordination on the assumption that block files are consumed only at startup/catch-up. If a future feature ever causes a follower to read a block file online (e.g. for cross-block range scans, or for some new replication mode), this assumption breaks silently. Worth marking the assumption load-bearing in TableCatalog/BufferPool so a future change can spot it."
+
+open question "At which lifecycle boundary must invalid block retention be rejected?"
+    -- GarbageCollectBlocks describes a top-level deletion pass before rejecting zero retention.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, BlockGarbageCollector rejects blocksToKeep below one during construction.
+    -- The native collector validates retention before opening a collection cycle.

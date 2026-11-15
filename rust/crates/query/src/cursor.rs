@@ -59,7 +59,8 @@ impl QueryCursor {
     pub async fn next_batch(&mut self) -> Result<Option<OwnedBatch>> {
         if let Err(error) = self.context.check_cancelled() { self.input = None; return Err(error); }
         let token = self.context.cancellation.clone();
-        let result = token.run_until_cancelled(self.pull_batch()).await.ok_or_else(cancelled);
+        let owner = self.context.owner_cancellation.clone();
+        let result = owner.run_until_cancelled(token.run_until_cancelled(self.pull_batch())).await.flatten().ok_or_else(cancelled);
         match result {
             Ok(Ok(batch)) => { if batch.is_none() { self.input = None; } Ok(batch) }
             Ok(Err(error)) | Err(error) => { self.input = None; Err(error) }

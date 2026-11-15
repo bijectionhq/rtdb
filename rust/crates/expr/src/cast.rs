@@ -1,15 +1,11 @@
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
 use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
-use chrono_tz::Tz;
+use crate::timezone::{Zone, zone};
 use num_bigint::BigInt;
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 use std::str::FromStr;
 
-pub(crate) fn zone(timezone: &str) -> Result<Tz> {
-    timezone.parse().map_err(|_| Anomaly::incorrect("xtdb/invalid-timezone", format!("Unknown time zone: {timezone}")))
-}
-
-fn local_instant(local: NaiveDateTime, timezone: &str) -> Result<DateTime<Tz>> {
+fn local_instant(local: NaiveDateTime, timezone: &str) -> Result<DateTime<Zone>> {
     let zone = zone(timezone)?;
     match zone.from_local_datetime(&local) {
         LocalResult::Single(value) => Ok(value),

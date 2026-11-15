@@ -1,0 +1,20 @@
+= Storage publication contracts
+
+Object stores are passive I/O capabilities.
+`put` and `put_file` publish immutable objects and accept an existing destination only when its bytes are identical.
+`put_file` takes a closed source file that the caller keeps unchanged and alive until the operation completes.
+
+The local adapter copies into a temporary file, syncs its contents, publishes without replacing an existing name, and syncs the destination directory ancestry.
+An existing file is compared in bounded chunks.
+The remote bridge uploads sequential multipart chunks to a unique private name, conditionally copies that object to the destination, and deletes the private name before returning.
+The provider must implement conditional copy; unsupported providers return an error without overwriting the destination.
+Existing remote objects are compared through bounded range reads.
+The memory adapter retains the whole object by definition.
+
+Normal upload failures attempt multipart cleanup.
+An upload future that is forcibly dropped, a failed cleanup request, or a process crash can leave private objects or multipart parts behind.
+The private `.tmp` namespace is excluded from object listings exposed to the database.
+Shutdown owners must allow in-flight publication calls to finish before joining their workers.
+Provider lifecycle policies and orphan cleanup remain operational obligations; hiding a temporary object does not reclaim it.
+
+All implementation and test source remains uncompiled and unexecuted during Phase 1.

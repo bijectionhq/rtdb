@@ -40,7 +40,8 @@ pub fn resolve_table(catalog: &dyn Catalog, name: &[Identifier], search_path: &[
     let normalized: Vec<_> = name.iter().map(Identifier::normalized).collect();
     let default_database = catalog.default_database();
     let mut candidates = match normalized.as_slice() {
-        [table] => search_path.iter().map(|schema| QualifiedTable { database: default_database.to_owned(), table: TableRef::new(schema, table) }).collect::<Vec<_>>(),
+        [table] => search_path.iter().map(|schema| QualifiedTable { database: default_database.to_owned(), table: TableRef::new(schema, table) })
+            .chain(std::iter::once(QualifiedTable { database: default_database.to_owned(), table: TableRef::new("pg_catalog", table) })).collect::<Vec<_>>(),
         [prefix, table] => {
             let mut candidates = vec![QualifiedTable { database: default_database.to_owned(), table: TableRef::new(prefix, table) }];
             if !catalog.transaction_scoped() && catalog.databases().contains(prefix) {
@@ -131,6 +132,10 @@ impl From<Schema> for Vec<Field> { fn from(schema: Schema) -> Self { schema.0 } 
 pub struct Binder { next_column: u32, parameter_types: BTreeMap<usize, LogicalType> }
 
 impl Binder {
+    pub fn after(schema: &Schema) -> Result<Self> {
+        let next_column = schema.fields().iter().map(|field| field.id.0).max().map(|id| id.checked_add(1).ok_or_else(|| Anomaly::incorrect("xtdb/query-too-large", "Column identifier space is exhausted"))).transpose()?.unwrap_or(0);
+        Ok(Self { next_column, parameter_types: BTreeMap::new() })
+    }
     pub fn field(&mut self, name: impl Into<String>, qualifier: Option<String>, data_type: LogicalType) -> Result<Field> {
         let id = ColumnId(self.next_column);
         self.next_column = self.next_column.checked_add(1).ok_or_else(|| Anomaly::incorrect("xtdb/query-too-large", "Column identifier space is exhausted"))?;

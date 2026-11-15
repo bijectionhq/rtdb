@@ -17,8 +17,24 @@ fn every_message_kind_carries_its_term_position_through_the_codec() {
     ];
     for message in messages {
         let stamped = ReplicaEnvelope { term: Term(3), term_sequence: Some(TermSequence(5)), message };
+        assert_eq!(stamped.encoded_len(), stamped.encode().len());
         assert_eq!(ReplicaEnvelope::decode(&stamped.encode()).unwrap(), Some(stamped));
     }
+}
+
+#[test]
+fn envelope_sizes_keep_zero_presence_and_signed_varint_widths() {
+    for term in [-1, 0, 127, 128, i64::MAX] {
+        for sequence in [None, Some(-1), Some(0), Some(128), Some(i64::MAX)] {
+            let envelope = ReplicaEnvelope { term: Term(term), term_sequence: sequence.map(TermSequence), message: ReplicaBody::NoOp(pb::NoOp::default()) };
+            assert_eq!(envelope.encoded_len(), envelope.encode().len());
+        }
+    }
+    let messages = [
+        rtdb_format::envelope::SourceMessage::LegacyTransaction(vec![0xff, 0, 1]),
+        rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(pb::FlushBlock { expected_block_idx: Some(-1) })),
+    ];
+    for message in messages { assert_eq!(message.encoded_len(), message.encode().unwrap().len()); }
 }
 
 #[test]

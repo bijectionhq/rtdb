@@ -1,0 +1,54 @@
+[package]
+name = "rtdb-node"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+kafka = ["dep:rtdb-kafka"]
+s3 = ["dep:rtdb-s3"]
+azure = ["dep:rtdb-azure"]
+gcs = ["dep:rtdb-gcs"]
+pg-source = ["dep:rtdb-pg-source"]
+all-backends = ["kafka", "s3", "azure", "gcs", "pg-source"]
+
+[dependencies]
+rtdb-types.workspace = true
+rtdb-columnar.workspace = true
+rtdb-format.workspace = true
+rtdb-storage.workspace = true
+rtdb-index.workspace = true
+rtdb-trie.workspace = true
+rtdb-plan.workspace = true
+rtdb-sql.workspace = true
+rtdb-xtql.workspace = true
+rtdb-expr.workspace = true
+rtdb-query.workspace = true
+rtdb-tx.workspace = true
+rtdb-replication.workspace = true
+rtdb-maintenance.workspace = true
+rtdb-kafka = { workspace = true, optional = true }
+rtdb-s3 = { workspace = true, optional = true }
+rtdb-azure = { workspace = true, optional = true }
+rtdb-gcs = { workspace = true, optional = true }
+rtdb-pg-source = { workspace = true, optional = true }
+async-trait.workspace = true
+futures.workspace = true
+prost-types.workspace = true
+prost.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

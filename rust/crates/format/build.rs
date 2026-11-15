@@ -28,6 +28,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         core.join("xtdb/cols/proto/cols.proto"),
         core.join("xtdb/trie.proto"),
         api.join("xtdb/proto/basis.proto"),
+        root.join("modules/aws/src/main/proto/s3.proto"),
+        root.join("modules/azure/src/main/proto/azure.proto"),
+        root.join("modules/google-cloud/src/main/proto/gcs.proto"),
+        root.join("modules/kafka/src/main/proto/kafka.proto"),
+        root.join("modules/postgres-source/src/main/proto/postgres_source.proto"),
     ];
     for path in &files {
         println!("cargo:rerun-if-changed={}", path.display());
@@ -42,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "VecType.type.fixed_size_list", "VecType.type.map", "VecType.type.struct", "VecType.type.maybe", "VecType.type.poly"] {
         config.boxed(format!(".xtdb.cols.proto.{field}"));
     }
-    let includes = [core, api, protoc_bin_vendored::include_path()?];
+    let includes = [core, api, root, protoc_bin_vendored::include_path()?];
     let mut descriptors = config.load_fds(&files, &includes)?;
     for file in &mut descriptors.file {
         if file.syntax.as_deref() == Some("editions") {

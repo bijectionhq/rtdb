@@ -1,0 +1,75 @@
+= Node and session source
+
+`Node` is a passive shared handle over a catalog, resource factories, runtime catalog providers, and cancellation.
+`NodeDriver` is the active owner of catalog commands and database task completion.
+`DatabaseCatalog` publishes immutable membership generations; its owner removes a detaching database from lookup before cancellation and releases its name after the driver joins.
+A database whose driver has already failed remains a member until an explicit detach, which can immediately release the joined name.
+`Database` is passive and retains partition snapshots, logs, storage, progress, and maintenance handles.
+`DatabaseDriver` supervises the active replica, maintenance, and log drivers, cancels and joins consumers before stopping log owners, and reports ingestion failure without terminating unrelated databases.
+`MaintenanceSupervisor` owns each leader term's GC and external-source region and joins it before assigning the next term.
+
+`NativeResources` opens independent memory or local source and replica logs plus the configured storage root.
+Feature-gated provider factories supply Kafka, S3, Azure, and GCS implementations.
+`PostgresSourceFactory` is a passive immutable registry of node-local remotes and native indexer factories.
+It constructs an unstarted source driver for each assigned term; the active driver owns its PostgreSQL sockets and confirmation state until teardown.
+Remote credentials stay out of persisted database configurations.
+Catalog admission checks shared configuration shape without consulting node-local provider registries.
+A skipped member retains its durable configuration even when its backend is not configured on this node.
+Provider availability is checked only when the database opens locally.
+Read-only local log readers do not acquire a writer lock or mutate log files.
+One cache allocation ceiling is shared across database buffer pools; a retained lease remains charged after its pool is dropped.
+
+`Session` is a passive object owned by one caller.
+Its transaction, buffer, characteristics, session settings, and last-submitted record are mutated only through that caller's exclusive borrow.
+`QueryBasis`, transaction settings, and commit results are passive values.
+`DmlBuffer` is a transient that coalesces adjacent executions of identical SQL only when both carry argument batches.
+An absent argument batch and an explicitly empty batch remain distinct.
+`SessionService` is the passive node capability used to await applied positions, capture the time basis, submit a source record, and await its transaction result.
+The service binds the authenticated identity; transaction options cannot choose another user.
+
+BEGIN leaves the read basis unpinned.
+The first query awaits the effective await token, then captures the snapshot token and clock unless read-only settings override them.
+A later query in that transaction keeps the same basis.
+A writing transaction buffers operations and rejects queries.
+Autocommit applies only when no explicit transaction is open.
+Manual mode opens lazily on its first operation.
+
+COMMIT of a writing transaction submits even an empty buffer.
+The explicit commit mode overrides the transaction's asynchronous setting.
+Synchronous commit awaits admitted application through the service; asynchronous commit returns the submitted position.
+SET TIME ZONE commits its session change and rolls it back on ROLLBACK.
+BEGIN and SET TRANSACTION time-zone overrides apply only to the open transaction.
+Closing a session discards its buffer and cancels its children.
+
+`NativeSessionService` connects the shared session state to native source submission, admitted application waiters, immutable snapshot capture, and the native SQL/XTQL query engine.
+When the requested transaction is older than the retained progress result, the node reads its outcome from `xt.txs` at a fresh basis.
+Autonomous submission can target another database without changing the connection database and advances the await token for the target database.
+Authentication revalidation is asynchronous and completes before reads or writes; synchronous session settings check only local connection lifetime.
+Frontends revalidate before their protocol commands.
+`NodeCatalogRuntime` forwards configured users and metric snapshots and reads role membership from a fresh primary snapshot independently of the outer query basis.
+`HealthChecks` is passive and retains the replica targets captured at startup.
+Its current observations distinguish critical from noncritical database failures, check a five-block lag threshold, and submit explicit block-flush requests.
+HTTP serving and metrics export are separate operational adapters still requiring composition.
+`PreparedSql` retains charged source and prepared metadata, rebinds at execution, and exposes separate PostgreSQL signature checks and dynamic Arrow schemas.
+
+The session tests preserve state observations from `InProcessAdbcTest`, `ConnectionTest`, and `tx.allium`.
+Native node tests cover data-dependent SQL writes, historical reads, asynchronous await tokens, local recovery, retained batches, skipped membership, and detach ordering around running or failed drivers.
+These are test sources and contain no execution evidence.
+SQL transaction-option execution, Flight handles, protocol entry points, and production server assembly remain incomplete.
+Time-zone validation shares expression conversion's named-zone and Java fixed-offset parser.
+Fixed-offset spellings are normalized for session output.
+
+The failed-transaction guard is enforced by the shared session API.
+The JVM connection exposes lower-level commit methods whose callers must choose rollback when failed; the frontend integration must preserve that distinction for pgwire COMMIT in a failed transaction.
+No source in this crate has been compiled or executed during Phase 1.
+
+`PreparedSql` query execution binds against its supplied `QueryContext` every time, so newly published table OIDs and union legs enter the execution plan.
+The dynamic signature policy supports ADBC schema discovery; the PostgreSQL policy rejects changed column counts and incompatible PostgreSQL result descriptors.
+Null results and empty lists retain a compatible PostgreSQL description.
+ADBC parameter fields have empty names and unknown nullable types in positional order.
+Prepared DML preserves the original SQL and the distinction between absent and explicitly empty argument batches, and resolves tables only during transaction execution.
+Session read-basis capture, access checks, and authentication revalidation precede prepared execution.
+`tests/statement.rs` contains source regressions for these contracts and the pgwire cached-plan guard.
+Preparation metadata has retained-byte accounting; SQL parser and planner transient allocations and operator descriptors still share the resource qualifications documented by the query crate.
+
+`tests/catalog.rs` carries source observations from `information_schema_test.clj`: namespace OIDs, the Npgsql columns/type join, role namespaces, redacted passwords, declared empty catalog schemas, and metrics tag Arrow layout.

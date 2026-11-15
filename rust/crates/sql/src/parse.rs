@@ -5,8 +5,25 @@ use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::
 #[derive(Clone, Debug)]
 pub struct ParsedStatement {
     pub span: SourceSpan,
+    parameter_count: usize,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatementKind { Query, Dml, Session }
+
+impl ParsedStatement {
+    pub fn parameter_count(&self) -> usize { self.parameter_count }
+    pub fn kind(&self) -> StatementKind {
+        match &self.statement {
+            Syntax::Standard(ast::Statement::Query(_)) => StatementKind::Query,
+            Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. }
+            | Syntax::Erase(_) | Syntax::Assert(_, _)
+            | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)) => StatementKind::Dml,
+            _ => StatementKind::Session,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -14,6 +31,9 @@ pub(crate) enum Syntax {
     Standard(ast::Statement),
     Erase(ast::Delete),
     Assert(ast::Expr, Option<String>),
+    Records { patch: bool, table: ast::ObjectName, records: Vec<ast::Expr> },
+    CreateTable { table: ast::ObjectName, columns: Vec<Identifier> },
+    GrantRole { user: Identifier, role: Identifier, revoke: bool },
     Set { name: Vec<Identifier>, value: ast::Expr, local: bool },
     Show(Vec<Identifier>),
 }
@@ -44,16 +64,45 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
         let span = source_span(sql, Span::new(slice[0].span.start, slice[slice.len() - 1].span.end));
         let mut tokens = slice.to_vec();
         let mut next = 1usize;
+        let mut parameter_count = 0;
         for token in &mut tokens {
             if let Token::Placeholder(value) = &mut token.token {
                 if value == "?" { *value = format!("${next}"); next += 1; }
                 else if !value.starts_with('$') || value[1..].parse::<usize>().ok().filter(|index| *index > 0).is_none() {
                     return Err(sql_error("SQL parameters use ? or a positive $n index", sql, token.span));
                 }
+                parameter_count = parameter_count.max(value[1..].parse::<usize>().map_err(|_| sql_error("Invalid parameter index", sql, token.span))?);
             }
         }
         let (mut tokens, temporal) = extract_temporal(tokens, sql)?;
-        let statement = if word(tokens.first(), "ERASE") {
+        let statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
+            let patch = word(tokens.first(), "PATCH");
+            let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
+            let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+            let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
+            let records = parser.parse_comma_separated(|parser| parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
+            Syntax::Records { patch, table, records }
+        } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
+            let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
+            let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+            let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            let mut columns = Vec::new();
+            if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
+                loop {
+                    columns.push(identifier_token(&parser.next_token())?);
+                    if parser.consume_token(&Token::RParen) { break; }
+                    parser.expect_token(&Token::Comma).map_err(|error| sql_error(error.to_string(), sql, parser.peek_token().span))?;
+                }
+            }
+            if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
+            Syntax::CreateTable { table, columns }
+        } else if word(tokens.first(), "GRANT") || word(tokens.first(), "REVOKE") {
+            let revoke = word(tokens.first(), "REVOKE");
+            if tokens.len() != 4 || !word(tokens.get(2), if revoke { "FROM" } else { "TO" }) { return Err(sql_error("Expected one role and one user", sql, slice[0].span)); }
+            Syntax::GrantRole { role: identifier_token(&tokens[1])?, user: identifier_token(&tokens[3])?, revoke }
+        } else if word(tokens.first(), "ERASE") {
             let replacement = Tokenizer::new(&dialect, "DELETE").tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
             tokens[0].token = replacement.into_iter().next().ok_or_else(|| Anomaly::fault("rtdb.sql/lexer", "Missing DELETE token"))?;
             let statement = standard(tokens, sql)?;
@@ -81,7 +130,7 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
             Syntax::Set { name, value, local }
         } else { Syntax::Standard(standard(tokens, sql)?) };
-        statements.push(ParsedStatement { span, statement, temporal });
+        statements.push(ParsedStatement { span, parameter_count, statement, temporal });
     }
     Ok(statements)
 }

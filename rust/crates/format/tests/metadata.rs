@@ -52,6 +52,14 @@ fn metadata_rejects_forward_children_and_unavailable_recency_leg() {
 }
 
 #[test]
+fn single_entity_pages_may_share_the_same_recency_ceiling() {
+    let nodes = vec![MetadataNode::Nil, MetadataNode::Nil, MetadataNode::RecencyBranch(vec![(Timestamp(100), 0), (Timestamp(100), 1)])];
+    let metadata = MetadataFile::from_nodes(nodes.clone(), true).unwrap();
+    assert_eq!(MetadataFile::read(metadata.write().unwrap().into()).unwrap().nodes(), &nodes);
+    assert!(MetadataFile::from_nodes(vec![MetadataNode::Nil, MetadataNode::Nil, MetadataNode::RecencyBranch(vec![(Timestamp(100), 0), (Timestamp(99), 1)])], true).is_err());
+}
+
+#[test]
 fn metadata_counts_masked_struct_children_and_keeps_numeric_bounds() {
     let ty = LogicalType::Struct(BTreeMap::from([("n".into(), LogicalType::Scalar(ScalarType::I64).maybe())])).maybe();
     let values = [Value::Null, Value::Struct(BTreeMap::from([("n".into(), Value::I64(-4))])), Value::Struct(BTreeMap::from([("n".into(), Value::I64(7))]))];

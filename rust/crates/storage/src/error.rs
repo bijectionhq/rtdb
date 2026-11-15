@@ -20,6 +20,10 @@ pub enum Error {
     UnavailableLogRange { requested: i64, first_retained: i64 },
     #[error("log is closed: {0}")]
     Closed(String),
+    #[error("cannot append to read-only log {0}")]
+    ReadOnlyLog(PathBuf),
+    #[error("log range exceeds read limits of {maximum_records} records or {maximum_payload_bytes} payload bytes")]
+    LogReadLimit { maximum_records: usize, maximum_payload_bytes: usize },
     #[error("message has {size} bytes; maximum is {maximum}")]
     MessageTooLarge { size: usize, maximum: usize },
     #[error("cache requires {requested} bytes; limit is {limit} with {retained} retained")]
@@ -49,6 +53,8 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::CorruptLog { path, offset, .. } => (Category::Fault, "rtdb.storage/corrupt-log", serde_json::json!({"path": path, "offset": offset})),
             Error::UnavailableLogRange { requested, first_retained } => (Category::Unavailable, "rtdb.storage/log-range-unavailable", serde_json::json!({"requested": requested, "first-retained": first_retained})),
             Error::Closed(_) => (Category::Unavailable, "rtdb.storage/closed", serde_json::json!({})),
+            Error::ReadOnlyLog(path) => (Category::Incorrect, "rtdb.storage/read-only-log", serde_json::json!({"path": path})),
+            Error::LogReadLimit { maximum_records, maximum_payload_bytes } => (Category::Busy, "rtdb.storage/log-read-limit", serde_json::json!({"maximum-records": maximum_records, "maximum-payload-bytes": maximum_payload_bytes})),
             Error::MessageTooLarge { size, maximum } => (Category::Incorrect, "rtdb.storage/message-too-large", serde_json::json!({"size": size, "maximum": maximum})),
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),

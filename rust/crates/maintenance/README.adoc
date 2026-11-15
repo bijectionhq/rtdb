@@ -1,0 +1,52 @@
+= Maintenance
+
+`available_jobs` selects work from an immutable trie-catalog snapshot.
+Selection covers L0 plus partial L1C, historical L1 size tiering with partial L2H, and four-way IID tiering.
+Only live inputs participate, and every recorded output shard contributes its high-water mark, including a nascent output awaiting its siblings.
+
+`SegmentCompactor` is a passive capability executing one immutable `CompactionJob` on the caller's task.
+It downloads immutable input files into an owned temporary directory, merges IID/system-time ordered pages, resolves L0 same-transaction overlap, partitions historical output by recency, and writes data and metadata files.
+The final layout supports IID branches, bounded recency cells, single-entity recency pages, and optional run-end encoded historical IIDs.
+Data and metadata files are published through `ObjectStore::put_file` before a notification is returned.
+Repeated publication accepts only identical bytes at an existing object key.
+An upload in progress must finish before the job's temporary files are released.
+
+`CompactionDriver` and `CycleDriver` are active objects whose `run` methods own their event choices.
+The database owner runs and joins them.
+Compaction belongs to the database lifetime; each garbage-collection driver belongs to one leader term.
+Driver queues are bounded, block signals are conflated, and request handles backpressure callers when their queue is full.
+Completion channels are per-request monitors; merge heaps, page builders, file writers, and cycle work lists are single-owner transients.
+The cancellation token is checked between object operations, and started compaction jobs are drained before driver teardown completes.
+
+`CompactionPublisher` completes after a source `TriesAdded` record is durable and admitted processing has applied it.
+`TrieDeletionPublisher` is a leader-term capability completing after admitted replica read-back applies the deletion.
+Its owner must fail outstanding requests when that term ends.
+These capabilities own publication and progress waiting; maintenance never writes serving catalog state.
+An executor or publication failure records that job as failed for the driver's lifetime, and later `compact_all` callers receive the failure without an automatic retry.
+A new database lifetime may retry the deterministic object keys.
+
+`TrieCollector` and `BlockCollector` are passive cycle capabilities.
+Trie collection uses one immutable snapshot, bounded table/delete concurrency, and chunks containing at most 1024 trie keys.
+It removes data before metadata, drains started deletes, then publishes one deletion record per completed chunk.
+L0 recovery files are excluded.
+Block collection removes expired catalog, table-block, and oversized-message objects without replica publication.
+Per-table failures are reported through `CollectionObserver` and isolated from other tables.
+An administrative awaiter receives a cycle started after its request; automatic signals alone are subject to the enabled flag.
+
+== Reference and qualification
+
+Selection follows `job_calculator.clj` and `job_calculator_test.clj`, including the nascent-output case in issue #4930.
+Merge and layout follow `SegmentMerge.kt`, `PageTrieWriter.kt`, `StreamingIidTrie.kt`, and the compactor tests.
+Collection follows `TrieGarbageCollector.kt`, `BlockGarbageCollector.kt`, and their test classes.
+The executable test sources in this crate cover selection, historical splitting, deterministic retries within the Rust writer, temporary-file cleanup, failure retention, concurrent cycle awaiters, block retention, deletion ordering, and L0 preservation.
+No Rust compilation, test execution, JVM comparison, or simulation has run during Phase 1.
+
+Cross-JVM Arrow byte identity remains unverified, including schema child order, dictionary encoding, FlatBuffer allocation order, and exact page boundaries.
+Compressed compaction inputs return an explicit unsupported error until their decoded allocation bounds are available.
+The job enforces temporary disk growth before writes and holds memory reservations for input pages, decoded rows, output pages, and retained metadata.
+Those conservative estimates are not a proof of bounded peak allocation for every nested Arrow schema.
+Catalog enumeration, object-store listings, and protobuf decoding still need complete peak-memory accounting.
+
+`block-gc.allium` describes a zero-retention sweep followed by failure.
+The pinned collector validates positive retention during construction; this implementation follows that source behavior and rejects the configuration before deletion.
+The discrepancy is unresolved rather than an executed compatibility result.

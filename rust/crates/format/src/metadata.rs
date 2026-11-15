@@ -34,6 +34,18 @@ pub struct MetadataBuilder {
     calculate_blooms: bool,
 }
 
+/// Estimates the retained metadata and its serialization scratch for one page, separately from the page's Arrow buffers.
+pub fn page_metadata_reservation(page: &arrow_array::RecordBatch) -> Result<usize> {
+    let mut bytes = page.get_array_memory_size().checked_mul(4).and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
+    let mut arrays: Vec<_> = page.columns().iter().map(|array| array.to_data()).collect();
+    while let Some(array) = arrays.pop() {
+        bytes = bytes.checked_add(array.len().checked_mul(256).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
+            .and_then(|size| size.checked_add(1024)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
+        arrays.extend(array.child_data().iter().cloned());
+    }
+    Ok(bytes)
+}
+
 impl MetadataBuilder {
     pub fn new(recency_branches: bool, calculate_blooms: bool) -> Self {
         Self { nodes: Vec::new(), column_count: 0, page_count: 0, row_count: 0,
@@ -51,7 +63,7 @@ impl MetadataBuilder {
         if !self.recency_branches { return Err(invalid("Recency branches require recency data")); }
         for (index, (upper, child)) in children.iter().enumerate() {
             validate_child(*child, self.nodes.len())?;
-            if index > 0 && children[index - 1].0 >= *upper { return Err(invalid("Recency ceilings must increase strictly")); }
+            if index > 0 && children[index - 1].0 > *upper { return Err(invalid("Recency ceilings must be nondecreasing")); }
         }
         self.push(MetadataNode::RecencyBranch(children))
     }
@@ -147,7 +159,7 @@ impl MetadataFile {
                         let Value::I32(index) = required(&fields, "idx")? else { return Err(invalid("Recency bucket has no child index")); };
                         let Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } = required(&fields, "max-recency")? else { return Err(invalid("Recency bucket has no microsecond ceiling")); };
                         let upper = Timestamp(*value);
-                        if buckets.last().is_some_and(|(previous, _)| *previous >= upper) { return Err(invalid("Recency ceilings must increase strictly")); }
+                        if buckets.last().is_some_and(|(previous, _)| *previous > upper) { return Err(invalid("Recency ceilings must be nondecreasing")); }
                         buckets.push((upper, child_index(*index, row)?));
                     }
                     MetadataNode::RecencyBranch(buckets)
@@ -177,7 +189,7 @@ impl MetadataFile {
                     if !recency_branches { return Err(invalid("Recency branches require the recency metadata schema")); }
                     for (index, (upper, child)) in children.iter().enumerate() {
                         validate_child(*child, parent)?;
-                        if index > 0 && children[index - 1].0 >= *upper { return Err(invalid("Recency ceilings must increase strictly")); }
+                        if index > 0 && children[index - 1].0 > *upper { return Err(invalid("Recency ceilings must be nondecreasing")); }
                     }
                 }
                 MetadataNode::Leaf { data_page_index, columns } => {

@@ -1,0 +1,100 @@
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+use std::sync::Arc;
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+use async_trait::async_trait;
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+use prost::Message;
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+use prost_types::Any;
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+use rtdb_types::{Anomaly, Result};
+#[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
+use rtdb_storage::{ObjectKey, ObjectStore};
+#[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
+use crate::RemoteStorageFactory;
+use crate::NativeResources;
+
+impl NativeResources {
+    #[cfg(feature = "kafka")]
+    pub fn with_kafka(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>) -> Result<Self> {
+        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer }))
+    }
+    #[cfg(feature = "s3")]
+    pub fn with_s3(self, remotes: Arc<dyn rtdb_s3::S3CredentialResolver>) -> Result<Self> {
+        self.register_storage("xtdb.aws.proto.S3ObjectStoreConfig", Arc::new(S3Factory { remotes }))
+    }
+    #[cfg(feature = "azure")]
+    pub fn with_azure(self, remotes: Arc<dyn rtdb_azure::AzureCredentialResolver>) -> Result<Self> {
+        self.register_storage("xtdb.azure.proto.AzureBlobStorageConfig", Arc::new(AzureFactory { remotes }))
+    }
+    #[cfg(feature = "gcs")]
+    pub fn with_gcs(self) -> Result<Self> { self.register_storage("xtdb.gcp.proto.GcsObjectStoreConfig", Arc::new(GcsFactory)) }
+}
+
+#[cfg(feature = "s3")]
+struct S3Factory { remotes: Arc<dyn rtdb_s3::S3CredentialResolver> }
+#[cfg(feature = "s3")]
+#[async_trait]
+impl RemoteStorageFactory for S3Factory {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+        let wire = rtdb_format::generated::xtdb::aws::proto::S3ObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
+        rtdb_s3::S3Config::from_proto(&wire).open(storage_root, self.remotes.as_ref()).await
+    }
+}
+
+#[cfg(feature = "azure")]
+struct AzureFactory { remotes: Arc<dyn rtdb_azure::AzureCredentialResolver> }
+#[cfg(feature = "azure")]
+#[async_trait]
+impl RemoteStorageFactory for AzureFactory {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+        let wire = rtdb_format::generated::xtdb::azure::proto::AzureBlobStorageConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
+        rtdb_azure::AzureConfig::from_proto(&wire).open(storage_root, self.remotes.as_ref()).await
+    }
+}
+
+#[cfg(feature = "gcs")]
+struct GcsFactory;
+#[cfg(feature = "gcs")]
+#[async_trait]
+impl RemoteStorageFactory for GcsFactory {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+        let wire = rtdb_format::generated::xtdb::gcp::proto::GcsObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
+        rtdb_gcs::GcsConfig::from_proto(&wire).open(storage_root).await
+    }
+}
+
+#[cfg(feature = "kafka")]
+struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver> }
+#[cfg(feature = "kafka")]
+#[async_trait]
+impl crate::LogFactory for KafkaFactory {
+    async fn open(&self, configuration: &Any, read_only: bool, cancellation: tokio_util::sync::CancellationToken) -> Result<crate::OpenedLogs> {
+        use futures::FutureExt;
+        use rtdb_kafka::{KafkaLog, KafkaLogConfig, KafkaLogOptions};
+        let wire = rtdb_format::generated::xtdb::kafka::proto::KafkaLogConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
+        let configuration = KafkaLogConfig::from_proto(&wire);
+        let source_cluster = self.clusters.get(&configuration.cluster).ok_or_else(|| invalid(format!("No Kafka cluster configured with alias '{}'", configuration.cluster)))?;
+        let replica_cluster = self.clusters.get(configuration.replica_cluster()).ok_or_else(|| invalid(format!("No Kafka cluster configured with alias '{}'", configuration.replica_cluster())))?;
+        if configuration.cluster == configuration.replica_cluster() && configuration.topic == configuration.replica_topic() {
+            return Err(invalid("Source and replica Kafka logs must use distinct topics or clusters"));
+        }
+        let mut source_options = KafkaLogOptions::new(&configuration.topic);
+        source_options.read_only = read_only;
+        let mut replica_options = KafkaLogOptions::new(configuration.replica_topic());
+        replica_options.read_only = read_only;
+        replica_options.pipelined = true;
+        let source = KafkaLog::open(source_cluster, source_options, Arc::clone(&self.observer)).await?;
+        let replica = KafkaLog::open(replica_cluster, replica_options, Arc::clone(&self.observer)).await?;
+        let mut drivers = Vec::new();
+        for driver in source.driver.into_iter().chain(replica.driver) {
+            let token = cancellation.clone();
+            drivers.push(async move { driver.run(token).await.map_err(Into::into) }.boxed());
+        }
+        let epoch = rtdb_types::StorageEpoch(configuration.epoch);
+        Ok(crate::OpenedLogs { source: source.log, replica: replica.log, source_epoch: epoch, replica_epoch: epoch, drivers })
+    }
+}
+
+#[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
+fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", message.to_string()) }

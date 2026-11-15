@@ -247,10 +247,10 @@ impl PartitionScan {
 
 fn bounds(scan: &Scan, snapshot: &Snapshot, execution: &Execution) -> Result<TemporalBounds> {
     let valid_time = dimension(&scan.valid_time, execution.context.current_time, execution)?;
-    let basis = snapshot.tx_basis().map(|basis| basis.system_time);
+    let basis = snapshot.system_time_cap();
     let default = basis.unwrap_or(execution.context.current_time);
     let system = dimension(&scan.system_time, default, execution)?;
-    let upper = basis.map(|basis| basis.0.saturating_add(1)).map(Timestamp).unwrap_or(Timestamp::MAX).min(system.upper());
+    let upper = basis.map(|basis| basis.0.saturating_add(1)).map(Timestamp).unwrap_or(Timestamp::MIN).min(system.upper());
     let system_time = Interval::new(system.lower().min(upper), upper)?;
     Ok(TemporalBounds { valid_time, system_time })
 }

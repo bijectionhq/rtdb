@@ -15,6 +15,8 @@ pub enum Dml {
     Erase { table: QualifiedTable, input: Arc<Relation> },
     Patch { table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter },
     Assert { input: Arc<Relation>, message: Option<String> },
+    CreateTable { table: QualifiedTable, columns: Vec<String> },
+    GrantRole { user: String, role: String, revoke: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

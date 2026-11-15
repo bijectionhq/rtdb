@@ -26,8 +26,14 @@ impl IndexBatch {
         Ok(Arc::new(Self { owned, events, put_types }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::build_events(events, declared, false, budget)
+    }
+    pub fn from_events_with_put_schema(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::build_events(events, declared, true, budget)
+    }
+    fn build_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, force_put: bool, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let mut fields = declared.clone();
-        let mut has_put = !declared.is_empty();
+        let mut has_put = force_put || !declared.is_empty();
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
                 let next = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();

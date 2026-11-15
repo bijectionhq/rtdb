@@ -56,6 +56,23 @@ pub enum LogicalType {
 }
 
 impl LogicalType {
+    /// Includes inline storage and owned capacities, with conservative tree-node overhead.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let mut bytes = std::mem::size_of::<Self>();
+        let overflow = || Anomaly::incorrect("rtdb/type-size", "Logical type size exceeds usize");
+        match self {
+            Self::Scalar(ScalarType::Timestamp { timezone: Some(timezone), .. }) => bytes = bytes.checked_add(timezone.capacity()).ok_or_else(overflow)?,
+            Self::List { element, .. } | Self::Maybe(element) | Self::RunEndEncoded { value: element, .. } => bytes = bytes.checked_add(element.retained_bytes()?).ok_or_else(overflow)?,
+            Self::Struct(fields) => for (name, ty) in fields {
+                bytes = bytes.checked_add(256).and_then(|n| n.checked_add(name.capacity())).and_then(|n| n.checked_add(std::mem::size_of::<String>())).ok_or_else(overflow)?;
+                bytes = bytes.checked_add(ty.retained_bytes()?).ok_or_else(overflow)?;
+            },
+            Self::Union(legs) => for leg in legs { bytes = bytes.checked_add(256).and_then(|n| n.checked_add(leg.retained_bytes().ok()?)).ok_or_else(overflow)?; },
+            _ => {}
+        }
+        Ok(bytes)
+    }
+
     pub fn list(element: Self) -> Self { Self::List { kind: ListKind::List, element: Box::new(element) } }
 
     /// Returns value kinds with physical encodings removed at every depth.

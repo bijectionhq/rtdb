@@ -11,6 +11,7 @@
 -- Entity/field names match the Kotlin in core/src/main/kotlin/xtdb/api/Xtdb.kt
 -- (Connection, Transaction, Phase Pending/Reading/Writing, Characteristics, DmlBuffer) and the SQL
 -- classifier in core/src/main/kotlin/xtdb/query/SqlParser.kt → ParsedStatement.
+-- Rust session state and its service boundary are in rust/crates/node/src/session.rs.
 --
 -- == Frontend parity (the point of this spec) ==
 --
@@ -1232,3 +1233,7 @@ surface ConnectionLifecycle {
 ---- Open Questions
 
 open question "AutoCommitDml stamps opts with user and default_tz only (no system_time). Is the read basis (await_token) the right post-write visibility contract for the immediately-following auto-commit query, or should auto-commit DML and the following query share a tighter basis?"
+
+open question "Which token does AutoCommitQuery supply as snapshot_token?"
+    -- ReadBasis declares a TimeBasisToken, while AutoCommitQuery supplies the connection's TxBasisToken.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, Connection.queryBasis uses Database.Catalog.snapshotToken after preparation has awaited the connection's writes.

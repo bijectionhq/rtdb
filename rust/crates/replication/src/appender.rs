@@ -1,0 +1,210 @@
+use std::collections::VecDeque;
+use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto};
+use rtdb_tx::{ResolvedTx, TransactionResult};
+use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, Term, TermSequence, Timestamp};
+use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
+
+use crate::{PartitionLogs, ReplicaMetadata, progress::term_ended};
+
+pub(crate) enum WriteBody { Resolved(Arc<ResolvedTx>), Message(ReplicaBody) }
+#[derive(Clone, Debug)]
+pub(crate) enum Applied { Transaction(Arc<TransactionResult>), Replica(ReplicaPosition) }
+
+pub(crate) struct PendingWrite {
+    pub body: WriteBody,
+    pub block: BlockIndex,
+    sequence: AtomicI64,
+    completion: Mutex<Option<oneshot::Sender<Result<Applied>>>>,
+    _reservation: Arc<MemoryReservation>,
+}
+impl PendingWrite {
+    pub fn new(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let extra = match &body { WriteBody::Resolved(_) => 1024, WriteBody::Message(body) =>
+            body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))? };
+        Ok(Arc::new(Self { body, block, sequence: AtomicI64::new(-1), completion: Mutex::new(completion), _reservation: memory.reserve(extra)? }))
+    }
+    pub fn sequence(&self) -> Option<TermSequence> { let value = self.sequence.load(Ordering::Acquire); (value >= 0).then_some(TermSequence(value)) }
+    pub fn finish(&self, result: Result<Applied>) { if let Some(completion) = self.completion.lock().take() { let _ = completion.send(result); } }
+}
+impl Drop for PendingWrite { fn drop(&mut self) { if let Some(completion) = self.completion.get_mut().take() { let _ = completion.send(Err(term_ended())); } } }
+
+struct AppendRequest { write: Arc<PendingWrite>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>> }
+
+#[derive(Clone)]
+pub(crate) struct AppenderHandle { sender: mpsc::UnboundedSender<AppendRequest> }
+impl AppenderHandle {
+    pub fn enqueue(&self, write: Arc<PendingWrite>) -> Result<()> {
+        self.sender.send(AppendRequest { write, durable: None }).map_err(|_| term_ended())
+    }
+    pub async fn append_durable(&self, write: Arc<PendingWrite>) -> Result<ReplicaMetadata> {
+        let (sender, receiver) = oneshot::channel();
+        self.sender.send(AppendRequest { write, durable: Some(sender) }).map_err(|_| term_ended())?;
+        receiver.await.map_err(|_| term_ended())?
+    }
+}
+
+pub(crate) struct ReplicaAppender {
+    logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, sequence: TermSequence,
+    queue: mpsc::UnboundedReceiver<AppendRequest>, assertion_interval: Duration, cancellation: CancellationToken,
+}
+impl ReplicaAppender {
+    pub fn new(logs: Arc<PartitionLogs>, memory: Arc<MemoryBudget>, term: Term, assertion_interval: Duration, cancellation: CancellationToken) -> (AppenderHandle, Self) {
+        let (sender, queue) = mpsc::unbounded_channel();
+        (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation })
+    }
+    pub async fn run(mut self) -> Result<()> {
+        let mut timer = tokio::time::interval(self.assertion_interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        timer.tick().await;
+        let mut receipts: futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, Result<()>>> = futures::stream::FuturesUnordered::new();
+        use futures::StreamExt;
+        let outcome = loop {
+            tokio::select! {
+                biased;
+                _ = self.cancellation.cancelled() => break Ok(()),
+                receipt = receipts.next(), if !receipts.is_empty() => {
+                    if let Some(Err(error)) = receipt { break Err(error); }
+                },
+                _ = timer.tick() => {
+                    let sequence = self.sequence;
+                    self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
+                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+                    match observe_enqueue(self.logs.enqueue_replica(&envelope, BlockIndex(0), now()), &self.cancellation, &mut receipts).await {
+                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, None, None)),
+                        Ok(None) => break Ok(()),
+                        Err(error) => break Err(error),
+                    }
+                }
+                request = self.queue.recv() => {
+                    let Some(request) = request else { break Ok(()); };
+                    let sequence = self.sequence;
+                    self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
+                    request.write.sequence.store(sequence.0, Ordering::Release);
+                    let resolved;
+                    let body = match &request.write.body {
+                        WriteBody::Resolved(tx) => match tx.to_replica_body(&self.memory) { Ok(body) => { resolved = body; resolved.body() }, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } },
+                        WriteBody::Message(body) => body,
+                    };
+                    let copy_bound = body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Append message copy size overflow"));
+                    let _copy_reservation = match copy_bound.and_then(|bytes| self.memory.reserve(bytes)) { Ok(reservation) => reservation, Err(error) => { request.write.finish(Err(error.clone())); break Err(error); } };
+                    let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: body.clone() };
+                    match observe_enqueue(self.logs.enqueue_replica(&envelope, request.write.block, now()), &self.cancellation, &mut receipts).await {
+                        Ok(Some(receipt)) => receipts.push(track_receipt(receipt, Some(Arc::clone(&request.write)), request.durable)),
+                        Ok(None) => { request.write.finish(Err(term_ended())); if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); } break Ok(()); }
+                        Err(error) => { request.write.finish(Err(error.clone())); if let Some(sender) = request.durable { let _ = sender.send(Err(error.clone())); } break Err(error); }
+                    }
+                }
+            }
+        };
+        self.queue.close();
+        while let Ok(request) = self.queue.try_recv() {
+            request.write.finish(Err(term_ended()));
+            if let Some(sender) = request.durable { let _ = sender.send(Err(term_ended())); }
+        }
+        drop(receipts);
+        outcome
+    }
+}
+
+async fn observe_enqueue(
+    enqueue: impl std::future::Future<Output = Result<crate::ReplicaReceipt>>,
+    cancellation: &CancellationToken,
+    receipts: &mut futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, Result<()>>>,
+) -> Result<Option<crate::ReplicaReceipt>> {
+    use futures::StreamExt;
+    tokio::pin!(enqueue);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(None),
+            receipt = receipts.next(), if !receipts.is_empty() => { if let Some(result) = receipt { result?; } }
+            receipt = &mut enqueue => return receipt.map(Some),
+        }
+    }
+}
+
+fn track_receipt(receipt: crate::ReplicaReceipt, write: Option<Arc<PendingWrite>>, durable: Option<oneshot::Sender<Result<ReplicaMetadata>>>) -> futures::future::BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        let outcome = receipt.durable().await;
+        if let Some(sender) = durable { let _ = sender.send(outcome.clone()); }
+        if let Err(error) = &outcome { if let Some(write) = write { write.finish(Err(error.clone())); } }
+        outcome.map(|_| ())
+    })
+}
+
+pub(crate) fn complete_record(pending: &mut VecDeque<Arc<PendingWrite>>, sequence: Option<TermSequence>, result: Result<Applied>) {
+    if let Some(index) = pending.iter().position(|item| item.sequence() == sequence && sequence.is_some()) {
+        if let Some(item) = pending.remove(index) { item.finish(result); }
+    }
+}
+pub(crate) fn now() -> Timestamp { Timestamp(chrono::Utc::now().timestamp_micros()) }
+pub(crate) fn join_error(error: tokio::task::JoinError) -> Anomaly { Anomaly::fault("rtdb.replication/child-task", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use rtdb_storage::{MemoryStore, cache::BufferPool, log::{AppendReceipt, Log, LogOffset, LogRecord, LogTail, MemoryLog}};
+    use rtdb_types::StorageEpoch;
+
+    struct ReceiptFailure { readable: MemoryLog }
+    #[async_trait]
+    impl Log for ReceiptFailure {
+        async fn enqueue(&self, _: Bytes, _: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+            let (sender, receiver) = oneshot::channel();
+            let _ = sender.send(Err(rtdb_storage::Error::Closed("provider rejected durability".into())));
+            Ok(AppendReceipt::new(receiver))
+        }
+        fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.readable.latest() }
+        async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> { self.readable.tail(after).await }
+        async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.readable.read_range(from, to).await }
+    }
+    fn pump(interval: Duration) -> (AppenderHandle, ReplicaAppender, Arc<MemoryBudget>) {
+        let memory = MemoryBudget::new(1 << 24);
+        let store = Arc::new(MemoryStore::default());
+        let cache = Arc::new(BufferPool::new(store.clone(), 1 << 20));
+        let source = Arc::new(MemoryLog::new(1 << 20));
+        let replica = Arc::new(ReceiptFailure { readable: MemoryLog::new(1 << 20) });
+        let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), rtdb_format::keys::CURRENT_STORAGE_VERSION, StorageEpoch(0), store, cache, Arc::clone(&memory)).unwrap();
+        let (handle, appender) = ReplicaAppender::new(logs, Arc::clone(&memory), Term(1), interval, CancellationToken::new());
+        (handle, appender, memory)
+    }
+    #[tokio::test]
+    async fn ordinary_append_receipt_failure_stops_pump_and_fails_its_completion() {
+        let (handle, appender, memory) = pump(Duration::from_secs(60));
+        let (sender, receiver) = oneshot::channel();
+        let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) })), BlockIndex(0), Some(sender), &memory).unwrap();
+        handle.enqueue(write).unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
+        assert!(error.message.contains("provider rejected durability"));
+        assert!(receiver.await.unwrap().unwrap_err().message.contains("provider rejected durability"));
+    }
+    #[tokio::test]
+    async fn heartbeat_receipt_failure_stops_pump_without_waiting_for_readback() {
+        let (_handle, appender, _) = pump(Duration::from_millis(1));
+        let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
+        assert!(error.message.contains("provider rejected durability"));
+    }
+
+    #[tokio::test]
+    async fn term_cancellation_drops_backpressured_enqueue_without_waiting_for_provider_shutdown() {
+        let cancellation = CancellationToken::new();
+        let mut receipts = futures::stream::FuturesUnordered::new();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropSignal { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+        let guard = DropSignal(Arc::clone(&dropped));
+        let enqueue = async move { let _guard = guard; std::future::pending::<Result<crate::ReplicaReceipt>>().await };
+        let cancel = async { tokio::task::yield_now().await; cancellation.cancel(); };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(observe_enqueue(enqueue, &cancellation, &mut receipts), cancel) }).await.unwrap();
+        assert!(result.unwrap().is_none());
+        assert!(dropped.load(Ordering::Acquire));
+    }
+}

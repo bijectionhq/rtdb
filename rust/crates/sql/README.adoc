@@ -3,16 +3,21 @@
 The parser and binder are passive objects.
 Each preparation owns its transient column allocator, parameter map, and CTE scope.
 Prepared statements retain immutable plans and their source text.
+Parsed statement metadata exposes the operation kind and lexical parameter count before table binding.
+Ordinary physical scans expose temporal columns to explicit expressions while keeping their synthetic column identities outside wildcard expansion.
+Column aliases rename document fields and preserve that hidden-column distinction.
 
 The parser tokenizes before binding so anonymous parameters follow lexical order across projection, predicate, nested query, and temporal clauses.
 Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
 Temporal clauses retain the source location of their table and become scan dimensions before execution.
 Error contexts retain byte spans and one-based positions in the original SQL text.
 
-Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, and basic transaction and session controls.
+Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, PATCH RECORDS, INSERT RECORDS, CREATE TABLE declarations, GRANT/REVOKE role membership, and basic transaction and session controls.
+Canonical mutation lowering preserves unassigned document fields, derives valid-time windows, and builds PATCH gap filling and shallow merge plans.
+Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.
 
-The frontend currently rejects correlated scalar and predicate subqueries, lateral relations, recursive CTEs, window functions, NATURAL and USING joins, PATCH and RECORDS input, DML RETURNING, query SETTING clauses, prepared-statement commands, COPY, database lifecycle commands, role commands, interval qualifiers, and decimal cast options.
+The frontend currently rejects correlated scalar and predicate subqueries, lateral relations, recursive CTEs, window functions, NATURAL and USING joins, DML RETURNING, query SETTING clauses, prepared-statement commands, COPY, database lifecycle commands, interval qualifiers, and decimal cast options.
 The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
 ORDER BY expressions are currently resolved against projected fields.
 The syntax and name errors have source positions; exact SQLSTATE and upstream diagnostic text remain comparison work.

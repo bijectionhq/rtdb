@@ -1,0 +1,135 @@
+= Replication
+
+This crate contains source for term admission, the partition driver, source resolution dispatch, ordered replica append, block production and adoption, recovery, and applied-progress waits.
+It remains in Phase 1: no Rust build, test, server, or runtime parity check has run.
+
+== Ownership and assembly
+
+`PartitionLogs` is a passive capability over distinct source and replica logs, their epochs, a partition-scoped object store, its buffer pool, and a memory budget.
+`BlockStore` is passive and reads or writes the same scoped storage namespace.
+Its `recover` operation loads the greatest published block index, every table file named by that block, the table and trie catalogs, the next live block, the applied source position, and the boundary's replica fence.
+Recovery itself does not require writable log capabilities.
+
+`ProgressMonitor` owns one published value containing the applied source position, transaction key and most recent result, and the most recent non-null external token.
+A driver publishes that value only after the corresponding effects apply.
+`DriverStatus` is a separate watched value for role, observed term, consumed replica position, open block, adopted block, and the latest failed promotion.
+
+`ReplicationDriver` is the active owner of election, replica input, source input, commands, resolution completion, production completion, and append-pump completion.
+`ReplicationDriver::new` starts no task.
+The node owns the task running `run`, invokes `ReplicationHandle::shutdown` to cancel it, and joins it before releasing storage, logs, or transaction dependencies.
+The driver cancels and joins its append pump at term end.
+An in-flight transaction future owns its resolver and external writer; demotion drops that future and fails its receipt.
+A block-production future observes cancellation between pages and completed storage operations, and the driver awaits it before the region ends.
+
+`TxResolver`, `BlockCycle`, and pending write items are passive transients owned by the current term.
+Each pending write owns its transaction or control body, assigned sequence, memory reservation, and optional completion sender.
+There is no separate completion map.
+`PendingBlock` is a passive transient retained across role changes; it owns the original boundary, its captured partition generation, and the already-admitted records held behind it.
+The driver applies both count and byte limits to pending-block records and to readbacks held behind an in-flight resolution.
+
+`DatabaseEffects` is the passive node/catalog capability for database-operation validation and application and primary-database configuration capture.
+A secondary database supplies its explicit catalog policy through this capability.
+Maintenance adapters call `ReplicationHandle::publish_compaction` and a captured `TermHandle::publish_deletions`.
+Both await application; a term-scoped deletion receipt fails when that term ends.
+The status stream announces block adoption after the leader has durably re-published the L0 notification to the source log.
+
+== Processing order
+
+The replica reader folds each delivered envelope into `TermFence` exactly once, including claims, stale records, and records later buffered behind a block.
+Fenced and voided records are consumed without applying their bodies.
+An admitted oversized envelope is fetched and checked against its outer term and sequence before the resolved body is retained or applied.
+Held records replay below the fence that already admitted them.
+
+A claim is a durable sequence-zero no-op in the next observed term.
+Leadership is confirmed by reading back that node's own claim at a position that opened a strictly newer term.
+The append pump assigns subsequent term sequences, fixes each append's order before accepting the next one, and emits heartbeat assertions independently of transaction resolution.
+Ordinary transaction writes do not wait for durability before the pump accepts the next write.
+Block-upload production retains its durability receipt.
+
+Resolution sees the durable snapshot overlaid with every unresolved predecessor.
+While a resolution future owns the resolver, the driver continues term admission and retains admitted readbacks under its configured limits.
+A newer term ends the old region, transfers those retained records to follower application, and preserves any pending block.
+A completed resolution returns its resolver before the driver enqueues the new transaction and drains held readbacks.
+
+For this term's transaction readback, the driver removes the oldest staged transaction before validating its ID.
+It applies the staged write atomically, publishes applied progress, and completes the transaction receipt.
+Transactions from earlier terms import their encoded tables through `rtdb-tx::decode_replica`.
+A missing legacy source position uses the transaction ID for ordinary databases and preserves the current source position for external-source databases.
+A null external token preserves the last non-null token.
+
+The resolve-side row gauge starts from applied live rows on promotion and advances when a transaction resolves.
+A cut queues the boundary in append order and pauses further resolution until its matching upload is adopted.
+Production writes L0 data, then its metadata completion marker, then all table-block files, and finally the block catalog.
+The original boundary's term, sequence, replica position, source position, and token are persisted even when a later term produces the block.
+A retry first reuses an already-published block after validating that boundary.
+Partial retries use the boundary log timestamp when calculating table-catalog transitions, so immutable publication does not depend on retry wall time.
+
+Adoption validates the loaded catalog against the retained boundary and changes catalogs, table metadata, and live-block state in one partition publication.
+The upload's source watermark is published before held records drain.
+A replay failure ends the driver; it does not reopen a follower after discarding the retained prefix.
+
+== Compatibility qualifications
+
+The applied-progress monitor intentionally differs from the pinned `api/log/Watchers.kt` and `db.allium`'s `ProcessingErrorHaltsNode`.
+An already-satisfied prefix remains available after a fault or shutdown; unmet waits fail with the current fault or stopped outcome.
+Only an explicitly initialized replacement driver clears the current fault.
+This follows the object-boundaries monitor requirement, and runtime/reference compatibility remains unresolved rather than claimed.
+
+The row gauge follows `BlockCutter.txResolved`, whose resolved count is initially seeded from applied rows.
+The `live-index.allium` header and `db.allium`'s `AppendTx` prose name applied rows, while the live-index cut rule names resolved rows.
+The existing open question in `live-index.allium` records this disagreement.
+
+Idle empty blocks follow `BlockFlusher.kt` and its retention-anchor behavior from #5778.
+The flush timer rearms when the persisted transaction changes; otherwise an elapsed deadline cuts even an empty block.
+`LeaderFlushTimeout` currently requires data, so its open question remains unresolved.
+
+Oversized-envelope admission precedes payload fetch, following the format/spec boundary.
+The pinned JVM `LogProcessor.kt` resolves the payload before applying the term fence.
+A fenced pointer to a missing object therefore has different failure behavior.
+
+Committed database-operation application preserves the pinned role distinction: the leader applies it before its transaction and propagates a caller failure; a follower applies it after its transaction and swallows a caller failure.
+The shared `ApplyDbOpToCatalog` deferred specification currently describes swallowing the fault for both roles.
+
+Boundary-timestamp table transitions make partial immutable retries deterministic.
+The pinned `BlockCutter` captures wall time while producing table blocks.
+Garbage-age effects of this timestamp choice require reference qualification.
+
+== Source regression mapping
+
+[cols="1,2"]
+|===
+|Rust source regression |Pinned source or behavioral obligation
+|`held_records_replay_below_the_fence_after_a_higher_term_upload` |`FollowerLogProcessorTest`: records held by a block apply when it closes; inherited blocks close across roles; lifecycle admission occurs once.
+|`wrong_epoch_upload_is_held_and_record_overflow_stops_apply` |`FollowerLogProcessorTest`: buffer overflow stops ingestion; upload version and epoch must match the retained block.
+|`sequence_gap_voids_the_term_and_later_records_cannot_apply` |`LogProcessorTest` term-sequence gap and voided-term behavior.
+|`block_production_is_repeatable_and_adoption_folds_rows_once` |`BlockCutterTest`: production leaves live rows in place; producing twice folds the row count once.
+|`oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched` |`OffloadedMessages.kt` envelope checks plus the spec-first fetch boundary qualification above.
+|`source_transaction_reads_back_applies_flushes_and_recovers` |`db.allium` source append, resolve, replica readback, cut, upload, adoption, and startup chain.
+|`higher_term_drops_an_inflight_external_writer_and_replays_held_prefix_before_the_new_term` |Leader term ownership and demotion while caller resolution is suspended.
+|`demotion_fails_queued_gc_publication_without_failing_the_progress_monitor` |`gc.allium` term-scoped pending publications and the monitor/term separation.
+|`resolved_rows_seed_from_applied_rows_and_resolution_stops_until_adoption` |`BlockCutterTest`: part-filled promotion and paused resolution through readback.
+|`flush_timeout_rearms_when_persisted_transaction_changes_and_cuts_idle_empty_blocks` |`BlockFlusher.kt` exact deadline and persisted-transaction change behavior.
+|`applied_prefix_remains_readable_after_ingestion_failure_and_restart_releases_new_waits` |Object-boundaries monitor contract; explicitly differs from the pinned absorbing Watchers failure.
+|`invalid_progress_does_not_partially_publish_source_or_token` |One atomic applied-progress value and strict source/transaction monotonicity.
+|===
+
+The query scan source additionally covers independent per-partition caps, an explicitly empty pre-ingestion basis, retained live generations after block adoption, and unchanged durable transaction identity.
+
+== Remaining review and integration obligations
+
+These sources have not been compiled or exercised.
+The node must provide concrete database effects, authorize ordinary submission, supervise the driver task, and supply source and replica log backends satisfying the durable-total-order contract.
+A storage upload already started must finish before its owner is joined.
+Leadership claims and all append receipts are owner-polled, so waiting for their durability does not block replica admission or cancellation.
+A log backend owns accepted writes until its own driver is shut down and joined.
+An external writer must own its resources within the supplied future and release them if the term drops that future.
+
+Encoded buffers, pending replica envelopes, append items, transaction deltas, and page scratch use reservations.
+Decoded block/table catalogs share their immutable protobuf allocations and reservation owners through recovery and snapshots.
+Semantic catalog generations, protobuf container overhead, and metadata serialization still need a complete retained-allocation audit.
+Backend tail batches can contain a large durable prefix; their maximum size is a backend obligation not yet enforced by the generic `LogTail` interface.
+The block writer reserves selected-cell decoding and Arrow building separately, drops page scratch after each write, and retains a separate metadata estimate until serialization.
+The metadata estimate remains conservative and requires nested-schema allocation qualification.
+
+Promotion rollback, node/database shutdown composition, cross-node election faults, durable transport loss/reordering qualification, and external-source resume/confirmation require the complete node-level traces and Phase 2 fault/parity runs.
+No runtime-parity, throughput, bounded-peak-memory, or production-readiness claim follows from this source checkpoint.

@@ -1,0 +1,18 @@
+= S3 adapter
+
+`S3Config` and `S3Credentials` are immutable passive configuration values.
+`S3CredentialResolver` is a passive node-local alias lookup; alias secrets do not enter persisted database configuration.
+`open` constructs an owned native `object_store` client behind the shared immutable-publication adapter.
+Keys are rooted at the configured prefix followed by the supplied storage-version and epoch root.
+
+Inline and remote-alias access keys take precedence over default credentials and conflict with each other.
+Default authentication uses the official AWS credential chain, including shared profiles, SSO, credential processes, web identity, container credentials, and instance credentials.
+The passive credential bridge serializes refreshes and retains credentials until their expiration approaches.
+Region discovery uses the same official configuration loader.
+Endpoint and path-style configuration retain the bucket in the request address.
+Conditional creation and multipart copy implement the shared no-clobber publication contract.
+The caller keeps an uploaded source file immutable and alive until `put_file` returns.
+
+Source references are `modules/aws/src/main/kotlin/xtdb/aws/S3.kt`, the existing `s3.proto`, and the shared remote-storage contract.
+Rust test sources cover configuration persistence, alias isolation, endpoint addressing, secret redaction, and expiring credential refresh.
+Provider requests, emulator behavior, multipart retry comparison, and credential-chain integration have not been executed during Phase 1.

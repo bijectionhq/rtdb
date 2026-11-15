@@ -1469,3 +1469,19 @@ deferred ApplyResolvedTxFromRecord
 deferred FoldIntoTermPosition
   -- Fold one record into this node's highest term read and its position within that term, and return the verdict: fenced, discarded, voided or admitted.
   -- See: log-processor-lifecycle.allium, Rules: fold a record into the term position
+
+---- Open Questions
+
+open question "Which already-applied query bases remain available after an ingestion failure?"
+    -- ProcessingErrorHaltsNode and the pinned JVM Watchers fail every later await.
+    -- The object-boundaries contract requires wait conditions to remain re-evaluable.
+    -- The Rust monitor serves an already-satisfied applied prefix, fails unmet waits with the current fault, and clears that fault only after an explicit successful driver restart.
+    -- Compatibility of this behavior remains unresolved.
+
+open question "Does the idle flush deadline advance the block catalog when the open block has no rows?"
+    -- LeaderFlushTimeout requires a block with data.
+    -- The pinned JVM BlockFlusher advances idle empty blocks to maintain log retention anchors, including after the persisted transaction has stopped changing.
+
+open question "Which node-local caller failures during committed database-operation apply terminate ingestion?"
+    -- ApplyDbOpToCatalog swallows a caller fault.
+    -- The pinned JVM follower does so after applying the transaction, while LeaderLogProcessor applies the database operation before the transaction and propagates the fault.

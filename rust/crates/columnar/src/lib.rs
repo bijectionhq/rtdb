@@ -2,10 +2,12 @@ mod allocation;
 mod iid;
 mod hash;
 mod memory;
+mod read_allocation;
 mod schema;
 mod values;
 
 pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs};
+pub use read_allocation::estimate_read_value_bytes;
 pub use iid::{IidView, build_iids};
 pub use hash::{hash_cell, hash_value, murmur3_32, xxhash32};
 pub use memory::{MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection};

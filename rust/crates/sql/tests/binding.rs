@@ -6,6 +6,50 @@ use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
 
 struct Fixture;
 
+#[test]
+fn parsed_parameter_count_precedes_dml_table_binding() {
+    let parsed = parse("UPDATE absent SET value = $3 WHERE _id = ?").unwrap();
+    assert_eq!(parsed[0].kind(), rtdb_sql::StatementKind::Dml);
+    assert_eq!(parsed[0].parameter_count(), 3);
+    assert_eq!(parse("SELECT '?' AS literal, $2").unwrap()[0].parameter_count(), 2);
+}
+
+#[test]
+fn temporal_projection_resolves_hidden_columns_without_expanding_wildcards() {
+    assert_eq!(query("SELECT * FROM foo").schema().len(), 4);
+    assert_eq!(query("SELECT _valid_from, _valid_to, _system_from, _system_to FROM foo FOR ALL SYSTEM_TIME").schema().len(), 4);
+    assert_eq!(query("SELECT f.* FROM foo AS f(a, b, c, d)").schema().len(), 4);
+    assert_eq!(query("SELECT * FROM UNNEST($1) AS items(value)").schema().len(), 1);
+}
+
+#[test]
+fn sql_to_static_ops_non_dml_5856_and_dynamic_expressions_remain_unexpanded() {
+    for sql in ["SELECT 1", "CREATE TABLE foo (_id, v)", "GRANT reader TO alice", "INSERT INTO foo (_id, v) VALUES (1, 1 + 2)"] {
+        assert!(rtdb_sql::prepare_static(sql, &Fixture, &PrepareOptions::default()).unwrap().is_none());
+    }
+    assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, v) VALUES (1, 12.34)", &Fixture, &PrepareOptions::default()).unwrap().is_some());
+    assert!(rtdb_sql::prepare_static("INSERT INTO foo (", &Fixture, &PrepareOptions::default()).is_err());
+}
+
+#[test]
+fn patch_records_null_valid_time_4448_binds_gap_operator_and_merge() {
+    let mutation = rtdb_sql::prepare_tx("PATCH INTO foo FOR PORTION OF VALID_TIME FROM NULL TO NULL RECORDS {_id: 1, price: 42}", &Fixture, &PrepareOptions::default()).unwrap();
+    let rtdb_sql::Mutation::Put { input, .. } = mutation else { panic!("Expected put plan") };
+    fn contains_gap(input: &Relation) -> bool { matches!(input.node(), RelationNode::PatchGaps { .. }) || input.children().iter().any(|child| contains_gap(child)) }
+    assert!(contains_gap(&input));
+    assert_eq!(input.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_iid", "_valid_from", "_valid_to", "doc"]);
+    let mut has_patch = false;
+    for expr in input.expressions() { expr.visit(&mut |expr| { if matches!(expr, Expr::Call { name, .. } if name == "_patch") { has_patch = true; } }); }
+    assert!(has_patch);
+}
+
+#[test]
+fn create_or_alter_table_and_role_membership_are_transaction_operations() {
+    for sql in ["CREATE TABLE empty_table", "CREATE OR ALTER TABLE empty_table (_id, v)", "GRANT reader TO alice", "REVOKE reader FROM alice"] {
+        assert!(matches!(prepare(sql, &Fixture, &PrepareOptions::default()).unwrap().statement, Statement::Dml(_)));
+    }
+}
+
 impl Catalog for Fixture {
     fn default_database(&self) -> &str { "xtdb" }
     fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into(), "archive".into()]) }

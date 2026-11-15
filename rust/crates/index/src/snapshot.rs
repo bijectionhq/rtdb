@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_trie::TrieConfig;
-use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef, TransactionKey};
+use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef, Timestamp, TransactionKey};
 
 use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
 
@@ -13,13 +13,23 @@ pub struct Snapshot {
     durable: Arc<LiveIndex>,
     layered: BTreeMap<TableRef, Vec<Arc<LiveTable>>>,
     basis: Option<TransactionKey>,
+    system_time_cap: Option<Timestamp>,
 }
 
 impl Snapshot {
     pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
-        Self { basis: live.latest_completed_tx(), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new() }
+        Self { basis: live.latest_completed_tx(), system_time_cap: live.latest_completed_tx().map(|key| key.system_time), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new() }
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
+    pub fn system_time_cap(&self) -> Option<Timestamp> { self.system_time_cap }
+    /// Keeps this generation's catalog and live buffers; `None` selects the empty, pre-ingestion basis.
+    pub fn with_system_time_cap(mut self, cap: Option<Timestamp>) -> Result<Self> {
+        if cap.is_some_and(|cap| self.basis.is_none_or(|basis| cap > basis.system_time)) {
+            return Err(Anomaly::incorrect("rtdb.index/future-read-basis", "Query basis exceeds the captured partition head"));
+        }
+        self.system_time_cap = cap;
+        Ok(self)
+    }
     pub fn block_index(&self) -> BlockIndex { self.durable.block_index() }
     pub fn trie_catalog(&self) -> &TrieCatalog { &self.trie_catalog }
     pub fn table_catalog(&self) -> &TableCatalog { &self.table_catalog }
@@ -68,6 +78,7 @@ impl Snapshot {
             }
             next.table_catalog = Arc::new(next.table_catalog.with_entries_for(write.tables().keys().cloned())?);
             next.basis = Some(write.tx_key());
+            next.system_time_cap = Some(write.tx_key().system_time);
         }
         Ok(next)
     }

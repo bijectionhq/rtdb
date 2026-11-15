@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use rtdb_columnar::MemoryBudget;
 use rtdb_index::Snapshot;
-use rtdb_plan::{Catalog, QualifiedTable, TableBinding};
+use rtdb_plan::{Catalog, CatalogRuntime, QualifiedTable, TableBinding};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, TableRef, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
@@ -18,6 +18,7 @@ pub struct CatalogSnapshot {
     default_database: String,
     databases: BTreeMap<String, DatabaseSnapshot>,
     transaction_scoped: bool,
+    pub(crate) runtime: Option<Arc<dyn CatalogRuntime>>,
 }
 
 impl CatalogSnapshot {
@@ -28,13 +29,15 @@ impl CatalogSnapshot {
         if transaction_scoped && databases.get(&default_database).is_none_or(|database| database.partitions.len() != 1) {
             return Err(invalid("transaction-partition-scope", "An index-time query must contain exactly its resolving partition"));
         }
-        Ok(Self { default_database, databases, transaction_scoped })
+        Ok(Self { default_database, databases, transaction_scoped, runtime: None })
     }
+    pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
     pub fn database(&self, name: &str) -> Result<&DatabaseSnapshot> {
         self.databases.get(name).ok_or_else(|| Anomaly::incorrect("xtdb/unknown-db", format!("Unknown database: {name}")))
     }
     fn binding(&self, database: &str, table: &TableRef) -> Result<Option<TableBinding>> {
         let snapshots = &self.database(database)?.partitions;
+        if let Some(definition) = crate::system_schema::definition(table) { return Ok(Some(definition.binding(database))); }
         if !snapshots.iter().any(|snapshot| snapshot.tables().contains(table)) { return Ok(None); }
         let mut columns: Option<BTreeMap<String, LogicalType>> = None;
         let mut oid = None;
@@ -58,6 +61,7 @@ impl Catalog for CatalogSnapshot {
     fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> { self.binding(&name.database, &name.table) }
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> {
         let names: BTreeSet<_> = self.database(database)?.partitions.iter().flat_map(Snapshot::tables).collect();
+        let names: BTreeSet<_> = names.into_iter().chain(crate::system_schema::DEFINITIONS.iter().map(|definition| TableRef::new(definition.schema, definition.name))).collect();
         names.iter().map(|table| self.binding(database, table)?.ok_or_else(|| invalid("missing-table", "Enumerated table has no binding"))).collect()
     }
     fn transaction_scoped(&self) -> bool { self.transaction_scoped }
@@ -82,25 +86,30 @@ pub struct QueryContext {
     pub timezone: String,
     pub options: QueryOptions,
     pub cancellation: CancellationToken,
+    pub(crate) owner_cancellation: CancellationToken,
     pub(crate) spill: Arc<SpillRegion>,
 }
 
 impl QueryContext {
     pub fn new(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: Timestamp, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken) -> Result<Arc<Self>> {
+        Self::with_owner(catalog, memory, current_time, timezone, options, parent_cancellation, parent_cancellation)
+    }
+    /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
+    pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: Timestamp, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
         if options.batch_rows == 0 || options.sort_memory_bytes == 0 || options.merge_fan_in < 2 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive; merge fan-in must be at least two"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time, timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), spill }))
+        Ok(Arc::new(Self { catalog, memory, current_time, timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.clone(), spill }))
     }
     pub fn check_cancelled(&self) -> Result<()> {
-        if self.cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
+        if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
     }
     pub fn spill_bytes(&self) -> u64 { self.spill.retained_bytes() }
     pub fn spill_peak_bytes(&self) -> u64 { self.spill.peak_bytes() }
     pub(crate) fn execution_child(&self) -> Arc<Self> {
         Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), spill: Arc::clone(&self.spill) })
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill) })
     }
 }
 

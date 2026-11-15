@@ -35,3 +35,30 @@ async fn a_provider_object_at_the_namespace_root_is_not_a_relative_object() {
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key.as_str(), "inside");
 }
+
+#[tokio::test]
+async fn multipart_file_publication_uses_an_immutable_destination_and_hides_staging() {
+    use object_store::{ObjectStore as _, ObjectStoreExt as _};
+    let provider = Arc::new(object_store::memory::InMemory::new());
+    let store = RemoteStore::new(provider.clone(), Some(ObjectKey::new("db").unwrap()));
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("data.arrow");
+    let key = ObjectKey::new("tables/a/data/trie.arrow").unwrap();
+    let mut data = vec![17u8; 5 * 1024 * 1024 + 31];
+    data[5 * 1024 * 1024] = 29;
+    std::fs::write(&path, &data).unwrap();
+    store.put_file(&key, &path).await.unwrap();
+    store.put_file(&key, &path).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), data.as_slice());
+    data[5 * 1024 * 1024] = 30;
+    std::fs::write(&path, &data).unwrap();
+    assert!(matches!(store.put_file(&key, &path).await, Err(Error::ConflictingObject(_))));
+    let orphan = object_store::path::Path::from("db/.tmp/interrupted-upload");
+    provider.put(&orphan, Bytes::from_static(b"staging").into()).await.unwrap();
+    assert_eq!(store.list(None).await.unwrap().len(), 1);
+    assert!(provider.head(&orphan).await.is_ok());
+    let empty = ObjectKey::new("empty").unwrap();
+    std::fs::write(&path, []).unwrap();
+    store.put_file(&empty, &path).await.unwrap();
+    assert_eq!(store.head(&empty).await.unwrap().size, 0);
+}

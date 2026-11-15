@@ -14,6 +14,10 @@ pub enum SourceMessage {
 }
 
 impl SourceMessage {
+    pub fn encoded_len(&self) -> usize {
+        match self { Self::LegacyTransaction(bytes) => bytes.len(), Self::Protobuf(message) => 1 + message.encoded_len() }
+    }
+
     /// Legacy transaction bytes include their 0xff header.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
@@ -52,6 +56,11 @@ pub struct ReplicaEnvelope {
 }
 
 impl ReplicaEnvelope {
+    pub fn encoded_len(&self) -> usize {
+        1 + self.message.encoded_len() + 1 + varint_length(self.term.0 as u64)
+            + self.term_sequence.map_or(0, |sequence| 1 + varint_length(sequence.0 as u64))
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty replica message"))?;
         if header != PROTOBUF_LOG_HEADER {
@@ -110,6 +119,12 @@ impl ReplicaEnvelope {
         }
         Ok(payload)
     }
+}
+
+fn varint_length(mut value: u64) -> usize {
+    let mut length = 1;
+    while value >= 128 { value >>= 7; length += 1; }
+    length
 }
 
 fn headered<M: Message>(message: &M) -> Vec<u8> {
