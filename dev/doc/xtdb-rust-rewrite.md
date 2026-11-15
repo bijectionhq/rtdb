@@ -4,6 +4,7 @@ Build a standalone Rust server that can open an existing XTDB database, serve it
 Start by making Rust a second reader of a database produced by the JVM server.
 Qualify the first production migration with a bounded write pause and one generation of writers active at a time.
 The JVM remains the reference implementation during development and a tested recovery option during the initial deployment window.
+The [crate and test parity design](rtdb-crates-and-test-parity.md) maps each subsystem to a proposed Cargo package and defines how the original test assertions carry over.
 
 This is a proposed design based on XTDB commit `c84f9334e`.
 Pin a released JVM distribution and its supported predecessor formats before promising compatibility to operators.
