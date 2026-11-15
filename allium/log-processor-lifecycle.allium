@@ -5,6 +5,7 @@
 -- A node reading a database's replica log claims leadership in that same log, leads as the sole writer of it for its term, and stands down when a higher term supersedes it.
 -- Includes: the Following/Leading state machine; how a claim is made and adjudicated; the term fence that keeps at most one CONFIRMED leader per database; the obligations the replica log itself has to meet for a term to mean anything.
 -- Excludes: record processing and the block lifecycle (db.allium), the live index (live-index.allium), the external source.
+-- Rust term admission is implemented in rust/crates/replication/src/admission.rs.
 --
 -- live-index.allium treats WHICH role owns the live index as a given.
 -- This spec says how that role is selected and swapped, and does not restate what the roles then do with it.

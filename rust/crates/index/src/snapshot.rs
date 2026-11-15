@@ -1,0 +1,74 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use rtdb_trie::TrieConfig;
+use rtdb_types::{Anomaly, BlockIndex, LogicalType, Result, TableRef, TransactionKey};
+
+use crate::{CatalogTrie, LiveIndex, LiveTable, StagedWrite, TableCatalog, TableEntry, TrieCatalog, absent_type};
+
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    trie_catalog: Arc<TrieCatalog>,
+    table_catalog: Arc<TableCatalog>,
+    durable: Arc<LiveIndex>,
+    layered: BTreeMap<TableRef, Vec<Arc<LiveTable>>>,
+    basis: Option<TransactionKey>,
+}
+
+impl Snapshot {
+    pub fn new(trie_catalog: Arc<TrieCatalog>, table_catalog: Arc<TableCatalog>, live: Arc<LiveIndex>) -> Self {
+        Self { basis: live.latest_completed_tx(), durable: live, trie_catalog, table_catalog, layered: BTreeMap::new() }
+    }
+    pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
+    pub fn block_index(&self) -> BlockIndex { self.durable.block_index() }
+    pub fn trie_catalog(&self) -> &TrieCatalog { &self.trie_catalog }
+    pub fn table_catalog(&self) -> &TableCatalog { &self.table_catalog }
+    pub fn table_entry(&self, table: &TableRef) -> Option<&TableEntry> { self.table_catalog.entry(table) }
+    pub fn trie_entries(&self, table: &TableRef) -> Vec<&CatalogTrie> { self.trie_catalog.current_tries(table) }
+    pub fn tables(&self) -> BTreeSet<TableRef> {
+        self.table_catalog.tables().keys().chain(self.durable.tables().keys()).chain(self.layered.keys()).cloned().collect()
+    }
+    pub fn column_names(&self, table: &TableRef) -> BTreeSet<String> {
+        let mut names = BTreeSet::new();
+        if let Some(metadata) = self.table_catalog.metadata(table) { names.extend(metadata.column_types.keys().cloned()); }
+        if let Some(durable) = self.durable.tables().get(table) { names.extend(durable.column_types().keys().cloned()); }
+        for segment in self.layered.get(table).into_iter().flatten() { names.extend(segment.column_types().keys().cloned()); }
+        names
+    }
+
+    /// Newer delta segments precede older ones, preserving operation order at equal system times.
+    pub fn segments(&self, table: &TableRef) -> Vec<Arc<LiveTable>> {
+        let mut segments: Vec<_> = self.layered.get(table).into_iter().flat_map(|layers| layers.iter().rev()).cloned().collect();
+        if let Some(durable) = self.durable.tables().get(table) {
+            if durable.block_index() > self.trie_catalog.l0_max_block_index(table) { segments.push(Arc::clone(durable)); }
+        }
+        segments
+    }
+
+    pub fn column_types(&self, table: &TableRef) -> BTreeMap<String, LogicalType> { self.column_types_for(table, self.column_names(table)) }
+    pub fn column_types_for(&self, table: &TableRef, columns: impl IntoIterator<Item = String>) -> BTreeMap<String, LogicalType> {
+        let sources: Vec<_> = self.durable.tables().get(table).into_iter().chain(self.layered.get(table).into_iter().flatten()).map(|segment| segment.column_types()).collect();
+        let absent: Vec<_> = sources.iter().map(|types| absent_type(types)).collect();
+        columns.into_iter().map(|name| {
+            let mut ty = self.table_catalog.contributed_type(table, &name);
+            for (types, absent) in sources.iter().zip(&absent) { ty = ty.join(types.get(&name).unwrap_or(absent)); }
+            (name, ty)
+        }).collect()
+    }
+
+    pub fn with_staged(&self, staged: &[Arc<StagedWrite>]) -> Result<Self> {
+        let mut next = self.clone();
+        for write in staged {
+            if write.predecessor() != next.basis || write.block_index() != self.block_index() {
+                return Err(Anomaly::incorrect("rtdb.index/overlay-order", "Staged overlay does not follow the snapshot basis and block"));
+            }
+            for (table, delta) in write.tables() {
+                let segment = LiveTable::new(table.clone(), write.block_index(), TrieConfig::default()).append(delta, write.tx_key().system_time)?;
+                next.layered.entry(table.clone()).or_default().push(Arc::new(segment));
+            }
+            next.table_catalog = Arc::new(next.table_catalog.with_entries_for(write.tables().keys().cloned())?);
+            next.basis = Some(write.tx_key());
+        }
+        Ok(next)
+    }
+}

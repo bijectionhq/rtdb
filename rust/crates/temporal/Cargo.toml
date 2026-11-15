@@ -1,0 +1,13 @@
+[package]
+name = "rtdb-temporal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rtdb-types.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -689,3 +689,7 @@ rule NextBlock {
 ------------------------------------------------------------
 
 open question "Does any path still deliver an L0 to the trie catalog ahead of its block's adoption? The TriesAdded re-published to the source log does not: it is appended only after the block adoption, and reaches the replica log behind the BlockUploaded. If no path does, the retention of superseded live tables' column types under L0 supersession can go."
+
+open question "Which row gauge governs CutBlock?"
+    -- The rule names the resolve-side gauge, while this module's header and db.allium's AppendTx use applied rows.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, BlockCutter seeds its gauge from applied rows and advances it when transactions resolve.

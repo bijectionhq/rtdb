@@ -1,0 +1,265 @@
+use crate::{Anomaly, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum TimeUnit { Second, Millisecond, Microsecond, Nanosecond }
+
+impl TimeUnit {
+    pub fn units_per_second(self) -> i64 {
+        match self { Self::Second => 1, Self::Millisecond => 1_000, Self::Microsecond => 1_000_000, Self::Nanosecond => 1_000_000_000 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum IntervalUnit { YearMonth, DayTime, MonthDayNano }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RunEndWidth { I16, I32, I64 }
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ScalarType {
+    Bool,
+    I8, I16, I32, I64,
+    U8, U16, U32, U64,
+    F16, F32, F64,
+    Utf8, Binary, FixedSizeBinary(i32),
+    Decimal { precision: u8, scale: i8, bit_width: u16 },
+    DateDay, DateMilli,
+    Time { unit: TimeUnit, bit_width: u8 },
+    Timestamp { unit: TimeUnit, timezone: Option<String> },
+    Duration(TimeUnit),
+    Interval(IntervalUnit),
+    IntervalMonthDayMicro,
+    Keyword, Uuid, Uri, Transit, Oid, RegClass, RegProc,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ListKind {
+    List,
+    Set,
+    Map { sorted: bool },
+    FixedSizeList(i32),
+    TimestampTzRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum LogicalType {
+    Nothing,
+    Null,
+    Scalar(ScalarType),
+    List { kind: ListKind, element: Box<LogicalType> },
+    Struct(BTreeMap<String, LogicalType>),
+    Maybe(Box<LogicalType>),
+    Union(BTreeSet<LogicalType>),
+    RunEndEncoded { width: RunEndWidth, value: Box<LogicalType> },
+}
+
+impl LogicalType {
+    pub fn list(element: Self) -> Self { Self::List { kind: ListKind::List, element: Box::new(element) } }
+
+    /// Returns value kinds with physical encodings removed at every depth.
+    pub fn legs(&self) -> BTreeSet<Self> {
+        match self {
+            Self::Nothing => BTreeSet::new(),
+            Self::Maybe(value) => { let mut legs = value.legs(); legs.insert(Self::Null); legs }
+            Self::Union(values) => values.iter().flat_map(Self::legs).collect(),
+            Self::RunEndEncoded { value, .. } => value.legs(),
+            value => BTreeSet::from([value.unencoded()]),
+        }
+    }
+
+    /// An empty leg set denotes an unknown prepared parameter and yields `Null`.
+    /// The lattice join retains `Nothing` when no input contributes a leg.
+    pub fn from_legs(legs: impl IntoIterator<Item = Self>) -> Self {
+        let mut legs: BTreeSet<_> = legs.into_iter().flat_map(|leg| leg.legs()).collect();
+        let nullable = legs.remove(&Self::Null);
+        if legs.is_empty() { return Self::Null; }
+        if legs.len() == 1 {
+            let value = legs.into_iter().next().unwrap_or(Self::Nothing);
+            return if nullable { Self::Maybe(Box::new(value)) } else { value };
+        }
+        if nullable { legs.insert(Self::Null); }
+        Self::Union(legs)
+    }
+
+    pub fn maybe(self) -> Self {
+        match self {
+            Self::Nothing | Self::Null => Self::Null,
+            value @ Self::Maybe(_) => value,
+            Self::RunEndEncoded { width, value } => Self::RunEndEncoded { width, value: Box::new((*value).maybe()) },
+            Self::Union(mut legs) => { legs.insert(Self::Null); Self::from_legs(legs) }
+            value => Self::Maybe(Box::new(value)),
+        }
+    }
+
+    pub fn nullable(&self) -> bool { self.legs().contains(&Self::Null) }
+
+    pub fn unencoded(&self) -> Self {
+        match self {
+            Self::RunEndEncoded { value, .. } => value.unencoded(),
+            Self::Maybe(value) => value.unencoded().maybe(),
+            Self::Union(legs) => Self::from_legs(legs.iter().map(Self::unencoded)),
+            Self::List { kind, element } => Self::List { kind: kind.clone(), element: Box::new(element.unencoded()) },
+            Self::Struct(children) => Self::Struct(children.iter().map(|(name, ty)| (name.clone(), ty.unencoded())).collect()),
+            value => value.clone(),
+        }
+    }
+
+    pub fn run_end_encoded(self, width: RunEndWidth) -> Result<Self> {
+        let value = self.unencoded();
+        if matches!(value, Self::Nothing | Self::Null) {
+            return Err(Anomaly::unsupported("xtdb/unsupported-run-end-type", "Null and bottom have no run-end encoding"));
+        }
+        Ok(Self::RunEndEncoded { width, value: Box::new(value) })
+    }
+
+    pub fn absent_contribution(has_put_rows: bool) -> Self {
+        if has_put_rows { Self::Null } else { Self::Nothing }
+    }
+
+    pub fn join(&self, other: &Self) -> Self { Self::join_all([self, other]) }
+
+    pub fn join_all<'a>(types: impl IntoIterator<Item = &'a Self>) -> Self {
+        let mut scalar_legs = BTreeSet::new();
+        let mut list_legs: BTreeMap<ListKind, Self> = BTreeMap::new();
+        let mut structs: Vec<BTreeMap<String, Self>> = Vec::new();
+        for ty in types {
+            for leg in ty.legs() {
+                match leg {
+                    Self::List { kind, element } => {
+                        list_legs.entry(kind).and_modify(|old| *old = old.join(&element)).or_insert(*element);
+                    }
+                    Self::Struct(children) => structs.push(children),
+                    other => { scalar_legs.insert(other); }
+                }
+            }
+        }
+        for (kind, element) in list_legs {
+            scalar_legs.insert(Self::List { kind, element: Box::new(element) });
+        }
+        if !structs.is_empty() {
+            let names: BTreeSet<_> = structs.iter().flat_map(|fields| fields.keys().cloned()).collect();
+            let mut merged = BTreeMap::new();
+            for name in names {
+                let ty = Self::join_all(structs.iter().map(|fields| fields.get(&name).unwrap_or(&Self::Null)));
+                merged.insert(name, ty);
+            }
+            scalar_legs.insert(Self::Struct(merged));
+        }
+        if scalar_legs.is_empty() { Self::Nothing } else { Self::from_legs(scalar_legs) }
+    }
+
+    /// Returns the computation type in the numeric/temporal promotion order.
+    /// This is separate from the lattice join: joining `I32` and `I64` retains two legs.
+    pub fn least_upper_bound(types: &[Self]) -> Option<Self> {
+        let legs: Vec<_> = types.iter().flat_map(Self::legs).filter(|ty| *ty != Self::Null).collect();
+        let mut iter = legs.into_iter();
+        let Some(mut result) = iter.next() else {
+            return Some(if types.iter().all(|ty| ty.legs().is_empty()) { Self::Nothing } else { Self::Null });
+        };
+        for next in iter {
+            let (Self::Scalar(left), Self::Scalar(right)) = (result, next) else { return None; };
+            result = Self::Scalar(left.promote(&right)?);
+        }
+        Some(result)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            Self::Maybe(value) if !matches!(value.as_ref(), Self::Scalar(_) | Self::List { .. } | Self::Struct(_)) => {
+                return Err(Anomaly::incorrect("xtdb/invalid-type", "Maybe requires a non-null monomorphic value type"));
+            }
+            Self::Maybe(value) => value.validate()?,
+            Self::Union(legs) => {
+                if legs.iter().filter(|leg| **leg != Self::Null).count() < 2 {
+                    return Err(Anomaly::incorrect("xtdb/invalid-type", "A union requires at least two non-null legs"));
+                }
+                for leg in legs {
+                    if !matches!(leg, Self::Null | Self::Scalar(_) | Self::List { .. } | Self::Struct(_)) || leg.unencoded() != *leg {
+                        return Err(Anomaly::incorrect("xtdb/invalid-type", "Union legs must be plain monomorphic types"));
+                    }
+                    leg.validate()?;
+                }
+            }
+            Self::RunEndEncoded { value, .. } => {
+                if matches!(value.as_ref(), Self::Nothing | Self::Null | Self::RunEndEncoded { .. }) {
+                    return Err(Anomaly::incorrect("xtdb/invalid-type", "Invalid run-end value type"));
+                }
+                value.validate()?;
+            }
+            Self::List { kind, element } => {
+                if matches!(kind, ListKind::FixedSizeList(size) if *size < 0) {
+                    return Err(Anomaly::incorrect("xtdb/invalid-type", "Negative fixed-size list width"));
+                }
+                element.validate()?;
+            }
+            Self::Struct(children) => { for child in children.values() { child.validate()?; } }
+            Self::Scalar(scalar) => scalar.validate()?,
+            Self::Nothing | Self::Null => {}
+        }
+        Ok(())
+    }
+}
+
+impl ScalarType {
+    fn signed_width(&self) -> Option<u8> {
+        match self { Self::I8 => Some(8), Self::I16 => Some(16), Self::I32 => Some(32), Self::I64 => Some(64), _ => None }
+    }
+    fn float_width(&self) -> Option<u8> {
+        match self { Self::F16 => Some(16), Self::F32 => Some(32), Self::F64 => Some(64), _ => None }
+    }
+    fn is_integer(&self) -> bool { matches!(self, Self::I8 | Self::I16 | Self::I32 | Self::I64 | Self::U8 | Self::U16 | Self::U32 | Self::U64) }
+    pub fn promote(&self, other: &Self) -> Option<Self> {
+        match (self, other) {
+            (left, right) if left.signed_width().is_some() && right.signed_width().is_some() => {
+                Some(if left.signed_width()? >= right.signed_width()? { left.clone() } else { right.clone() })
+            }
+            (left, right) if left.float_width().is_some() && right.float_width().is_some() => {
+                Some(if left.float_width()? >= right.float_width()? { left.clone() } else { right.clone() })
+            }
+            (left, right) if left.is_integer() && right.float_width().is_some() => Some(right.clone()),
+            (left, right) if left.float_width().is_some() && right.is_integer() => Some(left.clone()),
+            (left @ Self::Decimal { .. }, right) if right.is_integer() => Some(left.clone()),
+            (left, right @ Self::Decimal { .. }) if left.is_integer() => Some(right.clone()),
+            (Self::Decimal { .. }, right) if right.float_width().is_some() => Some(right.clone()),
+            (left, Self::Decimal { .. }) if left.float_width().is_some() => Some(left.clone()),
+            (Self::Decimal { precision: lp, scale: ls, .. }, Self::Decimal { precision: rp, scale: rs, .. }) => {
+                let scale = (*ls).max(*rs);
+                let integer_digits = (i16::from(*lp) - i16::from(*ls)).max(i16::from(*rp) - i16::from(*rs));
+                let precision = u8::try_from(integer_digits + i16::from(scale)).ok()?;
+                if precision > 76 { return None; }
+                let bit_width = match precision { 0..=9 => 32, 10..=18 => 64, 19..=38 => 128, _ => 256 };
+                Some(Self::Decimal { precision, scale, bit_width })
+            }
+            (Self::Duration(left), Self::Duration(right)) => Some(Self::Duration((*left).max(*right))),
+            (Self::Time { unit: left, .. }, Self::Time { unit: right, .. }) => {
+                let unit = (*left).max(*right);
+                let bit_width = if unit >= TimeUnit::Microsecond { 64 } else { 32 };
+                Some(Self::Time { unit, bit_width })
+            }
+            (Self::Timestamp { unit: left, timezone: lz }, Self::Timestamp { unit: right, timezone: rz }) => {
+                let timezone = match (lz, rz) {
+                    (None, None) => None,
+                    (Some(lz), Some(rz)) => Some(if lz == rz { lz.clone() } else { "Z".to_owned() }),
+                    _ => return None,
+                };
+                Some(Self::Timestamp { unit: (*left).max(*right), timezone })
+            }
+            _ => None,
+        }
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        let invalid = match self {
+            Self::FixedSizeBinary(width) => *width < 0,
+            Self::Decimal { precision, scale, bit_width } => {
+                let limit = match bit_width { 32 => 9, 64 => 18, 128 => 38, 256 => 76, _ => 0 };
+                *precision == 0 || *precision > limit || i16::from(*scale) > i16::from(*precision)
+            }
+            Self::Time { unit, bit_width } => *bit_width != if *unit >= TimeUnit::Microsecond { 64 } else { 32 },
+            _ => false,
+        };
+        if invalid { Err(Anomaly::incorrect("xtdb/invalid-type", format!("Invalid scalar type {self:?}"))) } else { Ok(()) }
+    }
+}

@@ -1,0 +1,67 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MPL-2.0"
+publish = false
+repository = "https://github.com/bijectionhq/rtdb"
+
+[workspace.dependencies]
+rtdb-types = { path = "crates/types" }
+rtdb-columnar = { path = "crates/columnar" }
+rtdb-temporal = { path = "crates/temporal" }
+rtdb-trie = { path = "crates/trie" }
+rtdb-format = { path = "crates/format" }
+rtdb-storage = { path = "crates/storage" }
+rtdb-index = { path = "crates/index" }
+rtdb-plan = { path = "crates/plan" }
+rtdb-expr = { path = "crates/expr" }
+rtdb-query = { path = "crates/query" }
+rtdb-xtql = { path = "crates/xtql" }
+rtdb-sql = { path = "crates/sql" }
+rtdb-replication = { path = "crates/replication" }
+sqlparser = "=0.63.0"
+arrow-array = "=58.4.1"
+arrow-buffer = "=58.4.1"
+arrow-data = "=58.4.1"
+arrow-schema = "=58.4.1"
+arrow-select = "=58.4.1"
+arrow-ipc = "=58.4.1"
+async-trait = "0.1"
+base64 = "0.22"
+bytes = { version = "1", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10.4"
+bigdecimal = "0.4.10"
+num-bigint = "0.4.8"
+num-traits = "0.2.19"
+regex = "1"
+futures = "0.3"
+fs2 = "0.4"
+half = "2"
+parking_lot = "0.12"
+object_store = { version = "=0.13.2", default-features = false }
+prost = "0.14.3"
+prost-types = "0.14.3"
+prost-build = "0.14.3"
+protoc-bin-vendored = "3"
+roaring = "0.11.5"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

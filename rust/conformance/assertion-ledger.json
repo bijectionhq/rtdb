@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "inventory_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "inventory_complete": false,
+  "runtime_reconciled": false,
+  "cases": [
+    {
+      "identity": {
+        "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+        "source": "core/src/test/kotlin/xtdb/bitemporal/PolygonCalculatorTest.kt",
+        "qualified_name": "xtdb.bitemporal.PolygonCalculatorTest.an earlier event resolves against only its own entity's ceiling",
+        "parameter_fixture": "rust/conformance/fixtures/temporal-ceilings.json",
+        "configuration": "unit/arrow/default"
+      },
+      "source_assertion_lines": [62, 63, 68, 69],
+      "counterparts": ["rtdb-temporal::polygons::earlier_event_resolves_against_only_its_own_entity_ceiling"],
+      "observations": [
+        {"id": "iid-a/earlier/valid-times", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "iid-a/earlier/system-time-ceilings", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "iid-b/valid-times", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "iid-b/system-time-ceilings", "comparison": "exact", "expected": {"kind": "returned"}}
+      ]
+    },
+    {
+      "identity": {
+        "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+        "source": "core/src/test/kotlin/xtdb/api/log/ReplicaMessageTermSeqTest.kt",
+        "qualified_name": "xtdb.api.log.ReplicaMessageTermSeqTest.a claim's position of zero reads back as zero, distinct from a record with none",
+        "parameter_fixture": "rust/conformance/fixtures/term-sequence.json",
+        "configuration": "unit/protobuf/current"
+      },
+      "source_assertion_lines": [35, 36],
+      "counterparts": ["rtdb-format::term_sequence::a_claim_position_of_zero_reads_back_as_zero_distinct_from_none"],
+      "observations": [
+        {"id": "legacy/decoded", "comparison": "exact", "expected": {"kind": "returned"}},
+        {"id": "claim/decoded", "comparison": "exact", "expected": {"kind": "returned"}}
+      ]
+    }
+  ]
+}

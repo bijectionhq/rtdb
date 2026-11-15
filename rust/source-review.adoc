@@ -1,0 +1,102 @@
+= Phase 1 source review
+
+The implementation remains incomplete and uncompiled.
+This record tracks source inspection and remaining work; it is not the Phase 1 completion review or a verification report.
+The reference checkout is pinned to `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+
+== Implemented source paths
+
+* `crates/types`, `columnar`, `temporal`, and `trie` contain semantic values, Arrow mappings and retained allocation owners, temporal polygons, immutable IID tries, event merging, and conservative metadata predicates.
+* `crates/format` contains storage keys, protobuf generation, envelopes, bases, table and block catalogs, Arrow IPC, event batches, column statistics, Bloom filters, HLL values, and Transit values.
+* `crates/storage` contains immutable object operations, local and memory stores, an optional `object_store` bridge, cache leases, and memory/local logs.
+* `crates/index` contains immutable live tables, transaction overlays, captured snapshots, table/trie catalog transitions, and atomic partition publication.
+* `crates/plan`, `expr`, `sql`, `xtql`, and `query` contain the initial native preparation and execution paths.
+The frontend READMEs and explicit unsupported errors identify dialect work still required.
+* `crates/replication` contains term admission only.
+The partition driver and application monitor are not implemented.
+* `crates/conformance` compares supplied observations and rejects missing, duplicate, malformed, skipped, or incorrectly declared failure evidence.
+The source inventory and two mandatory control mappings are present; process runners and runtime reconciliation are not.
+
+== Ownership review
+
+`Binder` is a transient used by one preparation; schemas, expressions, relational plans, table bindings, and prepared statements are passive values.
+`CompiledExpr` is passive and captures its input schema; evaluation borrows parameters, the query clock, time zone, and correlated rows.
+`CatalogSnapshot` and `QueryContext` are passive query regions retaining the read view, storage, memory budget, clock, and cancellation token.
+Pull cursors and their operator state are single-writer transients driven by the caller.
+`TermFence` is passive state owned by the long-lived replica reader, and `Admission` is a passive decision value.
+Neither term admission nor expression evaluation starts an autonomous task.
+
+Arrow buffers retain their allocation charge through custom allocation owners, including child arrays, validity buffers, and slices.
+Cache reads transfer their reservation into local blocking I/O so a cancelled fetch cannot leave an uncharged detached allocation.
+The local log driver requires cancellation followed by joining its run task; forcibly aborting that task can leave an in-progress blocking append with an unknown result.
+Several scalar and row-building paths still allocate transient values before charging their retained size.
+These paths require further work before claiming bounded peak query memory.
+Prepared parameters with an unknown type require rebinding to execution types before batch evaluation.
+The future session layer must also reprepare when the captured database OID or schema changes.
+Requested per-partition system-time bounds still need a query-basis value separate from the captured snapshot's transaction identity.
+Timestamp/duration arithmetic, interval and duration text casts, and full temporal lexical compatibility remain incomplete.
+
+== Findings against the reference
+
+The block-cut specifications disagree about the row gauge.
+`BlockCutter.kt` seeds its gauge from applied rows, then advances it as transactions resolve.
+The open question in `allium/live-index.allium` records that discrepancy; the Rust live index tracks applied rows.
+
+`trie-cat.allium` describes L1C supersession as making covered L0 entries garbage.
+The pinned `trie_catalog.clj` removes those entries from the catalog without scheduling their files for trie GC, retaining a recovery substrate.
+The Rust trie catalog follows that implementation, and the spec has an open question about the retention obligation.
+
+The pinned memory trie shares mutable log storage between derived values.
+Its bounded linear usage differs from the specification's general immutable-branch guarantee when two sibling descendants are extended before reading either.
+The Rust implementation retains independent immutable roots.
+This observation is from source; no JVM failure has been reproduced.
+
+The Java IPC writer emits a four-byte end-of-stream marker where Arrow Rust's writer emits eight bytes.
+The format writer adjusts that footer-relative marker.
+FlatBuffer layout, metadata field allocation order, and bidirectional file compatibility remain unverified.
+
+The repository protobuf files use edition 2023.
+The Rust build script obtains descriptors from the unchanged schemas and lowers their presence and packed-field settings for `prost-build`.
+That generation path has not executed.
+
+The pinned HLL estimator contains the signed conversion of `2^32 - 1`.
+The Rust estimator preserves the source formula; its serialized registers and estimates still require comparison runs.
+
+The grouping comparator applies null equality to the outer key and delegates nested structures to ordinary equality.
+A nested null can therefore prevent two otherwise identical compound keys from grouping together.
+An equality-compatible total ordering cannot silently replace that behavior.
+
+The Rust object key excludes parent traversal.
+The reference storage tests also exercise copies to a parent path and cross-root destinations.
+An explicit destination capability and its original assertions remain to be implemented; those tests are not mapped as covered.
+
+The Rust term fence rejects sequence overflow without publishing a wrapped value.
+The Kotlin implementation uses `Long.MAX_VALUE` as its voided sentinel and adds to sequence values without checked arithmetic.
+A same-term record at `Long.MAX_VALUE` therefore applies after a gap in Kotlin, contradicting the lifecycle specification's `DiscardInVoidedTerm` rule; Rust's explicit voided state discards it.
+Negative resumed or persisted sequence positions can also collide with Kotlin's unsequenced and unknown sentinels, while the Rust states remain distinct.
+The sequence domain and exhaustion behavior need an explicit compatibility decision; ordinary nonnegative positions below these limits follow the existing rules.
+
+== Required production traces
+
+|===
+|Trace |Current gap
+
+|Client read |No pgwire, Flight SQL, embedded service, or server composition root.
+|Data-dependent write |No transaction resolver connects the query snapshot to source/replica append and admitted apply.
+|Replica recovery |No partition driver, pending-block replay, or recovery assembly.
+|Compaction retry |No deterministic compaction worker or publication/retry path.
+|CDC restart |No PostgreSQL replication-slot adapter or durable checkpoint acknowledgement path.
+|Database shutdown |No node lifecycle or server-owned cancellation/join tree.
+|===
+
+Kafka, independent S3/Azure/GCS constructors, authentication, authorization, configuration, operational telemetry, packaging, the C ABI, and language-client integration remain outstanding.
+No release artifact or migration/rollback result exists.
+Phase 2 must not start until these paths and the remaining language/execution surfaces are implemented and the complete source trace review passes.
+
+== Source checks performed
+
+JSON and TOML documents were parsed, and the inventory collector's Python files were parsed as syntax trees without importing or executing them.
+The workspace dependency declarations were inspected for missing internal crates and dependency cycles.
+The pinned reference worktree remained clean.
+Git whitespace checks ran over the changes.
+No Rust compiler, formatter, build script, test runner, server, benchmark, Gradle task, or executable test-discovery command ran.

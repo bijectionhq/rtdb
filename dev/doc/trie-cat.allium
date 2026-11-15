@@ -392,3 +392,11 @@ surface ScanOperatorAccess {
         trie_catalog.currentTries(table)    -- live tries only; see operator/scan.clj
 }
 
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "What retains L0 recovery files after an L1C supersedes their serving entries?"
+    -- InsertTrie_L1C invokes the garbage transition through supersede_by_block_index.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, trie_catalog.clj removes those entries through drop-superseded-l0, leaving their files outside trie GC.
+

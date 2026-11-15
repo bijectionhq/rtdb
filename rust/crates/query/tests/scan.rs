@@ -1,0 +1,198 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
+
+use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_format::{block::proto as pb, catalog::{BlockCatalog, TableBlock}, data::build_event_batch, ipc::write_file, keys::{TrieKey, block_key}, metadata::MetadataBuilder};
+use rtdb_index::{CatalogTrie, PartitionState, PartitionValue, Snapshot, TableCatalog, TransactionBuffer, TrieCatalog};
+use rtdb_plan::{BinaryOp, Catalog, ColumnId, Expr, Field, QualifiedTable, Relation, Scan, TemporalFilter};
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
+use rtdb_trie::TrieConfig;
+use rtdb_types::{EntityId, Iid, Interval, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use tokio_util::sync::CancellationToken;
+
+fn table() -> TableRef { TableRef::new("public", "docs") }
+fn document(id: i64, value: Value) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), value)]) }
+fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) -> TransactionBuffer {
+    TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(id), system_time: Timestamp(system) }, Arc::clone(budget)).unwrap()
+}
+fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+fn at(value: i64) -> TemporalFilter { TemporalFilter::At(Expr::Literal(timestamp(value))) }
+fn query_context(snapshot: Snapshot, store: Arc<MemoryStore>, bypass: bool) -> Arc<QueryContext> {
+    let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    QueryContext::new(catalog, MemoryBudget::new(1 << 28), Timestamp(50), "UTC", QueryOptions { batch_rows: 2, bypass_temporal_pruning: bypass, ..QueryOptions::default() }, &CancellationToken::new()).unwrap()
+}
+fn scan(context: &QueryContext, columns: &[&str], valid_time: TemporalFilter, system_time: TemporalFilter, iids: Option<BTreeSet<Iid>>) -> Arc<Relation> {
+    let binding = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table: table() }).unwrap().unwrap();
+    let fields = columns.iter().enumerate().map(|(id, name)| {
+        let data_type = match *name {
+            "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            "_valid_from" | "_system_from" => LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
+            "_valid_to" | "_system_to" => LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe(),
+            name => binding.columns.get(name).cloned().unwrap_or(LogicalType::Null),
+        };
+        Field { id: ColumnId(id as u32), name: (*name).into(), qualifier: None, data_type }
+    }).collect();
+    Arc::new(Relation::scan(Scan { table: binding, columns: fields, valid_time, system_time, clamp_valid_time: false, iids }).unwrap())
+}
+async fn collect(relation: Arc<Relation>, context: Arc<QueryContext>) -> Result<Vec<Vec<Value>>> {
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, vec![])?;
+    let mut result = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        for row in 0..batch.batch().num_rows() {
+            result.push(batch.batch().schema().fields().iter().enumerate().map(|(column, field)| read_value(field, batch.batch().column(column).as_ref(), row)).collect::<Result<_>>()?);
+        }
+    }
+    Ok(result)
+}
+async fn persist(state: &PartitionState, store: &MemoryStore) -> (BlockCatalog, BTreeMap<TableRef, TableBlock>) {
+    let prepared = state.prepare_block().unwrap();
+    let catalog = prepared.table_catalog().unwrap();
+    let mut additions = BTreeMap::new();
+    for (table, live) in prepared.value().live().tables() {
+        let events = live.ordered_events().unwrap().iter().map(|event| event.source.event()).collect::<Result<Vec<_>>>().unwrap();
+        let batch = build_event_batch(&events, Some(live.column_types().clone()), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, false);
+        metadata.write_leaf(&batch).unwrap();
+        let (metadata, statistics) = metadata.finish().unwrap();
+        let bytes = write_file(batch.schema().as_ref(), &[batch]).unwrap();
+        let key = TrieKey::l0(prepared.block_index()).unwrap();
+        let slug = &catalog.entry(table).unwrap().slug;
+        let size = bytes.len() as i64;
+        store.put(&ObjectKey::new(slug.data_key(&key)).unwrap(), bytes.into()).await.unwrap();
+        store.put(&ObjectKey::new(slug.metadata_key(&key)).unwrap(), metadata.write().unwrap().into()).await.unwrap();
+        additions.insert(table.clone(), vec![CatalogTrie::notification(key, size, Some(statistics)).unwrap()]);
+    }
+    let basis = prepared.value().live().latest_completed_tx();
+    let block = BlockCatalog::from_proto(pb::Block {
+        block_index: Some(prepared.block_index().0), latest_completed_tx: basis.map(|key| pb::TxKey { tx_id: Some(key.tx_id.0), system_time: Some(key.system_time.0) }),
+        tables: catalog.entries().map(|entry| entry.to_proto()).collect(), table_names: catalog.entries().map(|entry| entry.table.schema_and_table()).collect(), ..pb::Block::default()
+    }).unwrap();
+    let tables = prepared.table_blocks(&additions, Timestamp(1000)).unwrap();
+    for (table, table_block) in &tables {
+        store.put(&ObjectKey::new(catalog.entry(table).unwrap().slug.block_key(prepared.block_index()).unwrap()).unwrap(), table_block.encode().into()).await.unwrap();
+    }
+    store.put(&ObjectKey::new(block_key(prepared.block_index()).unwrap()).unwrap(), block.encode().into()).await.unwrap();
+    state.adopt_block(prepared, block.clone(), &additions, Timestamp(1000)).unwrap();
+    (block, tables)
+}
+
+#[tokio::test]
+async fn persisted_and_live_history_resolves_before_value_filtering() {
+    let state = PartitionState::empty(TrieConfig::new(2, 2).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::from_micros(0, 100).unwrap()).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let pinned = state.value().snapshot();
+    persist(&state, &store).await;
+    let mut second = tx(&state, &budget, 1, 200);
+    second.put(table(), document(1, Value::I64(2)), Interval::from_micros(20, 80).unwrap()).unwrap();
+    state.apply(&second.stage().unwrap()).unwrap();
+    let current = state.value().snapshot();
+    for bypass in [false, true] {
+        let context = query_context(current.clone(), Arc::clone(&store), bypass);
+        let scan = scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None);
+        assert_eq!(collect(Arc::clone(&scan), Arc::clone(&context)).await.unwrap(), vec![vec![Value::I64(2)]]);
+        let predicate = Expr::binary(BinaryOp::Eq, scan.schema().fields()[0].expression(), Expr::Literal(Value::I64(1)));
+        assert!(collect(Arc::new(scan.filter(predicate).unwrap()), context).await.unwrap().is_empty());
+    }
+    let context = query_context(pinned, Arc::clone(&store), false);
+    assert_eq!(collect(scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap(), vec![vec![Value::I64(1)]]);
+    let context = query_context(current, store, false);
+    let history = scan(&context, &["v", "_valid_from", "_valid_to", "_system_from", "_system_to"], TemporalFilter::All, TemporalFilter::All, None);
+    assert_eq!(collect(history, context).await.unwrap(), vec![
+        vec![Value::I64(2), timestamp(20), timestamp(80), timestamp(200), Value::Null],
+        vec![Value::I64(1), timestamp(0), timestamp(20), timestamp(100), Value::Null],
+        vec![Value::I64(1), timestamp(20), timestamp(80), timestamp(100), timestamp(200)],
+        vec![Value::I64(1), timestamp(80), timestamp(100), timestamp(100), Value::Null],
+    ]);
+}
+
+#[tokio::test]
+async fn erase_suppresses_history_before_its_system_time_and_reinsert_starts_new_history() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    persist(&state, &store).await;
+    let mut erased = tx(&state, &budget, 1, 200);
+    erased.erase(table(), &EntityId::Integer(1)).unwrap();
+    state.apply(&erased.stage().unwrap()).unwrap();
+    for bypass in [false, true] {
+        let context = query_context(state.value().snapshot(), Arc::clone(&store), bypass);
+        assert!(collect(scan(&context, &["v"], TemporalFilter::All, at(150), None), context).await.unwrap().is_empty());
+    }
+    persist(&state, &store).await;
+    let mut reinsert = tx(&state, &budget, 2, 300);
+    reinsert.put(table(), document(1, Value::I64(3)), Interval::ALL).unwrap();
+    state.apply(&reinsert.stage().unwrap()).unwrap();
+    let context = query_context(state.value().snapshot(), store, false);
+    assert_eq!(collect(scan(&context, &["v"], TemporalFilter::All, TemporalFilter::All, None), context).await.unwrap(), vec![vec![Value::I64(3)]]);
+}
+
+#[tokio::test]
+async fn iid_lookup_and_pruned_scans_match_general_history_across_live_leaves() {
+    let state = PartitionState::empty(TrieConfig::new(1, 2).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut write = tx(&state, &budget, 0, 100);
+    for id in 0..20 { write.put(table(), document(id, Value::I64(id)), Interval::ALL).unwrap(); }
+    state.apply(&write.stage().unwrap()).unwrap();
+    let snapshot = state.value().snapshot();
+    let wanted = BTreeSet::from([EntityId::Integer(7).iid(), EntityId::Integer(11).iid()]);
+    let context = query_context(snapshot.clone(), Arc::clone(&store), false);
+    let fast = collect(scan(&context, &["_iid", "v"], TemporalFilter::All, TemporalFilter::All, Some(wanted.clone())), context).await.unwrap();
+    let context = query_context(snapshot, Arc::clone(&store), true);
+    let all = collect(scan(&context, &["_iid", "v"], TemporalFilter::All, TemporalFilter::All, None), context).await.unwrap();
+    let expected: Vec<_> = all.into_iter().filter(|row| match &row[0] { Value::FixedSizeBinary(bytes) => wanted.contains(&Iid::from_slice(bytes).unwrap()), _ => false }).collect();
+    assert_eq!(fast, expected);
+    persist(&state, &store).await;
+    for bypass in [false, true] {
+        let context = query_context(state.value().snapshot(), Arc::clone(&store), bypass);
+        assert_eq!(collect(scan(&context, &["_iid", "v"], TemporalFilter::All, TemporalFilter::All, Some(wanted.clone())), context).await.unwrap(), expected);
+    }
+}
+
+#[tokio::test]
+async fn reopened_catalog_reads_persisted_data_and_caps_system_time_at_its_basis() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut write = tx(&state, &budget, 0, 100);
+    write.put(table(), document(1, Value::I64(9)), Interval::ALL).unwrap();
+    state.apply(&write.stage().unwrap()).unwrap();
+    let (block, table_blocks) = persist(&state, &store).await;
+    let table_blocks = table_blocks.into_iter().map(|(table, block)| (table, TableBlock::decode(&block.encode()).unwrap())).collect();
+    let catalog = TableCatalog::load(Some(BlockCatalog::decode(&block.encode()).unwrap()), &table_blocks).unwrap();
+    let tries = TrieCatalog::load(&table_blocks, 100_000_000, Timestamp(1000)).unwrap();
+    let reopened = PartitionState::new(PartitionValue::loaded(tries, catalog, TrieConfig::default()).unwrap());
+    let context = query_context(reopened.value().snapshot(), Arc::clone(&store), false);
+    assert_eq!(collect(scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap(), vec![vec![Value::I64(9)]]);
+    let context = query_context(reopened.value().snapshot(), store, false);
+    assert!(collect(scan(&context, &["v"], TemporalFilter::All, at(200), None), context).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn changing_union_schema_requires_repreparation_and_old_snapshot_remains_valid() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let old = query_context(state.value().snapshot(), Arc::clone(&store), false);
+    let prepared = PreparedQuery::new(scan(&old, &["v"], TemporalFilter::Default, TemporalFilter::Default, None)).unwrap();
+    let mut second = tx(&state, &budget, 1, 200);
+    second.put(table(), document(2, Value::Utf8("x".into())), Interval::ALL).unwrap();
+    state.apply(&second.stage().unwrap()).unwrap();
+    let new = query_context(state.value().snapshot(), store, false);
+    let error = match prepared.execute(new, vec![]) { Ok(_) => panic!("changed schema reused a stale plan"), Err(error) => error };
+    assert_eq!(error.code, "rtdb.query/stale-plan");
+    let mut old_cursor = prepared.execute(old, vec![]).unwrap();
+    assert!(old_cursor.next_batch().await.unwrap().is_some());
+}

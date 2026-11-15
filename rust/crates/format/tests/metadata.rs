@@ -1,0 +1,110 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use rtdb_format::bloom::{BloomFilter, hashes};
+use rtdb_format::metadata::{MetadataFile, MetadataNode};
+use rtdb_types::{LogicalType, ScalarType, Timestamp, Value};
+
+#[test]
+fn bloom_matches_portable_roaring_without_run_containers() {
+    let mut bloom = BloomFilter::default();
+    bloom.insert_hashes(1, 1);
+    bloom.insert_hashes(1, 1);
+    let bytes = bloom.to_bytes().unwrap();
+    assert_eq!(bytes, [58, 48, 0, 0, 1, 0, 0, 0, 0, 0, 4, 0, 16, 0, 0, 0, 1, 0, 2, 0, 3, 0, 4, 0, 5, 0]);
+    assert_eq!(BloomFilter::from_bytes(&bytes).unwrap(), bloom);
+    assert!(bloom.contains_hashes(1, 1));
+    assert!(!bloom.contains_hashes(2, 2));
+    assert_eq!(bloom.cardinality(), 5);
+    assert_eq!(hashes(-1, i32::MAX), [4_194_303, 4_194_302, 4_194_301, 4_194_300, 4_194_299]);
+}
+
+fn columns() -> Vec<Value> {
+    vec![Value::Struct(BTreeMap::from([
+        ("col-name".into(), Value::Utf8("_iid".into())),
+        ("root-col?".into(), Value::Bool(true)),
+        ("count".into(), Value::I64(2)),
+        ("bytes".into(), Value::Struct(BTreeMap::from([("bloom".into(), Value::Binary(BloomFilter::default().to_bytes().unwrap()))]))),
+    ]))]
+}
+
+#[test]
+fn metadata_roundtrip_retains_iid_and_recency_branch_order() {
+    let nodes = vec![
+        MetadataNode::Leaf { data_page_index: 0, columns: columns() },
+        MetadataNode::Leaf { data_page_index: 1, columns: columns() },
+        MetadataNode::IidBranch(vec![None, Some(0), None, Some(1)]),
+        MetadataNode::Leaf { data_page_index: 2, columns: columns() },
+        MetadataNode::RecencyBranch(vec![(Timestamp(100), 2), (Timestamp::MAX, 3)]),
+    ];
+    let original = MetadataFile::from_nodes(nodes.clone(), true).unwrap();
+    let loaded = MetadataFile::read(Arc::from(original.write().unwrap())).unwrap();
+    assert_eq!(loaded.nodes(), &nodes);
+    assert_eq!(loaded.leaves(), [(vec![1], 0), (vec![3], 1), (vec![], 2)]);
+    assert_eq!(loaded.schema(), original.schema());
+    assert_eq!(loaded.write().unwrap(), original.write().unwrap());
+}
+
+#[test]
+fn metadata_rejects_forward_children_and_unavailable_recency_leg() {
+    assert!(MetadataFile::from_nodes(vec![MetadataNode::IidBranch(vec![Some(1), None, None, None])], false).is_err());
+    assert!(MetadataFile::from_nodes(vec![MetadataNode::Nil, MetadataNode::RecencyBranch(vec![(Timestamp(100), 0)])], false).is_err());
+}
+
+#[test]
+fn metadata_counts_masked_struct_children_and_keeps_numeric_bounds() {
+    let ty = LogicalType::Struct(BTreeMap::from([("n".into(), LogicalType::Scalar(ScalarType::I64).maybe())])).maybe();
+    let values = [Value::Null, Value::Struct(BTreeMap::from([("n".into(), Value::I64(-4))])), Value::Struct(BTreeMap::from([("n".into(), Value::I64(7))]))];
+    let field = rtdb_columnar::to_field("doc", &ty).unwrap();
+    let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+    let mut columns = Vec::new();
+    let root = rtdb_format::metadata::column_metadata(&field, array.as_ref(), true, false, &mut columns).unwrap();
+    assert_eq!(root, 1);
+    assert_eq!(columns[0].field("count"), Some(&Value::I64(2)));
+    assert_eq!(columns[0].field("root-col?"), Some(&Value::Bool(false)));
+    assert_eq!(columns[0].field("numbers").unwrap().field("min"), Some(&Value::F64(-4.0)));
+    assert_eq!(columns[0].field("numbers").unwrap().field("max"), Some(&Value::F64(7.0)));
+    assert_eq!(columns[root].field("struct"), Some(&Value::List(vec![Value::I32(0)])));
+    assert_eq!(columns[root].field("count"), Some(&Value::I64(2)));
+}
+
+#[test]
+fn iid_metadata_builds_bloom_when_other_columns_do_not() {
+    let ty = LogicalType::Scalar(ScalarType::FixedSizeBinary(16));
+    let values = [Value::FixedSizeBinary(vec![0; 16]), Value::FixedSizeBinary(vec![1; 16])];
+    let field = rtdb_columnar::to_field("_iid", &ty).unwrap();
+    let array = rtdb_columnar::build_array(&ty, &values).unwrap();
+    let mut columns = Vec::new();
+    rtdb_format::metadata::column_metadata(&field, array.as_ref(), true, false, &mut columns).unwrap();
+    let Value::Binary(bytes) = columns[0].field("bytes").unwrap().field("bloom").unwrap() else { panic!("IID bloom is required") };
+    let bloom = BloomFilter::from_bytes(bytes).unwrap();
+    assert!(bloom.contains_cell(&field, array.as_ref(), 0).unwrap());
+    assert!(bloom.contains_cell(&field, array.as_ref(), 1).unwrap());
+}
+
+#[test]
+fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_format::metadata::MetadataBuilder;
+    use rtdb_types::{Iid, Interval};
+
+    let document = BTreeMap::from([("nested".into(), Value::Struct(BTreeMap::from([("n".into(), Value::I64(5))])))]);
+    let event = StoredEvent { iid: Iid([1; 16]), system_from: Timestamp(10), valid_time: Interval::from_micros(0, 100).unwrap(), operation: StoredOperation::Put(document.clone()), recency: None };
+    let fields = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
+    let batch = build_event_batch(&[event], Some(fields), None).unwrap();
+    let mut writer = MetadataBuilder::new(false, false);
+    let first = writer.write_leaf(&batch).unwrap();
+    let second = writer.write_leaf(&batch).unwrap();
+    writer.write_iid_branch([Some(first), None, None, Some(second)]).unwrap();
+    let (file, summary) = writer.finish().unwrap();
+    let MetadataNode::Leaf { columns: first_columns, .. } = &file.nodes()[first] else { panic!("First node must be a leaf") };
+    let MetadataNode::Leaf { columns: second_columns, .. } = &file.nodes()[second] else { panic!("Second node must be a leaf") };
+    let nested = |columns: &[Value]| columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8("nested".into()))).unwrap().field("struct").unwrap().clone();
+    assert_eq!(nested(first_columns), Value::List(vec![Value::I32(4)]));
+    assert_eq!(nested(second_columns), Value::List(vec![Value::I32(4 + first_columns.len() as i32)]));
+    assert_eq!(summary.row_count, Some(2));
+    let temporal = summary.temporal_metadata.unwrap();
+    assert_eq!(temporal.min_valid_from, Some(0));
+    assert_eq!(temporal.max_valid_to, Some(100));
+    assert_eq!(MetadataFile::read(Arc::from(file.write().unwrap())).unwrap().leaves(), [(vec![0], 0), (vec![3], 1)]);
+}

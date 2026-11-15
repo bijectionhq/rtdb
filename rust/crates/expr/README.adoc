@@ -1,0 +1,18 @@
+= Expression source implementation
+
+Compiled expressions are passive values containing a bound expression and its input schema.
+Evaluation borrows the row, parameters, clock, time zone, and outer rows supplied by the query.
+Batch evaluation retains the declared result schema even for empty input or an input that contributes only one leg of a union.
+Returned Arrow buffers retain their allocation reservation.
+
+The source implements three-valued predicates, conditional evaluation, nested values, comparisons, checked numeric arithmetic, decimal precision and scale rules, scalar functions, casts, timestamp conversion, and period construction.
+Every result and diagnostic remains unverified until Phase 2.
+
+The tests retain inputs from `xtdb.expression-test/test-numeric-errors-503`, `test-decimal-arithmetic-and-coersion`, `substring-test`, `negative-substring-length-test`, `test-character-length`, `test-coalesce`, `test-nullif`, and the compound equality cases.
+Additional source tests cover declared result schemas, zero-row batches, binding errors, temporal precision, and period bounds.
+These are source mappings and do not cover every assertion in the upstream expression family.
+
+The prepared-statement layer still needs parameter rebinding when the initial type is unknown.
+Timestamp/duration arithmetic, interval and duration text casts, full cast options, PostgreSQL array literal parsing, and the complete scalar function catalog remain outstanding.
+Temporal lexical formats, time-zone labels, numeric result schemas, and diagnostics require full reference comparison.
+Scalar scratch values can allocate before their retained size is charged, so peak query memory is not yet bounded by this interface.

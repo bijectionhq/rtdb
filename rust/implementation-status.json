@@ -1,0 +1,33 @@
+{
+  "phase": "implementation",
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "design_revision": "c995e6b35b6812aa423c8a158c4e201e27532320",
+  "implementation_revision": null,
+  "source_completeness_review": "incomplete",
+  "compilation": "not_run",
+  "runtime_discovery": "not_run",
+  "tests": "not_run",
+  "release_artifacts": "pending",
+  "compatibility_claim": "none",
+  "areas": {
+    "types_columnar_durable_formats": "source_written_unverified",
+    "storage_indexing_historical_visibility": "source_written_with_recorded_gaps",
+    "sql_xtql_execution": "in_progress",
+    "writes_replication_recovery": "term_admission_only",
+    "compaction_gc_adapters": "pending",
+    "client_operational_surfaces": "pending",
+    "conformance_machinery": "source_inventory_comparator_and_two_control_mappings_only"
+  },
+  "source_review_record": "rust/source-review.adoc",
+  "assertion_ledger": "rust/conformance/assertion-ledger.json",
+  "runtime_assertion_denominator": null,
+  "required_production_traces": {
+    "client_read": "missing_protocol_and_server_entry_points",
+    "data_dependent_write": "missing_transaction_resolution_and_append_apply_path",
+    "replica_recovery": "missing_drivers_and_pending_block_replay",
+    "compaction_retry": "missing_maintenance_implementation",
+    "cdc_restart": "missing_postgresql_source_adapter",
+    "database_shutdown": "missing_node_and_server_lifecycle"
+  },
+  "phase_2_authorized_by_completeness_gate": false
+}
