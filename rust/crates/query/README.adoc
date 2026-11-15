@@ -1,0 +1,131 @@
+= Query execution source checkpoint
+
+This crate is Phase 1 implementation source.
+It has not been compiled or executed, and the tests below are test source rather than passing parity evidence.
+The crate does not establish that the complete RTDB implementation or its required production traces exist.
+
+== Ownership and calls
+
+`CatalogSnapshot` is a passive immutable value containing the database names, table OIDs, schemas, partition snapshots, and storage handles used by a preparation or execution.
+A transaction catalog accepts exactly one database and exactly its resolving partition, following `core/src/main/kotlin/xtdb/api/tx/OpenTx.kt`.
+Normal query catalogs may contain several databases and partitions.
+The caller must complete its basis barrier before constructing these snapshots.
+There is currently no independent requested system-time cap per partition: execution uses each retained `Snapshot::tx_basis()` as its upper bound.
+
+`QueryContext` is a passive execution region containing the query clock, timezone, memory budget, spill quota, and parent cancellation token.
+`PreparedQuery::execute` makes a child cancellation token for that cursor, so dropping or cancelling one cursor does not cancel its siblings.
+Executions made from the same context share its memory budget and spill quota.
+`QueryCursor` owns the operator tree and advances it on the caller's coroutine.
+Dropping a cursor releases its operator state and spill files.
+Returned `OwnedBatch` values and cloned Arrow arrays retain their own allocation reservations after the cursor has gone away.
+
+`PreparedQuery` contains an immutable relation and captured table dependencies.
+Execution rejects changed table OIDs or column types with `rtdb.query/stale-plan`.
+A caller must bind and prepare again against the new snapshot rather than reusing a schema that lacks newly introduced union legs.
+Parameters are positional `Value` values and remain charged while their execution retains them.
+Correlated apply holds the independent row while its dependent cursor executes and restores the previous parameter scope on the next independent row.
+
+The operator states are passive, single-writer transients.
+No operator starts a detached task or owns a transaction, ingestion, replication, or node lifecycle loop.
+Spill files are scoped temporary resources with a retained-byte quota.
+
+== Implemented source paths
+
+* Live trie leaves and persisted Arrow data pages merge in IID order and descending system time, with newer segments first at equal system times.
+* The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
+* Temporal file selection includes live candidates before dropping persisted files.
+* Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.
+* Metadata IID paths begin at the metadata root; a trie key's partition is a coarse file filter rather than an additional root prefix.
+* Projection, filters, offset/fetch, union-all, and unnest advance incrementally.
+* Inner, outer, semi, anti, and cross joins use a spill-backed nested loop.
+* Distinct and set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
+* Sort writes stable runs and merges them with a bounded fan-in.
+* Grouping assigns group IDs before spooling input and computes count, sum, average, min/max, boolean, variance, standard deviation, and ordered array aggregates.
+* Apply implements inner, left, scalar, exists, pull, and pull-many results, including cardinality errors and empty dependent relations.
+
+Default valid time is the query clock.
+Default system time is the partition snapshot basis.
+Explicit all-system-time scans retain their lower bound and are capped at the basis's next representable microsecond.
+Unconstrained relational algebra must request `TemporalFilter::All` explicitly.
+An AT null expression uses the query clock, while null range endpoints use the unbounded endpoints.
+A maximum-integer point is empty because no later microsecond is representable.
+
+== Reference-sensitive behavior
+
+The grouping comparator follows `core/src/main/clojure/xtdb/expression/map.clj`, `core/src/main/clojure/xtdb/expression/comparator.clj`, and the exact-one comparator check in `core/src/main/kotlin/xtdb/trie/MutableMemoryHashTrie.kt`.
+Top-level null keys match for grouping and general DISTINCT, while nested nulls and NaNs can make compound keys nonreflexive.
+Assigned group IDs keep each accepted input row in its own group even when its key would not compare equal to itself.
+
+`wrap-distinct` in `core/src/main/clojure/xtdb/operator/group_by.clj` does not request the grouping comparator's null-key equality.
+Aggregate DISTINCT therefore uses ordinary SQL equality and retains repeated null arguments in ARRAY_AGG.
+The current source contains no planner override for that comparator choice; execution parity for this behavior remains pending.
+
+Integer SUM follows the wrapping accumulation in `IntVector.kt` and `LongVector.kt` at the declared accumulator width.
+The reference has no byte or short accumulator implementation, and this executor reports that unsupported case.
+Nullable decimal SUM follows `DecimalVector.sumInto`, where a null input contributes zero.
+Variance and standard deviation use the reference `Variance.kt` formula based on sum, sum of squares, and count, including its floating-point cancellation behavior.
+Numeric average uses a double accumulator; duration average retains the duration unit and integer division.
+
+ARRAY_AGG includes null arguments and returns null for an empty global group or a group excluded entirely by FILTER.
+PULL and scalar apply return null for zero rows and reject multiple rows.
+PULL-many returns null for zero rows and a one-element list for a single empty document, following `src/test/clojure/xtdb/xtql/plan_test.clj`'s `test-pull`.
+
+== Source tests and upstream correspondence
+
+[cols="1,2"]
+|===
+|Rust test source |Upstream behavior inspected
+
+|`tests/operators.rs`: sort ordering, spill cleanup, cancellation isolation, output ownership
+|`xtdb.operator.order-by-test/test-order-by-with-nulls`, `test-order-by-spill`, `test-order-by-spill-cleans-up`; Rust-specific retained-buffer and sibling cancellation cases
+
+|`tests/operators.rs`: full/semi/anti/cross joins and zero-column empty right input
+|`xtdb.operator.join-test/test-full-outer-join`, `test-semi-equi-join`, `test-anti-equi-join`, `test-cross-join`, `test-full-outer-join-empty-rhs-schema-5669`
+
+|`tests/operators.rs`: top-level null DISTINCT and nonreflexive compound keys
+|`xtdb.operator.distinct-test/test-distinct`; comparator and relation-map source paths above
+
+|`tests/operators.rs`: empty/global aggregates, excluded groups, ordered arrays, null arguments, variance, SUM width
+|`xtdb.operator.group-by-test/test-count-empty-null-behaviour`, `test-sum-empty-null-behaviour`, `test-array-agg-orders-each-group-by-its-sort-keys`, `test-aggregate-filter`; primitive aggregation source paths above
+
+|`tests/operators.rs`: unnest order and ordinality
+|`xtdb.operator.unnest-test/test-simple-unnest`, `fix-ordinality-field-naming`
+
+|`tests/operators.rs`: per-row apply parameters, cardinality errors, empty dependent relations
+|`xtdb.operator.apply-test/test-apply-operator`, `test-apply-single`, `test-apply-empty-rel-bug-237`; `xtdb.xtql.plan-test/test-pull`
+
+|`tests/operators.rs`: transaction catalog scope
+|`OpenTx.queryCatalog` resolving database and partition restrictions
+
+|`tests/scan.rs`: live/persisted history, post-resolution filtering, erase/reinsert, IID selection, reopened catalog, snapshot retention
+|`xtdb.operator.scan-test/test-live-tries-with-multiple-leaves-are-loaded-correctly-2710`, `test-leaves-are-in-system-order`, `test-recency-filtering`, `test-range-query-earlier-filtering`, `temporal-bounds-apply-the-basis-to-both-system-time-bounds`; temporal calculator erase cases
+
+|`tests/scan.rs`: stale prepared schema
+|Captured prepared dependencies and changing union schemas; execution caller must reprepare
+|===
+
+== Remaining execution and resource work
+
+The executor is row-oriented and does not establish vectorized execution or expected production throughput.
+Nested-loop joins, spill-backed membership checks, and repeated group scans can be quadratic or worse across several grouping and aggregate operations.
+Sort currently writes runs even when its whole input could fit in memory.
+There is no hash join, top-k optimization, bloom pushdown, predicate pushdown, parallel partition scheduling, or coordinated scan-page spilling.
+A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
+
+The implemented scan accepts uncompressed Arrow trie files and explicitly rejects compressed pages before using encoded-size allocation estimates.
+The format crate can read compressed Arrow data; query accounting for its decompressed sizes remains missing.
+
+Memory reservations cover retained rows, output Arrow buffers, staged parameter values, decoded page bounds, and scoped spill work.
+Several bounds are conservative estimates rather than proven physical-allocation limits.
+Expression evaluation and some row cloning allocate before the resulting value is charged.
+Arrow footer inspection, schema metadata, operator descriptors, temporary container capacities, and allocator bookkeeping are not comprehensively measured.
+The object cache has a separate byte budget and retains encoded file leases independently of the query budget.
+Strict peak-allocation guarantees remain unproved.
+
+Cancellation checks occur between operations and rows, but CPU loops do not yet have a validated cooperative scheduling bound.
+Spill file access uses synchronous filesystem calls on the caller's coroutine; cancellation does not interrupt an in-flight filesystem call.
+No claim is made about cancellation latency.
+
+System catalog row materialization, external table providers, transaction-result shaping, network output, query preparation caches, transaction/replication drivers, durable recovery orchestration, and the required production traces are outside this source checkpoint.
+The declared aggregate IR does not yet include every upstream aggregate family, such as ordered-set percentiles.
+Compilation, execution, differential checks, fixture validation, resource measurements, and the required complete-workspace checks remain deferred until the user's full-implementation gate is satisfied.

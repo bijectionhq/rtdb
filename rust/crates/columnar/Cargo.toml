@@ -1,0 +1,18 @@
+[package]
+name = "rtdb-columnar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rtdb-types.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-buffer.workspace = true
+arrow-data.workspace = true
+arrow-select.workspace = true
+half.workspace = true
+
+[lints]
+workspace = true

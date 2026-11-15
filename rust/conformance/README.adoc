@@ -1,0 +1,24 @@
+= Compatibility evidence
+
+The source inventory records blobs from the pinned reference without loading a test framework.
+Its declarations are candidates for runtime reconciliation; they are not executed cases or an assertion denominator.
+Files with no recognized declarations remain in the inventory.
+Dynamic templates, inherited methods, disabled tests, tags, client helpers, and SQL logic selections require runtime discovery in Phase 2.
+
+[source,shell]
+----
+python3 rust/conformance/source_inventory.py --repository . --output rust/conformance/source-inventory.json
+----
+
+The parity ledger must keep the reference case identity, source assertion location, required configuration, native counterpart, and every required observation.
+Each required observation declares whether it must return a value or reproduce a specific failure stage, category, code, and signature.
+Run receipts cannot declare a failure to be expected without that ledger entry.
+Typed multiset observations contain a `schema` array and a `rows` array whose rows each match the schema width.
+Reference and Rust run receipts must record artifact and fixture digests, observation values, comparator version, and exact failure location.
+A missing receipt remains unverified even when a corresponding native test exists.
+Compilation and execution are pending under the Phase 1 work order.
+
+The initial `assertion-ledger.json` maps the two mandatory comparison controls.
+It is an incomplete ledger: the source inventory remains the record of unmapped files and candidate cases.
+Fixture `expected_observations` are transcribed assertions, not reference execution receipts.
+The JVM runner, native runner, runtime inventory reconciliation, and fault-injection integration remain to be implemented.

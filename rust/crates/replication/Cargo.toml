@@ -1,0 +1,14 @@
+[package]
+name = "rtdb-replication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtdb-types.workspace = true
+rtdb-format.workspace = true
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,25 @@
+[package]
+name = "rtdb-expr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtdb-types.workspace = true
+rtdb-plan.workspace = true
+rtdb-columnar.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bigdecimal.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+half.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

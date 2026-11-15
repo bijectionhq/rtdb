@@ -1,0 +1,303 @@
+use crate::{Error, Result};
+use async_trait::async_trait;
+use bytes::Bytes;
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::ops::Range;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ObjectKey(String);
+
+impl ObjectKey {
+    pub fn new(key: impl Into<String>) -> Result<Self> {
+        let key = key.into();
+        if key.is_empty() || key.contains('\\') || key.contains('\0')
+            || key.split('/').any(|part| part.is_empty() || part == "." || part == "..")
+            || Path::new(&key).components().any(|component| !matches!(component, Component::Normal(_)))
+            || key.split('/').any(|part| part == ".tmp")
+        {
+            return Err(Error::InvalidKey(key));
+        }
+        Ok(Self(key))
+    }
+
+    pub fn as_str(&self) -> &str { &self.0 }
+
+    pub fn is_under(&self, directory: &ObjectKey) -> bool {
+        self == directory || self.0.strip_prefix(&directory.0).is_some_and(|suffix| suffix.starts_with('/'))
+    }
+}
+
+impl std::fmt::Display for ObjectKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { self.0.fmt(f) }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredObject {
+    pub key: ObjectKey,
+    pub size: u64,
+}
+
+pub struct ReadReservation {
+    length: usize,
+    retention: Box<dyn Send + Sync>,
+}
+
+impl ReadReservation {
+    /// `retention` must hold the memory charge for `length` bytes until it is dropped.
+    pub fn new<T: Send + Sync + 'static>(length: usize, retention: T) -> Self {
+        Self { length, retention: Box::new(retention) }
+    }
+
+    pub fn length(&self) -> usize { self.length }
+
+    fn check_range(&self, range: &Range<u64>) -> Result<()> {
+        if range.end.checked_sub(range.start) != Some(self.length as u64) {
+            return Err(Error::Task("reserved read range does not match its allocation reservation".into()));
+        }
+        Ok(())
+    }
+
+    /// Transfers the charge to the completed allocation; mismatched byte counts are rejected.
+    pub fn finish(self, bytes: Bytes) -> Result<RetainedBytes> {
+        if bytes.len() != self.length { return Err(Error::Task("reserved read returned a different byte count".into())); }
+        Ok(RetainedBytes { bytes, _retention: self.retention })
+    }
+}
+
+pub struct RetainedBytes {
+    bytes: Bytes,
+    _retention: Box<dyn Send + Sync>,
+}
+
+impl RetainedBytes {
+    pub fn as_slice(&self) -> &[u8] { &self.bytes }
+    pub fn len(&self) -> usize { self.bytes.len() }
+    pub fn is_empty(&self) -> bool { self.bytes.is_empty() }
+}
+
+#[async_trait]
+pub trait ObjectStore: Send + Sync {
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
+    async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
+    /// Returns exactly the half-open byte range; an unavailable range is an error.
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;
+    /// Retains the allocation charge during the read and with the returned bytes.
+    /// Implementations that offload work beyond this future must move the reservation into that work.
+    async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        reservation.finish(self.get_range(key, range).await?)
+    }
+    /// Publishes an immutable object, accepting an identical existing object as a completed retry.
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
+    /// Returns a lexicographically ordered snapshot of object names under a directory.
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
+    async fn delete(&self, key: &ObjectKey) -> Result<()>;
+
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
+        self.put(destination, self.get(source).await?).await
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryStore {
+    objects: RwLock<BTreeMap<ObjectKey, Bytes>>,
+}
+
+fn checked_range(key: &ObjectKey, range: Range<u64>, length: u64) -> Result<Range<usize>> {
+    if range.start > range.end || range.end > length || range.end > usize::MAX as u64 {
+        return Err(Error::InvalidRange {
+            key: key.to_string(), start: range.start, end: range.end, length,
+        });
+    }
+    Ok(range.start as usize..range.end as usize)
+}
+
+#[async_trait]
+impl ObjectStore for MemoryStore {
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let objects = self.objects.read();
+        let bytes = objects.get(key).ok_or_else(|| Error::MissingObject(key.to_string()))?;
+        Ok(StoredObject { key: key.clone(), size: bytes.len() as u64 })
+    }
+
+    async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
+        self.objects.read().get(key).cloned().ok_or_else(|| Error::MissingObject(key.to_string()))
+    }
+
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+        let bytes = self.get(key).await?;
+        Ok(bytes.slice(checked_range(key, range, bytes.len() as u64)?))
+    }
+
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        let mut objects = self.objects.write();
+        match objects.get(key) {
+            Some(existing) if existing != &bytes => Err(Error::ConflictingObject(key.to_string())),
+            Some(_) => Ok(()),
+            None => { objects.insert(key.clone(), bytes); Ok(()) }
+        }
+    }
+
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
+        Ok(self.objects.read().iter()
+            .filter(|(key, _)| directory.is_none_or(|directory| key.is_under(directory)))
+            .map(|(key, value)| StoredObject { key: key.clone(), size: value.len() as u64 }).collect())
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        self.objects.write().remove(key);
+        Ok(())
+    }
+}
+
+pub struct LocalStore {
+    root: Arc<PathBuf>,
+}
+
+impl LocalStore {
+    pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
+        let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
+        Ok(Self { root: Arc::new(root) })
+    }
+
+    fn path(&self, key: &ObjectKey) -> PathBuf { self.root.join(key.as_str()) }
+}
+
+fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
+    File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound { Error::MissingObject(key.to_string()) }
+        else { Error::io(path, error) }
+    })
+}
+
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    tokio::task::spawn_blocking(f).await.map_err(|error| Error::Task(error.to_string()))?
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    File::open(path).and_then(|file| file.sync_all()).map_err(|error| Error::io(path, error))
+}
+
+fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+    let mut file = open_object(path, key)?;
+    let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+    let slice = checked_range(key, range.clone(), length)?;
+    file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(path, error))?;
+    let mut bytes = vec![0; slice.len()];
+    file.read_exact(&mut bytes).map_err(|error| Error::io(path, error))?;
+    Ok(Bytes::from(bytes))
+}
+
+#[async_trait]
+impl ObjectStore for LocalStore {
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let (path, key) = (self.path(key), key.clone());
+        blocking(move || {
+            let file = open_object(&path, &key)?;
+            let size = file.metadata().map_err(|error| Error::io(&path, error))?.len();
+            Ok(StoredObject { key, size })
+        }).await
+    }
+
+    async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
+        let (path, key) = (self.path(key), key.clone());
+        blocking(move || {
+            let mut file = open_object(&path, &key)?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
+            Ok(Bytes::from(bytes))
+        }).await
+    }
+
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+        let (path, key) = (self.path(key), key.clone());
+        blocking(move || read_local_range(&path, &key, range)).await
+    }
+
+    async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        let (path, key) = (self.path(key), key.clone());
+        blocking(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+    }
+
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        let (root, path, key) = (self.root.clone(), self.path(key), key.clone());
+        blocking(move || {
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            let temp_dir = root.join(".tmp");
+            fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            upload.write_all(&bytes).map_err(|error| Error::io(upload.path(), error))?;
+            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
+            match upload.persist_noclobber(&path) {
+                Ok(_) => (),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = fs::read(&path).map_err(|error| Error::io(&path, error))?;
+                    if existing.as_slice() != bytes.as_ref() {
+                        return Err(Error::ConflictingObject(key.to_string()));
+                    }
+                }
+                Err(error) => return Err(Error::io(&path, error.error)),
+            }
+            let mut current = parent;
+            loop {
+                sync_directory(current)?;
+                if current == root.as_path() { break; }
+                current = current.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            }
+            Ok(())
+        }).await
+    }
+
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
+        let root = self.root.clone();
+        let directory = directory.cloned();
+        blocking(move || {
+            fn visit(root: &Path, path: &Path, result: &mut Vec<StoredObject>) -> Result<()> {
+                let metadata = match fs::symlink_metadata(path) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                    Err(error) => return Err(Error::io(path, error)),
+                };
+                if metadata.is_symlink() {
+                    return Err(Error::InvalidKey(path.display().to_string()));
+                }
+                if metadata.is_file() {
+                    let relative = path.strip_prefix(root).map_err(|_| Error::InvalidKey(path.display().to_string()))?;
+                    let key = ObjectKey::new(relative.to_str().ok_or_else(|| Error::InvalidKey(relative.display().to_string()))?)?;
+                    result.push(StoredObject { key, size: metadata.len() });
+                } else if metadata.is_dir() {
+                    for entry in fs::read_dir(path).map_err(|error| Error::io(path, error))? {
+                        let entry = entry.map_err(|error| Error::io(path, error))?;
+                        if entry.file_name() != ".tmp" { visit(root, &entry.path(), result)?; }
+                    }
+                }
+                Ok(())
+            }
+            let start = directory.as_ref().map_or_else(|| root.as_ref().clone(), |key| root.join(key.as_str()));
+            let mut result = Vec::new();
+            visit(&root, &start, &mut result)?;
+            result.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok(result)
+        }).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        let path = self.path(key);
+        blocking(move || {
+            match fs::remove_file(&path) {
+                Ok(()) => sync_directory(path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(Error::io(&path, error)),
+            }
+        }).await
+    }
+}

@@ -1,4 +1,8 @@
 {
+    "rust-analyzer.checkOnSave": false,
+    "rust-analyzer.check.enable": false,
+    "rust-analyzer.cargo.buildScripts.enable": false,
+    "rust-analyzer.procMacro.enable": false,
     "sqltools.connections": [
         {
             "previewLimit": 50,

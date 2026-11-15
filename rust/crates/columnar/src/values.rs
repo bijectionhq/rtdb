@@ -1,0 +1,461 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use arrow_array::{Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray, DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray, IntervalMonthDayNanoArray, IntervalYearMonthArray, ListArray, MapArray, NullArray, RunArray, StringArray, StructArray, Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array, UnionArray, builder::FixedSizeBinaryBuilder, make_array, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_buffer::{IntervalDayTime, IntervalMonthDayNano, NullBuffer, OffsetBuffer, ScalarBuffer, i256};
+use arrow_schema::{DataType, Field, UnionMode};
+use rtdb_types::{Anomaly, DecimalValue, IntervalUnit, ListKind, LogicalType, Result, RunEndWidth, ScalarType, TimeUnit, Value};
+
+use crate::{from_field, to_field};
+
+/// Builds arrays with exact logical value types; numeric coercions belong to expressions.
+/// Undefined cells are accepted only for bottom-typed fields.
+pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    logical.validate()?;
+    for (row, value) in values.iter().enumerate() {
+        if !accepts(logical, value) {
+            return Err(Anomaly::incorrect("rtdb/column-type-mismatch", format!("Value at row {row} does not belong to {logical:?}")));
+        }
+    }
+    build(logical, values)
+}
+
+pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool {
+    if matches!(value, Value::Undefined) { return matches!(logical.unencoded(), LogicalType::Nothing); }
+    let plain = logical.unencoded();
+    plain.join(&value.logical_type()) == plain
+}
+
+fn validity(values: &[Value]) -> Option<NullBuffer> {
+    let valid: Vec<_> = values.iter().map(|v| !matches!(v, Value::Null | Value::Undefined)).collect();
+    valid.iter().any(|v| !v).then(|| NullBuffer::from(valid))
+}
+
+fn build(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    match logical {
+        LogicalType::Nothing | LogicalType::Null => Ok(Arc::new(NullArray::new(values.len()))),
+        LogicalType::Maybe(inner) => build(inner, values),
+        LogicalType::RunEndEncoded { width, value } => build_runs(logical, *width, value, values),
+        LogicalType::Scalar(scalar) => build_scalar(scalar, values),
+        LogicalType::Struct(children) => {
+            let field = to_field("", logical)?;
+            let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
+            let arrays = children.iter().map(|(name, child_type)| {
+                let child_values = values.iter().map(|v| match v {
+                    Value::Struct(fields) => fields.get(name).cloned().unwrap_or_else(|| if matches!(child_type, LogicalType::Nothing) { Value::Undefined } else { Value::Null }),
+                    _ => Value::Undefined,
+                }).collect::<Vec<_>>();
+                build(child_type, &child_values)
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, validity(values), values.len()).map_err(super::arrow_error)?))
+        }
+        LogicalType::List { kind, element } => build_list(logical, kind, element, values),
+        LogicalType::Union(_) => build_union(logical, values),
+    }
+}
+
+macro_rules! primitive {
+    ($values:expr, $array:ty, $pattern:pat => $value:expr) => {{
+        let values = $values.iter().map(|value| match value { $pattern => Some($value), _ => None }).collect::<Vec<_>>();
+        Ok(Arc::new(<$array>::from(values)) as ArrayRef)
+    }};
+}
+
+fn build_scalar(scalar: &ScalarType, values: &[Value]) -> Result<ArrayRef> {
+    use ScalarType::*;
+    match scalar {
+        Bool => primitive!(values, BooleanArray, Value::Bool(v) => *v),
+        I8 => primitive!(values, Int8Array, Value::I8(v) => *v),
+        I16 => primitive!(values, Int16Array, Value::I16(v) => *v),
+        I32 => primitive!(values, Int32Array, Value::I32(v) => *v),
+        I64 => primitive!(values, Int64Array, Value::I64(v) => *v),
+        U8 => primitive!(values, UInt8Array, Value::U8(v) => *v),
+        U16 => primitive!(values, UInt16Array, Value::U16(v) => *v),
+        U32 => primitive!(values, UInt32Array, Value::U32(v) => *v),
+        U64 => primitive!(values, UInt64Array, Value::U64(v) => *v),
+        F16 => primitive!(values, Float16Array, Value::F16(v) => half::f16::from_bits(*v)),
+        F32 => primitive!(values, Float32Array, Value::F32(v) => *v),
+        F64 => primitive!(values, Float64Array, Value::F64(v) => *v),
+        DateDay => primitive!(values, Date32Array, Value::DateDay(v) => *v),
+        DateMilli => primitive!(values, Date64Array, Value::DateMilli(v) => *v),
+        Oid => primitive!(values, Int32Array, Value::Oid(v) => *v),
+        RegClass => primitive!(values, Int32Array, Value::RegClass(v) => *v),
+        RegProc => primitive!(values, Int32Array, Value::RegProc(v) => *v),
+        Utf8 | Uri | Keyword => {
+            let strings = values.iter().map(|value| match value {
+                Value::Utf8(value) | Value::Uri(value) => Some(value.as_str()),
+                Value::Keyword(value) => Some(value.as_str()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            Ok(Arc::new(StringArray::from(strings)))
+        }
+        Binary | Transit => {
+            let values = values.iter().map(|value| match value {
+                Value::Binary(value) | Value::Transit(value) => Some(value.as_slice()),
+                _ => None,
+            }).collect::<Vec<_>>();
+            Ok(Arc::new(BinaryArray::from(values)))
+        }
+        FixedSizeBinary(width) => build_binary(*width, values),
+        Uuid => build_binary(16, values),
+        Decimal { precision, scale, bit_width } => build_decimal(*precision, *scale, *bit_width, values),
+        Time { unit, bit_width } => {
+            if *bit_width == 32 {
+                let converted = values.iter().map(|value| match value {
+                    Value::Time { value, .. } => i32::try_from(*value).map(Some).map_err(|_| Anomaly::incorrect("rtdb/time-overflow", "Time exceeds i32 representation")),
+                    _ => Ok(None),
+                }).collect::<Result<Vec<_>>>()?;
+                match unit {
+                    TimeUnit::Second => Ok(Arc::new(Time32SecondArray::from(converted))),
+                    TimeUnit::Millisecond => Ok(Arc::new(Time32MillisecondArray::from(converted))),
+                    _ => Err(layout_error()),
+                }
+            } else {
+                match unit {
+                    TimeUnit::Microsecond => primitive!(values, Time64MicrosecondArray, Value::Time { value, .. } => *value),
+                    TimeUnit::Nanosecond => primitive!(values, Time64NanosecondArray, Value::Time { value, .. } => *value),
+                    _ => Err(layout_error()),
+                }
+            }
+        }
+        Timestamp { unit, timezone } => {
+            let values = values.iter().map(|v| match v { Value::Timestamp { value, .. } => Some(*value), _ => None }).collect::<Vec<_>>();
+            match unit {
+                TimeUnit::Second => Ok(Arc::new(TimestampSecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
+                TimeUnit::Millisecond => Ok(Arc::new(TimestampMillisecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
+                TimeUnit::Microsecond => Ok(Arc::new(TimestampMicrosecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
+                TimeUnit::Nanosecond => Ok(Arc::new(TimestampNanosecondArray::from(values).with_timezone_opt(timezone.as_deref()))),
+            }
+        }
+        Duration(unit) => match unit {
+            TimeUnit::Second => primitive!(values, DurationSecondArray, Value::Duration { value, .. } => *value),
+            TimeUnit::Millisecond => primitive!(values, DurationMillisecondArray, Value::Duration { value, .. } => *value),
+            TimeUnit::Microsecond => primitive!(values, DurationMicrosecondArray, Value::Duration { value, .. } => *value),
+            TimeUnit::Nanosecond => primitive!(values, DurationNanosecondArray, Value::Duration { value, .. } => *value),
+        },
+        Interval(IntervalUnit::YearMonth) => primitive!(values, IntervalYearMonthArray, Value::IntervalYearMonth(v) => *v),
+        Interval(IntervalUnit::DayTime) => primitive!(values, IntervalDayTimeArray, Value::IntervalDayTime { days, milliseconds } => IntervalDayTime::new(*days, *milliseconds)),
+        Interval(IntervalUnit::MonthDayNano) => primitive!(values, IntervalMonthDayNanoArray, Value::IntervalMonthDayNano { months, days, nanoseconds } => IntervalMonthDayNano::new(*months, *days, *nanoseconds)),
+        IntervalMonthDayMicro => primitive!(values, IntervalMonthDayNanoArray, Value::IntervalMonthDayMicro { months, days, nanoseconds } => IntervalMonthDayNano::new(*months, *days, *nanoseconds)),
+    }
+}
+
+fn build_binary(width: i32, values: &[Value]) -> Result<ArrayRef> {
+    let mut builder = FixedSizeBinaryBuilder::with_capacity(values.len(), width);
+    for value in values {
+        match value {
+            Value::FixedSizeBinary(bytes) => builder.append_value(bytes).map_err(super::arrow_error)?,
+            Value::Uuid(bytes) => builder.append_value(bytes).map_err(super::arrow_error)?,
+            _ => builder.append_null(),
+        }
+    }
+    Ok(Arc::new(builder.finish()))
+}
+
+fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> Result<ArrayRef> {
+    match bit_width {
+        32 => {
+            let values = values.iter().map(|value| match value {
+                Value::Decimal(value) => {
+                    let bytes: [u8; 4] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
+                    Ok(Some(i32::from_be_bytes(bytes)))
+                }
+                _ => Ok(None),
+            }).collect::<Result<Vec<_>>>()?;
+            let array = Decimal32Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
+            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
+            Ok(Arc::new(array))
+        }
+        64 => {
+            let values = values.iter().map(|value| match value {
+                Value::Decimal(value) => {
+                    let bytes: [u8; 8] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
+                    Ok(Some(i64::from_be_bytes(bytes)))
+                }
+                _ => Ok(None),
+            }).collect::<Result<Vec<_>>>()?;
+            let array = Decimal64Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
+            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
+            Ok(Arc::new(array))
+        }
+        128 => {
+            let values = values.iter().map(|value| match value {
+                Value::Decimal(value) => {
+                    let bytes: [u8; 16] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
+                    Ok(Some(i128::from_be_bytes(bytes)))
+                }
+                _ => Ok(None),
+            }).collect::<Result<Vec<_>>>()?;
+            let array = Decimal128Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
+            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
+            Ok(Arc::new(array))
+        }
+        256 => {
+            let values = values.iter().map(|value| match value {
+                Value::Decimal(value) => {
+                    let bytes: [u8; 32] = value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?;
+                    Ok(Some(i256::from_be_bytes(bytes)))
+                }
+                _ => Ok(None),
+            }).collect::<Result<Vec<_>>>()?;
+            let array = Decimal256Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
+            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
+            Ok(Arc::new(array))
+        }
+        _ => Err(decimal_width()),
+    }
+}
+
+fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    let field = to_field("", logical)?;
+    let mut flat = Vec::new();
+    let mut offsets = vec![0i32];
+    let fixed = match kind { ListKind::FixedSizeList(size) => Some(*size as usize), ListKind::TimestampTzRange => Some(2), _ => None };
+    for value in values {
+        match value {
+            Value::List(children) | Value::Set(children) | Value::FixedSizeList(children) => flat.extend(children.iter().cloned()),
+            Value::TimestampTzRange { lower, upper } => {
+                flat.push(Value::Timestamp { value: *lower, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) });
+                flat.push(Value::Timestamp { value: *upper, unit: TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) });
+            }
+            Value::Map { entries, .. } => for (key, value) in entries {
+                if matches!(key, Value::Null | Value::Undefined) { return Err(Anomaly::incorrect("rtdb/null-map-key", "Arrow map keys cannot be null")); }
+                flat.push(Value::Struct(BTreeMap::from([("key".to_owned(), key.clone()), ("value".to_owned(), value.clone())])));
+            },
+            _ => if let Some(size) = fixed { flat.extend((0..size).map(|_| Value::Undefined)); },
+        }
+        offsets.push(i32::try_from(flat.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
+    }
+    let array = build(element, &flat)?;
+    match field.data_type() {
+        DataType::List(child) => Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), array, validity(values)).map_err(super::arrow_error)?)),
+        DataType::FixedSizeList(child, size) => Ok(Arc::new(FixedSizeListArray::try_new_with_length(Arc::clone(child), *size, array, validity(values), values.len()).map_err(super::arrow_error)?)),
+        DataType::Map(child, sorted) => {
+            let entries = array.as_any().downcast_ref::<StructArray>().ok_or_else(layout_error)?.clone();
+            Ok(Arc::new(MapArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), entries, validity(values), *sorted).map_err(super::arrow_error)?))
+        }
+        _ => Err(layout_error()),
+    }
+}
+
+fn build_union(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    let field = to_field("", logical)?;
+    let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return build(&from_field(&field)?, values); };
+    let legs = fields.iter().map(|(_, field)| from_field(field)).collect::<Result<Vec<_>>>()?;
+    let ids = fields.iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let mut children: Vec<Vec<Value>> = legs.iter().map(|_| Vec::new()).collect();
+    let mut type_ids = Vec::with_capacity(values.len());
+    let mut offsets = Vec::with_capacity(values.len());
+    for value in values {
+        let leg = if matches!(value, Value::Undefined) { 0 } else {
+            legs.iter().position(|leg| accepts(leg, value)).ok_or_else(|| Anomaly::incorrect("rtdb/union-value", "Value has no matching union leg"))?
+        };
+        type_ids.push(ids[leg]);
+        offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
+        children[leg].push(value.clone());
+    }
+    let children = legs.iter().zip(children).map(|(leg, values)| build(leg, &values)).collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(type_ids), Some(ScalarBuffer::from(offsets)), children).map_err(super::arrow_error)?))
+}
+
+fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    let mut distinct = Vec::new();
+    let mut ends = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if values.get(index + 1).is_none_or(|next| !same_representation(value, next)) {
+            distinct.push(value.clone());
+            ends.push(index + 1);
+        }
+    }
+    let array = build(value_type, &distinct)?;
+    let runs: ArrayRef = match width {
+        RunEndWidth::I16 => {
+            let ends = ends.into_iter().map(i16::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
+            Arc::new(RunArray::<Int16Type>::try_new(&Int16Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+        }
+        RunEndWidth::I32 => {
+            let ends = ends.into_iter().map(i32::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
+            Arc::new(RunArray::<Int32Type>::try_new(&Int32Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+        }
+        RunEndWidth::I64 => {
+            let ends = ends.into_iter().map(i64::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;
+            Arc::new(RunArray::<Int64Type>::try_new(&Int64Array::from(ends), array.as_ref()).map_err(super::arrow_error)?)
+        }
+    };
+    let data_type = to_field("", logical)?.data_type().clone();
+    let data = runs.to_data().into_builder().data_type(data_type).build().map_err(super::arrow_error)?;
+    Ok(make_array(data))
+}
+
+fn same_representation(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::F32(a), Value::F32(b)) => a.to_bits() == b.to_bits(),
+        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::List(a), Value::List(b)) | (Value::Set(a), Value::Set(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_representation(a, b)),
+        (Value::Struct(a), Value::Struct(b)) => a.len() == b.len() && a.iter().zip(b).all(|((ak, av), (bk, bv))| ak == bk && same_representation(av, bv)),
+        (Value::Map { entries: a, sorted: sa }, Value::Map { entries: b, sorted: sb }) => sa == sb && a.len() == b.len() && a.iter().zip(b).all(|((ak, av), (bk, bv))| same_representation(ak, bk) && same_representation(av, bv)),
+        _ => left == right,
+    }
+}
+
+/// Reads a logical cell, expanding unions and run-end layouts by the declared field.
+/// Reading bottom is a fault; slices retain their physical offset through Arrow's accessors.
+pub fn read_value(field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+    if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
+    if field.data_type() != array.data_type() { return Err(layout_error()); }
+    let logical = from_field(field)?;
+    read(&logical, field, array, row)
+}
+
+fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+    if matches!(logical, LogicalType::Nothing) { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
+    if let DataType::RunEndEncoded(ends, values) = field.data_type() {
+        return match ends.data_type() {
+            DataType::Int16 => { let runs = downcast::<RunArray<Int16Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int32 => { let runs = downcast::<RunArray<Int32Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int64 => { let runs = downcast::<RunArray<Int64Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            _ => Err(layout_error()),
+        };
+    }
+    if let DataType::Union(fields, UnionMode::Dense) = field.data_type() {
+        let union = downcast::<UnionArray>(array)?;
+        let id = union.type_id(row);
+        let child = fields.iter().find_map(|(child_id, field)| (child_id == id).then_some(field)).ok_or_else(layout_error)?;
+        return read_value(child, union.child(id).as_ref(), union.value_offset(row));
+    }
+    if array.is_null(row) { return Ok(Value::Null); }
+    match logical {
+        LogicalType::Null => Ok(Value::Null),
+        LogicalType::Maybe(inner) => read(inner, field, array, row),
+        LogicalType::Scalar(scalar) => read_scalar(scalar, array, row),
+        LogicalType::Struct(children) => {
+            let array = downcast::<StructArray>(array)?;
+            let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
+            let mut values = BTreeMap::new();
+            for (i, child) in fields.iter().enumerate() {
+                let child_type = children.get(child.name()).ok_or_else(layout_error)?;
+                let value = if matches!(child_type, LogicalType::Nothing) { Value::Undefined }
+                    else { read_value(child, array.column(i).as_ref(), row)? };
+                values.insert(child.name().clone(), value);
+            }
+            Ok(Value::Struct(values))
+        }
+        LogicalType::List { kind, .. } => read_list(kind, field, array, row),
+        _ => Err(layout_error()),
+    }
+}
+
+macro_rules! cell {
+    ($array:expr, $row:expr, $array_type:ty, $value:ident) => { Ok(Value::$value(downcast::<$array_type>($array)?.value($row))) };
+}
+
+fn read_scalar(scalar: &ScalarType, array: &dyn Array, row: usize) -> Result<Value> {
+    use ScalarType::*;
+    match scalar {
+        Bool => cell!(array, row, BooleanArray, Bool),
+        I8 => cell!(array, row, Int8Array, I8), I16 => cell!(array, row, Int16Array, I16),
+        I32 => cell!(array, row, Int32Array, I32), I64 => cell!(array, row, Int64Array, I64),
+        U8 => cell!(array, row, UInt8Array, U8), U16 => cell!(array, row, UInt16Array, U16),
+        U32 => cell!(array, row, UInt32Array, U32), U64 => cell!(array, row, UInt64Array, U64),
+        F16 => Ok(Value::F16(downcast::<Float16Array>(array)?.value(row).to_bits())),
+        F32 => cell!(array, row, Float32Array, F32), F64 => cell!(array, row, Float64Array, F64),
+        DateDay => cell!(array, row, Date32Array, DateDay), DateMilli => cell!(array, row, Date64Array, DateMilli),
+        Oid => cell!(array, row, Int32Array, Oid), RegClass => cell!(array, row, Int32Array, RegClass), RegProc => cell!(array, row, Int32Array, RegProc),
+        Utf8 => Ok(Value::Utf8(downcast::<StringArray>(array)?.value(row).to_owned())),
+        Keyword => Ok(Value::Keyword(rtdb_types::Keyword::from_name(downcast::<StringArray>(array)?.value(row)))),
+        Uri => Ok(Value::Uri(downcast::<StringArray>(array)?.value(row).to_owned())),
+        Binary => Ok(Value::Binary(downcast::<BinaryArray>(array)?.value(row).to_vec())),
+        Transit => Ok(Value::Transit(downcast::<BinaryArray>(array)?.value(row).to_vec())),
+        FixedSizeBinary(_) => Ok(Value::FixedSizeBinary(downcast::<FixedSizeBinaryArray>(array)?.value(row).to_vec())),
+        Uuid => {
+            let bytes = downcast::<FixedSizeBinaryArray>(array)?.value(row);
+            Ok(Value::Uuid(bytes.try_into().map_err(|_| layout_error())?))
+        }
+        Decimal { precision, scale, bit_width } => {
+            let unscaled = match bit_width {
+                32 => downcast::<Decimal32Array>(array)?.value(row).to_be_bytes().to_vec(),
+                64 => downcast::<Decimal64Array>(array)?.value(row).to_be_bytes().to_vec(),
+                128 => downcast::<Decimal128Array>(array)?.value(row).to_be_bytes().to_vec(),
+                256 => downcast::<Decimal256Array>(array)?.value(row).to_be_bytes().to_vec(),
+                _ => return Err(decimal_width()),
+            };
+            Ok(Value::Decimal(DecimalValue { unscaled, precision: *precision, scale: *scale, bit_width: *bit_width }))
+        }
+        Time { unit, bit_width } => {
+            let value = match unit {
+                TimeUnit::Second => i64::from(downcast::<Time32SecondArray>(array)?.value(row)),
+                TimeUnit::Millisecond => i64::from(downcast::<Time32MillisecondArray>(array)?.value(row)),
+                TimeUnit::Microsecond => downcast::<Time64MicrosecondArray>(array)?.value(row),
+                TimeUnit::Nanosecond => downcast::<Time64NanosecondArray>(array)?.value(row),
+            };
+            Ok(Value::Time { value, unit: *unit, bit_width: *bit_width })
+        }
+        Timestamp { unit, timezone } => {
+            let value = match unit {
+                TimeUnit::Second => downcast::<TimestampSecondArray>(array)?.value(row),
+                TimeUnit::Millisecond => downcast::<TimestampMillisecondArray>(array)?.value(row),
+                TimeUnit::Microsecond => downcast::<TimestampMicrosecondArray>(array)?.value(row),
+                TimeUnit::Nanosecond => downcast::<TimestampNanosecondArray>(array)?.value(row),
+            };
+            Ok(Value::Timestamp { value, unit: *unit, timezone: timezone.clone() })
+        }
+        Duration(unit) => {
+            let value = match unit {
+                TimeUnit::Second => downcast::<DurationSecondArray>(array)?.value(row),
+                TimeUnit::Millisecond => downcast::<DurationMillisecondArray>(array)?.value(row),
+                TimeUnit::Microsecond => downcast::<DurationMicrosecondArray>(array)?.value(row),
+                TimeUnit::Nanosecond => downcast::<DurationNanosecondArray>(array)?.value(row),
+            };
+            Ok(Value::Duration { value, unit: *unit })
+        }
+        Interval(IntervalUnit::YearMonth) => cell!(array, row, IntervalYearMonthArray, IntervalYearMonth),
+        Interval(IntervalUnit::DayTime) => {
+            let value = downcast::<IntervalDayTimeArray>(array)?.value(row);
+            Ok(Value::IntervalDayTime { days: value.days, milliseconds: value.milliseconds })
+        }
+        Interval(IntervalUnit::MonthDayNano) => {
+            let value = downcast::<IntervalMonthDayNanoArray>(array)?.value(row);
+            Ok(Value::IntervalMonthDayNano { months: value.months, days: value.days, nanoseconds: value.nanoseconds })
+        }
+        IntervalMonthDayMicro => {
+            let value = downcast::<IntervalMonthDayNanoArray>(array)?.value(row);
+            Ok(Value::IntervalMonthDayMicro { months: value.months, days: value.days, nanoseconds: value.nanoseconds })
+        }
+    }
+}
+
+fn read_list(kind: &ListKind, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+    let (child_field, values) = match field.data_type() {
+        DataType::List(child) => (child, downcast::<ListArray>(array)?.value(row)),
+        DataType::FixedSizeList(child, _) => (child, downcast::<FixedSizeListArray>(array)?.value(row)),
+        DataType::Map(child, _) => (child, Arc::new(downcast::<MapArray>(array)?.value(row)) as ArrayRef),
+        _ => return Err(layout_error()),
+    };
+    let values = (0..values.len()).map(|index| read_value(child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
+    match kind {
+        ListKind::List => Ok(Value::List(values)),
+        ListKind::Set => Ok(Value::Set(values)),
+        ListKind::FixedSizeList(_) => Ok(Value::FixedSizeList(values)),
+        ListKind::TimestampTzRange => {
+            if let [Value::Timestamp { value: lower, .. }, Value::Timestamp { value: upper, .. }] = values.as_slice() {
+                Ok(Value::TimestampTzRange { lower: *lower, upper: *upper })
+            } else { Err(Anomaly::incorrect("rtdb/timestamp-range", "Timestamp range requires two non-null timestamps")) }
+        }
+        ListKind::Map { sorted } => {
+            let entries = values.into_iter().map(|entry| match entry {
+                Value::Struct(mut fields) => {
+                    let key = fields.remove("key").ok_or_else(layout_error)?;
+                    let value = fields.remove("value").ok_or_else(layout_error)?;
+                    Ok((key, value))
+                }
+                _ => Err(layout_error()),
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(Value::Map { entries, sorted: *sorted })
+        }
+    }
+}
+
+fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout_error) }
+fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
+fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
+fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Array length exceeds its run-end index width") }

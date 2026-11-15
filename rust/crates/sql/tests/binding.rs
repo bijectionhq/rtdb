@@ -1,0 +1,160 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use rtdb_plan::*;
+use rtdb_sql::{PrepareOptions, parse, prepare};
+use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
+
+struct Fixture;
+
+impl Catalog for Fixture {
+    fn default_database(&self) -> &str { "xtdb" }
+    fn databases(&self) -> BTreeSet<String> { BTreeSet::from(["xtdb".into(), "archive".into()]) }
+    fn table(&self, name: &QualifiedTable) -> Result<Option<TableBinding>> {
+        Ok((name.table.schema == "public").then(|| TableBinding { name: name.clone(), oid: Some(if name.database == "xtdb" { 16384 } else { 20000 }), columns: BTreeMap::from([
+            ("_id".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("region".into(), LogicalType::Scalar(ScalarType::Utf8)),
+            ("price".into(), LogicalType::Scalar(ScalarType::I64)),
+            ("ExactName".into(), LogicalType::Scalar(ScalarType::Bool)),
+        ]) }))
+    }
+    fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Ok(Vec::new()) }
+}
+
+fn query(sql: &str) -> std::sync::Arc<Relation> {
+    let Statement::Query(query) = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap().statement else { panic!("Expected query") };
+    query
+}
+
+fn parameters(relation: &Relation) -> Vec<usize> {
+    let mut parameters = Vec::new();
+    for expression in relation.expressions() { expression.visit(&mut |expr| { if let Expr::Parameter { index, .. } = expr { parameters.push(*index); } }); }
+    for child in relation.children() { parameters.extend(self::parameters(child)); }
+    parameters
+}
+
+fn find_scan(relation: &Relation) -> &Scan {
+    if let RelationNode::Scan(scan) = relation.node() { return scan; }
+    find_scan(relation.children()[0])
+}
+
+#[test]
+fn anonymous_params_bound_in_lexical_order_5988() {
+    let projected = query("SELECT ? AS p1, ? AS p2, region FROM docs WHERE region = ?");
+    assert_eq!(parameters(&projected), [0, 1, 2]);
+    let grouped = query("SELECT ? AS p1, ? AS p2 FROM docs GROUP BY region HAVING region > ?");
+    assert_eq!(parameters(&grouped), [0, 1, 2]);
+    let nested = query("SELECT ? AS p1, s.x FROM (SELECT ? AS x FROM docs) s");
+    assert_eq!(parameters(&nested), [0, 1]);
+    let expression = query("SELECT ? || ? AS p1 FROM docs WHERE region = ?");
+    assert_eq!(parameters(&expression), [0, 1, 2]);
+}
+
+#[test]
+fn from_where_param_order_bug_4305() {
+    let relation = query("SELECT _id FROM foo FOR VALID_TIME AS OF ? WHERE _id = ?");
+    assert!(matches!(find_scan(&relation).valid_time, TemporalFilter::At(Expr::Parameter { index: 0, .. })));
+    assert_eq!(parameters(&relation), [1, 0]);
+}
+
+#[test]
+fn dynamic_temporal_filters_3068_bind_each_dimension() {
+    for (sql, expected) in [
+        ("SELECT price FROM foo FOR VALID_TIME FROM ? TO ?", "from-to"),
+        ("SELECT price FROM foo FOR VALID_TIME BETWEEN ? AND ?", "between"),
+    ] {
+        let relation = query(sql);
+        let filter = &find_scan(&relation).valid_time;
+        match (expected, filter) {
+            ("from-to", TemporalFilter::FromTo { from: Expr::Parameter { index: 0, .. }, to: Expr::Parameter { index: 1, .. } }) => {}
+            ("between", TemporalFilter::Between { from: Expr::Parameter { index: 0, .. }, to: Expr::Parameter { index: 1, .. } }) => {}
+            _ => panic!("Temporal parameter identity changed"),
+        }
+    }
+    let relation = query("SELECT price FROM foo FOR ALL SYSTEM_TIME FOR VALID_TIME ONLY FROM ? TO ?");
+    let scan = find_scan(&relation);
+    assert_eq!(scan.system_time, TemporalFilter::All);
+    assert!(scan.clamp_valid_time);
+}
+
+#[test]
+fn insert_plan_keeps_column_names_and_lexical_parameters() {
+    let prepared = prepare("INSERT INTO users (_id, region, price) VALUES (?, ?, ?)", &Fixture, &PrepareOptions::default()).unwrap();
+    let Statement::Dml(Dml::Insert { table, input }) = prepared.statement else { panic!("Expected insert") };
+    assert_eq!(table.table, TableRef::new("public", "users"));
+    assert_eq!(input.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["_id", "region", "price"]);
+    assert_eq!(parameters(&input), [0, 1, 2]);
+}
+
+#[test]
+fn temporal_dml_targets_keep_aliases_and_extent() {
+    let prepared = prepare("UPDATE users FOR PORTION OF VALID_TIME FROM DATE '2021-07-01' AS u SET region = 'eu' WHERE u._id = ?", &Fixture, &PrepareOptions::default()).unwrap();
+    let Statement::Dml(Dml::Update { input, valid_time, assignments, .. }) = prepared.statement else { panic!("Expected update") };
+    assert!(matches!(valid_time, TemporalFilter::FromTo { .. }));
+    assert_eq!(assignments[0], ("region".into(), Expr::Literal(Value::Utf8("eu".into()))));
+    assert_eq!(parameters(&input), [0]);
+    assert!(matches!(prepare("ERASE FROM users AS u WHERE u._id = ?", &Fixture, &PrepareOptions::default()).unwrap().statement, Statement::Dml(Dml::Erase { .. })));
+}
+
+#[test]
+fn database_oid_and_quoted_identifier_are_bound_from_catalog() {
+    let relation = query("SELECT \"ExactName\" FROM archive.public.docs");
+    assert_eq!(find_scan(&relation).table.name.database, "archive");
+    assert_eq!(find_scan(&relation).table.oid, Some(20000));
+    assert!(prepare("SELECT exactname FROM docs", &Fixture, &PrepareOptions::default()).is_err());
+}
+
+#[test]
+fn comments_and_string_semicolons_preserve_statement_spans() {
+    let source = "/* one /* nested */ */ SELECT ';' AS x;\nSELECT $2 AS y";
+    let parsed = parse(source).unwrap();
+    assert_eq!(parsed.len(), 2);
+    assert_eq!(&source[parsed[0].span.start..parsed[0].span.start + 6], "SELECT");
+    let prepared = prepare("SELECT $2 AS y, ? AS x", &Fixture, &PrepareOptions::default()).unwrap();
+    assert_eq!(prepared.parameter_types.keys().copied().collect::<Vec<_>>(), [0, 1]);
+    let error = prepare("SELECT missing FROM docs", &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.context.get("position"), Some(&serde_json::json!(8)));
+}
+
+#[test]
+fn aggregate_projection_has_group_then_aggregate_input() {
+    let relation = query("SELECT region, sum(price) AS total FROM docs GROUP BY region HAVING count(*) > 0 ORDER BY total DESC NULLS LAST");
+    let RelationNode::Sort { input, order_by } = relation.node() else { panic!("Expected sort") };
+    assert!(order_by[0].descending);
+    assert!(!order_by[0].nulls_first);
+    assert_eq!(input.schema().fields()[1].name, "total");
+    assert!(matches!(input.children()[0].children()[0].node(), RelationNode::Aggregate { .. }));
+}
+
+#[test]
+fn promoting_sum_and_minmax_use_the_argument_computation_type() {
+    let integer = LogicalType::Scalar(ScalarType::I32);
+    let mixed = LogicalType::join_all([&integer, &LogicalType::Scalar(ScalarType::F64)]);
+    let duration = LogicalType::join_all([
+        &LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Second)),
+        &LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Nanosecond)),
+    ]);
+    for (sql, argument, expected) in [
+        ("SELECT sum($1) FROM docs", integer.clone(), integer.clone().maybe()),
+        ("SELECT sum($1) FROM docs", mixed.clone(), LogicalType::Scalar(ScalarType::F64).maybe()),
+        ("SELECT min($1) FROM docs", mixed.clone(), LogicalType::Scalar(ScalarType::F64).maybe()),
+        ("SELECT max($1) FROM docs", mixed, LogicalType::Scalar(ScalarType::F64).maybe()),
+        ("SELECT avg($1) FROM docs", integer, LogicalType::Scalar(ScalarType::F64).maybe()),
+        ("SELECT avg($1) FROM docs", duration, LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Nanosecond)).maybe()),
+    ] {
+        let options = PrepareOptions { parameter_types: BTreeMap::from([(0, argument)]), ..Default::default() };
+        let Statement::Query(query) = prepare(sql, &Fixture, &options).unwrap().statement else { panic!("Expected query") };
+        assert_eq!(query.schema().fields()[0].data_type, expected);
+    }
+}
+
+#[test]
+fn minmax_rejects_incomparable_and_unsupported_argument_types_340() {
+    for argument in [
+        LogicalType::join_all([&LogicalType::Scalar(ScalarType::I64), &LogicalType::Scalar(ScalarType::Utf8)]),
+        LogicalType::Scalar(ScalarType::Bool),
+        LogicalType::list(LogicalType::Scalar(ScalarType::I64)),
+    ] {
+        let options = PrepareOptions { parameter_types: BTreeMap::from([(0, argument)]), ..Default::default() };
+        assert!(prepare("SELECT min($1) FROM docs", &Fixture, &options).is_err());
+    }
+}

@@ -1,0 +1,34 @@
+= SQL source implementation
+
+The parser and binder are passive objects.
+Each preparation owns its transient column allocator, parameter map, and CTE scope.
+Prepared statements retain immutable plans and their source text.
+
+The parser tokenizes before binding so anonymous parameters follow lexical order across projection, predicate, nested query, and temporal clauses.
+Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
+Temporal clauses retain the source location of their table and become scan dimensions before execution.
+Error contexts retain byte spans and one-based positions in the original SQL text.
+
+Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, and basic transaction and session controls.
+All execution results remain pending for Phase 2.
+
+The frontend currently rejects correlated scalar and predicate subqueries, lateral relations, recursive CTEs, window functions, NATURAL and USING joins, PATCH and RECORDS input, DML RETURNING, query SETTING clauses, prepared-statement commands, COPY, database lifecycle commands, role commands, interval qualifiers, and decimal cast options.
+The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
+ORDER BY expressions are currently resolved against projected fields.
+The syntax and name errors have source positions; exact SQLSTATE and upstream diagnostic text remain comparison work.
+
+== Assertion source mappings
+
+[cols="2,3"]
+|===
+|Pinned upstream identity |Rust source
+|`anonymous-params-bound-in-lexical-order-5988` |`tests/binding.rs::anonymous_params_bound_in_lexical_order_5988`
+|`from-where-param-order-bug-4305` |`tests/binding.rs::from_where_param_order_bug_4305`
+|`test-dynamic-temporal-filters-3068` |`tests/binding.rs::dynamic_temporal_filters_3068_bind_each_dimension`
+|`test-sql-insert-plan` |`tests/binding.rs::insert_plan_keeps_column_names_and_lexical_parameters`
+|`test-sql-update-plan`, `test-sql-erase-plan` |`tests/binding.rs::temporal_dml_targets_keep_aliases_and_extent`
+|`sql/multi_db_test.clj`, `sql/identifier_test.clj` |`tests/binding.rs::database_oid_and_quoted_identifier_are_bound_from_catalog`
+|===
+
+These sources check binding invariants and do not replace the upstream execution assertions or plan golden comparisons.
+No Rust test, parser invocation, or build has run during Phase 1.

@@ -1,0 +1,43 @@
+= Durable format implementation
+
+All components in this crate are passive values or codecs.
+Generated protobuf messages retain field presence from XTDB's edition-2023 schemas.
+The build script generates bindings from the original source files and maps their explicit-presence fields to prost's proto2 descriptor model.
+Repeated scalar fields retain edition-2023 packed encoding.
+Neither protobuf generation nor compilation has run during Phase 1.
+
+The source and replica envelopes retain the source header, optional term sequence, optional external token, database operation, and transaction payload bytes.
+The Transit codec retains tagged values, legacy error tags, and cache substitutions while decoding MessagePack.
+The current schema writer records version 6; other storage generations must be qualified and registered before recovery accepts them.
+Legacy source transaction bytes and obsolete flush records retain the JVM dispatch behavior.
+
+The Arrow readers accept files and streams through Arrow IPC, including multiple pages and run-end encoded IIDs.
+Event operations are selected by union leg name because type IDs can differ across file schemas.
+The writer uses eight-byte alignment and the JVM's four-byte end marker.
+Cross-process writer identity remains an unexecuted acceptance check, including FlatBuffer construction, schema ordering, and metadata encoding.
+The metadata codec retains column statistics and traverses IID and recency branches.
+Imported metadata retains its nested Arrow schema when written again.
+New leaf statistics include nested child references, counts, numeric bounds, presence flags, and byte-backed Bloom filters.
+Bloom filters use XXHash32 and MurmurHash3 x86 with the JVM's five hashes over 22 bits and portable Roaring serialization.
+New metadata schemas have deterministic field order; exact JVM field allocation order and nullability remain part of the byte-identity acceptance check.
+
+The HLL codec stores big-endian 32-bit registers and combines matching registers by maximum.
+Its estimator reproduces the pinned Kotlin expression, including the signed narrowing of `0xffffffff` to `-1` in the large-range correction.
+That source-level discrepancy needs a reference observation before any behavior change is proposed.
+
+== Assertion mappings
+
+[cols="2,3,1"]
+|===
+|Reference source |Rust test source |Execution
+|`core/src/test/kotlin/xtdb/api/log/ReplicaMessageTermSeqTest.kt` |`tests/term_sequence.rs` |Pending
+|`core/src/main/kotlin/xtdb/api/storage/Storage.kt`, `Trie.kt`, `TableSlug.kt` |`tests/persistence.rs` |Pending
+|`api/src/main/kotlin/xtdb/database/Basis.kt` |`tests/persistence.rs` |Pending
+|`core/src/main/kotlin/xtdb/table/ColumnMeta.kt` |`tests/persistence.rs` |Pending
+|`core/src/main/kotlin/xtdb/util/HyperLogLog.kt`, `MemoryHashTrie.kt` |`tests/hll_and_trie.rs` |Pending
+|`api/src/main/clojure/xtdb/serde.clj`, `xtdb/error.clj` |`tests/transit.rs` |Pending
+|`core/src/main/kotlin/xtdb/trie/MetadataFileWriter.kt`, `ColumnMetadata.kt`, `BloomBuilder.kt` |`tests/metadata.rs` |Pending
+|===
+
+The codec tests also read the tracked `compactor-reset-node` Arrow fixture without modifying it.
+These source mappings are not runtime discovery, execution receipts, or a claim of parity.

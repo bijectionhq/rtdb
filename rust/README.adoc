@@ -1,0 +1,34 @@
+= RTDB Rust implementation
+
+This workspace is being implemented against XTDB commit `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+The reviewed design is repository commit `c995e6b35b6812aa423c8a158c4e201e27532320`.
+The JVM source, tests, fixtures, and external language clients remain the compatibility reference.
+
+The implementation is in Phase 1.
+Compilation, dependency resolution, executable test discovery, tests, benchmarks, and server execution are deferred until every required production path has been implemented and reviewed from source.
+No build, compatibility, durability, or performance result is asserted by the presence of source or tests.
+Workspace editor settings disable Rust checks, build scripts, and procedural macro execution while this phase is active.
+
+See link:../dev/doc/rtdb-crates-and-test-parity.md[crate contracts] and link:../dev/doc/xtdb-rust-rewrite.md[migration and rollback contracts].
+Implementation status and evidence are tracked in link:implementation-status.json[the status manifest].
+The link:source-review.adoc[source review record] identifies concrete paths, source discrepancies, and missing production traces.
+
+== Ownership
+
+Semantic types, event headers, temporal ceilings, schemas, immutable tries, metadata, and wire codecs are passive objects.
+Temporal calculators and batch builders are single-writer transients that publish only completed values.
+An owning batch or cache lease retains the allocation and its memory charge until the last view is released.
+
+Storage adapters are passive I/O objects.
+The local log writer owns its ordered input queue and durable file handle; its driver is an active object that selects between queued writes and shutdown.
+Log progress and cache fetch completion are separate monitor objects.
+Readers own their log cursor, and only a successful read at the durable tip may report an empty poll.
+
+== Verification gate
+
+The Phase 1 source review must trace a client read, a data-dependent write, replica recovery, compaction retry, CDC restart, and database shutdown through concrete production implementations.
+Every design surface requires an implementation path before Phase 2 begins.
+The presence of a package, an interface, or an unexecuted assertion is not completion of that surface.
+
+Phase 2 follows the repository's `xtdb-testing` workflow for Gradle runs and preserves separate reference, native, and comparison receipts.
+The historical results recorded in the design are reference results, not a Rust baseline.

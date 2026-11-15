@@ -1,0 +1,332 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
+use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
+use rtdb_types::{Anomaly, LogicalType, Result, TimeUnit, Timestamp, Value};
+
+use crate::ipc::ArrowFile;
+
+pub use crate::statistics::{column_metadata, columns_for_event_page};
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MetadataNode {
+    Nil,
+    IidBranch(Vec<Option<usize>>),
+    RecencyBranch(Vec<(Timestamp, usize)>),
+    Leaf { data_page_index: usize, columns: Vec<Value> },
+}
+
+#[derive(Clone, Debug)]
+pub struct MetadataFile {
+    nodes: Vec<MetadataNode>,
+    schema: SchemaRef,
+}
+
+pub struct MetadataBuilder {
+    nodes: Vec<MetadataNode>,
+    column_count: usize,
+    page_count: usize,
+    row_count: i64,
+    temporal: crate::log::proto::TemporalMetadata,
+    recency_branches: bool,
+    calculate_blooms: bool,
+}
+
+impl MetadataBuilder {
+    pub fn new(recency_branches: bool, calculate_blooms: bool) -> Self {
+        Self { nodes: Vec::new(), column_count: 0, page_count: 0, row_count: 0,
+            temporal: crate::log::proto::TemporalMetadata::default(), recency_branches, calculate_blooms }
+    }
+
+    pub fn write_nil(&mut self) -> Result<usize> { self.push(MetadataNode::Nil) }
+
+    pub fn write_iid_branch(&mut self, children: [Option<usize>; 4]) -> Result<usize> {
+        for child in children.iter().flatten() { validate_child(*child, self.nodes.len())?; }
+        self.push(MetadataNode::IidBranch(children.to_vec()))
+    }
+
+    pub fn write_recency_branch(&mut self, children: Vec<(Timestamp, usize)>) -> Result<usize> {
+        if !self.recency_branches { return Err(invalid("Recency branches require recency data")); }
+        for (index, (upper, child)) in children.iter().enumerate() {
+            validate_child(*child, self.nodes.len())?;
+            if index > 0 && children[index - 1].0 >= *upper { return Err(invalid("Recency ceilings must increase strictly")); }
+        }
+        self.push(MetadataNode::RecencyBranch(children))
+    }
+
+    pub fn write_leaf(&mut self, batch: &RecordBatch) -> Result<usize> {
+        if batch.schema().index_of("_recency").is_ok() != self.recency_branches { return Err(invalid("Data recency column does not match metadata schema")); }
+        let events = crate::data::EventBatch::new(batch.clone())?;
+        let mut temporal = self.temporal.clone();
+        for row in 0..events.len() {
+            let event = events.header(row)?;
+            temporal.min_valid_from = Some(temporal.min_valid_from.unwrap_or(i64::MAX).min(event.valid_time.lower().0));
+            temporal.max_valid_from = Some(temporal.max_valid_from.unwrap_or(i64::MIN).max(event.valid_time.lower().0));
+            temporal.min_valid_to = Some(temporal.min_valid_to.unwrap_or(i64::MAX).min(event.valid_time.upper().0));
+            temporal.max_valid_to = Some(temporal.max_valid_to.unwrap_or(i64::MIN).max(event.valid_time.upper().0));
+            temporal.min_system_from = Some(temporal.min_system_from.unwrap_or(i64::MAX).min(event.system_from.0));
+            temporal.max_system_from = Some(temporal.max_system_from.unwrap_or(i64::MIN).max(event.system_from.0));
+        }
+        let mut columns = columns_for_event_page(batch, self.calculate_blooms)?;
+        let base = i32::try_from(self.column_count).map_err(invalid)?;
+        let column_count = self.column_count.checked_add(columns.len()).ok_or_else(|| invalid("Metadata column count overflow"))?;
+        i32::try_from(column_count).map_err(invalid)?;
+        for column in &mut columns {
+            let Value::Struct(fields) = column else { return Err(invalid("Column metadata must be a struct")); };
+            for (name, value) in fields {
+                match (name.as_str(), value) {
+                    ("list" | "set", Value::I32(index)) => *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?,
+                    ("struct", Value::List(children)) => for child in children {
+                        let Value::I32(index) = child else { return Err(invalid("Struct metadata child must be an integer")); };
+                        *index = index.checked_add(base).ok_or_else(|| invalid("Metadata child index overflow"))?;
+                    },
+                    _ => {}
+                }
+            }
+        }
+        let row_count = self.row_count.checked_add(i64::try_from(batch.num_rows()).map_err(invalid)?).ok_or_else(|| invalid("Metadata row count overflow"))?;
+        i32::try_from(self.page_count).map_err(invalid)?;
+        let index = self.push(MetadataNode::Leaf { data_page_index: self.page_count, columns })?;
+        self.column_count = column_count;
+        self.page_count += 1;
+        self.row_count = row_count;
+        self.temporal = temporal;
+        Ok(index)
+    }
+
+    pub fn finish(self) -> Result<(MetadataFile, crate::log::proto::TrieMetadata)> {
+        let metadata = crate::log::proto::TrieMetadata {
+            temporal_metadata: (self.row_count > 0).then_some(self.temporal), row_count: Some(self.row_count), iid_bloom: None,
+        };
+        Ok((MetadataFile::from_nodes(self.nodes, self.recency_branches)?, metadata))
+    }
+
+    fn push(&mut self, node: MetadataNode) -> Result<usize> {
+        let index = self.nodes.len();
+        i32::try_from(index).map_err(invalid)?;
+        self.nodes.push(node);
+        Ok(index)
+    }
+}
+
+impl MetadataFile {
+    pub fn read(bytes: Arc<[u8]>) -> Result<Self> {
+        Self::read_reader(std::io::Cursor::new(bytes))
+    }
+
+    pub fn read_reader(reader: impl std::io::Read + std::io::Seek + Send + 'static) -> Result<Self> {
+        let mut file = ArrowFile::from_reader(reader, None)?;
+        if file.page_count() != 1 { return Err(invalid("Trie metadata must contain exactly one Arrow record batch")); }
+        let batch = file.read_page(0)?;
+        let index = batch.schema().index_of("nodes").map_err(invalid)?;
+        let nodes = batch.column(index).as_any().downcast_ref::<UnionArray>().ok_or_else(|| invalid("Trie metadata nodes must be a union"))?;
+        let DataType::Union(fields, _) = nodes.data_type() else { return Err(invalid("Missing metadata union schema")); };
+        let mut decoded = Vec::with_capacity(nodes.len());
+        for row in 0..nodes.len() {
+            let id = nodes.type_id(row);
+            let field = fields.iter().find_map(|(type_id, field)| (id == type_id).then_some(field)).ok_or_else(|| invalid("Metadata node type has no declared leg"))?;
+            let value = rtdb_columnar::read_value(field, nodes.child(id).as_ref(), nodes.value_offset(row))?;
+            decoded.push(match field.name().as_str() {
+                "nil" => MetadataNode::Nil,
+                "branch-iid" => {
+                    let Value::List(children) = value else { return Err(invalid("IID branch is not a list")); };
+                    if children.len() != 4 { return Err(invalid("IID branch must have four buckets")); }
+                    MetadataNode::IidBranch(children.iter().map(|child| match child {
+                        Value::Null => Ok(None),
+                        Value::I32(child) => Ok(Some(child_index(*child, row)?)),
+                        _ => Err(invalid("IID child reference is not an integer")),
+                    }).collect::<Result<_>>()?)
+                }
+                "branch-recency" => {
+                    let Value::List(children) = value else { return Err(invalid("Recency branch is not a list")); };
+                    let mut buckets = Vec::with_capacity(children.len());
+                    for child in children {
+                        let Value::Struct(fields) = child else { return Err(invalid("Recency bucket is not a struct")); };
+                        let Value::I32(index) = required(&fields, "idx")? else { return Err(invalid("Recency bucket has no child index")); };
+                        let Value::Timestamp { value, unit: TimeUnit::Microsecond, .. } = required(&fields, "max-recency")? else { return Err(invalid("Recency bucket has no microsecond ceiling")); };
+                        let upper = Timestamp(*value);
+                        if buckets.last().is_some_and(|(previous, _)| *previous >= upper) { return Err(invalid("Recency ceilings must increase strictly")); }
+                        buckets.push((upper, child_index(*index, row)?));
+                    }
+                    MetadataNode::RecencyBranch(buckets)
+                }
+                "leaf" => {
+                    let Value::Struct(fields) = value else { return Err(invalid("Metadata leaf is not a struct")); };
+                    let Value::I32(index) = required(&fields, "data-page-idx")? else { return Err(invalid("Metadata leaf has no page index")); };
+                    let Value::List(columns) = required(&fields, "columns")? else { return Err(invalid("Metadata leaf has no columns")); };
+                    MetadataNode::Leaf { data_page_index: usize::try_from(*index).map_err(invalid)?, columns: columns.clone() }
+                }
+                other => return Err(invalid(format!("Unknown metadata node: {other}"))),
+            });
+        }
+        Ok(Self { nodes: decoded, schema: batch.schema() })
+    }
+
+    pub fn from_nodes(nodes: Vec<MetadataNode>, recency_branches: bool) -> Result<Self> {
+        let mut column_types = Vec::new();
+        for (parent, node) in nodes.iter().enumerate() {
+            match node {
+                MetadataNode::Nil => {}
+                MetadataNode::IidBranch(children) => {
+                    if children.len() != 4 { return Err(invalid("IID branch must have four buckets")); }
+                    for child in children.iter().flatten() { validate_child(*child, parent)?; }
+                }
+                MetadataNode::RecencyBranch(children) => {
+                    if !recency_branches { return Err(invalid("Recency branches require the recency metadata schema")); }
+                    for (index, (upper, child)) in children.iter().enumerate() {
+                        validate_child(*child, parent)?;
+                        if index > 0 && children[index - 1].0 >= *upper { return Err(invalid("Recency ceilings must increase strictly")); }
+                    }
+                }
+                MetadataNode::Leaf { data_page_index, columns } => {
+                    i32::try_from(*data_page_index).map_err(invalid)?;
+                    column_types.extend(columns.iter().map(Value::logical_type));
+                }
+            }
+        }
+        let mut columns = vec![Field::new("col-name", DataType::Utf8, false), Field::new("root-col?", DataType::Boolean, false), Field::new("count", DataType::Int64, false)];
+        if let LogicalType::Struct(types) = LogicalType::join_all(&column_types) {
+            for (name, ty) in types {
+                if !columns.iter().any(|field| field.name() == &name) { columns.push(column_stat_field(&name, &ty)?); }
+            }
+        }
+        let list = |name: &str, element: Field| Field::new(name, DataType::List(Arc::new(element)), false);
+        let mut legs = vec![Field::new("nil", DataType::Null, true), list("branch-iid", Field::new("$data$", DataType::Int32, true))];
+        if recency_branches {
+            legs.push(list("branch-recency", Field::new("$data$", DataType::Struct(vec![
+                Field::new("max-recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false),
+                Field::new("idx", DataType::Int32, false),
+            ].into()), false)));
+        }
+        legs.push(Field::new("leaf", DataType::Struct(vec![
+            Field::new("data-page-idx", DataType::Int32, false),
+            list("columns", Field::new("$data$", DataType::Struct(columns.into()), false)),
+        ].into()), false));
+        let fields = UnionFields::new(0..legs.len() as i8, legs);
+        Ok(Self { nodes, schema: Arc::new(Schema::new(vec![Field::new("nodes", DataType::Union(fields, UnionMode::Dense), false)])) })
+    }
+
+    pub fn write(&self) -> Result<Vec<u8>> {
+        let field = self.schema.field_with_name("nodes").map_err(invalid)?;
+        let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return Err(invalid("Metadata schema must use a dense node union")); };
+        let mut leg_values: Vec<Vec<Value>> = vec![Vec::new(); fields.len()];
+        let mut ids = Vec::with_capacity(self.nodes.len());
+        let mut offsets = Vec::with_capacity(self.nodes.len());
+        for node in &self.nodes {
+            let (name, value) = node_value(node)?;
+            let (position, (id, _)) = fields.iter().enumerate().find(|(_, (_, field))| field.name() == name).ok_or_else(|| invalid(format!("Metadata schema has no {name} leg")))?;
+            ids.push(id);
+            offsets.push(i32::try_from(leg_values[position].len()).map_err(invalid)?);
+            leg_values[position].push(value);
+        }
+        let children = fields.iter().zip(leg_values).map(|((_, field), values)| build_field_values(field, &values)).collect::<Result<Vec<_>>>()?;
+        let nodes: ArrayRef = Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(ids), Some(ScalarBuffer::from(offsets)), children).map_err(invalid)?);
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![nodes]).map_err(invalid)?;
+        crate::ipc::write_file(&self.schema, &[batch])
+    }
+
+    pub fn nodes(&self) -> &[MetadataNode] { &self.nodes }
+    pub fn schema(&self) -> &SchemaRef { &self.schema }
+    pub fn root_index(&self) -> Option<usize> { self.nodes.len().checked_sub(1) }
+
+    pub fn leaves(&self) -> Vec<(Vec<u8>, usize)> {
+        let mut leaves = Vec::new();
+        let mut pending = self.root_index().map(|root| vec![(root, Vec::new())]).unwrap_or_default();
+        while let Some((node, path)) = pending.pop() {
+            match &self.nodes[node] {
+                MetadataNode::Nil => {}
+                MetadataNode::Leaf { data_page_index, .. } => leaves.push((path, *data_page_index)),
+                MetadataNode::IidBranch(children) => {
+                    for (bucket, child) in children.iter().enumerate().rev() {
+                        if let Some(child) = child { let mut path = path.clone(); path.push(bucket as u8); pending.push((*child, path)); }
+                    }
+                }
+                MetadataNode::RecencyBranch(children) => for (_, child) in children.iter().rev() { pending.push((*child, path.clone())); },
+            }
+        }
+        leaves
+    }
+}
+
+fn validate_child(child: usize, parent: usize) -> Result<()> {
+    if child >= parent { return Err(invalid("Metadata children must precede their parent")); }
+    i32::try_from(child).map_err(invalid)?;
+    Ok(())
+}
+
+fn column_stat_field(name: &str, ty: &LogicalType) -> Result<Field> {
+    let data_type = match name {
+        "numbers" | "date-times" | "times-of-day" | "durations" => DataType::Struct(vec![
+            Field::new("min", DataType::Float64, true), Field::new("max", DataType::Float64, true),
+        ].into()),
+        "bytes" => DataType::Struct(vec![Field::new("bloom", DataType::Binary, true)].into()),
+        "list" | "set" => DataType::Int32,
+        "struct" => DataType::List(Arc::new(Field::new("$data$", DataType::Int32, false))),
+        _ => return rtdb_columnar::to_field(name, ty),
+    };
+    Ok(Field::new(name, data_type, true))
+}
+
+fn node_value(node: &MetadataNode) -> Result<(&'static str, Value)> {
+    Ok(match node {
+        MetadataNode::Nil => ("nil", Value::Null),
+        MetadataNode::IidBranch(children) => ("branch-iid", Value::List(children.iter().map(|child| child.map(|child| i32::try_from(child).map(Value::I32).map_err(invalid)).unwrap_or(Ok(Value::Null))).collect::<Result<_>>()?)),
+        MetadataNode::RecencyBranch(children) => ("branch-recency", Value::List(children.iter().map(|(upper, child)| Ok(Value::Struct(BTreeMap::from([
+            ("max-recency".into(), Value::Timestamp { value: upper.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
+            ("idx".into(), Value::I32(i32::try_from(*child).map_err(invalid)?)),
+        ])))).collect::<Result<_>>()?)),
+        MetadataNode::Leaf { data_page_index, columns } => ("leaf", Value::Struct(BTreeMap::from([
+            ("data-page-idx".into(), Value::I32(i32::try_from(*data_page_index).map_err(invalid)?)),
+            ("columns".into(), Value::List(columns.clone())),
+        ]))),
+    })
+}
+
+fn build_field_values(field: &Field, values: &[Value]) -> Result<ArrayRef> {
+    let nulls = values.iter().map(|value| !matches!(value, Value::Null | Value::Undefined)).collect::<Vec<_>>();
+    let nulls = nulls.iter().any(|valid| !valid).then(|| NullBuffer::from(nulls));
+    match field.data_type() {
+        DataType::Struct(fields) => {
+            let children = fields.iter().map(|field| {
+                let values = values.iter().map(|value| value.field(field.name()).cloned().unwrap_or(Value::Null)).collect::<Vec<_>>();
+                build_field_values(field, &values)
+            }).collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(StructArray::try_new_with_length(Fields::from(fields.iter().cloned().collect::<Vec<_>>()), children, nulls, values.len()).map_err(invalid)?))
+        }
+        DataType::List(element) => {
+            let mut elements = Vec::new();
+            let mut offsets = vec![0i32];
+            for value in values {
+                match value {
+                    Value::List(values) => elements.extend(values.iter().cloned()),
+                    Value::Null | Value::Undefined => {}
+                    _ => return Err(invalid("Metadata list field contains a non-list value")),
+                }
+                offsets.push(i32::try_from(elements.len()).map_err(invalid)?);
+            }
+            let elements = build_field_values(element, &elements)?;
+            Ok(Arc::new(ListArray::try_new(element.clone(), OffsetBuffer::new(ScalarBuffer::from(offsets)), elements, nulls).map_err(invalid)?))
+        }
+        _ => {
+            let ty = rtdb_columnar::from_field(field)?;
+            let ty = if nulls.is_some() && ty != LogicalType::Nothing { ty.maybe() } else { ty };
+            rtdb_columnar::build_array(&ty, values)
+        }
+    }
+}
+
+fn child_index(value: i32, parent: usize) -> Result<usize> {
+    let child = usize::try_from(value).map_err(invalid)?;
+    if child >= parent { return Err(invalid("Metadata children must precede their parent")); }
+    Ok(child)
+}
+
+fn required<'a>(fields: &'a BTreeMap<String, Value>, key: &str) -> Result<&'a Value> {
+    fields.get(key).ok_or_else(|| invalid(format!("Missing metadata field: {key}")))
+}
+
+fn invalid(error: impl std::fmt::Display) -> Anomaly {
+    Anomaly::incorrect("rtdb.format/invalid-trie-metadata", error.to_string())
+}

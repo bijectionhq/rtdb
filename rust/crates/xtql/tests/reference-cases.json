@@ -1,0 +1,18 @@
+{
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "mapping_status": "source_only_partial",
+  "runtime_discovery": "pending",
+  "execution": "pending",
+  "cases": [
+    {"source": "src/test/clojure/xtdb/xtql_test.clj", "qualified_name": "xtdb.xtql-test/test-parse-expr", "native": "xtdb_xtql_test_parse_expr_preserves_jvm_literal_widths_and_tag_payloads", "observation_scope": "literal preparation"},
+    {"source": "src/test/clojure/xtdb/xtql_test.clj", "qualified_name": "xtdb.xtql-test/test-parse-from", "native": "xtdb_xtql_test_parse_from_rejects_missing_bindings_and_invalid_options", "observation_scope": "binding and options validation"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-from", "native": "xtdb_xtql_plan_test_from_normalizes_aliases_and_preserves_duplicate_projections", "observation_scope": "output identity and schema; result execution pending"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-from-star", "native": "xtdb_xtql_plan_test_from_star_is_rejected_in_unify", "observation_scope": "unify star preparation error"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-from-unification", "native": "xtdb_xtql_plan_test_from_unification_adds_a_value_predicate_after_the_scan", "observation_scope": "equality placement; result execution pending"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-rel", "native": "xtdb_xtql_plan_test_rel_preserves_rows_and_missing_column_types", "observation_scope": "relation schema and row multiplicity plan"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-left-join", "native": "xtdb_xtql_plan_test_left_join_filters_unifying_variables_inside_the_dependent_plan", "observation_scope": "dependent filter placement; result execution pending"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-nested-subquery-parameters-3181", "native": "xtdb_xtql_plan_test_nested_subquery_parameters_do_not_inflate_external_arity", "observation_scope": "nested parameter identity"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-pull", "native": "xtdb_xtql_plan_test_pull_many_retains_nullable_empty_result_semantics", "observation_scope": "pull-many nullability; empty result execution pending"},
+    {"source": "src/test/clojure/xtdb/xtql/plan_test.clj", "qualified_name": "xtdb.xtql.plan-test/test-aggregate-exprs", "native": "xtdb_xtql_plan_test_aggregate_expressions_preserve_group_and_aggregate_scopes", "observation_scope": "aggregate and grouping scope"}
+  ]
+}

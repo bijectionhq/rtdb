@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "units": "microseconds",
+  "events": [
+    {"iid": "01010101010101010101010101010101", "system_from": 2, "valid_from": 10, "valid_to": 20, "operation": "put"},
+    {"iid": "01010101010101010101010101010101", "system_from": 1, "valid_from": 0, "valid_to": 100, "operation": "put"},
+    {"iid": "02020202020202020202020202020202", "system_from": 1, "valid_from": 0, "valid_to": 100, "operation": "put"}
+  ],
+  "query_bounds": null,
+  "expected_observations": {
+    "iid-a/earlier/valid-times": [0, 10, 20, 100],
+    "iid-a/earlier/system-time-ceilings": [9223372036854775807, 2, 9223372036854775807],
+    "iid-b/valid-times": [0, 100],
+    "iid-b/system-time-ceilings": [9223372036854775807]
+  },
+  "negative_control": {
+    "observation": "iid-a/earlier/system-time-ceilings",
+    "path": "/1",
+    "replacement": 3
+  },
+  "execution_status": "not_run"
+}

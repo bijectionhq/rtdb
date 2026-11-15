@@ -1,0 +1,32 @@
+= XTQL query preparation
+
+`read` produces EDN forms with UTF-8 byte spans.
+`parse_query` produces query, clause, binding, temporal-filter, and expression values.
+`compile` binds those values against one supplied catalog and produces `rtdb-plan::PreparedStatement`.
+The reader, parser, and compiler are passive.
+The compiler owns a transient column-ID allocator and nested parameter bindings; the supplied catalog retains the visibility basis.
+
+Native lowering covers scans, explicit and parameter relations, pipelines, unification, joins, left joins, projections, filters, unnest, ordering, limits, offsets, union-all, ordinary aggregates, and scalar/existence/pull subqueries.
+Shared variables produce SQL equality predicates.
+Parameterized dependent relations use `RelationNode::Apply`; bindings remain local to the dependent plan and do not increase external parameter arity.
+Left-join unification predicates execute inside the dependent plan before null extension.
+Shorthand binding symbols remain logic variables even when a function parameter has the same spelling.
+Scan value predicates remain above temporal resolution.
+
+The checked-in test source retains names from `xtdb.xtql-test` and `xtdb.xtql.plan-test`.
+Its structural checks are native preparation checks, not receipts proving the upstream result assertions executed.
+`tests/reference-cases.json` records the source identities and pending execution status.
+Compilation and all execution remain pending for Phase 2.
+
+The following surfaces remain outside this checkpoint's implementation.
+
+* Percentile and `vec-agg` aggregation do not have a complete shared-plan/executor representation.
+* The shared scalar function registry does not yet cover every JVM expression function, cast syntax, temporal operation, or collection operation reachable from XTQL.
+* The EDN reader does not implement reader conditionals, namespaced-map shorthand, arbitrary tagged Java objects, regex objects, ratios, or variadic anonymous functions.
+* Temporal scan filters containing relational subqueries are rejected.
+* Untyped prepared relation parameters require concrete argument types before they can produce their correct output schema.
+* Protocol submission, SQL-inline XTQL routing, result-key conversion, and transaction submission require the production frontend and session owners.
+
+Supported literal tags include UUIDs, hexadecimal bytes, URIs, dates, local timestamps, zoned/offset timestamps, instants, local times, durations, intervals, period-duration values, and timestamp ranges.
+Unsupported tags fail during preparation.
+Literal object compatibility, normalization collisions, exact failure signatures, and all result observations still require paired JVM/native execution.
