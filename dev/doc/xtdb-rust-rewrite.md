@@ -6,8 +6,9 @@ Qualify the first production migration with a bounded write pause and one genera
 The JVM remains the reference implementation during development and a tested recovery option during the initial deployment window.
 The [crate and test parity design](rtdb-crates-and-test-parity.md) maps each subsystem to a proposed Cargo package and defines how the original test assertions carry over.
 
-This is a proposed design based on XTDB commit `c84f9334e`.
-Pin a released JVM distribution and its supported predecessor formats before promising compatibility to operators.
+Build the development reference from XTDB commit `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+For a pilot, pin the deployed JVM distribution, configuration and intended rollback distribution independently.
+The development reference determines test parity; the pilot binaries determine whether an operator can transfer ownership in both directions.
 The design assumes a JVM-free server is a product requirement in its own right.
 Performance targets below are proposed acceptance criteria, not measurements.
 
@@ -32,7 +33,7 @@ General availability covers every backend and interface advertised for that rele
 Add a Cargo workspace under `rust/` beside the Gradle build.
 Keep `lang/rust` as an ordinary client that can point to either server.
 Build a single server binary and a test driver that consumes replay fixtures.
-Use Cargo modules for the boundaries below and split a crate out when it has an independent consumer or dependency boundary.
+Use the companion crate map for package dependencies; the table below describes runtime ownership across those packages.
 The client protocols, storage adapters, and asynchronous runtime may depend on the engine.
 The type system, history algorithm, and catalog transitions can be tested synchronously with owned inputs.
 
@@ -53,7 +54,9 @@ Model an in-flight block and staged transactions on the states that own them.
 Store the replica reader's term and sequence across role transitions at the partition level.
 Publish a whole partition generation through one synchronized pointer swap.
 An initial implementation can use a short-held lock around an immutable shared reference.
-Keep buffers alive through the final reader and finish or cancel database-owned tasks before releasing their storage.
+Retain each buffer until its final reader releases it.
+During shutdown stop admitting new work, signal cancellation to database-owned tasks, await their termination, then release the underlying storage and buffers.
+Test cancellation while an asynchronous read holds a cache lease and while an embedded consumer retains an exported batch.
 Enforce byte budgets for scans, joins, live writes, compaction, and cache retention.
 Collect peak memory and queue depth under concurrent workloads. [Partition state](../../core/src/main/kotlin/xtdb/database/PartitionValue.kt) · [Replica admission](../../core/src/main/kotlin/xtdb/indexer/LogProcessor.kt) · [Session model](tx.allium) · [Object roles](../../.claude/skills/xtdb-object-boundaries/SKILL.md)
 
@@ -146,25 +149,19 @@ Validate clean shutdown, slow object storage, exhausted disk cache, credential r
 
 ## 7. Conformance and performance
 
-- **Reference corpus.** Pin JVM binaries, configuration, clock, time zone, storage fixtures and log segments by digest.
-  Record the supported version matrix and a standalone command that replays each case against either binary.
-  Convert JVM-only tests that rely on planner hooks or a Kotlin scheduler into portable inputs and expected observations.
-- **Semantic oracle.** Drive both processes with the same ordered operations, fixed temporal inputs and explicit query basis.
-  Compare typed results, ordered rows when order is specified, row multisets otherwise, temporal boundaries, transaction outcomes and errors.
-  Preserve nullability, union legs, integer versus string IDs, and nanosecond/microsecond conversion behavior in comparisons.
-  For a spec/runtime discrepancy, retain the smallest reproducer and obtain a compatibility decision against the released behavior.
-- **Failure oracle.** Record the random seed and event trace for injected crashes, stale leaders, dropped appends, redelivery, oversized log records, partial compaction and delayed block confirmation.
-  Replay on restart and shrink failing histories.
-  Compare every acknowledged outcome and observable historical answer against the reference at the same replay position, including the effect of a subsequent erase.
-- **Performance budgets.** Run fixed-hardware cold and warm ID lookups, bitemporal range scans, mixed-type joins, bulk ingest, replicated commit, compaction under load and restore.
-  Record p50/p95/p99, throughput, resident memory, object-store bytes and requests, and recovery time.
-  As provisional pilot thresholds, investigate any p95 regression above 10% or throughput loss above 10% across repeated matched runs.
-  Set hard release limits with operators against their workload and baseline variance.
-  A semantics or durability mismatch blocks promotion regardless of throughput.
+Use the [parity ledger and comparison rules](rtdb-crates-and-test-parity.md#what-complete-test-parity-means) as the acceptance contract for functional behavior.
+Record the applied history, valid-time interval and system-time interval separately.
+An execution snapshot bounds the system time it can observe.
+For a paired read, stop or synchronize the readers at a named prefix and issue the same temporal query.
+A fixed SQL timestamp alone cannot align fixtures that have applied different erases.
 
-The Kotlin simulation harness already supplies useful failure scenarios.
-A Rust harness can share traces without reproducing its coroutine scheduler.
-Use the existing products and scan workloads for latency and the existing analytic benchmarks for throughput. [Seeded simulations](../../core/src/test/kotlin/xtdb/SimulationTestBase.kt) · [SQL logic runner](../../src/test/clojure/xtdb/sql/logic_test/xtdb_engine.clj) · [Benchmarks](../../modules/bench/src/main/clojure/xtdb/bench/)
+Benchmark the JVM and Rust binaries at the same commit-equivalent data state, configured memory budget, concurrency, object-store placement and compaction state.
+Measure cold and warm ID lookups, bitemporal ranges, mixed-type joins, bulk ingest, replicated commits, compaction under load and restore.
+Keep throughput, p50/p95/p99 latency, peak resident memory, bytes and requests to storage, and recovery time beside the fixture and configuration digest.
+Repeat on the JVM first to estimate run-to-run variance.
+As a provisional pilot trigger, investigate a repeatable p95 regression above 10% or throughput loss above 10%.
+Set release limits against the pilot workload and its observed variance.
+Any unexplained semantic or durability divergence blocks promotion regardless of throughput. [Benchmark workloads](../../modules/bench/src/main/clojure/xtdb/bench/)
 
 ## 8. Delivery sequence and staffing
 
@@ -174,8 +171,8 @@ The first six weeks should replace the most uncertain estimates with measurement
 
 | Elapsed time | Deliverable | Evidence to proceed |
 | --- | --- | --- |
-| Weeks 1–6 | Pin the released reference, inventory deployment features, build the differential runner, decode a real block and replay a replica record | Exact ID, schema and temporal results on one corrected product history, first report on nested unions, legacy payloads, and embedded buffer ownership |
-| Months 2–5 | Rust historical reader and read-only replica follower | Correct current and historical queries across live rows, compaction, restart, and catch-up from a retained block |
+| Weeks 1–6 | Capture the upstream inventory and pair the JVM and Rust runners for the per-IID ceiling and absent/zero sequence fixtures | Both produce the original observations, injected comparator errors are caught, and remaining unmapped cases are reported |
+| Months 2–5 | Rust historical reader and read-only replica follower | Reproduce the product-history fixture in §10 across live rows, compaction, restart and catch-up from a retained block |
 | Months 5–10 | Writable standalone server, session state, temporal DML and local recovery | Differential histories pass through puts, corrections, deletes and erases, acknowledged writes survive process kills |
 | Months 9–18 | Replicated writes, election, compaction, GC, Kafka and first cloud pilot, broaden query execution in parallel | Deterministic fault scenarios converge, shadow traffic agrees at a common basis, backlogs drain under sustained load |
 | Months 16–30 | Remaining cloud adapters, CDC, client and embedded compatibility, configuration and operations | Two-way restore, driver matrix, authorization, performance budgets and a full cutover/rollback rehearsal pass for each pilot configuration |
@@ -198,7 +195,9 @@ Re-estimate at the read-only milestone if format compatibility needs custom Arro
    Stop or fence every JVM publisher, including maintenance workers and upstream CDC acknowledgements.
    Reread the final log heads and capture each partition's finalized block, source and replica positions, durable transaction, term/sequence, storage version and epoch, and external token.
    Verify a restore from the protected files plus retained tail.
-   Grant Rust write credentials only for the verified manifest.
+   Keep the manifest with the restore artifacts and record which operator or control plane owns the writer lease.
+   A mismatch between a manifest position and the recovered position keeps ingress paused.
+   Grant Rust the writer credentials after manifest verification and confirmation that prior writers have lost publication access.
 4. **Transfer ownership.** Have Rust recover through the manifest and assert exact agreement.
    Exercise election and an identifiable canary write, confirm read-back, query it from a second node, restart a node, and check both current and historical results.
    Resume traffic gradually while comparing independent observations and auditing CDC progress.
@@ -207,19 +206,61 @@ Re-estimate at the read-only milestone if format compatibility needs custom Arro
    Verify history and canary reads before reopening writes.
    Restoring the pre-cutover backup alone would lose subsequent acknowledged work.
    Require this reverse path to pass on a clone before the first production write.
+   Inject a failure immediately after the Rust canary is acknowledged and another after a Rust compactor uploads only part of an existing job.
+   The fallback must recover the canary and finish or retry the maintenance job without changing the visible history.
+   If reverse recovery cannot reach the last acknowledged position, retain the Rust log and files, keep ingress paused, and recover forward from the verified artifacts.
 6. **Close the rollback window deliberately.** Allow new encodings or features unreadable by the fallback release only after operators end that window and verify a new restore point.
    If a deployment requires simultaneous JVM and Rust writers, qualify mixed elections, bidirectional log decoding, equivalent compaction keys and bytes, and GC races as a separate release milestone.
 
 Treat an unexplained history mismatch, an acknowledged write missing after replay, an unqualified storage generation, or a failed reverse handoff as a reason to hold the deployment at its last verified stage.
 Observe retention and erasure policies on shadow copies, replay traces and backups as well as the serving cluster. [Backup and recovery](../../docs/src/content/docs/ops/backup-and-restore/overview.md) · [Block checkpoint fields](../../core/src/main/proto/xtdb/meta/block/proto/block.proto)
 
-## 10. First implementation milestone
+## 10. Read-only follower acceptance fixture
 
-Use one released JVM node to write an April price of $12, a June price of $15, and a July correction setting May's price to $11.
-Persist fixtures before and after a block flush and after compaction, then include a replica-log tail carrying a delete and an erase.
-Have the Rust executable open the captured catalog, derive the product's internal ID, select candidate pages and report the price and temporal bounds at fixed valid-time and system-time points.
-Before consuming the erase, check that May as known in May returns $12 and May as known after the correction returns $11.
-After consuming the erase, repeat both historical queries and require the erased versions to be absent.
-Repeat after a cold restart and with pruning disabled.
-Deliver the data generator, fixture manifest, executable, differential report and measured bytes read as one reviewable change.
-This establishes the format, temporal and replay contracts on which the rest of the rewrite depends.
+The first deliverable pairs the two small JVM and Rust tests in the [implementation sequence](rtdb-crates-and-test-parity.md#implementation-order).
+The first end-to-end reader milestone uses a product history with known answers at each replay prefix.
+Use a UTC clock with all changes recorded at midnight on the indicated dates in 2026.
+Treat the system-time instants as inclusive points within the execution snapshot.
+Write product A at $12 on April 1 and product B at $7 as a surviving control.
+Write A at $15 effective June 1.
+On July 1, correct A's price to $11 for the half-open valid-time interval [May 1, June 1).
+On August 1, delete A effective that day.
+On September 1, erase A.
+The control stays at $7 throughout.
+
+| Applied prefix | Valid-time instant | System-time instant | Expected result for A |
+| --- | --- | --- | --- |
+| June put | May 15 noon | June 1 midnight | $12 |
+| July correction | May 15 noon | May 15 noon | $12 |
+| July correction | May 15 noon | July 1 midnight | $11 |
+| July correction | June 1 midnight | July 1 midnight | $15 |
+| August delete | August 2 noon | August 1 midnight | No row |
+| August delete | May 15 noon | August 1 midnight | $11 |
+| September erase | May 15 noon | May 15 noon | No row |
+
+Each prefix names the last applied user transaction.
+Flush and compaction add control records, so capture a separate physical checkpoint and replay offset for each layout while holding the user history fixed.
+For example, the query below runs at the July prefix and returns one row with price 11.
+
+```sql
+SELECT price
+FROM products
+  FOR VALID_TIME AS OF TIMESTAMP '2026-05-15T12:00:00Z'
+  FOR SYSTEM_TIME AS OF TIMESTAMP '2026-07-01T00:00:00Z'
+WHERE _id = 'A';
+```
+
+Capture the JVM's projected valid/system bounds as additional expected values.
+Run each prefix with live rows, after flush, after compaction and after cold restart using fixture-specific checkpoints.
+Run each query for A and B, first through normal pruning and then with temporal file/page filtering bypassed.
+Keep the IID predicate and the visibility resolver active in both runs.
+The June 1 query catches a correction that wrongly includes its upper endpoint.
+The last two prefixes distinguish a delete that preserves May history from an erase that removes it.
+Deliver the fixture generator, protected checkpoints and tails, typed expected results and bytes-read measurements for each layout. [Snapshot bounds](../../core/src/main/clojure/xtdb/operator/scan.clj) · [Original temporal tests](../../src/test/clojure/xtdb/as_of_test.clj)
+
+**JVM reference result.**
+At the pinned revision, all 112 price observations matched the table: seven queries × two products × four layouts × two temporal-pruning modes.
+The local-node run checked the new transaction in memory, its flushed block, the result after explicit compaction, and the reopened database.
+The compaction check required a live products trie above level zero.
+The bypass returned every candidate from `trie/filter-pages`.
+These observations cover the price projection; the Rust runner must also compare projected temporal bounds, record both binaries and attach the required receipts. [Local-node fixture](../../src/testFixtures/clojure/xtdb/test_util.clj) · [File and page filtering](../../core/src/main/clojure/xtdb/trie.clj)

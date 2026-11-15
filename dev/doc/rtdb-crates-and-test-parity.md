@@ -5,7 +5,8 @@
 XTDB's Gradle projects are packaging boundaries.
 The most important boundaries for the Rust port cut across them.
 For example, the public type representation lives in `api`, type merging lives in `core`, SQL planning calls Clojure, and the scan operator combines Kotlin and Clojure.
-The inventory below uses upstream revision `c84f9334e`, the parent of RTDB's design commit. [Gradle modules](../../settings.gradle.kts) · [Architecture tour](high-level-tour.adoc)
+The development oracle is upstream commit `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+Release qualification additionally uses the JVM version and configuration running at the deployment being migrated. [Gradle modules](../../settings.gradle.kts) · [Architecture tour](high-level-tour.adoc)
 
 | Current implementation | Responsibility that RTDB inherits | Where to look first |
 | --- | --- | --- |
@@ -24,10 +25,27 @@ The inventory below uses upstream revision `c84f9334e`, the parent of RTDB's des
 
 Put the server in a Cargo workspace under `rust/` and retain the JVM tree as a buildable reference.
 The proposed package names use the `rtdb-` prefix.
-All packages begin as private workspace members.
+Keep these workspace packages unpublished during development (`publish = false`).
 Keep `lang/rust` as an external client of the built server.
 An engine crate is justified by an independent contract, a genuine second consumer, a heavy optional dependency or a separate ABI.
 Start with modules inside each crate for the responsibilities grouped below.
+
+The arrows below show the dependency path for an UPDATE that reads existing rows.
+The tables also list dependencies used by other operations.
+
+```mermaid
+flowchart TD
+    pg["pgwire / Flight SQL"] --> node["node and session"]
+    node --> rep["replication"]
+    rep --> tx["tx resolver"]
+    tx --> query["query execution"]
+    tx --> index["index and snapshots"]
+    query --> index
+    query --> temporal["temporal resolution"]
+    maintenance["maintenance"] --> temporal
+    query --> storage["storage"]
+    maintenance --> storage
+```
 
 ### Foundation and persistence
 
@@ -44,8 +62,12 @@ Start with modules inside each crate for the responsibilities grouped below.
 The temporal crate accepts a borrowed event header and an opaque row reference.
 Its output can identify the winning row without knowing whether that row lives in a mutable batch, a mapped file or remote storage.
 Query scans and the compactor both use this implementation.
-Specify how a change of IID resets the ceiling and what an erase does to older events.
-A faithful translation of Kotlin's mutable ceiling can be faster to verify than a new algorithm; optimize it only after checking identical polygon boundaries. [Temporal test cases](../../core/src/test/kotlin/xtdb/bitemporal/PolygonCalculatorTest.kt)
+Reset the ceiling when the input IID changes.
+After an erase, suppress the remaining older events for that IID.
+For the first fixture, feed A's system-time 2 put over [10,20), A's system-time 1 put over [0,100), then B's system-time 1 put over [0,100).
+The second input yields valid-time breakpoints [0,10,20,100] and system-time ceilings [MAX,2,MAX].
+The third yields [0,100] and [MAX], where MAX is the upstream signed 64-bit sentinel.
+Compare the actual breakpoints as well as sampled point answers. [Temporal test cases](../../core/src/test/kotlin/xtdb/bitemporal/PolygonCalculatorTest.kt)
 
 Logical type lives in `types`; the mapping onto Arrow fields lives in `columnar`.
 A nullable field, a union containing null, a missing struct child and the bottom type have distinct roles in XTDB.
@@ -72,7 +94,10 @@ A missing term sequence in an old record must remain distinguishable from an exp
 Have the caller orchestrate frontend selection.
 For embedded XTQL in SQL, represent the embedded input as a parsed statement fragment, then dispatch to XTQL during preparation in the application service.
 No parser needs to import the other parser.
-An execution takes a bound request, one captured snapshot per referenced database, a storage reader, parameters, clock, memory budget and cancellation scope.
+A prepared plan owns its compiled expressions and dependencies.
+Each execution obtains snapshot handles, bound parameters, a clock, storage reader, memory budget and cancellation scope.
+A schema change between prepare and execute must follow the reference behavior for the protocol and statement in use.
+Include a test where the same SQL text resolves under two databases with different table OIDs and a second where a new union leg appears between binds.
 Resolve table OIDs, schema and rows from that same basis.
 Read-only sessions pin a basis according to the session rules; an execution then acquires its own snapshot handles.
 An index-time DML query receives a view scoped to the transaction's database. [Query catalog and DML expansion](../../core/src/main/kotlin/xtdb/query/IQuerySource.kt) · [SQL grammar](../../core/src/main/antlr/xtdb/antlr/Sql.g4)
@@ -81,7 +106,7 @@ Keep the scan inside `query` initially.
 The reusable pieces already live below it: event merging/trie traversal in `trie`, temporal resolution in `temporal`, frozen visibility in `index` and reads in `storage`.
 At a block handoff, an L0 file can already supply rows while the live table still contributes type information.
 Expose the snapshot's selected segments and merged schema through accessors so operators cannot accidentally count those rows twice.
-Use the same accessor for an ID lookup and a whole-table scan. [Partition snapshot implementation](../../core/src/main/kotlin/xtdb/indexer/Snapshot.kt)
+Use those accessors for both an ID lookup and a whole-table scan. [Partition snapshot implementation](../../core/src/main/kotlin/xtdb/indexer/Snapshot.kt)
 
 Evaluate a library-backed sort, aggregate or join behind `query` only after the native expression contract is testable.
 Require the same types, null behavior, results, cancellation and spill limits for the operator's entire original test family.
@@ -110,7 +135,15 @@ Only the active term owns its resolver and outstanding writes; it may resolve ah
 The long-lived partition reader owns term admission across promotion and demotion.
 Read-back advances visible state before the monitor signals callers waiting for application.
 Represent accepted enqueue, durable append and admitted apply as distinct events in both production and simulation.
-A crash between any two can yield a different legitimate caller outcome. [Log enqueue contract](../../core/src/main/kotlin/xtdb/api/log/Log.kt) · [Leader apply](../../core/src/main/kotlin/xtdb/indexer/LeaderLogProcessor.kt)
+In the admission fixture the reader starts below term 7, admits its position-0 claim, applies position 1, receives a duplicate 1, then receives 3 with 2 missing.
+The duplicate is discarded and the gap voids the term, including the record at 3.
+A subsequently delivered position 2 in term 7 cannot repair the gap.
+A valid claim at position 0 in term 8 establishes a new term.
+Use a resolved transaction at position 1 and observe that a waiter for that transaction completes after apply.
+Inspect the progress monitor after discarding or voiding a record and assert that its applied watermark stays fixed.
+For a unit test of admission alone, seed the reader at term 7 with next position 2 and replay the suffix.
+In the recovery test, generate a real block boundary and matching upload, take the term and sequence from the resulting catalog, and inject the duplicate and gap relative to those recorded positions.
+Run legacy boundaries with absent sequence fields as separate fixtures. [Log enqueue contract](../../core/src/main/kotlin/xtdb/api/log/Log.kt) · [Leader apply](../../core/src/main/kotlin/xtdb/indexer/LeaderLogProcessor.kt)
 
 **Let the protocol publish maintenance results.**
 Maintenance computes a job, writes immutable objects and requests publication through a small capability provided by the node.
@@ -136,15 +169,29 @@ Keep authentication policy and authorization decisions in the node service so pg
 Keep token negotiation and PostgreSQL-specific error serialization in their respective frontends.
 Expose telemetry at state transitions as typed events or counters; the binary chooses exporters.
 Use system-table providers over the same captured basis as ordinary queries, including metadata-only queries from drivers.
-The workspace DAG can be checked in CI with Cargo metadata: production packages must build without the test harness, cloud SDKs enter through adapters, and leaf algorithms build without the asynchronous server runtime.
+At each milestone, inspect Cargo metadata for ordinary build dependencies with the release feature set enabled.
+Compile the pure algorithm crates on their own, the local-only binary, and each advertised adapter combination.
+An external conformance driver links client protocols and fixture readers and starts the servers as child processes.
+Keep JVM test hooks and fault-injection controls in test builds.
+Use a separate black-box lane against the packaged server image to catch differences introduced by packaging or test hooks.
 
 ## What complete test parity means
 
 For each test collected from the pinned original implementation, identify the behavior it asserts, execute it against Rust directly or through an equivalent native test, and retain evidence that the assertion was exercised.
 **Every collected case needs an executable counterpart before parity can be claimed.**
 A case with no agreed translation stays open.
-Keep the original test source and expected data available so a reviewer can tell whether a port weakened the assertion.
-A green Rust unit-test count alone cannot establish coverage.
+Keep the original test source and expected data available so a reviewer can identify a weakened assertion.
+Track the number of new Rust-only tests separately from upstream coverage.
+
+### Two references with distinct jobs
+
+Build the development oracle in a clean worktree at the pinned upstream SHA, with its Gradle wrapper, Java toolchain, submodule revisions and test resources.
+Record the executable and fixture digests in the run manifest.
+Run the original tests there before extracting their inputs.
+Generate expected data only with an explicit reference update and preserve the previous artifacts for comparison.
+For a deployment, separately record the released JVM artifact that wrote the existing store and the exact JVM artifact designated for rollback.
+Qualify both read directions using their actual settings, including optional file encodings.
+A successful run against the development SHA supplies no evidence for a different writer or fallback binary.
 
 ### Inventory and case identity
 
@@ -154,7 +201,7 @@ A green Rust unit-test count alone cannot establish coverage.
    The checkout contains 611 tracked `.test` files under `sqlite-test/`; the standard SLT tasks select subsets and permit some failures.
    Record the upstream selection and per-record outcome, and distinguish the larger corpus from the regularly executed baseline.
 3. Give each entry an identity comprising source revision, relative path, qualified test name or SLT record position, and parameter/fixture identity.
-   Store the original assertion or its source location, owning Rust crate, counterpart test ID, required environment, comparison method and latest results for both engines.
+   Store the original assertion or its source location, owning Rust crate, counterpart test ID, required environment and comparison method.
    Track renames with an explicit alias; duplicate names cannot silently collapse two cases.
 4. Materialize a machine-readable ledger under the proposed `rust/conformance/` tree and emit a per-suite report for each paired run.
    The collector should fail on newly discovered cases without mappings and on mappings whose Rust tests disappeared.
@@ -162,13 +209,22 @@ A green Rust unit-test count alone cannot establish coverage.
    A permanently JVM-specific check, such as a JVM allocator lifetime test, remains separately identifiable and requires a reviewed native assertion of its resource invariant.
    Where the JVM API remains supported, exercise the original assertion through the binding as well.
 
-Use Gradle for JVM collection and execution.
-The reference lanes include unit, integration, property/simulation, nightly cloud, SLT, language clients and the tagged suites used by the release matrix.
-Benchmark runs establish performance budgets in a separate report.
-Track fixtures used by several cases by digest and generating revision. [Gradle test selection](../../build.gradle.kts) · [CI workflows](../../.github/workflows/) · [Language suites](../../lang/) · [Shared fixtures](../../src/testFixtures/)
+Collect these streams independently and merge their manifests after discovery.
+A job that aborts during namespace loading or finds zero tests leaves the affected lane incomplete.
 
-A proposed ledger entry for one upstream regression looks like this.
-The status records work left to do; the Rust target names describe proposed tests.
+| Reference lane | Baseline inputs to preserve |
+| --- | --- |
+| Gradle unit and integration | Project, JUnit engine, dynamic case descriptors, include/exclude tags and configuration; account for tests filtered out of the default task |
+| Property and simulation | Record both Gradle iteration settings, generated input and logical trace; the upstream nightly workflow supplies 500 property iterations and 1,000 simulation iterations |
+| SQL logic | Record per-file and per-record selection from both build tasks and the scheduled directory matrix, including explicit skips, expected values and failures |
+| Cloud and language clients | Record provider, driver and image versions, topology, prerequisites and service readiness; retain the five language-client jobs and tag-specific Gradle results |
+| Fixtures and benchmarks | Link each fixture digest to the cases using it; track workload performance in a separate report |
+
+The scheduled SLT workflow checks the upstream repository name.
+On the fork, require an actual job result for each selected directory before giving the lane credit.
+Run the same selected inputs under the same engine identifier so SLT `onlyif` and `skipif` retain their meaning. [Gradle test selection](../../build.gradle.kts) · [CI workflows](../../.github/workflows/) · [Language suites](../../lang/) · [Shared fixtures](../../src/testFixtures/)
+
+This proposed ledger entry maps a single upstream regression to its required observations and intended Rust tests.
 
 ```yaml
 reference: c84f9334e
@@ -181,12 +237,22 @@ counterparts:
   - target: rtdb-query::scan::erase_survives_temporal_pruning
     comparison: result_with_and_without_pruning
 requires: [local-log, local-storage]
-status: unmapped_until_tests_exist
+required_observations:
+  - as_of_before_erase_with_live_erase
+  - system_time_range_before_erase_with_live_erase
+  - as_of_before_erase_with_flushed_erase
+  - system_time_range_before_erase_with_flushed_erase
+mapping: proposed
 ```
 
-A run attaches its JVM binary digest, Rust revision, fixture digest, seed or trace ID, executed assertion IDs, outcomes and diagnostics to the entry.
-Reject a mapping to a filtered-out test or a test that executed zero assertions.
-For a single upstream test with multiple materially different assertions, record each assertion group and its corresponding output or native invariant.
+For each observation above, the original fixture expects exactly the unrelated document to survive.
+The interval query and point query must each execute twice, with the erase in memory and after its block flush.
+An additional pruning experiment gets its own observation ID.
+Keep the mapping under version control and store run receipts separately: binary and fixture digests, case and observation IDs, environment, trace, each side's outcome, comparator version and first differing observation.
+Test frameworks do not all expose assertion counts.
+Emit observation IDs at adapter boundaries, capture returned values or expected exceptions, and require a receipt for each required observation.
+Prove that the harness itself detects errors: alter one expected ceiling, remove the unrelated surviving ID, and feed a missing term sequence as zero in isolated negative controls.
+Each control must fail at its designated observation; the original fixture remains immutable.
 
 ### Four ways to preserve an assertion
 
@@ -194,7 +260,7 @@ For a single upstream test with multiple materially different assertions, record
 | --- | --- | --- |
 | Network client or SQL behavior | Run the same client script and fixture unchanged against two server URLs whenever possible | Typed rows, column order, schema, SQLSTATE, side effects and transaction outcomes at equal bases |
 | Pure JVM function or internal structure | Share a typed input/expected-output fixture and implement the same assertions in the owning Rust crate | Both produce the same result for each assertion, including boundary values, errors and internal states that the test intentionally inspects |
-| File, log or plan golden | Replay exact input bytes through both readers; generate both writer directions; expose a canonical logical-plan view for plan tests | Verify bytes where they are a contract, otherwise compare independently decoded structure and semantics; retain operator placement for rewrite tests |
+| File, log or plan golden | Replay exact input bytes through both readers, generate both writer directions; expose a canonical logical-plan view for plan tests | Verify bytes for byte-level contracts and independently decoded structure elsewhere, including operator placement for rewrite tests |
 | Concurrent or property test | Retain generator domains, distributions, iteration counts and invariants; capture concrete operations, delivery decisions and injected failures as a replayable trace | Both implementations consume the same trace and satisfy an independent model, with diagnostics at the first divergence |
 
 The existing SQL logic adapter can redefine the JVM planner and inject synthetic table metadata.
@@ -218,17 +284,27 @@ Original assertions appear in the following tests. [Per-IID ceilings](../../core
 
 - Fix the current time, default time zone, valid-time point, system-time point, durable transaction basis, storage version and feature settings.
   Compare ordered rows when order is specified, otherwise compare typed multisets preserving duplicates.
-  Use type-specific rules for floating-point results and allow nondeterminism only where the individual assertion does.
+  Honor an existing test's comparator first: the SLT runner implements `nosort`, `rowsort`, `valuesort`, result counts and MD5 assertions.
+  A typed multiset comparison is appropriate for a new unordered query property, but would weaken an upstream `nosort` record.
+  For timestamp, decimal, floating-point and Arrow results, record the units, time zone, precision, scale, nullability and physical representation that the assertion observes.
 - Compare statement lifecycle as well as rows: preparation errors versus execution errors, error codes, abort and retry behavior, await-token progress and visibility from another client.
   Keep expected failures and upstream exclusions attached to exact case IDs.
   A global SLT failure budget could let a regression replace an unrelated fixed case without changing the total.
 - For each supported generation, run JVM→Rust and Rust→JVM storage recovery, including crashes after data upload, before metadata publication, after append, before apply and during handoff.
   Assert byte identity for retriable outputs sharing a key and visibility at several historical bases.
   Keep a model independent of both engines for the subset of histories it covers.
-- Report discovery coverage, executable mapping coverage, cases passing in both, expected failures matching, unresolved differences, skipped/blocked cases and run environment per lane.
-  A tested bug fix with a deliberate difference is a versioned behavior change and should be reported separately from strict parity.
-  Promotion requires every in-scope original assertion accounted for and executed, zero unexplained divergences, and evidence for every supported configuration.
-  Publish dormant upstream cases and their disposition alongside that result.
+- Freeze the inventory revision and derive the denominator from original assertion groups and their required configurations.
+  A group can map to several Rust tests; count it once, after all its required observations have receipts.
+  Report separately those that pass on both, reproduce a known original failure, intentionally diverge, mismatch, or lack evidence.
+  Pair a known failure by case, stage and observable failure signature; two unrelated crashes do not match.
+  Filtered, disabled, unavailable and flaky cases keep their own disposition and remain visible in the denominator.
+  Calculate strict agreement as groups matching their original outcomes divided by required groups, and publish the passing-on-both count alongside it.
+  Count a permanently disabled original separately until a reviewed execution on the reference establishes its expected observation.
+  A partial baseline can support work on one crate.
+  An incomplete inventory, missing receipt or deliberate behavioral divergence precludes a claim of complete parity for that baseline.
+  If an Allium rule and its JVM implementation disagree, record the rule, minimized input, actual JVM result and both revisions.
+  The subsystem owner classifies the difference and records the intended release behavior.
+  Keep strict agreement with each reference and conformance to the chosen rule as separate report fields.
 - When advancing upstream, regenerate the catalog, diff added/removed/changed assertions, run the old and new reference engines, and require an explicit baseline decision before updating fixtures.
   Store failure inputs once and replay them offline without credentials or production data.
 
@@ -247,6 +323,9 @@ Original assertions appear in the following tests. [Per-IID ceilings](../../core
 5. **Qualify the complete release.** Add compaction and GC, Flight and embedded bindings, backend adapters, security and operational interfaces.
    Exercise the original client, cloud, property, SLT and failure matrices on built artifacts; rehearse the two-way migration in the [rewrite proposal](xtdb-rust-rewrite.md).
 
-The first reviewable deliverable should be a parity report with actual upstream case IDs and a working pair of runners for the per-IID ceiling and term-sequence examples.
+For the first review, run the existing `:xtdb-core:test` task with both class filters, `xtdb.bitemporal.PolygonCalculatorTest` and `xtdb.api.log.ReplicaMessageTermSeqTest`.
+Record the selected methods and the assertion groups exercised in the paired report.
+Cross-read encoded term records in both directions.
+For the ceiling fixture, compare each implementation with the expected breakpoints written in the upstream test.
+These two checks exercise binary compatibility and algorithmic behavior independently.
 Add the mixed-file scan, erase window and multi-node trace as their implementing crates become executable.
-That gives reviewers an executable definition of what each new crate must preserve and a way to reject a translation that passes for the wrong reason.
