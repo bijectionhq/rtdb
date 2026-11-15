@@ -94,6 +94,7 @@ pub trait ObjectStore: Send + Sync {
     }
     /// Publishes an immutable object, accepting an identical existing object as a completed retry.
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()>;
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()>;
     /// Returns a lexicographically ordered snapshot of object names under a directory.
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>>;
     async fn delete(&self, key: &ObjectKey) -> Result<()>;
@@ -143,6 +144,11 @@ impl ObjectStore for MemoryStore {
         }
     }
 
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        let bytes = tokio::fs::read(source).await.map_err(|error| Error::io(source, error))?;
+        self.put(key, Bytes::from(bytes)).await
+    }
+
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
         Ok(self.objects.read().iter()
             .filter(|(key, _)| directory.is_none_or(|directory| key.is_under(directory)))
@@ -183,6 +189,33 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'sta
 
 fn sync_directory(path: &Path) -> Result<()> {
     File::open(path).and_then(|file| file.sync_all()).map_err(|error| Error::io(path, error))
+}
+
+fn sync_parents(path: &Path, root: &Path) -> Result<()> {
+    let mut current = path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+    loop {
+        sync_directory(current)?;
+        if current == root { return Ok(()); }
+        current = current.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?;
+    }
+}
+
+fn equal_local_files(left: &Path, right: &Path) -> Result<bool> {
+    let mut left_file = File::open(left).map_err(|error| Error::io(left, error))?;
+    let mut right_file = File::open(right).map_err(|error| Error::io(right, error))?;
+    let length = left_file.metadata().map_err(|error| Error::io(left, error))?.len();
+    if length != right_file.metadata().map_err(|error| Error::io(right, error))?.len() { return Ok(false); }
+    let mut left_bytes = [0u8; 64 * 1024];
+    let mut right_bytes = [0u8; 64 * 1024];
+    let mut remaining = length;
+    while remaining != 0 {
+        let count = remaining.min(left_bytes.len() as u64) as usize;
+        left_file.read_exact(&mut left_bytes[..count]).map_err(|error| Error::io(left, error))?;
+        right_file.read_exact(&mut right_bytes[..count]).map_err(|error| Error::io(right, error))?;
+        if left_bytes[..count] != right_bytes[..count] { return Ok(false); }
+        remaining -= count as u64;
+    }
+    Ok(true)
 }
 
 fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
@@ -254,6 +287,28 @@ impl ObjectStore for LocalStore {
                 current = current.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             }
             Ok(())
+        }).await
+    }
+
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        let (root, path, source, key) = (Arc::clone(&self.root), self.path(key), source.to_owned(), key.clone());
+        blocking(move || {
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            let temp_dir = root.join(".tmp");
+            fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            let mut input = File::open(&source).map_err(|error| Error::io(&source, error))?;
+            std::io::copy(&mut input, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
+            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
+            match upload.persist_noclobber(&path) {
+                Ok(_) => (),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !equal_local_files(&path, error.file.path())? { return Err(Error::ConflictingObject(key.to_string())); }
+                }
+                Err(error) => return Err(Error::io(&path, error.error)),
+            }
+            sync_parents(&path, &root)
         }).await
     }
 

@@ -1,0 +1,15 @@
+= Google Cloud Storage adapter
+
+`GcsConfig` is an immutable passive value.
+`open` constructs a native storage client behind the shared immutable-publication adapter.
+The configured prefix and supplied storage-version and epoch root determine every object key.
+The project ID remains part of persisted configuration; GCS object requests address the globally named bucket.
+
+The official Google authentication library supplies Application Default Credentials, including service accounts, authorized users, external-account federation, impersonation, and metadata credentials.
+The passive credential bridge preserves refresh and bearer-token behavior.
+Its HTTP connector also retains authentication headers such as the quota project, which cannot fit in the storage client's bearer-only credential type.
+Credential lookup and request dispatch complete on the calling future; there is no adapter background driver.
+
+Source references are `modules/google-cloud/src/main/kotlin/xtdb/gcp/CloudStorage.kt`, `CloudStorageTest.kt`, and `gcs.proto`.
+Rust test sources cover configuration persistence, rooted keys, token refresh, and quota-project headers.
+Provider requests, external-account federation, conditional publication, and SDK integration have not been compiled or executed during Phase 1.

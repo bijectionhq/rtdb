@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use arrow_schema::Schema;
 use prost::Message;
+use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Anomaly, BlockIndex, LogicalType, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TransactionKey, TxId};
 
 use crate::generated::xtdb::{block::proto as pb, cols::proto as cpb, database::proto::DatabaseConfig};
@@ -35,19 +37,31 @@ impl TableEntry {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct BlockCatalog {
-    wire: pb::Block,
+    wire: Arc<pb::Block>,
+    charge: Option<Arc<MemoryReservation>>,
 }
+
+impl PartialEq for BlockCatalog { fn eq(&self, other: &Self) -> bool { self.wire == other.wire } }
 
 impl BlockCatalog {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         Self::from_proto(pb::Block::decode(bytes).map_err(invalid)?)
     }
 
+    /// The reservation must cover the decoded graph and any derived values that retain its charge.
+    pub fn decode_reserved(bytes: &[u8], reservation: Arc<MemoryReservation>) -> Result<Self> {
+        let mut catalog = Self::decode(bytes)?;
+        catalog.charge = Some(reservation);
+        Ok(catalog)
+    }
+
+    pub fn retain_charge(&self) -> Option<Arc<MemoryReservation>> { self.charge.clone() }
+
     pub fn from_proto(wire: pb::Block) -> Result<Self> {
         if wire.block_index.unwrap_or_default() < 0 { return Err(invalid("Block index is negative")); }
-        let catalog = Self { wire };
+        let catalog = Self { wire: Arc::new(wire), charge: None };
         catalog.table_entries()?;
         Ok(catalog)
     }
@@ -102,24 +116,36 @@ pub fn legacy_table_ref(name: &str) -> Result<TableRef> {
     Ok(TableRef::new(schema, table))
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct TableBlock {
-    wire: pb::TableBlock,
+    wire: Arc<pb::TableBlock>,
+    charge: Option<Arc<MemoryReservation>>,
 }
+
+impl PartialEq for TableBlock { fn eq(&self, other: &Self) -> bool { self.wire == other.wire } }
 
 impl TableBlock {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let wire = pb::TableBlock::decode(bytes).map_err(invalid)?;
         if wire.row_count.unwrap_or_default() < 0 { return Err(invalid("Table row count is negative")); }
-        Ok(Self { wire })
+        Ok(Self { wire: Arc::new(wire), charge: None })
     }
+
+    /// The reservation must cover the decoded graph and any derived values that retain its charge.
+    pub fn decode_reserved(bytes: &[u8], reservation: Arc<MemoryReservation>) -> Result<Self> {
+        let mut block = Self::decode(bytes)?;
+        block.charge = Some(reservation);
+        Ok(block)
+    }
+
+    pub fn retain_charge(&self) -> Option<Arc<MemoryReservation>> { self.charge.clone() }
 
     pub fn from_parts(columns: BTreeMap<String, cpb::ColumnMeta>, row_count: i64, partitions: Vec<pb::Partition>) -> Result<Self> {
         if row_count < 0 { return Err(invalid("Table row count is negative")); }
         let schema = Schema::new(columns.iter().map(|(name, column)| rtdb_columnar::to_field(name, &crate::columns::logical_type(column)?)).collect::<Result<Vec<_>>>()?);
         let arrow_schema = crate::ipc::write_schema_message(&schema)?;
         let column_name_to_hll = columns.iter().filter_map(|(name, column)| column.hll.as_ref().map(|hll| (name.clone(), hll.clone()))).collect();
-        Ok(Self { wire: pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns } })
+        Ok(Self { wire: Arc::new(pb::TableBlock { arrow_schema: Some(arrow_schema), row_count: Some(row_count), tries: Vec::new(), column_name_to_hll, partitions, columns }), charge: None })
     }
 
     pub fn encode(&self) -> Vec<u8> { self.wire.encode_to_vec() }

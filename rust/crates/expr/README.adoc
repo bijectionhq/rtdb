@@ -10,9 +10,12 @@ Every result and diagnostic remains unverified until Phase 2.
 
 The tests retain inputs from `xtdb.expression-test/test-numeric-errors-503`, `test-decimal-arithmetic-and-coersion`, `substring-test`, `negative-substring-length-test`, `test-character-length`, `test-coalesce`, `test-nullif`, and the compound equality cases.
 Additional source tests cover declared result schemas, zero-row batches, binding errors, temporal precision, and period bounds.
+The `_patch` scalar retains the observations from `xtdb.expression-test/test-patch`, replacing a whole field only when the patch supplies a non-null value and preserving existing fields otherwise.
 These are source mappings and do not cover every assertion in the upstream expression family.
 
 The prepared-statement layer still needs parameter rebinding when the initial type is unknown.
 Timestamp/duration arithmetic, interval and duration text casts, full cast options, PostgreSQL array literal parsing, and the complete scalar function catalog remain outstanding.
 Temporal lexical formats, time-zone labels, numeric result schemas, and diagnostics require full reference comparison.
+Fixed offsets accept the spellings defined by https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneOffset.html[Java ZoneOffset] and the `UTC`, `GMT`, and `UT` prefixes from https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneId.html[Java ZoneId].
+Named-zone rules still require qualification against the reference JVM's time-zone database version and available zone IDs.
 Scalar scratch values can allocate before their retained size is charged, so peak query memory is not yet bounded by this interface.

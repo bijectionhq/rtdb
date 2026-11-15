@@ -2,8 +2,10 @@ mod bind;
 mod expression;
 mod parse;
 mod types;
+mod mutation;
 
-pub use parse::{ParsedStatement, parse};
+pub use parse::{ParsedStatement, StatementKind, parse};
+pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_patch, prepare_static};
 
 use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, Result};

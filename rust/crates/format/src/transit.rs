@@ -41,6 +41,46 @@ pub fn decode_msgpack(bytes: &[u8]) -> Result<TransitValue> {
     unpack_value(packed, false, &mut Vec::new(), 0)
 }
 
+/// Decodes Transit JSON, retaining object entry order for Transit cache references.
+pub fn decode_json(bytes: &[u8]) -> Result<TransitValue> {
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let packed = <JsonPacked as serde::Deserialize>::deserialize(&mut decoder).map_err(invalid)?;
+    decoder.end().map_err(invalid)?;
+    unpack_value(packed.0, false, &mut Vec::new(), 0)
+}
+
+struct JsonPacked(Packed);
+
+impl<'de> serde::Deserialize<'de> for JsonPacked {
+    fn deserialize<D: serde::Deserializer<'de>>(decoder: D) -> std::result::Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = JsonPacked;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("a Transit JSON value") }
+            fn visit_unit<E: serde::de::Error>(self) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Null)) }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Bool(value))) }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Integer(value))) }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> std::result::Result<Self::Value, E> {
+                Ok(JsonPacked(Packed::Integer(i64::try_from(value).map_err(E::custom)?)))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::Float(value))) }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::String(value.into()))) }
+            fn visit_string<E: serde::de::Error>(self, value: String) -> std::result::Result<Self::Value, E> { Ok(JsonPacked(Packed::String(value))) }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = sequence.next_element::<JsonPacked>()? { values.push(value.0); }
+                Ok(JsonPacked(Packed::Array(values)))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> std::result::Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, JsonPacked>()? { values.push((Packed::String(key), value.0)); }
+                Ok(JsonPacked(Packed::Map(values)))
+            }
+        }
+        decoder.deserialize_any(Visitor)
+    }
+}
+
 pub fn encode_msgpack(value: &TransitValue) -> Result<Vec<u8>> {
     let mut encoder = Encoder { bytes: Vec::new(), cache: BTreeMap::new() };
     match value {
@@ -112,6 +152,14 @@ fn unpack(packed: Packed, key: bool, cache: &mut Vec<Decoded>, depth: usize) -> 
         Packed::Array(values) => {
             let mut values = values.into_iter();
             if let Some(first) = values.next() {
+                if matches!(&first, Packed::String(marker) if marker == "^ ") {
+                    let mut entries = Vec::new();
+                    while let Some(key) = values.next() {
+                        let value = values.next().ok_or_else(|| invalid("Transit map has an unmatched key"))?;
+                        entries.push((unpack_value(key, true, cache, depth + 1)?, unpack_value(value, false, cache, depth + 1)?));
+                    }
+                    return Ok(Decoded::Value(TransitValue::Map(entries)));
+                }
                 match unpack(first, false, cache, depth + 1)? {
                     Decoded::Tag(tag) => {
                         let rep = values.next().ok_or_else(|| invalid("Transit tag has no representation"))?;
@@ -146,6 +194,14 @@ fn unpack(packed: Packed, key: bool, cache: &mut Vec<Decoded>, depth: usize) -> 
 
 fn tagged(tag: String, representation: TransitValue) -> Result<TransitValue> {
     if tag == "'" { return Ok(representation); }
+    if tag == "cmap" {
+        let TransitValue::Array(values) = representation else { return Err(invalid("Composite map representation is not an array")); };
+        if values.len() % 2 != 0 { return Err(invalid("Composite map has an unmatched key")); }
+        let mut values = values.into_iter();
+        let mut entries = Vec::new();
+        while let Some(key) = values.next() { entries.push((key, values.next().ok_or_else(|| invalid("Composite map has no value"))?)); }
+        return Ok(TransitValue::Map(entries));
+    }
     if let TransitValue::String(text) = &representation {
         match tag.as_str() {
             "_" => return Ok(TransitValue::Null),
@@ -278,7 +334,10 @@ impl Encoder {
             TransitValue::Null => self.bytes.push(0xc0),
             TransitValue::Bool(value) => self.bytes.push(if *value { 0xc3 } else { 0xc2 }),
             TransitValue::Integer(value) => self.integer(*value),
-            TransitValue::Float(value) => { self.bytes.push(0xcb); self.bytes.extend_from_slice(&value.to_bits().to_be_bytes()); }
+            TransitValue::Float(value) => {
+                if value.is_finite() { self.bytes.push(0xcb); self.bytes.extend_from_slice(&value.to_bits().to_be_bytes()); }
+                else { self.string(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }, key)?; }
+            }
             TransitValue::String(value) => {
                 if value.starts_with(['~', '^', '`']) { self.string(&format!("~{value}"), key)?; }
                 else { self.string(value, key)?; }
@@ -291,8 +350,15 @@ impl Encoder {
                 for value in values { self.value(value, false, depth + 1)?; }
             }
             TransitValue::Map(entries) => {
-                self.length(entries.len(), 16, 0x80, 0xde, 0xdf)?;
-                for (key, value) in entries { self.value(key, true, depth + 1)?; self.value(value, false, depth + 1)?; }
+                if entries.iter().all(|(key, _)| stringable(key)) {
+                    self.length(entries.len(), 16, 0x80, 0xde, 0xdf)?;
+                    for (key, value) in entries { self.value(key, true, depth + 1)?; self.value(value, false, depth + 1)?; }
+                } else {
+                    self.array_len(2)?;
+                    self.string("~#cmap", false)?;
+                    self.array_len(entries.len().checked_mul(2).ok_or_else(|| invalid("Composite map length overflow"))?)?;
+                    for (key, value) in entries { self.value(key, false, depth + 1)?; self.value(value, false, depth + 1)?; }
+                }
             }
             TransitValue::Tagged { tag, representation } => {
                 if tag.chars().count() == 1 {
@@ -311,6 +377,14 @@ impl Encoder {
     }
 }
 
+fn stringable(value: &TransitValue) -> bool {
+    match value {
+        TransitValue::Array(_) | TransitValue::Map(_) => false,
+        TransitValue::Tagged { tag, representation } => tag.chars().count() == 1 && matches!(representation.as_ref(), TransitValue::String(_)),
+        _ => true,
+    }
+}
+
 pub fn encode_anomaly(error: &Anomaly) -> Result<Vec<u8>> {
     let category = match error.category {
         AnomalyCategory::Incorrect => "incorrect", AnomalyCategory::Unsupported => "unsupported",
@@ -319,22 +393,119 @@ pub fn encode_anomaly(error: &Anomaly) -> Result<Vec<u8>> {
         AnomalyCategory::Unavailable => "unavailable", AnomalyCategory::Interrupted => "interrupted",
         AnomalyCategory::Fault => "fault",
     };
-    let context = error.context.iter().map(|(key, value)| (TransitValue::Keyword(key.clone()), from_json(value))).collect();
+    let context = error.context.iter().map(|(key, value)| Ok((TransitValue::Keyword(key.clone()), from_json_value(value)?))).collect::<Result<_>>()?;
     encode_msgpack(&TransitValue::Tagged { tag: "xt/error".into(), representation: Box::new(TransitValue::Array(vec![
-        TransitValue::Keyword(category.into()), TransitValue::Keyword(error.code.clone()),
+        TransitValue::Keyword(category.into()), if error.code.is_empty() { TransitValue::Null } else { TransitValue::Keyword(error.code.clone()) },
         TransitValue::String(error.message.clone()), TransitValue::Map(context),
     ])) })
 }
 
-fn from_json(value: &serde_json::Value) -> TransitValue {
-    match value {
+pub fn decode_anomaly(bytes: &[u8]) -> Result<Anomaly> {
+    let TransitValue::Tagged { tag, representation } = decode_msgpack(bytes)? else { return Err(invalid("Error is not a tagged Transit value")); };
+    let TransitValue::Array(values) = representation.as_ref() else { return Err(invalid("Error representation is not an array")); };
+    if tag == "xtdb/exception-info" {
+        let [message, context] = values.as_slice() else { return Err(invalid("Legacy exception-info representation must have two fields")); };
+        let message = match message { TransitValue::Null => String::new(), TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error message is not text")) };
+        if !matches!(context, TransitValue::Map(_) | TransitValue::Null) { return Err(invalid("Legacy exception-info data is not a map")); }
+        return Ok(Anomaly::fault("xtdb.error/unknown", message));
+    }
+    let (category, code, message, context) = match (tag.as_str(), values.as_slice()) {
+        ("xt/error", [TransitValue::Keyword(category), code, message, context]) => (anomaly_category(category)?, code, message, context),
+        ("xtdb/illegal-arg" | "xtdb/runtime-err", [code, message, context, ..]) => (AnomalyCategory::Incorrect, code, message, context),
+        _ => return Err(invalid(format!("Unsupported error representation {tag}"))),
+    };
+    let code = match code { TransitValue::Null => String::new(), TransitValue::Keyword(value) | TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error code is not a keyword")) };
+    let message = match message { TransitValue::Null => String::new(), TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error message is not text")) };
+    let context = match context {
+        TransitValue::Null => BTreeMap::new(),
+        TransitValue::Map(entries) => entries.iter().map(|(key, value)| {
+            let key = match key { TransitValue::Keyword(key) | TransitValue::String(key) => key.clone(), _ => return Err(invalid("Error context key is not text")) };
+            Ok((key, to_json_value(value)?))
+        }).collect::<Result<_>>()?,
+        _ => return Err(invalid("Error context is not a map")),
+    };
+    Ok(Anomaly { category, code, message, context })
+}
+
+fn anomaly_category(category: &str) -> Result<AnomalyCategory> {
+    Ok(match category {
+        "incorrect" => AnomalyCategory::Incorrect, "unsupported" => AnomalyCategory::Unsupported, "not-found" => AnomalyCategory::NotFound,
+        "forbidden" => AnomalyCategory::Forbidden, "conflict" => AnomalyCategory::Conflict, "busy" => AnomalyCategory::Busy,
+        "unavailable" => AnomalyCategory::Unavailable, "interrupted" => AnomalyCategory::Interrupted, "fault" => AnomalyCategory::Fault,
+        _ => return Err(invalid("Unknown anomaly category")),
+    })
+}
+
+/// Preserves Transit value types in JSON using `$transit/type` wrappers, including map key types.
+/// This representation is internal JSON data, not the Transit JSON wire format.
+pub fn to_json_value(value: &TransitValue) -> Result<serde_json::Value> {
+    to_json(value, 0)
+}
+
+fn to_json(value: &TransitValue, depth: usize) -> Result<serde_json::Value> {
+    if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+    Ok(match value {
+        TransitValue::Null => serde_json::Value::Null,
+        TransitValue::Bool(value) => (*value).into(),
+        TransitValue::Integer(value) => (*value).into(),
+        TransitValue::Float(value) => serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::json!({"$transit/type":"float", "value":if value.is_nan() { "NaN" } else if value.is_sign_positive() { "INF" } else { "-INF" }})),
+        TransitValue::String(value) => value.clone().into(),
+        TransitValue::Keyword(value) => serde_json::json!({"$transit/type":"keyword", "value":value}),
+        TransitValue::Symbol(value) => serde_json::json!({"$transit/type":"symbol", "value":value}),
+        TransitValue::Bytes(value) => serde_json::json!({"$transit/type":"bytes", "value":STANDARD.encode(value)}),
+        TransitValue::Array(values) => serde_json::Value::Array(values.iter().map(|value| to_json(value, depth + 1)).collect::<Result<_>>()?),
+        TransitValue::Map(entries) => {
+            let entries = entries.iter().map(|(key, value)| Ok(serde_json::Value::Array(vec![to_json(key, depth + 1)?, to_json(value, depth + 1)?]))).collect::<Result<Vec<_>>>()?;
+            serde_json::json!({"$transit/type":"map", "value":entries})
+        }
+        TransitValue::Tagged { tag, representation } => serde_json::json!({"$transit/type":"tagged", "tag":tag, "value":to_json(representation, depth + 1)?}),
+    })
+}
+
+/// Reverses `to_json_value`; ordinary JSON objects become Transit maps with string keys.
+/// Objects with `$transit/type` use the wrapper schema and must have a valid representation.
+pub fn from_json_value(value: &serde_json::Value) -> Result<TransitValue> {
+    from_json(value, 0)
+}
+
+fn from_json(value: &serde_json::Value, depth: usize) -> Result<TransitValue> {
+    if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+    Ok(match value {
         serde_json::Value::Null => TransitValue::Null,
         serde_json::Value::Bool(value) => TransitValue::Bool(*value),
-        serde_json::Value::Number(value) => value.as_i64().map(TransitValue::Integer).unwrap_or_else(|| TransitValue::Float(value.as_f64().unwrap_or_default())),
+        serde_json::Value::Number(value) => {
+            if let Some(value) = value.as_i64() { TransitValue::Integer(value) }
+            else if let Some(value) = value.as_u64() { TransitValue::Tagged { tag: "n".into(), representation: Box::new(TransitValue::String(value.to_string())) } }
+            else { TransitValue::Float(value.as_f64().ok_or_else(|| invalid("JSON number is not representable"))?) }
+        }
         serde_json::Value::String(value) => TransitValue::String(value.clone()),
-        serde_json::Value::Array(values) => TransitValue::Array(values.iter().map(from_json).collect()),
-        serde_json::Value::Object(values) => TransitValue::Map(values.iter().map(|(key, value)| (TransitValue::String(key.clone()), from_json(value))).collect()),
-    }
+        serde_json::Value::Array(values) => TransitValue::Array(values.iter().map(|value| from_json(value, depth + 1)).collect::<Result<_>>()?),
+        serde_json::Value::Object(values) => {
+            if let Some(kind) = values.get("$transit/type") {
+                let kind = kind.as_str().ok_or_else(|| invalid("Transit JSON type is not text"))?;
+                let representation = values.get("value").ok_or_else(|| invalid("Transit JSON wrapper has no value"))?;
+                if values.len() != if kind == "tagged" { 3 } else { 2 } { return Err(invalid("Unexpected Transit JSON wrapper fields")); }
+                let text = || representation.as_str().ok_or_else(|| invalid("Transit JSON representation is not text"));
+                match kind {
+                    "keyword" => TransitValue::Keyword(text()?.into()), "symbol" => TransitValue::Symbol(text()?.into()),
+                    "bytes" => TransitValue::Bytes(STANDARD.decode(text()?).map_err(invalid)?),
+                    "float" => TransitValue::Float(match text()? { "NaN" => f64::NAN, "INF" => f64::INFINITY, "-INF" => f64::NEG_INFINITY, _ => return Err(invalid("Invalid special float")) }),
+                    "tagged" => TransitValue::Tagged { tag: values.get("tag").and_then(serde_json::Value::as_str).ok_or_else(|| invalid("Transit JSON wrapper has no tag"))?.into(), representation: Box::new(from_json(representation, depth + 1)?) },
+                    "map" => {
+                        let entries = representation.as_array().ok_or_else(|| invalid("Transit JSON map representation is not an array"))?;
+                        TransitValue::Map(entries.iter().map(|entry| {
+                            let pair = entry.as_array().filter(|entry| entry.len() == 2).ok_or_else(|| invalid("Transit JSON map entry is not a pair"))?;
+                            Ok((from_json(&pair[0], depth + 1)?, from_json(&pair[1], depth + 1)?))
+                        }).collect::<Result<_>>()?)
+                    }
+                    _ => return Err(invalid("Unknown Transit JSON wrapper type")),
+                }
+            } else {
+                TransitValue::Map(values.iter().map(|(key, value)| Ok((TransitValue::String(key.clone()), from_json(value, depth + 1)?))).collect::<Result<_>>()?)
+            }
+        }
+    })
 }
 
 fn invalid(error: impl std::fmt::Display) -> Anomaly {

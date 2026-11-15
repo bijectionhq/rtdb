@@ -1,8 +1,10 @@
 mod local;
 mod memory;
+mod read_only;
 
 pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
+pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
 use crate::{Error, Result};
 use async_trait::async_trait;
@@ -29,6 +31,9 @@ pub struct LogRecord {
 pub struct AppendReceipt { durable: oneshot::Receiver<Result<LogMetadata>> }
 
 impl AppendReceipt {
+    /// The driver must complete this receiver only after durable provider acknowledgement, or with an append error.
+    pub fn new(durable: oneshot::Receiver<Result<LogMetadata>>) -> Self { Self { durable } }
+
     /// Reports durable append, independently of replica admission or application.
     pub async fn durable(self) -> Result<LogMetadata> {
         self.durable.await.map_err(|_| Error::Closed("append driver ended before reporting durability".into()))?

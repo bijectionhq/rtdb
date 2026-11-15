@@ -693,3 +693,8 @@ open question "Does any path still deliver an L0 to the trie catalog ahead of it
 open question "Which row gauge governs CutBlock?"
     -- The rule names the resolve-side gauge, while this module's header and db.allium's AppendTx use applied rows.
     -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, BlockCutter seeds its gauge from applied rows and advances it when transactions resolve.
+
+open question "Should CommitTransaction retain explicit table declarations when their row count is zero?"
+    -- CommitTransaction currently stages only tables with rows.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, ResolvedTx.stage retains explicit CREATE TABLE declarations, and staged-empty-create-table-visible-across-a-batch-5507 requires later transactions to resolve their columns before read-back.
+    -- A mutation matching no rows does not declare its target table.

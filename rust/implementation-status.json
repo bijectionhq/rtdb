@@ -13,21 +13,22 @@
     "types_columnar_durable_formats": "source_written_unverified",
     "storage_indexing_historical_visibility": "source_written_with_recorded_gaps",
     "sql_xtql_execution": "in_progress",
-    "writes_replication_recovery": "term_admission_only",
-    "compaction_gc_adapters": "pending",
-    "client_operational_surfaces": "pending",
+    "writes_replication_recovery": "in_progress",
+    "compaction_gc_adapters": "in_progress",
+    "client_operational_surfaces": "native_node_session_auth_and_prepared_source_in_progress",
     "conformance_machinery": "source_inventory_comparator_and_two_control_mappings_only"
   },
   "source_review_record": "rust/source-review.adoc",
   "assertion_ledger": "rust/conformance/assertion-ledger.json",
   "runtime_assertion_denominator": null,
   "required_production_traces": {
-    "client_read": "missing_protocol_and_server_entry_points",
-    "data_dependent_write": "missing_transaction_resolution_and_append_apply_path",
-    "replica_recovery": "missing_drivers_and_pending_block_replay",
-    "compaction_retry": "missing_maintenance_implementation",
-    "cdc_restart": "missing_postgresql_source_adapter",
-    "database_shutdown": "missing_node_and_server_lifecycle"
+    "client_read": "native_session_query_path_written; protocol_and_server_entry_points_missing",
+    "data_dependent_write": "native_submission_resolver_replica_readback_apply_source_written; source_audit_in_progress",
+    "replica_recovery": "native_log_recovery_block_adoption_driver_source_written; source_audit_in_progress",
+    "compaction_retry": "native_maintenance_and_streaming_publication_source_written; source_audit_in_progress",
+    "cdc_restart": "native_postgresql_snapshot_pgoutput_resume_source_written; node_metrics_wiring_in_progress",
+    "database_shutdown": "native_node_database_term_driver_join_source_written; server_lifecycle_missing"
   },
-  "phase_2_authorized_by_completeness_gate": false
+  "phase_2_authorized_by_completeness_gate": false,
+  "last_source_checkpoint_revision": "2180677a3"
 }

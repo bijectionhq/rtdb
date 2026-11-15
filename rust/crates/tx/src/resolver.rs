@@ -1,0 +1,449 @@
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use prost::Message;
+use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
+use rtdb_format::{envelope::ReplicaBody, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
+use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
+use rtdb_plan::Statement;
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
+use rtdb_storage::cache::BufferPool;
+use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, Result, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
+use tokio_util::sync::CancellationToken;
+
+use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments}};
+
+pub trait TransactionAuthorization: Send + Sync {
+    /// Rejects an absent principal or a principal without the reference superuser authority.
+    fn check_role_membership(&self, database: &str, principal: Option<&str>) -> Result<()>;
+}
+
+pub struct ResolveContext {
+    pub database: String,
+    pub storage: Arc<BufferPool>,
+    pub memory: Arc<MemoryBudget>,
+    pub query_options: QueryOptions,
+    pub cancellation: CancellationToken,
+    pub default_tz: String,
+    pub authorization: Arc<dyn TransactionAuthorization>,
+}
+
+impl ResolveContext {
+    fn query_context(&self, snapshot: Snapshot, time: Timestamp, timezone: &str) -> Result<Arc<QueryContext>> {
+        let catalog = CatalogSnapshot::new(self.database.clone(), BTreeMap::from([(self.database.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&self.storage) })]), true)?;
+        QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)
+    }
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancellation.is_cancelled() { Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/transaction-cancelled", "Transaction resolution was cancelled")) } else { Ok(()) }
+    }
+}
+
+pub struct OwnedReplicaBody { body: ReplicaBody, _reservation: Arc<MemoryReservation> }
+impl OwnedReplicaBody { pub fn body(&self) -> &ReplicaBody { &self.body } }
+
+pub struct ResolvedTx {
+    writes: Arc<StagedWrite>,
+    result: TransactionResult,
+    source_position: SourcePosition,
+    external_token: Option<Vec<u8>>,
+    db_op: Option<DbOp>,
+    _reservation: Arc<MemoryReservation>,
+}
+impl ResolvedTx {
+    pub fn writes(&self) -> &Arc<StagedWrite> { &self.writes }
+    pub fn result(&self) -> &TransactionResult { &self.result }
+    pub fn source_position(&self) -> SourcePosition { self.source_position }
+    pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
+    pub fn db_op(&self) -> Option<&DbOp> { self.db_op.as_ref() }
+
+    /// Serializes only this transaction's deltas, including zero-row schema declarations.
+    /// The append owner supplies the term and sequence after obtaining this body.
+    pub fn to_replica_body(&self, memory: &Arc<MemoryBudget>) -> Result<OwnedReplicaBody> {
+        let mut tables = Vec::new();
+        let mut bound = 65_536usize.checked_add(db_op_bytes(self.db_op.as_ref())?).ok_or_else(overflow)?;
+        for (table, write) in self.writes.tables() {
+            let batch = write.batch().ok_or_else(|| Anomaly::fault("rtdb.tx/missing-table-batch", "Resolved table declaration has no Arrow batch"))?;
+            let bytes = crate::ipc::encode(batch.arrow().schema().as_ref(), [batch.arrow()], memory)?;
+            let name = format!("{}/{}", table.schema, table.table);
+            bound = bound.checked_add(bytes.as_slice().len()).and_then(|bound| bound.checked_add(name.capacity())).and_then(|bound| bound.checked_add(512)).ok_or_else(overflow)?;
+            tables.push((name, bytes));
+        }
+        let error = self.result.encoded_error()?;
+        bound = bound.checked_add(error.as_ref().map_or(0, |error| error.as_slice().len())).and_then(|bound| bound.checked_add(self.external_token.as_ref().map_or(0, Vec::capacity))).ok_or_else(overflow)?;
+        let reservation = memory.reserve(bound)?;
+        let key = self.result.tx_key();
+        let body = ReplicaBody::ResolvedTx(WireResolvedTx {
+            tx_id: Some(key.tx_id.0), system_time_micros: Some(key.system_time.0), committed: Some(self.result.committed()), error: error.map(|error| error.as_slice().to_vec()),
+            table_data: tables.into_iter().map(|(name, bytes)| (name, bytes.as_slice().to_vec())).collect(),
+            db_op: self.db_op.clone(), external_source_token: self.external_token.clone(), src_msg_id: Some(self.source_position.0),
+        });
+        Ok(OwnedReplicaBody { body, _reservation: reservation })
+    }
+}
+
+pub struct TxResolver {
+    resolved_head: Option<TransactionKey>,
+    source_position: SourcePosition,
+    external_token: Option<Vec<u8>>,
+    queue: VecDeque<Arc<ResolvedTx>>,
+    memory: Arc<MemoryBudget>,
+    token_reservation: Arc<MemoryReservation>,
+    queue_reservation: Arc<MemoryReservation>,
+}
+impl TxResolver {
+    pub fn new(seed: Option<TransactionKey>, source_position: SourcePosition, external_token: Option<Vec<u8>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let token_reservation = memory.reserve(external_token.as_ref().map_or(0, Vec::capacity).checked_add(512).ok_or_else(overflow)?)?;
+        let queue_reservation = memory.reserve(128)?;
+        Ok(Self { resolved_head: seed, source_position, external_token, queue: VecDeque::new(), memory: Arc::clone(memory), token_reservation, queue_reservation })
+    }
+    pub fn resolved_head(&self) -> Option<TransactionKey> { self.resolved_head }
+    pub fn source_position(&self) -> SourcePosition { self.source_position }
+    pub fn external_token(&self) -> Option<&[u8]> { self.external_token.as_deref() }
+    pub fn staged_rows(&self) -> Result<u64> { self.queue.iter().try_fold(0u64, |rows, tx| rows.checked_add(tx.writes.row_count()?).ok_or_else(overflow)) }
+    pub fn advance_source(&mut self, position: SourcePosition) -> Result<()> {
+        if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
+        self.source_position = position;
+        Ok(())
+    }
+    /// Transfers the oldest staged value before the read-back caller validates and applies it.
+    pub fn take_head(&mut self) -> Option<Arc<ResolvedTx>> { self.queue.pop_front() }
+    pub fn discard_staged(&mut self) { self.queue.clear(); }
+    pub fn staged_db_op(&self, name: &str) -> Option<&DbOp> {
+        self.queue.iter().rev().filter_map(|tx| tx.db_op()).find(|operation| match operation {
+            DbOp::AttachDatabase(attach) => attach.db_name.as_deref() == Some(name),
+            DbOp::DetachDatabase(detach) => detach.db_name.as_deref() == Some(name),
+        })
+    }
+    pub fn resolving_snapshot(&self, durable: Snapshot) -> Result<Snapshot> {
+        let writes = self.queue.iter().map(|tx| Arc::clone(&tx.writes)).collect::<Vec<_>>();
+        let snapshot = durable.with_staged(&writes)?;
+        if snapshot.tx_basis() != self.resolved_head { return Err(Anomaly::fault("rtdb.tx/resolved-basis", "Resolver head differs from durable and staged snapshots")); }
+        Ok(snapshot)
+    }
+
+    pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        context.check_cancelled()?;
+        let base = self.resolving_snapshot(durable)?;
+        let default_time = self.smooth(log_time)?;
+        let invalid_time = request.options.system_time.zip(self.resolved_head).filter(|(time, previous)| *time <= previous.system_time);
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: if invalid_time.is_some() { default_time } else { request.options.system_time.unwrap_or(default_time) } };
+        let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        let outcome = if let Some((requested, previous)) = invalid_time {
+            Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
+                .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
+                .with_context("latest-completed-tx", tx_key_context(previous)?))
+        } else {
+            let mut outcome = Ok(());
+            for (index, operation) in request.operations.iter().enumerate() {
+                if let Err(error) = tx.apply(operation).await {
+                    outcome = Err(error.with_context("tx-op-idx", index.into()).with_context("tx-key", tx_key_context(key)?));
+                    break;
+                }
+            }
+            outcome
+        };
+        let result = match outcome {
+            Ok(()) => TransactionResult::Committed { tx_key: key },
+            Err(error) if error.is_caller_error() => {
+                drop(tx);
+                tx = OpenTransaction::new(base, key, &request.options, context)?;
+                TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }
+            }
+            Err(error) => return Err(error),
+        };
+        tx.write_result(&result, request.options.user_metadata.as_ref())?;
+        context.check_cancelled()?;
+        self.stage(tx.buffer.stage()?, result, position, None, None, context)
+    }
+
+    pub async fn resolve_external(&mut self, durable: Snapshot, now: Timestamp, system_time: Option<Timestamp>, token: Option<Vec<u8>>, writer: &mut dyn TransactionWriter, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        context.check_cancelled()?;
+        let base = self.resolving_snapshot(durable)?;
+        let id = self.resolved_head.map_or(-1, |key| key.tx_id.0).checked_add(1).ok_or_else(overflow)?;
+        let key = TransactionKey { tx_id: TxId(id), system_time: self.smooth(system_time.unwrap_or(now))? };
+        let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
+        let mut tx = OpenTransaction::new(base.clone(), key, &options, context)?;
+        let (result, metadata) = match writer.write(&mut tx).await? {
+            WriterResult::Committed { user_metadata } => (TransactionResult::Committed { tx_key: key }, user_metadata),
+            WriterResult::Aborted { error, user_metadata } => {
+                drop(tx); tx = OpenTransaction::new(base, key, &options, context)?;
+                (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
+            }
+        };
+        tx.write_result(&result, metadata.as_ref())?;
+        context.check_cancelled()?;
+        self.stage(tx.buffer.stage()?, result, self.source_position, token, None, context)
+    }
+
+    pub fn resolve_db_op(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, operation: DbOp, verdict: Result<()>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let base = self.resolving_snapshot(durable)?;
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: log_time };
+        let (result, operation) = match verdict {
+            Ok(()) => (TransactionResult::Committed { tx_key: key }, Some(operation)),
+            Err(error) if error.is_caller_error() => (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, None),
+            Err(error) => return Err(error),
+        };
+        let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
+        let mut tx = OpenTransaction::new(base, key, &options, context)?;
+        tx.write_result(&result, None)?;
+        context.check_cancelled()?;
+        self.stage(tx.buffer.stage()?, result, position, None, operation, context)
+    }
+
+    fn smooth(&self, candidate: Timestamp) -> Result<Timestamp> {
+        match self.resolved_head { Some(previous) if candidate <= previous.system_time => previous.system_time.next(), _ => Ok(candidate) }
+    }
+    fn stage(&mut self, writes: StagedWrite, result: TransactionResult, position: SourcePosition, token: Option<Vec<u8>>, db_op: Option<DbOp>, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        if position < self.source_position { return Err(Anomaly::fault("rtdb.tx/source-watermark", "Resolve-side source watermark moved backwards")); }
+        let bound = 4096usize.checked_add(token.as_ref().map_or(0, Vec::capacity)).and_then(|bytes| bytes.checked_add(db_op_bytes(db_op.as_ref()).ok()?)).and_then(|bytes| bytes.checked_add(result.error().map(crate::values::anomaly_bytes).transpose().ok()?.unwrap_or(0))).ok_or_else(overflow)?;
+        let reservation = context.memory.reserve(bound)?;
+        let next_token_charge = token.as_ref().map(|token| self.memory.reserve(token.capacity().checked_add(512).ok_or_else(overflow)?)).transpose()?;
+        if self.queue.len() == self.queue.capacity() {
+            let capacity = self.queue.capacity().max(4).checked_mul(2).ok_or_else(overflow)?;
+            let charge = self.memory.reserve(capacity.checked_mul(std::mem::size_of::<Arc<ResolvedTx>>()).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?)?;
+            self.queue.reserve_exact(capacity - self.queue.len());
+            self.queue_reservation = charge;
+        }
+        let resolved = Arc::new(ResolvedTx { writes: Arc::new(writes), result, source_position: position, external_token: token, db_op, _reservation: reservation });
+        self.queue.push_back(Arc::clone(&resolved));
+        self.resolved_head = Some(resolved.result.tx_key());
+        self.source_position = position;
+        if let Some(token) = &resolved.external_token {
+            self.external_token = Some(token.clone());
+            self.token_reservation = next_token_charge.ok_or_else(|| Anomaly::fault("rtdb.tx/token-reservation", "External token has no reservation"))?;
+        }
+        Ok(resolved)
+    }
+}
+
+#[async_trait]
+pub trait TransactionWriter: Send {
+    async fn write(&mut self, transaction: &mut OpenTransaction<'_>) -> Result<WriterResult>;
+}
+pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
+
+pub struct OpenTransaction<'a> { buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext }
+impl<'a> OpenTransaction<'a> {
+    fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context })
+    }
+    pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
+    pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
+    pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.context.check_cancelled()?; self.buffer.append(table, event) }
+    pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
+
+    pub fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
+        let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
+        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/expected-query", "Expected a query statement")); };
+        PreparedQuery::new(relation)?.execute(context, arguments)
+    }
+
+    pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
+        self.execute_sql_typed(sql, arguments, None).await
+    }
+
+    async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>) -> Result<()> {
+        self.context.check_cancelled()?;
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let parameter_types = match types {
+            Some(types) => types.iter().cloned().enumerate().collect(),
+            None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+        };
+        let options = rtdb_sql::PrepareOptions { parameter_types, ..Default::default() };
+        let mutation = rtdb_sql::prepare_tx(sql, &context.catalog, &options)?;
+        self.execute_mutation(mutation, context, arguments).await.map_err(|error| error.with_context("sql", sql.into()))
+    }
+
+    async fn execute_mutation(&mut self, mutation: rtdb_sql::Mutation, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<()> {
+        use rtdb_sql::Mutation;
+        let (table, input, kind) = match mutation {
+            Mutation::Put { table, input } => (Some(table), input, 0),
+            Mutation::Delete { table, input } => (Some(table), input, 1),
+            Mutation::Erase { table, input } => (Some(table), input, 2),
+            Mutation::Assert { input, message } => {
+                let mut cursor = execute(input, context, arguments)?;
+                if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
+                return Ok(());
+            }
+            Mutation::CreateTable { table, columns } => return self.declare_table(table.table, columns),
+            Mutation::GrantRole { user, role, revoke } => {
+                if self.context.database != "xtdb" { return Err(Anomaly::incorrect("xtdb/role-membership-non-primary", "Role membership can only be managed on the primary 'xtdb' database.").with_context("db", self.context.database.clone().into())); }
+                self.context.authorization.check_role_membership(&self.context.database, self.options.user.as_deref())?;
+                use sha2::{Digest, Sha256};
+                let length = i32::try_from(user.len()).map_err(|_| overflow())?;
+                let mut hash = Sha256::new();
+                hash.update(length.to_be_bytes());
+                hash.update(user.as_bytes());
+                hash.update(role.as_bytes());
+                let digest = hash.finalize();
+                let iid = Iid::from_slice(&digest[..16])?;
+                let operation = if revoke { StoredOperation::Delete } else { StoredOperation::Put(BTreeMap::from([("user".into(), Value::Utf8(user)), ("role".into(), Value::Utf8(role))])) };
+                return self.buffer.append(TableRef::new("xt", "role_membership"), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(self.tx_key().system_time, Timestamp::MAX)?, operation, recency: None });
+            }
+        };
+        let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
+        if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
+        check_table(&table.table)?;
+        let mut cursor = execute(input, context, arguments)?;
+        while let Some(batch) = cursor.next_batch().await? {
+            let schema = batch.batch().schema();
+            let index = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()));
+            let iid_index = index("_iid")?;
+            for row in 0..batch.batch().num_rows() {
+                let cell = |column| read_value(schema.field(column), batch.batch().column(column).as_ref(), row);
+                let iid = match cell(iid_index)? { Value::FixedSizeBinary(bytes) => Iid::from_slice(&bytes)?, _ => return Err(Anomaly::incorrect("xtdb/invalid-id", "Mutation IID is null or invalid")) };
+                let valid_time = if kind == 2 { Interval::ALL } else { valid_range(cell(index("_valid_from")?)?, cell(index("_valid_to")?)?, self.tx_key().system_time)? };
+                let operation = match kind {
+                    0 => match cell(index("doc")?)? { Value::Struct(document) => StoredOperation::Put(document), _ => return Err(Anomaly::fault("rtdb.tx/mutation-document", "Put mutation has no document")) },
+                    1 => StoredOperation::Delete, _ => StoredOperation::Erase,
+                };
+                self.buffer.append(table.table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time, operation, recency: None })?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply(&mut self, operation: &Operation) -> Result<()> {
+        self.context.check_cancelled()?;
+        match operation {
+            Operation::Public(TxOp::Sql { sql, args }) => match args {
+                Some(arguments) => { for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; } Ok(()) }
+                None => self.execute_sql(sql, None).await,
+            },
+            Operation::Public(TxOp::SqlBytes { sql, arg_bytes }) => {
+                if arg_bytes.as_slice().is_empty() { return self.execute_sql(sql, None).await; }
+                let arguments = decode_arguments(arg_bytes.as_slice(), &self.context.memory)?;
+                for (index, row) in arguments.indexed_rows() { self.execute_sql_typed(sql, Some(row), Some(arguments.types())).await.map_err(|error| error.with_context("arg-idx", index.into()))?; }
+                Ok(())
+            }
+            Operation::Public(TxOp::PutDocs { table, documents, valid_from, valid_to }) => self.put_documents(table, documents.rows(), None, *valid_from, *valid_to),
+            Operation::PutIids { table, documents, iids, valid_from, valid_to } => self.put_documents(table, documents.rows(), Some(iids), *valid_from, *valid_to),
+            Operation::Public(TxOp::DeleteDocs { table, ids, valid_from, valid_to }) => {
+                check_table(table)?;
+                let interval = interval(valid_from.unwrap_or(self.tx_key().system_time), valid_to.unwrap_or(Timestamp::MAX))?;
+                for id in ids.ids() { self.buffer.delete(table.clone(), id, interval)?; }
+                Ok(())
+            }
+            Operation::Public(TxOp::EraseDocs { table, ids }) => { check_table(table)?; for id in ids.ids() { self.buffer.erase(table.clone(), id)?; } Ok(()) }
+            Operation::Public(TxOp::PatchDocs { table, documents, valid_from, valid_to }) => self.patch_documents(table, documents.rows(), None, *valid_from, *valid_to).await,
+            Operation::PatchIids { table, documents, iids, valid_from, valid_to } => self.patch_documents(table, documents.rows(), Some(iids), *valid_from, *valid_to).await,
+            Operation::Removed(name) => Err(Anomaly::unsupported(if name == "xtql" { "xtdb/xtql-dml-removed" } else { "xtdb/tx-fns-removed" }, if name == "xtql" { "XTQL DML is no longer supported, as of 2.0.0-beta7. Please use SQL DML statements instead - see the release notes for more information." } else { "tx-fns are no longer supported, as of 2.0.0-beta7. Please use ASSERTs and SQL DML statements instead - see the release notes for more information." })),
+        }
+    }
+    async fn patch_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        use rtdb_plan::{Binder, Expr, Relation, RelationNode, Schema, QualifiedTable, TemporalFilter};
+        use rtdb_types::{LogicalType, ScalarType};
+        check_table(table)?;
+        if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
+        let interval = interval(from.unwrap_or(self.tx_key().system_time), to.unwrap_or(Timestamp::MAX))?;
+        let bytes = documents.iter().try_fold(65_536usize, |bytes, document| bytes.checked_add(Value::document_retained_bytes(document)?.checked_mul(8).ok_or_else(overflow)?).ok_or_else(overflow))?;
+        let _reservation = self.context.memory.reserve(bytes)?;
+        let mut rows = Vec::with_capacity(documents.len());
+        let mut document_type = LogicalType::Struct(BTreeMap::new());
+        for (index, document) in documents.iter().enumerate() {
+            if document.keys().any(|name| name.starts_with('_') && !["_id", "_fn"].contains(&name.as_str())) { return Err(Anomaly::incorrect("xtdb/forbidden-columns", "Cannot patch documents with internal columns")); }
+            let iid = match iids { Some(iids) => iids[index], None => document.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.tx/missing-id", "missing _id"))?.entity_id()?.iid() };
+            let document = Value::Struct(document.clone());
+            document_type = document_type.join(&document.logical_type());
+            rows.push(vec![Expr::Literal(Value::FixedSizeBinary(iid.0.to_vec())), Expr::Literal(document)]);
+        }
+        let mut binder = Binder::default();
+        let fields = vec![binder.field("_iid", None, LogicalType::Scalar(ScalarType::FixedSizeBinary(16)))?, binder.field("doc", None, document_type)?];
+        let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
+        self.execute_mutation(mutation, context, None).await
+    }
+    fn put_documents(&mut self, table: &TableRef, documents: &[BTreeMap<String, Value>], iids: Option<&[Iid]>, from: Option<Timestamp>, to: Option<Timestamp>) -> Result<()> {
+        check_table(table)?;
+        if iids.is_some_and(|iids| iids.len() != documents.len()) { return Err(Anomaly::incorrect("xtdb/invalid-iids", "Document and IID counts differ")); }
+        for (index, document) in documents.iter().enumerate() {
+            if document.keys().any(|name| name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&name.as_str())) { return Err(Anomaly::incorrect("xtdb/forbidden-columns", "Cannot put documents with internal columns")); }
+            let iid = match iids { Some(iids) => iids[index], None => document.get("_id").ok_or_else(|| Anomaly::incorrect("xtdb.tx/missing-id", "missing _id"))?.entity_id()?.iid() };
+            let default_from = from.unwrap_or(self.tx_key().system_time);
+            let default_to = to.unwrap_or(Timestamp::MAX);
+            let row_from = document.get("_valid_from").map(|value| timestamp(value, default_from)).transpose()?.unwrap_or(default_from);
+            let row_to = document.get("_valid_to").map(|value| timestamp(value, default_to)).transpose()?.unwrap_or(default_to);
+            let document = document.iter().filter(|(name, _)| name.as_str() != "_valid_from" && name.as_str() != "_valid_to").map(|(name, value)| (name.clone(), value.clone())).collect();
+            self.buffer.append(table.clone(), StoredEvent { iid, system_from: self.tx_key().system_time, valid_time: interval(row_from, row_to)?, operation: StoredOperation::Put(document), recency: None })?;
+        }
+        Ok(())
+    }
+    fn write_result(&mut self, result: &TransactionResult, metadata: Option<&UserMetadata>) -> Result<()> {
+        let key = result.tx_key();
+        let error = result.encoded_error()?;
+        let bound = error.as_ref().map_or(0, |error| error.as_slice().len()).checked_add(metadata.map(|value| value.value().retained_bytes()).transpose()?.unwrap_or(0)).and_then(|bytes| bytes.checked_add(16_384)).ok_or_else(overflow)?;
+        let _reservation = self.context.memory.reserve(bound)?;
+        let document = BTreeMap::from([
+            ("_id".into(), Value::I64(key.tx_id.0)), ("system_time".into(), time_value(key.system_time)),
+            ("committed".into(), Value::Bool(result.committed())),
+            ("user_metadata".into(), metadata.map(|metadata| metadata.value().clone()).unwrap_or(Value::Null)),
+            ("error".into(), error.map(|error| Value::Transit(error.as_slice().to_vec())).unwrap_or(Value::Null)),
+        ]);
+        self.buffer.put(TableRef::new("xt", "txs"), document, interval(key.system_time, Timestamp::MAX)?)
+    }
+}
+
+fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
+    let encoded = match operation { Some(DbOp::AttachDatabase(value)) => value.encoded_len(), Some(DbOp::DetachDatabase(value)) => value.encoded_len(), None => 0 };
+    encoded.checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)
+}
+
+fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<QueryCursor> {
+    let count = input.parameter_count();
+    if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
+    let arguments = arguments.unwrap_or_default();
+    if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
+    PreparedQuery::new(input)?.execute(context, arguments.to_vec())
+}
+fn check_table(table: &TableRef) -> Result<()> {
+    if ["xt", "information_schema", "pg_catalog"].contains(&table.schema.as_str()) { Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}.{}", table.schema, table.table))) } else { Ok(()) }
+}
+fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
+    if from >= to { return Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "Invalid valid times").with_context("valid-from", from.0.into()).with_context("valid-to", to.0.into())); }
+    Interval::new(from, to)
+}
+fn timestamp(value: &Value, fallback: Timestamp) -> Result<Timestamp> {
+    match value { Value::Null | Value::Undefined => Ok(fallback), Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(_) } => Ok(Timestamp(*value)), _ => Err(Anomaly::fault("xtdb/invalid-timestamp-col-type", "Invalid timestamp col type")) }
+}
+fn valid_range(from: Value, to: Value, current_time: Timestamp) -> Result<Interval> { interval(timestamp(&from, current_time)?, timestamp(&to, Timestamp::MAX)?) }
+fn time_value(time: Timestamp) -> Value { Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+fn tx_key_context(key: TransactionKey) -> Result<serde_json::Value> {
+    use rtdb_format::transit::TransitValue as T;
+    rtdb_format::transit::to_json_value(&T::Tagged { tag: "xtdb/tx-key".into(), representation: Box::new(T::Map(vec![
+        (T::Keyword("tx-id".into()), T::Integer(key.tx_id.0)),
+        (T::Keyword("system-time".into()), T::Tagged { tag: "time/instant".into(), representation: Box::new(T::String(instant_text(key.system_time))) }),
+    ])) })
+}
+
+fn instant_text(value: Timestamp) -> String {
+    // Gregorian civil_from_days: https://howardhinnant.github.io/date_algorithms.html#civil_from_days
+    let days = value.0.div_euclid(86_400_000_000) + 719_468;
+    let era = days.div_euclid(146_097);
+    let day_of_era = days - era * 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = month_index + if month_index < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    let year = if year < 0 { format!("-{:04}", -year) } else if year > 9999 { format!("+{year}") } else { format!("{year:04}") };
+    let time = value.0.rem_euclid(86_400_000_000);
+    let seconds = time / 1_000_000;
+    let micros = time % 1_000_000;
+    let fraction = if micros == 0 { String::new() } else if micros % 1000 == 0 { format!(".{:03}", micros / 1000) } else { format!(".{micros:06}") };
+    format!("{year}-{month:02}-{day:02}T{:02}:{:02}:{:02}{fraction}Z", seconds / 3600, seconds / 60 % 60, seconds % 60)
+}
+fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction position or allocation exceeded its range") }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn error_transaction_keys_preserve_jvm_instant_text() {
+        for (micros, text) in [(0, "1970-01-01T00:00:00Z"), (-1, "1969-12-31T23:59:59.999999Z"), (1000, "1970-01-01T00:00:00.001Z"), (946_684_800_000_000, "2000-01-01T00:00:00Z")] { assert_eq!(instant_text(Timestamp(micros)), text); }
+    }
+}

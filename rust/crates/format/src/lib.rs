@@ -16,7 +16,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/xtdb.rs"));
 }
 
-pub use generated::xtdb::{block, cols, database, log, trie};
+pub use generated::xtdb::{block, cols, database, log, postgres, trie};
 
 pub const PROTOBUF_LOG_HEADER: u8 = 3;
 pub const LEGACY_TX_HEADER: u8 = 0xff;

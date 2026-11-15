@@ -1,0 +1,44 @@
+= Native authentication
+
+This crate implements the pinned `Authenticator`, `PasswordHash`, and `Principal` contracts using native Rust password hashing and HTTP.
+The source reference is `core/src/main/kotlin/xtdb/api/Authenticator.kt`, `PasswordHash.kt`, `core/src/main/clojure/xtdb/authn.clj`, and the corresponding upstream authentication tests.
+No authentication request or test has run in Phase 1.
+
+`Authenticator` is a passive immutable configuration handle.
+It routes ordered authentication rules, verifies root or configured-user passwords, discovers OIDC endpoints, and returns principals.
+`Principal` is passive and stores an immutable user identifier plus either static credentials or one mutex-protected token value.
+A caller refreshes expired credentials while holding that principal's asynchronous mutex; successful refresh replaces the complete token, and a failed refresh leaves it available for a later retry.
+`DeviceAuthorization` is a caller-owned polling workflow with explicit cancellation.
+`NativeHttp` is a passive request adapter whose response-body limit and memory reservations bound JSON buffering and decoded response ownership.
+Reqwest connection-pool and TLS allocations remain outside those reservations and require a separate operational memory qualification.
+
+Root authentication requires the username `xtdb` when a password is configured.
+Absent a password, its network rule selects trust.
+The user-list authenticator retains tagged Argon2id and bcrypt encodings and applies the first matching rule.
+An unknown remote address rejects a matching address-constrained rule before later rules are considered.
+Trusted embedded callers may construct principals independently of network rules, as in the pinned public API.
+Unauthenticated embedded connections retain a null user.
+
+GRANT and REVOKE require the primary database and a principal recognized as a superuser by the configured authenticator.
+Other database reads and writes have no database-specific role gate in the pinned implementation.
+The native `SessionIdentity` hook remains available for an explicitly supplied application policy.
+Configured users and superuser flags are exposed through a charged `CatalogUsers` snapshot without password material.
+
+OIDC supports password, client-credentials, device, and refresh-token grants.
+The user identity comes from the provider's userinfo subject.
+Expiry uses the provider clock and is strict: a token expires after its expiry instant.
+A missing refresh token in a successful refresh retains the previous token.
+Client-credentials refresh uses that principal's client credentials.
+Responses and transport errors omit token bodies and credentials from diagnostics.
+Endpoint redirects are rejected; HTTP response-size limits and malformed-response validation are explicit native limits requiring compatibility qualification.
+The pinned device endpoint helper calculates expiry with the system clock and polls using the configured provider clock.
+The Rust implementation uses the configured provider clock for both; clock-injection parity remains an explicit difference to resolve in the comparison suite.
+Principal identities, refresh grants, and device payloads retain reservations after their HTTP response is released.
+Configuration cloning and caller-returned `known_users()` copies remain outside the execution-budget accounting.
+
+Password algorithms use https://docs.rs/argon2/0.5.3/argon2/[RustCrypto Argon2] and https://docs.rs/bcrypt/0.19.3/bcrypt/[bcrypt].
+Argon2id derivation uses version 19, 64 MiB, three iterations, one lane, a random 16-byte salt, and a 32-byte result.
+Bcrypt derivation uses cost 12 and a random salt.
+Password verification is caller-driven CPU work; the server must account for authentication concurrency when sizing its execution resources.
+Tests retain the upstream rule-order, wrong-password, trusted-principal, stored-hash, concurrent-refresh, refresh-rotation, and device-polling observations.
+Network integration, OIDC provider interoperability, malformed-hash edge cases, and cryptographic-library compatibility remain unexecuted.

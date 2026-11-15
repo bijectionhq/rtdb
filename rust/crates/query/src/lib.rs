@@ -6,6 +6,9 @@ mod join;
 mod sort;
 mod scan;
 mod spill;
+mod patch;
+mod system_schema;
+mod system;
 
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};

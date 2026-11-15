@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use rtdb_storage::{Error, LocalStore, MemoryStore, ObjectKey, ObjectStore, cache::BufferPool};
+use rtdb_storage::{Error, LocalStore, MemoryStore, ObjectKey, ObjectStore, cache::{BufferPool, CacheBudget}};
 use std::sync::Arc;
 
 async fn immutable_objects(store: Arc<dyn ObjectStore>) {
@@ -28,6 +28,57 @@ async fn memory_objects_are_immutable_and_ranges_are_exact() {
 async fn local_objects_are_immutable_and_ranges_are_exact() {
     let directory = tempfile::tempdir().unwrap();
     immutable_objects(Arc::new(LocalStore::open(directory.path()).unwrap())).await;
+}
+
+async fn immutable_file_upload(store: Arc<dyn ObjectStore>) {
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path().join("source.arrow");
+    let key = ObjectKey::new("tables/products/data/file.arrow").unwrap();
+    let mut data = vec![73u8; 2 * 1024 * 1024 + 19];
+    data[65_536] = 4;
+    std::fs::write(&path, &data).unwrap();
+    store.put_file(&key, &path).await.unwrap();
+    store.put_file(&key, &path).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), data.as_slice());
+    data[65_536] = 5;
+    std::fs::write(&path, &data).unwrap();
+    assert!(matches!(store.put_file(&key, &path).await, Err(Error::ConflictingObject(_))));
+    assert_eq!(store.get_range(&key, 65_536..65_537).await.unwrap().as_ref(), &[4]);
+    let empty = ObjectKey::new("empty").unwrap();
+    std::fs::write(&path, []).unwrap();
+    store.put_file(&empty, &path).await.unwrap();
+    store.put_file(&empty, &path).await.unwrap();
+    assert_eq!(store.head(&empty).await.unwrap().size, 0);
+    assert_eq!(store.list(None).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn local_streamed_publication_accepts_exact_retries_and_rejects_same_size_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    immutable_file_upload(Arc::new(LocalStore::open(directory.path()).unwrap())).await;
+}
+
+#[tokio::test]
+async fn memory_file_publication_has_the_same_immutable_contract() {
+    immutable_file_upload(Arc::new(MemoryStore::default())).await;
+}
+
+#[tokio::test]
+async fn concurrent_local_file_publishers_never_replace_the_winner() {
+    let source = tempfile::tempdir().unwrap();
+    let first = source.path().join("first");
+    let second = source.path().join("second");
+    std::fs::write(&first, vec![1u8; 1 << 20]).unwrap();
+    std::fs::write(&second, vec![2u8; 1 << 20]).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(directory.path()).unwrap();
+    let key = ObjectKey::new("winner").unwrap();
+    let (a, b) = tokio::join!(store.put_file(&key, &first), store.put_file(&key, &second));
+    assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+    let winner = if a.is_ok() { 1 } else { 2 };
+    assert!(store.get(&key).await.unwrap().iter().all(|byte| *byte == winner));
+    let error = if let Err(error) = a { error } else { b.unwrap_err() };
+    assert!(matches!(error, Error::ConflictingObject(_)));
 }
 
 #[tokio::test]
@@ -144,4 +195,24 @@ async fn reserved_reads_reject_a_different_range_length() {
     let key = ObjectKey::new("object").unwrap();
     store.put(&key, Bytes::from_static(b"abc")).await.unwrap();
     assert!(store.get_reserved_range(&key, 0..3, ReadReservation::new(2, ())).await.is_err());
+}
+
+#[tokio::test]
+async fn database_pools_share_one_ceiling_while_a_detached_pool_lease_remains_live() {
+    let first_store = Arc::new(MemoryStore::default());
+    let second_store = Arc::new(MemoryStore::default());
+    let key = ObjectKey::new("object").unwrap();
+    first_store.put(&key, Bytes::from_static(b"first")).await.unwrap();
+    second_store.put(&key, Bytes::from_static(b"other")).await.unwrap();
+    let budget = CacheBudget::new(5);
+    let first = BufferPool::with_budget(first_store, budget.clone());
+    let second = BufferPool::with_budget(second_store, budget.clone());
+    let retained = first.get(&key).await.unwrap();
+    drop(first);
+    assert_eq!(budget.retained_bytes(), 5);
+    assert!(matches!(second.get(&key).await, Err(Error::MemoryLimit { limit: 5, .. })));
+    assert_eq!(retained.as_slice(), b"first");
+    drop(retained);
+    assert_eq!(budget.retained_bytes(), 0);
+    assert_eq!(second.get(&key).await.unwrap().as_slice(), b"other");
 }

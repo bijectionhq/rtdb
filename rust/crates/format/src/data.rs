@@ -180,6 +180,20 @@ pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<Str
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid)
 }
 
+/// Keeps the declared recency column even when a page is empty.
+pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+    if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
+    let batch = build_event_batch(events, put_fields, iid_encoding)?;
+    if recency && events.is_empty() {
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(TimestampMicrosecondArray::from(Vec::<i64>::new()).with_timezone("UTC")));
+        return RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(invalid);
+    }
+    Ok(batch)
+}
+
 fn invalid(error: impl std::fmt::Display) -> Anomaly {
     Anomaly::incorrect("rtdb.format/invalid-event-data", error.to_string())
 }

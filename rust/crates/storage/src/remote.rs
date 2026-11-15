@@ -4,6 +4,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::{ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOptions, path::Path};
 use std::{ops::Range, sync::Arc};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 pub struct RemoteStore {
     client: Arc<dyn ProviderStore>,
@@ -25,6 +26,22 @@ impl RemoteStore {
             None => value,
         };
         ObjectKey::new(relative)
+    }
+
+    async fn compare_file(&self, key: &ObjectKey, file: &mut tokio::fs::File, source: &std::path::Path, length: u64) -> Result<()> {
+        if self.head(key).await?.size != length { return Err(Error::ConflictingObject(key.to_string())); }
+        file.rewind().await.map_err(|error| Error::io(source, error))?;
+        let mut offset = 0;
+        let mut buffer = vec![0u8; 1024 * 1024];
+        while offset < length {
+            let count = (length - offset).min(buffer.len() as u64) as usize;
+            file.read_exact(&mut buffer[..count]).await.map_err(|error| Error::io(source, error))?;
+            if self.get_range(key, offset..offset + count as u64).await?.as_ref() != &buffer[..count] {
+                return Err(Error::ConflictingObject(key.to_string()));
+            }
+            offset += count as u64;
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +88,45 @@ impl ObjectStore for RemoteStore {
         }
     }
 
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        let mut input = tokio::fs::File::open(source).await.map_err(|error| Error::io(source, error))?;
+        let length = input.metadata().await.map_err(|error| Error::io(source, error))?.len();
+        match self.head(key).await {
+            Ok(_) => return self.compare_file(key, &mut input, source, length).await,
+            Err(Error::MissingObject(_)) => (),
+            Err(error) => return Err(error),
+        }
+        if length == 0 { return self.put(key, Bytes::new()).await; }
+        let temporary = format!(".tmp/upload-{}", uuid::Uuid::new_v4());
+        let temporary = Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{temporary}"), None => temporary });
+        let mut upload = self.client.put_multipart(&temporary).await.map_err(|error| provider_error(key, error))?;
+        let uploaded: Result<()> = async {
+            let mut remaining = length;
+            while remaining != 0 {
+                let count = remaining.min(5 * 1024 * 1024) as usize;
+                let mut bytes = vec![0u8; count];
+                input.read_exact(&mut bytes).await.map_err(|error| Error::io(source, error))?;
+                upload.put_part(Bytes::from(bytes).into()).await.map_err(|error| provider_error(key, error))?;
+                remaining -= count as u64;
+            }
+            upload.complete().await.map_err(|error| provider_error(key, error))?;
+            Ok(())
+        }.await;
+        if let Err(error) = uploaded {
+            if let Err(cleanup) = upload.abort().await {
+                return Err(Error::Remote { key: key.to_string(), message: format!("{error}; multipart abort also failed: {cleanup}") });
+            }
+            return Err(error);
+        }
+        let published = match self.client.copy_if_not_exists(&temporary, &self.path(key)).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => self.compare_file(key, &mut input, source, length).await,
+            Err(error) => Err(provider_error(key, error)),
+        };
+        let cleanup = self.client.delete(&temporary).await.map_err(|error| provider_error(key, error));
+        published.and(cleanup)
+    }
+
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
         let path = directory.map(|key| self.path(key)).or_else(|| self.prefix.as_ref().map(|key| Path::from(key.as_str())));
         let mut stream = self.client.list(path.as_ref());
@@ -81,6 +137,11 @@ impl ObjectStore for RemoteStore {
             if self.prefix.as_ref().is_some_and(|prefix| !metadata.location.as_ref().starts_with(&format!("{prefix}/"))) {
                 continue;
             }
+            let relative = match &self.prefix {
+                Some(prefix) => metadata.location.as_ref().strip_prefix(&format!("{prefix}/")).unwrap_or_default(),
+                None => metadata.location.as_ref(),
+            };
+            if relative.split('/').any(|part| part == ".tmp") { continue; }
             let key = self.key(&metadata.location)?;
             if directory.is_none_or(|directory| key.is_under(directory)) {
                 result.push(StoredObject { key, size: metadata.size });

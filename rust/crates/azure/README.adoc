@@ -1,0 +1,22 @@
+= Azure Blob Storage adapter
+
+Configuration and credential aliases are passive values and lookups.
+The connection parser produces one immutable account, endpoint, and credential choice.
+Inline account keys and node-local alias connection strings retain the JVM precedence rules.
+Connection strings support account keys, SAS tokens, explicit Blob endpoints, endpoint suffixes, and Azurite development storage.
+The native store creates its container idempotently before returning.
+Object keys include the configured prefix and the supplied storage-version and epoch root.
+Shared immutable publication retains conditional creation and exact retry comparisons.
+
+The passive default-credential bridge uses official Azure Identity clients.
+It selects configured environment client secrets or certificates, workload federation, managed identity, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
+Credential refresh occurs inside the selected provider on each request; the bridge has no background loop.
+Credential commands run in owned process groups with a 30-second deadline, bounded output, and joined output readers.
+Command execution occupies the caller's thread until the group exits or is terminated.
+`AZURE_TOKEN_CREDENTIALS` restricts production, development, or an individual supported provider; unsupported selections return errors.
+A configured service identity failure does not switch to a different principal.
+Default credential coverage is not yet identical to the Java SDK: Azure Arc, Azure ML, Cloud Shell, Service Fabric, IntelliJ, and shared desktop token caches need explicit implementation or qualification.
+
+Source references are `modules/azure/src/main/kotlin/xtdb/azure/BlobStorage.kt`, `azure.proto`, and the shared remote-storage contract.
+Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, and failure precedence.
+No Azure requests, credential commands, compilation, or tests have been run during Phase 1.

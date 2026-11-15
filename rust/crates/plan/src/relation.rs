@@ -76,6 +76,8 @@ pub enum RelationNode {
     Distinct { input: Arc<Relation> },
     Set { left: Arc<Relation>, right: Arc<Relation>, operator: SetOperator, all: bool },
     Unnest { input: Arc<Relation>, expr: Expr, element: Field, ordinality: Option<Field>, outer: bool },
+    /// Input is ordered by IID then valid-from, with nonoverlapping intervals per IID.
+    PatchGaps { input: Arc<Relation>, iid: ColumnId, valid_from: ColumnId, valid_to: ColumnId, document: ColumnId, from: Expr, to: Expr },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -116,7 +118,7 @@ impl Relation {
             RelationNode::Project { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Sort { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
-            | RelationNode::Unnest { input, .. } => vec![input],
+            | RelationNode::Unnest { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => vec![left, right],
             RelationNode::Apply { input, dependent, .. } => vec![input, dependent],
         }
@@ -136,6 +138,7 @@ impl Relation {
             RelationNode::Sort { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
             RelationNode::Unnest { expr, .. } => vec![expr],
+            RelationNode::PatchGaps { from, to, .. } => vec![from, to],
             RelationNode::Distinct { .. } | RelationNode::Set { .. } => vec![],
         }
     }
@@ -246,6 +249,19 @@ impl Relation {
                 if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([element]).chain(ordinality.iter())) {
                     return invalid("Unnest fields differ from output schema");
                 }
+            }
+            RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => {
+                if [*iid, *valid_from, *valid_to, *document].into_iter().collect::<BTreeSet<_>>().len() != 4 { return invalid("Patch gap columns must be distinct"); }
+                for id in [iid, valid_from, valid_to, document] {
+                    if input.schema.get(*id).is_none() { return invalid("Patch gap column is absent from input"); }
+                }
+                from.validate_columns(&BTreeSet::new())?;
+                to.validate_columns(&BTreeSet::new())?;
+                let fields = input.schema.fields().iter().cloned().map(|mut field| {
+                    if field.id == *document { field.data_type = field.data_type.maybe(); }
+                    field
+                }).collect();
+                if self.schema != Schema::new(fields)? { return invalid("Patch gap schema must make only its document nullable"); }
             }
         }
         Ok(())

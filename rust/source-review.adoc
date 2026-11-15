@@ -12,8 +12,13 @@ The reference checkout is pinned to `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
 * `crates/index` contains immutable live tables, transaction overlays, captured snapshots, table/trie catalog transitions, and atomic partition publication.
 * `crates/plan`, `expr`, `sql`, `xtql`, and `query` contain the initial native preparation and execution paths.
 The frontend READMEs and explicit unsupported errors identify dialect work still required.
-* `crates/replication` contains term admission only.
-The partition driver and application monitor are not implemented.
+* `crates/tx` contains typed source operations, native source/replica codecs, transaction-local resolution, SQL mutations, abort publication, and retained transaction errors.
+* `crates/replication` contains term admission, ordered append receipts, leader/follower drivers, applied-progress monitors, block production/adoption, recovery, and pending-block replay.
+* `crates/maintenance` contains deterministic job selection, streaming segment merges, publication, term-scoped trie GC, and block GC.
+* `crates/kafka`, `s3`, `azure`, `gcs`, and `pg-source` contain native backend and PostgreSQL snapshot/pgoutput implementations.
+Their source audits and credential-chain completion are ongoing.
+* `crates/node` contains passive node/session handles, database catalog generations, resource factories, active lifecycle supervision, native query/submission services, prepared SQL, and runtime catalog integration.
+* `crates/auth` contains native configured-user, root-password, and OIDC authenticators, asynchronous principal revalidation, and the pinned superuser gate.
 * `crates/conformance` compares supplied observations and rejects missing, duplicate, malformed, skipped, or incorrectly declared failure evidence.
 The source inventory and two mandatory control mappings are present; process runners and runtime reconciliation are not.
 
@@ -32,8 +37,9 @@ The local log driver requires cancellation followed by joining its run task; for
 Several scalar and row-building paths still allocate transient values before charging their retained size.
 These paths require further work before claiming bounded peak query memory.
 Prepared parameters with an unknown type require rebinding to execution types before batch evaluation.
-The future session layer must also reprepare when the captured database OID or schema changes.
-Requested per-partition system-time bounds still need a query-basis value separate from the captured snapshot's transaction identity.
+Prepared SQL rebinds against each execution context and checks PostgreSQL result signatures separately from dynamic Arrow schemas.
+Query bases now carry requested per-partition system-time caps separately from captured snapshot identities.
+Parser/IR transient allocation accounting remains incomplete.
 Timestamp/duration arithmetic, interval and duration text casts, and full temporal lexical compatibility remain incomplete.
 
 == Findings against the reference
@@ -82,14 +88,17 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |Trace |Current gap
 
 |Client read |No pgwire, Flight SQL, embedded service, or server composition root.
-|Data-dependent write |No transaction resolver connects the query snapshot to source/replica append and admitted apply.
-|Replica recovery |No partition driver, pending-block replay, or recovery assembly.
-|Compaction retry |No deterministic compaction worker or publication/retry path.
-|CDC restart |No PostgreSQL replication-slot adapter or durable checkpoint acknowledgement path.
-|Database shutdown |No node lifecycle or server-owned cancellation/join tree.
+|Data-dependent write |Native session → source codec → resolver and staged snapshot → replica append/read-back → admitted apply is written; independent source audit is ongoing.
+|Replica recovery |Native local/Kafka log readers, block recovery, term-fenced replay, and pending-block adoption are written; source audit is ongoing.
+|Compaction retry |Native deterministic selection, streaming merge, immutable file publication, and source-log publication are written; byte compatibility and retry execution remain pending.
+|CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; operational observer integration is ongoing.
+|Database shutdown |Node/database/term cancellation and joins are written; production server listeners and shutdown composition remain missing.
 |===
 
-Kafka, independent S3/Azure/GCS constructors, authentication, authorization, configuration, operational telemetry, packaging, the C ABI, and language-client integration remain outstanding.
+Configuration, operational telemetry, packaging, the C ABI, language-client integration, and complete protocol handlers remain outstanding.
+Kafka Connect ingestion, its configured converter/transform/indexer contracts, and node factory integration remain outstanding independently of the native Kafka log implementation.
+Authentication and backend source exist, with credential-chain and error/limit compatibility findings recorded in their crate documentation.
+Node tests cover actual engine paths but have not been executed.
 No release artifact or migration/rollback result exists.
 Phase 2 must not start until these paths and the remaining language/execution surfaces are implemented and the complete source trace review passes.
 

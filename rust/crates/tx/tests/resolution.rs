@@ -1,0 +1,121 @@
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use rtdb_columnar::MemoryBudget;
+use rtdb_format::data::StoredOperation;
+use rtdb_index::PartitionState;
+use rtdb_query::QueryOptions;
+use rtdb_storage::{MemoryStore, cache::BufferPool};
+use rtdb_tx::*;
+use rtdb_types::{Anomaly, Interval, Result, SourcePosition, TableRef, Timestamp, Value};
+use tokio_util::sync::CancellationToken;
+
+struct Denied;
+impl TransactionAuthorization for Denied {
+    fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
+}
+fn context() -> ResolveContext {
+    ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied) }
+}
+fn table() -> TableRef { TableRef::new("public", "docs") }
+fn document(value: i64) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
+fn request(ops: Vec<TxOp>, context: &ResolveContext) -> SourceTransaction { SourceTransaction::new(ops, SubmitOptions::default(), &context.memory).unwrap() }
+fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp::PutDocs { table: table(), documents: Documents::new(vec![document(value)], &context.memory).unwrap(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)) } }
+fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
+
+#[tokio::test]
+async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 1, 0, i64::MAX)], &context), &context).await.unwrap();
+    assert!(first.result().committed());
+    assert!(!state.value().snapshot().tables().contains(&table()));
+    let args = SqlArguments::from_rows(vec![vec![Value::I64(2)], vec![Value::I64(3)]], &context.memory).unwrap();
+    let second = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![TxOp::Sql { sql: "UPDATE docs SET v = v + ?".into(), args: Some(args) }], &context), &context).await.unwrap();
+    assert!(second.result().committed(), "{:?}", second.result());
+    let batch = second.writes().tables()[&table()].batch().unwrap();
+    let values: Vec<_> = (0..batch.len()).map(|row| match batch.view().read_event(row).unwrap().operation { StoredOperation::Put(document) => (document["v"].clone(), document["keep"].clone()), _ => panic!("Expected put") }).collect();
+    assert_eq!(values, [(Value::I64(3), Value::Utf8("retained".into())), (Value::I64(6), Value::Utf8("retained".into()))]);
+    assert_eq!(resolver.take_head().unwrap().result().tx_key(), first.result().tx_key());
+    state.apply(first.writes()).unwrap();
+    assert_eq!(resolver.resolving_snapshot(state.value().snapshot()).unwrap().tx_basis(), Some(second.result().tx_key()));
+}
+
+#[tokio::test]
+async fn indexer_cleans_up_aborted_transactions_2489_and_advances_the_clock() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let aborted = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 1, 0, i64::MAX), sql("ASSERT FALSE")], &context), &context).await.unwrap();
+    assert_eq!(aborted.result().error().unwrap().code, "xtdb/assert-failed");
+    assert_eq!(aborted.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(50), request(vec![], &context), &context).await.unwrap();
+    assert_eq!(next.result().tx_key().system_time, Timestamp(101));
+    let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(101)), ..Default::default() }, &context.memory).unwrap();
+    let invalid = resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(50), request, &context).await.unwrap();
+    assert_eq!(invalid.result().error().unwrap().code, "invalid-system-time");
+    assert_eq!(invalid.result().tx_key().system_time, Timestamp(102));
+}
+
+#[tokio::test]
+async fn patch_operator_3879_fills_both_gaps_and_preserves_null_rhs_fields() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 7, 10, 20)], &context), &context).await.unwrap();
+    let patch = TxOp::PatchDocs { table: table(), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::Null), ("added".into(), Value::Bool(true))])], &context.memory).unwrap(), valid_from: Some(Timestamp(0)), valid_to: Some(Timestamp(30)) };
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![patch], &context), &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result());
+    let batch = resolved.writes().tables()[&table()].batch().unwrap();
+    let mut events = (0..batch.len()).map(|row| batch.view().read_event(row).unwrap()).collect::<Vec<_>>();
+    events.sort_by_key(|event| event.valid_time.lower());
+    assert_eq!(events.iter().map(|event| event.valid_time).collect::<Vec<_>>(), [Interval::from_micros(0, 10).unwrap(), Interval::from_micros(10, 20).unwrap(), Interval::from_micros(20, 30).unwrap()]);
+    for (index, event) in events.iter().enumerate() {
+        let StoredOperation::Put(document) = &event.operation else { panic!("Expected patch put") };
+        assert_eq!(document["added"], Value::Bool(true));
+        assert_eq!(document["v"], if index == 1 { Value::I64(7) } else { Value::Null });
+    }
+}
+
+#[tokio::test]
+async fn staged_empty_create_table_visible_across_a_batch_5507() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let declared = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("CREATE TABLE empty_table (_id, v)")], &context), &context).await.unwrap();
+    assert!(declared.result().committed(), "{:?}", declared.result());
+    let empty = TableRef::new("public", "empty_table");
+    assert_eq!(declared.writes().tables()[&empty].row_count(), 0);
+    let next = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![sql("INSERT INTO untouched (_id, v) SELECT _id, v FROM empty_table")], &context), &context).await.unwrap();
+    assert!(next.result().committed(), "{:?}", next.result());
+    assert!(!next.writes().tables().contains_key(&TableRef::new("public", "untouched")));
+    let body = declared.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
+    let (decoded, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    assert_eq!(&result, declared.result());
+    assert_eq!(decoded.tables()[&empty].column_types(), declared.writes().tables()[&empty].column_types());
+}
+
+#[tokio::test]
+async fn explicit_empty_sql_batch_executes_zero_times_and_absent_arguments_abort() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let args = SqlArguments::new(vec![rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::I64)], vec![], &context.memory).unwrap();
+    let empty = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![TxOp::Sql { sql: "INSERT INTO docs (_id) VALUES (?)".into(), args: Some(args) }], &context), &context).await.unwrap();
+    assert!(empty.result().committed());
+    assert!(!empty.writes().tables().contains_key(&table()));
+    let missing = resolver.resolve_source(state.value().snapshot(), SourcePosition(1), Timestamp(101), request(vec![sql("INSERT INTO docs (_id) VALUES (?)")], &context), &context).await.unwrap();
+    assert_eq!(missing.result().error().unwrap().code, "xtdb.indexer/missing-sql-args");
+}
+
+#[tokio::test]
+async fn grant_and_revoke_require_explicit_authorization() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let denied = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("GRANT reader TO alice")], &context), &context).await.unwrap();
+    assert_eq!(denied.result().error().unwrap().category, rtdb_types::AnomalyCategory::Forbidden);
+    assert!(!denied.writes().tables().contains_key(&TableRef::new("xt", "role_membership")));
+}

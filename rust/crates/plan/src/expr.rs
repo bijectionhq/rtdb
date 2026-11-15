@@ -1,6 +1,6 @@
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ColumnId(pub u32);
@@ -18,6 +18,7 @@ pub enum BinaryOp {
 pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalType> {
     use ScalarType as S;
     let name = name.to_lowercase().replace('-', "_");
+    if name == "_patch" { return patch_type(arguments); }
     let numeric = || LogicalType::least_upper_bound(arguments).unwrap_or_else(|| LogicalType::join_all(arguments));
     let (ty, arity, nullable) = match name.as_str() {
         "lower" | "upper" => {
@@ -35,6 +36,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
             (LogicalType::join_all(&outputs), 1..=1, true)
         }
         "str" => (LogicalType::Scalar(S::Utf8), 1..=1, true),
+        "format_type" => (LogicalType::Scalar(S::Utf8), 2..=2, false),
         "trim" | "trim_leading" | "trim_trailing" => (LogicalType::Scalar(S::Utf8), 1..=2, true),
         "substring" | "substr" => (LogicalType::Scalar(S::Utf8), 2..=3, true),
         "replace" => (LogicalType::Scalar(S::Utf8), 3..=3, true),
@@ -74,6 +76,14 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
     if !arity.contains(&arguments.len()) {
         return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}: {}", arguments.len())));
     }
+    if name == "format_type" {
+        for (index, ty) in arguments.iter().enumerate() {
+            if ty.legs().iter().any(|leg| !matches!(leg, LogicalType::Null | LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64)) && !(index == 0 && *leg == LogicalType::Scalar(S::Oid))) {
+                return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "format_type requires an integer or OID and an integer modifier"));
+            }
+        }
+        return Ok(if arguments[0] == LogicalType::Null { LogicalType::Null } else if arguments[0].nullable() { ty.maybe() } else { ty });
+    }
     if name == "period" {
         let date_time = |ty: &LogicalType| matches!(ty, LogicalType::Scalar(S::DateDay | S::DateMilli | S::Timestamp { .. }));
         let type_name = |ty: &LogicalType| match ty {
@@ -98,6 +108,36 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         }
     }
     Ok(if nullable && arguments.iter().any(LogicalType::nullable) { ty.maybe() } else { ty })
+}
+
+fn patch_type(arguments: &[LogicalType]) -> Result<LogicalType> {
+    if arguments.len() != 2 {
+        return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for _patch: {}", arguments.len())));
+    }
+    let mut results = Vec::new();
+    for left in arguments[0].legs() {
+        for right in arguments[1].legs() {
+            let LogicalType::Struct(right) = right else {
+                return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "_patch requires a struct on the right"));
+            };
+            let mut fields = match &left {
+                LogicalType::Null => BTreeMap::new(),
+                LogicalType::Struct(fields) => fields.clone(),
+                _ => return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "_patch requires a struct or null on the left")),
+            };
+            for (name, right_type) in right {
+                let field_type = if right_type.nullable() {
+                    let mut legs = right_type.legs();
+                    legs.remove(&LogicalType::Null);
+                    legs.extend(fields.get(&name).unwrap_or(&LogicalType::Null).legs());
+                    LogicalType::from_legs(legs)
+                } else { right_type };
+                fields.insert(name, field_type);
+            }
+            results.push(LogicalType::Struct(fields));
+        }
+    }
+    Ok(LogicalType::join_all(&results))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

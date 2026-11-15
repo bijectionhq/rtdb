@@ -1,0 +1,117 @@
+= Native PostgreSQL source
+
+`rtdb-pg-source` imports an exported PostgreSQL snapshot and then consumes the slot's `pgoutput` stream through native Rust sockets.
+The source owns no JVM connection, subprocess, or background transport task.
+These sources and their test cases have not been compiled or executed.
+
+== Composition and ownership
+
+The node resolves `SourceConfig.remote` through its configured remote registry and constructs a `Remote` with the credentials and transport settings.
+Credentials remain in that registry and the active source's cloned `Remote`; they are absent from the durable source protobuf and from debug formatting.
+`SourceConfig::decode` consumes the persisted `PostgresSourceConfig` Any, including legacy configurations whose missing indexer selects `DirectMirror`.
+A custom configuration requires the caller to supply a native `PgIndexer` implementation.
+`SourceDriver::new` performs configuration validation without starting a connection.
+
+`Remote`, `SourceConfig`, `ResumeToken`, `Lsn`, `RowOperation`, and `PgTransaction` are passive values.
+`Connection`, `SnapshotReader`, `ChangeStream`, `Decoder`, and `ImportWriter` are passive resources or transients whose work completes on the caller's future.
+The decoder owns its relation cache and the transaction being assembled across protocol frames.
+Rows retain their allocation reservations through indexing, and the decoded operation type has no implicit clone operation.
+`ConfirmationState` owns one assignment's received, submitted, durable, and confirmed positions.
+`SourceDriver` owns the choice among upstream input, applied receipts, adopted-block updates, reconnect completion, status deadlines, and cancellation.
+Its status watch is a separate watch-channel monitor holding immutable `SourceStatus` observations.
+
+The node runs one source per leading term with its `TermHandle`, applied resume token, adopted-block watch, and cancellation token.
+The node cancels and joins that run before starting another assignment.
+Cancelling the run drops its owned socket, any partially read frame, exported snapshot connections, reconnect future, and apply receivers.
+The replication driver owns accepted transaction commands and their term-scoped completion handles.
+A custom indexer must keep its resources and work inside the supplied future so dropping an in-flight term releases them.
+
+== Snapshot and streaming
+
+The source checks that the publication exists before choosing a snapshot or resume path.
+An incomplete snapshot token is an ingestion fault because PostgreSQL's exported snapshot cannot survive the creating connection.
+A new source creates a failover-enabled logical slot with an exported snapshot, requiring PostgreSQL 17 or later.
+The slot connection stays open without another command while a second connection imports that snapshot in a repeatable-read transaction.
+Publication tables and table rows use bounded server cursors with pages of 1,000 rows.
+The source submits snapshot pages in order with an incomplete token and awaits the final complete-token transaction after all pages.
+The snapshot transaction is rolled back when the import finishes; cancelling the run closes both connections.
+
+Streaming uses protocol version 1 and the applied token's committed end LSN.
+Relation changes replace the decoder's relation descriptor; ignored tables are skipped before text conversion.
+A transaction accumulates inserts, updates, and deletes across frames and is submitted only at its Commit message.
+An unchanged TOAST value must have a text value at the same position in the old tuple.
+A missing or null old value fails ingestion with the table and column context.
+Empty or fully ignored transactions advance received progress without writing a target transaction.
+The reader rejects protocol tags that the pinned source does not support, including TRUNCATE.
+
+`DirectMirror` writes the upstream table name, requires an `_id` of a supported entity-ID type, and consumes TIMESTAMPTZ `_valid_from` and `_valid_to` columns.
+The upper valid-time column requires the lower column.
+Absent valid time begins at the resolving target transaction's system time; deletes use that default interval.
+The target resolver smooths the supplied upstream commit time according to its external-source transaction rules.
+
+`TermHandle::submit_external` fixes command order before returning an `ExternalReceipt`.
+The source advances its held LSN after accepted submission and retains at most its configured number of pending applies.
+It consumes apply results in submission order and records stream metrics at apply, so redelivery does not count an imported transaction twice.
+A target submission or apply failure ends the source instead of reopening the upstream connection.
+
+== Confirmation and reconnect
+
+The resume token is taken from admitted applied progress.
+The durable token is taken only from an adopted block catalog.
+When a durable token exists below the held LSN, that token bounds slot confirmation.
+When the durable token covers held progress, received WAL may advance confirmation across unrelated WAL.
+The pinned source also permits received progress when there is no durable block yet.
+Neither a connection reopen nor an incoming keepalive automatically advances the flush/apply positions sent to PostgreSQL.
+An explicit standby-status message is sent before the first stream read, at status deadlines, on requested keepalive replies, and when the confirmable bound advances.
+
+Only PostgreSQL connection and server errors enter the reconnect loop.
+The loop closes the failed socket, keeps the same slot, and reopens from the last submitted transaction's LSN.
+Redelivered commits at or below that position are skipped.
+Retries use capped exponential delay with downward jitter; a presented transaction or a sufficiently long quiet connection resets the failure count.
+Pending apply failures and block updates remain observable while a reconnect is waiting.
+Cancellation ends the reconnect future, including an attempt to open the connection.
+
+== Wire and value compatibility
+
+The connection supports cleartext password, MD5, and SCRAM-SHA-256 authentication, with server-signature verification for SCRAM.
+It supports PostgreSQL SSL negotiation, native TLS, the simple query protocol, server cursors, and CopyBoth replication.
+Its incremental frame reader retains partial header/body progress across cancelled read futures and reserves a configured maximum frame before payload allocation.
+The transport does not configure automatic WAL flush acknowledgement.
+
+Text decoding follows `PgType.readText` together with the object writer's `ValueTypes.asVectorType`.
+That distinction controls decimal precision 32/64, nanosecond local times, microsecond durations and timestamps, timezone names, and interval variants.
+Unknown upstream OIDs remain strings; a known type without a text reader remains an error.
+JSON integer literals retain their digits before choosing a long, decimal, or double.
+Common JSON-LD and Transit scalar/container tags use native values; imported exception/form values retain Transit bytes.
+The shared `rtdb-types::PgType` registry identifies the pinned OID set.
+
+Protocol references are https://www.postgresql.org/docs/17/protocol-replication.html[PostgreSQL replication], https://www.postgresql.org/docs/17/protocol-logicalrep-message-formats.html[pgoutput messages], and https://www.postgresql.org/docs/17/protocol-message-formats.html[frontend/backend framing].
+Authentication uses https://docs.rs/postgres-protocol/0.6.12/postgres_protocol/authentication/index.html[postgres-protocol 0.6.12].
+TLS uses https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/[tokio-rustls 0.26.6] and https://docs.rs/webpki-roots/1.0.12/webpki_roots/[webpki-roots 1.0.12].
+Replication command literals follow https://github.com/postgres/postgres/blob/REL_17_STABLE/src/backend/replication/repl_scanner.l[the replication scanner], whose quoting differs from SQL escape strings.
+
+== Source regression coverage
+
+`tests/semantics.rs` records the durable/apply distinction, caught-up WAL gap, first-block exception, resume-before-durable case, token compatibility, retry backoff, scalar/array decoding, end-LSN commits, old-tuple TOAST recovery, ignored tables, and reservation lifetime.
+The cases map to `PostgresSourceIntegrationTest`, `PostgresSourceToastTest`, `PostgresSourceTypesPropertyTest`, and `ReconnectPolicyTest`.
+The frame-reader tests cover cancellation after a partial header and partial body, and rejection before allocating an oversized frame.
+`src/integration.rs` contains explicit PostgreSQL 17+ tests for exported snapshot consistency, concurrent changes, full TOAST, native CopyBoth resume/delete, and the complete source→replica apply→block adoption→WAL confirmation path.
+Those tests require an operator-provided logical-replication PostgreSQL server and `RTDB_PG_HOST`, `RTDB_PG_PORT`, `RTDB_PG_DATABASE`, `RTDB_PG_USER`, and `RTDB_PG_PASSWORD`.
+They are marked ignored until that external test environment is deliberately selected; none has been run during Phase 1.
+
+== Compatibility qualifications
+
+The `pgsrc.allium` questions about keepalives ahead of undelivered commits and recovery without a durable extent remain open.
+The native source preserves the pinned received-position and no-block rules; it does not claim those upstream assumptions have been proved.
+The native default prefers TLS and verifies certificates/hostnames whenever TLS is negotiated, with plaintext used only when the server declines TLS.
+That differs from permissive JDBC TLS defaults and is recorded as an explicit spec question.
+Callers can require TLS, disable it explicitly, or provide a custom rustls trust configuration.
+Unsigned LSN ordering preserves PostgreSQL's 64-bit position domain; the pinned JVM uses signed longs, so the upper half of that domain remains a theoretical compatibility distinction.
+
+The status monitor exposes connection phase, applied event/commit counts, latest commit time/lag, and received/held/confirmed LSNs.
+A passive `SourceObserver` samples WAL lag through a caller-owned SQL query only while assigned; the assignment cancellation token ends in-flight sampling when the source exits.
+The observer retains its own credential configuration until the node releases it.
+A Micrometer-compatible transport or metrics exporter is a node adapter obligation.
+The broad Java-specific JSON-LD/Transit object families require fixture qualification; source values without an Arrow document representation fail explicitly.
+Frame/row/relation reservations precede decoding, but TLS/authentication internals, remote configuration allocations, and all nested JSON/Transit amplification still need a complete retained-allocation audit.
+Native protocol integration, failover, authentication, permission, reconnect fault injection, simulation/property parity, and source-level performance remain unexecuted Phase 2 work.

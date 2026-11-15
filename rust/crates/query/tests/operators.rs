@@ -15,6 +15,23 @@ fn query_context(options: QueryOptions) -> Arc<QueryContext> {
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(100), "UTC", options, &CancellationToken::new()).unwrap()
 }
+
+#[tokio::test]
+async fn patch_operator_fills_leading_internal_and_trailing_gaps_across_output_batches() {
+    let instant = scalar(ScalarType::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+    let timestamp = |value| Value::Timestamp { value, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+    let document = Value::Struct(BTreeMap::from([("v".into(), Value::I64(7))]));
+    let fields = vec![field(0, "_iid", scalar(ScalarType::FixedSizeBinary(16))), field(1, "_valid_from", instant.clone()), field(2, "_valid_to", instant.clone().maybe()), field(3, "doc", document.logical_type())];
+    let rows = [(1, 10, 20), (1, 30, 40), (2, 0, 50)].into_iter().map(|(iid, from, to)| vec![Value::FixedSizeBinary(vec![iid; 16]), timestamp(from), timestamp(to), document.clone()].into_iter().map(Expr::Literal).collect()).collect();
+    let input = Arc::new(Relation::new(Schema::new(fields.clone()).unwrap(), RelationNode::Values { rows }).unwrap());
+    let mut output = fields;
+    output[3].data_type = output[3].data_type.clone().maybe();
+    let relation = Arc::new(Relation::new(Schema::new(output).unwrap(), RelationNode::PatchGaps { input, iid: ColumnId(0), valid_from: ColumnId(1), valid_to: ColumnId(2), document: ColumnId(3), from: Expr::Literal(timestamp(0)), to: Expr::Literal(timestamp(50)) }).unwrap());
+    let rows = collect(relation, query_context(QueryOptions { batch_rows: 1, ..Default::default() })).await.unwrap();
+    let intervals = rows.iter().map(|row| (rtdb_expr::timestamp_micros(&row[1], "UTC").unwrap().0, rtdb_expr::timestamp_micros(&row[2], "UTC").unwrap().0)).collect::<Vec<_>>();
+    assert_eq!(intervals, [(0, 10), (10, 20), (20, 30), (30, 40), (40, 50), (0, 50)]);
+    assert_eq!(rows.iter().map(|row| row[3].clone()).collect::<Vec<_>>(), [Value::Null, document.clone(), Value::Null, document.clone(), Value::Null, document]);
+}
 fn values(id: u32, name: &str, ty: LogicalType, rows: Vec<Value>) -> Arc<Relation> {
     Arc::new(Relation::new(Schema::new(vec![field(id, name, ty)]).unwrap(), RelationNode::Values { rows: rows.into_iter().map(|value| vec![Expr::Literal(value)]).collect() }).unwrap())
 }

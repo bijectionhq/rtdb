@@ -1,0 +1,42 @@
+= Kafka log adapter
+
+`KafkaLog` is a passive append/read capability.
+`KafkaLogDriver` is the active owner of producer submission, callback polling, and shutdown.
+Capacity semaphores and per-append completion channels are monitors shared with callers.
+`KafkaTail` is a passive cursor with caller-controlled polling and an explicitly assigned partition.
+The native client owns transport threads; no Rust producer task is detached.
+The owner runs the returned driver and cancels and joins it before releasing writable-log resources.
+Read-only opening returns no producer or driver.
+
+`enqueue` returns after the native producer accepts the record and fixes its submission order.
+The receipt completes after the delivery callback reports the broker acknowledgement.
+`acks=all` is mandatory.
+Disabling idempotence also limits outstanding broker requests to one so retries cannot reorder appends.
+This last override is stricter than the JVM producer configuration, which leaves that property overridable.
+An error after submission can leave an unknown broker outcome; replication reconciles its term and sequence through read-back.
+The supplied local timestamp is unused, as in the JVM Kafka transport; Kafka record timestamps have millisecond precision.
+
+Each log requires one partition.
+Topic creation uses one replica and `LogAppendTime` timestamps.
+Existing replicated topics report weak minimum-ISR or unclean-election configuration through the required observer.
+Denied configuration inspection is advisory.
+Automatic consumer metadata requests cannot create topics.
+The source and replica topic names and storage epoch use the existing protobuf schema.
+
+Configuration properties merge bootstrap servers, the property map, then the ISO-8859-1 Java properties file.
+The documented PLAIN JAAS configuration and SCRAM username/password configuration translate to native SASL properties.
+Other login modules and Java client extensions require an explicit native adapter and return an error.
+Native TLS and SASL properties pass through to librdkafka.
+The schema registry URL is retained for source configuration; the log transports envelope bytes without a registry lookup.
+
+Fresh broker watermarks determine the durable tip.
+Retention, withdrawn observed offsets, unexpected gaps, tombstones, and fetch timeout before a known tip return errors.
+Empty polling means the cursor reached the observed tip.
+The transport does not open Kafka transactions; externally written transaction/control records that introduce offset gaps are rejected.
+Poll batches and range reads have explicit limits; a range exceeding its limits fails instead of truncating silently.
+Native prefetch and decompression allocations still require qualification against the process-wide memory contract.
+
+Source references are `modules/kafka/src/main/kotlin/xtdb/api/log/KafkaCluster.kt`, `KafkaClusterTest.kt`, `KafkaLogFactoryTest.kt`, `KafkaDurabilityTest.kt`, and `allium/log-processor-lifecycle.allium`.
+The Rust test sources cover configuration precedence, JAAS credentials, acknowledgements, topic partition validation, read-back, read-only handles, and cancellation while admission is backpressured.
+They have not been compiled or executed during Phase 1.
+Real broker failover, retained-range truncation, authentication, and native shutdown qualification remain required before backend compatibility can be claimed.

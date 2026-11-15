@@ -14,7 +14,9 @@ use crate::{invalid, QueryContext};
 pub(crate) fn build(relation: Arc<Relation>, execution: Execution) -> Result<BoxCursor> {
     Ok(match relation.node() {
         RelationNode::Values { .. } => Box::new(Values { relation, execution, row: 0 }),
-        RelationNode::Scan(scan) => Box::new(crate::scan::ScanCursor::new(scan.clone(), execution)?),
+        RelationNode::Scan(scan) => if crate::system_schema::definition(&scan.table.name.table).is_some() {
+            Box::new(crate::system::SystemCursor::new(scan.clone(), execution))
+        } else { Box::new(crate::scan::ScanCursor::new(scan.clone(), execution)?) },
         RelationNode::Project { input, expressions } => Box::new(Project { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), expressions: expressions.clone(), execution }),
         RelationNode::Filter { input, predicate } => Box::new(Filter { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), predicate: predicate.clone(), execution }),
         RelationNode::Limit { input, offset, fetch } => {
@@ -36,6 +38,7 @@ pub(crate) fn build(relation: Arc<Relation>, execution: Execution) -> Result<Box
         }
         RelationNode::Unnest { input, expr, ordinality, outer, .. } => Box::new(Unnest { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), expr: expr.clone(), ordinality: ordinality.is_some(), outer: *outer, current: None, elements: None, index: 0, execution }),
         RelationNode::Apply { input, dependent, arguments, kind, .. } => Box::new(Apply { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), dependent: Arc::clone(dependent), arguments: arguments.clone(), kind: *kind, execution, current: None, cursor: None, matched: false }),
+        RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => Box::new(crate::patch::PatchGaps::new(build(Arc::clone(input), execution.clone())?, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution)?),
     })
 }
 

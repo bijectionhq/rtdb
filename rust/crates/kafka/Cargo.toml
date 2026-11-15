@@ -1,0 +1,24 @@
+[package]
+name = "rtdb-kafka"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtdb-storage.workspace = true
+rtdb-types.workspace = true
+rtdb-format.workspace = true
+rdkafka = { version = "=0.38.0", features = ["cmake-build", "tokio", "ssl-vendored", "sasl"] }
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

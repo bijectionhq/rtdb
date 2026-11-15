@@ -4,14 +4,17 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 use std::sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}};
 
-struct Budget {
+pub struct CacheBudget {
     limit: usize,
     retained: AtomicUsize,
 }
 
-struct Reservation { budget: Arc<Budget>, bytes: usize }
+struct Reservation { budget: Arc<CacheBudget>, bytes: usize }
 
-impl Budget {
+impl CacheBudget {
+    pub fn new(limit: usize) -> Arc<Self> { Arc::new(Self { limit, retained: AtomicUsize::new(0) }) }
+    pub fn retained_bytes(&self) -> usize { self.retained.load(Ordering::Acquire) }
+    pub fn limit_bytes(&self) -> usize { self.limit }
     fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Reservation> {
         self.retained.fetch_update(Ordering::AcqRel, Ordering::Acquire, |retained| {
             retained.checked_add(bytes).filter(|total| *total <= self.limit)
@@ -57,20 +60,26 @@ struct CacheEntry {
 pub struct BufferPool {
     store: Arc<dyn ObjectStore>,
     entries: Mutex<BTreeMap<ObjectKey, Arc<CacheEntry>>>,
-    budget: Arc<Budget>,
+    budget: Arc<CacheBudget>,
     access_clock: AtomicU64,
 }
 
 impl BufferPool {
     pub fn new(store: Arc<dyn ObjectStore>, byte_limit: usize) -> Self {
+        Self::with_budget(store, CacheBudget::new(byte_limit))
+    }
+
+    /// Shares an allocation ceiling across pools; each pool evicts only its own idle entries.
+    pub fn with_budget(store: Arc<dyn ObjectStore>, budget: Arc<CacheBudget>) -> Self {
         Self {
             store, entries: Mutex::new(BTreeMap::new()),
-            budget: Arc::new(Budget { limit: byte_limit, retained: AtomicUsize::new(0) }),
+            budget,
             access_clock: AtomicU64::new(0),
         }
     }
 
     pub fn retained_bytes(&self) -> usize { self.budget.retained.load(Ordering::Acquire) }
+    pub fn object_store(&self) -> &Arc<dyn ObjectStore> { &self.store }
 
     /// An evicted object remains charged while a caller retains any slice of its lease.
     pub fn evict(&self, key: &ObjectKey) -> bool {

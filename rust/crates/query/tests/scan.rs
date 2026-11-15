@@ -196,3 +196,46 @@ async fn changing_union_schema_requires_repreparation_and_old_snapshot_remains_v
     let mut old_cursor = prepared.execute(old, vec![]).unwrap();
     assert!(old_cursor.next_batch().await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn independent_query_cap_keeps_the_captured_live_generation_and_durable_identity() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let mut second = tx(&state, &budget, 1, 200);
+    second.put(table(), document(1, Value::I64(2)), Interval::ALL).unwrap();
+    state.apply(&second.stage().unwrap()).unwrap();
+    let current = state.value().snapshot();
+    let capped = current.clone().with_system_time_cap(Some(Timestamp(100))).unwrap();
+    assert_eq!(capped.tx_basis(), current.tx_basis());
+    persist(&state, &store).await;
+    let context = query_context(capped, Arc::clone(&store), false);
+    assert_eq!(collect(scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap(), vec![vec![Value::I64(1)]]);
+    let context = query_context(current.clone().with_system_time_cap(None).unwrap(), Arc::clone(&store), false);
+    assert!(collect(scan(&context, &["v"], TemporalFilter::All, TemporalFilter::All, None), context).await.unwrap().is_empty());
+    assert!(current.with_system_time_cap(Some(Timestamp(201))).is_err());
+}
+
+#[tokio::test]
+async fn each_partition_uses_its_own_read_basis() {
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut partitions = Vec::new();
+    for id in [1, 2] {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        for (tx_id, system, value) in [(0, 100, 1), (1, 200, 2)] {
+            let mut write = tx(&state, &budget, tx_id, system);
+            write.put(table(), document(id, Value::I64(value)), Interval::ALL).unwrap();
+            state.apply(&write.stage().unwrap()).unwrap();
+        }
+        partitions.push(state.value().snapshot().with_system_time_cap(Some(Timestamp(if id == 1 { 100 } else { 200 }))).unwrap());
+    }
+    let database = DatabaseSnapshot { partitions, storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    let context = QueryContext::new(catalog, Arc::clone(&budget), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+    let rows = collect(scan(&context, &["_id", "v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap();
+    assert_eq!(rows, vec![vec![Value::I64(1), Value::I64(1)], vec![Value::I64(2), Value::I64(2)]]);
+}

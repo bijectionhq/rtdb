@@ -1,0 +1,30 @@
+[package]
+name = "rtdb-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rtdb-types.workspace = true
+rtdb-columnar.workspace = true
+rtdb-node.workspace = true
+rtdb-plan.workspace = true
+rtdb-tx.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+subtle = "2.6.1"
+zeroize = "1.8"
+argon2 = "=0.5.3"
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+bcrypt = "=0.19.3"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "form", "json"] }
+tokio.workspace = true
+tokio-util.workspace = true
+url.workspace = true
+
+[lints]
+workspace = true

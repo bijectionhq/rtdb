@@ -51,3 +51,52 @@ fn impossible_fixed_width_products_fail_before_allocation() {
     }
     assert!(estimate_builder_bytes(&logical.maybe(), &[Value::Null]).is_err());
 }
+
+#[test]
+fn selected_cell_read_bound_ignores_unselected_variable_payloads_and_union_legs() {
+    use rtdb_columnar::{estimate_read_value_bytes, read_value};
+    let values = vec![Value::Utf8("small".into()), Value::Binary(vec![7; 1 << 20])];
+    let ty = values[0].logical_type().join(&values[1].logical_type());
+    let field = to_field("value", &ty).unwrap();
+    let array = build_array(&ty, &values).unwrap();
+    let small = estimate_read_value_bytes(&field, array.as_ref(), 0).unwrap();
+    let large = estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap();
+    assert!(small < 100_000);
+    assert!(large >= 1 << 20);
+    assert!(small >= read_value(&field, array.as_ref(), 0).unwrap().retained_bytes().unwrap());
+    let slice = array.slice(1, 1);
+    assert_eq!(estimate_read_value_bytes(&field, slice.as_ref(), 0).unwrap(), large);
+}
+
+#[test]
+fn selected_nested_and_run_end_cells_fit_the_read_bound() {
+    use rtdb_columnar::{estimate_read_value_bytes, read_value};
+    let values = vec![
+        Value::Struct(BTreeMap::from([("list".into(), Value::List(vec![Value::Utf8("abc".into()), Value::Null])), ("map".into(), Value::Map { entries: vec![(Value::Utf8("key".into()), Value::Binary(vec![1; 8192]))], sorted: false })])),
+        Value::Struct(BTreeMap::from([("list".into(), Value::List(vec![])), ("map".into(), Value::Map { entries: vec![], sorted: false })])),
+    ];
+    let ty = values[0].logical_type().join(&values[1].logical_type());
+    for ty in [ty.clone(), LogicalType::RunEndEncoded { width: RunEndWidth::I16, value: Box::new(ty) }] {
+        let field = to_field("value", &ty).unwrap();
+        let array = build_array(&ty, &values).unwrap();
+        for row in 0..2 {
+            let bound = estimate_read_value_bytes(&field, array.as_ref(), row).unwrap();
+            assert!(bound >= read_value(&field, array.as_ref(), row).unwrap().retained_bytes().unwrap());
+        }
+        let slice = array.slice(1, 1);
+        assert_eq!(estimate_read_value_bytes(&field, slice.as_ref(), 0).unwrap(), estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap());
+    }
+}
+
+#[test]
+fn selected_list_bound_uses_its_offsets_and_rejects_unknown_extensions() {
+    use rtdb_columnar::estimate_read_value_bytes;
+    let ty = LogicalType::list(LogicalType::Scalar(ScalarType::Binary));
+    let field = to_field("value", &ty).unwrap();
+    let array = build_array(&ty, &[Value::List(vec![Value::Binary(vec![1; 1 << 20])]), Value::List(vec![Value::Binary(vec![2])])]).unwrap();
+    assert!(estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap() < 100_000);
+    let slice = array.slice(1, 1);
+    assert_eq!(estimate_read_value_bytes(&field, slice.as_ref(), 0).unwrap(), estimate_read_value_bytes(&field, array.as_ref(), 1).unwrap());
+    let field = field.with_metadata(std::collections::HashMap::from([(rtdb_columnar::EXTENSION_NAME_KEY.into(), "unknown/extension".into())]));
+    assert_eq!(estimate_read_value_bytes(&field, array.as_ref(), 0).unwrap_err().code, "rtdb/unknown-arrow-extension");
+}

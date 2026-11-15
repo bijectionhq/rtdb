@@ -1,5 +1,5 @@
 use crate::{EvalContext, cast, compare, null_eq, sql_eq};
-use crate::cast::zone;
+use crate::timezone::zone;
 use crate::compare::nullish;
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
 use chrono::{DateTime, Timelike};
@@ -15,6 +15,24 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     let name = name.to_lowercase().replace('-', "_");
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
     match name.as_str() {
+        "format_type" => {
+            if nullish(&args[0]) { return Ok(Value::Null); }
+            let oid = match &args[0] { Value::Oid(oid) => *oid, value => i32::try_from(integer(value).ok_or_else(|| inapplicable("format_type", &[value]))?).map_err(|_| overflow())? };
+            let modifier = if nullish(&args[1]) { -1 } else { i32::try_from(integer(&args[1]).ok_or_else(|| inapplicable("format_type", &[&args[1]]))?).map_err(|_| overflow())? };
+            return Ok(Value::Utf8(rtdb_types::PgType::format_oid(oid, modifier)));
+        }
+        "_patch" => {
+            let Value::Struct(right) = &args[1] else { return Err(inapplicable("_patch", &[&args[0], &args[1]])); };
+            let mut fields = match &args[0] {
+                Value::Struct(left) => left.clone(),
+                Value::Null | Value::Undefined => std::collections::BTreeMap::new(),
+                _ => return Err(inapplicable("_patch", &[&args[0], &args[1]])),
+            };
+            for (name, value) in right {
+                if !nullish(value) || !fields.contains_key(name) { fields.insert(name.clone(), value.clone()); }
+            }
+            return Ok(Value::Struct(fields));
+        }
         "coalesce" => return Ok(args.iter().find(|value| !nullish(value)).cloned().unwrap_or(Value::Null)),
         "nullif" => return Ok(if sql_eq(&args[0], &args[1])? == Some(true) { Value::Null } else { args[0].clone() }),
         "nil?" | "is_null" => return Ok(Value::Bool(nullish(&args[0]))),

@@ -38,11 +38,11 @@ pub struct LocalLogDriver {
 
 struct Writer { file: File, path: Arc<PathBuf> }
 
-fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
+pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
 }
 
-fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
+pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogRecord> {
     let offset = file.stream_position().map_err(|error| Error::io(path, error))?;
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
     let mut header = [0; HEADER_BYTES as usize];

@@ -1,4 +1,5 @@
-use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::fs::File;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -31,9 +32,15 @@ impl ArrowFile {
 
     pub fn from_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>) -> Result<Self> {
         let mut reader: Box<dyn RetainedReader> = Box::new(reader);
-        let encoded_page_sizes = inspect_file(reader.as_mut())?.page_encoded_bytes;
+        let layout = inspect_file(reader.as_mut())?;
+        Self::from_inspected_reader(reader, projection, layout)
+    }
+
+    /// The layout must describe this immutable reader, as returned by `inspect_file`.
+    pub fn from_inspected_reader(reader: impl Read + Seek + Send + 'static, projection: Option<Vec<usize>>, layout: FileLayout) -> Result<Self> {
+        let mut reader: Box<dyn RetainedReader> = Box::new(reader);
         reader.seek(SeekFrom::Start(0)).map_err(invalid)?;
-        Ok(Self { reader: FileReader::try_new(reader, projection).map_err(invalid)?, encoded_page_sizes })
+        Ok(Self { reader: FileReader::try_new(reader, projection).map_err(invalid)?, encoded_page_sizes: layout.page_encoded_bytes })
     }
 
     pub fn schema(&self) -> SchemaRef { self.reader.schema() }
@@ -55,6 +62,11 @@ impl ArrowFile {
 }
 
 pub fn inspect_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<FileLayout> {
+    inspect_file_reserved(reader, |_| Ok(()))
+}
+
+/// Acquires a caller-owned guard before each footer or message allocation and retains it while those bytes are inspected.
+pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut reserve: impl FnMut(usize) -> Result<G>) -> Result<FileLayout> {
     let end = reader.seek(SeekFrom::End(0)).map_err(invalid)?;
     if end < 10 { return Err(invalid("Arrow file is shorter than its footer")); }
     reader.seek(SeekFrom::End(-10)).map_err(invalid)?;
@@ -62,6 +74,7 @@ pub fn inspect_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<FileLayou
     reader.read_exact(&mut tail).map_err(invalid)?;
     let footer_length = arrow_ipc::reader::read_footer_length(tail).map_err(invalid)?;
     let footer_start = end.checked_sub(10 + footer_length as u64).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
+    let _footer = reserve(footer_length.checked_mul(2).and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Arrow inspection allocation overflow"))?)?;
     reader.seek(SeekFrom::Start(footer_start)).map_err(invalid)?;
     let mut bytes = Vec::new();
     bytes.try_reserve_exact(footer_length).map_err(invalid)?;
@@ -78,7 +91,9 @@ pub fn inspect_file<R: Read + Seek + ?Sized>(reader: &mut R) -> Result<FileLayou
         let offset = u64::try_from(block.offset()).map_err(invalid)?;
         let block_size = size(block)?;
         if offset.checked_add(block_size as u64).is_none_or(|end| end > footer_start) { return Err(invalid("Arrow block exceeds data region")); }
-        let mut metadata = vec![0; usize::try_from(block.metaDataLength()).map_err(invalid)?];
+        let metadata_length = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+        let _message = reserve(metadata_length)?;
+        let mut metadata = vec![0; metadata_length];
         reader.seek(SeekFrom::Start(offset)).map_err(invalid)?;
         reader.read_exact(&mut metadata).map_err(invalid)?;
         let prefix = if metadata.starts_with(&[0xff; 4]) { 8 } else { 4 };
@@ -132,6 +147,80 @@ pub fn write_file(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+pub struct ArrowFileWriter { writer: FileWriter<LimitedFile> }
+
+struct LimitedFile { file: File, position: u64, limit: u64 }
+
+impl Write for LimitedFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.position.checked_add(bytes.len() as u64).is_none_or(|position| position > self.limit) {
+            return Err(std::io::Error::other("Arrow output byte limit exceeded"));
+        }
+        let count = self.file.write(bytes)?;
+        self.position += count as u64;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.file.flush() }
+}
+
+impl ArrowFileWriter {
+    /// The file must be empty and positioned at offset zero.
+    pub fn new(file: File, schema: &Schema) -> Result<Self> {
+        Self::new_bounded(file, schema, u64::MAX)
+    }
+
+    /// Rejects a write before the file would exceed `byte_limit`, including its footer.
+    pub fn new_bounded(mut file: File, schema: &Schema, byte_limit: u64) -> Result<Self> {
+        if file.metadata().map_err(invalid)?.len() != 0 || file.stream_position().map_err(invalid)? != 0 { return Err(invalid("Arrow output file must be empty and positioned at zero")); }
+        Ok(Self { writer: FileWriter::try_new_with_options(LimitedFile { file, position: 0, limit: byte_limit }, schema, write_options()?).map_err(invalid)? })
+    }
+
+    pub fn bytes_written(&mut self) -> u64 { self.writer.get_mut().position }
+
+    /// The owner may lower the remaining allowance between writes; already-written bytes must still fit.
+    pub fn set_byte_limit(&mut self, byte_limit: u64) -> Result<()> {
+        let sink = self.writer.get_mut();
+        if sink.position > byte_limit { return Err(invalid("Arrow output already exceeds the requested byte limit")); }
+        sink.limit = byte_limit;
+        Ok(())
+    }
+
+    pub fn write(&mut self, page: &RecordBatch) -> Result<()> { self.writer.write(page).map_err(invalid) }
+
+    /// Finishes the JVM-compatible end marker and returns the caller-owned file at its end.
+    pub fn finish(mut self) -> Result<File> {
+        self.writer.finish().map_err(invalid)?;
+        let mut file = self.writer.into_inner().map_err(invalid)?.file;
+        let end = file.seek(SeekFrom::End(0)).map_err(invalid)?;
+        file.seek(SeekFrom::End(-10)).map_err(invalid)?;
+        let mut tail = [0; 10];
+        file.read_exact(&mut tail).map_err(invalid)?;
+        let length = arrow_ipc::reader::read_footer_length(tail).map_err(invalid)? as u64;
+        let footer_start = end.checked_sub(length + 10).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
+        let marker = footer_start.checked_sub(8).ok_or_else(|| invalid("Arrow file has no end marker"))?;
+        file.seek(SeekFrom::Start(marker)).map_err(invalid)?;
+        let mut expected = [0; 8];
+        file.read_exact(&mut expected).map_err(invalid)?;
+        if expected != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
+        file.seek(SeekFrom::Start(marker)).map_err(invalid)?;
+        file.write_all(&[0; 4]).map_err(invalid)?;
+        let mut buffer = [0; 8192];
+        let mut position = footer_start;
+        while position < end {
+            let count = usize::try_from((end - position).min(buffer.len() as u64)).map_err(invalid)?;
+            file.seek(SeekFrom::Start(position)).map_err(invalid)?;
+            file.read_exact(&mut buffer[..count]).map_err(invalid)?;
+            file.seek(SeekFrom::Start(position - 4)).map_err(invalid)?;
+            file.write_all(&buffer[..count]).map_err(invalid)?;
+            position += count as u64;
+        }
+        file.set_len(end - 4).map_err(invalid)?;
+        file.seek(SeekFrom::End(0)).map_err(invalid)?;
+        file.flush().map_err(invalid)?;
+        Ok(file)
+    }
+}
+
 pub fn write_stream(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut writer = StreamWriter::try_new_with_options(Vec::new(), schema, write_options()?).map_err(invalid)?;
     for page in pages { writer.write(page).map_err(invalid)?; }
@@ -140,6 +229,33 @@ pub fn write_stream(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
     let end = bytes.len();
     jvm_end_marker(&mut bytes, end)?;
     Ok(bytes)
+}
+
+/// Writes pages without buffering the complete stream; the sink owns and enforces its allocation bound.
+pub fn write_stream_to<'a, W: Write>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, sink: W) -> Result<W> {
+    let mut writer = StreamWriter::try_new_with_options(TailWriter { inner: sink, pending: Vec::with_capacity(8) }, schema, write_options()?).map_err(invalid)?;
+    for page in pages { writer.write(page).map_err(invalid)?; }
+    writer.finish().map_err(invalid)?;
+    let mut sink = writer.into_inner().map_err(invalid)?;
+    if sink.pending.as_slice() != [0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0] { return Err(invalid("Arrow writer produced an unexpected end marker")); }
+    sink.inner.write_all(&[0; 4]).map_err(invalid)?;
+    sink.inner.flush().map_err(invalid)?;
+    Ok(sink.inner)
+}
+
+struct TailWriter<W> { inner: W, pending: Vec<u8> }
+
+impl<W: Write> Write for TailWriter<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.pending.len().saturating_add(bytes.len()).saturating_sub(8);
+        let old = count.min(self.pending.len());
+        self.inner.write_all(&self.pending[..old])?;
+        self.pending.drain(..old);
+        self.inner.write_all(&bytes[..count - old])?;
+        self.pending.extend_from_slice(&bytes[count - old..]);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { self.inner.flush() }
 }
 
 pub fn read_schema_message(bytes: &[u8]) -> Result<Schema> {
