@@ -8,15 +8,130 @@ use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, disk_cache::DiskCache};
 use rtdb_types::Result;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/io.rs"]
+mod io;
+
 struct Remote;
 #[async_trait]
 impl RemoteStorageFactory for Remote {
-    async fn open(&self, configuration: &Any, root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+    async fn open(&self, configuration: &Any, root: &ObjectKey, _: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         assert!(!root.as_str().is_empty());
         let store = Arc::new(MemoryStore::default());
         store.put(&ObjectKey::new("same")?, configuration.value.clone().into()).await?;
         Ok(store)
     }
+}
+
+struct ScopedLocalRemote {
+    root: std::path::PathBuf,
+    opened: tokio::sync::mpsc::UnboundedSender<Arc<rtdb_storage::LocalStore>>,
+}
+
+#[async_trait]
+impl RemoteStorageFactory for ScopedLocalRemote {
+    async fn open(&self, configuration: &Any, root: &ObjectKey, io: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        let name = ObjectKey::new(String::from_utf8(configuration.value.clone()).unwrap())?;
+        let store = Arc::new(rtdb_storage::LocalStore::open_in(self.root.join(name.as_str()).join(root.as_str()), io)?);
+        self.opened.send(Arc::clone(&store)).unwrap();
+        Ok(store)
+    }
+}
+
+#[tokio::test]
+async fn reused_provider_factory_receives_a_distinct_region_for_each_node() {
+    let provider_directory = tempfile::tempdir().unwrap();
+    let first_cache = tempfile::tempdir().unwrap();
+    let second_cache = tempfile::tempdir().unwrap();
+    let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+    let provider = Arc::new(ScopedLocalRemote { root: provider_directory.path().to_owned(), opened });
+    let first = NativeResources::default().with_disk_cache(DiskCache::open(first_cache.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
+        .register_storage("test.Remote", provider.clone()).unwrap();
+    let second = NativeResources::default().with_disk_cache(DiskCache::open(second_cache.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
+        .register_storage("test.Remote", provider).unwrap();
+    let first_database = first.open("xtdb", &configuration(b"first"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+    let first_store = stores.recv().await.unwrap();
+    let second_database = second.open("xtdb", &configuration(b"second"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+    let second_store = stores.recv().await.unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    first_store.put(&key, vec![1].into()).await.unwrap();
+    second_store.put(&key, vec![2].into()).await.unwrap();
+    drop(first_database);
+    first.close().await.unwrap();
+    assert!(matches!(first_store.get(&key).await, Err(rtdb_storage::Error::Closed(_))));
+    assert_eq!(second_store.get(&key).await.unwrap().as_ref(), &[2]);
+    drop(second_database);
+    second.close().await.unwrap();
+    assert!(matches!(second_store.get(&key).await, Err(rtdb_storage::Error::Closed(_))));
+}
+
+#[tokio::test]
+async fn database_region_closure_rejects_cached_and_remote_reads_without_closing_siblings() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let provider_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+        let native = NativeResources::default()
+            .with_disk_cache(DiskCache::open(cache_directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
+            .register_storage("test.Remote", Arc::new(ScopedLocalRemote { root: provider_directory.path().to_owned(), opened })).unwrap();
+        let first = native.open("first", &configuration(b"first"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+        let first_store = stores.recv().await.unwrap();
+        let second = native.open("second", &configuration(b"second"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+        let second_store = stores.recv().await.unwrap();
+        assert!(!Arc::ptr_eq(&first.io, &second.io));
+        let key = ObjectKey::new("object").unwrap();
+        first_store.put(&key, vec![1].into()).await.unwrap();
+        second_store.put(&key, vec![2].into()).await.unwrap();
+        assert_eq!(first.store.get(&key).await.unwrap().as_ref(), &[1]);
+        first.io.close_and_wait().await;
+        assert!(matches!(first.store.get(&key).await, Err(rtdb_storage::Error::Closed(_))));
+        assert!(matches!(first_store.get(&key).await, Err(rtdb_storage::Error::Closed(_))));
+        assert_eq!(second.store.get(&key).await.unwrap().as_ref(), &[2]);
+        native.close().await.unwrap();
+        assert!(matches!(second_store.get(&key).await, Err(rtdb_storage::Error::Closed(_))));
+    }).await.unwrap();
+}
+
+struct FailingRemote {
+    root: std::path::PathBuf,
+    opened: tokio::sync::mpsc::UnboundedSender<(Arc<dyn ObjectStore>, std::sync::mpsc::Sender<()>)>,
+}
+#[async_trait]
+impl RemoteStorageFactory for FailingRemote {
+    async fn open(&self, configuration: &Any, root: &ObjectKey, io: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        let name = ObjectKey::new(String::from_utf8(configuration.value.clone()).unwrap())?;
+        let store: Arc<dyn ObjectStore> = Arc::new(rtdb_storage::LocalStore::open_in(self.root.join(name.as_str()).join(root.as_str()), io)?);
+        if configuration.value.as_slice() == b"fail" {
+            let release = io::hold_cancelled_local_read(&store).await;
+            self.opened.send((store, release)).unwrap();
+            return Err(rtdb_types::Anomaly::fault("test/provider-open", "Injected provider opening failure"));
+        }
+        Ok(store)
+    }
+}
+
+#[tokio::test]
+async fn provider_open_failure_drains_only_the_partial_database_region() {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let provider_directory = tempfile::tempdir().unwrap();
+        let cache_directory = tempfile::tempdir().unwrap();
+        let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+        let native = Arc::new(NativeResources::default()
+            .with_disk_cache(DiskCache::open(cache_directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
+            .register_storage("test.Remote", Arc::new(FailingRemote { root: provider_directory.path().to_owned(), opened })).unwrap());
+        let sibling = native.open("sibling", &configuration(b"sibling"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+        let factory = Arc::clone(&native);
+        let opening = tokio::spawn(async move { factory.open("failed", &configuration(b"fail"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await });
+        let (store, release) = stores.recv().await.unwrap();
+        let key = ObjectKey::new("probe").unwrap();
+        while !matches!(store.head(&key).await, Err(rtdb_storage::Error::Closed(_))) { tokio::task::yield_now().await; }
+        assert!(!opening.is_finished());
+        sibling.store.put(&key, vec![3].into()).await.unwrap();
+        assert_eq!(sibling.store.get(&key).await.unwrap().as_ref(), &[3]);
+        release.send(()).unwrap();
+        let error = match opening.await.unwrap() { Err(error) => error, Ok(_) => panic!("provider opening succeeded") };
+        assert_eq!(error.code, "test/provider-open");
+        native.close().await.unwrap();
+    }).await.unwrap();
 }
 fn configuration(value: &[u8]) -> DatabaseConfig {
     DatabaseConfig { storage: Some(database_config::Storage::RemoteStorage(RemoteStorage {

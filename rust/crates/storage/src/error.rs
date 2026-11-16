@@ -32,6 +32,10 @@ pub enum Error {
     Task(String),
     #[error("remote storage at {key}: {message}")]
     Remote { key: String, message: String },
+    #[error("remote storage permission denied at {key}: {message}")]
+    PermissionDenied { key: String, message: String },
+    #[error("{upload}; multipart abort also failed: {abort}")]
+    MultipartAbort { #[source] upload: Box<Error>, abort: Box<Error> },
 }
 
 impl Error {
@@ -49,6 +53,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::MissingObject(key) => (Category::NotFound, "rtdb.storage/missing-object", serde_json::json!({"key": key})),
             Error::InvalidRange { key, start, end, length } => (Category::Incorrect, "rtdb.storage/invalid-range", serde_json::json!({"key": key, "start": start, "end": end, "length": length})),
             Error::ConflictingObject(key) => (Category::Conflict, "rtdb.storage/immutable-object-conflict", serde_json::json!({"key": key})),
+            Error::Io { path, source } if source.kind() == std::io::ErrorKind::PermissionDenied => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"path": path})),
             Error::Io { path, .. } => (Category::Unavailable, "rtdb.storage/io", serde_json::json!({"path": path})),
             Error::CorruptLog { path, offset, .. } => (Category::Fault, "rtdb.storage/corrupt-log", serde_json::json!({"path": path, "offset": offset})),
             Error::UnavailableLogRange { requested, first_retained } => (Category::Unavailable, "rtdb.storage/log-range-unavailable", serde_json::json!({"requested": requested, "first-retained": first_retained})),
@@ -59,9 +64,47 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::MemoryLimit { requested, limit, retained } => (Category::Busy, "rtdb.storage/memory-limit", serde_json::json!({"requested": requested, "limit": limit, "retained": retained})),
             Error::Task(_) => (Category::Fault, "rtdb.storage/task", serde_json::json!({})),
             Error::Remote { key, .. } => (Category::Unavailable, "rtdb.storage/remote", serde_json::json!({"key": key})),
+            Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
+            Error::MultipartAbort { upload, abort } => {
+                let mut anomaly = Anomaly::from(*upload);
+                anomaly.message = message;
+                anomaly.context.insert("multipart-abort".into(), serde_json::json!(Anomaly::from(*abort)));
+                return anomaly;
+            }
         };
         let mut anomaly = Anomaly::new(category, code, message);
         if let serde_json::Value::Object(context) = context { anomaly.context.extend(context); }
         anomaly
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_permission_denials_preserve_the_path_and_typed_category() {
+        let path = PathBuf::from("/isolated/meta/trie.arrow");
+        let anomaly = rtdb_types::Anomaly::from(Error::io(&path, std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected access policy")));
+        assert_eq!(anomaly.category, rtdb_types::AnomalyCategory::Forbidden);
+        assert_eq!(anomaly.code, "rtdb.storage/permission-denied");
+        assert_eq!(anomaly.context["path"], serde_json::json!(path));
+        let generic = rtdb_types::Anomaly::from(Error::io("/isolated/other", std::io::Error::other("PermissionDenied")));
+        assert_eq!(generic.category, rtdb_types::AnomalyCategory::Unavailable);
+        assert_eq!(generic.code, "rtdb.storage/io");
+    }
+
+    #[test]
+    fn failed_abort_preserves_the_upload_classification_and_both_diagnostics() {
+        let anomaly = rtdb_types::Anomaly::from(Error::MultipartAbort {
+            upload: Box::new(Error::PermissionDenied { key: "meta/trie.arrow".into(), message: "upload denied".into() }),
+            abort: Box::new(Error::Remote { key: "meta/trie.arrow".into(), message: "abort unavailable".into() }),
+        });
+        assert_eq!(anomaly.category, rtdb_types::AnomalyCategory::Forbidden);
+        assert_eq!(anomaly.code, "rtdb.storage/permission-denied");
+        assert_eq!(anomaly.context["key"], "meta/trie.arrow");
+        assert_eq!(anomaly.context["multipart-abort"]["code"], "rtdb.storage/remote");
+        assert!(anomaly.message.contains("upload denied"));
+        assert!(anomaly.message.contains("abort unavailable"));
     }
 }

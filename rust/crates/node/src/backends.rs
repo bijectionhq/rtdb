@@ -9,7 +9,7 @@ use prost_types::Any;
 #[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
 use rtdb_types::{Anomaly, Result};
 #[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
-use rtdb_storage::{ObjectKey, ObjectStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore};
 #[cfg(any(feature = "s3", feature = "azure", feature = "gcs"))]
 use crate::RemoteStorageFactory;
 use crate::NativeResources;
@@ -40,9 +40,9 @@ struct S3Factory { remotes: Arc<dyn rtdb_s3::S3CredentialResolver> }
 #[cfg(feature = "s3")]
 #[async_trait]
 impl RemoteStorageFactory for S3Factory {
-    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let wire = rtdb_format::generated::xtdb::aws::proto::S3ObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
-        rtdb_s3::S3Config::from_proto(&wire).open(storage_root, self.remotes.as_ref()).await
+        rtdb_s3::S3Config::from_proto(&wire).open(storage_root, self.remotes.as_ref(), io).await
     }
 }
 
@@ -51,9 +51,9 @@ struct AzureFactory { remotes: Arc<dyn rtdb_azure::AzureCredentialResolver> }
 #[cfg(feature = "azure")]
 #[async_trait]
 impl RemoteStorageFactory for AzureFactory {
-    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let wire = rtdb_format::generated::xtdb::azure::proto::AzureBlobStorageConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
-        rtdb_azure::AzureConfig::from_proto(&wire).open(storage_root, self.remotes.as_ref()).await
+        rtdb_azure::AzureConfig::from_proto(&wire).open(storage_root, self.remotes.as_ref(), io).await
     }
 }
 
@@ -62,9 +62,9 @@ struct GcsFactory;
 #[cfg(feature = "gcs")]
 #[async_trait]
 impl RemoteStorageFactory for GcsFactory {
-    async fn open(&self, configuration: &Any, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+    async fn open(&self, configuration: &Any, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         let wire = rtdb_format::generated::xtdb::gcp::proto::GcsObjectStoreConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
-        rtdb_gcs::GcsConfig::from_proto(&wire).open(storage_root).await
+        rtdb_gcs::GcsConfig::from_proto(&wire).open(storage_root, io).await
     }
 }
 

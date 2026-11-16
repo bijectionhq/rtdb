@@ -1,4 +1,4 @@
-use crate::{Error, ObjectKey, ObjectStore, Result, StoredObject};
+use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::TryStreamExt;
@@ -6,24 +6,90 @@ use object_store::{ObjectStore as ProviderStore, ObjectStoreExt, PutMode, PutOpt
 use std::{ops::Range, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-pub struct RemoteStore {
-    client: Arc<dyn ProviderStore>,
-    prefix: Option<ObjectKey>,
-}
+#[derive(Clone)]
+pub struct RemoteStore { objects: Arc<RemoteObjects>, io: Arc<IoRegion> }
 
 impl RemoteStore {
-    /// The prefix scopes all keys to one configured database partition and storage generation.
-    pub fn new(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>) -> Self { Self { client, prefix } }
+    /// Opens an independent I/O region; the owner calls `close_and_wait` before runtime shutdown.
+    /// The prefix scopes keys to one configured database partition and storage generation.
+    pub fn new(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>) -> Self {
+        Self::new_in(client, prefix, IoRegion::new())
+    }
+
+    /// Uses the owner's I/O region, which must be closed and joined after all store consumers finish.
+    /// Every admitted operation remains owned through caller cancellation, including publication cleanup.
+    pub fn new_in(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>, io: Arc<IoRegion>) -> Self {
+        Self { objects: Arc::new(RemoteObjects { client, prefix }), io }
+    }
+
+    /// Rejects new requests and waits for admitted operations, including requests whose callers were cancelled.
+    /// This closes the complete shared region when the store was opened with `new_in`.
+    pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
     /// Copies between explicit roots backed by the same provider client.
     /// Distinct client instances are rejected before I/O, even when they name the same bucket.
     /// The provider must support conditional copy; existing destinations are accepted only when their bytes match.
-    /// Missing sources return MissingObject and different destination bytes return ConflictingObject.
+    /// Missing sources return MissingObject, different destination bytes return ConflictingObject, and a closed region returns Closed.
+    /// Provider authorization failures return PermissionDenied; a panicking provider task returns Task.
     /// Incompatible clients, unsupported copy operations and provider failures return Remote; a failed request may have published the destination.
+    /// Both regions retain admitted work until provider completion, even if the caller cancels.
     pub async fn copy_to(&self, source: &ObjectKey, destination: &RemoteStore, key: &ObjectKey) -> Result<()> {
-        if !Arc::ptr_eq(&self.client, &destination.client) {
+        if !Arc::ptr_eq(&self.objects.client, &destination.objects.client) {
             return Err(Error::Remote { key: key.to_string(), message: "object copy requires a shared provider client".into() });
         }
+        let admission = self.io.admit()?.and(destination.io.admit()?);
+        let (objects, destination_objects, source, key) = (Arc::clone(&self.objects), Arc::clone(&destination.objects), source.clone(), key.clone());
+        IoRegion::run_async_admitted(admission, async move { objects.copy_to(&source, &destination_objects, &key).await }).await
+    }
+}
+
+#[async_trait]
+impl ObjectStore for RemoteStore {
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.head(&key).await }).await
+    }
+    async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.get(&key).await }).await
+    }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.get_range(&key, range).await }).await
+    }
+    async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        reservation.check_range(&range)?;
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { reservation.finish(objects.get_range(&key, range).await?) }).await
+    }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.put(&key, bytes).await }).await
+    }
+    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
+        let admission = self.io.admit()?;
+        let input = std::fs::File::open(source).map_err(|error| Error::io(source, error))?;
+        let (objects, key, source) = (Arc::clone(&self.objects), key.clone(), source.to_owned());
+        IoRegion::run_async_admitted(admission, async move { objects.put_opened_file(&key, tokio::fs::File::from_std(input), &source).await }).await
+    }
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { self.copy_to(source, self, destination).await }
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
+        let (objects, directory) = (Arc::clone(&self.objects), directory.cloned());
+        self.io.run_async(async move { objects.list(directory.as_ref()).await }).await
+    }
+    async fn delete(&self, key: &ObjectKey) -> Result<()> {
+        let (objects, key) = (Arc::clone(&self.objects), key.clone());
+        self.io.run_async(async move { objects.delete(&key).await }).await
+    }
+}
+
+struct RemoteObjects {
+    client: Arc<dyn ProviderStore>,
+    prefix: Option<ObjectKey>,
+}
+
+impl RemoteObjects {
+    async fn copy_to(&self, source: &ObjectKey, destination: &RemoteObjects, key: &ObjectKey) -> Result<()> {
         match self.client.copy_if_not_exists(&self.path(source), &destination.path(key)).await {
             Ok(()) => Ok(()),
             Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
@@ -39,7 +105,8 @@ impl RemoteStore {
                 }
                 Ok(())
             }
-            Err(error) => Err(provider_error(source, error)),
+            Err(error @ object_store::Error::NotFound { .. }) => Err(provider_error(source, error)),
+            Err(error) => Err(provider_error(key, error)),
         }
     }
 
@@ -76,12 +143,12 @@ impl RemoteStore {
 fn provider_error(key: &ObjectKey, error: object_store::Error) -> Error {
     match error {
         object_store::Error::NotFound { .. } => Error::MissingObject(key.to_string()),
+        error @ object_store::Error::PermissionDenied { .. } => Error::PermissionDenied { key: key.to_string(), message: error.to_string() },
         error => Error::Remote { key: key.to_string(), message: error.to_string() },
     }
 }
 
-#[async_trait]
-impl ObjectStore for RemoteStore {
+impl RemoteObjects {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let metadata = self.client.head(&self.path(key)).await.map_err(|error| provider_error(key, error))?;
         Ok(StoredObject { key: key.clone(), size: metadata.size })
@@ -116,8 +183,7 @@ impl ObjectStore for RemoteStore {
         }
     }
 
-    async fn put_file(&self, key: &ObjectKey, source: &std::path::Path) -> Result<()> {
-        let mut input = tokio::fs::File::open(source).await.map_err(|error| Error::io(source, error))?;
+    async fn put_opened_file(&self, key: &ObjectKey, mut input: tokio::fs::File, source: &std::path::Path) -> Result<()> {
         let length = input.metadata().await.map_err(|error| Error::io(source, error))?.len();
         match self.head(key).await {
             Ok(_) => return self.compare_file(key, &mut input, source, length).await,
@@ -142,7 +208,7 @@ impl ObjectStore for RemoteStore {
         }.await;
         if let Err(error) = uploaded {
             if let Err(cleanup) = upload.abort().await {
-                return Err(Error::Remote { key: key.to_string(), message: format!("{error}; multipart abort also failed: {cleanup}") });
+                return Err(Error::MultipartAbort { upload: Box::new(error), abort: Box::new(provider_error(key, cleanup)) });
             }
             return Err(error);
         }
@@ -155,16 +221,16 @@ impl ObjectStore for RemoteStore {
         published.and(cleanup)
     }
 
-    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
-        self.copy_to(source, self, destination).await
-    }
-
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
         let path = directory.map(|key| self.path(key)).or_else(|| self.prefix.as_ref().map(|key| Path::from(key.as_str())));
         let mut stream = self.client.list(path.as_ref());
         let mut result = Vec::new();
-        while let Some(metadata) = stream.try_next().await.map_err(|error| Error::Remote {
-            key: path.as_ref().map(ToString::to_string).unwrap_or_default(), message: error.to_string(),
+        while let Some(metadata) = stream.try_next().await.map_err(|error| {
+            let key = directory.map(ToString::to_string).unwrap_or_default();
+            match error {
+                error @ object_store::Error::PermissionDenied { .. } => Error::PermissionDenied { key, message: error.to_string() },
+                error => Error::Remote { key, message: error.to_string() },
+            }
         })? {
             if self.prefix.as_ref().is_some_and(|prefix| !metadata.location.as_ref().starts_with(&format!("{prefix}/"))) {
                 continue;
@@ -188,5 +254,35 @@ impl ObjectStore for RemoteStore {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(error) => Err(provider_error(key, error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_permission_denial_retains_the_requested_object_identity() {
+        let key = ObjectKey::new("tables/foo/meta/l01-rc-b00.arrow").unwrap();
+        let error = object_store::Error::PermissionDenied {
+            path: "configured-prefix/tables/foo/meta/l01-rc-b00.arrow".into(),
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected provider denial")),
+        };
+        let error = provider_error(&key, error);
+        assert!(matches!(&error, Error::PermissionDenied { key: actual, .. } if actual == key.as_str()));
+        let anomaly = rtdb_types::Anomaly::from(error);
+        assert_eq!(anomaly.category, rtdb_types::AnomalyCategory::Forbidden);
+        assert_eq!(anomaly.code, "rtdb.storage/permission-denied");
+        assert_eq!(anomaly.context["key"], key.as_str());
+        assert!(anomaly.message.contains("injected provider denial"));
+    }
+
+    #[test]
+    fn permission_words_in_generic_provider_errors_are_not_denials() {
+        let key = ObjectKey::new("object").unwrap();
+        let error = object_store::Error::Generic {
+            store: "test", source: Box::new(std::io::Error::other("403 AccessDenied PermissionDenied")),
+        };
+        assert!(matches!(provider_error(&key, error), Error::Remote { .. }));
     }
 }

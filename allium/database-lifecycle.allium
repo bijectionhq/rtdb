@@ -269,6 +269,7 @@ rule RemoveRefusedWhileTearingDown {
 
 rule TeardownCompletesRemoval {
     -- The record goes only once the database has released its resources.
+    -- Completion includes every admitted I/O operation, including operations whose callers have stopped waiting.
     -- Until then it occupies its name, which is what stops a re-admission racing its own teardown.
     when: TeardownCompleted(entry)
     requires: entry.lifecycle = detaching

@@ -4,7 +4,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use parking_lot::Mutex;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use tokio_util::{sync::CancellationToken, task::TaskTrackerToken};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
 
@@ -74,7 +74,7 @@ impl DiskCache {
         cache.trim(None);
         Ok(cache)
     }
-    fn begin_operation(&self) -> Result<TaskTrackerToken> {
+    fn begin_operation(&self) -> Result<crate::io_region::IoAdmission> {
         self.operations.admit()
     }
     /// Rejects new cache work, cancels downloads, and joins all admitted work, including blocking reads whose callers were cancelled.
@@ -180,13 +180,23 @@ impl DiskCache {
         Ok(lease)
     }
     pub fn scope(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
-        Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote }))
+        self.scope_in(namespace, remote, Arc::clone(&self.operations))
+    }
+    /// Gates this store's requests with `io`, including cache hits and retained blocking work.
+    /// Its owner closes and joins that region after consumers finish; other cache scopes remain usable.
+    /// The remote capability must retain any offloaded provider work in the same region.
+    pub fn scope_in(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote, io }))
     }
 
     /// Caches a completed immutable upload; the caller keeps `source` unchanged until this returns.
     /// The source file remains at its original path.
     pub async fn put_file(self: &Arc<Self>, key: &ObjectKey, source: &Path) -> Result<()> {
+        self.put_file_admitted(key, source, None).await
+    }
+    async fn put_file_admitted(self: &Arc<Self>, key: &ObjectKey, source: &Path, scope: Option<crate::io_region::IoAdmission>) -> Result<()> {
         let operation = self.begin_operation()?;
+        let operation = match scope { Some(scope) => operation.and(scope), None => operation };
         let lease = DiskLease { cache: Arc::clone(self), entry: self.entry(key)? };
         let guard = self.cancellation.run_until_cancelled(Arc::clone(&lease.entry.loading).lock_owned()).await.ok_or_else(cache_closed)?;
         if lease.entry.file.get().is_some() { return Ok(()); }
@@ -224,7 +234,7 @@ fn idle(entry: &Arc<Entry>, releasing: Option<&Arc<Entry>>) -> bool {
 }
 fn cache_closed() -> Error { Error::Closed("disk cache is closed".into()) }
 
-struct DiskCachedStore { cache: Arc<DiskCache>, namespace: ObjectKey, remote: Arc<dyn ObjectStore> }
+struct DiskCachedStore { cache: Arc<DiskCache>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>, io: Arc<IoRegion> }
 struct OwnedRead(RetainedBytes);
 impl AsRef<[u8]> for OwnedRead { fn as_ref(&self) -> &[u8] { self.0.as_slice() } }
 impl DiskCachedStore {
@@ -233,6 +243,7 @@ impl DiskCachedStore {
 #[async_trait]
 impl ObjectStore for DiskCachedStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let _scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
         match self.cache.cached_size(&self.key(key)?) { Some(size) => Ok(StoredObject { key: key.clone(), size }), None => self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)? }
     }
@@ -245,12 +256,14 @@ impl ObjectStore for DiskCachedStore {
         self.get_reserved_range(key, range, reservation).await.map(|bytes| Bytes::from_owner(OwnedRead(bytes)))
     }
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let scope = self.io.admit()?;
         let cache_key = self.key(key)?;
         let lease = self.cache.get(&cache_key, self.remote.as_ref(), key).await?;
         if range.end.checked_sub(range.start) != Some(reservation.length() as u64) || range.end > lease.size() {
             return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: lease.size() });
         }
-        self.cache.operations.run(move || {
+        let operation = self.cache.begin_operation()?.and(scope);
+        IoRegion::run_admitted(operation, move || {
             let lease = lease;
             let mut file = File::open(lease.path()).map_err(|error| Error::io(lease.path(), error))?;
             file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(lease.path(), error))?;
@@ -259,13 +272,14 @@ impl ObjectStore for DiskCachedStore {
             reservation.finish(Bytes::from(bytes))
         }).await
     }
-    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        let scope = self.io.admit()?;
         let _operation = self.cache.begin_operation()?;
         self.remote.put_file(key, source).await?;
-        self.cache.put_file(&self.key(key)?, source).await
+        self.cache.put_file_admitted(&self.key(key)?, source, Some(scope)).await
     }
-    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
-    async fn delete(&self, key: &ObjectKey) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.delete(key).await }
-    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
+    async fn delete(&self, key: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.delete(key).await }
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _scope = self.io.admit()?; let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }
 }

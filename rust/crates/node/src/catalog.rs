@@ -105,34 +105,48 @@ impl DatabaseCatalog {
         *value = Arc::new(next);
         Ok(())
     }
-    pub(crate) fn begin_detach(&self, name: &str) -> Result<()> {
+    pub(crate) fn begin_detach(&self, name: &str) -> Result<Option<Arc<Database>>> {
         self.check_detach(name)?;
         let mut value = self.value.write();
         let mut next = value.as_ref().clone();
-        let cancel = match next.entries.remove(name) {
-            Some(Entry::Open { database, driver: DriverLifetime::Running }) => {
+        let (cancel, drain) = match next.entries.remove(name) {
+            Some(Entry::Open { database, driver }) => {
                 next.entries.insert(name.into(), Entry::Detaching(Arc::clone(&database)));
-                Some(database)
+                (Some(database), matches!(driver, DriverLifetime::Joined))
             }
-            Some(Entry::Open { driver: DriverLifetime::Joined, .. } | Entry::Skipped(_)) => None,
+            Some(Entry::Skipped(_)) => (None, false),
             _ => return Err(no_database(name)),
         };
         *value = Arc::new(next);
         drop(value);
-        if let Some(database) = cancel { database.cancel(); }
-        Ok(())
+        if let Some(database) = &cancel { database.cancel(); }
+        Ok(if drain { cancel } else { None })
     }
-    pub(crate) fn driver_finished(&self, database: &Arc<Database>) {
+    pub(crate) fn driver_finished(&self, database: &Arc<Database>) -> bool {
         let mut value = self.value.write();
         let mut next = value.as_ref().clone();
         match next.entries.get(database.name()) {
-            Some(Entry::Detaching(detaching)) if Arc::ptr_eq(detaching, database) => { next.entries.remove(database.name()); }
+            Some(Entry::Detaching(detaching)) if Arc::ptr_eq(detaching, database) => return true,
             Some(Entry::Open { database: open, .. }) if Arc::ptr_eq(open, database) => {
                 next.entries.insert(database.name().into(), Entry::Open { database: Arc::clone(database), driver: DriverLifetime::Joined });
             }
-            _ => return,
+            _ => return false,
         }
         *value = Arc::new(next);
+        false
+    }
+    pub(crate) fn teardown_finished(&self, database: &Arc<Database>) {
+        let mut value = self.value.write();
+        if !matches!(value.entries.get(database.name()), Some(Entry::Detaching(detaching)) if Arc::ptr_eq(detaching, database)) { return; }
+        let mut next = value.as_ref().clone();
+        next.entries.remove(database.name());
+        *value = Arc::new(next);
+    }
+    pub(crate) fn held_databases(&self) -> Vec<Arc<Database>> {
+        self.value.read().entries.values().filter_map(|entry| match entry {
+            Entry::Open { database, .. } | Entry::Detaching(database) => Some(Arc::clone(database)),
+            Entry::Skipped(_) => None,
+        }).collect()
     }
     pub(crate) fn cancel_all(&self) {
         for entry in self.value.read().entries.values() {

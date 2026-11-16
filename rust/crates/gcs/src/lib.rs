@@ -3,7 +3,7 @@ mod credential;
 use std::sync::Arc;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use rtdb_format::generated::xtdb::gcp::proto::GcsObjectStoreConfig;
-use rtdb_storage::{ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -25,7 +25,8 @@ impl GcsConfig {
 
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.
     /// Application Default Credentials refresh during requests and retain their quota-project headers.
-    pub async fn open(&self, storage_root: &ObjectKey) -> Result<Arc<dyn ObjectStore>> {
+    /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
+    pub async fn open(&self, storage_root: &ObjectKey, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         if self.project_id.is_empty() || self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.gcp/invalid-config", "GCS requires a project ID and bucket")); }
         let prefix = self.object_prefix(storage_root)?;
         let credentials = google_cloud_auth::credentials::Builder::default().with_scopes(["https://www.googleapis.com/auth/devstorage.full_control"]).build()
@@ -34,7 +35,7 @@ impl GcsConfig {
         let client = GoogleCloudStorageBuilder::new().with_bucket_name(&self.bucket).with_skip_signature(false)
             .with_credentials(Arc::new(bridge.clone())).with_http_connector(bridge).build()
             .map_err(|error| Anomaly::incorrect("xtdb.gcp/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new(Arc::new(client), Some(prefix))))
+        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }
 
     pub fn to_proto(&self) -> GcsObjectStoreConfig {

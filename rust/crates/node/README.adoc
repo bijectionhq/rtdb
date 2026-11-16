@@ -6,10 +6,10 @@ The failed-transaction marker stores only the state needed to reject subsequent 
 Borrowed parameter iteration lets protocol adapters reserve before copying response settings.
 
 `Node` is a passive shared handle over a catalog, resource factories, runtime catalog providers, and cancellation.
-`NodeDriver` is the active owner of catalog commands and database task completion.
-`DatabaseCatalog` publishes immutable membership generations; its owner removes a detaching database from lookup before cancellation and releases its name after the driver joins.
-A database whose driver has already failed remains a member until an explicit detach, which can immediately release the joined name.
-`Database` is passive and retains partition snapshots, logs, storage, progress, and maintenance handles.
+`NodeDriver` is the active owner of catalog commands, database worker completion, and database I/O drain completion.
+`DatabaseCatalog` publishes immutable membership generations; its owner removes a detaching database from lookup before cancellation and releases its name after its workers join and admitted I/O drains.
+A database whose driver has already failed remains a queryable member until an explicit detach, which closes and drains its I/O region before releasing the name.
+`Database` is passive and retains partition snapshots, logs, storage, progress, maintenance handles, and its I/O region.
 `DatabaseDriver` supervises the active replica, maintenance, and log drivers, cancels and joins consumers before stopping log owners, and reports ingestion failure without terminating unrelated databases.
 `MaintenanceSupervisor` owns each leader term's GC and external-source region and joins it before assigning the next term.
 It retains one passive `ExternalSource` for the database lifetime and asks it for a fresh assignment driver after each previous term has joined.
@@ -19,7 +19,12 @@ The passive `LogAccess` value distinguishes read-only logs, a writable source wi
 An eligible leader opens both writers; a writable follower opens only the source writer, allowing compaction publication without replica-writer ownership.
 Source owners are created only on nodes eligible to lead.
 The node owns its resource region and calls `ResourceFactory::close` after database drivers join or an ordinary startup failure.
-Native resource closure cancels cache downloads and waits for cache and local-store I/O regions, including work whose I/O caller was cancelled.
+Native resource closure cancels cache downloads and waits for cache, local-store and remote-provider I/O regions, including work whose I/O caller was cancelled.
+Each database receives a fresh child I/O region shared by its local stores, local-log read offloads, remote provider operations, and scoped cache work.
+The node parent tracks each admitted operation; idle child handles do not delay its drain.
+Remote provider factories receive the database child when opening a store; closing it leaves sibling databases available.
+Ordinary resource-opening failures drop partial owners and drain the child before returning.
+Cancellation of an in-progress attach leaves its admitted operations in the node parent's final drain.
 Custom resource-factory wrappers must forward closure to their wrapped factory.
 Each native resource factory belongs to one node lifetime; a later node opens a new factory and I/O region while immutable provider configuration and clocks may be shared.
 Remote storage requires a shared `DiskCache`, with file keys scoped by database and partition.
@@ -80,6 +85,7 @@ HTTP serving and metrics export are separate operational adapters still requirin
 
 The session tests preserve state observations from `InProcessAdbcTest`, `ConnectionTest`, and `tx.allium`.
 Native node tests cover data-dependent SQL writes, historical reads, asynchronous await tokens, local recovery, retained batches, skipped membership, and detach ordering around running or failed drivers.
+The I/O lifecycle regressions hold canceled reads through detach, partial-opening failure and node shutdown, check storage reads after worker failure, and keep sibling cache/provider scopes usable.
 These are test sources and contain no execution evidence.
 SQL transaction-option execution, Flight handles, protocol entry points, and production server assembly remain incomplete.
 Time-zone validation shares expression conversion's named-zone and Java fixed-offset parser.
