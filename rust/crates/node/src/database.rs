@@ -97,14 +97,16 @@ impl DatabaseFactory {
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
         let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
-        let resources = self.resources.open(&name, &configuration, access, log_cancellation.clone()).await?;
+        let resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let opened = async {
             let storage = Arc::new(BufferPool::with_budget(Arc::clone(&resources.store), Arc::clone(&self.cache)));
-            let logs = PartitionLogs::new(resources.logs.source, resources.logs.replica, resources.logs.source_epoch, resources.logs.replica_epoch,
-                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
-            let recovered = blocks.recover(self.options.trie, logs.source_floor()?, self.clock.now()).await?;
+            let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now()).await?;
+            let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;
+            let logs = PartitionLogs::new(opened_logs.source, opened_logs.replica, opened_logs.source_epoch, opened_logs.replica_epoch,
+                resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
+            let recovered = recovered.with_source_floor(logs.source_floor()?);
             let secondaries = recovered.block.as_ref().map(|block| block.secondary_databases().clone()).unwrap_or_default();
             let partition = Arc::clone(&recovered.partition);
             let progress = ProgressMonitor::new(recovered.progress.clone());
@@ -128,7 +130,7 @@ impl DatabaseFactory {
             let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source };
             let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, cancellation: cancellation.clone(), io: Arc::clone(&io) });
-            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: resources.logs.drivers, log_cancellation };
+            let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: opened_logs.drivers, log_cancellation };
             Ok(OpenedDatabase { database, driver, secondaries })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }

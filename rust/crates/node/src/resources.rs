@@ -37,6 +37,14 @@ pub struct DatabaseResources {
     pub io: Arc<IoRegion>,
 }
 
+pub struct DatabaseStorage {
+    pub store: Arc<dyn ObjectStore>,
+    pub storage_epoch: StorageEpoch,
+    pub storage_version: StorageVersion,
+    /// The caller drains this region if later database assembly fails.
+    pub io: Arc<IoRegion>,
+}
+
 #[async_trait]
 pub trait LogFactory: Send + Sync {
     /// Opens distinct source and replica logs without spawning their drivers.
@@ -54,9 +62,23 @@ pub trait RemoteStorageFactory: Send + Sync {
 #[async_trait]
 pub trait ResourceFactory: Send + Sync {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()>;
+    /// Opens a fresh database storage region without opening logs; partial failures drain that region.
+    /// The region's operations also belong to this factory's node region, which retains them after caller cancellation.
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage>;
+    /// Opens unstarted log owners within the caller's opened storage region.
+    /// Storage must come from this factory's `open_storage` for the same name and configuration.
+    /// An error drops partial log owners; the caller must then drain the storage region.
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs>;
     /// No driver may run before this returns; an error releases partial owners and drains their admitted I/O.
-    /// Each successful open returns a fresh database region; its operations also belong to this factory's node region.
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken) -> Result<DatabaseResources>;
+    /// This convenience operation opens storage and logs without recovering persisted database state between them.
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken) -> Result<DatabaseResources> {
+        let storage = self.open_storage(name, configuration).await?;
+        let logs = match self.open_logs(name, configuration, access, log_cancellation, &storage).await {
+            Ok(logs) => logs,
+            Err(error) => { storage.io.close_and_wait().await; return Err(error); }
+        };
+        Ok(DatabaseResources { logs, store: storage.store, storage_epoch: storage.storage_epoch, storage_version: storage.storage_version, io: storage.io })
+    }
     /// The node calls this after its database workers join, or after an ordinary open failure.
     /// Closes this node's resource region and joins work retained beyond a cancelled I/O caller.
     /// Wrappers around another resource factory must forward this call.
@@ -165,25 +187,10 @@ impl ResourceFactory for NativeResources {
         Ok(())
     }
 
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken) -> Result<DatabaseResources> {
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
         self.validate(name, configuration)?;
         let io = self.io.child();
         let opened = async {
-            let logs = match &configuration.log {
-                None | Some(database_config::Log::InMemoryLog(_)) => {
-                    let epoch = match &configuration.log { Some(database_config::Log::InMemoryLog(log)) => log.epoch.unwrap_or(0), _ => 0 };
-                    OpenedLogs { source: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
-                        source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), drivers: Vec::new() }
-                }
-                Some(database_config::Log::LocalLog(log)) => {
-                    let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
-                    let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(&io))?;
-                    let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(&io))?;
-                    let epoch = StorageEpoch(log.epoch.unwrap_or(0));
-                    OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, drivers: source_driver.into_iter().chain(replica_driver).collect() }
-                }
-                Some(database_config::Log::OtherLog(log)) => self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?.open(log, access, log_cancellation).await?,
-            };
             let epoch = match &configuration.storage {
                 Some(database_config::Storage::InMemoryStorage(storage)) => storage.epoch,
                 Some(database_config::Storage::LocalStorage(storage)) => storage.epoch,
@@ -202,10 +209,29 @@ impl ResourceFactory for NativeResources {
                     cache.scope_in(cache_namespace(name)?, remote, Arc::clone(&io))?
                 }
             };
-            Ok(DatabaseResources { logs, store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
+            Ok(DatabaseStorage { store, storage_epoch, storage_version: CURRENT_STORAGE_VERSION, io: Arc::clone(&io) })
         }.await;
         if opened.is_err() { io.close_and_wait().await; }
         opened
+    }
+
+    async fn open_logs(&self, _: &str, configuration: &DatabaseConfig, access: LogAccess, log_cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        let io = &storage.io;
+        match &configuration.log {
+            None | Some(database_config::Log::InMemoryLog(_)) => {
+                let epoch = match &configuration.log { Some(database_config::Log::InMemoryLog(log)) => log.epoch.unwrap_or(0), _ => 0 };
+                Ok(OpenedLogs { source: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
+                    source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), drivers: Vec::new() })
+            }
+            Some(database_config::Log::LocalLog(log)) => {
+                let path = PathBuf::from(log.path.as_deref().ok_or_else(|| invalid("Local log has no path"))?);
+                let (source, source_driver) = self.local_log(path.join("LOG"), true, access.source_read_only(), log_cancellation.clone(), Arc::clone(io))?;
+                let (replica, replica_driver) = self.local_log(path.join("REPLICA_LOG"), false, access.replica_read_only(), log_cancellation.clone(), Arc::clone(io))?;
+                let epoch = StorageEpoch(log.epoch.unwrap_or(0));
+                Ok(OpenedLogs { source, replica, source_epoch: epoch, replica_epoch: epoch, drivers: source_driver.into_iter().chain(replica_driver).collect() })
+            }
+            Some(database_config::Log::OtherLog(log)) => self.log_factories.get(type_name(log)?).ok_or_else(|| invalid("Native log factory is unavailable"))?.open(log, access, log_cancellation).await,
+        }
     }
 }
 

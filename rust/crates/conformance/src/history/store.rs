@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_format::database::proto::DatabaseConfig;
-use rtdb_node::{DatabaseResources, LogAccess, ResourceFactory};
+use rtdb_node::{DatabaseStorage, LogAccess, OpenedLogs, ResourceFactory};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation, RetainedBytes, StoredObject};
 use std::{ops::Range, path::Path, sync::{Arc, atomic::{AtomicU64, Ordering}}};
 use tokio_util::sync::CancellationToken;
@@ -16,11 +16,12 @@ pub(super) struct CountingResources { pub inner: Arc<dyn ResourceFactory>, pub r
 #[async_trait]
 impl ResourceFactory for CountingResources {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> rtdb_types::Result<()> { self.inner.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> rtdb_types::Result<DatabaseResources> {
-        let mut resources = self.inner.open(name, configuration, access, cancellation).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> rtdb_types::Result<DatabaseStorage> {
+        let mut resources = self.inner.open_storage(name, configuration).await?;
         resources.store = Arc::new(CountingStore { inner: resources.store, reads: self.reads.clone() });
         Ok(resources)
     }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> rtdb_types::Result<OpenedLogs> { self.inner.open_logs(name, configuration, access, cancellation, storage).await }
     async fn close(&self) -> rtdb_types::Result<()> { self.inner.close().await }
 }
 struct CountingStore { inner: Arc<dyn ObjectStore>, reads: Arc<Reads> }

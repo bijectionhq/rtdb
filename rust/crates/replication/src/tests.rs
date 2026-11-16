@@ -157,6 +157,26 @@ async fn block_production_is_repeatable_and_adoption_folds_rows_once() {
 }
 
 #[tokio::test]
+async fn recovery_advances_to_the_source_epoch_floor_without_changing_the_persisted_boundary() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    fixture.driver.consume(raw(0, 1, 0, resolved(7, 3))).await.unwrap();
+    let token = vec![1, 2, 3];
+    fixture.driver.consume(raw(1, 1, 1, ReplicaBody::BlockBoundary(proto::BlockBoundary {
+        block_index: Some(0), latest_processed_msg_id: Some(4), external_source_token: Some(token.clone()),
+    }))).await.unwrap();
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    for (floor, expected) in [(SourcePosition(-1), SourcePosition(4)), (SourcePosition::from_epoch_offset(StorageEpoch(1), -1).unwrap(), SourcePosition::from_epoch_offset(StorageEpoch(1), -1).unwrap())] {
+        let recovered = fixture.blocks.recover(TrieConfig::default(), floor, Timestamp(1000)).await.unwrap();
+        assert_eq!(recovered.progress.source_position, expected);
+        assert_eq!(recovered.progress.tx_key, Some(TransactionKey { tx_id: TxId(7), system_time: Timestamp(800) }));
+        assert_eq!(recovered.progress.external_token.as_deref(), Some(token.as_slice()));
+        assert_eq!(recovered.block.as_ref().unwrap().latest_source_position(), Some(SourcePosition(4)));
+        assert_eq!(recovered.fence.position(), TermPosition::Expecting(TermSequence(2)));
+    }
+}
+
+#[tokio::test]
 async fn oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 256).await;
     let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::TriesDeleted(proto::TriesDeleted { table_name: Some("public/docs".into()), trie_keys: (0..100).map(|index| rtdb_format::keys::TrieKey::l0(BlockIndex(index)).unwrap().to_string()).collect() }) };

@@ -95,6 +95,20 @@ struct FailingRemote {
     root: std::path::PathBuf,
     opened: tokio::sync::mpsc::UnboundedSender<(Arc<dyn ObjectStore>, std::sync::mpsc::Sender<()>)>,
 }
+
+struct UnopenedLog;
+#[async_trait]
+impl rtdb_node::LogFactory for UnopenedLog {
+    async fn open(&self, _: &Any, _: rtdb_node::LogAccess, _: CancellationToken) -> Result<rtdb_node::OpenedLogs> { panic!("log opened before storage failure"); }
+}
+
+struct FailingLog;
+#[async_trait]
+impl rtdb_node::LogFactory for FailingLog {
+    async fn open(&self, _: &Any, _: rtdb_node::LogAccess, _: CancellationToken) -> Result<rtdb_node::OpenedLogs> {
+        Err(rtdb_types::Anomaly::fault("test/log-open", "Injected log opening failure"))
+    }
+}
 #[async_trait]
 impl RemoteStorageFactory for FailingRemote {
     async fn open(&self, configuration: &Any, root: &ObjectKey, io: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn ObjectStore>> {
@@ -110,17 +124,22 @@ impl RemoteStorageFactory for FailingRemote {
 }
 
 #[tokio::test]
-async fn provider_open_failure_drains_only_the_partial_database_region() {
+async fn provider_open_failure_skips_logs_and_drains_only_the_partial_database_region() {
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let provider_directory = tempfile::tempdir().unwrap();
         let cache_directory = tempfile::tempdir().unwrap();
         let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
         let native = Arc::new(NativeResources::default()
             .with_disk_cache(DiskCache::open(cache_directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
-            .register_storage("test.Remote", Arc::new(FailingRemote { root: provider_directory.path().to_owned(), opened })).unwrap());
+            .register_storage("test.Remote", Arc::new(FailingRemote { root: provider_directory.path().to_owned(), opened })).unwrap()
+            .register_log("test.UnopenedLog", Arc::new(UnopenedLog)).unwrap());
         let sibling = native.open("sibling", &configuration(b"sibling"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
         let factory = Arc::clone(&native);
-        let opening = tokio::spawn(async move { factory.open("failed", &configuration(b"fail"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await });
+        let opening = tokio::spawn(async move {
+            let mut configuration = configuration(b"fail");
+            configuration.log = Some(database_config::Log::OtherLog(Any { type_url: "type.googleapis.com/test.UnopenedLog".into(), value: Vec::new() }));
+            factory.open("failed", &configuration, rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await
+        });
         let (store, release) = stores.recv().await.unwrap();
         let key = ObjectKey::new("probe").unwrap();
         while !matches!(store.head(&key).await, Err(rtdb_storage::Error::Closed(_))) { tokio::task::yield_now().await; }
@@ -132,6 +151,32 @@ async fn provider_open_failure_drains_only_the_partial_database_region() {
         assert_eq!(error.code, "test/provider-open");
         native.close().await.unwrap();
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn log_open_failure_closes_the_already_opened_storage_region_without_closing_siblings() {
+    let provider_directory = tempfile::tempdir().unwrap();
+    let cache_directory = tempfile::tempdir().unwrap();
+    let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+    let native = NativeResources::default()
+        .with_disk_cache(DiskCache::open(cache_directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap())
+        .register_storage("test.Remote", Arc::new(ScopedLocalRemote { root: provider_directory.path().to_owned(), opened })).unwrap()
+        .register_log("test.FailingLog", Arc::new(FailingLog)).unwrap();
+    let sibling = native.open("sibling", &configuration(b"sibling"), rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await.unwrap();
+    let _sibling_store = stores.recv().await.unwrap();
+    let mut configuration = configuration(b"failed");
+    configuration.log = Some(database_config::Log::OtherLog(Any { type_url: "type.googleapis.com/test.FailingLog".into(), value: Vec::new() }));
+    let error = match native.open("failed", &configuration, rtdb_node::LogAccess::ReadOnly, CancellationToken::new()).await {
+        Err(error) => error,
+        Ok(_) => panic!("log opening succeeded"),
+    };
+    assert_eq!(error.code, "test/log-open");
+    let failed_store = stores.recv().await.unwrap();
+    let key = ObjectKey::new("probe").unwrap();
+    assert!(matches!(failed_store.head(&key).await, Err(rtdb_storage::Error::Closed(_))));
+    sibling.store.put(&key, vec![3].into()).await.unwrap();
+    assert_eq!(sibling.store.get(&key).await.unwrap().as_ref(), &[3]);
+    native.close().await.unwrap();
 }
 fn configuration(value: &[u8]) -> DatabaseConfig {
     DatabaseConfig { storage: Some(database_config::Storage::RemoteStorage(RemoteStorage {

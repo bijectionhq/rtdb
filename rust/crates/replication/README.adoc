@@ -19,6 +19,8 @@ Its Arrow operations are not decoded and its skip does not increment the transac
 `BlockStore` is passive and reads or writes the same scoped storage namespace.
 Its `recover` operation loads the greatest published block index, every table file named by that block, the table and trie catalogs, the next live block, the applied source position, and the boundary's replica fence.
 Recovery itself does not require writable log capabilities.
+Recovered source progress is the greater of the persisted source position and the configured source epoch floor.
+The persisted transaction key, external token and block boundary retain their recorded identities.
 
 `ProgressMonitor` owns one published value containing the applied source position, transaction key and most recent result, and the most recent non-null external token.
 A driver publishes that value only after the corresponding effects apply.
@@ -26,6 +28,8 @@ A driver publishes that value only after the corresponding effects apply.
 
 `ReplicationDriver` is the active owner of election, replica input, source input, commands, resolution completion, production completion, and append-pump completion.
 `ReplicationDriver::new` starts no task.
+It validates a persisted source boundary against the configured log before returning a handle, including when indexing is disabled or the database cannot lead.
+A newer source epoch is accepted; an older epoch or a same-epoch log ending before the persisted boundary fails database opening.
 The node owns the task running `run`, invokes `ReplicationHandle::shutdown` to cancel it, and joins it before releasing storage, logs, or transaction dependencies.
 The driver cancels and joins its append pump at term end.
 An in-flight transaction future owns its resolver and external writer; demotion drops that future and fails its receipt.
@@ -114,6 +118,8 @@ Garbage-age effects of this timestamp choice require reference qualification.
 |`wrong_epoch_upload_is_held_and_record_overflow_stops_apply` |`FollowerLogProcessorTest`: buffer overflow stops ingestion; upload version and epoch must match the retained block.
 |`sequence_gap_voids_the_term_and_later_records_cannot_apply` |`LogProcessorTest` term-sequence gap and voided-term behavior.
 |`block_production_is_repeatable_and_adoption_folds_rows_once` |`BlockCutterTest`: production leaves live rows in place; producing twice folds the row count once.
+|`recovery_advances_to_the_source_epoch_floor_without_changing_the_persisted_boundary` |`Database.open`: seed source progress at the current epoch floor while preserving transaction and external-token identity.
+|`retained_leader_does_not_claim_again_while_confirmed_or_producing_an_inherited_block` |`LogProcessor.claimLeadership` and `ClaimOnEmptyRead`: only a follower can begin a claim.
 |`oversized_payload_keeps_outer_admission_identity_and_fenced_missing_payload_is_not_fetched` |`OffloadedMessages.kt` envelope checks plus the spec-first fetch boundary qualification above.
 |`source_transaction_reads_back_applies_flushes_and_recovers` |`db.allium` source append, resolve, replica readback, cut, upload, adoption, and startup chain.
 |`higher_term_drops_an_inflight_external_writer_and_replays_held_prefix_before_the_new_term` |Leader term ownership and demotion while caller resolution is suspended.
@@ -125,6 +131,7 @@ Garbage-age effects of this timestamp choice require reference qualification.
 |===
 
 The query scan source additionally covers independent per-partition caps, an explicitly empty pre-ingestion basis, retained live generations after block adoption, and unchanged durable transaction identity.
+The node source regressions cover a persisted database reopening on an empty newer source epoch, public `sync_all` and reads, and rejection of short or older-epoch logs during `Node::open` across database modes.
 
 == Remaining review and integration obligations
 

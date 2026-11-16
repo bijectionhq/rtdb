@@ -230,6 +230,145 @@ async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_ba
 }
 
 #[tokio::test]
+async fn local_recovery_syncs_an_empty_newer_log_epoch_and_preserves_flushed_rows() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let mut configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log-0").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration.clone(), skipped: BTreeSet::new() };
+        let runtime_services = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let transaction = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
+        assert!(transaction.committed());
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        stop(&node, driver).await;
+
+        configuration.log = Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log-1").to_string_lossy().into_owned()), epoch: Some(1) }));
+        settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+        let (reopened, driver) = running(settings, fresh_local_services(&runtime_services)).await;
+        reopened.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        let progress = reopened.catalog().database("xtdb").unwrap().progress().current();
+        assert_eq!(progress.source_position, rtdb_types::SourcePosition::from_epoch_offset(rtdb_types::StorageEpoch(1), -1).unwrap());
+        assert_eq!(progress.tx_key, Some(transaction.tx_key()));
+        let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(session.query_sql("SELECT _id, value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(1), Value::I64(10)]]);
+        stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn local_recovery_rejects_out_of_sync_source_logs_before_open_returns_in_every_database_mode() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("original").to_string_lossy().into_owned()), epoch: Some(1) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(directory.path().join("store").to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration.clone(), skipped: BTreeSet::new() };
+        let runtime_services = services();
+        let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        stop(&node, driver).await;
+
+        for epoch in [0, 1] {
+            for (enabled, read_only, may_lead, external) in [(true, false, true, false), (false, false, true, false), (true, true, true, false), (true, false, false, false), (true, false, true, true)] {
+                let mut configuration = configuration.clone();
+                configuration.log = Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("empty").to_string_lossy().into_owned()), epoch: Some(epoch) }));
+                if external { configuration.external_source = Some(prost_types::Any { type_url: "proto.xtdb.com/test.StartupSource".into(), value: Vec::new() }); }
+                let mut settings = options();
+                settings.replication.enabled = enabled;
+                settings.replication.may_lead = may_lead;
+                settings.read_only = read_only;
+                settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+                let mut runtime = fresh_local_services(&runtime_services);
+                runtime.external_sources.insert("test.StartupSource".into(), Arc::new(UnopenedStartupSourceFactory));
+                let error = match Node::open(settings, runtime).await {
+                    Ok((_, driver)) => { driver.close_without_run().await.unwrap(); panic!("out-of-sync source log opened"); }
+                    Err(error) => error,
+                };
+                assert_eq!(error.code, "xtdb/out-of-sync-log");
+            }
+        }
+    }).await.unwrap();
+}
+
+struct UnopenedStartupSourceFactory;
+#[async_trait]
+impl ExternalSourceFactory for UnopenedStartupSourceFactory {
+    fn validate(&self, _: &prost_types::Any) -> Result<()> { Ok(()) }
+    async fn open(&self, _: &prost_types::Any, _: &str) -> Result<Box<dyn ExternalSource>> { panic!("source opened before persisted log validation"); }
+}
+
+struct RecoveryCatalogStorage {
+    bytes: Vec<u8>,
+    opened: tokio::sync::mpsc::UnboundedSender<Arc<rtdb_storage::IoRegion>>,
+}
+#[async_trait]
+impl RemoteStorageFactory for RecoveryCatalogStorage {
+    async fn open(&self, _: &prost_types::Any, _: &rtdb_storage::ObjectKey, io: Arc<rtdb_storage::IoRegion>) -> Result<Arc<dyn rtdb_storage::ObjectStore>> {
+        use rtdb_storage::ObjectStore;
+        let store = Arc::new(rtdb_storage::MemoryStore::default());
+        store.put(&rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(rtdb_types::BlockIndex(0))?)?, self.bytes.clone().into()).await?;
+        self.opened.send(io).unwrap();
+        Ok(store)
+    }
+}
+struct RecoveryLogFactory(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait]
+impl LogFactory for RecoveryLogFactory {
+    async fn open(&self, _: &prost_types::Any, _: LogAccess, _: CancellationToken) -> Result<OpenedLogs> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(Anomaly::fault("test/recovery-log-open", "Observed log opening"))
+    }
+}
+
+#[tokio::test]
+async fn persisted_catalog_recovery_precedes_log_opening_and_failed_open_drains_its_region() {
+    use rtdb_format::{block::proto::Block, catalog::{BlockCatalog, TableEntry}};
+    let missing_table = BlockCatalog::from_proto(Block {
+        block_index: Some(0), tables: vec![TableEntry::new(16_384, TableRef::new("public", "docs")).unwrap().to_proto()], ..Default::default()
+    }).unwrap().encode();
+    let empty_catalog = BlockCatalog::from_proto(Block { block_index: Some(0), ..Default::default() }).unwrap().encode();
+    for (bytes, expected, calls) in [(vec![0xff], "rtdb.format/invalid-catalog", 0), (missing_table, "rtdb.storage/missing-object", 0), (empty_catalog, "test/recovery-log-open", 1)] {
+        let cache_directory = tempfile::tempdir().unwrap();
+        let cache = rtdb_storage::disk_cache::DiskCache::open(cache_directory.path(), 1024 * 1024, rtdb_columnar::MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+        let (opened, mut regions) = tokio::sync::mpsc::unbounded_channel();
+        let log_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resources = NativeResources::default().with_disk_cache(cache)
+            .register_storage("test.RecoveryCatalog", Arc::new(RecoveryCatalogStorage { bytes, opened })).unwrap()
+            .register_log("test.RecoveryLog", Arc::new(RecoveryLogFactory(Arc::clone(&log_calls)))).unwrap();
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::OtherLog(prost_types::Any { type_url: "proto.xtdb.com/test.RecoveryLog".into(), value: Vec::new() })),
+            storage: Some(database_config::Storage::RemoteStorage(rtdb_format::database::proto::RemoteStorage {
+                object_store: Some(prost_types::Any { type_url: "proto.xtdb.com/test.RecoveryCatalog".into(), value: Vec::new() }), epoch: None,
+            })), ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
+        let runtime = NodeServices { resources: Arc::new(resources), ..services() };
+        let error = match Node::open(settings, runtime).await {
+            Err(error) => error,
+            Ok((_, driver)) => { driver.close_without_run().await.unwrap(); panic!("invalid recovery fixture opened"); }
+        };
+        assert_eq!(error.code, expected);
+        assert_eq!(log_calls.load(Ordering::SeqCst), calls);
+        let region = regions.recv().await.unwrap();
+        assert!(matches!(region.run_blocking(|| Ok(())).await, Err(rtdb_storage::Error::Closed(_))));
+    }
+}
+
+#[tokio::test]
 async fn offline_export_copies_one_loaded_block_and_reopens_as_a_single_partition_store() {
     tokio::time::timeout(Duration::from_secs(30), async {
         let directory = tempfile::tempdir().unwrap();
@@ -384,12 +523,14 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
     #[async_trait]
     impl ResourceFactory for SharedResources {
         fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
-        async fn open(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken) -> Result<DatabaseResources> {
-            Ok(DatabaseResources {
-                logs: OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new() },
+        async fn open_storage(&self, _: &str, _: &DatabaseConfig) -> Result<DatabaseStorage> {
+            Ok(DatabaseStorage {
                 store: self.store.clone(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
                 io: rtdb_storage::IoRegion::new(),
             })
+        }
+        async fn open_logs(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken, _: &DatabaseStorage) -> Result<OpenedLogs> {
+            Ok(OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new() })
         }
     }
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -451,19 +592,20 @@ struct HeldTeardown {
 impl ResourceFactory for HeldTeardown {
     async fn close(&self) -> Result<()> { self.native.close().await }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, access, cancellation.clone()).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> { self.native.open_storage(name, configuration).await }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        let mut logs = self.native.open_logs(name, configuration, access, cancellation.clone(), storage).await?;
         if name == "other" && self.armed.swap(false, Ordering::AcqRel) {
             let started = Arc::clone(&self.started);
             let release = Arc::clone(&self.release);
-            resources.logs.drivers.push(async move {
+            logs.drivers.push(async move {
                 cancellation.cancelled().await;
                 started.add_permits(1);
                 release.acquire().await.unwrap().forget();
                 Ok(())
             }.boxed());
         }
-        Ok(resources)
+        Ok(logs)
     }
 }
 
@@ -495,12 +637,13 @@ struct FailedResource { native: NativeResources, armed: AtomicBool }
 impl ResourceFactory for FailedResource {
     async fn close(&self) -> Result<()> { self.native.close().await }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, access, cancellation).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> { self.native.open_storage(name, configuration).await }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        let mut logs = self.native.open_logs(name, configuration, access, cancellation, storage).await?;
         if name == "other" && self.armed.swap(false, Ordering::AcqRel) {
-            resources.logs.drivers.push(async { Err(Anomaly::fault("test/resource-failed", "Injected resource failure")) }.boxed());
+            logs.drivers.push(async { Err(Anomaly::fault("test/resource-failed", "Injected resource failure")) }.boxed());
         }
-        Ok(resources)
+        Ok(logs)
     }
 }
 
@@ -508,10 +651,11 @@ struct ClosingResource { native: NativeResources, fail_open: bool, closing: Sema
 #[async_trait]
 impl ResourceFactory for ClosingResource {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
         if self.fail_open { return Err(Anomaly::fault("test/open-failed", "Injected resource opening failure")); }
-        self.native.open(name, configuration, access, cancellation).await
+        self.native.open_storage(name, configuration).await
     }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> { self.native.open_logs(name, configuration, access, cancellation, storage).await }
     async fn close(&self) -> Result<()> { self.closing.add_permits(1); self.release.acquire().await.unwrap().forget(); self.native.close().await }
 }
 
@@ -568,13 +712,17 @@ struct ObservedIoResources {
 impl ResourceFactory for ObservedIoResources {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
     async fn close(&self) -> Result<()> { self.native.close().await }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, access, cancellation.clone()).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> {
+        let storage = self.native.open_storage(name, configuration).await?;
+        if name == "other" { self.opened.send(Arc::clone(&storage.store)).unwrap(); }
+        Ok(storage)
+    }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        let mut logs = self.native.open_logs(name, configuration, access, cancellation.clone(), storage).await?;
         if name == "other" {
-            self.opened.send(Arc::clone(&resources.store)).unwrap();
             if let Some(fail) = &self.fail {
                 let fail = Arc::clone(fail);
-                resources.logs.drivers.push(async move {
+                logs.drivers.push(async move {
                     tokio::select! {
                         _ = cancellation.cancelled() => Ok(()),
                         permit = fail.acquire() => { permit.unwrap().forget(); Err(Anomaly::fault("test/io-driver-failed", "Injected worker failure")) },
@@ -582,7 +730,7 @@ impl ResourceFactory for ObservedIoResources {
                 }.boxed());
             }
         }
-        Ok(resources)
+        Ok(logs)
     }
 }
 
@@ -645,15 +793,16 @@ struct PartialIoResources {
 impl ResourceFactory for PartialIoResources {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
     async fn close(&self) -> Result<()> { self.native.close().await }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, access, cancellation).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<DatabaseStorage> { self.native.open_storage(name, configuration).await }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+        let mut logs = self.native.open_logs(name, configuration, access, cancellation, storage).await?;
         if name == "other" {
-            let release = io::hold_cancelled_local_read(&resources.store).await;
-            self.opened.send((Arc::clone(&resources.store), release)).unwrap();
+            let release = io::hold_cancelled_local_read(&storage.store).await;
+            self.opened.send((Arc::clone(&storage.store), release)).unwrap();
             if self.pending { std::future::pending::<()>().await; }
-            resources.logs.replica = Arc::clone(&resources.logs.source);
+            logs.replica = Arc::clone(&logs.source);
         }
-        Ok(resources)
+        Ok(logs)
     }
 }
 

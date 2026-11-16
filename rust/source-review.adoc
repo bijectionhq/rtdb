@@ -134,7 +134,7 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 
 |Client read |Pgwire, Flight SQL and embedded bindings reach shared session controls, native preparation and query execution; independent source review and missing language surfaces remain.
 |Data-dependent write |Native session → source codec → resolver and staged snapshot → replica append/read-back → admitted apply is written; independent source audit is ongoing.
-|Replica recovery |Native local/Kafka log readers, block recovery, term-fenced replay, and pending-block adoption are written; source audit is ongoing.
+|Replica recovery |Public startup, catalog-before-log assembly, local/Kafka replay, term admission, pending-block adoption, read visibility and failure/restart ownership are traced; independent source review is clear for this bounded path, with provider and runtime qualification pending.
 |Compaction retry |Native deterministic selection, streaming merge, immutable file publication, and source-log publication are written; byte compatibility and retry execution remain pending.
 |CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; database-lifetime source owners and observer integration are written; source audit is ongoing.
 |Database shutdown |Node/database/term and production server listener cancellation and joins are written; child and ancestor I/O drains, cancelled remote operations, scoped cache work and Flight lifecycle integration have source review; execution qualification remains pending.
@@ -233,6 +233,30 @@ Independent source review corrected a native receipt provenance field and covere
 Exotic JVM object formatting, unqualified temporal-zone formatting and remaining synthetic visitor forms are explicit harness gaps.
 Full generated fault traces, original-case ledger reconciliation, deployment qualification, performance runners and release orchestration remain under implementation.
 The ledger remains incomplete, its denominator remains unset, and the Phase 2 gate remains closed.
+
+== Replica recovery source trace
+
+Production server and embedded startup open database storage and recover the greatest published block and its referenced table catalogs before opening source or replica logs.
+The passive `DatabaseStorage` capability keeps partial assembly in one child I/O region; storage recovery and later log-opening failures drain it before returning.
+Every resource-factory wrapper forwards the staged operations, including the conformance storage and log fault adapters.
+Direct backend inspection retains a complete-resource convenience operation without database recovery.
+
+Recovered source progress is the greater of the persisted watermark and the configured source epoch floor, while transaction identity, external token and the persisted fence remain independent.
+A persisted boundary ahead of a same-epoch log or from a newer epoch fails database construction before catalog publication and listener binding, including when indexing is disabled or the database cannot lead.
+The driver admits a new claim only when it owns no leader, including during inherited-block production before the leading role is published.
+Public source regressions cover empty newer-epoch reopening and `sync_all`, invalid-source startup across database modes, malformed or missing catalog metadata before log opening, and partial-region cleanup.
+
+Concrete local and Kafka readers were followed through durable offsets, retained ranges and error handling into the replica fence.
+Already-admitted records remain below that fence while held behind a pending block; matching upload adoption changes catalogs and live-block state together before held records drain.
+Applied snapshot generations remain available to readers across adoption and term loss.
+Driver failure joins term and log owners while preserving the readable applied prefix; process reopening and secondary detach/reattach provide the public restart paths.
+There is no automatic public replacement of a failed database driver.
+
+Independent source review covered the recovery repairs, staged resource assembly, all factory consumers, role consumers, failure ownership and regression expectations.
+The existing watcher-failure, integer-exhaustion, oversized-fetch-order and retry-timestamp compatibility qualifications remain explicit.
+Startup health tracks consumed replica positions; query basis waits remain the visibility barrier.
+Local writable-tail batches, catalog allocation estimates, broker durability and crash behavior still require memory, provider and runtime qualification.
+No build, test, formatter, server or fault execution was used for this trace.
 
 == Source checks performed
 
