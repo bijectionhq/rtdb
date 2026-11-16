@@ -1,0 +1,81 @@
+= Pinned legacy locale data
+
+`temurin-25.0.1+8.tar` retains the unchanged resource class bytes used by OpenJDK25's default CLDR locale provider and its root fallback.
+The native build reads their constant string and array declarations as data.
+It does not load classes, invoke Java methods or start a JVM.
+
+[cols="1,3"]
+|===
+|Upstream artifact |https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jmods_x64_linux_hotspot_25.0.1_8.tar.gz[Official Eclipse Temurin JMOD archive]
+|Release |`jdk-25.0.1+8`
+|Archive SHA-256 |`99deb26c3ab1546e1735ccd13ff3aaf48b34b2658fa9427f4a3cbe80ce88b436`
+|Selected modules |`java.base.jmod`, `jdk.localedata.jmod`
+|CLDR version |`47`, from the retained `legal/cldr.md`
+|Retained bundle SHA-256 |`953468a698924bbf0a70b14cc900365d8311028209cf58473e0678a7f2042458`
+|Retained bundle size |`16,604,160` bytes in `750` regular entries
+|===
+
+Both modules' `LICENSE`, `ADDITIONAL_LICENSE_INFO`, `ASSEMBLY_EXCEPTION` and `cldr.md` are retained under their original module names inside the bundle.
+The compiled resources are covered by the OpenJDK license and Classpath exception and the retained Unicode CLDR license.
+
+== Selection and reproduction
+
+Extract the two JMOD files from the verified upstream archive.
+JMOD uses a four-byte prefix before its ZIP directory; a ZIP extraction tool can report this prefix while reading the unchanged entries.
+Extract the following paths beneath separate `java.base/` and `jdk.localedata/` directories.
+Exclude `FormatDataProvider.class` and `TimeZoneNamesProvider.class`; these are provider implementations rather than resource data.
+
+[source,text]
+----
+java.base:
+  classes/sun/text/resources/cldr/FormatData*.class
+  classes/sun/util/resources/cldr/TimeZoneNames*.class
+  classes/sun/util/resources/cldr/CalendarData.class
+  classes/sun/text/resources/FormatData.class
+  classes/sun/util/resources/TimeZoneNames.class
+  classes/sun/util/resources/CalendarData.class
+  classes/sun/util/cldr/CLDRBaseLocaleDataMetaInfo*.class
+jdk.localedata:
+  classes/sun/text/resources/cldr/ext/FormatData*.class
+  classes/sun/util/resources/cldr/ext/TimeZoneNames*.class
+  classes/sun/util/resources/cldr/provider/CLDRLocaleDataMetaInfo.class
+both modules:
+  legal/LICENSE
+  legal/ADDITIONAL_LICENSE_INFO
+  legal/ASSEMBLY_EXCEPTION
+  legal/cldr.md
+----
+
+Preserve the ZIP entries' bytes, modification times and modes.
+Create a relative regular-file list in bytewise lexical order with `LC_ALL=C sort`.
+Use USTAR, numeric owner and group zero, owner and group names `root`, no extended attributes, ACLs or file flags, and that exact file list.
+The retained archive was produced with the following command from the extraction root using BSD tar.
+
+[source,shell]
+----
+tar --format=ustar --no-xattrs --no-acls --no-fflags \
+    --uid 0 --gid 0 --uname root --gname root \
+    -cf temurin-25.0.1+8.tar -T sorted-files.txt
+----
+
+Verify the resulting bundle digest before updating the pinned value in `build_support/locale.rs`.
+No Java compiler, launcher or bytecode execution is part of extraction or native decoding.
+
+== Decoder contract
+
+`build_support/locale_class.rs` recognizes generated resource literal construction and the locale metadata declarations emitted by OpenJDK's pinned `ResourceBundleGenerator`.
+Within the selected data initializers, general method invocations, branches, loops, object construction and exception handlers are rejected.
+Other methods are skipped as opaque class-file attributes and are never invoked.
+The metadata grammar recognizes only literal map declarations, literal language tags and literal map entries.
+Each declared map transfers to one field; aliases through additional fields are rejected before retaining another map value.
+Class constant strings use modified UTF-8 with checked UTF-16 decoding.
+Resource and map entry order is retained, including repeated keys, for the runtime provider's lookup rules.
+
+The archive is bounded to 32 MiB and 4,096 regular entries, each at most one MiB.
+Each literal initializer is bounded by its declared stack and locals, 131,072 array slots and 32 MiB of expanded text.
+All decoded bundles are bounded to 128 MiB and generated Rust source to 256 MiB.
+The build verifies the exact input SHA-256 before decoding and has no runtime data downloads or mutable locale cache.
+
+The locale catalog, environment selection, provider fallback and formatter consumers are still being implemented.
+The presence of this bundle alone does not establish complete formatter or calendar-provider parity.
+Regression sources have not been executed during the source-only implementation phase.

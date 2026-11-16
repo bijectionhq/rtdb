@@ -37,6 +37,9 @@ serde.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 openssl = { version = "=0.10.81", features = ["vendored"] }
 tempfile.workspace = true
