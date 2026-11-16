@@ -8,6 +8,7 @@ import tarfile
 import uuid
 from pathlib import Path
 
+from source_gate import require_phase_two
 from client_results import compare_clients, parse_exunit, parse_junit, parse_libtest, parse_trx
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, owned_cancellation, run_process, write_json
 
@@ -284,9 +285,7 @@ def main():
     args = parser.parse_args()
     if args.timeout <= 0:
         raise ValueError("client process timeout must be positive")
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not args.phase_two or not state["phase_2_authorized_by_completeness_gate"]:
-        raise ValueError("packaged client execution belongs to Phase 2 after the completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     args.reference, args.output = args.reference.resolve(), args.output.resolve()
     revision = git(REPOSITORY, "rev-parse", "HEAD")
     if git(args.reference, "rev-parse", "HEAD") != REFERENCE:

@@ -1,0 +1,313 @@
+{
+  "schema_version": 1,
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "design_revision": "c995e6b35b6812aa423c8a158c4e201e27532320",
+  "implementation_revision": null,
+  "areas": {
+    "types_columnar_durable_formats": {
+      "status": "pending",
+      "conclusion": "The final source review must reconcile type, Arrow, durable-codec and registered-object coverage with the reviewed design.",
+      "implementation_paths": [
+        "rust/crates/types/src/lib.rs",
+        "rust/crates/columnar/src/lib.rs",
+        "rust/crates/format/src/lib.rs",
+        "rust/crates/temporal/src/lib.rs",
+        "rust/crates/trie/src/lib.rs"
+      ]
+    },
+    "storage_indexing_historical_visibility": {
+      "status": "pending",
+      "conclusion": "Storage, cache, snapshot and visibility paths are written; their final source closure and recorded allocation gaps remain to be reconciled.",
+      "implementation_paths": [
+        "rust/crates/storage/src/lib.rs",
+        "rust/crates/index/src/live.rs",
+        "rust/crates/index/src/snapshot.rs",
+        "rust/crates/query/src/scan.rs"
+      ]
+    },
+    "sql_xtql_execution": {
+      "status": "pending",
+      "conclusion": "Physical operator schedules, regex host forms and remaining registered Transit semantics still require source completion.",
+      "implementation_paths": [
+        "rust/crates/sql/src/lib.rs",
+        "rust/crates/xtql/src/lib.rs",
+        "rust/crates/plan/src/lib.rs",
+        "rust/crates/expr/src/evaluate.rs",
+        "rust/crates/expr/src/transit_object.rs",
+        "rust/crates/query/src/lib.rs"
+      ]
+    },
+    "writes_replication_recovery": {
+      "status": "pending",
+      "conclusion": "The recorded write and recovery traces are source-reviewed; the complete area still needs its final design-surface reconciliation.",
+      "implementation_paths": [
+        "rust/crates/tx/src/submission.rs",
+        "rust/crates/tx/src/resolver.rs",
+        "rust/crates/replication/src/driver.rs",
+        "rust/crates/replication/src/state.rs"
+      ]
+    },
+    "compaction_gc_adapters": {
+      "status": "pending",
+      "conclusion": "Maintenance and CDC have recorded source traces; Azure credentials and Kafka configuration paths still have implementation gaps.",
+      "implementation_paths": [
+        "rust/crates/maintenance/src/driver.rs",
+        "rust/crates/maintenance/src/gc.rs",
+        "rust/crates/kafka/src/lib.rs",
+        "rust/crates/s3/src/lib.rs",
+        "rust/crates/azure/src/lib.rs",
+        "rust/crates/gcs/src/lib.rs",
+        "rust/crates/pg-source/src/driver.rs"
+      ]
+    },
+    "client_operational_surfaces": {
+      "status": "pending",
+      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present; the final public-entry and configuration review is pending.",
+      "implementation_paths": [
+        "rust/crates/node/src/runtime.rs",
+        "rust/crates/pgwire/src/lib.rs",
+        "rust/crates/pg-codec/src/lib.rs",
+        "rust/crates/flight-sql/src/lib.rs",
+        "rust/crates/ffi/src/lib.rs",
+        "rust/crates/auth/src/lib.rs",
+        "rust/crates/server/src/main.rs",
+        "rust/crates/config/src/main.rs",
+        "rust/crates/metrics/src/lib.rs",
+        "rust/crates/tls/src/lib.rs"
+      ]
+    },
+    "conformance_machinery": {
+      "status": "pending",
+      "conclusion": "Source inventory, controls, discovery reconciliation, failure and release runners exist; review their wiring before execution. Runtime discovery and the full assertion denominator belong to Phase 2.",
+      "implementation_paths": [
+        "rust/crates/conformance/src/main.rs",
+        "rust/conformance/source_inventory.py",
+        "rust/conformance/runtime_inventory.py",
+        "rust/conformance/run_controls.py",
+        "rust/conformance/run_recovery.py",
+        "rust/release/run_matrix.py",
+        "rust/conformance/source_gate.py"
+      ]
+    }
+  },
+  "traces": {
+    "client_read": {
+      "status": "pending",
+      "conclusion": "The public read path is recorded; its language, expression and physical-operator completion still has open source findings.",
+      "implementation_paths": [
+        "rust/crates/pgwire/src/protocol.rs",
+        "rust/crates/flight-sql/src/execute.rs",
+        "rust/crates/ffi/src/statement.rs",
+        "rust/crates/node/src/session.rs",
+        "rust/crates/query/src/scan.rs"
+      ]
+    },
+    "data_dependent_write": {
+      "status": "reviewed",
+      "conclusion": "The recorded whole-path source review covers public sessions, durable submission, staged predecessor reads, native mutation resolution, replica read-back, term admission, atomic publication and caller completion.",
+      "implementation_paths": [
+        "rust/crates/node/src/session.rs",
+        "rust/crates/node/src/statement.rs",
+        "rust/crates/tx/src/submission.rs",
+        "rust/crates/tx/src/resolver.rs",
+        "rust/crates/replication/src/appender.rs",
+        "rust/crates/replication/src/admission.rs",
+        "rust/crates/replication/src/driver.rs"
+      ],
+      "evidence": {
+        "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
+        "rust/crates/node/src/statement.rs": "c23c62efb2345f44f2644c6cd6cef4aa98b38a4f433cad4eadee500184efa42a",
+        "rust/crates/tx/src/submission.rs": "dd666de0fbcc94b00e3fcf56178d4af913d0a07dfecd1c32f687bbcc8e765ed0",
+        "rust/crates/tx/src/resolver.rs": "5de2a6f21839cbc23ab47688adc14e1b5ab3e9d904659e7683301102a2ecdc91",
+        "rust/crates/replication/src/appender.rs": "cb1fb1e6740df647d8eb4f5ac884c42914a74746cd10987998714acefa537974",
+        "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
+        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30"
+      }
+    },
+    "replica_recovery": {
+      "status": "reviewed",
+      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, replay and adoption, readable restored state, and failure restart.",
+      "implementation_paths": [
+        "rust/crates/server/src/main.rs",
+        "rust/crates/server/src/runtime.rs",
+        "rust/crates/node/src/runtime.rs",
+        "rust/crates/node/src/database.rs",
+        "rust/crates/replication/src/driver.rs",
+        "rust/crates/replication/src/blocks.rs"
+      ],
+      "evidence": {
+        "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
+        "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
+        "rust/crates/node/src/runtime.rs": "c12183ea68cae8e37663e2e948182aba43ac8cb13844cf7bf7195f142746f906",
+        "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
+        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30",
+        "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
+      }
+    },
+    "compaction_retry": {
+      "status": "reviewed",
+      "conclusion": "The recorded source review covers database and standalone compactor entry points, selection, merge, immutable publication, replica read-back, catalog adoption and replacement-owner retry.",
+      "implementation_paths": [
+        "rust/crates/server/src/main.rs",
+        "rust/crates/maintenance/src/driver.rs",
+        "rust/crates/maintenance/src/job.rs",
+        "rust/crates/maintenance/src/merge.rs",
+        "rust/crates/maintenance/src/publication.rs",
+        "rust/crates/replication/src/driver.rs",
+        "rust/crates/index/src/trie_catalog.rs"
+      ],
+      "evidence": {
+        "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
+        "rust/crates/maintenance/src/driver.rs": "72ce0b9147fd994dfc003768e856e594f96d638de9b534129fdb2142c0e5d0a2",
+        "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
+        "rust/crates/maintenance/src/merge.rs": "8d98ac24d4936cc79fc04fe33df70cad55b549ce19a1ef5bb697027751ecf142",
+        "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
+        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30",
+        "rust/crates/index/src/trie_catalog.rs": "e4a93d9e43bad76771738eb45d192c0783e18848e147ba12ae831ebf50c1a625"
+      }
+    },
+    "cdc_restart": {
+      "status": "reviewed",
+      "conclusion": "The recorded source review covers public configuration, assignment, snapshot and resume, pgoutput, ordered import, read-back, adopted-block confirmation and cancellation.",
+      "implementation_paths": [
+        "rust/crates/node/src/postgres.rs",
+        "rust/crates/pg-source/src/driver.rs",
+        "rust/crates/pg-source/src/snapshot.rs",
+        "rust/crates/pg-source/src/stream.rs",
+        "rust/crates/pg-source/src/indexer.rs",
+        "rust/crates/pg-source/src/token.rs",
+        "rust/crates/replication/src/driver.rs"
+      ],
+      "evidence": {
+        "rust/crates/node/src/postgres.rs": "1b17a33ecf1f59af84aa1dfef572b09e5c4b9333f31d2c30b7c2a1bbee2447d2",
+        "rust/crates/pg-source/src/driver.rs": "c46fd1c124c0aa46e9e82ca83d2545fd5295b9ecb750a8fa6455f140bc4782e4",
+        "rust/crates/pg-source/src/snapshot.rs": "9ee624e1690e231814b41933f318b27f3b68b67136969b076dd7e8eed879388b",
+        "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
+        "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
+        "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
+        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30"
+      }
+    },
+    "database_shutdown": {
+      "status": "reviewed",
+      "conclusion": "The recorded source review covers public server signals, unstarted and failed startup, embedded closure, listeners, database and term tasks, log owners, and retained I/O drain.",
+      "implementation_paths": [
+        "rust/crates/server/src/main.rs",
+        "rust/crates/server/src/runtime.rs",
+        "rust/crates/ffi/src/lib.rs",
+        "rust/crates/node/src/node.rs",
+        "rust/crates/node/src/runtime.rs",
+        "rust/crates/node/src/database.rs",
+        "rust/crates/storage/src/io_region.rs"
+      ],
+      "evidence": {
+        "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
+        "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
+        "rust/crates/ffi/src/lib.rs": "2b96bf5956f2082e33f96e9c903d8df29737db7dc0869784cd9440e4d3ae51c6",
+        "rust/crates/node/src/node.rs": "26eb2e6929a8b7eb6c1788d8a9c6eb57c1c35f78f7e02db5afa4c53ab95064c0",
+        "rust/crates/node/src/runtime.rs": "c12183ea68cae8e37663e2e948182aba43ac8cb13844cf7bf7195f142746f906",
+        "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
+        "rust/crates/storage/src/io_region.rs": "0113b3f0778db0c1111afe87cce05b33d21156e9b4cf8ac8e9e87379de843faa"
+      }
+    }
+  },
+  "findings": [
+    {
+      "id": "regex-host-and-carriers",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including isolated UTF16 source carriers; reconcile dev/doc/rust-regex.adoc against the final implementation."
+    },
+    {
+      "id": "transit-registered-objects",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "types_columnar_durable_formats",
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers, plus required Path provider environments."
+    },
+    {
+      "id": "physical-expression-schedules",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Complete the recorded remaining sort algorithms, aggregate primitive factory schedules and expression invocation boundaries."
+    },
+    {
+      "id": "azure-desktop-credentials",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "compaction_gc_adapters",
+        "client_operational_surfaces"
+      ],
+      "requirement": "Complete the required IntelliJ credential path and the unavailable-provider behavior of the pinned default chain; absent broker dependencies and SharedTokenCache outside that chain do not require invented providers."
+    },
+    {
+      "id": "kafka-configurations",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "compaction_gc_adapters",
+        "client_operational_surfaces"
+      ],
+      "requirement": "Complete required built-in TLS algorithm/provider choices and nondefault Connect settings; reconcile native extension registrations with the shipped classpath."
+    },
+    {
+      "id": "final-design-closure",
+      "kind": "review",
+      "status": "open",
+      "targets": [
+        "types_columnar_durable_formats",
+        "storage_indexing_historical_visibility",
+        "sql_xtql_execution",
+        "writes_replication_recovery",
+        "compaction_gc_adapters",
+        "client_operational_surfaces",
+        "conformance_machinery"
+      ],
+      "requirement": "Check every reviewed design surface and production configuration against a concrete source path; classify reachable unsupported branches, mock-only adapters, JVM database delegation and remaining allocation findings before recording the implementation revision."
+    },
+    {
+      "id": "build-and-artifacts",
+      "kind": "qualification",
+      "status": "open",
+      "targets": [
+        "client_operational_surfaces",
+        "conformance_machinery"
+      ],
+      "requirement": "Compile production, bindings, tests and supported features; repair compiler, linker, ABI and packaging failures and retain packaged artifact evidence."
+    },
+    {
+      "id": "runtime-inventory-and-controls",
+      "kind": "qualification",
+      "status": "open",
+      "targets": [
+        "conformance_machinery"
+      ],
+      "requirement": "Discover pinned JVM and native cases, reconcile source candidates and disabled selections, execute both mismatch controls, and populate the full assertion ledger without treating source candidates as an executed denominator."
+    },
+    {
+      "id": "interop-failure-and-performance",
+      "kind": "qualification",
+      "status": "open",
+      "targets": [
+        "storage_indexing_historical_visibility",
+        "writes_replication_recovery",
+        "compaction_gc_adapters",
+        "conformance_machinery"
+      ],
+      "requirement": "Run temporal history, failure schedules, real backend/client lanes, JVM/Rust recovery and rollback, resource lifetime checks and matched performance measurements."
+    }
+  ]
+}

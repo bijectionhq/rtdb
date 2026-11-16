@@ -13,6 +13,8 @@ import sys
 import time
 from pathlib import Path
 
+from source_gate import require_phase_two
+
 
 REFERENCE = "c84f9334eb060ceb92d28ecdd4a06e6b625932fd"
 HERE = Path(__file__).resolve().parent
@@ -318,11 +320,7 @@ def negative_control(args, ledger, reference, native_path, mapping, directory):
 
 
 def run(args):
-    if not args.phase_two:
-        raise ValueError("execution requires --phase-two after the source completeness gate has passed")
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not state.get("phase_2_authorized_by_completeness_gate", False):
-        raise ValueError("implementation-status.json has not opened the Phase 2 gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     if git(args.reference, "rev-parse", "HEAD") != REFERENCE or git(args.reference, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("the reference checkout must be clean and pinned to the required revision")
     revision = git(REPOSITORY, "rev-parse", "HEAD")

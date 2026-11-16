@@ -8,6 +8,7 @@ import time
 import uuid
 from pathlib import Path
 
+from source_gate import require_phase_two
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, owned_cancellation, write_json
 from run_clients import Commands, image_record, materialize_clients, validate_package, validate_package_files, verify_running_artifact
 from performance_plan import operation_trace_digest, validate_plan
@@ -307,9 +308,7 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
 
 
 def run(args):
-    state = read_json(REPOSITORY / "rust/implementation-status.json")
-    if not args.phase_two or state.get("phase_2_authorized_by_completeness_gate") is not True:
-        raise ValueError("performance execution requires the Phase 2 completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     plan = validate_plan(read_json(args.plan))
     fixture_path = artifact(args.plan.parent, plan["fixture"])
     if digest(fixture_path) != plan["fixture_sha256"]:
