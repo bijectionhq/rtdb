@@ -21,6 +21,14 @@ azure_core = "=1.0.0"
 azure_identity = { version = "=1.0.0", features = ["tokio", "client_certificate"] }
 command-group = "=5.0.1"
 openssl = "0.10.79"
+reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "stream"] }
+futures.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

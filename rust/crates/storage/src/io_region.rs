@@ -28,6 +28,13 @@ impl IoRegion {
     /// Rejects new work and joins every admitted operation, including tasks whose callers were cancelled.
     /// The owner awaits this before shutting down the Tokio runtime; dropping an I/O future only drops its waiter.
     pub async fn close_and_wait(&self) { self.close(); self.wait().await; }
+    /// Runs blocking work within this region and returns its result to the caller.
+    /// A closed region rejects the operation; worker panics return a task error.
+    /// Dropping the future cancels only the waiter, so the owner must drain this region before runtime shutdown.
+    /// An undelivered result is destroyed before the drain completes; a delivered result belongs to the caller.
+    pub async fn run_blocking<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+        self.run(work).await
+    }
     pub(crate) async fn run<T: Send + 'static>(&self, work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
         let operation = self.admit()?;
         Self::run_admitted(operation, work).await
@@ -77,7 +84,7 @@ mod tests {
         let (finish_work, work_release) = std::sync::mpsc::channel();
         let (dropping, drop_started) = tokio::sync::oneshot::channel();
         let (finish_drop, drop_release) = std::sync::mpsc::channel();
-        let mut request = Box::pin(region.run(move || {
+        let mut request = Box::pin(region.run_blocking(move || {
             working.send(()).unwrap(); work_release.recv().unwrap();
             Ok(HeldDrop { entered: Some(dropping), release: drop_release })
         }));
@@ -92,7 +99,7 @@ mod tests {
     #[tokio::test]
     async fn delivered_result_is_owned_by_the_caller_after_drain() {
         let region = IoRegion::new();
-        let result = region.run(|| Ok(Arc::new(()))).await.unwrap();
+        let result = region.run_blocking(|| Ok(Arc::new(()))).await.unwrap();
         let weak = Arc::downgrade(&result);
         region.close_and_wait().await;
         assert!(weak.upgrade().is_some());
@@ -102,7 +109,7 @@ mod tests {
     #[tokio::test]
     async fn panicking_worker_releases_the_region_and_reports_the_join_failure() {
         let region = IoRegion::new();
-        let result: Result<()> = region.run(|| panic!("injected I/O failure")).await;
+        let result: Result<()> = region.run_blocking(|| panic!("injected I/O failure")).await;
         assert!(matches!(result, Err(Error::Task(_))));
         region.close_and_wait().await;
     }

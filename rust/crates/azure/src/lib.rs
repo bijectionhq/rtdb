@@ -2,6 +2,8 @@ mod connection;
 mod credential;
 mod process;
 mod powershell;
+mod managed;
+mod managed_error;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +84,7 @@ impl AzureConfig {
         if let Some(credential) = connection.credential {
             builder = builder.with_credentials(Arc::new(StaticCredentialProvider::new(credential)));
         } else {
-            builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(self.user_managed_identity_client_id.as_deref())?));
+            builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(self.user_managed_identity_client_id.as_deref(), Arc::clone(&io))?));
         }
         let client = builder.build().map_err(invalid)?;
         ensure_container(&client, &connection.account, &connection.endpoint, &self.container).await?;

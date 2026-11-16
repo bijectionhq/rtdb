@@ -2,12 +2,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use async_trait::async_trait;
 use azure_core::credentials::{Secret, SecretBytes, TokenCredential};
-use azure_identity::{AzureCliCredential, AzureCliCredentialOptions, AzureDeveloperCliCredential, AzureDeveloperCliCredentialOptions, ClientCertificateCredential, ClientCertificateCredentialOptions, ClientSecretCredential, ManagedIdentityCredential, ManagedIdentityCredentialOptions, UserAssignedId, WorkloadIdentityCredential};
+use azure_identity::{AzureCliCredential, AzureCliCredentialOptions, AzureDeveloperCliCredential, AzureDeveloperCliCredentialOptions, ClientCertificateCredential, ClientCertificateCredentialOptions, ClientSecretCredential, WorkloadIdentityCredential, WorkloadIdentityCredentialOptions};
 use object_store::{CredentialProvider, azure::AzureCredential};
 use rtdb_types::{Anomaly, Result};
 use tokio::sync::Mutex;
 
-struct Candidate { credential: Arc<dyn TokenCredential>, continue_on_error: bool }
+enum FailurePolicy { Stop, Continue, ManagedUnavailable }
+impl FailurePolicy {
+    fn continues(&self, error: &azure_core::Error) -> bool {
+        match self { Self::Stop => false, Self::Continue => true, Self::ManagedUnavailable => crate::managed::is_unavailable(error) }
+    }
+}
+struct Candidate { credential: Arc<dyn TokenCredential>, failure: FailurePolicy }
 
 pub(crate) struct CredentialBridge { sources: Vec<Candidate>, selected: Mutex<Option<usize>> }
 
@@ -16,8 +22,8 @@ impl std::fmt::Debug for CredentialBridge {
 }
 
 impl CredentialBridge {
-    pub fn new(managed_identity_client_id: Option<&str>) -> Result<Self> {
-        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "MSI_ENDPOINT"]
+    pub fn new(managed_identity_client_id: Option<&str>, io: Arc<rtdb_storage::IoRegion>) -> Result<Self> {
+        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "IDENTITY_HEADER", "IDENTITY_SERVER_THUMBPRINT", "IMDS_ENDPOINT", "MSI_ENDPOINT", "AZURE_POD_IDENTITY_AUTHORITY_HOST", "ProgramData"]
             .into_iter().filter_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()).map(|value| (name, value))).collect();
         let selection = environment.get("AZURE_TOKEN_CREDENTIALS").map(|value| value.trim().to_ascii_lowercase()).unwrap_or_default();
         if !matches!(selection.as_str(), "" | "prod" | "dev" | "environmentcredential" | "workloadidentitycredential" | "managedidentitycredential" | "azureclicredential" | "azurepowershellcredential" | "azuredeveloperclicredential") {
@@ -26,34 +32,35 @@ impl CredentialBridge {
         let mut sources = Vec::new();
         if let (Some(tenant), Some(client)) = (environment.get("AZURE_TENANT_ID"), environment.get("AZURE_CLIENT_ID")) {
             if let Some(secret) = environment.get("AZURE_CLIENT_SECRET").filter(|_| matches!(selection.as_str(), "" | "prod" | "environmentcredential")) {
-                sources.push(Candidate { credential: ClientSecretCredential::new(tenant, client.clone(), Secret::new(secret.clone()), None).map_err(invalid)?, continue_on_error: false });
+                sources.push(Candidate { credential: ClientSecretCredential::new(tenant, client.clone(), Secret::new(secret.clone()), None).map_err(invalid)?, failure: FailurePolicy::Stop });
             } else if let Some(path) = environment.get("AZURE_CLIENT_CERTIFICATE_PATH").filter(|_| matches!(selection.as_str(), "" | "prod" | "environmentcredential")) {
                 let options = ClientCertificateCredentialOptions { password: environment.get("AZURE_CLIENT_CERTIFICATE_PASSWORD").cloned().map(Secret::new), ..Default::default() };
                 let certificate = certificate(&std::fs::read(path).map_err(invalid)?, options.password.as_ref())?;
-                sources.push(Candidate { credential: ClientCertificateCredential::new(tenant.clone(), client.clone(), certificate, Some(options)).map_err(invalid)?, continue_on_error: false });
+                sources.push(Candidate { credential: ClientCertificateCredential::new(tenant.clone(), client.clone(), certificate, Some(options)).map_err(invalid)?, failure: FailurePolicy::Stop });
             }
             if !sources.is_empty() { return Ok(Self { sources, selected: Mutex::new(None) }); }
             if environment.contains_key("AZURE_FEDERATED_TOKEN_FILE") && matches!(selection.as_str(), "" | "prod" | "workloadidentitycredential") {
-                sources.push(Candidate { credential: WorkloadIdentityCredential::new(None).map_err(invalid)?, continue_on_error: false });
+                sources.push(Candidate { credential: WorkloadIdentityCredential::new(None).map_err(invalid)?, failure: FailurePolicy::Stop });
                 return Ok(Self { sources, selected: Mutex::new(None) });
             }
         }
         if matches!(selection.as_str(), "environmentcredential" | "workloadidentitycredential") { return Err(invalid("Selected Azure credential requires complete environment configuration")); }
         let managed_id = managed_identity_client_id.map(str::to_owned).or_else(|| environment.get("AZURE_CLIENT_ID").cloned());
         if matches!(selection.as_str(), "" | "prod" | "managedidentitycredential") {
-            let managed = ManagedIdentityCredential::new(Some(ManagedIdentityCredentialOptions { user_assigned_id: managed_id.map(UserAssignedId::ClientId), ..Default::default() })).map_err(invalid)?;
-            let explicit_managed = environment.contains_key("IDENTITY_ENDPOINT") || environment.contains_key("MSI_ENDPOINT");
-            sources.push(Candidate { credential: managed, continue_on_error: !explicit_managed && selection.is_empty() });
+            let managed: Arc<dyn TokenCredential> = if environment.contains_key("AZURE_TENANT_ID") && environment.contains_key("AZURE_FEDERATED_TOKEN_FILE") {
+                WorkloadIdentityCredential::new(Some(WorkloadIdentityCredentialOptions { client_id: managed_id, ..Default::default() })).map_err(invalid)?
+            } else { crate::managed::ManagedCredential::new(&environment, managed_id, io).map_err(invalid)? };
+            sources.push(Candidate { credential: managed, failure: FailurePolicy::ManagedUnavailable });
         }
         let executor: Arc<dyn azure_identity::Executor> = Arc::new(crate::process::JoinedExecutor);
         if matches!(selection.as_str(), "" | "dev" | "azureclicredential") {
-            sources.push(Candidate { credential: AzureCliCredential::new(Some(AzureCliCredentialOptions { executor: Some(Arc::clone(&executor)), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, continue_on_error: selection != "azureclicredential" });
+            sources.push(Candidate { credential: AzureCliCredential::new(Some(AzureCliCredentialOptions { executor: Some(Arc::clone(&executor)), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, failure: if selection != "azureclicredential" { FailurePolicy::Continue } else { FailurePolicy::Stop } });
         }
         if matches!(selection.as_str(), "" | "dev" | "azurepowershellcredential") {
-            sources.push(Candidate { credential: crate::powershell::PowerShellCredential::new(Arc::clone(&executor), environment.get("AZURE_TENANT_ID").cloned()).map_err(invalid)?, continue_on_error: selection != "azurepowershellcredential" });
+            sources.push(Candidate { credential: crate::powershell::PowerShellCredential::new(Arc::clone(&executor), environment.get("AZURE_TENANT_ID").cloned()).map_err(invalid)?, failure: if selection != "azurepowershellcredential" { FailurePolicy::Continue } else { FailurePolicy::Stop } });
         }
         if matches!(selection.as_str(), "" | "dev" | "azuredeveloperclicredential") {
-            sources.push(Candidate { credential: AzureDeveloperCliCredential::new(Some(AzureDeveloperCliCredentialOptions { executor: Some(executor), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, continue_on_error: false });
+            sources.push(Candidate { credential: AzureDeveloperCliCredential::new(Some(AzureDeveloperCliCredentialOptions { executor: Some(executor), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, failure: FailurePolicy::Stop });
         }
         Ok(Self { sources, selected: Mutex::new(None) })
     }
@@ -74,7 +81,7 @@ impl CredentialProvider for CredentialBridge {
                     *selected = Some(index);
                     return Ok(Arc::new(AzureCredential::BearerToken(token.token.secret().into())));
                 }
-                Err(error) if !source.continue_on_error => return Err(provider_error(error)),
+                Err(error) if !source.failure.continues(&error) => return Err(provider_error(error)),
                 Err(_) => (),
             }
         }
@@ -129,8 +136,8 @@ mod tests {
         let unavailable = Arc::new(AtomicUsize::new(0));
         let available = Arc::new(AtomicUsize::new(0));
         let bridge = CredentialBridge { sources: vec![
-            Candidate { credential: Arc::new(Source { calls: Arc::clone(&unavailable), available: false }), continue_on_error: true },
-            Candidate { credential: Arc::new(Source { calls: Arc::clone(&available), available: true }), continue_on_error: false },
+            Candidate { credential: Arc::new(Source { calls: Arc::clone(&unavailable), available: false }), failure: FailurePolicy::Continue },
+            Candidate { credential: Arc::new(Source { calls: Arc::clone(&available), available: true }), failure: FailurePolicy::Stop },
         ], selected: Mutex::new(None) };
         assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-0"));
         assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-1"));
@@ -142,11 +149,46 @@ mod tests {
     async fn configured_identity_failure_does_not_fall_through_to_another_identity() {
         let unused = Arc::new(AtomicUsize::new(0));
         let bridge = CredentialBridge { sources: vec![
-            Candidate { credential: Arc::new(Source { calls: Arc::new(AtomicUsize::new(0)), available: false }), continue_on_error: false },
-            Candidate { credential: Arc::new(Source { calls: Arc::clone(&unused), available: true }), continue_on_error: false },
+            Candidate { credential: Arc::new(Source { calls: Arc::new(AtomicUsize::new(0)), available: false }), failure: FailurePolicy::Stop },
+            Candidate { credential: Arc::new(Source { calls: Arc::clone(&unused), available: true }), failure: FailurePolicy::Stop },
         ], selected: Mutex::new(None) };
         assert!(bridge.get_credential().await.is_err());
         assert_eq!(unused.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reachable_managed_identity_authentication_failure_does_not_select_developer_credentials() {
+        let unused = Arc::new(AtomicUsize::new(0));
+        let bridge = CredentialBridge { sources: vec![
+            Candidate { credential: Arc::new(Source { calls: Arc::new(AtomicUsize::new(0)), available: false }), failure: FailurePolicy::ManagedUnavailable },
+            Candidate { credential: Arc::new(Source { calls: Arc::clone(&unused), available: true }), failure: FailurePolicy::Continue },
+        ], selected: Mutex::new(None) };
+        assert!(bridge.get_credential().await.is_err());
+        assert_eq!(unused.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unsupported_managed_client_id_allows_default_chain_developer_fallback_without_http() {
+        use futures::FutureExt;
+        for service_fabric in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}/token", listener.local_addr().unwrap());
+            let environment = if service_fabric {
+                BTreeMap::from([("IDENTITY_ENDPOINT", endpoint), ("IDENTITY_HEADER", "secret".into()), ("IDENTITY_SERVER_THUMBPRINT", "thumbprint".into())])
+            } else { BTreeMap::from([("MSI_ENDPOINT", endpoint)]) };
+            let io = rtdb_storage::IoRegion::new();
+            let managed = crate::managed::ManagedCredential::new(&environment, Some("client".into()), Arc::clone(&io)).unwrap();
+            let bridge = CredentialBridge { sources: vec![
+                Candidate { credential: managed.clone(), failure: FailurePolicy::ManagedUnavailable },
+                Candidate { credential: Arc::new(Source { calls: Arc::new(AtomicUsize::new(0)), available: true }), failure: FailurePolicy::Continue },
+            ], selected: Mutex::new(None) };
+            assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-0"));
+            assert!(listener.accept().now_or_never().is_none());
+            let explicit = CredentialBridge { sources: vec![Candidate { credential: managed, failure: FailurePolicy::ManagedUnavailable }], selected: Mutex::new(None) };
+            assert!(explicit.get_credential().await.is_err());
+            assert!(listener.accept().now_or_never().is_none());
+            io.close_and_wait().await;
+        }
     }
 
     #[test]

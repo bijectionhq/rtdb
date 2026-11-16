@@ -18,6 +18,8 @@ Closing a child rejects requests for that database and drains its active work wh
 An idle child handle does not delay either drain.
 The node's local source and replica log reader offloads share that same region.
 Closing a region rejects new work and waits for queued and running I/O after its caller has been cancelled.
+Provider adapters use `IoRegion::run_blocking` for auxiliary filesystem work such as Azure Arc challenge reads.
+Successful delivery transfers the result to the caller; cancellation retains result destruction in the region's drain.
 File uploads open their source before offloading so an unlinked temporary source remains available to admitted work.
 Remote uploads retain that source through conditional publication and private-object cleanup.
 Reserved remote reads transfer their allocation charge into the admitted operation and then into the returned bytes.
