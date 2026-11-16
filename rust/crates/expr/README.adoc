@@ -390,7 +390,8 @@ Native host compilation admits all emitted pattern programs before any pattern b
 Its initial lexical and string forms include simple-symbol `let`/`let*`, `if`, `do`, `quote`, `when`, `when-not`, `and`, `or`, vector evaluation, and `str`, `identity`, `name`, `namespace`, `subs`, `not` and `boolean` calls.
 Lexical function values preserve strict argument evaluation, and substring indexes count UTF16 units.
 Host numeric values share exact BigInt, BigDecimal and JVM primitive categories with stored Transit objects, retaining decimal scale and Java numeric text.
-Checked `byte`, `short`, `int`, `long`, `float` and `double` calls preserve primitive inline overloads and boxed function invocation; substring indexes use boxed RT integer conversion.
+Checked `byte`, `short`, `int`, `long`, `float` and `double` calls preserve primitive inline overloads and boxed function invocation.
+Substring indexes require Number objects before boxed integer conversion; Character indexes require an explicit numeric cast.
 Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.
 The host admission limits are 128 nested forms and 65536 instructions, with a 16MiB limit per computed text temporary.
 General host arithmetic, interop and effects, namespace state, destructuring/functions/macros, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
