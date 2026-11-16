@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
-use std::str::FromStr;
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
-use bigdecimal::BigDecimal;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
+use crate::interval::parse as interval;
 
 /// The caller covers decoding allocations and the returned value with its own reservation.
 /// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
@@ -20,7 +19,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         1114 => { let time = local_timestamp(text)?; Value::Timestamp { value: time.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None } },
         1184 => timestamp(text)?,
         1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
-        11112 => { let (months, days, nanos) = interval(text)?; if months != 0 { return Err(invalid("Duration cannot contain years or months")); } Value::Duration { value: i64::from(days).checked_mul(86_400_000_000_000).and_then(|value| value.checked_add(nanos)).ok_or_else(|| invalid("Duration overflow"))?.div_euclid(1000), unit: TimeUnit::Microsecond } },
+        11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
         1007 | 1016 | 1009 => { let element = match oid { 1007 => 23, 1016 => 20, _ => 25 }; Value::List(array(text)?.into_iter().map(|value| value.map_or(Ok(Value::Null), |text| read_text(element, &text))).collect::<Result<_>>()?) },
         114 | 3802 => read_json(text)?,
         3910 => {
@@ -75,29 +74,6 @@ fn array(text: &str) -> Result<Vec<Option<String>>> {
     }
     if quoted || escaped { return Err(invalid("Unterminated PostgreSQL array element")); }
     finish(&mut result, &mut value, special); Ok(result)
-}
-fn interval(text: &str) -> Result<(i32, i32, i64)> {
-    let (sign, text) = text.strip_prefix('-').map_or((1i128, text), |text| (-1, text));
-    let text = text.strip_prefix('P').ok_or_else(|| invalid("Interval requires an ISO-8601 P prefix"))?;
-    let mut months = 0i128; let mut days = 0i128; let mut nanos = 0i128; let mut time = false; let mut start = 0;
-    for (index, character) in text.char_indices() {
-        if character == 'T' { if index != start || time { return Err(invalid("Invalid ISO interval time separator")); } time = true; start = index + 1; continue; }
-        if !character.is_ascii_alphabetic() { continue; }
-        let number = &text[start..index]; start = index + 1;
-        if character == 'S' && time {
-            let value = BigDecimal::from_str(number).map_err(invalid)? * BigDecimal::from(1_000_000_000i64);
-            let (coefficient, scale) = value.as_bigint_and_exponent();
-            if scale.unsigned_abs() > 128 { return Err(invalid("Interval seconds exceed supported precision")); }
-            let coefficient = if scale > 0 { coefficient / num_bigint::BigInt::from(10).pow(u32::try_from(scale).map_err(invalid)?) } else { coefficient * num_bigint::BigInt::from(10).pow(u32::try_from(-scale).map_err(invalid)?) };
-            nanos = nanos.checked_add(coefficient.to_string().parse::<i128>().map_err(invalid)?).ok_or_else(|| invalid("Interval overflow"))?;
-            continue;
-        }
-        let number = number.parse::<i128>().map_err(invalid)?;
-        let (target, factor) = match (character, time) { ('Y', false) => (&mut months, 12), ('M', false) => (&mut months, 1), ('W', false) => (&mut days, 7), ('D', false) => (&mut days, 1), ('H', true) => (&mut nanos, 3_600_000_000_000), ('M', true) => (&mut nanos, 60_000_000_000), _ => return Err(invalid("Unsupported ISO interval component")) };
-        *target = target.checked_add(number.checked_mul(factor).ok_or_else(|| invalid("Interval overflow"))?).ok_or_else(|| invalid("Interval overflow"))?;
-    }
-    if start != text.len() { return Err(invalid("Unterminated ISO interval component")); }
-    Ok((i32::try_from(months * sign).map_err(invalid)?, i32::try_from(days * sign).map_err(invalid)?, i64::try_from(nanos * sign).map_err(invalid)?))
 }
 fn read_json(text: &str) -> Result<Value> {
     use serde_json::value::RawValue;
@@ -159,7 +135,8 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                 "m" => Value::Timestamp { value: string()?.parse::<i64>().map_err(invalid)?.checked_mul(1000).ok_or_else(|| invalid("Transit date overflow"))?, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
                 "time/instant" => { let mut value = timestamp(string()?)?; if let Value::Timestamp { timezone, .. } = &mut value { *timezone = Some("UTC".into()); } value },
                 "time/zoned-date-time" => zoned_timestamp(string()?)?, "time/offset-date-time" => timestamp(string()?)?,
-                "time/date-time" => read_text(1114, string()?)?, "time/date" => read_text(1082, string()?)?, "time/time" => read_text(1083, string()?)?, "time/duration" => read_text(11112, string()?)?, "xtdb/interval" => read_text(1186, string()?)?,
+                "time/date-time" => read_text(1114, string()?)?, "time/date" => read_text(1082, string()?)?, "time/time" => read_text(1083, string()?)?, "time/duration" => read_text(11112, string()?)?,
+                "xtdb/interval" => if crate::interval::matches_interval(string()?) { read_text(1186, string()?)? } else { Value::Null },
                 "i8" | "i16" | "i32" | "i64" | "f32" | "f64" => {
                     let value = transit(*representation)?;
                     let scalar = match tag.as_str() { "i8" => rtdb_types::ScalarType::I8, "i16" => rtdb_types::ScalarType::I16, "i32" => rtdb_types::ScalarType::I32, "i64" => rtdb_types::ScalarType::I64, "f32" => rtdb_types::ScalarType::F32, _ => rtdb_types::ScalarType::F64 };
@@ -177,12 +154,8 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                 }
                 "xtdb/period-duration" => {
                     let T::Array(parts) = *representation else { return Err(invalid("Transit period-duration requires an array")); };
-                    let [T::String(period), T::String(duration)] = parts.as_slice() else { return Err(invalid("Transit period-duration requires period and duration strings")); };
-                    let (months, days, _) = interval(period)?; let (_, duration_days, nanos) = interval(duration)?;
-                    let nanos = i64::from(duration_days).checked_mul(86_400_000_000_000).and_then(|days| days.checked_add(nanos)).ok_or_else(|| invalid("Period duration overflow"))?;
-                    if days == 0 && nanos == 0 { Value::IntervalYearMonth(months) }
-                    else if months == 0 && nanos % 1_000_000 == 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds: nanos } }
-                    else { Value::IntervalMonthDayNano { months, days, nanoseconds: nanos } }
+                    let [T::String(period), T::String(duration), ..] = parts.as_slice() else { return Err(invalid("Transit period-duration requires period and duration strings")); };
+                    crate::interval::period_duration(period, duration)?
                 }
                 "xtdb/clj-form" | "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Value::Transit(encode_msgpack(&T::Tagged { tag, representation })?),
                 _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-transit-value", format!("Transit tag {tag} cannot be imported as a native document value"))),
