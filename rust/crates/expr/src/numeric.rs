@@ -68,8 +68,14 @@ pub(crate) fn inapplicable(name: &str, values: &[&Value]) -> Anomaly {
 }
 
 pub fn arithmetic(op: BinaryOp, left: &Value, right: &Value) -> Result<Value> {
+    arithmetic_in_timezone(op, left, right, "UTC")
+}
+
+/// Temporal operations interpret mixed local/zoned operands using the supplied session time zone.
+pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezone: &str) -> Result<Value> {
     use BinaryOp as B;
     if matches!(left, Value::Null | Value::Undefined) || matches!(right, Value::Null | Value::Undefined) { return Ok(Value::Null); }
+    if let Some(result) = crate::temporal::arithmetic(op, left, right, timezone) { return result; }
     if matches!(op, B::ShiftLeft | B::ShiftRight) {
         let a = integer(left).ok_or_else(|| inapplicable("bit shift", &[left, right]))? as i64;
         let b = integer(right).ok_or_else(|| inapplicable("bit shift", &[left, right]))? as u32 & 63;

@@ -27,5 +27,8 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[dev-dependencies]
+rtdb-metrics.workspace = true
+
 [lints]
 workspace = true

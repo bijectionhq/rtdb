@@ -270,9 +270,9 @@ impl ScalarType {
     pub fn validate(&self) -> Result<()> {
         let invalid = match self {
             Self::FixedSizeBinary(width) => *width < 0,
-            Self::Decimal { precision, scale, bit_width } => {
+            Self::Decimal { precision, bit_width, .. } => {
                 let limit = match bit_width { 32 => 9, 64 => 18, 128 => 38, 256 => 76, _ => 0 };
-                *precision == 0 || *precision > limit || i16::from(*scale) > i16::from(*precision)
+                *precision > limit || limit == 0
             }
             Self::Time { unit, bit_width } => *bit_width != if *unit >= TimeUnit::Microsecond { 64 } else { 32 },
             _ => false,

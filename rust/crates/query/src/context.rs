@@ -32,6 +32,16 @@ impl CatalogSnapshot {
         Ok(Self { default_database, databases, transaction_scoped, runtime: None })
     }
     pub fn with_runtime(mut self, runtime: Arc<dyn CatalogRuntime>) -> Self { self.runtime = Some(runtime); self }
+    pub fn database_names(&self) -> impl Iterator<Item = &str> { self.databases.keys().map(String::as_str) }
+    /// Reserves schema enumeration and joins before creating the returned table bindings.
+    /// Clones of the result share its retained allocation charge.
+    pub fn tables_reserved(&self, database: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_plan::CatalogRows<TableBinding>> {
+        let overflow = || invalid("catalog-size", "Table metadata allocation exceeds addressable memory");
+        let mut bytes = crate::system_schema::allocation_bound(database)?;
+        for partition in &self.database(database)?.partitions { bytes = bytes.checked_add(partition.schema_allocation_bound(database)?).ok_or_else(overflow)?; }
+        let reservation = memory.reserve(bytes)?;
+        Ok(rtdb_plan::CatalogRows::new(self.tables(database)?, reservation))
+    }
     pub fn database(&self, name: &str) -> Result<&DatabaseSnapshot> {
         self.databases.get(name).ok_or_else(|| Anomaly::incorrect("xtdb/unknown-db", format!("Unknown database: {name}")))
     }
@@ -88,6 +98,9 @@ pub struct QueryContext {
     pub cancellation: CancellationToken,
     pub(crate) owner_cancellation: CancellationToken,
     pub(crate) spill: Arc<SpillRegion>,
+    pub(crate) execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
+    pub(crate) tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
+    pub(crate) trace_parent: Option<rtdb_plan::SpanContext>,
 }
 
 impl QueryContext {
@@ -100,7 +113,17 @@ impl QueryContext {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive; merge fan-in must be at least two"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
-        Ok(Arc::new(Self { catalog, memory, current_time, timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.clone(), spill }))
+        Ok(Arc::new(Self { catalog, memory, current_time, timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.clone(), spill, execution_observer: None, tracer: None, trace_parent: None }))
+    }
+    /// Applies only to cursors opened from this context; existing cursors retain their original observer.
+    pub fn with_observer(self: Arc<Self>, observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>) -> Arc<Self> {
+        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: observer, tracer: self.tracer.clone(), trace_parent: self.trace_parent })
+    }
+    /// Applies explicit span parentage to subsequently opened executions without thread-local context.
+    pub fn with_tracer(self: Arc<Self>, tracer: Option<Arc<dyn rtdb_plan::Tracer>>, parent: Option<rtdb_plan::SpanContext>) -> Arc<Self> {
+        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.clone(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer, trace_parent: parent })
     }
     pub fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() || self.owner_cancellation.is_cancelled() { Err(cancelled()) } else { Ok(()) }
@@ -108,8 +131,8 @@ impl QueryContext {
     pub fn spill_bytes(&self) -> u64 { self.spill.retained_bytes() }
     pub fn spill_peak_bytes(&self) -> u64 { self.spill.peak_bytes() }
     pub(crate) fn execution_child(&self) -> Arc<Self> {
-        Arc::new(Self { catalog: self.catalog.clone(), memory: Arc::clone(&self.memory), current_time: self.current_time,
-            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill) })
+        Arc::new(Self { catalog: self.catalog.clone(), memory: self.memory.scope(), current_time: self.current_time,
+            timezone: self.timezone.clone(), options: self.options.clone(), cancellation: self.cancellation.child_token(), owner_cancellation: self.owner_cancellation.clone(), spill: Arc::clone(&self.spill), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone(), trace_parent: self.trace_parent })
     }
 }
 

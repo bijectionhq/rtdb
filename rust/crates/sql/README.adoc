@@ -17,10 +17,16 @@ Canonical mutation lowering preserves unassigned document fields, derives valid-
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.
 
-The frontend currently rejects correlated scalar and predicate subqueries, lateral relations, recursive CTEs, window functions, NATURAL and USING joins, DML RETURNING, query SETTING clauses, prepared-statement commands, COPY, database lifecycle commands, interval qualifiers, and decimal cast options.
+The relational binder currently rejects lateral relations, recursive CTEs, DML RETURNING, query SETTING clauses, and interval qualifiers.
+Prepared-statement commands, COPY, and database lifecycle commands use the separate shared control parser described below.
 The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
-ORDER BY expressions are currently resolved against projected fields.
+ORDER BY expressions can use projected aliases and retained input columns; unqualified output names take precedence, including inside expressions.
 The syntax and name errors have source positions; exact SQLSTATE and upstream diagnostic text remain comparison work.
+
+Missing base tables and unresolved columns are planning errors, including projection, WHERE, GROUP BY, HAVING, and window scopes.
+The pinned planner's `xt.not_found` scan and unresolved-column null projections are intermediate error-collection values; `-plan-query` rejects its accumulated errors before returning a plan.
+`tests/missing_names.rs` maps `test-operators-with-unresolved-column-references-3640`, `TableRefVisitor`, and `ExprPlanVisitor` without treating those intermediate values as executable success.
+An empty table declared in the catalog still supplies its schema without requiring any data rows.
 
 == Assertion source mappings
 
@@ -37,3 +43,104 @@ The syntax and name errors have source positions; exact SQLSTATE and upstream di
 
 These sources check binding invariants and do not replace the upstream execution assertions or plan golden comparisons.
 No Rust test, parser invocation, or build has run during Phase 1.
+
+== Decimal casts
+
+`DECIMAL`, `NUMERIC`, and `DEC` retain existing decimal precision and scale when no precision is supplied.
+Other numeric and text inputs use precision 64, scale 9, and 256-bit storage.
+Explicit precision selects 128-bit storage through precision 32 and 256-bit storage through precision 64, with scale zero when omitted and half-even rounding.
+Array casts apply these rules recursively and preserve element nullability.
+Precision zero accepts null-only results; a non-null coefficient requires at least one digit.
+Scales larger than precision are valid when the unscaled coefficient fits, such as `0.001::DECIMAL(1,3)`.
+`rtdb-plan::CastTarget` is an immutable passive value retaining the distinction between an unspecified decimal target and fixed metadata.
+Native prepared statements rebind that target against the current parameter types on each execution.
+
+`tests/decimal_casts.rs` maps `xtdb.sql-test/decimal-casting`; expression and XTQL cast sources also map `test-cast-list-elementwise`, `test-cast-pg-array-text-to-list`, and `test-cast-list-applies-element-cast-opts`.
+The native Arrow schema and decimal values store scale as a signed byte; the JVM stores a signed 32-bit scale.
+Scales outside the native range fail explicitly and remain an implementation gap requiring a wider value and Arrow IPC boundary.
+Exact failure timing, diagnostic equivalence, and all execution observations remain unverified.
+
+== Subqueries
+
+Scalar subqueries, EXISTS, IN, ANY, SOME and ALL lower to the shared Apply operator.
+Their scopes include projection, WHERE, HAVING, grouping and aggregate arguments, VALUES, ORDER BY, mutation predicates and assignments, ASSERT, and inner/left/right join conditions.
+Correlation scopes capture columns in apply-local parameters allocated above the statement's lexical parameter indices.
+Nested subqueries and CTE reuse retain those bindings without adding client parameters.
+Quantified comparisons count true and unknown outcomes separately, preserving empty-set and NULL behavior.
+A NULL array contributes one NULL candidate; an empty array contributes none.
+UPDATE retains the original target-column identities separately from subquery helper fields.
+
+The source mapping is `xtdb.sql-test/test-subqueries`, `test-in-subquery`, `test-scalar-subquery-with-expressions`, and the array-quantifier paths in `xtdb.sql/visitQuantifiedComparisonExpr`.
+`tests/subqueries.rs` contains native result assertions for correlation, nested CTEs, cardinality, null truth tables, parameter numbering, wildcard output, grouping and outer joins.
+Full upstream plan golden comparison and optimizer-dependent error elision remain qualification work.
+The lowering preserves dependent evaluation without implementing the reference decorrelation optimizer.
+Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone control values still reject relational subqueries.
+ORDER BY subqueries can capture both projected aliases and retained input columns.
+
+== Named joins and ordering
+
+NATURAL joins compare every shared visible name; USING joins compare their named columns with SQL equality.
+Each side keeps its qualified columns and its wildcard expansion order.
+The unqualified common name binds to the original left column, including RIGHT and FULL joins, as in the pinned `JoinTable` scope.
+An unmatched right row consequently has a null unqualified common value.
+Wildcard expansion retains both common columns; duplicate output names are rejected.
+Explicit output names suppress matching names from an unqualified wildcard, and those explicit outputs follow the expanded columns.
+Column binding metadata belongs to the immutable plan field and remains attached when a scope is captured by a subquery.
+New table aliases establish a fresh name-binding scope.
+
+SELECT ordering evaluates after its output expressions and before final projection and DISTINCT.
+Nonprojected sort columns do not participate in duplicate elimination.
+Set-operation ordering sees only the resulting output columns.
+Ordinal ordering refers to output positions; aggregate expressions must be projected and referenced by their aliases.
+The source regression cases in `tests/joins_order.rs` map `test-named-columns-join`, `test-natural-join`, `test-order-by-3065`, `test-order-by-alias`, `test-order-by-unqualified-derived-column-refs`, and `test-duplicate-column-projection`.
+Additional cases retain the pinned outer-join and DISTINCT behavior without assuming another SQL implementation's rules.
+Wildcard EXCLUDE and RENAME modifiers remain outside the binder's supported surface.
+All execution results and exact diagnostics remain unverified pending Phase 2.
+
+== Window functions
+
+Each SELECT supports one ROW_NUMBER, LEAD, or LAG call, including a call inside a scalar output expression.
+Partitions use column references, and their order follows the first input occurrence of each grouping key.
+Window ordering accepts scalar expressions, preserves input order for equal keys, and applies explicit or default null ordering.
+ROW_NUMBER returns a non-null signed 64-bit value starting at one in each partition.
+LEAD and LAG take a column or a projected aggregate result and an optional unsigned integer offset; the default offset is one.
+They retain the operand type with nullability, respect null rows, and return null beyond the current partition.
+
+The pinned planner rejects multiple window calls in one SELECT, explicit frames, direct named-window references, default expressions, and explicit null treatment.
+Its WINDOW definitions and existing name inside `OVER (name ...)` are inert; they do not supply partitioning or ordering.
+QUALIFY is unsupported, while an outer query can filter a projected window result.
+Ranks, NTILE, value-selection functions, and aggregate windows have no implemented reference window factory and remain unsupported.
+Subqueries and output ordinals in window ORDER BY remain rejected.
+
+The passive `Window` plan owns immutable function and partition descriptors.
+Its caller-pulled executor assigns group IDs, uses stable external sorting, and retains sequential spill readers for shifted values.
+Spill quota, memory reservations, cancellation, and cursor drop govern those retained resources.
+`tests/windows.rs` maps `xtdb.sql-test/test-window-functions`, `test-lead-lag-window-functions`, and the planner's `visitWindowSpecificationDetails` and `wrap-windows` behavior.
+The query crate's window sources additionally cover multiple relational-algebra outputs, nonreflexive grouping keys, cancellation, output ownership, and spill failure cleanup.
+Compilation, execution, differential assertions, and exact diagnostic matching remain unverified.
+
+== Shared control parser
+
+`parse_control` recognizes BEGIN and START TRANSACTION characteristics, SET TRANSACTION, COMMIT modes, ROLLBACK, session settings, SHOW, SQL PREPARE and EXECUTE, COPY input, and database attachment controls.
+Its immutable result lives in `rtdb-plan`; scalar option binding is independent of a live database catalog.
+`split_statements` separates statements by tokenizer spans before classification, preserving semicolons inside strings and comments.
+Callers classify each span with `parse_control` before passing query or DML text to the relational binder.
+The frontend owns prepared statement registries and COPY wire state; `rtdb-node` owns session transitions and control effects.
+
+== Inline XTQL
+
+XTQL string queries enter the ordinary SQL query-expression path, including derived tables, CTEs, set operations, scalar and quantified subqueries, and INSERT sources.
+Their parsed descriptors retain the original token span, and the binder recognizes each injected table reference by that span and its generated name together.
+User-written table and CTE names remain ordinary catalog or lexical references.
+SQL and XTQL share the preparation's transient column allocator and internal parameter cursor; the returned relation is immutable.
+
+A top-level XTQL function without an explicit SQL argument list claims parameter positions where its query expression occurs in the original SQL text.
+An explicit argument list maps function arguments to the supplied anonymous or numbered SQL parameter positions.
+Non-function queries ignore explicit placeholders; those placeholders still occupy anonymous lexical slots but do not themselves contribute to the prepared statement's external arity.
+Nested XTQL and SQL applies allocate beyond the containing statement's external positions.
+Native prepared execution binds the embedded query again against the current argument types and catalog.
+
+`tests/inline_xtql.rs` maps `xtdb.sql-test/inline-xtql`, including the parameter-position cases for 5995, and adds query-expression placement, alias isolation, error-span, and shared apply-allocation assertions.
+`rtdb-node/tests/statement.rs` retains a dynamic prepared-parameter rebinding case.
+The shared XTQL function registry and SQL surfaces still have the independently documented gaps; embedding does not expand those languages' supported operators.
+All execution results and complete upstream inline-query comparisons remain unverified.

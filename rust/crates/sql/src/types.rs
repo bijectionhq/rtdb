@@ -3,6 +3,22 @@ use sqlparser::ast as ast;
 
 use crate::bind::{error, identifiers, unsupported};
 
+pub(crate) fn cast_target(data_type: &ast::DataType) -> Result<rtdb_plan::CastTarget> {
+    use ast::{DataType as D, ExactNumberInfo as N};
+    match data_type {
+        D::Numeric(info) | D::Decimal(info) | D::Dec(info) => {
+            let (precision, scale) = match info { N::None => (None, None), N::Precision(p) => (Some(*p), None), N::PrecisionAndScale(p, s) => (Some(*p), Some(*s)) };
+            if scale.is_some_and(|scale| scale < 0) { return Err(error("SQL decimal scale must be unsigned")); }
+            rtdb_plan::CastTarget::decimal(precision, scale)
+        }
+        D::Array(element) => {
+            let element = match element { ast::ArrayElemTypeDef::AngleBracket(element) | ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Parenthesis(element) | ast::ArrayElemTypeDef::Qualified(element, _) => element, _ => return Err(error("Array cast requires an element type")) };
+            Ok(rtdb_plan::CastTarget::List(Box::new(cast_target(element)?)))
+        }
+        other => Ok(rtdb_plan::CastTarget::fixed(self::data_type(other)?)),
+    }
+}
+
 pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
     use ast::DataType as D;
     let scalar = match data_type {
@@ -12,8 +28,7 @@ pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
         D::BigInt(_) | D::Int8(_) => ScalarType::I64,
         D::Float(_) | D::Real | D::Float4 => ScalarType::F32,
         D::Double(_) | D::DoublePrecision | D::Float8 => ScalarType::F64,
-        D::Numeric(ast::ExactNumberInfo::None) | D::Decimal(ast::ExactNumberInfo::None) => ScalarType::Decimal { precision: 64, scale: 9, bit_width: 256 },
-        D::Numeric(_) | D::Decimal(_) => return Err(unsupported("Decimal casts with precision or scale options")),
+        D::Numeric(info) | D::Decimal(info) | D::Dec(info) => decimal_type(info)?,
         D::Character(_) | D::Char(_) | D::CharacterVarying(_) | D::CharVarying(_) | D::Varchar(_) | D::Text => ScalarType::Utf8,
         D::Binary(_) | D::Varbinary(_) | D::Bytea => ScalarType::Binary,
         D::Uuid => ScalarType::Uuid,
@@ -44,6 +59,17 @@ pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
     };
     scalar.validate()?;
     Ok(LogicalType::Scalar(scalar))
+}
+
+fn decimal_type(info: &ast::ExactNumberInfo) -> Result<ScalarType> {
+    let (precision, scale) = match info {
+        ast::ExactNumberInfo::None => (64, 9),
+        ast::ExactNumberInfo::Precision(precision) => (*precision, 0),
+        ast::ExactNumberInfo::PrecisionAndScale(precision, scale) => (*precision, *scale),
+    };
+    if precision > 64 { return Err(rtdb_types::Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
+    if scale < 0 { return Err(error("SQL decimal scale must be unsigned")); }
+    Ok(ScalarType::Decimal { precision: precision as u8, scale: i8::try_from(scale).map_err(error)?, bit_width: if precision <= 32 { 128 } else { 256 } })
 }
 
 fn time_unit(precision: Option<u64>) -> Result<TimeUnit> {

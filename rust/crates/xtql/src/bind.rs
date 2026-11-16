@@ -20,7 +20,8 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
     for index in options.named_parameters.values().map(|(index, _)| index).chain(options.parameter_indices.iter().flatten()) {
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
     }
-    let mut compiler = Compiler { catalog, binder: Binder::default(), next_parameter };
+    let mut binder = Binder::default();
+    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter };
     let mut parameters = BTreeMap::new();
     for (name, (index, data_type)) in &options.named_parameters {
         parameters.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
@@ -33,7 +34,7 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
             let index = options.parameter_indices.as_ref().map_or(position, |indices| indices[position]);
             let data_type = options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Null);
             parameters.insert(normal(name), compiler.binder.parameter(index, data_type));
-            compiler.next_parameter = compiler.next_parameter.max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
+            *compiler.next_parameter = (*compiler.next_parameter).max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
         }
         body.as_ref()
     } else { &query };
@@ -41,12 +42,30 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
     Ok(PreparedStatement { statement: Statement::Query(plan.relation), parameter_types: compiler.binder.parameter_types().clone(), source: source.into() })
 }
 
+/// Binds an embedded query using the caller's column identities and apply-parameter allocator.
+/// Arguments pair external parameter positions with their types and must match a top-level function's arity.
+/// Queries without a top-level function ignore the arguments.
+/// The allocator starts above every parameter owned by the containing statement and advances for nested applies.
+pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)]) -> Result<Arc<Relation>> {
+    let mut parameters = BTreeMap::new();
+    let body = if let Query::Function { parameters: names, body } = query {
+        if names.len() != arguments.len() { return Err(error("xtql/fn-arity-error", format!("XTQL fn expects {} argument(s), got {}", names.len(), arguments.len()))); }
+        for (name, (index, data_type)) in names.iter().zip(arguments) {
+            *next_parameter = (*next_parameter).max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
+            parameters.insert(normal(name), binder.parameter(*index, data_type.clone()));
+        }
+        body.as_ref()
+    } else { query };
+    let mut compiler = Compiler { catalog, binder, next_parameter };
+    Ok(compiler.query(body, &parameters)?.relation)
+}
+
 type Parameters = BTreeMap<String, PExpr>;
 
-struct Compiler<'a> {
+struct Compiler<'a, 'b> {
     catalog: &'a dyn Catalog,
-    binder: Binder,
-    next_parameter: usize,
+    binder: &'b mut Binder,
+    next_parameter: &'b mut usize,
 }
 
 struct Bound { relation: Arc<Relation>, variables: BTreeMap<String, Field> }
@@ -59,10 +78,10 @@ impl Bound {
     }
 }
 
-impl Compiler<'_> {
+impl Compiler<'_, '_> {
     fn parameter_index(&mut self) -> Result<usize> {
-        let index = self.next_parameter;
-        self.next_parameter = index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?;
+        let index = *self.next_parameter;
+        *self.next_parameter = index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?;
         Ok(index)
     }
 
@@ -387,6 +406,7 @@ impl Compiler<'_> {
     fn expr(&mut self, expr: &Expr, bound: &mut Bound, parameters: &Parameters) -> Result<PExpr> {
         Ok(match expr {
             Expr::Literal(value) => PExpr::Literal(value.clone()),
+            Expr::Cast { expr, target } => PExpr::Cast { expr: Box::new(self.expr(expr, bound, parameters)?), target: target.clone() },
             Expr::Variable(name) => parameters.get(&normal(name)).cloned().or_else(|| bound.variables.get(&normal(name)).map(Field::expression))
                 .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
             Expr::LogicVariable(name) => bound.variables.get(&normal(name)).map(Field::expression)
@@ -487,6 +507,7 @@ impl Compiler<'_> {
                 Expr::Variable(name)
             }
             Expr::Call { function, arguments } => Expr::Call { function: function.clone(), arguments: arguments.iter().map(|expr| self.rewrite_aggregates(expr, bound, parameters, aggregates)).collect::<Result<_>>()? },
+            Expr::Cast { expr, target } => Expr::Cast { expr: Box::new(self.rewrite_aggregates(expr, bound, parameters, aggregates)?), target: target.clone() },
             Expr::Get { object, field } => Expr::Get { object: Box::new(self.rewrite_aggregates(object, bound, parameters, aggregates)?), field: field.clone() },
             Expr::List(values) => Expr::List(values.iter().map(|expr| self.rewrite_aggregates(expr, bound, parameters, aggregates)).collect::<Result<_>>()?),
             Expr::Set(values) => Expr::Set(values.iter().map(|expr| self.rewrite_aggregates(expr, bound, parameters, aggregates)).collect::<Result<_>>()?),
@@ -562,6 +583,7 @@ fn required_expr(expr: &Expr, parameters: &Parameters, result: &mut BTreeSet<Str
         Expr::LogicVariable(name) => { result.insert(normal(name)); }
         Expr::Call { arguments, .. } | Expr::List(arguments) | Expr::Set(arguments) => for argument in arguments { required_expr(argument, parameters, result); },
         Expr::Get { object, .. } => required_expr(object, parameters, result),
+        Expr::Cast { expr, .. } => required_expr(expr, parameters, result),
         Expr::Map(values) => for (_, value) in values { required_expr(value, parameters, result); },
         Expr::Subquery { query, arguments, .. } => required_arguments(query, arguments.as_deref(), parameters, result),
         _ => {}
@@ -602,6 +624,7 @@ fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Call { function, arguments } => aggregate_function(function).is_some() || arguments.iter().any(contains_aggregate),
         Expr::Get { object, .. } => contains_aggregate(object),
+        Expr::Cast { expr, .. } => contains_aggregate(expr),
         Expr::List(values) | Expr::Set(values) => values.iter().any(contains_aggregate),
         Expr::Map(values) => values.iter().any(|(_, value)| contains_aggregate(value)),
         _ => false,

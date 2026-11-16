@@ -2,7 +2,7 @@ mod local;
 mod memory;
 mod read_only;
 
-pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
+pub use local::{LocalLog, LocalLogDriver, LocalLogOptions, LocalTimestampSource};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
 use std::{sync::Arc, time::Duration};
+use std::{future::Future, pin::Pin};
 use tokio::sync::{oneshot, watch};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -28,15 +29,47 @@ pub struct LogRecord {
     pub payload: Bytes,
 }
 
-pub struct AppendReceipt { durable: oneshot::Receiver<Result<LogMetadata>> }
+impl LogRecord {
+    /// Keeps the caller's pre-read charge alive for every clone of the payload.
+    pub fn retain(self, reservation: crate::object_store::ReadReservation) -> Result<Self> {
+        if reservation.length() < self.payload.len().saturating_add(256) { return Err(Error::Task("log record exceeds its read reservation".into())); }
+        struct Retained { bytes: Bytes, _reservation: crate::object_store::ReadReservation }
+        impl AsRef<[u8]> for Retained { fn as_ref(&self) -> &[u8] { &self.bytes } }
+        Ok(Self { metadata: self.metadata, payload: Bytes::from_owner(Retained { bytes: self.payload, _reservation: reservation }) })
+    }
+}
+
+#[async_trait]
+pub trait LogRange: Send {
+    /// The caller reserves this many bytes before each read; returned payloads retain that charge.
+    fn allocation_bound(&self) -> usize;
+    /// Returns one record from the captured range, or None at its permanent end.
+    async fn next(&mut self, reservation: crate::object_store::ReadReservation) -> Result<Option<LogRecord>>;
+}
+
+enum Completion {
+    Driver(oneshot::Receiver<Result<LogMetadata>>),
+    Observed(Pin<Box<dyn Future<Output = Result<LogMetadata>> + Send>>),
+}
+
+pub struct AppendReceipt { completion: Completion }
 
 impl AppendReceipt {
     /// The driver must complete this receiver only after durable provider acknowledgement, or with an append error.
-    pub fn new(durable: oneshot::Receiver<Result<LogMetadata>>) -> Self { Self { durable } }
+    pub fn new(durable: oneshot::Receiver<Result<LogMetadata>>) -> Self { Self { completion: Completion::Driver(durable) } }
+
+    /// Wraps receipt observation without changing the accepted write's backend ownership.
+    /// The future runs only while the caller polls `durable`; dropping it cancels observation, not the accepted append.
+    pub fn observed(future: impl Future<Output = Result<LogMetadata>> + Send + 'static) -> Self {
+        Self { completion: Completion::Observed(Box::pin(future)) }
+    }
 
     /// Reports durable append, independently of replica admission or application.
     pub async fn durable(self) -> Result<LogMetadata> {
-        self.durable.await.map_err(|_| Error::Closed("append driver ended before reporting durability".into()))?
+        match self.completion {
+            Completion::Driver(durable) => durable.await.map_err(|_| Error::Closed("append driver ended before reporting durability".into()))?,
+            Completion::Observed(future) => future.await,
+        }
     }
 }
 
@@ -52,6 +85,9 @@ pub trait Log: Send + Sync {
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt>;
     fn latest(&self) -> Result<LogOffset>;
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>>;
+    /// Captures record starts in [from, to), bounded by the current durable tip.
+    /// A missing start within the captured tip is an error; starts beyond the tip return an empty range.
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn LogRange>>;
     /// Reads record starts in [from, to), rejecting a missing retained start position.
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>>;
 }

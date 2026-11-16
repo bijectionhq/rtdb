@@ -1,0 +1,120 @@
+use std::{collections::BTreeMap, sync::{Arc, Mutex}, time::Duration};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_node::Clock;
+use rtdb_types::{Anomaly, Result, Timestamp};
+
+pub(crate) trait Leased: Send + Sync { fn close(&self); }
+struct Live<V> { value: Arc<V>, since: Timestamp, limit: Duration, idle: Duration, users: usize, _reservation: Arc<MemoryReservation> }
+enum Entry<V> { Live(Live<V>), Expired { at: Timestamp, after: Duration, _reservation: Arc<MemoryReservation> } }
+pub(crate) enum Lookup<V> { Found(Arc<V>), Expired(Duration), Unknown }
+pub(crate) struct Registry<K, V> { entries: Mutex<BTreeMap<K, Entry<V>>>, clock: Arc<dyn Clock>, memory: Arc<MemoryBudget> }
+impl<K: Ord + Clone, V: Leased> Registry<K, V> {
+    pub fn new(clock: Arc<dyn Clock>, memory: Arc<MemoryBudget>) -> Self { Self { entries: Mutex::new(BTreeMap::new()), clock, memory } }
+    pub fn insert(&self, key: K, value: Arc<V>, idle: Duration, first: Duration, acquired: bool, key_bytes: usize) -> Result<()> {
+        let reservation = self.memory.reserve(key_bytes.checked_add(256).ok_or_else(|| Anomaly::incorrect("rtdb.flight-sql/lease-size", "Lease identity exceeds addressable memory"))?)?;
+        let mut entries = self.entries.lock().expect("lease lock");
+        if entries.contains_key(&key) { return Err(Anomaly::fault("rtdb.flight-sql/duplicate-handle", "Generated Flight handle already exists")); }
+        entries.insert(key, Entry::Live(Live { value, since: self.clock.now(), limit: first, idle, users: usize::from(acquired), _reservation: reservation }));
+        Ok(())
+    }
+    pub fn lookup(&self, key: &K, acquire: bool) -> Lookup<V> {
+        let now = self.clock.now();
+        let mut entries = self.entries.lock().expect("lease lock");
+        let Some(entry) = entries.get_mut(key) else { return Lookup::Unknown; };
+        expire(entry, now);
+        match entry {
+            Entry::Live(live) => { live.since = now; live.limit = live.idle; live.users += usize::from(acquire); Lookup::Found(Arc::clone(&live.value)) }
+            Entry::Expired { after, .. } => Lookup::Expired(*after),
+        }
+    }
+    pub fn release(&self, key: &K) {
+        if let Some(Entry::Live(live)) = self.entries.lock().expect("lease lock").get_mut(key) {
+            assert!(live.users != 0); live.users -= 1; live.since = self.clock.now();
+        }
+    }
+    pub fn take(&self, key: &K) -> Lookup<V> {
+        let mut entries = self.entries.lock().expect("lease lock");
+        let Some(entry) = entries.get_mut(key) else { return Lookup::Unknown; };
+        expire(entry, self.clock.now());
+        match entry {
+            Entry::Expired { after, .. } => Lookup::Expired(*after),
+            Entry::Live(_) => match entries.remove(key).expect("present lease") { Entry::Live(live) => Lookup::Found(live.value), Entry::Expired { .. } => unreachable!() },
+        }
+    }
+    pub fn sweep(&self) {
+        let now = self.clock.now();
+        self.entries.lock().expect("lease lock").retain(|_, entry| {
+            let remove = matches!(entry, Entry::Expired { at, after, .. } if elapsed(*at, now) >= *after);
+            if !remove { expire(entry, now); } !remove
+        });
+    }
+    pub fn close(&self) {
+        let entries = std::mem::take(&mut *self.entries.lock().expect("lease lock"));
+        for entry in entries.into_values() { if let Entry::Live(live) = entry { live.value.close(); } }
+    }
+    pub fn len(&self) -> usize { self.entries.lock().expect("lease lock").values().filter(|entry| matches!(entry, Entry::Live(_))).count() }
+}
+fn elapsed(since: Timestamp, now: Timestamp) -> Duration { Duration::from_micros(now.0.saturating_sub(since.0).max(0) as u64) }
+fn expire<V: Leased>(entry: &mut Entry<V>, now: Timestamp) {
+    if let Entry::Live(live) = entry {
+        if live.users == 0 && elapsed(live.since, now) >= live.limit {
+            live.value.close();
+            *entry = Entry::Expired { at: now, after: live.limit, _reservation: Arc::clone(&live._reservation) };
+        }
+    }
+}
+
+pub(crate) fn duration(value: Duration) -> String {
+    let seconds = value.as_secs(); let hours = seconds / 3600; let minutes = seconds % 3600 / 60; let seconds = seconds % 60;
+    let mut output = "PT".to_owned();
+    if hours != 0 { output.push_str(&format!("{hours}H")); }
+    if minutes != 0 { output.push_str(&format!("{minutes}M")); }
+    if seconds != 0 || value.subsec_nanos() != 0 || output == "PT" {
+        output.push_str(&seconds.to_string());
+        if value.subsec_nanos() != 0 { output.push('.'); output.push_str(format!("{:09}", value.subsec_nanos()).trim_end_matches('0')); }
+        output.push('S');
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+    struct TestClock(AtomicI64);
+    impl Clock for TestClock { fn now(&self) -> Timestamp { Timestamp(self.0.load(Ordering::Relaxed)) } }
+    struct Resource(AtomicUsize);
+    impl Leased for Resource { fn close(&self) { self.0.fetch_add(1, Ordering::Relaxed); } }
+    #[test]
+    fn acquired_session_survives_idle_deadline_and_release_restarts_first_limit() {
+        let clock = Arc::new(TestClock(AtomicI64::new(0))); let memory = MemoryBudget::new(4096);
+        let registry = Registry::new(clock.clone(), memory.clone()); let resource = Arc::new(Resource(AtomicUsize::new(0)));
+        registry.insert(1, resource.clone(), Duration::from_secs(30), Duration::from_secs(1), true, 8).unwrap();
+        clock.0.store(5_000_000, Ordering::Relaxed); registry.sweep(); assert_eq!(resource.0.load(Ordering::Relaxed), 0);
+        registry.release(&1); clock.0.store(6_000_000, Ordering::Relaxed);
+        assert!(matches!(registry.lookup(&1, false), Lookup::Expired(after) if after == Duration::from_secs(1)));
+        assert_eq!(resource.0.load(Ordering::Relaxed), 1); registry.sweep(); assert!(memory.used_bytes() > 0);
+        clock.0.store(7_000_000, Ordering::Relaxed); registry.sweep(); assert_eq!(memory.used_bytes(), 0); assert!(matches!(registry.lookup(&1, false), Lookup::Unknown));
+    }
+    #[test]
+    fn presenting_session_switches_to_idle_limit_and_nested_calls_each_release_once() {
+        let clock = Arc::new(TestClock(AtomicI64::new(0))); let registry = Registry::new(clock.clone(), MemoryBudget::new(4096));
+        registry.insert(1, Arc::new(Resource(AtomicUsize::new(0))), Duration::from_secs(30), Duration::from_secs(1), false, 8).unwrap();
+        clock.0.store(999_999, Ordering::Relaxed); assert!(matches!(registry.lookup(&1, true), Lookup::Found(_)));
+        assert!(matches!(registry.lookup(&1, true), Lookup::Found(_))); registry.release(&1);
+        clock.0.store(100_000_000, Ordering::Relaxed); registry.sweep(); assert_eq!(registry.len(), 1); registry.release(&1);
+        clock.0.store(130_000_000, Ordering::Relaxed); assert!(matches!(registry.take(&1), Lookup::Expired(after) if after == Duration::from_secs(30)));
+    }
+    #[test]
+    fn ended_handle_transfers_close_to_claimant_and_does_not_keep_tombstone() {
+        let clock = Arc::new(TestClock(AtomicI64::new(0))); let memory = MemoryBudget::new(4096); let registry = Registry::new(clock, memory.clone());
+        let resource = Arc::new(Resource(AtomicUsize::new(0))); registry.insert(1, resource.clone(), Duration::from_secs(1), Duration::from_secs(1), false, 8).unwrap();
+        let Lookup::Found(claimed) = registry.take(&1) else { panic!("live resource"); };
+        assert_eq!(resource.0.load(Ordering::Relaxed), 0); assert_eq!(memory.used_bytes(), 0); claimed.close(); assert!(matches!(registry.take(&1), Lookup::Unknown));
+        assert_eq!(resource.0.load(Ordering::Relaxed), 1);
+    }
+    #[test]
+    fn idle_duration_uses_java_iso_format() {
+        assert_eq!(duration(Duration::from_secs(1800)), "PT30M"); assert_eq!(duration(Duration::from_millis(1250)), "PT1.25S"); assert_eq!(duration(Duration::from_secs(3661)), "PT1H1M1S");
+    }
+}

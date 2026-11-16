@@ -1,0 +1,61 @@
+= Native RTDB runtime
+
+The Rust implementation is in its source-writing phase.
+The commands and interfaces below have implementation and regression-test source, but no native build or execution evidence yet.
+Use link:../../rust/implementation-status.json[the implementation status] and link:../../rust/source-review.adoc[the source review] for the remaining work and the compilation gate.
+The reviewed link:xtdb-rust-rewrite.md[migration design] remains the cutover contract.
+
+== Server and clients
+
+The `rtdb` binary assembles the native node, configured resource providers, authentication, pgwire, Flight SQL, health checks, metrics and tracing.
+`node --file PATH` selects a YAML or data-only EDN configuration.
+`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` sets the explicit allocation ceiling; the default is one GiB.
+Library-internal HTTP, TLS and cloud SDK allocations still require whole-process measurement.
+See link:../../rust/crates/server/README.adoc[server configuration and lifecycle] for listener defaults and shutdown behavior.
+
+Pgwire simple and extended queries, prepared statements, COPY, cancellation and session controls use the native session implementation.
+Flight SQL uses the same query and transaction services through authenticated sessions, prepared handles and streaming ingest.
+The link:../../rust/crates/pgwire/README.adoc[pgwire] and link:../../rust/crates/flight-sql/README.adoc[Flight SQL] references describe their current surfaces and compatibility qualifications.
+The link:../../rust/crates/sql/README.adoc[SQL] and link:../../rust/crates/xtql/README.adoc[XTQL] references identify language forms that remain incomplete.
+
+The embedded library exposes a versioned C ABI with Arrow C Data and C Stream ownership.
+The Java foreign-memory adapter implements ADBC and the existing Clojure connection protocols over that library.
+Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` classes need the migration described in link:../../rust/crates/ffi/README.adoc[the embedded binding reference].
+Native buffer owners survive statement closure until the foreign consumer releases them.
+
+== Operations
+
+Health HTTP exposes the index, metrics, started, alive and ready routes, plus POST `/system/finish-block`.
+Prometheus, OTLP tracing and configured Azure Monitor or CloudWatch publishers share native execution observations.
+CloudWatch requires the corresponding binary feature.
+Exporter compatibility, transport allocations and shutdown budgets remain unmeasured.
+
+`export-snapshot DATABASE` captures the selected block's recoverable files and copies them within the configured storage root.
+`reset-compactor DATABASE` requires an exclusive maintenance window with other nodes, clients and upstream writers stopped.
+It publishes and adopts a replacement catalog before deleting compacted files.
+Both commands have `--dry-run` modes, described in link:../../rust/crates/server/README.adoc[the operational command reference].
+
+`compactor` follows replica progress and publishes compaction results for a separate writer to apply.
+Concurrent deployment requires a source-log provider supporting multiple writers; the local log keeps its exclusive writer lock.
+The local artifact inspection commands decode Arrow, hash-trie, table-block and block-catalog files without starting a node.
+Their output is typed JSON; it differs from the JVM helpers' Clojure pretty-print output.
+
+The paired `rtdb-config` binary qualifies configuration offline against explicit environment and artifact provenance inputs.
+Its link:../../rust/crates/config/README.adoc[redacted report] does not authorize cutover.
+JVM object-valued configuration hooks require a native replacement.
+
+== Packaging and comparison evidence
+
+The link:../../rust/release/README.adoc[release recipes] retain source revisions, feature selections, immutable image identities and extracted artifact hashes.
+Each package remains unqualified until its selected backend and client lanes have executed.
+No native package is available from the source-writing phase.
+
+The link:../../rust/conformance/README.adoc[conformance runners] retain upstream case identities, selections, actual execution outcomes and precise typed mismatches.
+The link:../../rust/conformance/sql-logic.adoc[SQL logic runner] retains original record expectations and separately reports skipped, suppressed, malformed and unqualified observations.
+Historical-price comparisons cover live, flushed, compacted and restarted layouts with temporal pruning enabled and bypassed.
+The link:../../rust/conformance/RECOVERY.adoc[sequential local recovery harness] transfers closed checkpoints in both directions and requires the JVM fallback to recover an acknowledged Rust canary write.
+Its partial-compaction scenario preserves the uploaded data bytes while the JVM completes the missing metadata.
+Those scenarios remain unexecuted and do not establish production fencing, remote-backend, CDC or deployment-budget qualification.
+
+Compilation starts only after the complete source review passes.
+The assertion ledger, runtime denominator, release matrix, matched performance measurements and migration/rollback evidence remain delivery requirements.

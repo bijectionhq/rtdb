@@ -11,6 +11,7 @@ pub enum Expr {
     /// Binding shorthand always names a logic variable, including inside a query function.
     LogicVariable(String),
     Call { function: String, arguments: Vec<Expr> },
+    Cast { expr: Box<Expr>, target: rtdb_plan::CastTarget },
     Get { object: Box<Expr>, field: String }, List(Vec<Expr>), Set(Vec<Expr>), Map(Vec<(String, Expr)>),
     Subquery { kind: SubqueryKind, query: Box<Query>, arguments: Option<Vec<Expr>> },
 }
@@ -109,6 +110,10 @@ pub fn parse_expr(form: &Edn) -> Result<Expr> {
         EdnKind::List(_) => {
             let (op, args) = form_list(form, "xtql/malformed-call")?;
             match op {
+                "cast" => {
+                    if !(2..=3).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "cast requires an expression, target type, and optional cast options")); }
+                    Expr::Cast { expr: Box::new(parse_expr(&args[0])?), target: crate::cast::target(&args[1], args.get(2))? }
+                }
                 "." => {
                     if args.len() != 2 || args[1].symbol().is_none() { return Err(error("xtql/malformed-get", "Malformed get")); }
                     Expr::Get { object: Box::new(parse_expr(&args[0])?), field: args[1].symbol().unwrap_or_default().into() }

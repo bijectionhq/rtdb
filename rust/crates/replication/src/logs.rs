@@ -54,6 +54,14 @@ impl PartitionLogs {
     }
     pub async fn source_tail(&self, after: SourcePosition) -> Result<Box<dyn LogTail>> { self.source.tail(LogOffset(after.after_offset(self.source_epoch))).await.map_err(Into::into) }
     pub async fn replica_tail(&self, after: ReplicaPosition) -> Result<Box<dyn LogTail>> { self.replica.tail(LogOffset(after.after_offset(self.replica_epoch))).await.map_err(Into::into) }
+    pub async fn source_range(&self, from: SourcePosition, to: SourcePosition) -> Result<Box<dyn rtdb_storage::log::LogRange>> {
+        let (from, to) = inspection_offsets(from.0, to.0, self.source_epoch)?;
+        self.source.range(from, to).await.map_err(Into::into)
+    }
+    pub async fn replica_range(&self, from: ReplicaPosition, to: ReplicaPosition) -> Result<Box<dyn rtdb_storage::log::LogRange>> {
+        let (from, to) = inspection_offsets(from.0, to.0, self.replica_epoch)?;
+        self.replica.range(from, to).await.map_err(Into::into)
+    }
     pub fn validate_source_boundary(&self, after: SourcePosition) -> Result<()> {
         let offset = after.after_offset(self.source_epoch);
         let latest = self.source.latest()?.0;
@@ -107,6 +115,17 @@ impl PartitionLogs {
         let reservation = self.memory.reserve(bound)?;
         let envelope = record.envelope.unwrap_payload(lease.as_slice())?;
         Ok(ReplicaRecord { metadata: record.metadata, envelope: Arc::new(envelope), reservation })
+    }
+}
+
+fn inspection_offsets(from: i64, to: i64, epoch: StorageEpoch) -> Result<(LogOffset, LogOffset)> {
+    if from >= to { return Ok((LogOffset(0), LogOffset(0))); }
+    let base = SourcePosition::from_epoch_offset(epoch, 0)?.0;
+    let from = from.checked_sub(base).filter(|offset| (0..(1_i64 << 48)).contains(offset));
+    let to = to.checked_sub(base).filter(|offset| (0..=(1_i64 << 48)).contains(offset));
+    match (from, to) {
+        (Some(from), Some(to)) => Ok((LogOffset(from), LogOffset(to))),
+        _ => Err(Anomaly::incorrect("xtdb/log-epoch-mismatch", "Inspection bounds must belong to the configured log epoch")),
     }
 }
 

@@ -1,0 +1,134 @@
+package xtdb.rust;
+
+import java.lang.foreign.Arena;
+import java.lang.foreign.FunctionDescriptor;
+import java.lang.foreign.Linker;
+import java.lang.foreign.MemoryLayout;
+import java.lang.foreign.MemorySegment;
+import java.lang.foreign.SymbolLookup;
+import java.lang.foreign.ValueLayout;
+import java.lang.invoke.MethodHandle;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import org.apache.arrow.adbc.core.AdbcException;
+
+final class NativeAbi {
+    static final ValueLayout.OfLong I64 = ValueLayout.JAVA_LONG;
+    static final ValueLayout.OfInt I32 = ValueLayout.JAVA_INT;
+    static final java.lang.foreign.AddressLayout PTR = ValueLayout.ADDRESS;
+    private final Map<String, MethodHandle> functions = new HashMap<>();
+
+    private NativeAbi() {
+        if (PTR.byteSize() != 8) throw new IllegalStateException("RTDB v1 JVM bindings require a 64-bit process");
+        String path = System.getProperty("xtdb.native.library");
+        if (path == null) throw new IllegalStateException("Set xtdb.native.library to the absolute rtdb_ffi shared-library path");
+        SymbolLookup library = SymbolLookup.libraryLookup(Path.of(path), Arena.global());
+        Linker linker = Linker.nativeLinker();
+        register(library, linker, "abi_version");
+        register(library, linker, "database_open", PTR, I64, I64, PTR, PTR);
+        register(library, linker, "retain", I64, PTR, PTR);
+        register(library, linker, "release", I64, PTR);
+        register(library, linker, "close", I64, PTR);
+        register(library, linker, "error_field", I64, I32, PTR, PTR);
+        register(library, linker, "session_open", I64, PTR, I64, I32, PTR, I64, PTR, I64, PTR, PTR);
+        register(library, linker, "operation_new", I64, PTR, PTR);
+        register(library, linker, "cancel", I64, PTR);
+        register(library, linker, "session_action", I64, I64, I32, PTR);
+        register(library, linker, "session_set_catalog", I64, PTR, I64, PTR);
+        register(library, linker, "session_transact", I64, I64, PTR, I64, PTR, PTR);
+        register(library, linker, "session_await_token", I64, PTR, PTR);
+        register(library, linker, "statement_new", I64, PTR, I64, I32, PTR, PTR);
+        register(library, linker, "statement_set_sql", I64, PTR, I64, PTR);
+        register(library, linker, "statement_prepare", I64, I64, PTR);
+        register(library, linker, "statement_bind", I64, PTR, PTR, PTR);
+        register(library, linker, "statement_bind_transit", I64, PTR, I64, PTR);
+        register(library, linker, "statement_schema", I64, I64, I32, PTR, PTR);
+        register(library, linker, "statement_query", I64, I64, PTR, PTR);
+        register(library, linker, "statement_update", I64, I64, PTR, PTR);
+        register(library, linker, "cursor_schema", I64, PTR, PTR);
+        register(library, linker, "cursor_next", I64, PTR, PTR, PTR, PTR);
+        register(library, linker, "cursor_next_transit", I64, PTR, PTR);
+        register(library, linker, "cursor_consumer_error", I64, PTR);
+        register(library, linker, "bytes", I64, PTR, PTR);
+        register(library, linker, "metadata", I64, I64, PTR, I64, PTR, PTR);
+        register(library, linker, "memory_used", I64, PTR, PTR);
+        try { if (invoke("abi_version") != 1) throw new IllegalStateException("Unsupported RTDB native ABI version"); }
+        catch (AdbcException error) { throw new IllegalStateException(error); }
+    }
+    private static final class Holder { static final NativeAbi INSTANCE = new NativeAbi(); }
+    static NativeAbi get() { return Holder.INSTANCE; }
+    private void register(SymbolLookup library, Linker linker, String name, MemoryLayout... arguments) {
+        functions.put(name, linker.downcallHandle(library.find("rtdb_v1_" + name).orElseThrow(), FunctionDescriptor.of(I32, arguments)));
+    }
+    private int invoke(String name, Object... arguments) throws AdbcException {
+        try { return (int) functions.get(name).invokeWithArguments(arguments); }
+        catch (Throwable error) { throw AdbcException.internal("Native ABI invocation failed: " + name).withCause(error); }
+    }
+    void call(String name, Object... arguments) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment error = arena.allocate(I64);
+            Object[] full = Arrays.copyOf(arguments, arguments.length + 1);
+            full[arguments.length] = error;
+            if (invoke(name, full) != 0) throw diagnostic(error.get(I64, 0));
+        }
+    }
+    long handle(String name, Object... arguments) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment out = arena.allocate(I64);
+            Object[] full = Arrays.copyOf(arguments, arguments.length + 1);
+            full[arguments.length] = out;
+            call(name, full);
+            return out.get(I64, 0);
+        }
+    }
+    void dispose(long handle, boolean close) throws AdbcException {
+        if (handle == 0) return;
+        AdbcException failure = null;
+        try { if (close) call("close", handle); } catch (AdbcException error) { failure = error; }
+        try { call("release", handle); } catch (AdbcException error) { if (failure == null) failure = error; else failure.addSuppressed(error); }
+        if (failure != null) throw failure;
+    }
+    byte[] copiedBytes(long handle) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment slice = arena.allocate(16, 8);
+            call("bytes", handle, slice);
+            return copySlice(slice);
+        }
+    }
+    private NativeException diagnostic(long handle) throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) {
+            byte[][] fields = new byte[4][];
+            for (int field = 0; field < fields.length; field++) {
+                MemorySegment slice = arena.allocate(16, 8);
+                MemorySegment error = arena.allocate(I64);
+                if (invoke("error_field", handle, field, slice, error) != 0) {
+                    long secondary = error.get(I64, 0);
+                    MemorySegment ignored = arena.allocate(I64);
+                    invoke("release", secondary, ignored);
+                    throw AdbcException.internal("Unable to read native diagnostic");
+                }
+                fields[field] = copySlice(slice);
+            }
+            return new NativeException(new String(fields[0], StandardCharsets.UTF_8), new String(fields[1], StandardCharsets.UTF_8), new String(fields[2], StandardCharsets.UTF_8), fields[3]);
+        } finally { dispose(handle, false); }
+    }
+    private static byte[] copySlice(MemorySegment slice) {
+        long length = slice.get(I64, 8);
+        if (length == 0) return new byte[0];
+        return slice.get(PTR, 0).reinterpret(length).toArray(ValueLayout.JAVA_BYTE);
+    }
+    static MemorySegment bytes(Arena arena, byte[] bytes) { return arena.allocateFrom(ValueLayout.JAVA_BYTE, bytes); }
+    static MemorySegment text(Arena arena, String text) { return bytes(arena, text.getBytes(StandardCharsets.UTF_8)); }
+    static MemorySegment address(long address) { return MemorySegment.ofAddress(address); }
+    static String json(String text) {
+        if (text == null) return "null";
+        StringBuilder out = new StringBuilder("\"");
+        for (char ch : text.toCharArray()) {
+            switch (ch) { case '"' -> out.append("\\\""); case '\\' -> out.append("\\\\"); case '\n' -> out.append("\\n"); case '\r' -> out.append("\\r"); case '\t' -> out.append("\\t"); default -> { if (ch < 32) out.append(String.format("\\u%04x", (int) ch)); else out.append(ch); } }
+        }
+        return out.append('"').toString();
+    }
+}

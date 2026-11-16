@@ -82,6 +82,9 @@ fn read_batch(file: &mut File, path: &Path, options: &ReadOnlyLocalLogOptions, f
 
 #[async_trait]
 impl Log for ReadOnlyLocalLog {
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
+        file_range(Arc::clone(&self.path), self.options.maximum_message_bytes, from, to, None)
+    }
     async fn enqueue(&self, _: Bytes, _: Timestamp) -> Result<AppendReceipt> { Err(Error::ReadOnlyLog(self.path.as_ref().clone())) }
 
     fn latest(&self) -> Result<LogOffset> {
@@ -125,6 +128,67 @@ impl Log for ReadOnlyLocalLog {
         let (records, next) = read_batch(&mut file, &self.path, &self.options, from.0 as u64, to.0 as u64, latest)?;
         if next < (to.0 as u64).min(end) { return Err(Error::LogReadLimit { maximum_records: self.options.maximum_poll_records, maximum_payload_bytes: self.options.maximum_poll_bytes }); }
         Ok(records)
+    }
+}
+
+fn frame_end(file: &mut File, path: &Path, start: u64, maximum: usize) -> Result<u64> {
+    file.seek(SeekFrom::Start(start)).map_err(|error| Error::io(path, error))?;
+    let mut header = [0; 13];
+    file.read_exact(&mut header).map_err(|error| corrupt(path, start, error.to_string()))?;
+    let size = i32::from_be_bytes(header[1..5].try_into().expect("fixed header"));
+    if header[0] != 0x1e || size < 0 || size as usize > maximum { return Err(corrupt(path, start, "invalid record header")); }
+    let end = start.checked_add(21 + size as u64).ok_or_else(|| corrupt(path, start, "record end overflow"))?;
+    file.seek(SeekFrom::Start(end - 8)).map_err(|error| Error::io(path, error))?;
+    let mut trailer = [0; 8];
+    file.read_exact(&mut trailer).map_err(|error| corrupt(path, start, error.to_string()))?;
+    if i64::from_be_bytes(trailer) != start as i64 { return Err(corrupt(path, start, "record trailer does not name its start")); }
+    Ok(end)
+}
+
+pub(super) fn file_range(path: Arc<PathBuf>, maximum: usize, from: LogOffset, to: LogOffset, durable: Option<LogOffset>) -> Result<Box<dyn super::LogRange>> {
+    if from.0 < 0 { return Err(unavailable(from)); }
+    if to < from { return Err(Error::Task("log range end precedes its start".into())); }
+    let mut file = open_existing(&path)?;
+    let end = if let Some(file) = &mut file {
+        let length = file.metadata().map_err(|error| Error::io(path.as_ref(), error))?.len();
+        let latest = match durable {
+            Some(latest) => latest,
+            None if length == 0 => LogOffset(-1),
+            None => {
+                if length < 21 || length >= 1 << 48 { return Err(corrupt(&path, length, "invalid log length")); }
+                file.seek(SeekFrom::Start(length - 8)).map_err(|error| Error::io(path.as_ref(), error))?;
+                let mut trailer = [0; 8];
+                file.read_exact(&mut trailer).map_err(|error| corrupt(&path, length - 8, error.to_string()))?;
+                LogOffset(i64::from_be_bytes(trailer))
+            }
+        };
+        let end = if latest.0 == -1 { 0 } else {
+            if latest.0 < 0 || latest.0 as u64 >= length { return Err(corrupt(&path, length, "invalid final offset")); }
+            frame_end(file, &path, latest.0 as u64, maximum)?
+        };
+        if durable.is_none() && end != length { return Err(corrupt(&path, end, "final record does not end at file length")); }
+        if (from.0 as u64) < end { frame_end(file, &path, from.0 as u64, maximum)?; }
+        end.min(to.0 as u64)
+    } else if durable.is_some_and(|latest| latest.0 >= 0) {
+        return Err(corrupt(&path, 0, "durable log file disappeared"));
+    } else {
+        0
+    };
+    Ok(Box::new(FileRange { file, path, maximum, next: from.0 as u64, end }))
+}
+
+struct FileRange { file: Option<File>, path: Arc<PathBuf>, maximum: usize, next: u64, end: u64 }
+#[async_trait]
+impl super::LogRange for FileRange {
+    fn allocation_bound(&self) -> usize { self.maximum.saturating_add(256) }
+    async fn next(&mut self, reservation: crate::object_store::ReadReservation) -> Result<Option<LogRecord>> {
+        if reservation.length() < self.allocation_bound() { return Err(Error::Task("log read reservation is too small".into())); }
+        if self.next >= self.end { return Ok(None); }
+        let file = self.file.as_mut().ok_or_else(|| unavailable(LogOffset(self.next as i64)))?;
+        file.seek(SeekFrom::Start(self.next)).map_err(|error| Error::io(self.path.as_ref(), error))?;
+        let record = read_record(file, &self.path, self.maximum)?;
+        self.next = file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?;
+        record.retain(reservation).map(Some)
     }
 }
 

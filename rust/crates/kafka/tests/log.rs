@@ -35,6 +35,10 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].payload, Bytes::from_static(b"first"));
     assert_eq!(records[1].metadata, second);
+    let mut range = reader.log.range(LogOffset(0), LogOffset(1)).await.unwrap();
+    let bound = range.allocation_bound();
+    assert_eq!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().unwrap().metadata, first);
+    assert!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().is_none());
     let mut tail = reader.log.tail(second.offset).await.unwrap();
     assert!(tail.poll(Duration::from_millis(20)).await.unwrap().is_empty());
     cancellation.cancel();

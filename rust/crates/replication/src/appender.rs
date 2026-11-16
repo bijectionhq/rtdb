@@ -164,6 +164,7 @@ mod tests {
         }
         fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.readable.latest() }
         async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> { self.readable.tail(after).await }
+        async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn rtdb_storage::log::LogRange>> { self.readable.range(from, to).await }
         async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> { self.readable.read_range(from, to).await }
     }
     fn pump(interval: Duration) -> (AppenderHandle, ReplicaAppender, Arc<MemoryBudget>) {

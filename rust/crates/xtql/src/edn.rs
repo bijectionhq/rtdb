@@ -64,16 +64,7 @@ impl<'a> Reader<'a> {
         let kind = match ch {
             '(' => EdnKind::List(self.sequence(')')?),
             '[' => EdnKind::Vector(self.sequence(']')?),
-            '{' => {
-                let mut values = self.sequence('}')?.into_iter();
-                let mut pairs: Vec<(Edn, Edn)> = Vec::new();
-                while let Some(key) = values.next() {
-                    let value = values.next().ok_or_else(|| self.failure("Map requires an even number of forms"))?;
-                    if pairs.iter().any(|(existing, _)| same_form(existing, &key)) { return Err(self.failure("Duplicate EDN map key")); }
-                    pairs.push((key, value));
-                }
-                EdnKind::Map(pairs)
-            }
+            '{' => self.map(None)?,
             '"' => EdnKind::String(self.string()?),
             ':' => {
                 let token = self.token();
@@ -95,6 +86,15 @@ impl<'a> Reader<'a> {
                 EdnKind::Character(ch)
             }
             '#' => match self.peek() {
+                Some(':') => {
+                    self.next();
+                    let namespace = self.form()?;
+                    let EdnKind::Symbol(namespace) = namespace.kind else { return Err(self.failure("Namespaced map requires an unqualified namespace symbol")); };
+                    if namespace.contains('/') && namespace != "/" { return Err(self.failure("Namespaced map namespace must be unqualified")); }
+                    while self.peek().is_some_and(|ch| ch.is_whitespace() || ch == ',') { self.next(); }
+                    if self.next() != Some('{') { return Err(self.failure("Namespaced map requires a map literal")); }
+                    self.map(Some(&namespace))?
+                }
                 Some('{') => {
                     self.next();
                     let values = self.sequence('}')?;
@@ -139,6 +139,23 @@ impl<'a> Reader<'a> {
         };
         self.depth -= 1;
         Ok(Edn { span: SourceSpan { start, end: self.offset }, kind })
+    }
+
+    fn map(&mut self, namespace: Option<&str>) -> Result<EdnKind> {
+        let mut values = self.sequence('}')?.into_iter();
+        let mut pairs: Vec<(Edn, Edn)> = Vec::new();
+        while let Some(mut key) = values.next() {
+            let value = values.next().ok_or_else(|| self.failure("Map requires an even number of forms"))?;
+            if let Some(namespace) = namespace {
+                if let EdnKind::Keyword(name) | EdnKind::Symbol(name) = &mut key.kind {
+                    if name == "/" || !name.contains('/') { *name = format!("{namespace}/{name}"); }
+                    else if let Some(("_", local)) = name.rsplit_once('/') { *name = local.to_owned(); }
+                }
+            }
+            if pairs.iter().any(|(existing, _)| same_form(existing, &key)) { return Err(self.failure("Duplicate EDN map key")); }
+            pairs.push((key, value));
+        }
+        Ok(EdnKind::Map(pairs))
     }
 
     fn sequence(&mut self, end: char) -> Result<Vec<Edn>> {

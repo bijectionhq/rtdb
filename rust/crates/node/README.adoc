@@ -1,5 +1,10 @@
 = Node and session source
 
+Session parameter entries, database and timezone strings, await/snapshot tokens, pinned transaction bases and buffered SQL carry execution-budget reservations for their retained lifetime.
+Rejected parameter updates retain the previous value.
+The failed-transaction marker stores only the state needed to reject subsequent commands; it does not retain the command's diagnostic payload.
+Borrowed parameter iteration lets protocol adapters reserve before copying response settings.
+
 `Node` is a passive shared handle over a catalog, resource factories, runtime catalog providers, and cancellation.
 `NodeDriver` is the active owner of catalog commands and database task completion.
 `DatabaseCatalog` publishes immutable membership generations; its owner removes a detaching database from lookup before cancellation and releases its name after the driver joins.
@@ -7,11 +12,32 @@ A database whose driver has already failed remains a member until an explicit de
 `Database` is passive and retains partition snapshots, logs, storage, progress, and maintenance handles.
 `DatabaseDriver` supervises the active replica, maintenance, and log drivers, cancels and joins consumers before stopping log owners, and reports ingestion failure without terminating unrelated databases.
 `MaintenanceSupervisor` owns each leader term's GC and external-source region and joins it before assigning the next term.
+It retains one passive `ExternalSource` for the database lifetime and asks it for a fresh assignment driver after each previous term has joined.
 
 `NativeResources` opens independent memory or local source and replica logs plus the configured storage root.
+The passive `LogAccess` value distinguishes read-only logs, a writable source with a read-only replica, and two writable logs.
+An eligible leader opens both writers; a writable follower opens only the source writer, allowing compaction publication without replica-writer ownership.
+Source owners are created only on nodes eligible to lead.
+The node owns its resource region and calls `ResourceFactory::close` after database drivers join or an ordinary startup failure.
+Native resource closure cancels cache downloads and waits for cache and local-store I/O regions, including work whose I/O caller was cancelled.
+Custom resource-factory wrappers must forward closure to their wrapped factory.
+Each native resource factory belongs to one node lifetime; a later node opens a new factory and I/O region while immutable provider configuration and clocks may be shared.
+Remote storage requires a shared `DiskCache`, with file keys scoped by database and partition.
+Database names that cannot form a safe single path component use an injective hexadecimal cache-directory encoding.
+Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.
+The clock is sampled during append, after queue admission.
+`Node::snapshot_export` requires indexing and compaction to be disabled and returns a passive, charged manifest for the loaded block.
+The plan copies through the existing object-store capability, accepts completed immutable copies on retry and checks cancellation between copies.
+`Node::prepare_compactor_reset` catches up through a block and captures surviving L0 pairs directly from storage, including files whose serving entries were removed by compaction.
+The passive `CompactorReset` plan retains its catalog generation, term capability, deletion list and memory reservations.
+Its application requires an exclusive maintenance node with indexing enabled and compaction and automatic GC disabled.
+The active replication driver accepts the reset only against that catalog and block, owns the reset completion within its leader term, and acknowledges it after adopting the replacement block.
+The plan then deletes compacted metadata before data; cancellation and failed publication retain the files needed for recovery.
+Planning alone performs the initial catch-up flush but makes no reset or deletion.
 Feature-gated provider factories supply Kafka, S3, Azure, and GCS implementations.
 `PostgresSourceFactory` is a passive immutable registry of node-local remotes and native indexer factories.
-It constructs an unstarted source driver for each assigned term; the active driver owns its PostgreSQL sockets and confirmation state until teardown.
+The database source retains its native indexer and metric registration across leader changes; each active assignment driver owns its PostgreSQL sockets and confirmation state until teardown.
+Kafka Connect likewise retains its custom mutable indexer across assignments, with converter and transform state scoped to one assignment.
 Remote credentials stay out of persisted database configurations.
 Catalog admission checks shared configuration shape without consulting node-local provider registries.
 A skipped member retains its durable configuration even when its backend is not configured on this node.
@@ -73,3 +99,29 @@ Session read-basis capture, access checks, and authentication revalidation prece
 Preparation metadata has retained-byte accounting; SQL parser and planner transient allocations and operator descriptors still share the resource qualifications documented by the query crate.
 
 `tests/catalog.rs` carries source observations from `information_schema_test.clj`: namespace OIDs, the Npgsql columns/type join, role namespaces, redacted passwords, declared empty catalog schemas, and metrics tag Arrow layout.
+== SQL session controls and inspection
+
+`rtdb_sql::parse_control` binds transaction options and classifies session controls for the native session, PostgreSQL, ADBC, and Flight consumers.
+`NativeSession::execute_control_with` applies timezone options before coercing temporal values, preserves absent options separately from `DEFAULT`, and returns typed commands, SHOW cursors, or frontend-owned PREPARE, EXECUTE, and COPY instructions.
+ADBC and Flight reject BEGIN, COMMIT, and ROLLBACK submitted as SQL; their transaction APIs remain the entry points for those operations.
+Preparation awaits the session token without resolving a bare pending transaction.
+Unchecked contexts admit SHOW and EXECUTE argument evaluation in a writing transaction, and pin a pending transaction only when it was declared read-only.
+Operation cancellation tokens descend from the session token; query cursors also observe the independent node lifetime.
+
+The five `xt` log and block inspection tables require the same explicit predicates as the pinned JVM producers.
+Log cursors capture a finite durable range and retain an allocation reservation with every input payload and returned row.
+Block scans preserve the reference's 1024-candidate windows, including termination when a window produces no readable block rows.
+Source operation rendering retains named union tags, keyword key normalization, null omission, and charged decoded ownership.
+Kotlin database configuration reflection strings and Java Throwable class prefixes remain display qualifications; the durable protobuf and Transit values are decoded without substituting fabricated contents.
+The standalone expression evaluator's transient output peak, including control expressions that expand strings, is not yet proven against the execution byte budget.
+
+== Connection and database observation
+
+`NodeServices.execution_observer` supplies shared synchronous query, transaction and protocol callbacks.
+Native session contexts carry that observer into cursor execution; direct node contexts leave internal queries unobserved.
+Asynchronous submission and synchronous execution have distinct timers, and only the synchronous await contributes to `node.tx.await`.
+The session counts presubmit failures and synchronous abort results; the resolver counts ingestion aborts separately and excludes configured skips.
+`Node::metrics_provider` observes database watermarks, leadership, the most recent successful block upload and the shared cache budget.
+It holds weak node-resource references between samples, and each returned catalog snapshot retains its own allocation reservation.
+Runtime metric catalogs await caller-owned live provider samples, including PostgreSQL WAL lag.
+All new Rust fixtures are source-only until the implementation gate permits compilation and execution.

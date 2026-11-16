@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         root.join("modules/azure/src/main/proto/azure.proto"),
         root.join("modules/google-cloud/src/main/proto/gcs.proto"),
         root.join("modules/kafka/src/main/proto/kafka.proto"),
+        root.join("modules/kafka/src/main/proto/kafka_connect_source.proto"),
         root.join("modules/postgres-source/src/main/proto/postgres_source.proto"),
     ];
     for path in &files {

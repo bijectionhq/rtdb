@@ -1,7 +1,7 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result, TableRef, Timestamp, Value};
-use crate::{Lsn, text::read_text, wire::{Input, protocol}};
+use crate::{Lsn, read_text, wire::{Input, protocol}};
 
 pub const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

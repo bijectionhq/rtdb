@@ -15,20 +15,20 @@
     "sql_xtql_execution": "in_progress",
     "writes_replication_recovery": "in_progress",
     "compaction_gc_adapters": "in_progress",
-    "client_operational_surfaces": "native_node_session_auth_and_prepared_source_in_progress",
-    "conformance_machinery": "source_inventory_comparator_and_two_control_mappings_only"
+    "client_operational_surfaces": "pgwire_flight_controls_bounded_config_tls_server_metrics_tracing_exporters_ffi_jvm_bindings_export_reset_compactor_inspection_offline_config_qualification_and_package_recipes_source_written; remaining_compatibility_and_release_orchestration_in_progress",
+    "conformance_machinery": "source_inventory_control_runners_negative_controls_comparator_runtime_reconciliation_fault_adapters_packaged_client_capture_jvm_native_history_sql_logic_and_sequential_local_recovery_runners_source_written; full_ledger_mappings_external_lane_reconciliation_production_cutover_performance_and_release_orchestration_in_progress"
   },
   "source_review_record": "rust/source-review.adoc",
   "assertion_ledger": "rust/conformance/assertion-ledger.json",
   "runtime_assertion_denominator": null,
   "required_production_traces": {
-    "client_read": "native_session_query_path_written; protocol_and_server_entry_points_missing",
+    "client_read": "pgwire_flight_and_embedded_native_session_query_server_source_written; language_surface_completion_and_source_audit_in_progress",
     "data_dependent_write": "native_submission_resolver_replica_readback_apply_source_written; source_audit_in_progress",
     "replica_recovery": "native_log_recovery_block_adoption_driver_source_written; source_audit_in_progress",
     "compaction_retry": "native_maintenance_and_streaming_publication_source_written; source_audit_in_progress",
-    "cdc_restart": "native_postgresql_snapshot_pgoutput_resume_source_written; node_metrics_wiring_in_progress",
-    "database_shutdown": "native_node_database_term_driver_join_source_written; server_lifecycle_missing"
+    "cdc_restart": "native_postgresql_snapshot_pgoutput_resume_and_database_lifetime_metrics_source_written; source_audit_in_progress",
+    "database_shutdown": "native_node_database_term_listener_and_local_io_region_drains_source_written; source_review_in_progress"
   },
   "phase_2_authorized_by_completeness_gate": false,
-  "last_source_checkpoint_revision": "2180677a3"
+  "last_source_checkpoint_revision": "2cd840a8f"
 }

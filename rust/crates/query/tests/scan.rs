@@ -32,7 +32,7 @@ fn scan(context: &QueryContext, columns: &[&str], valid_time: TemporalFilter, sy
             "_valid_to" | "_system_to" => LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).maybe(),
             name => binding.columns.get(name).cloned().unwrap_or(LogicalType::Null),
         };
-        Field { id: ColumnId(id as u32), name: (*name).into(), qualifier: None, data_type }
+        Field { id: ColumnId(id as u32), name: (*name).into(), qualifier: None, qualified_only: false, data_type }
     }).collect();
     Arc::new(Relation::scan(Scan { table: binding, columns: fields, valid_time, system_time, clamp_valid_time: false, iids }).unwrap())
 }
@@ -76,6 +76,28 @@ async fn persist(state: &PartitionState, store: &MemoryStore) -> (BlockCatalog, 
     store.put(&ObjectKey::new(block_key(prepared.block_index()).unwrap()).unwrap(), block.encode().into()).await.unwrap();
     state.adopt_block(prepared, block.clone(), &additions, Timestamp(1000)).unwrap();
     (block, tables)
+}
+
+#[tokio::test]
+async fn tracing_scan_reports_only_consulted_files_pages_and_loaded_rows() {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let mut first = tx(&state, &memory, 0, 100);
+    first.put(table(), document(1, Value::I64(1)), Interval::ALL).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap(); persist(&state, &store).await;
+    let context = query_context(state.value().snapshot(), store, false);
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, true, true).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let relation = scan(&context, &["v"], TemporalFilter::All, TemporalFilter::All, None);
+    assert_eq!(collect(relation, context).await.unwrap(), vec![vec![Value::I64(1)]]);
+    tracer.close();
+    let mut scan = None; while let Some(span) = receiver.next().await { if span.name == "query.cursor.scan.public.docs" { scan = Some(span); } }
+    let scan = scan.unwrap(); let attributes: BTreeMap<_, _> = scan.attributes().collect();
+    assert_eq!(attributes["scan_db"], "xtdb"); assert_eq!(attributes["scan_source"], "public.docs");
+    assert_eq!(attributes["scan_files_used"], "1"); assert_eq!(attributes["scan_files_pruned"], "0");
+    assert_eq!(attributes["scan_pages_used"], "1"); assert_eq!(attributes["scan_pages_pruned"], "0");
+    assert_eq!(attributes["scan_rows_read"], "1");
 }
 
 #[tokio::test]

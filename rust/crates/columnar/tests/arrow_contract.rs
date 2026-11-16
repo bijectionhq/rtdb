@@ -101,6 +101,41 @@ fn decimal_coefficients_preserve_signed_big_endian_width_and_scale() {
 }
 
 #[test]
+fn decimal_vector_scale_can_exceed_precision_without_relaxing_coefficient_checks() {
+    for width in [32, 64, 128, 256] {
+        for scale in [i8::MIN, -3, 3, i8::MAX] {
+            let ty = scalar(ScalarType::Decimal { precision: 1, scale, bit_width: width }).maybe();
+            for coefficient in [-9i128, 0, 1, 9] {
+                let bytes = arrow_buffer::i256::from_i128(coefficient).to_be_bytes();
+                let value = Value::Decimal(DecimalValue::new(bytes[32 - usize::from(width / 8)..].to_vec(), 1, scale, width).unwrap());
+                round_trip(ty.clone(), vec![Value::Null, value.clone()]);
+                let array = build_array(&ty, &[Value::Null, value.clone()]).unwrap().slice(1, 1);
+                array.to_data().validate_full().unwrap();
+                assert_eq!(read_value(&to_field("x", &ty).unwrap(), array.as_ref(), 0).unwrap(), value);
+            }
+            for coefficient in [-10i128, 10] {
+                let bytes = arrow_buffer::i256::from_i128(coefficient).to_be_bytes();
+                let value = Value::Decimal(DecimalValue::new(bytes[32 - usize::from(width / 8)..].to_vec(), 1, scale, width).unwrap());
+                assert!(build_array(&ty, &[value]).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn decimal_vector_zero_precision_accepts_only_empty_and_null_arrays() {
+    for width in [32, 64, 128, 256] {
+        for scale in [-3, 0, 3] {
+            let ty = scalar(ScalarType::Decimal { precision: 0, scale, bit_width: width }).maybe();
+            round_trip(ty.clone(), vec![]);
+            round_trip(ty.clone(), vec![Value::Null]);
+            let zero = Value::Decimal(DecimalValue::new(vec![0; usize::from(width / 8)], 0, scale, width).unwrap());
+            assert!(build_array(&ty, &[zero]).is_err());
+        }
+    }
+}
+
+#[test]
 fn timestamps_and_durations_preserve_unit_and_zone() {
     for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
         for timezone in [None, Some("UTC".to_owned()), Some("Europe/London".to_owned())] {

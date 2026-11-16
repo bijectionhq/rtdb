@@ -3,6 +3,16 @@
 This crate contains source for term admission, the partition driver, source resolution dispatch, ordered replica append, block production and adoption, recovery, and applied-progress waits.
 It remains in Phase 1: no Rust build, test, server, or runtime parity check has run.
 
+The leader accepts an exclusive compactor-reset command against a captured trie catalog and open-block index while its staging pipeline is idle.
+`LeaderState` is passive term-owned state; its passive `CompactorReset` retains a block target, completion sender and manifest reservations until adoption or term teardown.
+The driver publishes a normal block boundary after replacing the catalog and acknowledges the reset only after adopting that block.
+Term loss fails the reset receipt, so the maintenance caller cannot delete compacted files on that receipt.
+
+Disabled indexing retains source submission and recovered state while the driver waits for shutdown without consuming either log.
+An operator-selected skipped transaction saves its source payload under the pinned `skipped-txs` key before staging an aborted `xt.txs` row.
+The abort uses the source position and smoothed system time, then follows ordinary append, read-back and apply ordering.
+Its Arrow operations are not decoded and its skip does not increment the transaction error counter.
+
 == Ownership and assembly
 
 `PartitionLogs` is a passive capability over distinct source and replica logs, their epochs, a partition-scoped object store, its buffer pool, and a memory budget.

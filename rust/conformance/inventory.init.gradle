@@ -1,0 +1,72 @@
+import groovy.json.JsonOutput
+import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.JavaExec
+import org.gradle.api.tasks.compile.JavaCompile
+import org.gradle.api.tasks.testing.Test
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    def adapter = root.file(root.providers.gradleProperty("rtdb.adapterRoot").get())
+    def evidence = root.file(root.providers.gradleProperty("rtdb.inventoryOutput").get())
+    def compiled = root.layout.buildDirectory.dir("rtdb-conformance/recorder")
+    gradle.taskGraph.whenReady { graph ->
+        evidence.mkdirs()
+        def target = new File(evidence, "requested-lanes.json")
+        if (target.exists()) throw new GradleException("RTDB requested-lane manifest already exists: $target")
+        def lanes = graph.allTasks.findAll { it instanceof Test }.collect {
+            [project: it.project.path, task: it.path, enabled: it.enabled]
+        }
+        target.text = JsonOutput.prettyPrint(JsonOutput.toJson([schema_version: 1, lanes: lanes])) + "\n"
+    }
+    def compile = root.tasks.register("compileRtdbInventoryRecorder", JavaCompile) {
+        dependsOn root.tasks.named("testClasses")
+        source = root.fileTree(new File(adapter, "jvm-java")) { include "**/*.java" }
+        classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath
+        destinationDirectory = compiled
+        javaCompiler = root.tasks.named("compileTestJava", JavaCompile).flatMap { it.javaCompiler }
+    }
+    root.allprojects { project ->
+        if (project.tasks.findByName("testClasses") != null && project.tasks.findByName("test") instanceof Test) {
+            project.tasks.register("rtdbDiscoverTests", JavaExec) {
+                dependsOn compile, project.tasks.named("testClasses")
+                def baseline = project.tasks.named("test", Test)
+                classpath = baseline.get().classpath + root.files(compiled, new File(adapter, "jvm-services"))
+                javaLauncher = baseline.get().javaLauncher
+                mainClass = "rtdb.conformance.DiscoveryRecorder"
+                jvmArgs baseline.get().jvmArgs
+                systemProperty "rtdb.inventory.project", project.path
+                args([new File(evidence, project.path.replace(':', '_') + "-discovery.json").absolutePath] +
+                    baseline.get().testClassesDirs.files.collect { it.absolutePath })
+                outputs.upToDateWhen { false }
+            }
+        }
+        project.tasks.withType(Test).configureEach { task ->
+            dependsOn compile
+            classpath += root.files(compiled, new File(adapter, "jvm-services"))
+            systemProperty "rtdb.inventory.output", new File(evidence, task.path.replace(':', '_')).absolutePath
+            systemProperty "rtdb.inventory.project", project.path
+            systemProperty "rtdb.inventory.task", task.path
+            outputs.upToDateWhen { false }
+            doFirst {
+                def directory = new File(evidence, task.path.replace(':', '_'))
+                directory.mkdirs()
+                def options = task.options
+                def selection = [schema_version: 1, project: project.path, task: task.path,
+                    includes: task.includes.sort(), excludes: task.excludes.sort(),
+                    include_patterns: task.filter.includePatterns.sort(),
+                    exclude_patterns: task.filter.excludePatterns.sort(),
+                    include_tags: options.hasProperty("includeTags") ? options.includeTags.sort() : [],
+                    exclude_tags: options.hasProperty("excludeTags") ? options.excludeTags.sort() : [],
+                    include_engines: options.hasProperty("includeEngines") ? options.includeEngines.sort() : [],
+                    exclude_engines: options.hasProperty("excludeEngines") ? options.excludeEngines.sort() : [],
+                    property_iterations: task.systemProperties["xtdb.property-test-iterations"],
+                    simulation_iterations: task.systemProperties["xtdb.simulation-test-iterations"],
+                    test_class_directories: task.testClassesDirs.files.collect { it.absolutePath }.sort(),
+                    classpath: task.classpath.files.collect { it.absolutePath }]
+                def target = new File(directory, "selection.json")
+                if (target.exists()) throw new GradleException("RTDB inventory selection already exists: $target")
+                target.text = JsonOutput.prettyPrint(JsonOutput.toJson(selection)) + "\n"
+            }
+        }
+    }
+}

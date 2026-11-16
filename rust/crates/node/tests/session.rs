@@ -13,13 +13,22 @@ use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey,
 use tokio_util::sync::CancellationToken;
 
 struct State { clock: i64, submissions: Vec<(String, Vec<TxOp>, SubmitOptions)>, observations: Vec<&'static str>, abort: Option<Anomaly> }
-struct Service { state: Mutex<State> }
+#[derive(Default)]
+struct Metrics { durations: Mutex<Vec<rtdb_plan::ExecutionTimer>>, errors: Mutex<Vec<rtdb_plan::ExecutionError>> }
+impl rtdb_plan::ExecutionObserver for Metrics {
+    fn record_duration(&self, timer: rtdb_plan::ExecutionTimer, _: Duration) { self.durations.lock().push(timer); }
+    fn record_error(&self, error: rtdb_plan::ExecutionError) { self.errors.lock().push(error); }
+}
+struct Service { state: Mutex<State>, memory: Arc<MemoryBudget>, metrics: Arc<Metrics> }
 impl Service {
-    fn new() -> Arc<Self> { Arc::new(Self { state: Mutex::new(State { clock: 1, submissions: Vec::new(), observations: Vec::new(), abort: None }) }) }
+    fn new() -> Arc<Self> { Self::with_memory(1_000_000) }
+    fn with_memory(bytes: usize) -> Arc<Self> { Arc::new(Self { state: Mutex::new(State { clock: 1, submissions: Vec::new(), observations: Vec::new(), abort: None }), memory: MemoryBudget::new(bytes), metrics: Arc::new(Metrics::default()) }) }
     fn session(self: &Arc<Self>) -> Session { Session::new(self.clone(), "xtdb", "UTC", &CancellationToken::new()).unwrap() }
 }
 #[async_trait]
 impl SessionService for Service {
+    fn memory(&self) -> &Arc<MemoryBudget> { &self.memory }
+    fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { Some(self.metrics.clone()) }
     fn user(&self) -> Option<&str> { Some("alice") }
     fn check_open(&self) -> Result<()> { Ok(()) }
     async fn revalidate(&self) -> Result<()> { Ok(()) }
@@ -45,6 +54,63 @@ impl SessionService for Service {
 fn operation() -> TxOp { TxOp::Sql { sql: "INSERT INTO foo (_id) VALUES (1)".into(), args: None } }
 fn read_only() -> TransactionSettings { TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings::default())), ..Default::default() } }
 fn read_write() -> TransactionSettings { TransactionSettings { access: Some(AccessSettings::ReadWrite(ReadWriteSettings::default())), ..Default::default() } }
+
+#[tokio::test]
+async fn show_basis_after_async_submit_does_not_await_or_resolve_pending_read_only() {
+    let service = Service::new(); let mut session = service.session();
+    session.submit_tx(vec![operation()], Default::default()).await.unwrap();
+    session.begin_with(read_only()).unwrap();
+    let first = session.inspection_basis().unwrap();
+    assert_eq!(session.status(), TransactionStatus::Pending);
+    assert_eq!(service.state.lock().observations, ["submit", "snapshot"]);
+    service.state.lock().clock = 2;
+    assert_ne!(session.inspection_basis().unwrap(), first);
+    let pinned = session.read_basis().await.unwrap();
+    service.state.lock().clock = 3;
+    assert_eq!(session.inspection_basis().unwrap(), pinned);
+    assert_eq!(service.state.lock().observations, ["submit", "snapshot", "snapshot", "await-basis", "snapshot"]);
+}
+
+#[tokio::test]
+async fn connection_transaction_metrics_distinguish_async_submission_sync_wait_and_abort() {
+    use rtdb_plan::{ExecutionError, ExecutionTimer};
+    let service = Service::new(); let mut session = service.session();
+    session.submit_tx(vec![operation()], Default::default()).await.unwrap();
+    assert_eq!(*service.metrics.durations.lock(), [ExecutionTimer::TxSubmit]);
+    service.state.lock().abort = Some(Anomaly::incorrect("test/abort", "aborted"));
+    assert!(!session.execute_tx(vec![operation()], Default::default()).await.unwrap().committed());
+    assert_eq!(*service.metrics.durations.lock(), [ExecutionTimer::TxSubmit, ExecutionTimer::TxAwait, ExecutionTimer::TxExecute]);
+    assert_eq!(*service.metrics.errors.lock(), [ExecutionError::Transaction]);
+    session.begin().unwrap(); session.execute_operation(operation()).await.unwrap();
+    session.rollback_tx().unwrap();
+    assert_eq!(service.metrics.durations.lock().len(), 3);
+}
+
+#[tokio::test]
+async fn prepare_and_unchecked_reads_leave_unspecified_pending_transactions_unresolved() {
+    let service = Service::new(); let mut session = service.session(); session.begin().unwrap();
+    let prepared = session.prepare_basis().await.unwrap();
+    assert_eq!(session.status(), TransactionStatus::Pending);
+    service.state.lock().clock = 2;
+    let unchecked = session.unchecked_read_basis().await.unwrap();
+    assert_ne!(prepared, unchecked);
+    assert_eq!(session.status(), TransactionStatus::Pending);
+    session.execute_operation(operation()).await.unwrap();
+    assert_eq!(session.status(), TransactionStatus::Writing);
+    assert!(session.unchecked_read_basis().await.is_ok());
+    assert_eq!(session.read_basis().await.unwrap_err().code, "xtdb/queries-in-read-write-tx");
+}
+
+#[tokio::test]
+async fn unchecked_reads_pin_declared_read_only_but_preparation_does_not() {
+    let service = Service::new(); let mut session = service.session(); session.begin_with(read_only()).unwrap();
+    session.prepare_basis().await.unwrap();
+    assert_eq!(session.status(), TransactionStatus::Pending);
+    let first = session.unchecked_read_basis().await.unwrap();
+    assert_eq!(session.status(), TransactionStatus::Reading);
+    service.state.lock().clock = 10;
+    assert_eq!(first, session.unchecked_read_basis().await.unwrap());
+}
 
 #[tokio::test]
 async fn autonomous_transactions_use_the_target_database_and_keep_the_connection_database() {
@@ -233,4 +299,69 @@ fn session_timezone_echo_normalizes_fixed_offsets_and_zero() {
     assert_eq!(session.parameters().get("timezone"), Some(&Some("UTC+01:00".into())));
     session.set_timezone("-00:00").unwrap();
     assert_eq!(session.effective_timezone(), "Z");
+}
+
+#[test]
+fn retained_parameters_reject_over_budget_updates_atomically() {
+    let service = Service::with_memory(4096);
+    let mut session = service.session();
+    let baseline = service.memory.used_bytes();
+    session.set_parameter("application_name", Some("client".into())).unwrap();
+    let retained = service.memory.used_bytes();
+    assert!(retained > baseline);
+    assert!(session.set_parameter("application_name", Some("x".repeat(4096))).is_err());
+    assert_eq!(session.parameter("application_name"), Some("client"));
+    assert_eq!(service.memory.used_bytes(), retained);
+    session.reset().unwrap();
+    assert_eq!(service.memory.used_bytes(), baseline);
+    drop(session);
+    assert_eq!(service.memory.used_bytes(), 0);
+}
+
+#[test]
+fn failed_transaction_does_not_retain_an_unbounded_error_payload() {
+    let service = Service::with_memory(4096);
+    let mut session = service.session();
+    session.begin().unwrap();
+    let before = service.memory.used_bytes();
+    session.fail_transaction(Anomaly::incorrect("example", "x".repeat(16384)));
+    assert_eq!(session.status(), TransactionStatus::Failed);
+    assert_eq!(service.memory.used_bytes(), before);
+    session.rollback_tx().unwrap();
+    assert_eq!(session.status(), TransactionStatus::Idle);
+}
+
+#[tokio::test]
+async fn buffered_sql_owns_its_charge_until_rollback_or_commit() {
+    let service = Service::with_memory(8192);
+    let mut session = service.session();
+    session.set_auto_commit(false).await.unwrap();
+    let baseline = service.memory.used_bytes();
+    session.execute_operation(TxOp::Sql { sql: "x".repeat(2048), args: None }).await.unwrap();
+    assert!(service.memory.used_bytes() >= baseline + 2048);
+    assert!(session.execute_operation(TxOp::Sql { sql: "x".repeat(8192), args: None }).await.is_err());
+    session.rollback_tx().unwrap();
+    assert_eq!(service.memory.used_bytes(), baseline);
+    session.execute_operation(operation()).await.unwrap();
+    session.commit_tx(None).await.unwrap();
+    assert!(session.effective_await_token().is_some());
+    session.close();
+    assert_eq!(service.memory.used_bytes(), baseline);
+    drop(session);
+    assert_eq!(service.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn read_basis_and_transaction_tokens_release_on_rollback() {
+    let service = Service::with_memory(8192);
+    let mut session = service.session();
+    let baseline = service.memory.used_bytes();
+    session.begin_with(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings {
+        snapshot_token: OptionUpdate::Set(rtdb_format::basis::encode_time_basis(&TimeBasis::default())), ..Default::default()
+    })), ..Default::default() }).unwrap();
+    assert!(service.memory.used_bytes() > baseline);
+    session.read_basis().await.unwrap();
+    assert!(service.memory.used_bytes() > baseline);
+    session.rollback_tx().unwrap();
+    assert_eq!(service.memory.used_bytes(), baseline);
 }

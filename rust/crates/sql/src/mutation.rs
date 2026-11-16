@@ -67,11 +67,11 @@ pub(crate) fn timestamp_literal(value: i64) -> Expr { Expr::Literal(Value::Times
 fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
     Ok(match dml {
         Dml::Insert { table, input } => Mutation::Put { table, input: canonical_put(input, None)? },
-        Dml::Update { table, input, assignments, .. } => {
+        Dml::Update { table, input, target_columns, assignments, .. } => {
             let mut allocator = allocator(&input)?;
-            let old: BTreeMap<_, _> = input.schema().fields().iter().map(|field| (field.name.clone(), field.expression())).collect();
+            let old: BTreeMap<_, _> = input.schema().fields().iter().filter(|field| target_columns.contains(&field.id)).map(|field| (field.name.clone(), field.expression())).collect();
             let mut expressions = Vec::new();
-            for field in input.schema().fields() {
+            for field in input.schema().fields().iter().filter(|field| target_columns.contains(&field.id)) {
                 if !assignments.iter().any(|(name, _)| name == &field.name) { expressions.push(NamedExpr { field: field.clone(), expr: field.expression() }); }
             }
             let mut differences = Vec::new();
@@ -162,7 +162,7 @@ fn canonical_put(input: Arc<Relation>, iid_name: Option<&str>) -> Result<Arc<Rel
     Ok(Arc::new(input.project(expressions)?))
 }
 
-fn instant_cast(expr: Expr) -> Expr { Expr::Cast { expr: Box::new(expr), data_type: instant_type() } }
+fn instant_cast(expr: Expr) -> Expr { Expr::Cast { expr: Box::new(expr), target: rtdb_plan::CastTarget::fixed(instant_type()) } }
 fn select(input: Arc<Relation>, names: &[&str]) -> Result<Arc<Relation>> {
     let expressions = names.iter().map(|name| {
         let field = input.schema().fields().iter().find(|field| field.name == *name).ok_or_else(|| invalid(format!("Mutation input has no {name}")))?;

@@ -1,0 +1,81 @@
+= Server composition source
+
+`HealthDriver` owns the health HTTP listener and a bounded set of joined connection tasks.
+`HealthHandle` is a passive shutdown capability and retains the resolved address.
+Each connection selects HTTP progress or cancellation, requests graceful shutdown, and closes after its drain deadline.
+The listener stops accepting before joining every connection.
+`HealthApplication` and the Prometheus renderer are passive components.
+
+Routes correspond to `xtdb.healthz`: the index, metrics, started/alive/ready checks and POST `/system/finish-block`.
+The finish-block database query parameter retains the reference's raw matching semantics.
+The node captures startup replica targets once and evaluates liveness against current membership.
+The Prometheus renderer exports counters, gauges and timer observations from the same metric provider used by SQL catalogs; rendered byte slices keep their memory reservation alive.
+
+`ServerDriver::open` decodes passive settings into a node, authenticator, provider registry, shared metrics registry, pgwire listeners, Flight SQL listener and health listener.
+Every bind completes before a driver starts.
+Ordinary listener-setup failures close the unstarted node and drain its resource region.
+Inspection-only callers use `ServerDriver::close_without_run` to release bound listeners and drain resources without starting database workers.
+The active server owner requests listener shutdown and joins their connection work before stopping and joining the node.
+Configured tracing starts a bounded OTLP HTTP exporter under the server owner.
+Shutdown closes trace admission after joining database work, drains admitted exports within thirty seconds and joins the exporter before returning.
+Trace exporter failures report diagnostics without failing user queries or transactions.
+Configured CloudWatch and Azure Monitor modules construct native clients and publish from the shared registry's sixty-second step accumulators.
+The exporter owner polls rollover independently of in-flight requests, skips overlapping publication for a destination and retains each request's metric snapshot through completion.
+Shutdown joins current sends and publishes the final partial step within a thirty-second drain period.
+CloudWatch requires the `cloudwatch` feature, included by `all-backends`, and uses the AWS SDK's default credential and region providers.
+Its requests retain Micrometer's metric suffixes, millisecond timer units, percentile `phi` tags, value clamping, dimension limits and batches of at most one thousand data points.
+The native client further subdivides those batches by a conservative encoded-byte bound to respect CloudWatch's one-MiB request ceiling; the pinned Micrometer partitioner limits only the point count.
+Azure Monitor accepts Application Insights connection strings, including sovereign endpoint suffixes and explicit ingestion endpoints.
+It publishes native JSON metric envelopes and retries only the rejected retryable indices from partial-acceptance responses.
+Copied configuration, projected metric points, wire payloads and decoded response trees acquire reservations before allocation.
+AWS SDK and HTTP/TLS internal allocations remain a separate runtime qualification.
+The native publishers use bounded request and drain deadlines and a native SDK identity; they do not reproduce Application Insights Java's disk-backed retry channel or its process resource tags.
+Closing follows Micrometer's start-time bookkeeping: an in-flight publication is awaited before the partial-step rollover, without another completed-step flush afterward.
+Meter observations can cross a wall-clock boundary during live gauge I/O, as in the reference registry; the exporter does not claim an atomic observation of all meters.
+`ServerHandle` retains passive node, authentication, metric and cancellation capabilities.
+The command-line source handles YAML or EDN node startup, YAML ingest startup, playground startup, password hashing, help and version output.
+Playground listeners bind all IPv4 interfaces; ordinary Pgwire and Flight settings retain loopback defaults.
+The EDN adapter preserves configured backend tags, aliases, numeric millisecond timeouts, `#env`, authentication-rule defaults and ignored top-level keys.
+JVM object-valued configuration hooks require native replacements; the EDN reader accepts data and never evaluates code.
+The process listens for interrupt and termination signals and reports shutdowns that take longer than ten seconds.
+After that diagnostic deadline it continues joining the server owner, including admitted blocking I/O, before returning a failure status.
+Announcement, export-capture and signal-registration errors also close or join their already-opened server resources.
+JKS and PKCS#12 loading uses the configured store password for private keys and retains a memory charge with the TLS certificate resolver.
+JKS password encoding uses UTF-16 code units, including supplementary characters.
+The loader selects a usable signing algorithm from the available identities; certificate-alias selection and multiple PKCS#12 private identities still need compatibility work.
+
+The node applies indexing enablement, skipped transaction IDs, trie limits, flush policy, compactor options, GC options and database membership from its startup settings.
+`--memory-limit` or `RTDB_MEMORY_LIMIT_BYTES` controls the allocation ceiling shared by the cache and execution regions; the default is one GiB.
+`ParsedConfiguration` owns startup settings and their allocation reservations until they transfer into the execution region.
+CLI and embedded startup reserve parser events before parsing, each expanded YAML alias value before construction, and environment values before copying.
+The data-only EDN adapter uses the same charged environment lookup and a bound on its input-derived syntax tree.
+The startup owner retains the resulting lease through server shutdown.
+`ProcessEnvironment` requires the host to exclude concurrent native environment mutation while configuration is being read.
+Transport and cryptographic libraries have allocations outside those explicit regions, and whole-process peak allocation qualification is pending.
+
+The server constructs the shared disk cache from an explicit byte capacity or a ratio of filesystem capacity and registers its pinned, evictable, free and maximum byte gauges.
+`export-snapshot DATABASE` opens the configured storage with indexing, compaction, tracing and listeners disabled.
+Its dry run lists the captured file manifest; execution copies that manifest below `exports/b<block>_<UTC timestamp>/v06` within the source storage root.
+The manifest contains one block catalog, its table blocks and the live/nascent trie pairs needed to recover that block.
+Copies preserve object bytes, and identical retries are accepted.
+`reset-compactor DATABASE` runs an exclusive maintenance node with compaction, automatic GC and listeners disabled.
+Every other node, client and upstream writer must remain stopped until it finishes.
+The command catches up, enumerates surviving L0 pairs, publishes their replacement catalog and waits for its block adoption before deleting compacted files.
+`--dry-run` reports the replacement tries and deletion list after the catch-up flush.
+`compactor` opens the database catalog, follows replica progress, performs deterministic compaction and publishes results through the source log.
+It opens no pgwire or Flight listeners and never claims leadership; the configured health listener remains available.
+A separate writer must apply its source-log notifications before jobs are acknowledged.
+Concurrent operation therefore requires a log provider that supports multiple source writers; the local log retains its exclusive writer lock.
+The pinned JVM command's inspected startup path creates no database compactor registrations, so this useful native command is an explicit behavioral difference awaiting runtime qualification.
+The `read-arrow-file`, `read-arrow-stream-file`, `read-hash-trie-file`, `read-table-block-file` and `read-block-file` commands decode local artifacts without opening a node.
+They accept a file path and an optional memory limit.
+Inspection uses typed JSON rather than the JVM commands' Clojure object pretty-print format; this is an intentional diagnostic-output difference.
+Arrow output contains the physical schema and positional typed values, preserving duplicate column names and floating-point bit patterns.
+Arrow stream inspection reports the first batch, matching the reference helper's single-relation behavior.
+Catalog output retains optional wire-field presence, including absent versus zero boundary term sequence, and retains opaque provider configuration bytes.
+The passive inspection routines own their input and decoding reservations for the duration of the call, write output incrementally, and reject declared decoded allocations beyond the budget.
+Tracing and cloud metric exporter construction and lifecycle paths are source-written; executable compatibility qualification remains pending.
+The local-log `useInstantSourceForNonTx` option controls the writer's timestamp policy.
+Exact Micrometer output and the configuration bounds' runtime allocation qualification remain pending.
+No binary, listener, test or release artifact has been executed during Phase 1.
+HTTP, TLS, configuration, CLI, metrics payload lifetime and server lifecycle test sources are written for Phase 2.

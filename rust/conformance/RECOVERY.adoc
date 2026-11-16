@@ -1,0 +1,64 @@
+= Sequential local recovery qualification
+
+This harness exercises the two-way restore and Rust-canary fallback paths in `dev/doc/xtdb-rust-rewrite.md` sections 9 and 10.
+It consumes closed checkpoints retained by `run_history.py` and leaves those originals unchanged.
+Its scope is local logs and storage, storage version 6, epoch zero, one partition, no external source, and sequential ownership of each directory.
+It does not qualify production writer fencing, remote backends, external-source confirmations, mixed writers, or a deployment's pause and recovery budgets.
+Source and test fixtures have been written; no recovery qualification has been executed during Phase 1.
+
+After the implementation completeness gate authorizes Phase 2, use a clean implementation checkout, the built conformance executable, the clean designated JVM checkout at `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`, and a successful retained history run:
+
+[source,shell]
+----
+python3 rust/conformance/run_recovery.py --phase-two \
+  --reference /absolute/pinned-xtdb \
+  --native /absolute/rtdb-conformance \
+  --history /absolute/retained-history-run \
+  --output /absolute/new-recovery-run
+----
+
+The runner verifies the original history observations against the independent price assertions, all retained file hashes, the native binary revision and digest, and the JVM runtime artifact closure.
+Every transfer creates ordinary independent files in a fresh isolated directory; symbolic links, special files, nested transfer regions, and shared source/destination regions are rejected.
+The original history observations precede node closure, so their offsets need not be the final physical log heads.
+An origin-engine read-only follower first opens an isolated copy, consumes the final retained replica head, preserves the latest user transaction, and records the final applied checkpoint.
+The runner closes that follower and verifies the copy is byte-for-byte unchanged before protecting the resulting manifest.
+Source-log head and applied source position remain separate fields because a retained source control record can await resolution.
+No accepted user transaction is inferred from an unapplied source position.
+
+Each manifest retains the exact source and replica heads, final transaction, adopted-block source/replica boundary and term/sequence, open block, storage version/epoch, explicit absence of an external token, input provenance, and complete file inventory.
+Every history prefix and physical layout is transferred JVM to Rust and Rust to JVM.
+The destination reaches the exact replica head and compares its recovered source position, transaction and block boundaries with the protected manifest.
+It executes the historical A/B queries with both pruning modes, preserving typed temporal bounds, and current A/B/C queries at the recovered transaction time.
+The comparator uses the independent fixture prices as well as the retained original temporal observations.
+Missing, duplicate, unexecuted, malformed, or failed observations cannot count as agreement.
+
+The canary cases begin from each JVM flushed prefix.
+Rust recovers that prefix, acquires local leadership, writes product C at price 991 with valid and system time `2026-10-01T00:00:00Z`, and waits for the committed read-back result.
+The adapter writes the acknowledgement identity and checkpoint through a file sync, atomic rename, and directory sync before publishing a separate readiness receipt identifying the durable fault boundary.
+The Python process owner then sends SIGKILL and joins the writer's complete process group.
+Only after that join does it hash the crash artifacts or make another copy.
+The current canary read must return its acknowledged price and exact valid/system start, and the recovered checkpoint must retain its transaction ID and system time.
+Historical A/B reads still compare with the pre-canary observations, including history erased at the September prefix.
+An independent Rust follower copy and the designated JVM fallback copy both perform these reads.
+
+The partial-compaction cases first acknowledge the same canary and flush its block.
+A passive object-store wrapper admits a compaction data upload, verifies its paired metadata is absent, persists the boundary marker, and holds that caller before metadata publication.
+After SIGKILL and process-group join, the runner protects those bytes and opens separate recovery copies.
+The JVM fallback then acquires leadership and runs ordinary deterministic compaction.
+Its retry must complete the missing metadata and preserve the already-uploaded data bytes under the same key.
+Current and historical reads are checked both before and after the retry.
+This fault case covers Rust partial output retried by the JVM; the reverse partial-output direction remains a separate qualification.
+
+Ordinary adapter returns close their nodes and join drivers before enumerating artifacts.
+Forced-kill receipts explicitly distinguish an intentional process crash from graceful closure.
+Timeout, cancellation, boundary mismatch, process failure, malformed framing, or recovery mismatch retains request, manifest, stdout/stderr, available execution receipts, and failure evidence.
+The failure report keeps ingress paused and leaves the protected logs and files available for investigation or forward recovery.
+The runner never repairs a truncated log or substitutes the pre-canary backup for the acknowledged post-canary state.
+
+The harness shares the exact versioned history adapter's query, checkpoint, clock and typed-value functions.
+The JVM adapter references its private harness Vars; their source directory is part of the retained JVM runtime closure and explicit input digests.
+Production JVM sources and original tests remain unchanged.
+Native hooks are limited to the conformance CLI and a history helper accepting an explicit resource factory and read-only mode.
+
+Written tests cover exact immutable copying, malformed log tails, missing and duplicate observations, incorrect canary identity, partial-output conflicts, forced-kill descendant joins, timeout and cancellation cleanup, native manifest rejection before node open, and JVM request validation.
+Success sets only `recovery_selection_passed`; `complete_parity` and production, mixed-writer, and external-source qualification remain false.

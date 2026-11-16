@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -163,15 +163,24 @@ impl ObjectStore for MemoryStore {
 
 pub struct LocalStore {
     root: Arc<PathBuf>,
+    io: Arc<IoRegion>,
 }
 
 impl LocalStore {
+    /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_in(root, IoRegion::new())
+    }
+    /// Shares a caller-owned I/O region with sibling stores; closing the region closes admission for every sibling.
+    pub fn open_in(root: impl AsRef<Path>, io: Arc<IoRegion>) -> Result<Self> {
+        let _operation = io.admit()?;
         let root = root.as_ref();
         fs::create_dir_all(root).map_err(|err| Error::io(root, err))?;
         let root = fs::canonicalize(root).map_err(|err| Error::io(root, err))?;
-        Ok(Self { root: Arc::new(root) })
+        Ok(Self { root: Arc::new(root), io })
     }
+    /// Rejects new work and joins this store's I/O region, including cancelled callers' blocking work.
+    pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
     fn path(&self, key: &ObjectKey) -> PathBuf { self.root.join(key.as_str()) }
 }
@@ -181,10 +190,6 @@ fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
         if error.kind() == std::io::ErrorKind::NotFound { Error::MissingObject(key.to_string()) }
         else { Error::io(path, error) }
     })
-}
-
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
-    tokio::task::spawn_blocking(f).await.map_err(|error| Error::Task(error.to_string()))?
 }
 
 fn sync_directory(path: &Path) -> Result<()> {
@@ -232,7 +237,7 @@ fn read_local_range(path: &Path, key: &ObjectKey, range: Range<u64>) -> Result<B
 impl ObjectStore for LocalStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         let (path, key) = (self.path(key), key.clone());
-        blocking(move || {
+        self.io.run(move || {
             let file = open_object(&path, &key)?;
             let size = file.metadata().map_err(|error| Error::io(&path, error))?.len();
             Ok(StoredObject { key, size })
@@ -241,7 +246,7 @@ impl ObjectStore for LocalStore {
 
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         let (path, key) = (self.path(key), key.clone());
-        blocking(move || {
+        self.io.run(move || {
             let mut file = open_object(&path, &key)?;
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).map_err(|error| Error::io(&path, error))?;
@@ -251,18 +256,18 @@ impl ObjectStore for LocalStore {
 
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         let (path, key) = (self.path(key), key.clone());
-        blocking(move || read_local_range(&path, &key, range)).await
+        self.io.run(move || read_local_range(&path, &key, range)).await
     }
 
     async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
         reservation.check_range(&range)?;
         let (path, key) = (self.path(key), key.clone());
-        blocking(move || reservation.finish(read_local_range(&path, &key, range)?)).await
+        self.io.run(move || reservation.finish(read_local_range(&path, &key, range)?)).await
     }
 
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> {
         let (root, path, key) = (self.root.clone(), self.path(key), key.clone());
-        blocking(move || {
+        self.io.run(move || {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
             let temp_dir = root.join(".tmp");
@@ -291,14 +296,15 @@ impl ObjectStore for LocalStore {
     }
 
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
-        let (root, path, source, key) = (Arc::clone(&self.root), self.path(key), source.to_owned(), key.clone());
-        blocking(move || {
+        let _opening = self.io.admit()?;
+        let mut input = File::open(source).map_err(|error| Error::io(source, error))?;
+        let (root, path, key) = (Arc::clone(&self.root), self.path(key), key.clone());
+        self.io.run(move || {
             let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
             fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
             let temp_dir = root.join(".tmp");
             fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
             let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
-            let mut input = File::open(&source).map_err(|error| Error::io(&source, error))?;
             std::io::copy(&mut input, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
             upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
             match upload.persist_noclobber(&path) {
@@ -315,7 +321,7 @@ impl ObjectStore for LocalStore {
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
         let root = self.root.clone();
         let directory = directory.cloned();
-        blocking(move || {
+        self.io.run(move || {
             fn visit(root: &Path, path: &Path, result: &mut Vec<StoredObject>) -> Result<()> {
                 let metadata = match fs::symlink_metadata(path) {
                     Ok(metadata) => metadata,
@@ -347,7 +353,7 @@ impl ObjectStore for LocalStore {
 
     async fn delete(&self, key: &ObjectKey) -> Result<()> {
         let path = self.path(key);
-        blocking(move || {
+        self.io.run(move || {
             match fs::remove_file(&path) {
                 Ok(()) => sync_directory(path.parent().ok_or_else(|| Error::InvalidKey(path.display().to_string()))?),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),

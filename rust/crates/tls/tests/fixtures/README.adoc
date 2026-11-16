@@ -1,0 +1,7 @@
+= Keystore vectors
+
+The JKS vectors come from https://github.com/kurtbrose/pyjks/tree/0a046e54337a0c271ef5f7fdd9aa79c5ad350486/tests/keystores/jks[pyjks commit 0a046e54337a0c271ef5f7fdd9aa79c5ad350486].
+The upstream filenames are `RSA1024.jks`, `custom_entry_passwords.jks`, and `non_ascii_password.jks`.
+Their passwords and expected entry roles are recorded by the corresponding assertions in upstream `tests/test_jks.py`.
+`LICENSE.pyjks` accompanies these independently generated test vectors.
+These public fixture keys are test data.

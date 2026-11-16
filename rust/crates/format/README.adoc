@@ -1,6 +1,8 @@
 = Durable format implementation
 
 All components in this crate are passive values or codecs.
+IPC inspection exposes allocation bounds for messages, streams and files, including compressed buffers' declared decoded lengths and row descriptors.
+Callers reserve those bounds before decoding and retain their guards until the decoded buffers are released.
 Generated protobuf messages retain field presence from XTDB's edition-2023 schemas.
 The build script generates bindings from the original source files and maps their explicit-presence fields to prost's proto2 descriptor model.
 Repeated scalar fields retain edition-2023 packed encoding.
@@ -12,6 +14,11 @@ The current schema writer records version 6; other storage generations must be q
 Legacy source transaction bytes and obsolete flush records retain the JVM dispatch behavior.
 
 The Arrow readers accept files and streams through Arrow IPC, including multiple pages and run-end encoded IIDs.
+Decimal metadata is checked recursively before Arrow's native schema conversion in file, stream, standalone schema, COPY, and Flight input paths.
+Precision outside an unsigned byte, scale outside a signed byte, and unsupported bit widths return an Unsupported anomaly instead of reaching Arrow 58.4.1's unchecked narrowing.
+Precision zero and scale greater than precision remain representable metadata; coefficient validation belongs to the column writer.
+`tests/ipc_decimal_metadata.rs` changes nested FlatBuffer metadata directly and retains those accepted and rejected boundaries as unexecuted regression source.
+The JVM's wider signed 32-bit decimal metadata remains an implementation gap; this guard does not extend the native value representation or validate other Arrow schema kinds.
 Event operations are selected by union leg name because type IDs can differ across file schemas.
 The writer uses eight-byte alignment and the JVM's four-byte end marker.
 Cross-process writer identity remains an unexecuted acceptance check, including FlatBuffer construction, schema ordering, and metadata encoding.
@@ -25,6 +32,12 @@ The HLL codec stores big-endian 32-bit registers and combines matching registers
 Its estimator reproduces the pinned Kotlin expression, including the signed narrowing of `0xffffffff` to `-1` in the large-range correction.
 That source-level discrepancy needs a reference observation before any behavior change is proposed.
 
+The passive YAML codec converts database declarations to the existing protobuf configuration, preserving defaults and nested provider/indexer types.
+It keeps environment expansion separate: pinned `Database.Config.fromYaml` does not expand `!Env`, whereas node startup configuration does.
+Provider aliases suppress inline credentials in the durable encoding.
+Local-log clock overrides and Kafka topic-creation flags are accepted but omitted from database protobufs, matching the pinned serialization boundary.
+Custom YAML registration, exact parser error text and input allocation qualification remain source and runtime review items.
+
 == Assertion mappings
 
 [cols="2,3,1"]
@@ -37,6 +50,7 @@ That source-level discrepancy needs a reference observation before any behavior 
 |`core/src/main/kotlin/xtdb/util/HyperLogLog.kt`, `MemoryHashTrie.kt` |`tests/hll_and_trie.rs` |Pending
 |`api/src/main/clojure/xtdb/serde.clj`, `xtdb/error.clj` |`tests/transit.rs` |Pending
 |`core/src/main/kotlin/xtdb/trie/MetadataFileWriter.kt`, `ColumnMetadata.kt`, `BloomBuilder.kt` |`tests/metadata.rs` |Pending
+|`core/src/main/kotlin/xtdb/database/Database.kt`, `core/src/test/kotlin/xtdb/api/YamlSerdeTest.kt`, provider factory serialization |`tests/config.rs` |Pending
 |===
 
 The codec tests also read the tracked `compactor-reset-node` Arrow fixture without modifying it.

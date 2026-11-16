@@ -1,0 +1,139 @@
+#ifndef RTDB_V1_H
+#define RTDB_V1_H
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef uint64_t RtdbHandle;
+typedef struct { const uint8_t *data; size_t length; } RtdbSlice;
+
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+struct ArrowSchema {
+  const char *format;
+  const char *name;
+  const char *metadata;
+  int64_t flags;
+  int64_t n_children;
+  struct ArrowSchema **children;
+  struct ArrowSchema *dictionary;
+  void (*release)(struct ArrowSchema *);
+  void *private_data;
+};
+struct ArrowArray {
+  int64_t length;
+  int64_t null_count;
+  int64_t offset;
+  int64_t n_buffers;
+  int64_t n_children;
+  const void **buffers;
+  struct ArrowArray **children;
+  struct ArrowArray *dictionary;
+  void (*release)(struct ArrowArray *);
+  void *private_data;
+};
+#endif
+
+/* Calls are blocking and return 0 on success, 1 on failure.
+ * Every error output must be non-null and receives an owned diagnostic handle on failure.
+ * Release all returned handles, including diagnostics; handle 0 is empty.
+ * Inputs remain borrowed for the call; outputs require aligned, writable, disjoint storage.
+ * Text is UTF-8 with explicit byte lengths; a null pointer is allowed only with length zero.
+ * All entry points contain Rust panics. Invalid foreign pointers remain caller errors outside this guarantee.
+ * Retain creates an independent handle identity; close affects every alias of the underlying object.
+ * Released identities are never reused and return an invalid-handle error.
+ * Concurrent calls are serialized per session/statement/cursor; cancellation does not acquire their locks.
+ * Do not call from a Tokio runtime thread or from a foreign Arrow release callback.
+ * Exclude concurrent native environment mutation while database_open reads its configuration.
+ */
+uint32_t rtdb_v1_abi_version(void);
+int32_t rtdb_v1_database_open(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_retain(RtdbHandle handle, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_release(RtdbHandle handle, RtdbHandle *error);
+
+/* Close is idempotent while its handle remains retained.
+ * Closing a database cancels admitted operations and joins all native drivers before returning.
+ * Already-exported Arrow arrays remain readable and retain their allocation charges.
+ * Closing a statement does not close previously returned cursors.
+ * Releasing the last database handle also closes it; sessions do not keep an unclosed database running.
+ */
+int32_t rtdb_v1_close(RtdbHandle handle, RtdbHandle *error);
+
+/* Fields: 0 category, 1 stable code, 2 message, 3 Transit MessagePack anomaly.
+ * The returned slice borrows the diagnostic until release; do not concurrently release it while reading.
+ * Emergency diagnostic 1 has an empty Transit field when the diagnostic budget is exhausted.
+ */
+int32_t rtdb_v1_error_field(RtdbHandle handle, uint32_t field, RtdbSlice *out, RtdbHandle *error);
+
+/* Authentication: 0 unauthenticated embedded caller, 1 explicitly trusted user,
+ * 2 password, 3 OAuth client credentials (user is client ID).
+ * Modes 0 and 1 are privileged host APIs, as Xtdb.connect/authenticateTrusted are.
+ */
+int32_t rtdb_v1_session_open(RtdbHandle database, const uint8_t *name, size_t name_length, uint32_t authentication,
+                           const uint8_t *user, size_t user_length, const uint8_t *secret, size_t secret_length,
+                           RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_session_set_catalog(RtdbHandle session, const uint8_t *name, size_t name_length, RtdbHandle *error);
+int32_t rtdb_v1_session_await_token(RtdbHandle session, RtdbHandle *out, RtdbHandle *error);
+
+/* Operations descend from their session's cancellation lifetime.
+ * Create one per operation, retain it until its cursor closes, and release after the call/stream finishes.
+ * Releasing the last operation handle cancels its work; sibling operation tokens remain usable.
+ */
+int32_t rtdb_v1_operation_new(RtdbHandle session, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_cancel(RtdbHandle operation_or_cursor, RtdbHandle *error);
+
+/* Actions: 0 autocommit off, 1 on, 2 begin, 3 ADBC commit, 4 ADBC rollback,
+ * 5 commit sync, 6 commit async, 7 rollback transaction.
+ * SET TRANSACTION and other session settings execute through statements.
+ */
+int32_t rtdb_v1_session_action(RtdbHandle session, RtdbHandle operation, uint32_t action, RtdbHandle *error);
+
+/* bulk=0: SQL source; bulk=1: CREATE_APPEND table name.
+ * A bind replaces existing arguments, preserves ordinal positions and explicit zero-row batches.
+ * Valid Arrow input structs are moved into this call once decoding begins and copied before return.
+ * On earlier rejection their release callbacks remain set and the caller must release them.
+ * Foreign release callbacks must be non-throwing and callable from the initiating thread.
+ */
+int32_t rtdb_v1_statement_new(RtdbHandle session, const uint8_t *source, size_t length, uint32_t bulk, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_statement_set_sql(RtdbHandle statement, const uint8_t *source, size_t length, RtdbHandle *error);
+int32_t rtdb_v1_statement_prepare(RtdbHandle statement, RtdbHandle operation, RtdbHandle *error);
+int32_t rtdb_v1_statement_bind(RtdbHandle statement, struct ArrowArray *array, struct ArrowSchema *schema, RtdbHandle *error);
+int32_t rtdb_v1_statement_bind_transit(RtdbHandle statement, const uint8_t *msgpack_rows, size_t length, RtdbHandle *error);
+
+/* Arrow output structs must be zero-initialized or released.
+ * Each successful export has its own release callback and may outlive every native handle.
+ * Release each struct exactly once according to the Arrow C Data Interface.
+ * parameters=0 returns result schema; 1 returns positional parameter schema after prepare.
+ */
+int32_t rtdb_v1_statement_schema(RtdbHandle statement, RtdbHandle operation, uint32_t parameters, struct ArrowSchema *out, RtdbHandle *error);
+int32_t rtdb_v1_statement_query(RtdbHandle statement, RtdbHandle operation, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_statement_update(RtdbHandle statement, RtdbHandle operation, int64_t *affected, RtdbHandle *error);
+int32_t rtdb_v1_cursor_schema(RtdbHandle cursor, struct ArrowSchema *out, RtdbHandle *error);
+int32_t rtdb_v1_cursor_next(RtdbHandle cursor, struct ArrowArray *array, struct ArrowSchema *schema, uint32_t *has_batch, RtdbHandle *error);
+int32_t rtdb_v1_cursor_consumer_error(RtdbHandle cursor, RtdbHandle *error);
+
+/* Transit row export returns an owned byte handle, or 0 at end-of-stream.
+ * It consumes the same cursor as Arrow export; choose one representation per stream.
+ * bytes borrows its byte handle until release; do not concurrently release it while reading.
+ * session_transact takes a Transit MessagePack map of operations/options/asynchronous;
+ * its result is an owned Transit JSON transaction-key byte handle.
+ */
+int32_t rtdb_v1_cursor_next_transit(RtdbHandle cursor, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_bytes(RtdbHandle bytes, RtdbSlice *out, RtdbHandle *error);
+int32_t rtdb_v1_session_transact(RtdbHandle session, RtdbHandle operation, const uint8_t *request, size_t length, RtdbHandle *out, RtdbHandle *error);
+
+/* Metadata JSON: kind 0=getInfo, 1=getTableTypes, 2=getObjects, 3=getTableSchema.
+ * Optional fields: info_codes, catalog, schema, table, column, table_types.
+ * getObjects depth: 0=ALL, 1=CATALOGS, 2=DB_SCHEMAS, 3=TABLES; filters use SQL LIKE.
+ * getTableSchema uses exact names and defaults catalog/session and schema/public.
+ */
+int32_t rtdb_v1_metadata(RtdbHandle session, RtdbHandle operation, const uint8_t *request_json, size_t length, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_memory_used(RtdbHandle database, size_t *out, RtdbHandle *error);
+
+#ifdef __cplusplus
+}
+#endif
+#endif

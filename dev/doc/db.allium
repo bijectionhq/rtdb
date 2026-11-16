@@ -1385,6 +1385,65 @@ contract ExternalSourceConfirmation {
         -- A follower has no upstream connection and no position of its own, so a leadership handover cannot produce two nodes confirming different positions to the same upstream.
 }
 
+contract OfflineSnapshotExport {
+    @invariant CompletedBlockRequired
+        -- An export captures one completed block from a database opened with indexing and compaction disabled.
+        -- A database with no completed block yields no export.
+
+    @invariant CapturedRecoveryFiles
+        -- The manifest contains the captured block catalog, its per-table block files and the data/meta pairs of its live and nascent tries.
+        -- Every copied object retains its original bytes.
+
+    @invariant EpochZeroDestination
+        -- The destination is a fresh single-partition storage root at epoch zero, under an export directory named by the captured block and export time.
+
+    @invariant RetryableCopies
+        -- A failed export retains copies already completed.
+        -- Repeating a copy accepts an identical destination object.
+        -- Cancellation takes effect between object copies after the current copy finishes.
+
+    @invariant DryRunManifest
+        -- A dry run returns the file manifest and leaves the destination unchanged.
+}
+
+contract CompactorReset {
+    @invariant ExclusiveMaintenance
+        -- The operator keeps every other node, client and upstream writer stopped throughout the reset.
+        -- The maintenance node catches up through a completed block with indexing enabled and compaction and automatic garbage collection disabled.
+
+    @invariant SurvivingL0Files
+        -- The replacement catalog contains the L0 files found in object storage with both metadata and data present.
+        -- A metadata file whose paired data is absent contributes no trie.
+        -- L0 file sizes come from the data objects, and temporal metadata is recovered when those files are read.
+
+    @invariant PublicationPrecedesDeletion
+        -- A reset with a completed transaction publishes the replacement catalog in a new block.
+        -- Compacted files become eligible for deletion after the maintenance node adopts that block in the term that accepted the reset.
+        -- Deletion removes each compacted trie's metadata before its data.
+
+    @invariant CapturedCatalogIdentity
+        -- A reset prepared from an earlier catalog or block is rejected if either changes before acceptance.
+
+    @invariant InterruptedResetRetainsRecovery
+        -- A reset interrupted before its block is adopted retains all compacted files.
+        -- An interruption during deletion retains the published L0 recovery catalog and any remaining compacted files.
+
+    @invariant DryRunPlan
+        -- A dry run performs the initial catch-up flush and reports the replacement L0 catalog and proposed deletions.
+        -- Its plan leaves the catalog and files as they stood after that catch-up.
+}
+
+contract StandaloneCompactor {
+    @invariant FollowerCompaction
+        -- A compactor-only node follows admitted replica progress and compacts the available catalog using the ordinary deterministic job selection.
+        -- It remains ineligible for leadership and exposes its configured health endpoint.
+
+    @invariant SourcePublication
+        -- Completed compaction outputs are published to the database source log.
+        -- A separate leader applies those notifications before the compactor reports the jobs complete.
+        -- The source provider must admit the compactor alongside the writer.
+}
+
 ---- Actor Declarations
 
 actor ClientActor {
@@ -1393,6 +1452,16 @@ actor ClientActor {
 }
 
 ---- Surfaces
+
+surface MaintenanceCommands {
+    facing operator: ClientActor
+    context db: Database
+
+    contracts:
+        fulfils OfflineSnapshotExport
+        fulfils CompactorReset
+        fulfils StandaloneCompactor
+}
 
 surface TransactionSubmission {
     facing caller: ClientActor
@@ -1475,8 +1544,6 @@ deferred FoldIntoTermPosition
 open question "Which already-applied query bases remain available after an ingestion failure?"
     -- ProcessingErrorHaltsNode and the pinned JVM Watchers fail every later await.
     -- The object-boundaries contract requires wait conditions to remain re-evaluable.
-    -- The Rust monitor serves an already-satisfied applied prefix, fails unmet waits with the current fault, and clears that fault only after an explicit successful driver restart.
-    -- Compatibility of this behavior remains unresolved.
 
 open question "Does the idle flush deadline advance the block catalog when the open block has no rows?"
     -- LeaderFlushTimeout requires a block with data.
@@ -1485,3 +1552,12 @@ open question "Does the idle flush deadline advance the block catalog when the o
 open question "Which node-local caller failures during committed database-operation apply terminate ingestion?"
     -- ApplyDbOpToCatalog swallows a caller fault.
     -- The pinned JVM follower does so after applying the transaction, while LeaderLogProcessor applies the database operation before the transaction and propagates the fault.
+
+open question "How should operator-selected skipped transactions be represented in this processing model?"
+    -- The pinned resolver persists the source payload under skipped-txs before staging an aborted xt.txs row carrying xtdb/skipped-tx.
+    -- Its transaction ID is the source position and its system time is smoothed against the resolved head.
+    -- The skip takes effect before decoding transaction operations and uses the ordinary append, read-back and apply pipeline.
+
+open question "What processing obligations apply to a database opened with indexing disabled?"
+    -- The pinned database opens its persisted state and logs, accepts source submissions, and runs no log processor or external source.
+    -- This model currently requires a log processor for each database.

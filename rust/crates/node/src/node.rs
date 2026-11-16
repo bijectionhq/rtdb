@@ -28,10 +28,12 @@ pub struct NodeServices {
     pub clock: Arc<dyn Clock>,
     pub catalog_users: Arc<dyn CatalogUsers>,
     pub catalog_metrics: Arc<dyn CatalogMetrics>,
+    pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
+    pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
 }
 impl NodeServices {
     pub fn local(authorization: Arc<dyn TransactionAuthorization>, observer: Arc<dyn CollectionObserver>, users: Arc<dyn CatalogUsers>, metrics: Arc<dyn CatalogMetrics>) -> Self {
-        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics }
+        Self { resources: Arc::new(NativeResources::default()), transaction_authorization: authorization, collection_observer: observer, external_sources: BTreeMap::new(), clock: Arc::new(SystemClock), catalog_users: users, catalog_metrics: metrics, execution_observer: None, tracer: None }
     }
 }
 
@@ -51,17 +53,51 @@ pub struct NodeDriver {
 }
 
 impl Node {
+    /// The provider observes current catalog generations and keeps no node or database alive between samples.
+    pub fn metrics_provider(&self) -> Result<Arc<dyn CatalogMetrics>> {
+        Ok(Arc::new(crate::metrics::NodeMetrics::new(Arc::downgrade(&self.catalog), Arc::downgrade(&self.factory), Arc::clone(self.memory()))?))
+    }
+    pub fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { self.factory.execution_observer.clone() }
+    pub fn tracer(&self) -> Option<Arc<dyn rtdb_plan::Tracer>> { self.factory.tracer.clone() }
+    pub(crate) fn require_offline_export(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.factory.options.replication.enabled || self.factory.options.compaction_threads > 0 {
+            return Err(Anomaly::incorrect("rtdb.export/active-node", "Snapshot export requires indexing and compaction to be disabled"));
+        }
+        Ok(())
+    }
+    pub(crate) fn require_compactor_reset(&self) -> Result<()> {
+        self.ensure_open()?;
+        if !self.factory.options.replication.enabled || self.factory.options.compaction_threads > 0 || self.factory.options.automatic_gc {
+            return Err(Anomaly::incorrect("rtdb.compactor-reset/active-maintenance", "Compactor reset requires indexing enabled, zero compactor threads and automatic GC disabled"));
+        }
+        Ok(())
+    }
     /// Opens persisted catalogs and returns their unstarted owner.
     /// Run the driver once, then request shutdown and await it before releasing the node's resources.
-    pub async fn open(mut options: NodeOptions, services: NodeServices) -> Result<(Self, NodeDriver)> {
-        if options.command_capacity == 0 || options.execution_memory_bytes == 0 || options.cache_bytes == 0 || options.compaction_threads == 0 {
-            return Err(Anomaly::incorrect("rtdb.node/invalid-options", "Node capacities and compaction concurrency must be positive"));
+    pub async fn open(options: NodeOptions, services: NodeServices) -> Result<(Self, NodeDriver)> {
+        let memory = MemoryBudget::new(options.execution_memory_bytes);
+        Self::open_with_memory(options, services, memory).await
+    }
+    /// Authentication, source factories and the node may share this execution allocation ceiling.
+    /// The budget limit must equal `options.execution_memory_bytes`.
+    pub async fn open_with_memory(options: NodeOptions, services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
+        let resources = Arc::clone(&services.resources);
+        match Self::open_region(options, services, memory).await {
+            Ok(opened) => Ok(opened),
+            Err(error) => match resources.close().await { Ok(()) => Err(error), Err(close) => Err(error.with_context("resource-close-error", close.to_string().into())) },
+        }
+    }
+    async fn open_region(mut options: NodeOptions, services: NodeServices, memory: Arc<MemoryBudget>) -> Result<(Self, NodeDriver)> {
+        if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.node/invalid-memory-budget", "Node options and supplied execution budget have different limits")); }
+        if options.command_capacity == 0 || options.execution_memory_bytes == 0 || options.cache_bytes == 0 {
+            return Err(Anomaly::incorrect("rtdb.node/invalid-options", "Node capacities must be positive"));
         }
         options.default_timezone = rtdb_expr::normalize_timezone(&options.default_timezone)?;
         let catalog = DatabaseCatalog::new(options.membership.clone());
         let runtime = Arc::new(crate::runtime::RuntimeProviders { users: services.catalog_users, metrics: services.catalog_metrics });
-        let factory = Arc::new(DatabaseFactory { memory: MemoryBudget::new(options.execution_memory_bytes), cache: CacheBudget::new(options.cache_bytes),
-            resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer,
+        let factory = Arc::new(DatabaseFactory { memory, cache: CacheBudget::new(options.cache_bytes),
+            resources: services.resources, authorization: services.transaction_authorization, observer: services.collection_observer, execution_observer: services.execution_observer, tracer: services.tracer,
             external_sources: services.external_sources, clock: services.clock, options });
         let (commands, receiver) = mpsc::channel(factory.options.command_capacity);
         let node = Self { catalog, factory, commands, cancellation: CancellationToken::new(), runtime };
@@ -247,6 +283,19 @@ impl Node {
 }
 
 impl NodeDriver {
+    /// Closes an unstarted node, drops its database drivers, and drains its resource region.
+    /// Use after listener setup fails or after read-only startup inspection; `run` consumes this same owner.
+    pub async fn close_without_run(mut self) -> Result<()> {
+        self.node.shutdown();
+        self.commands.close();
+        while let Ok(command) = self.commands.try_recv() {
+            match command { CatalogCommand::Apply { completion, .. } => { let _ = completion.send(Err(closed())); }, CatalogCommand::AttachLocal { completion, .. } => { let _ = completion.send(Err(closed())); } }
+        }
+        self.node.catalog.cancel_all();
+        self.initial.clear();
+        self.node.catalog.clear_after_join();
+        self.node.factory.resources.close().await
+    }
     pub async fn run(mut self) -> Result<()> {
         let mut tasks = JoinSet::new();
         for (database, driver) in self.initial.drain(..) { tasks.spawn(async move { (database, driver.run().await) }); }
@@ -285,6 +334,7 @@ impl NodeDriver {
             }
         }
         self.node.catalog.clear_after_join();
+        if let Err(error) = self.node.factory.resources.close().await { if failure.is_none() { failure = Some(error); } }
         failure.map_or(Ok(()), Err)
     }
     async fn command(&mut self, command: CatalogCommand, tasks: &mut JoinSet<(Arc<Database>, Result<()>)>) {
@@ -319,7 +369,7 @@ impl NativeSession {
     pub fn state_mut(&mut self) -> &mut Session { &mut self.state }
     pub async fn query_context(&mut self) -> Result<Arc<QueryContext>> {
         let basis = self.state.read_basis().await?;
-        self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), self.state.cancellation()).await
+        Ok(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), self.state.cancellation()).await?.with_observer(self.service.execution_observer()).with_tracer(self.service.node.tracer(), None))
     }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
@@ -340,6 +390,8 @@ impl NativeSession {
 pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity> }
 #[async_trait]
 impl SessionService for NativeSessionService {
+    fn memory(&self) -> &Arc<MemoryBudget> { self.node.memory() }
+    fn execution_observer(&self) -> Option<Arc<dyn rtdb_plan::ExecutionObserver>> { self.node.factory.execution_observer.clone() }
     fn user(&self) -> Option<&str> { self.identity.user() }
     fn check_open(&self) -> Result<()> { self.node.ensure_open() }
     async fn revalidate(&self) -> Result<()> { self.node.ensure_open()?; self.identity.revalidate(self.node.now()).await }

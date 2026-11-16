@@ -8,8 +8,31 @@ fn read<T: DeserializeOwned>(path: &str) -> Result<T, Box<dyn std::error::Error>
 
 fn run() -> Result<bool, Box<dyn std::error::Error>> {
     let arguments: Vec<_> = env::args().skip(1).collect();
+    if arguments.len() == 3 && arguments[0] == "recovery" {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let execution = runtime.block_on(rtdb_conformance::history::recovery::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
+        println!("{}", serde_json::to_string(&execution)?);
+        return Ok(execution["execution_complete"] == true);
+    }
+    if arguments.len() == 2 && arguments[0] == "observe" {
+        let execution = rtdb_conformance::controls::execute(Path::new(&arguments[1]))?;
+        println!("{}", serde_json::to_string(&execution)?);
+        return Ok(true);
+    }
+    if arguments.len() == 3 && arguments[0] == "history" {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let execution = runtime.block_on(rtdb_conformance::history::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
+        println!("{}", serde_json::to_string(&execution)?);
+        return Ok(execution["execution_complete"] == true);
+    }
+    if arguments.len() == 3 && arguments[0] == "sql-logic" {
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let execution = runtime.block_on(rtdb_conformance::sql_logic::execute(Path::new(&arguments[1]), Path::new(&arguments[2])))?;
+        println!("{}", serde_json::to_string(&execution)?);
+        return Ok(execution["execution_complete"] == true);
+    }
     if arguments.len() != 4 || arguments[0] != "compare" {
-        return Err("usage: rtdb-conformance compare LEDGER.json REFERENCE.json RUST.json".into());
+        return Err("usage: rtdb-conformance observe FIXTURE.json | history FIXTURE.json OUTPUT | recovery REQUEST.json OUTPUT | sql-logic PLAN.json OUTPUT | compare LEDGER.json REFERENCE.json RUST.json".into());
     }
     let ledger: Ledger = read(&arguments[1])?;
     let reference: Vec<CaseReceipt> = read(&arguments[2])?;

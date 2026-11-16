@@ -2,6 +2,9 @@
 
 `LocalLogDriver` is active and owns append selection, serialization, and durability acknowledgement.
 Its owner cancels and joins the driver before releasing the log.
+Writable-log reader offloads belong to an `IoRegion`, which the owner closes after consumers and the writer join.
+Standalone logs expose `close_and_wait`; native node logs share their region with local object stores.
+The drain includes queued reads whose caller futures have been cancelled.
 `LocalLog`, `MemoryLog`, and their cursors are passive capabilities.
 The progress channel is a monitor carrying the current tip or terminal failure.
 
@@ -22,3 +25,6 @@ These limits do not yet connect log buffers to the node-wide allocation budget.
 `tests/read_only_log.rs` maps to `ReadOnlyLocalLogTest`'s existing/subsequent external-write polling behavior and adds missing-file, writer-lock coexistence, corruption, truncation, range-bound, and no-write checks.
 Partition path selection and retired-message decoding remain the caller's responsibilities.
 The source has not been compiled or executed during Phase 1.
+`AppendReceipt` is a passive completion value.
+An observed receipt wraps a caller-polled future without changing the backend's ownership of an accepted write.
+Dropping an observation future does not withdraw bytes already accepted by the log.

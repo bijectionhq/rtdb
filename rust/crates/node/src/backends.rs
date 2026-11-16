@@ -17,7 +17,11 @@ use crate::NativeResources;
 impl NativeResources {
     #[cfg(feature = "kafka")]
     pub fn with_kafka(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>) -> Result<Self> {
-        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer }))
+        self.with_kafka_topic_creation(clusters, observer, true)
+    }
+    #[cfg(feature = "kafka")]
+    pub fn with_kafka_topic_creation(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool) -> Result<Self> {
+        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer, auto_create_topic }))
     }
     #[cfg(feature = "s3")]
     pub fn with_s3(self, remotes: Arc<dyn rtdb_s3::S3CredentialResolver>) -> Result<Self> {
@@ -65,11 +69,11 @@ impl RemoteStorageFactory for GcsFactory {
 }
 
 #[cfg(feature = "kafka")]
-struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver> }
+struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool }
 #[cfg(feature = "kafka")]
 #[async_trait]
 impl crate::LogFactory for KafkaFactory {
-    async fn open(&self, configuration: &Any, read_only: bool, cancellation: tokio_util::sync::CancellationToken) -> Result<crate::OpenedLogs> {
+    async fn open(&self, configuration: &Any, access: crate::LogAccess, cancellation: tokio_util::sync::CancellationToken) -> Result<crate::OpenedLogs> {
         use futures::FutureExt;
         use rtdb_kafka::{KafkaLog, KafkaLogConfig, KafkaLogOptions};
         let wire = rtdb_format::generated::xtdb::kafka::proto::KafkaLogConfig::decode(configuration.value.as_slice()).map_err(invalid)?;
@@ -80,9 +84,11 @@ impl crate::LogFactory for KafkaFactory {
             return Err(invalid("Source and replica Kafka logs must use distinct topics or clusters"));
         }
         let mut source_options = KafkaLogOptions::new(&configuration.topic);
-        source_options.read_only = read_only;
+        source_options.read_only = access.source_read_only();
+        source_options.auto_create_topic = self.auto_create_topic;
         let mut replica_options = KafkaLogOptions::new(configuration.replica_topic());
-        replica_options.read_only = read_only;
+        replica_options.read_only = access.replica_read_only();
+        replica_options.auto_create_topic = self.auto_create_topic;
         replica_options.pipelined = true;
         let source = KafkaLog::open(source_cluster, source_options, Arc::clone(&self.observer)).await?;
         let replica = KafkaLog::open(replica_cluster, replica_options, Arc::clone(&self.observer)).await?;

@@ -20,7 +20,8 @@ Rows retain their allocation reservations through indexing, and the decoded oper
 `SourceDriver` owns the choice among upstream input, applied receipts, adopted-block updates, reconnect completion, status deadlines, and cancellation.
 Its status watch is a separate watch-channel monitor holding immutable `SourceStatus` observations.
 
-The node runs one source per leading term with its `TermHandle`, applied resume token, adopted-block watch, and cancellation token.
+The node retains one passive source owner per database and runs one assignment driver per leading term with its `TermHandle`, applied resume token, adopted-block watch, and cancellation token.
+Custom indexers and source metric registrations survive assignment teardown until the database source closes.
 The node cancels and joins that run before starting another assignment.
 Cancelling the run drops its owned socket, any partially read frame, exported snapshot connections, reconnect future, and apply receivers.
 The replication driver owns accepted transaction commands and their term-scoped completion handles.
@@ -79,6 +80,7 @@ Its incremental frame reader retains partial header/body progress across cancell
 The transport does not configure automatic WAL flush acknowledgement.
 
 Text decoding follows `PgType.readText` together with the object writer's `ValueTypes.asVectorType`.
+The implementation is shared with the native frontend through `rtdb-pg-codec::read_text`; the source crate keeps its existing re-export.
 That distinction controls decimal precision 32/64, nanosecond local times, microsecond durations and timestamps, timezone names, and interval variants.
 Unknown upstream OIDs remain strings; a known type without a text reader remains an error.
 JSON integer literals retain their digits before choosing a long, decimal, or double.
@@ -110,8 +112,11 @@ Unsigned LSN ordering preserves PostgreSQL's 64-bit position domain; the pinned 
 
 The status monitor exposes connection phase, applied event/commit counts, latest commit time/lag, and received/held/confirmed LSNs.
 A passive `SourceObserver` samples WAL lag through a caller-owned SQL query only while assigned; the assignment cancellation token ends in-flight sampling when the source exits.
-The observer retains its own credential configuration until the node releases it.
-A Micrometer-compatible transport or metrics exporter is a node adapter obligation.
+The observer retains a charged shared copy of its credential configuration until the final reader releases it.
+The optional `SourceMetricsFactory` registers database-lifetime event and commit counters and a commit-lag distribution summary.
+Each assignment owns a guard for its connection and last-event gauges; applying a transaction records lag after millisecond rounding, as in the pinned source.
+The native metrics adapter supplies caller-owned asynchronous WAL-lag sampling and the reference metric names and labels.
 The broad Java-specific JSON-LD/Transit object families require fixture qualification; source values without an Arrow document representation fail explicitly.
+Float4 text parses directly at single precision, and interval parsing rejects exponents beyond the bounded native decimal conversion range.
 Frame/row/relation reservations precede decoding, but TLS/authentication internals, remote configuration allocations, and all nested JSON/Transit amplification still need a complete retained-allocation audit.
 Native protocol integration, failover, authentication, permission, reconnect fault injection, simulation/property parity, and source-level performance remain unexecuted Phase 2 work.

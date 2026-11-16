@@ -79,12 +79,15 @@ pub struct Field {
     pub id: ColumnId,
     pub name: String,
     pub qualifier: Option<String>,
+    /// Retained in wildcards and qualified lookup, excluded from one-part name lookup.
+    #[serde(default)]
+    pub qualified_only: bool,
     pub data_type: LogicalType,
 }
 
 impl Field {
     pub fn expression(&self) -> Expr { Expr::column(self.id, self.data_type.clone()) }
-    pub fn unqualified(mut self) -> Self { self.qualifier = None; self }
+    pub fn unqualified(mut self) -> Self { self.qualifier = None; self.qualified_only = false; self }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,7 +112,7 @@ impl Schema {
     pub fn resolve(&self, name: &[Identifier]) -> Result<&Field> {
         let parts: Vec<_> = name.iter().map(Identifier::normalized).collect();
         let matches: Vec<_> = self.0.iter().filter(|field| match parts.as_slice() {
-            [column] => &field.name == column,
+            [column] => !field.qualified_only && &field.name == column,
             [qualifier, column] => &field.name == column && field.qualifier.as_ref() == Some(qualifier),
             _ => false,
         }).collect();
@@ -139,7 +142,7 @@ impl Binder {
     pub fn field(&mut self, name: impl Into<String>, qualifier: Option<String>, data_type: LogicalType) -> Result<Field> {
         let id = ColumnId(self.next_column);
         self.next_column = self.next_column.checked_add(1).ok_or_else(|| Anomaly::incorrect("xtdb/query-too-large", "Column identifier space is exhausted"))?;
-        Ok(Field { id, name: name.into(), qualifier, data_type })
+        Ok(Field { id, name: name.into(), qualifier, qualified_only: false, data_type })
     }
     pub fn parameter(&mut self, index: usize, data_type: LogicalType) -> Expr {
         let data_type = self.parameter_types.entry(index).and_modify(|old| *old = old.join(&data_type)).or_insert(data_type).clone();

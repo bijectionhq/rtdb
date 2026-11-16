@@ -1,0 +1,81 @@
+= Native PostgreSQL frontend
+
+`rtdb-pgwire` implements a PostgreSQL v3 frontend over native Rust sockets and `rtdb-node` sessions.
+It uses native SQL preparation, query cursors, transaction resolution, authentication, Arrow IPC, and Transit codecs.
+It starts no JVM process and delegates no application operation to a JVM server.
+The implementation and its regression test sources have not been compiled or executed during Phase 1.
+
+== Composition and ownership
+
+`ServerDriver::bind` opens the listener and returns a passive `ServerHandle` plus an unstarted driver.
+The caller owns `ServerDriver::run`, requests shutdown through the handle, and awaits that run through every child join.
+The driver bounds active connections and pending accepted sockets separately.
+At capacity it closes the newly accepted socket without writing an unsolicited protocol response.
+Shutdown closes admission, drains connections through the configured deadline, then cancels and joins the remaining connection regions.
+
+The server and each connection are Active Objects.
+Each authenticated connection owns one bounded reader child that detects peer termination while query execution is suspended.
+The connection cancels and joins that reader before releasing the socket and session.
+Its passive protocol transient owns prepared registrations, portals, the implicit-transaction marker, protocol mode, and optional COPY file.
+Each portal owns its query cursor, current Arrow batch, row offset, cumulative row count, argument reservations, and cancellation token.
+Prepared statements are immutable shared values; named registrations own their name/map charge.
+The cancellation registry contains weak capabilities to connection-owned cancellation slots.
+`ServerStatus` is a separate watch-channel monitor containing immutable observations.
+
+The node must remain available until the server run has joined.
+Dropping the run future is not a shutdown operation.
+The handle exposes the bound address, current status, and a watch receiver for node telemetry composition.
+
+== Authentication and protocol
+
+The startup deadline covers the initial packet, SSL negotiation, TLS handshake, password exchange, and external authentication.
+Startup and pre-authentication packets use the pinned 10,000-byte body limit; authenticated packets use the configured limit below one GiB.
+An authenticated connection may remain idle indefinitely.
+TLS uses the caller's native rustls server configuration; Java keystores are not consumed by this crate.
+Trust, password, client-credentials, and device authentication delegate to `rtdb-auth`.
+Device authentication sends the pinned authentication-success and URL notice before polling for the principal.
+GSS negotiation is unsupported, matching the reference.
+
+Simple Query supports multiple statements, implicit transaction completion, explicit transaction controls, empty statements, session parameters, SHOW, SQL PREPARE/EXECUTE, and COPY IN.
+Shared control parsing and execution live in `rtdb-sql` and `rtdb-node`.
+Parse/Bind/Describe/Execute/Close/Flush/Sync retain named prepared statements and portals across protocol messages.
+Bind captures the query context and opens the cursor.
+An extended-protocol error skips messages until Sync.
+Sync completes an implicit transaction and leaves an explicit transaction open.
+Execute limits suspend the portal even when the limit exactly matches the remaining rows; a subsequent Execute observes exhaustion and reports the cumulative count.
+Statement close releases its associated portals, and transaction completion releases transaction-scoped portals.
+
+The frontend preserves the reference's JDBC type-lookup exception inside a write transaction and its DBeaver projection rewrite from issue 4528.
+It also preserves the canned keyword response.
+The server read-only flag applies to DML; COPY independently enforces the connection's read-only transaction state.
+`SET ROLE` follows the pinned no-response visitor.
+CancelRequest uses the connection identifier and ignores the supplied secret; BackendKeyData sends zero as the secret.
+These protocol choices are compatibility behavior, and the read-only/COPY and cancellation policies are recorded as open questions in `dev/doc/tx.allium`.
+
+== COPY and memory
+
+COPY input is written into a bounded temporary file owned by the protocol state.
+CopyFail, disconnect, shutdown, and completion release that file.
+Transit JSON and MessagePack accept multiple top-level documents, resetting the Transit cache for each value.
+Transit COPY commits one batch when no transaction is open.
+Arrow file and stream COPY preserve record-batch boundaries and commit one transaction per batch outside an explicit transaction.
+Inside an explicit transaction, all batches remain buffered until the user's commit or rollback.
+Keyword document keys use the source normalization, including `:xt/id` to `_id`; the literal string `xt/id` remains a different key.
+
+Frame, parameter, environment, prepared-registration, portal-descriptor, decoded-row, and encoded-value owners retain memory reservations.
+Arrow COPY inspects metadata and compressed buffer lengths before loading payloads, then holds a reservation through the reader and each selected-value conversion.
+Transit COPY reserves the bounded file's decoding allowance before reading it into memory.
+Temporary-file reads and writes run synchronously on the owning future; cancellation is observed between those operations and during asynchronous transaction work.
+TLS internals, compiler scratch, and worst-case nested codec amplification still need complete retained-allocation qualification.
+
+== Source regression coverage
+
+`tests/protocol.rs` starts the native Node and server within each test source and speaks protocol frames directly.
+It covers password authentication, simple transaction visibility and rollback, binary parameters/results, exact-limit portal suspension, extended-error recovery, fragmented Transit COPY, Arrow file/stream batch boundaries, COPY rollback/failure, pre-authentication limits, SSL refusal and upgrade with the pinned test certificate, and joined shutdown.
+Internal cases cover frame reservation lifetime, malformed payloads, temporary-file cleanup, disk limits, cancellation registration, and peer-disconnect cancellation.
+These cases map to `src/test/clojure/xtdb/pgwire_protocol_test.clj`, `src/test/clojure/xtdb/pgwire/copy_test.clj`, and the pinned `pgwire.clj`/`pgwire/io.clj` lifecycle.
+
+Protocol references are https://www.postgresql.org/docs/17/protocol-message-formats.html[message formats] and https://www.postgresql.org/docs/17/protocol-flow.html[protocol flow].
+TLS uses https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/[tokio-rustls 0.26.6].
+Interop with PostgreSQL clients, successful TLS handshakes, external authentication, connection-saturation fault injection, client-disconnect write races, and full resource accounting remain unexecuted qualification work.
+Planning warnings are not yet exposed as protocol notices by the shared preparation API.

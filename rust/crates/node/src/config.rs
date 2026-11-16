@@ -64,10 +64,16 @@ pub trait ExternalSourceDriver: Send {
 }
 
 #[async_trait]
+pub trait ExternalSource: Send {
+    /// The previous assignment must be cancelled and joined before requesting the next driver.
+    async fn assign(&mut self) -> Result<Box<dyn ExternalSourceDriver>>;
+}
+
+#[async_trait]
 pub trait ExternalSourceFactory: Send + Sync {
     fn validate(&self, configuration: &Any) -> Result<()>;
-    /// Returns an unstarted source driver whose resources are owned by its next `run` call.
-    async fn open(&self, configuration: &Any, database: &str) -> Result<Box<dyn ExternalSourceDriver>>;
+    /// Opens one database-scoped source; its assignment-independent state survives leader changes.
+    async fn open(&self, configuration: &Any, database: &str) -> Result<Box<dyn ExternalSource>>;
 }
 
 pub type ExternalSources = BTreeMap<String, Arc<dyn ExternalSourceFactory>>;

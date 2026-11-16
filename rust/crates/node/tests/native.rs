@@ -34,7 +34,11 @@ impl CatalogMetrics for CatalogFixtures { fn metrics(&self) -> Result<CatalogRow
 struct TickClock(AtomicI64);
 impl Clock for TickClock { fn now(&self) -> Timestamp { Timestamp(self.0.fetch_add(1000, Ordering::Relaxed)) } }
 fn services() -> NodeServices {
-    NodeServices { clock: Arc::new(TickClock(AtomicI64::new(1_000_000))), ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) }
+    let clock = Arc::new(TickClock(AtomicI64::new(1_000_000)));
+    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(clock.clone(), false)), clock, ..NodeServices::local(Arc::new(Authority), Arc::new(Observer), Arc::new(CatalogFixtures), Arc::new(CatalogFixtures)) }
+}
+fn fresh_local_services(template: &NodeServices) -> NodeServices {
+    NodeServices { resources: Arc::new(NativeResources::default().with_local_log_clock(Arc::clone(&template.clock), false)), ..template.clone() }
 }
 fn options() -> NodeOptions {
     let mut options = NodeOptions::default();
@@ -50,12 +54,103 @@ async fn running(options: NodeOptions, services: NodeServices) -> (Node, tokio::
     let (node, driver) = Node::open(options, services).await.unwrap();
     (node, tokio::spawn(driver.run()))
 }
+
+#[tokio::test]
+async fn database_metric_provider_uses_current_catalog_without_retaining_node_lifetime() {
+    let (node, driver) = Node::open(options(), services()).await.unwrap();
+    let provider = node.metrics_provider().unwrap();
+    let snapshot = provider.metrics().unwrap();
+    assert!(snapshot.rows().iter().any(|metric| matches!(metric, CatalogMetric::Gauge { name, tags, value, .. } if name == "node.tx.latestCompletedTxId" && *value == -1.0 && tags.get("db").is_some_and(|name| name == "xtdb"))));
+    assert!(snapshot.rows().iter().any(|metric| matches!(metric, CatalogMetric::Gauge { name, value, .. } if name == "xtdb.block.last_upload_time" && *value == 0.0)));
+    drop(node); drop(driver);
+    assert!(provider.metrics().unwrap().rows().is_empty());
+    assert!(!snapshot.rows().is_empty());
+}
 async fn stop(node: &Node, driver: tokio::task::JoinHandle<Result<()>>) {
     node.shutdown();
     tokio::time::timeout(Duration::from_secs(10), driver).await.unwrap().unwrap().unwrap();
 }
 fn put(node: &Node, id: i64, value: i64) -> TxOp {
     TxOp::PutDocs { table: TableRef::new("public", "docs"), documents: Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(id)), ("value".into(), Value::I64(value))])], node.memory()).unwrap(), valid_from: None, valid_to: None }
+}
+
+#[tokio::test]
+async fn disabled_indexing_and_read_only_nodes_do_not_resolve_external_source_factories() {
+    for read_only in [false, true] {
+        let mut config = options();
+        config.replication.enabled = read_only;
+        config.read_only = read_only;
+        let Membership::Durable { primary, .. } = &mut config.membership else { panic!("expected durable membership") };
+        primary.external_source = Some(prost_types::Any { type_url: "proto.xtdb.com/unknown.Source".into(), value: vec![1, 2, 3] });
+        let (node, driver) = running(config, services()).await;
+        assert!(node.catalog().database("xtdb").unwrap().external_source());
+        assert!(node.catalog().database("xtdb").unwrap().progress().fault().is_none());
+        stop(&node, driver).await;
+    }
+}
+
+#[tokio::test]
+async fn log_tables_test_source_log_msgs_basic_and_tx_ops_decoded() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+        session.state_mut().execute_operation(put(&node, 2, 20)).await.unwrap();
+        let messages = rows(session.query_sql("SELECT msg_id, log_offset, msg, tx_ops FROM xt.source_log_msgs WHERE msg_id BETWEEN 0 AND 100 ORDER BY msg_id", vec![]).await.unwrap()).await;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0][0], Value::I64(0)); assert_eq!(messages[0][1], Value::I64(0));
+        assert!(matches!(&messages[0][2], Value::Utf8(value) if value.contains(":type :tx")));
+        assert!(matches!(&messages[0][3], Value::Utf8(value) if value.contains("#xt/tagged [:put-docs") && value.contains(":xt/id 1")));
+        assert!(rows(session.query_sql("SELECT * FROM xt.source_log_msgs WHERE msg_id BETWEEN 99999 AND 99999", vec![]).await.unwrap()).await.is_empty());
+        let error = match session.query_sql("SELECT msg_id FROM xt.source_log_msgs", vec![]).await { Ok(_) => panic!("unbounded inspection succeeded"), Err(error) => error };
+        assert_eq!(error.code, "xtdb/missing-log-bounds");
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn block_tables_test_block_files_with_params_and_table_block_tries() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+        let database = node.catalog().database("xtdb").unwrap();
+        database.flush().await.unwrap();
+        loop { if database.status().adopted_block.is_some() { break; } tokio::task::yield_now().await; }
+        let blocks = rows(session.query_sql("SELECT block_idx, file_size FROM xt.block_files WHERE block_idx BETWEEN ? AND ?", vec![Value::Utf8("00".into()), Value::Utf8("264".into())]).await.unwrap()).await;
+        assert_eq!(blocks.len(), 1); assert_eq!(blocks[0][0], Value::Utf8("00".into()));
+        assert!(matches!(blocks[0][1], Value::I64(size) if size > 0));
+        let table = rows(session.query_sql("SELECT table_name, row_count, fields, partition_count FROM xt.table_block_files WHERE table_name = ? AND block_idx = ?", vec![Value::Utf8("public/docs".into()), Value::Utf8("00".into())]).await.unwrap()).await;
+        assert_eq!(table.len(), 1); assert_eq!(table[0][0], Value::Utf8("public/docs".into()));
+        assert!(matches!(&table[0][2], Value::Utf8(value) if value.contains("_id")));
+        let tries = rows(session.query_sql("SELECT trie_key, data_file_size FROM xt.table_block_file_tries WHERE table_name = 'public/docs' AND block_idx = '00'", vec![]).await.unwrap()).await;
+        assert!(!tries.is_empty());
+        assert!(rows(session.query_sql("SELECT * FROM xt.table_block_files WHERE table_name = 'public/nonexistent' AND block_idx = '00'", vec![]).await.unwrap()).await.is_empty());
+        let error = match session.query_sql("SELECT * FROM xt.table_block_files WHERE table_name = 'public/docs'", vec![]).await { Ok(_) => panic!("missing block equality accepted"), Err(error) => error };
+        assert_eq!(error.code, "xtdb/missing-table-block-predicates");
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_show_controls_pin_snapshot_reads_and_keep_generic_show_unresolved() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let parse = |sql| rtdb_sql::parse_control(sql, &Default::default()).unwrap().unwrap();
+    session.execute_control(&parse("BEGIN"), &[], &token).await.unwrap();
+    session.prepare_context(&token).await.unwrap();
+    assert_eq!(session.state().status(), TransactionStatus::Pending);
+    let ControlResult::Rows(show) = session.execute_control(&parse("SHOW latest_submitted_tx"), &[], &token).await.unwrap() else { panic!() };
+    assert!(rows(show).await.is_empty()); assert_eq!(session.state().status(), TransactionStatus::Pending);
+    let ControlResult::Rows(show) = session.execute_control(&parse("SHOW snapshot_token"), &[], &token).await.unwrap() else { panic!() };
+    assert_eq!(rows(show).await.len(), 1); assert_eq!(session.state().status(), TransactionStatus::Reading);
+    session.execute_control(&parse("ROLLBACK"), &[], &token).await.unwrap();
+    let error = match session.execute_control_with(&parse("BEGIN"), &[], &token, ControlExecutionOptions { frontend: ControlFrontend::Adbc, ..Default::default() }).await { Ok(_) => panic!(), Err(error) => error };
+    assert_eq!(error.code, "xtdb.adbc/tx-control-as-sql");
+    token.cancel(); assert!(session.prepare_context(&token).await.is_err());
+    assert!(!session.state().cancellation().is_cancelled());
+    stop(&node, driver).await;
 }
 async fn rows(mut cursor: QueryCursor) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
@@ -110,7 +205,7 @@ async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_ba
         let mut configuration_options = options();
         configuration_options.membership = Membership::Durable { primary: configuration, skipped: BTreeSet::new() };
         let runtime_services = services();
-        let (node, driver) = running(configuration_options.clone(), runtime_services.clone()).await;
+        let (node, driver) = running(configuration_options.clone(), fresh_local_services(&runtime_services)).await;
         let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
         assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
         node.catalog().database("xtdb").unwrap().flush().await.unwrap();
@@ -123,11 +218,201 @@ async fn local_recovery_reads_flushed_and_unflushed_transactions_and_retained_ba
         stop(&node, driver).await;
         assert_eq!(retained.batch().num_rows(), 2);
         assert_eq!(read_value(retained.batch().schema().field(1), retained.batch().column(1).as_ref(), 1).unwrap(), Value::I64(20));
-        let (reopened, driver) = running(configuration_options, runtime_services).await;
+        let (reopened, driver) = running(configuration_options, fresh_local_services(&runtime_services)).await;
         reopened.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
         let mut session = reopened.session("xtdb", Arc::new(Authority)).unwrap();
         assert_eq!(rows(session.query_sql("SELECT _id, value FROM docs ORDER BY _id", vec![]).await.unwrap()).await, vec![vec![Value::I64(1), Value::I64(10)], vec![Value::I64(2), Value::I64(20)]]);
         stop(&reopened, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_export_copies_one_loaded_block_and_reopens_as_a_single_partition_store() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let directory = tempfile::tempdir().unwrap();
+        let store_path = directory.path().join("store");
+        let configuration = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(store_path.to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary: configuration.clone(), skipped: BTreeSet::new() };
+        let runtime_services = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        node.catalog().database("xtdb").unwrap().compaction().unwrap().compact_all().await.unwrap();
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        assert!(node.snapshot_export("xtdb", Timestamp(0)).is_err());
+        drop(session);
+        stop(&node, driver).await;
+        drop(node);
+
+        settings.replication.enabled = false;
+        settings.compaction_threads = 0;
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
+        let plan = node.snapshot_export("xtdb", Timestamp(0)).unwrap().unwrap();
+        assert!(plan.directory().as_str().ends_with("_19700101T000000Z"));
+        assert_eq!(plan.files()[0].as_str(), rtdb_format::keys::block_key(plan.block_index()).unwrap());
+        assert!(plan.files().iter().any(|path| path.as_str().contains("/data/l01-rc")));
+        assert!(!plan.files().iter().any(|path| path.as_str().contains("/data/l00-")));
+        let destination = store_path.join("v06").join(plan.directory().as_str());
+        assert!(!destination.exists());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(plan.copy(&cancelled).await.is_err());
+        assert!(!destination.exists());
+        plan.copy(&CancellationToken::new()).await.unwrap();
+        plan.copy(&CancellationToken::new()).await.unwrap();
+        for source in plan.files() {
+            assert_eq!(std::fs::read(store_path.join("v06").join(source.as_str())).unwrap(), std::fs::read(store_path.join("v06").join(plan.destination(source).unwrap().as_str())).unwrap());
+        }
+        drop(plan);
+        stop(&node, driver).await;
+        drop(node);
+        let mut exported = configuration;
+        exported.storage = Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(destination.to_string_lossy().into_owned()), epoch: Some(0) }));
+        settings.membership = Membership::Durable { primary: exported, skipped: BTreeSet::new() };
+        let (restored, driver) = running(settings, fresh_local_services(&runtime_services)).await;
+        let mut session = restored.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
+        drop(session);
+        stop(&restored, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn offline_export_has_no_manifest_before_a_completed_block() {
+    let mut settings = options();
+    settings.replication.enabled = false;
+    settings.compaction_threads = 0;
+    let (node, driver) = running(settings, services()).await;
+    assert!(node.snapshot_export("xtdb", Timestamp(0)).unwrap().is_none());
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn compactor_reset_preserves_l0_history_and_deletes_compacted_files_only_after_publication() {
+    tokio::time::timeout(Duration::from_secs(40), async {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join("store");
+        let primary = DatabaseConfig {
+            log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.path().join("log").to_string_lossy().into_owned()), epoch: Some(0) })),
+            storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(store.to_string_lossy().into_owned()), epoch: Some(0) })),
+            ..Default::default()
+        };
+        let mut settings = options();
+        settings.membership = Membership::Durable { primary, skipped: BTreeSet::new() };
+        let runtime_services = services();
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        session.state_mut().execute_operation(put(&node, 1, 10)).await.unwrap();
+        session.state_mut().execute_operation(put(&node, 1, 20)).await.unwrap();
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        node.catalog().database("xtdb").unwrap().compaction().unwrap().compact_all().await.unwrap();
+        let sql = "SELECT value FROM docs FOR ALL SYSTEM_TIME ORDER BY value";
+        let before = rows(session.query_sql(sql, vec![]).await.unwrap()).await;
+        assert_eq!(before, vec![vec![Value::I64(10)], vec![Value::I64(20)]]);
+        assert!(node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.is_err());
+        drop(session);
+        stop(&node, driver).await;
+        drop(node);
+
+        settings.compaction_threads = 0;
+        let (node, driver) = running(settings.clone(), fresh_local_services(&runtime_services)).await;
+        let cancellation = CancellationToken::new();
+        let plan = node.prepare_compactor_reset("xtdb", &cancellation).await.unwrap();
+        let compacted = plan.files_to_delete().to_vec();
+        assert!(!compacted.is_empty());
+        assert!(plan.replacement_tries().values().flatten().all(|trie| trie.key.level() == 0));
+        assert!(plan.replacement_tries().values().any(|tries| !tries.is_empty()));
+        for key in &compacted { assert!(store.join("v06").join(key.as_str()).is_file()); }
+        cancellation.cancel();
+        assert!(plan.apply(&cancellation).await.is_err());
+        for key in &compacted { assert!(store.join("v06").join(key.as_str()).is_file()); }
+
+        let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
+        node.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        node.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        assert_eq!(plan.apply(&CancellationToken::new()).await.unwrap_err().code, "rtdb.compactor-reset/catalog-moved");
+        for key in &compacted { assert!(store.join("v06").join(key.as_str()).is_file()); }
+
+        let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
+        let published = plan.apply(&CancellationToken::new()).await.unwrap();
+        assert!(node.catalog().database("xtdb").unwrap().status().adopted_block.as_ref().is_some_and(|block| block.block_index() >= published));
+        for key in &compacted { assert!(!store.join("v06").join(key.as_str()).exists()); }
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+        drop(session);
+        stop(&node, driver).await;
+        drop(node);
+
+        let (node, driver) = running(settings, fresh_local_services(&runtime_services)).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(session.query_sql(sql, vec![]).await.unwrap()).await, before);
+        drop(session);
+        stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn compactor_reset_requires_a_completed_transaction() {
+    let mut settings = options();
+    settings.compaction_threads = 0;
+    let (node, driver) = running(settings, services()).await;
+    let plan = node.prepare_compactor_reset("xtdb", &CancellationToken::new()).await.unwrap();
+    assert!(plan.files_to_delete().is_empty());
+    assert_eq!(plan.apply(&CancellationToken::new()).await.unwrap_err().code, "rtdb.compactor-reset/no-transactions");
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn follower_compactor_publishes_results_through_the_writer_without_claiming_a_term() {
+    struct SharedResources {
+        source: Arc<rtdb_storage::log::MemoryLog>,
+        replica: Arc<rtdb_storage::log::MemoryLog>,
+        store: Arc<rtdb_storage::MemoryStore>,
+    }
+    #[async_trait]
+    impl ResourceFactory for SharedResources {
+        fn validate(&self, _: &str, _: &DatabaseConfig) -> Result<()> { Ok(()) }
+        async fn open(&self, _: &str, _: &DatabaseConfig, _: LogAccess, _: CancellationToken) -> Result<DatabaseResources> {
+            Ok(DatabaseResources {
+                logs: OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new() },
+                store: self.store.clone(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
+            })
+        }
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let shared = Arc::new(SharedResources {
+            source: Arc::new(rtdb_storage::log::MemoryLog::new(1 << 26)), replica: Arc::new(rtdb_storage::log::MemoryLog::new(1 << 26)), store: Arc::new(rtdb_storage::MemoryStore::default()),
+        });
+        let runtime_services = NodeServices { resources: shared, ..services() };
+        let mut writer_options = options();
+        writer_options.compaction_threads = 0;
+        let (writer, writer_driver) = running(writer_options, runtime_services.clone()).await;
+        let mut session = writer.session("xtdb", Arc::new(Authority)).unwrap();
+        session.state_mut().execute_operation(put(&writer, 1, 10)).await.unwrap();
+        writer.catalog().database("xtdb").unwrap().flush().await.unwrap();
+        writer.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        let mut follower_options = options();
+        follower_options.replication.may_lead = false;
+        let (follower, follower_driver) = running(follower_options, runtime_services).await;
+        follower.catalog().database("xtdb").unwrap().compaction().unwrap().compact_all().await.unwrap();
+        follower.sync_all(Duration::from_secs(10), &CancellationToken::new()).await.unwrap();
+        assert_eq!(follower.catalog().database("xtdb").unwrap().status().role, rtdb_replication::Role::Following);
+        assert!(matches!(writer.catalog().database("xtdb").unwrap().status().role, rtdb_replication::Role::Leading(_)));
+        assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
+        let mut follower_session = follower.session("xtdb", Arc::new(Authority)).unwrap();
+        assert_eq!(rows(follower_session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
+        drop((session, follower_session));
+        stop(&follower, follower_driver).await;
+        stop(&writer, writer_driver).await;
     }).await.unwrap();
 }
 
@@ -160,9 +445,10 @@ struct HeldTeardown {
 }
 #[async_trait]
 impl ResourceFactory for HeldTeardown {
+    async fn close(&self) -> Result<()> { self.native.close().await }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, read_only: bool, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, read_only, cancellation.clone()).await?;
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+        let mut resources = self.native.open(name, configuration, access, cancellation.clone()).await?;
         if name == "other" && self.armed.swap(false, Ordering::AcqRel) {
             let started = Arc::clone(&self.started);
             let release = Arc::clone(&self.release);
@@ -203,14 +489,51 @@ async fn detach_removes_lookup_and_membership_before_join_but_reuses_the_name_on
 struct FailedResource { native: NativeResources, armed: AtomicBool }
 #[async_trait]
 impl ResourceFactory for FailedResource {
+    async fn close(&self) -> Result<()> { self.native.close().await }
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, read_only: bool, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.native.open(name, configuration, read_only, cancellation).await?;
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+        let mut resources = self.native.open(name, configuration, access, cancellation).await?;
         if name == "other" && self.armed.swap(false, Ordering::AcqRel) {
             resources.logs.drivers.push(async { Err(Anomaly::fault("test/resource-failed", "Injected resource failure")) }.boxed());
         }
         Ok(resources)
     }
+}
+
+struct ClosingResource { native: NativeResources, fail_open: bool, closing: Semaphore, release: Semaphore }
+#[async_trait]
+impl ResourceFactory for ClosingResource {
+    fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+        if self.fail_open { return Err(Anomaly::fault("test/open-failed", "Injected resource opening failure")); }
+        self.native.open(name, configuration, access, cancellation).await
+    }
+    async fn close(&self) -> Result<()> { self.closing.add_permits(1); self.release.acquire().await.unwrap().forget(); self.native.close().await }
+}
+
+#[tokio::test]
+async fn node_shutdown_and_failed_open_await_resource_region_close() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        for mode in 0..3 {
+            let fail_open = mode == 1;
+            let resources = Arc::new(ClosingResource { native: NativeResources::default(), fail_open, closing: Semaphore::new(0), release: Semaphore::new(0) });
+            let mut services = services(); services.resources = resources.clone();
+            if fail_open {
+                let opening = tokio::spawn(Node::open(options(), services));
+                resources.closing.acquire().await.unwrap().forget(); assert!(!opening.is_finished()); resources.release.add_permits(1);
+                let Err(error) = opening.await.unwrap() else { panic!("opening should fail"); }; assert_eq!(error.code, "test/open-failed");
+            } else if mode == 0 {
+                let (node, driver) = running(options(), services).await; node.shutdown();
+                resources.closing.acquire().await.unwrap().forget(); assert!(!driver.is_finished()); resources.release.add_permits(1);
+                driver.await.unwrap().unwrap();
+            } else {
+                let (node, driver) = Node::open(options(), services).await.unwrap();
+                let closing = tokio::spawn(driver.close_without_run());
+                resources.closing.acquire().await.unwrap().forget(); assert!(!closing.is_finished()); assert!(node.cancellation().is_cancelled()); resources.release.add_permits(1);
+                closing.await.unwrap().unwrap();
+            }
+        }
+    }).await.unwrap();
 }
 
 #[tokio::test]
@@ -324,4 +647,21 @@ async fn skipped_membership_does_not_require_a_node_local_backend_factory() {
         assert!(node.catalog().database("dormant").is_err());
         stop(&node, driver).await;
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn zero_compactor_threads_disable_compaction_and_shared_memory_covers_sessions() {
+    let mut options = options();
+    options.compaction_threads = 0;
+    let memory = rtdb_columnar::MemoryBudget::new(options.execution_memory_bytes);
+    let (node, driver) = Node::open_with_memory(options, services(), Arc::clone(&memory)).await.unwrap();
+    assert!(Arc::ptr_eq(node.memory(), &memory));
+    assert!(node.catalog().database("xtdb").unwrap().compaction().is_none());
+    let baseline = memory.used_bytes();
+    let session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(memory.used_bytes() > baseline);
+    drop(session);
+    assert_eq!(memory.used_bytes(), baseline);
+    let task = tokio::spawn(driver.run());
+    stop(&node, task).await;
 }

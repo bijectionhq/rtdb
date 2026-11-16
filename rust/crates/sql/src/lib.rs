@@ -1,11 +1,18 @@
 mod bind;
 mod expression;
+mod window;
+mod inline_xtql;
+mod subquery;
 mod parse;
 mod types;
 mod mutation;
+mod control;
+mod split;
 
 pub use parse::{ParsedStatement, StatementKind, parse};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_patch, prepare_static};
+pub use control::parse_control;
+pub use split::split_statements;
 
 use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, Result};

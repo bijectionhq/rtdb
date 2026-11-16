@@ -152,7 +152,7 @@ pub enum Expr {
     Unary { op: UnaryOp, expr: Box<Expr> },
     Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
     Call { name: String, args: Vec<Expr>, return_type: LogicalType },
-    Cast { expr: Box<Expr>, data_type: LogicalType },
+    Cast { expr: Box<Expr>, target: crate::CastTarget },
     Case { branches: Vec<(Expr, Expr)>, otherwise: Box<Expr> },
     Coalesce(Vec<Expr>),
     Field { expr: Box<Expr>, name: String, data_type: LogicalType },
@@ -176,11 +176,7 @@ impl Expr {
             Self::Column { data_type, .. } | Self::Parameter { data_type, .. }
             | Self::Correlated { data_type, .. }
             | Self::Field { data_type, .. } | Self::Subscript { data_type, .. } => data_type.clone(),
-            Self::Cast { expr, data_type } => {
-                let source = expr.data_type();
-                if matches!(source, LogicalType::Null | LogicalType::Nothing) { source }
-                else if source.nullable() { data_type.clone().maybe() } else { data_type.clone() }
-            }
+            Self::Cast { expr, target } => target.result_type(&expr.data_type()),
             Self::Call { return_type, .. } => return_type.clone(),
             Self::Unary { op: U::IsNull | U::IsNotNull | U::IsTrue | U::IsFalse | U::IsUnknown, .. } => LogicalType::Scalar(ScalarType::Bool),
             Self::Unary { op: U::Not, expr } => boolean_type(expr.data_type().nullable()),
@@ -290,6 +286,12 @@ pub fn arithmetic_type(op: BinaryOp, left: &LogicalType, right: &LogicalType) ->
     let mut results = Vec::new();
     for left in left.legs() {
         for right in right.legs() {
+            if let (LogicalType::Scalar(left), LogicalType::Scalar(right)) = (&left, &right) {
+                if let Some(result) = crate::temporal_arithmetic_type(op, left, right) {
+                    results.push(LogicalType::Scalar(result));
+                    continue;
+                }
+            }
             let decimal_parts = |ty: &LogicalType| match ty {
                 LogicalType::Scalar(ScalarType::Decimal { precision, scale, .. }) => Some((*precision, *scale)),
                 LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64) => Some((32, 0)),

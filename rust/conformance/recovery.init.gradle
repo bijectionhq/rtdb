@@ -1,0 +1,19 @@
+import org.gradle.api.tasks.JavaExec
+import org.gradle.api.tasks.SourceSetContainer
+
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    [rtdbConformanceRecovery: "rtdb.conformance.recovery", rtdbConformanceRecoveryAdapterTest: "rtdb.conformance.recovery-test"].each { taskName, namespace ->
+        root.tasks.register(taskName, JavaExec) {
+            dependsOn root.tasks.named("testClasses")
+            classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+            mainClass = "clojure.main"
+            jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED", "--enable-native-access=ALL-UNNAMED", "-Dio.netty.tryReflectionSetAccessible=true", "-Dio.netty.noUnsafe=false", "-Duser.timezone=UTC", "-Darrow.memory.debug.allocator=true"
+            args "-m", namespace
+            if (taskName == "rtdbConformanceRecovery") {
+                args root.providers.gradleProperty("rtdb.request").get(), root.providers.gradleProperty("rtdb.output").get()
+            }
+            outputs.upToDateWhen { false }
+        }
+    }
+}

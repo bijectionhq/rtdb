@@ -81,6 +81,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         _ => (),
     }
     if args.iter().any(nullish) { return Ok(Value::Null); }
+    if name == "abs" { if let Some(result) = crate::temporal::absolute(&args[0]) { return result; } }
     if let Some(Value::TimestampTzRange { lower, upper }) = args.first() {
         match name.as_str() {
             "lower" => return Ok(Value::Timestamp { value: *lower, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }),

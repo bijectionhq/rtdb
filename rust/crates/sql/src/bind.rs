@@ -8,20 +8,39 @@ use sqlparser::ast as ast;
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
 use crate::PrepareOptions;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HiddenColumn { ExplicitOnly, Internal }
+
 pub(crate) struct Context<'a> {
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
     pub options: &'a PrepareOptions,
     pub binder: Binder,
     temporal: Vec<TemporalClause>,
+    inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
     ctes: BTreeMap<String, Arc<Relation>>,
-    hidden_columns: BTreeSet<ColumnId>,
+    pub(crate) hidden_columns: BTreeMap<ColumnId, HiddenColumn>,
+    pub(crate) outer_scopes: Vec<crate::subquery::CorrelationScope>,
+    pub(crate) next_parameter: usize,
+}
+
+pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions) -> Result<Expr> {
+    struct ScalarCatalog;
+    impl Catalog for ScalarCatalog {
+        fn default_database(&self) -> &str { "xtdb" }
+        fn databases(&self) -> BTreeSet<String> { BTreeSet::new() }
+        fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
+        fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
+    }
+    let mut context = Context { source, catalog: &ScalarCatalog, options, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), ctes: BTreeMap::new(), hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0 };
+    context.expr(expression, &Schema::default(), &BTreeMap::new())
 }
 
 pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
-    let mut context = Context { source, catalog, options, binder: Binder::default(), temporal: parsed.temporal, ctes: BTreeMap::new(), hidden_columns: BTreeSet::new() };
+    let next_parameter = parsed.parameter_count();
+    let mut context = Context { source, catalog, options, binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, ctes: BTreeMap::new(), hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter };
     let statement = context.statement(&parsed.statement)?;
     Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: source.to_owned() })
 }
@@ -76,8 +95,9 @@ impl Context<'_> {
             Syntax::Set { name, value, local } => Ok(Statement::Set { name: name.clone(), value: self.expr(value, &Schema::default(), &BTreeMap::new())?, local: *local }),
             Syntax::Show(name) => Ok(Statement::Show { name: name.clone() }),
             Syntax::Assert(expression, message) => {
-                let predicate = self.expr(expression, &Schema::default(), &BTreeMap::new())?;
-                Ok(Statement::Dml(Dml::Assert { input: Arc::new(Arc::new(Relation::unit()).filter(predicate)?), message: message.clone() }))
+                let mut input = Arc::new(Relation::unit());
+                let predicate = self.relational_expr(expression, &mut input, &BTreeMap::new())?;
+                Ok(Statement::Dml(Dml::Assert { input: Arc::new(input.filter(predicate)?), message: message.clone() }))
             }
         }
     }
@@ -105,17 +125,18 @@ impl Context<'_> {
                 if update.from.is_some() || update.returning.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(unsupported("UPDATE FROM, joined targets, ordering, or RETURNING")); }
                 let mut input = self.mutation_table(&update.table.relation, false)?;
                 let (target, valid_time) = scan_target(&input)?;
-                if let Some(predicate) = &update.selection { let predicate = self.expr(predicate, input.schema(), &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
+                let target_columns = input.schema().ids();
+                if let Some(predicate) = &update.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
                 let assignments = update.assignments.iter().map(|assignment| {
                     let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(unsupported("Tuple assignments")); };
                     let names = identifiers(name)?;
                     if names.len() != 1 { return Err(error("UPDATE assignment target must be a column")); }
                     let name = names[0].normalized();
                     if name.starts_with('_') { return Err(error(format!("Cannot UPDATE {name} column"))); }
-                    Ok((name, self.expr(&assignment.value, input.schema(), &BTreeMap::new())?))
+                    Ok((name, self.relational_expr(&assignment.value, &mut input, &BTreeMap::new())?))
                 }).collect::<Result<Vec<_>>>()?;
                 if assignments.iter().map(|(name, _)| name).collect::<BTreeSet<_>>().len() != assignments.len() { return Err(error("UPDATE repeats an assignment")); }
-                Statement::Dml(Dml::Update { table: target, input, assignments, valid_time })
+                Statement::Dml(Dml::Update { table: target, input, target_columns, assignments, valid_time })
             }
             ast::Statement::Delete(delete) => return self.delete(delete, false),
             ast::Statement::StartTransaction { modes, statements, .. } => {
@@ -143,7 +164,7 @@ impl Context<'_> {
         let mut input = self.mutation_table(&tables[0].relation, erase)?;
         let RelationNode::Scan(scan) = input.node() else { return Err(error("Mutation target must be a base table")); };
         let (target, valid_time) = (scan.table.name.clone(), scan.valid_time.clone());
-        if let Some(predicate) = &delete.selection { let predicate = self.expr(predicate, input.schema(), &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
+        if let Some(predicate) = &delete.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         Ok(Statement::Dml(if erase { Dml::Erase { table: target, input } } else { Dml::Delete { table: target, input, valid_time } }))
     }
 
@@ -158,11 +179,23 @@ impl Context<'_> {
                 self.ctes.insert(identifier(&cte.alias.name).normalized(), input);
             }
         }
-        let mut input = self.set_expr(&query.body)?;
-        if let Some(order) = &query.order_by {
+        let integrated_order = matches!(query.body.as_ref(), ast::SetExpr::Select(_));
+        let mut input = match query.body.as_ref() {
+            ast::SetExpr::Select(select) => self.select(select, query.order_by.as_ref())?,
+            body => self.set_expr(body)?,
+        };
+        if let Some(order) = query.order_by.as_ref().filter(|_| !integrated_order) {
             let ast::OrderByKind::Expressions(expressions) = &order.kind else { return Err(unsupported("ORDER BY ALL")); };
-            let order = expressions.iter().map(|order| self.sort_expr(order, input.schema(), &BTreeMap::new())).collect::<Result<_>>()?;
+            let fields = input.schema().fields().to_vec();
+            let order = expressions.iter().map(|order| {
+                if let Some(index) = ordinal(&order.expr)? {
+                    let expr = fields.get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression();
+                    let descending = order.options.asc == Some(false);
+                    Ok(SortExpr { expr, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
+                } else { self.relational_sort_expr(order, &mut input, &BTreeMap::new()) }
+            }).collect::<Result<_>>()?;
             input = Arc::new(input.sort(order)?);
+            if input.schema().len() != fields.len() { input = Arc::new(input.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?); }
         }
         let mut offset = None;
         let mut fetch = None;
@@ -185,20 +218,39 @@ impl Context<'_> {
         Ok(input)
     }
 
+    fn values(&mut self, rows: &[ast::Parens<Vec<ast::Expr>>]) -> Result<Arc<Relation>> {
+        let mut bound = Vec::new();
+        for row in rows {
+            let mut input = Arc::new(Relation::unit());
+            let expressions = row.iter().map(|expr| self.relational_expr(expr, &mut input, &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
+            bound.push((input, expressions));
+        }
+        let width = bound.first().map_or(0, |(_, row)| row.len());
+        if bound.iter().any(|(_, row)| row.len() != width) { return Err(error("VALUES rows have different column counts")); }
+        let fields = (0..width).map(|index| {
+            let types: Vec<_> = bound.iter().map(|(_, row)| row[index].data_type()).collect();
+            self.binder.field(format!("column{}", index + 1), None, LogicalType::join_all(&types))
+        }).collect::<Result<Vec<_>>>()?;
+        let schema = Schema::new(fields.clone())?;
+        if bound.iter().all(|(input, _)| input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]])) {
+            return Ok(Arc::new(Relation::new(schema, RelationNode::Values { rows: bound.into_iter().map(|(_, row)| row).collect() })?));
+        }
+        let mut result = None;
+        for (input, row) in bound {
+            let projected = Arc::new(input.project(fields.iter().cloned().zip(row).map(|(field, expr)| NamedExpr { field, expr }).collect())?);
+            result = Some(match result {
+                None => projected,
+                Some(left) => Arc::new(Relation::new(schema.clone(), RelationNode::Set { left, right: projected, operator: SetOperator::Union, all: true })?),
+            });
+        }
+        Ok(result.unwrap_or_else(|| Arc::new(Relation::empty(schema))))
+    }
+
     fn set_expr(&mut self, set: &ast::SetExpr) -> Result<Arc<Relation>> {
         match set {
-            ast::SetExpr::Select(select) => self.select(select),
+            ast::SetExpr::Select(select) => self.select(select, None),
             ast::SetExpr::Query(query) => self.query(query),
-            ast::SetExpr::Values(values) => {
-                let rows = values.rows.iter().map(|row| row.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect::<Result<Vec<_>>>()).collect::<Result<Vec<_>>>()?;
-                let width = rows.first().map_or(0, Vec::len);
-                if rows.iter().any(|row| row.len() != width) { return Err(error("VALUES rows have different column counts")); }
-                let fields = (0..width).map(|index| {
-                    let types: Vec<_> = rows.iter().map(|row| row[index].data_type()).collect();
-                    self.binder.field(format!("column{}", index + 1), None, LogicalType::join_all(&types))
-                }).collect::<Result<_>>()?;
-                Ok(Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?))
-            }
+            ast::SetExpr::Values(values) => self.values(&values.rows),
             ast::SetExpr::SetOperation { left, op, set_quantifier, right } => {
                 let left = self.set_expr(left)?;
                 let right = self.set_expr(right)?;
@@ -212,14 +264,14 @@ impl Context<'_> {
         }
     }
 
-    fn select(&mut self, select: &ast::Select) -> Result<Arc<Relation>> {
-        if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.named_window.is_empty() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension or window clause")); }
+    fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
+        if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension")); }
         let mut input = Arc::new(Relation::unit());
         for table in &select.from {
             let right = self.joined_table(table)?;
             input = if input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) { right } else { join(input, right, JoinKind::Cross, None)? };
         }
-        if let Some(predicate) = &select.selection { let predicate = self.expr(predicate, input.schema(), &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
+        if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
         let mut aggregate_calls = BTreeMap::new();
         for item in &select.projection {
@@ -231,45 +283,96 @@ impl Context<'_> {
             let mut named_groups = Vec::new();
             for (index, group) in groups.iter().enumerate() {
                 let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
-                let expr = self.expr(group, input.schema(), &BTreeMap::new())?;
-                let field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
+                let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
+                let qualifier = match &expr { Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()), _ => None };
+                let field = self.binder.field(expression_name(group, index), qualifier, expr.data_type())?;
                 replacements.insert(group.to_string(), field.clone());
                 named_groups.push(NamedExpr { field, expr });
             }
             let mut aggregates = Vec::new();
             for (key, function) in aggregate_calls {
-                let aggregate = self.aggregate(&function, input.schema(), aggregates.len())?;
+                let aggregate = self.aggregate(&function, &mut input, aggregates.len())?;
                 replacements.insert(key, aggregate.field.clone());
                 aggregates.push(aggregate);
             }
             let schema = Schema::new(named_groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|agg| agg.field.clone())).collect())?;
             input = Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups: named_groups, aggregates })?);
         }
-        if let Some(having) = &select.having { let predicate = self.expr(having, input.schema(), &replacements)?; input = Arc::new(input.filter(predicate)?); }
+        if let Some(having) = &select.having { let predicate = self.relational_expr(having, &mut input, &replacements)?; input = Arc::new(input.filter(predicate)?); }
+        let mut windows = Vec::new();
+        for item in &select.projection {
+            if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
+        }
+        if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
+        if let Some((key, function)) = windows.pop() {
+            let (window, field) = self.window(input, &function, &replacements)?;
+            input = window;
+            replacements.insert(key, field);
+        }
         let mut projected = Vec::new();
-        for (index, item) in select.projection.iter().enumerate() {
+        for (index, item) in select.projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    let expression = self.expr(expr, input.schema(), &replacements)?;
+                    let expression = self.relational_expr(expr, &mut input, &replacements)?;
                     let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else { expression_name(expr, index) };
                     let field = self.binder.field(name, None, expression.data_type())?;
                     projected.push(NamedExpr { field, expr: expression });
-                }
-                ast::SelectItem::Wildcard(options) => {
-                    if !wildcard_plain(options) { return Err(unsupported("Wildcard modifiers")); }
-                    for field in input.schema().fields().iter().filter(|field| !self.hidden_columns.contains(&field.id)) { projected.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() }); }
                 }
                 ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
                     if !wildcard_plain(options) { return Err(unsupported("Wildcard modifiers")); }
                     let qualifier = identifiers(name)?.last().map(Identifier::normalized).ok_or_else(|| error("Empty wildcard qualifier"))?;
                     let matching: Vec<_> = input.schema().fields().iter().filter(|field| field.qualifier.as_ref() == Some(&qualifier)).collect();
                     if matching.is_empty() { return Err(error(format!("Unknown wildcard qualifier: {qualifier}"))); }
-                    for field in matching.into_iter().filter(|field| !self.hidden_columns.contains(&field.id)) { projected.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() }); }
+                    for field in matching.into_iter().filter(|field| !self.hidden_columns.contains_key(&field.id)) { projected.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() }); }
                 }
                 _ => return Err(unsupported("Projection shape")),
             }
         }
-        input = Arc::new(input.project(projected)?);
+        let wildcards = select.projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
+        if let Some((index, options)) = wildcards.first() {
+            if wildcards.len() != 1 || (*index != 0 && *index + 1 != select.projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
+            if !wildcard_plain(options) { return Err(unsupported("Wildcard modifiers")); }
+            let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
+            let mut expanded = Vec::new();
+            for field in input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id) && !explicit_names.contains(&field.name)) {
+                expanded.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() });
+            }
+            expanded.extend(projected);
+            projected = expanded;
+        }
+        let mut names = BTreeSet::new();
+        for projection in &projected {
+            if !names.insert(projection.field.name.clone()) { return Err(error(format!("Duplicate column projection: {}", projection.field.name))); }
+        }
+        if let Some(order_by) = order_by {
+            let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(unsupported("ORDER BY ALL")); };
+            let fields = projected.iter().map(|projection| projection.field.clone()).collect::<Vec<_>>();
+            let mut retained = input.schema().fields().iter().map(|field| {
+                let mut output = field.clone();
+                if names.contains(&field.name) { output.qualified_only = true; }
+                NamedExpr { field: output, expr: field.expression() }
+            }).collect::<Vec<_>>();
+            retained.extend(projected);
+            input = Arc::new(input.project(retained)?);
+            let mut order_replacements = replacements.clone();
+            for group in groups {
+                let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
+                if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&group.to_string()); }
+            }
+            let mut order = Vec::new();
+            for expression in expressions {
+                let mut aggregates = BTreeMap::new();
+                crate::expression::aggregate_calls(&expression.expr, &mut aggregates)?;
+                if !aggregates.is_empty() { return Err(error("Aggregate functions are not allowed directly in ORDER BY")); }
+                let expr = if let Some(index) = ordinal(&expression.expr)? {
+                    fields.get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression()
+                } else { self.relational_expr(&expression.expr, &mut input, &order_replacements)? };
+                let descending = expression.options.asc == Some(false);
+                order.push(SortExpr { expr, descending, nulls_first: expression.options.nulls_first.unwrap_or(descending) });
+            }
+            input = Arc::new(input.sort(order)?);
+            input = Arc::new(input.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
+        } else { input = Arc::new(input.project(projected)?); }
         if let Some(distinct) = &select.distinct {
             if !matches!(distinct, ast::Distinct::Distinct) { return Err(unsupported("DISTINCT ON")); }
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
@@ -290,10 +393,63 @@ impl Context<'_> {
                 _ => return Err(unsupported("Join operator")),
             };
             let schema = left.schema().concat(right.schema())?;
+            let common = match constraint {
+                Some(ast::JoinConstraint::Using(names)) => Some(names.iter().map(|name| {
+                    let names = identifiers(name)?;
+                    if names.len() != 1 { return Err(error("USING columns must be unqualified")); }
+                    Ok(names[0].normalized())
+                }).collect::<Result<BTreeSet<_>>>()?),
+                Some(ast::JoinConstraint::Natural) => {
+                    let names = |input: &Relation| input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).map(|field| field.name.clone()).collect::<BTreeSet<_>>();
+                    Some(names(&left).intersection(&names(&right)).cloned().collect())
+                }
+                _ => None,
+            };
+            if let Some(common) = common {
+                let predicates = common.iter().map(|name| {
+                    let names = [Identifier::quoted(name)];
+                    Ok(Expr::binary(BinaryOp::Eq, left.schema().resolve(&names)?.expression(), right.schema().resolve(&names)?.expression()))
+                }).collect::<Result<Vec<_>>>()?;
+                let predicate = predicates.into_iter().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)).unwrap_or(Expr::Literal(Value::Bool(true)));
+                let right_ids = right.schema().fields().iter().filter(|field| common.contains(&field.name)).map(|field| field.id).collect::<BTreeSet<_>>();
+                let joined = join(left, right, kind, Some(predicate))?;
+                let projections = joined.schema().fields().iter().map(|field| {
+                    let mut output = field.clone();
+                    if right_ids.contains(&field.id) { output.qualified_only = true; }
+                    NamedExpr { field: output, expr: field.expression() }
+                }).collect();
+                left = Arc::new(joined.project(projections)?);
+                continue;
+            }
+            if let Some(ast::JoinConstraint::On(predicate)) = constraint {
+                if crate::expression::contains_subquery(predicate) {
+                    if !matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) { return Err(unsupported("Subqueries in FULL OUTER JOIN conditions")); }
+                    crate::expression::reject_ambiguous_columns(predicate, &schema)?;
+                    let original_order = schema.fields().iter().map(|field| field.id).collect::<Vec<_>>();
+                    let (outer, mut dependent) = if kind == JoinKind::Right { (right, left) } else { (left, right) };
+                    let fields = dependent.schema().fields().to_vec();
+                    self.outer_scopes.push(crate::subquery::CorrelationScope::new(outer.schema().clone()));
+                    let predicate = self.relational_expr(predicate, &mut dependent, &BTreeMap::new());
+                    let arguments = self.outer_scopes.pop().ok_or_else(|| error("Join correlation scope is unavailable"))?.arguments();
+                    dependent = Arc::new(dependent.filter(predicate?)?);
+                    dependent = Arc::new(dependent.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
+                    let nullable = kind != JoinKind::Inner;
+                    let schema = outer.schema().concat(&if nullable { dependent.schema().nullable()? } else { dependent.schema().clone() })?;
+                    let joined = Arc::new(Relation::new(schema, RelationNode::Apply { input: outer, dependent, arguments, kind: if nullable { ApplyKind::Left } else { ApplyKind::Inner }, output: None })?);
+                    left = if kind == JoinKind::Right {
+                        let expressions = original_order.into_iter().map(|id| {
+                            let field = joined.schema().get(id).cloned().ok_or_else(|| error("Joined column is unavailable"))?;
+                            Ok(NamedExpr { expr: field.expression(), field })
+                        }).collect::<Result<Vec<_>>>()?;
+                        Arc::new(joined.project(expressions)?)
+                    } else { joined };
+                    continue;
+                }
+            }
             let condition = match constraint {
                 Some(ast::JoinConstraint::On(expr)) => Some(self.expr(expr, &schema, &BTreeMap::new())?),
                 Some(ast::JoinConstraint::None) | None => None,
-                _ => return Err(unsupported("NATURAL or USING joins")),
+                _ => return Err(error("Named join constraint was not lowered")),
             };
             left = join(left, right, kind, condition)?;
         }
@@ -304,6 +460,11 @@ impl Context<'_> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, .. } => {
                 if args.is_some() || version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() { return Err(unsupported("Table function, sample, or dialect-specific version")); }
+                if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
+                    let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
+                    let relation = rtdb_xtql::compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments).map_err(|error| inline.error(error,self.source))?;
+                    return match alias { Some(alias) => self.alias(relation,alias),None => Ok(relation) };
+                }
                 let names = identifiers(name)?;
                 if names.len() == 1 {
                     if let Some(cte) = self.ctes.get(&names[0].normalized()).cloned() {
@@ -319,7 +480,7 @@ impl Context<'_> {
                     for (name, ty) in [("_iid", LogicalType::Scalar(ScalarType::FixedSizeBinary(16))), ("_valid_from", crate::mutation::instant_type()), ("_system_from", crate::mutation::instant_type()), ("_valid_to", crate::mutation::instant_type().maybe()), ("_system_to", crate::mutation::instant_type().maybe())] {
                         if columns.iter().any(|field| field.name == name) { continue; }
                         let field = self.binder.field(name, Some(qualifier.clone()), ty)?;
-                        self.hidden_columns.insert(field.id);
+                        self.hidden_columns.insert(field.id,HiddenColumn::ExplicitOnly);
                         columns.push(field);
                     }
                 }
@@ -410,29 +571,30 @@ impl Context<'_> {
     }
 
     fn rename(&mut self, input: Arc<Relation>, qualifier: Option<String>, columns: Option<Vec<String>>) -> Result<Arc<Relation>> {
-        let visible = input.schema().fields().iter().filter(|field| !self.hidden_columns.contains(&field.id)).count();
+        let visible = input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).count();
         if columns.as_ref().is_some_and(|columns| columns.len() != visible) { return Err(error("Alias column count differs from relation")); }
         let mut index = 0;
         let mut expressions = Vec::new();
         for field in input.schema().fields() {
-            let hidden = self.hidden_columns.contains(&field.id);
-            let name = if hidden { field.name.clone() } else {
+            let hidden = self.hidden_columns.get(&field.id).copied();
+            let name = if hidden.is_some() { field.name.clone() } else {
                 let name = columns.as_ref().map(|columns| columns[index].clone()).unwrap_or_else(|| field.name.clone());
                 index += 1;
                 name
             };
             let renamed = self.binder.field(name, qualifier.clone(), field.data_type.clone())?;
-            if hidden { self.hidden_columns.insert(renamed.id); }
+            if let Some(hidden) = hidden { self.hidden_columns.insert(renamed.id,hidden); }
             expressions.push(NamedExpr { field: renamed, expr: field.expression() });
         }
         Ok(Arc::new(input.project(expressions)?))
     }
 
-    pub(crate) fn sort_expr(&mut self, order: &ast::OrderByExpr, schema: &Schema, replacements: &BTreeMap<String, Field>) -> Result<SortExpr> {
-        let expr = if let Some(index) = ordinal(&order.expr)? { schema.fields().get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression() } else { self.expr(&order.expr, schema, replacements)? };
+    pub(crate) fn relational_sort_expr(&mut self, order: &ast::OrderByExpr, input: &mut Arc<Relation>, replacements: &BTreeMap<String, Field>) -> Result<SortExpr> {
+        let expr = if let Some(index) = ordinal(&order.expr)? { input.schema().fields().get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression() } else { self.relational_expr(&order.expr, input, replacements)? };
         let descending = order.options.asc == Some(false);
         Ok(SortExpr { expr, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
     }
+
 }
 
 pub(crate) fn identifier(identifier: &ast::Ident) -> Identifier { Identifier { text: identifier.value.clone(), quoted: identifier.quote_style.is_some() } }
@@ -460,7 +622,7 @@ fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Op
 fn wildcard_plain(options: &ast::WildcardAdditionalOptions) -> bool { options.to_string().is_empty() }
 
 pub(crate) fn expression_name(expr: &ast::Expr, index: usize) -> String {
-    match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
+    match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) if function.over.is_none() => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
 }
 
 fn ordinal(expr: &ast::Expr) -> Result<Option<usize>> {

@@ -1,11 +1,23 @@
 mod catalog;
 mod expr;
+mod cast;
 mod relation;
 mod statement;
 mod runtime;
+mod control;
+mod inspection;
+mod observer;
+mod trace;
+mod temporal;
 
 pub use catalog::*;
 pub use expr::*;
+pub use cast::*;
 pub use relation::*;
 pub use statement::*;
 pub use runtime::*;
+pub use control::*;
+pub use inspection::*;
+pub use observer::*;
+pub use trace::*;
+pub use temporal::temporal_arithmetic_type;

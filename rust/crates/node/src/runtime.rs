@@ -22,11 +22,16 @@ impl CatalogUsers for NodeCatalogRuntime {
     fn users(&self) -> Result<CatalogRows<CatalogUser>> { self.node.runtime.users.users() }
     fn is_superuser(&self, user: &str) -> bool { self.node.runtime.users.is_superuser(user) }
 }
+#[async_trait]
 impl CatalogMetrics for NodeCatalogRuntime {
     fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> { self.node.runtime.metrics.metrics() }
+    async fn sample(&self) -> Result<CatalogRows<CatalogMetric>> { self.node.runtime.metrics.sample().await }
 }
 #[async_trait]
 impl CatalogRuntime for NodeCatalogRuntime {
+    async fn open_inspection(&self, database: &str, request: rtdb_plan::InspectionRequest) -> Result<Box<dyn rtdb_plan::CatalogInspection>> {
+        crate::inspection::open(self.node.catalog().database(database)?, request, Arc::clone(self.node.memory())).await
+    }
     async fn memberships(&self) -> Result<CatalogRows<(String, String)>> {
         let empty = || Ok(CatalogRows::new(Vec::new(), self.node.memory().reserve(0)?));
         let Ok(database) = self.node.catalog().database("xtdb") else { return empty(); };

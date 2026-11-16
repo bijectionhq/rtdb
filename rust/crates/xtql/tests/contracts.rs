@@ -136,6 +136,21 @@ fn xtdb_xtql_plan_test_nested_subquery_parameters_do_not_inflate_external_arity(
 }
 
 #[test]
+fn embedded_compilation_uses_callers_column_and_apply_parameter_allocators() {
+    let mut binder = rtdb_plan::Binder::default();
+    let before = binder.field("before",None,LogicalType::Scalar(ScalarType::I64)).unwrap();
+    let mut next_parameter = 100;
+    let query = rtdb_xtql::parse_query(&rtdb_xtql::read("(fn [wanted] (-> (rel [{:a wanted}] [a]) (with {:result (q [(fn [inner] (rel [{:result inner}] [result])) a])})))").unwrap()).unwrap();
+    let relation = rtdb_xtql::compile_query(&query,&FixtureCatalog,&mut binder,&mut next_parameter,&[(7,LogicalType::Scalar(ScalarType::I64))]).unwrap();
+    assert_eq!(relation.parameter_count(),8);
+    assert_eq!(next_parameter,101);
+    assert!(relation.schema().fields().iter().all(|field| field.id.0>before.id.0));
+    let after = binder.field("after",None,LogicalType::Scalar(ScalarType::I64)).unwrap();
+    assert!(relation.schema().fields().iter().all(|field| field.id.0<after.id.0));
+    assert_eq!(binder.parameter_types().keys().copied().collect::<Vec<_>>(),[7]);
+}
+
+#[test]
 fn xtdb_xtql_plan_test_pull_many_retains_nullable_empty_result_semantics() {
     let relation = plan("(unify (with {orders (pull* (rel [] []))}))");
     let apply = find(&relation, &|node| matches!(node, RelationNode::Apply { kind: ApplyKind::PullMany, .. })).unwrap();

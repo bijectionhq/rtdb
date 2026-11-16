@@ -8,7 +8,7 @@ The reference checkout is pinned to `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
 
 * `crates/types`, `columnar`, `temporal`, and `trie` contain semantic values, Arrow mappings and retained allocation owners, temporal polygons, immutable IID tries, event merging, and conservative metadata predicates.
 * `crates/format` contains storage keys, protobuf generation, envelopes, bases, table and block catalogs, Arrow IPC, event batches, column statistics, Bloom filters, HLL values, and Transit values.
-* `crates/storage` contains immutable object operations, local and memory stores, an optional `object_store` bridge, cache leases, and memory/local logs.
+* `crates/storage` contains immutable object operations, local and memory stores, an optional `object_store` bridge, shared disk caching, cache leases, and memory/local logs.
 * `crates/index` contains immutable live tables, transaction overlays, captured snapshots, table/trie catalog transitions, and atomic partition publication.
 * `crates/plan`, `expr`, `sql`, `xtql`, and `query` contain the initial native preparation and execution paths.
 The frontend READMEs and explicit unsupported errors identify dialect work still required.
@@ -19,8 +19,21 @@ The frontend READMEs and explicit unsupported errors identify dialect work still
 Their source audits and credential-chain completion are ongoing.
 * `crates/node` contains passive node/session handles, database catalog generations, resource factories, active lifecycle supervision, native query/submission services, prepared SQL, and runtime catalog integration.
 * `crates/auth` contains native configured-user, root-password, and OIDC authenticators, asynchronous principal revalidation, and the pinned superuser gate.
+* `crates/pg-codec` and `pgwire` contain shared PostgreSQL values, startup/authentication/TLS, simple and extended query execution, COPY, cancellation and joined connection lifetimes.
+* `crates/flight-sql` contains the native producer, authenticated sessions, transaction/prepared leases, query tickets, streaming ingest and metadata operations.
+Source review corrected schema preparation to use the ticket's captured basis; execution and protocol qualification remain pending.
+* `crates/metrics` contains execution observers, retained provider registrations, Hdr timer windows, disk-cache gauges, Kafka commit-lag summaries and PostgreSQL source metrics.
+Asynchronous sampling reads live WAL position only while assigned.
+Native process gauges, bounded query/transaction tracing, OTLP export, and Azure/CloudWatch metric export are written and source-reviewed.
+Micrometer runtime comparisons and transport-allocation qualification remain pending.
+* `crates/server` contains node/database YAML decoding, provider assembly, TLS keystore loading, health HTTP, Prometheus rendering, CLI startup and ordered listener/node shutdown.
+The parsed settings that still lack resource construction are listed in its README.
+* `crates/config` contains bounded offline YAML/EDN qualification with explicit environment and artifact provenance inputs.
+It shares the production configuration parser, emits redacted backend/root/auth/module inventory, and keeps deployment cutover eligibility false without the separate handoff evidence.
+* `crates/ffi` and `bindings/jvm` contain the versioned native ABI, JDK foreign-memory adapter, ADBC interfaces and Clojure connection protocols.
+Statement preparation and reads retain the database selected at statement creation; direct transaction submission retains the connection's current database selection.
 * `crates/conformance` compares supplied observations and rejects missing, duplicate, malformed, skipped, or incorrectly declared failure evidence.
-The source inventory and two mandatory control mappings are present; process runners and runtime reconciliation are not.
+The source inventory, two mandatory control mappings, process runners and runtime-reconciliation source are present; full assertion mappings and runtime evidence are absent.
 
 == Ownership review
 
@@ -33,6 +46,13 @@ Neither term admission nor expression evaluation starts an autonomous task.
 
 Arrow buffers retain their allocation charge through custom allocation owners, including child arrays, validity buffers, and slices.
 Cache reads transfer their reservation into local blocking I/O so a cancelled fetch cannot leave an uncharged detached allocation.
+`DiskCache` is a shared monitor; each load has one caller holding its per-entry exclusion guard, and passive leases prevent file eviction during reads.
+`NativeResources` is a node-scoped passive factory retaining the shared cache, local I/O region and timestamp capability.
+`IoRegion` is a monitor whose close rejects new work and joins admitted local blocking I/O, including calls whose waiters were cancelled.
+Ordinary node/server startup failure, unstarted closure and joined shutdown all drain that region.
+The disk-cache directory lock excludes concurrent owners and precedes abandoned temporary-file cleanup.
+Cache identity retains the pinned database/partition layout; provider or epoch replacement under the same cache root requires explicit qualification.
+`Writer` and `LocalTimestampSource` are passive; the local log driver chooses work, and the writer samples each record's clock before append.
 The local log driver requires cancellation followed by joining its run task; forcibly aborting that task can leave an in-progress blocking append with an unknown result.
 Several scalar and row-building paths still allocate transient values before charging their retained size.
 These paths require further work before claiming bounded peak query memory.
@@ -40,9 +60,23 @@ Prepared parameters with an unknown type require rebinding to execution types be
 Prepared SQL rebinds against each execution context and checks PostgreSQL result signatures separately from dynamic Arrow schemas.
 Query bases now carry requested per-partition system-time caps separately from captured snapshot identities.
 Parser/IR transient allocation accounting remains incomplete.
-Timestamp/duration arithmetic, interval and duration text casts, and full temporal lexical compatibility remain incomplete.
+Timestamp/duration/calendar arithmetic and unqualified interval/duration text casts have source and regression cases.
+Temporal comparison, qualified interval/cast options, named-zone extreme dates and full temporal lexical compatibility remain incomplete.
+Session parameters, buffered SQL, pinned read bases and retained token/timezone strings now carry co-owned reservations; failed transaction state retains a flag instead of an arbitrary error payload.
+Server authentication, source factories and the node share one execution allocation budget.
+Startup cache and execution ceilings divide the configured process allocation limit, while transport and cryptographic library allocation qualification remains pending.
+Production configuration parsing reserves input, expanded YAML nodes and environment copies before construction and retains its transferred lease in the CLI or embedded lifetime.
+Embedded handles resolve through a monotonic registry; its admission monitor rejects new operations during closure and waits for admitted operations before native resource teardown.
+Arrow export owners retain native allocation leases until the foreign consumer releases its data, including after statement closure.
+FFI and JVM source regressions cover stale handles, cancellation, statement database capture, SET/SHOW side effects and foreign buffer lifetime; none has executed.
+TLS issuer-name and PEM conversion results own independent allocation reservations, including when multiple results outlive their source store.
 
 == Findings against the reference
+
+The native progress monitor serves an already-satisfied applied prefix after an ingestion failure, fails unmet waits with the current fault, and clears that fault after an explicit successful driver restart.
+The pinned JVM Watchers fail every later await; `db.allium` retains the unresolved contract question.
+The frontend source retains the pinned read-only COPY distinction, connection-ID-only cancellation routing, and Flight handle ownership by caller identity.
+The corresponding policy questions remain in `tx.allium`; implementation status is recorded here rather than in the specification.
 
 The block-cut specifications disagree about the row gauge.
 `BlockCutter.kt` seeds its gauge from applied rows, then advances it as transactions resolve.
@@ -76,6 +110,12 @@ The Rust object key excludes parent traversal.
 The reference storage tests also exercise copies to a parent path and cross-root destinations.
 An explicit destination capability and its original assertions remain to be implemented; those tests are not mapped as covered.
 
+The pinned `compactor` command initializes `xtdb/base` through `open-compactor`, and the inspected path creates no database-specific compactor registrations.
+The command therefore appears idle in this revision.
+The native `compactor` command deliberately opens database followers and compaction owners, writes source notifications and waits for a separate writer to apply them.
+This source-level difference is explicit; concurrent execution needs a multi-writer source provider, while local logs retain exclusive writer ownership.
+This is a source finding, not an executed observation.
+
 The Rust term fence rejects sequence overflow without publishing a wrapped value.
 The Kotlin implementation uses `Long.MAX_VALUE` as its voided sentinel and adds to sequence values without checked arithmetic.
 A same-term record at `Long.MAX_VALUE` therefore applies after a gap in Kotlin, contradicting the lifecycle specification's `DiscardInVoidedTerm` rule; Rust's explicit voided state discards it.
@@ -87,20 +127,97 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |===
 |Trace |Current gap
 
-|Client read |No pgwire, Flight SQL, embedded service, or server composition root.
+|Client read |Pgwire, Flight SQL and embedded bindings reach shared session controls, native preparation and query execution; independent source review and missing language surfaces remain.
 |Data-dependent write |Native session → source codec → resolver and staged snapshot → replica append/read-back → admitted apply is written; independent source audit is ongoing.
 |Replica recovery |Native local/Kafka log readers, block recovery, term-fenced replay, and pending-block adoption are written; source audit is ongoing.
 |Compaction retry |Native deterministic selection, streaming merge, immutable file publication, and source-log publication are written; byte compatibility and retry execution remain pending.
-|CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; operational observer integration is ongoing.
-|Database shutdown |Node/database/term cancellation and joins are written; production server listeners and shutdown composition remain missing.
+|CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; database-lifetime source owners and observer integration are written; source audit is ongoing.
+|Database shutdown |Node/database/term and production server listener cancellation and joins are written; local I/O drain and Flight lifecycle integration are written; source review is ongoing.
 |===
 
-Configuration, operational telemetry, packaging, the C ABI, language-client integration, and complete protocol handlers remain outstanding.
-Kafka Connect ingestion, its configured converter/transform/indexer contracts, and node factory integration remain outstanding independently of the native Kafka log implementation.
+Operational tracing, offline configuration qualification and release recipes are written; exporter review, complete release orchestration and remaining protocol compatibility work continue.
+The C ABI, Java/Clojure binding, packaged language-client runner and native/reference image recipes are written and unexecuted.
+The binding implements ADBC and existing Clojure connection protocols; consumers tied to concrete `Xtdb.Connection` or JVM `RelationReader` classes require the documented migration.
+Offline snapshot-export planning, CLI execution and retry/cancellation/restoration regression source are written; execution and byte comparison remain pending.
+Compactor-reset planning and CLI source now enumerate surviving L0 pairs, reject stale plans, publish through a term-owned block completion and delete compacted files afterwards.
+Dry-run, cancelled/stale plan, history/restart and term-loss regression sources are written and unexecuted.
+The reset plan is passive; its completion is passive leader-term state driven by the existing active replication owner.
+Object-listing response allocation and reset interruption at every storage boundary remain qualification work.
+Local artifact inspection commands are written for Arrow files/streams, hash tries, table blocks and block catalogs.
+Their typed JSON and positional rows intentionally replace Clojure pretty-print representations; physical schema, typed values and optional catalog fields remain observable.
+Input, declared decoded buffers and rendered row allocations are budgeted before decoding; malformed IPC and compressed-size checks have unexecuted source regressions.
+The disk cache is wired into native remote resources and startup configuration, with file-lifetime, failure/retry, namespace and upload-cache regression source.
+The data-only EDN configuration adapter is written, including environment tags, backend maps, aliases and authentication-default differences; native replacements for JVM object-valued hooks require explicit compatibility qualification.
+Kafka Connect ingestion, converter/transform/indexer owners and node factory integration are being written independently of the native Kafka log implementation; native registry converters, shipped transforms and recursive schema ownership are written, while registry policy/credential completion and source review continue.
 Authentication and backend source exist, with credential-chain and error/limit compatibility findings recorded in their crate documentation.
+Source/replica and block/table inspection cursors use bounded ranges and retained row charges.
+The pinned block inspection cursor ends after its first empty 1024-candidate window, even when a later block exists; native source preserves that behavior.
+Exact transient Java configuration and exception display strings in inspection tables remain a compatibility qualification.
+Disabled indexing and operator-selected skipped transactions follow their pinned source paths; their missing processing-spec coverage is recorded in `dev/doc/db.allium`.
 Node tests cover actual engine paths but have not been executed.
 No release artifact or migration/rollback result exists.
 Phase 2 must not start until these paths and the remaining language/execution surfaces are implemented and the complete source trace review passes.
+
+== SQL subquery source checkpoint
+
+SQL scalar, existence and quantified subqueries lower to the existing shared Apply executor.
+Correlation scopes are preparation transients; their captured columns become apply-local parameters above the lexical client-parameter range.
+The source follows `xtdb.sql/plan-sq`, `apply-sqs` and the quantified-array NULL normalization.
+Native result test source covers nested correlation and CTE reuse, scalar cardinality, quantified truth tables, grouping, outer joins and parameter arity.
+UPDATE's immutable plan identifies its original target columns, so dependent-query fields cannot enter the persisted document.
+The scalar and quantified paths retain dependent execution; the JVM decorrelation optimizer and its error-elision behavior have not been ported or compared.
+Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone controls still reject relational subqueries.
+ORDER BY can use nonprojected inputs and projected aliases, with final projection and DISTINCT following ordering.
+NATURAL/USING joins preserve the pinned left-column common-name binding and qualified wildcard behavior, including unmatched right rows.
+ROW_NUMBER and restricted LEAD/LAG lower to a caller-pulled window cursor with stable partition order, owned spills, and sequential shifted readers.
+These paths have native regression source and independent source review, but no execution results.
+Inline SQL XTQL query expressions share the caller's column allocator and apply-parameter scope, including derived tables, CTEs, set operations and relational subqueries.
+Their source review follows the pinned occurrence-based parameter numbering and preserves original SQL spans through rewriting.
+Explicit and correlated temporal endpoint columns resolve without exposing those columns through wildcard expansion.
+Lateral relations, recursive CTEs, query settings, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
+Shared decimal cast targets distinguish default decimal preservation from explicit precision/scale and recurse through list element unions.
+The JVM's wider decimal metadata, additional XTQL target/options syntax and exact decimal diagnostics remain gaps; their narrower native paths are not declared equivalent.
+XTQL percentile/vec-agg and its documented EDN reader extensions remain gaps as well.
+These source assertions have not run and do not establish plan, error or result parity.
+
+== Conformance runner source checkpoint
+
+The mandatory ceiling and term-sequence controls have production-codec runners for the pinned JVM and Rust implementations.
+The Gradle reference adapter preserves the clean reference sources and records the runtime artifact closure.
+The process orchestrator captures receipts, checks a repeated reference run, and demands the precise designated mismatch from each isolated negative control.
+The JVM test listener and unfiltered discovery adapter preserve runtime identities, dynamic cases, tags, selection, skips and outcomes.
+The native discovery adapter lists already-built test executables and records their exact counterpart names and binary digests.
+Reconciliation leaves source candidates, unselected cases, missing counterparts and external lanes visible until explicit mappings and execution evidence cover them.
+None of those adapters has loaded or executed during Phase 1.
+
+Fault schedules intercept real log and object-store operations before and after effects, including caller-polled append durability receipts.
+The resource wrapper carries those adapters into ordinary native node assembly without replacing the database drivers.
+The new test source covers lost source acknowledgement followed by local restart and current/historical reads, along with the lower-level publication, cancellation and retry boundaries.
+The packaged-client source runs the unchanged JavaScript, Python, Elixir, Rust and .NET assertions against immutable image selections.
+Its framework reports retain source identities, skip/failure states and precise case selections; incomplete reports and matching unexpected failures cannot pass.
+The original client build contexts come from the pinned Git archive, while adapters and actual running server artifacts have independent digests.
+Image packaging records source manifests, feature selections, actual image IDs and extracted artifacts; successful builds still require the full qualification matrix.
+The native historical-price lifecycle runner and typed comparison source retain every required query point, physical layout, pruning mode and projected temporal bound.
+Its ordinary failure paths join node owners, and closed log/storage directories carry exact artifact manifests.
+Independent source review added explicit flushed-layout checks and retained maintenance failures.
+The JVM historical adapter is written and source-reviewed against the pinned node, query-catalog, metadata, buffer-pool and cursor interfaces.
+Both adapters retain exact closed-file manifests and implementation/runtime artifact digests.
+Native object-store payload bytes and JVM buffer-pool logical payload bytes name different read boundaries; the runner reports them separately and makes no cross-engine I/O-performance comparison.
+The orchestrator verifies artifact contents and typed schemas/results, repeats the reference run, and preserves precise mismatches.
+The sequential local recovery runner transfers every retained history prefix/layout in both directions through isolated copies and final read-only origin captures.
+Its Rust acknowledgement and partial-compaction fault markers are durable before the process owner kills and joins the complete writer process group.
+Current and historical observations, exact replica heads, applied checkpoints and immutable partial output have independent comparison assertions.
+The JVM fallback must recover the acknowledged canary and complete the interrupted compaction metadata without changing the uploaded data bytes.
+Independent source review covered adapter calls, process ownership, manifest identity and comparison rules; every execution result remains pending.
+Production writer fencing, remote backends, external-source confirmation and the reverse partial-compaction direction remain separate work.
+The SQL logic runner preserves original Gradle/direct selections and immutable per-record identities, including unselected files and skipped or malformed records.
+The JVM adapter invokes the pinned record methods and engine; native scripts use production node/session/query paths, each with an owned and joined driver.
+The comparator independently checks source expectations, execution flags, counters, formatting bytes and record cardinality; matching failures and exclusions cannot pass.
+Both requested decorrelation variants execute separately, but the native Apply path does not establish optimizer or plan parity.
+Independent source review corrected a native receipt provenance field and covered parser selection, formatter rules, JVM interop, process cleanup and comparison failure paths.
+Exotic JVM object formatting, unqualified temporal-zone formatting and remaining synthetic visitor forms are explicit harness gaps.
+Full generated fault traces, original-case ledger reconciliation, deployment qualification, performance runners and release orchestration remain under implementation.
+The ledger remains incomplete, its denominator remains unset, and the Phase 2 gate remains closed.
 
 == Source checks performed
 
@@ -108,4 +225,5 @@ JSON and TOML documents were parsed, and the inventory collector's Python files 
 The workspace dependency declarations were inspected for missing internal crates and dependency cycles.
 The pinned reference worktree remained clean.
 Git whitespace checks ran over the changes.
+An independent whole-wave comment/spec review found allocation-contract and lifecycle wording issues; the source owners corrected them, and implementation-status prose moved out of the policy questions.
 No Rust compiler, formatter, build script, test runner, server, benchmark, Gradle task, or executable test-discovery command ran.

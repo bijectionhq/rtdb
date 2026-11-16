@@ -3,6 +3,13 @@ use rtdb_types::{ListKind, LogicalType as L, ScalarType as S, TableRef, TimeUnit
 use std::collections::BTreeMap;
 
 pub(crate) struct Definition { pub schema: &'static str, pub name: &'static str, fields: &'static str }
+pub(crate) fn allocation_bound(database: &str) -> rtdb_types::Result<usize> {
+    let overflow = || crate::invalid("catalog-size", "System schema allocation exceeds addressable memory");
+    DEFINITIONS.iter().try_fold(4096usize, |bytes, definition| {
+        let text = database.len().checked_add(definition.schema.len()).and_then(|n| n.checked_add(definition.name.len())).and_then(|n| n.checked_add(definition.fields.len())).ok_or_else(overflow)?;
+        bytes.checked_add(text.checked_mul(256).ok_or_else(overflow)?).and_then(|n| n.checked_add(4096)).ok_or_else(overflow)
+    })
+}
 macro_rules! definition { ($schema:literal, $name:literal, $fields:literal) => { Definition { schema: $schema, name: $name, fields: $fields } }; }
 pub(crate) const DEFINITIONS: &[Definition] = &[
     definition!("information_schema", "tables", "table_catalog:s table_schema:s table_name:s table_type:s"),
@@ -43,6 +50,11 @@ pub(crate) const DEFINITIONS: &[Definition] = &[
     definition!("xt", "metrics_timers", "name:s tags:tags count:l mean_time:duration? p75_time:duration? p95_time:duration? p99_time:duration? p999_time:duration? max_time:duration?"),
     definition!("xt", "metrics_gauges", "name:s tags:tags value:f"),
     definition!("xt", "metrics_counters", "name:s tags:tags count:f"),
+    definition!("xt", "source_log_msgs", "msg_id:l log_offset:l log_timestamp:instant msg_type:s msg:s tx_ops:s?"),
+    definition!("xt", "replica_log_msgs", "msg_id:l log_offset:l log_timestamp:instant msg_type:s msg:s"),
+    definition!("xt", "block_files", "block_idx:s tx_id:l? system_time:instant? latest_processed_msg_id:l table_names:s boundary_replica_msg_id:l? file_size:l"),
+    definition!("xt", "table_block_files", "table_name:s block_idx:s row_count:l fields:s hlls:s partition_count:i"),
+    definition!("xt", "table_block_file_tries", "table_name:s block_idx:s level:i recency:s? part:s trie_key:s data_file_size:l trie_state:s? row_count:l? temporal_metadata:s?"),
 ];
 
 pub(crate) fn definition(table: &TableRef) -> Option<&'static Definition> { DEFINITIONS.iter().find(|entry| entry.schema == table.schema && entry.name == table.table) }
@@ -56,6 +68,7 @@ impl Definition {
                 "b" => L::Scalar(S::Bool), "f" => L::Scalar(S::F64), "null" => L::Null,
                 "li" => L::list(L::Scalar(S::I32)), "ls" => L::list(L::Scalar(S::Utf8)),
                 "date" => L::Scalar(S::DateDay), "duration" => L::Scalar(S::Duration(TimeUnit::Nanosecond)),
+                "instant" => instant(),
                 "tags" => L::List { kind: ListKind::Map { sorted: false }, element: Box::new(L::Struct(BTreeMap::from([("key".into(), L::Scalar(S::Utf8)), ("value".into(), L::Scalar(S::Utf8))]))) },
                 "temporal" => L::Struct(["min_valid_from", "max_valid_from", "min_valid_to", "max_valid_to", "min_system_from", "max_system_from"].into_iter().map(|name| (name.into(), instant())).collect()),
                 _ => unreachable!("catalog field type"),

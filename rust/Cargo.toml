@@ -33,13 +33,20 @@ rtdb-azure = { path = "crates/azure" }
 rtdb-gcs = { path = "crates/gcs" }
 rtdb-pg-source = { path = "crates/pg-source" }
 rtdb-auth = { path = "crates/auth" }
+rtdb-pg-codec = { path = "crates/pg-codec" }
+rtdb-pgwire = { path = "crates/pgwire" }
+rtdb-server = { path = "crates/server" }
+rtdb-metrics = { path = "crates/metrics" }
+rtdb-flight-sql = { path = "crates/flight-sql" }
+rtdb-ffi = { path = "crates/ffi" }
+rtdb-tls = { path = "crates/tls" }
 sqlparser = "=0.63.0"
-arrow-array = "=58.4.1"
+arrow-array = { version = "=58.4.1", features = ["ffi"] }
 arrow-buffer = "=58.4.1"
-arrow-data = "=58.4.1"
-arrow-schema = "=58.4.1"
+arrow-data = { version = "=58.4.1", features = ["ffi"] }
+arrow-schema = { version = "=58.4.1", features = ["ffi", "serde"] }
 arrow-select = "=58.4.1"
-arrow-ipc = "=58.4.1"
+arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
 http = "1"
 base64 = "0.22"
@@ -62,7 +69,9 @@ protoc-bin-vendored = "3"
 roaring = "0.11.5"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+serde_yaml = "=0.9.34"
 sha2 = "0.10"
+subtle = "2.6.1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util", "net", "signal"] }

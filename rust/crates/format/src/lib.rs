@@ -2,6 +2,7 @@ pub mod basis;
 pub mod bloom;
 pub mod catalog;
 pub mod columns;
+pub mod config;
 pub mod data;
 pub mod envelope;
 pub mod hll;

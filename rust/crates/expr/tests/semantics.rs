@@ -258,7 +258,7 @@ fn batch_evaluation_retains_unobserved_union_legs_and_empty_batch_type() {
     use rtdb_plan::{ColumnId, Field};
 
     let ty = T::Scalar(S::Bool);
-    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "flag".into(), qualifier: None, data_type: ty.clone() }]).unwrap();
+    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "flag".into(), qualifier: None, qualified_only: false, data_type: ty.clone() }]).unwrap();
     let expression = Expr::Case { branches: vec![(Expr::column(ColumnId(0), ty.clone()), Expr::Literal(V::I64(1)))], otherwise: Box::new(Expr::Literal(V::Utf8("fallback".into()))) };
     let compiled = CompiledExpr::compile(&expression, &schema).unwrap();
     let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![to_field("flag", &ty).unwrap()]));

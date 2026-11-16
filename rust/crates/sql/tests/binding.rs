@@ -18,6 +18,8 @@ fn parsed_parameter_count_precedes_dml_table_binding() {
 fn temporal_projection_resolves_hidden_columns_without_expanding_wildcards() {
     assert_eq!(query("SELECT * FROM foo").schema().len(), 4);
     assert_eq!(query("SELECT _valid_from, _valid_to, _system_from, _system_to FROM foo FOR ALL SYSTEM_TIME").schema().len(), 4);
+    assert_eq!(query("SELECT f._iid, f._valid_from, (SELECT f._system_from) AS captured FROM foo AS f(a,b,c,d)").schema().len(), 3);
+    assert_eq!(query("SELECT f.* FROM foo AS f(a,b,c,d) WHERE f._valid_from<=CURRENT_TIMESTAMP").schema().len(), 4);
     assert_eq!(query("SELECT f.* FROM foo AS f(a, b, c, d)").schema().len(), 4);
     assert_eq!(query("SELECT * FROM UNNEST($1) AS items(value)").schema().len(), 1);
 }
@@ -137,6 +139,16 @@ fn temporal_dml_targets_keep_aliases_and_extent() {
     assert_eq!(assignments[0], ("region".into(), Expr::Literal(Value::Utf8("eu".into()))));
     assert_eq!(parameters(&input), [0]);
     assert!(matches!(prepare("ERASE FROM users AS u WHERE u._id = ?", &Fixture, &PrepareOptions::default()).unwrap().statement, Statement::Dml(Dml::Erase { .. })));
+}
+
+#[test]
+fn update_subqueries_preserve_target_fields_without_persisting_apply_helpers() {
+    let mutation = rtdb_sql::prepare_tx("UPDATE foo AS f SET price = (SELECT f.price + 1) WHERE EXISTS (SELECT 1 WHERE f._id = 1)", &Fixture, &PrepareOptions::default()).unwrap();
+    let rtdb_sql::Mutation::Put { input, .. } = mutation else { panic!("expected put mutation") };
+    let RelationNode::Project { expressions, .. } = input.node() else { panic!("expected canonical projection") };
+    let Expr::Struct(fields) = &expressions.iter().find(|expression| expression.field.name == "doc").unwrap().expr else { panic!("expected document") };
+    assert_eq!(fields.iter().map(|(name, _)| name.as_str()).collect::<BTreeSet<_>>(), BTreeSet::from(["_id", "ExactName", "price", "region"]));
+    assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, price) VALUES (1, (SELECT 2))", &Fixture, &PrepareOptions::default()).unwrap().is_none());
 }
 
 #[test]

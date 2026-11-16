@@ -1,7 +1,7 @@
-use crate::{Expr, Identifier, QualifiedTable, Relation, TemporalFilter};
+use crate::{ColumnId, Expr, Identifier, QualifiedTable, Relation, TemporalFilter};
 use rtdb_types::LogicalType;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,7 +10,7 @@ pub enum AccessMode { ReadOnly, ReadWrite }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Dml {
     Insert { table: QualifiedTable, input: Arc<Relation> },
-    Update { table: QualifiedTable, input: Arc<Relation>, assignments: Vec<(String, Expr)>, valid_time: TemporalFilter },
+    Update { table: QualifiedTable, input: Arc<Relation>, target_columns: BTreeSet<ColumnId>, assignments: Vec<(String, Expr)>, valid_time: TemporalFilter },
     Delete { table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter },
     Erase { table: QualifiedTable, input: Arc<Relation> },
     Patch { table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter },

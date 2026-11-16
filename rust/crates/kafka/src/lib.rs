@@ -1,6 +1,7 @@
 mod config;
 mod driver;
 mod tail;
+pub mod connect;
 
 pub use config::{KafkaClusterConfig, KafkaLogConfig, KafkaLogOptions, native_properties, parse_properties, producer_properties};
 pub use driver::KafkaLogDriver;
@@ -143,6 +144,17 @@ async fn ensure_topic(properties: &BTreeMap<String, String>, options: &KafkaLogO
 
 #[async_trait]
 impl Log for KafkaLog {
+    async fn range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Box<dyn rtdb_storage::log::LogRange>> {
+        if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
+        let mut options = self.options.clone();
+        options.maximum_poll_records = 1;
+        let consumer = consumer(&self.properties, &options)?;
+        let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
+        if from.0 < low { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: low }); }
+        let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1))?;
+        let end = high.min(to.0);
+        Ok(Box::new(tail::KafkaRange::new(tail, end, self.options.maximum_message_bytes, self.options.request_timeout)))
+    }
     async fn enqueue(&self, payload: Bytes, _: Timestamp) -> StorageResult<AppendReceipt> {
         self.progress.check()?;
         let Access::Writable { queue, bytes, records } = &self.access else { return Err(Error::ReadOnlyLog(self.options.topic.clone().into())); };

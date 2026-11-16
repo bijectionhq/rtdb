@@ -1,0 +1,85 @@
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use rtdb_columnar::MemoryBudget;
+use rtdb_maintenance::CollectionObserver;
+use rtdb_node::{Node, NodeOptions, NodeServices};
+use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers};
+use rtdb_server::{health::{HealthConfig, HealthDriver}, prometheus};
+use rtdb_tx::TransactionAuthorization;
+use rtdb_types::{Anomaly, Result, TableRef};
+use tokio_util::sync::CancellationToken;
+
+struct Fixtures;
+impl TransactionAuthorization for Fixtures { fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) } }
+impl CollectionObserver for Fixtures { fn table_failed(&self, _: Option<&TableRef>, error: &Anomaly) { panic!("{error}"); } }
+impl CatalogUsers for Fixtures {
+    fn users(&self) -> Result<CatalogRows<CatalogUser>> { Ok(CatalogRows::new(Vec::new(), Arc::new(()))) }
+    fn is_superuser(&self, _: &str) -> bool { false }
+}
+impl CatalogMetrics for Fixtures {
+    fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> {
+        Ok(CatalogRows::new(vec![CatalogMetric::Counter { name: "query.error".into(), tags: BTreeMap::new(), count: 3.0 }], Arc::new(())))
+    }
+}
+
+#[tokio::test]
+async fn health_listener_routes_real_requests_and_joins_idle_connections() {
+    let mut options = NodeOptions::default();
+    options.automatic_compaction = false;
+    options.automatic_gc = false;
+    let services = NodeServices::local(Arc::new(Fixtures), Arc::new(Fixtures), Arc::new(Fixtures), Arc::new(Fixtures));
+    let (node, node_driver) = Node::open(options, services).await.unwrap();
+    let node_task = tokio::spawn(node_driver.run());
+    let config = HealthConfig { drain_timeout: Duration::from_millis(100), ..Default::default() };
+    let (health, driver) = HealthDriver::bind(config, node.clone(), Arc::new(Fixtures), &CancellationToken::new()).await.unwrap();
+    let task = tokio::spawn(driver.run());
+    let client = reqwest::Client::new();
+    let base = format!("http://{}", health.address());
+    for (path, body) in [("ready", "Ready."), ("alive", "Alive."), ("started", "Started.")] {
+        let response = client.get(format!("{base}/healthz/{path}")).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), body);
+    }
+    let response = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(response.headers()["content-type"], "text/plain; version=0.0.4");
+    assert!(response.text().await.unwrap().contains("query_error_total 3"));
+    assert_eq!(client.get(format!("{base}/system/finish-block")).send().await.unwrap().status(), 405);
+    let response = client.post(format!("{base}/system/finish-block?db=absent")).send().await.unwrap();
+    assert_eq!(response.status(), 500);
+    assert_eq!(client.get(format!("{base}/missing")).send().await.unwrap().status(), 404);
+    let idle = tokio::net::TcpStream::connect(health.address()).await.unwrap();
+    health.shutdown();
+    tokio::time::timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    drop(idle);
+    assert!(tokio::net::TcpStream::connect(health.address()).await.is_err());
+    node.shutdown();
+    node_task.await.unwrap().unwrap();
+}
+
+#[test]
+fn prometheus_names_escaping_units_and_payload_lifetime() {
+    let memory = MemoryBudget::new(1_000_000);
+    let tags = BTreeMap::from([("node-id".into(), "line\n\"\\".into())]);
+    let metrics = vec![
+        CatalogMetric::Gauge { name: "node.tx.lag.MsgId".into(), tags: tags.clone(), unit: None, value: f64::NAN },
+        CatalogMetric::Timer { name: "query.timer".into(), tags, count: 2, total_ns: 1_000_000_001.0, mean_ns: Some(500_000_000), max_ns: Some(750_000_000), p75_ns: Some(750_000_000), p95_ns: None, p99_ns: None, p999_ns: None, percentiles_ns: [750_000_000.0; 6] },
+        CatalogMetric::DistributionSummary { name: "commit.lag".into(), tags: BTreeMap::new(), unit: None, count: 2, total: 3.25, maximum: 2.0, percentiles: [1.25, 2.0, 2.0] },
+        CatalogMetric::Gauge { name: "allocator.memory".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: 42.0 },
+        CatalogMetric::Gauge { name: "block.upload.seconds".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Seconds), value: 7.0 },
+    ];
+    let bytes = prometheus::render(&metrics, &memory).unwrap();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("node_tx_lag_MsgId{node_id=\"line\\n\\\"\\\\\"} NaN"));
+    assert!(text.contains("query_timer_seconds_sum{node_id=\"line\\n\\\"\\\\\"} 1.000000001\n"));
+    for quantile in ["0.75", "0.85", "0.95", "0.98", "0.99", "0.999"] { assert!(text.contains(&format!("quantile=\"{quantile}\""))); }
+    assert!(text.contains("commit_lag{quantile=\"0.5\"} 1.25\n"));
+    assert!(text.contains("commit_lag_count 2\ncommit_lag_sum 3.25\ncommit_lag_max 2\n"));
+    assert!(text.contains("allocator_memory_bytes 42\n"));
+    assert!(text.contains("block_upload_seconds 7\n"));
+    assert!(!text.contains("block_upload_seconds_seconds"));
+    let retained = bytes.slice(0..1);
+    drop(bytes);
+    assert!(memory.used_bytes() > 0);
+    drop(retained);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(prometheus::render(&metrics, &MemoryBudget::new(100)).is_err());
+}

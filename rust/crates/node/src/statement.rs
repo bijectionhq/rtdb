@@ -85,7 +85,7 @@ impl PreparedSql {
 
     /// ADBC parameters are positional, have empty field names, and publish unknown nullable types.
     pub fn parameter_schema(&self) -> Result<Schema> {
-        Schema::new((0..self.parameter_count()).map(|index| Ok(Field { id: ColumnId(u32::try_from(index).map_err(|_| size_error())?), name: String::new(), qualifier: None, data_type: LogicalType::Null })).collect::<Result<_>>()?)
+        Schema::new((0..self.parameter_count()).map(|index| Ok(Field { id: ColumnId(u32::try_from(index).map_err(|_| size_error())?), name: String::new(), qualifier: None, qualified_only: false, data_type: LogicalType::Null })).collect::<Result<_>>()?)
     }
 
     /// Returns the current Arrow signature without opening an execution cursor.
@@ -99,7 +99,7 @@ impl PreparedSql {
         let types = arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
         let query = self.bind(&context, &types)?;
         self.check_signature(query.schema())?;
-        query.execute(context, arguments)
+        query.execute_with_text(context, arguments, Some(self.source()))
     }
 
     /// Preserves absent arguments and an explicitly empty argument batch as distinct source operations.

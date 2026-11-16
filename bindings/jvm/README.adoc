@@ -1,0 +1,66 @@
+= Embedded Java and Clojure migration
+
+This module implements `AdbcDatabase`, `AdbcConnection` and `AdbcStatement` over the Rust C ABI.
+It uses JDK 25 Foreign Function and Memory calls and Arrow Java 19 C Data import/export.
+It has no dependency on `xtdb-core` and does not delegate database execution to JVM code.
+
+Set `-Dxtdb.native.library=/absolute/path/to/librtdb_ffi.dylib` on macOS, or the corresponding shared library on the host platform.
+Enable native access with `--enable-native-access=ALL-UNNAMED` and Arrow's required `--add-opens=java.base/java.nio=ALL-UNNAMED`.
+The native library remains loaded for the process lifetime so retained Arrow release callbacks remain callable.
+The binding requires a 64-bit process.
+
+[source,java]
+----
+try (var allocator = new RootAllocator();
+     var database = NativeDatabase.open(allocator,
+         "server: null\nflightSql: null\n", 512L * 1024 * 1024);
+     var connection = database.connect();
+     var statement = connection.createStatement("SELECT 42 AS answer");
+     var result = statement.executeQuery()) {
+    while (result.getReader().loadNextBatch()) {
+        var batch = result.getReader().getVectorSchemaRoot();
+        System.out.println(batch.contentToTSVString());
+    }
+}
+----
+
+The supplied Arrow allocator belongs to the caller.
+Close readers, retained Arrow batches and imported vectors before closing that allocator.
+Closing a statement leaves previously returned readers usable.
+Closing a node cancels its readers and joins the native drivers; already retained Arrow buffers remain readable.
+Ordinary session and statement calls are serialized by the caller, as required by ADBC.
+`cancel()` is safe from another thread.
+
+`xtdb.rust.AdbcDriverFactory` accepts `xtdb.config-yaml`, `xtdb.config-path` and `xtdb.native-memory-bytes`.
+Only `CREATE_APPEND` bulk ingest is supported, matching the pinned embedded API.
+Arrow binds are copied, including duplicate or unnamed parameter columns, so an external source allocator may close immediately after `bind` returns.
+Metadata includes `getInfo`, `getObjects`, `getTableTypes` and `getTableSchema` with the standard ADBC schemas.
+SQL transaction-control statements are rejected; use autocommit, commit and rollback, or the explicit native begin/commit methods.
+
+[source,clojure]
+----
+(require '[xtdb.api :as xt] '[xtdb.rust])
+(with-open [allocator (org.apache.arrow.memory.RootAllocator.)
+            node (xtdb.rust.NativeDatabase/open
+                   allocator "server: null\nflightSql: null\n" (* 512 1024 1024))]
+  (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :value "native"}]])
+  (xt/q node "SELECT * FROM docs"))
+----
+
+Loading `xtdb.rust` extends the existing `xtdb.protocols/Connectable` protocol onto native databases and connections.
+Queries remain reducible, early reduction closes their cursor, node operations merge their await token, and connection operations reject a `:database` override.
+The passive database adapter owns the merged await token; each borrowed connection owns its native transaction state.
+Existing transaction-op parsing, key functions and value readers come from `xtdb-api`.
+
+== Explicit compatibility boundary
+
+The existing `Xtdb.Connection` is a concrete class tied to JVM allocator/query/catalog internals.
+`NativeConnection` implements ADBC and the Clojure protocol instead of claiming binary compatibility with that class.
+Java callers whose variables use `Xtdb`, `Xtdb.Connection`, `ResultCursor`, `RelationReader` or JVM `Xtdb.Config` must migrate to this module's ADBC/native API.
+JVM module, authenticator, storage and log factory objects do not cross the C ABI; configure their native equivalents in YAML.
+The binding rejects the `xtdb.config` factory-object option explicitly.
+Existing remote JDBC, PostgreSQL, Python Flight SQL and Rust clients retain their protocol interfaces.
+
+The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
+The test sources require a separately built library at `xtdb.native.library` when the full implementation gate permits execution.
+No native, JVM or Clojure test has been run in the implementation phase.
