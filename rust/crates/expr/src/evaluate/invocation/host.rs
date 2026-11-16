@@ -174,6 +174,7 @@ impl HostValue<'_> {
         match self { Self::Number(value) => Ok(Cow::Borrowed(value)),Self::Constant(form) => literal_number(form,context).map(Cow::Owned),_ => Err(error("Host value is not a Number")) }
     }
     fn index(&self,context: &EvalContext<'_>) -> Result<i32> {
+        drop(self.number(context)?);
         let value = numeric_cast(Cast::Int,self.clone(),false,context)?;
         match value { Self::Number(value) => match value.as_ref() { Number::Int(value) => Ok(*value),_ => unreachable!() },_ => unreachable!() }
     }

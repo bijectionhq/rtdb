@@ -87,7 +87,7 @@ async fn host_numeric_objects_keep_exact_text_and_boxed_substring_indexes() {
         ("4611686018427387904",r#"(let [f float] (str (long (f 4611686293305294849))))"#),
         ("a",r#"(subs "😀a" 2N 3.9M)"#),
         ("a",r#"(subs "a" ##NaN 1.9)"#),
-        ("a",r#"(subs "a" \u0000 \u0001)"#),
+        ("a",r#"(subs "a" (int \u0000) (int \u0001))"#),
     ] {
         assert_eq!(project(&format!(r#"(regexp-replace "{source}" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{pattern}");
     }
@@ -100,6 +100,7 @@ async fn host_inline_casts_preserve_primitive_selection_and_compile_time_arity()
         r#"(str (int (if true 2147483647.9 0.0)))"#,r#"(str (byte ##NaN))"#,
         r#"(let [f int] (str (f (float 2147483648.0))))"#,r#"(str (long 9223372036854775808N))"#,
         r#"(if true "a" (int))"#,r#"(if true "a" (long 1 2))"#,
+        r#"(subs "a" \u0000 \u0001)"#,
     ] {
         assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().code,"xtdb.error/unknown","{pattern}");
     }
