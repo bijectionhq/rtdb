@@ -172,7 +172,7 @@ impl Context<'_> {
         if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() { return Err(unsupported("Query locking, output clauses, pipes, or settings")); }
         let old_ctes = self.ctes.clone();
         if let Some(with) = &query.with {
-            if with.recursive { return Err(unsupported("Recursive CTEs")); }
+            if with.recursive { return Err(Anomaly::unsupported("xtdb.sql/recursive-ctes", "Recursive CTEs are not supported yet")); }
             for cte in &with.cte_tables {
                 let input = self.query(&cte.query)?;
                 let input = self.alias(input, &cte.alias)?;
@@ -267,9 +267,12 @@ impl Context<'_> {
     fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
         if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension")); }
         let mut input = Arc::new(Relation::unit());
-        for table in &select.from {
-            let right = self.joined_table(table)?;
-            input = if input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) { right } else { join(input, right, JoinKind::Cross, None)? };
+        for (index, table) in select.from.iter().enumerate() {
+            let (right, arguments) = if index == 0 { (self.joined_table(table, self.outer_scopes.len())?, Vec::new()) }
+                else { self.from_scope(input.schema().clone(), |context, start| context.joined_table(table, start))? };
+            input = if !arguments.is_empty() { apply_join(input, right, ApplyKind::Inner, arguments)? }
+                else if input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) { right }
+                else { join(input, right, JoinKind::Cross, None)? };
         }
         if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
@@ -380,10 +383,9 @@ impl Context<'_> {
         Ok(input)
     }
 
-    fn joined_table(&mut self, table: &ast::TableWithJoins) -> Result<Arc<Relation>> {
-        let mut left = self.table(&table.relation)?;
+    fn joined_table(&mut self, table: &ast::TableWithJoins, lateral_start: usize) -> Result<Arc<Relation>> {
+        let mut left = self.table(&table.relation, lateral_start)?;
         for joined in &table.joins {
-            let right = self.table(&joined.relation)?;
             let (kind, constraint) = match &joined.join_operator {
                 ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => (JoinKind::Inner, Some(constraint)),
                 ast::JoinOperator::LeftOuter(constraint) | ast::JoinOperator::Left(constraint) => (JoinKind::Left, Some(constraint)),
@@ -392,6 +394,11 @@ impl Context<'_> {
                 ast::JoinOperator::CrossJoin(_) => (JoinKind::Cross, None),
                 _ => return Err(unsupported("Join operator")),
             };
+            let (right, mut arguments) = self.from_scope(left.schema().clone(), |context, start| {
+                let start = if kind == JoinKind::Cross || matches!(constraint, Some(ast::JoinConstraint::Natural)) { start } else { lateral_start };
+                context.table(&joined.relation, start)
+            })?;
+            if !arguments.is_empty() && matches!(kind, JoinKind::Right | JoinKind::Full) { return Err(unsupported("Correlated LATERAL in RIGHT or FULL OUTER JOIN")); }
             let schema = left.schema().concat(right.schema())?;
             let common = match constraint {
                 Some(ast::JoinConstraint::Using(names)) => Some(names.iter().map(|name| {
@@ -408,11 +415,18 @@ impl Context<'_> {
             if let Some(common) = common {
                 let predicates = common.iter().map(|name| {
                     let names = [Identifier::quoted(name)];
-                    Ok(Expr::binary(BinaryOp::Eq, left.schema().resolve(&names)?.expression(), right.schema().resolve(&names)?.expression()))
+                    let left_field = left.schema().resolve(&names)?;
+                    let left = if arguments.is_empty() { left_field.expression() } else {
+                        let (parameter, capture) = self.parameter_capture(left_field)?;
+                        arguments.push(capture);
+                        parameter
+                    };
+                    Ok(Expr::binary(BinaryOp::Eq, left, right.schema().resolve(&names)?.expression()))
                 }).collect::<Result<Vec<_>>>()?;
                 let predicate = predicates.into_iter().reduce(|left, right| Expr::binary(BinaryOp::And, left, right)).unwrap_or(Expr::Literal(Value::Bool(true)));
                 let right_ids = right.schema().fields().iter().filter(|field| common.contains(&field.name)).map(|field| field.id).collect::<BTreeSet<_>>();
-                let joined = join(left, right, kind, Some(predicate))?;
+                let joined = if arguments.is_empty() { join(left, right, kind, Some(predicate))? }
+                    else { apply_join(left, Arc::new(right.filter(predicate)?), if kind == JoinKind::Left { ApplyKind::Left } else { ApplyKind::Inner }, arguments)? };
                 let projections = joined.schema().fields().iter().map(|field| {
                     let mut output = field.clone();
                     if right_ids.contains(&field.id) { output.qualified_only = true; }
@@ -422,7 +436,7 @@ impl Context<'_> {
                 continue;
             }
             if let Some(ast::JoinConstraint::On(predicate)) = constraint {
-                if crate::expression::contains_subquery(predicate) {
+                if !arguments.is_empty() || crate::expression::contains_subquery(predicate) {
                     if !matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Right) { return Err(unsupported("Subqueries in FULL OUTER JOIN conditions")); }
                     crate::expression::reject_ambiguous_columns(predicate, &schema)?;
                     let original_order = schema.fields().iter().map(|field| field.id).collect::<Vec<_>>();
@@ -430,7 +444,7 @@ impl Context<'_> {
                     let fields = dependent.schema().fields().to_vec();
                     self.outer_scopes.push(crate::subquery::CorrelationScope::new(outer.schema().clone()));
                     let predicate = self.relational_expr(predicate, &mut dependent, &BTreeMap::new());
-                    let arguments = self.outer_scopes.pop().ok_or_else(|| error("Join correlation scope is unavailable"))?.arguments();
+                    arguments.extend(self.outer_scopes.pop().ok_or_else(|| error("Join correlation scope is unavailable"))?.arguments());
                     dependent = Arc::new(dependent.filter(predicate?)?);
                     dependent = Arc::new(dependent.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
                     let nullable = kind != JoinKind::Inner;
@@ -451,12 +465,13 @@ impl Context<'_> {
                 Some(ast::JoinConstraint::None) | None => None,
                 _ => return Err(error("Named join constraint was not lowered")),
             };
-            left = join(left, right, kind, condition)?;
+            left = if arguments.is_empty() { join(left, right, kind, condition)? }
+                else { apply_join(left, right, if kind == JoinKind::Left { ApplyKind::Left } else { ApplyKind::Inner }, arguments)? };
         }
         Ok(left)
     }
 
-    fn table(&mut self, table: &ast::TableFactor) -> Result<Arc<Relation>> {
+    fn table(&mut self, table: &ast::TableFactor, lateral_start: usize) -> Result<Arc<Relation>> {
         match table {
             ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, .. } => {
                 if args.is_some() || version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() { return Err(unsupported("Table function, sample, or dialect-specific version")); }
@@ -489,17 +504,17 @@ impl Context<'_> {
                 if alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { self.alias(relation, alias.as_ref().ok_or_else(|| error("Missing alias"))?) } else { Ok(relation) }
             }
             ast::TableFactor::Derived { subquery, alias, lateral, .. } => {
-                if *lateral { return Err(unsupported("LATERAL subqueries")); }
-                let relation = self.query(subquery)?;
+                if *lateral && alias.is_none() { return Err(error("LATERAL derived tables require an alias")); }
+                let relation = if *lateral { self.lateral_scope(lateral_start, |context| context.query(subquery))? } else { self.query(subquery)? };
                 match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
             }
             ast::TableFactor::NestedJoin { table_with_joins, alias } => {
-                let relation = self.joined_table(table_with_joins)?;
+                let relation = self.joined_table(table_with_joins, lateral_start)?;
                 match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
             }
             ast::TableFactor::UNNEST { array_exprs, alias, with_ordinality, with_offset, .. } => {
                 if array_exprs.len() != 1 || *with_offset { return Err(unsupported("Multi-array UNNEST or OFFSET")); }
-                let expr = self.expr(&array_exprs[0], &Schema::default(), &BTreeMap::new())?;
+                let expr = self.lateral_scope(lateral_start, |context| context.expr(&array_exprs[0], &Schema::default(), &BTreeMap::new()))?;
                 let ty = match expr.data_type().unencoded() { LogicalType::Nothing | LogicalType::Null => LogicalType::Null, LogicalType::List { element, .. } => *element, LogicalType::Maybe(value) => match *value { LogicalType::List { element, .. } => *element, _ => return Err(error("UNNEST requires an array")) }, _ => return Err(error("UNNEST requires an array")) };
                 let element = self.binder.field("unnest", None, ty)?;
                 let ordinality = if *with_ordinality { Some(self.binder.field("ordinality", None, LogicalType::Scalar(ScalarType::I64))?) } else { None };
@@ -512,7 +527,7 @@ impl Context<'_> {
     }
 
     fn mutation_table(&mut self, table: &ast::TableFactor, erase: bool) -> Result<Arc<Relation>> {
-        let input = self.table(table)?;
+        let input = self.table(table, self.outer_scopes.len())?;
         let RelationNode::Scan(source) = input.node() else { return Err(error("Mutation target must be a base table")); };
         let mut scan = source.clone();
         if scan.system_time != TemporalFilter::Default { return Err(error("Mutation targets do not accept SYSTEM_TIME clauses")); }
@@ -607,6 +622,11 @@ fn scan_target(input: &Relation) -> Result<(QualifiedTable, TemporalFilter)> {
         RelationNode::Scan(scan) if scan.system_time == TemporalFilter::Default => Ok((scan.table.name.clone(), scan.valid_time.clone())),
         _ => Err(error("DML requires an unmodified table scan without SYSTEM_TIME")),
     }
+}
+
+fn apply_join(input: Arc<Relation>, dependent: Arc<Relation>, kind: ApplyKind, arguments: Vec<(usize, Expr)>) -> Result<Arc<Relation>> {
+    let schema = input.schema().concat(&if kind == ApplyKind::Left { dependent.schema().nullable()? } else { dependent.schema().clone() })?;
+    Ok(Arc::new(Relation::new(schema, RelationNode::Apply { input, dependent, arguments, kind, output: None })?))
 }
 
 fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr>) -> Result<Arc<Relation>> {

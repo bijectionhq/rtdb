@@ -175,7 +175,9 @@ These paths have native regression source and independent source review, but no 
 Inline SQL XTQL query expressions share the caller's column allocator and apply-parameter scope, including derived tables, CTEs, set operations and relational subqueries.
 Their source review follows the pinned occurrence-based parameter numbering and preserves original SQL spans through rewriting.
 Explicit and correlated temporal endpoint columns resolve without exposing those columns through wildcard expansion.
-Lateral relations, recursive CTEs, query settings, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
+Lateral derived tables and implicit lateral UNNEST lower to the shared dependent-query executor with the pinned lexical scope rules.
+The pinned implementation explicitly rejects recursive CTEs, and native preparation retains that rejection.
+Query settings, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
 Shared decimal cast targets distinguish default decimal preservation from explicit precision/scale and recurse through list element unions.
 Decimal values and logical fields retain signed 32-bit precision and scale through protobuf, Arrow files/streams, Flight, COPY and the C Data interface.
 Native Arrow carriers retain validated full-parameter annotations internally; external schemas carry the actual Arrow parameters and reject those reserved annotations on ingress.
