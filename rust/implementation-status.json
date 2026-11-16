@@ -16,7 +16,7 @@
     "writes_replication_recovery": "in_progress",
     "compaction_gc_adapters": "in_progress",
     "client_operational_surfaces": "pgwire_flight_controls_bounded_config_tls_server_metrics_tracing_exporters_ffi_jvm_bindings_export_reset_compactor_inspection_offline_config_qualification_and_package_recipes_source_written; remaining_compatibility_and_release_orchestration_in_progress",
-    "conformance_machinery": "source_inventory_control_runners_negative_controls_comparator_runtime_reconciliation_fault_adapters_packaged_client_capture_jvm_native_history_sql_logic_and_sequential_local_recovery_runners_source_written; full_ledger_mappings_external_lane_reconciliation_production_cutover_performance_and_release_orchestration_in_progress"
+    "conformance_machinery": "source_inventory_controls_runtime_reconciliation_faults_packaged_clients_history_sql_logic_local_and_real_backend_recovery_performance_release_matrix_and_owned_filesystem_observation_source_written; full_ledger_reconciliation_and_runtime_qualification_pending"
   },
   "source_review_record": "rust/source-review.adoc",
   "assertion_ledger": "rust/conformance/assertion-ledger.json",
@@ -25,10 +25,10 @@
     "client_read": "pgwire_flight_and_embedded_native_session_query_server_source_written; language_surface_completion_and_source_audit_in_progress",
     "data_dependent_write": "native_submission_resolver_replica_readback_apply_source_written; source_audit_in_progress",
     "replica_recovery": "native_log_recovery_block_adoption_driver_source_written; source_audit_in_progress",
-    "compaction_retry": "native_maintenance_and_streaming_publication_source_written; source_audit_in_progress",
+    "compaction_retry": "native_streaming_publication_observable_actual_job_failures_and_bidirectional_packaged_backend_retry_runner_source_written; complete_public_entry_trace_audit_pending",
     "cdc_restart": "native_postgresql_snapshot_pgoutput_resume_and_database_lifetime_metrics_source_written; source_audit_in_progress",
-    "database_shutdown": "native_node_database_term_listener_and_local_io_region_drains_source_written; source_review_in_progress"
+    "database_shutdown": "native_database_admission_and_retained_local_remote_io_drains_source_written_and_source_reviewed; complete_public_entry_trace_audit_pending"
   },
   "phase_2_authorized_by_completeness_gate": false,
-  "last_source_checkpoint_revision": "4fddcfad6adc0bd0cd93b7447a7c2685c563f8a7"
+  "last_source_checkpoint_revision": "8adf990e0219cf953cf78ffc689305cf5b60005e"
 }

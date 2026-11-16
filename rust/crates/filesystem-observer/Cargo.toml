@@ -1,0 +1,25 @@
+[package]
+name = "rtdb-filesystem-observer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+rtdb-server = { workspace = true, default-features = false }
+rtdb-format.workspace = true
+rtdb-columnar.workspace = true
+rtdb-types.workspace = true
+rtdb-sql.workspace = true
+rtdb-plan.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-31"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

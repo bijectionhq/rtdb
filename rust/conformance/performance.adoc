@@ -82,7 +82,15 @@ Upstream DNS resolution occurs before listener admission, and TLS still verifies
 HTTP trailer forms that cannot be preserved by this adapter are rejected and remain unqualified.
 The proxy's overhead is part of this explicitly matched measurement path for both engines.
 
-Local filesystem payload/request accounting remains an implementation gap.
+Local-only workloads can select `owned_filesystem_observer` with the same clean observer binary, limits and backing placement on both engines.
+The Linux host mounts it before Docker creates node binds; the owner removes node containers before unmount and join.
+The bounded production decoder verifies local object roots and separate logs, and host/container mountinfo establishes the actual shared boundary.
+`successful_backing_filesystem_payload_and_requests` counts successful backing reads/writes, including mmap-driven FUSE reads; metadata has separate counters.
+Raw snapshots with no dispatched instrumented callback, physical backing device/host identity, artifact/settings hashes and lifecycle evidence are retained and checked offline.
+Snapshot quiescence does not flush dirty mappings or kernel queues; it bounds completed backing calls at that instant.
+The common FUSE overhead qualifies an instrumented filesystem path, not physical disk transfers or uninstrumented storage performance.
+Linux `/dev/fuse`, mount privileges and `allow_other` permission are required execution inputs.
+See `performance-inputs.adoc` and the filesystem-observer crate README for the exact selection, limits and privileged regression sources.
 Process `/proc/1/io` counters include logs and runtime work and are never substituted for object-provider counters.
 The historical correctness runner's JVM BufferPool bytes and native ObjectStore bytes likewise remain incomparable for this purpose.
 A missing provider observer or a workload that never uses its claimed provider path cannot qualify packaged performance.

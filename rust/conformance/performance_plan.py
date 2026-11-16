@@ -6,6 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "release"))
 from evidence import canonical, digest_value, index, integer, number, text
+from filesystem_observer import validate_selection
 
 
 WORKLOADS = {"id_lookup", "bitemporal_range", "mixed_type_join", "bulk_ingest", "replicated_commit", "compaction_under_load", "restore"}
@@ -94,8 +95,17 @@ def validate_plan(plan):
             integer(node.get("health_port"), "health port", 1)
         text(selected.get("engine_memory_configuration"), "engine-specific memory accounting")
         measurement = selected.get("provider_measurement")
-        if measurement is not None and measurement.get("kind") != "owned_http_observer":
+        if measurement is not None and measurement.get("kind") not in {"owned_http_observer", "owned_filesystem_observer"}:
             raise ValueError("performance requires the owned provider observation path")
+        if measurement is not None and measurement.get("kind") == "owned_filesystem_observer":
+            validate_selection(measurement)
+            digest_value(measurement.get("observer_artifact", {}).get("sha256"), "filesystem observer artifact")
+            if capabilities != ["local"]:
+                raise ValueError("filesystem provider observation requires an explicitly local-only package capability selection")
+    first = plan["engines"]["jvm"].get("provider_measurement")
+    second = plan["engines"]["rust"].get("provider_measurement")
+    if any(selection and selection.get("kind") == "owned_filesystem_observer" for selection in (first, second)) and second != first:
+        raise ValueError("paired filesystem observers must select identical binary, limits, and backing placement")
     cases = index(plan.get("cases"), lambda case: text(case.get("id"), "case ID"), "performance case")
     seen = set()
     node_names = {node["name"] for node in plan["engines"]["jvm"]["nodes"]}
