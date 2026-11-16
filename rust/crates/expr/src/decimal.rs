@@ -147,15 +147,18 @@ pub(crate) fn rounded(value: &DecimalValue, scale: i32, mode: RoundingMode) -> R
 /// Formats the canonical Java BigDecimal representation, including its scale and scientific exponent.
 /// The output length is bounded by coefficient digits plus exponent digits, including at i32 scale limits.
 pub fn decimal_text(value: &DecimalValue) -> String {
-    let coefficient = coefficient(value);
+    decimal_parts_text(&coefficient(value),value.scale)
+}
+
+pub(crate) fn decimal_parts_text(coefficient: &BigInt,scale: i32) -> String {
     let signed = coefficient.to_str_radix(10);
     let digits = signed.trim_start_matches('-');
-    let adjusted = digits.len() as i64 - 1 - i64::from(value.scale);
-    if value.scale == 0 { return signed; }
+    let adjusted = digits.len() as i64 - 1 - i64::from(scale);
+    if scale == 0 { return signed; }
     let mut result = String::new();
     if coefficient.sign() == Sign::Minus { result.push('-'); }
-    if value.scale >= 0 && adjusted >= -6 {
-        let point = digits.len() as i64 - i64::from(value.scale);
+    if scale >= 0 && adjusted >= -6 {
+        let point = digits.len() as i64 - i64::from(scale);
         if point > 0 {
             let point = point as usize;
             result.push_str(&digits[..point]); result.push('.'); result.push_str(&digits[point..]);

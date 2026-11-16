@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
-struct Prepared { source: String, kind: PreparedKind, oids: Vec<i32>, supplied_oid_count: usize, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
+struct Prepared { source: String, kind: PreparedKind, oids: Vec<i32>, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
 struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, row: usize, sent: u64 }
 enum PortalState { Query(QueryPortal), Ready }
@@ -65,7 +65,9 @@ impl ProtocolSession {
                 self.extended = true;
                 let name = input.string()?.to_owned(); let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?; self.register_statement(name, prepared)?; writer.empty(b'1').await?;
+                let prepared = self.prepare(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                Self::planning_warnings(&prepared, writer).await?;
+                self.register_statement(name, prepared)?; writer.empty(b'1').await?;
             }
             b'B' => {
                 self.extended = true;
@@ -73,7 +75,7 @@ impl ProtocolSession {
                 let prepared = Arc::clone(&self.statements.get(statement).ok_or_else(|| protocol("no prepared statement"))?.prepared);
                 let count = usize::from(input.short()?); let formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?;
                 let count = usize::from(input.short()?);
-                if matches!(prepared.kind, PreparedKind::Dml(_)) && count != prepared.supplied_oid_count { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
+                if matches!(prepared.kind, PreparedKind::Dml(_)) && count != prepared.oids.len() { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
                 let mut arguments = Vec::with_capacity(count); let mut charges = Vec::with_capacity(count + 1);
                 for index in 0..count {
                     let length = input.integer()?; if length == -1 { arguments.push(Value::Null); continue; }
@@ -85,7 +87,7 @@ impl ProtocolSession {
                     let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| Anomaly::incorrect("xtdb.pgwire/invalid-arg-representation", error.message).with_context("arg-idx", index.into()).with_context("arg-format", if format == Format::Binary { "binary" } else { "text" }.into()))?;
                     let (value, charge) = decoded.into_parts(); arguments.push(value); charges.push(charge);
                 }
-                if count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
+                if matches!(prepared.kind, PreparedKind::Query(_) | PreparedKind::Control(ControlStatement::Execute { .. })) && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
                 let count = usize::from(input.short()?); let result_formats = (0..count).map(|_| Format::from_code(input.short()? as i16)).collect::<Result<Vec<_>>>()?; input.end()?;
                 if name.is_empty() { self.portals.remove(&name); } else if self.portals.contains_key(&name) { return Err(protocol("Named portals must be explicit closed before they can be redefined")); }
                 charges.push(Arc::clone(&frame.charge));
@@ -120,7 +122,6 @@ impl ProtocolSession {
     }
 
     async fn prepare(&mut self, source: &str, mut oids: Vec<i32>) -> Result<Arc<Prepared>> {
-        let supplied_oid_count = oids.len();
         let _scratch = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
         let spans = rtdb_sql::split_statements(source)?;
         if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
@@ -129,20 +130,26 @@ impl ProtocolSession {
         let (kind, columns, count) = if source.is_empty() { (PreparedKind::Empty, None, 0) }
         else if source.to_ascii_lowercase().starts_with("select string_agg(word, ',') from pg_catalog.pg_get_keywords()") { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
         else if let Some(control) = rtdb_sql::parse_control(source, &options)? {
-            let count = control.parameter_count(); let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })).collect::<Result<_>>()).transpose()?;
+            let count = match &control { ControlStatement::Execute { .. } => control.parameter_count(), ControlStatement::Show { .. } => 0, _ => oids.len() }; let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })).collect::<Result<_>>()).transpose()?;
             (PreparedKind::Control(control), columns, count)
         } else {
             let context = self.session.prepare_context(&token).await?;
             let prepared = PreparedSql::prepare_postgres(source, &context, options.search_path, &oids)?;
             let count = prepared.parameter_count();
-            if prepared.is_dml() { (PreparedKind::Dml(prepared), None, count) }
+            if prepared.is_dml() { (PreparedKind::Dml(prepared), None, oids.len()) }
             else { let columns = prepared.prepared_schema().zip(prepared.postgres_types()).map(|(schema, types)| schema.fields().iter().zip(types).map(|(field, ty)| Column { name: field.name.clone(), ty: *ty, format: Format::Text }).collect()); (PreparedKind::Query(prepared), columns, count) }
         };
-        if oids.len() > count { return Err(protocol("Too many supplied parameter OIDs")); }
         oids.resize(count, 0);
         let column_bytes = columns.as_deref().unwrap_or_default().iter().try_fold(0usize, |bytes, column| bytes.checked_add(column.name.capacity()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Column descriptors are too large")))?;
-        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(count.checked_mul(256)?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
-        Ok(Arc::new(Prepared { source: source.into(), kind, oids, supplied_oid_count, columns, _reservation: reservation }))
+        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(count.checked_mul(256)?)).and_then(|n| n.checked_add(oids.capacity().checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
+        Ok(Arc::new(Prepared { source: source.into(), kind, oids, columns, _reservation: reservation }))
+    }
+
+    async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
+        if let PreparedKind::Query(statement) | PreparedKind::Dml(statement) = &prepared.kind {
+            for notice in statement.notices() { writer.planning_warning(&notice.message).await?; }
+        }
+        Ok(())
     }
 
     async fn bind(&mut self, prepared: Arc<Prepared>, arguments: Vec<Value>, mut charges: Vec<Arc<MemoryReservation>>, formats: &[Format]) -> Result<Portal> {
@@ -153,13 +160,13 @@ impl ProtocolSession {
         let mut portal = Portal { prepared: Arc::clone(&prepared), arguments, _charges: charges, columns, state: PortalState::Ready, cancellation: token.clone() };
         let control_options = self.control_options();
         let cursor = match &prepared.kind {
-            PreparedKind::Query(query) => { let checked = !self.session.state().is_read_write(); let context = self.session.query_context_with(&token, checked).await?; Some(query.open_query(context, std::mem::take(&mut portal.arguments))?) },
+            PreparedKind::Query(query) => { let checked = !self.session.state().is_read_write(); let context = self.session.query_context_with(&token, checked).await?; Some(query.open_query(context, std::mem::take(&mut portal.arguments)).await?) },
             PreparedKind::Control(statement @ ControlStatement::Show { .. }) => match self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? { ControlResult::Rows(cursor) => Some(cursor), _ => return Err(protocol("SHOW did not produce rows")) },
             PreparedKind::Control(statement @ ControlStatement::Execute { .. }) => {
-                let ControlResult::Execute { name, arguments, reservation } = self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? else { return Err(protocol("EXECUTE did not produce arguments")); };
+                let ControlResult::Execute { name, arguments, reservation, allocation: _allocation } = self.session.execute_control_with(statement, &portal.arguments, &token, control_options).await? else { return Err(protocol("EXECUTE did not produce arguments")); };
                 let inner = Arc::clone(&self.statements.get(&name).ok_or_else(|| protocol("no prepared statement"))?.prepared);
                 if !matches!(inner.kind, PreparedKind::Query(_) | PreparedKind::Dml(_)) { return Err(Anomaly::unsupported("xtdb.pgwire/unsupported-execute", "EXECUTE only supports a prepared query or DML statement")); }
-                if arguments.len() != inner.oids.len() { return Err(protocol("EXECUTE argument count differs from prepared statement")); }
+                if matches!(inner.kind, PreparedKind::Query(_)) && arguments.len() != inner.oids.len() { return Err(protocol("EXECUTE argument count differs from prepared statement")); }
                 return Box::pin(self.bind(inner, arguments, vec![reservation], formats)).await;
             }
             _ => None,
@@ -206,15 +213,15 @@ impl ProtocolSession {
                 let result = self.session.execute_control_with(statement, &portal.arguments, &portal.cancellation, options).await;
                 if matches!(statement, ControlStatement::Commit(_) | ControlStatement::Rollback) && self.session.state().status() == TransactionStatus::Idle { self.end_transaction(); }
                 match result? {
-                    ControlResult::Command { tag, parameter_status, .. } => {
+                    ControlResult::Command { tag, parameter_status, allocation: _allocation, .. } => {
                         if matches!(statement, ControlStatement::Begin(_)) { self.implicit = false; }
                         if let Some((name, value)) = parameter_status { writer.parameter(display_parameter(&name), if name == "standard_conforming_strings" { "on" } else { &value }).await?; }
                         if matches!(statement, ControlStatement::Discard(DiscardTarget::All)) { self.end_transaction(); self.statements.clear(); apply_startup(&mut self.session, &self.startup.parameters, writer).await?; }
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::Prepare { name, source } => { let prepared = self.prepare(&source, Vec::new()).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
-                    ControlResult::CopyIn { table, format } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
+                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new()).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
+                    ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
                     _ => Err(protocol("Unexpected control execution result")),
                 }
             }
@@ -262,6 +269,7 @@ impl ProtocolSession {
             if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
             let result: Result<()> = async {
                 let prepared = self.prepare(sql, Vec::new()).await?;
+                Self::planning_warnings(&prepared, writer).await?;
                 if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
                 let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
                 if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }

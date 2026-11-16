@@ -65,7 +65,10 @@ Prepared SQL rebinds against each execution context and checks PostgreSQL result
 Query bases now carry requested per-partition system-time caps separately from captured snapshot identities.
 Parser/IR transient allocation accounting remains incomplete.
 Timestamp/duration/calendar arithmetic and unqualified interval/duration text casts have source and regression cases.
-Temporal comparison, qualified interval/cast options, named-zone extreme dates and full temporal lexical compatibility remain incomplete.
+Temporal comparison now borrows the session zone through scalar predicates, sorting, grouping, set operations and window partitions.
+The source retains checked unit conversion, raw temporal inequality, strict zone/type equality, and the reference interval comparator's wrapping arithmetic.
+Qualified interval/cast options retain source-dependent option consumption and have independently reviewed regression source.
+Named-zone extreme dates and full temporal lexical compatibility remain incomplete.
 Session parameters, buffered SQL, pinned read bases and retained token/timezone strings now carry co-owned reservations; failed transaction state retains a flag instead of an arbitrary error payload.
 Server authentication, source factories and the node share one execution allocation budget.
 Startup cache and execution ceilings divide the configured process allocation limit, while transport and cryptographic library allocation qualification remains pending.
@@ -132,12 +135,12 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |===
 |Trace |Current gap
 
-|Client read |Pgwire, Flight SQL and embedded bindings reach shared session controls, native preparation and query execution; independent source review and missing language surfaces remain.
-|Data-dependent write |Native session → source codec → resolver and staged snapshot → replica append/read-back → admitted apply is written; independent source audit is ongoing.
+|Client read |Pgwire, Flight SQL and embedded bindings are traced through session bases, one captured catalog/row generation per database, native preparation, temporal scans and owned output; null-token compatibility is source-reviewed; remaining language and allocation surfaces stay open.
+|Data-dependent write |Public pgwire, Flight SQL and embedded submission paths are traced through native source durability, transaction-local staged reads, ordered replica append, term admission, atomic apply and caller completion; independent whole-path source review is clear, and runtime qualification remains pending.
 |Replica recovery |Public startup, catalog-before-log assembly, local/Kafka replay, term admission, pending-block adoption, read visibility and failure/restart ownership are traced; independent source review is clear for this bounded path, with provider and runtime qualification pending.
-|Compaction retry |Native deterministic selection, streaming merge, immutable file publication, and source-log publication are written; byte compatibility and retry execution remain pending.
-|CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; database-lifetime source owners and observer integration are written; source audit is ongoing.
-|Database shutdown |Node/database/term and production server listener cancellation and joins are written; child and ancestor I/O drains, cancelled remote operations, scoped cache work and Flight lifecycle integration have source review; execution qualification remains pending.
+|Compaction retry |Public database and standalone compactor assembly, deterministic merge, data-before-metadata publication, source/replica read-back, catalog visibility and replacement-owner retry are traced; cross-engine bytes and failure execution remain pending.
+|CDC restart |Public remote/source configuration, leader-term assignment, snapshot/resume, ordered import, replica read-back, adopted-block confirmation and cancellation are traced through native implementations; upstream assumptions and runtime qualification remain pending.
+|Database shutdown |Public server signals, startup failure, unstarted closure and embedded closure are traced through listener, node, database, term and log completion into child and ancestor I/O drains; no source gap remains in this bounded trace; execution qualification remains pending.
 |===
 
 Operational tracing, offline configuration qualification and release recipes are written; exporter review, complete release orchestration and remaining protocol compatibility work continue.
@@ -154,6 +157,10 @@ Input, declared decoded buffers and rendered row allocations are budgeted before
 The disk cache is wired into native remote resources and startup configuration, with file-lifetime, failure/retry, namespace and upload-cache regression source.
 The data-only EDN configuration adapter is written, including environment tags, backend maps, aliases and authentication-default differences; native replacements for JVM object-valued hooks require explicit compatibility qualification.
 Kafka Connect ingestion, converter/transform/indexer owners and node factory integration are being written independently of the native Kafka log implementation; native registry converters, shipped transforms and recursive schema ownership are written, while registry policy/credential completion and source review continue.
+Registry reader selection, directional migration orchestration and native DLQ producer actions have source implementations and regression sources under independent review.
+DLQ actions retain framed read payloads or migration JSON, rule headers, target-metadata topic fallback and configured action identity.
+The assignment retains both converter owners outside its cancellation choice and awaits their admitted delivery drains.
+Additional Java producer adapters, multiple native Kafka client identities, Connect legacy calendar behavior and remaining converter options still prevent this surface from satisfying the completeness gate.
 Authentication and backend source exist, with credential-chain and error/limit compatibility findings recorded in their crate documentation.
 Source/replica and block/table inspection cursors use bounded ranges and retained row charges.
 The pinned block inspection cursor ends after its first empty 1024-candidate window, even when a later block exists; native source preserves that behavior.
@@ -162,6 +169,106 @@ Disabled indexing and operator-selected skipped transactions follow their pinned
 Node tests cover actual engine paths but have not been executed.
 No release artifact or migration/rollback result exists.
 Phase 2 must not start until these paths and the remaining language/execution surfaces are implemented and the complete source trace review passes.
+
+=== Client read public-entry trace
+
+Pgwire query binding, Flight ticket execution and embedded ADBC query handles open the shared native preparation and cursor path.
+Session revalidation and basis waits precede capture; a Reading transaction retains its token and clock.
+Each execution derives schema, table OIDs and scanned rows from one retained partition generation per database.
+Prepared statements rebind against that execution catalog and enforce their result-signature policy before opening physical operators.
+Temporal scanning merges immutable and live events before applying final value predicates, preserving corrections, deletes and erases that supersede matching documents.
+Query cursors own parameters, operator state, spill regions and Arrow output reservations under caller and node cancellation.
+Protocol streams retain those cursors and batches through suspended reads, and embedded exports retain their buffers independently of cursor closure.
+Missing or null partition times in a snapshot token leave the system-time dimension unconstrained, matching the pinned query implementation.
+An empty token can expose historical versions, and a transaction pinned before ingestion can observe a later applied generation while retaining its null token entry.
+The corresponding isolation question is recorded in `tx.allium`; the broad snapshot-isolation wording is not treated as proof of the pinned edge behavior.
+Independent source review covers the null-basis repair and direct, SQL and public-node regression expectations.
+Language-catalogue completion, parser/IR allocation and transport peak accounting remain separate implementation work.
+Protocol bytes, schemas, ordering, SQLSTATEs, resource limits and all regression observations remain unexecuted.
+
+=== Data-dependent write public-entry trace
+
+Pgwire, Flight SQL and embedded updates produce native transaction operations through the shared session.
+Manual transactions retain operations until commit; synchronous submission awaits application after the source log's durable receipt.
+Static mutation expansion leaves data-dependent SQL for the leader's resolver.
+The resolver overlays queued predecessors on the durable snapshot, and each operation or SQL argument row adds its transaction-local writes to the next query view.
+The native SQL mutation binder and pull operators query that view without a dependency from the query layer back into the leader.
+A caller error discards partial writes and stages only an aborted `xt.txs` row; successful resolution stages the result row with the user events.
+
+The ordered replica appender stamps native bodies with the leader term and sequence.
+Read-back meets the node-owned term fence before application.
+The leader applies its oldest matching staged write; a follower decodes the replicated write.
+Partition publication precedes the applied-progress signal and external-source completion.
+A synchronous client retrieves an older result from `xt.txs` after waiting for its applied position.
+Term loss cancels in-flight resolution and fails pending external receipts; cancelling a client wait does not retract an already durable source submission.
+
+Public node regression source covers a data-dependent update, current and historical reads, and retrieval of an older transaction result.
+Resolver regression source covers staged predecessors, repeated argument rows, partial-write rollback and smoothed aborted keys.
+Root and independent source reviews are complete for these bounded paths; provider durability, exact wire/errors and failure-schedule execution remain pending.
+The recorded block-cut, watcher, integer-domain and oversized-fetch qualifications still apply.
+
+=== Compaction retry public-entry trace
+
+`server` configuration assembles the ordinary database compactor and the standalone compactor through `DatabaseFactory::open`.
+Each uses the real `SegmentCompactor`, immutable partition snapshots, configured storage provider and `PublishCompaction` capability.
+The standalone mode follows replica progress and writes source notifications while remaining ineligible for leadership.
+
+`CompactionDriver::run` selects deterministic jobs from the current catalog, rechecks each job before executing, and joins its workers during cancellation.
+`SegmentCompactor::execute` reads actual data and metadata, reserves dictionary/page decoding bounds, resolves same-time L0 events, merges temporal polygons and normalizes its temporary output files.
+It uploads each data file before its metadata marker, with historical outputs preceding the current output that completes an L0 job.
+Local and remote `put_file` implementations accept an existing destination only when its bytes equal the attempted output.
+A partial data-only upload therefore remains reusable after the process stops; a conflicting output fails explicitly.
+
+The completed `TriesAdded` notification enters the source log and receives its real source position.
+The leader forwards it through the ordered replica appender, and each node applies only records admitted by its term fence.
+Read-back applies matching storage-version and storage-epoch additions to the immutable catalog before advancing the source watermark awaited by the compactor.
+A catalog snapshot therefore includes the publication before the completed worker can select another job.
+Pending block boundaries hold later records until adoption; catalog high-water marks ignore repeated or stale notifications.
+
+Executor and publication failures remain recorded for the compactor owner's lifetime, matching the pinned `Compactor.kt` queue.
+A replacement database owner retries a still-available job; completed catalog outputs suppress work already recorded by another node.
+Started storage operations retain their I/O admissions through caller cancellation, and the database owner drains those admissions before closing resources.
+
+The packaged recovery runner targets one actual metadata key with a provider denial, witnesses its data-only output, stops the failed owner, and opens the opposite engine to retry and adopt it.
+Its retained observations require unchanged uploaded data, completed metadata, current and historical results, and a fallback read after retry.
+Those sources and the native merge/driver/immutable-store regressions remain unexecuted.
+Source tracing found no remaining placeholder in this bounded compaction path; cross-engine bytes, provider behavior, injected failures and peak allocation remain Phase 2 qualification work.
+
+=== PostgreSQL CDC restart public-entry trace
+
+Server remote configuration and the persisted `!Postgres` source configuration reach `PostgresSourceFactory`, `DatabaseFactory` and the leading term's `MaintenanceSupervisor`.
+The assignment receives admitted applied progress as its resume token and a separate watch of adopted block catalogs.
+An incomplete snapshot token fails before reopening a stream.
+A new source retains its exported-snapshot connection while a repeatable-read query connection imports bounded pages, then awaits the ordered complete-marker transaction before streaming.
+
+`ImportWriter` and `DirectMirror` write through `TxResolver`, the term append pipeline and admitted replica apply.
+The source's held position advances after command admission; its apply receipts complete after read-back, while the upstream confirmation bound comes from the adopted block's captured token.
+Native CopyBoth decoding, explicit standby-status messages, duplicate suppression and reconnect remain owned by the assignment future.
+Partial frame state survives cancelled read branches, and term cancellation releases the sockets, snapshot connections, reconnect future and metric assignment guard before replacement.
+
+The `pgsrc.allium` questions about keepalive ordering and recovery without a durable extent remain open.
+The source follows the pinned first-block and caught-up confirmation rules; this trace does not prove those upstream assumptions.
+The documented TLS-policy and upper-half LSN differences, scalar object-family qualifications, peak-allocation audit and PostgreSQL integration/fault tests remain qualification work.
+
+=== Database shutdown public-entry trace
+
+`server/src/main.rs::run_server` requests shutdown after either a successful or failed signal wait and awaits the driver through `join_with_deadline`.
+Deadline expiry reports failure while continuing to await the owner; Tokio runtime shutdown follows completion of `run`.
+`ServerDriver::run` joins PostgreSQL, Flight and health listeners before shutting down and joining the node, then closes and joins exporters.
+PostgreSQL joins connections after its drain deadline; Flight closes its transport and leases and waits for admitted calls to release their guards.
+Startup failure and `close_without_run` drain the unstarted node through the same resource factory.
+
+`NodeDriver::run` closes command admission, cancels catalog owners and joins database workers and their I/O-drain tasks.
+`DatabaseDriver::run` joins replication, compaction and maintenance before cancelling and joining log drivers.
+Maintenance joins term-owned GC and external-source tasks; replication demotion joins its append pump and retained block production.
+The local log awaits an admitted blocking append before observing shutdown, while Kafka drains acknowledgements and reports flush failure before its driver returns.
+Database child I/O regions drain before held catalog entries are cleared, and the resource factory subsequently drains the ancestor node region.
+Detachment retains its name until the matching database owner has completed this drain; a failed worker alone retains read access.
+
+`ffi::rtdb_v1_close` reaches `EmbeddedRegion::close`, which closes call admission, requests server/node cancellation, waits for admitted foreign calls and joins the server before runtime destruction.
+`IoRegion` retains admitted operations through caller cancellation and destroys an undelivered result before releasing its drain tokens.
+The corresponding lifecycle regression sources remain unexecuted.
+This trace addresses joined shutdown; recovery after abrupt process termination remains a separate review and execution obligation.
 
 == SQL subquery source checkpoint
 
@@ -181,7 +288,13 @@ Their source review follows the pinned occurrence-based parameter numbering and 
 Explicit and correlated temporal endpoint columns resolve without exposing those columns through wildcard expansion.
 Lateral derived tables and implicit lateral UNNEST lower to the shared dependent-query executor with the pinned lexical scope rules.
 The pinned implementation explicitly rejects recursive CTEs, and native preparation retains that rejection.
-Query settings, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
+Query settings now have parser, passive prepared metadata, default table extents and shared execution source.
+The pinned `query.clj:455–461` resolves planned snapshot-token metadata but reads snapshot time only from API options, ignoring planned `SNAPSHOT_TIME`; native execution preserves this observable discrepancy.
+Invalid typed temporal literals still fail during planning, including in ignored metadata and overwritten duplicate settings.
+Requested token times validate against the captured partition heads before the independent API cap is applied; SQL overrides do not acquire a newer catalog.
+SQL, shared prepared node, transaction and conformance consumers retain settings, and `SNAPSHOT_TOKEN` borrows the effective execution token.
+The new query-settings and temporal-literal test sources have not run.
+EXPLAIN/ANALYZE, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
 Shared decimal cast targets distinguish default decimal preservation from explicit precision/scale and recurse through list element unions.
 Decimal values and logical fields retain signed 32-bit precision and scale through protobuf, Arrow files/streams, Flight, COPY and the C Data interface.
 Native Arrow carriers retain validated full-parameter annotations internally; external schemas carry the actual Arrow parameters and reject those reserved annotations on ingress.
@@ -192,7 +305,11 @@ Computed projections validate their final nested decimal cells; bare columns and
 Static submission converts parameter decimal objects back to inferred 32/64-digit document fields, while compiled VALUES performs ordinary projection validation.
 Decimal arithmetic, comparison, canonical text and integer conversion bound powers by coefficient digits; expanding PostgreSQL binary and SQL logic fixed-point output reserves its expansion first.
 XTQL target/options syntax and exact decimal diagnostics remain gaps; those paths are not declared equivalent.
-XTQL percentile/vec-agg and its documented EDN reader extensions remain gaps as well.
+The shared ordered-set percentile operators now have plan, SQL, execution, spill, and regression source.
+Ordered-vector comparisons retain the pinned decimal double conversion, signed concrete reads of unsigned physical vectors, and comparator-factory checks across every observed key type and spill run.
+The broader unsigned execution boundary still needs to normalize domain values without changing durable Arrow schemas, raw payloads, or internal unsigned operator identifiers.
+The documented EDN reader extensions remain gaps.
+XTQL `vec-agg` source now preserves empty global vectors, grouped empty inputs and null elements through the shared aggregate cursor.
 These source assertions have not run and do not establish plan, error or result parity.
 
 == Conformance runner source checkpoint
@@ -224,14 +341,19 @@ Its Rust acknowledgement and partial-compaction fault markers are durable before
 Current and historical observations, exact replica heads, applied checkpoints and immutable partial output have independent comparison assertions.
 The JVM fallback must recover the acknowledged canary and complete the interrupted compaction metadata without changing the uploaded data bytes.
 Independent source review covered adapter calls, process ownership, manifest identity and comparison rules; every execution result remains pending.
-Production writer fencing, remote backends, external-source confirmation and the reverse partial-compaction direction remain separate work.
+The packaged recovery runner now covers both directions for real local, S3, Azure, GCS, Kafka, Kafka Connect, and PostgreSQL source deployments selected by the release matrix.
+It binds images and backend-helper binaries to the exact production build, retains actual provider denial evidence, and independently reconstructs expected CDC row sets.
+Compaction faults run through a node that owns database registration; offline verification checks the executed command and role configuration.
+Missing credentials, audit inputs, or exact fault policies leave required scenarios unmet.
+Production cutover fencing and runtime interoperability still need execution evidence.
 The SQL logic runner preserves original Gradle/direct selections and immutable per-record identities, including unselected files and skipped or malformed records.
 The JVM adapter invokes the pinned record methods and engine; native scripts use production node/session/query paths, each with an owned and joined driver.
 The comparator independently checks source expectations, execution flags, counters, formatting bytes and record cardinality; matching failures and exclusions cannot pass.
 Both requested decorrelation variants execute separately, but the native Apply path does not establish optimizer or plan parity.
 Independent source review corrected a native receipt provenance field and covered parser selection, formatter rules, JVM interop, process cleanup and comparison failure paths.
 Exotic JVM object formatting, unqualified temporal-zone formatting and remaining synthetic visitor forms are explicit harness gaps.
-Full generated fault traces, original-case ledger reconciliation, deployment qualification, performance runners and release orchestration remain under implementation.
+Matched packaged performance and release orchestration have concrete source paths with independent artifact binding and offline comparison.
+Local filesystem physical-performance observation, full generated fault traces, original-case ledger reconciliation, and deployment qualification remain under implementation.
 The ledger remains incomplete, its denominator remains unset, and the Phase 2 gate remains closed.
 
 == Replica recovery source trace
@@ -267,6 +389,20 @@ Git whitespace checks ran over the changes.
 An independent whole-wave comment/spec review found allocation-contract and lifecycle wording issues; the source owners corrected them, and implementation-status prose moved out of the policy questions.
 No Rust compiler, formatter, build script, test runner, server, benchmark, Gradle task, or executable test-discovery command ran.
 
+== Credential and expression review follow-ups
+
+The native Azure managed-identity adapter covers App Service, Service Fabric, Cloud Shell, Arc, and IMDS endpoint protocols with bounded responses and retries.
+The default bridge distinguishes unavailable credentials from authentication failure, including unsupported client selectors and the pinned JSON error-envelope classification.
+Arc challenge reads belong to the database I/O region; Unix nonblocking open and regular-file validation reject FIFOs before reading.
+Independent source review of those repairs is clear; desktop-cache credentials and runtime qualification remain pending.
+
+SQL CONCAT now stringifies arguments and replaces null with empty text, while the strict scalar concat and concatenation operator retain their own semantics.
+Unused and overwritten SETTING forms preserve syntactic validation and lexical parameter requirements without premature scalar typing.
+Timestamp parsing includes SMART calendar resolution and the pinned lenient year width; DATE literals retain strict ISO spelling.
+Encoded and nullable XTQL cast targets retain their original dispatch/identity constraints, and integer reader tokens normalize radix before field-name rendering and duplicate-key comparison.
+Session-information scalars and version functions have implementation and regression sources; native version observations identify the native artifact and require per-engine evidence binding.
+These changes have no compilation or runtime evidence yet.
+
 == Filesystem observer source checkpoint
 
 The Linux filesystem observer measures successful backing payload syscalls through one mounted FUSE boundary shared by both packaged engines.
@@ -275,3 +411,133 @@ Normal shutdown requires verified removal of node containers, followed by unmoun
 Independent source review covered append/mmap offsets, mode inheritance, bounded ownership, canonical paths, environment/workload binding and offline evidence checks.
 Regression sources include mounted filesystem behavior, failed cleanup and falsified receipts.
 No mount, executable, compiler or test ran; Linux provisioning and all runtime qualification remain pending.
+
+=== Array bounds and lazy trimming
+
+The plan signature dispatch, scalar entry, deferred collection evaluator, SQL function binding and XTQL call binding implement `array_upper`, `array_lower`, `array_length` and `trim_array`.
+The implementation follows pinned `expression.clj` array emitters and `trim-array-view`, including null short-circuiting and negative trim counts that extend the reader view.
+Clojure 1.12.0 `Compiler.emitBody` checks the primitive long-to-int return for `ListValueReader.size`; the trim reader retains that deferred check, so `array_lower` can observe an oversized view without reading its size.
+Regression source covers dimensions, empty arrays, the signed type dispatch matrix, discarded failing cells, deferred casts, oversized readers, memory exhaustion, and cancellation through the SQL, XTQL and expression entries.
+Independent source review found and repaired deferred count ordering, including CASE/coalesce selection, array dimension demand and polymorphic payload boxing.
+The repaired catalogue path also covers discarded `col_description`, `pg_indexam_has_property` and MOD arguments.
+General scalar continuation timing remains open source work; the larger IN-list implementation is reviewed separately below, and all execution remains pending.
+
+
+=== Series and Connect source follow-ups
+
+Signed integer and temporal series have shared type/signature, scalar, lazy reader, SQL and XTQL implementation and regression source.
+SQL GENERATE_SERIES captures its endpoint policy from node configuration through direct/prepared queries, static submission and transaction resolution; RANGE and explicit XTQL endpoints retain their own contracts.
+The table path binds aliases, preceding FROM columns and ordinality, retains generated-name metadata until projection, and keeps integer series allocation independent of total length.
+Independent review repaired non-list UNNEST type admission and discarded-payload semantics in the shared table-input path.
+The table and scalar regression sources remain unexecuted.
+
+The retained Connect locale bundle contains unchanged resources from the pinned Temurin archive, with exact archive/entry hashes, licenses and reproduction instructions.
+A bounded source decoder produces static Rust locale data; it does not execute Java methods or delegate formatting behavior to a JVM.
+Independent source review verified the retained archive bytes and repaired a metadata-map alias expansion before allocation.
+Formatter/provider integration and its behavior review remain active.
+
+External-source factories receive the existing database I/O child region.
+Cancelled Connect capture work and its undelivered results drain before the database releases its name, while parent-node shutdown still joins all admitted work.
+A separate root review traced database open, cancelled assignment, worker completion, child drain and name release, and found the repaired ownership path consistent with the existing lifecycle spec.
+Regression source covers detach, shutdown, cancelled capture, retained-charge release and sibling admission; no test or executable probe ran.
+
+=== IN lists, URI components and formatter review
+
+SQL IN candidates now share scalar admission at every list size, with single-column row constructors and a relational mark for longer lists.
+Shared candidates are completely built before input evaluation; correlated candidates are built per row and evaluate the complete comparison batch.
+Independent review identified and repaired the shared scalar hash-selection boundary, retaining whole-build null facts and every-row comparison for nested candidate types.
+Equality uses the existing continuation reader for selected controls, null payload pruning and polymorphic boxing.
+Regression source covers value and comparison ordering, parameter types, nulls, correlation, cancellation and spill cleanup.
+
+The shared URI parser validates Java URI spellings and implements all seven component extractors without normalization or name resolution.
+Independent review covered SQL and XTQL binding, casts, columnar object/read admission, Transit input, authority fallback and percent-decoder replacement groups.
+A separate root review covered URI object equality, raw vector-hash candidate selection, reached ordering failures and Unicode NFC ASCII rendering.
+The borrowed parser and caller-owned rendering charges retain their existing lifetime boundaries; regression source spans expression, SQL, XTQL and source-log inspection paths.
+
+The Connect provider and formatter reviews traced pinned locale fallback, numeric/name parsing, calendar and timezone selection, mutable parsed-zone state, lazy name catalogs and allocation ownership.
+The review repaired the long-number formatter's 309-digit padding limit and added provider and formatter regression source.
+Consumer review repaired schema-default ordering and cache ownership in Cast and TimestampConverter, together with final logical-name handling in Avro conversion.
+Null defaults share one semantic owner rule across schemas, caches and graph metadata.
+Final Avro Date, Time, Timestamp and Decimal conversion follows child conversion and the final Connect logical name; default construction retains its earlier name-assignment point.
+A separate correction preserves boxed floating defaults, signed zeros, NaN equality and order-independent map defaults in both transform caches.
+Provider property overrides, isolated UTF-16 carriers and clock-sensitive cache lifetime remain explicit qualification work.
+No compilation, test, executable discovery or runtime parity result is claimed by these source reviews.
+
+=== Shared scalar catalogue follow-ups
+
+Signed bitwise functions and SQL operators have shared type and value dispatch, with checked narrow shift counts and continuation-based null demand.
+Independent source review repaired SQL precedence, tilde operand precedence, Sharp token admission and Caret rejection, and checked signed-width output and argument admission regressions.
+Truth aliases, null-safe distinctness and metadata-double conversion reach shared expression, XTQL and prepared-query runtime type paths.
+Their independent source review repaired the unsupported half-float boundary; source regressions include discarded payloads, forced controls and polymorphic boxes.
+Generic comparison calls have bounded independent source review, covering exact byte-pair result magnitudes, temporal and numeric admission, null placement and discarded payloads.
+Core temporal functions and exact query-clock propagation have bounded independent source review.
+Query clocks retain nanoseconds through sessions and Flight tickets, with explicit narrowing at physical scan, SHOW and durable boundaries.
+Set equality admission and generic interval constructors have bounded independent source review.
+The Set review repaired missed CASE conditions, index/pattern children and scan temporal expression traversal during runtime type refinement.
+Shared field access covers Structs, Transit maps, stored errors and transaction-key records, with bounded source review of recursive error and record reconstruction.
+SQL JSON field and path operators reuse the shared field/index/cast path and have bounded root source review.
+LIKE and ILIKE share the Java-compatible pattern owner with bounded independent source review of type admission, Unicode/binary matching, ignored SQL ESCAPE and null/control demand.
+Full registered Transit object handling, general scalar continuation timing and row/patch bound admission remain active source tasks.
+All compilation and runtime evidence remains pending until source completeness clears.
+
+The ordinary scalar continuation source pass is independently clear for its bounded routing and control changes.
+Simple SQL CASE now retains one eager operand binding, with source regressions for null effects, repeated WHEN comparisons, result boxing and runtime equality admission.
+The shared nth signature now checks signed index legs, distinguishes ordinary list elements from constant-null non-list sources, and rejects unregistered fixed-size-list dispatch.
+These changes have independent source reviews and remain unexecuted.
+The row-limit review also rejected combined LIMIT and FETCH clauses while retaining either OFFSET ordering.
+Transit scalar writing still requires the reviewed Float32 wire-width correction, and PATCH endpoint review requires literal FALSE normalization and typed inversion context.
+Regex compilation timing, physical PATCH page grouping, registered Transit families and semantic object consumers remain active source work.
+
+The generic function admission pass is independently source-clear.
+Unregistered native function entries were removed, and strict null or unresolved-type specializations follow the pinned generic dispatch contract.
+The Transit Float32 writer correction is independently source-clear, including selected scalar, nested and map-key wire-width regression sources.
+PATCH endpoint literal FALSE and inversion error-context corrections are also independently source-clear.
+Raw PATCH page copying still requires the reviewed extra-column null-fill correction before its bounded review can close.
+
+The `_patch` scalar continuation source pass is independently clear, preserving discarded null-left payloads and demanded Struct controls.
+The raw PATCH page-copy correction is independently clear for extra-column null filling.
+LIKE_REGEX admission, SQL predicate lowering and compilation-before-input demand have independent bounded source clearance.
+Ordinary predicate precedence, ignored ESCAPE parsing, BETWEEN binding, regex batch metadata and remaining matcher cases still require source work.
+
+The runtime expression metadata pass and its captured-parameter repair are independently source-clear.
+Scalar controls use complete runtime input and outer schemas, while one immutable parameter owner retains selected cells with all declared vector alternatives.
+Prepared and nested-correlated CASE regressions retain the division error that nullable result boxing requires.
+The Transit identity visitor and default registered handlers are independently source-clear, including the reviewed fixed-width Long parser correction.
+The bounded scan, project, filter, table and sort page-grouping path is independently source-clear for production PATCH inputs.
+Remaining physical operators, projection column order, regex invocation metadata, registered Transit collections and semantic object consumers remain active source work.
+Ordinary SQL predicate precedence and common-value admission are independently source-clear.
+BETWEEN once-binding and symmetric syntax are written and under source review; compilation and all execution evidence remain pending.
+
+=== Expression metadata, registered objects and page execution
+
+BETWEEN once-binding and symmetric syntax are independently source-clear, including the reviewed generic comparison admission boundary.
+Period predicate precedence has independent source review against all ordered grammar pairs.
+The inherited unary-sign path was confirmed to use the correct multiplicative boundary; the earlier contrary finding was withdrawn.
+Complete POSITION needle parsing and its grammar/recursion regression source are independently source-reviewed.
+Regex replacement metadata retains host forms outside ordinary expression dependencies and prepares metadata at invocation boundaries, including empty pages.
+Its bounded review repaired eager rejection of an unreachable COALESCE source branch.
+Explicit UTF16 graph dispatch and unified replacement assembly have independent root source review; raw host-form execution, generated-local multiplicity and isolated-surrogate source carriers remain open.
+
+Registered Transit collections retain incremental map/set construction, cache identity, numeric equality and Java collection hashing.
+Their independent review repaired tagged-value hash multiplication.
+Registered temporal objects and XML legacy Date parsing have independent review, including empty range destructuring, ASCII duration case folding and cutover-day carry corrections.
+Registered Path and the shared Java UTF8 decoder have bounded root source review for the default UTF8 Unix and standard runtime-image providers.
+Other platform/provider environments and remaining registered objects are still required work.
+
+Projection, expansion, materialized bindings, mark selection and sort-key projection preserve complete semantic pages and have bounded independent source reviews.
+Cross join has independent source review of retained-left page pairing, empty pages and left-row/right-row traversal.
+Window columns complete over shared sorted input before publishing a result page.
+Its independent review repaired full-hash partition discrimination and upstream SQL order-expression projection; the projection repair also has a separate root review.
+Aggregate page/spec processing has bounded independent source review, including complete FILTER and DISTINCT masks, full-hash grouping, global array ordering and complete-column finalization.
+Ordinary hash join and shared Mark spill scheduling have independent bounded source reviews.
+The reviews repaired theta comparator schemas and distinguished absent Values input from genuine empty semantic callbacks.
+Deeper Sort algorithms, aggregate primitive factory schedules and remaining invocation boundaries stay on the source-completeness list.
+All regression sources remain unexecuted, the source gate remains false, and Phase 2 has not begun.
+
+The initial pure host-form compiler and evaluator have bounded root source review for lexical controls, strict string functions and whole-program admission before binding execution.
+General namespace resolution, interop/effects, additional object families, functions/macros and emitted-local specialization remain required source work.
+POSITION delimiter review found exponential speculative reparsing in nested expressions; independently reviewed cumulative work admission now bounds nested retries and token snapshots, with sticky exhaustion preserved through speculative parsing.
+The parser repair and its regression sources remain unexecuted.
+
+Transit Throwable structural equality, normalized exception data, retained causes and Java object hashing are independently source-reviewed.
+ExceptionInfo identity and the corresponding JSON/MessagePack regression sources remain unexecuted.

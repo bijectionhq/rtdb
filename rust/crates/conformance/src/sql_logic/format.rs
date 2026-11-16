@@ -1,5 +1,4 @@
 use bigdecimal::BigDecimal;
-use chrono::Timelike;
 use num_bigint::BigInt;
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
 use std::{cmp::Ordering, str::FromStr};
@@ -121,8 +120,8 @@ fn text(value: &Value, nested: bool) -> Result<String> {
         }
         Value::Keyword(value) => format!(":{}", value.as_str()),
         Value::Uuid(value) => uuid::Uuid::from_bytes(*value).to_string(), Value::Uri(value) => value.clone(),
-        Value::DateDay(day) => chrono::DateTime::from_timestamp(i64::from(*day) * 86_400, 0).ok_or_else(unsupported)?.format("%Y-%m-%d").to_string(),
-        Value::DateMilli(value) => chrono::DateTime::from_timestamp((*value / 86_400_000) * 86_400, 0).ok_or_else(unsupported)?.format("%Y-%m-%d").to_string(),
+        Value::DateDay(day) => rtdb_types::CivilDate::from_epoch_day(i64::from(*day))?.to_string(),
+        Value::DateMilli(value) => rtdb_types::CivilDate::from_epoch_day(value / 86_400_000)?.to_string(),
         Value::Time { value, unit, .. } => {
             let nanos = nanos(*value, *unit);
             if !(0..86_400_000_000_000).contains(&nanos) { return Err(unsupported()); }
@@ -130,12 +129,14 @@ fn text(value: &Value, nested: bool) -> Result<String> {
         }
         Value::Timestamp { value, unit, timezone } => {
             let nanos = nanos(*value, *unit);
-            let instant = chrono::DateTime::from_timestamp(i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| unsupported())?, nanos.rem_euclid(1_000_000_000) as u32).ok_or_else(unsupported)?;
-            let local = format!("{}T{}", instant.format("%Y-%m-%d"), local_time(instant.num_seconds_from_midnight(), instant.nanosecond()));
-            match timezone.as_deref() {
-                Some("UTC") => format!("{local}Z[UTC]"), Some("Z") => format!("{local}Z"),
-                None => local,
-                _ => return Err(unsupported()),
+            let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| unsupported())?;
+            let zone = timezone.as_deref().map(rtdb_types::ZoneId::parse).transpose()?;
+            let offset = zone.map(|zone| zone.offset_at(seconds)).transpose()?;
+            let local = rtdb_types::CivilDateTime::from_epoch_nanos(nanos + i128::from(offset.map_or(0, |offset| offset.seconds())) * 1_000_000_000)?;
+            let text = format!("{}T{}", local.date(), local_time(local.second_of_day(), local.nano()));
+            match (zone, offset) {
+                (Some(zone), Some(offset)) => { let name = zone.to_string(); format!("{text}{offset}{}", if name == offset.to_string() { String::new() } else { format!("[{name}]") }) },
+                _ => text,
             }
         }
         Value::List(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| text(value, true)).collect::<Result<Vec<_>>>()?.join(" ")),
@@ -236,5 +237,12 @@ mod tests {
         assert_eq!(cell(b'T', &Value::F32(0.1)).unwrap(), "0.1");
         assert_eq!(cell(b'T', &Value::Timestamp { value: 0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap(), "1970-01-01T00:00Z[UTC]");
         assert_eq!(cell(b'T', &Value::Time { value: 123_000_000, unit: TimeUnit::Nanosecond, bit_width: 64 }).unwrap(), "00:00:00.123");
+    }
+    #[test] fn temporal_formatter_preserves_wide_dates_and_future_region_rules() {
+        let day = rtdb_types::CivilDate::from_ymd(300_000,7,1).unwrap().epoch_day();
+        assert_eq!(cell(b'T',&Value::DateDay(i32::MAX)).unwrap(),rtdb_types::CivilDate::from_epoch_day(i64::from(i32::MAX)).unwrap().to_string());
+        let timestamp = Value::Timestamp { value: day * 86_400 - 7200,unit: TimeUnit::Second,timezone: Some("Europe/Paris".into()) };
+        assert_eq!(cell(b'T',&timestamp).unwrap(),"+300000-07-01T00:00+02:00[Europe/Paris]");
+        assert!(cell(b'T',&Value::List(vec![timestamp])).is_err());
     }
 }

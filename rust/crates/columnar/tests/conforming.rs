@@ -7,6 +7,29 @@ use rtdb_columnar::{MemoryBudget, OwnedBatch, conform_batch, copy_array, read_va
 use rtdb_types::{DecimalValue, LogicalType, ScalarType, Value};
 
 #[test]
+fn signed_execution_buffers_retain_bits_in_unsigned_declared_fields() {
+    let memory = MemoryBudget::new(1 << 22);
+    for (signed, unsigned, value, physical) in [
+        (ScalarType::I8, ScalarType::U8, Value::I8(-1), Value::U8(u8::MAX)),
+        (ScalarType::I16, ScalarType::U16, Value::I16(i16::MIN), Value::U16(1 << 15)),
+        (ScalarType::I32, ScalarType::U32, Value::I32(-1), Value::U32(u32::MAX)),
+        (ScalarType::I64, ScalarType::U64, Value::I64(i64::MIN), Value::U64(1 << 63)),
+    ] {
+        let source_type = LogicalType::list(LogicalType::Scalar(signed).maybe());
+        let target_type = LogicalType::list(LogicalType::Scalar(unsigned).maybe());
+        let source = RecordBatch::try_new(Arc::new(Schema::new(vec![to_field("v", &source_type).unwrap()])), vec![copy_array(&source_type, &[Value::List(vec![value.clone(), Value::Null])]).unwrap()]).unwrap();
+        let target = Schema::new(vec![to_field("v", &target_type).unwrap()]);
+        let page = conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
+        assert_eq!(page.declared_schema().as_ref(), &target);
+        assert_eq!(page.batch().schema().as_ref(), &target);
+        assert_eq!(read_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![physical, Value::Null]));
+        assert_eq!(rtdb_columnar::read_execution_value(target.field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::List(vec![value, Value::Null]));
+        drop(page);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn conforming_unloader_promotes_present_nulls_without_changing_declared_fields() {
     let memory = MemoryBudget::new(1 << 22);
     let source = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)])), vec![Arc::new(NullArray::new(2))]).unwrap();

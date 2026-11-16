@@ -3,13 +3,19 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, Binder, C
 use rtdb_types::{ListKind, LogicalType, Result, ScalarType, TimeUnit, Value};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct CompileOptions {
     /// Indexed by external argument position; absent positions remain unknown until argument rebinding.
     pub parameter_types: Vec<LogicalType>,
     /// Maps a top-level function's parameters to external argument positions, as required by SQL-inline XTQL.
     pub parameter_indices: Option<Vec<usize>>,
     pub named_parameters: BTreeMap<String, (usize, LogicalType)>,
+    /// Execution-zone metadata for `cast-tstz`; defaults to UTC.
+    pub default_timezone: String,
+}
+
+impl Default for CompileOptions {
+    fn default() -> Self { Self { parameter_types: Vec::new(), parameter_indices: None, named_parameters: BTreeMap::new(), default_timezone: "UTC".into() } }
 }
 
 /// Binds all sources against one retained catalog and emits a native query plan.
@@ -21,7 +27,7 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
     }
     let mut binder = Binder::default();
-    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter };
+    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone };
     let mut parameters = BTreeMap::new();
     for (name, (index, data_type)) in &options.named_parameters {
         parameters.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
@@ -39,14 +45,15 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
         body.as_ref()
     } else { &query };
     let plan = compiler.query(body, &parameters)?;
-    Ok(PreparedStatement { statement: Statement::Query(plan.relation), parameter_types: compiler.binder.parameter_types().clone(), source: source.into() })
+    Ok(PreparedStatement { statement: Statement::Query(plan.relation), parameter_types: compiler.binder.parameter_types().clone(), source: source.into(), notices: Vec::new(), settings: Default::default() })
 }
 
 /// Binds an embedded query using the caller's column identities and apply-parameter allocator.
 /// Arguments pair external parameter positions with their types and must match a top-level function's arity.
 /// Queries without a top-level function ignore the arguments.
 /// The allocator starts above every parameter owned by the containing statement and advances for nested applies.
-pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)]) -> Result<Arc<Relation>> {
+/// `timezone` binds session-dependent cast result metadata to the containing statement's execution zone.
+pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str) -> Result<Arc<Relation>> {
     let mut parameters = BTreeMap::new();
     let body = if let Query::Function { parameters: names, body } = query {
         if names.len() != arguments.len() { return Err(error("xtql/fn-arity-error", format!("XTQL fn expects {} argument(s), got {}", names.len(), arguments.len()))); }
@@ -56,7 +63,7 @@ pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, 
         }
         body.as_ref()
     } else { query };
-    let mut compiler = Compiler { catalog, binder, next_parameter };
+    let mut compiler = Compiler { catalog, binder, next_parameter, timezone };
     Ok(compiler.query(body, &parameters)?.relation)
 }
 
@@ -66,6 +73,7 @@ struct Compiler<'a, 'b> {
     catalog: &'a dyn Catalog,
     binder: &'b mut Binder,
     next_parameter: &'b mut usize,
+    timezone: &'a str,
 }
 
 struct Bound { relation: Arc<Relation>, variables: BTreeMap<String, Field> }
@@ -140,7 +148,7 @@ impl Compiler<'_, '_> {
         let valid_time = self.temporal(from.valid_time.as_ref(), &mut temporal_scope, parameters)?;
         let system_time = self.temporal(from.system_time.as_ref(), &mut temporal_scope, parameters)?;
         if !matches!(temporal_scope.relation.node(), RelationNode::Values { .. }) { return Err(error("xtql/invalid-expression", "Temporal scan filters cannot contain relational subqueries")); }
-        let scan = Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time: false, iids: None })?;
+        let scan = Relation::scan(Scan { table, columns, valid_time, system_time, clamp_valid_time: false, iids: None, predicates: Vec::new() })?;
         let mut bound = Bound::from_relation(scan);
         let mut period_projections = Vec::new();
         for (period, lower_name, upper_name) in [("_valid_time", "_valid_from", "_valid_to"), ("_system_time", "_system_from", "_system_to")] {
@@ -406,14 +414,19 @@ impl Compiler<'_, '_> {
     fn expr(&mut self, expr: &Expr, bound: &mut Bound, parameters: &Parameters) -> Result<PExpr> {
         Ok(match expr {
             Expr::Literal(value) => PExpr::Literal(value.clone()),
-            Expr::Cast { expr, target } => PExpr::Cast { expr: Box::new(self.expr(expr, bound, parameters)?), target: target.clone() },
+            Expr::RegexReplace { source,recipe } => PExpr::regex_replace(self.expr(source,bound,parameters)?,recipe.clone()),
+            Expr::Cast { expr, target } => {
+                let expr = self.expr(expr, bound, parameters)?;
+                target.validate_source(&expr.data_type())?;
+                PExpr::Cast { expr: Box::new(expr), target: target.bind_timezone(self.timezone) }
+            }
             Expr::Variable(name) => parameters.get(&normal(name)).cloned().or_else(|| bound.variables.get(&normal(name)).map(Field::expression))
                 .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
             Expr::LogicVariable(name) => bound.variables.get(&normal(name)).map(Field::expression)
                 .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
             Expr::Get { object, field } => {
                 let object = self.expr(object, bound, parameters)?;
-                let name = normal(field);
+                let name = field.clone();
                 let data_type = field_type(&object.data_type(), &name);
                 PExpr::Field { expr: Box::new(object), name, data_type }
             }
@@ -427,7 +440,7 @@ impl Compiler<'_, '_> {
             Expr::Call { function, arguments } => {
                 if aggregate_function(function).is_some() { return Err(error("xtql/invalid-expression", "Aggregate functions require an aggregate clause")); }
                 let args = arguments.iter().map(|value| self.expr(value, bound, parameters)).collect::<Result<Vec<_>>>()?;
-                scalar_call(function, args)?
+                rtdb_plan::bind_clock_timezone(scalar_call(function, args)?,Some(self.timezone))?
             }
             Expr::Subquery { kind, query, arguments } => {
                 let (dependent, arguments) = self.subquery(query, arguments.as_deref(), bound, parameters)?;
@@ -464,7 +477,7 @@ impl Compiler<'_, '_> {
         }
         if !groups.is_empty() {
             for aggregate in &mut aggregates {
-                if aggregate.function == AggregateFunction::ArrayAgg {
+                if aggregate.function.canonical() == AggregateFunction::ArrayAgg {
                     aggregate.field.data_type = LogicalType::list(aggregate.argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Null));
                 }
             }
@@ -481,15 +494,26 @@ impl Compiler<'_, '_> {
             Expr::Call { function, arguments } if aggregate_function(function).is_some() => {
                 let (function, distinct) = aggregate_function(function).ok_or_else(|| error("xtql/invalid-expression", "Unknown aggregate"))?;
                 if arguments.iter().any(contains_aggregate) { return Err(error("xtql/invalid-expression", "Aggregate functions cannot be nested")); }
-                let argument = if function == AggregateFunction::CountStar {
+                let argument = if function.canonical() == AggregateFunction::CountStar {
                     if !arguments.is_empty() { return Err(error("xtql/invalid-expression", "row-count takes no arguments")); }
                     None
                 } else {
                     if arguments.len() != 1 { return Err(error("xtql/invalid-expression", "Aggregate requires one argument")); }
                     Some(self.expr(&arguments[0], bound, parameters)?)
                 };
+                let argument = match argument {
+                    Some(expr) if !matches!(expr, PExpr::Column { .. }) => {
+                        let field = self.binder.field(format!("xt$aggregate$input${}", aggregates.len()), None, expr.data_type())?;
+                        let mut projections = bound.relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect::<Vec<_>>();
+                        projections.push(NamedExpr { field: field.clone(), expr });
+                        bound.relation = Arc::new(Arc::clone(&bound.relation).project(projections)?);
+                        Some(field.expression())
+                    }
+                    argument => argument,
+                };
                 let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
-                let data_type = match function {
+                let data_type = match function.canonical() {
+                    AggregateFunction::Alias(_) | AggregateFunction::Named(_) => unreachable!(),
                     AggregateFunction::Count | AggregateFunction::CountStar => LogicalType::Scalar(ScalarType::I64),
                     AggregateFunction::Average => match LogicalType::least_upper_bound(&[input_type.clone()]) {
                         Some(data_type @ LogicalType::Scalar(ScalarType::Duration(_))) => data_type.maybe(),
@@ -498,6 +522,8 @@ impl Compiler<'_, '_> {
                     AggregateFunction::VariancePopulation | AggregateFunction::VarianceSample | AggregateFunction::StddevPopulation | AggregateFunction::StddevSample => LogicalType::Scalar(ScalarType::F64).maybe(),
                     AggregateFunction::Every | AggregateFunction::Any => LogicalType::Scalar(ScalarType::Bool).maybe(),
                     AggregateFunction::ArrayAgg => LogicalType::list(input_type).maybe(),
+                    AggregateFunction::VecAgg => LogicalType::list(input_type),
+                    AggregateFunction::Percentile { .. } => return Err(error("xtql/invalid-expression", "Ordered-set aggregates require the SQL WITHIN GROUP syntax")),
                     AggregateFunction::Sum => LogicalType::least_upper_bound(&[input_type.clone()]).ok_or_else(|| error("xtql/invalid-expression", "Cannot compute SUM over the input type"))?.maybe(),
                     AggregateFunction::Min | AggregateFunction::Max => input_type.maybe(),
                 };
@@ -507,6 +533,7 @@ impl Compiler<'_, '_> {
                 Expr::Variable(name)
             }
             Expr::Call { function, arguments } => Expr::Call { function: function.clone(), arguments: arguments.iter().map(|expr| self.rewrite_aggregates(expr, bound, parameters, aggregates)).collect::<Result<_>>()? },
+            Expr::RegexReplace { source,recipe } => Expr::RegexReplace { source: Box::new(self.rewrite_aggregates(source,bound,parameters,aggregates)?),recipe: recipe.clone() },
             Expr::Cast { expr, target } => Expr::Cast { expr: Box::new(self.rewrite_aggregates(expr, bound, parameters, aggregates)?), target: target.clone() },
             Expr::Get { object, field } => Expr::Get { object: Box::new(self.rewrite_aggregates(object, bound, parameters, aggregates)?), field: field.clone() },
             Expr::List(values) => Expr::List(values.iter().map(|expr| self.rewrite_aggregates(expr, bound, parameters, aggregates)).collect::<Result<_>>()?),
@@ -535,8 +562,7 @@ fn source_type(table: &TableBinding, name: &str) -> LogicalType {
     }
 }
 fn field_type(logical: &LogicalType, name: &str) -> LogicalType {
-    let types: Vec<_> = logical.legs().iter().map(|leg| match leg { LogicalType::Struct(fields) => fields.get(name).cloned().unwrap_or(LogicalType::Null), _ => LogicalType::Null }).collect();
-    LogicalType::join_all(&types)
+    rtdb_plan::field_type(logical, name)
 }
 fn list_element(logical: &LogicalType) -> LogicalType {
     let types: Vec<_> = logical.legs().iter().filter_map(|leg| match leg { LogicalType::List { element, .. } => Some(element.as_ref().clone()), _ => None }).collect();
@@ -568,6 +594,10 @@ fn scalar_call(name: &str, args: Vec<PExpr>) -> Result<PExpr> {
         let op = match name { "not" => UnaryOp::Not, "nil?" | "null?" => UnaryOp::IsNull, "true?" => UnaryOp::IsTrue, _ => UnaryOp::IsFalse };
         return Ok(PExpr::unary(op, args[0].clone()));
     }
+    if matches!(name,"between" | "between-symmetric" | "between_symmetric") {
+        let [operand,low,high]: [PExpr;3] = args.try_into().map_err(|_|error("xtql/malformed-call","BETWEEN requires three arguments"))?;
+        return Ok(PExpr::between(operand,low,high,name != "between"));
+    }
     if name == "coalesce" { return Ok(PExpr::Coalesce(args)); }
     if name == "if" {
         if args.len() != 3 { return Err(error("xtql/malformed-call", "if requires condition, consequent, and alternative")); }
@@ -583,6 +613,7 @@ fn required_expr(expr: &Expr, parameters: &Parameters, result: &mut BTreeSet<Str
         Expr::LogicVariable(name) => { result.insert(normal(name)); }
         Expr::Call { arguments, .. } | Expr::List(arguments) | Expr::Set(arguments) => for argument in arguments { required_expr(argument, parameters, result); },
         Expr::Get { object, .. } => required_expr(object, parameters, result),
+        Expr::RegexReplace { source,.. } => required_expr(source,parameters,result),
         Expr::Cast { expr, .. } => required_expr(expr, parameters, result),
         Expr::Map(values) => for (_, value) in values { required_expr(value, parameters, result); },
         Expr::Subquery { query, arguments, .. } => required_arguments(query, arguments.as_deref(), parameters, result),
@@ -607,23 +638,15 @@ fn required_clause(clause: &Clause, parameters: &Parameters) -> BTreeSet<String>
     result
 }
 fn aggregate_function(name: &str) -> Option<(AggregateFunction, bool)> {
-    let name = normal(name);
-    let distinct = name.ends_with("_distinct");
-    let base = name.strip_suffix("_distinct").or_else(|| name.strip_suffix("_all")).unwrap_or(&name);
-    let function = match base {
-        "row_count" => AggregateFunction::CountStar, "count" => AggregateFunction::Count, "sum" => AggregateFunction::Sum,
-        "avg" | "average" => AggregateFunction::Average, "min" => AggregateFunction::Min, "max" => AggregateFunction::Max,
-        "array_agg" => AggregateFunction::ArrayAgg, "every" | "bool_and" => AggregateFunction::Every,
-        "any" | "bool_or" => AggregateFunction::Any, "var_pop" => AggregateFunction::VariancePopulation,
-        "var_samp" => AggregateFunction::VarianceSample, "stddev_pop" => AggregateFunction::StddevPopulation,
-        "stddev_samp" => AggregateFunction::StddevSample, _ => return None,
-    };
-    Some((function, distinct))
+    let name = rtdb_plan::AggregateName::new(name).ok()?;
+    let distinct = name.distinct();
+    Some((AggregateFunction::Named(name), distinct))
 }
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Call { function, arguments } => aggregate_function(function).is_some() || arguments.iter().any(contains_aggregate),
         Expr::Get { object, .. } => contains_aggregate(object),
+        Expr::RegexReplace { source,.. } => contains_aggregate(source),
         Expr::Cast { expr, .. } => contains_aggregate(expr),
         Expr::List(values) | Expr::Set(values) => values.iter().any(contains_aggregate),
         Expr::Map(values) => values.iter().any(|(_, value)| contains_aggregate(value)),

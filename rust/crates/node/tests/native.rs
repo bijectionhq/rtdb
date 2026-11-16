@@ -78,6 +78,31 @@ fn put(node: &Node, id: i64, value: i64) -> TxOp {
 }
 
 #[tokio::test]
+async fn read_transaction_pinned_before_ingestion_retains_a_null_partition_time() {
+    let (node, driver) = running(options(), services()).await;
+    let mut reader = node.session("xtdb", Arc::new(Authority)).unwrap();
+    reader.state_mut().set_auto_commit(false).await.unwrap();
+    assert_eq!(rows(reader.query_sql("SELECT 1", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+    let basis = reader.state_mut().read_basis().await.unwrap();
+    assert_eq!(basis.snapshot.databases["xtdb"], vec![None]);
+    let mut writer = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(writer.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    assert_eq!(rows(reader.query_sql("SELECT value FROM docs FOR ALL VALID_TIME", vec![]).await.unwrap()).await, [vec![Value::I64(10)]]);
+    assert_eq!(reader.state_mut().read_basis().await.unwrap().snapshot, basis.snapshot);
+    reader.state_mut().rollback_tx().unwrap();
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
+async fn native_sql_and_xtql_admit_unsigned_external_parameters_before_binding() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert_eq!(rows(session.query_sql("SELECT STR(?) AS v", vec![Value::U64(u64::MAX)]).await.unwrap()).await, [vec![Value::Utf8("-1".into())]]);
+    assert_eq!(rows(session.query_xtql("#(rel [{:v %}] [v])", vec![Value::U8(u8::MAX)]).await.unwrap()).await, [vec![Value::I8(-1)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn disabled_indexing_and_read_only_nodes_do_not_resolve_external_source_factories() {
     for read_only in [false, true] {
         let mut config = options();
@@ -155,6 +180,24 @@ async fn shared_show_controls_pin_snapshot_reads_and_keep_generic_show_unresolve
     assert!(!session.state().cancellation().is_cancelled());
     stop(&node, driver).await;
 }
+#[tokio::test(flavor = "current_thread")]
+async fn cancelled_sleep_in_begin_options_does_not_publish_a_partial_transaction() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("BEGIN READ WRITE WITH (METADATA PG_SLEEP(60.0))", &Default::default()).unwrap().unwrap();
+    let (result, ()) = tokio::join!(session.execute_control(&statement, &[], &token), async { tokio::task::yield_now().await; token.cancel(); });
+    assert!(result.is_err());
+    assert_eq!(session.state().status(), TransactionStatus::Idle);
+    assert!(!session.state().cancellation().is_cancelled());
+    let token = session.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("BEGIN", &Default::default()).unwrap().unwrap();
+    drop(session.execute_control(&statement, &[], &token).await.unwrap());
+    assert_eq!(session.state().status(), TransactionStatus::Pending);
+    session.state_mut().rollback_tx().unwrap();
+    stop(&node, driver).await;
+}
+
 async fn rows(mut cursor: QueryCursor) -> Vec<Vec<Value>> {
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
@@ -182,6 +225,44 @@ async fn native_sessions_execute_data_dependent_writes_and_keep_historical_reads
         assert_eq!(rows(session.query_sql("SELECT value FROM docs FOR ALL SYSTEM_TIME WHERE _id = 1 ORDER BY _system_from", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)], vec![Value::I64(15)]]);
         stop(&node, driver).await;
     }).await.unwrap();
+}
+
+#[tokio::test]
+async fn control_result_retains_allocation_during_pending_write_and_releases_on_drop() {
+    use tokio::io::AsyncWriteExt;
+    let mut config = options(); config.replication.enabled = false;
+    let (node, driver) = running(config, services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let statement = rtdb_plan::ControlStatement::Prepare { name: "large".into(), source: "x".repeat(100_000) };
+    let cancellation = session.state().cancellation().child_token();
+    let result = session.execute_control(&statement, &[], &cancellation).await.unwrap();
+    let memory = Arc::clone(node.memory());
+    let (mut writer, _reader) = tokio::io::duplex(64);
+    let mut write = Box::pin(async move {
+        let ControlResult::Prepare { source, allocation, .. } = result else { panic!("prepare") };
+        writer.write_all(source.as_bytes()).await.unwrap();
+        drop(source); drop(allocation);
+    });
+    assert!(write.as_mut().now_or_never().is_none());
+    drop(session); stop(&node, driver).await; drop(node);
+    assert!(memory.used_bytes() >= 100_000);
+    drop(write);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn control_and_resolver_text_casts_share_captured_relation_names() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let statement = rtdb_sql::parse_control("SET application_name = CAST(CAST('pg_class' AS REGCLASS) AS TEXT)", &Default::default()).unwrap().unwrap();
+    drop(session.execute_control(&statement, &[], &token).await.unwrap());
+    assert_eq!(session.state().parameter("application_name"), Some("pg_class"));
+    let statement = TxOp::Sql { sql: "INSERT INTO docs (_id,value) VALUES (1,CAST(CAST('pg_class' AS REGCLASS) AS TEXT))".into(), args: None };
+    let result = session.state_mut().execute_tx(vec![statement], AutonomousTxOptions::default()).await.unwrap();
+    assert!(result.committed(), "{:?}", result.error());
+    assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, [vec![Value::Utf8("pg_class".into())]]);
+    drop(session); stop(&node, driver).await;
 }
 
 #[tokio::test]
@@ -307,7 +388,7 @@ struct UnopenedStartupSourceFactory;
 #[async_trait]
 impl ExternalSourceFactory for UnopenedStartupSourceFactory {
     fn validate(&self, _: &prost_types::Any) -> Result<()> { Ok(()) }
-    async fn open(&self, _: &prost_types::Any, _: &str) -> Result<Box<dyn ExternalSource>> { panic!("source opened before persisted log validation"); }
+    async fn open(&self, _: &prost_types::Any, _: &str, _: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>> { panic!("source opened before persisted log validation"); }
 }
 
 struct RecoveryCatalogStorage {
@@ -891,7 +972,7 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
             let request = {
                 let node = node.clone(); let identity = Arc::clone(&identity); let cancellation = cancellation.clone();
                 tokio::spawn(async move {
-                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, snapshot_time: None, current_time: node.now(), timezone: "UTC".into() };
+                    let basis = QueryBasis { snapshot: node.snapshot_basis()?, snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
                     node.query_context("xtdb", &basis, identity.as_ref(), &cancellation).await
                 })
             };
@@ -908,10 +989,10 @@ async fn caller_or_node_cancellation_drops_inflight_identity_refresh_before_quer
 async fn node_shutdown_cancels_direct_query_contexts_with_independent_caller_tokens() {
     let (node, driver) = running(options(), services()).await;
     let cancellation = CancellationToken::new();
-    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), snapshot_time: None, current_time: node.now(), timezone: "UTC".into() };
+    let basis = QueryBasis { snapshot: node.snapshot_basis().unwrap(), snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
     let context = node.query_context("xtdb", &basis, &Authority, &cancellation).await.unwrap();
     let prepared = PreparedSql::prepare("SELECT 1", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let mut cursor = prepared.open_query(context, Vec::new()).unwrap();
+    let mut cursor = prepared.open_query(context, Vec::new()).await.unwrap();
     stop(&node, driver).await;
     assert!(!cancellation.is_cancelled());
     assert_eq!(cursor.next_batch().await.unwrap_err().category, rtdb_types::AnomalyCategory::Interrupted);
@@ -950,4 +1031,110 @@ async fn zero_compactor_threads_disable_compaction_and_shared_memory_covers_sess
     assert_eq!(memory.used_bytes(), baseline);
     let task = tokio::spawn(driver.run());
     stop(&node, task).await;
+}
+
+struct SourceCaptureGate { started: tokio::sync::oneshot::Sender<()>, release: std::sync::mpsc::Receiver<()> }
+struct HeldSourceCapture {
+    _charge: Arc<rtdb_columnar::MemoryReservation>,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for HeldSourceCapture { fn drop(&mut self) { self.dropped.store(true, Ordering::SeqCst); } }
+struct HeldSourceFactory {
+    gate: std::sync::Mutex<Option<SourceCaptureGate>>,
+    opened: tokio::sync::mpsc::UnboundedSender<Arc<rtdb_storage::IoRegion>>,
+    memory: Arc<rtdb_columnar::MemoryBudget>,
+    dropped: Arc<AtomicBool>,
+}
+struct HeldSource {
+    gate: Option<SourceCaptureGate>,
+    io: Arc<rtdb_storage::IoRegion>,
+    memory: Arc<rtdb_columnar::MemoryBudget>,
+    dropped: Arc<AtomicBool>,
+}
+#[async_trait]
+impl ExternalSourceFactory for HeldSourceFactory {
+    fn validate(&self, _: &prost_types::Any) -> Result<()> { Ok(()) }
+    async fn open(&self, _: &prost_types::Any, _: &str, io: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>> {
+        self.opened.send(Arc::clone(&io)).unwrap();
+        Ok(Box::new(HeldSource { gate: self.gate.lock().unwrap().take(), io, memory: Arc::clone(&self.memory), dropped: Arc::clone(&self.dropped) }))
+    }
+}
+#[async_trait]
+impl ExternalSource for HeldSource {
+    async fn assign(&mut self) -> Result<Box<dyn ExternalSourceDriver>> {
+        let Some(gate) = self.gate.take() else { return std::future::pending().await; };
+        let charge = self.memory.reserve(4096)?;
+        let dropped = Arc::clone(&self.dropped);
+        let _capture = self.io.run_blocking(move || {
+            gate.started.send(()).unwrap();
+            gate.release.recv().unwrap();
+            Ok(HeldSourceCapture { _charge: charge, dropped })
+        }).await.map_err(Anomaly::from)?;
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn cancelled_source_assignment_io_drains_before_database_name_reuse_or_node_shutdown() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for shutdown in [false, true] {
+            let (entered, started) = tokio::sync::oneshot::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let (opened, mut regions) = tokio::sync::mpsc::unbounded_channel();
+            let memory = rtdb_columnar::MemoryBudget::new(4096);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut services = services();
+            services.external_sources.insert("test.HeldSource".into(), Arc::new(HeldSourceFactory {
+                gate: std::sync::Mutex::new(Some(SourceCaptureGate { started: entered, release: held })), opened,
+                memory: Arc::clone(&memory), dropped: Arc::clone(&dropped),
+            }));
+            let (node, driver) = running(options(), services).await;
+            let token = CancellationToken::new();
+            let configuration = DatabaseConfig { external_source: Some(prost_types::Any { type_url: "proto.xtdb.com/test.HeldSource".into(), value: Vec::new() }), ..Default::default() };
+            assert!(node.attach_database("other".into(), configuration, &Authority, &token).await.unwrap().committed());
+            let io = regions.recv().await.unwrap();
+            started.await.unwrap();
+            assert_eq!(memory.used_bytes(), 4096);
+            if shutdown { node.shutdown(); }
+            else { assert!(node.detach_database("other".into(), &Authority, &token).await.unwrap().committed()); }
+            while !matches!(io.run_blocking(|| Ok(())).await, Err(rtdb_storage::Error::Closed(_))) { tokio::task::yield_now().await; }
+            assert!(!dropped.load(Ordering::SeqCst));
+            assert_eq!(memory.used_bytes(), 4096);
+            assert!(!driver.is_finished());
+            if !shutdown {
+                assert!(node.catalog().database("other").is_err());
+                assert!(!node.catalog().secondary_databases().contains_key("other"));
+                assert_eq!(node.catalog().check_attach("other", &DatabaseConfig::default()).unwrap_err().code, "xtdb/db-being-detached");
+                let mut primary = node.session("xtdb", Arc::new(Authority)).unwrap();
+                assert_eq!(rows(primary.query_sql("SELECT 1", vec![]).await.unwrap()).await, [vec![Value::I64(1)]]);
+            }
+            release.send(()).unwrap();
+            if shutdown { driver.await.unwrap().unwrap(); }
+            else {
+                while node.catalog().check_attach("other", &DatabaseConfig::default()).is_err() { tokio::task::yield_now().await; }
+                assert!(node.attach_database("other".into(), DatabaseConfig::default(), &Authority, &token).await.unwrap().committed());
+                stop(&node, driver).await;
+            }
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(memory.used_bytes(), 0);
+            assert!(matches!(io.run_blocking(|| Ok(())).await, Err(rtdb_storage::Error::Closed(_))));
+        }
+    }).await.unwrap();
+}
+
+#[tokio::test]
+async fn source_log_uri_values_render_as_nfc_ascii_without_changing_stored_text() {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        let (node, driver) = running(options(), services()).await;
+        let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+        let original = "HTTP://host/e\u{301}";
+        let operation = TxOp::PutDocs { table: TableRef::new("public","docs"), documents: Documents::new(vec![BTreeMap::from([
+            ("_id".into(),Value::I64(1)),("uri".into(),Value::Uri(original.into())),
+        ])],node.memory()).unwrap(),valid_from: None,valid_to: None };
+        session.state_mut().execute_operation(operation).await.unwrap();
+        let messages = rows(session.query_sql("SELECT tx_ops FROM xt.source_log_msgs WHERE msg_id BETWEEN 0 AND 100",vec![]).await.unwrap()).await;
+        assert!(messages.iter().any(|row| matches!(&row[0],Value::Utf8(text) if text.contains("#xt/uri \"HTTP://host/%C3%A9\""))));
+        assert_eq!(rows(session.query_sql("SELECT CAST(uri AS VARCHAR) FROM docs",vec![]).await.unwrap()).await,[vec![Value::Utf8(original.into())]]);
+        stop(&node,driver).await;
+    }).await.unwrap();
 }

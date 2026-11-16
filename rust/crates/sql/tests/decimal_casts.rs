@@ -17,7 +17,7 @@ async fn query(sql: &str) -> Result<(LogicalType, Value)> {
     let context = context();
     let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default())?.statement else { panic!("expected query") };
     let data_type = relation.schema().fields()[0].data_type.clone();
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, Vec::new())?;
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, Vec::new()).await?;
     let batch = cursor.next_batch().await?.unwrap();
     assert_eq!(batch.batch().num_rows(), 1);
     let value = read_value(&batch.batch().schema().fields()[0], batch.batch().column(0).as_ref(), 0)?;
@@ -78,7 +78,7 @@ async fn unqualified_decimal_cast_preserves_mixed_decimal_union_metadata() {
     let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("Expected query") };
     let expected = [decimal(125, 4, 2, 128), decimal(1234, 5, 3, 128)];
     assert_eq!(relation.schema().fields()[0].data_type, LogicalType::join_all(&expected.iter().map(Value::logical_type).collect::<Vec<_>>()));
-    let mut cursor = PreparedQuery::new(relation).unwrap().execute(context, Vec::new()).unwrap();
+    let mut cursor = PreparedQuery::new(relation).unwrap().execute(context, Vec::new()).await.unwrap();
     let mut actual = Vec::new();
     while let Some(page) = cursor.next_batch().await.unwrap() {
         for row in 0..page.batch().num_rows() { actual.push(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), row).unwrap()); }

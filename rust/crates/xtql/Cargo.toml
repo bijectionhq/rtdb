@@ -21,6 +21,8 @@ num-traits.workspace = true
 
 [dev-dependencies]
 rtdb-expr.workspace = true
+rtdb-format.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

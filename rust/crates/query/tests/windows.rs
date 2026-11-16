@@ -30,7 +30,7 @@ async fn multiple_window_outputs_share_sorted_input_with_nonreflexive_group_keys
     let null_list = V::List(vec![V::Null]);
     let rows = vec![vec![V::Null,V::I64(3)],vec![null_list.clone(),V::I64(5)],vec![V::Null,V::I64(1)],vec![null_list.clone(),V::I64(2)]];
     let context = context(1 << 24);
-    let mut cursor = PreparedQuery::new(relation(rows,true)).unwrap().execute(Arc::clone(&context),vec![]).unwrap();
+    let mut cursor = PreparedQuery::new(relation(rows,true)).unwrap().execute(Arc::clone(&context),vec![]).await.unwrap();
     let mut actual = Vec::new();
     while let Some(page) = cursor.next_batch().await.unwrap() {
         let batch = page.batch();
@@ -53,9 +53,10 @@ async fn cancelling_or_dropping_window_cursor_releases_spills_while_output_page_
     for cancel in [false,true] {
         let context = context(1 << 24);
         let prepared = PreparedQuery::new(relation((0..32).rev().map(|n| vec![V::I64(0),V::I64(n)]).collect(),false)).unwrap();
-        let mut cursor = prepared.execute(Arc::clone(&context),vec![]).unwrap();
+        let mut cursor = prepared.execute(Arc::clone(&context),vec![]).await.unwrap();
         let page = cursor.next_batch().await.unwrap().unwrap();
-        assert!(context.spill_bytes() > 0);
+        assert!(context.spill_peak_bytes() > 0);
+        assert_eq!(context.spill_bytes(),0);
         if cancel { cursor.cancel(); assert!(cursor.next_batch().await.is_err()); }
         drop(cursor);
         assert!(!context.cancellation.is_cancelled());
@@ -70,7 +71,7 @@ async fn cancelling_or_dropping_window_cursor_releases_spills_while_output_page_
 #[tokio::test]
 async fn window_spill_failure_releases_partial_state() {
     let context = context(1);
-    let mut cursor = PreparedQuery::new(relation(vec![vec![V::I64(0),V::I64(1)]],false)).unwrap().execute(Arc::clone(&context),vec![]).unwrap();
+    let mut cursor = PreparedQuery::new(relation(vec![vec![V::I64(0),V::I64(1)]],false)).unwrap().execute(Arc::clone(&context),vec![]).await.unwrap();
     assert!(cursor.next_batch().await.is_err());
     drop(cursor);
     assert_eq!(context.spill_bytes(),0);

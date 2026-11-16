@@ -1,0 +1,63 @@
+use std::{collections::BTreeMap,sync::Arc};
+use rtdb_columnar::{MemoryBudget,read_value};
+use rtdb_plan::Statement;
+use rtdb_query::{CatalogSnapshot,DatabaseSnapshot,PreparedQuery,QueryContext,QueryOptions};
+use rtdb_sql::{PrepareOptions,prepare};
+use rtdb_storage::{MemoryStore,cache::BufferPool};
+use rtdb_types::{ListKind,LogicalType as L,Result,ScalarType as S,Timestamp,Value as V};
+use tokio_util::sync::CancellationToken;
+
+fn context() -> Arc<QueryContext> {
+    let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
+    QueryContext::new(catalog,MemoryBudget::new(1 << 27),Timestamp(0),"UTC",QueryOptions::default(),&CancellationToken::new()).unwrap()
+}
+async fn query(source: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
+    let context = context();
+    let result = async {
+        let Statement::Query(relation) = prepare(source,&context.catalog,&PrepareOptions::default())?.statement else { panic!() };
+        let mut cursor = PreparedQuery::new(relation)?.execute(Arc::clone(&context),arguments).await?;
+        let mut rows = vec![];
+        while let Some(batch) = cursor.next_batch().await? {
+            for row in 0..batch.batch().num_rows() { rows.push(batch.batch().schema().fields().iter().zip(batch.batch().columns()).map(|(field,array)|read_value(field,array.as_ref(),row)).collect::<Result<_>>()?); }
+        }
+        Ok(rows)
+    }.await;
+    assert_eq!(context.memory.used_bytes(),0);
+    result
+}
+#[tokio::test]
+async fn sql_equality_rejects_runtime_set_parameters_and_empty_declared_set_lists() {
+    for source in ["SELECT $1 = $2","SELECT $1 <> $2","SELECT $1 IS DISTINCT FROM $2","SELECT 1 WHERE $1 = $2","SELECT CASE WHEN FALSE THEN $1 = $2 ELSE TRUE END"] {
+        assert_eq!(query(source,vec![V::Set(vec![]),V::Set(vec![])]).await.unwrap_err().code,"xtdb.expression/set-equality","{source}");
+    }
+    let context = context();
+    let element = L::List { kind: ListKind::Set,element: Box::new(L::Scalar(S::I64)) };
+    let options = PrepareOptions { parameter_types: BTreeMap::from([(0,L::list(element))]),..Default::default() };
+    assert!(prepare("SELECT $1 = $1",&context.catalog,&options).is_err());
+    assert_eq!(query("SELECT $1 = NULL",vec![V::Set(vec![])]).await.unwrap(),[vec![V::Null]]);
+}
+#[tokio::test]
+async fn implicit_set_equality_rejects_the_first_row_but_preserves_empty_inputs_and_masks() {
+    for source in [
+        "SELECT DISTINCT $1 AS v",
+        "SELECT COUNT(*) FROM (SELECT $1 AS v) q GROUP BY v",
+        "SELECT COUNT(DISTINCT v) FROM (SELECT $1 AS v) q",
+        "SELECT ROW_NUMBER() OVER (PARTITION BY v) FROM (SELECT $1 AS v) q",
+        "SELECT $1 AS v INTERSECT ALL SELECT $1 AS v",
+        "SELECT $1 AS v EXCEPT ALL SELECT $1 AS v",
+    ] { assert_eq!(query(source,vec![V::Set(vec![])]).await.unwrap_err().code,"xtdb.expression/set-equality","{source}"); }
+    assert_eq!(query("SELECT DISTINCT v FROM (SELECT $1 AS v) q WHERE FALSE",vec![V::Set(vec![])]).await.unwrap(),Vec::<Vec<V>>::new());
+    assert_eq!(query("SELECT COUNT(DISTINCT v) FILTER (WHERE FALSE) FROM (SELECT $1 AS v) q",vec![V::Set(vec![])]).await.unwrap(),[vec![V::I64(0)]]);
+}
+
+#[tokio::test]
+async fn refined_set_equality_is_admitted_in_unselected_expression_children() {
+    for source in [
+        "SELECT CASE WHEN TRUE THEN 1 WHEN $1 = $2 THEN 2 ELSE 3 END",
+        "SELECT NULL[CASE WHEN TRUE THEN 1 WHEN $1 = $2 THEN 2 ELSE 3 END]",
+        "SELECT NULL LIKE CASE WHEN TRUE THEN '%' WHEN $1 = $2 THEN '_' ELSE 'x' END",
+        "SELECT * FROM information_schema.tables FOR VALID_TIME AS OF CASE WHEN TRUE THEN TIMESTAMP '1970-01-01T00:00:00Z' WHEN $1 = $2 THEN TIMESTAMP '1970-01-02T00:00:00Z' ELSE NULL END",
+        "SELECT * FROM information_schema.tables FOR SYSTEM_TIME AS OF CASE WHEN TRUE THEN TIMESTAMP '1970-01-01T00:00:00Z' WHEN $1 = $2 THEN TIMESTAMP '1970-01-02T00:00:00Z' ELSE NULL END",
+    ] { assert_eq!(query(source,vec![V::Set(vec![]),V::Set(vec![])]).await.unwrap_err().code,"xtdb.expression/set-equality","{source}"); }
+}

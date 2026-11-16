@@ -38,6 +38,7 @@ impl SpillFile {
 
 pub(crate) struct SpillWriter { file: File, retained: Arc<SpillFile> }
 impl SpillWriter {
+    pub fn position(&mut self) -> Result<u64> { self.file.stream_position().map_err(io_error) }
     pub fn reader(&mut self, memory: Arc<MemoryBudget>) -> Result<SpillReader> {
         self.file.flush().map_err(io_error)?;
         self.retained.reader(memory)
@@ -60,6 +61,11 @@ impl SpillWriter {
 
 pub(crate) struct SpillReader { file: File, retained: Arc<SpillFile>, memory: Arc<MemoryBudget> }
 impl SpillReader {
+    pub fn seek(&mut self, offset: u64) -> Result<()> {
+        if offset > self.retained.bytes.load(Ordering::Relaxed) { return Err(invalid("invalid-spill","Spill offset exceeds its file")); }
+        self.file.seek(SeekFrom::Start(offset)).map_err(io_error)?;
+        Ok(())
+    }
     pub fn rewind(&mut self) -> Result<()> { self.file.seek(SeekFrom::Start(0)).map_err(io_error)?; Ok(()) }
     pub fn next(&mut self) -> Result<Option<OwnedRow>> {
         let mut prefix = [0u8; 8];

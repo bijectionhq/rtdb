@@ -4,6 +4,18 @@ use rtdb_server::cli::{self, Command, NodeMode};
 fn parse(arguments: &[&str]) -> Command { cli::parse(arguments.iter().map(|value| (*value).into()), &|_| None).unwrap() }
 
 #[test]
+fn compiled_build_info_ignores_runtime_version_overrides() {
+    assert!(matches!(parse(&["--build-info"]), Command::BuildInfo));
+    assert!(cli::parse(["--build-info", "extra"].map(str::to_owned), &|_| None).is_err());
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_rtdb")).arg("--build-info").env("XTDB_VERSION", "runtime-only-version").env("GIT_SHA", "runtime-only-revision").output().unwrap();
+    assert!(output.status.success());
+    let actual: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(actual, serde_json::to_value(rtdb_types::compiled_build_info()).unwrap());
+    assert_eq!(actual["tzdb_sha256"].as_str().unwrap().len(), 64);
+    assert_ne!(actual["version"], "runtime-only-version");
+}
+
+#[test]
 fn node_and_ingest_options_keep_configuration_and_allocation_limits() {
     let Command::Start(options) = parse(&["node", "-f", "node.yaml", "--memory-limit", "1048576"]) else { panic!("expected start") };
     assert_eq!(options.mode, NodeMode::Node);

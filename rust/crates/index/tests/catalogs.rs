@@ -84,6 +84,21 @@ fn partition_roundtrip_preserves_states_watermarks_and_omits_table_name() {
 }
 
 #[test]
+fn wide_recency_partitions_roundtrip_and_reject_microsecond_overflow() {
+    use rtdb_types::calendar::CivilDate;
+    let catalog = apply(&[("l02-r2800000103-b00", 10)]);
+    let mut partitions = catalog.partitions(&table()).unwrap();
+    let midnight = CivilDate::from_ymd(280_000, 1, 3).unwrap().epoch_day() * 86_400_000_000;
+    assert_eq!(partitions[0].recency, Some(midnight));
+    partitions[0].recency = Some(midnight + 86_400_000_000 - 1);
+    let block = TableBlock::from_parts(BTreeMap::new(), 0, partitions).unwrap();
+    let loaded = TrieCatalog::load(&BTreeMap::from([(table(), block)]), 20, Timestamp(200)).unwrap();
+    assert_eq!(catalog.all_tries(&table()), loaded.all_tries(&table()));
+    assert_eq!(loaded.partitions(&table()).unwrap()[0].recency, Some(midnight));
+    assert!(apply(&[("l02-r9999999991231-b00", 10)]).partitions(&table()).is_err());
+}
+
+#[test]
 fn reset_rebuilds_l0_from_supplied_objects_and_clears_compaction() {
     let catalog = apply(&[("l01-rc-b01", 10), ("l02-rc-p0-b01", 10)]);
     let reset = catalog.reset_to_l0(BTreeMap::from([(table(), vec![notification("l00-rc-b00", 10), notification("l00-rc-b01", 10)])])).unwrap();

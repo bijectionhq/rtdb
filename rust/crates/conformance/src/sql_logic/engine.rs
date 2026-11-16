@@ -166,16 +166,17 @@ impl Engine {
         let mut basis = self.session.state_mut().read_basis().await?;
         basis.timezone = "UTC".into();
         if let Some(Some(value)) = variables.get("CURRENT_TIMESTAMP") {
-            basis.current_time = Timestamp(chrono::DateTime::parse_from_rfc3339(value).map_err(|error| Anomaly::incorrect("rtdb.conformance/slt-clock", error.to_string()))?.timestamp_micros());
+            basis.current_time = rtdb_types::Instant::parse_iso(value)?;
         }
         let token = self.session.state().cancellation().child_token();
         let context = self.session.query_context_at(&basis, &token).await?;
         let sql = record.sql.as_deref().unwrap_or("");
         let catalog = HiddenIdCatalog { delegate: &context.catalog, hide: !options.direct_sql };
-        let statement = rtdb_sql::prepare(sql, &catalog, &rtdb_sql::PrepareOptions::default())?.statement;
-        let Statement::Query(relation) = statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement is not a query")); };
+        let mut prepared = rtdb_sql::prepare(sql, &catalog, &rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..rtdb_sql::PrepareOptions::default() })?;
+        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement is not a query")); };
         let relation = if options.direct_sql { relation } else { restore_dependencies(&relation, &context)? };
-        let mut cursor = PreparedQuery::new(relation)?.execute(context.clone(), vec![])?;
+        prepared.statement = Statement::Query(relation);
+        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), vec![]).await?;
         let mut bytes = cursor.schema().fields().iter().try_fold(8192usize, |bytes, field| {
             let field = field.data_type.retained_bytes()?.checked_add(field.name.len()).and_then(|bytes| bytes.checked_mul(32)).ok_or_else(|| gap("SLT schema size overflow"))?;
             bytes.checked_add(field).ok_or_else(|| gap("SLT schema size overflow"))
@@ -213,7 +214,7 @@ impl Engine {
         let row_count = rows.len();
         let result = format::finish(rows, record.sort.as_deref().unwrap_or("nosort"))?;
         Ok((json!({"text":result,"rows":row_count,"values":actual_values,"schema":schema,
-                  "basis":{"current_time_micros":basis.current_time.0,"timezone":"UTC","snapshot_token":basis.snapshot_token()}}), charges))
+                  "basis":{"current_time_micros":basis.current_time.as_micros()?.0,"timezone":"UTC","snapshot_token":basis.snapshot_token()}}), charges))
     }
 }
 

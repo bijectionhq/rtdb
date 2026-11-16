@@ -1,5 +1,15 @@
 = XTQL query preparation
 
+`random` and duration-valued `sleep` use the shared scalar evaluator.
+Their result types are double and null respectively; sleep's unit arithmetic is documented in the expression crate.
+`tests/volatile.rs` retains type, range, null and awaited-duration source assertions without executing them.
+
+Aggregate calls retain original case and hyphen/underscore spelling, including explicit `all` or `distinct` forms.
+The passive `AggregateName` value validates a spelling against the closed evaluator set and fixes its quantifier; deserialization uses the same validation.
+Each spelling resolves to a fixed evaluator variant; absent factories such as `average` and `vec-agg-distinct` fail preparation.
+Computed aggregate arguments become input projections before grouping.
+SQL integration fixtures in `rtdb-sql/tests/aggregate_forms.rs` retain the resulting explanations and execution results as unrun source.
+
 `read` produces EDN forms with UTF-8 byte spans.
 `parse_query` produces query, clause, binding, temporal-filter, and expression values.
 `compile` binds those values against one supplied catalog and produces `rtdb-plan::PreparedStatement`.
@@ -20,9 +30,12 @@ Its structural checks are native preparation checks, not receipts proving the up
 `tests/reference-cases.json` records the source identities and pending execution status.
 Compilation and all execution remain pending for Phase 2.
 
+The shared plan and executor implement SQL ordered-set percentiles.
+The pinned XTQL aggregate lowering projects every argument to a column, which cannot construct the literal-or-parameter fraction and sort specification required by the ordered-set operator.
+No successful XTQL percentile call syntax is added.
+
 The following surfaces remain outside this checkpoint's implementation.
 
-* Percentile and `vec-agg` aggregation do not have a complete shared-plan/executor representation.
 * The shared scalar function registry does not yet cover every JVM expression function, cast option, temporal operation, or collection operation reachable from XTQL.
 * The EDN reader does not implement reader conditionals, automatic namespace aliases, arbitrary tagged Java objects, regex objects, ratios, or variadic anonymous functions.
 * Temporal scan filters containing relational subqueries are rejected.
@@ -36,7 +49,22 @@ Key spans retain the original source spelling; collisions are checked after name
 The reader remains a caller-owned transient and returns the existing passive map representation.
 Literal object compatibility, normalization collisions, exact failure signatures, and all result observations still require paired JVM/native execution.
 
-Cast forms accept `#xt/type` scalar and list targets with decimal `:precision` and `:scale` options.
+`vec-agg` preserves input order and null elements and returns an empty vector for an empty global input.
+Grouped empty input produces no result rows.
+Its metadata is a nonnullable list, and the pinned registry has no distinct `vec-agg` factory.
+The plan variant is passive immutable aggregate metadata; execution uses the existing caller-pulled aggregate cursor and its owned spill files.
+`sql/tests/inline_xtql.rs` retains the value assertions from `xtdb.operator.group-by-test/test-vec-agg` through the public inline XTQL path.
+
+Cast forms accept `#xt/type` scalar, list, set, struct, map, run-end, fixed binary, and timestamp-range targets with decimal `:precision` and `:scale` options.
+Nested `#xt/type` values resolve recursively.
+Struct field names retain the string conversion of ordinary EDN values, including Java numeric spelling and readable collection children.
+Map entry types retain their `:sorted?` flag using EDN truthiness.
+Applying a run-end width replaces only the outer layout and retains child encodings and nullability.
+Cast dispatch retains the requested nullable or encoded type separately from its lowered decimal and list conversion.
+The fallback identity cast compares that requested type exactly; an encoded or nullable composite target does not turn a plain input into that layout.
+Specialized numeric casts still dispatch through their value kind, and encoded decimal targets apply the same precision and scale options as plain decimal targets.
+Nullable list elements use the list union-remapping path rather than a nullable scalar cast.
+Known source types are checked during XTQL binding, and nonnull values supplied for previously unknown parameters are checked during evaluation.
 Unspecified precision preserves existing decimal legs; explicit precision and scale apply recursively to list elements.
 The parser retains the target as the shared passive `CastTarget` value, and binding tracks cast operands through unification and aggregate extraction.
 `tests/casts.rs` maps the reference expression list-cast, array-text, and recursive decimal-option assertions.
@@ -44,4 +72,134 @@ Decimal literals and cast targets preserve the full signed 32-bit scale, includi
 ROUND with integer or decimal input requires a constant scale and retains it in result metadata.
 String-to-decimal casts accept OpenJDK 21's BMP decimal digits; decimal literal tokens retain the ASCII grammar from https://github.com/clojure/clojure/blob/clojure-1.12.0/src/jvm/clojure/lang/EdnReader.java[Clojure 1.12 EdnReader].
 The reader classifies BMP digit prefixes as numeric tokens and rejects Unicode decimal literals at that grammar boundary.
-Struct, map, run-end, and fixed-size collection type specifications, non-decimal cast options, and negative precision metadata remain outside this cast parser's supported surface.
+Nullable vector forms flatten their type constructor, such as `[:? :list :i64]`.
+The pinned `serde.types/->type` dispatch passes a bare `:fixed-size-list` to the Arrow constructor, which then lacks its required width; this parser retains rejection for that form.
+Nonpositive decimal precision remains valid metadata, although it rejects nonnull values at the vector write boundary.
+Object-valued tagged struct field keys and hash-map/set iteration spelling remain source-completeness obligations.
+Integer reader tokens normalize octal, hexadecimal, and explicit radix syntax before field-name printing or literal conversion.
+An `N` suffix preserves the BigInteger distinction, while integers outside signed 64 bits become BigInteger reader values automatically, as in Clojure 1.12 `EdnReader.matchNumber`.
+Their later vector-value conversion retains the existing signed 64-bit value limit.
+Duplicate reader keys and set elements compare integers across Long/BigInteger representation, decimals independently of scale, and lists/vectors by their sequence contents.
+
+Temporal cast options retain `:precision`, including recursive list and encoded targets.
+Interval cast options retain string-valued `:start-field` and `:end-field`, with `:leading-precision` and `:fractional-precision` validated according to the source value family.
+Source-family rejection and qualifier validation precede numeric options that are read only to select the resulting interval representation.
+Integer interval casts accept a start field alone; unused precision options have no effect.
+An absent qualifier preserves interval input metadata; an explicitly empty option map retains the reference's distinct duration dispatch and fails for duration inputs.
+Raw options remain passive values until the source leg consumes them, including malformed values ignored by timestamp-to-timestamp and integer-to-interval casts.
+Consumed numeric options retain Clojure's unchecked primitive-long conversion during code generation and checked conversion in generated temporal calls for integer, floating, decimal, and BigInteger reader values.
+`cast-interval` retains its earlier fractional option conversion when choosing the alias target type.
+`tests/casts.rs` contains recursive temporal, encoded interval, integer qualifier, ignored malformed options, numeric coercion, and deferred parameter cases.
+Consumed malformed option values retain native typed diagnostics rather than the JVM's class-cast or null-unboxing exception spelling.
+`cast-tstz` and `cast-interval`, including underscore spellings, lower to the same passive cast descriptors.
+`CompileOptions.default_timezone` binds the timestamp alias's result field; SQL-inline XTQL inherits its containing statement's preparation zone.
+Native session execution passes its current query zone into compilation.
+
+Tagged timestamp readers use the pinned `Time.asLocalDateTime`, `asZonedDateTime`, `asOffsetDateTime` and `asInstant` SQL grammar, including SMART dates and extended years within the Arrow microsecond range.
+Local tags preserve parsed local fields; offset tags retain the zone's offset at the resolved instant.
+The Clojure `#inst` reader retains its separate four-digit year, optional trailing fields, millisecond truncation, leap-second rollover and GregorianCalendar cutover behavior.
+Calendar and timezone rules come from `rtdb-types`; the source tests cover these parser distinctions and future named-zone transitions without executing the JVM.
+Tagged dates retain the full LocalDate calendar range inside expressions, with vector narrowing deferred until the completed expression result.
+
+== Array bounds and trimming
+
+`array_upper`, `array_lower` and `array_length` accept an ordinary list and an I64 dimension.
+Dimension one returns the element count, lower bound one, and element count respectively; an empty list keeps lower bound one.
+Other dimensions return `xtdb.expression/array-dimension-error`.
+`trim_array` accepts a signed integer count and keeps a lazy view of the input list.
+An overtrim returns `xtdb.expression/array-element-error` with the remaining length.
+Negative counts extend the declared view, and reading beyond the input fails.
+The view checks the signed 32-bit size limit when its size is observed; `array_lower` does not observe that size.
+Null arguments short-circuit later argument evaluation.
+`tests/arrays.rs` contains regression source; compilation and execution remain pending.
+
+`col_description` and `pg_indexam_has_property` return NULL with the signed integer, OID and text signatures exposed by the pinned reference.
+`tests/pg_null_functions.rs` retains the source assertions for those compatibility calls.
+The numeric catalogue includes `log10`, `sinh`, `cosh`, `tanh` and `mod`; expression and XTQL callers also expose the `double` conversion.
+`tests/math_catalogue.rs` covers nulls, result types and native numeric dispatch as unexecuted source.
+
+`generate-series` and `generate_series` expose the shared three-argument exclusive series operation and optional fourth endpoint-inclusion Boolean.
+Their endpoint behavior is independent of the SQL process setting.
+`tests/series.rs` preserves integer results, explicit inclusion and lazy size/element observations as unexecuted regression source.
+
+`#xt/uri` literals validate the shared Java URI syntax before constructing a value.
+The seven `uri-*` component functions accept URI values, preserve absent versus empty components and expose the port as a nullable signed 32-bit integer.
+Text casts retain the original URI spelling.
+URI equality follows Java component equality, and nested text rendering applies NFC before ASCII percent encoding.
+`tests/uri.rs` covers literals, casts, extractor types, invalid values, object equality, rendering and reached ordering failure as unexecuted regression source.
+
+XTQL exposes `bit-not`, `bit-and`, `bit-or`, `bit-xor`, `bit-shift-left` and `bit-shift-right` through the shared signed-integer function contract.
+`tests/bitwise.rs` covers alias binding, signed casts, null demand, arity and narrow shift-count overflow as unexecuted regression source.
+
+`extract`, `date-trunc`, `date-bin`, `range-bins` and `age` use the shared temporal expression contracts.
+XTQL temporal fields remain case-sensitive uppercase literal strings.
+`range-bins` takes separate from/to endpoints and returns lazy `_from`, `_to` and `_weight` structures; SQL's period syntax is lowered before reaching that contract.
+`current-timezone`, `local-date`, `local-time` and `local-timestamp` accept the underscore aliases, with compact `localdate`, `localtime` and `localtimestamp` aliases as well.
+Clock precision is a literal integer, and current timestamp output metadata binds the compile options' timezone.
+`tests/temporal_functions.rs` retains field, bin, calendar, clock and rejected-input regression sources; execution remains pending.
+
+XTQL generic calls accept `is_true`, `is_false`, `distinct_from` and `_meta_double`, including their hyphenated aliases.
+These calls share expression type selection, nested unknown equality and temporal metadata conversion.
+`tests/scalar_aliases.rs` provides unexecuted regression source.
+
+XTQL exposes `compare`, `compare_nulls_first` and `compare_nulls_last` through the shared scalar catalogue, including hyphenated names.
+Their signed integer results retain the reference byte-comparator magnitude and explicit null placement.
+`tests/comparison_calls.rs` supplies unexecuted source regressions.
+
+`(. object field)` selects Struct members and Transit map fields, including stored error data and transaction-key records.
+The field symbol retains its spelling; Struct literal member names follow the ordinary normalized-name rules.
+`get-field` and `get_field` retain the shared generic call's absent field-name metadata.
+`tests/field_access.rs` covers both call forms, null results, false-value behavior and evaluation demand as unexecuted regression source.
+
+`like` and `ilike` expose the shared two-argument wildcard matcher.
+LIKE accepts text or binary pairs; ILIKE accepts text pairs and uses Java Unicode case folding.
+`tests/like_calls.rs` records generic-call admission and null-demand cases as unexecuted regression source.
+
+`=`, `<>` and null-safe distinctness reject Set/Set pairs, including pairs nested in ordinary list alternatives or equal-shaped structs.
+This admission precedes collection-length and selected-branch evaluation; different struct key sets retain their constant result.
+Strict `===` has a separate object-equality contract.
+`tests/set_equality.rs` retains these admission cases as unexecuted regression source.
+
+XTQL generic calls admit `single-field-interval` and `multi-field-interval`, including their underscore spellings.
+Single-field calls take source, unit, leading precision and fractional precision; multi-field calls take source, start unit, leading precision, end unit and fractional precision.
+Consumed metadata uses literal uppercase unit names and integer precisions, with leading precision 1 through 8 and SECOND fractional precision 0 through 9.
+Single-field fractional metadata outside SECOND is ignored after argument control selection.
+`tests/interval_constructors.rs` records value, null, metadata and unused-payload cases; these sources remain unexecuted.
+
+Scalar calls select argument types before consuming monomorphic payloads, so `(+ (/ 1 0) nil)` returns null.
+Selected control expressions and polymorphic result boxes retain their demand.
+`if` uses boolean coercion, while `true?` and `false?` recognize only booleans.
+For example, `(if (/ 1 0) 1 2)` selects the first branch from the numeric type without consuming the division payload.
+
+`nth` accepts signed integer indexes on nonnull sources and returns null for registered non-list source kinds.
+A null source or index selects the strict null result before payload demand.
+
+Generic function names require a matching registered method for every nonnull argument combination.
+A definite null argument retains strict null selection even for an unregistered name.
+The predicates `nil?`, `true?`, `false?` and `boolean` are registered; additional Clojure type-predicate names have no generic method.
+
+`like-regex` requires three UTF8 arguments: input, pattern and flags, with strict null specialization.
+Literal flags control matching; nonliteral flag payloads are ignored while their type-selection controls still run.
+The selected pattern compiles before the input payload is consumed.
+
+`_patch` discards a monomorphic null left payload and preserves both arguments’ control selection.
+Constructed Struct fields are evaluated before the merge, and nested list cells remain deferred until read.
+
+BETWEEN binds complex subjects once before evaluating bounds, including null-producing subjects.
+Symmetric BETWEEN tries the reversed bounds only after the forward comparison fails to return true; reached bound expressions may be evaluated again.
+
+== Raw replacement metadata
+
+`regexp-replace` parses only its first argument as an XTQL expression.
+Pattern, replacement, start, occurrence and flags retain raw forms, missing fields become nil, and later fields are ignored.
+Raw metadata does not introduce variable, parameter or aggregate dependencies.
+Flags consume a string's characters or direct character entries of raw sequences; symbols and strings inside a raw list are not evaluated.
+Nil and false start/occurrence fields are false; zero, empty strings and empty collections are true.
+Applicable emitted source types admit metadata before invocation, while a null-only source leaves it uninterpreted.
+The owned carrier preserves nonliteral host pattern syntax through the native host compilation and invocation phases described below.
+`tests/regex_replace_metadata.rs` records missing/extra fields, raw flags, dead COALESCE tails and host-form preservation as unexecuted source regressions.
+Native REGEXP_REPLACE host patterns retain their own lexical compilation and invocation phases.
+Simple lexical bindings and pure string/control forms compile independently of XTQL row variables, while raw replacement and flag fields retain their metadata contracts.
+Host BigInt and BigDecimal literals preserve exact numeric text, and checked primitive conversions retain the difference between direct inline calls and calls through lexical function values.
+`tests/regex_host.rs` records computed patterns, shadowing, strict arguments, UTF16 substring indexes and dead-branch compilation as unexecuted source.
+General host arithmetic, interop, effects, object rendering and generated-local multiplicity remain required follow-on work.

@@ -42,7 +42,7 @@ impl CatalogRuntime for Runtime {
 }
 async fn query(context: &Arc<QueryContext>, sql: &str) -> Vec<Vec<Value>> {
     let prepared = PreparedSql::prepare(sql, context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let mut cursor = prepared.open_query(Arc::clone(context), vec![]).unwrap();
+    let mut cursor = prepared.open_query(Arc::clone(context), vec![]).await.unwrap();
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await.unwrap() {
         let schema = batch.batch().schema();
@@ -91,7 +91,7 @@ async fn metrics_tags_stream_as_arrow_and_declared_empty_catalogs_keep_their_sch
     assert_eq!(prepared.prepared_schema().unwrap().len(), 2);
     assert!(query(&context, "SELECT * FROM pg_depend").await.is_empty());
     let prepared = PreparedSql::prepare("SELECT usename FROM pg_user", &missing, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    let mut cursor = prepared.open_query(missing, vec![]).unwrap();
+    let mut cursor = prepared.open_query(missing, vec![]).await.unwrap();
     assert_eq!(cursor.next_batch().await.unwrap_err().code, "rtdb.query/catalog-runtime-unavailable");
 }
 

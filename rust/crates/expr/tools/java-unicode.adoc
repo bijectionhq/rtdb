@@ -1,0 +1,29 @@
+= Java regular-expression Unicode catalog
+
+`generate_java_unicode.py` generates `src/string/java_unicode_data.rs` from digest-pinned Unicode 16.0 data and the OpenJDK 25 `Character` catalog.
+Run it with the directory containing the named source files as its sole argument.
+The generator transforms source data; compilation and regression execution are separate operations.
+The generated data carries the Unicode License V3 notice, with the full notice in `../LICENSE-UNICODE`.
+
+The Unicode source files are https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt[UnicodeData], https://www.unicode.org/Public/16.0.0/ucd/PropList.txt[PropList], https://www.unicode.org/Public/16.0.0/ucd/DerivedCoreProperties.txt[DerivedCoreProperties], https://www.unicode.org/Public/16.0.0/ucd/Scripts.txt[Scripts], https://www.unicode.org/Public/16.0.0/ucd/SpecialCasing.txt[SpecialCasing], and https://www.unicode.org/Public/16.0.0/ucd/emoji/emoji-data.txt[emoji-data].
+Their local names have the `unicode16-` prefix.
+The Java catalog is https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/lang/Character.java[Character.java], retained as `openjdk25-Character.java`.
+The behavioral references are https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/util/regex/CharPredicates.java[CharPredicates], https://github.com/openjdk/jdk/blob/jdk-25-ga/src/java.base/share/classes/java/util/regex/Pattern.java[Pattern], and https://github.com/openjdk/jdk/blob/jdk-25-ga/make/jdk/src/classes/build/tools/generatecharacter/CharacterName.java[the character-name data generator].
+
+The range sets, character names, accepted block/script aliases and case mappings are immutable passive source values.
+Catalog lookup and class rendering complete on the caller with no cache or background owner.
+The expression translator owns and reserves the resulting pattern buffers.
+
+`property_class` returns a native character-class body after Java property-name dispatch.
+General-category property names retain case sensitivity; Unicode POSIX, binary-property, block and script lookups apply their respective Java naming rules.
+Sets contain pinned code points instead of delegating alias validation or Unicode membership to another regex library.
+Surrogate-only sets render as empty scalar classes; isolated UTF-16 matching remains the matcher's responsibility.
+
+`named_character` implements Java character-name lookup, including old control names and unnamed assigned characters represented by block identifier plus uppercase hexadecimal code point.
+It returns the Unicode code point, including surrogate code points, so the caller retains the decision about UTF-16 matching.
+
+`literal_single`, `folded_literal`, `class_single`, and `class_range` return Unicode case-insensitive class bodies for their respective Java parser paths.
+A single literal uses `Pattern.single`; a multi-literal slice uses uppercase-then-lowercase comparison for every member.
+A character-class singleton retains the Latin-1 bit-class optimization, while an explicit range accepts a candidate when its original, uppercase, or uppercase-then-lowercase value belongs to the original range.
+Those predicates can differ for the same singleton code point.
+The translator must preserve singleton, literal-run and explicit-range syntax when selecting these helpers.

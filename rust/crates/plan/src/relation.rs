@@ -27,10 +27,16 @@ pub struct Scan {
     pub system_time: TemporalFilter,
     pub clamp_valid_time: bool,
     pub iids: Option<BTreeSet<Iid>>,
+    #[serde(default)]
+    pub predicates: Vec<Expr>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NamedExpr { pub field: Field, pub expr: Expr }
+
+/// An immutable lexical binding; references retain this definition and are opened within its `Let` scope.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MaterializedBinding { pub name: String, pub relation: Arc<Relation> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JoinKind { Inner, Left, Right, Full, Semi, Anti, Cross }
@@ -47,9 +53,137 @@ pub enum SetOperator { Union, Intersect, Except }
 pub struct SortExpr { pub expr: Expr, pub descending: bool, pub nulls_first: bool }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PercentileKind { Continuous, Discrete }
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+/// Parameters use zero-based indices and must contain numeric values when the cursor opens.
+/// Literal fractions are unrestricted: discrete percentiles clamp them, while continuous ranks can fail outside the input.
+pub enum PercentileFraction { Integer(i64), Literal(#[serde(with = "percentile_fraction_bits")] f64), Parameter { index: usize } }
+
+mod percentile_fraction_bits {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(value: &f64, serializer: S) -> std::result::Result<S::Ok, S::Error> { serializer.serialize_u64(value.to_bits()) }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> std::result::Result<f64, D::Error> { u64::deserialize(deserializer).map(f64::from_bits) }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum AggregateFunction {
-    Count, CountStar, Sum, Average, Min, Max, ArrayAgg, Every, Any,
+    Count, CountStar, Sum, Average, Min, Max, ArrayAgg, VecAgg, Every, Any,
     VariancePopulation, VarianceSample, StddevPopulation, StddevSample,
+    /// Sorts the nonnull column in `AggregateExpr.argument`; DISTINCT and `AggregateExpr.order_by` must be absent.
+    /// Continuous output is nullable F64; discrete output retains the nullable input type.
+    Percentile { kind: PercentileKind, fraction: PercentileFraction, descending: bool },
+    Alias(AggregateAlias),
+    Named(AggregateName),
+}
+
+/// Supported factory spellings with the same evaluation as a canonical aggregate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AggregateAlias {
+    BoolAnd, RowCountUnderscore, ArrayAggUnderscore,
+    CountAll, SumAll, AverageAll, MinAll, MaxAll,
+    BoolAndHyphen, BoolOrHyphen, VecAggHyphen, VariancePopulationHyphen, VarianceSampleHyphen,
+    StddevPopulationHyphen, StddevSampleHyphen, CountAllHyphen, SumAllHyphen, AverageAllHyphen, MinAllHyphen, MaxAllHyphen,
+    CountDistinctHyphen, SumDistinctHyphen, AverageDistinctHyphen, MinDistinctHyphen, MaxDistinctHyphen, ArrayAggDistinctHyphen, ArrayAggUnderscoreDistinctHyphen,
+}
+impl AggregateAlias {
+    /// Returns the factory symbol retained in the plan.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::BoolAnd => "bool_and", Self::RowCountUnderscore => "row_count", Self::ArrayAggUnderscore => "array_agg",
+            Self::CountAll => "count_all", Self::SumAll => "sum_all", Self::AverageAll => "avg_all", Self::MinAll => "min_all", Self::MaxAll => "max_all",
+            Self::BoolAndHyphen => "bool-and", Self::BoolOrHyphen => "bool-or", Self::VecAggHyphen => "vec-agg",
+            Self::VariancePopulationHyphen => "var-pop", Self::VarianceSampleHyphen => "var-samp", Self::StddevPopulationHyphen => "stddev-pop", Self::StddevSampleHyphen => "stddev-samp",
+            Self::CountAllHyphen => "count-all", Self::SumAllHyphen => "sum-all", Self::AverageAllHyphen => "avg-all", Self::MinAllHyphen => "min-all", Self::MaxAllHyphen => "max-all",
+            Self::CountDistinctHyphen => "count-distinct", Self::SumDistinctHyphen => "sum-distinct", Self::AverageDistinctHyphen => "avg-distinct", Self::MinDistinctHyphen => "min-distinct", Self::MaxDistinctHyphen => "max-distinct", Self::ArrayAggDistinctHyphen => "array-agg-distinct", Self::ArrayAggUnderscoreDistinctHyphen => "array_agg-distinct",
+        }
+    }
+    /// Resolves the spelling to its evaluator variant.
+    pub fn canonical(self) -> AggregateFunction {
+        match self {
+            Self::BoolAnd | Self::BoolAndHyphen => AggregateFunction::Every,
+            Self::BoolOrHyphen => AggregateFunction::Any,
+            Self::RowCountUnderscore => AggregateFunction::CountStar,
+            Self::ArrayAggUnderscore | Self::ArrayAggDistinctHyphen | Self::ArrayAggUnderscoreDistinctHyphen => AggregateFunction::ArrayAgg,
+            Self::VecAggHyphen => AggregateFunction::VecAgg,
+            Self::CountAll | Self::CountAllHyphen | Self::CountDistinctHyphen => AggregateFunction::Count,
+            Self::SumAll | Self::SumAllHyphen | Self::SumDistinctHyphen => AggregateFunction::Sum,
+            Self::AverageAll | Self::AverageAllHyphen | Self::AverageDistinctHyphen => AggregateFunction::Average,
+            Self::MinAll | Self::MinAllHyphen | Self::MinDistinctHyphen => AggregateFunction::Min,
+            Self::MaxAll | Self::MaxAllHyphen | Self::MaxDistinctHyphen => AggregateFunction::Max,
+            Self::VariancePopulationHyphen => AggregateFunction::VariancePopulation,
+            Self::VarianceSampleHyphen => AggregateFunction::VarianceSample,
+            Self::StddevPopulationHyphen => AggregateFunction::StddevPopulation,
+            Self::StddevSampleHyphen => AggregateFunction::StddevSample,
+        }
+    }
+    /// Returns the quantifier fixed by this spelling, or None when it remains a separate argument.
+    pub fn distinct(self) -> Option<bool> {
+        match self {
+            Self::CountAll | Self::SumAll | Self::AverageAll | Self::MinAll | Self::MaxAll | Self::CountAllHyphen | Self::SumAllHyphen | Self::AverageAllHyphen | Self::MinAllHyphen | Self::MaxAllHyphen => Some(false),
+            Self::CountDistinctHyphen | Self::SumDistinctHyphen | Self::AverageDistinctHyphen | Self::MinDistinctHyphen | Self::MaxDistinctHyphen | Self::ArrayAggDistinctHyphen | Self::ArrayAggUnderscoreDistinctHyphen => Some(true),
+            _ => None,
+        }
+    }
+}
+
+/// A validated ordinary aggregate factory symbol with its original spelling.
+/// Factory lookup follows XTQL name normalization; the spelling is retained for plan descriptions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct AggregateName { spelling: String, evaluator: AggregateAlias }
+
+impl AggregateName {
+    /// Rejects names without an ordinary aggregate factory, including unsupported ALL/DISTINCT combinations.
+    pub fn new(spelling: impl Into<String>) -> Result<Self> {
+        use AggregateAlias as A;
+        let spelling = spelling.into();
+        let normalized = crate::Identifier::unquoted(&spelling).normalized();
+        let evaluator = match normalized.as_str() {
+            "row_count" => A::RowCountUnderscore,
+            "count" | "count_all" => A::CountAll, "count_distinct" => A::CountDistinctHyphen,
+            "sum" | "sum_all" => A::SumAll, "sum_distinct" => A::SumDistinctHyphen,
+            "avg" | "avg_all" => A::AverageAll, "avg_distinct" => A::AverageDistinctHyphen,
+            "min" | "min_all" => A::MinAll, "min_distinct" => A::MinDistinctHyphen,
+            "max" | "max_all" => A::MaxAll, "max_distinct" => A::MaxDistinctHyphen,
+            "array_agg" => A::ArrayAggUnderscore, "array_agg_distinct" => A::ArrayAggDistinctHyphen,
+            "vec_agg" => A::VecAggHyphen, "every" | "bool_and" => A::BoolAnd, "bool_or" => A::BoolOrHyphen,
+            "var_pop" => A::VariancePopulationHyphen, "var_samp" => A::VarianceSampleHyphen,
+            "stddev_pop" => A::StddevPopulationHyphen, "stddev_samp" => A::StddevSampleHyphen,
+            _ => return Err(Anomaly::incorrect("rtdb.plan/aggregate-name", format!("Unknown aggregate factory: {spelling}"))),
+        };
+        Ok(Self { spelling, evaluator })
+    }
+    /// Returns the original, unnormalized factory symbol.
+    pub fn spelling(&self) -> &str { &self.spelling }
+    /// Whether this factory symbol requests duplicate elimination.
+    pub fn distinct(&self) -> bool { self.evaluator.distinct().unwrap_or(false) }
+}
+impl TryFrom<String> for AggregateName {
+    type Error = Anomaly;
+    fn try_from(spelling: String) -> Result<Self> { Self::new(spelling) }
+}
+impl From<AggregateName> for String { fn from(name: AggregateName) -> Self { name.spelling } }
+
+impl AggregateFunction {
+    /// Resolves alias spellings to evaluator variants.
+    pub fn canonical(&self) -> Self { match self { Self::Alias(alias) => alias.canonical(), Self::Named(name) => name.evaluator.canonical(), function => function.clone() } }
+    /// Returns the quantifier fixed by a factory spelling, when present.
+    pub fn quantifier(&self) -> Option<bool> { match self { Self::Alias(alias) => alias.distinct(), Self::Named(name) => Some(name.distinct()), _ => None } }
+    /// Includes the descriptor and any retained original-name capacity.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        std::mem::size_of::<Self>().checked_add(match self { Self::Named(name) => name.spelling.capacity(), _ => 0 })
+            .ok_or_else(|| Anomaly::incorrect("rtdb.plan/aggregate-size", "Aggregate descriptor exceeds addressable memory"))
+    }
+    /// Returns the factory symbol used by plan descriptions.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Count => "count", Self::CountStar => "row-count", Self::Sum => "sum", Self::Average => "avg", Self::Min => "min", Self::Max => "max",
+            Self::ArrayAgg => "array-agg", Self::VecAgg => "vec_agg", Self::Every => "every", Self::Any => "bool_or",
+            Self::VariancePopulation => "var_pop", Self::VarianceSample => "var_samp", Self::StddevPopulation => "stddev_pop", Self::StddevSample => "stddev_samp",
+            Self::Percentile { kind: PercentileKind::Continuous, .. } => "percentile_cont", Self::Percentile { .. } => "percentile_disc", Self::Alias(alias) => alias.name(), Self::Named(name) => name.spelling(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,12 +225,24 @@ pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
     Scan(Scan),
     Project { input: Arc<Relation>, expressions: Vec<NamedExpr> },
+    Rename { input: Arc<Relation>, prefix: String, expressions: Vec<NamedExpr> },
+    Let { binding: Arc<MaterializedBinding>, body: Arc<Relation> },
+    Reference { binding: Arc<MaterializedBinding> },
     Filter { input: Arc<Relation>, predicate: Expr },
     Join { left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr> },
     Apply { input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, output: Option<Field> },
+    /// Appends a nullable Boolean mark to each input row.
+    /// - `dependent` has one candidate column; `arguments` bind unique zero-based dependent parameters from input expressions.
+    /// - `comparison` reads the combined input/candidate schema and returns Boolean or null.
+    /// - `output` has nullable Boolean type and is appended to the input schema.
+    /// - A match yields true, an unmatched unknown comparison yields null, and an empty or all-false comparison set yields false.
+    /// Empty arguments select a shared build before input evaluation, with scalar equality hash selection and whole-build null facts.
+    /// Correlated builds evaluate their complete comparison batch for each input row; shared comparisons stop at true.
+    Mark { input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, comparison: Expr, output: Field },
     Aggregate { input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr> },
     Window { input: Arc<Relation>, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr> },
     Sort { input: Arc<Relation>, order_by: Vec<SortExpr> },
+    SortLimit { input: Arc<Relation>, order_by: Vec<SortExpr>, offset: Option<Expr>, fetch: Option<Expr> },
     Limit { input: Arc<Relation>, offset: Option<Expr>, fetch: Option<Expr> },
     Distinct { input: Arc<Relation> },
     Set { left: Arc<Relation>, right: Arc<Relation>, operator: SetOperator, all: bool },
@@ -139,33 +285,36 @@ impl Relation {
 
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
-            RelationNode::Values { .. } | RelationNode::Scan(_) => vec![],
-            RelationNode::Project { input, .. } | RelationNode::Filter { input, .. }
-            | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
+            RelationNode::Values { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
+            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
+            | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
             | RelationNode::Unnest { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => vec![left, right],
-            RelationNode::Apply { input, dependent, .. } => vec![input, dependent],
+            RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => vec![input, dependent],
+            RelationNode::Let { binding, body } => vec![&binding.relation, body],
         }
     }
 
     pub fn expressions(&self) -> Vec<&Expr> {
         match &self.node {
             RelationNode::Values { rows } => rows.iter().flatten().collect(),
-            RelationNode::Scan(scan) => scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()).collect(),
-            RelationNode::Project { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
+            RelationNode::Scan(scan) => scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()).chain(scan.predicates.iter()).collect(),
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
             RelationNode::Filter { predicate, .. } => vec![predicate],
             RelationNode::Join { condition, .. } => condition.iter().collect(),
             RelationNode::Apply { arguments, .. } => arguments.iter().map(|(_, expr)| expr).collect(),
+            RelationNode::Mark { arguments, comparison, .. } => arguments.iter().map(|(_, expr)| expr).chain(std::iter::once(comparison)).collect(),
             RelationNode::Aggregate { groups, aggregates, .. } => groups.iter().map(|expr| &expr.expr).chain(aggregates.iter().flat_map(|agg| {
                 agg.argument.iter().chain(agg.filter.iter()).chain(agg.order_by.iter().map(|order| &order.expr))
             })).collect(),
             RelationNode::Sort { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
+            RelationNode::SortLimit { order_by, offset, fetch, .. } => order_by.iter().map(|order| &order.expr).chain(offset.iter()).chain(fetch.iter()).collect(),
             RelationNode::Window { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
             RelationNode::Unnest { expr, .. } => vec![expr],
             RelationNode::PatchGaps { from, to, .. } => vec![from, to],
-            RelationNode::Distinct { .. } | RelationNode::Set { .. } => vec![],
+            RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } => vec![],
         }
     }
 
@@ -175,10 +324,15 @@ impl Relation {
 
     pub fn parameter_indices(&self) -> BTreeSet<usize> {
         let mut indices = BTreeSet::new();
+        if let RelationNode::Aggregate { aggregates, .. } = &self.node {
+            for aggregate in aggregates {
+                if let AggregateFunction::Percentile { fraction: PercentileFraction::Parameter { index }, .. } = &aggregate.function { indices.insert(*index); }
+            }
+        }
         for expr in self.expressions() {
             expr.visit(&mut |expr| { if let Expr::Parameter { index, .. } = expr { indices.insert(*index); } });
         }
-        if let RelationNode::Apply { input, dependent, arguments, .. } = &self.node {
+        if let RelationNode::Apply { input, dependent, arguments, .. } | RelationNode::Mark { input, dependent, arguments, .. } = &self.node {
             indices.extend(input.parameter_indices());
             let bound: BTreeSet<_> = arguments.iter().map(|(index, _)| *index).collect();
             indices.extend(dependent.parameter_indices().difference(&bound));
@@ -197,7 +351,18 @@ impl Relation {
     }
 
     pub fn validate(&self) -> Result<()> {
-        let inputs: BTreeSet<ColumnId> = self.children().iter().flat_map(|child| child.schema.ids()).collect();
+        if let RelationNode::Limit { offset,fetch,.. } | RelationNode::SortLimit { offset,fetch,.. } = &self.node {
+            for expression in offset.iter().chain(fetch) {
+                let valid = match expression {
+                    Expr::Parameter { .. } => true,
+                    Expr::Literal(Value::I8(value)) => *value >= 0,Expr::Literal(Value::I16(value)) => *value >= 0,
+                    Expr::Literal(Value::I32(value)) => *value >= 0,Expr::Literal(Value::I64(value)) => *value >= 0,
+                    _ => false,
+                };
+                if !valid { return Err(Anomaly::incorrect("xtdb/invalid-row-count","LIMIT and OFFSET require a non-negative integer literal or parameter")); }
+            }
+        }
+        let inputs: BTreeSet<ColumnId> = if matches!(self.node, RelationNode::Scan(_)) { self.schema.ids() } else { self.children().iter().flat_map(|child| child.schema.ids()).collect() };
         for expr in self.expressions() { expr.validate_columns(&inputs)?; }
         let invalid = |message| Err(Anomaly::fault("rtdb.plan/invalid-relation", message));
         match &self.node {
@@ -206,15 +371,24 @@ impl Relation {
             }
             RelationNode::Scan(scan) => {
                 if self.schema.fields() != scan.columns { return invalid("Scan columns differ from output schema"); }
+                for expression in scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()) { expression.validate_columns(&BTreeSet::new())?; }
             }
-            RelationNode::Project { expressions, .. } => {
+            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
                 if !self.schema.fields().iter().eq(expressions.iter().map(|expr| &expr.field)) { return invalid("Projection fields differ from output schema"); }
             }
-            RelationNode::Filter { input, .. } | RelationNode::Sort { input, .. }
+            RelationNode::Let { binding, body } => {
+                if binding.name.is_empty() { return invalid("Materialized binding name is empty"); }
+                if self.schema != body.schema { return invalid("Let output differs from its body schema"); }
+            }
+            RelationNode::Reference { binding } => {
+                if self.schema != binding.relation.schema { return invalid("Reference differs from its bound relation schema"); }
+            }
+            RelationNode::Filter { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input } => {
                 if self.schema != input.schema { return invalid("Pass-through operator changes its schema"); }
             }
-            RelationNode::Join { left, right, kind, .. } => {
+            RelationNode::Join { left, right, kind, condition } => {
+                if *kind == JoinKind::Cross && condition.is_some() { return invalid("Cross join cannot declare a condition"); }
                 let expected = match kind {
                     JoinKind::Semi | JoinKind::Anti => left.schema.clone(),
                     JoinKind::Left => left.schema.concat(&right.schema.nullable()?)?,
@@ -223,6 +397,17 @@ impl Relation {
                     JoinKind::Inner | JoinKind::Cross => left.schema.concat(&right.schema)?,
                 };
                 if self.schema != expected { return invalid("Join schema does not describe its output"); }
+            }
+            RelationNode::Mark { input, dependent, arguments, comparison, output } => {
+                let mut parameters = BTreeSet::new();
+                for (index, expr) in arguments {
+                    if !parameters.insert(index) { return invalid("Mark parameter is bound more than once"); }
+                    expr.validate_columns(&input.schema.ids())?;
+                }
+                if dependent.schema.len() != 1 { return invalid("Mark requires a single candidate column"); }
+                if comparison.data_type().legs().iter().any(|ty| !matches!(ty, LogicalType::Null | LogicalType::Nothing | LogicalType::Scalar(ScalarType::Bool))) { return invalid("Mark comparison must be Boolean or null"); }
+                if output.data_type != LogicalType::Scalar(ScalarType::Bool).maybe() { return invalid("Mark output must be nullable Boolean"); }
+                if self.schema != input.schema.concat(&Schema::new(vec![output.clone()])?)? { return invalid("Mark schema does not describe its output"); }
             }
             RelationNode::Apply { input, dependent, arguments, kind, output } => {
                 let mut parameters = BTreeSet::new();
@@ -260,8 +445,18 @@ impl Relation {
                     return invalid("Aggregate schema does not describe its output");
                 }
                 for aggregate in aggregates {
-                    if (aggregate.function == AggregateFunction::CountStar) != aggregate.argument.is_none() {
+                    if aggregate.function.quantifier().is_some_and(|distinct| distinct != aggregate.distinct) { return invalid("Aggregate quantifier differs from its factory spelling"); }
+                    if (aggregate.function.canonical() == AggregateFunction::CountStar) != aggregate.argument.is_none() {
                         return invalid("Only COUNT(*) omits its input expression");
+                    }
+                    if aggregate.argument.as_ref().is_some_and(|argument| !matches!(argument, Expr::Column { .. })) || aggregate.order_by.iter().any(|order| !matches!(order.expr, Expr::Column { .. })) {
+                        return invalid("Aggregate inputs and ordering expressions must be projected to columns before filtering");
+                    }
+                    if aggregate.distinct && !matches!(aggregate.function.canonical(), AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Average | AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::ArrayAgg) {
+                        return invalid("The aggregate factory does not support DISTINCT");
+                    }
+                    if matches!(aggregate.function, AggregateFunction::Percentile { .. }) && (aggregate.distinct || !aggregate.order_by.is_empty()) {
+                        return invalid("Percentiles use their single input and direction, without DISTINCT or additional ordering");
                     }
                 }
             }
@@ -285,6 +480,8 @@ impl Relation {
                 }
             }
             RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => {
+                crate::PatchEndpoint::from_expr(from)?;
+                crate::PatchEndpoint::from_expr(to)?;
                 if [*iid, *valid_from, *valid_to, *document].into_iter().collect::<BTreeSet<_>>().len() != 4 { return invalid("Patch gap columns must be distinct"); }
                 for id in [iid, valid_from, valid_to, document] {
                     if input.schema.get(*id).is_none() { return invalid("Patch gap column is absent from input"); }

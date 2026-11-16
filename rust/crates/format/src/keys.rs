@@ -1,7 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use chrono::{Datelike, NaiveDate};
+use rtdb_types::calendar::CivilDate;
 use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, TableRef};
 use serde::Serialize;
 
@@ -93,13 +93,13 @@ impl TableSlug {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize)]
 pub struct TrieKey {
     level: i64,
-    recency: Option<NaiveDate>,
+    recency: Option<CivilDate>,
     part: Vec<u8>,
     block_index: BlockIndex,
 }
 
 impl TrieKey {
-    pub fn new(level: i64, recency: Option<NaiveDate>, part: Vec<u8>, block_index: BlockIndex) -> Result<Self> {
+    pub fn new(level: i64, recency: Option<CivilDate>, part: Vec<u8>, block_index: BlockIndex) -> Result<Self> {
         nonnegative(level, "trie level")?;
         nonnegative(block_index.0, "block index")?;
         if part.iter().any(|bucket| *bucket > 3) || recency.is_some_and(|date| date.year() < 0) {
@@ -110,7 +110,7 @@ impl TrieKey {
 
     pub fn l0(block_index: BlockIndex) -> Result<Self> { Self::new(0, None, Vec::new(), block_index) }
     pub fn level(&self) -> i64 { self.level }
-    pub fn recency(&self) -> Option<NaiveDate> { self.recency }
+    pub fn recency(&self) -> Option<CivilDate> { self.recency }
     pub fn part(&self) -> &[u8] { &self.part }
     pub fn block_index(&self) -> BlockIndex { self.block_index }
 }
@@ -141,12 +141,14 @@ impl FromStr for TrieKey {
         let recency = if recency == "c" {
             None
         } else {
-            if recency.len() < 8 || !recency.bytes().all(|c| c.is_ascii_digit()) { return Err(invalid_key(key)); }
+            let recency = recency.strip_prefix('+').unwrap_or(recency);
+            if !(5..=13).contains(&recency.len()) || !recency.bytes().all(|c| c.is_ascii_digit()) { return Err(invalid_key(key)); }
             let split = recency.len() - 4;
             let year = recency[..split].parse::<i32>().map_err(|_| invalid_key(key))?;
             let month = recency[split..split + 2].parse::<u32>().map_err(|_| invalid_key(key))?;
             let day = recency[split + 2..].parse::<u32>().map_err(|_| invalid_key(key))?;
-            Some(NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| invalid_key(key))?)
+            if !(1..=12).contains(&month) || !(1..=31).contains(&day) { return Err(invalid_key(key)); }
+            Some(CivilDate::from_ymd(year, month, day.min(CivilDate::month_length(year, month))).map_err(|_| invalid_key(key))?)
         };
         let part = if parts.len() == 4 {
             let digits = parts[2].strip_prefix('p').ok_or_else(|| invalid_key(key))?;

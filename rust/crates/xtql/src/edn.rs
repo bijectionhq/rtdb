@@ -219,25 +219,36 @@ fn parse_number(value: &str) -> std::result::Result<EdnKind, &'static str> {
         if rtdb_types::decimal_text_scale(value).is_err() { return Err("Invalid decimal literal"); }
         return Ok(EdnKind::Decimal(value.into()));
     }
-    if let Some(value) = value.strip_suffix('N') { return Ok(EdnKind::BigInteger(value.into())); }
+    if let Some(value) = value.strip_suffix('N') { return Ok(EdnKind::BigInteger(integer_token(value)?.to_string())); }
+    use num_traits::ToPrimitive;
+    if let Ok(parsed) = integer_token(value) {
+        return Ok(match parsed.to_i64() { Some(value) => EdnKind::Integer(value), None => EdnKind::BigInteger(parsed.to_string()) });
+    }
     if value.contains(['.', 'e', 'E']) { return value.parse().map(EdnKind::Float).map_err(|_| "Invalid floating-point literal"); }
+    Err("Invalid integer literal")
+}
+
+fn integer_token(value: &str) -> std::result::Result<num_bigint::BigInt, &'static str> {
     let (negative, unsigned) = if let Some(value) = value.strip_prefix('-') { (true, value) } else { (false, value.strip_prefix('+').unwrap_or(value)) };
-    let parsed = if let Some(hex) = unsigned.strip_prefix("0x").or_else(|| unsigned.strip_prefix("0X")) { i128::from_str_radix(hex, 16) }
-        else if let Some((radix, digits)) = unsigned.split_once('r') {
-            let radix = radix.parse().map_err(|_| "Invalid integer radix")?;
+    let (digits, radix) = if let Some(hex) = unsigned.strip_prefix("0x").or_else(|| unsigned.strip_prefix("0X")) { (hex, 16) }
+        else if let Some((radix, digits)) = unsigned.split_once(['r', 'R']) {
+            if radix.is_empty() || radix.len() > 2 || radix.starts_with('0') || !radix.bytes().all(|byte| byte.is_ascii_digit()) { return Err("Invalid integer radix"); }
+            let radix: u32 = radix.parse().map_err(|_| "Invalid integer radix")?;
             if !(2..=36).contains(&radix) { return Err("Integer radix must be between 2 and 36"); }
-            i128::from_str_radix(digits, radix)
+            (digits, radix)
         }
-        else if unsigned.len() > 1 && unsigned.starts_with('0') { i128::from_str_radix(&unsigned[1..], 8) }
-        else { unsigned.parse::<i128>() };
-    let parsed = parsed.map_err(|_| "Invalid integer literal")?;
-    let parsed = if negative { -parsed } else { parsed };
-    i64::try_from(parsed).map(EdnKind::Integer).map_err(|_| "Integer literal exceeds signed 64 bits; use a decimal suffix")
+        else if unsigned.len() > 1 && unsigned.starts_with('0') { (&unsigned[1..], 8) }
+        else { (unsigned, 10) };
+    if digits.is_empty() || !digits.chars().all(|ch| ch.is_ascii_alphanumeric() && ch.to_digit(radix).is_some()) { return Err("Invalid integer literal"); }
+    let parsed = num_bigint::BigInt::parse_bytes(digits.as_bytes(), radix).ok_or("Invalid integer literal")?;
+    Ok(if negative { -parsed } else { parsed })
 }
 
 fn same_form(left: &Edn, right: &Edn) -> bool {
     match (&left.kind, &right.kind) {
-        (EdnKind::List(a), EdnKind::List(b)) | (EdnKind::Vector(a), EdnKind::Vector(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_form(a, b)),
+        (EdnKind::Integer(a), EdnKind::BigInteger(b)) | (EdnKind::BigInteger(b), EdnKind::Integer(a)) => b.parse::<i64>().ok() == Some(*a),
+        (EdnKind::Decimal(a), EdnKind::Decimal(b)) => a.parse::<bigdecimal::BigDecimal>().ok().zip(b.parse::<bigdecimal::BigDecimal>().ok()).is_some_and(|(a, b)| a == b),
+        (EdnKind::List(a) | EdnKind::Vector(a), EdnKind::List(b) | EdnKind::Vector(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same_form(a, b)),
         (EdnKind::Set(a), EdnKind::Set(b)) => a.len() == b.len() && a.iter().all(|value| b.iter().any(|other| same_form(value, other))),
         (EdnKind::Map(a), EdnKind::Map(b)) => a.len() == b.len() && a.iter().all(|(key, value)| b.iter().any(|(other_key, other_value)| same_form(key, other_key) && same_form(value, other_value))),
         (EdnKind::Tagged { tag: a, value: av }, EdnKind::Tagged { tag: b, value: bv }) => a == b && same_form(av, bv),

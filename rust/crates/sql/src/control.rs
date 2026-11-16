@@ -56,15 +56,26 @@ impl ControlParser<'_> {
     fn expression(&mut self) -> Result<Expr> {
         if self.eat("ON") { return Ok(Expr::Literal(Value::Bool(true))); }
         if self.eat("OFF") { return Ok(Expr::Literal(Value::Bool(false))); }
-        let dialect = GenericDialect {};
+        let dialect = crate::dialect::SqlDialect::default();
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
-        let expression = parser.parse_expr().map_err(|error| self.error(error.to_string()))?;
+        let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
         self.index += parser.index();
         crate::bind::control_expression(self.source, &expression, self.options)
     }
-    fn option_value(&mut self) -> Result<ControlValue> {
+    fn option_value(&mut self, clock: bool) -> Result<ControlValue> {
         self.token(Token::Eq);
-        if self.eat("DEFAULT") { Ok(ControlValue::Default) } else { self.expression().map(ControlValue::Expression) }
+        if self.eat("DEFAULT") { return Ok(ControlValue::Default); }
+        if clock && !word(self.tokens.get(self.index),"ON") && !word(self.tokens.get(self.index),"OFF") {
+            let dialect = crate::dialect::SqlDialect::default();
+            let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
+            let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
+            self.index += parser.index();
+            return match crate::settings::clock_timestamp_literal(&expression)? {
+                Some(text) => Ok(ControlValue::TimestampLiteral(text)),
+                None => crate::bind::control_expression(self.source,&expression,self.options).map(ControlValue::Expression),
+            };
+        }
+        self.expression().map(ControlValue::Expression)
     }
     fn isolation(&mut self) -> Result<()> {
         self.expect("LEVEL")?;
@@ -99,7 +110,7 @@ impl ControlParser<'_> {
                 if !["timezone", "snapshot_token", "snapshot_time", "clock_time", "await_token", "system_time", "metadata", "async"].contains(&name.as_str()) {
                     return Err(self.error(format!("Unknown transaction option: {name}")));
                 }
-                let value = self.option_value()?;
+                let value = self.option_value(name == "clock_time")?;
                 if name == "async" && !matches!(&value, ControlValue::Default | ControlValue::Expression(Expr::Literal(_))) { return Err(self.error("ASYNC requires a literal or DEFAULT")); }
                 values.insert(name, value); saw_mode = true;
             }

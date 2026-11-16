@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_expr::{EvalContext, evaluate};
+use rtdb_expr::{EvalContext, EvaluationScope, evaluate_async};
 use rtdb_format::basis::decode_tx_basis;
 use rtdb_plan::{Binder, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Expr, Identifier, Schema, TransactionOptions};
 use rtdb_query::{QueryContext, QueryCursor};
@@ -21,12 +21,14 @@ pub struct ControlExecutionOptions {
     pub implicit_transaction: bool,
 }
 
+/// Owned control results retain their evaluation scope through transfer or protocol output.
+/// When extracting a payload, retain `allocation` until that payload has another allocation owner.
 pub enum ControlResult {
-    Command { tag: String, transaction: Option<CommitResult>, parameter_status: Option<(String, String)> },
+    Command { tag: String, transaction: Option<CommitResult>, parameter_status: Option<(String, String)>, allocation: Arc<EvaluationScope> },
     Rows(QueryCursor),
-    Prepare { name: String, source: String },
-    Execute { name: String, arguments: Vec<Value>, reservation: Arc<MemoryReservation> },
-    CopyIn { table: Vec<Identifier>, format: Option<CopyFormat> },
+    Prepare { name: String, source: String, allocation: Arc<EvaluationScope> },
+    Execute { name: String, arguments: Vec<Value>, reservation: Arc<MemoryReservation>, allocation: Arc<EvaluationScope> },
+    CopyIn { table: Vec<Identifier>, format: Option<CopyFormat>, allocation: Arc<EvaluationScope> },
 }
 
 pub fn control_schema(statement: &ControlStatement) -> Result<Option<Schema>> {
@@ -113,77 +115,105 @@ impl NativeSession {
             return Err(Anomaly::incorrect("xtdb/tx-failed", "Current transaction is aborted; roll back before issuing more statements"));
         }
         if arguments.len() < statement.parameter_count() { return Err(Anomaly::incorrect("xtdb/missing-parameter", "Control statement has fewer parameters than its expressions")); }
+        let allocation = Arc::new(EvaluationScope::new(self.service.node.memory())?);
+        allocation.reserve(arguments.iter().try_fold(256usize, |bytes, value| size(bytes, value.retained_bytes()?))?)?;
+        let mut admitted_arguments = arguments.to_vec();
+        admitted_arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        let arguments = admitted_arguments.as_slice();
+        let needs_catalog = match statement {
+            ControlStatement::Begin(options) | ControlStatement::SetTransaction(options) => options.expressions().iter().any(|expr| control_requires_catalog(expr, arguments)),
+            ControlStatement::SetTimeZone(expr) | ControlStatement::SetAwaitToken(expr) | ControlStatement::SetParameter { value: expr, .. } => control_requires_catalog(expr, arguments),
+            _ => false,
+        };
+        let catalog_context = if needs_catalog {
+            let basis = self.state.inspection_basis()?;
+            Some(self.service.node.query_context(self.state.database(), &basis, self.service.identity.as_ref(), cancellation).await?)
+        } else { None };
+        let catalog = catalog_context.as_ref().map(|context| &context.catalog as &dyn rtdb_expr::PgCatalogLookup);
         match statement {
             ControlStatement::Begin(options) => {
-                self.state.begin()?;
-                let settings = transaction_settings(options, arguments, self.state.effective_timezone(), self.state.session_timezone(), self.service.node.now(), self.service.node.memory());
-                if let Err(error) = settings.and_then(|settings| self.state.set_transaction(settings)) { self.state.rollback_tx()?; return Err(error); }
-                Ok(command("BEGIN"))
+                self.state.check_begin()?;
+                let settings = transaction_settings(options, arguments, self.state.effective_timezone(), self.state.session_timezone(), self.service.node.query_instant(), self.service.node.memory(), &allocation, catalog).await?;
+                self.state.begin_with(settings)?;
+                Ok(command("BEGIN", allocation))
             }
             ControlStatement::SetTransaction(options) => {
-                let settings = transaction_settings(options, arguments, self.state.effective_timezone(), self.state.session_timezone(), self.service.node.now(), self.service.node.memory())?;
-                self.state.set_transaction(settings)?; Ok(command("SET TRANSACTION"))
+                let settings = transaction_settings(options, arguments, self.state.effective_timezone(), self.state.session_timezone(), self.service.node.query_instant(), self.service.node.memory(), &allocation, catalog).await?;
+                self.state.set_transaction(settings)?; Ok(command("SET TRANSACTION", allocation))
             }
             ControlStatement::Commit(mode) => {
                 let result = self.state.commit_tx(mode.map(|mode| match mode { ControlCommitMode::Sync => CommitMode::Sync, ControlCommitMode::Async => CommitMode::Async })).await?;
                 if let CommitResult::Executed(tx) = &result { if let Some(error) = tx.error() { return Err(error.clone()); } }
-                Ok(ControlResult::Command { tag: "COMMIT".into(), transaction: Some(result), parameter_status: None })
+                Ok(ControlResult::Command { tag: "COMMIT".into(), transaction: Some(result), parameter_status: None, allocation })
             }
-            ControlStatement::Rollback => { self.state.rollback_tx()?; Ok(command("ROLLBACK")) }
-            ControlStatement::SetSessionCharacteristics(access) => { self.state.set_session_characteristics(*access)?; Ok(command("SET SESSION CHARACTERISTICS")) }
+            ControlStatement::Rollback => { self.state.rollback_tx()?; Ok(command("ROLLBACK", allocation)) }
+            ControlStatement::SetSessionCharacteristics(access) => { self.state.set_session_characteristics(*access)?; Ok(command("SET SESSION CHARACTERISTICS", allocation)) }
             ControlStatement::SetTimeZone(expression) => {
-                let value = self.control_value(expression, arguments)?;
+                let value = self.control_value(expression, arguments, &allocation, catalog).await?;
                 self.state.set_timezone(string(value, "TIME ZONE")?.ok_or_else(|| invalid("TIME ZONE requires a string"))?)?;
-                Ok(ControlResult::Command { tag: "SET TIME ZONE".into(), transaction: None, parameter_status: Some(("TimeZone".into(), self.state.effective_timezone().into())) })
+                allocation.reserve(self.state.effective_timezone().len())?;
+                Ok(ControlResult::Command { tag: "SET TIME ZONE".into(), transaction: None, parameter_status: Some(("TimeZone".into(), self.state.effective_timezone().into())), allocation })
             }
             ControlStatement::SetAwaitToken(expression) => {
-                self.state.set_await_token(string(self.control_value(expression, arguments)?, "AWAIT_TOKEN")?)?; Ok(command("SET AWAIT_TOKEN"))
+                let value = self.control_value(expression, arguments, &allocation, catalog).await?;
+                self.state.set_await_token(string(value, "AWAIT_TOKEN")?)?; Ok(command("SET AWAIT_TOKEN", allocation))
             }
             ControlStatement::SetParameter { name, value } => {
-                let value = self.control_value(value, arguments)?;
+                let value = self.control_value(value, arguments, &allocation, catalog).await?;
+                allocation.reserve(rtdb_expr::text_allocation_bound(&value)?)?;
+                allocation.reserve(name.len().checked_mul(4).ok_or_else(|| invalid("SET name allocation overflow"))?)?;
                 let value = if matches!(value, Value::Null | Value::Undefined) { None } else {
-                    let Value::Utf8(value) = rtdb_expr::cast(&value, &LogicalType::Scalar(ScalarType::Utf8), self.state.effective_timezone())? else { return Err(invalid("Session parameter could not be formatted")); };
+                    let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(&allocation), catalog };
+                    let Value::Utf8(value) = rtdb_expr::scalar_call("str", &[value], &eval)? else { return Err(invalid("Session parameter could not be formatted")); };
                     Some(value)
                 };
                 self.state.set_parameter(name.clone(), value.clone())?;
-                Ok(ControlResult::Command { tag: "SET".into(), transaction: None, parameter_status: value.map(|value| (name.clone(), value)) })
+                Ok(ControlResult::Command { tag: "SET".into(), transaction: None, parameter_status: value.map(|value| (name.clone(), value)), allocation })
             }
-            ControlStatement::SetRole => Ok(command("SET ROLE")),
+            ControlStatement::SetRole => Ok(command("SET ROLE", allocation)),
             ControlStatement::Discard(target) => {
                 if *target == DiscardTarget::All { self.state.reset()?; }
-                Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }))
+                Ok(command(match target { DiscardTarget::All => "DISCARD ALL", DiscardTarget::Plans => "DISCARD PLANS", DiscardTarget::Temporary => "DISCARD TEMP", DiscardTarget::Sequences => "DISCARD SEQUENCES" }, allocation))
             }
             ControlStatement::Show { name } => self.show(name, statement.requires_read_transaction(), cancellation).await.map(ControlResult::Rows),
-            ControlStatement::Prepare { name, source } => Ok(ControlResult::Prepare { name: name.clone(), source: source.clone() }),
+            ControlStatement::Prepare { name, source } => {
+                allocation.reserve(size(name.len(), source.len())?)?;
+                Ok(ControlResult::Prepare { name: name.clone(), source: source.clone(), allocation })
+            }
             ControlStatement::Execute { name, arguments: expressions } => {
                 let context = self.query_context_with(cancellation, false).await?;
                 let bound = arguments.iter().try_fold(8192usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
-                let reservation = context.memory.reserve(size(bound, expressions.len().checked_mul(8192).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?)?;
-                let eval = EvalContext { parameters: arguments, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[] };
-                let arguments = expressions.iter().map(|expression| evaluate(expression, &Schema::default(), &[], &eval)).collect::<Result<Vec<_>>>()?;
+                let _scratch = context.memory.reserve(size(bound, expressions.len().checked_mul(8192).ok_or_else(|| invalid("EXECUTE allocation size overflow"))?)?)?;
+                let eval = EvalContext { parameters: arguments, parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: context.snapshot_token(), allocation: Some(&allocation), catalog: Some(&context.catalog) };
+                let mut arguments = Vec::with_capacity(expressions.len());
+                for expression in expressions { arguments.push(evaluate_async(expression, &Schema::default(), &[], &eval).await?); }
                 let actual = arguments.iter().try_fold(0usize, |bytes, value| size(bytes, value.retained_bytes()?))?;
-                if actual > reservation.bytes() { return Err(invalid("EXECUTE result exceeds its allocation reservation")); }
-                Ok(ControlResult::Execute { name: name.clone(), arguments, reservation })
+                let reservation = context.memory.reserve(size(actual, size(name.len(), 256)?)?)?;
+                allocation.reserve(name.len())?;
+                Ok(ControlResult::Execute { name: name.clone(), arguments, reservation, allocation })
             }
-            ControlStatement::CopyIn { table, format } => Ok(ControlResult::CopyIn { table: table.clone(), format: *format }),
+            ControlStatement::CopyIn { table, format } => {
+                allocation.reserve(table.iter().try_fold(256usize, |bytes, identifier| size(bytes, size(identifier.text.len(), 128)?))?)?;
+                Ok(ControlResult::CopyIn { table: table.clone(), format: *format, allocation })
+            }
             ControlStatement::AttachDatabase { name, configuration_yaml } => {
                 self.check_database_control("attach", options)?;
                 let configuration = configuration_yaml.as_deref().map(rtdb_format::config::decode_database_yaml).transpose()?.unwrap_or_else(rtdb_format::config::default_database_config);
                 let result = self.service.node.attach_database(name.clone(), configuration, self.service.identity.as_ref(), cancellation).await?;
                 if let Some(error) = result.error() { return Err(error.clone()); }
-                Ok(ControlResult::Command { tag: "ATTACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None })
+                Ok(ControlResult::Command { tag: "ATTACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None, allocation })
             }
             ControlStatement::DetachDatabase { name } => {
                 self.check_database_control("detach", options)?;
                 let result = self.service.node.detach_database(name.clone(), self.service.identity.as_ref(), cancellation).await?;
                 if let Some(error) = result.error() { return Err(error.clone()); }
-                Ok(ControlResult::Command { tag: "DETACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None })
+                Ok(ControlResult::Command { tag: "DETACH DATABASE".into(), transaction: Some(CommitResult::Executed(result)), parameter_status: None, allocation })
             }
         }
     }
 
-    fn control_value(&self, expression: &Expr, parameters: &[Value]) -> Result<Value> {
-        evaluate(expression, &Schema::default(), &[], &EvalContext { parameters, current_time: self.service.node.now(), timezone: self.state.effective_timezone(), outer_rows: &[] })
+    async fn control_value(&self, expression: &Expr, parameters: &[Value], allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<Value> {
+        evaluate_async(expression, &Schema::default(), &[], &EvalContext { parameters, parameter_types: None, current_time: self.service.node.query_instant(), timezone: self.state.effective_timezone(), outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog }).await
     }
 
     fn check_database_control(&self, action: &str, options: ControlExecutionOptions) -> Result<()> {
@@ -214,7 +244,7 @@ impl NativeSession {
         let instant = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
         let (fields, rows) = match name {
             "snapshot_token" => (vec![(name, text.clone())], vec![vec![Value::Utf8(snapshot_token.unwrap_or_default())]]),
-            "clock_time" => (vec![(name, instant.clone())], vec![vec![timestamp(basis.current_time)]]),
+            "clock_time" => (vec![(name, instant.clone())], vec![vec![timestamp(basis.current_time.as_micros()?)]]),
             "timezone" => (vec![(name, text.clone())], vec![vec![Value::Utf8(self.state.effective_timezone().into())]]),
             "transaction_isolation" => (vec![(name, text.clone())], vec![vec![Value::Utf8("read committed".into())]]),
             "await_token" => (vec![(name, text.clone().maybe())], vec![vec![self.state.effective_await_token().map_or(Value::Null, |token| Value::Utf8(token.into()))]]),
@@ -251,39 +281,65 @@ impl NativeSession {
     }
 }
 
-pub fn transaction_settings(options: &TransactionOptions, parameters: &[Value], timezone: &str, session_timezone: &str, current_time: Timestamp, memory: &Arc<MemoryBudget>) -> Result<TransactionSettings> {
-    let eval = |expression: &Expr, timezone: &str| evaluate(expression, &Schema::default(), &[], &EvalContext { parameters, current_time, timezone, outer_rows: &[] });
-    let timezone_update = update(options.timezone.as_ref(), |expression| string(eval(expression, timezone)?, "TIMEZONE"))?;
+/// Retain `allocation` until returned settings are installed into charged session state or dropped.
+/// `catalog` must be the captured basis when an expression resolves relation names.
+/// Evaluation stays on the caller's future; dropping it cancels SLEEP without installing partial settings.
+pub async fn transaction_settings(options: &TransactionOptions, parameters: &[Value], timezone: &str, session_timezone: &str, current_time: impl Into<rtdb_types::Instant>, memory: &Arc<MemoryBudget>, allocation: &EvaluationScope, catalog: Option<&dyn rtdb_expr::PgCatalogLookup>) -> Result<TransactionSettings> {
+    let initial = EvalContext { parameters, parameter_types: None, current_time: current_time.into(), timezone, outer_rows: &[], snapshot_token: None, allocation: Some(allocation), catalog };
+    let timezone_update = update(options.timezone.as_ref(), &initial, |value| string(value, "TIMEZONE")).await?;
     let timezone = match &timezone_update { OptionUpdate::Set(timezone) => rtdb_expr::normalize_timezone(timezone)?, OptionUpdate::Clear => session_timezone.to_owned(), OptionUpdate::Unchanged => timezone.to_owned() };
-    let token = |expression: &Expr| string(eval(expression, &timezone)?, "Transaction token");
-    let instant = |expression: &Expr| {
-        let value = eval(expression, &timezone)?;
+    let eval = EvalContext { timezone: &timezone, ..initial };
+    let token = |value| string(value, "Transaction token");
+    let instant = |value| {
         if matches!(value, Value::Null | Value::Undefined) { Ok(None) } else { rtdb_expr::timestamp_micros(&value, &timezone).map(Some) }
     };
     let access = match &options.access {
         None => None,
         Some(ControlAccessOptions::ReadOnly(options)) => Some(AccessSettings::ReadOnly(ReadOnlySettings {
-            snapshot_token: update(options.snapshot_token.as_ref(), token)?, snapshot_time: update(options.snapshot_time.as_ref(), instant)?,
-            clock_time: update(options.clock_time.as_ref(), instant)?, await_token: update(options.await_token.as_ref(), token)?,
+            snapshot_token: update(options.snapshot_token.as_ref(), &eval, token).await?, snapshot_time: update(options.snapshot_time.as_ref(), &eval, instant).await?,
+            clock_time: clock_update(options.clock_time.as_ref(), &eval).await?, await_token: update(options.await_token.as_ref(), &eval, token).await?,
         })),
         Some(ControlAccessOptions::ReadWrite(options)) => Some(AccessSettings::ReadWrite(ReadWriteSettings {
-            system_time: update(options.system_time.as_ref(), instant)?,
-            user_metadata: update(options.metadata.as_ref(), |expression| match eval(expression, &timezone)? { Value::Null | Value::Undefined => Ok(None), value => UserMetadata::new(value, memory).map(Some) })?,
-            asynchronous: update(options.asynchronous.as_ref(), |expression| match eval(expression, &timezone)? { Value::Null | Value::Undefined => Ok(None), Value::Bool(value) => Ok(Some(value)), _ => Err(invalid("ASYNC requires a boolean")) })?,
+            system_time: update(options.system_time.as_ref(), &eval, instant).await?,
+            user_metadata: update(options.metadata.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), value => UserMetadata::new(value, memory).map(Some) }).await?,
+            asynchronous: update(options.asynchronous.as_ref(), &eval, |value| match value { Value::Null | Value::Undefined => Ok(None), Value::Bool(value) => Ok(Some(value)), _ => Err(invalid("ASYNC requires a boolean")) }).await?,
         })),
     };
     Ok(TransactionSettings { access, timezone: timezone_update })
 }
 
-fn update<T>(option: Option<&ControlValue>, evaluate: impl FnOnce(&Expr) -> Result<Option<T>>) -> Result<OptionUpdate<T>> {
+async fn update<T>(option: Option<&ControlValue>, context: &EvalContext<'_>, convert: impl FnOnce(Value) -> Result<Option<T>>) -> Result<OptionUpdate<T>> {
     Ok(match option { None => OptionUpdate::Unchanged, Some(ControlValue::Default) => OptionUpdate::Clear,
-        Some(ControlValue::Expression(expression)) => match evaluate(expression)? { Some(value) => OptionUpdate::Set(value), None => OptionUpdate::Clear },
+        Some(ControlValue::Expression(expression)) => match convert(evaluate_async(expression, &Schema::default(), &[], context).await?)? { Some(value) => OptionUpdate::Set(value), None => OptionUpdate::Clear },
+        Some(ControlValue::TimestampLiteral(_)) => return Err(invalid("An unadmitted timestamp literal requires CLOCK_TIME resolution")),
     })
+}
+async fn clock_update(option: Option<&ControlValue>, context: &EvalContext<'_>) -> Result<OptionUpdate<rtdb_types::Instant>> {
+    if let Some(ControlValue::TimestampLiteral(text)) = option {
+        return rtdb_types::parse_sql_timestamp_instant(text,context.timezone).map(OptionUpdate::Set);
+    }
+    update(option,context,|value| if matches!(value,Value::Null | Value::Undefined) { Ok(None) }
+        else { rtdb_expr::query_clock_instant(&value,context.timezone).map(Some) }).await
 }
 fn string(value: Value, option: &str) -> Result<Option<String>> {
     match value { Value::Null | Value::Undefined => Ok(None), Value::Utf8(value) => Ok(Some(value)), _ => Err(invalid(format!("{option} requires a string"))) }
 }
-fn command(tag: &str) -> ControlResult { ControlResult::Command { tag: tag.into(), transaction: None, parameter_status: None } }
+fn control_requires_catalog(expression: &Expr, arguments: &[Value]) -> bool {
+    fn regclass(value: &Value) -> bool { match value {
+        Value::RegClass(_) => true,
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().any(regclass),
+        Value::Struct(fields) => fields.values().any(regclass),
+        Value::Map { entries, .. } => entries.iter().any(|(key, value)| regclass(key) || regclass(value)),
+        _ => false,
+    } }
+    if rtdb_expr::requires_pg_catalog(expression) { return true; }
+    let mut required = false;
+    expression.visit(&mut |expr| {
+        if let Expr::Parameter { index, .. } = expr { required |= arguments.get(*index).is_some_and(regclass); }
+    });
+    required
+}
+fn command(tag: &str, allocation: Arc<EvaluationScope>) -> ControlResult { ControlResult::Command { tag: tag.into(), transaction: None, parameter_status: None, allocation } }
 fn timestamp(value: Timestamp) -> Value { Value::Timestamp { value: value.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 fn size(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| invalid("Control allocation size overflow")) }
 fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-transaction-option", message) }

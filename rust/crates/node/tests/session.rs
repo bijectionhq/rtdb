@@ -12,7 +12,7 @@ use rtdb_tx::{SqlArguments, SubmitOptions, SubmittedTx, TransactionResult, TxOp}
 use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
-struct State { clock: i64, submissions: Vec<(String, Vec<TxOp>, SubmitOptions)>, observations: Vec<&'static str>, abort: Option<Anomaly> }
+struct State { clock: i64, extra_nanos: u32, submissions: Vec<(String, Vec<TxOp>, SubmitOptions)>, observations: Vec<&'static str>, abort: Option<Anomaly> }
 #[derive(Default)]
 struct Metrics { durations: Mutex<Vec<rtdb_plan::ExecutionTimer>>, errors: Mutex<Vec<rtdb_plan::ExecutionError>> }
 impl rtdb_plan::ExecutionObserver for Metrics {
@@ -22,7 +22,7 @@ impl rtdb_plan::ExecutionObserver for Metrics {
 struct Service { state: Mutex<State>, memory: Arc<MemoryBudget>, metrics: Arc<Metrics> }
 impl Service {
     fn new() -> Arc<Self> { Self::with_memory(1_000_000) }
-    fn with_memory(bytes: usize) -> Arc<Self> { Arc::new(Self { state: Mutex::new(State { clock: 1, submissions: Vec::new(), observations: Vec::new(), abort: None }), memory: MemoryBudget::new(bytes), metrics: Arc::new(Metrics::default()) }) }
+    fn with_memory(bytes: usize) -> Arc<Self> { Arc::new(Self { state: Mutex::new(State { clock: 1, extra_nanos: 0, submissions: Vec::new(), observations: Vec::new(), abort: None }), memory: MemoryBudget::new(bytes), metrics: Arc::new(Metrics::default()) }) }
     fn session(self: &Arc<Self>) -> Session { Session::new(self.clone(), "xtdb", "UTC", &CancellationToken::new()).unwrap() }
 }
 #[async_trait]
@@ -33,6 +33,10 @@ impl SessionService for Service {
     fn check_open(&self) -> Result<()> { Ok(()) }
     async fn revalidate(&self) -> Result<()> { Ok(()) }
     fn now(&self) -> Timestamp { Timestamp(self.state.lock().clock) }
+    fn query_instant(&self) -> Instant {
+        let state = self.state.lock();let base = Instant::from(Timestamp(state.clock));
+        Instant::new(base.seconds(),base.nanos()+state.extra_nanos).unwrap()
+    }
     fn snapshot_basis(&self) -> Result<TimeBasis> {
         let mut state = self.state.lock();
         state.observations.push("snapshot");
@@ -230,9 +234,9 @@ async fn options_can_be_cleared_before_the_first_statement_and_begin_failure_rol
     let service = Service::new(); let mut session = service.session();
     let invalid = TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings { await_token: OptionUpdate::Set("not-base64".into()), ..Default::default() })), ..Default::default() };
     assert!(session.begin_with(invalid).is_err()); assert_eq!(session.status(), TransactionStatus::Idle);
-    session.begin_with(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings { clock_time: OptionUpdate::Set(Timestamp(99)), ..Default::default() })), ..Default::default() }).unwrap();
+    session.begin_with(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings { clock_time: OptionUpdate::Set(Timestamp(99).into()), ..Default::default() })), ..Default::default() }).unwrap();
     session.set_transaction(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings { clock_time: OptionUpdate::Clear, ..Default::default() })), ..Default::default() }).unwrap();
-    assert_eq!(session.read_basis().await.unwrap().current_time, Timestamp(1));
+    assert_eq!(session.read_basis().await.unwrap().current_time, Timestamp(1).into());
     assert_eq!(session.set_transaction(read_write()).unwrap_err().code, "xtdb/set-transaction-after-first-statement");
     session.set_transaction(TransactionSettings::default()).unwrap();
 }
@@ -364,4 +368,32 @@ async fn read_basis_and_transaction_tokens_release_on_rollback() {
     assert!(service.memory.used_bytes() > baseline);
     session.rollback_tx().unwrap();
     assert_eq!(service.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn pinned_read_basis_retains_submicrosecond_clock_and_commit_time_stays_microseconds() {
+    let service = Service::new();let mut session = service.session();
+    let clock = Instant::new(0,999).unwrap();
+    session.begin_with(TransactionSettings { access: Some(AccessSettings::ReadOnly(ReadOnlySettings { clock_time: OptionUpdate::Set(clock),..Default::default() })),..Default::default() }).unwrap();
+    let basis = session.read_basis().await.unwrap();
+    assert_eq!(basis.current_time,clock);
+    service.state.lock().clock = 7;
+    assert_eq!(session.read_basis().await.unwrap(),basis);
+    session.rollback_tx().unwrap();
+    let result = session.submit_tx(vec![operation()],AutonomousTxOptions { system_time: Some(Timestamp(2)),..Default::default() }).await.unwrap();
+    assert_eq!(result.tx_id,TxId(1));
+    assert_eq!(service.state.lock().submissions[0].2.system_time,Some(Timestamp(2)));
+}
+
+#[tokio::test]
+async fn session_clock_capability_keeps_exact_readings_until_the_basis_is_pinned() {
+    let service = Service::new();service.state.lock().extra_nanos = 789;
+    let mut session = service.session();
+    assert_eq!(session.read_basis().await.unwrap().current_time,Instant::new(0,1789).unwrap());
+    session.begin_with(read_only()).unwrap();
+    let pinned = session.read_basis().await.unwrap();
+    service.state.lock().extra_nanos = 999;
+    assert_eq!(session.read_basis().await.unwrap(),pinned);
+    session.rollback_tx().unwrap();
+    assert_eq!(session.read_basis().await.unwrap().current_time,Instant::new(0,1999).unwrap());
 }

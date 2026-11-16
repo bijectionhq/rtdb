@@ -10,11 +10,14 @@ pub trait Converter: Send {
     /// None is a Kafka tombstone; failures stop the assignment before submitting its current batch.
     /// Reserve before allocating and retain shared cache charges in `context`; its owner must outlive the returned data.
     async fn decode(&mut self, topic: &str, bytes: Option<&[u8]>, context: &mut ConversionContext) -> Result<ConnectData>;
+    /// The assignment owner awaits this after its final or cancelled decode, before releasing converter state.
+    /// Implementations drain admitted external work even when decode returned an error.
+    async fn close(&mut self) -> Result<()> { Ok(()) }
 }
-pub struct ConversionContext { memory: Arc<MemoryBudget>, charges: Vec<Arc<MemoryReservation>>, limit: usize, reserved: usize }
+pub struct ConversionContext { memory: Arc<MemoryBudget>, charges: Vec<Arc<MemoryReservation>>, limit: usize, reserved: usize, registry_key: Option<Vec<u8>> }
 impl ConversionContext {
-    pub fn new(memory: Arc<MemoryBudget>) -> Self { let limit = memory.limit_bytes(); Self { memory, charges: Vec::new(), limit, reserved: 0 } }
-    pub fn with_limit(memory: Arc<MemoryBudget>, limit: usize) -> Self { Self { memory, charges: Vec::new(), limit, reserved: 0 } }
+    pub fn new(memory: Arc<MemoryBudget>) -> Self { let limit = memory.limit_bytes(); Self { memory, charges: Vec::new(), limit, reserved: 0, registry_key: None } }
+    pub fn with_limit(memory: Arc<MemoryBudget>, limit: usize) -> Self { Self { memory, charges: Vec::new(), limit, reserved: 0, registry_key: None } }
     pub fn allocation_limit(&self) -> usize { self.limit }
     pub fn reserve(&mut self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         let reserved = self.reserved.checked_add(bytes).filter(|bytes| *bytes <= self.limit).ok_or_else(|| error("batch-too-large", "Converter allocation exceeds its per-record limit"))?;
@@ -25,6 +28,13 @@ impl ConversionContext {
         let reserved = self.reserved.checked_add(charge.bytes()).filter(|bytes| *bytes <= self.limit).ok_or_else(|| error("batch-too-large", "Retained converter allocation exceeds its per-record limit"))?;
         self.charges.push(charge); self.reserved = reserved; Ok(())
     }
+    pub(super) fn set_registry_key(&mut self, bytes: Option<&[u8]>) -> Result<()> {
+        if let Some(bytes) = bytes { self.reserve(bytes.len().checked_add(64).ok_or_else(|| error("allocation-overflow", "Registry key allocation overflow"))?)?; }
+        self.registry_key = bytes.map(<[u8]>::to_vec);
+        Ok(())
+    }
+    pub(super) fn registry_key(&self) -> Option<&[u8]> { self.registry_key.as_deref() }
+    pub(super) fn clear_registry_key(&mut self) { self.registry_key = None; }
     pub(crate) fn into_charges(self) -> Vec<Arc<MemoryReservation>> { self.charges }
 }
 pub trait ConverterFactory: Send + Sync { fn open(&self, options: &BTreeMap<String, String>, is_key: bool) -> Result<Box<dyn Converter>>; }
@@ -63,7 +73,11 @@ impl PluginRegistry {
         if let Some(factory) = self.converters.get(&spec.class_name) { return factory.open(&spec.options, is_key); }
         super::converter::open(spec, is_key)
     }
-    pub fn chain(&self, config: &ConnectConfig) -> Result<TransformChain> {
+    /// Opens an assignment-owned, single-writer transform chain with explicit process date defaults.
+    /// Built-in date transforms retain the shared environment; custom factories retain their own configuration.
+    /// Eager configuration and allocation failures return before publishing the chain.
+    /// TimestampRouter constructs its formatter on the first timestamped record, so its pattern errors are returned by `apply`.
+    pub fn chain_with_environment(&self, config: &ConnectConfig, environment: Arc<super::DateEnvironment>) -> Result<TransformChain> {
         let mut predicates = BTreeMap::new();
         let mut steps = Vec::new();
         for spec in &config.transforms {
@@ -74,7 +88,7 @@ impl PluginRegistry {
                     predicates.insert(alias.clone(), opened);
                 }
             }
-            let transform = match self.transforms.get(&spec.plugin.class_name) { Some(factory) => factory.open(&spec.plugin.options)?, None => super::transforms::open(&spec.plugin)? };
+            let transform = match self.transforms.get(&spec.plugin.class_name) { Some(factory) => factory.open(&spec.plugin.options)?, None => super::transforms::open(&spec.plugin, Arc::clone(&environment))? };
             let configuration_bytes = spec.plugin.options.iter().try_fold(4096usize, |size, (key, value)| size.checked_add(key.len()).and_then(|size| size.checked_add(value.len())).ok_or_else(|| error("allocation-overflow", "Transform configuration size overflow")))?;
             steps.push(Step { transform, predicate: spec.predicate.clone(), negate: spec.negate, configuration_bytes });
         }

@@ -144,7 +144,7 @@ impl SystemCursor {
                             ("min_valid_from", metadata.min_valid_from), ("max_valid_from", metadata.max_valid_from), ("min_valid_to", metadata.min_valid_to),
                             ("max_valid_to", metadata.max_valid_to), ("min_system_from", metadata.min_system_from), ("max_system_from", metadata.max_system_from),
                         ].into_iter().map(|(name, value)| (name.into(), timestamp(value.unwrap_or(if name.starts_with("min_") { i64::MAX } else { i64::MIN })))).collect())).unwrap_or(Value::Null);
-                        let recency = trie.key.recency().map(|date| Value::DateDay(date.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch date")).num_days() as i32)).unwrap_or(Value::Null);
+                        let recency = trie.key.recency().map(|date| Value::DateDay(date.epoch_day() as i32)).unwrap_or(Value::Null);
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("trie_key", text(&trie.key.to_string())), ("level", Value::I32(i32::try_from(trie.key.level()).map_err(|_| size_error())?)),
                             ("recency", recency), ("trie_state", text(match trie.state { rtdb_index::TrieState::Nascent => "nascent", rtdb_index::TrieState::Live => "live", rtdb_index::TrieState::Garbage { .. } => "garbage" })),
                             ("data_file_size", Value::I64(trie.data_file_size)), ("row_count", metadata.map(|metadata| Value::I64(metadata.row_count.unwrap_or_default())).unwrap_or(Value::Null)), ("temporal_metadata", temporal)]));

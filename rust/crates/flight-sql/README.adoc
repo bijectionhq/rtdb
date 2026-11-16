@@ -3,6 +3,8 @@
 `rtdb-flight-sql` serves Arrow Flight SQL through native tonic HTTP/2 and Arrow IPC.
 ADBC Flight SQL drivers use the same `rtdb-node` sessions, SQL preparation, query cursors, transaction resolver, and authentication as the PostgreSQL frontend.
 The source and regression cases remain uncompiled and unexecuted during Phase 1.
+Schema descriptions retain the supplied physical parameter fields, while query execution opens their signed vector view.
+Retained parameter IPC remains lossless, and bulk ingestion admits cells before constructing logical documents.
 
 == Composition and ownership
 
@@ -18,6 +20,10 @@ The driver's socket adapter observes cancellation during reads and writes, inclu
 The driver also waits for the admitted-call monitor to reach zero before reporting completion.
 
 Service methods and response streams are passive caller-owned work.
+The stream advertises the prepared result schema and conforms runtime pages through the passive `rtdb-columnar::DeclaredBatch` adapter.
+This follows the pinned Flight producer's ADBC `ArrowReader`, including NULL endpoint vectors under advertised timestamp fields.
+The encoder checks the complete declared schema before encoding physical buffers, including signed decimal precision and scale metadata.
+Schema and record-node regression sources remain unexecuted.
 An admission owner retains its semaphore permit through authentication, execution, and the final response stream.
 An acquired-session guard releases its in-use count even when a call is dropped during identity revalidation.
 Sessions own their catalog selection and per-database connections.
@@ -114,3 +120,6 @@ These cases map to `core/src/test/kotlin/xtdb/flight_sql/LeaseTest.kt`, `src/tes
 The protocol references are https://arrow.apache.org/docs/format/FlightSql.html[Flight SQL] and https://github.com/apache/arrow/blob/main/format/Flight.proto[Flight session actions].
 The implementation uses https://docs.rs/arrow-flight/58.4.1/arrow_flight/[Arrow Flight 58.4.1] and https://docs.rs/tonic/0.14.5/tonic/[tonic 0.14.5].
 Interop with Java, Go, Python, R, and ADBC drivers, external authentication, flow-control cancellation races, concurrent expiry/claim races, and every test listed here remain unexecuted qualification work.
+
+Ticket `currentTime` retains the query clock's nanoseconds through serialization and later execution.
+The captured snapshot-time cap retains its separate microsecond representation.

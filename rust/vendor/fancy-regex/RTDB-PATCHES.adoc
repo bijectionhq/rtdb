@@ -1,0 +1,94 @@
+= RTDB vendored fancy-regex
+
+This directory contains the crates.io `fancy-regex` 0.16.2 release, from upstream commit `68d300b2853cfb390a99020719114c22254878e5`.
+The original `fancy-regex-0.16.2.crate` archive has SHA-256 `998b056554fbe42e03ae0e152895cd1a7e1002aec800fdc6635d20270260c46f`.
+The upstream MIT license is retained in `LICENSE`; original source copyright notices and package metadata remain intact.
+The workspace uses a direct path dependency and excludes this package from workspace membership.
+
+== Local resource patches
+
+* `src/lib.rs`: `RegexOptions` and `RegexBuilder::backtrack_stack_limit` expose a separate retained-branch limit; hard-pattern compilation passes the selected options to the compiler.
+* `src/compile.rs`: `compile_with_options` supplies those options to every delegated regex; the existing `compile` entry point retains upstream defaults.
+* `src/vm.rs`: matcher state uses the selected branch limit; Unicode case-insensitive backreferences compare bounded per-character fold classes without constructing an input-sized regex during matching.
+The backreference comparison advances by matched UTF-8 scalar widths, including when the captured and matching characters have different byte lengths.
+The default branch limit remains 1,000,000.
+
+`tests/regex_options.rs` contains regressions for all three patches.
+Phase 2 must run the vendored test target explicitly with `cargo test --manifest-path rust/vendor/fancy-regex/Cargo.toml --test regex_options`, in addition to the workspace qualification.
+The ASCII backreference regression must also run with `--no-default-features --features std` to qualify the matcher without Unicode tables.
+No vendored test or workspace build was executed while preparing these Phase 1 sources.
+
+== Java matching extensions
+
+`RegexBuilder::java_matching` selects atomic positive lookaround, variable lookbehind with nearest-first candidate starts, dynamic failure of undefined capture references, and Java Unicode backreference casing.
+The analyzer retains backreference nodes when their groups are undefined; the compiler emits a failing instruction for those references before internal save slots are allocated.
+Lookbehind stores its endpoint and lower bound in caller-owned VM save slots and keeps one next-candidate branch at a time.
+Existing branch and attempt limits apply to those candidates.
+Delegated matches retain captures omitted by a later successful iteration in Java mode, following `Pattern.GroupTail`; failed branches restore the earlier VM capture state.
+The parser represents ASCII-insensitive backreferences separately through `(?i-u:...)`; other consuming expressions in a `-u` scope remain unsupported.
+`captures_from_pos_with_previous_end` preserves the preceding match endpoint independently of the next search start.
+The existing capture APIs retain their original `\G` convention.
+
+`src/unicode_case.rs` derives simple uppercase and lowercase mappings from https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt[UnicodeData 16.0.0], the Unicode version identified by OpenJDK 25's Unicode notice.
+The input SHA-256 is `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`.
+`LICENSE-UNICODE` retains the Unicode License V3 notice from the https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/legal/unicode.md[OpenJDK 25 Unicode notice].
+`tools/generate_unicode_case.py` verifies that digest and regenerates the immutable tables from a supplied copy of the data file.
+Java-mode backreferences use table lookups without allocating fold classes.
+
+`tests/java_matching.rs` covers capture ordering, lookbehind endpoint checks, lookaround atomicity, independent previous-match positions, resource limits, case modes and missing references.
+Phase 2 must run `cargo test --manifest-path rust/vendor/fancy-regex/Cargo.toml --test java_matching` and repeat that target with `--no-default-features --features std`.
+The implementation was source-traced against OpenJDK 25 `Pattern.Behind`, `BehindS`, `NotBehind`, `CIBackRef`, `LastMatch`, and `Matcher.find`.
+These extensions do not establish complete Java Pattern parity; remaining source work is listed in `dev/doc/rust-regex.adoc`.
+
+`src/grapheme.rs` implements the `\X` consuming atom with the pinned Java Unicode 16 segmentation behavior.
+Its caller-owned cursor consumes a cluster atomically, with no heap state or intermediate backtracking positions.
+`tools/generate_grapheme.py` verifies the UnicodeData, emoji-data and DerivedCoreProperties source digests before generating `src/grapheme_data.rs`.
+The generated classifications include Java's treatment of unassigned characters, spacing-mark exclusions and Indic conjunct sequences.
+The original data are available under https://www.unicode.org/Public/16.0.0/ucd/[Unicode 16.0.0 UCD] and use the retained Unicode license.
+The behavioral source is https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/jdk/internal/util/regex/Grapheme.java[OpenJDK 25 Grapheme].
+`tests/java_matching.rs` includes segmentation, capture, atomic consumption and lookbehind-width regression sources.
+
+`(?n:[...])` is the translator's native canonical-class atom; it is not exposed as Java pattern syntax.
+The compiler retains its bounded delegated class and the VM evaluates longest-first NFC prefixes without allocating an input-sized buffer.
+`unicode-normalization` is pinned to 0.1.24, whose immutable Unicode tables identify version 16.0.0.
+The implementation calls its allocation-free character decomposition/composition functions with fixed storage.
+The Unicode 16 canonical decomposition maximum is four scalars; a prefix with more than four input scalars cannot normalize to one scalar.
+Single-scalar graphemes use the original scalar and multi-scalar graphemes never fall back to an unnormalized single-scalar prefix, following `Pattern.NFCCharProperty`.
+
+== Java node programs
+
+`src/java.rs` compiles Java-mode expressions containing `\b{g}` or `\R` into immutable nodes and executes them in a caller-owned transient matcher.
+The executor retains UTF-16 capture intervals, group locals, eligible failed-position sets and Java's last accepted position.
+The latter survives failed continuations and search-start retries.
+The compiler distinguishes character-property greedy loops, optional group branches, Curly, deterministic GroupCurly, recursive Loop and LazyLoop, and possessive quantifiers.
+GroupCurly's changed-width retry uses UTF-16 units, independently of UTF-8 byte lengths.
+Depth and attempt limits apply to node calls and variable-width repeat recursion.
+Native calls have a 512-frame ceiling in addition to the configured depth limit.
+`src/java_class.rs` retains the translated character predicates as immutable integer ranges and set operations, including surrogate code units.
+The native vendor `\Z` anchor remains zero-width and permits trailing newlines when Java node execution is selected.
+Native class subtraction and symmetric difference use the existing delegated compiler, which also rejects inverted ranges.
+`src/grapheme.rs` and `src/canonical.rs` provide UTF-16 entry points using the same pinned classifications and fixed normalization storage as the scalar matcher.
+
+The translation syntax `(?j:...)` preserves a source noncapturing group, `(?o:...)` preserves a source atom whose expansion must not affect acceptance state, and `(?j<=...)`/`(?j<!...)` select supplementary-aware lookbehind movement.
+These forms are internal to the translator and are not accepted as Java source syntax.
+`RegexBuilder::java_supplementary` retains the source compiler's distinction between Start and StartS advancement.
+`captures_utf16` returns owned code-unit capture intervals; the existing borrowed UTF-8 capture API reports an error if a participating capture splits a surrogate pair.
+The boolean API does not convert capture intervals to UTF-8.
+Borrowed iterators retain the preceding Java acceptance position and retain their existing UTF-8 advancement and adjacent-empty-match rules.
+Java replacement uses `captures_utf16` for code-unit advancement and all empty matches.
+RTDB replacement consumes the UTF-16 API and encodes only after assembling the complete replacement result.
+
+The behavioral sources are OpenJDK 25 `Pattern.GraphemeBound`, `Node`, `LastNode`, `GroupTail`, `Ques`, `Curly`, `GroupCurly`, `Loop`, `LazyLoop`, `LineEnding`, `Start`, `StartS`, and `TreeInfo`, together with `Matcher.search` and `Matcher.find`.
+`LineEnding` permits CRLF-to-CR continuation fallback; Curly's successful atom call commits that choice.
+The source is https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/java/util/regex/Pattern.java[OpenJDK 25 Pattern].
+`tests/java_grapheme_boundary.rs` records source-derived acceptance-state, node-selection, changed-width, failure-cache, UTF-16 capture and resource-limit cases.
+Phase 2 must run this target with the default features and with `--no-default-features --features std`, alongside the existing Java matching targets.
+No tests, builds, parsers or formatters were executed while preparing these sources.
+
+== Explicit Java UTF16 graph selection
+
+`RegexBuilder::java_utf16` selects the existing Java node program even without grapheme-boundary or line-ending atoms and also enables Java matching.
+Turning Java matching off clears the graph selection; native defaults and the scalar engine remain available.
+The option bypasses scalar-tree optimization and the easy regex wrapper, then uses the same analyzer and Java Program compiler as marker-selected graphs.
+UTF16 captures retain all code-unit intervals, while borrowed UTF8 capture APIs keep their non-UTF8-boundary error contract.
+`tests/java_utf16.rs` contains unexecuted regression source for explicit selection, option resets, surrogate intervals, empty matches and execution limits.

@@ -1,33 +1,124 @@
 = SQL source implementation
 
+PG_SLEEP and PG_SLEEP_FOR cast their operand to a millisecond duration before calling SLEEP, following `sql.clj/visitPgSleepFunction` and `visitPgSleepForFunction`.
+Floating-point seconds and the existing duration-text formats follow the shared cast path; integer seconds do not acquire an implicit floating-point cast.
+`tests/volatile.rs` retains the `pg2_test.clj/pg-sleep-test` and `pg-sleep-for-test` inputs, lazy conditional branches, null/error cases and rejection of expression-only RANDOM calls.
+Timing tests use a paused Tokio clock and remain unexecuted.
+
+Aggregate preparation retains supported factory spellings such as `BOOL_AND` and `EVERY` and distinguishes integer percentile literals from floating-point literals in EXPLAIN.
+Computed aggregate inputs and ARRAY_AGG ordering keys run in a projection before FILTER masks.
+Each parsed aggregate occurrence receives separate input and output fields, including repeated calls with identical text in SELECT and HAVING.
+The passive binding replacement keys distinguish source-span aggregate identities from structural grouping and window substitutions.
+The pinned grammar does not expose ANY, SOME, VARIANCE, or STDDEV aggregate aliases, ARRAY_AGG set quantifiers, or ordinary-aggregate WITHIN GROUP clauses.
+Unsupported aggregate factories and modifiers fail during preparation.
+`tests/aggregate_forms.rs` retains these cases as unexecuted regression source.
+
+Text expressions bind POSITION with CHARACTERS or OCTETS units, OVERLAY with an explicit or inferred replacement length, and binary substring/trim/concatenation.
+The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
+REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.
+Applicable UTF8 source types reject unsupported start/occurrence arguments during emitted-type admission; null-only sources leave metadata uninterpreted.
+Integer metadata uses the SQL signed 64-bit literal boundary, including when the source is null.
+Session-information expressions expose CURRENT_USER, CURRENT_CATALOG, CURRENT_DATABASE, CURRENT_SCHEMA, CURRENT_SCHEMAS, and CURRENT_SETTING.
+The pinned user/database value is `xtdb`, and the explicit search path is `public`, with `pg_catalog` prepended when CURRENT_SCHEMAS requests implicit schemas.
+CURRENT_SETTING accepts the case-sensitive names `server_version_num`, `search_path`, and `xtdb.version`; other names retain the requested key in an unsupported-setting diagnostic.
+VERSION and XT.VERSION retain the PostgreSQL and XTDB display forms and report the actual native process version, including an available source revision in XT.VERSION.
+
 The parser and binder are passive objects.
 Each preparation owns its transient column allocator, parameter map, and CTE scope.
 Prepared statements retain immutable plans and their source text.
+Their ordered planning warnings retain one entry per source occurrence; PostgreSQL renders them as WARNING with SQLSTATE 01000.
 Parsed statement metadata exposes the operation kind and lexical parameter count before table binding.
 Ordinary physical scans expose temporal columns to explicit expressions while keeping their synthetic column identities outside wildcard expansion.
-Column aliases rename document fields and preserve that hidden-column distinction.
+Base-table alias column lists declare the available document names, preserving declaration order and discarding duplicates.
+Derived-table alias column lists rename output fields positionally.
 
 The parser tokenizes before binding so anonymous parameters follow lexical order across projection, predicate, nested query, and temporal clauses.
 Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
 Temporal clauses retain the source location of their table and become scan dimensions before execution.
 Error contexts retain byte spans and one-based positions in the original SQL text.
 
+Base-table `_valid_time` and `_system_time` references project `period(from, to)` before joins.
+They remain hidden from base-table wildcards and NATURAL join keys unless declared in an alias column list; an explicit SELECT exports them as ordinary derived-table or CTE columns.
+Correlated references capture their projected column identities, and unmatched outer-join rows carry NULL period values.
+The binder's passive `TablePurpose` value distinguishes query projection, mutation scans, and erase scans.
+UPDATE and DELETE resolve period names through physical document fields, normally NULL, matching the pinned `DmlTableRef` plan; ERASE exposes only declared document names and temporal endpoints.
+Mutation output excludes scope-only period columns from documents.
+The stateless SQL dialect delegates sqlparser 0.63.0's generic syntax flags and parses period predicates using the original token locations.
+PERIOD and TSTZRANGE constructors, LOWER, UPPER, LOWER_INF, UPPER_INF, period intersection, variadic OVERLAPS, and infix period predicates use the existing passive expression and projection operators.
+An open upper endpoint is stored as MAX, UPPER returns NULL for it, and LOWER preserves the MIN lower sentinel.
+Virtual tables advertise the ordinary temporal endpoint types but emit NULL vectors for their absent endpoints.
+Their period projections construct the unbounded range; the execution retains separate advertised and runtime schemas.
+The SQL LEADS predicates retain the endpoint comparisons in `sql.clj`; quoted scalar period predicates are absent from the SQL function registry and fail binding.
+`tests/periods.rs` maps `test-valid-time-correlated-subquery`, `cte-exporting-valid-time-4054`, `test-lower-upper-period-fns-3660`, `test-derived-columns-with-periods`, the period-intersection assertions in `sql/temporal_test.clj`, and the DML period-reference golden plan.
+Exact diagnostic wording remains outstanding; these source assertions have not been executed.
+
 Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, PATCH RECORDS, INSERT RECORDS, CREATE TABLE declarations, GRANT/REVOKE role membership, and basic transaction and session controls.
 Canonical mutation lowering preserves unassigned document fields, derives valid-time windows, and builds PATCH gap filling and shallow merge plans.
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.
 
-The relational binder currently rejects DML RETURNING, query SETTING clauses, and interval qualifiers.
+PERCENTILE_CONT and PERCENTILE_DISC accept a numeric literal or parameter fraction, one WITHIN GROUP ordering expression, and FILTER.
+Null input is excluded; explicit NULLS FIRST or NULLS LAST produces the pinned `NullOrderingIgnored` warning and does not change the result.
+Continuous results are nullable doubles; discrete results retain the nullable input type.
+The discrete function clamps fractions to the first or last sorted value, while continuous fractions outside the ranks fail for a multi-value input, as in the pinned implementation.
+`tests/percentiles.rs` maps `test-ordered-set-aggregates`, `test-aggregate-filter`, and pgwire's `error-propagation`, and adds parameter, type, rank, and syntax assertions.
+These are source regressions; none has executed in Phase 1.
+
+INSERT, UPDATE, and DELETE accept RETURNING select lists and ignore them, as in the pinned planner.
+This includes INSERT RECORDS; ERASE and PATCH reject RETURNING.
+The parser validates select-list syntax without binding its names, functions, subqueries, or typed expressions.
+Its passive borrowed `ReturningClause` descriptor retains the original token spans while the mutation prefix supplies parameter requirements and inline-XTQL descriptors.
+RETURNING-only parameters do not increase the prepared parameter count, and mutation-prefix question marks keep their original indices.
+The retained source SQL and statement span still include the clause.
+The pinned select-list grammar permits empty lists and omitted items after commas; an unqualified wildcard appears once, first or last.
+`tests/returning.rs` maps `ignore-returning-keys-3668`, with static-expansion and transaction-result sources in the transaction crate and shared preparation coverage in the node crate.
+These sources have not been compiled or executed.
+The separate PostgreSQL DML parameter-description path still needs qualification: pinned pgwire retains the client-supplied OID count, while the native shared preparation uses the parsed effective count.
 `WITH RECURSIVE` retains the pinned planner's Unsupported anomaly `xtdb.sql/recursive-ctes`, including when the body does not refer to itself.
 Prepared-statement commands, COPY, and database lifecycle commands use the separate shared control parser described below.
 The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
+Query-level `SETTING` prefixes bind default valid/system extents into table scans, with explicit table extents taking precedence.
+The passive `QuerySettings` value retains clock, snapshot-token and snapshot-time metadata alongside the prepared relation; repeated settings are all planned and the last occurrence determines the value.
+Its passive `SettingValue` distinguishes literals, unadmitted `CLOCK_TIME` timestamp literals, parameters and unevaluated forms, retaining the parameter count of forms whose scalar type is never needed.
+Ignored snapshot-time settings and overwritten settings still validate function names, arities and typed literal spelling without scalar type checking.
+Temporal defaults retain their syntax in the preparation transient and bind scalar types when a scan uses the default.
+`PreparedQuery::from_prepared` carries this metadata into the shared node, transaction, ADBC/Flight and PostgreSQL execution path.
+Clock and snapshot-token settings resolve literals and parameters at query opening; scalar forms are recorded as unevaluated metadata and fail when consumed.
+Prepared queries retain parameter requirements from overwritten settings, including through dependency restoration in the SQL logic harness.
+The pinned `query.clj` ignores planned `SNAPSHOT_TIME` metadata and applies only the API snapshot-time option; native execution preserves that behavior.
+Typed DATE, TIME and TIMESTAMP literals are validated during preparation, including within ignored snapshot-time settings.
+TIMESTAMP uses the reference formatter's SMART resolution: day 29–31 clamps to the last day of its month, and exact 24:00 advances to the next date.
+DATE keeps strict calendar and ISO year-sign validation; TIME does not accept 24:00.
+`tests/query_settings.rs` maps `setting-default-system-time`, `test-read-only-tx-settings`, and snapshot-token pgwire cases, and distinguishes ignored planned snapshot time from the effective API cap.
+These sources have not been compiled or executed.
+SQL CONCAT stringifies each argument and substitutes empty text for null, including its single-argument form.
+Its result is text; the scalar concat primitive and `||` retain homogeneous types and strict null propagation.
+SQL STR requires at least one argument, while the scalar primitive permits an empty argument list.
 ORDER BY expressions can use projected aliases and retained input columns; unqualified output names take precedence, including inside expressions.
+Query, aggregate, window, and percentile ordering read sqlparser 0.63.0's ASC/DESC enum; USING operators are rejected under the pinned SQL grammar.
 The syntax and name errors have source positions; exact SQLSTATE and upstream diagnostic text remain comparison work.
 
 Missing base tables and unresolved columns are planning errors, including projection, WHERE, GROUP BY, HAVING, and window scopes.
 The pinned planner's `xt.not_found` scan and unresolved-column null projections are intermediate error-collection values; `-plan-query` rejects its accumulated errors before returning a plan.
 `tests/missing_names.rs` maps `test-operators-with-unresolved-column-references-3640`, `TableRefVisitor`, and `ExprPlanVisitor` without treating those intermediate values as executable success.
 An empty table declared in the catalog still supplies its schema without requiring any data rows.
+
+== Qualified columns
+
+Qualified plan fields own a passive `ColumnQualifier` describing their binding namespace.
+Base-table references accept column, alias.column, schema.alias.column, and database.schema.alias.column forms, with the resolved schema and database retained when the table is aliased.
+Derived tables, CTE references, UNNEST, UPDATE, DELETE, and ERASE use an alias scope.
+The pinned scope destructuring ignores components before the database for base tables and before the alias for alias scopes.
+Column prefixes do not change a mutation's target database.
+Grouping, joins, period projections, and correlated subqueries retain the same namespace descriptors; a new derived-table alias establishes a fresh alias scope.
+Qualified wildcards accept a single table alias and reject schema or database prefixes.
+
+A dotted identifier chain is resolved as one column reference.
+Parenthesized expressions provide explicit struct-field access, such as `(xtdb.public.foo.payload).leaf`.
+`tests/qualified_columns.rs` maps the five enabled forms in `xtdb.sql-test/test-schema-qualified-names` and the transaction-scoped resolution rules in `sql/multi_db_test.clj`.
+The upstream `test-schema-qualified-names-field` case is disabled; its unparenthesized chain remains a column-resolution error under the pinned `visitColumnReference` path.
+The source tests also cover quoted names, cross-database ambiguity, aliases, grouping, LATERAL captures, period columns, mutation scopes, and explicit nested field access.
+These are source-grounded assertions; execution and exact diagnostic equivalence remain unverified.
 
 == Assertion source mappings
 
@@ -79,6 +170,7 @@ The source mapping is `xtdb.sql-test/test-subqueries`, `test-in-subquery`, `test
 Full upstream plan golden comparison and optimizer-dependent error elision remain qualification work.
 The lowering preserves dependent evaluation without implementing the reference decorrelation optimizer.
 Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone control values still reject relational subqueries.
+
 LATERAL derived tables and implicitly lateral UNNEST capture preceding FROM columns in the existing Apply operator.
 Comma-separated sources, CROSS and inner joins emit every matching dependent row; left joins filter their dependent rows before adding one null-extended row when none match.
 USING and NATURAL joins retain their ordinary common-column and qualified-column visibility.
@@ -111,8 +203,26 @@ Set-operation ordering sees only the resulting output columns.
 Ordinal ordering refers to output positions; aggregate expressions must be projected and referenced by their aliases.
 The source regression cases in `tests/joins_order.rs` map `test-named-columns-join`, `test-natural-join`, `test-order-by-3065`, `test-order-by-alias`, `test-order-by-unqualified-derived-column-refs`, and `test-duplicate-column-projection`.
 Additional cases retain the pinned outer-join and DISTINCT behavior without assuming another SQL implementation's rules.
-Wildcard EXCLUDE and RENAME modifiers remain outside the binder's supported surface.
 All execution results and exact diagnostics remain unverified pending Phase 2.
+
+== Wildcard modifiers
+
+Unqualified and table-qualified wildcards accept EXCLUDE followed by RENAME, with either one source or a parenthesized list.
+EXCLUDE matches original unqualified column names.
+An unqualified wildcard's RENAME can resolve a qualified column chain; a table-qualified wildcard's RENAME accepts unqualified names.
+Quoted identifiers preserve case and literal dots, and AS is optional except before an unquoted DEFAULT alias.
+Renames resolve original column identities, so renaming `x` to `y` does not change the source of a later `y` rename.
+Repeated renames of one source use the last alias, missing rename sources are ignored, and excluded sources are not restored by a rename.
+Unqualified renames resolve before exclusions; a table-qualified wildcard must retain at least one column after exclusions before its renames resolve.
+Explicit projection names suppress original names from an unqualified wildcard before renaming, and expanded wildcard columns precede the explicit projections.
+Final duplicate output names remain planning errors.
+Wildcard lookup searches visible outer scopes when the local selection is empty, including after exclusions.
+
+`WildcardRename` is a passive immutable source descriptor retaining the original identifier span and full source chain across sqlparser's single-identifier rename representation.
+The caller-owned token scan and preparation context build these descriptors and projections; they add no execution state.
+`tests/wildcards.rs` maps `test-select-star-projections`, `able-to-select-star-from-two-tables-bug-3389`, `test-select-star-asterisk-clause`, `test-select-star-qualified-join`, and `test-expand-asterisk-parenthesized-joined-table`.
+Additional sources cover repeated and missing renames, outer nulls, correlated fallback, optional AS, identifier spans, and rejected modifier shapes.
+These sources have not been compiled or executed.
 
 == Window functions
 
@@ -156,8 +266,199 @@ An explicit argument list maps function arguments to the supplied anonymous or n
 Non-function queries ignore explicit placeholders; those placeholders still occupy anonymous lexical slots but do not themselves contribute to the prepared statement's external arity.
 Nested XTQL and SQL applies allocate beyond the containing statement's external positions.
 Native prepared execution binds the embedded query again against the current argument types and catalog.
+The SQL series endpoint policy applies to the containing SQL expressions; embedded XTQL series retain their explicit step and endpoint arguments.
 
 `tests/inline_xtql.rs` maps `xtdb.sql-test/inline-xtql`, including the parameter-position cases for 5995, and adds query-expression placement, alias isolation, error-span, and shared apply-allocation assertions.
 `rtdb-node/tests/statement.rs` retains a dynamic prepared-parameter rebinding case.
+`tests/series_inline.rs` covers SQL endpoint policy alongside embedded XTQL three- and four-argument series.
 The shared XTQL function registry and SQL surfaces still have the independently documented gaps; embedding does not expand those languages' supported operators.
 All execution results and complete upstream inline-query comparisons remain unverified.
+
+Date and timestamp comparison casts apply to UTF-8 literals; parameters and document strings retain their runtime types.
+Scalar SQL IN lists of at most eight items lower to equality disjunctions, matching the reference planner's literal-cast boundary.
+Longer lists and explicit ROW constructors lower to a relational mark with a single candidate column.
+Every candidate value is constructed before comparisons begin.
+Uncorrelated candidates are built once before the needle input and stop comparisons at a match; correlated candidates are built per input row and evaluate their complete comparison batch.
+Uncorrelated scalar candidates use the reference vector-hash selection, while nested candidates compare every row to retain inner-null equality semantics.
+Candidate expressions admit no subqueries, aggregates or window functions at either list length; row constructors require one column.
+`tests/in_lists.rs` covers the list-size boundary, nullable marks, correlated values, row arity, candidate demand, comparison ordering and cancellation/spill cleanup as source-only regression cases.
+GREATEST and LEAST accept empty argument lists, choose the right operand on a tie, and stop evaluation after a null operand.
+`tests/temporal_comparison.rs` covers these SQL paths and session-zone comparisons; execution remains pending.
+
+Timestamp years use the pinned lenient one-to-nine-digit parsing before SMART calendar resolution; DATE literals retain strict ISO sign and width rules.
+
+== Explain and materialized CTEs
+
+Materialized common-table expressions use `WITH MATERIALIZED name AS (...)`; a marker following `AS` is a syntax error in every lexical scope.
+
+`EXPLAIN` and `EXPLAIN ANALYZE` are query statements and carry query-level settings through the shared prepared-query path.
+The binder retains immutable rename descriptors and lexical materialized relation definitions.
+`WITH MATERIALIZED name AS (...)` follows the pinned grammar; ordinary CTEs remain inline definitions.
+Referenced materialized definitions are evaluated once per execution and replayed for each reference.
+Unused definitions are not advanced.
+Recursive CTEs and CTE column alias lists retain the reference's unsupported behavior.
+`tests/explain.rs` contains parser, shared-execution, scan-predicate, replay, cancellation, and analysis-counter assertions as source only.
+The query crate documents the remaining optimizer and original-form retention gaps affecting exact EXPLAIN output.
+
+== Temporal cast options
+
+TIME, TIMESTAMP and DURATION casts preserve their requested fractional precision; text and interval-duration conversions validate and apply the options used by their source type.
+SQL qualifiers support every single interval field and the YEAR TO MONTH, DAY TO HOUR/MINUTE/SECOND, HOUR TO MINUTE/SECOND and MINUTE TO SECOND ranges.
+SECOND precision determines nanosecond versus micro-interval metadata for multi-field, duration and interval inputs; single-field text and integer inputs keep the reference's micro-interval result metadata.
+TIME WITH TIME ZONE follows the pinned planner's timestamp-with-zone cast lowering.
+`PrepareOptions.default_timezone` supplies the zone label for prepared query and DML result types.
+The default is UTC; callers using another execution zone must supply it during preparation.
+Retained control expressions resolve that zone from `EvalContext` when executed.
+`tests/temporal_casts.rs` covers these paths through SQL binding, cursor evaluation and Arrow output; execution remains pending.
+
+== Array bounds and trimming
+
+`array_upper`, `array_lower` and `array_length` accept an ordinary list and an I64 dimension.
+Dimension one returns the element count, lower bound one, and element count respectively; an empty list keeps lower bound one.
+Other dimensions return `xtdb.expression/array-dimension-error`.
+`trim_array` accepts a signed integer count and keeps a lazy view of the input list.
+An overtrim returns `xtdb.expression/array-element-error` with the remaining length.
+Negative counts extend the declared view, and reading beyond the input fails.
+The view checks the signed 32-bit size limit when its size is observed; `array_lower` does not observe that size.
+Null arguments short-circuit later argument evaluation.
+`tests/arrays.rs` contains regression source; compilation and execution remain pending.
+
+`col_description` and `pg_indexam_has_property` return NULL with the signed integer, OID and text signatures exposed by the pinned reference.
+`tests/pg_null_functions.rs` retains the source assertions for those compatibility calls.
+Generic scalar function calls ignore one schema qualifier, including `pg_catalog.format_type`, as the reference SQL visitor does.
+The final identifier must match the SQL function registry before shared expression normalization; quoted case and punctuation remain exact.
+Dedicated syntax keeps its grammar-specific schema permissions.
+Unknown names, expression-only names such as `random` and `double`, and three-part function names fail binding.
+Generic function arity follows the SQL registry, including two-argument LOG and nonempty LEAST/GREATEST.
+The numeric catalogue includes `log10`, `sinh`, `cosh`, `tanh` and `mod`; expression and XTQL callers also expose the `double` conversion.
+`tests/math_catalogue.rs` covers nulls, result types and native numeric dispatch as unexecuted source.
+The catalogue regressions also preserve discarded scalar payloads and null arguments without losing the control or union selection that the reference evaluator still demands.
+
+== Series expression lowering
+
+SQL GENERATE_SERIES and RANGE accept two or three arguments and one optional schema qualifier.
+The omitted step is the signed integer one.
+GENERATE_SERIES includes its endpoint unless `PrepareOptions.generate_series_end_exclusive` is true; RANGE excludes it in both modes.
+Both forms lower to the same expression operation with an explicit Boolean endpoint argument.
+The prepared plan captures that choice, so subsequent execution does not consult process environment variables.
+`tests/series.rs` retains the range result and compatibility-flag planner cases from `generate_series_test.clj`, plus name, qualification and internal-argument admission checks.
+The regression source has not executed.
+
+Series table forms require a table alias and accept an optional single column name, or two names with `WITH ORDINALITY`.
+Their arguments bind against the preceding FROM scope, permitting correlated series for each preceding row.
+Unnamed table fields retain internal binding identities; wildcard projections assign `_column_1`, `_column_2` and subsequent labels within that wildcard expansion.
+UNNEST uses the same table-column naming contract.
+Integer series table iteration retains a constant-size reader and copies only requested rows, including when a LIMIT stops a large range early.
+Temporal series retain eager construction.
+The series regressions include unnamed and named projection schemas, lateral arguments, ordinality and a limited read from a signed 32-bit maximum-length range.
+
+URI literals validate during binding, and casts from text validate when their value is consumed.
+The seven dedicated URI component functions accept one URI argument and return null for an absent component.
+They preserve empty components as empty text, and URI_PORT returns a nullable signed 32-bit integer.
+These dedicated names are unquoted and unqualified, matching the SQL grammar.
+URI equality follows Java object components, while DISTINCT, grouping, set operations and joins retain raw vector hashes for candidate selection.
+MIN/MAX compares raw URI bytes; scalar ordering and ORDER BY report the pinned comparator failure when two nonnull URI values are compared.
+`tests/uri.rs` covers literal and cast paths, extractors, nulls, invalid input, dedicated-name admission, equality, hash candidates and ordering as unexecuted regression source.
+
+SQL bitwise operators `~`, `&`, `|`, `#`, `<<` and `>>` use signed integer dispatch, including types resolved from prepared parameters.
+Binary bitwise operators and concatenation share one left-associative precedence level below arithmetic; `~` consumes arithmetic before applying bitwise negation.
+Narrow left operands require a representable signed 32-bit shift count before shift masking; left-shift output wraps to the left width.
+Named bitwise functions remain outside the SQL function catalogue.
+`tests/bitwise.rs` covers operator output types, null demand, prepared argument admission and count overflow as unexecuted regression source.
+
+`EXTRACT(field FROM value)` and `DATE_TRUNC(field, value[, timezone])` lower to shared temporal expressions.
+SQL normalizes literal truncation fields to uppercase and accepts the grammar's bare field spelling.
+`AGE(end, start)` retains calendar period and duration components.
+`DATE_BIN` requires an interval literal stride; `RANGE_BINS` takes that stride, a period and an optional origin, lowering the period to its lower and upper bounds.
+An unbounded upper period bound propagates null through `RANGE_BINS`.
+Current and local clock forms support their unsigned integer precision argument; `CURRENT_TIMEZONE` exposes the session zone.
+`CURRENT_TIME`, `LOCAL_TIME` and `LOCAL_TIMESTAMP` require a precision when parentheses are present; `CURRENT_TIMESTAMP()` and `NOW()` retain their empty forms.
+The shared temporal syntax validator applies the same field, timezone-literal and precision grammar to query expressions and query settings.
+`CURRENT_DATE` and `CURRENT_TIME` retain the reference UTC semantics, while the `LOCAL_` forms use the session zone.
+Each query preparation binds `CURRENT_TIMESTAMP` output metadata to its command's timezone, and retained controls defer that zone to execution.
+`tests/temporal_functions.rs` contains planner and real query-path regression sources for fields, units, bins, clocks, aliases and rejected forms; they remain unexecuted.
+
+Field access uses `(expression).field` for Struct members and Transit map fields, including stored error data and transaction-key records.
+Missing Struct members and unsupported source types return null; Transit map access checks keyword keys before string keys and suppresses final false or null values.
+`tests/field_access.rs` records parameter refinement, result types and expression-demand regressions as unexecuted source.
+
+SQL LIKE and ILIKE share the native Java-compatible pattern matcher with XTQL's generic calls.
+The pinned SQL visitor ignores the ESCAPE expression, including its value, referenced columns and function calls.
+Binary LIKE retains the reference hexadecimal wildcard transformation; binary ILIKE is rejected.
+`tests/like_calls.rs` covers those behaviors and nullable parameters as unexecuted regression source.
+
+LIMIT, OFFSET and explicit FETCH counts accept unsigned integer literals or parameters.
+Parameter values must be nonnegative integers within signed 64-bit range; null, floating and text counts raise the expected-number anomaly.
+FETCH without a count retains its one-row default, and LIMIT ALL is rejected.
+`tests/row_limits.rs` records grammar and execution-path regression source; execution remains pending.
+
+Equality, inequality and `IS DISTINCT FROM` reject unsupported Set/Set pairs after prepared argument types are known.
+DISTINCT, grouping, DISTINCT aggregates, set membership and window partitions apply the same key admission when a row reaches the comparator.
+Empty inputs and aggregate rows excluded by a filter do not construct that implicit comparator.
+`tests/set_equality.rs` covers prepared arguments, declared empty collection types and implicit relational equality as unexecuted regression source.
+
+SQL interval values retain the `INTERVAL` grammar surface.
+The shared internal names `single_field_interval` and `multi_field_interval` are available through XTQL generic calls and remain outside SQL named-function syntax.
+`tests/interval_constructors.rs` records that dialect boundary as unexecuted regression source.
+
+== PostgreSQL JSON access operators
+
+`->` and `->>` select an exact string field name or a zero-based integer list position.
+`#>` and `#>>` traverse a literal array of string and integer steps; an empty path returns the input.
+The `>>` forms cast the selected result to UTF8, retaining null for a missing field or list position.
+These operators use the same struct, list and Transit field readers as other expressions.
+Field names retain their literal spelling and case, and integer positions follow the existing `nth` bounds semantics.
+Parameters, scalar expressions and nonliteral path arrays are rejected as access metadata, including inside unused query settings.
+JSON access binds more tightly than unary arithmetic and multiplication, and less tightly than casts, dot access and subscripts.
+`tests/json_access.rs` maps the reference `expression/pg_test.clj` operator cases and adds mixed paths, precedence, exact names, bounds and setting-admission regressions; these sources remain unexecuted.
+
+Scalar argument selection retains the reference's null and control-flow demand rules.
+For example, `POWER(1 / 0, NULL)` returns null, while `POWER(CASE WHEN 1 / 0 = 0 THEN 1 ELSE 2 END, NULL)` evaluates the condition and fails.
+Searched `CASE` tests use `IS TRUE`, so a nonboolean monomorphic test can return false without consuming its payload.
+`CHAR_LENGTH` lowers to the shared `character_length` function.
+
+Dynamic PATCH lowering preserves direct datetime, parameter and current-timestamp endpoints for PatchGaps.
+Literal NULL or FALSE bounds in a FROM/TO clause become start/end-of-time, while a missing clause starts at the query clock.
+PATCH rejects ALL VALID_TIME before static or dynamic planning.
+Scalar endpoint expressions and explicit current-timestamp precision are rejected at the operator boundary.
+Static PATCH expansion has a separate constant path and retains its accepted constant conversions.
+`tests/patch_endpoints.rs` records both paths as unexecuted regression source.
+
+Simple `CASE operand WHEN value THEN result ... END` evaluates its operand once before testing alternatives.
+The binding is evaluated even when the operand is null or an enclosing expression later discards the CASE result.
+A literal WHEN value retains temporal literal coercion; the bound operand is a local value and no longer has literal status.
+
+Array subscripts validate the index type after prepared parameters are refined.
+A floating index fails function admission, and a null index yields null.
+
+The SQL function catalog is checked before generic method admission.
+`CHAR_LENGTH` remains a SQL spelling of `character_length`, while unregistered SQL function names fail even with null arguments.
+
+Regex search predicates support `LIKE_REGEX`, optional `NOT` and `FLAG`, and PostgreSQL `~`, `~*`, `!~` and `!~*`.
+The case-insensitive PostgreSQL forms supply literal `i` flags; an omitted FLAG supplies an empty literal.
+Nonliteral FLAG payloads do not affect matching, though their control expressions and polymorphic boxes retain argument selection.
+Patterns compile before the input payload, after strict null selection.
+The predicates bind below arithmetic, concatenation and bitwise operations and above period predicates and comparisons.
+`LIKE_REGEX(...)` is not a generic SQL function registration.
+
+Ordinary IN, LIKE, ILIKE and BETWEEN predicates bind above comparisons and below arithmetic, concatenation and bitwise operators.
+BETWEEN bounds, LIKE patterns and ESCAPE values, and regex patterns and FLAG values admit common value expressions; parenthesized expressions may contain predicates and Boolean operators.
+ESCAPE is parsed but not bound or evaluated, matching the reference visitor.
+Its parameters retain their lexical positions for later placeholders while ignored parameters add no bound parameter type.
+
+BETWEEN binds complex subjects once before evaluating bounds, including null-producing subjects.
+Symmetric BETWEEN tries the reversed bounds only after the forward comparison fails to return true; reached bound expressions may be evaluated again.
+Period predicates follow their individual grammar precedence levels, from OVERLAPS through IMMEDIATELY LEADS, between ordinary predicates and comparisons.
+
+Ordinary Java regex patterns use UTF16 matching for LIKE_REGEX and REGEXP_REPLACE, including lookbehind captures and empty-match replacement inside supplementary input.
+`tests/java_utf16.rs` records those code-unit cases without requiring a grapheme-boundary or line-ending marker.
+
+Window ORDER BY inputs are private upstream projections evaluated on semantic input pages before partition mapping.
+Their errors and effects precede partition comparison admission, and their temporary columns are excluded from names and wildcard output.
+Window partition clauses retain column-reference syntax.
+`tests/window_order_projection.rs` records projection shape, competing errors, sleep effects and visible output as unexecuted regression source.
+
+POSITION parses a complete expression on each side of its IN delimiter, retaining nested predicates, CASE and parenthesized haystacks.
+Nested POSITION delimiter retries share a cumulative work limit that includes token snapshot payloads; exhausting it returns a SQL error before further speculative parsing.
+Delimiter speculation keeps the existing parser's recursion budget and restores its token stream before returning.
+The source regression modules retain full-expression type admission, nested delimiter selection, failed speculation and recursion-limit behavior.

@@ -9,21 +9,30 @@ pub(crate) struct NodeId(usize);
 pub struct SchemaReference { graph: Arc<SchemaGraph>, node: NodeId }
 #[derive(Clone, Debug, PartialEq)]
 struct SchemaGraph { nodes: Vec<Node>, retained_bytes: usize, view_bytes: usize }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct Metadata {
     pub optional: bool, pub name: Option<String>, pub version: Option<i32>, pub doc: Option<String>,
     pub parameters: BTreeMap<String, String>, pub default: Option<Value>,
+}
+impl PartialEq for Metadata {
+    fn eq(&self, other: &Self) -> bool {
+        self.optional == other.optional && self.name == other.name && self.version == other.version
+            && self.doc == other.doc && self.parameters == other.parameters
+            && super::data::defaults_equal(self.default.as_ref(), other.default.as_ref())
+    }
 }
 impl Default for Metadata {
     fn default() -> Self { Self { optional: false, name: None, version: None, doc: None, parameters: BTreeMap::new(), default: None } }
 }
 impl Metadata {
     pub fn from_schema(schema: &ConnectSchema) -> Self {
-        Self { optional: schema.optional, name: schema.name.clone(), version: schema.version, doc: schema.doc.clone(), parameters: schema.parameters.clone(), default: schema.default.clone() }
+        Self { optional: schema.optional, name: schema.name.clone(), version: schema.version, doc: schema.doc.clone(), parameters: schema.parameters.clone(), default: schema.default_value().cloned() }
     }
-    pub fn schema(self, kind: SchemaKind) -> ConnectSchema {
+    pub fn schema(mut self, kind: SchemaKind) -> ConnectSchema {
+        self.normalize_default();
         ConnectSchema { kind, optional: self.optional, name: self.name, version: self.version, doc: self.doc, parameters: self.parameters, default: self.default }
     }
+    fn normalize_default(&mut self) { if self.default == Some(Value::Null) { self.default = None; } }
     fn merge(&mut self, outer: &Self) {
         self.optional |= outer.optional;
         if outer.name.is_some() { self.name.clone_from(&outer.name); }
@@ -63,7 +72,11 @@ impl GraphBuilder {
         self.finish_with(root, |_, schema| Ok(Metadata::from_schema(schema)))
     }
     pub fn finish_with(self, root: NodeId, mut metadata: impl FnMut(NodeId, &ConnectSchema) -> Result<Metadata>) -> Result<Arc<ConnectSchema>> {
-        let nodes = self.nodes.into_iter().map(|node| node.ok_or_else(|| error("schema-graph", "Schema graph contains an undefined node"))).collect::<Result<Vec<_>>>()?;
+        let nodes = self.nodes.into_iter().map(|node| {
+            let mut node = node.ok_or_else(|| error("schema-graph", "Schema graph contains an undefined node"))?;
+            node.metadata.normalize_default();
+            Ok(node)
+        }).collect::<Result<Vec<_>>>()?;
         if root.0 >= nodes.len() { return Err(error("schema-graph", "Schema graph root is absent")); }
         let mut retained_bytes = 4096usize;
         for node in &nodes {
@@ -91,7 +104,8 @@ impl GraphBuilder {
         let order = metadata_order(&nodes);
         let mut graph = Arc::new(SchemaGraph { nodes, retained_bytes, view_bytes: retained_bytes });
         for id in order {
-            let updated = metadata(id, &graph.view(id))?;
+            let mut updated = metadata(id, &graph.view(id))?;
+            updated.normalize_default();
             Arc::get_mut(&mut graph).expect("metadata contains no graph references").nodes[id.0].metadata = updated;
         }
         let graph_mut = Arc::get_mut(&mut graph).expect("metadata contains no graph references");
@@ -190,5 +204,43 @@ mod tests {
     fn schema_graph_rejects_undefined_nodes_and_alias_only_cycles() {
         let mut builder = GraphBuilder::new(); let root = builder.reserve(); assert!(builder.finish(root).is_err());
         let mut builder = GraphBuilder::new(); let root = builder.reserve(); builder.define(root, Node { kind: NodeKind::Alias(root), metadata: Metadata::default() }).unwrap(); assert!(builder.finish(root).is_err());
+    }
+    #[test]
+    fn recursive_graph_null_defaults_have_the_same_schema_identity_and_accounting_as_absence() {
+        let build = |explicit: bool| {
+            let metadata = || Metadata { optional: true, default: explicit.then_some(Value::Null), ..Default::default() };
+            let mut builder = GraphBuilder::new();
+            let root = builder.reserve();
+            let value = builder.insert(Node { kind: NodeKind::Scalar(Scalar::String), metadata: metadata() });
+            let array = builder.insert(Node { kind: NodeKind::Array(value), metadata: metadata() });
+            let map = builder.insert(Node { kind: NodeKind::Map(value, array), metadata: metadata() });
+            let next = builder.insert(Node { kind: NodeKind::Alias(root), metadata: metadata() });
+            builder.define(root, Node { kind: NodeKind::Struct(vec![("value".into(), value), ("items".into(), map), ("next".into(), next)]), metadata: metadata() }).unwrap();
+            builder.finish_with(root, |_, schema| {
+                let mut metadata = Metadata::from_schema(schema);
+                metadata.default = explicit.then_some(Value::Null);
+                Ok(metadata)
+            }).unwrap()
+        };
+        let absent = build(false);
+        let explicit = build(true);
+        assert_eq!(absent, explicit);
+        assert_eq!(absent.retained_bytes().unwrap(), explicit.retained_bytes().unwrap());
+        assert_eq!(absent.view_allocation_bound(), explicit.view_allocation_bound());
+        assert!(explicit.default.is_none());
+        for field in ["value", "items", "next"] { assert!(explicit.field(field).unwrap().schema.default.is_none()); }
+    }
+    #[test]
+    fn recursive_graph_defaults_canonicalize_nan_equality_and_distinguish_signed_zero() {
+        let build = |default| {
+            let mut builder = GraphBuilder::new();
+            let root = builder.reserve();
+            let value = builder.insert(Node { kind: NodeKind::Scalar(Scalar::F64), metadata: Metadata { default: Some(Value::F64(default)), ..Default::default() } });
+            let next = builder.insert(Node { kind: NodeKind::Alias(root), metadata: Metadata { optional: true, ..Default::default() } });
+            builder.define(root, Node { kind: NodeKind::Struct(vec![("value".into(), value), ("next".into(), next)]), metadata: Metadata::default() }).unwrap();
+            builder.finish(root).unwrap()
+        };
+        assert_eq!(build(f64::from_bits(0x7ff8_0000_0000_0001)), build(f64::from_bits(0xfff8_0000_0000_0002)));
+        assert_ne!(build(0.0), build(-0.0));
     }
 }

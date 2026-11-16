@@ -3,6 +3,8 @@ mod bind;
 mod cast;
 mod edn;
 mod literal;
+mod legacy_inst;
+mod regex_replace;
 
 pub use ast::{Binding, Clause, Expr, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, parse_query};
 pub use bind::{CompileOptions, compile, compile_query};

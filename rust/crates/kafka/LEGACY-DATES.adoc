@@ -1,0 +1,80 @@
+= Connect date conversion
+
+Connect logical Date, Time and Timestamp values retain the signed milliseconds of their `java.util.Date` representation while passing through converters and transforms.
+The native carrier is a UTC millisecond timestamp value with the Connect schema retained alongside it.
+Date schema values are not narrowed to Arrow days during conversion, and Time values retain the reference converter's inclusive one-day endpoint.
+DocsIndexer performs the final schema-aware admission to document date, time or timestamp values.
+Primitive casts use the logical schema's encoding before numeric conversion; date-to-string conversion uses the raw milliseconds and the process date environment.
+Avro datum conversion uses the final Connect logical name, including explicit `connect.name` annotations on physical int and long schemas.
+Container children are converted before the enclosing logical date conversion.
+Avro defaults are converted before an explicit `connect.name` is installed; physical Avro logical types already name their schemas at that point.
+Decimal follows the same final-name and default-order rules, using the final Connect scale parameter with Java signed-integer parsing.
+Empty decimal coefficients fail before scale lookup, and container children convert before the container's logical conversion.
+
+== Environment and lifetime
+
+`DateEnvironment` is a passive, immutable set of locale and timezone defaults shared by one assignment's formatters.
+`DateEnvironment::from_inputs` accepts an explicit FORMAT locale, Unicode extensions, default timezone, provider initialization time and fixed observation/construction times.
+`DateEnvironment::capture` reads host defaults inside the supplied database I/O region and retains a caller-owned `DateClock` for later formatter construction and CLDR observations.
+All clock values are signed epoch milliseconds.
+The SQL session timezone does not participate in this environment.
+
+Linux capture uses a private libc locale object and the process locale environment; macOS capture uses the CoreFoundation preferred language and current region.
+Neither path mutates the process locale.
+Timezone discovery follows the process `TZ` value, the `/etc/localtime` link or matching timezone-file bytes, and the host current-offset fallback for unrecognized identifiers.
+File traversal and reads have explicit entry, depth and byte limits.
+Cancelled capture remains owned by the database I/O region, which must drain before the database name is released.
+
+The environment reserves its retained locale state before construction.
+Pattern objects reserve their parsed representation and retain that charge until drop.
+A formatter reserves a single-zone display value on its first named-zone formatting call and replaces that value if parsing changes its timezone.
+Full named-zone parsing catalogs reserve before the first named-zone parse; numeric timezone parsing and numeric timezone formatting do not construct them.
+Parsing reserves bounded scratch before numeric normalization.
+Transform and header record owners retain the output-allocation reservations; formatter objects do not start tasks or own background work.
+
+== Calendar and formatter behavior
+
+The formatter implements the `SimpleDateFormat` pattern fields `GyMdkHmsSEDFwWahKzZYuXL`, quoted literals, localized integer digits and names, calendar field precedence, lenient calendar normalization and partial-input parsing.
+Numeric field padding follows the reference long-number formatter's limit of 309 integer digits.
+Gregorian and Buddhist calendars use the reference Julian/Gregorian cutover; the Japanese calendar uses the five built-in eras through Reiwa.
+Week dates use the selected locale's first-day/minimal-days rules and supported Unicode overrides.
+Legacy timezone rules retain the Java `ZoneInfo` table boundaries and recurring `SimpleTimeZone` rules; modern rules are used where the CLDR provider explicitly requests them.
+
+Each formatter captures its century pivot when it is constructed.
+TimestampConverter constructs its formatter during configuration; TimestampRouter constructs it on its first record with a timestamp.
+Both apply the explicit UTC override after formatter construction, preserving the reference pivot timezone.
+Header temporal parsing and Cast date formatting create fresh formatters with the process timezone.
+Their literal `Z` suffix is ordinary quoted text in the reference patterns.
+Named-zone parsing mutates a formatter's current timezone, including when a subsequent field fails; one transform writer owns that state.
+Field TimestampConverter requires a Struct or null row before converting schema defaults; null rows still convert their schema defaults.
+Field TimestampConverter converts the Struct schema's default before its first row's fields and retains the converted schema in the reference sixteen-entry LRU.
+Cache hits preserve formatter state without replaying default conversion, and returned records share the cached schema's allocation charge.
+Cast converts all schema defaults before row values and retains the converted schemas in its own sixteen-entry LRU.
+Both caches retain complete schemas after a row conversion fails, and outstanding records retain their schema charges after cache eviction or transform drop.
+Converted defaults and Struct fields are validated against their output schemas, including required nulls and logical names retained by whole-value Cast.
+An optional schema's explicit null default is equivalent to an absent default, including nested schema equality and transform cache keys.
+JSON and graph-backed schema construction publish that default as absent; JSON conversion rejects required null defaults.
+Schema-default comparison uses Java boxed floating equality: NaN payloads compare equal, while positive and negative zero remain distinct through nested defaults and transform cache keys.
+Map defaults compare by their key/value mappings independently of entry order.
+
+The `Values.dateFormatFor` pattern choice uses raw milliseconds: values below one day select the time pattern, exact later day multiples select the date pattern, and remaining values select the timestamp pattern.
+Header temporal recognition uses the reference UTF-16 token lengths and does not require the parser to consume every character.
+Malformed temporal text can fall back to a string or byte header value; memory exhaustion and other operational anomalies propagate to the assignment owner.
+
+== Pinned data and qualification
+
+link:data/locale/README.adoc[Locale bundle provenance] records the official Temurin25.0.1+8 artifact, retained bytes, licenses, digest and reproduction procedure.
+The native build decodes bounded literal resource declarations without loading Java classes or running a JVM.
+`connect::LOCALE_DATA_SHA256` exposes the selected locale-bundle digest for artifact receipts.
+Timezone data uses the shared compiled TZDB identity exposed by `rtdb-types`.
+Case-insensitive name matching uses the unchanged Unicode16 simple-case table in `rust/vendor/fancy-regex/src/unicode_case.rs`, under that vendor directory's license and provenance.
+
+The native default provider is the retained CLDR provider data and its source-defined locale fallback.
+Custom Java locale SPI or HOST providers, Java process-property overrides and supplemental Japanese-era definitions are not represented by this adapter; deployments requiring them remain unqualified until their provider/input contract is supplied.
+Ambiguous timezone-name fallback order includes the pinned JVM's process-randomized short-alias map iteration; native ordering is deterministic within equal hash buckets, while current/default-zone precedence is preserved.
+Native display-name values are formatter-owned; the reference's process-wide soft-reference cache can retain CLDR fallback observations across formatter lifetimes, so clock-sensitive cache retention is a separate runtime comparison obligation.
+Native strings do not represent isolated UTF-16 surrogates; such malformed Java-only inputs remain an open representation boundary.
+Malformed calendar ERA exception-class details remain pending comparison with the reference.
+
+All tests added in this implementation phase are source regressions.
+No build, test, JVM execution or runtime parity claim has been made during the source-only phase.

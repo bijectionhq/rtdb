@@ -5,7 +5,10 @@ Its report implements the configuration inventory in `dev/doc/xtdb-rust-rewrite.
 The release image and extracted artifacts include the binary with the same backend feature selection as the server.
 This source has not been compiled or executed during Phase 1.
 
-The command reads exactly three explicitly supplied files and writes JSON to standard output.
+`rtdb-config --build-info` prints the compiled version, full revision and selected time-zone version/SHA-256 without configuration inputs.
+Runtime `XTDB_VERSION` and `GIT_SHA` overrides do not alter this artifact identity.
+
+The qualification command reads exactly three explicitly supplied files and writes JSON to standard output.
 It opens no node, log, object store, credential provider, TLS keystore, Kafka properties file, registry, subprocess or network connection.
 It creates no configuration or storage files and changes no deployment state.
 The supplied environment JSON is the entire environment used by the production decoder; the tool does not inherit deployment credentials or options from its own process environment.

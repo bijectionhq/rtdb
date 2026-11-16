@@ -43,7 +43,7 @@ pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::Prepare
     fn decimal_target(target: &CastTarget) -> bool {
         match target {
             CastTarget::DecimalDefault | CastTarget::Fixed(LogicalType::Scalar(ScalarType::Decimal { .. })) => true,
-            CastTarget::List(element) => decimal_target(element),
+            CastTarget::List(element) | CastTarget::Checked { target: element, .. } => decimal_target(element),
             _ => false,
         }
     }
@@ -111,17 +111,19 @@ fn lower(dml: Dml, catalog: &dyn Catalog) -> Result<Mutation> {
     })
 }
 
-/// The input exposes `_iid` and a non-null `doc` struct; bounds are evaluated once per execution.
+/// The input exposes `_iid` and a non-null `doc` struct.
+/// Endpoints must be datetime literals, direct parameters or a zero-argument current timestamp; unsupported expressions return a planning anomaly.
+/// Literal NULL clause endpoints become start/end-of-time, and omitted valid time starts at the captured query clock.
 pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: TemporalFilter, catalog: &dyn Catalog) -> Result<Mutation> {
     let now = Expr::Call { name: "current_timestamp".into(), args: vec![], return_type: instant_type() };
     let (from, to) = match valid_time {
         TemporalFilter::Default => (now, timestamp_literal(i64::MAX)),
         TemporalFilter::All => (timestamp_literal(i64::MIN), timestamp_literal(i64::MAX)),
-        TemporalFilter::FromTo { from, to } => (
-            instant_cast(Expr::Coalesce(vec![from, timestamp_literal(i64::MIN)])),
-            instant_cast(Expr::Coalesce(vec![to, timestamp_literal(i64::MAX)]))),
+        TemporalFilter::FromTo { from, to } => (patch_bound(from, i64::MIN), patch_bound(to, i64::MAX)),
         _ => return Err(invalid("PATCH requires ALL or FROM/TO valid time")),
     };
+    PatchEndpoint::from_expr(&from)?;
+    PatchEndpoint::from_expr(&to)?;
     let new_iid = input.schema().fields().iter().find(|field| field.name == "_iid").ok_or_else(|| invalid("PATCH input has no IID"))?.expression();
     let new_doc = input.schema().fields().iter().find(|field| field.name == "doc").ok_or_else(|| invalid("PATCH input has no document"))?.expression();
     let mut binder = allocator(&input)?;
@@ -133,7 +135,7 @@ pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: Te
     columns.insert("_valid_to".into(), instant_type().maybe());
     let fields = columns.into_iter().map(|(name, ty)| binder.field(name, None, ty)).collect::<Result<Vec<_>>>()?;
     let old = match binding {
-        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None })?),
+        Some(table) => Arc::new(Relation::scan(Scan { table, columns: fields, valid_time: TemporalFilter::FromTo { from: from.clone(), to: to.clone() }, system_time: TemporalFilter::Default, clamp_valid_time: true, iids: None, predicates: Vec::new() })?),
         None => Arc::new(Relation::empty(Schema::new(fields)?)),
     };
     let find = |name: &str| old.schema().fields().iter().find(|field| field.name == name).map(Field::expression).ok_or_else(|| invalid("PATCH old column is absent"));
@@ -149,6 +151,14 @@ pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: Te
     let doc = Expr::Call { name: "_patch".into(), return_type: function_type("_patch", &doc_args.iter().map(Expr::data_type).collect::<Vec<_>>())?, args: doc_args };
     let expressions = [("_iid", new_iid), ("_valid_from", instant_cast(Expr::Coalesce(vec![old_from.expression(), from]))), ("_valid_to", instant_cast(Expr::Coalesce(vec![old_to.expression(), to]))), ("doc", doc)].into_iter().map(|(name, expr)| Ok(NamedExpr { field: binder.field(name, None, expr.data_type())?, expr })).collect::<Result<_>>()?;
     Ok(Mutation::Put { table, input: Arc::new(joined.project(expressions)?) })
+}
+
+fn patch_bound(expression: Expr, fallback: i64) -> Expr {
+    match expression {
+        Expr::Literal(Value::Null | Value::Bool(false)) => timestamp_literal(fallback),
+        Expr::Call { name,args,return_type } if name == "now" && args.is_empty() => Expr::Call { name: "current_timestamp".into(),args,return_type },
+        expression => expression,
+    }
 }
 
 fn canonical_put(input: Arc<Relation>, iid_name: Option<&str>) -> Result<Arc<Relation>> {

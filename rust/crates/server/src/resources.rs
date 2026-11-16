@@ -38,7 +38,7 @@ pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBud
         }).collect::<std::collections::BTreeMap<_, _>>();
         resources = resources.with_kafka_topic_creation(clusters.clone(), metrics.clone(), config.kafka_auto_create_topic)?;
         #[cfg(feature = "kafka-connect")]
-        sources.insert("xtdb.kafka.connectsrc.proto.KafkaConnectSourceConfig".into(), Arc::new(rtdb_node::KafkaConnectSourceFactory::new(clusters, Arc::clone(memory)).with_observer(metrics.clone())));
+        sources.insert("xtdb.kafka.connectsrc.proto.KafkaConnectSourceConfig".into(), Arc::new(rtdb_node::KafkaConnectSourceFactory::new(clusters, Arc::clone(memory), Arc::new(rtdb_node::SystemClock)).with_observer(metrics.clone())));
     }
     #[cfg(feature = "s3")]
     {

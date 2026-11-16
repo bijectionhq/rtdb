@@ -68,6 +68,7 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         self.fields(b'E', &fields).await
     }
     pub async fn notice(&mut self, message: &str) -> Result<()> { self.fields(b'N', &[(b'S', "NOTICE"), (b'V', "NOTICE"), (b'C', "00000"), (b'M', message)]).await }
+    pub async fn planning_warning(&mut self, message: &str) -> Result<()> { self.fields(b'N', &[(b'S', "WARNING"), (b'V', "WARNING"), (b'C', "01000"), (b'M', message)]).await }
     async fn fields(&mut self, tag: u8, fields: &[(u8, &str)]) -> Result<()> { let bound = fields.iter().try_fold(1usize, |n, (_, text)| n.checked_add(text.len() + 2).ok_or_else(|| protocol("Error fields too large")))?; self.record(tag, bound, |bytes| { for (tag, value) in fields { bytes.push(*tag); cstring(bytes, value)?; } bytes.push(0); Ok(()) }).await?; self.flush().await }
     async fn record(&mut self, tag: u8, length: usize, fill: impl FnOnce(&mut Vec<u8>) -> Result<()>) -> Result<()> { let _charge = self.memory.reserve(length + 256)?; let mut body = Vec::with_capacity(length); fill(&mut body)?; self.send(tag, &body).await }
     pub fn into_inner(self) -> W { self.output }

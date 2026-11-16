@@ -1,0 +1,93 @@
+use std::{collections::BTreeMap, sync::Arc};
+use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_index::PartitionState;
+use rtdb_plan::Statement;
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+use rtdb_sql::{PrepareOptions, prepare};
+use rtdb_storage::{MemoryStore, cache::BufferPool};
+use rtdb_trie::TrieConfig;
+use rtdb_types::{LogicalType, Result, Timestamp, Value as V};
+use tokio_util::sync::CancellationToken;
+
+fn context() -> Arc<QueryContext> {
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap()
+}
+async fn query(source: &str) -> Result<Vec<Vec<V>>> {
+    let context = context();
+    let Statement::Query(relation) = prepare(source, &context.catalog, &PrepareOptions::default())?.statement else { panic!("query") };
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, vec![]).await?;
+    let mut rows = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        for row in 0..batch.batch().num_rows() { rows.push(batch.batch().schema().fields().iter().zip(batch.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), row)).collect::<Result<_>>()?); }
+    }
+    Ok(rows)
+}
+fn text(value: &str) -> V { V::Utf8(value.into()) }
+
+#[tokio::test]
+async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
+    assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1),CONCAT(1),CONCAT(NULL),CONCAT(X'0102',TRUE)").await.unwrap(),
+        [vec![text("a"), text("a1"), text("1"), text(""), text("\\x0102true")]]);
+    assert_eq!(query("SELECT 'a'||NULL,X'01'||X'02'").await.unwrap(), [vec![V::Null, V::Binary(vec![1, 2])]]);
+    for sql in ["SELECT CONCAT()", "SELECT STR()"] { assert!(prepare(sql, &context().catalog, &PrepareOptions::default()).is_err(), "{sql}"); }
+}
+
+#[tokio::test]
+async fn stringutil_sql_overlay_position_units_and_binary_functions() {
+    assert_eq!(query("SELECT POSITION('é' IN 'a😀éz'),POSITION('é' IN 'a😀éz' USING OCTETS),POSITION('é' IN 'a😀éz' USING CHARACTERS)").await.unwrap(), [vec![V::I32(3), V::I32(6), V::I32(3)]]);
+    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING 'zz' FROM 2),OVERLAY('abcdef' PLACING 'zz' FROM 2 FOR 3),SUBSTRING(X'010203' FROM 2 FOR 1),TRIM(X'00' FROM X'000100')").await.unwrap(), [vec![text("azzdef"), text("azzef"), V::Binary(vec![2]), V::Binary(vec![1])]]);
+    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING LOWER('ZZ') FROM 2 FOR 1),X'01'||X'02'").await.unwrap(), [vec![text("azzcdef"), V::Binary(vec![1, 2])]]);
+}
+
+#[tokio::test]
+async fn string_null_policy_is_preserved_when_virtual_columns_narrow_at_execution() {
+    let context = context();
+    let source = "SELECT STR(_valid_from),STRING_TO_ARRAY('ab',CAST(_valid_from AS TEXT)),FORMAT('%s',_valid_from) FROM pg_catalog.pg_namespace LIMIT 1";
+    let Statement::Query(relation) = prepare(source, &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("query") };
+    let mut cursor = PreparedQuery::new(relation).unwrap().execute(context, vec![]).await.unwrap();
+    assert!(cursor.runtime_schema().fields().iter().all(|field| field.data_type != LogicalType::Null));
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    let row = batch.batch().schema().fields().iter().zip(batch.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), 0).unwrap()).collect::<Vec<_>>();
+    assert_eq!(row, [text(""), V::List(vec![text("a"), text("b")]), text("")]);
+}
+
+#[tokio::test]
+async fn regexp_replace_literals_and_unsupported_start_are_admitted_before_rows() {
+    assert_eq!(query("SELECT REGEXP_REPLACE('a b a','a','x')").await.unwrap(), [vec![text("x b x")]]);
+    let error = query("SELECT REGEXP_REPLACE('a','a','x',1)").await.unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/unsupported");
+}
+
+#[tokio::test]
+async fn regclass_and_regproc_text_casts_resolve_captured_catalog_and_search_path() {
+    let oid = rtdb_types::pg_table_oid(None, &rtdb_types::TableRef::new("pg_catalog", "pg_class"));
+    assert_eq!(query("SELECT CAST('pg_class' AS REGCLASS),CAST(CAST('pg_catalog.pg_class' AS REGCLASS) AS TEXT),STR(CAST('pg_class' AS REGCLASS))").await.unwrap(), [vec![V::RegClass(oid), text("pg_class"), text("pg_class")]]);
+    assert_eq!(query("SELECT CAST(CAST(42 AS REGCLASS) AS TEXT),CAST(CAST('pg_catalog.array_in' AS REGPROC) AS TEXT),CAST(CAST('array_in' AS REGPROC) AS INTEGER)").await.unwrap(), [vec![text("42"), text("array_in"), V::I32(rtdb_types::pg_name_oid("array_in"))]]);
+    assert_eq!(query("SELECT CAST('does_not_exist' AS REGCLASS)").await.unwrap_err().code, "xtdb.expression.pg/unknown-relation");
+    assert_eq!(query("SELECT CAST('does_not_exist' AS REGPROC)").await.unwrap_err().code, "xtdb.expression.pg/unknown-proc");
+}
+
+#[tokio::test]
+async fn position_full_predicate_needles_reach_string_type_admission() {
+    for source in ["SELECT POSITION(TRUE=TRUE IN 'x')","SELECT POSITION(TRUE IN (TRUE) IN ('x'))","SELECT POSITION(FALSE OR TRUE IN 'x')"] {
+        assert_eq!(query(source).await.unwrap_err().code,"xtdb.expression/function-type-mismatch","{source}");
+    }
+    assert_eq!(query("SELECT POSITION(CASE WHEN TRUE IN (TRUE) THEN 'b' ELSE 'a' END IN ('abc')),POSITION('b' IN CASE WHEN TRUE THEN 'abc' ELSE 'x' END USING OCTETS)").await.unwrap(),[vec![V::I32(2),V::I32(2)]]);
+}
+
+#[test]
+fn position_retry_exhaustion_is_a_public_sql_error() {
+    for case_haystack in [false,true] {
+        let mut source = "'x'".to_string();
+        for _ in 0..16 {
+            source = if case_haystack { format!("POSITION(CAST({source} AS VARCHAR) IN CASE WHEN 'x' IN ('x') THEN 'x' ELSE 'x' END)") }
+                else { format!("POSITION({source} IN 'x' IN ('x'))") };
+        }
+        let error = rtdb_sql::parse(&format!("SELECT {source}")).unwrap_err();
+        assert_eq!(error.code,"xtdb/sql-error");
+        assert!(error.message.contains("POSITION cumulative parsing work limit exceeded"),"{error:?}");
+    }
+}

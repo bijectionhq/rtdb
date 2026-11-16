@@ -4,14 +4,29 @@ Columnar builders and readers are passive call-owned transforms.
 `OwnedBatch`, `OwnedColumn`, and cloned Arrow arrays retain their allocation reservations independently of the query cursor.
 Schema codecs preserve native logical types and the full signed decimal precision and scale at external boundaries.
 
+Execution admission uses `execution_type`, `execution_field_type`, `admit_execution_value`, and `read_execution_value`.
+Unsigned integer storage is read as the signed integer of the same width, including nested cells, matching the pinned Arrow vector opener.
+The in-place value adapter preserves integer bits and existing allocations.
+The type adapter retains nullability and child encodings and joins union legs that become equal.
+Raw `from_field` and `read_value` preserve physical types and values for IPC, source payloads, durable artifacts, and inspection.
+Callers apply admission to domain values entering execution; spill sequence numbers and group identities retain their unsigned representation.
+Calendar objects entering `admit_execution_value` or `build_array` use the reference vector object writer's day truncation and millisecond multiplication rules.
+`copy_array` and semantic vector hashes reject unadmitted calendar objects, including nested cells.
+Expression evaluation applies its checked day narrowing before handing completed values to these stored-cell surfaces.
+
 `DeclaredBatch` retains a wire schema and a page conformed to that schema's physical layout.
 `conform_batch` reserves schema work, decoded values, and builders before allocating them.
-It preserves nonnull logical values and exact decimal metadata, fills nullable missing fields, and rejects fields outside the target layout.
+It preserves integer bits and exact decimal metadata, fills nullable missing fields, and rejects fields outside the target layout.
 Adaptation preserves declared nested field order, child names, metadata and dense union type IDs.
 Set and timestamp-range extensions retain their declared child layouts while validating the extension's storage container.
+Signed execution integers conform to a same-width unsigned declared field by retaining their buffer bits under the declared physical type.
+Named union admission still requires a matching declared leg.
 Single typed columns are wrapped in declared unions, and nullable rows select the union's NULL leg.
 Exact-schema pages pass through with their original physical layout.
 Present NULL values can promote physical field nullability while the declared wire flags stay unchanged, following `core/src/main/kotlin/xtdb/arrow/ConformingUnloader.kt`.
 The internal RecordBatch uses checked constructors; Flight IPC and C exports supply the separate declared schema.
 This adapter's source tests cover null promotion, nested layouts, union remapping, column order, retained memory, missing required columns and decimal metadata mismatch.
 All compilation, execution, and cross-runtime qualification remain pending.
+
+URI object writes and reads validate Java URI syntax while retaining the original UTF-8 spelling and extension layout.
+`tests/uri.rs` covers invalid stored spellings and object inputs as unexecuted regression source.

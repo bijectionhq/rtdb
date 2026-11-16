@@ -46,7 +46,12 @@ python3 rust/release/build.py --phase-two --engine jvm \
 
 The output directory must not exist.
 `package.json` records the actual image ID, source revision and manifest, build arguments, platform, extracted artifact hashes and saved image archive hash.
-The driver creates and removes an unstarted container to extract artifacts; it never starts the database during packaging.
+The driver creates an owned container to extract artifacts and starts the native container's two build-information commands before removing it.
+`rtdb --build-info` and `rtdb-config --build-info` report compiled version, full source revision, TZDB version and TZDB SHA-256, independently of runtime version overrides.
+Packaging compares both reports with the archived source revision and selected time-zone bytes, and retains the reports and `tzdb.dat` alongside executable hashes.
+Client, recovery and performance runners validate those same retained reports and bytes before starting a packaged server, and the client evidence importer repeats that validation after relocation.
+Native packaging uses the bundled time-zone data by default; `--tzdb /absolute/path/tzdb.dat` copies an explicit replacement into the retained build context and image.
+The build compiles that exact file through `RTDB_TZDB_PATH`; subsequent changes to the original path do not change the captured input.
 The extraction owner captures the container's anonymous volume names, removes the container and volumes separately, and checks that each resource is gone.
 `extraction-lifecycle.json` retains the primary failure and every cleanup failure; incomplete cleanup cannot publish a package manifest.
 The image archive can be loaded using `docker image load --input` and selected by the recorded image ID.

@@ -69,8 +69,31 @@ fn scope_rejects_ambiguous_names_and_preserves_qualifiers() {
 }
 
 #[test]
+fn base_table_column_qualifiers_match_database_schema_and_alias_as_one_namespace() {
+    let field = |id, database: &str, schema: &str, alias: &str| Field { id: ColumnId(id), name: "v".into(),
+        qualifier: Some(ColumnQualifier::BaseTable { database: database.into(), schema: schema.into(), alias: alias.into() }),
+        qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let first = field(1, "xtdb", "public", "f");
+    let second = field(2, "archive", "public", "f");
+    let input = Schema::new(vec![first.clone(), second]).unwrap();
+    let names = |parts: &[&str]| parts.iter().map(|part| Identifier::unquoted(*part)).collect::<Vec<_>>();
+    assert_eq!(input.resolve(&names(&["xtdb", "public", "f", "v"])).unwrap(), &first);
+    assert_eq!(input.resolve(&names(&["ignored", "xtdb", "public", "f", "v"])).unwrap(), &first);
+    assert_eq!(input.resolve(&names(&["public", "f", "v"])).unwrap_err().code, "xtdb/ambiguous-column");
+    assert_eq!(input.resolve(&names(&["f", "v"])).unwrap_err().code, "xtdb/ambiguous-column");
+    assert_eq!(input.resolve(&names(&["xtdb", "other", "f", "v"])).unwrap_err().code, "xtdb/column-not-found");
+    let mut derived = first.clone(); derived.qualifier = Some(ColumnQualifier::Alias("d".into()));
+    let input = Schema::new(vec![derived.clone()]).unwrap();
+    assert_eq!(input.resolve(&names(&["ignored", "prefix", "d", "v"])).unwrap(), &derived);
+    assert!(input.resolve(&names(&["f", "v"])).is_err());
+    let encoded = serde_json::to_vec(&first).unwrap();
+    assert_eq!(serde_json::from_slice::<Field>(&encoded).unwrap(), first);
+    assert!(first.qualifier.as_ref().unwrap().retained_bytes().unwrap() >= "xtdbpublicf".len());
+}
+
+#[test]
 fn schema_and_deserialization_reject_duplicate_column_ids() {
-    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Null };
     assert!(Schema::new(vec![field.clone(), field.clone()]).is_err());
     let encoded = serde_json::to_string(&vec![field.clone(), field]).unwrap();
     assert!(serde_json::from_str::<Schema>(&encoded).is_err());
@@ -78,14 +101,14 @@ fn schema_and_deserialization_reject_duplicate_column_ids() {
 
 #[test]
 fn projection_cannot_reference_a_column_outside_its_input() {
-    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Null };
     let projection = Arc::new(Relation::unit()).project(vec![NamedExpr { field: field.clone(), expr: field.expression() }]);
     assert_eq!(projection.unwrap_err().code, "rtdb.plan/unbound-column");
 }
 
 #[test]
 fn raw_record_packing_requires_existing_columns_and_unique_output_names() {
-    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Null };
     let expression = Expr::RowCopy(vec![field.clone()]);
     assert_eq!(expression.referenced_columns(), BTreeSet::from([field.id]));
     assert_eq!(expression.validate_columns(&BTreeSet::new()).unwrap_err().code, "rtdb.plan/unbound-column");
@@ -115,7 +138,7 @@ fn nonconstant_filter_remains_above_temporal_scan() {
     let price = binder.field("price", None, table.columns["price"].clone()).unwrap();
     let scan = Arc::new(Relation::scan(Scan {
         table, columns: vec![price.clone()], valid_time: TemporalFilter::All,
-        system_time: TemporalFilter::All, clamp_valid_time: false, iids: None,
+        system_time: TemporalFilter::All, clamp_valid_time: false, iids: None, predicates: Vec::new(),
     }).unwrap());
     let filtered = Arc::new(scan.clone().filter(Expr::binary(BinaryOp::Gt, price.expression(), Expr::Literal(Value::I64(100)))).unwrap());
     let simplified = simplify(filtered.clone()).unwrap();

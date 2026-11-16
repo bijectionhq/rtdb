@@ -75,7 +75,7 @@ fn batch_evaluation_copies_raw_decimal_outputs_and_retains_their_allocation() {
     for precision in [-1, 1, 256, i32::MAX] {
         let value = Value::Decimal(decimal(123, precision, i32::MAX));
         let ty = value.logical_type();
-        let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, data_type: ty.clone() }]).unwrap();
+        let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone() }]).unwrap();
         let expression = CompiledExpr::compile(&Expr::column(ColumnId(0), ty.clone()), &schema).unwrap();
         let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![to_field("v", &ty).unwrap()])), vec![copy_array(&ty, &[value.clone()]).unwrap()]).unwrap();
         let memory = MemoryBudget::new(16 << 20);
@@ -98,7 +98,7 @@ fn computed_projections_write_selected_decimal_results_but_identity_copies_raw_c
     let previous = decimal_sum(None, Some(&first), 1, 0, 128).unwrap();
     let value = Value::Decimal(decimal_sum(Some(&previous), Some(&first), 1, 0, 128).unwrap());
     let ty = value.logical_type();
-    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, data_type: ty.clone() }]).unwrap();
+    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone() }]).unwrap();
     let column = Expr::column(ColumnId(0), ty.clone());
     let context = EvalContext::default();
     let row = [value.clone()];
@@ -141,7 +141,7 @@ fn batch_projection_failure_releases_its_decimal_validation_reservation() {
     use rtdb_plan::{CastTarget, ColumnId, Expr, Field, Schema};
     let value = Value::Decimal(decimal(18, 1, 0));
     let ty = value.logical_type();
-    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, data_type: ty.clone() }]).unwrap();
+    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone() }]).unwrap();
     let cast = Expr::Cast { expr: Box::new(schema.fields()[0].expression()), target: CastTarget::fixed(ty.clone()) };
     let expression = CompiledExpr::compile(&cast, &schema).unwrap();
     let batch = RecordBatch::try_new(Arc::new(arrow_schema::Schema::new(vec![to_field("v", &ty).unwrap()])), vec![copy_array(&ty, &[value]).unwrap()]).unwrap();
@@ -162,7 +162,7 @@ fn projection_rejects_nonpositive_precision_and_checks_nested_cells_only_when_wr
         assert!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[value.clone()], ..Default::default() }).is_err());
         assert_eq!(evaluate_projection(&cast, &Schema::default(), &[], &EvalContext { parameters: &[Value::Null], ..Default::default() }).unwrap(), Value::Null);
         let nested = Value::List(vec![Value::Struct(std::collections::BTreeMap::from([("v".into(), value)]))]);
-        let schema = Schema::new(vec![Field { id: ColumnId(0), name: "nested".into(), qualifier: None, qualified_only: false, data_type: nested.logical_type() }]).unwrap();
+        let schema = Schema::new(vec![Field { id: ColumnId(0), name: "nested".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: nested.logical_type() }]).unwrap();
         let column = schema.fields()[0].expression();
         assert_eq!(evaluate_projection(&column, &schema, &[nested.clone()], &EvalContext::default()).unwrap(), nested);
         let computed = Expr::Coalesce(vec![column, Expr::Literal(Value::Null)]);

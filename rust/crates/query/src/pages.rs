@@ -1,0 +1,297 @@
+use std::sync::Arc;
+use async_trait::async_trait;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_plan::{Expr,Schema};
+use rtdb_types::Result;
+use crate::{QueryContext, cursor::{BoxCursor, OwnedRow, RowCursor}, invalid};
+
+pub(crate) struct OwnedPage { rows: std::vec::IntoIter<OwnedRow>, _reservation: Arc<MemoryReservation> }
+impl OwnedPage {
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn rows(&self) -> &[OwnedRow] { self.rows.as_slice() }
+    pub fn next(&mut self) -> Option<OwnedRow> { self.rows.next() }
+}
+
+pub(crate) struct PageBuilder { rows: Vec<OwnedRow>, limit: usize, reservation: Arc<MemoryReservation> }
+impl PageBuilder {
+    pub fn new(limit: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bytes = limit.checked_mul(std::mem::size_of::<OwnedRow>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("page-size", "Page row container exceeds addressable memory"))?;
+        let reservation = memory.reserve(bytes)?;
+        Ok(Self { rows: Vec::with_capacity(limit), limit, reservation })
+    }
+    pub fn push(&mut self, row: OwnedRow) -> Result<()> {
+        if self.rows.len() == self.limit { return Err(invalid("page-size", "Page exceeded its reserved row count")); }
+        self.rows.push(row);
+        Ok(())
+    }
+    pub fn len(&self) -> usize { self.rows.len() }
+    pub fn rows_mut(&mut self) -> &mut [OwnedRow] { &mut self.rows }
+    pub fn push_growing(&mut self, row: OwnedRow, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if self.rows.len() == self.limit {
+            let limit = self.limit.checked_mul(2).map(|limit|limit.max(1)).ok_or_else(|| invalid("page-size", "Page row capacity overflow"))?;
+            let bytes = limit.checked_mul(std::mem::size_of::<OwnedRow>()).and_then(|bytes|bytes.checked_add(256)).ok_or_else(||invalid("page-size","Page row capacity overflow"))?;
+            let reservation = memory.reserve(bytes)?;
+            self.rows.reserve_exact(limit - self.rows.len());
+            self.limit = limit;
+            self.reservation = reservation;
+        }
+        self.push(row)
+    }
+    pub fn finish(self) -> OwnedPage { OwnedPage { rows: self.rows.into_iter(), _reservation: self.reservation } }
+}
+
+pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
+    let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
+    for _ in 0..page.len() { output.push(OwnedRow::copy_parts(&[],0,expressions.len(),&execution.context.memory)?)?; }
+    for (column,expression) in expressions.enumerate() {
+        let metadata_scope = execution.scope()?;
+        let invocation = execution.prepare_expression(expression,schema,&metadata_scope)?;
+        for (input,row) in page.rows().iter().zip(output.rows_mut()) {
+            let scope = execution.scope()?;
+            let value = execution.evaluate_invocation(&scope,&invocation,&input.values).await?;
+            row.replace_value(column,value,&execution.context.memory)?;
+        }
+    }
+    Ok(output.finish())
+}
+
+pub(crate) fn coalesce(input: BoxPageCursor, context: Arc<QueryContext>) -> BoxPageCursor { Box::new(CoalescingPages { input,context,seen: 0 }) }
+struct CoalescingPages { input: BoxPageCursor,context: Arc<QueryContext>,seen: usize }
+#[async_trait]
+impl PageCursor for CoalescingPages {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        let mut output: Option<PageBuilder> = None;
+        loop {
+            self.context.check_cancelled()?;
+            let Some(mut page) = self.input.next_page().await? else { return Ok(output.filter(|page|page.len() > 0).map(PageBuilder::finish)); };
+            if self.seen < 100 { self.seen = self.seen.saturating_add(page.len());return Ok(Some(page)); }
+            if page.len() >= 100 && output.is_none() { return Ok(Some(page)); }
+            if output.is_none() { output = Some(PageBuilder::new(100,&self.context.memory)?); }
+            let rows = output.as_mut().ok_or_else(||invalid("page-state","Coalescing page builder is absent"))?;
+            while let Some(row) = page.next() { rows.push_growing(row,&self.context.memory)?; }
+            if rows.len() >= 100 { return Ok(output.map(PageBuilder::finish)); }
+        }
+    }
+    fn trace_attributes(&self,span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+#[async_trait]
+pub(crate) trait PageCursor: Send {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>>;
+    fn trace_attributes(&self, _span: &mut dyn rtdb_plan::TraceSpan) {}
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { None }
+}
+pub(crate) type BoxPageCursor = Box<dyn PageCursor>;
+
+pub(crate) fn from_rows(input: BoxCursor, context: Arc<QueryContext>) -> BoxPageCursor {
+    Box::new(RowPageCursor { input, context, exhausted: false })
+}
+pub(crate) fn rows(input: BoxPageCursor, context: Arc<QueryContext>) -> BoxCursor { Box::new(PageRows { input, page: None, context }) }
+pub(crate) fn complete(input: BoxCursor, context: Arc<QueryContext>) -> BoxPageCursor { Box::new(CompletePage { input: Some(input),context }) }
+
+struct CompletePage { input: Option<BoxCursor>,context: Arc<QueryContext> }
+#[async_trait]
+impl PageCursor for CompletePage {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.context.check_cancelled()?;
+        let Some(mut input) = self.input.take() else { return Ok(None); };
+        let mut page = PageBuilder::new(0,&self.context.memory)?;
+        while let Some(row) = input.next().await? {
+            self.context.check_cancelled()?;
+            page.push_growing(row,&self.context.memory)?;
+        }
+        Ok((page.len() > 0).then(||page.finish()))
+    }
+}
+
+pub(crate) fn retain_page_state(input: BoxPageCursor, reservation: Arc<MemoryReservation>) -> BoxPageCursor { Box::new(RetainedPageState { input, _reservation: reservation }) }
+struct RetainedPageState { input: BoxPageCursor, _reservation: Arc<MemoryReservation> }
+#[async_trait]
+impl PageCursor for RetainedPageState {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> { self.input.next_page().await }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+pub(crate) fn retain_state(input: BoxCursor, reservation: Arc<MemoryReservation>) -> BoxCursor { Box::new(RetainedState { input, _reservation: reservation }) }
+struct RetainedState { input: BoxCursor, _reservation: Arc<MemoryReservation> }
+#[async_trait]
+impl RowCursor for RetainedState {
+    async fn next(&mut self) -> Result<Option<OwnedRow>> { self.input.next().await }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+struct RowPageCursor { input: BoxCursor, context: Arc<QueryContext>, exhausted: bool }
+#[async_trait]
+impl PageCursor for RowPageCursor {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.context.check_cancelled()?;
+        if self.exhausted { return Ok(None); }
+        let bytes = self.context.options.batch_rows.checked_mul(std::mem::size_of::<OwnedRow>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| invalid("page-size", "Page row container exceeds addressable memory"))?;
+        let reservation = self.context.memory.reserve(bytes)?;
+        let mut rows = Vec::with_capacity(self.context.options.batch_rows);
+        while rows.len() < self.context.options.batch_rows {
+            self.context.check_cancelled()?;
+            match self.input.next().await? {
+                Some(row) => rows.push(row),
+                None => { self.exhausted = true; break; },
+            }
+        }
+        if rows.is_empty() { return Ok(None); }
+        Ok(Some(OwnedPage { rows: rows.into_iter(), _reservation: reservation }))
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+struct PageRows { input: BoxPageCursor, page: Option<OwnedPage>, context: Arc<QueryContext> }
+#[async_trait]
+impl RowCursor for PageRows {
+    async fn next(&mut self) -> Result<Option<OwnedRow>> {
+        self.context.check_cancelled()?;
+        loop {
+            if let Some(row) = self.page.as_mut().and_then(OwnedPage::next) { return Ok(Some(row)); }
+            self.page = self.input.next_page().await?;
+            if self.page.is_none() { return Ok(None); }
+        }
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) { self.input.trace_attributes(span); }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.scan_counts() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::BTreeMap, sync::atomic::{AtomicBool, AtomicUsize, Ordering}};
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_storage::{MemoryStore, cache::BufferPool};
+    use rtdb_types::{Anomaly, Timestamp, Value};
+    use tokio_util::sync::CancellationToken;
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryOptions};
+
+    struct Input { next: usize, end: usize, fail_at: Option<usize>, polls: Arc<AtomicUsize>, closed: Arc<AtomicBool>, memory: Arc<MemoryBudget> }
+    #[async_trait]
+    impl RowCursor for Input {
+        async fn next(&mut self) -> Result<Option<OwnedRow>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_at == Some(self.next) { return Err(Anomaly::fault("test/input", "input failed")); }
+            if self.next == self.end { return Ok(None); }
+            let value = self.next; self.next += 1;
+            OwnedRow::new(vec![Value::I64(value as i64)], &self.memory).map(Some)
+        }
+    }
+    impl Drop for Input { fn drop(&mut self) { self.closed.store(true, Ordering::SeqCst); } }
+    fn context(batch_rows: usize) -> Arc<QueryContext> {
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) })]), false).unwrap();
+        QueryContext::new(catalog, MemoryBudget::new(1 << 20), Timestamp(0), "UTC", QueryOptions { batch_rows, ..Default::default() }, &CancellationToken::new()).unwrap()
+    }
+    fn input(context: &Arc<QueryContext>, end: usize, fail_at: Option<usize>) -> (BoxCursor, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let polls = Arc::new(AtomicUsize::new(0)); let closed = Arc::new(AtomicBool::new(false));
+        (Box::new(Input { next: 0, end, fail_at, polls: Arc::clone(&polls), closed: Arc::clone(&closed), memory: Arc::clone(&context.memory) }), polls, closed)
+    }
+
+    #[tokio::test]
+    async fn page_boundary_is_bounded_and_returned_rows_outlive_the_cursor() {
+        let context = context(2);
+        let (input, polls, closed) = input(&context, 5, None);
+        let mut cursor = from_rows(input, Arc::clone(&context));
+        let mut first = cursor.next_page().await.unwrap().unwrap();
+        assert_eq!(first.len(), 2); assert_eq!(polls.load(Ordering::SeqCst), 2);
+        let retained = first.next().unwrap();
+        assert_eq!(retained.values, [Value::I64(0)]);
+        drop(first);
+        assert_eq!(cursor.next_page().await.unwrap().unwrap().len(), 2);
+        assert_eq!(cursor.next_page().await.unwrap().unwrap().len(), 1);
+        assert!(cursor.next_page().await.unwrap().is_none());
+        assert_eq!(polls.load(Ordering::SeqCst), 6);
+        drop(cursor); assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(context.memory.used_bytes(), retained.bytes());
+        drop(retained); assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_rejects_buffered_rows_and_drop_releases_the_full_page() {
+        let context = context(2);
+        let (input, polls, closed) = input(&context, 5, None);
+        let mut cursor = rows(from_rows(input, Arc::clone(&context)), Arc::clone(&context));
+        drop(cursor.next().await.unwrap().unwrap());
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert!(context.memory.used_bytes() > 0);
+        context.cancellation.cancel();
+        assert_eq!(cursor.next().await.err().unwrap().code, "xtdb/query-cancelled");
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        drop(cursor); assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(context.memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn partial_page_failure_releases_rows_and_oversized_container_never_polls() {
+        let context = context(4);
+        let (input, polls, _) = input(&context, 5, Some(2));
+        let mut cursor = from_rows(input, Arc::clone(&context));
+        assert_eq!(cursor.next_page().await.err().unwrap().code, "test/input");
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert_eq!(context.memory.used_bytes(), 0);
+        drop(cursor);
+        let context = super::tests::context(usize::MAX);
+        let (input, polls, _) = super::tests::input(&context, 1, None);
+        let mut cursor = from_rows(input, context);
+        assert_eq!(cursor.next_page().await.err().unwrap().code, "rtdb.query/page-size");
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn completed_page_drains_all_rows_before_return_and_is_independent_of_client_batch_size() {
+        for batch_rows in [1,1024] {
+            let context = context(batch_rows);let (input,polls,closed) = input(&context,3,None);
+            let mut cursor = complete(input,Arc::clone(&context));
+            let mut page = cursor.next_page().await.unwrap().unwrap();
+            assert_eq!(page.len(),3);assert_eq!(polls.load(Ordering::SeqCst),4);assert!(closed.load(Ordering::SeqCst));
+            assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);
+            for value in 0..3 { assert_eq!(page.next().unwrap().values,[Value::I64(value)]); }
+            drop(page);assert_eq!(context.memory.used_bytes(),0);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_page_failure_discards_earlier_rows_and_closes_input() {
+        let context = context(1);let (input,polls,closed) = input(&context,3,Some(2));
+        let mut cursor = complete(input,Arc::clone(&context));
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"test/input");
+        assert_eq!(polls.load(Ordering::SeqCst),3);assert!(closed.load(Ordering::SeqCst));assert_eq!(context.memory.used_bytes(),0);
+        assert!(cursor.next_page().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn completed_empty_input_does_not_publish_a_page() {
+        let context = context(1);let (input,polls,closed) = input(&context,0,None);
+        let mut cursor = complete(input,Arc::clone(&context));
+        assert!(cursor.next_page().await.unwrap().is_none());assert_eq!(polls.load(Ordering::SeqCst),1);assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(context.memory.used_bytes(),0);
+    }
+
+    #[tokio::test]
+    async fn coalescing_passes_first_hundred_rows_then_accumulates_whole_small_pages() {
+        let context = context(60);
+        let (input,_,closed) = input(&context,300,None);
+        let mut cursor = coalesce(from_rows(input,Arc::clone(&context)),Arc::clone(&context));
+        let mut sizes = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() { sizes.push(page.len()); }
+        assert_eq!(sizes,[60,60,120,60]);
+        drop(cursor);assert!(closed.load(Ordering::SeqCst));assert_eq!(context.memory.used_bytes(),0);
+    }
+
+    #[tokio::test]
+    async fn coalescing_failure_drops_accumulated_rows_and_preserves_input_error() {
+        let context = context(60);
+        let (input,_,closed) = input(&context,300,Some(200));
+        let mut cursor = coalesce(from_rows(input,Arc::clone(&context)),Arc::clone(&context));
+        drop(cursor.next_page().await.unwrap());drop(cursor.next_page().await.unwrap());
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"test/input");
+        drop(cursor);assert!(closed.load(Ordering::SeqCst));assert_eq!(context.memory.used_bytes(),0);
+    }
+}

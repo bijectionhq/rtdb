@@ -1,24 +1,48 @@
-use crate::{arithmetic_in_timezone, compare, functions::scalar_call, null_eq, sql_eq};
+use crate::{arithmetic_in_timezone, compare_in_timezone, functions::scalar_call, sql_eq_in_timezone, sql_not_eq_in_timezone};
 use crate::compare::nullish;
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, OwnedBatch, copy_array, estimate_builder_bytes, read_value, to_field};
+use rtdb_columnar::{MemoryBudget, OwnedBatch, copy_array, estimate_builder_bytes, to_field};
 use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
-use rtdb_types::{Anomaly, LogicalType, Result, Timestamp, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, Instant, Value};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+mod reader;
+mod invocation;
+pub use invocation::ExpressionInvocation;
+
+/// Derives all emitted type alternatives from the complete input and outer schemas and bound parameters.
+/// Performs expression admission without reading row payloads; metadata allocations use the caller's evaluation scope.
+pub fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) -> Result<LogicalType> {
+    reader::expression_type(expr,schema,context)
+}
+
 pub struct OuterRow<'a> { pub schema: &'a Schema, pub values: &'a [Value] }
 
+/// Borrowed scalar inputs and allocation scope.
+/// With no allocation scope, the caller must reserve expression intermediates and returned values independently.
+/// Catalog-dependent evaluation borrows the captured catalog and requires an allocation scope for enumeration.
 pub struct EvalContext<'a> {
     pub parameters: &'a [Value],
-    pub current_time: Timestamp,
+    /// Complete declared vector types for the bound parameters, including unselected union legs.
+    /// When supplied, the slice must have the same width as `parameters` and overrides expression annotations.
+    /// Each type must describe its parameter cell using execution vector types.
+    pub parameter_types: Option<&'a [LogicalType]>,
+    pub current_time: Instant,
     pub timezone: &'a str,
     pub outer_rows: &'a [OuterRow<'a>],
+    pub snapshot_token: Option<&'a str>,
+    pub allocation: Option<&'a crate::EvaluationScope>,
+    pub catalog: Option<&'a dyn crate::PgCatalogLookup>,
 }
 
 impl Default for EvalContext<'_> {
-    fn default() -> Self { Self { parameters: &[], current_time: Timestamp(0), timezone: "UTC", outer_rows: &[] } }
+    fn default() -> Self { Self { parameters: &[], parameter_types: None, current_time: Instant::default(), timezone: "UTC", outer_rows: &[], snapshot_token: None, allocation: None, catalog: None } }
+}
+
+impl EvalContext<'_> {
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { match self.allocation { Some(scope) => scope.reserve(bytes), None => Ok(()) } }
 }
 
 #[derive(Clone)]
@@ -38,6 +62,47 @@ impl CompiledExpr {
     }
     pub fn data_type(&self) -> LogicalType { self.expr.data_type() }
     pub fn evaluate(&self, row: &[Value], context: &EvalContext<'_>) -> Result<Value> { evaluate(&self.expr, &self.schema, row, context) }
+    /// Evaluates with the caller-owned suspension, cancellation and allocation contract of `evaluate_async`.
+    pub async fn evaluate_async(&self, row: &[Value], context: &EvalContext<'_>) -> Result<Value> { evaluate_async(&self.expr, &self.schema, row, context).await }
+}
+
+enum ListStorage { Integer(crate::series::IntegerSeries), Bins { reader: crate::temporal_functions::RangeBins,length: usize }, Values(Vec<Value>) }
+
+/// Owned list cells or an immutable generated-list descriptor.
+/// Retain the evaluation scope until the result is dropped or its `retained_bytes` charge is transferred.
+pub struct EvaluatedList { storage: ListStorage }
+impl EvaluatedList {
+    pub fn len(&self) -> usize { match &self.storage { ListStorage::Integer(series) => series.len(), ListStorage::Bins { length,.. } => *length, ListStorage::Values(values) => values.len() } }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    /// Bounds the temporary allocation made by `get`; reserve it before calling and retain it while the returned cell lives.
+    pub fn cell_allocation_bound(&self) -> usize { if matches!(self.storage,ListStorage::Bins {..}) { 4096 } else { 0 } }
+    /// Returns no cell outside the list; generated cells are owned and stored cells remain borrowed.
+    /// The caller owns the temporary charge described by `cell_allocation_bound`.
+    pub fn get(&self, index: usize) -> Option<std::borrow::Cow<'_, Value>> {
+        match &self.storage {
+            ListStorage::Integer(series) => (index < series.len()).then(|| std::borrow::Cow::Owned(series.nth(index))),
+            ListStorage::Bins { reader,length } => (index < *length).then(|| std::borrow::Cow::Owned(reader.nth(index))),
+            ListStorage::Values(values) => values.get(index).map(std::borrow::Cow::Borrowed),
+        }
+    }
+    /// Includes the descriptor, vector capacity and all owned cell storage.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let base = std::mem::size_of::<Self>();
+        match &self.storage {
+            ListStorage::Integer(_) | ListStorage::Bins {..} => Ok(base),
+            ListStorage::Values(values) => {
+                let spare = (values.capacity() - values.len()).checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?;
+                values.iter().try_fold(base.checked_add(spare).ok_or_else(overflow)?, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))
+            }
+        }
+    }
+}
+
+/// Evaluates a list-table input with the projection validation and cancellation contract of `evaluate_projection_async`.
+/// Integer series and range bins retain their constant-size readers; other lists are materialized and non-list inputs produce no cells.
+/// Returned cells borrow no inputs; the caller retains the allocation scope until it transfers the result charge.
+pub async fn evaluate_list_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<EvaluatedList> {
+    ExpressionInvocation::prepare(expr,schema,context)?.evaluate_list_async(row,context).await
 }
 
 pub fn is_true(value: &Value) -> Result<bool> {
@@ -48,126 +113,238 @@ fn truth(value: &Value) -> Result<Option<bool>> {
     match value { Value::Bool(value) => Ok(Some(*value)), Value::Null | Value::Undefined => Ok(None), _ => Err(inapplicable("boolean", &[value])) }
 }
 fn boolean(value: Option<bool>) -> Value { value.map(Value::Bool).unwrap_or(Value::Null) }
+fn retained_clone(value: &Value, context: &EvalContext<'_>) -> Result<Value> { context.reserve(value.retained_bytes()?)?; Ok(value.clone()) }
 
-pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
-    let eval = |expr: &Expr| evaluate(expr, schema, row, context);
-    match expr {
-        Expr::Literal(value) => Ok(value.clone()),
-        Expr::Column { id, .. } => schema.position(*id).and_then(|index| row.get(index)).cloned()
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0))),
-        Expr::Parameter { index, .. } => context.parameters.get(*index).cloned()
-            .ok_or_else(|| Anomaly::incorrect("xtdb/missing-parameter", format!("Missing parameter ${}", index + 1))),
-        Expr::Correlated { depth, id, .. } => context.outer_rows.get(*depth)
-            .and_then(|outer| outer.schema.position(*id).and_then(|index| outer.values.get(index))).cloned()
-            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable")),
-        Expr::Unary { op, expr } => {
-            let value = eval(expr)?;
-            match op {
-                UnaryOp::IsNull | UnaryOp::IsUnknown => Ok(Value::Bool(nullish(&value))),
-                UnaryOp::IsNotNull => Ok(Value::Bool(!nullish(&value))),
-                UnaryOp::IsTrue => Ok(Value::Bool(truth(&value)? == Some(true))),
-                UnaryOp::IsFalse => Ok(Value::Bool(truth(&value)? == Some(false))),
-                UnaryOp::Not => Ok(boolean(truth(&value)?.map(|value| !value))),
-                _ if nullish(&value) => Ok(Value::Null),
-                UnaryOp::Negate => {
-                    if let Some(result) = crate::temporal::negate(&value) { return result; }
-                    if let Some(integer) = integer(&value) {
-                        let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("negate", &[&value])); };
-                        integer_value(integer.checked_neg().ok_or_else(overflow)?, &ty)
-                    } else if let Some(number) = number(&value) {
-                        let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("negate", &[&value])); };
-                        if let Value::Decimal(decimal) = &value { crate::numeric::decimal_value(-crate::numeric::decimal(decimal), decimal.precision, decimal.scale, decimal.bit_width) }
-                        else { Ok(crate::numeric::floating_value(-number, &ty)) }
-                    } else { Err(inapplicable("negate", &[&value])) }
-                }
-                UnaryOp::BitNot => {
-                    let integer = integer(&value).ok_or_else(|| inapplicable("bit_not", &[&value]))?;
-                    let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("bit_not", &[&value])); };
-                    integer_value(!integer, &ty)
-                }
+fn coerce_comparison_literals(left_is_literal: bool, right_is_literal: bool, left: &mut Value, right: &mut Value, timezone: &str) -> Result<()> {
+    let date_time = |value: &Value| value.date_days().is_some() || matches!(value, Value::Timestamp { .. });
+    if left_is_literal && date_time(right) { *left = crate::cast(left, &right.logical_type(), timezone)?; }
+    else if right_is_literal && date_time(left) { *right = crate::cast(right, &left.logical_type(), timezone)?; }
+    Ok(())
+}
+
+fn unary_value(op: UnaryOp, value: Value) -> Result<Value> {
+    match op {
+        UnaryOp::IsNull | UnaryOp::IsUnknown => Ok(Value::Bool(nullish(&value))),
+        UnaryOp::IsNotNull => Ok(Value::Bool(!nullish(&value))),
+        UnaryOp::IsTrue => Ok(Value::Bool(truth(&value)? == Some(true))),
+        UnaryOp::IsFalse => Ok(Value::Bool(truth(&value)? == Some(false))),
+        UnaryOp::Not => Ok(boolean(truth(&value)?.map(|value| !value))),
+        _ if nullish(&value) => Ok(Value::Null),
+        UnaryOp::Negate => {
+            if let Some(result) = crate::temporal::negate(&value) { return result; }
+            if let Some(integer) = integer(&value) {
+                let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("negate", &[&value])); };
+                integer_value(integer.checked_neg().ok_or_else(overflow)?, &ty)
+            } else if let Some(number) = number(&value) {
+                let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("negate", &[&value])); };
+                if let Value::Decimal(decimal) = &value { crate::numeric::decimal_value(-crate::numeric::decimal(decimal), decimal.precision, decimal.scale, decimal.bit_width) }
+                else { Ok(crate::numeric::floating_value(-number, &ty)) }
+            } else { Err(inapplicable("negate", &[&value])) }
+        }
+        UnaryOp::BitNot => {
+            crate::bitwise::call("bit_not", &[value]).unwrap()
+        }
+    }
+}
+
+fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'_>) -> Result<Value> {
+    use BinaryOp as B;
+    if matches!(op, B::Eq | B::NotEq | B::IsDistinctFrom | B::IsNotDistinctFrom) { context.reserve(crate::equality_allocation_bound(&left, &right)?)?; }
+    match op {
+        B::And => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None })),
+        B::Or => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None })),
+        B::IsDistinctFrom | B::IsNotDistinctFrom => {
+            let distinct = if nullish(&left) || nullish(&right) { Some(nullish(&left) != nullish(&right)) }
+                else { sql_not_eq_in_timezone(&left, &right, context.timezone)? };
+            Ok(boolean(distinct.map(|distinct| if op == B::IsDistinctFrom { distinct } else { !distinct })))
+        }
+        B::Eq => Ok(boolean(sql_eq_in_timezone(&left, &right, context.timezone)?)),
+        B::NotEq => Ok(boolean(sql_not_eq_in_timezone(&left, &right, context.timezone)?)),
+        _ if nullish(&left) || nullish(&right) => Ok(Value::Null),
+        B::Lt | B::LtEq | B::Gt | B::GtEq => {
+            if number(&left).is_some_and(f64::is_nan) || number(&right).is_some_and(f64::is_nan) { return Ok(Value::Bool(false)); }
+            let order = compare_in_timezone(&left, &right, false, context.timezone)?;
+            Ok(Value::Bool(match op { B::Lt => order == Ordering::Less, B::LtEq => order != Ordering::Greater, B::Gt => order == Ordering::Greater, _ => order != Ordering::Less }))
+        }
+        B::Concat => {
+            context.reserve(left.retained_bytes()?.checked_add(right.retained_bytes()?).and_then(|bytes| bytes.checked_mul(2)).ok_or_else(overflow)?)?;
+            match (left,right) {
+                (Value::Utf8(mut a),Value::Utf8(b)) => { a.push_str(&b);Ok(Value::Utf8(a)) },
+                (Value::Binary(mut a),Value::Binary(b)) => { a.extend(b);Ok(Value::Binary(a)) },
+                (Value::List(mut a),Value::List(b)) => { a.extend(b);Ok(Value::List(a)) },
+                (a,b) => Err(inapplicable("concat",&[&a,&b])),
             }
+        }
+        _ => arithmetic_in_timezone(op,&left,&right,context.timezone),
+    }
+}
+
+macro_rules! expression_body {
+    ($expression:expr, $input_schema:expr, $input_row:expr, $inputs:expr, $eval:ident, $call:ident, $reader:ident) => {{
+    let (expr, schema, row, context) = ($expression, $input_schema, $input_row, $inputs);
+    match expr {
+        Expr::Literal(value) => retained_clone(value, context),
+        Expr::Column { id, .. } => retained_clone(schema.position(*id).and_then(|index| row.get(index))
+            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", id.0)))?, context),
+        Expr::Parameter { index, .. } => retained_clone(context.parameters.get(*index)
+            .ok_or_else(|| Anomaly::incorrect("xtdb/missing-parameter", format!("Missing parameter ${}", index + 1)))?, context),
+        Expr::Correlated { depth, id, .. } => retained_clone(context.outer_rows.get(*depth)
+            .and_then(|outer| outer.schema.position(*id).and_then(|index| outer.values.get(index)))
+            .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-correlated-column", "Correlated row is unavailable"))?, context),
+        Expr::Unary { op, expr } => {
+            let value = $eval!(expr)?;
+            unary_value(*op,value)
         }
         Expr::Binary { op, left, right } => {
             use BinaryOp as B;
-            let left = eval(left)?;
+            let (left_expr, right_expr) = (left.as_ref(), right.as_ref());
+            let mut left = $eval!(left_expr)?;
             if *op == B::And && truth(&left)? == Some(false) { return Ok(Value::Bool(false)); }
             if *op == B::Or && truth(&left)? == Some(true) { return Ok(Value::Bool(true)); }
-            let right = eval(right)?;
-            match op {
-                B::And => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None })),
-                B::Or => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None })),
-                B::IsDistinctFrom | B::IsNotDistinctFrom => {
-                    let equal = if nullish(&left) || nullish(&right) { Some(nullish(&left) && nullish(&right)) }
-                        else { sql_eq(&left, &right)? };
-                    Ok(boolean(equal.map(|equal| if *op == B::IsDistinctFrom { !equal } else { equal })))
-                }
-                B::Eq => Ok(boolean(sql_eq(&left, &right)?)),
-                B::NotEq => Ok(boolean(sql_eq(&left, &right)?.map(|value| !value))),
-                _ if nullish(&left) || nullish(&right) => Ok(Value::Null),
-                B::Lt | B::LtEq | B::Gt | B::GtEq => {
-                    if number(&left).is_some_and(f64::is_nan) || number(&right).is_some_and(f64::is_nan) { return Ok(Value::Bool(false)); }
-                    let order = compare(&left, &right, false)?;
-                    Ok(Value::Bool(match op { B::Lt => order == Ordering::Less, B::LtEq => order != Ordering::Greater, B::Gt => order == Ordering::Greater, _ => order != Ordering::Less }))
-                }
-                B::Concat => match (left, right) {
-                    (Value::Utf8(mut a), Value::Utf8(b)) => { a.push_str(&b); Ok(Value::Utf8(a)) }
-                    (Value::List(mut a), Value::List(b)) => { a.extend(b); Ok(Value::List(a)) }
-                    (a, b) => Err(inapplicable("concat", &[&a, &b])),
-                },
-                _ => arithmetic_in_timezone(*op, &left, &right, context.timezone),
+            if *op == B::Concat && nullish(&left) { return Ok(Value::Null); }
+            let mut right = $eval!(right_expr)?;
+            if matches!(op, B::Eq | B::NotEq | B::Lt | B::LtEq | B::Gt | B::GtEq) {
+                coerce_comparison_literals(matches!(left_expr, Expr::Literal(Value::Utf8(_))), matches!(right_expr, Expr::Literal(Value::Utf8(_))), &mut left, &mut right, context.timezone)?;
             }
+            binary_value(*op,left,right,context)
         }
         Expr::Call { name, args, .. } if name == "coalesce" => {
-            for expr in args { let value = eval(expr)?; if !nullish(&value) { return Ok(value); } }
+            for expr in args { let value = $eval!(expr)?; if !nullish(&value) { return Ok(value); } }
             Ok(Value::Null)
         }
-        Expr::Call { name, args, .. } => scalar_call(name, &args.iter().map(eval).collect::<Result<Vec<_>>>()?, context),
-        Expr::Cast { expr, target } => crate::cast::cast_target(&eval(expr)?, target, context.timezone),
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("date_bin") || name.eq_ignore_ascii_case("date-bin") => {
+            let stride = $eval!(&args[0])?;
+            let origin = if let Some(origin) = args.get(2) { $eval!(origin)? } else { Value::Timestamp { value: 0,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) } };
+            if nullish(&stride) || nullish(&origin) { return Ok(Value::Null); }
+            let source = $eval!(&args[1])?;
+            $call!(name, &[stride,source,origin])
+        }
+        Expr::Call { name, args, .. } if name.eq_ignore_ascii_case("concat") => {
+            context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+            let mut values = Vec::with_capacity(args.len());
+            for expr in args {
+                let value = $eval!(expr)?;
+                if nullish(&value) { return Ok(Value::Null); }
+                values.push(value);
+            }
+            $call!(name, &values)
+        }
+        Expr::Call { name, args, .. } if name == "nullif" => {
+            let mut left = $eval!(&args[0])?;
+            let mut right = $eval!(&args[1])?;
+            coerce_comparison_literals(false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), &mut left, &mut right, context.timezone)?;
+            context.reserve(crate::equality_allocation_bound(&left,&right)?)?;
+            Ok(if sql_eq_in_timezone(&left, &right, context.timezone)? == Some(true) { Value::Null } else { left })
+        }
+        Expr::Call { name, args, .. } if name == "greatest" || name == "least" => {
+            let Some(first) = args.first() else { return Ok(Value::Null); };
+            let mut best = $eval!(first)?;
+            for expr in &args[1..] {
+                if nullish(&best) { return Ok(Value::Null); }
+                best = $call!(name, &[best, $eval!(expr)?])?;
+            }
+            Ok(best)
+        }
+        Expr::Call { name, args, .. } => {
+            context.reserve(args.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+            let mut values = Vec::with_capacity(args.len());
+            for argument in args { values.push($eval!(argument)?); }
+            $call!(name, &values)
+        }
+        Expr::Cast { expr, target } => {
+            let value = $eval!(expr)?;
+            context.reserve(crate::string::render::allocation_bound(&value)?)?;
+            crate::pg_catalog::cast(&value, target, context)
+        }
+        Expr::SimpleCase { .. } | Expr::Between { .. } | Expr::RegexReplace {..} => $reader!(expr),
         Expr::Case { branches, otherwise } => {
-            for (condition, value) in branches { if is_true(&eval(condition)?)? { return eval(value); } }
-            eval(otherwise)
+            for (condition, value) in branches { if is_true(&$eval!(condition)?)? { return $eval!(value); } }
+            $eval!(otherwise)
         }
         Expr::Coalesce(args) => {
-            for expr in args { let value = eval(expr)?; if !nullish(&value) { return Ok(value); } }
+            for expr in args { let value = $eval!(expr)?; if !nullish(&value) { return Ok(value); } }
             Ok(Value::Null)
         }
-        Expr::Field { expr, name, .. } => match eval(expr)? {
-            Value::Struct(mut fields) => Ok(fields.remove(name).unwrap_or(Value::Null)),
-            Value::Null | Value::Undefined => Ok(Value::Null), value => Err(inapplicable("get_field", &[&value])),
+        Expr::Field { expr, name, .. } => crate::field::get(&$eval!(expr)?,Some(name),context),
+        Expr::Subscript { expr, index, .. } => $call!("nth", &[$eval!(expr)?, $eval!(index)?]),
+        Expr::List(items) => {
+            context.reserve(items.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items { values.push($eval!(item)?); }
+            Ok(Value::List(values))
+        }
+        Expr::Struct(fields) => {
+            let mut values = std::collections::BTreeMap::new();
+            for (name, expr) in fields {
+                context.reserve(name.len().checked_add(4096).ok_or_else(overflow)?)?;
+                let mut value = $eval!(expr)?;
+                value.admit_box_date()?;
+                values.insert(name.clone(),value);
+            }
+            Ok(Value::Struct(values))
         },
-        Expr::Subscript { expr, index, .. } => scalar_call("nth", &[eval(expr)?, eval(index)?], context),
-        Expr::List(items) => Ok(Value::List(items.iter().map(eval).collect::<Result<Vec<_>>>()?)),
-        Expr::Struct(fields) => Ok(Value::Struct(fields.iter().map(|(name, expr)| Ok((name.clone(), eval(expr)?))).collect::<Result<_>>()?)),
         Expr::RowCopy(fields) => Ok(Value::Struct(fields.iter().map(|field| {
-            let value = schema.position(field.id).and_then(|index| row.get(index)).cloned()
+            let value = schema.position(field.id).and_then(|index| row.get(index))
                 .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", field.id.0)))?;
-            Ok((field.name.clone(), value))
+            context.reserve(field.name.len().checked_add(4096).ok_or_else(overflow)?)?;
+            Ok((field.name.clone(), retained_clone(value, context)?))
         }).collect::<Result<_>>()?)),
         Expr::In { expr, values, negated } => {
-            let value = eval(expr)?;
+            let value = $eval!(expr)?;
             let mut unknown = false;
             for candidate in values {
-                match sql_eq(&value, &eval(candidate)?)? { Some(true) => return Ok(Value::Bool(!*negated)), None => unknown = true, _ => () }
+                let candidate = $eval!(candidate)?;
+                context.reserve(crate::equality_allocation_bound(&value,&candidate)?)?;
+                match sql_eq_in_timezone(&value, &candidate, context.timezone)? { Some(true) => return Ok(Value::Bool(!*negated)), None => unknown = true, _ => () }
             }
             Ok(if unknown { Value::Null } else { Value::Bool(*negated) })
         }
         Expr::Like { expr, pattern, escape, case_insensitive, negated } => {
-            let (value, pattern) = (eval(expr)?, eval(pattern)?);
-            if nullish(&value) || nullish(&pattern) { return Ok(Value::Null); }
-            let (Value::Utf8(value), Value::Utf8(pattern)) = (&value, &pattern) else { return Err(inapplicable("like", &[&value, &pattern])); };
-            let mut regex = String::from(if *case_insensitive { "(?i)^" } else { "^" });
-            let mut chars = pattern.chars();
-            while let Some(ch) = chars.next() {
-                if Some(ch) == *escape {
-                    let escaped = chars.next().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-like-pattern", "LIKE pattern ends with its escape character"))?;
-                    regex.push_str(&regex::escape(&escaped.to_string()));
-                } else { match ch { '%' => regex.push_str(".*"), '_' => regex.push('.'), _ => regex.push_str(&regex::escape(&ch.to_string())) } }
-            }
-            regex.push_str("\\z");
-            let matches = regex::Regex::new(&regex).map_err(|error| Anomaly::incorrect("xtdb/invalid-regex", error.to_string()))?.is_match(value);
-            Ok(Value::Bool(matches != *negated))
+            let (value, pattern) = ($eval!(expr)?, $eval!(pattern)?);
+            crate::string::pattern::like(&value,&pattern,*escape,*case_insensitive,*negated,context)
         }
     }
+    }};
+}
+
+/// Evaluates immediately on the caller's thread, preserving short-circuit branches.
+/// A reached nonzero SLEEP returns `rtdb.expr/async-required`; production callers accepting SLEEP use `evaluate_async`.
+/// Returned values borrow no inputs; retain the allocation scope until their memory charge is transferred or dropped.
+/// Scalar calendar intermediates retain their range; struct fields and demanded list cells undergo typed-box admission.
+/// List size and type checks do not read elements; each element read reruns its expression.
+/// Returned collections are fully materialized and completed dates undergo expression-vector narrowing.
+pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    ExpressionInvocation::prepare(expr,schema,context)?.evaluate(row,context)
+}
+
+fn evaluate_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    macro_rules! eval { ($child:expr) => { evaluate_inner($child, schema, row, context) }; }
+    macro_rules! call { ($name:expr, $args:expr) => { scalar_call($name, $args, context) }; }
+    macro_rules! reader { ($expression:expr) => { reader::execute_sync($expression,schema,row,context) }; }
+    expression_body!(expr, schema, row, context, eval, call, reader)
+}
+
+/// Evaluates on the caller's future, suspending for reached SLEEP calls and yielding during temporal series construction.
+/// Dropping the future drops its timer and intermediates; the caller owns cancellation and retains the allocation scope.
+/// SLEEP requires a Tokio time driver; non-suspending scalar expressions keep the synchronous evaluation path.
+pub async fn evaluate_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    ExpressionInvocation::prepare(expr,schema,context)?.evaluate_async(row,context).await
+}
+
+async fn evaluate_async_inner(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    if !expr.requires_suspension() { return evaluate_inner(expr, schema, row, context); }
+    evaluate_suspending(expr, schema, row, context)?.await
+}
+
+fn evaluate_suspending<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>) -> Result<std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>>> {
+    let future = async move {
+        macro_rules! eval { ($child:expr) => { evaluate_async_inner($child, schema, row, context).await }; }
+        macro_rules! call { ($name:expr, $args:expr) => { crate::functions::scalar_call_async($name, $args, context).await }; }
+        macro_rules! reader { ($expression:expr) => { reader::execute_async($expression,schema,row,context).await }; }
+        expression_body!(expr, schema, row, context, eval, call, reader)
+    };
+    context.reserve(std::mem::size_of_val(&future).checked_add(256).ok_or_else(overflow)?)?;
+    Ok(Box::pin(future))
 }
 
 /// Evaluates one vector projection, copying columns or RowCopy records and validating computed decimal outputs.
@@ -176,6 +353,14 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
 /// Scalar evaluation can allocate before its result is measured and charged.
 pub fn evaluate_projection(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     let value = evaluate(expr, schema, row, context)?;
+    if !matches!(expr, Expr::Column { .. } | Expr::RowCopy(_)) { validate_projection_value(&value)?; }
+    Ok(value)
+}
+
+/// Uses the same output validation and ownership contract as `evaluate_projection`, with caller-owned suspension.
+/// Dropping the future releases pending SLEEP timers; cancellation is controlled by the caller.
+pub async fn evaluate_projection_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    let value = evaluate_async(expr, schema, row, context).await?;
     if !matches!(expr, Expr::Column { .. } | Expr::RowCopy(_)) { validate_projection_value(&value)?; }
     Ok(value)
 }
@@ -191,24 +376,39 @@ fn validate_projection_value(value: &Value) -> Result<()> {
 }
 
 /// The input batch remains borrowed; returned Arrow buffers retain their budget reservation.
+/// Compile expressions against `execution_field_type` fields; input cells and domain parameters use signed vector reads.
 /// Bare columns retain raw coefficients; computed outputs follow ordinary decimal vector-write validation.
 pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalContext<'_>, budget: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if batch.num_columns() != expr.schema.len() { return Err(Anomaly::fault("rtdb.expr/input-schema", "Batch width differs from bound expression input")); }
+    let schema_bytes = batch.schema().fields().iter().try_fold(0usize, |bytes, field| bytes.checked_add(field.size().checked_mul(64).ok_or_else(overflow)?).ok_or_else(overflow))?;
+    let _schema = budget.reserve(schema_bytes)?;
     for (actual, expected) in batch.schema().fields().iter().zip(expr.schema.fields()) {
-        if rtdb_columnar::from_field(actual)?.unencoded() != expected.data_type.unencoded() {
+        if rtdb_columnar::execution_field_type(actual)?.unencoded() != expected.data_type.unencoded() {
             return Err(Anomaly::fault("rtdb.expr/input-schema", format!("Input type differs from bound column {}", expected.name)));
         }
     }
+    let container_bytes = batch.num_rows().checked_mul(std::mem::size_of::<Value>() + std::mem::size_of::<Arc<rtdb_columnar::MemoryReservation>>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)?;
+    let _containers = budget.reserve(container_bytes)?;
+    let parameter_bytes = context.parameters.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
+    let _parameters = budget.reserve(parameter_bytes)?;
+    let mut parameters = context.parameters.to_vec();
+    parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+    let preparation = crate::EvaluationScope::new(budget)?;
+    let preparation_context = EvalContext { parameters: &parameters,parameter_types: context.parameter_types,current_time: context.current_time,timezone: context.timezone,outer_rows: context.outer_rows,snapshot_token: context.snapshot_token,allocation: Some(&preparation),catalog: context.catalog };
+    let invocation = ExpressionInvocation::prepare(&expr.expr,&expr.schema,&preparation_context)?;
     let mut values = Vec::with_capacity(batch.num_rows());
-    let mut scratch = Vec::new();
+    let mut scratch = Vec::with_capacity(batch.num_rows());
     for index in 0..batch.num_rows() {
+        let scope = crate::EvaluationScope::new(budget)?;
+        let context = EvalContext { parameters: &parameters, parameter_types: context.parameter_types, current_time: context.current_time, timezone: context.timezone, outer_rows: context.outer_rows, snapshot_token: context.snapshot_token, allocation: Some(&scope), catalog: context.catalog };
         let _decimal_validation = budget.reserve(4096)?;
-        let row = batch.columns().iter().zip(batch.schema().fields()).map(|(array, field)| read_value(field, array.as_ref(), index)).collect::<Result<Vec<_>>>()?;
-        let value = evaluate_projection(&expr.expr, &expr.schema, &row, context)?;
+        scope.reserve(batch.columns().iter().zip(batch.schema().fields()).try_fold(0usize, |bytes, (array, field)| bytes.checked_add(rtdb_columnar::estimate_read_value_bytes(field, array.as_ref(), index)?).ok_or_else(overflow))?)?;
+        let row = batch.columns().iter().zip(batch.schema().fields()).map(|(array, field)| rtdb_columnar::read_execution_value(field, array.as_ref(), index)).collect::<Result<Vec<_>>>()?;
+        let value = invocation.evaluate_projection(&row,&context)?;
         scratch.push(budget.reserve(value.retained_bytes()?)?);
         values.push(value);
     }
-    let logical = expr.data_type();
+    let logical = invocation.data_type().clone();
     let reservation = budget.reserve(estimate_builder_bytes(&logical, &values)?)?;
     let array = copy_array(&logical, &values)?;
     let schema = Arc::new(arrow_schema::Schema::new(vec![to_field("result", &logical)?]));

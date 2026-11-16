@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
-use chrono::{Datelike, Days, NaiveDate};
+use rtdb_types::calendar::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
@@ -58,7 +58,7 @@ struct InputSegment { key: TrieKey, metadata: MetadataFile, reader: ArrowFile, _
 struct MergeFile {
     path: PathBuf,
     part: Vec<u8>,
-    recency: Option<NaiveDate>,
+    recency: Option<CivilDate>,
     carries_recency: bool,
     writer: Option<ArrowFileWriter>,
     leaves: Vec<layout::Leaf>,
@@ -203,17 +203,15 @@ fn resolve_same_time(events: &[StoredEvent], memory: &Arc<MemoryBudget>) -> Resu
     Ok((result, charges))
 }
 
-pub fn recency_partition(recency: Timestamp, partition: RecencyPartition) -> Result<NaiveDate> {
-    let instant = chrono::DateTime::from_timestamp_micros(recency.0).ok_or_else(|| crate::invalid("Recency timestamp exceeds calendar range"))?;
-    let instant = instant.checked_sub_signed(chrono::Duration::nanoseconds(1)).ok_or_else(|| crate::invalid("Recency timestamp underflow"))?;
-    let date = instant.date_naive();
-    let result = match partition {
-        RecencyPartition::Week => date.checked_add_days(Days::new(u64::from(7 - date.weekday().num_days_from_monday()))),
-        RecencyPartition::Month => if date.month() == 12 { NaiveDate::from_ymd_opt(date.year() + 1, 1, 1) } else { NaiveDate::from_ymd_opt(date.year(), date.month() + 1, 1) },
-        RecencyPartition::Quarter => { let month = (date.month0() / 3 + 1) * 3 + 1; NaiveDate::from_ymd_opt(date.year() + i32::from(month > 12), if month > 12 { 1 } else { month }, 1) }
-        RecencyPartition::Year => NaiveDate::from_ymd_opt(date.year() + 1, 1, 1),
-    };
-    result.ok_or_else(|| crate::invalid("Recency partition exceeds calendar range"))
+pub fn recency_partition(recency: Timestamp, partition: RecencyPartition) -> Result<CivilDate> {
+    let epoch_day = recency.0.div_euclid(86_400_000_000) - i64::from(recency.0.rem_euclid(86_400_000_000) == 0);
+    let date = CivilDate::from_epoch_day(epoch_day)?;
+    match partition {
+        RecencyPartition::Week => date.plus_days(i64::from(8 - date.iso_day_of_week())),
+        RecencyPartition::Month => CivilDate::from_ymd(date.year(), date.month(), 1)?.plus_months(1),
+        RecencyPartition::Quarter => CivilDate::from_ymd(date.year(), (date.month() - 1) / 3 * 3 + 1, 1)?.plus_months(3),
+        RecencyPartition::Year => CivilDate::from_ymd(date.year() + 1, 1, 1),
+    }
 }
 
 #[async_trait]
@@ -317,7 +315,7 @@ impl CompactionExecutor for SegmentCompactor {
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<NaiveDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
         let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?, memory)?;

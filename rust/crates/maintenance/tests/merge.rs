@@ -90,10 +90,32 @@ async fn compressed_data_and_metadata_compact_with_identical_retry_bytes() {
 
 #[test]
 fn recency_partition_boundaries_are_inclusive() {
-    let monday = chrono::NaiveDate::from_ymd_opt(2020, 1, 6).unwrap();
-    let micros = monday.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_micros();
+    let monday = rtdb_types::calendar::CivilDate::from_ymd(2020, 1, 6).unwrap();
+    let micros = monday.epoch_day() * 86_400_000_000;
     assert_eq!(recency_partition(Timestamp(micros), RecencyPartition::Week).unwrap(), monday);
-    assert_eq!(recency_partition(Timestamp(micros + 1), RecencyPartition::Week).unwrap(), chrono::NaiveDate::from_ymd_opt(2020, 1, 13).unwrap());
+    assert_eq!(recency_partition(Timestamp(micros + 1), RecencyPartition::Week).unwrap(), rtdb_types::calendar::CivilDate::from_ymd(2020, 1, 13).unwrap());
+}
+
+#[test]
+fn recency_partitions_cover_wide_calendar_years_and_all_timestamp_values() {
+    use rtdb_types::calendar::CivilDate;
+    for year in [-280_000, 0, 280_000] {
+        for (partition, month, day, next_year, next_month, next_day) in [
+            (RecencyPartition::Week, 1, 3, year, 1, 10),
+            (RecencyPartition::Month, 1, 1, year, 2, 1),
+            (RecencyPartition::Quarter, 1, 1, year, 4, 1),
+            (RecencyPartition::Year, 1, 1, year + 1, 1, 1),
+        ] {
+            let boundary = CivilDate::from_ymd(year, month, day).unwrap();
+            let micros = boundary.epoch_day() * 86_400_000_000;
+            assert_eq!(recency_partition(Timestamp(micros), partition).unwrap(), boundary);
+            assert_eq!(recency_partition(Timestamp(micros + 1), partition).unwrap(), CivilDate::from_ymd(next_year, next_month, next_day).unwrap());
+        }
+    }
+    for partition in [RecencyPartition::Week, RecencyPartition::Month, RecencyPartition::Quarter, RecencyPartition::Year] {
+        assert!(recency_partition(Timestamp::MIN, partition).is_ok());
+        assert!(recency_partition(Timestamp::MAX, partition).is_ok());
+    }
 }
 
 #[tokio::test]

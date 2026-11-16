@@ -1,8 +1,6 @@
-use crate::{EvalContext, cast, compare, null_eq, sql_eq};
-use crate::timezone::zone;
+use crate::{EvalContext, cast, compare_in_timezone, null_eq_in_timezone, sql_eq_in_timezone};
 use crate::compare::nullish;
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
-use chrono::{DateTime, Timelike};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Value};
 use std::cmp::Ordering;
 
@@ -11,10 +9,70 @@ pub use rtdb_plan::function_type;
 fn text(value: &Value) -> Result<&str> { match value { Value::Utf8(text) => Ok(text), _ => Err(inapplicable("text", &[value])) } }
 fn count(value: usize) -> Result<Value> { Ok(Value::I32(i32::try_from(value).map_err(|_| overflow())?)) }
 
+/// Runs a scalar call on the caller's future; SLEEP borrows the Tokio time driver without spawning a task.
+/// Dropping this future cancels its timer; callers retain the evaluation allocation scope and own cancellation.
+/// Temporal GENERATE_SERIES and RANGE_BINS yield while constructing results; cancellation drops that construction.
+/// Remaining scalar calls use the synchronous implementation and return the same errors.
+pub async fn scalar_call_async(name: &str, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    if name.eq_ignore_ascii_case("generate_series") || name.eq_ignore_ascii_case("generate-series") {
+        return crate::series::prepare(args,context)?.materialize_async(context).await;
+    }
+    if name.eq_ignore_ascii_case("range_bins") || name.eq_ignore_ascii_case("range-bins") {
+        return match crate::temporal_functions::RangeBins::prepare(args,context)? { Some(bins) => bins.materialize_async(context).await, None => Ok(Value::Null) };
+    }
+    if name.eq_ignore_ascii_case("sleep") {
+        let bytes = args.iter().try_fold(4096usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
+        context.reserve(bytes.checked_mul(4).ok_or_else(overflow)?)?;
+        function_type(name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
+        let mut remaining = crate::volatile::sleep_millis(&args[0])?;
+        while remaining != 0 {
+            let millis = remaining.min(86_400_000);
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+            remaining -= millis;
+        }
+        return Ok(Value::Null);
+    }
+    scalar_call(name, args, context)
+}
+
 pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    let bytes = args.iter().try_fold(256usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
+    context.reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?;
     let name = name.to_lowercase().replace('-', "_");
     function_type(&name, &args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
+    if let Some(result) = crate::period::predicate(&name, args, context) { return result; }
+    if let Some(result) = crate::string::call(&name, args, context) { return result; }
+    if let Some(result) = crate::session_info::call(&name, args, context) { return result; }
+    if let Some(result) = crate::collection::call(&name, args, context) { return result; }
+    if let Some(result) = crate::bitwise::call(&name, args) { return result; }
+    if let Some(result) = crate::temporal_functions::call(&name, args, context) { return result; }
+    if let Some(result) = crate::interval_constructor::call(&name, args) { return result; }
+    if name == "get_field" { return crate::field::get(&args[0],None,context); }
+    if name == "generate_series" { return crate::series::prepare(args,context)?.materialize(context); }
+    if matches!(name.as_str(), "compare" | "compare_nulls_first" | "compare_nulls_last") {
+        if name == "compare" && args.iter().any(nullish) { return Ok(Value::Null); }
+        return crate::ordered::scalar_compare(&args[0],&args[1],name == "compare_nulls_first",context.timezone).map(Value::I32);
+    }
+    if matches!(name.as_str(), "uri_scheme" | "uri_user_info" | "uri_host" | "uri_port" | "uri_path" | "uri_query" | "uri_fragment") {
+        if nullish(&args[0]) { return Ok(Value::Null); }
+        let Value::Uri(text) = &args[0] else { return Err(inapplicable(&name, &[&args[0]])); };
+        let uri = rtdb_types::UriParts::parse(text)?;
+        if name == "uri_port" { return Ok(uri.port().map(Value::I32).unwrap_or(Value::Null)); }
+        let component = match name.as_str() {
+            "uri_scheme" => uri.scheme().map(std::borrow::Cow::Borrowed),
+            "uri_host" => uri.host().map(std::borrow::Cow::Borrowed),
+            "uri_user_info" => uri.user_info(),
+            "uri_path" => uri.path(),
+            "uri_query" => uri.query(),
+            _ => uri.fragment(),
+        };
+        return Ok(component.map(|text| Value::Utf8(text.into_owned())).unwrap_or(Value::Null));
+    }
     match name.as_str() {
+        "col_description" | "pg_indexam_has_property" => return Ok(Value::Null),
+        "random" => return crate::volatile::random(),
+        "sleep" => return if crate::volatile::sleep_millis(&args[0])? == 0 { Ok(Value::Null) }
+            else { Err(Anomaly::unsupported("rtdb.expr/async-required", "SLEEP requires asynchronous expression evaluation")) },
         "format_type" => {
             if nullish(&args[0]) { return Ok(Value::Null); }
             let oid = match &args[0] { Value::Oid(oid) => *oid, value => i32::try_from(integer(value).ok_or_else(|| inapplicable("format_type", &[value]))?).map_err(|_| overflow())? };
@@ -34,12 +92,19 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             return Ok(Value::Struct(fields));
         }
         "coalesce" => return Ok(args.iter().find(|value| !nullish(value)).cloned().unwrap_or(Value::Null)),
-        "nullif" => return Ok(if sql_eq(&args[0], &args[1])? == Some(true) { Value::Null } else { args[0].clone() }),
+        "nullif" => return Ok(if sql_eq_in_timezone(&args[0], &args[1], context.timezone)? == Some(true) { Value::Null } else { args[0].clone() }),
         "nil?" | "is_null" => return Ok(Value::Bool(nullish(&args[0]))),
-        "true?" => return Ok(Value::Bool(args[0] == Value::Bool(true))),
-        "false?" => return Ok(Value::Bool(args[0] == Value::Bool(false))),
+        "true?" | "is_true" => return Ok(Value::Bool(args[0] == Value::Bool(true))),
+        "false?" | "is_false" => return Ok(Value::Bool(args[0] == Value::Bool(false))),
+        "distinct_from" => return if args.iter().any(nullish) { Ok(Value::Bool(!args.iter().all(nullish))) }
+            else { Ok(crate::sql_not_eq_in_timezone(&args[0], &args[1], context.timezone)?.map(Value::Bool).unwrap_or(Value::Null)) },
+        "_meta_double" => return Ok(if let Some(value) = number(&args[0]) { Value::F64(value) }
+            else if let Some(days) = crate::temporal::date_days(&args[0]) { Value::F64(days as f64 * 86_400.0) }
+            else if let Value::Timestamp { value, unit, .. } | Value::Time { value, unit, .. } | Value::Duration { value, unit } = &args[0] { Value::F64(*value as f64 / unit.units_per_second() as f64) }
+            else { Value::Null }),
         "boolean" => return Ok(Value::Bool(!nullish(&args[0]) && args[0] != Value::Bool(false))),
-        "null_eq" => return Ok(Value::Bool(null_eq(&args[0], &args[1])?)),
+        "null_eq" => return Ok(Value::Bool(null_eq_in_timezone(&args[0], &args[1], context.timezone)?)),
+        "===" => return Ok(Value::Bool(crate::strict_eq(&args[0], &args[1])?)),
         "period" => {
             let timestamp = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
             let endpoint = |value: &Value, unbounded| -> Result<i64> {
@@ -57,26 +122,22 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         }
         "set" => {
             let mut items = Vec::new();
-            for value in args { if !items.iter().any(|old| null_eq(old, value).unwrap_or(false)) { items.push(value.clone()); } }
+            for value in args {
+                let mut found = false;
+                for old in &items {
+                    let equal = if nullish(old) || nullish(value) { nullish(old) && nullish(value) } else { crate::compare::sql_eq_value(old,value,context.timezone)? == Some(true) };
+                    if equal { found = true; break; }
+                }
+                if !found { items.push(value.clone()); }
+            }
             return Ok(Value::Set(items));
         }
-        "boolean?" | "number?" | "integer?" | "float?" | "string?" | "keyword?" | "uuid?" | "list?" | "set?" | "map?" => {
-            return Ok(Value::Bool(match name.as_str() {
-                "boolean?" => matches!(args[0], Value::Bool(_)), "number?" => number(&args[0]).is_some(),
-                "integer?" => integer(&args[0]).is_some(), "float?" => matches!(args[0], Value::F16(_) | Value::F32(_) | Value::F64(_)),
-                "string?" => matches!(args[0], Value::Utf8(_)), "keyword?" => matches!(args[0], Value::Keyword(_)),
-                "uuid?" => matches!(args[0], Value::Uuid(_)), "list?" => matches!(args[0], Value::List(_) | Value::FixedSizeList(_)),
-                "set?" => matches!(args[0], Value::Set(_)), _ => matches!(args[0], Value::Struct(_) | Value::Map { .. }),
-            }));
-        }
-        "current_timestamp" | "now" | "localtimestamp" | "current_date" | "current_time" | "localtime" => {
-            let time = DateTime::from_timestamp_micros(context.current_time.0).ok_or_else(overflow)?.with_timezone(&zone(context.timezone)?);
-            return Ok(match name.as_str() {
-                "current_timestamp" | "now" => Value::Timestamp { value: context.current_time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
-                "localtimestamp" => Value::Timestamp { value: time.naive_local().and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None },
-                "current_date" => Value::DateDay(i32::try_from(time.date_naive().and_hms_opt(0, 0, 0).ok_or_else(overflow)?.and_utc().timestamp().div_euclid(86400)).map_err(|_| overflow())?),
-                _ => Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1_000_000 + i64::from(time.nanosecond()) / 1_000, unit: TimeUnit::Microsecond, bit_width: 64 },
-            });
+        "snapshot_token" => {
+            if let Some(token) = context.snapshot_token {
+                if let Some(allocation) = context.allocation { allocation.reserve(token.len())?; }
+                return Ok(Value::Utf8(token.to_owned()));
+            }
+            return Ok(Value::Null);
         }
         _ => (),
     }
@@ -94,41 +155,9 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
     match name.as_str() {
         "lower" => Ok(Value::Utf8(text(&args[0])?.to_lowercase())),
         "upper" => Ok(Value::Utf8(text(&args[0])?.to_uppercase())),
-        "char_length" | "character_length" | "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
-        "octet_length" => count(text(&args[0])?.len()),
-        "bit_length" => count(text(&args[0])?.len().checked_mul(8).ok_or_else(overflow)?),
-        "concat" => Ok(Value::Utf8(args.iter().map(text).collect::<Result<Vec<_>>>()?.concat())),
-        "str" => cast(&args[0], &LogicalType::Scalar(ScalarType::Utf8), context.timezone),
-        "trim" | "trim_leading" | "trim_trailing" => {
-            let value = text(&args[0])?;
-            let trim = args.get(1).map(text).transpose()?.unwrap_or(" ");
-            let mut chars = trim.chars();
-            let trim = chars.next().ok_or_else(|| Anomaly::incorrect("xtdb/trim-error", "Trim character must contain one Unicode character"))?;
-            if chars.next().is_some() { return Err(Anomaly::incorrect("xtdb/trim-error", "Trim character must contain one Unicode character")); }
-            Ok(Value::Utf8(match name.as_str() { "trim_leading" => value.trim_start_matches(trim), "trim_trailing" => value.trim_end_matches(trim), _ => value.trim_matches(trim) }.into()))
-        }
-        "substring" | "substr" => {
-            let value = text(&args[0])?;
-            let from = integer(args.get(1).ok_or_else(|| inapplicable(&name, &[]))?).ok_or_else(|| inapplicable(&name, &[]))?;
-            let length = args.get(2).map(|value| integer(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?;
-            if length.is_some_and(|length| length < 0) { return Err(Anomaly::incorrect("xtdb/substring-error", "Negative substring length")); }
-            let first = from.max(1) - 1;
-            let end = length.map(|length| from.saturating_add(length).max(1) - 1).unwrap_or(i128::MAX);
-            Ok(Value::Utf8(value.chars().skip(usize::try_from(first).unwrap_or(usize::MAX)).take(usize::try_from((end - first).max(0)).unwrap_or(usize::MAX)).collect()))
-        }
-        "position" => {
-            let haystack = text(args.get(1).ok_or_else(|| inapplicable(&name, &[]))?)?;
-            let needle = text(&args[0])?;
-            count(haystack.find(needle).map(|index| haystack[..index].chars().count() + 1).unwrap_or(0))
-        }
-        "replace" => {
-            if args.len() != 3 { return Err(inapplicable("replace", &[])); }
-            Ok(Value::Utf8(text(&args[0])?.replace(text(&args[1])?, text(&args[2])?)))
-        }
+        "length" => match &args[0] { Value::Utf8(text) => count(text.chars().count()), Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => count(bytes.len()), Value::List(items) => count(items.len()), value => Err(inapplicable(&name, &[value])) },
         "_iid" => Ok(Value::FixedSizeBinary(args[0].entity_id()?.iid().0.to_vec())),
         "keyword" => cast(&args[0], &LogicalType::Scalar(ScalarType::Keyword), context.timezone),
-        "uuid" => cast(&args[0], &LogicalType::Scalar(ScalarType::Uuid), context.timezone),
-        "uri" => cast(&args[0], &LogicalType::Scalar(ScalarType::Uri), context.timezone),
         "namespace" | "local_name" => {
             let Value::Keyword(keyword) = &args[0] else { return Err(inapplicable(&name, &[&args[0]])); };
             let parts = keyword.as_str().split_once('/');
@@ -139,24 +168,23 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         "nth" => {
             let index = integer(&args[1]).ok_or_else(|| inapplicable(&name, &[&args[1]]))?;
             let items = match &args[0] { Value::List(items) | Value::FixedSizeList(items) => items, _ => return Ok(Value::Null) };
-            Ok(usize::try_from(index).ok().and_then(|index| items.get(index)).cloned().unwrap_or(Value::Null))
+            let mut value = usize::try_from(index).ok().and_then(|index| items.get(index)).cloned().unwrap_or(Value::Null);
+            value.admit_box_date()?;
+            Ok(value)
         }
         "greatest" | "least" => {
-            let mut best = args[0].clone();
+            let Some(first) = args.first() else { return Ok(Value::Null); };
+            let mut best = first.clone();
             for value in &args[1..] {
-                let ordering = compare(&best, value, false)?;
-                if (name == "greatest" && ordering == Ordering::Less) || (name == "least" && ordering == Ordering::Greater) { best = value.clone(); }
+                let unordered = number(&best).is_some_and(f64::is_nan) || number(value).is_some_and(f64::is_nan);
+                let ordering = if unordered { Ordering::Equal } else { compare_in_timezone(&best, value, false, context.timezone)? };
+                if ordering != if name == "greatest" { Ordering::Greater } else { Ordering::Less } { best = value.clone(); }
             }
             Ok(best)
         }
-        "like_regex" => {
-            let mut builder = regex::RegexBuilder::new(text(&args[1])?);
-            for flag in args.get(2).map(text).transpose()?.unwrap_or("").chars() {
-                match flag { 'i' => { builder.case_insensitive(true); }, 's' => { builder.dot_matches_new_line(true); }, 'm' => { builder.multi_line(true); }, 'x' => { builder.ignore_whitespace(true); }, _ => return Err(Anomaly::incorrect("xtdb/invalid-regex-flag", format!("Unknown regex flag: {flag}"))) }
-            }
-            Ok(Value::Bool(builder.build().map_err(|error| Anomaly::incorrect("xtdb/invalid-regex", error.to_string()))?.is_match(text(&args[0])?)))
-        }
-        "abs" | "floor" | "ceil" | "ceiling" | "round" | "trunc" => {
+        "like_regex" => crate::string::pattern::matches(args, context),
+        "regexp_replace" => crate::string::pattern::replace(args, context),
+        "abs" | "floor" | "ceil" | "ceiling" | "round" => {
             let scale = args.get(1).map(|value| integer(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?.unwrap_or(0);
             if matches!(name.as_str(), "floor" | "ceil" | "ceiling") {
                 let value = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
@@ -164,9 +192,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             }
             if let Value::Decimal(value) = &args[0] {
                 if name == "abs" { return decimal_value(decimal(value).abs(), value.precision, value.scale, value.bit_width); }
-                let rounded = crate::decimal::rounded(value, i32::try_from(scale).map_err(|_| overflow())?, if name == "round" { bigdecimal::RoundingMode::HalfUp } else { bigdecimal::RoundingMode::Down })?;
-                return if name == "round" { Ok(Value::Decimal(rounded)) }
-                    else { crate::decimal_rescale(&rounded, value.precision, value.scale, value.bit_width).map(Value::Decimal) };
+                return crate::decimal::rounded(value, i32::try_from(scale).map_err(|_| overflow())?, bigdecimal::RoundingMode::HalfUp).map(Value::Decimal);
             }
             let LogicalType::Scalar(ty) = args[0].logical_type() else { return Err(inapplicable(&name, &[&args[0]])); };
             if let Some(integer) = integer(&args[0]) {
@@ -186,17 +212,18 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
                 if !value.is_finite() { return Err(overflow()); }
                 return Ok(Value::F64(if scale >= 0 { value.round() / factor } else { value.round() * factor }));
             }
-            let factor = 10.0_f64.powi(i32::try_from(scale).map_err(|_| overflow())?);
-            Ok(floating_value(match name.as_str() { "abs" => x.abs(), "floor" => x.floor(), "ceil" | "ceiling" => x.ceil(), "round" => (x * factor).round() / factor, _ => (x * factor).trunc() / factor }, &ty))
+            Ok(floating_value(x.abs(), &ty))
         }
-        "sqrt" | "exp" | "ln" | "log" | "power" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians" => {
+        "mod" => crate::arithmetic(rtdb_plan::BinaryOp::Modulo, &args[0], &args[1]),
+        "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh" | "double" | "asin" | "acos" | "atan" => {
             let x = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
             let y = args.get(1).map(|value| number(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?;
             let value = match name.as_str() {
                 "sqrt" => x.sqrt(), "exp" => x.exp(), "ln" => x.ln(),
+                "log10" => x.log10(), "sinh" => x.sinh(), "cosh" => x.cosh(), "tanh" => x.tanh(), "double" => x,
                 "log" => y.map_or_else(|| x.log10(), |y| y.log(x)), "power" => x.powf(y.ok_or_else(|| inapplicable(&name, &[]))?),
                 "sin" => x.sin(), "cos" => x.cos(), "tan" => x.tan(), "asin" => x.asin(), "acos" => x.acos(),
-                "atan" => x.atan(), "atan2" => x.atan2(y.ok_or_else(|| inapplicable(&name, &[]))?), "degrees" => x.to_degrees(), _ => x.to_radians(),
+                "atan" => x.atan(), _ => return Err(inapplicable(&name, &[])),
             };
             Ok(Value::F64(value))
         }

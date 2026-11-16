@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use arrow_array::RecordBatch;
 use arrow_flight::{FlightData, PutResult, sql::{Command, CommandStatementIngest, DoPutUpdateResult, TableExistsOption, TableNotExistOption}};
 use prost::Message;
-use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_read_value_bytes};
 use rtdb_tx::{Documents, SqlArguments, TxOp};
 use rtdb_types::{TableRef, Value};
 use tonic::{Response, Status, Streaming};
@@ -89,6 +89,6 @@ fn documents(batch: &RecordBatch, service: &Service) -> Result<(Vec<BTreeMap<Str
     let schema = batch.schema(); let mut bound = 8192;
     for row in 0..batch.num_rows() { for (column, field) in schema.fields().iter().enumerate() { bound = wire::add(bound, wire::add(field.name().len(), estimate_read_value_bytes(field, batch.column(column).as_ref(), row).map_err(status)?)?)?; } }
     let scratch = service.memory().reserve(bound).map_err(status)?;
-    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), read_value(field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<BTreeMap<_, _>, Status>>()).collect::<Result<Vec<_>, _>>()?;
+    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row).map_err(status)?))).collect::<Result<BTreeMap<_, _>, Status>>()).collect::<Result<Vec<_>, _>>()?;
     Ok((rows, scratch))
 }

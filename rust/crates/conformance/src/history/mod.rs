@@ -4,7 +4,6 @@ pub mod recovery;
 
 use rtdb_columnar::read_value;
 use rtdb_node::{AutonomousTxOptions, Node};
-use rtdb_plan::Statement;
 use rtdb_query::PreparedQuery;
 use rtdb_tx::{Documents, EntityIds, TxOp};
 use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TimeUnit, Timestamp, Value};
@@ -34,7 +33,7 @@ struct Prefix { id: String, transactions: usize }
 #[derive(Deserialize)]
 struct Query { id: String, prefix: String, valid_time: String, system_time: String }
 
-fn instant(value: &str) -> Result<Timestamp, Error> { Ok(Timestamp(chrono::DateTime::parse_from_rfc3339(value)?.timestamp_micros())) }
+fn instant(value: &str) -> Result<Timestamp, Error> { Ok(rtdb_types::Instant::parse_iso(value)?.as_micros()?) }
 fn valid_id(value: &str) -> bool { !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')) }
 impl Fixture {
     fn validate(&self) -> Result<(), Error> {
@@ -144,13 +143,12 @@ async fn observe(node: &Node, reads: &Reads, prefix: &str, layout: &str, query: 
     let mut session = node.session("xtdb", Arc::new(Identity))?;
     let mut context = session.query_context().await?;
     Arc::get_mut(&mut context).ok_or("fixture query context is not exclusively owned")?.options.bypass_temporal_pruning = bypass;
-    let valid = chrono::DateTime::parse_from_rfc3339(&query.valid_time)?.to_rfc3339();
-    let system = chrono::DateTime::parse_from_rfc3339(&query.system_time)?.to_rfc3339();
+    let valid = rtdb_types::Instant::parse_iso(&query.valid_time)?.to_iso_string()?;
+    let system = rtdb_types::Instant::parse_iso(&query.system_time)?.to_iso_string()?;
     let sql = format!("SELECT price, _valid_from AS valid_from, _valid_to AS valid_to, _system_from AS system_from, _system_to AS system_to FROM products FOR VALID_TIME AS OF TIMESTAMP '{valid}' FOR SYSTEM_TIME AS OF TIMESTAMP '{system}' WHERE _id = '{id}'");
     let before = reads.snapshot();
     let prepared = rtdb_sql::prepare(&sql, &context.catalog, &Default::default())?;
-    let Statement::Query(relation) = prepared.statement else { return Err("history SELECT was not a query".into()); };
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, vec![])?;
+    let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, vec![]).await?;
     let schema = cursor.schema().fields().iter().map(|field| Ok(json!({"name":field.name,"types":type_tag(&field.data_type)?}))).collect::<Result<Vec<_>, Error>>()?;
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {

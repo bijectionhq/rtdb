@@ -83,6 +83,51 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
 }
 
 #[tokio::test]
+async fn percentile_planning_warning_precedes_simple_and_extended_results_without_repeating_at_bind() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let sql = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v NULLS FIRST) AS p FROM (VALUES (1), (3)) AS t(v)";
+    let expected = b"SWARNING\0VWARNING\0C01000\0MNULL ordering is ignored for percentile_cont (nulls are excluded from ordered-set aggregates)\0\0";
+    let simple = client.query(sql).await;
+    assert_eq!(tags(&simple), b"NTDCZ");
+    assert_eq!(simple[0].1, expected);
+    client.parse("percentile", sql, &[]).await;
+    client.bind("first", "percentile").await;
+    client.execute("first", 0).await;
+    client.send(b'S', &[]).await;
+    let extended = client.through(b'Z').await;
+    assert_eq!(tags(&extended), b"N12DCZ");
+    assert_eq!(extended[0].1, expected);
+    client.bind("second", "percentile").await;
+    client.execute("second", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"2DCZ");
+    let prepared = client.query(&format!("PREPARE named AS {sql}")).await;
+    assert_eq!(tags(&prepared), b"NCZ");
+    assert_eq!(prepared[0].1, expected);
+    assert_eq!(tags(&client.query("EXECUTE named").await), b"TDCZ");
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn virtual_endpoint_retains_timestamp_description_and_emits_null() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("endpoint", "SELECT _valid_from FROM pg_catalog.pg_namespace LIMIT 1", &[]).await;
+    client.bind("endpoint", "endpoint").await;
+    let mut description = vec![b'P']; description.extend_from_slice(&cstring("endpoint")); client.send(b'D', &description).await;
+    client.execute("endpoint", 0).await; client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12TDCZ");
+    assert_eq!(rows(&frames), vec![vec![None]]);
+    let description = &frames.iter().find(|frame| frame.0 == b'T').unwrap().1;
+    let name_end = 2 + description[2..].iter().position(|byte| *byte == 0).unwrap();
+    assert_eq!(i32::from_be_bytes(description[name_end + 7..name_end + 11].try_into().unwrap()), 1184);
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
 async fn simple_queries_password_authentication_and_transaction_visibility() {
     let running = Running::start(ServerConfig::default(), Some("correct")).await;
     let mut client = Client::connect(&running.server, Some("correct")).await;
@@ -177,6 +222,76 @@ async fn binary_bind_parameters_and_result_formats_use_declared_oids() {
     drop(client); running.stop().await;
 }
 
+#[tokio::test]
+async fn parameter_descriptions_keep_dml_and_control_oids_and_resize_query_oids() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (name, sql, supplied, expected, result) in [
+        ("dml_missing", "UPDATE docs SET v=$2", vec![], vec![], b'n'),
+        ("dml_extra", "DELETE FROM docs", vec![23, 0], vec![23, 25], b'n'),
+        ("control_missing", "SET TIME ZONE $1", vec![], vec![], b'n'),
+        ("control_extra", "SET TIME ZONE 'UTC'", vec![25], vec![25], b'n'),
+        ("query_extra", "SELECT $1 AS value", vec![23, 999_999], vec![23], b'T'),
+        ("query_missing", "SELECT $2 AS value", vec![23], vec![23, 25], b'T'),
+    ] {
+        client.parse(name, sql, &supplied).await;
+        let mut description = vec![b'S']; description.extend_from_slice(&cstring(name));
+        client.send(b'D', &description).await; client.send(b'S', &[]).await;
+        let frames = client.through(b'Z').await;
+        assert_eq!(tags(&frames), vec![b'1', b't', result, b'Z'], "{name}");
+        let mut bytes = (expected.len() as u16).to_be_bytes().to_vec();
+        for oid in expected { bytes.extend_from_slice(&i32::to_be_bytes(oid)); }
+        assert_eq!(frames[1].1, bytes, "{name}");
+    }
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn dml_missing_sql_arguments_reach_commit_after_successful_bind_and_execute() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("INSERT INTO docs (_id,v) VALUES (1,10)").await), b"CZ");
+    assert_eq!(tags(&client.query("BEGIN READ WRITE").await), b"CZ");
+    client.parse("missing", "UPDATE docs SET v=$1", &[]).await;
+    client.bind("missing", "missing").await; client.execute("missing", 0).await; client.send(b'S', &[]).await;
+    let buffered = client.through(b'Z').await;
+    assert_eq!(tags(&buffered), b"12CZ");
+    assert_eq!(buffered.last().unwrap().1, b"T");
+    let commit = client.query("COMMIT").await;
+    assert_eq!(tags(&commit), b"EZ");
+    assert!(String::from_utf8_lossy(&commit[0].1).contains("Arguments list was expected but not provided"));
+    assert_eq!(rows(&client.query("SELECT v FROM docs").await), vec![vec![Some(b"10".to_vec())]]);
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn sql_execute_binds_derived_dml_arguments_without_wire_oid_descriptors() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("PREPARE insert_doc AS INSERT INTO docs (_id,v) VALUES ($1,$2)").await), b"CZ");
+    assert_eq!(tags(&client.query("EXECUTE insert_doc(1,42)").await), b"CZ");
+    assert_eq!(rows(&client.query("SELECT _id,v FROM docs").await), vec![vec![Some(b"1".to_vec()), Some(b"42".to_vec())]]);
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn unprepared_controls_consume_actual_arguments_independently_of_description_width() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("zone", "SET TIME ZONE 'UTC'", &[25]).await;
+    client.bind("zone", "zone").await; client.execute("zone", 0).await; client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12SCZ");
+    client.parse("show", "SHOW TIME ZONE", &[]).await;
+    let mut bind = cstring("show"); bind.extend_from_slice(&cstring("show"));
+    bind.extend_from_slice(&0u16.to_be_bytes()); bind.extend_from_slice(&1u16.to_be_bytes()); bind.extend_from_slice(&(-1i32).to_be_bytes()); bind.extend_from_slice(&0u16.to_be_bytes());
+    client.send(b'B', &bind).await; client.execute("show", 0).await; client.send(b'S', &[]).await;
+    let frames = client.through(b'Z').await;
+    assert_eq!(tags(&frames), b"12DCZ");
+    assert_eq!(rows(&frames), vec![vec![Some(b"UTC".to_vec())]]);
+    drop(client); running.stop().await;
+}
+
 fn arrow_copy_bytes(file: bool, offset: i64) -> Vec<u8> {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch};
     let batch = |id, value| RecordBatch::try_from_iter(vec![("_id", Arc::new(Int64Array::from(vec![id])) as ArrayRef), ("n", Arc::new(Int64Array::from(vec![value])) as ArrayRef)]).unwrap();
@@ -184,6 +299,24 @@ fn arrow_copy_bytes(file: bool, offset: i64) -> Vec<u8> {
     if file { let mut writer = arrow_ipc::writer::FileWriter::try_new(&mut bytes, first.schema().as_ref()).unwrap(); writer.write(&first).unwrap(); writer.write(&second).unwrap(); writer.finish().unwrap(); }
     else { let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut bytes, first.schema().as_ref()).unwrap(); writer.write(&first).unwrap(); writer.write(&second).unwrap(); writer.finish().unwrap(); }
     bytes
+}
+
+#[tokio::test]
+async fn arrow_copy_unsigned_ids_and_values_enter_signed_execution() {
+    use arrow_array::{ArrayRef, RecordBatch, UInt64Array};
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let batch = RecordBatch::try_from_iter(vec![("_id", Arc::new(UInt64Array::from(vec![u64::MAX])) as ArrayRef), ("v", Arc::new(UInt64Array::from(vec![1 << 63])) as ArrayRef)]).unwrap();
+    for (table, file) in [("unsigned_stream", false), ("unsigned_file", true)] {
+        let bytes = if file { rtdb_format::ipc::write_file(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() } else { rtdb_format::ipc::write_stream(batch.schema().as_ref(), std::slice::from_ref(&batch)).unwrap() };
+        client.send(b'Q', &cstring(&format!("COPY {table} FROM STDIN WITH (FORMAT '{}')", if file { "arrow-file" } else { "arrow-stream" }))).await;
+        assert_eq!(client.receive().await.0, b'G');
+        client.send(b'd', &bytes).await; client.send(b'c', &[]).await;
+        assert_eq!(tags(&client.through(b'Z').await), b"CZ");
+        let frames = client.query(&format!("SELECT _id,v FROM {table}")).await;
+        assert_eq!(rows(&frames), vec![vec![Some(b"-1".to_vec()), Some(i64::MIN.to_string().into_bytes())]]);
+    }
+    drop(client); running.stop().await;
 }
 
 #[tokio::test]

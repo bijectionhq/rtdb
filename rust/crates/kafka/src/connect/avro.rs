@@ -1,12 +1,23 @@
-use std::{collections::BTreeMap, io::Cursor, sync::Arc};
-use apache_avro::{Schema, types::Value as Avro};
-use rtdb_types::{DecimalValue, Result, TimeUnit, Value};
+use std::{collections::BTreeMap, sync::Arc};
+use apache_avro::Schema;
+use rtdb_types::{DecimalValue, Result, Value};
 use super::{ConnectData, ConnectSchema, ConversionContext, SchemaKind, error};
 mod metadata;
 mod graph;
 mod union;
+mod resolution;
+mod migration;
+mod datum;
+mod output;
+mod default_json;
+pub(super) use datum::AvroDatum;
+use datum::{PhysicalValue as Avro, AvroMap, MapKey};
+pub(super) use resolution::AvroResolution;
 
-pub(super) struct AvroPlan { root: Schema, references: Vec<Schema>, names: BTreeMap<String, Schema>, connect: Arc<ConnectSchema>, unions: graph::UnionOptions }
+pub(super) struct AvroDatumPlan { root: Schema, names: BTreeMap<String, Schema>, metadata: metadata::Metadata, defaults: default_json::Defaults, unions: graph::UnionOptions, schema_bytes: usize }
+pub(super) struct AvroPlan { datum: Arc<AvroDatumPlan>, branch: Option<u32>, connect: Arc<ConnectSchema>, charges: Vec<Arc<rtdb_columnar::MemoryReservation>> }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum AvroOutput { Writer, Reader { branch: Option<u32> } }
 impl AvroPlan {
     #[cfg(test)]
     pub fn parse(text: &str, references: &[String]) -> Result<Self> { Self::parse_version(text, references, &BTreeMap::new(), None) }
@@ -15,36 +26,148 @@ impl AvroPlan {
         Self::parse_version_index(text, references, options, version, &mut 0)
     }
     pub fn parse_version_index(text: &str, references: &[String], options: &BTreeMap<String, String>, version: Option<i32>, next_union: &mut i32) -> Result<Self> {
-        let metadata = metadata::Metadata::new(text, references, options, version)?;
-        let unions = graph::UnionOptions::parse(options)?;
-        let text = physical_logical_types(text)?;
-        let references = references.iter().map(|text| physical_logical_types(text)).collect::<Result<Vec<_>>>()?;
-        let (root, references) = Schema::parse_str_with_list(&text, &references).map_err(|cause| error("avro-schema", cause))?;
-        let mut names = BTreeMap::new(); collect_names(&root, &mut names);
-        for reference in &references { collect_names(reference, &mut names); }
-        let connect = graph::build(&root, &names, &metadata, unions, next_union)?;
-        Ok(Self { root, references, names, connect, unions })
+        let datum = Arc::new(AvroDatumPlan::parse(text, references, options)?);
+        let connect = datum.build_connect(None, version, next_union)?;
+        Ok(Self { datum, branch: None, connect, charges: Vec::new() })
+    }
+    pub fn datum_plan(&self) -> &AvroDatumPlan { &self.datum }
+    pub fn convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
+        for charge in &self.charges { context.retain(Arc::clone(charge))?; }
+        let bytes = resolution::value_bound(&datum.value, 0)?.checked_mul(self.connect.view_allocation_bound().checked_div(4096).unwrap_or(0).checked_add(2).ok_or_else(resolution::overflow)?).ok_or_else(resolution::overflow)?;
+        context.reserve(bytes)?;
+        let value = if Arc::ptr_eq(&self.datum, &datum.plan) {
+            if self.branch.is_some() { let Avro::Union(_, child) = datum.value else { return Err(error("avro-decode", "Selected record output requires union datum")); }; *child } else { datum.value }
+        } else {
+            context.reserve(datum.plan.schema_bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(resolution::overflow)?)?;
+            output::bridge(self.datum.selected_root(self.branch)?, &datum.plan.root, datum.value, &self.connect, &self.datum, &datum.plan, next_union, context, 0)?
+        };
+        let value = metadata::coerce(convert(self.datum.selected_root(self.branch)?, value, &self.datum.names, self.datum.unions, &self.connect, 0)?, &self.connect)?;
+        Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value })
     }
     #[cfg(test)]
     pub fn decode(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<ConnectData> {
-        self.convert(self.decode_datum(bytes, context)?)
+        self.convert(self.datum.decode_datum(bytes, context)?, &mut 0, context)
     }
-    pub fn decode_datum(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<Avro> {
-        if matches!(&self.root, Schema::Bytes) || matches!(&self.root, Schema::Decimal(value) if matches!(value.inner.as_ref(), Schema::Bytes)) {
-            context.reserve(bytes.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Avro byte value allocation overflow"))?)?;
-            return Ok(Avro::Bytes(bytes.to_vec()));
+}
+impl AvroDatumPlan {
+    pub fn parse(text: &str, references: &[String], options: &BTreeMap<String, String>) -> Result<Self> {
+        let defaults = default_json::Defaults::parse(text, references)?;
+        let metadata_text = default_json::metadata_text(text)?;
+        let metadata_references = references.iter().map(|text| default_json::metadata_text(text)).collect::<Result<Vec<_>>>()?;
+        let metadata = metadata::Metadata::new(&metadata_text, &metadata_references, options, None)?;
+        let unions = graph::UnionOptions::parse(options)?;
+        let schema_bytes = references.iter().try_fold(text.len(), |bytes, text| bytes.checked_add(text.len()).ok_or_else(|| error("allocation-overflow", "Avro schema size overflow")))?;
+        let text = physical_logical_types(&metadata_text)?;
+        let references = metadata_references.iter().map(|text| physical_logical_types(text)).collect::<Result<Vec<_>>>()?;
+        let text = without_field_defaults(&text)?;
+        let references = references.iter().map(|text| without_field_defaults(text)).collect::<Result<Vec<_>>>()?;
+        let (mut root, mut references) = Schema::parse_str_with_list(&text, &references).map_err(|cause| error("avro-schema", cause))?;
+        restore_field_defaults(&mut root, metadata.root(), &metadata);
+        for schema in &mut references { restore_field_defaults(schema, metadata.root(), &metadata); }
+        let mut names = BTreeMap::new(); collect_names(&root, &mut names);
+        for reference in &references { collect_names(reference, &mut names); }
+        Ok(Self { root, names, metadata, defaults, unions, schema_bytes })
+    }
+    pub fn connect_plan(self: &Arc<Self>, branch: Option<u32>, version: Option<i32>, next_union: &mut i32, context: &mut ConversionContext) -> Result<AvroPlan> {
+        let bytes = self.connect_allocation_bound(branch)?;
+        let charge = context.reserve(bytes)?;
+        let connect = self.build_connect(branch, version, next_union)?;
+        Ok(AvroPlan { datum: Arc::clone(self), branch, connect, charges: vec![charge] })
+    }
+    fn selected_root(&self, branch: Option<u32>) -> Result<&Schema> {
+        match (resolve(&self.root, &self.names)?, branch) {
+            (Schema::Union(union), Some(index)) => union.variants().get(index as usize).ok_or_else(|| error("avro-schema", "Output union branch is absent")),
+            (_, None) => Ok(&self.root),
+            _ => Err(error("avro-schema", "Output branch requires a union schema")),
         }
-        let mut preflight = Preflight { bytes, offset: 0, allocated: 4096, limit: context.allocation_limit(), names: &self.names, view_bytes: self.connect.view_allocation_bound() };
-        preflight.value(&self.root, 0)?;
-        if preflight.offset != bytes.len() { return Err(error("avro-decode", "Trailing bytes after Avro datum")); }
-        context.reserve(preflight.allocated)?;
-        let mut reader = Cursor::new(bytes);
-        let mut schemata = self.references.iter().collect::<Vec<_>>(); schemata.push(&self.root);
-        apache_avro::from_avro_datum_schemata(&self.root, schemata, &mut reader, None).map_err(|cause| error("avro-decode", cause))
     }
-    pub fn convert(&self, value: Avro) -> Result<ConnectData> {
-        let value = metadata::coerce(convert(&self.root, value, &self.names, self.unions, &self.connect, 0)?, &self.connect)?;
-        Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value })
+    fn build_connect(&self, branch: Option<u32>, version: Option<i32>, next_union: &mut i32) -> Result<Arc<ConnectSchema>> {
+        let raw = self.metadata.root();
+        let raw = match branch {
+            None => raw,
+            Some(index) => raw.as_array().or_else(|| raw.get("type").and_then(serde_json::Value::as_array)).and_then(|values| values.get(index as usize)).ok_or_else(|| error("avro-schema", "Output union metadata is absent"))?,
+        };
+        graph::build_at(self.selected_root(branch)?, raw, &self.names, &self.metadata, &self.defaults, self.unions, version, next_union)
+    }
+    fn connect_allocation_bound(&self, branch: Option<u32>) -> Result<usize> {
+        let defaults = resolution::default_allocation_bound(self.selected_root(branch)?, &self.names, &self.defaults)?;
+        self.schema_bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(65_536)).and_then(|bytes| bytes.checked_add(defaults)).ok_or_else(resolution::overflow)
+    }
+    pub fn decode_datum(self: &Arc<Self>, bytes: &[u8], context: &mut ConversionContext) -> Result<AvroDatum> {
+        if self.raw_bytes() {
+            context.reserve(bytes.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Avro byte value allocation overflow"))?)?;
+            return Ok(AvroDatum { value: Avro::Bytes(bytes.to_vec()), plan: Arc::clone(self) });
+        }
+        let mut preflight = Preflight { bytes, offset: 0, window: BinaryWindow::new(bytes.len()), allocated: 4096, limit: context.allocation_limit(), names: &self.names, view_bytes: 0 };
+        preflight.value(&self.root, 0)?;
+        context.reserve(preflight.allocated)?;
+        let value = datum::decode(self, bytes)?;
+        Ok(AvroDatum { value, plan: Arc::clone(self) })
+    }
+    pub fn root_record(&self) -> bool { matches!(resolve(&self.root, &self.names), Ok(Schema::Record(_))) }
+    pub fn raw_bytes(&self) -> bool { match &self.root { Schema::Bytes => true, Schema::Decimal(decimal) => matches!(decimal.inner.as_ref(), Schema::Bytes), _ => false } }
+    pub fn select_output(&self, reader: &Self, datum: &AvroDatum) -> Result<AvroOutput> {
+        if !self.root_record() { return Ok(AvroOutput::Writer); }
+        let branch = if let Avro::Union(index, _) = &datum.value { Some(*index) } else { None };
+        if !matches!(resolve(reader.selected_root(branch)?, &reader.names)?, Schema::Record(_)) { return Err(error("avro-decode", "Record writer resolved to a non-record output")); }
+        Ok(AvroOutput::Reader { branch })
+    }
+    pub fn prepare_output(&self, reader: &Self, datum: AvroDatum, _context: &mut ConversionContext) -> Result<(AvroOutput, AvroDatum)> {
+        let output = self.select_output(reader, &datum)?;
+        Ok((output, datum))
+    }
+    pub fn binary_result(self: &Arc<Self>, mut datum: AvroDatum, context: &mut ConversionContext) -> Result<AvroDatum> {
+        if matches!(resolve(&self.root, &self.names)?, Schema::String) {
+            let mut value = datum.value;
+            while let Avro::Union(_, child) = value { value = *child; }
+            value = match value {
+                Avro::String(value) => Avro::String(value),
+                Avro::Utf8(value) => { context.reserve(value.len().checked_mul(6).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(resolution::overflow)?)?; Avro::String(datum::java_utf8(&value)) },
+                Avro::Bytes(value) => { context.reserve(4096)?; Avro::String(format!("java.nio.HeapByteBuffer[pos=0 lim={} cap={}]", value.len(), value.len())) },
+                _ => return Err(error("avro-decode", "String writer resolved to an invalid output")),
+            };
+            datum.value = value; datum.plan = Arc::clone(self);
+        }
+        Ok(datum)
+    }
+}
+fn without_field_defaults(text: &str) -> Result<String> {
+    fn strip(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                if fields.get("type").and_then(serde_json::Value::as_str) == Some("record") {
+                    if let Some(fields) = fields.get_mut("fields").and_then(serde_json::Value::as_array_mut) { for field in fields { if let Some(field) = field.as_object_mut() { field.remove("default"); } } }
+                }
+                for value in fields.values_mut() { strip(value); }
+            }
+            serde_json::Value::Array(values) => for value in values { strip(value); },
+            _ => {}
+        }
+    }
+    let mut value = serde_json::from_str(text).map_err(|cause| error("avro-schema", cause))?;
+    strip(&mut value); serde_json::to_string(&value).map_err(|cause| error("avro-schema", cause))
+}
+fn restore_field_defaults(schema: &mut Schema, raw: &serde_json::Value, metadata: &metadata::Metadata) {
+    match schema {
+        Schema::Record(record) => {
+            let raw = metadata.named(&record.name.fullname(None)).unwrap_or(raw);
+            for field in &mut record.fields {
+                if let Some(raw) = raw.get("fields").and_then(serde_json::Value::as_array).and_then(|fields| fields.iter().find(|raw| raw.get("name").and_then(serde_json::Value::as_str) == Some(field.name.as_str()))) {
+                    field.default = raw.get("default").cloned();
+                    restore_field_defaults(&mut field.schema, &raw["type"], metadata);
+                }
+            }
+        }
+        Schema::Array(array) => restore_field_defaults(&mut array.items, &raw["items"], metadata),
+        Schema::Map(map) => restore_field_defaults(&mut map.types, &raw["values"], metadata),
+        Schema::Union(union) => {
+            let raw = raw.as_array().or_else(|| raw.get("type").and_then(serde_json::Value::as_array));
+            if let Some(raw) = raw {
+                let variants = union.variants().iter().cloned().zip(raw).map(|(mut schema, raw)| { restore_field_defaults(&mut schema, raw, metadata); schema }).collect();
+                *union = apache_avro::schema::UnionSchema::new(variants).expect("preserved union member identities");
+            }
+        }
+        _ => {}
     }
 }
 fn collect_names(schema: &Schema, names: &mut BTreeMap<String, Schema>) {
@@ -86,7 +209,11 @@ fn physical_logical_types(text: &str) -> Result<String> {
     let mut value = serde_json::from_str(text).map_err(|cause| error("avro-schema", cause))?; normalize(&mut value);
     serde_json::to_string(&value).map_err(|cause| error("avro-schema", cause))
 }
-struct Preflight<'a> { bytes: &'a [u8], offset: usize, allocated: usize, limit: usize, names: &'a BTreeMap<String, Schema>, view_bytes: usize }
+struct BinaryWindow { origin: usize, compacted: bool, rewind_remaining: usize }
+impl BinaryWindow {
+    fn new(bytes: usize) -> Self { Self { origin: 0, compacted: false, rewind_remaining: bytes } }
+}
+struct Preflight<'a> { bytes: &'a [u8], offset: usize, window: BinaryWindow, allocated: usize, limit: usize, names: &'a BTreeMap<String, Schema>, view_bytes: usize }
 impl Preflight<'_> {
     fn claim(&mut self, bytes: usize) -> Result<()> {
         self.allocated = self.allocated.checked_add(bytes).filter(|bytes| *bytes <= self.limit).ok_or_else(|| error("batch-too-large", "Avro decoded allocation exceeds its limit"))?; Ok(())
@@ -96,15 +223,30 @@ impl Preflight<'_> {
         let bytes = self.bytes.get(self.offset..end).ok_or_else(|| error("avro-decode", "Truncated Avro datum"))?; self.offset = end; Ok(bytes)
     }
     fn long(&mut self) -> Result<i64> {
+        self.compact_for(10);
         let mut value = 0u64;
         for shift in (0..70).step_by(7) {
             let byte = self.take(1)?[0];
-            if shift == 63 && byte > 1 { return Err(error("avro-decode", "Avro long exceeds 64 bits")); }
             value |= u64::from(byte & 127) << shift;
             if byte & 128 == 0 { return Ok(((value >> 1) as i64) ^ -((value & 1) as i64)); }
         }
         Err(error("avro-decode", "Invalid Avro varint"))
     }
+    fn int(&mut self) -> Result<i32> {
+        self.compact_for(5);
+        let mut value = 0u32;
+        for shift in (0..35).step_by(7) {
+            let byte = self.take(1)?[0]; value ^= u32::from(byte & 127) << shift;
+            if byte & 128 == 0 { return Ok(((value >> 1) as i32) ^ -((value & 1) as i32)); }
+        }
+        Err(error("avro-decode", "Invalid Avro int encoding"))
+    }
+    fn compact_for(&mut self, width: usize) {
+        if !self.window.compacted && self.bytes.len() - self.offset < width {
+            self.window.origin = self.offset; self.window.compacted = true;
+        }
+    }
+    fn number_bytes(&mut self, width: usize) -> Result<&[u8]> { self.compact_for(width); self.take(width) }
     fn bytes(&mut self) -> Result<()> {
         let count = usize::try_from(self.long()?).map_err(|_| error("avro-decode", "Negative Avro byte count"))?;
         self.claim(count.checked_mul(4).ok_or_else(|| error("avro-decode", "Avro byte count overflow"))?)?; self.take(count)?; Ok(())
@@ -114,8 +256,14 @@ impl Preflight<'_> {
         self.claim(4096usize.saturating_add(self.view_bytes))?;
         match resolve(schema, self.names)? {
             Schema::Null => (), Schema::Boolean => { self.take(1)?; }
-            Schema::Int | Schema::Long | Schema::Date | Schema::TimeMillis | Schema::TimeMicros | Schema::TimestampMillis | Schema::TimestampMicros | Schema::TimestampNanos | Schema::LocalTimestampMillis | Schema::LocalTimestampMicros | Schema::LocalTimestampNanos | Schema::Enum(_) => { self.long()?; }
-            Schema::Float => { self.take(4)?; } Schema::Double => { self.take(8)?; }
+            Schema::Int | Schema::Date | Schema::TimeMillis => { self.int()?; }
+            Schema::Enum(enumeration) => {
+                let index = usize::try_from(self.int()?).map_err(|cause| error("avro-decode", cause))?;
+                let symbol = enumeration.symbols.get(index).ok_or_else(|| error("avro-decode", "Enum index is out of range"))?;
+                self.claim(symbol.len().checked_mul(4).ok_or_else(resolution::overflow)?)?;
+            }
+            Schema::Long | Schema::TimeMicros | Schema::TimestampMillis | Schema::TimestampMicros | Schema::TimestampNanos | Schema::LocalTimestampMillis | Schema::LocalTimestampMicros | Schema::LocalTimestampNanos => { self.long()?; }
+            Schema::Float => { self.number_bytes(4)?; } Schema::Double => { self.number_bytes(8)?; }
             Schema::Bytes | Schema::String | Schema::Uuid | Schema::BigDecimal => self.bytes()?,
             Schema::Fixed(value) => { self.claim(value.size.saturating_mul(4))?; self.take(value.size)?; }
             Schema::Duration => { self.take(12)?; }
@@ -123,7 +271,7 @@ impl Preflight<'_> {
             Schema::Record(record) => for field in &record.fields { self.claim(field.name.len().saturating_mul(4))?; self.value(&field.schema, depth + 1)?; },
             Schema::Union(union) => {
                 self.claim(union.variants().len().checked_mul(self.view_bytes.saturating_add(4096)).ok_or_else(|| error("allocation-overflow", "Avro union view allocation exceeds range"))?)?;
-                let index = usize::try_from(self.long()?).map_err(|_| error("avro-decode", "Negative Avro union index"))?;
+                let index = usize::try_from(self.int()?).map_err(|_| error("avro-decode", "Negative Avro union index"))?;
                 let selected = union.variants().get(index).ok_or_else(|| error("avro-decode", "Avro union index is out of range"))?;
                 self.value(selected, depth + 1)?;
             }
@@ -135,16 +283,9 @@ impl Preflight<'_> {
     }
     fn collection(&mut self, schema: &Schema, map: bool, depth: usize) -> Result<()> {
         loop {
-            let count = self.long()?; if count == 0 { return Ok(()); }
-            let (count, block_end) = if count < 0 {
-                let count = count.checked_neg().ok_or_else(|| error("avro-decode", "Avro collection count overflow"))?;
-                let size = usize::try_from(self.long()?).map_err(|_| error("avro-decode", "Negative Avro block byte count"))?;
-                (count, Some(self.offset.checked_add(size).ok_or_else(|| error("avro-decode", "Avro block length overflow"))?))
-            } else { (count, None) };
-            let count = usize::try_from(count).map_err(|_| error("avro-decode", "Avro collection count overflow"))?;
+            let count = datum::read_block(self)?; if count == 0 { return Ok(()); }
             self.claim(count.checked_mul(4096).ok_or_else(|| error("avro-decode", "Avro collection allocation overflow"))?)?;
             for _ in 0..count { if map { self.bytes()?; } self.value(schema, depth)?; }
-            if block_end.is_some_and(|end| end != self.offset) { return Err(error("avro-decode", "Avro block byte count disagrees with its contents")); }
         }
     }
 }
@@ -152,21 +293,26 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
     if depth > 128 { return Err(error("avro-decode", "Avro datum nesting limit exceeded")); }
     let schema = resolve(schema, names)?;
     let connect = connect.resolved();
-    Ok(match value {
-        Avro::Null => Value::Null, Avro::Boolean(value) => Value::Bool(value), Avro::Int(value) => Value::I32(value), Avro::Long(value) => Value::I64(value),
+    if !matches!(schema, Schema::Union(_)) && !matches!(&value, Avro::Null) {
+        let valid = match &connect.kind {
+            SchemaKind::Bool => matches!(&value, Avro::Boolean(_)),
+            SchemaKind::I8 | SchemaKind::I16 | SchemaKind::I32 => matches!(&value, Avro::Int(_)),
+            SchemaKind::I64 => matches!(&value, Avro::Long(_)),
+            SchemaKind::F32 => matches!(&value, Avro::Float(_)), SchemaKind::F64 => matches!(&value, Avro::Double(_)),
+            SchemaKind::String => matches!(&value, Avro::String(_) | Avro::Utf8(_) | Avro::Enum(_, _)),
+            SchemaKind::Bytes => matches!(&value, Avro::Bytes(_) | Avro::Fixed(_, _)),
+            _ => true,
+        };
+        if !valid { return Err(error("avro-decode", "Resolved value does not match the selected Connect output type")); }
+    }
+    let logical_conversion = !matches!(&value, Avro::Null | Avro::Union(_, _));
+    let converted = match value {
+        Avro::Null => Value::Null, Avro::Boolean(value) => Value::Bool(value),
+        Avro::Int(value) => Value::I32(value),
+        Avro::Long(value) => Value::I64(value),
         Avro::Float(value) => Value::F32(value), Avro::Double(value) => Value::F64(value), Avro::String(value) | Avro::Enum(_, value) => Value::Utf8(value),
-        Avro::Bytes(value) | Avro::Fixed(_, value) => match schema { Schema::Decimal(decimal) => decimal_value(value, decimal.scale)?, _ => Value::Binary(value) },
-        Avro::Date(value) => Value::DateDay(value), Avro::TimeMillis(value) => {
-            if !(0..86_400_000).contains(&value) { return Err(error("avro-decode", "Time is outside one day")); }
-            Value::Time { value: i64::from(value), unit: TimeUnit::Millisecond, bit_width: 32 }
-        },
-        Avro::TimestampMillis(value) => Value::Timestamp { value, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) },
-        Avro::TimeMicros(value) | Avro::TimestampMicros(value) | Avro::TimestampNanos(value) | Avro::LocalTimestampMillis(value) | Avro::LocalTimestampMicros(value) | Avro::LocalTimestampNanos(value) => Value::I64(value),
-        Avro::Uuid(value) => Value::Utf8(value.to_string()),
-        Avro::Decimal(value) => {
-            let bytes = Vec::<u8>::try_from(value).map_err(|cause| error("avro-decode", cause))?;
-            match schema { Schema::Decimal(decimal) => decimal_value(bytes, decimal.scale)?, _ => Value::Binary(bytes) }
-        }
+        Avro::Utf8(value) => Value::Utf8(datum::java_utf8(&value)),
+        Avro::Bytes(value) | Avro::Fixed(_, value) => Value::Binary(value),
         Avro::Array(values) => {
             let Schema::Array(array) = schema else { return Err(error("avro-decode", "Array value lacks its schema")); };
             let element = match &connect.kind { SchemaKind::Array(element) => element.as_ref(), SchemaKind::Map(_, _) => connect.as_ref(), _ => return Err(error("avro-decode", "Array Connect schema is absent")) };
@@ -175,7 +321,10 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
         Avro::Map(values) => {
             let Schema::Map(map) = schema else { return Err(error("avro-decode", "Map value lacks its schema")); };
             let SchemaKind::Map(_, element) = &connect.kind else { return Err(error("avro-decode", "Map Connect schema is absent")); };
-            Value::Map { entries: values.into_iter().map(|(key, value)| Ok((Value::Utf8(key), convert(&map.types, value, names, unions, element, depth + 1)?))).collect::<Result<_>>()?, sorted: false }
+            let entries = values.ordered()?.into_iter().map(|(key, value)| Ok((MapKey::String(key.into_text()), convert(&map.types, value, names, unions, element, depth + 1)?))).collect::<Result<Vec<_>>>()?;
+            let order = datum::string_map_order(&entries)?;
+            let mut entries = entries.into_iter().map(Some).collect::<Vec<_>>();
+            Value::Map { entries: order.into_iter().map(|index| { let (key, value) = entries[index].take().expect("unique converted map key"); (Value::Utf8(key.into_text()), value) }).collect(), sorted: false }
         }
         Avro::Record(values) => {
             let Schema::Record(record) = schema else { return Err(error("avro-decode", "Record value lacks its schema")); };
@@ -196,12 +345,37 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
             else if (union.variants().len() == 1 && unions.flatten_singleton) || (union.variants().len() == 2 && union.variants().iter().any(|schema| matches!(schema, Schema::Null))) { convert(selected, *value, names, unions, &connect, depth + 1)? }
             else { union::convert(union.variants(), selected, *value, names, unions, &connect, depth + 1)? }
         }
-        Avro::Duration(value) => Value::Binary(<[u8; 12]>::from(value).to_vec()),
-        Avro::BigDecimal(_) => return Err(error("avro-decode", "Avro big-decimal extension requires its original byte representation")),
-    })
+    };
+    if logical_conversion {
+        if connect.name.as_deref() == Some("org.apache.kafka.connect.data.Decimal") {
+            let Value::Binary(bytes) = converted else { return Err(error("avro-decode", "Logical Decimal value has an incompatible primitive representation")); };
+            return decimal_value(bytes, &connect);
+        }
+        let millis = match (connect.name.as_deref(), &connect.kind, &converted) {
+            (Some("org.apache.kafka.connect.data.Date"), SchemaKind::I32, Value::I32(value)) => Some(i64::from(*value) * 86_400_000),
+            (Some("org.apache.kafka.connect.data.Time"), SchemaKind::I32, Value::I32(value)) => {
+                if !(0..=86_400_000).contains(value) { return Err(error("avro-decode", "Time is outside one day")); }
+                Some(i64::from(*value))
+            }
+            (Some("org.apache.kafka.connect.data.Timestamp"), SchemaKind::I64, Value::I64(value)) => Some(*value),
+            (Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp"), _, _) => return Err(error("avro-decode", "Logical date value has an incompatible primitive representation")),
+            _ => None,
+        };
+        if let Some(millis) = millis { return Ok(super::data::date_value(millis)); }
+    }
+    Ok(converted)
 }
-fn decimal_value(bytes: Vec<u8>, scale: usize) -> Result<Value> {
-    decimal_value_at_scale(bytes, i32::try_from(scale).map_err(|cause| error("avro-decode", cause))?)
+fn decimal_value(bytes: Vec<u8>, schema: &ConnectSchema) -> Result<Value> {
+    if bytes.is_empty() { return Err(error("avro-decode", "Decimal coefficient bytes are empty")); }
+    let text = schema.parameters.get("scale").ok_or_else(|| error("avro-decode", "Decimal schema has no scale"))?;
+    let (negative, digits) = if let Some(digits) = text.strip_prefix('-') { (true, digits) } else { (false, text.strip_prefix('+').unwrap_or(text)) };
+    let invalid = || error("avro-decode", "Decimal scale is not a signed 32-bit integer");
+    if digits.is_empty() { return Err(invalid()); }
+    let magnitude = digits.chars().try_fold(0i64, |value, digit| {
+        let digit = rtdb_types::decimal_digit(digit).filter(|_| digit.len_utf16() == 1).ok_or_else(invalid)?;
+        value.checked_mul(10).and_then(|value| value.checked_add(i64::from(digit))).filter(|value| *value <= i64::from(i32::MAX) + i64::from(negative)).ok_or_else(invalid)
+    })?;
+    decimal_value_at_scale(bytes, if negative { -magnitude } else { magnitude } as i32)
 }
 fn decimal_value_at_scale(bytes: Vec<u8>, scale: i32) -> Result<Value> {
     if bytes.is_empty() { return Err(error("avro-decode", "Decimal coefficient bytes are empty")); }
@@ -312,6 +486,7 @@ mod tests {
     }
     #[test]
     fn nested_avro_records_nullable_union_and_logical_types_decode_with_bounded_preflight() {
+        use apache_avro::types::Value as Avro;
         let schema = r#"{"type":"record","name":"Event","fields":[{"name":"id","type":"long"},{"name":"optional","type":["null","string"]},{"name":"day","type":{"type":"int","logicalType":"date"}},{"name":"amount","type":{"type":"bytes","logicalType":"decimal","precision":10,"scale":2}}]}"#;
         let parsed = Schema::parse_str(schema).unwrap();
         let bytes = apache_avro::to_avro_datum(&parsed, Avro::Record(vec![
@@ -321,9 +496,108 @@ mod tests {
         let plan = AvroPlan::parse(schema, &[]).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let Value::Struct(values) = plan.decode(&bytes, &mut context).unwrap().value else { panic!("expected Struct") };
-        assert_eq!(values["id"], Value::I64(7)); assert_eq!(values["optional"], Value::Utf8("value".into())); assert_eq!(values["day"], Value::DateDay(20_000));
+        assert_eq!(values["id"], Value::I64(7)); assert_eq!(values["optional"], Value::Utf8("value".into())); assert_eq!(values["day"], super::super::data::date_value(20_000 * 86_400_000));
         let Value::Decimal(amount) = &values["amount"] else { panic!("expected Decimal") };
         assert_eq!(amount.precision, 32); assert_eq!(amount.scale, 2); assert_eq!(&amount.unscaled[14..], &[0x30, 0x39]);
+    }
+    #[test]
+    fn avro_logical_dates_retain_raw_milliseconds_and_time_accepts_the_day_endpoint() {
+        use apache_avro::types::Value as Avro;
+        let date = AvroPlan::parse(r#"{"type":"int","logicalType":"date"}"#, &[]).unwrap();
+        let time = AvroPlan::parse(r#"{"type":"int","logicalType":"time-millis"}"#, &[]).unwrap();
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        for days in [i32::MIN, -1, 0, i32::MAX] {
+            let bytes = apache_avro::to_avro_datum(&Schema::Date, Avro::Date(days)).unwrap();
+            assert_eq!(date.decode(&bytes, &mut context).unwrap().value, super::super::data::date_value(i64::from(days) * 86_400_000));
+        }
+        for millis in [0, 86_399_999, 86_400_000] {
+            let bytes = apache_avro::to_avro_datum(&Schema::TimeMillis, Avro::TimeMillis(millis)).unwrap();
+            assert_eq!(time.decode(&bytes, &mut context).unwrap().value, super::super::data::date_value(i64::from(millis)));
+        }
+        for millis in [-1, 86_400_001] {
+            let bytes = apache_avro::to_avro_datum(&Schema::TimeMillis, Avro::TimeMillis(millis)).unwrap();
+            assert!(time.decode(&bytes, &mut context).is_err());
+        }
+    }
+    #[test]
+    fn explicit_avro_date_names_keep_primitive_width_and_time_range_checks() {
+        use apache_avro::types::Value as Avro;
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        for text in [
+            r#"{"type":"long","connect.name":"org.apache.kafka.connect.data.Date"}"#,
+            r#"{"type":"int","connect.name":"org.apache.kafka.connect.data.Timestamp"}"#,
+            r#"{"type":"int","connect.type":"int8","connect.name":"org.apache.kafka.connect.data.Date"}"#,
+        ] {
+            assert!(AvroPlan::parse(text, &[]).unwrap().decode(&[2], &mut context).is_err());
+        }
+        let time = AvroPlan::parse(r#"{"type":"int","connect.name":"org.apache.kafka.connect.data.Time"}"#, &[]).unwrap();
+        for millis in [-1, 86_400_000, 86_400_001] {
+            let bytes = apache_avro::to_avro_datum(&Schema::Int, Avro::Int(millis)).unwrap();
+            let result = time.decode(&bytes, &mut context);
+            if millis == 86_400_000 { assert_eq!(result.unwrap().value, super::super::data::date_value(i64::from(millis))); }
+            else { assert!(result.is_err()); }
+        }
+        let timestamp = AvroPlan::parse(r#"{"type":"long","connect.name":"org.apache.kafka.connect.data.Timestamp"}"#, &[]).unwrap();
+        for millis in [i64::MIN, i64::MAX] {
+            let bytes = apache_avro::to_avro_datum(&Schema::Long, Avro::Long(millis)).unwrap();
+            assert_eq!(timestamp.decode(&bytes, &mut context).unwrap().value, super::super::data::date_value(millis));
+        }
+        let union = AvroPlan::parse(r#"["null",{"type":"int","connect.name":"org.apache.kafka.connect.data.Date"}]"#, &[]).unwrap();
+        assert_eq!(union.decode(&[0], &mut context).unwrap().value, Value::Null);
+        assert_eq!(union.decode(&[2,2], &mut context).unwrap().value, super::super::data::date_value(86_400_000));
+    }
+    #[test]
+    fn explicit_date_names_preserve_defaults_built_before_name_assignment() {
+        let explicit = AvroPlan::parse(r#"{"type":"int","connect.name":"org.apache.kafka.connect.data.Time","connect.default":86400001}"#, &[]).unwrap();
+        assert_eq!(explicit.connect.default, Some(Value::I32(86_400_001)));
+        let physical = AvroPlan::parse(r#"{"type":"int","logicalType":"time-millis","connect.default":86400001}"#, &[]).unwrap();
+        assert!(physical.connect.default.is_none());
+        let union = AvroPlan::parse(r#"{"type":"record","name":"Dates","fields":[{"name":"day","type":[{"type":"int","connect.name":"org.apache.kafka.connect.data.Date"},"null"],"default":1}]}"#, &[]).unwrap();
+        assert_eq!(union.connect.field("day").unwrap().schema.default, Some(Value::I32(1)));
+        assert!(AvroPlan::parse(r#"{"type":"bytes","logicalType":"decimal","precision":8,"scale":0,"connect.name":"org.apache.kafka.connect.data.Date"}"#, &[]).is_err());
+    }
+    #[test]
+    fn nested_avro_values_convert_before_the_container_logical_date_name() {
+        let schema = r#"{"type":"record","name":"Container","connect.name":"org.apache.kafka.connect.data.Date","fields":[{"name":"time","type":{"type":"int","connect.name":"org.apache.kafka.connect.data.Time"}}]}"#;
+        let parsed = Schema::parse_str(schema).unwrap();
+        let plan = AvroPlan::parse(schema, &[]).unwrap();
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        for (time, expected) in [(-1, "Time is outside one day"), (0, "Logical date value has an incompatible primitive representation")] {
+            let bytes = apache_avro::to_avro_datum(&parsed, apache_avro::types::Value::Record(vec![("time".into(), apache_avro::types::Value::Int(time))])).unwrap();
+            assert!(plan.decode(&bytes, &mut context).unwrap_err().message.contains(expected));
+        }
+    }
+    #[test]
+    fn final_decimal_name_uses_schema_scale_and_keeps_default_name_order() {
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        for (scale, expected) in [("2", 2), ("-2147483648", i32::MIN), ("+٢", 2)] {
+            let text = format!(r#"{{"type":"bytes","connect.name":"org.apache.kafka.connect.data.Decimal","connect.parameters":{{"scale":"{scale}"}},"connect.default":"\u0001"}}"#);
+            let plan = AvroPlan::parse(&text, &[]).unwrap();
+            assert_eq!(plan.connect.default, Some(Value::Binary(vec![1])));
+            let Value::Decimal(value) = plan.decode(&[1], &mut context).unwrap().value else { panic!("expected Decimal") };
+            assert_eq!(value.scale, expected);
+            assert_eq!(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), 1.into());
+        }
+        let physical = AvroPlan::parse(r#"{"type":"bytes","logicalType":"decimal","precision":8,"scale":2,"connect.parameters":{"scale":"-2"},"connect.default":"\u0001"}"#, &[]).unwrap();
+        let Value::Decimal(default) = physical.connect.default.as_ref().unwrap() else { panic!("expected Decimal default") };
+        assert_eq!(default.scale, -2);
+        let Value::Decimal(value) = physical.decode(&[1], &mut context).unwrap().value else { panic!("expected Decimal") };
+        assert_eq!(value.scale, -2);
+    }
+    #[test]
+    fn decimal_coefficients_and_children_fail_before_parent_scale_or_representation() {
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        let missing_scale = AvroPlan::parse(r#"{"type":"bytes","connect.name":"org.apache.kafka.connect.data.Decimal"}"#, &[]).unwrap();
+        assert_eq!(missing_scale.decode(&[], &mut context).unwrap_err().message, "Decimal coefficient bytes are empty");
+        assert_eq!(missing_scale.decode(&[1], &mut context).unwrap_err().message, "Decimal schema has no scale");
+        for scale in ["2147483648", "-2147483649", " 2", "2 ", "", "𝟚"] {
+            let text = format!(r#"{{"type":"bytes","connect.name":"org.apache.kafka.connect.data.Decimal","connect.parameters":{{"scale":"{scale}"}}}}"#);
+            assert_eq!(AvroPlan::parse(&text, &[]).unwrap().decode(&[1], &mut context).unwrap_err().message, "Decimal scale is not a signed 32-bit integer");
+        }
+        let text = r#"{"type":"record","name":"Container","connect.name":"org.apache.kafka.connect.data.Decimal","fields":[{"name":"time","type":{"type":"int","connect.name":"org.apache.kafka.connect.data.Time"}}]}"#;
+        let plan = AvroPlan::parse(text, &[]).unwrap();
+        assert_eq!(plan.decode(&[1], &mut context).unwrap_err().message, "Time is outside one day");
+        assert_eq!(plan.decode(&[0], &mut context).unwrap_err().message, "Logical Decimal value has an incompatible primitive representation");
     }
     #[test]
     fn confluent_root_bytes_have_no_avro_length_prefix() {
@@ -333,6 +607,7 @@ mod tests {
     }
     #[test]
     fn avro_connect_annotations_defaults_and_registry_version_are_preserved() {
+        use apache_avro::types::Value as Avro;
         let schema = r#"{"type":"record","name":"Event","doc":"avro doc","connect.doc":"connect doc","connect.version":8,"fields":[{"name":"small","type":{"type":"int","connect.type":"int8"},"default":257},{"name":"fixed","type":{"type":"fixed","name":"Bytes","size":2}},{"name":"choice","type":{"type":"enum","name":"Choice","symbols":["A","B"]}}]}"#;
         let plan = AvroPlan::parse_version(schema, &[], &BTreeMap::new(), Some(3)).unwrap();
         assert_eq!(plan.connect.version, Some(8)); assert_eq!(plan.connect.doc.as_deref(), Some("connect doc"));
@@ -347,6 +622,7 @@ mod tests {
     }
     #[test]
     fn avro_map_entry_arrays_become_non_string_key_maps() {
+        use apache_avro::types::Value as Avro;
         let schema = r#"{"type":"array","items":{"type":"record","name":"MapEntry","namespace":"io.confluent.connect.avro","fields":[{"name":"key","type":"long"},{"name":"value","type":"string"}]}}"#;
         let parsed = Schema::parse_str(schema).unwrap();
         let bytes = apache_avro::to_avro_datum(&parsed, Avro::Array(vec![Avro::Record(vec![("key".into(), Avro::Long(9)), ("value".into(), Avro::String("nine".into()))])])).unwrap();
@@ -357,7 +633,7 @@ mod tests {
     fn avro_collection_counts_are_checked_before_allocating_elements() {
         let schema = Schema::parse_str(r#"{"type":"array","items":"null"}"#).unwrap();
         let names = BTreeMap::new();
-        let mut preflight = Preflight { bytes: &[0x80, 0x80, 0x80, 0x01, 0], offset: 0, allocated: 0, limit: 1 << 20, names: &names, view_bytes: 0 };
+        let mut preflight = Preflight { bytes: &[0x80, 0x80, 0x80, 0x01, 0], offset: 0, window: BinaryWindow::new(5), allocated: 0, limit: 1 << 20, names: &names, view_bytes: 0 };
         assert!(preflight.value(&schema, 0).unwrap_err().code.ends_with("batch-too-large"));
     }
 }

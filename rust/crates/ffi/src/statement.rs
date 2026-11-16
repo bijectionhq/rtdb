@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use parking_lot::Mutex;
 use arrow_schema::Schema as ArrowSchema;
-use rtdb_columnar::{MemoryReservation, OwnedBatch};
+use rtdb_columnar::{DeclaredBatch, MemoryReservation, OwnedBatch, conform_batch};
 use rtdb_node::{ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, PreparedSql, ResultSignaturePolicy, control_schema};
 use rtdb_plan::ControlStatement;
 use rtdb_query::QueryCursor;
@@ -145,7 +145,7 @@ impl StatementHandle {
                     }
                     let context = session.query_context_for(&self.creation_database, token).await?;
                     let values = argument_row(args, self.session.region.memory())?;
-                    prepared.as_ref().ok_or_else(not_prepared)?.open_query(context, values.0)
+                    prepared.as_ref().ok_or_else(not_prepared)?.open_query_typed(context, values.0, args.map(SqlArguments::types).unwrap_or_default()).await
                 }
                 Source::Show { statement: control, prepared } => {
                     if !*prepared && args.is_some() { return Err(Anomaly::incorrect("xtdb.adbc/bind-without-prepare", "Call prepare before executing with bound arguments")); }
@@ -191,7 +191,7 @@ impl StatementHandle {
                     let node = super::add(super::mul(std::mem::size_of::<(String, Value)>(), 16)?, 256)?;
                     let bytes = bound.arguments.rows().try_fold(4096, |bytes, row| bound.names.iter().zip(row).try_fold(bytes, |bytes, (name, value)| super::add(bytes, super::add(super::add(value.retained_bytes()?, name.len())?, node)?)))?;
                     let _scratch = self.session.region.memory().reserve(super::mul(bytes, 2)?)?;
-                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned()).collect::<BTreeMap<_, _>>()).collect();
+                    let rows = bound.arguments.rows().map(|row| bound.names.iter().cloned().zip(row.iter().cloned().map(|mut value| { rtdb_columnar::admit_execution_value(&mut value); value })).collect::<BTreeMap<_, _>>()).collect();
                     let operation = TxOp::PutDocs { table: table.clone(), documents: Documents::new(rows, self.session.region.memory())?, valid_from: None, valid_to: None };
                     token.run_until_cancelled(session.state_mut().execute_operation(operation)).await.ok_or_else(super::cancelled)??;
                     Ok(count)
@@ -231,14 +231,14 @@ impl CursorHandle {
         let schema = batch.batch().schema().as_ref().clone();
         Ok(Arc::new(Self { region, token, schema, state: Mutex::new(Some(CursorInput::Batch(batch))), _reservation: reservation }))
     }
-    pub fn next(&self) -> Result<Option<OwnedBatch>> {
+    pub fn next(&self) -> Result<Option<DeclaredBatch>> {
         let mut state = self.state.lock();
         if self.token.is_cancelled() { state.take(); return Err(super::cancelled()); }
         if matches!(state.as_ref(), Some(CursorInput::Batch(_))) {
-            let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() }; return Ok(Some(batch));
+            let Some(CursorInput::Batch(batch)) = state.take() else { unreachable!() }; return conform_batch(batch, &self.schema, self.region.memory()).map(Some);
         }
         let Some(CursorInput::Query(cursor)) = state.as_mut() else { return Ok(None); };
-        let result = self.region.run(cursor.next_batch());
+        let result = self.region.run(cursor.next_batch()).and_then(|batch| batch.map(|batch| conform_batch(batch, &self.schema, self.region.memory()).inspect_err(|_| cursor.record_consumer_error())).transpose());
         if !matches!(&result, Ok(Some(_))) { state.take(); }
         result
     }

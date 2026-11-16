@@ -3,6 +3,8 @@
 `rtdb-pgwire` implements a PostgreSQL v3 frontend over native Rust sockets and `rtdb-node` sessions.
 It uses native SQL preparation, query cursors, transaction resolution, authentication, Arrow IPC, and Transit codecs.
 It starts no JVM process and delegates no application operation to a JVM server.
+Arrow COPY admits unsigned integer cells at the corresponding signed width before submitting logical documents.
+The retained input file preserves the original Arrow bytes.
 The implementation and its regression test sources have not been compiled or executed during Phase 1.
 
 == Composition and ownership
@@ -39,6 +41,13 @@ GSS negotiation is unsupported, matching the reference.
 Simple Query supports multiple statements, implicit transaction completion, explicit transaction controls, empty statements, session parameters, SHOW, SQL PREPARE/EXECUTE, and COPY IN.
 Shared control parsing and execution live in `rtdb-sql` and `rtdb-node`.
 Parse/Bind/Describe/Execute/Close/Flush/Sync retain named prepared statements and portals across protocol messages.
+Planning warnings are sent during preparation with severity `WARNING` and SQLSTATE `01000`, before ParseComplete or simple-query results.
+Their occurrence order is retained; Bind and execution-time rebinding do not emit them again.
+Interactive DML warning planning is best-effort and is skipped when the client supplied parameter OIDs.
+DML and unprepared control parameter descriptions retain the supplied OID list.
+Query and EXECUTE descriptions use their planned placeholder count, padding missing OIDs with the fallback type and truncating excess OIDs.
+Direct DML Bind requires matching argument and OID counts and a declared type for each non-null value.
+SQL EXECUTE derives its DML argument types from expressions; SQL argument-width validation occurs during submission and transaction resolution.
 Bind captures the query context and opens the cursor.
 An extended-protocol error skips messages until Sync.
 Sync completes an implicit transaction and leaves an explicit transaction open.

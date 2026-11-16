@@ -158,7 +158,10 @@ fn decode_operations(bytes: Option<&[u8]>, memory: &Arc<MemoryBudget>) -> Result
         Err(error) if error.code == "rtdb/memory-budget-exceeded" => return Err(error),
         Err(_) => return Ok((Value::Utf8("<error decoding tx-ops>".into()), None)),
     };
-    let reservation = memory.reserve(allocation(rows.allocation_bytes(), 8)?)?;
+    let bound = rows.rows().iter().try_fold(allocation(rows.allocation_bytes(), 8)?, |bytes,value| {
+        bytes.checked_add(edn::operation_allocation_bound(value)?).ok_or_else(size_error)
+    })?;
+    let reservation = memory.reserve(bound)?;
     let rendered = rows.rows().iter().map(edn::operation).collect::<Result<Vec<_>>>();
     let value = match rendered { Ok(rows) => edn::vector(rows), Err(_) => "<error decoding tx-ops>".into() };
     Ok((Value::Utf8(value), Some(reservation)))
@@ -207,7 +210,7 @@ fn partitions(metadata: &TableBlock) -> Result<Vec<rtdb_format::block::proto::Pa
     let mut groups = std::collections::BTreeMap::new();
     for details in &metadata.as_proto().tries {
         let key: TrieKey = details.trie_key.as_deref().unwrap_or_default().parse()?;
-        let recency = key.recency().map(|date| date.and_hms_opt(0, 0, 0).map(|date| date.and_utc().timestamp_micros()).ok_or_else(size_error)).transpose()?;
+        let recency = key.recency().map(|date| date.epoch_day().checked_mul(86_400_000_000).ok_or_else(size_error)).transpose()?;
         groups.entry((key.level(), recency, key.part().to_vec())).or_insert_with(Vec::new).push(details.clone());
     }
     groups.into_iter().map(|((level, recency, part), tries)| Ok(rtdb_format::block::proto::Partition {
@@ -266,7 +269,7 @@ mod tests {
 
     #[test]
     fn table_block_file_tries_groups_legacy_tries_and_retains_recency_as_micros() {
-        let date = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let date = rtdb_types::calendar::CivilDate::from_ymd(2024, 1, 1).unwrap();
         let key = TrieKey::new(2, Some(date), vec![1, 3], BlockIndex(10)).unwrap();
         let wire = TableBlockProto { row_count: Some(1), tries: vec![proto::TrieDetails { trie_key: Some(key.to_string()), ..Default::default() }], ..Default::default() };
         let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();
@@ -275,5 +278,17 @@ mod tests {
         assert_eq!(partitions[0].level, Some(2));
         assert_eq!(partitions[0].part, Some(vec![1, 3]));
         assert_eq!(partitions[0].recency, Some(1_704_067_200_000_000));
+    }
+
+    #[test]
+    fn legacy_partition_inspection_supports_wide_recency_and_checks_midnight_overflow() {
+        let date = rtdb_types::calendar::CivilDate::from_ymd(280_000, 1, 3).unwrap();
+        let key = TrieKey::new(2, Some(date), vec![], BlockIndex(0)).unwrap();
+        let wire = TableBlockProto { tries: vec![proto::TrieDetails { trie_key: Some(key.to_string()), ..Default::default() }], ..Default::default() };
+        let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();
+        assert_eq!(partitions(&metadata).unwrap()[0].recency, Some(date.epoch_day() * 86_400_000_000));
+        let wire = TableBlockProto { tries: vec![proto::TrieDetails { trie_key: Some("l02-r9999999991231-b00".into()), ..Default::default() }], ..Default::default() };
+        let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();
+        assert!(partitions(&metadata).is_err());
     }
 }

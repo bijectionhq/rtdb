@@ -11,6 +11,7 @@ rtdb-storage.workspace = true
 rtdb-types.workspace = true
 rtdb-tls.workspace = true
 zeroize = "1.8"
+libc = "0.2"
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-native-certs = "=0.8.1"
 rtdb-format.workspace = true
@@ -28,9 +29,13 @@ bigdecimal.workspace = true
 num-bigint.workspace = true
 apache-avro = { version = "=0.21.0", default-features = false }
 reqwest = { version = "=0.13.4", default-features = false, features = ["rustls", "json", "stream"] }
-jsonschema = { version = "=0.33.0", default-features = false }
+jsonschema = { package = "rtdb-validation-jsonschema", path = "../../vendor/validation-jsonschema", version = "=0.33.0", default-features = false }
+validation_json = { package = "rtdb-validation-json", path = "../../vendor/validation-json", version = "=1.0.151", features = ["arbitrary_precision"] }
 futures.workspace = true
-rdkafka = { version = "=0.38.0", features = ["cmake-build", "tokio", "ssl-vendored", "sasl"] }
+rdkafka = { version = "=0.38.0", path = "../../vendor/rdkafka", features = ["cmake-build", "tokio", "ssl-vendored", "sasl"] }
+openssl = { version = "=0.10.81", features = ["vendored"] }
+openssl-sys = "=0.9.117"
+foreign-types = "0.3.2"
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -41,7 +46,6 @@ tokio-util.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-openssl = { version = "=0.10.81", features = ["vendored"] }
 tempfile.workspace = true
 
 [lints]

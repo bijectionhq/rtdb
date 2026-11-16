@@ -1,73 +1,13 @@
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
-use chrono::{DateTime, LocalResult, NaiveDate, NaiveDateTime, NaiveTime, Offset, TimeZone, Utc};
-use crate::timezone::{Zone, zone};
+use crate::timezone::zone;
 use num_bigint::BigInt;
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
+use rtdb_types::{Anomaly, CivilDate, DateUnit, Instant, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
 use std::str::FromStr;
-
-fn local_instant(local: NaiveDateTime, timezone: &str) -> Result<DateTime<Zone>> {
-    let zone = zone(timezone)?;
-    local_instant_in_zone(local, &zone)
-}
-
-pub(crate) fn local_instant_in_zone(local: NaiveDateTime, zone: &Zone) -> Result<DateTime<Zone>> {
-    match zone.from_local_datetime(&local) {
-        LocalResult::Single(value) => Ok(value),
-        LocalResult::Ambiguous(first, _) => Ok(first),
-        LocalResult::None => {
-            let mut before = None;
-            let mut after = None;
-            for minutes in 1..=2880 {
-                let duration = chrono::Duration::minutes(minutes);
-                if before.is_none() { before = local.checked_sub_signed(duration).and_then(|time| zone.from_local_datetime(&time).earliest()); }
-                if after.is_none() { after = local.checked_add_signed(duration).and_then(|time| zone.from_local_datetime(&time).earliest()); }
-                if let (Some(before), Some(after)) = (&before, &after) {
-                    let gap = after.offset().fix().local_minus_utc() - before.offset().fix().local_minus_utc();
-                    let shifted = local.checked_add_signed(chrono::Duration::seconds(i64::from(gap))).ok_or_else(overflow)?;
-                    return zone.from_local_datetime(&shifted).earliest().ok_or_else(|| Anomaly::incorrect("xtdb/invalid-local-time", "Local time cannot be resolved in its time zone"));
-                }
-            }
-            Err(Anomaly::incorrect("xtdb/invalid-local-time", format!("Local time {local} cannot be resolved in {zone:?}")))
-        }
-    }
-}
 
 pub fn parse_timestamp(text: &str, timezone: &str) -> Result<Timestamp> {
     if text == "infinity" { return Ok(Timestamp::MAX); }
     if text == "-infinity" { return Ok(Timestamp::MIN); }
-    Ok(Timestamp(parse_instant(text, timezone)?.timestamp_micros()))
-}
-
-fn parse_instant(text: &str, timezone: &str) -> Result<DateTime<Utc>> {
-    if let Ok(value) = DateTime::parse_from_rfc3339(text) { return Ok(value.with_timezone(&Utc)); }
-    for format in ["%Y-%m-%d %H:%M:%S%.f%:z", "%Y-%m-%d %H:%M:%S%.f %:z"] {
-        if let Ok(value) = DateTime::parse_from_str(text, format) { return Ok(value.with_timezone(&Utc)); }
-    }
-    for format in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
-        if let Ok(value) = NaiveDateTime::parse_from_str(text, format) { return Ok(local_instant(value, timezone)?.with_timezone(&Utc)); }
-    }
-    if let Ok(value) = NaiveDate::parse_from_str(text, "%Y-%m-%d") {
-        return Ok(local_instant(value.and_hms_opt(0, 0, 0).ok_or_else(overflow)?, timezone)?.with_timezone(&Utc));
-    }
-    Err(Anomaly::incorrect("xtdb/invalid-timestamp", format!("Invalid timestamp: {text}")))
-}
-
-fn instant_nanos(value: &Value, timezone: &str) -> Result<i128> {
-    let timestamp = match value {
-        Value::Timestamp { value, unit, timezone: Some(_) } => return Ok(i128::from(*value) * (1_000_000_000 / i128::from(unit.units_per_second()))),
-        Value::Timestamp { value, unit, timezone: None } => {
-            let local = datetime_from_nanos(i128::from(*value) * (1_000_000_000 / i128::from(unit.units_per_second())))?.naive_utc();
-            local_instant(local, timezone)?.with_timezone(&Utc)
-        }
-        Value::Utf8(text) => parse_instant(text, timezone)?,
-        _ => return Ok(i128::from(timestamp_micros(value, timezone)?.0) * 1_000),
-    };
-    Ok(i128::from(timestamp.timestamp()) * 1_000_000_000 + i128::from(timestamp.timestamp_subsec_nanos()))
-}
-
-fn datetime_from_nanos(nanos: i128) -> Result<DateTime<Utc>> {
-    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| overflow())?;
-    DateTime::from_timestamp(seconds, nanos.rem_euclid(1_000_000_000) as u32).ok_or_else(overflow)
+    rtdb_types::parse_sql_timestamp_instant(text, timezone)?.as_micros()
 }
 
 fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
@@ -75,39 +15,68 @@ fn rescale_units(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> 
     i64::try_from(scaled).map_err(|_| overflow())
 }
 
+fn shift_zone(value: i64, unit: TimeUnit, timezone: &str, to_local: bool) -> Result<i64> {
+    let zone = zone(timezone)?;
+    let seconds = value.div_euclid(unit.units_per_second());
+    let offset = if to_local { zone.offset_at(seconds)? } else { zone.offset_for_local(seconds, None)? };
+    let adjustment = i64::from(offset.seconds()).checked_mul(unit.units_per_second()).ok_or_else(overflow)?;
+    if to_local { value.checked_add(adjustment) } else { value.checked_sub(adjustment) }.ok_or_else(overflow)
+}
+
+fn local_seconds(value: i64, unit: TimeUnit, timezone: Option<&str>) -> Result<i64> {
+    let local = match timezone { None => value, Some(timezone) => shift_zone(value, unit, timezone, true)? };
+    Ok(local.div_euclid(unit.units_per_second()))
+}
+
 pub fn timestamp_micros(value: &Value, timezone: &str) -> Result<Timestamp> {
     match value {
+        Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => query_clock_instant(value, timezone)?.as_micros(),
         Value::Timestamp { value, unit, timezone: Some(_) } => {
             let micros = (i128::from(*value) * 1_000_000).div_euclid(i128::from(unit.units_per_second()));
             Ok(Timestamp(i64::try_from(micros).map_err(|_| overflow())?))
         }
         Value::Timestamp { value, unit, timezone: None } => {
-            let seconds = value.div_euclid(unit.units_per_second());
-            let nanos = value.rem_euclid(unit.units_per_second()) * (1_000_000_000 / unit.units_per_second());
-            let local = DateTime::from_timestamp(seconds, nanos as u32).ok_or_else(overflow)?.naive_utc();
-            Ok(Timestamp(local_instant(local, timezone)?.timestamp_micros()))
-        }
-        Value::DateDay(days) => {
-            let local = DateTime::from_timestamp(i64::from(*days) * 86400, 0).ok_or_else(overflow)?.naive_utc();
-            Ok(Timestamp(local_instant(local, timezone)?.timestamp_micros()))
-        }
-        Value::DateMilli(millis) => {
-            let local = DateTime::from_timestamp((millis / 86_400_000) * 86_400, 0).ok_or_else(overflow)?.naive_utc();
-            Ok(Timestamp(local_instant(local, timezone)?.timestamp_micros()))
+            let raw = shift_zone(*value, *unit, timezone, false)?;
+            Ok(Timestamp(i64::try_from((i128::from(raw) * 1_000_000).div_euclid(i128::from(unit.units_per_second()))).map_err(|_| overflow())?))
         }
         Value::Utf8(text) => parse_timestamp(text, timezone),
         _ => Err(inapplicable("timestamp", &[value])),
     }
 }
 
+/// Resolves a query clock without narrowing its fractional precision.
+/// Local temporal values use `timezone`; strings use `Time.asInstant`'s date fallback.
+/// Unsupported values and invalid calendar/zone inputs return an anomaly.
+pub fn query_clock_instant(value: &Value, timezone: &str) -> Result<Instant> {
+    if let Some(days) = value.date_days() {
+        return zone(timezone)?.resolve_local(rtdb_types::CivilDateTime::midnight(CivilDate::from_epoch_day(days)?), None);
+    }
+    match value {
+        Value::Timestamp { value, unit, timezone: source_zone } => {
+            let hz = unit.units_per_second();
+            let seconds = value.div_euclid(hz);
+            let nanos = (value.rem_euclid(hz) * (1_000_000_000 / hz)) as u32;
+            if source_zone.is_some() { Instant::new(seconds, nanos) }
+            else {
+                let local = rtdb_types::CivilDateTime::from_epoch_second(seconds, nanos)?;
+                zone(timezone)?.resolve_local(local, None)
+            }
+        }
+        Value::Utf8(text) => rtdb_types::parse_query_clock(text, timezone),
+        _ => Err(inapplicable("query-clock", &[value])),
+    }
+}
+
+/// Produces a scalar intermediate, preserving calendar dates until the caller's admission boundary.
+/// Expression outputs use `Value::admit_expression_dates`; object inputs use `Value::admit_object_dates`.
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
     let data_type = data_type.unencoded();
     let data_type = match &data_type { LogicalType::Maybe(ty) => ty.as_ref(), ty => ty };
     if let Some(days) = crate::temporal::date_days(value) {
         match data_type {
-            LogicalType::Scalar(ScalarType::DateDay) => return Ok(Value::DateDay(i32::try_from(days).map_err(|_| overflow())?)),
-            LogicalType::Scalar(ScalarType::DateMilli) => return Ok(Value::DateMilli(days.checked_mul(86_400_000).ok_or_else(overflow)?)),
+            LogicalType::Scalar(ScalarType::DateDay) => return Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, DateUnit::Day)),
+            LogicalType::Scalar(ScalarType::DateMilli) => return Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, DateUnit::Millisecond)),
             _ => {}
         }
     }
@@ -120,6 +89,17 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
     };
     use ScalarType as S;
     match target {
+        S::I32 if matches!(value, Value::Oid(_) | Value::RegClass(_) | Value::RegProc(_)) => match value {
+            Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => Ok(Value::I32(*value)), _ => unreachable!(),
+        },
+        S::Oid | S::RegClass | S::RegProc => {
+            let oid = match value {
+                Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => *value,
+                Value::Utf8(name) if *target == S::RegProc => crate::pg_catalog::proc_oid(name)?,
+                value => i32::try_from(integer(value).ok_or_else(|| inapplicable("oid", &[value]))?).map_err(|_| overflow())?,
+            };
+            Ok(match target { S::Oid => Value::Oid(oid), S::RegClass => Value::RegClass(oid), S::RegProc => Value::RegProc(oid), _ => unreachable!() })
+        }
         S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 => {
             let value = match value {
                 Value::Utf8(text) => text.parse::<i128>().map_err(|_| inapplicable("integer", &[value]))?,
@@ -155,61 +135,52 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             value if number(value).is_some() => Ok(Value::Bool(number(value) != Some(0.0))),
             _ => Err(inapplicable("boolean", &[value])),
         },
-        S::Utf8 => {
-            let text = match value {
-                Value::Utf8(text) | Value::Uri(text) => text.clone(), Value::Bool(value) => value.to_string(),
-                Value::Keyword(value) => value.to_string(), Value::Uuid(value) => uuid::Uuid::from_bytes(*value).to_string(),
-                Value::Decimal(value) => crate::decimal_text(value),
-                value if integer(value).is_some() => integer(value).ok_or_else(overflow)?.to_string(),
-                value if number(value).is_some() => number(value).ok_or_else(overflow)?.to_string(),
-                Value::Timestamp { .. } => DateTime::from_timestamp_micros(timestamp_micros(value, timezone)?.0).ok_or_else(overflow)?.to_rfc3339(),
-                Value::DateDay(days) => DateTime::from_timestamp(i64::from(*days) * 86400, 0).ok_or_else(overflow)?.date_naive().to_string(),
-                Value::Duration { value, unit } => {
-                    let nanos = i128::from(*value) * (1_000_000_000 / i128::from(unit.units_per_second()));
-                    crate::temporal_text::duration_text(i128::from(i64::try_from(nanos).map_err(|_| overflow())?))
-                }
-                value if crate::temporal::IntervalParts::of(value).is_some() => crate::temporal_text::interval_text(crate::temporal::IntervalParts::of(value).ok_or_else(overflow)?),
-                _ => return Err(inapplicable("text", &[value])),
-            };
-            Ok(Value::Utf8(text))
-        }
+        S::Utf8 => Ok(Value::Utf8(crate::string::render::text(value)?)),
         S::Keyword => match value { Value::Utf8(text) => Ok(Value::Keyword(rtdb_types::Keyword::from_name(text))), _ => Err(inapplicable("keyword", &[value])) },
         S::Uuid => match value { Value::Utf8(text) => Ok(Value::Uuid(*uuid::Uuid::parse_str(text).map_err(|_| inapplicable("uuid", &[value]))?.as_bytes())), Value::FixedSizeBinary(bytes) | Value::Binary(bytes) => Ok(Value::Uuid(bytes.as_slice().try_into().map_err(|_| inapplicable("uuid", &[value]))?)), _ => Err(inapplicable("uuid", &[value])) },
-        S::Uri => match value { Value::Utf8(text) => Ok(Value::Uri(text.clone())), _ => Err(inapplicable("uri", &[value])) },
+        S::Uri => match value { Value::Utf8(text) => { rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.clone())) }, _ => Err(inapplicable("uri", &[value])) },
         S::Timestamp { unit, timezone: target_zone } => {
             if let Value::Timestamp { value, unit: source_unit, timezone: source_zone } = value {
                 if source_zone.is_some() == target_zone.is_some() {
                     return Ok(Value::Timestamp { value: rescale_units(*value, *source_unit, *unit)?, unit: *unit, timezone: target_zone.clone() });
                 }
+                let shifted = shift_zone(*value, *source_unit, timezone, target_zone.is_none())?;
+                let scaled = (i128::from(shifted) * i128::from(unit.units_per_second())).div_euclid(i128::from(source_unit.units_per_second()));
+                return Ok(Value::Timestamp { value: i64::try_from(scaled).map_err(|_| overflow())?, unit: *unit, timezone: target_zone.clone() });
+            }
+            if let Some(days) = crate::temporal::date_days(value) {
+                let seconds = if target_zone.is_some() { zone(timezone)?.start_of_day(CivilDate::from_epoch_day(days)?)? }
+                    else { days.checked_mul(86_400).ok_or_else(overflow)? };
+                return Ok(Value::Timestamp { value: seconds.checked_mul(unit.units_per_second()).ok_or_else(overflow)?, unit: *unit, timezone: target_zone.clone() });
             }
             if let Value::Utf8(text) = value {
                 if text == "infinity" || text == "-infinity" { return Ok(Value::Timestamp { value: if text == "infinity" { i64::MAX } else { i64::MIN }, unit: *unit, timezone: target_zone.clone() }); }
+                let nanos = rtdb_types::parse_sql_timestamp_cast(text, target_zone.is_some())?;
+                let value = nanos.div_euclid(1_000_000_000 / i128::from(unit.units_per_second()));
+                return Ok(Value::Timestamp { value: i64::try_from(value).map_err(|_| overflow())?, unit: *unit, timezone: target_zone.clone() });
             }
-            let instant = instant_nanos(value, timezone)?;
-            let nanos = if target_zone.is_none() {
-                let local = datetime_from_nanos(instant)?.with_timezone(&zone(timezone)?).naive_local().and_utc();
-                i128::from(local.timestamp()) * 1_000_000_000 + i128::from(local.timestamp_subsec_nanos())
-            } else { instant };
-            let value = nanos.div_euclid(1_000_000_000 / i128::from(unit.units_per_second()));
-            Ok(Value::Timestamp { value: i64::try_from(value).map_err(|_| overflow())?, unit: *unit, timezone: target_zone.clone() })
+            Err(inapplicable("timestamp", &[value]))
         }
         S::DateDay | S::DateMilli => {
-            let timestamp = timestamp_micros(value, timezone)?;
-            let date = DateTime::from_timestamp_micros(timestamp.0).ok_or_else(overflow)?.with_timezone(&zone(timezone)?).date_naive();
-            let days = date.signed_duration_since(NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(overflow)?).num_days();
-            if *target == S::DateDay { Ok(Value::DateDay(i32::try_from(days).map_err(|_| overflow())?)) }
-            else { Ok(Value::DateMilli(days.checked_mul(86_400_000).ok_or_else(overflow)?)) }
+            let days = match value {
+                Value::Utf8(text) => CivilDate::parse_iso(text)?.epoch_day(),
+                Value::Timestamp { value, unit, timezone: source_zone } => local_seconds(*value, *unit, source_zone.as_ref().map(|_| timezone))?.div_euclid(86_400),
+                _ => return Err(inapplicable("date", &[value])),
+            };
+            Ok(Value::calendar_date(CivilDate::from_epoch_day(days)?, if *target == S::DateDay { DateUnit::Day } else { DateUnit::Millisecond }))
         }
         S::Time { unit, bit_width } => {
-            use chrono::Timelike;
             if let Value::Time { value, unit: source_unit, .. } = value {
                 return Ok(Value::Time { value: rescale_units(*value, *source_unit, *unit)?, unit: *unit, bit_width: *bit_width });
             }
-            let time = match value {
-                Value::Utf8(text) => NaiveTime::parse_from_str(text, "%H:%M:%S%.f").map_err(|_| inapplicable("time", &[value]))?,
-                _ => datetime_from_nanos(instant_nanos(value, timezone)?)?.with_timezone(&zone(timezone)?).time(),
+            let nanos = match value {
+                Value::Utf8(text) => rtdb_types::parse_iso_local_time(text)? as i64,
+                Value::Timestamp { value, unit, timezone: source_zone } => {
+                    let seconds = local_seconds(*value, *unit, source_zone.as_ref().map(|_| timezone))?;
+                    seconds.rem_euclid(86_400) * 1_000_000_000 + value.rem_euclid(unit.units_per_second()) * (1_000_000_000 / unit.units_per_second())
+                }
+                _ => return Err(inapplicable("time", &[value])),
             };
-            let nanos = i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond());
             Ok(Value::Time { value: nanos / (1_000_000_000 / unit.units_per_second()), unit: *unit, bit_width: *bit_width })
         }
         S::Duration(unit) => match value {
@@ -255,18 +226,27 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
 }
 
 /// Applies expression cast semantics, including source-preserving decimal defaults and recursive lists.
+/// Time-to-timestamp casts require `evaluate` with an `EvalContext` supplying the query date.
 pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str) -> Result<Value> {
     use rtdb_plan::CastTarget;
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
+    target.validate_source(&value.logical_type())?;
     match target {
+        CastTarget::Checked { target: inner, .. } => cast_target(value, inner, timezone),
         CastTarget::Fixed(data_type) => cast(value, data_type, timezone),
         CastTarget::DecimalDefault => match value {
             Value::Decimal(_) => Ok(value.clone()),
             value => cast(value, &rtdb_plan::default_decimal_type(), timezone),
         },
-        CastTarget::IntervalDefault => cast(value, &LogicalType::Scalar(ScalarType::IntervalMonthDayMicro), timezone),
+        CastTarget::IntervalDefault | CastTarget::IntervalEmptyOptions => cast(value, &LogicalType::Scalar(ScalarType::IntervalMonthDayMicro), timezone),
+        CastTarget::Temporal(target) => crate::temporal_cast::cast(value, target, timezone),
+        CastTarget::Deferred(target) => match target.resolve_value(&value.logical_type())? {
+            CastTarget::Temporal(target) => crate::temporal_cast::cast_resolved(value,&target,timezone),
+            target => cast_target(value,&target,timezone),
+        },
+        CastTarget::Interval(target) => crate::interval_cast::cast(value, target),
         CastTarget::List(element) => {
-            if let CastTarget::Fixed(target @ (LogicalType::Union(_) | LogicalType::Maybe(_))) = element.as_ref() {
+            if let Some(target) = element.union_target() {
                 let Value::List(values) = value else { return Err(inapplicable("list union", &[value])); };
                 let legs = target.legs();
                 if values.iter().any(|value| !legs.contains(&value.logical_type())) { return Err(inapplicable("list union", &[value])); }
@@ -283,7 +263,7 @@ pub fn cast_target(value: &Value, target: &rtdb_plan::CastTarget, timezone: &str
     }
 }
 
-fn pg_array_text(text: &str) -> Result<Vec<Value>> {
+pub(crate) fn pg_array_text(text: &str) -> Result<Vec<Value>> {
     let text = text.trim();
     let inner = text.strip_prefix('{').and_then(|text| text.strip_suffix('}')).ok_or_else(|| Anomaly::incorrect("xtdb.expression/malformed-array-literal", format!("Malformed array literal: '{text}'")))?;
     if inner.trim_start().starts_with('{') { return Err(Anomaly::unsupported("xtdb.expression/multi-dimensional-array-literal", "Multi-dimensional array literals aren't supported")); }

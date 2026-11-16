@@ -96,15 +96,13 @@ impl Service {
                 }
             } else {
                 let context = native.query_context_at(&basis.read()?, &token).await.map_err(status)?;
-                let mut options = options;
-                if let Some(arguments) = &arguments { for (index, ty) in arguments.types().iter().enumerate() { options.parameter_types.insert(index, ty.clone()); } }
                 let prepared = PreparedSql::prepare(&sql, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
                 if prepared.is_dml() { return Err(invalid("ticket query cannot execute an update")); }
                 let row = match &arguments { None => &[][..], Some(arguments) => arguments.rows().next().ok_or_else(|| invalid("Query parameter batch has no rows"))? };
                 let bound = row.iter().try_fold(wire::add(1024, wire::mul(row.len(), std::mem::size_of::<rtdb_types::Value>())?)?, |bytes, value| wire::add(bytes, value.retained_bytes().map_err(status)?))?;
                 let _values = self.memory().reserve(bound).map_err(status)?;
                 let values = row.to_vec();
-                prepared.open_query(context, values).map_err(status)?
+                prepared.open_query_typed(context, values, arguments.as_ref().map(SqlArguments::types).unwrap_or_default()).await.map_err(status)?
             };
             drop(native); Ok::<_, Status>((cursor, connection, token_guard))
         };
@@ -118,7 +116,8 @@ impl Service {
             loop {
                 let batch = _call.cancellation.run_until_cancelled(cursor.next_batch()).await.ok_or_else(cancelled)?.map_err(status)?;
                 let Some(batch) = batch else { break; };
-                let encoded = match encoder.batch(batch.batch(), service.memory()) { Ok(encoded) => encoded, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
+                let batch = match rtdb_columnar::conform_batch(batch, &schema, service.memory()).map_err(status) { Ok(batch) => batch, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
+                let encoded = match encoder.declared_batch(&batch, service.memory()) { Ok(encoded) => encoded, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
                 for data in encoded { yield data; }
             }
         });

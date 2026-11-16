@@ -42,6 +42,31 @@ impl Drop for Native {
 }
 
 #[test]
+fn adbc_virtual_endpoints_keep_declared_schema_and_conformed_null_buffers() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let session = handles::session(native.session).unwrap();
+    let token = handles::cancellation(operation, &session).unwrap();
+    let statement = native.statement("SELECT _valid_from,_valid_time FROM pg_catalog.pg_namespace LIMIT 1");
+    let statement = handles::statement(statement).unwrap();
+    statement.prepare(&token).unwrap();
+    let prepared = statement.schema(false, &token).unwrap();
+    assert!(!prepared.schema.field(0).is_nullable());
+    let cursor = statement.query(&token).unwrap();
+    assert_eq!(cursor.schema, prepared.schema);
+    let batch = cursor.next().unwrap().unwrap();
+    assert_eq!(batch.declared_schema().as_ref(), &cursor.schema);
+    assert_eq!(batch.batch().column(0).null_count(), 1);
+    assert!(batch.batch().schema().field(0).is_nullable());
+    let (array, schema) = arrow::export_declared_batch(batch, session.region.memory()).unwrap();
+    let exported = Schema::try_from(&schema).unwrap();
+    assert_eq!(exported, cursor.schema);
+    assert_eq!(array.child(0).null_count(), 1);
+    assert!(cursor.next().unwrap().is_none());
+    drop(array); drop(schema);
+}
+
+#[test]
 fn statement_captures_creation_catalog_for_prepare_schema_and_reexecution() {
     let mut native = Native::open();
     let operation = native.operation();
@@ -154,6 +179,48 @@ fn adbc_unnamed_parameters_are_bound_by_ordinal_and_copied() {
     assert_eq!(values.arguments.rows().next().unwrap(), &[rtdb_types::Value::I64(3), rtdb_types::Value::I64(7)]);
     assert_eq!(values.names, vec!["", ""]);
     drop(values); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn adbc_unsigned_parameter_buffers_execute_as_signed_and_preserve_typed_nulls() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let handle = native.statement("SELECT ? AS value");
+    let statement = handles::statement(handle).unwrap();
+    let token = handles::cancellation(operation, &statement.session).unwrap();
+    statement.prepare(&token).unwrap();
+    for value in [Some(u64::MAX), None] {
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("", DataType::UInt64, true)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![value]))]).unwrap();
+        let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+        let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+        let imported = unsafe { arrow::import_rows(&mut array, &mut schema, statement.session.region.memory()) }.unwrap();
+        assert_eq!(imported.arguments.types(), &[rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64).maybe()]);
+        statement.bind(imported).unwrap();
+        let cursor = statement.query(&token).unwrap();
+        assert_eq!(cursor.schema.field(0).data_type(), &DataType::Int64);
+        let page = cursor.next().unwrap().unwrap();
+        let expected = value.map(|_| rtdb_types::Value::I64(-1)).unwrap_or(rtdb_types::Value::Null);
+        assert_eq!(rtdb_columnar::read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), expected);
+    }
+}
+
+#[test]
+fn adbc_unsigned_bulk_documents_admit_ids_before_submission() {
+    let mut native = Native::open();
+    let operation = native.operation();
+    let handle = native.statement("SELECT 1");
+    let statement = handles::statement(handle).unwrap();
+    let token = handles::cancellation(operation, &statement.session).unwrap();
+    statement.replace_source("unsigned_docs", true).unwrap();
+    let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("_id", DataType::UInt64, false), Field::new("v", DataType::UInt64, false)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX]))]).unwrap();
+    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+    statement.bind(unsafe { arrow::import_rows(&mut array, &mut schema, statement.session.region.memory()) }.unwrap()).unwrap();
+    assert_eq!(statement.update(&token).unwrap(), 1);
+    statement.replace_source("SELECT _id,v FROM unsigned_docs", false).unwrap();
+    let cursor = statement.query(&token).unwrap();
+    let page = cursor.next().unwrap().unwrap();
+    for column in 0..2 { assert_eq!(rtdb_columnar::read_value(page.batch().schema().field(column), page.batch().column(column).as_ref(), 0).unwrap(), rtdb_types::Value::I64(-1)); }
 }
 
 #[test]

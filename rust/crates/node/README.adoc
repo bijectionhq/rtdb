@@ -1,5 +1,15 @@
 = Node and session source
 
+Session control expressions and transaction characteristics use caller-owned asynchronous evaluation.
+BEGIN validates its preconditions and evaluates characteristics before publishing transaction state, so dropping a pending option evaluation leaves the session idle.
+Successful BEGIN still installs the same transaction characteristics atomically through `begin_with`.
+`tx.allium` requires complete option evaluation and validation before the transaction becomes observable.
+`tests/native.rs` retains a cancelled SLEEP-in-BEGIN case followed by a successful sibling command, as unexecuted source.
+
+Prepared query execution admits unsigned arguments at their signed vector width.
+`PreparedSql::open_query_typed` retains supplied vector field types for typed nulls and empty containers; `open_query` infers fields from its values.
+Result-schema description preserves supplied physical parameter fields, while opening a query binds against the signed execution field view.
+
 Session parameter entries, database and timezone strings, await/snapshot tokens, pinned transaction bases and buffered SQL carry execution-budget reservations for their retained lifetime.
 Rejected parameter updates retain the previous value.
 The failed-transaction marker stores only the state needed to reject subsequent commands; it does not retain the command's diagnostic payload.
@@ -65,6 +75,10 @@ The service binds the authenticated identity; transaction options cannot choose 
 
 BEGIN leaves the read basis unpinned.
 The first query awaits the effective await token, then captures the snapshot token and clock unless read-only settings override them.
+The pinned query clock retains nanoseconds through later commands and frontend tickets.
+`Clock::query_instant` supplies the exact reading; injected clocks that implement only `now` retain their explicit microsecond precision.
+Typed SQL `CLOCK_TIME` literals resolve after the same statement's timezone option, before Arrow value admission.
+Durable transaction system times and SHOW clock output retain their microsecond representation.
 A later query in that transaction keeps the same basis.
 A writing transaction buffers operations and rejects queries.
 Autocommit applies only when no explicit transaction is open.
@@ -93,6 +107,8 @@ Native node tests cover data-dependent SQL writes, historical reads, asynchronou
 The I/O lifecycle regressions hold canceled reads through detach, partial-opening failure and node shutdown, check storage reads after worker failure, and keep sibling cache/provider scopes usable.
 These are test sources and contain no execution evidence.
 SQL transaction-option execution, Flight handles, protocol entry points, and production server assembly remain incomplete.
+`PreparedSql` retains ordered planning warnings with its allocation charge and exposes them independently of execution-time rebinding.
+PostgreSQL DML preparation collects warnings on a best-effort basis when the caller supplied no parameter OIDs; planning errors still defer to transaction resolution.
 Time-zone validation shares expression conversion's named-zone and Java fixed-offset parser.
 Fixed-offset spellings are normalized for session output.
 
@@ -105,6 +121,7 @@ The dynamic signature policy supports ADBC schema discovery; the PostgreSQL poli
 Null results and empty lists retain a compatible PostgreSQL description.
 ADBC parameter fields have empty names and unknown nullable types in positional order.
 Prepared DML preserves the original SQL and the distinction between absent and explicitly empty argument batches, and resolves tables only during transaction execution.
+It preserves the supplied argument width for validation during submission and transaction resolution.
 Session read-basis capture, access checks, and authentication revalidation precede prepared execution.
 `tests/statement.rs` contains source regressions for these contracts and the pgwire cached-plan guard.
 Preparation metadata has retained-byte accounting; SQL parser and planner transient allocations and operator descriptors still share the resource qualifications documented by the query crate.
@@ -136,3 +153,21 @@ The session counts presubmit failures and synchronous abort results; the resolve
 It holds weak node-resource references between samples, and each returned catalog snapshot retains its own allocation reservation.
 Runtime metric catalogs await caller-owned live provider samples, including PostgreSQL WAL lag.
 All new Rust fixtures are source-only until the implementation gate permits compilation and execution.
+
+Prepared SQL temporal casts capture the preparation context's zone for advertised fields and rebind against each execution context's zone.
+Dynamic and PostgreSQL result-signature policies admit compatible rebinding; exact signatures reject changed zone metadata.
+Prepared control expressions retain a passive session-zone marker and read the current borrowed evaluation context on each execution.
+The statement and control regression sources cover both lifetimes.
+
+External-source factories receive the database I/O region when they open a source.
+Kafka Connect assignments capture their legacy date environment through that region.
+The source factory retains its provider initialization time and caller-owned clock; formatters sample that clock when they are constructed and when they observe timezone names.
+The assignment retains the captured locale and default timezone independently of SQL session timezone settings.
+Database removal drains admitted platform reads after source workers join, including reads whose assignment caller was cancelled, before releasing the database name.
+Node shutdown drains all database regions through their shared parent.
+The source-assignment regression holds a cancelled capture through detach and node shutdown; the Kafka adapter regression checks result cleanup and sibling-region admission.
+
+Source-log transaction inspection prints URI objects using Unicode 16 NFC followed by ASCII percent encoding.
+Inspection admits decoded operation rendering scratch before building the EDN text and retains that charge with the page.
+Stored URI text remains unchanged.
+The URI log-inspection regression source is unexecuted.

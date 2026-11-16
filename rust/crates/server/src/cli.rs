@@ -6,19 +6,24 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
 #[derive(Clone, Debug)]
 pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32 }
 #[derive(Clone, Debug)]
-pub enum Command { Help, Version, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
+pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
 pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(&str) -> Option<String>) -> Result<Command> {
     let mut arguments = arguments.into_iter().peekable();
     if matches!(arguments.peek().map(String::as_str), Some("help" | "--help" | "-h")) { return Ok(Command::Help); }
     if matches!(arguments.peek().map(String::as_str), Some("--version" | "-V")) { return Ok(Command::Version); }
+    if arguments.peek().is_some_and(|argument| argument == "--build-info") {
+        arguments.next();
+        if arguments.next().is_some() { return Err(invalid("--build-info accepts no arguments")); }
+        return Ok(Command::BuildInfo);
+    }
     let inspection = match arguments.peek().map(String::as_str) {
         Some("read-arrow-file") => Some(crate::inspect::FileKind::ArrowFile),
         Some("read-arrow-stream-file") => Some(crate::inspect::FileKind::ArrowStream),

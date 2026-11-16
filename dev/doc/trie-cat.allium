@@ -58,6 +58,11 @@ value TrieKey {
     is_current: recency = null
 
     -- Serialised as a string using lex hex encoding for levels and blocks.
+    -- A historical key's date uses a nonnegative ISO proleptic Gregorian year through 999999999, followed by two-digit month and day.
+    -- The rendered year has at least four digits and carries no sign.
+    -- Parsing accepts one through nine year digits and an optional plus sign, with exactly two month and day digits.
+    -- It requires months 1 through 12 and days 1 through 31, then clamps the day to the month's last day.
+    -- Partition metadata and scan ceilings convert the date to UTC midnight in signed 64-bit microseconds, rejecting overflow.
     -- Lex hex: first digit is the length of the hex string minus one; remainder is the hex string.
     -- e.g. b134 is block 0x34 (decimal 52).
     -- Examples:

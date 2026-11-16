@@ -7,6 +7,24 @@ fn iid(value: u32) -> Iid {
     Iid(iid)
 }
 
+#[test]
+fn unsigned_physical_extrema_never_prune_signed_execution_predicates() {
+    for (minimum, maximum, probes) in [
+        (Value::U8(0), Value::U8(255), vec![Value::I8(-1), Value::I8(127), Value::U8(255)]),
+        (Value::U16(32767), Value::U16(32768), vec![Value::I16(i16::MIN), Value::I16(i16::MAX)]),
+        (Value::U32(0), Value::U32(u32::MAX), vec![Value::I32(-1), Value::I32(0)]),
+        (Value::U64(1 << 63), Value::U64(u64::MAX), vec![Value::I64(i64::MIN), Value::I64(-1), Value::U64(0)]),
+    ] {
+        let summary = ColumnSummary { bounds: Some(ScalarBounds { minimum, maximum }), null_count: Some(0), value_count: Some(2) };
+        for probe in probes {
+            for comparison in [Comparison::Equal, Comparison::NotEqual, Comparison::Less, Comparison::LessEqual, Comparison::Greater, Comparison::GreaterEqual] {
+                assert!(summary.may_match(comparison, &probe));
+            }
+        }
+        assert!(!summary.may_be_null());
+    }
+}
+
 fn indices(trie: &MemoryHashTrie, iids: &[Iid]) -> Vec<u32> {
     let mut rows = trie.sorted_rows(iids).unwrap();
     rows.sort_unstable();

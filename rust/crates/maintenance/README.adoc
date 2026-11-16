@@ -6,6 +6,9 @@ Only live inputs participate, and every recorded output shard contributes its hi
 
 `SegmentCompactor` is a passive capability executing one immutable `CompactionJob` on the caller's task.
 It downloads immutable input files into an owned temporary directory, merges IID/system-time ordered pages, resolves L0 same-transaction overlap, partitions historical output by recency, and writes data and metadata files.
+Recency partitioning uses `CivilDate` for the complete signed 64-bit microsecond input range, including dates beyond Chrono's calendar range.
+Weekly, monthly, quarterly and yearly partitions include their UTC midnight ceiling.
+Persisted partition metadata and scan ceilings check the separate signed 64-bit microsecond bound when converting a trie date back to midnight.
 The final layout supports IID branches, bounded recency cells, single-entity recency pages, and optional run-end encoded historical IIDs.
 Data page copies retain signed decimal precision and scale and preserve raw coefficients under the merged field schema.
 They reject parameter relabeling and check physical coefficient width without imposing ordinary writer precision limits on stored cells.

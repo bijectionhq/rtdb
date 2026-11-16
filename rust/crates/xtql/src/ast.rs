@@ -11,6 +11,7 @@ pub enum Expr {
     /// Binding shorthand always names a logic variable, including inside a query function.
     LogicVariable(String),
     Call { function: String, arguments: Vec<Expr> },
+    RegexReplace { source: Box<Expr>,recipe: rtdb_plan::RegexReplacement },
     Cast { expr: Box<Expr>, target: rtdb_plan::CastTarget },
     Get { object: Box<Expr>, field: String }, List(Vec<Expr>), Set(Vec<Expr>), Map(Vec<(String, Expr)>),
     Subquery { kind: SubqueryKind, query: Box<Query>, arguments: Option<Vec<Expr>> },
@@ -110,12 +111,21 @@ pub fn parse_expr(form: &Edn) -> Result<Expr> {
         EdnKind::List(_) => {
             let (op, args) = form_list(form, "xtql/malformed-call")?;
             match op {
+                "regexp-replace" | "regexp_replace" => Expr::RegexReplace {
+                    source: Box::new(args.first().map(parse_expr).transpose()?.unwrap_or(Expr::Literal(Value::Null))),
+                    recipe: crate::regex_replace::metadata(args),
+                },
                 "cast" => {
                     if !(2..=3).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "cast requires an expression, target type, and optional cast options")); }
                     Expr::Cast { expr: Box::new(parse_expr(&args[0])?), target: crate::cast::target(&args[1], args.get(2))? }
                 }
+                "cast-tstz" | "cast_tstz" | "cast-interval" | "cast_interval" => {
+                    if !(1..=2).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "Temporal cast requires an expression and optional cast options")); }
+                    let target = if matches!(op,"cast-tstz" | "cast_tstz") { crate::cast::session_timestamp(args.get(1))? } else { crate::cast::interval_alias(args.get(1))? };
+                    Expr::Cast { expr: Box::new(parse_expr(&args[0])?), target }
+                }
                 "." => {
-                    if args.len() != 2 || args[1].symbol().is_none() { return Err(error("xtql/malformed-get", "Malformed get")); }
+                    if args.len() != 2 || matches!(args[0].kind,EdnKind::Nil | EdnKind::Bool(false)) || args[1].symbol().is_none() { return Err(error("xtql/malformed-get", "Malformed get")); }
                     Expr::Get { object: Box::new(parse_expr(&args[0])?), field: args[1].symbol().unwrap_or_default().into() }
                 }
                 "q" | "exists?" | "pull" | "pull*" => {

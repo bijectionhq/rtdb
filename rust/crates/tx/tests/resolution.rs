@@ -24,6 +24,28 @@ fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp:
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
 
 #[tokio::test]
+async fn replayed_unsigned_argument_payloads_bind_signed_and_keep_source_bytes() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let args = SqlArguments::new(vec![rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::U64)], vec![vec![Value::U64(u64::MAX)]], &context.memory).unwrap();
+    let source = request(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) SELECT 1, ? + 2".into(), args: Some(args) }], &context);
+    let encoded = source.encode().unwrap();
+    let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+    let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+    assert_eq!(decoded.encode().unwrap().as_slice(), encoded.as_slice());
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+    assert!(resolved.result().committed(), "{:?}", resolved.result());
+    let batch = resolved.writes().tables()[&table()].batch().unwrap();
+    let StoredOperation::Put(document) = batch.view().read_event(0).unwrap().operation else { panic!("Expected put") };
+    assert_eq!(document["v"], Value::I64(1));
+    let body = resolved.to_replica_body(&context.memory).unwrap();
+    let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
+    let (replica, _) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+    assert_eq!(replica.tables()[&table()].batch().unwrap().view().read_event(0).unwrap().operation, StoredOperation::Put(document));
+}
+
+#[tokio::test]
 async fn transaction_trace_contains_one_sql_span_per_operation_and_skipped_zero_count() {
     let state = PartitionState::empty(Default::default()).unwrap();
     let mut context = context();
@@ -240,5 +262,21 @@ async fn compiled_values_rejects_raw_decimal_arguments_at_the_expression_writer(
         let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
         assert_eq!(resolved.result().error().unwrap().code, "rtdb/decimal-precision");
         assert!(!resolved.writes().tables().contains_key(&table()));
+    }
+}
+
+#[tokio::test]
+async fn resolved_series_dml_uses_the_resolving_nodes_endpoint_policy() {
+    for end_exclusive in [false,true] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let mut context = context();
+        context.query_options.generate_series_end_exclusive = end_exclusive;
+        let source = request(vec![sql("INSERT INTO docs (_id,v) SELECT 1,GENERATE_SERIES(1,3)")],&context);
+        let mut resolver = TxResolver::new(None,SourcePosition(-1),None,&context.memory).unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(),SourcePosition(0),Timestamp(100),source,&context).await.unwrap();
+        assert!(resolved.result().committed(),"{:?}",resolved.result());
+        let batch = resolved.writes().tables()[&table()].batch().unwrap();
+        let StoredOperation::Put(document) = batch.view().read_event(0).unwrap().operation else { panic!("put") };
+        assert_eq!(document["v"],Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
     }
 }

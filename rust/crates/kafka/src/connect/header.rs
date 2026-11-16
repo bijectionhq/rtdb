@@ -1,17 +1,18 @@
 use std::{str::FromStr, sync::Arc};
-use rtdb_types::{DecimalValue, Result, TimeUnit, Value};
+use rtdb_types::{DecimalValue, Result, Value};
 use super::{ConnectData, ConnectSchema, SchemaKind, error};
 
-pub(super) fn decode(bytes: Option<&[u8]>) -> Result<ConnectData> {
+pub(super) fn decode_with_environment(bytes: Option<&[u8]>, environment: &Arc<super::DateEnvironment>) -> Result<ConnectData> {
     let Some(bytes) = bytes else { return Ok(ConnectData::null()); };
-    match literal(&String::from_utf8_lossy(bytes)) {
+    match literal_with_environment(&String::from_utf8_lossy(bytes), environment) {
         Ok(value) => Ok(value),
-        Err(_) => Ok(typed(SchemaKind::Bytes, Value::Binary(bytes.to_vec()))),
+        Err(cause) if cause.category == rtdb_types::AnomalyCategory::Incorrect => Ok(typed(SchemaKind::Bytes, Value::Binary(bytes.to_vec()))),
+        Err(cause) => Err(cause),
     }
 }
-pub(super) fn literal(text: &str) -> Result<ConnectData> {
+pub(super) fn literal_with_environment(text: &str, environment: &Arc<super::DateEnvironment>) -> Result<ConnectData> {
     if text.is_empty() { return Ok(ConnectData::null()); }
-    let mut parser = Parser { original: text, tokens: tokens(text), next: 0 };
+    let mut parser = Parser { original: text, tokens: tokens(text), next: 0, environment };
     parser.value(false, 0)
 }
 fn typed(kind: SchemaKind, value: Value) -> ConnectData { ConnectData { schema: Some(Arc::new(ConnectSchema::new(kind))), value } }
@@ -27,7 +28,7 @@ fn tokens(text: &str) -> Vec<&str> {
     }
     if start < text.len() { result.push(&text[start..]); } result
 }
-struct Parser<'a> { original: &'a str, tokens: Vec<&'a str>, next: usize }
+struct Parser<'a> { original: &'a str, tokens: Vec<&'a str>, next: usize, environment: &'a Arc<super::DateEnvironment> }
 impl Parser<'_> {
     fn take(&mut self) -> Result<&str> { let value = self.tokens.get(self.next).copied().ok_or_else(|| error("header-parse", "Unexpected end of header literal"))?; self.next += 1; Ok(value) }
     fn can(&mut self, expected: &str) -> bool {
@@ -40,7 +41,7 @@ impl Parser<'_> {
         if embedded && self.can("\"") {
             let mut content = String::new();
             while self.next < self.tokens.len() { if self.can("\"") { break; } content.push_str(self.take()?); }
-            return Ok(temporal(&content).unwrap_or_else(|| typed(SchemaKind::String, Value::Utf8(content))));
+            return Ok(temporal(&content,self.environment)?.unwrap_or_else(|| typed(SchemaKind::String, Value::Utf8(content))));
         }
         for (token, value) in [("null", None), ("true", Some(true)), ("false", Some(false))] {
             let mark = self.next;
@@ -49,7 +50,11 @@ impl Parser<'_> {
         }
         let mark = self.next;
         let collection = if self.can("[") { Some(self.array(depth + 1)) } else if self.can("{") { Some(self.map(depth + 1)) } else { None };
-        if let Some(Ok(value)) = collection { return Ok(value); }
+        match collection {
+            Some(Ok(value)) => return Ok(value),
+            Some(Err(cause)) if cause.category != rtdb_types::AnomalyCategory::Incorrect => return Err(cause),
+            _ => (),
+        }
         self.next = mark;
         let token = self.take()?.to_owned();
         if token.trim().is_empty() { return Ok(typed(SchemaKind::String, Value::Utf8(token))); }
@@ -57,9 +62,9 @@ impl Parser<'_> {
         if token.starts_with(|character: char| rtdb_types::decimal_digit(character).is_some()) {
             if self.next + 4 <= self.tokens.len() {
                 let extended = format!("{token}{}", self.tokens[self.next..self.next + 4].concat());
-                if let Some(value) = temporal(&extended) { self.next += 4; return Ok(value); }
+                if let Some(value) = temporal(&extended,self.environment)? { self.next += 4; return Ok(value); }
             }
-            if let Some(value) = temporal(token) { return Ok(value); }
+            if let Some(value) = temporal(token,self.environment)? { return Ok(value); }
         }
         if token.starts_with(|character: char| rtdb_types::decimal_digit(character).is_some() || character == '+' || character == '-') { if let Ok(value) = number(token) { return Ok(value); } }
         if embedded { Err(error("header-parse", "Invalid embedded header literal")) } else { Ok(typed(SchemaKind::String, Value::Utf8(self.original.into()))) }
@@ -112,9 +117,29 @@ impl Merger {
 }
 fn rank(kind: &SchemaKind) -> Option<u8> { match kind { SchemaKind::I8 => Some(0), SchemaKind::I16 => Some(1), SchemaKind::I32 => Some(2), SchemaKind::I64 => Some(3), SchemaKind::F32 => Some(4), SchemaKind::F64 => Some(5), _ => None } }
 fn align(value: Value, schema: &ConnectSchema) -> Result<Value> {
-    if value == Value::Null || schema.name.is_some() { return Ok(value); }
+    if value == Value::Null { return Ok(value); }
+    let logical = schema.name.as_deref().filter(|name| matches!(*name, "org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp"));
+    if super::data::date_millis(&value).is_some() {
+        if logical.is_some() { return Ok(value); }
+        if rank(&schema.kind).is_some() { return Err(error("header-parse", "A date object has no numeric schema during header alignment")); }
+    }
+    if schema.name.is_some() && logical.is_none() { return Ok(value); }
     let numeric = match &value { Value::I8(v) => Some((i64::from(*v), f64::from(*v))), Value::I16(v) => Some((i64::from(*v), f64::from(*v))), Value::I32(v) => Some((i64::from(*v), f64::from(*v))), Value::I64(v) => Some((*v, *v as f64)), Value::F32(v) => Some((*v as i64, f64::from(*v))), Value::F64(v) => Some((*v as i64, *v)), _ => None };
-    if let Some((integer, float)) = numeric { return Ok(match schema.kind { SchemaKind::I8 => Value::I8(integer as i8), SchemaKind::I16 => Value::I16(integer as i16), SchemaKind::I32 => Value::I32(integer as i32), SchemaKind::I64 => Value::I64(integer), SchemaKind::F32 => Value::F32(float as f32), SchemaKind::F64 => Value::F64(float), _ => value }); }
+    if let Some((integer, float)) = numeric {
+        if let Some(logical) = logical {
+            let millis = match logical {
+                "org.apache.kafka.connect.data.Date" => i64::from(integer as i32) * 86_400_000,
+                "org.apache.kafka.connect.data.Time" => {
+                    let millis = integer as i32;
+                    if !(0..=86_400_000).contains(&millis) { return Err(error("header-parse", "Aligned Time value is outside one day")); }
+                    i64::from(millis)
+                }
+                _ => integer,
+            };
+            return Ok(super::data::date_value(millis));
+        }
+        return Ok(match schema.kind { SchemaKind::I8 => Value::I8(integer as i8), SchemaKind::I16 => Value::I16(integer as i16), SchemaKind::I32 => Value::I32(integer as i32), SchemaKind::I64 => Value::I64(integer), SchemaKind::F32 => Value::F32(float as f32), SchemaKind::F64 => Value::F64(float), _ => value });
+    }
     Ok(value)
 }
 fn number(text: &str) -> Result<ConnectData> {
@@ -155,21 +180,29 @@ fn exact_integer(coefficient: &num_bigint::BigInt, scale: i32) -> Option<i64> {
         integer.parse().ok()
     }
 }
-fn temporal(text: &str) -> Option<ConnectData> {
+fn temporal(text: &str, environment: &Arc<super::DateEnvironment>) -> Result<Option<ConnectData>> {
     let text = text.replace("\\:", ":");
-    let (kind, name, value) = match text.len() {
-        10 => { let day = chrono::NaiveDate::parse_from_str(&text, "%Y-%m-%d").ok()?; let days = day.signed_duration_since(chrono::NaiveDate::from_ymd_opt(1970, 1, 1)?).num_days(); (SchemaKind::I32, "Date", Value::DateDay(i32::try_from(days).ok()?)) }
-        13 => { use chrono::Timelike; let time = chrono::NaiveTime::parse_from_str(&text, "%H:%M:%S%.3fZ").ok()?; (SchemaKind::I32, "Time", Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1000 + i64::from(time.nanosecond() / 1_000_000), unit: TimeUnit::Millisecond, bit_width: 32 }) }
-        24 => { let time = chrono::NaiveDateTime::parse_from_str(&text, "%Y-%m-%dT%H:%M:%S%.3fZ").ok()?; (SchemaKind::I64, "Timestamp", Value::Timestamp { value: time.and_utc().timestamp_millis(), unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }) }
-        _ => return None,
+    let (kind, name, pattern) = match text.encode_utf16().count() {
+        10 => (SchemaKind::I32, "Date", "yyyy-MM-dd"),
+        13 => (SchemaKind::I32, "Time", "HH:mm:ss.SSS'Z'"),
+        24 => (SchemaKind::I64, "Timestamp", "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"),
+        _ => return Ok(None),
     };
+    let mut pattern = super::date_pattern::DatePattern::compile(pattern,Arc::clone(environment),false)?;
+    let millis = match pattern.read(&text) {
+        Ok(value) => value,
+        Err(cause) if cause.category == rtdb_types::AnomalyCategory::Incorrect => return Ok(None),
+        Err(cause) => return Err(cause),
+    };
+    let value = super::data::date_value(millis);
     let mut schema = ConnectSchema::new(kind); schema.name = Some(format!("org.apache.kafka.connect.data.{name}")); schema.version = Some(1);
-    Some(ConnectData { schema: Some(Arc::new(schema)), value })
+    Ok(Some(ConnectData { schema: Some(Arc::new(schema)), value }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn literal(text: &str) -> Result<ConnectData> { literal_with_environment(text,&super::super::date_environment::test_environment("en","US","UTC")) }
     #[test]
     fn header_literals_preserve_top_level_quotes_and_narrow_numeric_types() {
         assert_eq!(literal("\"text\"").unwrap().value, Value::Utf8("\"text\"".into()));
@@ -204,8 +237,26 @@ mod tests {
     }
     #[test]
     fn header_temporal_literals_preserve_logical_names_and_millisecond_values() {
-        assert_eq!(literal("12:34:56.789Z").unwrap().value, Value::Time { value: 45_296_789, unit: TimeUnit::Millisecond, bit_width: 32 });
-        assert_eq!(literal("1970-01-02").unwrap().value, Value::DateDay(1));
-        assert_eq!(decode(None).unwrap(), ConnectData::null());
+        assert_eq!(literal("12:34:56.789Z").unwrap().value, super::super::data::date_value(45_296_789));
+        assert_eq!(literal("1970-01-02").unwrap().value, super::super::data::date_value(86_400_000));
+        assert_eq!(decode_with_environment(None,&super::super::date_environment::test_environment("en","US","UTC")).unwrap(), ConnectData::null());
+    }
+    #[test]
+    fn header_alignment_preserves_raw_dates_and_rejects_untyped_numeric_conversion() {
+        let date = literal("1970-01-02").unwrap();
+        let schema = date.schema.as_deref().unwrap();
+        assert_eq!(align(Value::I8(2), schema).unwrap(), super::super::data::date_value(172_800_000));
+        assert_eq!(align(super::super::data::date_value(-1), schema).unwrap(), super::super::data::date_value(-1));
+        assert!(align(date.value, &ConnectSchema::new(SchemaKind::I32)).is_err());
+        assert_eq!(literal("[1970-01-02,32768]").unwrap().value, Value::Utf8("[1970-01-02,32768]".into()));
+    }
+    #[test]
+    fn literal_z_suffix_keeps_default_zone_and_hybrid_lenient_calendar() {
+        let environment = super::super::date_environment::test_environment("en","US","GMT+01:00");
+        assert_eq!(literal_with_environment("1970-01-02",&environment).unwrap().value,super::super::data::date_value(23 * 3_600_000));
+        assert_eq!(literal_with_environment("00:00:00.000Z",&environment).unwrap().value,super::super::data::date_value(-3_600_000));
+        assert_eq!(literal_with_environment("1970-01-32",&environment).unwrap().value,super::super::data::date_value(31 * 86_400_000 - 3_600_000));
+        let julian = super::super::legacy_calendar::RawFields { year: 1500,month0: 1,day: 29,..Default::default() }.local_millis();
+        assert_eq!(literal_with_environment("1500-02-29",&environment).unwrap().value,super::super::data::date_value(julian - 3_600_000));
     }
 }

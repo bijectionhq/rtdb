@@ -3,7 +3,7 @@ use sqlparser::ast as ast;
 
 use crate::bind::{error, identifiers, unsupported};
 
-pub(crate) fn cast_target(data_type: &ast::DataType) -> Result<rtdb_plan::CastTarget> {
+pub(crate) fn cast_target(data_type: &ast::DataType, timezone: Option<&str>) -> Result<rtdb_plan::CastTarget> {
     use ast::{DataType as D, ExactNumberInfo as N};
     match data_type {
         D::Numeric(info) | D::Decimal(info) | D::Dec(info) => {
@@ -17,11 +17,34 @@ pub(crate) fn cast_target(data_type: &ast::DataType) -> Result<rtdb_plan::CastTa
         }
         D::Array(element) => {
             let element = match element { ast::ArrayElemTypeDef::AngleBracket(element) | ast::ArrayElemTypeDef::SquareBracket(element, _) | ast::ArrayElemTypeDef::Parenthesis(element) | ast::ArrayElemTypeDef::Qualified(element, _) => element, _ => return Err(error("Array cast requires an element type")) };
-            Ok(rtdb_plan::CastTarget::List(Box::new(cast_target(element)?)))
+            Ok(rtdb_plan::CastTarget::List(Box::new(cast_target(element, timezone)?)))
+        }
+        D::Time(precision, zone) | D::Timestamp(precision, zone) => {
+            use rtdb_plan::{CastTimezone, TemporalCast, TemporalKind};
+            let kind = if matches!(zone, ast::TimezoneInfo::WithTimeZone | ast::TimezoneInfo::Tz) { TemporalKind::TimestampZone(timezone.map_or(CastTimezone::Session, |zone| CastTimezone::Explicit(zone.into()))) }
+                else if matches!(data_type, D::Time(..)) { TemporalKind::Time } else { TemporalKind::TimestampLocal };
+            Ok(rtdb_plan::CastTarget::Temporal(TemporalCast { kind, unit: precision_unit(*precision), precision: precision.map(|precision| i64::try_from(precision).map_err(error)).transpose()? }))
+        }
+        D::Interval { fields, precision } => {
+            use ast::IntervalFields as A;
+            use rtdb_plan::{IntervalField as F, IntervalQualifier};
+            let Some(fields) = fields else { return Ok(rtdb_plan::CastTarget::IntervalDefault); };
+            let (start, end) = match fields { A::Year => (F::Year,None), A::Month => (F::Month,None), A::Day => (F::Day,None), A::Hour => (F::Hour,None), A::Minute => (F::Minute,None), A::Second => (F::Second,None), A::YearToMonth => (F::Year,Some(F::Month)), A::DayToHour => (F::Day,Some(F::Hour)), A::DayToMinute => (F::Day,Some(F::Minute)), A::DayToSecond => (F::Day,Some(F::Second)), A::HourToMinute => (F::Hour,Some(F::Minute)), A::HourToSecond => (F::Hour,Some(F::Second)), A::MinuteToSecond => (F::Minute,Some(F::Second)) };
+            if precision.is_some() && start != F::Second && end != Some(F::Second) { return Err(error("Interval precision requires a SECOND field")); }
+            Ok(rtdb_plan::CastTarget::Interval(IntervalQualifier { start, end, leading_precision: Some(2), fractional_precision: Some(precision.map(|precision| i64::try_from(precision).map_err(error)).transpose()?.unwrap_or(6)) }))
+        }
+        D::Custom(name, arguments) if identifiers(name)?.len() == 1 && matches!(identifiers(name)?[0].normalized().as_str(), "duration" | "timestamptz") => {
+            use rtdb_plan::{CastTimezone, TemporalCast, TemporalKind};
+            if arguments.len() > 1 { return Err(error("Temporal cast accepts one precision")); }
+            let precision = arguments.first().map(|value| value.parse::<u64>().map_err(error)).transpose()?;
+            let kind = if identifiers(name)?[0].normalized() == "duration" { TemporalKind::Duration } else { TemporalKind::TimestampZone(timezone.map_or(CastTimezone::Session, |zone| CastTimezone::Explicit(zone.into()))) };
+            Ok(rtdb_plan::CastTarget::Temporal(TemporalCast { kind, unit: precision_unit(precision), precision: precision.map(|precision| i64::try_from(precision).map_err(error)).transpose()? }))
         }
         other => Ok(rtdb_plan::CastTarget::fixed(self::data_type(other)?)),
     }
 }
+
+fn precision_unit(precision: Option<u64>) -> TimeUnit { if precision.is_some_and(|precision| precision > 6) { TimeUnit::Nanosecond } else { TimeUnit::Microsecond } }
 
 pub(crate) fn data_type(data_type: &ast::DataType) -> Result<LogicalType> {
     use ast::DataType as D;

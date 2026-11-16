@@ -95,6 +95,33 @@ fn integer(batch: &RecordBatch, column: usize, row: usize) -> i64 { batch.column
 fn arguments(values: Vec<i64>) -> RecordBatch { RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("any-client-name", DataType::Int64, false)])), vec![Arc::new(Int64Array::from(values))]).unwrap() }
 
 #[tokio::test]
+async fn unsigned_parameter_fields_and_bits_admit_signed_query_and_dml_values() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let unsigned = |value| RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("any-name", DataType::UInt64, true)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![value]))]).unwrap();
+    let query = client.prepare("SELECT ? AS n", None).await;
+    for value in [Some(u64::MAX), None] {
+        client.upload(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }, vec![unsigned(value)]).await;
+        let descriptor = FlightDescriptor::new_cmd(CommandPreparedStatementQuery { prepared_statement_handle: query.prepared_statement_handle.clone() }.as_any().encode_to_vec());
+        let request = client.request(descriptor);
+        let info = client.client.get_flight_info(request).await.unwrap().into_inner();
+        assert_eq!(info.clone().try_decode_schema().unwrap().field(0).data_type(), &DataType::UInt64);
+        let rows = client.redeem(&info).await;
+        assert_eq!(rows[0].schema().field(0).data_type(), &DataType::Int64);
+        let expected = value.map(|_| rtdb_types::Value::I64(-1)).unwrap_or(rtdb_types::Value::Null);
+        assert_eq!(rtdb_columnar::read_value(rows[0].schema().field(0), rows[0].column(0).as_ref(), 0).unwrap(), expected);
+    }
+    let update = client.prepare("INSERT INTO docs (_id,v) VALUES (1,?)", None).await;
+    client.upload(CommandPreparedStatementUpdate { prepared_statement_handle: update.prepared_statement_handle }, vec![unsigned(Some(u64::MAX))]).await;
+    assert_eq!(integer(&client.query("SELECT v FROM docs").await[0], 0, 0), -1);
+    let bulk = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("_id", DataType::UInt64, false), Field::new("v", DataType::UInt64, false)])), vec![Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX])), Arc::new(arrow_array::UInt64Array::from(vec![u64::MAX]))]).unwrap();
+    client.upload(CommandStatementIngest { table: "bulk_unsigned".into(), ..Default::default() }, vec![bulk]).await;
+    let rows = client.query("SELECT _id,v FROM bulk_unsigned").await;
+    assert_eq!((integer(&rows[0], 0, 0), integer(&rows[0], 1, 0)), (-1, -1));
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn ticket_basis_is_immutable_and_update_ticket_redemption_is_effect_free() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let update = client.info("INSERT INTO docs (_id,n) VALUES (1,10)", None).await; assert!(client.redeem(&update).await.is_empty()); assert!(client.redeem(&update).await.is_empty());

@@ -9,17 +9,26 @@ publish.workspace = true
 rtdb-types.workspace = true
 rtdb-plan.workspace = true
 rtdb-columnar.workspace = true
+rtdb-format.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
 bigdecimal.workspace = true
+base64.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 half.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 regex.workspace = true
+fancy-regex.workspace = true
+regex-syntax.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+tokio.workspace = true
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

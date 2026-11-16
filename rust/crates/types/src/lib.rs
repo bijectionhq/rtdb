@@ -2,21 +2,24 @@ mod error;
 mod calendar;
 mod zone;
 mod legacy_zone;
-mod instant_text;
+mod float_text;
 mod id;
 mod logical;
 mod position;
 mod pg;
 mod type_edn;
 mod time;
+mod instant_text;
 mod value;
 mod uri;
 mod utf8;
+mod version;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
 pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
 pub use legacy_zone::LegacyTimeZone;
+pub use float_text::{java_f32_text, java_f64_text};
 pub use id::{EntityId, Iid, Keyword, TableRef};
 pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, TimeUnit};
 pub use position::*;
@@ -25,6 +28,9 @@ pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds, Timestam
 pub use value::{DecimalValue, Value};
 pub use uri::UriParts;
 pub use utf8::decode_java_utf8;
+pub use version::{BuildInfo, compiled_build_info, runtime_version, runtime_revision};
 
 mod decimal_text;
 pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};
+mod sql_time;
+pub use sql_time::{parse_sql_timestamp_literal, parse_sql_timestamp_cast, parse_sql_timestamp_instant, parse_sql_local_datetime, parse_sql_zoned_datetime, parse_sql_date_literal, parse_query_clock, validate_sql_time_literal};

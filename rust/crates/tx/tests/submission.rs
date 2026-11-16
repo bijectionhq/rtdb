@@ -4,6 +4,28 @@ use rtdb_tx::*;
 use rtdb_types::{LogicalType, ScalarType, Value};
 
 #[test]
+fn volatile_and_query_clock_sql_remain_in_source_log_for_transaction_time_evaluation() {
+    for sql in ["INSERT INTO foo (_id, v) VALUES (1, PG_SLEEP(60.0))", "INSERT INTO foo (_id, v) VALUES (1, CAST(TIME '12:00:00' AS TIMESTAMP))"] {
+        let memory = MemoryBudget::new(1 << 25);
+        let request = prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: None }], SubmitOptions::default(), "xtdb", &memory).unwrap();
+        let encoded = request.encode().unwrap();
+        let SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(tx)) = SourceMessage::decode(encoded.as_slice()).unwrap().unwrap() else { panic!() };
+        let mut stream = rtdb_format::ipc::ArrowStream::open(std::sync::Arc::from(tx.tx_ops.as_deref().unwrap()), None).unwrap();
+        let page = stream.next().unwrap().unwrap();
+        let arrow_schema::DataType::Union(fields, _) = page.column(0).data_type() else { panic!() };
+        assert_eq!(fields.iter().map(|(_, field)| field.name().as_str()).collect::<Vec<_>>(), ["sql"], "{sql}");
+    }
+}
+
+#[test]
+fn static_sql_submission_rejects_functions_absent_from_the_sql_registry() {
+    let memory = MemoryBudget::new(1 << 25);
+    for sql in ["INSERT INTO foo (_id, v) VALUES (1, RANDOM())", "INSERT INTO foo (_id, v) VALUES (1, \"double\"(7))"] {
+        assert!(prepare_submission(vec![TxOp::Sql { sql: sql.into(), args: None }], SubmitOptions::default(), "xtdb", &memory).is_err(), "{sql}");
+    }
+}
+
+#[test]
 fn sql_to_static_ops_3484_retains_decimal_values_and_groups_valid_bounds() {
     let memory = MemoryBudget::new(1 << 27);
     let operation = TxOp::Sql { sql: "INSERT INTO foo (_id, v, _valid_from) VALUES (1, 12.34, TIMESTAMP '2024-01-01T00:00:00Z'), (2, 56.78, TIMESTAMP '2024-01-01T00:00:00Z')".into(), args: None };

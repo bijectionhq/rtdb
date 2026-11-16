@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use chrono::{DateTime, FixedOffset, NaiveDate, Offset, Timelike, Utc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::TransitValue;
 use rtdb_types::{Anomaly, PgType, Result, TimeUnit, Value};
@@ -41,7 +40,9 @@ pub fn encode(ty: PgType, format: Format, value: &Value, environment: &SessionEn
 }
 
 /// Requires caller-owned scratch and output reservations; use `encode` for a retained payload owner.
+/// Unadmitted calendar objects are rejected; this surface encodes completed vector cells.
 pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: &SessionEnvironment) -> Result<Vec<u8>> {
+    if value.has_calendar_object() { return Err(invalid("PostgreSQL output requires admitted calendar values")); }
     if ty == PgType::Default { ty = environment.fallback(); }
     let binary = format == Format::Binary;
     let bytes = match ty {
@@ -68,12 +69,12 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         }
         PgType::Date => {
             let days = match value {
-                Value::DateDay(days) => *days,
+                Value::DateDay(days) => i64::from(*days),
                 Value::DateMilli(_) if binary => return Err(Anomaly::fault("xtdb.arrow/unsupported-vector-operation", "getInt unsupported on DateMilliVector")),
-                Value::DateMilli(value) => i32::try_from(value / 86_400_000).map_err(invalid)?,
+                Value::DateMilli(value) => value / 86_400_000,
                 _ => return Err(incompatible(ty, value)),
             };
-            if binary { days.wrapping_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec() } else { date_text(days)?.into_bytes() }
+            if binary { (days as i32).wrapping_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec() } else { date_text(days)?.into_bytes() }
         }
         PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes().to_vec() } else { time_text(value, true)?.into_bytes() } }
         PgType::Interval => { let (months, days, nanos) = interval_parts(value)?; interval_text(months, days, nanos / 1000 * 1000).into_bytes() }
@@ -114,7 +115,7 @@ fn array_write(ty: PgType, format: Format, value: &Value, env: &SessionEnvironme
 }
 
 pub(crate) fn nanos(value: i64, unit: TimeUnit) -> i128 { i128::from(value) * match unit { TimeUnit::Second => 1_000_000_000, TimeUnit::Millisecond => 1_000_000, TimeUnit::Microsecond => 1000, TimeUnit::Nanosecond => 1 } }
-fn date_text(days: i32) -> Result<String> { let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| invalid("Invalid date epoch"))?; Ok(epoch.checked_add_signed(chrono::Duration::days(i64::from(days))).ok_or_else(|| invalid("Date exceeds calendar range"))?.to_string()) }
+fn date_text(days: i64) -> Result<String> { Ok(rtdb_types::CivilDate::from_epoch_day(days)?.to_string()) }
 fn fraction(nanos: u32, grouped: bool) -> String {
     if nanos == 0 { return String::new(); }
     let width = if grouped { if nanos % 1_000_000 == 0 { 3 } else if nanos % 1000 == 0 { 6 } else { 9 } } else { 9 };
@@ -128,20 +129,12 @@ fn time_text(value: i128, force_seconds: bool) -> Result<String> {
 }
 fn timestamp_text(value: i64, unit: TimeUnit, timezone: Option<&str>, iso: bool, include_zone: bool) -> Result<String> {
     let total = nanos(value, unit); let seconds = i64::try_from(total.div_euclid(1_000_000_000)).map_err(invalid)?; let sub = total.rem_euclid(1_000_000_000) as u32;
-    let instant = DateTime::<Utc>::from_timestamp(seconds, sub).ok_or_else(|| invalid("Timestamp exceeds calendar range"))?;
-    let offset = match timezone { None | Some("UTC" | "Z") => FixedOffset::east_opt(0).ok_or_else(|| invalid("Invalid UTC offset"))?, Some(zone) => {
-        if let Ok(zone) = zone.parse::<chrono_tz::Tz>() { instant.with_timezone(&zone).offset().fix() }
-        else {
-            let normalized = rtdb_expr::normalize_timezone(zone)?;
-            let offset = ["UTC", "GMT", "UT"].into_iter().find_map(|prefix| normalized.strip_prefix(prefix)).unwrap_or(&normalized);
-            let seconds = if offset.is_empty() || offset == "Z" { 0 } else { let mut parts = offset[1..].split(':').map(|part| part.parse::<i32>().map_err(invalid)); let hours = parts.next().transpose()?.unwrap_or(0); let minutes = parts.next().transpose()?.unwrap_or(0); let seconds = parts.next().transpose()?.unwrap_or(0); (hours * 3600 + minutes * 60 + seconds) * if offset.starts_with('-') { -1 } else { 1 } };
-            FixedOffset::east_opt(seconds).ok_or_else(|| invalid("Invalid time zone offset"))?
-        }
-    } };
-    let local = instant.with_timezone(&offset);
-    let mut output = if iso { format!("{}T{}", local.date_naive(), time_text(i128::from(local.num_seconds_from_midnight()) * 1_000_000_000 + i128::from(local.nanosecond()), false)?) }
-    else { format!("{} {:02}:{:02}:{:02}{}", local.date_naive(), local.hour(), local.minute(), local.second(), fraction(local.nanosecond() / 1000 * 1000, false)) };
-    if let Some(zone) = timezone { if iso && offset.local_minus_utc() == 0 { output.push('Z'); } else { output.push_str(&offset.to_string()); } if iso && include_zone && !matches!(zone, "Z") && !zone.starts_with(['+', '-']) { output.push('['); output.push_str(zone); output.push(']'); } }
+    let offset = timezone.map(rtdb_types::ZoneId::parse).transpose()?.map_or(Ok(rtdb_types::FixedOffset::UTC), |zone| zone.offset_at(seconds))?;
+    let local = rtdb_types::CivilDateTime::from_epoch_second(seconds.checked_add(i64::from(offset.seconds())).ok_or_else(|| invalid("Timestamp offset overflow"))?, sub)?;
+    let second = local.second_of_day();
+    let mut output = if iso { format!("{}T{}", local.date(), time_text(i128::from(local.nano_of_day()), false)?) }
+    else { format!("{} {:02}:{:02}:{:02}{}", local.date(), second / 3600, second / 60 % 60, second % 60, fraction(local.nano() / 1000 * 1000, false)) };
+    if let Some(zone) = timezone { if !iso && offset.seconds() == 0 { output.push_str("+00:00"); } else { output.push_str(&offset.to_string()); } if iso && include_zone && !matches!(zone, "Z") && !zone.starts_with(['+', '-']) { output.push('['); output.push_str(zone); output.push(']'); } }
     Ok(output)
 }
 fn duration_text(nanos: i128) -> String {
@@ -155,34 +148,7 @@ fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> { match value { Valu
 fn interval_text(months: i32, days: i32, nanos: i64) -> String { let mut text = String::from("P"); if months / 12 != 0 { text.push_str(&format!("{}Y", months / 12)); } if months % 12 != 0 { text.push_str(&format!("{}M", months % 12)); } if days != 0 { text.push_str(&format!("{days}D")); } if nanos != 0 { text.push_str(&duration_text(i128::from(nanos))[1..]); } text }
 fn decimal_text(value: &rtdb_types::DecimalValue) -> String { rtdb_expr::decimal_text(value) }
 fn float_text(value: f64, single: Option<f32>) -> String {
-    if value.is_nan() { return "NaN".into(); }
-    if value == f64::INFINITY { return "Infinity".into(); }
-    if value == f64::NEG_INFINITY { return "-Infinity".into(); }
-    if value == 0.0 { return if value.is_sign_negative() { "-0.0" } else { "0.0" }.into(); }
-    let mut text = single.map_or_else(|| format!("{value:?}"), |value| format!("{value:?}"));
-    let mut negative = false;
-    if text.starts_with('-') { negative = true; text.remove(0); }
-    let (mantissa, power) = text.split_once('e').map_or((text.as_str(), 0), |(mantissa, power)| (mantissa, power.parse::<i32>().unwrap_or(0)));
-    let dot = mantissa.find('.').unwrap_or(mantissa.len());
-    let mut digits = mantissa.replace('.', "");
-    let leading = digits.bytes().take_while(|byte| *byte == b'0').count();
-    let exponent = dot as i32 - leading as i32 - 1 + power;
-    digits.drain(..leading);
-    while digits.len() > 1 && digits.ends_with('0') { digits.pop(); }
-    let mut result = if negative { "-".to_owned() } else { String::new() };
-    if (-3..7).contains(&exponent) {
-        let place = exponent + 1;
-        if place <= 0 { result.push_str("0."); result.extend(std::iter::repeat_n('0', (-place) as usize)); result.push_str(&digits); }
-        else if place as usize >= digits.len() { result.push_str(&digits); result.extend(std::iter::repeat_n('0', place as usize - digits.len())); result.push_str(".0"); }
-        else { result.push_str(&digits[..place as usize]); result.push('.'); result.push_str(&digits[place as usize..]); }
-    } else {
-        if digits.len() == 1 {
-            let precise = single.map_or_else(|| format!("{:.1e}", value.abs()), |value| format!("{:.1e}", value.abs()));
-            digits = precise.split('e').next().unwrap_or("0.0").replace('.', "");
-        }
-        result.push_str(&digits[..1]); result.push('.'); result.push_str(&digits[1..]); result.push('E'); result.push_str(&exponent.to_string());
-    }
-    result
+    single.map_or_else(|| rtdb_types::java_f64_text(value), rtdb_types::java_f32_text)
 }
 fn unsupported(ty: PgType, operation: &str) -> Anomaly { Anomaly::unsupported("xtdb.pgwire/unsupported-value-operation", format!("{} has no {operation}", ty.descriptor().name)) }
 fn incompatible(ty: PgType, value: &Value) -> Anomaly { Anomaly::incorrect("xtdb.pgwire/incompatible-value", format!("Cannot serialize {:?} as {}", value.logical_type(), ty.descriptor().name)) }
@@ -210,7 +176,7 @@ fn tagged_json(tag: &str, text: &str, output: &mut String) -> Result<()> { outpu
 fn scalar_text(value: &Value) -> Result<(&'static str, String)> {
     Ok(match value {
         Value::Keyword(value) => ("xt:keyword", value.as_str().into()), Value::Uuid(value) => ("xt:uuid", uuid::Uuid::from_bytes(*value).to_string()),
-        Value::DateDay(days) => ("xt:date", date_text(*days)?), Value::DateMilli(value) => ("xt:date", date_text(i32::try_from(value / 86_400_000).map_err(invalid)?)?),
+        Value::DateDay(days) => ("xt:date", date_text(i64::from(*days))?), Value::DateMilli(value) => ("xt:date", date_text(value / 86_400_000)?),
         Value::Time { value, unit, .. } => ("xt:time", time_text(nanos(*value, *unit), false)?),
         Value::Timestamp { value, unit, timezone } => (if timezone.is_some() { "xt:timestamptz" } else { "xt:timestamp" }, timestamp_text(*value, *unit, timezone.as_deref(), true, true)?),
         Value::Duration { value, unit } => ("xt:duration", duration_text(nanos(*value, *unit))),

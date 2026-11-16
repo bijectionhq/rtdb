@@ -1,4 +1,3 @@
-use chrono::{DateTime, LocalResult, Offset, TimeZone};
 use rtdb_plan::BinaryOp;
 use rtdb_types::{Anomaly, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
 use crate::{cast::cast, numeric::{division_by_zero, inapplicable, integer, number, overflow}, timezone::{Zone, zone}};
@@ -54,8 +53,8 @@ pub(crate) fn absolute(value: &Value) -> Option<Result<Value>> {
 fn rescale(value: i64, source: TimeUnit, target: TimeUnit) -> Result<i64> {
     i64::try_from(i128::from(value) * i128::from(target.units_per_second()) / i128::from(source.units_per_second())).map_err(|_| overflow())
 }
-pub(crate) fn date_days(value: &Value) -> Option<i64> { match value { Value::DateDay(days) => Some(i64::from(*days)), Value::DateMilli(millis) => Some(millis / 86_400_000), _ => None } }
-fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
+pub(crate) fn date_days(value: &Value) -> Option<i64> { value.date_days() }
+pub(crate) fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str) -> Result<i64> {
     if let Some(days) = date_days(value) { return days.checked_mul(86_400).and_then(|seconds| seconds.checked_mul(unit.units_per_second())).ok_or_else(overflow); }
     match value {
         Value::Timestamp { value, unit: source, timezone: source_zone } => {
@@ -71,53 +70,15 @@ fn timestamp_units(value: &Value, unit: TimeUnit, localize: bool, timezone: &str
 }
 
 fn offset_at(value: i64, unit: TimeUnit, zone: &Zone) -> Result<i32> {
-    if let Zone::Fixed(offset) = zone { return Ok(offset.local_minus_utc()); }
-    let seconds = value.div_euclid(unit.units_per_second());
-    let instant = DateTime::from_timestamp(seconds, 0).ok_or_else(overflow)?;
-    Ok(zone.offset_from_utc_datetime(&instant.naive_utc()).fix().local_minus_utc())
+    Ok(zone.offset_at(value.div_euclid(unit.units_per_second()))?.seconds())
 }
 
 fn local_near(local_seconds: i64, zone: &Zone, preferred_offset: i32) -> Result<i64> {
-    if let Zone::Fixed(offset) = zone { return local_seconds.checked_sub(i64::from(offset.local_minus_utc())).ok_or_else(overflow); }
-    let local = DateTime::from_timestamp(local_seconds, 0).ok_or_else(overflow)?.naive_utc();
-    match zone.from_local_datetime(&local) {
-        LocalResult::Single(value) => Ok(value.timestamp()),
-        LocalResult::Ambiguous(first, second) => Ok(if second.offset().fix().local_minus_utc() == preferred_offset { second } else { first }.timestamp()),
-        LocalResult::None => Ok(crate::cast::local_instant_in_zone(local, zone)?.timestamp()),
-    }
-}
-
-// Gregorian civil-day conversion: Howard Hinnant, https://howardhinnant.github.io/date_algorithms.html.
-fn civil_date(epoch_day: i64) -> (i64, i64, i64) {
-    let shifted = epoch_day + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted.rem_euclid(146_097);
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month + 2) / 5 + 1;
-    let month = month + if month < 10 { 3 } else { -9 };
-    (year_of_era + era * 400 + i64::from(month <= 2), month, day)
-}
-fn epoch_day(year: i64, month: i64, day: i64) -> Result<i64> {
-    if !(-999_999_999..=999_999_999).contains(&year) { return Err(overflow()); }
-    let year = year - i64::from(month <= 2);
-    let era = year.div_euclid(400);
-    let year_of_era = year.rem_euclid(400);
-    let month = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month + 2) / 5 + day - 1;
-    Ok(era * 146_097 + year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year - 719_468)
+    let offset = zone.offset_for_local(local_seconds, Some(rtdb_types::FixedOffset::from_seconds(preferred_offset)?))?;
+    local_seconds.checked_sub(i64::from(offset.seconds())).ok_or_else(overflow)
 }
 fn calendar_days(day: i64, parts: IntervalParts, sign: i64) -> Result<i64> {
-    let (year, month, old_day) = civil_date(day);
-    let total_months = year * 12 + month - 1 + i64::from(parts.months) * sign;
-    let (year, month) = (total_months.div_euclid(12), total_months.rem_euclid(12) + 1);
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let maximum = match month { 2 => if leap { 29 } else { 28 }, 4 | 6 | 9 | 11 => 30, _ => 31 };
-    let result = epoch_day(year, month, old_day.min(maximum))?.checked_add(i64::from(parts.days) * sign).ok_or_else(overflow)?;
-    let (year, _, _) = civil_date(result);
-    if !(-999_999_999..=999_999_999).contains(&year) { return Err(overflow()); }
-    Ok(result)
+    Ok(rtdb_types::CivilDate::from_epoch_day(day)?.plus_months(i64::from(parts.months) * sign)?.plus_days(i64::from(parts.days) * sign)?.epoch_day())
 }
 fn calendar_units(value: i64, unit: TimeUnit, parts: IntervalParts, sign: i64) -> Result<i64> {
     if parts.months == 0 && parts.days == 0 { return Ok(value); }
@@ -127,7 +88,7 @@ fn calendar_units(value: i64, unit: TimeUnit, parts: IntervalParts, sign: i64) -
 fn add_interval(value: &Value, parts: IntervalParts, result: &ScalarType, sign: i64) -> Result<Value> {
     if matches!(result, ScalarType::DateDay | ScalarType::DateMilli) {
         let days = calendar_days(date_days(value).ok_or_else(|| inapplicable("interval arithmetic", &[value]))?, parts, sign)?;
-        return Ok(if *result == ScalarType::DateDay { Value::DateDay(i32::try_from(days).map_err(|_| overflow())?) } else { Value::DateMilli(days.checked_mul(86_400_000).ok_or_else(overflow)?) });
+        return Ok(Value::calendar_date(rtdb_types::CivilDate::from_epoch_day(days)?, if *result == ScalarType::DateDay { rtdb_types::DateUnit::Day } else { rtdb_types::DateUnit::Millisecond }));
     }
     let ScalarType::Timestamp { unit, timezone } = result else { return Err(inapplicable("interval arithmetic", &[value])); };
     let value = timestamp_units(value, *unit, false, "UTC")?;

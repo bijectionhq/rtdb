@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_value};
-use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogRuntime, CatalogUser, CatalogUsers, Statement};
+use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows, CatalogRuntime, CatalogUser, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_types::{Anomaly, Result, TableRef, Value};
 use tokio_util::sync::CancellationToken;
@@ -41,8 +41,7 @@ impl CatalogRuntime for NodeCatalogRuntime {
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let context = QueryContext::with_owner(catalog, Arc::clone(self.node.memory()), self.node.now(), "UTC", QueryOptions::default(), &self.cancellation, self.node.cancellation())?;
         let prepared = rtdb_sql::prepare("SELECT \"user\", \"role\" FROM xt.role_membership", &context.catalog, &Default::default())?;
-        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::fault("rtdb.node/role-query", "Role membership scan produced no query")); };
-        let mut cursor = PreparedQuery::new(relation)?.execute(context, Vec::new())?;
+        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, Vec::new()).await?;
         let mut rows = Vec::new();
         let mut reservations = Vec::<Arc<MemoryReservation>>::new();
         while let Some(batch) = cursor.next_batch().await? {

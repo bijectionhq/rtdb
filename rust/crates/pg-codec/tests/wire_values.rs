@@ -151,6 +151,25 @@ fn local_time_date_only_timestamps_and_region_offsets_follow_sql_timestamp_parse
 }
 
 #[test]
+fn protocol_calendar_values_cover_wide_dates_and_future_region_rules() {
+    let day = rtdb_types::CivilDate::from_ymd(280_000,7,1).unwrap().epoch_day();
+    let value = read_text(1184,"280000-07-01T00:00[Europe/Paris]").unwrap();
+    assert_eq!(value,Value::Timestamp { value: day * 86_400_000_000 - 7_200_000_000,unit: TimeUnit::Microsecond,timezone: Some("Europe/Paris".into()) });
+    assert_eq!(output(PgType::TimestampTz,Format::Text,&value),b"+280000-07-01 00:00:00+02:00");
+    for days in [i32::MIN,i32::MAX] {
+        let text = rtdb_types::CivilDate::from_epoch_day(i64::from(days)).unwrap().to_string();
+        assert_eq!(output(PgType::Date,Format::Text,&Value::DateDay(days)),text.as_bytes());
+        assert_eq!(read_text(1082,&text).unwrap(),Value::DateDay(days));
+    }
+    let date = rtdb_types::CivilDate::from_ymd(999_999_999,1,1).unwrap();
+    let mut value = read_text(1082,&date.to_string()).unwrap();
+    assert_eq!(value,Value::calendar_date(date,rtdb_types::DateUnit::Day));
+    assert!(encode_value(PgType::Date,Format::Text,&value,&SessionEnvironment::default()).is_err());
+    rtdb_columnar::admit_execution_value(&mut value);
+    assert_eq!(value,Value::DateDay(date.epoch_day() as i32));
+}
+
+#[test]
 fn interval_and_oid_binary_output_follow_the_pinned_textual_writers() {
     let interval = Value::IntervalMonthDayNano { months: 14, days: 3, nanoseconds: 1_000_000_999 };
     for format in [Format::Text, Format::Binary] {
@@ -185,6 +204,7 @@ fn json_keeps_large_integer_and_decimal_digits_and_jsonb_requires_version_one() 
 
 #[test]
 fn java_float_text_thresholds_and_subnormal_digits_are_preserved() {
+    assert_eq!(output(PgType::Float8, Format::Text, &Value::F64(f64::from_bits(2))), b"9.9E-324");
     for (value, expected) in [(0.001, "0.001"), (0.0001, "1.0E-4"), (10_000_000.0, "1.0E7"), (-0.0, "-0.0"), (f64::from_bits(1), "4.9E-324")] {
         assert_eq!(output(PgType::Float8, Format::Text, &Value::F64(value)), expected.as_bytes());
     }

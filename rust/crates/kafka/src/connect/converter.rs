@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use rtdb_types::{DecimalValue, Result, TimeUnit, Value};
-use serde_json::Value as Json;
+use super::json_value::JsonValue as Json;
 use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error};
 
 pub(super) fn open(spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>> {
@@ -15,7 +15,7 @@ pub(super) fn open(spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>
             if let Some(size) = spec.options.get("schemas.cache.size") { if size.parse::<i32>().map_err(|cause| error("invalid-plugin-config", cause))? < 0 { return Err(error("invalid-plugin-config", "schemas.cache.size is negative")); } }
             let enabled = option_bool(&spec.options, "schemas.enable", true)?;
             let replace = option_bool(&spec.options, "replace.null.with.default", true)?;
-            let schema = if enabled { spec.options.get("schema.content").map(|text| serde_json::from_str::<Json>(text).map_err(|cause| error("invalid-plugin-config", cause)).and_then(|json| schema(&json, replace, 0, &mut DecodeBudget::new(text.len())?))).transpose()?.flatten() } else { None };
+            let schema = if enabled { spec.options.get("schema.content").map(|text| Json::from_str(text).map_err(|cause| error("invalid-plugin-config", cause)).and_then(|json| schema(&json, replace, 0, &mut DecodeBudget::new(text.len())?))).transpose()?.flatten() } else { None };
             Ok(Box::new(JsonConverter { enabled, replace, schema }))
         }
         class if matches!(class, "org.apache.kafka.connect.storage.StringConverter" | "org.apache.kafka.connect.converters.ByteArrayConverter" | "org.apache.kafka.connect.converters.BooleanConverter" | "org.apache.kafka.connect.converters.ShortConverter" | "org.apache.kafka.connect.converters.IntegerConverter" | "org.apache.kafka.connect.converters.LongConverter" | "org.apache.kafka.connect.converters.FloatConverter" | "org.apache.kafka.connect.converters.DoubleConverter") => {
@@ -79,11 +79,11 @@ impl Converter for JsonConverter {
         let mut budget = DecodeBudget::new(bytes.len())?;
         context.reserve(budget.remaining)?;
         budget.claim(bytes.len().saturating_mul(64))?;
-        let json: Json = serde_json::from_slice(bytes).map_err(|cause| error("conversion-error", cause))?;
+        let json = Json::from_slice(bytes).map_err(|cause| error("conversion-error", cause))?;
         let (schema, value) = if let Some(schema) = &self.schema { (Some(Arc::clone(schema)), &json) }
         else if self.enabled {
-            let object = json.as_object().filter(|object| object.len() == 2 && object.contains_key("schema") && object.contains_key("payload")).ok_or_else(|| error("conversion-error", "JsonConverter requires exactly schema and payload fields"))?;
-            (schema(&object["schema"], self.replace, 0, &mut budget)?, &object["payload"])
+            json.as_object().filter(|object| object.len() == 2 && json.get("schema").is_some() && json.get("payload").is_some()).ok_or_else(|| error("conversion-error", "JsonConverter requires exactly schema and payload fields"))?;
+            (schema(json.get("schema").expect("validated envelope"), self.replace, 0, &mut budget)?, json.get("payload").expect("validated envelope"))
         } else { (None, &json) };
         let value = convert_budget(&schema, value, self.replace, 0, &mut budget)?;
         Ok(ConnectData { schema, value })
@@ -113,11 +113,11 @@ fn schema(json: &Json, replace: bool, depth: usize, budget: &mut DecodeBudget) -
     result.optional = json.get("optional").and_then(Json::as_bool).unwrap_or(false);
     result.name = json.get("name").and_then(Json::as_str).map(str::to_owned);
     result.doc = json.get("doc").and_then(Json::as_str).map(str::to_owned);
-    result.version = json.get("version").and_then(Json::as_i64).map(|number| number as i32);
+    result.version = json.get("version").filter(|value| value.is_integral()).and_then(Json::int_value);
     if let Some(parameters) = json.get("parameters").and_then(Json::as_object) {
         result.parameters = parameters.iter().map(|(key, value)| Ok((key.clone(), value.as_str().ok_or_else(|| error("conversion-error", "Schema parameter must be a string"))?.to_owned()))).collect::<Result<_>>()?;
     }
-    if let Some(default) = json.get("default") { result.default = Some(convert_budget(&Some(Arc::new(result.clone())), default, replace, depth + 1, budget)?); }
+    if let Some(default) = json.get("default") { result.default = Some(convert_budget(&Some(Arc::new(result.clone())), default, replace, depth + 1, budget)?).filter(|value| *value != Value::Null); }
     Ok(Some(Arc::new(result)))
 }
 fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: bool, depth: usize, budget: &mut DecodeBudget) -> Result<Value> {
@@ -129,30 +129,31 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
     if depth > 128 { return Err(error("conversion-error", "Connect value nesting limit exceeded")); }
     if json.is_null() {
         if let Some(schema) = schema {
-            if replace { if let Some(default) = &schema.default { budget.claim(default.retained_bytes()?)?; return Ok(default.clone()); } }
+            if replace { if let Some(default) = schema.default_value() { budget.claim(default.retained_bytes()?)?; return Ok(default.clone()); } }
             if !schema.optional { return Err(error("conversion-error", "Null for required Connect field")); }
         }
         return Ok(Value::Null);
     }
     if let Some(name) = schema.as_ref().and_then(|schema| schema.name.as_deref()) {
-        let integer = || json.as_i64().ok_or_else(|| error("conversion-error", "Logical temporal value must be an integer"));
+        let integer = || if json.is_integral() { Ok(json.long_value().expect("integral number")) } else { Err(error("conversion-error", "Logical temporal value must be an integer")) };
+        let int = || if json.is_int() { Ok(json.int_value().expect("IntNode number")) } else { Err(error("conversion-error", "Logical Date and Time require an IntNode")) };
         match name {
             "org.apache.kafka.connect.data.Timestamp" => return Ok(Value::Timestamp { value: integer()?, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }),
-            "org.apache.kafka.connect.data.Date" => return Ok(Value::DateDay(i32::try_from(integer()?).map_err(|cause| error("conversion-error", cause))?)),
-            "org.apache.kafka.connect.data.Time" => { let value = integer()?; if !(0..86_400_000).contains(&value) { return Err(error("conversion-error", "Time is outside one day")); } return Ok(Value::Time { value, unit: TimeUnit::Millisecond, bit_width: 32 }); }
+            "org.apache.kafka.connect.data.Date" => return Ok(Value::Timestamp { value: i64::from(int()?) * 86_400_000, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }),
+            "org.apache.kafka.connect.data.Time" => { let value = i64::from(int()?); if !(0..=86_400_000).contains(&value) { return Err(error("conversion-error", "Time is outside one day")); } return Ok(Value::Timestamp { value, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }); }
             "org.apache.kafka.connect.data.Decimal" => return decimal(json, schema.as_ref().expect("logical schema")),
             _ => (),
         }
     }
     if let Some(text) = json.as_str() { budget.claim(text.len().saturating_mul(2))?; }
     let kind = schema.as_ref().map(|schema| &schema.kind);
-    let integral = || json.as_i64().or_else(|| json.as_u64().map(|value| value as i64)).unwrap_or_else(|| json.as_f64().unwrap_or(0.0) as i64);
-    let int32 = || json.as_i64().map(|value| value as i32).or_else(|| json.as_u64().map(|value| value as i32)).unwrap_or_else(|| json.as_f64().unwrap_or(0.0) as i32);
+    let integral = || json.long_value().unwrap_or(0);
+    let int32 = || json.int_value().unwrap_or(0);
     Ok(match kind {
         Some(SchemaKind::Bool) => Value::Bool(json.as_bool().unwrap_or(false)),
         Some(SchemaKind::I8) => Value::I8(int32() as i8), Some(SchemaKind::I16) => Value::I16(int32() as i16),
         Some(SchemaKind::I32) => Value::I32(int32()), Some(SchemaKind::I64) => Value::I64(integral()),
-        Some(SchemaKind::F32) => Value::F32(json.as_f64().unwrap_or(0.0) as f32), Some(SchemaKind::F64) => Value::F64(json.as_f64().unwrap_or(0.0)),
+        Some(SchemaKind::F32) => Value::F32(json.float_value().unwrap_or(0.0)), Some(SchemaKind::F64) => Value::F64(json.double_value().unwrap_or(0.0)),
         Some(SchemaKind::String) => json.as_str().map(|value| Value::Utf8(value.into())).unwrap_or(Value::Null),
         Some(SchemaKind::Bytes) => Value::Binary(STANDARD.decode(json.as_str().ok_or_else(|| error("conversion-error", "Bytes must be base64 text"))?).map_err(|cause| error("conversion-error", cause))?),
         Some(SchemaKind::Struct(fields)) => {
@@ -183,8 +184,8 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
         }
         Some(SchemaKind::Reference(_)) => unreachable!("schema references resolve before conversion"),
         None => match json {
-            Json::Null => Value::Null, Json::Bool(value) => Value::Bool(*value), Json::String(value) => Value::Utf8(value.clone()),
-            Json::Number(value) => if value.is_i64() || value.is_u64() { Value::I64(value.as_i64().unwrap_or_else(|| value.as_u64().unwrap_or_default() as i64)) } else { Value::F64(value.as_f64().ok_or_else(|| error("conversion-error", "Invalid number"))?) },
+            Json::Null => Value::Null, Json::Boolean(value) => Value::Bool(*value), Json::String(value) => Value::Utf8(value.clone()),
+            Json::Number(_) | Json::Decimal(_) => if json.is_integral() { Value::I64(integral()) } else { Value::F64(json.double_value().ok_or_else(|| error("conversion-error", "Invalid number"))?) },
             Json::Array(values) => Value::List(values.iter().map(|value| convert_budget(&None, value, replace, depth + 1, budget)).collect::<Result<_>>()?),
             Json::Object(values) => Value::Map { entries: values.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), convert_budget(&None, value, replace, depth + 1, budget)?))).collect::<Result<_>>()?, sorted: false },
         },
@@ -193,7 +194,7 @@ fn convert_budget(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: boo
 fn decimal(json: &Json, schema: &ConnectSchema) -> Result<Value> {
     use std::str::FromStr;
     let (coefficient, scale) = if json.is_number() {
-        bigdecimal::BigDecimal::from_str(&json.to_string()).map_err(|cause| error("conversion-error", cause))?.as_bigint_and_exponent()
+        bigdecimal::BigDecimal::from_str(&json.number_text().expect("numeric value")).map_err(|cause| error("conversion-error", cause))?.as_bigint_and_exponent()
     } else {
         let scale = schema.parameters.get("scale").ok_or_else(|| error("conversion-error", "Decimal schema has no scale"))?.parse::<i64>().map_err(|cause| error("conversion-error", cause))?;
         let bytes = STANDARD.decode(json.as_str().ok_or_else(|| error("conversion-error", "Decimal must be numeric or base64"))?).map_err(|cause| error("conversion-error", cause))?;
@@ -216,12 +217,12 @@ impl DecodeBudget {
     fn claim(&mut self, bytes: usize) -> Result<()> { self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| error("batch-too-large", "Connect decoded allocation exceeds its reserved bound"))?; Ok(()) }
 }
 pub(super) fn convert(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: bool, depth: usize) -> Result<Value> {
-    let encoded = serde_json::to_vec(json).map_err(|cause| error("conversion-error", cause))?;
+    let encoded = json.to_vec().map_err(|cause| error("conversion-error", cause))?;
     convert_budget(schema, json, replace, depth, &mut DecodeBudget::new(encoded.len())?)
 }
 
 pub(super) fn parse_schema(json: &Json) -> Result<Option<Arc<ConnectSchema>>> {
-    let bytes = serde_json::to_vec(json).map_err(|cause| error("conversion-error", cause))?;
+    let bytes = json.to_vec().map_err(|cause| error("conversion-error", cause))?;
     schema(json, true, 0, &mut DecodeBudget::new(bytes.len())?)
 }
 pub(super) fn convert_registry(schema: &Arc<ConnectSchema>, json: &Json, limit: usize) -> Result<Value> {
@@ -235,7 +236,7 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
     if depth > 128 { return Err(error("conversion-error", "Registry value nesting limit exceeded")); }
     budget.claim(512)?;
     let Some(json) = json else {
-        if let Some(default) = &schema.default { budget.claim(default.retained_bytes()?)?; return Ok(default.clone()); }
+        if let Some(default) = schema.default_value() { budget.claim(default.retained_bytes()?)?; return Ok(default.clone()); }
         return Ok(Value::Null);
     };
     if json.is_null() { return convert_budget(&Some(Arc::clone(schema)), json, true, depth, budget); }
@@ -246,7 +247,7 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
                 if matches!(field.schema.kind, SchemaKind::Reference(_)) { budget.claim(field.schema.view_allocation_bound())?; }
                 let member = field.schema.resolved();
                 let primitive = match &member.kind {
-                    SchemaKind::Bool => json.is_boolean(), SchemaKind::I8 | SchemaKind::I16 | SchemaKind::I32 | SchemaKind::I64 => json.is_i64() || json.is_u64(),
+                    SchemaKind::Bool => json.is_boolean(), SchemaKind::I8 | SchemaKind::I16 | SchemaKind::I32 | SchemaKind::I64 => json.is_integral(),
                     SchemaKind::F32 | SchemaKind::F64 => json.is_number(), SchemaKind::String => json.is_string(), SchemaKind::Bytes => false,
                     SchemaKind::Array(_) | SchemaKind::ArrayOfNull => json.is_array(), SchemaKind::Map(_, _) | SchemaKind::MapWithNullValues(_) | SchemaKind::MapOfNull => json.is_object() || json.is_array(), SchemaKind::Struct(_) | SchemaKind::Reference(_) => false,
                 };
@@ -270,7 +271,7 @@ fn registry_value(schema: &Arc<ConnectSchema>, json: Option<&Json>, depth: usize
                 json.as_object().ok_or_else(|| error("conversion-error", "Connect map payload must be an object"))?.iter().map(|(name, json)| { budget.claim(name.len().saturating_add(512))?; Ok((Value::Utf8(name.clone()), registry_value(value, Some(json), depth + 1, budget)?)) }).collect::<Result<_>>()?
             } else {
                 json.as_array().ok_or_else(|| error("conversion-error", "Connect map payload must be an array of entry objects"))?.iter().map(|entry| {
-                    let entry = entry.as_object().filter(|entry| entry.len() == 2).ok_or_else(|| error("conversion-error", "Map entry must be an object with key and value"))?;
+                    entry.as_object().filter(|entry| entry.len() == 2).ok_or_else(|| error("conversion-error", "Map entry must be an object with key and value"))?;
                     Ok((registry_value(key, entry.get("key"), depth + 1, budget)?, registry_value(value, entry.get("value"), depth + 1, budget)?))
                 }).collect::<Result<_>>()?
             }; Ok(Value::Map { entries, sorted: false })
@@ -282,8 +283,8 @@ fn matching_struct_fields(schema: &ConnectSchema, json: &Json, depth: usize, bud
     if depth > 128 { return Err(error("conversion-error", "Registry value nesting limit exceeded")); }
     if matches!(schema.kind, SchemaKind::Reference(_)) { budget.claim(schema.view_allocation_bound())?; }
     let schema = schema.resolved();
-    let (SchemaKind::Struct(fields), Some(object)) = (&schema.kind, json.as_object()) else { return Ok(0); };
-    fields.iter().try_fold(0usize, |matched, field| match object.get(&field.name) {
+    let (SchemaKind::Struct(fields), Some(_)) = (&schema.kind, json.as_object()) else { return Ok(0); };
+    fields.iter().try_fold(0usize, |matched, field| match json.get(&field.name) {
         Some(value) => {
             let nested = matching_struct_fields(&field.schema, value, depth + 1, budget)?;
             matched.checked_add(1).and_then(|matched| matched.checked_add(nested)).ok_or_else(|| error("allocation-overflow", "Union match count exceeds range"))

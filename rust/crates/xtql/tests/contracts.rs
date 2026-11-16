@@ -141,7 +141,7 @@ fn embedded_compilation_uses_callers_column_and_apply_parameter_allocators() {
     let before = binder.field("before",None,LogicalType::Scalar(ScalarType::I64)).unwrap();
     let mut next_parameter = 100;
     let query = rtdb_xtql::parse_query(&rtdb_xtql::read("(fn [wanted] (-> (rel [{:a wanted}] [a]) (with {:result (q [(fn [inner] (rel [{:result inner}] [result])) a])})))").unwrap()).unwrap();
-    let relation = rtdb_xtql::compile_query(&query,&FixtureCatalog,&mut binder,&mut next_parameter,&[(7,LogicalType::Scalar(ScalarType::I64))]).unwrap();
+    let relation = rtdb_xtql::compile_query(&query,&FixtureCatalog,&mut binder,&mut next_parameter,&[(7,LogicalType::Scalar(ScalarType::I64))],"UTC").unwrap();
     assert_eq!(relation.parameter_count(),8);
     assert_eq!(next_parameter,101);
     assert!(relation.schema().fields().iter().all(|field| field.id.0>before.id.0));

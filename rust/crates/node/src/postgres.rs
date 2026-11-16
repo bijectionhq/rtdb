@@ -49,7 +49,7 @@ impl PostgresSourceFactory {
 #[async_trait]
 impl ExternalSourceFactory for PostgresSourceFactory {
     fn validate(&self, configuration: &Any) -> Result<()> { self.configuration(configuration).map(|_| ()) }
-    async fn open(&self, configuration: &Any, database: &str) -> Result<Box<dyn ExternalSource>> {
+    async fn open(&self, configuration: &Any, database: &str, _: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>> {
         let configuration_charge = self.memory.reserve(configuration.value.len().checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(allocation_overflow)?)?;
         let source = self.configuration(configuration)?;
         let remote = self.remotes.get(&source.remote).ok_or_else(|| invalid("PostgreSQL remote is absent"))?;

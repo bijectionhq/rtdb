@@ -89,8 +89,9 @@ pub(crate) fn open(session: &Arc<SessionHandle>, token: CancellationToken, reque
 fn matches_pattern(value: &str, pattern: Option<&str>, context: &rtdb_query::QueryContext) -> Result<bool> {
     let Some(pattern) = pattern else { return Ok(true); };
     let _scratch = context.memory.reserve(crate::add(65_536, crate::mul(crate::add(value.len(), pattern.len())?, 256)?)?)?;
+    let scope = rtdb_expr::EvaluationScope::new(&context.memory)?;
     let expr = Expr::Like { expr: Box::new(Expr::Literal(Value::Utf8(value.into()))), pattern: Box::new(Expr::Literal(Value::Utf8(pattern.into()))), escape: Some('\\'), case_insensitive: false, negated: false };
-    Ok(evaluate(&expr, &Default::default(), &[], &EvalContext { parameters: &[], current_time: context.current_time, timezone: &context.timezone, outer_rows: &[] })? == Value::Bool(true))
+    Ok(evaluate(&expr, &Default::default(), &[], &EvalContext { parameters: &[], parameter_types: None, current_time: context.current_time, timezone: &context.timezone, outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: Some(&context.catalog) })? == Value::Bool(true))
 }
 fn object<const N: usize>(entries: [(&str, Value); N]) -> Value { Value::Struct(entries.into_iter().map(|(key, value)| (key.into(), value)).collect()) }
 fn list(name: &str, children: Vec<Field>) -> Field { Field::new(name, DataType::List(Arc::new(Field::new("item", DataType::Struct(children.into()), true))), true) }

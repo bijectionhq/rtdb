@@ -1,95 +1,211 @@
 use std::sync::Arc;
-
 use async_trait::async_trait;
-use rtdb_expr::is_true;
-use rtdb_plan::{Expr, JoinKind, Schema};
-use rtdb_types::{Result, Value};
+use rtdb_expr::{ExpressionInvocation,is_true};
+use rtdb_plan::{JoinKind,Relation,RelationNode};
+use rtdb_types::{Result,Value};
+use crate::{context::Execution,cursor::OwnedRow,join_key::{JoinInput,JoinLayout},join_storage::{BuildAccumulator,BuildInput,BuildTable,HashedPage,PartitionSpool},operators::DeferredInput,pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor},pushdown::PushdownBuilder,invalid};
 
-use crate::context::Execution;
-use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
-use crate::operators::OrdinalSet;
-use crate::spill::SpillReader;
-use crate::invalid;
-
+enum Phase {
+    Build { input: BoxPageCursor,probe: DeferredInput },
+    Memory { table: BuildTable,probe: BoxPageCursor,_build: BoxPageCursor },
+    Disk { build: PartitionSpool,probe: PartitionSpool,table: Option<BuildTable>,build_part: usize,probe_part: usize,_build_input: BoxPageCursor,_probe_input: BoxPageCursor },
+    Done,
+}
 pub(crate) struct JoinCursor {
-    left: Option<BoxCursor>, right: Option<BoxCursor>, reader: Option<SpillReader>,
-    current: Option<OwnedRow>, matched: bool, ordinal: u64, unmatched_phase: bool,
-    matched_right: OrdinalSet, left_width: usize, right_width: usize,
-    schema: Schema, kind: JoinKind, condition: Option<Expr>, execution: Execution,
+    phase: Phase,plan: JoinPlan,
 }
+struct JoinPlan { layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution }
 impl JoinCursor {
-    pub fn new(left: BoxCursor, right: BoxCursor, left_schema: Schema, right_schema: Schema, kind: JoinKind, condition: Option<Expr>, execution: Execution) -> Result<Self> {
-        Ok(Self { left: Some(left), right: Some(right), reader: None, current: None, matched: false, ordinal: 0, unmatched_phase: false,
-            matched_right: OrdinalSet::new(&execution.context)?, left_width: left_schema.len(), right_width: right_schema.len(),
-            schema: left_schema.concat(&right_schema)?, kind, condition, execution })
-    }
-    fn next_ordinal(&mut self) -> Result<u64> {
-        let ordinal = self.ordinal;
-        self.ordinal = self.ordinal.checked_add(1).ok_or_else(|| invalid("row-count", "Join row count overflow"))?;
-        Ok(ordinal)
+    pub fn new(build: BoxPageCursor,probe: DeferredInput,mut layout: JoinLayout,build_left: bool,kind: JoinKind,execution: Execution) -> Result<Self> {
+        if kind == JoinKind::Cross { return Err(invalid("join-kind","Cross join requires its page-pair cursor")); }
+        if kind == JoinKind::Full || kind == JoinKind::Left && !build_left || kind == JoinKind::Right && build_left { layout.with_null_build(build_left)?; }
+        Ok(Self { phase: Phase::Build { input: build,probe },plan: JoinPlan { layout,build_left,kind,execution } })
     }
 }
-#[async_trait]
-impl RowCursor for JoinCursor {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
-        if let Some(mut right) = self.right.take() {
-            let mut writer = self.execution.context.spill.create()?;
-            while let Some(row) = right.next().await? {
-                self.execution.context.check_cancelled()?;
-                writer.write(&row.values, &self.execution.context.memory)?;
-            }
-            self.reader = Some(writer.finish()?.reader(Arc::clone(&self.execution.context.memory))?);
-        }
-        loop {
-            self.execution.context.check_cancelled()?;
-            if self.unmatched_phase {
-                let Some(right) = self.reader.as_mut().ok_or_else(|| invalid("join-state", "Right input is not spooled"))?.next()? else { return Ok(None); };
-                let ordinal = self.next_ordinal()?;
-                if self.matched_right.contains(ordinal)? { continue; }
-                let values = (0..self.left_width).map(|_| Value::Null).chain(right.values.iter().cloned()).collect();
-                return OwnedRow::new(values, &self.execution.context.memory).map(Some);
-            }
-            if self.current.is_none() {
-                let next = match &mut self.left { Some(left) => left.next().await?, None => None };
-                let Some(left) = next else {
-                    self.left = None;
-                    if !matches!(self.kind, JoinKind::Right | JoinKind::Full) { return Ok(None); }
-                    self.unmatched_phase = true;
-                    self.ordinal = 0;
-                    self.reader.as_mut().ok_or_else(|| invalid("join-state", "Right input is not spooled"))?.rewind()?;
+impl JoinPlan {
+    fn build_layout(&self) -> &JoinInput { if self.build_left { &self.layout.left } else { &self.layout.right } }
+    fn probe_layout(&self) -> &JoinInput { if self.build_left { &self.layout.right } else { &self.layout.left } }
+    fn track_build(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && self.build_left || self.kind == JoinKind::Right && !self.build_left }
+    fn preserve_probe(&self) -> bool { self.kind == JoinKind::Full || self.kind == JoinKind::Left && !self.build_left || self.kind == JoinKind::Right && self.build_left }
+    fn blooms(&self) -> bool { matches!(self.kind,JoinKind::Inner | JoinKind::Semi) || self.track_build() && self.kind != JoinKind::Full }
+    fn joined(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
+        let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
+        OwnedRow::copy_parts(&[&left.values,&right.values],0,0,&self.execution.context.memory)
+    }
+    fn unmatched(&self,row: &OwnedRow,left: bool) -> Result<OwnedRow> {
+        let input = if left { &self.layout.left } else { &self.layout.right };
+        OwnedRow::copy_parts(&[input.output(row)],if left { 0 } else { self.layout.left.original.len() },if left { self.layout.right.original.len() } else { 0 },&self.execution.context.memory)
+    }
+    fn output(&self,build: &OwnedRow,probe: &OwnedRow) -> Result<OwnedRow> {
+        let (left,right) = if self.build_left { (build,probe) } else { (probe,build) };
+        OwnedRow::copy_parts(&[self.layout.left.output(left),self.layout.right.output(right)],0,0,&self.execution.context.memory)
+    }
+    fn probe_output(&self,probe: &OwnedRow) -> Result<OwnedRow> {
+        OwnedRow::copy_parts(&[self.probe_layout().output(probe)],0,0,&self.execution.context.memory)
+    }
+    async fn accepted(&self,comparisons: &[ExpressionInvocation<'_>],build: &OwnedRow,probe: &OwnedRow) -> Result<bool> {
+        if comparisons.is_empty() { return Ok(true); }
+        let joined = self.joined(build,probe)?;
+        let mut unknown = false;
+        for (index,comparison) in comparisons.iter().enumerate() {
+            if self.preserve_probe() && index < self.build_layout().key_count() {
+                let build_null = matches!(self.build_layout().key(build,index)?,Value::Null | Value::Undefined);
+                let probe_null = matches!(self.probe_layout().key(probe,index)?,Value::Null | Value::Undefined);
+                if build_null || probe_null {
+                    if build_null != probe_null { return Ok(false); }
                     continue;
-                };
-                self.current = Some(left);
-                self.matched = false;
-                self.ordinal = 0;
-                self.reader.as_mut().ok_or_else(|| invalid("join-state", "Right input is not spooled"))?.rewind()?;
-            }
-            let right = self.reader.as_mut().ok_or_else(|| invalid("join-state", "Right input is not spooled"))?.next()?;
-            if let Some(right) = right {
-                let ordinal = self.next_ordinal()?;
-                let left = self.current.as_ref().ok_or_else(|| invalid("join-state", "Left input is absent"))?;
-                let values: Vec<_> = left.values.iter().chain(&right.values).cloned().collect();
-                let joined = OwnedRow::new(values, &self.execution.context.memory)?;
-                let matched = self.condition.as_ref().map(|condition| is_true(&self.execution.evaluate(condition, &self.schema, &joined.values)?)).transpose()?.unwrap_or(true);
-                if !matched { continue; }
-                self.matched = true;
-                if matches!(self.kind, JoinKind::Right | JoinKind::Full) { self.matched_right.insert(ordinal)?; }
-                match self.kind {
-                    JoinKind::Semi => return Ok(self.current.take()),
-                    JoinKind::Anti => { self.current = None; continue; }
-                    _ => return Ok(Some(joined)),
                 }
             }
-            let left = self.current.take().ok_or_else(|| invalid("join-state", "Left input is absent"))?;
-            if self.matched { continue; }
-            match self.kind {
-                JoinKind::Anti => return Ok(Some(left)),
-                JoinKind::Left | JoinKind::Full => {
-                    let values = left.values.iter().cloned().chain((0..self.right_width).map(|_| Value::Null)).collect();
-                    return OwnedRow::new(values, &self.execution.context.memory).map(Some);
+            let scope = self.execution.scope()?;
+            let value = self.execution.evaluate_invocation(&scope,comparison,&joined.values).await?;
+            if matches!(value,Value::Null | Value::Undefined) { unknown = true; }
+            else if !is_true(&value)? { return Ok(false); }
+        }
+        Ok(!unknown)
+    }
+    async fn probe_page(&self,table: &mut BuildTable,probe_page: OwnedPage) -> Result<OwnedPage> {
+        let metadata = self.execution.scope()?;
+        metadata.reserve(self.layout.comparisons.len().checked_mul(std::mem::size_of::<ExpressionInvocation<'_>>()).ok_or_else(size_error)?)?;
+        let mut comparisons = Vec::with_capacity(self.layout.comparisons.len());
+        for (index,expression) in self.layout.comparisons.iter().enumerate() {
+            let schema = if index < self.build_layout().key_count() { &self.layout.schema } else { &self.layout.theta_schema };
+            comparisons.push(self.execution.prepare_expression(expression,schema,&metadata)?);
+        }
+        let mut output = PageBuilder::new(0,&self.execution.context.memory)?;
+        let _hash_scratch = self.execution.context.memory.reserve(4096)?;
+        let BuildTable { rows,index,unmatched,.. } = table;
+        for probe in probe_page.rows() {
+            self.execution.context.check_cancelled()?;
+            let mut matched = false;
+            if self.kind == JoinKind::Anti {
+                for build in rows.page.rows() {
+                    if self.accepted(&comparisons,build,probe).await? { matched = true;break; }
                 }
-                _ => {}
+            } else {
+                for build_index in index.candidates(self.probe_layout().hash(probe)?) {
+                    let build = &rows.page.rows()[build_index];
+                    if !self.accepted(&comparisons,build,probe).await? { continue; }
+                    matched = true;
+                    if let Some(unmatched) = unmatched { unmatched[build_index] = 0; }
+                    if self.kind == JoinKind::Semi { break; }
+                    append(&mut output,self.output(build,probe)?,&self.execution)?;
+                }
+            }
+            if self.kind == JoinKind::Semi && matched || self.kind == JoinKind::Anti && !matched {
+                append(&mut output,self.probe_output(probe)?,&self.execution)?;
+            } else if !matched && self.preserve_probe() {
+                append(&mut output,self.unmatched(probe,!self.build_left)?,&self.execution)?;
+            }
+        }
+        Ok(output.finish())
+    }
+    fn unmatched_page(&self,table: &BuildTable) -> Result<Option<OwnedPage>> {
+        let mut output = PageBuilder::new(0,&self.execution.context.memory)?;
+        for index in table.unmatched() {
+            self.execution.context.check_cancelled()?;
+            append(&mut output,self.unmatched(&table.rows.page.rows()[index],self.build_left)?,&self.execution)?;
+        }
+        Ok((output.len() > 0).then(||output.finish()))
+    }
+}
+
+fn append(page: &mut PageBuilder,row: OwnedRow,execution: &Execution) -> Result<()> {
+    if page.len() == i32::MAX as usize { return Err(size_error()); }
+    page.push_growing(row,&execution.context.memory)
+}
+fn size_error() -> rtdb_types::Anomaly { invalid("join-size","Join output or comparator metadata exceeds supported allocation bounds") }
+
+#[async_trait]
+impl PageCursor for JoinCursor {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        let plan = &self.plan;
+        loop {
+            plan.execution.context.check_cancelled()?;
+            match std::mem::replace(&mut self.phase,Phase::Done) {
+                Phase::Build { mut input,probe } => {
+                    let mut accumulator = BuildAccumulator::new(plan.execution.context.options.join_build_rows,Arc::clone(&plan.execution.context))?;
+                    while let Some(page) = input.next_page().await? {
+                        accumulator.append(plan.build_layout().project_page(page,&plan.execution).await?)?;
+                    }
+                    match accumulator.finish()? {
+                        BuildInput::Memory(page) => {
+                            let row_count = i64::try_from(page.len()).map_err(|_|size_error())?;
+                            let table = BuildTable::new(HashedPage::new(page,|row|plan.build_layout().hash(row),&plan.execution.context.memory)?,plan.track_build(),&plan.execution.context.memory)?;
+                            let mut filters = PushdownBuilder::new(plan.layout.condition.as_ref(),&plan.build_layout().schema,&plan.probe_layout().original,row_count,plan.blooms(),&plan.execution)?;
+                            if plan.blooms() {
+                                for row in table.rows.page.rows() { filters.insert(&plan.build_layout().schema,&row.values,&plan.execution).await?; }
+                            }
+                            let filters = filters.finish(&plan.execution.context.memory)?;
+                            let probe = probe.open_pages(filters).await?;
+                            self.phase = Phase::Memory { table,probe,_build: input };
+                        }
+                        BuildInput::Spilled(blocks) => {
+                            let build = PartitionSpool::build(blocks,1,|row|plan.build_layout().hash(row),&plan.execution.context)?;
+                            let mut probe = probe.open_pages(None).await?;
+                            let mut accumulator = BuildAccumulator::new(plan.execution.context.options.join_build_rows,Arc::clone(&plan.execution.context))?;
+                            while let Some(page) = probe.next_page().await? { accumulator.append(plan.probe_layout().project_page(page,&plan.execution).await?)?; }
+                            let probe_shuffle = PartitionSpool::build(accumulator.finish_spilled()?,build.part_count(),|row|plan.probe_layout().hash(row),&plan.execution.context)?;
+                            self.phase = Phase::Disk { build,probe: probe_shuffle,table: None,build_part: 0,probe_part: 0,_build_input: input,_probe_input: probe };
+                        }
+                    }
+                }
+                Phase::Memory { mut table,mut probe,_build } => {
+                    let Some(page) = probe.next_page().await? else { return plan.unmatched_page(&table); };
+                    let page = plan.probe_layout().project_page(page,&plan.execution).await?;
+                    let output = plan.probe_page(&mut table,page).await?;
+                    self.phase = Phase::Memory { table,probe,_build };
+                    if output.len() > 0 { return Ok(Some(output)); }
+                }
+                Phase::Disk { build,probe,mut table,mut build_part,mut probe_part,_build_input,_probe_input } => {
+                    if build_part == build.part_count() { return Ok(None); }
+                    if table.is_none() { table = Some(BuildTable::new(build.load(build_part,&plan.execution.context)?,plan.track_build(),&plan.execution.context.memory)?); }
+                    let probes_per_build = probe.part_count() / build.part_count();
+                    let output = if probe_part == probes_per_build {
+                        let result = plan.unmatched_page(table.as_ref().ok_or_else(||invalid("join-state","Loaded build partition is absent"))?)?;
+                        table = None;build_part += 1;probe_part = 0;result
+                    } else {
+                        let page = probe.load(probe_part * build.part_count() + build_part,&plan.execution.context)?;
+                        let result = plan.probe_page(table.as_mut().ok_or_else(||invalid("join-state","Loaded build partition is absent"))?,page.page).await?;
+                        probe_part += 1;(result.len() > 0).then_some(result)
+                    };
+                    self.phase = Phase::Disk { build,probe,table,build_part,probe_part,_build_input,_probe_input };
+                    if output.is_some() { return Ok(output); }
+                }
+                Phase::Done => return Ok(None),
             }
         }
     }
 }
+
+pub(crate) fn build_left(left: &Relation,right: &Relation,kind: JoinKind,execution: &Execution) -> Result<bool> {
+    Ok(match kind {
+        JoinKind::Left => row_count(left,execution)? < row_count(right,execution)?,
+        JoinKind::Right => row_count(left,execution)? <= row_count(right,execution)?,
+        JoinKind::Inner | JoinKind::Full => true,
+        JoinKind::Semi | JoinKind::Anti => false,
+        JoinKind::Cross => return Err(invalid("join-kind","Cross join has no hash build side")),
+    })
+}
+fn row_count(relation: &Relation,execution: &Execution) -> Result<i64> {
+    match relation.node() {
+        RelationNode::Values { rows } => i64::try_from(rows.len()).map_err(|_|size_error()),
+        RelationNode::Scan(scan) => {
+            let partitions = &execution.context.catalog.database(&scan.table.name.database)?.partitions;
+            if partitions.is_empty() { return Ok(i64::MAX); }
+            let mut rows = 0i64;
+            for partition in partitions {
+                let Some(table) = partition.table_catalog().metadata(&scan.table.name.table) else { return Ok(i64::MAX); };
+                rows = rows.checked_add(table.row_count).ok_or_else(size_error)?;
+            }
+            Ok(rows)
+        }
+        RelationNode::Project { input,.. } | RelationNode::Rename { input,.. } | RelationNode::Filter { input,.. } => row_count(input,execution),
+        RelationNode::Reference { binding } => row_count(&binding.relation,execution),
+        RelationNode::Let { body,.. } => row_count(body,execution),
+        _ => Ok(i64::MAX),
+    }
+}
+
+#[cfg(test)]
+#[path = "join_empty_page_tests.rs"]
+mod empty_page_tests;

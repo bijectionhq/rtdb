@@ -98,7 +98,7 @@ async fn reads(node: &Node, counts: &Reads, fixture: &Fixture, request: &Request
         } }
     }
     let current = manifest["checkpoint"]["tx_key"]["system_time_micros"].as_i64().ok_or("manifest has no transaction time")?;
-    let current = chrono::DateTime::from_timestamp_micros(current).ok_or("manifest time is outside calendar range")?.to_rfc3339();
+    let current = rtdb_types::Instant::from(Timestamp(current)).to_iso_string()?;
     let query = Query { id: "current".into(), prefix: request.prefix.clone(), valid_time: current.clone(), system_time: current };
     for product in ["A", "B", "C"] { result.push(observe(node, counts, &request.prefix, "recovery", &query, product, false).await?); }
     Ok(result)

@@ -256,12 +256,11 @@ impl<'a> OpenTransaction<'a> {
     pub fn append(&mut self, table: TableRef, event: StoredEvent) -> Result<()> { self.context.check_cancelled()?; self.buffer.append(table, event) }
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
-    pub fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
+    pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
-        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
+        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
-        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/expected-query", "Expected a query statement")); };
-        PreparedQuery::new(relation)?.execute_with_text(context, arguments, Some(sql))
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute_with_text(context, arguments, Some(sql)).await
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
@@ -272,10 +271,10 @@ impl<'a> OpenTransaction<'a> {
         self.context.check_cancelled()?;
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let parameter_types = match types {
-            Some(types) => types.iter().cloned().enumerate().collect(),
-            None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
+            Some(types) => types.iter().map(rtdb_columnar::execution_type).enumerate().collect(),
+            None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
         };
-        let options = rtdb_sql::PrepareOptions { parameter_types, ..Default::default() };
+        let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let mutation = rtdb_sql::prepare_tx(sql, &context.catalog, &options)?;
         self.execute_mutation(mutation, context, arguments).await.map_err(|error| error.with_context("sql", sql.into()))
     }
@@ -287,7 +286,7 @@ impl<'a> OpenTransaction<'a> {
             Mutation::Delete { table, input } => (Some(table), input, 1),
             Mutation::Erase { table, input } => (Some(table), input, 2),
             Mutation::Assert { input, message } => {
-                let mut cursor = execute(input, context, arguments)?;
+                let mut cursor = execute(input, context, arguments).await?;
                 if cursor.next_batch().await?.is_none() { return Err(Anomaly::new(AnomalyCategory::Conflict, "xtdb/assert-failed", message.unwrap_or_else(|| "Assert failed".into()))); }
                 return Ok(());
             }
@@ -310,7 +309,7 @@ impl<'a> OpenTransaction<'a> {
         let table = table.ok_or_else(|| Anomaly::fault("rtdb.tx/mutation-table", "Mutation has no target"))?;
         if table.database != self.context.database { return Err(Anomaly::incorrect("xtdb/table-not-found", "Mutation cannot write to another database")); }
         check_table(&table.table)?;
-        let mut cursor = execute(input, context, arguments)?;
+        let mut cursor = execute(input, context, arguments).await?;
         while let Some(batch) = cursor.next_batch().await? {
             let schema = batch.batch().schema();
             let index = |name| schema.index_of(name).map_err(|error| Anomaly::fault("rtdb.tx/mutation-schema", error.to_string()));
@@ -427,12 +426,12 @@ fn db_op_bytes(operation: Option<&DbOp>) -> Result<usize> {
     encoded.checked_mul(4).and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)
 }
 
-fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<QueryCursor> {
+async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, arguments: Option<&[Value]>) -> Result<QueryCursor> {
     let count = input.parameter_count();
     if arguments.is_none() && count != 0 { return Err(Anomaly::incorrect("xtdb.indexer/missing-sql-args", "Arguments list was expected but not provided").with_context("param-count", count.into())); }
     let arguments = arguments.unwrap_or_default();
     if arguments.len() != count { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", format!("Parameter error: {} provided, {count} expected", arguments.len())).with_context("param-count", count.into()).with_context("arg-count", arguments.len().into())); }
-    PreparedQuery::new(input)?.execute(context, arguments.to_vec())
+    PreparedQuery::new(input)?.execute(context, arguments.to_vec()).await
 }
 fn check_table(table: &TableRef) -> Result<()> {
     if ["xt", "information_schema", "pg_catalog"].contains(&table.schema.as_str()) { Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}.{}", table.schema, table.table))) } else { Ok(()) }

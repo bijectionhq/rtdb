@@ -1,0 +1,49 @@
+= Native regular-expression execution
+
+`LIKE_REGEX` searches for a match, and `REGEXP_REPLACE` replaces every match using Java replacement references and the pinned PostgreSQL backslash-number conversion.
+External flags recognize `i`, `s`, and `m`; other characters are ignored, matching the pinned expression implementation.
+The SQL planner retains the pinned rejection of `REGEXP_REPLACE` start and occurrence arguments.
+
+The expression module translates Java literals, quoting, character ranges and intersections, predefined classes, supported character properties, inline flags, anchors, capture groups, backreferences, variable-length lookaround, atomic groups, and possessive quantifiers into the native matcher.
+Translation and compiled patterns are passive, per-call values.
+The caller's `EvaluationScope` owns their memory reservations and the returned replacement buffer.
+The vendored matcher enforces separate delegated-NFA, DFA-cache, backtracking-attempt and retained-branch limits.
+Pattern byte length, nesting, capture count and counted repetition also have explicit bounds.
+Replacement first counts the output bytes, reserves that size, and then writes the output.
+Lookbehind tries the nearest possible starting position first and requires the body to end at the original position.
+Successful positive lookaround commits its captures before the surrounding expression continues.
+Replacement retains the preceding match end independently of the search position used after an empty match, including for `\G` inside lookbehind.
+Numeric backreferences can precede their capture group; an unmatched or undefined group fails that matching branch.
+Case-insensitive backreferences use ASCII casing or the Unicode 16.0 simple uppercase-then-lowercase mappings selected by Java's flags.
+The Unicode tables are immutable source data and allocate no matching-time state.
+Java character names, block/script aliases and property membership use generated Unicode 16 catalogs with Java's accepted-name rules.
+Unicode case-insensitive translation preserves the different predicates used for a single literal, a multi-character literal run, a class singleton and an explicit range.
+Quote preprocessing preserves Java's treatment of letters and the first quoted digit, including quotes inside numeric escapes and property names.
+COMMENTS parsing retains non-ASCII comment terminators, distinguishes a leading class caret from one preceded by ignored text, and recognizes intersections across ignored text.
+Character ranges retain Java's legacy vertical-tab meaning for `\v` at range boundaries.
+Word boundaries include the pinned combining-mark base search, including its UTF-16 code-unit stepping around supplementary characters.
+`\X` consumes one complete extended grapheme cluster using pinned Unicode 16 classifications and Java's segmentation state transitions.
+The segmenter uses immutable generated tables and a caller-owned cursor without allocating intermediate cluster positions.
+Inline canonical-equivalence flags wrap character classes and Unicode properties in a native NFC matcher.
+That matcher tries complete and shortened grapheme prefixes in Java's order, preserves original capture text, and uses a fixed stack buffer with Unicode 16 normalization tables.
+Inline `(?c)` leaves literal runs unchanged, matching the reference compiler's ordering of whole-pattern normalization and inline-flag parsing.
+Patterns containing `\b{g}` or `\R` use a native Java node program with UTF-16 input and capture positions.
+The grapheme-boundary assertion starts segmentation from Java's last accepted position, including updates retained after failed branches and lookahead conditions.
+Compilation preserves source groups, literal runs, deterministic group repetition and the distinct greedy character-property loop.
+Failed-position caching follows the reference's eligible outer greedy loops and is disabled by capture references.
+The caller's depth and attempt limits bound the node executor, with an additional 512-frame native call ceiling.
+The evaluation scope covers its captures, locals, failure sets and UTF-16 buffers.
+Line endings try CRLF before CR and retain the shorter endpoint when the following expression fails.
+Quantifier atom acceptance controls whether that shorter endpoint remains available.
+Replacement for these node programs assembles the complete UTF-16 result before encoding UTF-8, so adjacent surrogate halves can recombine and remaining unpaired surrogates become `?`, following Java `String.getBytes(UTF_8)`.
+
+== Remaining implementation work
+
+This source wave is not a declaration of Java Pattern parity.
+Patterns using the ordinary scalar matcher still need isolated-surrogate pattern semantics and replacement advancement after an empty match before a supplementary character.
+These known cases return explicit unsupported errors where detected.
+The Java node program retains UTF-16 lookbehind edge positions and capture intervals; the ordinary scalar matcher still needs that representation.
+Remaining parser edge cases and the interaction of repeated captures with backtracking require Phase 2 differential qualification.
+
+The behavioral references are the pinned `core/src/main/clojure/xtdb/expression.clj` implementation and the https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Pattern.html[Java Pattern] and https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Matcher.html[Matcher] contracts.
+Focused native regression sources live in `rust/crates/expr/tests/java_pattern.rs`; vendored resource-patch provenance and qualification are recorded in `rust/vendor/fancy-regex/RTDB-PATCHES.adoc`.
