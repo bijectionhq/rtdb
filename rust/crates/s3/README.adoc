@@ -16,3 +16,28 @@ The caller keeps an uploaded source file immutable and alive until `put_file` re
 Source references are `modules/aws/src/main/kotlin/xtdb/aws/S3.kt`, the existing `s3.proto`, and the shared remote-storage contract.
 Rust test sources cover configuration persistence, alias isolation, endpoint addressing, secret redaction, and expiring credential refresh.
 Provider requests, emulator behavior, multipart retry comparison, and credential-chain integration have not been executed during Phase 1.
+
+== Upload and copy boundaries
+
+The pinned `RemoteBufferPool.uploadArrowFile` maps the complete file through `MemoryUtil.toMmapPath` before choosing an ordinary or multipart upload.
+That call uses the `FileChannel.map(MapMode, long, long)` overload returning a `MappedByteBuffer`, whose https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/nio/channels/FileChannel.html#map(java.nio.channels.FileChannel.MapMode,long,long)[Java 25 contract] limits the mapping to `Integer.MAX_VALUE` bytes.
+The default production Arrow-file upload therefore cannot exceed 2,147,483,647 bytes.
+Its multipart path splits on Arrow batch boundaries after at least five MiB and completes directly under the final object key.
+
+The pinned `S3.copyObject` uses one `CopyObject` request through the default `S3AsyncClient`; the factory does not enable automatic multipart transfers or construct a transfer manager.
+AWS documents the https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html[single-request copy limit] as five GB and requires `UploadPartCopy` for larger objects.
+The native `object_store` 0.13.2 `S3CopyIfNotExists::Multipart` path creates a multipart upload, copies the entire source in one part, and completes with `If-None-Match: *`.
+Its one-part copy is bounded by the https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html[S3 five-GiB part limit].
+Fresh native `put_file` publication shares that bound because its final step copies the private staging object through this path.
+This covers the pinned production Arrow-file size range; larger native file publication is not advertised here.
+
+The separately callable JVM `S3.startMultipart` surface can upload larger objects through multiple caller-supplied `ByteBuffer` parts.
+Each part remains bounded by the buffer's signed integer capacity and the provider's part rules; the current service permits at most 10,000 parts.
+The only production caller in the pinned repository is `RemoteBufferPool`; the remaining callers are test bridges and fixtures.
+The native adapter has no equivalent public begin/part/complete API, and its `put_file` publication does not establish parity for that direct JVM surface.
+The original multipart upload, abort, and upload-list observations still need native counterparts under the test-parity contract.
+
+Destination conditions also differ at the adapter boundary.
+The pinned ordinary `putObject` returns after a successful HEAD without comparing bytes, while its multipart completion and copy requests carry no destination precondition.
+The native adapter retains the rewrite design's immutable publication contract: conditional creation, identical-byte retry acceptance, and an error for conflicting bytes.
+These are source findings; provider boundary requests and retry behavior remain unexecuted.

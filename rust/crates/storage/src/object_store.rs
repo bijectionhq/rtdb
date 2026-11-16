@@ -166,6 +166,11 @@ pub struct LocalStore {
     io: Arc<IoRegion>,
 }
 
+struct AdmittedFile {
+    file: File,
+    _admission: tokio_util::task::TaskTrackerToken,
+}
+
 impl LocalStore {
     /// Opens a store with an independent I/O region; its owner calls `close_and_wait` before runtime shutdown.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
@@ -183,6 +188,38 @@ impl LocalStore {
     pub async fn close_and_wait(&self) { self.io.close_and_wait().await; }
 
     fn path(&self, key: &ObjectKey) -> PathBuf { self.root.join(key.as_str()) }
+
+    /// Copies to an explicit destination store, including a different filesystem root.
+    /// Publication is immutable and accepts identical retries; both I/O regions retain admitted work through cancellation.
+    /// Missing sources return MissingObject, different destination bytes return ConflictingObject, and either closed region returns Closed.
+    /// An I/O or synchronization error can occur after the destination has been published.
+    pub async fn copy_to(&self, source: &ObjectKey, destination: &LocalStore, key: &ObjectKey) -> Result<()> {
+        let admission = self.io.admit()?;
+        let file = open_object(&self.path(source), source)?;
+        destination.publish_file(key, AdmittedFile { file, _admission: admission }).await
+    }
+
+    async fn publish_file(&self, key: &ObjectKey, input: AdmittedFile) -> Result<()> {
+        let (root, path, key) = (Arc::clone(&self.root), self.path(key), key.clone());
+        self.io.run(move || {
+            let mut input = input;
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            let temp_dir = root.join(".tmp");
+            fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
+            std::io::copy(&mut input.file, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
+            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
+            match upload.persist_noclobber(&path) {
+                Ok(_) => (),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if !equal_local_files(&path, error.file.path())? { return Err(Error::ConflictingObject(key.to_string())); }
+                }
+                Err(error) => return Err(Error::io(&path, error.error)),
+            }
+            sync_parents(&path, &root)
+        }).await
+    }
 }
 
 fn open_object(path: &Path, key: &ObjectKey) -> Result<File> {
@@ -296,26 +333,13 @@ impl ObjectStore for LocalStore {
     }
 
     async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
-        let _opening = self.io.admit()?;
-        let mut input = File::open(source).map_err(|error| Error::io(source, error))?;
-        let (root, path, key) = (Arc::clone(&self.root), self.path(key), key.clone());
-        self.io.run(move || {
-            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
-            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
-            let temp_dir = root.join(".tmp");
-            fs::create_dir_all(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
-            let mut upload = tempfile::NamedTempFile::new_in(&temp_dir).map_err(|error| Error::io(&temp_dir, error))?;
-            std::io::copy(&mut input, &mut upload).map_err(|error| Error::io(upload.path(), error))?;
-            upload.as_file().sync_all().map_err(|error| Error::io(upload.path(), error))?;
-            match upload.persist_noclobber(&path) {
-                Ok(_) => (),
-                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !equal_local_files(&path, error.file.path())? { return Err(Error::ConflictingObject(key.to_string())); }
-                }
-                Err(error) => return Err(Error::io(&path, error.error)),
-            }
-            sync_parents(&path, &root)
-        }).await
+        let admission = self.io.admit()?;
+        let file = File::open(source).map_err(|error| Error::io(source, error))?;
+        self.publish_file(key, AdmittedFile { file, _admission: admission }).await
+    }
+
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
+        self.copy_to(source, self, destination).await
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {
