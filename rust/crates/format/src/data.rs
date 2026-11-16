@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{IidView, build_array, build_iids, read_value, to_field};
+use rtdb_columnar::{IidView, build_array, build_iids, copy_array, read_value, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,6 +126,17 @@ impl EventBatch {
 
 /// All rows must either carry recency or omit it; the caller supplies the put schema captured with the rows.
 pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
+    event_batch(events, put_fields, iid_encoding, false)
+}
+
+/// Reconstructs stored cells under their captured put schema, preserving raw decimal coefficients.
+/// Every value must belong to that schema; no decimal parameter or coefficient is converted.
+/// The caller reserves column-builder bounds, document clones and event-array overhead before calling.
+pub fn copy_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>) -> Result<RecordBatch> {
+    event_batch(events, put_fields, iid_encoding, true)
+}
+
+fn event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, copy: bool) -> Result<RecordBatch> {
     let mut puts = Vec::new();
     let mut deletes = 0usize;
     let mut erases = 0usize;
@@ -153,7 +164,7 @@ pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<Str
     if let Some(fields) = put_fields {
         let ty = LogicalType::Struct(fields);
         op_fields.push(Arc::new(to_field("put", &ty)?));
-        children.push(build_array(&ty, &puts)?);
+        children.push(if copy { copy_array(&ty, &puts)? } else { build_array(&ty, &puts)? });
     }
     op_fields.extend([Arc::new(Field::new("delete", DataType::Null, true)), Arc::new(Field::new("erase", DataType::Null, true))]);
     children.extend([Arc::new(NullArray::new(deletes)) as ArrayRef, Arc::new(NullArray::new(erases)) as ArrayRef]);
@@ -182,8 +193,17 @@ pub fn build_event_batch(events: &[StoredEvent], put_fields: Option<BTreeMap<Str
 
 /// Keeps the declared recency column even when a page is empty.
 pub fn build_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, false)
+}
+
+/// Copies stored cells with the same ownership obligations as `copy_event_batch`, retaining empty-page recency metadata.
+pub fn copy_event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool) -> Result<RecordBatch> {
+    event_batch_with_recency(events, put_fields, iid_encoding, recency, true)
+}
+
+fn event_batch_with_recency(events: &[StoredEvent], put_fields: Option<BTreeMap<String, LogicalType>>, iid_encoding: Option<RunEndWidth>, recency: bool, copy: bool) -> Result<RecordBatch> {
     if events.iter().any(|event| event.recency.is_some() != recency) { return Err(invalid("Event recency does not match the declared schema")); }
-    let batch = build_event_batch(events, put_fields, iid_encoding)?;
+    let batch = event_batch(events, put_fields, iid_encoding, copy)?;
     if recency && events.is_empty() {
         let mut fields = batch.schema().fields().to_vec();
         fields.push(Arc::new(Field::new("_recency", DataType::Timestamp(ArrowTimeUnit::Microsecond, Some("UTC".into())), false)));

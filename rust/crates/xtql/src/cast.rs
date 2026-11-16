@@ -12,8 +12,7 @@ pub(crate) fn target(form: &Edn, options: Option<&Edn>) -> Result<CastTarget> {
 fn expression_target(data_type: LogicalType, options: Option<&Edn>) -> Result<CastTarget> {
     Ok(match data_type {
         LogicalType::Scalar(S::Decimal { .. }) => {
-            let precision = options.and_then(|options| options.option("precision")).filter(|value| !matches!(value.kind, EdnKind::Nil)).map(integer).transpose()?
-                .map(|precision| u64::try_from(precision).map_err(|_| error("xtdb.expression/unsupported-precision", "Decimal precision must be nonnegative"))).transpose()?;
+            let precision = options.and_then(|options| options.option("precision")).filter(|value| !matches!(value.kind, EdnKind::Nil)).map(integer).transpose()?;
             let scale = if precision.is_some() { options.and_then(|options| options.option("scale")).filter(|value| !matches!(value.kind, EdnKind::Nil)).map(integer).transpose()? } else { None };
             CastTarget::decimal(precision, scale)?
         }
@@ -57,7 +56,7 @@ fn data_type(form: &Edn) -> Result<LogicalType> {
         "keyword" => S::Keyword, "uuid" => S::Uuid, "uri" => S::Uri, "transit" => S::Transit,
         "oid" => S::Oid, "regclass" => S::RegClass, "regproc" => S::RegProc,
         "decimal" => S::Decimal {
-            precision: u8::try_from(integer(arg(0)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal precision exceeds native metadata"))?,
+            precision: i32::try_from(integer(arg(0)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal precision exceeds signed 32 bits"))?,
             scale: i32::try_from(integer(arg(1)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal scale exceeds signed 32 bits"))?,
             bit_width: integer(arg(2)?)?.try_into().map_err(|_| error("xtdb/invalid-type", "Invalid decimal bit width"))?,
         },

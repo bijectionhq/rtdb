@@ -91,9 +91,9 @@ Call or response-stream cancellation releases query work; the source does not im
 
 Transport message sizes and concurrent calls are bounded.
 Parameter IPC inspection checks metadata, body extents, buffer extents, and declared decompression sizes before Arrow decoding.
-Schemas, record batches and retained parameter streams preserve signed 32-bit decimal scales through the shared IPC codec.
+Schemas, record batches and retained parameter streams preserve signed 32-bit decimal precision and scale through the shared IPC codec.
 External schemas cannot supply the codec's reserved native annotation, and exported schemas contain only the real decimal metadata.
-Each output encoder retains its declared native schema and rejects batches whose full-scale metadata differs.
+Each output encoder retains its declared native schema and rejects batches whose full-width metadata differs.
 Decoded Arrow owners and encoded `Bytes` retain their reservations through clones and transport delivery.
 Metadata enumeration reserves borrowed schema bounds before cloning table bindings; returned catalog snapshots retain those reservations.
 The schema and codec estimates are conservative allowances, not a demonstrated bound for every possible nested Arrow representation.

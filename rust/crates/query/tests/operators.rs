@@ -310,6 +310,54 @@ async fn sum_wraps_reference_integer_width_and_variance_uses_reference_formula()
     assert_eq!(collect(aggregate(input, vec![], vec![variance, average]), query_context(QueryOptions::default())).await.unwrap(), vec![vec![Value::F64(1.0), Value::F64(2.0)]]);
 }
 
+fn decimal_cell(coefficient: i128, precision: i32, scale: i32, width: u16) -> Value {
+    let bytes = coefficient.to_be_bytes(); let length = usize::from(width / 8);
+    let mut unscaled = vec![if coefficient < 0 { 0xff } else { 0 }; length];
+    let copied = length.min(bytes.len()); unscaled[length-copied..].copy_from_slice(&bytes[bytes.len()-copied..]);
+    Value::Decimal(rtdb_types::DecimalValue::new(unscaled, precision, scale, width).unwrap())
+}
+
+async fn decimal_total(input_type: LogicalType, rows: Vec<Value>) -> Result<Vec<Vec<Value>>> {
+    let output = LogicalType::least_upper_bound(std::slice::from_ref(&input_type)).unwrap().maybe();
+    let input = values(0, "v", input_type, rows);
+    let sum = agg(1, AggregateFunction::Sum, Some(input.schema().fields()[0].expression()), output);
+    collect(aggregate(input, vec![], vec![sum]), query_context(QueryOptions::default())).await
+}
+
+#[tokio::test]
+async fn decimal_vector_sum_preserves_precision_overflow_and_null_cell_storage() {
+    let ty = scalar(ScalarType::Decimal { precision: 1, scale: 0, bit_width: 128 }).maybe();
+    assert_eq!(decimal_total(ty.clone(), vec![Value::Null, decimal_cell(9, 1, 0, 128), decimal_cell(9, 1, 0, 128)]).await.unwrap(), vec![vec![decimal_cell(18, 1, 0, 128)]]);
+    assert_eq!(decimal_total(ty.clone(), vec![Value::Null]).await.unwrap(), vec![vec![decimal_cell(0, 1, 0, 128)]]);
+    assert_eq!(decimal_total(ty, vec![]).await.unwrap(), vec![vec![Value::Null]]);
+    let ty = scalar(ScalarType::Decimal { precision: 1, scale: -2, bit_width: 128 }).maybe();
+    assert_eq!(decimal_total(ty.clone(), vec![Value::Null, decimal_cell(1, 1, -2, 128)]).await.unwrap(), vec![vec![decimal_cell(1, 1, -2, 128)]]);
+    assert_eq!(decimal_total(ty, vec![decimal_cell(1, 1, -2, 128), Value::Null]).await.unwrap(), vec![vec![decimal_cell(100, 1, -2, 128)]]);
+}
+
+#[tokio::test]
+async fn decimal_sum_unions_use_output_scale_and_distinguish_null_and_integer_legs() {
+    let decimal = |precision, scale| scalar(ScalarType::Decimal { precision, scale, bit_width: 128 });
+    let ty = LogicalType::from_legs([decimal(1, 0), decimal(1, 2), LogicalType::Null]);
+    assert_eq!(decimal_total(ty, vec![Value::Null, decimal_cell(1, 1, 0, 128), decimal_cell(2, 1, 2, 128), Value::Null]).await.unwrap(), vec![vec![decimal_cell(102, 3, 2, 32)]]);
+    let ty = LogicalType::from_legs([decimal(1, -2), decimal(1, -1), LogicalType::Null]);
+    assert_eq!(decimal_total(ty.clone(), vec![Value::Null]).await.unwrap(), vec![vec![Value::Null]]);
+    assert_eq!(decimal_total(ty, vec![decimal_cell(1, 1, -2, 128), Value::Null]).await.unwrap(), vec![vec![decimal_cell(10, 2, -1, 32)]]);
+    let ty = LogicalType::from_legs([decimal(1, 0), scalar(ScalarType::I64)]);
+    assert!(decimal_total(ty, vec![decimal_cell(1, 1, 0, 128)]).await.is_err());
+}
+
+#[tokio::test]
+async fn decimal_sum_accepts_wide_and_wrapped_precision_and_rejects_physical_overflow() {
+    let decimal = |precision, scale, bit_width| scalar(ScalarType::Decimal { precision, scale, bit_width });
+    let ty = LogicalType::from_legs([decimal(32, -100, 128), decimal(32, 100, 128)]);
+    assert_eq!(decimal_total(ty, vec![decimal_cell(0, 32, -100, 128), decimal_cell(1, 32, 100, 128)]).await.unwrap(), vec![vec![decimal_cell(1, 232, 100, 256)]]);
+    let ty = LogicalType::from_legs([decimal(32, 0, 128), decimal(32, i32::MAX, 128)]);
+    assert_eq!(decimal_total(ty, vec![decimal_cell(0, 32, 0, 128), decimal_cell(0, 32, i32::MAX, 128)]).await.unwrap(), vec![vec![decimal_cell(0, -2_147_483_617, i32::MAX, 32)]]);
+    let ty = decimal(i32::MAX, 0, 128);
+    assert!(decimal_total(ty, vec![decimal_cell(i128::MAX, i32::MAX, 0, 128), decimal_cell(1, i32::MAX, 0, 128)]).await.is_err());
+}
+
 #[tokio::test]
 async fn unnest_keeps_list_order_and_outer_ordinality_is_null() {
     let ty = LogicalType::list(scalar(ScalarType::I64));

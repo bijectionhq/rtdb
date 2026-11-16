@@ -24,9 +24,14 @@ impl AggregateCursor {
         let mut keys = self.execution.context.spill.create()?;
         let mut rows = self.execution.context.spill.create()?;
         let mut group_count = 0u64;
+        let mut checked_sum_types = false;
         if self.groups.is_empty() { keys.write(&[Value::U64(0)], &self.execution.context.memory)?; group_count = 1; }
         while let Some(row) = input.next().await? {
             self.execution.context.check_cancelled()?;
+            if !checked_sum_types {
+                for aggregate in &self.aggregates { validate_decimal_sum_input(aggregate)?; }
+                checked_sum_types = true;
+            }
             let group = OwnedRow::new(self.groups.iter().map(|group| self.execution.evaluate(&group.expr, &self.schema, &row.values)).collect::<Result<_>>()?, &self.execution.context.memory)?;
             let mut reader = keys.reader(Arc::clone(&self.execution.context.memory))?;
             let mut id = None;
@@ -76,22 +81,31 @@ impl AggregateCursor {
                 continue;
             }
             if matches!(value, Value::Null | Value::Undefined) {
-                if aggregate.function == AggregateFunction::Sum && decimal_null_contributes_zero(aggregate) && accumulator.is_none() {
-                    let zero = cast(&Value::I64(0), &aggregate.field.data_type, &self.execution.context.timezone)?;
-                    accumulator = Some(OwnedRow::new(vec![zero], &self.execution.context.memory)?);
+                if aggregate.function == AggregateFunction::Sum && decimal_null_contributes_zero(aggregate) {
+                    let _scratch = self.execution.context.memory.reserve(4096)?;
+                    let (precision, scale, bit_width) = decimal_type(&aggregate.field.data_type).ok_or_else(|| invalid("aggregate-type", "Decimal SUM requires a decimal output"))?;
+                    let previous = accumulator.as_ref().map(|row| decimal_value(&row.values[0])).transpose()?;
+                    let sum = rtdb_expr::decimal_sum(previous, None, precision, scale, bit_width)?;
+                    accumulator = Some(OwnedRow::new(vec![Value::Decimal(sum)], &self.execution.context.memory)?);
                 }
                 continue;
             }
             count = count.checked_add(1).ok_or_else(|| invalid("row-count", "Aggregate count overflow"))?;
             use AggregateFunction as A;
             let previous = accumulator.as_ref().map(|row| &row.values[0]);
+            let _decimal_scratch = if aggregate.function == AggregateFunction::Sum && decimal_type(&aggregate.field.data_type).is_some() { Some(self.execution.context.memory.reserve(4096)?) } else { None };
             let next = match aggregate.function {
                 A::Count | A::CountStar => None,
                 A::Sum => {
-                    let value = cast(&value, &aggregate.field.data_type, &self.execution.context.timezone)?;
-                    if matches!(value, Value::I8(_) | Value::I16(_)) { return Err(rtdb_types::Anomaly::unsupported("rtdb.query/small-integer-sum", "Reference SUM does not implement byte or short accumulators")); }
-                    let sum = match previous { Some(previous) => sum_value(previous, &value)?, None => value };
-                    Some(cast(&sum, &aggregate.field.data_type, &self.execution.context.timezone)?)
+                    if let Some((precision, scale, bit_width)) = decimal_type(&aggregate.field.data_type) {
+                        let previous = previous.map(decimal_value).transpose()?;
+                        Some(Value::Decimal(rtdb_expr::decimal_sum(previous, Some(decimal_value(&value)?), precision, scale, bit_width)?))
+                    } else {
+                        let value = cast(&value, &aggregate.field.data_type, &self.execution.context.timezone)?;
+                        if matches!(value, Value::I8(_) | Value::I16(_)) { return Err(rtdb_types::Anomaly::unsupported("rtdb.query/small-integer-sum", "Reference SUM does not implement byte or short accumulators")); }
+                        let sum = match previous { Some(previous) => sum_value(previous, &value)?, None => value };
+                        Some(cast(&sum, &aggregate.field.data_type, &self.execution.context.timezone)?)
+                    }
                 }
                 A::Average => {
                     if aggregate.field.data_type.unencoded().legs().iter().any(|ty| matches!(ty, LogicalType::Scalar(ScalarType::Duration(_)))) {
@@ -196,9 +210,24 @@ fn group_id(row: &[Value]) -> Result<u64> {
 }
 fn decimal_null_contributes_zero(aggregate: &AggregateExpr) -> bool {
     let Some(argument) = &aggregate.argument else { return false; };
-    let legs = argument.data_type().legs();
-    legs.iter().any(|ty| matches!(ty, LogicalType::Scalar(ScalarType::Decimal { .. })))
-        && legs.iter().all(|ty| matches!(ty, LogicalType::Null | LogicalType::Scalar(ScalarType::Decimal { .. })))
+    decimal_type(&argument.data_type()).is_some()
+}
+fn decimal_type(logical: &LogicalType) -> Option<(i32, i32, u16)> {
+    match logical {
+        LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width }) => Some((*precision, *scale, *bit_width)),
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => decimal_type(inner),
+        _ => None,
+    }
+}
+fn decimal_value(value: &Value) -> Result<&rtdb_types::DecimalValue> {
+    if let Value::Decimal(value) = value { Ok(value) } else { Err(invalid("decimal-sum", "Reference decimal SUM accepts decimal input vectors")) }
+}
+fn validate_decimal_sum_input(aggregate: &AggregateExpr) -> Result<()> {
+    if aggregate.function != AggregateFunction::Sum || decimal_type(&aggregate.field.data_type).is_none() { return Ok(()); }
+    if aggregate.argument.as_ref().is_some_and(|argument| argument.data_type().legs().iter().any(|leg| !matches!(leg, LogicalType::Null | LogicalType::Scalar(ScalarType::Decimal { .. })))) {
+        return Err(rtdb_types::Anomaly::unsupported("rtdb.query/decimal-sum-input", "Reference SUM cannot accumulate a nondecimal vector into decimal output"));
+    }
+    Ok(())
 }
 fn sum_value(left: &Value, right: &Value) -> Result<Value> {
     Ok(match (left, right) {

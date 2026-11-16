@@ -4,10 +4,20 @@ use rtdb_types::{Anomaly, Result};
 
 /// Reserved native field metadata; external Arrow schemas must reject this key on ingress.
 pub const INTERNAL_DECIMAL_SCALE_KEY: &str = "rtdb:internal:decimal-scale-i32";
+/// Reserved native field metadata; external Arrow schemas must reject this key on ingress.
+pub const INTERNAL_DECIMAL_PRECISION_KEY: &str = "rtdb:internal:decimal-precision-i32";
+
+/// Logical decimal metadata; signed precision and scale do not constrain the physical coefficient until an ordinary write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecimalParameters { pub precision: i32, pub scale: i32, pub bit_width: u16 }
+
+/// Physical Arrow precision used with an independently retained full-precision field annotation.
+pub fn decimal_storage_precision(precision: i32) -> u8 { u8::try_from(precision).unwrap_or(1) }
 
 /// Physical Arrow scale used with an independently retained full-scale field annotation.
 pub fn decimal_storage_scale(scale: i32) -> i8 { i8::try_from(scale).unwrap_or(1) }
 
+/// Reads physical storage parameters, including dictionary values; logical annotations are read by `decimal_field_parameters`.
 pub fn decimal_parameters(data_type: &DataType) -> Option<(u8, i8, u16)> {
     match data_type {
         DataType::Decimal32(p, s) => Some((*p, *s, 32)),
@@ -19,30 +29,48 @@ pub fn decimal_parameters(data_type: &DataType) -> Option<(u8, i8, u16)> {
     }
 }
 
-/// Reads the true scale of a native field and checks its physical carrier.
-pub fn decimal_scale(field: &Field) -> Result<Option<i32>> {
-    let annotation = field.metadata().get(INTERNAL_DECIMAL_SCALE_KEY);
-    let Some((_, stored, _)) = decimal_parameters(field.data_type()) else {
-        return if annotation.is_some() { Err(invalid("Decimal scale annotation requires decimal storage")) } else { Ok(None) };
+/// Reads signed logical decimal parameters and checks their physical carriers and canonical annotations.
+pub fn decimal_field_parameters(field: &Field) -> Result<Option<DecimalParameters>> {
+    let precision = field.metadata().get(INTERNAL_DECIMAL_PRECISION_KEY);
+    let scale = field.metadata().get(INTERNAL_DECIMAL_SCALE_KEY);
+    let Some((stored_precision, stored_scale, bit_width)) = decimal_parameters(field.data_type()) else {
+        return if precision.is_some() || scale.is_some() { Err(invalid("Decimal annotation requires decimal storage")) } else { Ok(None) };
     };
-    let Some(annotation) = annotation else { return Ok(Some(i32::from(stored))); };
-    let scale = annotation.parse::<i32>().map_err(|_| invalid("Invalid full-width decimal scale"))?;
-    if i8::try_from(scale).is_ok() || stored != decimal_storage_scale(scale) || annotation != &scale.to_string() {
-        return Err(invalid("Decimal scale annotation disagrees with its carrier"));
+    fn annotated(value: Option<&String>, stored: i32, narrow: impl Fn(i32) -> bool) -> Result<i32> {
+        let Some(value) = value else { return Ok(stored); };
+        let parsed = value.parse::<i32>().map_err(|_| invalid("Invalid full-width decimal parameter"))?;
+        if narrow(parsed) || stored != 1 || value != &parsed.to_string() { return Err(invalid("Decimal annotation disagrees with its carrier")); }
+        Ok(parsed)
     }
-    Ok(Some(scale))
+    Ok(Some(DecimalParameters {
+        precision: annotated(precision, i32::from(stored_precision), |value| u8::try_from(value).is_ok())?,
+        scale: annotated(scale, i32::from(stored_scale), |value| i8::try_from(value).is_ok())?,
+        bit_width,
+    }))
 }
 
-/// Attaches a true scale after the caller has established matching physical decimal storage.
-pub fn with_decimal_scale(mut field: Field, scale: i32) -> Result<Field> {
-    if decimal_parameters(field.data_type()).is_none_or(|(_, stored, _)| stored != decimal_storage_scale(scale)) {
-        return Err(invalid("Decimal storage scale disagrees with its logical scale"));
+/// Reads the true scale of a native field, validating both logical decimal parameters.
+pub fn decimal_scale(field: &Field) -> Result<Option<i32>> { Ok(decimal_field_parameters(field)?.map(|parameters| parameters.scale)) }
+
+/// Attaches logical parameters after the caller has established matching physical decimal storage.
+pub fn with_decimal_parameters(mut field: Field, parameters: DecimalParameters) -> Result<Field> {
+    if decimal_parameters(field.data_type()) != Some((decimal_storage_precision(parameters.precision), decimal_storage_scale(parameters.scale), parameters.bit_width)) {
+        return Err(invalid("Decimal storage disagrees with its logical parameters"));
     }
     let mut metadata = field.metadata().clone();
     metadata.remove(INTERNAL_DECIMAL_SCALE_KEY);
-    if i8::try_from(scale).is_err() { metadata.insert(INTERNAL_DECIMAL_SCALE_KEY.into(), scale.to_string()); }
+    metadata.remove(INTERNAL_DECIMAL_PRECISION_KEY);
+    if i8::try_from(parameters.scale).is_err() { metadata.insert(INTERNAL_DECIMAL_SCALE_KEY.into(), parameters.scale.to_string()); }
+    if u8::try_from(parameters.precision).is_err() { metadata.insert(INTERNAL_DECIMAL_PRECISION_KEY.into(), parameters.precision.to_string()); }
     field.set_metadata(metadata);
     Ok(field)
+}
+
+/// Replaces the logical scale while preserving and validating the field's logical precision.
+pub fn with_decimal_scale(field: Field, scale: i32) -> Result<Field> {
+    let mut parameters = decimal_field_parameters(&field)?.ok_or_else(|| invalid("Decimal scale requires decimal storage"))?;
+    parameters.scale = scale;
+    with_decimal_parameters(field, parameters)
 }
 
 /// Rebuilds a schema's fields bottom-up, preserving container layouts and schema metadata.
@@ -74,4 +102,4 @@ pub fn map_schema_fields(schema: &Schema, mut map: impl FnMut(Field) -> Result<F
     Ok(Schema::new_with_metadata(schema.fields().iter().map(|value| field(value, &mut map)).collect::<Result<Vec<_>>>()?, schema.metadata().clone()))
 }
 
-fn invalid(message: &str) -> Anomaly { Anomaly::incorrect("rtdb/decimal-scale", message) }
+fn invalid(message: &str) -> Anomaly { Anomaly::incorrect("rtdb/decimal-metadata", message) }

@@ -161,6 +161,9 @@ pub enum Expr {
     Subscript { expr: Box<Expr>, index: Box<Expr>, data_type: LogicalType },
     List(Vec<Expr>),
     Struct(Vec<(String, Expr)>),
+    /// Packs selected input columns without evaluating or rewriting their cells.
+    /// Column IDs must exist in the input, and field names must be unique within the record.
+    RowCopy(Vec<crate::Field>),
     In { expr: Box<Expr>, values: Vec<Expr>, negated: bool },
     Like { expr: Box<Expr>, pattern: Box<Expr>, escape: Option<char>, case_insensitive: bool, negated: bool },
 }
@@ -227,6 +230,7 @@ impl Expr {
                 LogicalType::list(LogicalType::join_all(&types))
             }
             Self::Struct(fields) => LogicalType::Struct(fields.iter().map(|(name, expr)| (name.clone(), expr.data_type())).collect()),
+            Self::RowCopy(fields) => LogicalType::Struct(fields.iter().map(|field| (field.name.clone(), field.data_type.clone())).collect()),
         }
     }
 
@@ -240,13 +244,17 @@ impl Expr {
             Self::Struct(fields) => fields.iter().map(|(_, value)| value).collect(),
             Self::In { expr, values, .. } => std::iter::once(expr.as_ref()).chain(values).collect(),
             Self::Like { expr, pattern, .. } => vec![expr, pattern],
-            Self::Literal(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } => vec![],
+            Self::Literal(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => vec![],
         }
     }
 
     pub fn referenced_columns(&self) -> BTreeSet<ColumnId> {
         let mut columns = BTreeSet::new();
-        self.visit(&mut |expr| { if let Self::Column { id, .. } = expr { columns.insert(*id); } });
+        self.visit(&mut |expr| { match expr {
+            Self::Column { id, .. } => { columns.insert(*id); }
+            Self::RowCopy(fields) => columns.extend(fields.iter().map(|field| field.id)),
+            _ => {}
+        } });
         columns
     }
 
@@ -267,6 +275,12 @@ impl Expr {
         }
         let mut failure = None;
         self.visit(&mut |expr| {
+            if let Self::RowCopy(fields) = expr {
+                let mut names = BTreeSet::new();
+                if fields.iter().any(|field| !names.insert(&field.name)) {
+                    failure = Some(Anomaly::fault("rtdb.plan/duplicate-record-field", "Raw record fields must have unique names"));
+                }
+            }
             if let Self::Binary { op, left, right } = expr {
                 for left in left.data_type().legs() { for right in right.data_type().legs() {
                     if let (LogicalType::Scalar(ScalarType::Decimal { scale: left, .. }), LogicalType::Scalar(ScalarType::Decimal { scale: right, .. })) = (left, right) {

@@ -11,13 +11,25 @@ use crate::{from_field, to_field};
 /// Builds arrays with exact logical value types; numeric coercions belong to expressions.
 /// Undefined cells are accepted only for bottom-typed fields.
 pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    build_values(logical, values, true)
+}
+
+/// Reconstructs typed cells without revalidating decimal precision against their stored coefficients.
+/// Every nonnull value must belong to its target logical type, including exact decimal parameters.
+/// Coefficient width is checked; values are neither rescaled nor relabeled.
+/// The caller reserves `estimate_builder_bytes` before invoking this function.
+pub fn copy_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    build_values(logical, values, false)
+}
+
+fn build_values(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     logical.validate()?;
     for (row, value) in values.iter().enumerate() {
         if !accepts(logical, value) {
             return Err(Anomaly::incorrect("rtdb/column-type-mismatch", format!("Value at row {row} does not belong to {logical:?}")));
         }
     }
-    build(logical, values)
+    build(logical, values, check_precision)
 }
 
 pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool {
@@ -31,12 +43,12 @@ fn validity(values: &[Value]) -> Option<NullBuffer> {
     valid.iter().any(|v| !v).then(|| NullBuffer::from(valid))
 }
 
-fn build(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     match logical {
         LogicalType::Nothing | LogicalType::Null => Ok(Arc::new(NullArray::new(values.len()))),
-        LogicalType::Maybe(inner) => build(inner, values),
-        LogicalType::RunEndEncoded { width, value } => build_runs(logical, *width, value, values),
-        LogicalType::Scalar(scalar) => build_scalar(scalar, values),
+        LogicalType::Maybe(inner) => build(inner, values, check_precision),
+        LogicalType::RunEndEncoded { width, value } => build_runs(logical, *width, value, values, check_precision),
+        LogicalType::Scalar(scalar) => build_scalar(scalar, values, check_precision),
         LogicalType::Struct(children) => {
             let field = to_field("", logical)?;
             let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
@@ -45,12 +57,12 @@ fn build(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
                     Value::Struct(fields) => fields.get(name).cloned().unwrap_or_else(|| if matches!(child_type, LogicalType::Nothing) { Value::Undefined } else { Value::Null }),
                     _ => Value::Undefined,
                 }).collect::<Vec<_>>();
-                build(child_type, &child_values)
+                build(child_type, &child_values, check_precision)
             }).collect::<Result<Vec<_>>>()?;
             Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, validity(values), values.len()).map_err(super::arrow_error)?))
         }
-        LogicalType::List { kind, element } => build_list(logical, kind, element, values),
-        LogicalType::Union(_) => build_union(logical, values),
+        LogicalType::List { kind, element } => build_list(logical, kind, element, values, check_precision),
+        LogicalType::Union(_) => build_union(logical, values, check_precision),
     }
 }
 
@@ -61,7 +73,7 @@ macro_rules! primitive {
     }};
 }
 
-fn build_scalar(scalar: &ScalarType, values: &[Value]) -> Result<ArrayRef> {
+fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     use ScalarType::*;
     match scalar {
         Bool => primitive!(values, BooleanArray, Value::Bool(v) => *v),
@@ -98,7 +110,7 @@ fn build_scalar(scalar: &ScalarType, values: &[Value]) -> Result<ArrayRef> {
         }
         FixedSizeBinary(width) => build_binary(*width, values),
         Uuid => build_binary(16, values),
-        Decimal { precision, scale, bit_width } => build_decimal(*precision, *scale, *bit_width, values),
+        Decimal { precision, scale, bit_width } => build_decimal(*precision, *scale, *bit_width, values, check_precision),
         Time { unit, bit_width } => {
             if *bit_width == 32 {
                 let converted = values.iter().map(|value| match value {
@@ -152,7 +164,7 @@ fn build_binary(width: i32, values: &[Value]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) -> Result<ArrayRef> {
+fn build_decimal(precision: i32, scale: i32, bit_width: u16, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     match bit_width {
         32 => {
             let values = values.iter().map(|value| match value {
@@ -162,7 +174,7 @@ fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) ->
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal32Array::from(values), precision, scale)
+            finish_decimal(Decimal32Array::from(values), precision, scale, check_precision)
         }
         64 => {
             let values = values.iter().map(|value| match value {
@@ -172,7 +184,7 @@ fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) ->
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal64Array::from(values), precision, scale)
+            finish_decimal(Decimal64Array::from(values), precision, scale, check_precision)
         }
         128 => {
             let values = values.iter().map(|value| match value {
@@ -182,7 +194,7 @@ fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) ->
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal128Array::from(values), precision, scale)
+            finish_decimal(Decimal128Array::from(values), precision, scale, check_precision)
         }
         256 => {
             let values = values.iter().map(|value| match value {
@@ -192,20 +204,20 @@ fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) ->
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            finish_decimal(Decimal256Array::from(values), precision, scale)
+            finish_decimal(Decimal256Array::from(values), precision, scale, check_precision)
         }
         _ => Err(decimal_width()),
     }
 }
 
-fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: u8, scale: i32) -> Result<ArrayRef> {
-    if array.iter().flatten().any(|coefficient| precision == 0 || !T::is_valid_decimal_precision(coefficient, precision)) {
+fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: i32, scale: i32, check_precision: bool) -> Result<ArrayRef> where T::Native: std::fmt::Display {
+    if check_precision && array.iter().flatten().any(|coefficient| precision <= 0 || coefficient.to_string().trim_start_matches('-').len() > precision as usize) {
         return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
     }
-    Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(precision, crate::decimal_storage_scale(scale)))))
+    Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(crate::decimal_storage_precision(precision), crate::decimal_storage_scale(scale)))))
 }
 
-fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     let field = to_field("", logical)?;
     let mut flat = Vec::new();
     let mut offsets = vec![0i32];
@@ -225,7 +237,7 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
         }
         offsets.push(i32::try_from(flat.len()).map_err(|_| Anomaly::incorrect("rtdb/list-offset-overflow", "List children exceed i32 offsets"))?);
     }
-    let array = build(element, &flat)?;
+    let array = build(element, &flat, check_precision)?;
     match field.data_type() {
         DataType::List(child) => Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), array, validity(values)).map_err(super::arrow_error)?)),
         DataType::FixedSizeList(child, size) => Ok(Arc::new(FixedSizeListArray::try_new_with_length(Arc::clone(child), *size, array, validity(values), values.len()).map_err(super::arrow_error)?)),
@@ -237,9 +249,9 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
     }
 }
 
-fn build_union(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+fn build_union(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     let field = to_field("", logical)?;
-    let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return build(&from_field(&field)?, values); };
+    let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return build(&from_field(&field)?, values, check_precision); };
     let legs = fields.iter().map(|(_, field)| from_field(field)).collect::<Result<Vec<_>>>()?;
     let ids = fields.iter().map(|(id, _)| id).collect::<Vec<_>>();
     let mut children: Vec<Vec<Value>> = legs.iter().map(|_| Vec::new()).collect();
@@ -253,11 +265,11 @@ fn build_union(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
         offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
         children[leg].push(value.clone());
     }
-    let children = legs.iter().zip(children).map(|(leg, values)| build(leg, &values)).collect::<Result<Vec<_>>>()?;
+    let children = legs.iter().zip(children).map(|(leg, values)| build(leg, &values, check_precision)).collect::<Result<Vec<_>>>()?;
     Ok(Arc::new(UnionArray::try_new(fields.clone(), ScalarBuffer::from(type_ids), Some(ScalarBuffer::from(offsets)), children).map_err(super::arrow_error)?))
 }
 
-fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     let mut distinct = Vec::new();
     let mut ends = Vec::new();
     for (index, value) in values.iter().enumerate() {
@@ -266,7 +278,7 @@ fn build_runs(logical: &LogicalType, width: RunEndWidth, value_type: &LogicalTyp
             ends.push(index + 1);
         }
     }
-    let array = build(value_type, &distinct)?;
+    let array = build(value_type, &distinct, check_precision)?;
     let runs: ArrayRef = match width {
         RunEndWidth::I16 => {
             let ends = ends.into_iter().map(i16::try_from).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| run_overflow())?;

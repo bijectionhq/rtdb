@@ -111,7 +111,7 @@ pub(super) fn mask(value: Value, replacement: Option<&str>) -> Result<Value> {
             let bytes = coefficient.to_signed_bytes_be(); let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; usize::from(precision / 2)];
             if bytes.len() > unscaled.len() { return Err(error("transform-error", "Decimal mask exceeds its coefficient width")); }
             let start = unscaled.len() - bytes.len(); unscaled[start..].copy_from_slice(&bytes);
-            return Ok(Value::Decimal(rtdb_types::DecimalValue::new(unscaled, precision, i32::try_from(scale).map_err(|cause| error("transform-error", cause))?, u16::from(precision) * 4)?));
+            return Ok(Value::Decimal(rtdb_types::DecimalValue::new(unscaled, i32::from(precision), i32::try_from(scale).map_err(|cause| error("transform-error", cause))?, u16::from(precision) * 4)?));
         }
         let target = match value { Value::I8(_) => Target::I8, Value::I16(_) => Target::I16, Value::I32(_) => Target::I32, Value::I64(_) => Target::I64, Value::F32(_) => Target::F32, Value::F64(_) => Target::F64, Value::Utf8(_) => Target::String, _ => return Err(error("transform-error", "Custom mask requires numeric or string input")) };
         if matches!(target, Target::F32 | Target::F64) {

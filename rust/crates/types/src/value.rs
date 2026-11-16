@@ -6,13 +6,14 @@ use std::collections::BTreeMap;
 pub struct DecimalValue {
     /// Signed two's-complement coefficient, most significant byte first.
     pub unscaled: Vec<u8>,
-    pub precision: u8,
+    pub precision: i32,
     pub scale: i32,
     pub bit_width: u16,
 }
 
 impl DecimalValue {
-    pub fn new(unscaled: Vec<u8>, precision: u8, scale: i32, bit_width: u16) -> Result<Self> {
+    /// Preserves raw vector metadata and checks coefficient width; ordinary writes validate precision separately.
+    pub fn new(unscaled: Vec<u8>, precision: i32, scale: i32, bit_width: u16) -> Result<Self> {
         ScalarType::Decimal { precision, scale, bit_width }.validate()?;
         if unscaled.len() != usize::from(bit_width / 8) {
             return Err(Anomaly::incorrect("xtdb/invalid-decimal", "Decimal coefficient width does not match its type"));

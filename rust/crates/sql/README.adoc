@@ -60,6 +60,7 @@ Decimal values, explicit SQL scale arguments, and result metadata retain the ful
 ROUND over a decimal or integer requires a constant scale and derives its result metadata from that scale, while FLOOR and CEIL return doubles.
 The expression implementation bounds coefficient work before rescaling and preserves the reference's rounding and overflow boundaries.
 The source tests include wide-scale casts, aggregates, recursive arrays, and dynamic prepared-parameter rebinding.
+They also distinguish a raw SUM cell retained by column renaming from computed casts, CASE, COALESCE, and nested results that pass through decimal vector-write checks.
 Exact failure timing, diagnostic equivalence, and all execution observations remain unverified.
 
 == Subqueries

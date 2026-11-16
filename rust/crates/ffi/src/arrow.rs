@@ -1,7 +1,7 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
 use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_value, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, from_field, read_value, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, Result};
 
@@ -45,16 +45,16 @@ pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
 
 pub(crate) fn export_schema(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<FFI_ArrowSchema> {
     let reservation = memory.reserve(schema_bound(schema)?)?;
-    if schema.metadata().contains_key(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY) { return Err(super::invalid("Decimal scale annotation cannot appear on a schema")); }
-    let mut scales = Vec::new();
+    if schema.metadata().keys().any(|key| reserved_decimal_key(key)) { return Err(super::invalid("Decimal annotation cannot appear on a schema")); }
+    let mut decimals = Vec::new();
     let clean = rtdb_columnar::map_schema_fields(schema, |mut field| {
-        if let Some(scale) = rtdb_columnar::decimal_scale(&field)? { scales.push(scale); }
-        let mut metadata = field.metadata().clone(); metadata.remove(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY); field.set_metadata(metadata); Ok(field)
+        if let Some(parameters) = rtdb_columnar::decimal_field_parameters(&field)? { decimals.push(parameters); }
+        let mut metadata = field.metadata().clone(); metadata.retain(|key, _| !reserved_decimal_key(key)); field.set_metadata(metadata); Ok(field)
     })?;
     let mut exported = FFI_ArrowSchema::try_from(&clean).map_err(arrow_error)?;
-    let mut scales = scales.into_iter();
-    retain_schema(&mut exported, reservation, &mut scales)?;
-    if scales.next().is_some() { return Err(super::invalid("Unused decimal C export scale")); }
+    let mut decimals = decimals.into_iter();
+    retain_schema(&mut exported, reservation, &mut decimals)?;
+    if decimals.next().is_some() { return Err(super::invalid("Unused decimal C export parameters")); }
     Ok(exported)
 }
 
@@ -76,14 +76,14 @@ fn retain_array(array: &mut FFI_ArrowArray, reservation: Arc<MemoryReservation>)
     let lease = Box::new(ArrayLease { private: array.private_data, release: array.release, _reservation: reservation });
     array.private_data = Box::into_raw(lease).cast(); array.release = Some(release_array);
 }
-fn retain_schema(schema: &mut FFI_ArrowSchema, reservation: Arc<MemoryReservation>, scales: &mut impl Iterator<Item = i32>) -> Result<()> {
-    for index in 0..schema.n_children as usize { unsafe { retain_schema(&mut **schema.children.add(index), Arc::clone(&reservation), scales)?; } }
-    if !schema.dictionary.is_null() { unsafe { retain_schema(&mut *schema.dictionary, Arc::clone(&reservation), scales)?; } }
+fn retain_schema(schema: &mut FFI_ArrowSchema, reservation: Arc<MemoryReservation>, decimals: &mut impl Iterator<Item = DecimalParameters>) -> Result<()> {
+    for index in 0..schema.n_children as usize { unsafe { retain_schema(&mut **schema.children.add(index), Arc::clone(&reservation), decimals)?; } }
+    if !schema.dictionary.is_null() { unsafe { retain_schema(&mut *schema.dictionary, Arc::clone(&reservation), decimals)?; } }
     let format = schema.format;
-    let full_format = if let Some((precision, _, width)) = decimal_format(schema.format())? {
-        let scale = scales.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?;
-        if i8::try_from(scale).is_err() {
-            let text = if width == 128 { format!("d:{precision},{scale}") } else { format!("d:{precision},{scale},{width}") };
+    let full_format = if decimal_format(schema.format())?.is_some() {
+        let DecimalParameters { precision, scale, bit_width } = decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?;
+        if i8::try_from(scale).is_err() || u8::try_from(precision).is_err() {
+            let text = if bit_width == 128 { format!("d:{precision},{scale}") } else { format!("d:{precision},{scale},{bit_width}") };
             Some(CString::new(text).map_err(|_| super::invalid("Invalid decimal C format"))?)
         } else { None }
     } else { None };
@@ -154,22 +154,22 @@ pub(crate) struct ImportedRows {
 
 /// Takes ownership of a valid Arrow C Data array and schema by replacing both with released structs.
 /// Foreign buffers are copied into retained native values before returning, including on zero-row binds.
-/// Decimal scales come from C format strings; reserved native field annotations are rejected.
+/// Decimal precision and scale come from C format strings; reserved native field annotations are rejected.
 pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_ArrowSchema, memory: &Arc<MemoryBudget>) -> Result<ImportedRows> {
     if array.release.is_none() || schema.release.is_none() { return Err(super::invalid("Arrow bind inputs have already been released")); }
     let schema_charge = memory.reserve(unsafe { foreign_schema_bound(schema, 0) }?)?;
     let array = std::mem::replace(array, FFI_ArrowArray::empty());
     let schema = std::mem::replace(schema, FFI_ArrowSchema::empty());
-    let mut scales = Vec::new();
-    let carrier = foreign_carrier(&schema, &mut scales)?;
+    let mut decimals = Vec::new();
+    let carrier = foreign_carrier(&schema, &mut decimals)?;
     let fields = Schema::try_from(&carrier).map_err(arrow_error)?;
-    let mut scales = scales.into_iter();
+    let mut decimals = decimals.into_iter();
     let fields = rtdb_columnar::map_schema_fields(&fields, |field| {
         if rtdb_columnar::decimal_parameters(field.data_type()).is_some() {
-            rtdb_columnar::with_decimal_scale(field, scales.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?)
+            rtdb_columnar::with_decimal_parameters(field, decimals.next().ok_or_else(|| super::invalid("Decimal C schema traversal disagrees with native schema"))?)
         } else { Ok(field) }
     })?;
-    if scales.next().is_some() { return Err(super::invalid("Unused decimal C schema scale")); }
+    if decimals.next().is_some() { return Err(super::invalid("Unused decimal C schema parameters")); }
     let imported = unsafe { from_ffi(array, &carrier) }.map_err(arrow_error)?;
     imported.validate_full().map_err(arrow_error)?;
     if !matches!(imported.data_type(), DataType::Struct(_)) { return Err(super::invalid("Arrow bind requires a record-batch struct")); }
@@ -192,26 +192,28 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     Ok(ImportedRows { arguments: SqlArguments::new(types, rows, memory)?, names, _reservation: schema_charge })
 }
 
-fn decimal_format(format: &str) -> Result<Option<(u8, i32, u16)>> {
+fn decimal_format(format: &str) -> Result<Option<DecimalParameters>> {
     let Some(decimal) = format.strip_prefix("d:") else { return Ok(None); };
     let mut parts = decimal.split(',');
-    let precision = parts.next().and_then(|part| part.parse::<u8>().ok()).ok_or_else(|| super::invalid("Invalid decimal C precision"))?;
+    let precision = parts.next().and_then(|part| part.parse::<i32>().ok()).ok_or_else(|| super::invalid("Invalid decimal C precision"))?;
     let scale = parts.next().and_then(|part| part.parse::<i32>().ok()).ok_or_else(|| super::invalid("Invalid decimal C scale"))?;
     let width = parts.next().map(|part| part.parse::<u16>().map_err(|_| super::invalid("Invalid decimal C width"))).transpose()?.unwrap_or(128);
     if parts.next().is_some() || !matches!(width, 32 | 64 | 128 | 256) { return Err(super::invalid("Invalid decimal C format")); }
-    Ok(Some((precision, scale, width)))
+    Ok(Some(DecimalParameters { precision, scale, bit_width: width }))
 }
 
-fn foreign_carrier(schema: &FFI_ArrowSchema, scales: &mut Vec<i32>) -> Result<FFI_ArrowSchema> {
+fn foreign_carrier(schema: &FFI_ArrowSchema, decimals: &mut Vec<DecimalParameters>) -> Result<FFI_ArrowSchema> {
     let metadata = schema.metadata().map_err(arrow_error)?;
-    if metadata.contains_key(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY) { return Err(super::invalid("External Arrow metadata uses a reserved decimal key")); }
-    let children = schema.children().map(|child| foreign_carrier(child, scales)).collect::<Result<Vec<_>>>()?;
-    let dictionary = schema.dictionary().map(|dictionary| foreign_carrier(dictionary, scales)).transpose()?;
+    if metadata.keys().any(|key| reserved_decimal_key(key)) { return Err(super::invalid("External Arrow metadata uses a reserved decimal key")); }
+    let children = schema.children().map(|child| foreign_carrier(child, decimals)).collect::<Result<Vec<_>>>()?;
+    let dictionary = schema.dictionary().map(|dictionary| foreign_carrier(dictionary, decimals)).transpose()?;
     let format = match decimal_format(schema.format())? {
-        Some((precision, scale, width)) => {
-            scales.push(scale);
-            if width == 128 { format!("d:{precision},{}", rtdb_columnar::decimal_storage_scale(scale)) }
-            else { format!("d:{precision},{},{width}", rtdb_columnar::decimal_storage_scale(scale)) }
+        Some(parameters) => {
+            decimals.push(parameters);
+            let precision = rtdb_columnar::decimal_storage_precision(parameters.precision);
+            let scale = rtdb_columnar::decimal_storage_scale(parameters.scale);
+            if parameters.bit_width == 128 { format!("d:{precision},{scale}") }
+            else { format!("d:{precision},{scale},{}", parameters.bit_width) }
         }
         None => schema.format().to_owned(),
     };
@@ -220,4 +222,5 @@ fn foreign_carrier(schema: &FFI_ArrowSchema, scales: &mut Vec<i32>) -> Result<FF
     if let Some(flags) = schema.flags() { carrier = carrier.with_flags(flags).map_err(arrow_error)?; }
     Ok(carrier)
 }
+fn reserved_decimal_key(key: &str) -> bool { matches!(key, rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY | rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY) }
 pub(crate) fn arrow_error(error: arrow_schema::ArrowError) -> Anomaly { Anomaly::incorrect("rtdb.ffi/arrow", error.to_string()) }

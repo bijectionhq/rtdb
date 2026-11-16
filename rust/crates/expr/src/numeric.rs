@@ -32,7 +32,7 @@ pub(crate) fn exact_decimal(value: &Value) -> Option<BigDecimal> {
     else { integer(value).map(|value| BigDecimal::new(BigInt::from(value), 0)) }
 }
 
-pub(crate) fn decimal_value(value: BigDecimal, precision: u8, scale: i32, bit_width: u16) -> Result<Value> {
+pub(crate) fn decimal_value(value: BigDecimal, precision: i32, scale: i32, bit_width: u16) -> Result<Value> {
     crate::decimal::from_bigdecimal(value, precision, scale, bit_width).map(Value::Decimal)
 }
 

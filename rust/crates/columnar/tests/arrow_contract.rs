@@ -136,6 +136,54 @@ fn decimal_vector_zero_precision_accepts_only_empty_and_null_arrays() {
 }
 
 #[test]
+fn signed_decimal_precision_preserves_metadata_and_accepts_full_signed_coefficients() {
+    for (width, bytes, digits) in [
+        (32, i32::MIN.to_be_bytes().to_vec(), 10), (64, i64::MIN.to_be_bytes().to_vec(), 19),
+        (128, i128::MIN.to_be_bytes().to_vec(), 39), (256, arrow_buffer::i256::MIN.to_be_bytes().to_vec(), 77),
+    ] {
+        for precision in [digits, 255, 256, i32::MAX] {
+            for scale in [0, i32::MAX] {
+                let ty = scalar(ScalarType::Decimal { precision, scale, bit_width: width });
+                let value = Value::Decimal(DecimalValue::new(bytes.clone(), precision, scale, width).unwrap());
+                round_trip(ty, vec![value]);
+            }
+        }
+        let value = Value::Decimal(DecimalValue::new(bytes, digits - 1, 0, width).unwrap());
+        assert!(build_array(&value.logical_type(), &[value.clone()]).is_err());
+        let copied = rtdb_columnar::copy_array(&value.logical_type(), std::slice::from_ref(&value)).unwrap();
+        assert_eq!(read_value(&to_field("value", &value.logical_type()).unwrap(), copied.as_ref(), 0).unwrap(), value);
+        for precision in [i32::MIN, -1, 0] {
+            let ty = scalar(ScalarType::Decimal { precision, scale: 0, bit_width: width }).maybe();
+            round_trip(ty.clone(), vec![Value::Null]);
+            let value = Value::Decimal(DecimalValue::new(vec![0; usize::from(width / 8)], precision, 0, width).unwrap());
+            assert!(build_array(&ty, std::slice::from_ref(&value)).is_err());
+            assert!(rtdb_columnar::copy_array(&ty, &[value]).is_ok());
+        }
+    }
+}
+
+#[test]
+fn typed_decimal_copy_rejects_metadata_relabeling_and_invalid_width_at_every_depth() {
+    let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), 256, 129, 128).unwrap());
+    for target in [
+        scalar(ScalarType::Decimal { precision: 257, scale: 129, bit_width: 128 }),
+        scalar(ScalarType::Decimal { precision: 256, scale: 130, bit_width: 128 }),
+        scalar(ScalarType::Decimal { precision: 256, scale: 129, bit_width: 256 }),
+    ] {
+        assert!(rtdb_columnar::copy_array(&target, std::slice::from_ref(&value)).is_err());
+        assert!(rtdb_columnar::copy_array(&LogicalType::list(target), &[Value::List(vec![value.clone()])]).is_err());
+    }
+    let mut malformed = if let Value::Decimal(value) = value { value } else { unreachable!() };
+    malformed.unscaled.pop();
+    let malformed = Value::Decimal(malformed);
+    assert!(rtdb_columnar::copy_array(&malformed.logical_type(), &[malformed.clone()]).is_err());
+    for (key, text) in [(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY, "256"), (rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY, "129")] {
+        let field = arrow_schema::Field::new("value", arrow_schema::DataType::Decimal128(2, 2), false).with_metadata(std::collections::HashMap::from([(key.to_owned(), text.to_owned())]));
+        assert!(from_field(&field).is_err());
+    }
+}
+
+#[test]
 fn decimal_hash_uses_java_double_value_at_full_scale_limits() {
     for (scale, expected) in [(i32::MIN, f64::NEG_INFINITY), (i32::MAX, -0.0)] {
         let value = Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());

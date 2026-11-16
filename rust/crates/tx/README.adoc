@@ -28,9 +28,17 @@ Source transactions, argument chunks, metadata, encoded bytes, table buffers, an
 Decoded aborts retain their original Transit representation, including historical exception tags, while exposing a normalized anomaly to callers.
 Replica payloads contain only the transaction's deltas, including declared zero-row schemas.
 Follower decoding finishes all tables before returning a value that can be applied atomically.
+Typed source documents and SQL arguments, resolved query rows, and replica batches preserve exact decimal parameters and raw coefficient bytes.
+These copy boundaries retain values produced by vector accumulation even when their coefficient exceeds the declared precision.
+Computed expression projections and ordinary column writes validate precision and physical width.
+Canonical INSERT and UPDATE document packing uses the passive `RowCopy` descriptor to retain selected input cells; PATCH's computed document expressions pass through vector-write validation.
 
 The written fixtures map to `staged-txs-read-your-writes-across-a-batch`, `staged-empty-create-table-visible-across-a-batch-5507`, `test-indexer-cleans-up-aborted-transactions-2489`, `test-patch-operator`, `test-sql->static-ops-3484`, and the source operation codec paths.
 They also cover absent and empty argument batches, explicit IID preservation, invalid/equal system time, retained transport ownership, and authorization rejection.
+The decimal regression carries raw document cells through source serialization, replay, SUM insertion, staged writes, replica decoding, and the block-page copy seam.
+Separate fixtures preserve raw SQL argument metadata in the codec and reject an overprecision parameter when compiled VALUES writes it.
+Submit-time static document expansion re-infers decimal metadata from actual coefficient digits throughout nested values, choosing precision 32/width 128 or precision 64/width 256 and retaining scale.
+Coefficients above 64 digits fail before submission, following `ValueTypes.kt` and `PutDocs.openFromRows`; decimal-cast expressions remain SQL operations for compiled execution.
 These fixtures have not been compiled or executed under the implementation gate.
 
 The SQL parser's remaining general SQL coverage limits also apply to transaction SQL.

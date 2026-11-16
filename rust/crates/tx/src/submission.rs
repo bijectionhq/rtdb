@@ -72,11 +72,24 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
         }
     }
     let operations = groups.into_iter().map(|((valid_from, valid_to), documents)| {
+        let mut documents = documents;
+        for document in &mut documents { for value in document.values_mut() { infer_document_decimals(value)?; } }
         let documents = Documents::new(documents, memory)?;
         let table = plan.table.table.clone();
         Ok(if plan.patch { TxOp::PatchDocs { table, documents, valid_from, valid_to } } else { TxOp::PutDocs { table, documents, valid_from, valid_to } })
     }).collect::<Result<Vec<_>>>()?;
     Ok((!operations.is_empty()).then_some(operations))
+}
+
+fn infer_document_decimals(value: &mut Value) -> Result<()> {
+    match value {
+        Value::Decimal(decimal) => *decimal = rtdb_expr::infer_decimal(decimal)?,
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => for value in values { infer_document_decimals(value)?; },
+        Value::Struct(fields) => for value in fields.values_mut() { infer_document_decimals(value)?; },
+        Value::Map { entries, .. } => for (key, value) in entries { infer_document_decimals(key)?; infer_document_decimals(value)?; },
+        _ => {}
+    }
+    Ok(())
 }
 
 fn materialize(input: &Relation, context: &EvalContext<'_>) -> Result<Vec<Vec<Value>>> {
@@ -90,3 +103,68 @@ fn bound_value(value: &Value, fallback: Timestamp, context: &EvalContext<'_>) ->
     if matches!(value, Value::Null | Value::Undefined) { Ok(fallback) } else { rtdb_expr::timestamp_micros(value, context.timezone) }
 }
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Static transaction allocation exceeds address space") }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decimal(coefficient: i128, precision: i32, scale: i32) -> Value {
+        Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128).unwrap())
+    }
+
+    fn expanded(value: Value, memory: &Arc<MemoryBudget>) -> SourceTransaction {
+        let args = SqlArguments::new(vec![value.logical_type()], vec![vec![value]], memory).unwrap();
+        prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args) }], SubmitOptions::default(), "xtdb", memory).unwrap()
+    }
+
+    fn document(source: &SourceTransaction) -> &BTreeMap<String, Value> {
+        let crate::source::Operation::Public(TxOp::PutDocs { documents, .. }) = &source.operations[0] else { panic!("Expected static documents") };
+        &documents.rows()[0]
+    }
+
+    #[test]
+    fn static_parameter_documents_infer_decimal_metadata_from_coefficients() {
+        let memory = MemoryBudget::new(1 << 24);
+        for precision in [i32::MIN, -1, 0, 1, 256, i32::MAX] {
+            let source = expanded(decimal(18, precision, i32::MAX), &memory);
+            assert_eq!(document(&source)["v"], decimal(18, 32, i32::MAX));
+            let encoded = source.encode().unwrap();
+            let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+            let replay = SourceTransaction::decode(&message, &memory).unwrap();
+            let crate::source::Operation::PutIids { documents, .. } = &replay.operations[0] else { panic!("Expected decoded static documents") };
+            assert_eq!(documents.rows()[0]["v"], decimal(18, 32, i32::MAX));
+        }
+        let source = expanded(decimal(i128::MAX, -1, i32::MIN), &memory);
+        let Value::Decimal(value) = &document(&source)["v"] else { panic!("Expected decimal") };
+        assert_eq!((value.precision, value.scale, value.bit_width), (64, i32::MIN, 256));
+        assert_eq!(&value.unscaled[16..], &i128::MAX.to_be_bytes());
+        drop(source);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn static_document_inference_visits_every_nested_decimal_cell() {
+        let memory = MemoryBudget::new(1 << 24);
+        let nested = |value: Value| Value::Struct(BTreeMap::from([
+            ("list".into(), Value::List(vec![value.clone(), Value::Null])),
+            ("set".into(), Value::Set(vec![value.clone()])),
+            ("fixed".into(), Value::FixedSizeList(vec![value.clone()])),
+            ("map".into(), Value::Map { entries: vec![(value.clone(), value.clone())], sorted: false }),
+            ("struct".into(), Value::Struct(BTreeMap::from([("child".into(), value)]))),
+        ]));
+        let source = expanded(nested(decimal(18, -1, 129)), &memory);
+        assert_eq!(document(&source)["v"], nested(decimal(18, 32, 129)));
+    }
+
+    #[test]
+    fn static_document_inference_rejects_coefficients_above_sixty_four_digits_without_retaining_scratch() {
+        let memory = MemoryBudget::new(1 << 24);
+        let value = Value::Decimal(rtdb_types::DecimalValue::new(vec![127; 32], i32::MAX, i32::MIN, 256).unwrap());
+        let args = SqlArguments::new(vec![value.logical_type()], vec![vec![value]], &memory).unwrap();
+        let error = prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args) }], SubmitOptions::default(), "xtdb", &memory).err().unwrap();
+        assert_eq!(error.category, rtdb_types::AnomalyCategory::Unsupported);
+        assert_eq!(error.code, "");
+        assert_eq!(error.message, "Unsupported precision: 77");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

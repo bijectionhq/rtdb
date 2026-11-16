@@ -24,7 +24,7 @@ pub enum ScalarType {
     U8, U16, U32, U64,
     F16, F32, F64,
     Utf8, Binary, FixedSizeBinary(i32),
-    Decimal { precision: u8, scale: i32, bit_width: u16 },
+    Decimal { precision: i32, scale: i32, bit_width: u16 },
     DateDay, DateMilli,
     Time { unit: TimeUnit, bit_width: u8 },
     Timestamp { unit: TimeUnit, timezone: Option<String> },
@@ -243,10 +243,9 @@ impl ScalarType {
             (left, Self::Decimal { .. }) if left.float_width().is_some() => Some(left.clone()),
             (Self::Decimal { precision: lp, scale: ls, .. }, Self::Decimal { precision: rp, scale: rs, .. }) => {
                 let scale = (*ls).max(*rs);
-                let integer_digits = (i64::from(*lp) - i64::from(*ls)).max(i64::from(*rp) - i64::from(*rs));
-                let precision = u8::try_from(integer_digits + i64::from(scale)).ok()?;
-                if precision > 76 { return None; }
-                let bit_width = match precision { 0..=9 => 32, 10..=18 => 64, 19..=38 => 128, _ => 256 };
+                let integer_digits = lp.wrapping_sub(*ls).max(rp.wrapping_sub(*rs));
+                let precision = integer_digits.wrapping_add(scale);
+                let bit_width = if precision <= 9 { 32 } else if precision <= 18 { 64 } else if precision <= 38 { 128 } else { 256 };
                 Some(Self::Decimal { precision, scale, bit_width })
             }
             (Self::Duration(left), Self::Duration(right)) => Some(Self::Duration((*left).max(*right))),
@@ -270,10 +269,7 @@ impl ScalarType {
     pub fn validate(&self) -> Result<()> {
         let invalid = match self {
             Self::FixedSizeBinary(width) => *width < 0,
-            Self::Decimal { precision, bit_width, .. } => {
-                let limit = match bit_width { 32 => 9, 64 => 18, 128 => 38, 256 => 76, _ => 0 };
-                *precision > limit || limit == 0
-            }
+            Self::Decimal { bit_width, .. } => !matches!(bit_width, 32 | 64 | 128 | 256),
             Self::Time { unit, bit_width } => *bit_width != if *unit >= TimeUnit::Microsecond { 64 } else { 32 },
             _ => false,
         };

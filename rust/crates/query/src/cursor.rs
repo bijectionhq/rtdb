@@ -3,7 +3,7 @@ use std::sync::Arc;
 use arrow_array::{ArrayRef, RecordBatch, RecordBatchOptions};
 use arrow_schema::Schema as ArrowSchema;
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, estimate_builder_bytes_refs, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, copy_array, estimate_builder_bytes_refs, to_field};
 use rtdb_plan::{Catalog, ExecutionError, ExecutionSample, ExecutionTimer, Relation, Schema};
 use rtdb_types::{Result, Value};
 
@@ -114,7 +114,7 @@ impl QueryCursor {
         let reservation = self.context.memory.reserve(bound)?;
         let fields = self.schema.fields().iter().map(|field| to_field(&field.name, &field.data_type)).collect::<Result<Vec<_>>>()?;
         let arrays: Vec<ArrayRef> = self.schema.fields().iter().enumerate().map(|(column, field)| {
-            build_array(&field.data_type, &rows.iter().map(|row| row.values[column].clone()).collect::<Vec<_>>())
+            copy_array(&field.data_type, &rows.iter().map(|row| row.values[column].clone()).collect::<Vec<_>>())
         }).collect::<Result<_>>()?;
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         let batch = RecordBatch::try_new_with_options(Arc::new(ArrowSchema::new(fields)), arrays, &options).map_err(|error| invalid("output-arrow", error))?;

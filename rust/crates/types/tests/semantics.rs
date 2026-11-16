@@ -4,12 +4,25 @@ use std::collections::BTreeMap;
 fn scalar(scalar: S) -> T { T::Scalar(scalar) }
 
 #[test]
-fn decimal_metadata_accepts_zero_precision_and_scales_larger_than_precision() {
-    for (precision, scale) in [(0, 3), (1, 3), (32, -128), (32, 127), (1, i32::MIN), (1, i32::MAX)] {
+fn decimal_metadata_accepts_signed_precision_and_scale_independently_of_width() {
+    for (precision, scale) in [(i32::MIN, i32::MAX), (-1, 0), (0, 3), (1, 3), (32, -128), (32, 127), (39, 0), (256, i32::MIN), (i32::MAX, i32::MAX)] {
         assert!(S::Decimal { precision, scale, bit_width: 128 }.validate().is_ok());
     }
-    assert!(S::Decimal { precision: 39, scale: 0, bit_width: 128 }.validate().is_err());
     assert!(S::Decimal { precision: 1, scale: 0, bit_width: 16 }.validate().is_err());
+}
+
+#[test]
+fn decimal_least_upper_bound_preserves_kotlin_int_wrapping_and_width_selection() {
+    let decimal = |precision, scale, bit_width| scalar(S::Decimal { precision, scale, bit_width });
+    for (left, right, expected) in [
+        (decimal(32, -100, 128), decimal(32, 100, 128), decimal(232, 100, 256)),
+        (decimal(32, 0, 128), decimal(32, i32::MAX, 128), decimal(-2_147_483_617, i32::MAX, 32)),
+        (decimal(32, i32::MIN, 128), decimal(32, 0, 128), decimal(32, 0, 128)),
+        (decimal(i32::MAX, 0, 256), decimal(1, 1, 32), decimal(i32::MIN, 1, 32)),
+    ] {
+        assert_eq!(T::least_upper_bound(&[left.clone(), right.clone()]), Some(expected));
+        assert_eq!(left.join(&right), T::from_legs([left, right]));
+    }
 }
 fn structure(fields: &[(&str, T)]) -> T {
     T::Struct(fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect())

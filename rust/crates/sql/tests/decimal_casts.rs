@@ -25,7 +25,7 @@ async fn query(sql: &str) -> Result<(LogicalType, Value)> {
     Ok((data_type, value))
 }
 
-fn decimal(coefficient: i128, precision: u8, scale: i32, bit_width: u16) -> Value {
+fn decimal(coefficient: i128, precision: i32, scale: i32, bit_width: u16) -> Value {
     let width = usize::from(bit_width / 8);
     let mut bytes = vec![if coefficient < 0 { 255 } else { 0 }; width];
     bytes[width - 16..].copy_from_slice(&coefficient.to_be_bytes());
@@ -108,4 +108,24 @@ async fn decimal_casts_retain_signed32_scale_and_round_result_metadata() {
 async fn decimal_aggregates_use_bounded_full_scale_values() {
     assert_eq!(query("SELECT SUM(v) FROM (VALUES ('1E-1000'::DECIMAL(32,1000)), ('2E-1000'::DECIMAL(32,1000))) t(v)").await.unwrap().1, decimal(3, 32, 1000, 128));
     assert_eq!(query("SELECT AVG(v) FROM (VALUES ('1E-2147483647'::DECIMAL(32,2147483647)), ('2E-2147483647'::DECIMAL(32,2147483647))) t(v)").await.unwrap().1, Value::F64(0.0));
+}
+
+#[tokio::test]
+async fn decimal_sum_raw_output_survives_identity_and_requires_valid_computed_projection() {
+    let source = "(SELECT SUM(v) AS s FROM (VALUES ('9'::DECIMAL(1,0)), ('9'::DECIMAL(1,0))) t(v)) sums";
+    assert_eq!(query(&format!("SELECT s AS renamed FROM {source}")).await.unwrap().1, decimal(18, 1, 0, 128));
+    for projection in [
+        "CAST(s AS DECIMAL(1,0))", "CAST(s AS DECIMAL)", "COALESCE(s, NULL)",
+        "CASE WHEN true THEN s ELSE NULL END", "ARRAY[s]", "{'v': s}",
+        "ARRAY[s]::DECIMAL(1,0)[]",
+    ] {
+        assert_eq!(query(&format!("SELECT {projection} FROM {source}")).await.unwrap_err().code, "rtdb/decimal-precision", "{projection}");
+    }
+    assert!(query(&format!("SELECT s + '0'::DECIMAL(1,0) FROM {source}")).await.is_err());
+    for projection in ["CAST(s AS DECIMAL(1,0)) > 0", "CAST(s AS DECIMAL) > 0", "COALESCE(s, NULL) > 0"] {
+        assert_eq!(query(&format!("SELECT {projection} FROM {source}")).await.unwrap().1, Value::Bool(true), "{projection}");
+    }
+    assert_eq!(query(&format!("SELECT CAST(CAST(s AS DECIMAL(1,0)) AS TEXT) FROM {source}")).await.unwrap().1, Value::Utf8("18".into()));
+    assert_eq!(query(&format!("SELECT CASE WHEN false THEN s ELSE NULL END FROM {source}")).await.unwrap().1, Value::Null);
+    assert_eq!(query(&format!("SELECT s::DECIMAL(2,0) FROM {source}")).await.unwrap().1, decimal(18, 2, 0, 128));
 }

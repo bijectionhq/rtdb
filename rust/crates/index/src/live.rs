@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, estimate_builder_bytes_refs, from_field};
-use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch};
+use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch, copy_event_batch};
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
@@ -11,6 +11,9 @@ use crate::{Snapshot, TableMeta, merge_column_types};
 
 #[derive(Debug)]
 pub struct IndexBatch { owned: OwnedBatch, events: EventBatch, put_types: BTreeMap<String, LogicalType> }
+
+#[derive(Clone, Copy)]
+enum EventBuild { Write, CopyInferred, CopyCaptured }
 
 impl IndexBatch {
     pub fn new(batch: RecordBatch, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
@@ -26,18 +29,37 @@ impl IndexBatch {
         Ok(Arc::new(Self { owned, events, put_types }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        Self::build_events(events, declared, false, budget)
+        Self::build_events(events, declared, EventBuild::Write, budget)
     }
-    pub fn from_events_with_put_schema(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        Self::build_events(events, declared, true, budget)
+    /// Copies typed event cells, joining their exact types with declarations without numeric coercion.
+    /// Raw decimal coefficients retain their parameters; returned arrays retain their reservation independently.
+    pub fn copy_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::build_events(events, declared, EventBuild::CopyInferred, budget)
     }
-    fn build_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, force_put: bool, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let mut fields = declared.clone();
-        let mut has_put = force_put || !declared.is_empty();
+    /// Reconstructs stored event rows with the captured put schema and unchanged decimal parameters and coefficients.
+    /// The returned arrays retain their reservation independently of this index batch.
+    pub fn copy_events_with_put_schema(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        Self::build_events(events, declared, EventBuild::CopyCaptured, budget)
+    }
+    fn build_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, mode: EventBuild, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let mut schema_bytes = 4096usize;
+        for (name, ty) in declared {
+            schema_bytes = schema_bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(ty.retained_bytes().ok()?)).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
+        }
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
-                let next = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
-                fields = merge_column_types(&fields, &next);
+                schema_bytes = schema_bytes.checked_add(Value::document_retained_bytes(document)?).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
+            }
+        }
+        let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
+        let mut fields = declared.clone();
+        let mut has_put = matches!(mode, EventBuild::CopyCaptured) || !declared.is_empty();
+        for event in events {
+            if let StoredOperation::Put(document) = &event.operation {
+                if !matches!(mode, EventBuild::CopyCaptured) {
+                    let next = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
+                    fields = merge_column_types(&fields, &next);
+                }
                 has_put = true;
             }
         }
@@ -58,7 +80,10 @@ impl IndexBatch {
             }
         }
         let reservation = budget.reserve(bytes)?;
-        let batch = build_event_batch(events, has_put.then_some(fields), None)?;
+        let batch = match mode {
+            EventBuild::Write => build_event_batch(events, has_put.then_some(fields), None)?,
+            EventBuild::CopyInferred | EventBuild::CopyCaptured => copy_event_batch(events, has_put.then_some(fields), None)?,
+        };
         Self::from_owned(OwnedBatch::with_reservation(batch, reservation)?)
     }
     pub fn view(&self) -> &EventBatch { &self.events }
@@ -267,7 +292,7 @@ impl TransactionBuffer {
     pub fn stage(self) -> Result<StagedWrite> { self.materialize() }
     fn materialize(&self) -> Result<StagedWrite> {
         let tables = self.tables.iter().map(|(table, pending)| {
-            let batch = Some(IndexBatch::from_events(&pending.events, &pending.declared, &self.budget)?);
+            let batch = Some(IndexBatch::copy_events(&pending.events, &pending.declared, &self.budget)?);
             Ok((table.clone(), TableWrite::new(pending.declared.clone(), batch)))
         }).collect::<Result<_>>()?;
         StagedWrite::new(self.tx_key, self.base.tx_basis(), self.base.block_index(), tables)

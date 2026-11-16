@@ -178,3 +178,67 @@ async fn grant_and_revoke_require_explicit_authorization() {
     assert_eq!(denied.result().error().unwrap().category, rtdb_types::AnomalyCategory::Forbidden);
     assert!(!denied.writes().tables().contains_key(&TableRef::new("xt", "role_membership")));
 }
+
+#[tokio::test]
+async fn raw_decimal_cells_survive_source_replay_resolution_sum_and_replica_staging() {
+    use rtdb_types::DecimalValue;
+    for precision in [-1, 1, 256, i32::MAX] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let context = context();
+        let value = Value::Decimal(DecimalValue::new(18i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap());
+        let documents = Documents::new([1, 2].into_iter().map(|id| BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), value.clone())])).collect(), &context.memory).unwrap();
+        let source = request(vec![
+            TxOp::PutDocs { table: table(), documents, valid_from: None, valid_to: None },
+            sql("INSERT INTO sums (_id, v) SELECT 1, SUM(v) FROM docs"),
+        ], &context);
+        let encoded = source.encode().unwrap();
+        let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+        assert!(resolved.result().committed(), "{:?}", resolved.result());
+        let docs = resolved.writes().tables()[&table()].batch().unwrap();
+        assert_eq!(docs.len(), 2);
+        for row in 0..docs.len() {
+            let StoredOperation::Put(document) = docs.view().read_event(row).unwrap().operation else { panic!("Expected put") };
+            assert_eq!(document["v"], value);
+        }
+        let sums = TableRef::new("public", "sums");
+        let total = resolved.writes().tables()[&sums].batch().unwrap();
+        let StoredOperation::Put(document) = total.view().read_event(0).unwrap().operation else { panic!("Expected sum put") };
+        assert_eq!(document["v"], Value::Decimal(DecimalValue::new(36i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap()));
+        let body = resolved.to_replica_body(&context.memory).unwrap();
+        let rtdb_format::envelope::ReplicaBody::ResolvedTx(body) = body.body() else { panic!("Expected resolved payload") };
+        let (replica, result) = decode_replica(body, None, state.value().snapshot().block_index(), &context.memory).unwrap();
+        assert_eq!(&result, resolved.result());
+        for table in [table(), sums] {
+            let expected = resolved.writes().tables()[&table].batch().unwrap();
+            let actual = replica.tables()[&table].batch().unwrap();
+            assert_eq!(actual.put_types(), expected.put_types());
+            for row in 0..expected.len() { assert_eq!(actual.view().read_event(row).unwrap(), expected.view().read_event(row).unwrap()); }
+            let events = (0..actual.len()).map(|row| actual.view().read_event(row).unwrap()).collect::<Vec<_>>();
+            let flushed = rtdb_index::IndexBatch::copy_events_with_put_schema(&events, actual.put_types(), &context.memory).unwrap();
+            for row in 0..actual.len() { assert_eq!(flushed.view().read_event(row).unwrap(), actual.view().read_event(row).unwrap()); }
+        }
+        state.apply(&replica).unwrap();
+        assert!(state.value().snapshot().tables().contains(&TableRef::new("public", "sums")));
+    }
+}
+
+#[tokio::test]
+async fn compiled_values_rejects_raw_decimal_arguments_at_the_expression_writer() {
+    for precision in [-1, 0, 1] {
+        let state = PartitionState::empty(Default::default()).unwrap();
+        let context = context();
+        let value = Value::Decimal(rtdb_types::DecimalValue::new(18i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap());
+        let arguments = SqlArguments::new(vec![value.logical_type()], vec![vec![value]], &context.memory).unwrap();
+        let source = request(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (2, ?)".into(), args: Some(arguments) }], &context);
+        let encoded = source.encode().unwrap();
+        let message = rtdb_format::envelope::SourceMessage::decode(encoded.as_slice()).unwrap().unwrap();
+        let decoded = SourceTransaction::decode(&message, &context.memory).unwrap();
+        let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+        let resolved = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), decoded, &context).await.unwrap();
+        assert_eq!(resolved.result().error().unwrap().code, "rtdb/decimal-precision");
+        assert!(!resolved.writes().tables().contains_key(&table()));
+    }
+}

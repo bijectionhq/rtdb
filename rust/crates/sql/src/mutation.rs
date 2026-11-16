@@ -40,10 +40,18 @@ pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::Prepare
         Statement::Dml(Dml::Patch { table, input, valid_time }) => StaticMutation { table, input, patch: true, valid_time },
         _ => return Ok(None),
     };
+    fn decimal_target(target: &CastTarget) -> bool {
+        match target {
+            CastTarget::DecimalDefault | CastTarget::Fixed(LogicalType::Scalar(ScalarType::Decimal { .. })) => true,
+            CastTarget::List(element) => decimal_target(element),
+            _ => false,
+        }
+    }
     fn expression(expr: &Expr) -> bool {
         match expr {
             Expr::Literal(_) | Expr::Parameter { .. } | Expr::Column { .. } => true,
-            Expr::Cast { expr, .. } | Expr::Field { expr, .. } | Expr::Unary { op: UnaryOp::Negate, expr } => expression(expr),
+            Expr::Cast { expr, target } => !decimal_target(target) && expression(expr),
+            Expr::Field { expr, .. } | Expr::Unary { op: UnaryOp::Negate, expr } => expression(expr),
             Expr::List(values) => values.iter().all(expression),
             Expr::Struct(fields) => fields.iter().all(|(_, expr)| expression(expr)),
             _ => false,
@@ -156,8 +164,8 @@ fn canonical_put(input: Arc<Relation>, iid_name: Option<&str>) -> Result<Arc<Rel
     let now = Expr::Call { name: "current_timestamp".into(), args: vec![], return_type: instant_type() };
     let from = instant_cast(Expr::Coalesce(vec![find("_valid_from").unwrap_or(Expr::Literal(Value::Null)), now]));
     let to = instant_cast(Expr::Coalesce(vec![find("_valid_to").unwrap_or(Expr::Literal(Value::Null)), timestamp_literal(i64::MAX)]));
-    let fields = input.schema().fields().iter().filter(|field| !["_iid", "_valid_from", "_valid_to", "_system_from", "_system_to"].contains(&field.name.as_str())).map(|field| (field.name.clone(), field.expression())).collect();
-    let expressions = [("_iid", iid), ("_valid_from", from), ("_valid_to", to), ("doc", Expr::Struct(fields))].into_iter()
+    let fields = input.schema().fields().iter().filter(|field| !["_iid", "_valid_from", "_valid_to", "_system_from", "_system_to"].contains(&field.name.as_str())).cloned().collect();
+    let expressions = [("_iid", iid), ("_valid_from", from), ("_valid_to", to), ("doc", Expr::RowCopy(fields))].into_iter()
         .map(|(name, expr)| Ok(NamedExpr { field: allocator.field(name, None, expr.data_type())?, expr })).collect::<Result<_>>()?;
     Ok(Arc::new(input.project(expressions)?))
 }

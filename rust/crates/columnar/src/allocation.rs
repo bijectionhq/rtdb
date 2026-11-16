@@ -1,6 +1,6 @@
 use rtdb_types::{Anomaly, ListKind, LogicalType, Result, ScalarType, Value};
 
-/// Bounds allocations made by `build_array`, including temporary value clones and Arrow container capacities.
+/// Bounds allocations made by `build_array` and `copy_array`, including temporary value clones and Arrow container capacities.
 /// Sum this bound for each column before building a batch; existing input values require their own reservation.
 /// The bound includes batch overhead and rejects incompatible input types or arithmetic overflow.
 pub fn estimate_builder_bytes(logical: &LogicalType, values: &[Value]) -> Result<usize> {

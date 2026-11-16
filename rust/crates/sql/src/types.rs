@@ -9,6 +9,10 @@ pub(crate) fn cast_target(data_type: &ast::DataType) -> Result<rtdb_plan::CastTa
         D::Numeric(info) | D::Decimal(info) | D::Dec(info) => {
             let (precision, scale) = match info { N::None => (None, None), N::Precision(p) => (Some(*p), None), N::PrecisionAndScale(p, s) => (Some(*p), Some(*s)) };
             if scale.is_some_and(|scale| scale < 0) { return Err(error("SQL decimal scale must be unsigned")); }
+            let precision = precision.map(|precision| {
+                if precision > 64 { return Err(rtdb_types::Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
+                Ok(precision as i64)
+            }).transpose()?;
             rtdb_plan::CastTarget::decimal(precision, scale)
         }
         D::Array(element) => {
@@ -69,7 +73,7 @@ fn decimal_type(info: &ast::ExactNumberInfo) -> Result<ScalarType> {
     };
     if precision > 64 { return Err(rtdb_types::Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
     if scale < 0 { return Err(error("SQL decimal scale must be unsigned")); }
-    Ok(ScalarType::Decimal { precision: precision as u8, scale: i32::try_from(scale).map_err(error)?, bit_width: if precision <= 32 { 128 } else { 256 } })
+    Ok(ScalarType::Decimal { precision: precision as i32, scale: i32::try_from(scale).map_err(error)?, bit_width: if precision <= 32 { 128 } else { 256 } })
 }
 
 fn time_unit(precision: Option<u64>) -> Result<TimeUnit> {

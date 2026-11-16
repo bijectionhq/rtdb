@@ -20,7 +20,7 @@ fn project(expression: &str) -> (T, V) {
     (expression.data_type(), evaluate(expression, input.schema(), &[], &EvalContext::default()).unwrap())
 }
 
-fn decimal(coefficient: i128, precision: u8, scale: i32) -> V {
+fn decimal(coefficient: i128, precision: i32, scale: i32) -> V {
     V::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128).unwrap())
 }
 
@@ -87,5 +87,29 @@ fn java_unicode_decimal_string_casts_keep_clojure_ascii_literal_grammar() {
     assert!(matches!(rtdb_xtql::read("𝟙M").unwrap().kind, rtdb_xtql::EdnKind::Symbol(_)));
     for source in ["1M", "+1.M", "1.e2M", "1E+2147483648M"] {
         assert!(matches!(rtdb_xtql::read(source).unwrap().kind, rtdb_xtql::EdnKind::Decimal(_)), "{source}");
+    }
+}
+
+#[test]
+fn decimal_inference_keeps_32_and_64_digit_classes_and_signed_cast_metadata() {
+    for (digits, precision, bit_width) in [(32, 32, 128), (33, 64, 256), (64, 64, 256)] {
+        let expression = format!("{}M", "9".repeat(digits));
+        let (logical, value) = project(&expression);
+        assert_eq!(logical, T::Scalar(S::Decimal { precision, scale: 0, bit_width }));
+        let V::Decimal(value) = value else { panic!("Expected decimal") };
+        assert_eq!((value.precision, value.scale, value.bit_width), (precision, 0, bit_width));
+    }
+    let source = format!("(-> (rel [{{}}] []) (return {{:v {}M}}))", "9".repeat(65));
+    assert!(compile(&source, &EmptyCatalog, &CompileOptions::default()).is_err());
+    for precision in [i32::MIN, -1, 0] {
+        let source = format!("(-> (rel [{{}}] []) (return {{:v (cast 0 #xt/type [:decimal 2147483647 -2147483648 128] {{:precision {precision} :scale 0}})}}))");
+        let Statement::Query(relation) = compile(&source, &EmptyCatalog, &CompileOptions::default()).unwrap().statement else { panic!("Expected query") };
+        let RelationNode::Project { input, expressions } = relation.node() else { panic!("Expected projection") };
+        assert_eq!(expressions[0].expr.data_type(), T::Scalar(S::Decimal { precision, scale: 0, bit_width: 128 }));
+        assert!(evaluate(&expressions[0].expr, input.schema(), &[], &EvalContext::default()).is_err());
+        let null_source = source.replace("(cast 0 ", "(cast nil ");
+        let Statement::Query(relation) = compile(&null_source, &EmptyCatalog, &CompileOptions::default()).unwrap().statement else { panic!("Expected query") };
+        let RelationNode::Project { input, expressions } = relation.node() else { panic!("Expected projection") };
+        assert_eq!(evaluate(&expressions[0].expr, input.schema(), &[], &EvalContext::default()).unwrap(), V::Null);
     }
 }

@@ -135,7 +135,7 @@ fn number(text: &str) -> Result<ConnectData> {
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; usize::from(precision / 2)];
     if bytes.len() > unscaled.len() { return Err(error("header-parse", "Decimal coefficient exceeds its width")); }
     let start = unscaled.len() - bytes.len(); unscaled[start..].copy_from_slice(&bytes);
-    let value = Value::Decimal(DecimalValue::new(unscaled, precision, scale, u16::from(precision) * 4)?);
+    let value = Value::Decimal(DecimalValue::new(unscaled, i32::from(precision), scale, u16::from(precision) * 4)?);
     let mut schema = ConnectSchema::new(SchemaKind::Bytes); schema.name = Some("org.apache.kafka.connect.data.Decimal".into()); schema.version = Some(1); schema.parameters.insert("scale".into(), scale.to_string());
     Ok(ConnectData { schema: Some(Arc::new(schema)), value })
 }
