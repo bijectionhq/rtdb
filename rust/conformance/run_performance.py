@@ -12,6 +12,7 @@ from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, owned_cancell
 from run_clients import Commands, image_record, materialize_clients, validate_package, validate_package_files, verify_running_artifact
 from performance_plan import operation_trace_digest, validate_plan
 from performance_results import PROVIDER_BOUNDARY, compare
+from packaged_lifecycle import validate_stopped
 sys.path.insert(0, str(HERE.parent / "release"))
 from evidence import artifact, read_json, retained
 
@@ -150,15 +151,16 @@ def provider_delta(before, after, plan):
     return result
 
 
-def clean_stop(commands, compose, names):
+def clean_stop(commands, compose, names, engine):
     commands.run("stop-server-owners", compose + ["stop", "--timeout", "60", *names], timeout=180)
     for name in names:
         _, ids = commands.run("stopped-server-id", compose + ["ps", "--all", "--quiet", name])
         identifier = ids.read_text().strip()
         _, output = commands.run("stopped-server-state", ["docker", "inspect", "--format", "{{json .State}}", identifier])
         state = read_json(output)
-        if state.get("Running") is not False or state.get("OOMKilled") is not False or state.get("ExitCode") != 0:
-            raise ValueError("packaged server did not finish a clean owner drain")
+        _, logs = commands.run("stopped-server-logs", ["docker", "logs", identifier])
+        combined = logs.read_text() + logs.with_name("stderr.log").read_text()
+        validate_stopped(engine, state, combined)
 
 
 def run_case(args, plan, engine, package, client_image, adapters, case, directory):
@@ -192,7 +194,7 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
             outer_count = case["samples"] if case["cache_mode"] == "process_cold" else 1
             for outer in range(outer_count):
                 if case["cache_mode"] == "process_cold" or case.get("restart_before_measurement"):
-                    clean_stop(commands, compose, names)
+                    clean_stop(commands, compose, names, engine)
                     started = time.perf_counter_ns()
                     commands.run("restore-server-owners", compose + ["start", *names])
                     for name in names:
@@ -223,10 +225,10 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
         finally:
             owner.begin_cleanup()
             try:
-                clean_stop(commands, compose, names)
+                clean_stop(commands, compose, names, engine)
                 if "object-observer" in owners:
                     commands.run("stop-provider-observer", compose + ["stop", "--timeout", "330", "object-observer"], timeout=360)
-                    clean_stop(commands, compose, ["object-observer"])
+                    clean_stop(commands, compose, ["object-observer"], "provider_observer")
             except BaseException as error:
                 cleanup.append(error)
             for action, command in [("server-logs", compose + ["logs", "--no-color"]),
@@ -278,7 +280,7 @@ def run(args):
         if host != plan["resources"]["architecture"]:
             raise ValueError("matched performance requires a native worker architecture, without CPU emulation")
         inputs = [args.plan, fixture_path, Path(__file__), HERE / "performance_plan.py", HERE / "performance_results.py", HERE / "run_clients.py", HERE / "run_controls.py",
-                  HERE / "client_results.py", HERE.parent / "release/evidence.py"]
+                  HERE / "client_results.py", HERE / "packaged_lifecycle.py", HERE.parent / "release/evidence.py"]
         packages = {}
         for engine, selected in plan["engines"].items():
             path = artifact(args.plan.parent, selected["package"])

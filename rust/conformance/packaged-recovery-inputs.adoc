@@ -1,0 +1,254 @@
+= Packaged recovery inputs, version 1
+
+`run_packaged_recovery.py` owns real packaged JVM and Rust processes, their protocol clients, and one isolated backend namespace per scenario.
+It writes transactions through pgwire, captures actual provider objects and source/replica records through the native production backends, and compares historical results after cross-engine recovery.
+The runner and regression tests are source-only until the Phase 2 completeness gate permits execution.
+No source inspection result establishes backend compatibility, a successful test, or production cutover authority.
+
+== Invocation and ownership
+
+[source,shell]
+----
+python3 rust/conformance/run_packaged_recovery.py --phase-two \
+  --plan recovery-plan.json --reference /absolute/pinned-checkout \
+  --output /absolute/new-evidence-directory --timeout 900
+----
+
+The implementation and reference checkouts must be clean, and the reference must match the repository's pinned revision.
+Docker must run the selected architecture natively.
+Both server images must already exist locally and have verified package receipts and retained package artifacts.
+The helper is the `rtdb-conformance` production target built with the same matrix feature selection as the native server package.
+It runs inside that package's runtime image; the helper executable is copied into the evidence directory and its hash is checked on every invocation.
+The client image is built from the pinned repository's Python client source and Poetry lockfile, and its image identity and build outputs are retained.
+The Kafka upstream client uses Kafka Admin/Producer classes from the selected JVM package, with its mounted script retained as an input artifact.
+
+`--timeout` is the positive subprocess deadline in seconds.
+Timeout or cancellation joins the subprocess group and triggers the owning Compose region's cleanup; a timeout never counts as a successful owner drain.
+Native zero exit and JVM SIGTERM exit 143 are distinguished.
+The latter requires the pinned shutdown hook's `Node stopped.` output, a stopped non-OOM container, and no forced-exit marker.
+The deliberate fault crash requires the observed SIGKILL exit 137 and is recorded separately from clean shutdown.
+All admitted container IDs, inspected image IDs, actual mounts, wait results, stop logs, and final project/volume checks are retained.
+Container inspection selects identity, labels, lifecycle state and mounts; credential environment values are excluded before output capture.
+
+The operator must reserve each namespace exclusively for this invocation and keep external lifecycle agents, retention, IAM changes, and concurrent writers outside it.
+The runner checks absence before claiming topics, upstream schema/publication/slot, or provider objects.
+It never purges a namespace that failed that initial ownership check.
+On ordinary failure, admitted server owners stop before object cleanup, Kafka topic deletion, and PostgreSQL slot/publication/schema cleanup.
+Cleanup failures remain unsuccessful evidence and retain the affected names for operator repair.
+Credential files are mounted read-only beneath `/secrets`; neither their contents nor resolved environment values are written to the plan or Compose evidence.
+
+== Plan
+
+All fields are required unless marked optional.
+An `Artifact` is `{ "path": "relative/path", "sha256": "64 lowercase hexadecimal digits", "bytes": 123 }`; `bytes` is optional.
+References resolve beneath the plan directory without symlinks or `..` components.
+Package producer directories remain part of the retained matrix evidence closure; a package JSON file alone is insufficient provenance.
+
+[cols="1,3",options="header"]
+|===
+|Field |Contract
+|`schema_version` |Integer `1`.
+|`namespace` |`rtdb-recovery-` followed by 12–24 lowercase letters/digits, newly reserved by the operator.
+|`platform` |`linux/amd64` or `linux/arm64`.
+|`capability` |One of `local`, `kafka`, `kafka-connect`, `s3`, `azure`, `gcs`, `pg-source`.
+|`engines` |Exactly `jvm` and `rust`, each containing only `package: Artifact`.
+|`native` |Artifact for the selected retained production `rtdb-conformance` executable.
+|`fixture` |Artifact with the exact committed `fixtures/historical-prices.json` bytes.
+|`storage` |One backend object from the next table.
+|`kafka` |Required only for `kafka` or `kafka-connect`: `{bootstrap_servers: string, properties_environment: {KafkaJavaProperty: EnvironmentName}}`.
+|`postgres` |Required only for `pg-source`: `{hostname: string, port: 1..65535, database: string, username: string, password_environment: EnvironmentName}`.
+|`credentials` |Normal credential binding described below.
+|`client_password` |Artifact naming the password file mounted into the protocol client; it must contain the same password as `RTDB_RECOVERY_PASSWORD`.
+|`faults` |Optional map from each selected `*-partial` scenario ID to its exact policy/key/credential binding.
+Absence leaves that required scenario unmet while other scenarios still execute.
+|`memory_bytes` |Integer 256 MiB–64 GiB container limit; swap is capped at the same value.
+|`cpu_count` |Integer 1–64 container CPU limit.
+|`timeout_seconds` |Integer 1–600 for individual readiness, recovery, provider, and adoption barriers.
+|`maximum_capture_bytes` |Integer 1–8 GiB maximum retained object/log payload bytes per native capture.
+|===
+
+[cols="1,3",options="header"]
+|===
+|Storage kind |Exact fields
+|`local` |`{kind: "local"}`.
+The private Compose volume contains the selected scenario's storage and logs.
+|`s3` |`{kind: "s3", bucket: string, region: string-or-null, prefix: string, endpoint: URL-or-null, path_style: boolean}`.
+|`azure` |`{kind: "azure", account: string, container: string, prefix: string, endpoint: URL-or-null}`.
+|`gcs` |`{kind: "gcs", project: string, bucket: string, prefix: string}`.
+|===
+
+Remote prefixes are canonical directory paths without empty components, dot segments, backslashes, percent escapes, queries, or fragments.
+The exact scenario namespace is appended as a whole path component.
+Provider endpoints must be HTTP(S) URLs without embedded credentials, query parameters, or fragments.
+GCS uses the pinned factory's normal endpoint and Application Default Credentials; this runner does not invent an endpoint override.
+Cloud capabilities require their corresponding remote storage backend and local logs.
+Kafka capabilities require real Kafka source and replica topics and local object storage.
+`pg-source` requires durable local storage/logs plus the real PostgreSQL source.
+The `local` scenario requires durable local storage and logs.
+
+== Credentials and exact faults
+
+A credential binding contains `environment`, a map from container environment names to already-defined host environment names, and optional `files`, an array of Artifacts with an additional absolute `/secrets/...` `target`.
+`RTDB_RECOVERY_PASSWORD` must have an explicit environment binding.
+Kafka's property environment names and PostgreSQL's password environment name must be present in the container binding.
+SDK credential chains use the normal AWS, Azure, or Google credential environment and mounted files.
+Bindings cannot replace packaged startup code through `JAVA_TOOL_OPTIONS`, `JDK_JAVA_OPTIONS`, `CLASSPATH`, `LD_PRELOAD`, `LD_LIBRARY_PATH`, `PATH`, `PYTHONPATH`, or `RUSTFLAGS`.
+Fault bindings override only the specified normal environment/file bindings.
+
+Each fault entry contains exactly:
+
+[cols="1,3",options="header"]
+|===
+|Field |Contract
+|`policy` |Artifact containing the operator-installed provider policy or AppArmor profile; the runner retains its bytes and SHA-256.
+|`metadata_key` |Exact relative `tables/<recorded-slug>/meta/<non-L0-trie>.arrow` key returned by the captured production compaction planner.
+|`credentials` |Fault credential overrides with the same binding format as normal credentials.
+|`apparmor_profile` |For local storage, exactly `<plan namespace>-<scenario ID>`, installed before execution.
+For remote storage, JSON `null`.
+|`gcs_audit` |Required only for GCS with a JVM-origin fault: `{principal_email: string}` naming the actual fault-policy writer.
+All other fault entries omit this field.
+|`cloudtrail` |Optional only for S3 with a JVM-origin fault: `{bucket: string, prefix: string, region: string, principal: {arn: string}}` or the same object with `principal: {principal_id: string}`.
+The bucket/prefix/region identify actual CloudTrail S3 log storage; `prefix` ends at the region directory before the date components.
+The principal is the exact writer user ARN, assumed-role session ARN, or complete `principalId` including its session suffix.
+|===
+
+The access policy must deny publication at this one metadata key while permitting startup reads, existing metadata/data, source/replica logs, all other required writes, the corresponding data output, and normal-credential inspector reads.
+For local storage, the installed AppArmor profile targets the full metadata pathname below `/var/lib/rtdb/<scenario namespace>/storage/v06/` and permits the helper and selected engine's libraries, temporary files, cache, and shutdown operations.
+The profile must cover create/link/rename publication at that exact target, including the immutable no-clobber path.
+It is not installed or modified by the runner.
+For cloud storage, use provider authorization scoped to the exact object key, including the configured prefix and storage-version directory.
+The policy file is retained provenance; its declared contents never substitute for an observed provider failure.
+
+The helper first probes immutable publication at the exact absent metadata key under the fault policy.
+It requires typed provider `PermissionDenied`, or a local I/O error with `ErrorKind::PermissionDenied`.
+An unexpected successful probe fails the scenario and is cleaned only within the already-claimed namespace.
+The actual packaged compactor must then report the matching failed worker operation.
+Native evidence is the `compaction_failed` stderr JSON event with the exact output trie, metadata key, `put_file` operation, Forbidden anomaly, and message digest.
+Pinned JVM evidence retains its actual failed-job stack trace naming the same output and metadata key and the provider permission error.
+For Azure, the provider's preceding exact-key warning can supply the key only when its `BlobStorageException` header, including the provider request ID, is repeated in the failed worker trace.
+For S3, an enhanced denial identifying the exact key can qualify directly.
+A keyless denial requires its actual AWS request ID and matching CloudTrail evidence from the configured reader below.
+The pinned GCS `CloudStorage.putObject` loses the original `StorageException` cause when wrapping failed publication.
+For this provider, the JVM worker's exact failed-job/key trace must also match an actual Cloud Audit Log denial; the runner cannot infer permission failure from the wrapped message.
+The runner witnesses data present and metadata absent before SIGKILL, captures that boundary again after joining the crash, and retries with normal credentials on the other engine.
+The fault owner runs the ordinary node command with one compaction worker against the completed origin data.
+Flush barriers inspect the fixed scenarios' first sixteen block indices through an explicit `xt.block_files` range and require both a new adopted block and empty live tables.
+The data bytes must remain identical; metadata must appear; the output must become a live trie; the acknowledged canary and temporal history must survive.
+
+=== GCS audit prerequisite
+
+Enable the bucket project's Cloud Storage Data Access `DATA_WRITE` audit logging before execution and give the normal inspector credentials access to the corresponding private log entries.
+The fault principal must remain visible as `protoPayload.authenticationInfo.principalEmail`.
+Missing viewer permission, disabled logging, redacted identity, unavailable entries, or delivery beyond the scenario deadline leaves the partial-compaction scenario unmet.
+The runner does not configure project logging, IAM, or credentials.
+
+The selected Google Cloud JVM image runs the retained `gcs_recovery_audit.clj` helper with Application Default Credentials scoped to `https://www.googleapis.com/auth/logging.read`.
+It calls the documented https://docs.cloud.google.com/logging/docs/reference/v2/rest/v2/entries/list[`entries:list`] endpoint over HTTPS without overriding TLS trust.
+The filter names the exact project, bucket, full metadata object, `storage.objects.create` method, status code `7`, configured writer principal, and interval from the actual compactor container's `StartedAt` to observation of its failed worker trace.
+The denial probe finishes before this worker starts and cannot satisfy that interval.
+The comparator repeats the same identity/time checks against retained raw entries and checks that the interval ends before the joined worker's `FinishedAt`.
+
+Each helper invocation accepts version 1 fields `namespace`, `project`, `bucket`, `object`, `principal_email`, `started_at`, and `ended_at`.
+It follows at most ten pages of 100 entries, bounds each raw response to eight MiB, and retains raw JSON pages with byte counts and SHA-256 values.
+The HTTP client and response streams close before a successful receipt; the outer invocation owner cancels and joins the process if its deadline expires.
+Audit delivery polling never widens the worker time interval.
+The helper's query metadata and provider pages are retained; authorization headers and OAuth tokens are not.
+The https://docs.cloud.google.com/storage/docs/audit-logging[Cloud Storage audit logging contract] defines the logging and access prerequisites.
+
+=== S3 CloudTrail prerequisite
+
+For a keyless JVM S3 denial, configure https://docs.aws.amazon.com/awscloudtrail/latest/userguide/logging-data-events-with-cloudtrail.html[CloudTrail S3 data events] for the target bucket before the scenario starts and supply the `cloudtrail` fault entry.
+The normal inspector credentials need list/get access to the selected log location and any required KMS decryption permission.
+For example, `prefix` can be `AWSLogs/123456789012/CloudTrail/us-east-1`; custom trail prefixes remain explicit.
+The runner never creates a trail, changes its selectors, or removes audit objects.
+Missing logging, read access, request ID, principal identity, or delivery within the scenario deadline remains unmet evidence.
+
+The selected AWS JVM image runs the retained `s3_recovery_audit.clj` helper using its S3 SDK and default credential chain.
+It lists the UTC day directories intersecting the worker interval and its bounded ten-minute delivery window, then reads actual `.json.gz` objects with their listed ETags as `If-Match` preconditions.
+Every raw compressed object is retained with bucket, key, ETag, length and SHA-256.
+Capture permits at most twenty listing pages, 1,000 objects, eight MiB per compressed object, and 64 MiB total compressed bytes.
+The comparator separately bounds expansion to eight MiB per object and 64 MiB per invocation.
+
+The decoded https://docs.aws.amazon.com/AmazonS3/latest/userguide/cloudtrail-request-identification.html[CloudTrail event] must identify the actual worker request ID, exact authenticated principal, `AccessDenied`, and destination bucket/key for `PutObject` or `CopyObject`.
+The copy source or temporary staging object cannot satisfy a final metadata destination check.
+The `eventTime` second must intersect the retained worker interval; exact request-ID equality prevents an earlier denial probe from satisfying a second containing both operations.
+Assumed-role issuer ARNs and principal-ID prefixes do not substitute for the actual session identity.
+The original failed-job trace still identifies the deterministic compaction output.
+
+The helper accepts version 1 fields `namespace`, `bucket`, `prefix`, `region`, `principal`, `target_bucket`, `target_object`, `request_id`, `started_at`, and `ended_at`.
+Its S3 client and credential provider close before a successful receipt; the existing invocation owner joins cancellation or timeout.
+The outer verifier binds both audit helper scripts to the same immutable JVM package and retained process/request receipts as the failed worker.
+
+== Required scenarios
+
+Each direction, JVM→Rust and Rust→JVM, executes the June, July, August, and September prefixes from the committed historical fixture.
+All but the last transaction are flushed; the last remains in the live log tail when the first writer stops.
+The target opens as a read-only reader, then as the writer of the identifiable `C=991` canary.
+A separate read-only target node observes that acknowledged write before the writer stops.
+The target restarts, and the origin engine performs the reverse fallback.
+Every stage retains actual historical prices, schema metadata, and valid/system bounds, including exclusive and unbounded upper bounds.
+Each direction also executes the exact partial-compaction fault after an acknowledged canary.
+
+For `kafka-connect` and `pg-source`, each direction additionally executes both retained-log and storage-only recovery.
+The upstream snapshot/initial row and a streamed row become durable in an adopted block.
+A third source transaction is queryable above that durable token and remains unflushed.
+Another upstream write arrives while the target is stopped.
+The retained-log case reuses the source/replica logs.
+The storage-only case retains object storage and starts new source/replica logs at epoch 1, following the pinned storage-only PostgreSQL fixture.
+The same rows must reappear, become durable, survive a restart, and survive reverse-engine recovery.
+KafkaConnect includes an actual tombstone and compares the held token with the Kafka producer's acknowledged offset.
+PostgreSQL additionally observes the unrelated-WAL confirmation gap, samples that the held transaction remains above `confirmed_flush_lsn`, and requires confirmation to advance after block adoption.
+The offline comparator reconstructs the required rows for every phase, including the held row, the post-stop row and the Kafka tombstone, independently of the client requests.
+The durable row's historical bounds must remain unchanged; re-resolving an unflushed upstream transaction after storage-only recovery is not claimed to preserve its discarded target transaction timestamp.
+
+The original upstream mappings are `PostgresSourceIntegrationTest`'s resume, unflushed-confirmation, and storage-only recovery cases, and `KafkaConnectSourceIntegrationTest`'s restart and tombstone cases.
+The matrix still requires the complete original integration suites and their original assertion identities separately.
+These packaged scenarios do not infer coverage for every converter, source type, failover topology, or provider option from one successful fixture.
+
+== Evidence and helper contract
+
+`comparison.json` reports `packaged_recovery_qualified` only when the immutable scenario denominator completes and its observations revalidate.
+`production_cutover_authorized` remains false.
+Each scenario retains generated configurations, requests, client receipts, raw object/log payloads, helper stdout, process receipts, actual container identity, fault policy and worker logs, captured token/block/job metadata, and lifecycle events.
+Changing a summary cannot create a successful assertion without its corresponding retained invocation.
+The matrix verifier binds both package manifests and the helper binary to the exact declared dependency, variant, platform, and feature selection before recomputing the comparison.
+
+`rtdb-conformance backend REQUEST.json NEW_DIRECTORY` is a passive finite invocation; it opens production backend factories and read-only logs without opening a Node, election, CDC driver, or GC owner.
+It accepts version 1 fields `namespace`, `configuration` (absolute container YAML path), `configuration_sha256`, `capability`, `token_kind` (`none`, `postgres`, `kafka_connect`), `action`, `maximum_bytes` and `timeout_seconds`.
+Actions are `{kind: "capture"}`, `{kind: "denial_probe", key, policy_sha256}`, and `{kind: "purge", manifest, manifest_sha256}`.
+Only the latter two explicitly mutate the isolated object namespace.
+Purge requires an exact captured namespace/configuration manifest, compares each object's bytes, and rejects any extra object before deletion.
+Captures use a maximum of 10,000 objects, 100,000 records per log, one-MiB object read chunks, 16-MiB individual catalog documents, and a 512-MiB explicit memory budget for charged reads/configuration/decoding.
+Provider list construction and SDK-internal allocations remain their provider implementation's boundary; these limits are not a proof of every SDK peak allocation.
+Resource close is awaited on success, operation failure, timeout, and SIGTERM before a receipt can report `resources_closed`.
+The read-only local-log scenario retains the source implementation's concurrent append/read framing behavior.
+A partially visible record remains an observed scenario failure; the harness does not retry a fabricated stable log prefix or change either engine's reader.
+
+== Local plan shape
+
+Replace all artifact references and hashes below with retained files before execution.
+The omitted fault entries intentionally leave partial-compaction qualification unmet until exact policies are supplied.
+
+[source,json]
+----
+{
+  "schema_version": 1,
+  "namespace": "rtdb-recovery-0123456789abcdef",
+  "platform": "linux/amd64",
+  "capability": "local",
+  "engines": {
+    "jvm": {"package": {"path": "jvm/package.json", "sha256": "<sha256>"}},
+    "rust": {"package": {"path": "rust/package.json", "sha256": "<sha256>"}}
+  },
+  "native": {"path": "production/rtdb-conformance", "sha256": "<sha256>"},
+  "fixture": {"path": "historical-prices.json", "sha256": "<sha256>"},
+  "storage": {"kind": "local"},
+  "credentials": {"environment": {"RTDB_RECOVERY_PASSWORD": "RECOVERY_PASSWORD"}, "files": []},
+  "client_password": {"path": "credentials/password", "sha256": "<sha256>"},
+  "faults": {},
+  "memory_bytes": 2147483648,
+  "cpu_count": 2,
+  "timeout_seconds": 300,
+  "maximum_capture_bytes": 1073741824
+}
+----

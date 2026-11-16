@@ -49,11 +49,11 @@ def expected_artifacts(lane, dependency):
             raise ValueError("selected package must retain its embedded shared library")
         return artifact(path.parent, references[0])
 
-    if runner in {"controls", "history", "sql-logic", "recovery"}:
+    if runner in {"controls", "history", "sql-logic", "recovery", "packaged-recovery"}:
         add("native", native + "/production", executable)
     if runner == "embedded":
         add("native_library", native + "/package", library)
-    if runner in {"clients", "performance"}:
+    if runner in {"clients", "performance", "packaged-recovery"}:
         add("native_package", native + "/package", package)
         add("jvm_package", prefix + "/jvm/" + lane["selection"]["jvm_variant"] + "/package", package)
     if runner == "recovery":
@@ -65,16 +65,22 @@ def expected_artifacts(lane, dependency):
 
 def bind_inputs(lane, directory, root, source, dependency):
     expected = expected_artifacts(lane, dependency)
-    plan_path = source("performance_plan") if lane["runner"] == "performance" else None
+    plan_role = {"performance": "performance_plan", "packaged-recovery": "recovery_plan"}.get(lane["runner"])
+    plan_path = source(plan_role) if plan_role else None
     plan = read_json(plan_path) if plan_path else None
-    if plan is not None:
+    if plan is not None and lane["runner"] == "performance":
         if plan["resources"]["architecture"] != lane["platform"] or plan.get("package_capabilities") != lane["selection"]["capabilities"]:
             raise ValueError("performance plan differs from selected platform or package capabilities")
         (directory / "selected-performance-plan.json").write_bytes(plan_path.read_bytes())
+    if plan is not None and lane["runner"] == "packaged-recovery":
+        if plan.get("platform") != lane["platform"] or plan.get("capability") != lane["selection"]["capability"]:
+            raise ValueError("packaged recovery plan differs from its selected platform or capability")
+        (directory / "selected-recovery-plan.json").write_bytes(plan_path.read_bytes())
     result = []
     for role, (identity, produced) in expected.items():
         if plan is not None:
-            consumed = artifact(plan_path.parent, plan["engines"]["rust" if role == "native_package" else "jvm"]["package"])
+            reference = plan["native"] if role == "native" else plan["engines"]["rust" if role == "native_package" else "jvm"]["package"]
+            consumed = artifact(plan_path.parent, reference)
         else:
             consumed = source(role)
             if role == "history":
@@ -91,7 +97,7 @@ def bind_inputs(lane, directory, root, source, dependency):
             value["executed_path"] = str(directory / consumed.name)
         result.append(value)
     if plan_path:
-        result.append({"role": "performance_plan", "consumed_path": str(plan_path), "consumed_sha256": sha256(plan_path)})
+        result.append({"role": plan_role, "consumed_path": str(plan_path), "consumed_sha256": sha256(plan_path)})
     return result
 
 
@@ -99,7 +105,8 @@ def verify_bindings(lane, directory, root, dependency):
     expected = expected_artifacts(lane, dependency)
     records = read_json(directory / "artifact-bindings.json")
     bindings = {value["role"]: value for value in records}
-    roles = set(expected) | ({"performance_plan"} if lane["runner"] == "performance" else set())
+    plan_role = {"performance": "performance_plan", "packaged-recovery": "recovery_plan"}.get(lane["runner"])
+    roles = set(expected) | ({plan_role} if plan_role else set())
     if len(bindings) != len(records) or set(bindings) != roles:
         raise ValueError("consumed artifact binding denominator differs from selected lane")
     for role, (identity, produced) in expected.items():
@@ -131,14 +138,32 @@ def verify_bindings(lane, directory, root, dependency):
             captured = read_json(directory / "run" / (side + "-package.json"))
             if captured["manifest_sha256"] != bindings[role]["consumed_sha256"] or captured["manifest"] != read_json(expected[role][1]):
                 raise ValueError("client execution uses another package manifest")
+    if lane["runner"] == "packaged-recovery":
+        from packaged_recovery_plan import validate_plan
+        from packaged_recovery_results import comparison as compare_recovery
+        plan_path = directory / "selected-recovery-plan.json"
+        plan = validate_plan(read_json(plan_path))
+        if sha256(plan_path) != bindings["recovery_plan"]["consumed_sha256"] or plan["platform"] != lane["platform"] or plan["capability"] != lane["selection"]["capability"]:
+            raise ValueError("retained recovery plan selection differs")
+        if plan["native"]["sha256"] != bindings["native"]["consumed_sha256"]:
+            raise ValueError("recovery helper differs from the selected production build")
+        for role, engine in (("native_package", "rust"), ("jvm_package", "jvm")):
+            captured = read_json(directory / "run" / (engine + "-package.json"))
+            if captured["manifest_sha256"] != bindings[role]["consumed_sha256"] or captured["manifest"] != read_json(expected[role][1]) or plan["engines"][engine]["package"]["sha256"] != captured["manifest_sha256"]:
+                raise ValueError("recovery execution uses another selected package")
+        runs = [read_json(path) for path in sorted((directory / "run").glob("*/receipt.json"))]
+        actual = compare_recovery(plan, runs, directory / "run")
+        recorded = read_json(directory / "run/comparison.json")
+        if recorded.get("plan_sha256") != sha256(plan_path) or actual["packaged_recovery_qualified"] is not True or any(recorded.get(key) != value for key, value in actual.items()):
+            raise ValueError("recovery summary differs from retained selected observations")
     flags = {"native": "--native", "native_package": "--native-provenance", "jvm_package": "--reference-provenance",
-             "performance_plan": "--plan", "history": "--history", "native_inventory": "--native"}
+             "performance_plan": "--plan", "recovery_plan": "--plan", "history": "--history", "native_inventory": "--native"}
     if bindings:
         runner = lane["runner"]
         process = read_json(directory / ("embedded-binding.process.json" if runner == "embedded" else runner + ".process.json"))
         command = process["command"]
         for role, value in bindings.items():
-            if runner == "performance" and role != "performance_plan":
+            if plan_role is not None and role != plan_role:
                 continue
             if role == "native_library":
                 result = read_json(directory / "embedded-results.json")

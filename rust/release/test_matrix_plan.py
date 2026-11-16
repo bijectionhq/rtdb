@@ -21,6 +21,18 @@ class ReleaseSelections(unittest.TestCase):
         properties = [lane for lane in lanes if lane["runner"] == "gradle" and lane["selection"]["task"] == "property-test"]
         self.assertTrue(all(lane["selection"]["iterations"] == 500 and lane["selection"]["simulation_iterations"] == 1000 for lane in properties))
 
+    def test_packaged_recovery_binds_every_shared_capability_to_both_packages_and_helper(self):
+        lanes = expand(self.matrix)
+        self.assertFalse(any(lane["runner"] == "required-recovery-adapter" for lane in lanes))
+        selected = [lane for lane in lanes if lane["runner"] == "packaged-recovery"]
+        self.assertEqual({"local", "kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"}, {lane["selection"]["capability"] for lane in selected})
+        for lane in selected:
+            prefix = lane["platform"].replace("/", "-")
+            native = prefix + "/rust/" + lane["selection"]["variant"]
+            self.assertEqual({native + "/production", native + "/package", prefix + "/jvm/" + lane["selection"]["jvm_variant"] + "/package"}, set(lane["dependencies"]))
+            self.assertEqual(["jvm-to-rust", "rust-to-jvm"], lane["selection"]["directions"])
+            self.assertIn("partial-compaction", lane["selection"]["checkpoints"])
+
     def test_features_and_missing_lanes_cannot_be_inferred_from_supplied_receipts(self):
         lanes = expand(self.matrix)
         bindings = [{"id": lane["id"], "runner": lane["runner"], "selection": lane["selection"], "inputs": {}} for lane in lanes]

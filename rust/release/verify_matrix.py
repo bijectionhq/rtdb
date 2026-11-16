@@ -94,7 +94,8 @@ def verify_lane_artifacts(directory, receipt):
     else:
         fields = {"controls": ("result.json", "controls_verified"), "history": ("result.json", "history_selection_passed"),
             "recovery": ("result.json", "recovery_selection_passed"), "sql-logic": ("result.json", "selection_passed"),
-            "clients": ("comparison.json", "client_selection_passed"), "performance": ("comparison.json", "packaged_performance_qualified")}
+            "clients": ("comparison.json", "client_selection_passed"), "performance": ("comparison.json", "packaged_performance_qualified"),
+            "packaged-recovery": ("comparison.json", "packaged_recovery_qualified")}
         if runner not in fields:
             raise ValueError("successful receipt names an unimplemented verification adapter")
         path, field = fields[runner]

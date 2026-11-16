@@ -98,9 +98,10 @@ It checks every retained artifact and process drain again, requires native execu
 One architecture's result cannot stand in for the other.
 Successful builds remain unqualified until every required lane is present.
 
-Remote and external-source reverse-recovery/fault adapters are explicit required lanes that currently report an implementation gap.
-The existing recovery runner exercises local storage only.
-These adapters remain source-completeness obligations before Phase 2; the matrix does not treat local execution as remote recovery evidence.
+Each compatible package pair has required link:../conformance/packaged-recovery-inputs.adoc[packaged recovery lanes] for every shared local, remote, log, and external-source capability.
+These execute real writes, retained-tail and storage-only handoffs, acknowledged canaries, second-node/restart/fallback observations, and exact failed compaction publication against the selected images.
+The existing Node-level recovery runner remains a separate local acceptance path.
+Missing credentials, endpoints, or exact fault policies leave their selected scenarios unmet; local execution never stands in for remote evidence.
 The shared packaged performance runner is described in link:../conformance/performance.adoc[matched performance evidence].
 The new orchestration, observer, fixtures and regression tests are source-only and have not run.
 

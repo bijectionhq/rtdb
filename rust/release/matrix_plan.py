@@ -54,11 +54,15 @@ def expand(matrix):
                 result.append(lane(native + "/" + runner, runner, platform, (native + "/tests", dependency), variant=variant, features=features))
             result.append(lane(native + "/recovery", "recovery", platform, (native + "/history", native + "/production"), variant=variant,
                                capabilities=["local"]))
-            for capability in sorted(CAPABILITIES[variant] - {"local"}):
-                result.append(lane(native + "/recovery-" + capability, "required-recovery-adapter", platform,
-                                   (native + "/package",), variant=variant, capability=capability,
-                                   directions=["jvm-to-rust", "rust-to-jvm"],
-                                   checkpoints=["acknowledged-write", "partial-compaction", "external-resume-token"]))
+            for jvm in PAIRS[variant]:
+                for capability in sorted(CAPABILITIES[variant].intersection(matrix["jvm_variants"][jvm]["capabilities"])):
+                    checkpoints = ["historical-live-tail", "acknowledged-write", "second-node", "restart", "reverse-fallback", "partial-compaction"]
+                    if capability in {"kafka-connect", "pg-source"}:
+                        checkpoints += ["external-retained-log-resume", "external-storage-only-resume"]
+                    result.append(lane(native + "/with-" + jvm + "/recovery-" + capability, "packaged-recovery", platform,
+                                       (native + "/production", native + "/package", prefix + "/jvm/" + jvm + "/package"),
+                                       variant=variant, jvm_variant=jvm, features=features, capability=capability,
+                                       directions=["jvm-to-rust", "rust-to-jvm"], checkpoints=checkpoints))
             for selection in ("slt-test", "slt-test-2", "direct-sql-test"):
                 result.append(lane(native + "/" + selection, "sql-logic", platform, (native + "/tests", native + "/production"), variant=variant, selection=selection))
             for directory in SLT_DIRECTORIES:

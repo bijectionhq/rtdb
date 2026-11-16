@@ -47,7 +47,7 @@ Workers execute only their native architecture; unmatched or unavailable lanes r
 |`clients` |`native_package`, `jvm_package` |Artifacts or predecessor references to the two selected package dependencies' `run/package.json` files.
 |`performance` |`performance_plan` |Artifact conforming to link:../conformance/performance-inputs.adoc[Performance plan version 1]; its packages must be byte-identical to the selected dependencies, its architecture must equal the lane, and its `package_capabilities` must equal the lane's capabilities.
 |`inventory` |`source_inventory`, `ledger`, `native_inventory`, `aliases`, `invocations`; optional `external` |Artifacts described under Runtime inventory inputs; `native_inventory` must be the selected native-tests dependency's `run/native-inventory.json`.
-|`required-recovery-adapter` |None |Reserved required lane; currently reports an implementation gap for the selected remote/external capability.
+|`packaged-recovery` |`recovery_plan` |Version 1 link:../conformance/packaged-recovery-inputs.adoc[packaged recovery plan], bound to its selected JVM/native package producers and native production helper.
 |===
 
 Each executable/package/library input is checked against the actual selected producer bytes before invocation.
