@@ -105,6 +105,18 @@ fn joining_encoded_and_plain_values_removes_physical_encoding_recursively() {
 }
 
 #[test]
+fn replacing_outer_run_end_width_retains_nested_layouts_and_nullability() {
+    let child = scalar(S::I64).maybe().run_end_encoded(RunEndWidth::I16).unwrap();
+    for plain in [T::list(child.clone()), structure(&[("x", child.clone())]).maybe()] {
+        let encoded = plain.clone().run_end_encoded(RunEndWidth::I32).unwrap();
+        let replaced = encoded.run_end_encoded(RunEndWidth::I64).unwrap();
+        assert_eq!(replaced, T::RunEndEncoded { width: RunEndWidth::I64, value: Box::new(plain.clone()) });
+        replaced.validate().unwrap();
+        assert_eq!(replaced.unencoded(), plain.unencoded());
+    }
+}
+
+#[test]
 fn absent_contribution_depends_on_whether_a_segment_contains_puts() {
     assert_eq!(T::absent_contribution(false), T::Nothing);
     assert_eq!(T::absent_contribution(true), T::Null);
