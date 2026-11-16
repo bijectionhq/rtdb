@@ -47,11 +47,15 @@ Neither term admission nor expression evaluation starts an autonomous task.
 Arrow buffers retain their allocation charge through custom allocation owners, including child arrays, validity buffers, and slices.
 Cache reads transfer their reservation into local blocking I/O so a cancelled fetch cannot leave an uncharged detached allocation.
 `DiskCache` is a shared monitor; each load has one caller holding its per-entry exclusion guard, and passive leases prevent file eviction during reads.
-`NativeResources` is a node-scoped passive factory retaining the shared cache, local I/O region and timestamp capability.
-`IoRegion` is a monitor whose close rejects new work and joins admitted local blocking I/O, including calls whose waiters were cancelled.
-Ordinary node/server startup failure, unstarted closure and joined shutdown all drain that region.
+`NativeResources` is a node-scoped passive factory retaining the shared cache, I/O region and timestamp capability.
+`IoRegion` is a monitor whose close rejects new work and joins admitted local blocking I/O and remote provider operations, including calls whose waiters were cancelled.
+Each database owns a child region; detach releases its name after worker completion and child drain, while worker failure alone leaves storage reads available.
+Ancestor drains track admitted operations without retaining idle child handles, and scoped cache offloads retain both cache and database admissions.
+`RemoteStore` and its private provider capability are passive adapters; the region retains admitted multipart publication and cleanup, reserved reads, and both ends of provider copies until completion.
+Ordinary database-opening failure, node/server startup failure, unstarted closure and joined shutdown drain their owned regions.
 The disk-cache directory lock excludes concurrent owners and precedes abandoned temporary-file cleanup.
-Cache identity retains the pinned database/partition layout; provider or epoch replacement under the same cache root requires explicit qualification.
+Cache identity retains the pinned database/partition layout from `RemoteBufferPool.kt`; provider or epoch replacement under the same cache root requires explicit qualification in both engines.
+Such a replacement must use a fresh cache root or remove the previous cache while its owner is stopped; retained cache bytes do not establish storage identity.
 `Writer` and `LocalTimestampSource` are passive; the local log driver chooses work, and the writer samples each record's clock before append.
 The local log driver requires cancellation followed by joining its run task; forcibly aborting that task can leave an in-progress blocking append with an unknown result.
 Several scalar and row-building paths still allocate transient values before charging their retained size.
@@ -133,7 +137,7 @@ The sequence domain and exhaustion behavior need an explicit compatibility decis
 |Replica recovery |Native local/Kafka log readers, block recovery, term-fenced replay, and pending-block adoption are written; source audit is ongoing.
 |Compaction retry |Native deterministic selection, streaming merge, immutable file publication, and source-log publication are written; byte compatibility and retry execution remain pending.
 |CDC restart |Native snapshot, pgoutput decoder, ordered submissions, reconnect, and adopted-block confirmation are written; database-lifetime source owners and observer integration are written; source audit is ongoing.
-|Database shutdown |Node/database/term and production server listener cancellation and joins are written; local I/O drain and Flight lifecycle integration are written; source review is ongoing.
+|Database shutdown |Node/database/term and production server listener cancellation and joins are written; child and ancestor I/O drains, cancelled remote operations, scoped cache work and Flight lifecycle integration have source review; execution qualification remains pending.
 |===
 
 Operational tracing, offline configuration qualification and release recipes are written; exporter review, complete release orchestration and remaining protocol compatibility work continue.

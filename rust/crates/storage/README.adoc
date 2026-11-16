@@ -8,18 +8,25 @@ The local adapter copies into a temporary file, syncs its contents, publishes wi
 An existing file is compared in bounded chunks.
 The remote bridge uploads sequential multipart chunks to a unique private name, conditionally copies that object to the destination, and deletes the private name before returning.
 The provider must implement conditional copy; unsupported providers return an error without overwriting the destination.
+Provider permission denials retain the requested object identity and become Forbidden anomalies; generic provider messages are not parsed to infer authorization outcomes.
 Existing remote objects are compared through bounded range reads.
 The memory adapter retains the whole object by definition.
-Every local store offload belongs to an `IoRegion` monitor.
+Every local store offload and remote provider operation belongs to an `IoRegion` monitor.
 Standalone stores create a region and expose `close_and_wait`; node stores share the region supplied by `NativeResources`.
+Each database's child region tracks its admitted operations in the node region as well.
+Closing a child rejects requests for that database and drains its active work while sibling regions remain open.
+An idle child handle does not delay either drain.
 The node's local source and replica log reader offloads share that same region.
 Closing a region rejects new work and waits for queued and running I/O after its caller has been cancelled.
 File uploads open their source before offloading so an unlinked temporary source remains available to admitted work.
+Remote uploads retain that source through conditional publication and private-object cleanup.
+Reserved remote reads transfer their allocation charge into the admitted operation and then into the returned bytes.
 Local object copies stream through the destination's immutable file publication path.
 `LocalStore::copy_to` accepts an explicit destination store for copies across filesystem roots.
 The open source file retains admission in the source region until the destination operation finishes, including after caller cancellation.
 `RemoteStore::copy_to` accepts an explicit destination prefix backed by the same provider client.
 Remote copies use provider-side conditional publication and compare existing destinations in one-MiB ranges.
+Both source and destination regions retain a copy until provider completion.
 The ordinary `ObjectStore::copy` method uses these paths within its configured root.
 
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
@@ -32,13 +39,16 @@ The cache acquires an exclusive directory lock before removing staging files lef
 The lock remains held until the final cache owner or lease is released.
 File uploads warm the cache after durable remote publication; remote deletion leaves cached immutable files available until eviction.
 Blocking range reads retain both their disk lease and allocation reservation until the I/O task finishes, including after caller cancellation.
+Scoped cache stores admit cache hits and provider requests through their database region.
+Blocking cache reads and cache publication hold both cache and database admissions through work completion and cancelled-result destruction.
 The region owner calls `close_and_wait` to reject new work, cancel downloads, and join admitted operations and blocking reads before shutting down the runtime.
 The native node closes this shared resource region after its database workers join, and after an ordinary startup failure.
 
 Normal upload failures attempt multipart cleanup.
-An upload future that is forcibly dropped, a failed cleanup request, or a process crash can leave private objects or multipart parts behind.
+When multipart abort also fails, the diagnostic preserves the upload's typed category and object key alongside the abort failure.
+A failed cleanup request, a forcibly stopped runtime, or a process crash can leave private objects or multipart parts behind.
 The private `.tmp` namespace is excluded from object listings exposed to the database.
-Shutdown owners must allow in-flight publication calls to finish before joining their workers.
+Shutdown owners join the I/O region after consumers finish and before stopping the runtime.
 Provider lifecycle policies and orphan cleanup remain operational obligations; hiding a temporary object does not reclaim it.
 
 All implementation and test source remains uncompiled and unexecuted during Phase 1.

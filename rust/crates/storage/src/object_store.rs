@@ -55,7 +55,7 @@ impl ReadReservation {
 
     pub fn length(&self) -> usize { self.length }
 
-    fn check_range(&self, range: &Range<u64>) -> Result<()> {
+    pub(crate) fn check_range(&self, range: &Range<u64>) -> Result<()> {
         if range.end.checked_sub(range.start) != Some(self.length as u64) {
             return Err(Error::Task("reserved read range does not match its allocation reservation".into()));
         }
@@ -168,7 +168,7 @@ pub struct LocalStore {
 
 struct AdmittedFile {
     file: File,
-    _admission: tokio_util::task::TaskTrackerToken,
+    _admission: crate::io_region::IoAdmission,
 }
 
 impl LocalStore {

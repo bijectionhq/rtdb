@@ -15,6 +15,9 @@ use rtdb_types::{Anomaly, Result, TableRef, Timestamp, TxBasis, TxId, Value};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/io.rs"]
+mod io;
+
 struct Authority;
 impl TransactionAuthorization for Authority { fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) } }
 #[async_trait]
@@ -385,6 +388,7 @@ async fn follower_compactor_publishes_results_through_the_writer_without_claimin
             Ok(DatabaseResources {
                 logs: OpenedLogs { source: self.source.clone(), replica: self.replica.clone(), source_epoch: rtdb_types::StorageEpoch(0), replica_epoch: rtdb_types::StorageEpoch(0), drivers: Vec::new() },
                 store: self.store.clone(), storage_epoch: rtdb_types::StorageEpoch(0), storage_version: rtdb_format::keys::CURRENT_STORAGE_VERSION,
+                io: rtdb_storage::IoRegion::new(),
             })
         }
     }
@@ -552,6 +556,139 @@ async fn failed_database_remains_queryable_and_can_be_detached_after_its_driver_
         while node.catalog().check_attach("other", &Default::default()).is_err() { tokio::task::yield_now().await; }
         assert!(node.attach_database("other".into(), Default::default(), &Authority, &token).await.unwrap().committed());
         stop(&node, driver).await;
+    }).await.unwrap();
+}
+
+struct ObservedIoResources {
+    native: NativeResources,
+    opened: tokio::sync::mpsc::UnboundedSender<Arc<dyn rtdb_storage::ObjectStore>>,
+    fail: Option<Arc<Semaphore>>,
+}
+#[async_trait]
+impl ResourceFactory for ObservedIoResources {
+    fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
+    async fn close(&self) -> Result<()> { self.native.close().await }
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+        let mut resources = self.native.open(name, configuration, access, cancellation.clone()).await?;
+        if name == "other" {
+            self.opened.send(Arc::clone(&resources.store)).unwrap();
+            if let Some(fail) = &self.fail {
+                let fail = Arc::clone(fail);
+                resources.logs.drivers.push(async move {
+                    tokio::select! {
+                        _ = cancellation.cancelled() => Ok(()),
+                        permit = fail.acquire() => { permit.unwrap().forget(); Err(Anomaly::fault("test/io-driver-failed", "Injected worker failure")) },
+                    }
+                }.boxed());
+            }
+        }
+        Ok(resources)
+    }
+}
+
+fn local_database(directory: &std::path::Path) -> DatabaseConfig {
+    DatabaseConfig {
+        log: Some(database_config::Log::LocalLog(LocalLog { path: Some(directory.join("log").to_string_lossy().into_owned()), epoch: None })),
+        storage: Some(database_config::Storage::LocalStorage(LocalStorage { path: Some(directory.join("store").to_string_lossy().into_owned()), epoch: None })),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn detach_holds_the_name_until_cancelled_io_drains_for_running_and_failed_workers() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for fail_worker in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+            let failure = Arc::new(Semaphore::new(0));
+            let mut services = services();
+            services.resources = Arc::new(ObservedIoResources { native: NativeResources::default().with_local_log_clock(Arc::clone(&services.clock), false), opened, fail: fail_worker.then(|| Arc::clone(&failure)) });
+            let (node, driver) = running(options(), services).await;
+            let token = CancellationToken::new();
+            assert!(node.attach_database("other".into(), local_database(directory.path()), &Authority, &token).await.unwrap().committed());
+            let store = stores.recv().await.unwrap();
+            let database = node.catalog().database("other").unwrap();
+            let mut session = node.session("other", Arc::new(Authority)).unwrap();
+            assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+            database.flush().await.unwrap();
+            while database.status().adopted_block.is_none() { tokio::task::yield_now().await; }
+            if fail_worker {
+                failure.add_permits(1);
+                while database.progress().fault().is_none() { tokio::task::yield_now().await; }
+                assert_eq!(rows(session.query_sql("SELECT value FROM docs", vec![]).await.unwrap()).await, vec![vec![Value::I64(10)]]);
+                assert_eq!(database.block_lag().await.unwrap(), 0);
+            }
+            let release = io::hold_cancelled_local_read(&store).await;
+            assert!(node.detach_database("other".into(), &Authority, &token).await.unwrap().committed());
+            assert!(node.catalog().database("other").is_err());
+            assert!(!node.catalog().secondary_databases().contains_key("other"));
+            let missing = rtdb_storage::ObjectKey::new("closed-probe").unwrap();
+            while !matches!(store.head(&missing).await, Err(rtdb_storage::Error::Closed(_))) { tokio::task::yield_now().await; }
+            assert_eq!(node.catalog().check_attach("other", &DatabaseConfig::default()).unwrap_err().code, "xtdb/db-being-detached");
+            let mut primary = node.session("xtdb", Arc::new(Authority)).unwrap();
+            assert_eq!(rows(primary.query_sql("SELECT 1", vec![]).await.unwrap()).await, vec![vec![Value::I64(1)]]);
+            release.send(()).unwrap();
+            while node.catalog().check_attach("other", &DatabaseConfig::default()).is_err() { tokio::task::yield_now().await; }
+            assert!(matches!(store.head(&missing).await, Err(rtdb_storage::Error::Closed(_))));
+            assert!(node.attach_database("other".into(), DatabaseConfig::default(), &Authority, &token).await.unwrap().committed());
+            stop(&node, driver).await;
+        }
+    }).await.unwrap();
+}
+
+struct PartialIoResources {
+    native: NativeResources,
+    opened: tokio::sync::mpsc::UnboundedSender<(Arc<dyn rtdb_storage::ObjectStore>, std::sync::mpsc::Sender<()>)>,
+    pending: bool,
+}
+#[async_trait]
+impl ResourceFactory for PartialIoResources {
+    fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.native.validate(name, configuration) }
+    async fn close(&self) -> Result<()> { self.native.close().await }
+    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
+        let mut resources = self.native.open(name, configuration, access, cancellation).await?;
+        if name == "other" {
+            let release = io::hold_cancelled_local_read(&resources.store).await;
+            self.opened.send((Arc::clone(&resources.store), release)).unwrap();
+            if self.pending { std::future::pending::<()>().await; }
+            resources.logs.replica = Arc::clone(&resources.logs.source);
+        }
+        Ok(resources)
+    }
+}
+
+#[tokio::test]
+async fn failed_or_cancelled_attach_drains_partial_io_after_releasing_unstarted_log_writers() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for pending in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let (opened, mut stores) = tokio::sync::mpsc::unbounded_channel();
+            let mut services = services();
+            services.resources = Arc::new(PartialIoResources { native: NativeResources::default(), opened, pending });
+            let (node, driver) = running(options(), services).await;
+            let configuration = local_database(directory.path());
+            let opening_node = node.clone();
+            let opening = tokio::spawn(async move { opening_node.database_or_attach("other".into(), configuration).await });
+            let (store, release) = stores.recv().await.unwrap();
+            if pending { node.shutdown(); }
+            let key = rtdb_storage::ObjectKey::new("closed-probe").unwrap();
+            while !matches!(store.head(&key).await, Err(rtdb_storage::Error::Closed(_))) { tokio::task::yield_now().await; }
+            assert!(!driver.is_finished());
+            if !pending { assert!(!opening.is_finished()); }
+            let (log, writer) = rtdb_storage::log::LocalLog::open(directory.path().join("log/LOG"), rtdb_storage::log::LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 8 }).unwrap();
+            drop(writer);
+            log.close_and_wait().await;
+            release.send(()).unwrap();
+            let error = match opening.await.unwrap() { Err(error) => error, Ok(_) => panic!("partial opening succeeded") };
+            if pending { driver.await.unwrap().unwrap(); }
+            else {
+                assert_eq!(error.code, "rtdb.replication/aliased-logs");
+                assert!(node.catalog().check_attach("other", &DatabaseConfig::default()).is_ok());
+                let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+                assert_eq!(rows(session.query_sql("SELECT 1", vec![]).await.unwrap()).await, vec![vec![Value::I64(1)]]);
+                stop(&node, driver).await;
+            }
+        }
     }).await.unwrap();
 }
 

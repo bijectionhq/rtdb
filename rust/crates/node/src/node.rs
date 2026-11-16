@@ -52,6 +52,8 @@ pub struct NodeDriver {
     initial: Vec<(Arc<Database>, DatabaseDriver)>,
 }
 
+enum DatabaseCompletion { Worker { database: Arc<Database>, result: Result<()> }, Drained(Arc<Database>) }
+
 impl Node {
     /// The provider observes current catalog generations and keeps no node or database alive between samples.
     pub fn metrics_provider(&self) -> Result<Arc<dyn CatalogMetrics>> {
@@ -293,12 +295,13 @@ impl NodeDriver {
         }
         self.node.catalog.cancel_all();
         self.initial.clear();
+        futures::future::join_all(self.node.catalog.held_databases().into_iter().map(|database| async move { database.close_io().await })).await;
         self.node.catalog.clear_after_join();
         self.node.factory.resources.close().await
     }
     pub async fn run(mut self) -> Result<()> {
         let mut tasks = JoinSet::new();
-        for (database, driver) in self.initial.drain(..) { tasks.spawn(async move { (database, driver.run().await) }); }
+        for (database, driver) in self.initial.drain(..) { tasks.spawn(async move { DatabaseCompletion::Worker { database, result: driver.run().await } }); }
         let mut failure = None;
         loop {
             tokio::select! {
@@ -312,10 +315,7 @@ impl NodeDriver {
                     None => break,
                 },
                 completion = tasks.join_next(), if !tasks.is_empty() => match completion {
-                    Some(Ok((database, result))) => {
-                        if let Err(error) = result { database.progress().ingestion_failed(error); }
-                        self.node.catalog.driver_finished(&database);
-                    }
+                    Some(Ok(completion)) => { let _ = self.complete(completion, &mut tasks); }
                     Some(Err(error)) => { failure = Some(Anomaly::fault("rtdb.node/database-task", error.to_string())); break; }
                     None => (),
                 },
@@ -329,20 +329,36 @@ impl NodeDriver {
         self.node.catalog.cancel_all();
         while let Some(completion) = tasks.join_next().await {
             match completion {
-                Ok((database, result)) => { self.node.catalog.driver_finished(&database); if let Err(error) = result { if failure.is_none() { failure = Some(error); } } }
+                Ok(completion) => if let Err(error) = self.complete(completion, &mut tasks) { if failure.is_none() { failure = Some(error); } },
                 Err(error) => if failure.is_none() { failure = Some(Anomaly::fault("rtdb.node/database-task", error.to_string())); },
             }
         }
+        futures::future::join_all(self.node.catalog.held_databases().into_iter().map(|database| async move { database.close_io().await })).await;
         self.node.catalog.clear_after_join();
         if let Err(error) = self.node.factory.resources.close().await { if failure.is_none() { failure = Some(error); } }
         failure.map_or(Ok(()), Err)
     }
-    async fn command(&mut self, command: CatalogCommand, tasks: &mut JoinSet<(Arc<Database>, Result<()>)>) {
+    fn drain(database: Arc<Database>, tasks: &mut JoinSet<DatabaseCompletion>) {
+        tasks.spawn(async move { database.close_io().await; DatabaseCompletion::Drained(database) });
+    }
+    fn complete(&self, completion: DatabaseCompletion, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<()> {
+        match completion {
+            DatabaseCompletion::Worker { database, result } => {
+                if let Err(error) = &result { database.progress().ingestion_failed(error.clone()); }
+                if self.node.catalog.driver_finished(&database) { Self::drain(database, tasks); }
+                result
+            }
+            DatabaseCompletion::Drained(database) => { self.node.catalog.teardown_finished(&database); Ok(()) }
+        }
+    }
+    async fn command(&mut self, command: CatalogCommand, tasks: &mut JoinSet<DatabaseCompletion>) {
         match command {
             CatalogCommand::Apply { operation, completion } => {
                 let result = match operation {
                     DbOp::AttachDatabase(attach) => self.attach(attach.db_name.unwrap_or_default(), attach.config.unwrap_or_default(), tasks).await.map(|_| ()),
-                    DbOp::DetachDatabase(detach) => self.node.catalog.begin_detach(detach.db_name.as_deref().unwrap_or_default()),
+                    DbOp::DetachDatabase(detach) => self.node.catalog.begin_detach(detach.db_name.as_deref().unwrap_or_default()).map(|ready| {
+                        if let Some(database) = ready { Self::drain(database, tasks); }
+                    }),
                 };
                 let _ = completion.send(result);
             }
@@ -352,13 +368,17 @@ impl NodeDriver {
             }
         }
     }
-    async fn attach(&mut self, name: String, configuration: DatabaseConfig, tasks: &mut JoinSet<(Arc<Database>, Result<()>)>) -> Result<Option<Arc<Database>>> {
+    async fn attach(&mut self, name: String, configuration: DatabaseConfig, tasks: &mut JoinSet<DatabaseCompletion>) -> Result<Option<Arc<Database>>> {
         self.node.catalog.check_attach(&name, &configuration)?;
         if self.node.catalog.skipped(&name) { self.node.catalog.insert_skipped(name, configuration)?; return Ok(None); }
         let opened = self.node.factory.open(name, configuration, Arc::clone(&self.node.catalog), self.node.commands.clone(), &self.node.cancellation).await?;
         let database = Arc::clone(&opened.database);
-        self.node.catalog.insert_open(Arc::clone(&database))?;
-        tasks.spawn(async move { (opened.database, opened.driver.run().await) });
+        if let Err(error) = self.node.catalog.insert_open(Arc::clone(&database)) {
+            drop(opened);
+            database.close_io().await;
+            return Err(error);
+        }
+        tasks.spawn(async move { DatabaseCompletion::Worker { database: opened.database, result: opened.driver.run().await } });
         Ok(Some(database))
     }
 }

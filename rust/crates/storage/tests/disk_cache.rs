@@ -31,7 +31,10 @@ impl ObjectStore for ObservedStore {
         self.inner.get_range(key, range).await
     }
     async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { self.inner.put(key, bytes).await }
-    async fn put_file(&self, key: &ObjectKey, path: &Path) -> Result<()> { self.inner.put_file(key, path).await }
+    async fn put_file(&self, key: &ObjectKey, path: &Path) -> Result<()> {
+        let bytes = std::fs::read(path).map_err(|source| Error::Io { path: path.to_owned(), source })?;
+        self.inner.put(key, bytes.into()).await
+    }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> Result<()> { self.inner.delete(key).await }
 }
@@ -179,7 +182,8 @@ fn cancelled_blocking_read_holds_disk_lease_and_read_charge_until_io_finishes() 
     std::fs::write(directory.path().join("db/0/object"), b"retained").unwrap();
     let memory = MemoryBudget::new(4 * 1024 * 1024);
     let cache = DiskCache::open(directory.path(), 8, memory.clone()).unwrap();
-    let store = cache.scope(ObjectKey::new("db/0").unwrap(), Arc::new(MemoryStore::default())).unwrap();
+    let database = rtdb_storage::IoRegion::new();
+    let store = cache.scope_in(ObjectKey::new("db/0").unwrap(), Arc::new(MemoryStore::default()), database.clone()).unwrap();
     let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
     runtime.block_on(async {
         let (started, waiting) = tokio::sync::oneshot::channel();
@@ -195,15 +199,60 @@ fn cancelled_blocking_read_holds_disk_lease_and_read_charge_until_io_finishes() 
         drop(read);
         assert_eq!(cache.stats().pinned_bytes, 8);
         assert_eq!(memory.used_bytes(), retained + 8);
+        let mut database_close = Box::pin(database.close_and_wait());
+        poll_fn(|context| { assert!(database_close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        assert!(matches!(store.head(&key).await, Err(Error::Closed(_))));
         let mut close = Box::pin(cache.close_and_wait());
         poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
         assert!(matches!(store.get(&key).await, Err(Error::Closed(_))));
         resume.send(()).unwrap();
         blocker.await.unwrap();
+        database_close.await;
         close.await;
         assert_eq!(release.try_recv(), Ok(()));
         assert_eq!(cache.stats().pinned_bytes, 0);
         assert_eq!(memory.used_bytes(), retained);
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn database_close_joins_cancelled_cache_publication_after_provider_completion() {
+    use std::{future::{Future, poll_fn}, task::Poll};
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let database = rtdb_storage::IoRegion::new();
+    let sibling = rtdb_storage::IoRegion::new();
+    let remote = Arc::new(ObservedStore::new(false));
+    let store = cache.scope_in(ObjectKey::new("db/0").unwrap(), remote.clone(), database.clone()).unwrap();
+    let other = cache.scope_in(ObjectKey::new("other/0").unwrap(), Arc::new(MemoryStore::default()), sibling.clone()).unwrap();
+    let source = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(source.path(), b"published").unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (release, finish) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || { entered.send(()).unwrap(); finish.recv().unwrap(); });
+        started.await.unwrap();
+        let key = ObjectKey::new("object").unwrap();
+        let mut upload = Box::pin(store.put_file(&key, source.path()));
+        poll_fn(|context| { assert!(upload.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        assert_eq!(remote.head(&key).await.unwrap().size, 9);
+        assert!(!directory.path().join("db/0/object").exists());
+        drop(upload);
+        drop(source);
+        let mut close = Box::pin(database.close_and_wait());
+        poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        other.put(&key, Bytes::from_static(b"sibling")).await.unwrap();
+        assert_eq!(other.head(&key).await.unwrap().size, 7);
+        release.send(()).unwrap();
+        blocker.await.unwrap();
+        close.await;
+        assert_eq!(std::fs::read(directory.path().join("db/0/object")).unwrap(), b"published");
+        assert!(matches!(store.head(&key).await, Err(Error::Closed(_))));
+        assert_eq!(other.get(&key).await.unwrap().as_ref(), b"sibling");
+        sibling.close_and_wait().await;
+        cache.close_and_wait().await;
     });
 }
 

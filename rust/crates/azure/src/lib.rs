@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use object_store::{ClientOptions, StaticCredentialProvider, azure::{AzureAuthorizer, MicrosoftAzure, MicrosoftAzureBuilder}, client::{HttpConnector, HttpRequest, HttpRequestBody, ReqwestConnector}};
 use rtdb_format::generated::xtdb::azure::proto::AzureBlobStorageConfig;
-use rtdb_storage::{ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -71,7 +71,8 @@ impl AzureConfig {
     /// Creates the container if absent and appends `storage_root` to the configured prefix.
     /// `storage_root` must already contain the storage version and epoch.
     /// Default credential commands may occupy the caller's thread for up to 30 seconds per attempted provider.
-    pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn AzureCredentialResolver) -> Result<Arc<dyn ObjectStore>> {
+    /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
+    pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn AzureCredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         if self.storage_account.is_empty() || self.container.is_empty() { return Err(invalid("Azure requires an account and container")); }
         let prefix = self.object_prefix(storage_root)?;
         let credentials = self.resolve_credentials(remotes)?;
@@ -85,7 +86,7 @@ impl AzureConfig {
         }
         let client = builder.build().map_err(invalid)?;
         ensure_container(&client, &connection.account, &connection.endpoint, &self.container).await?;
-        Ok(Arc::new(RemoteStore::new(Arc::new(client), Some(prefix))))
+        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }
 
     pub fn to_proto(&self) -> Result<AzureBlobStorageConfig> {

@@ -3,7 +3,7 @@ mod credential;
 use std::sync::Arc;
 use object_store::{StaticCredentialProvider, aws::{AmazonS3Builder, AmazonS3ConfigKey, AwsCredential, S3ConditionalPut, S3CopyIfNotExists}};
 use rtdb_format::generated::xtdb::aws::proto as pb;
-use rtdb_storage::{ObjectKey, ObjectStore, remote::RemoteStore};
+use rtdb_storage::{IoRegion, ObjectKey, ObjectStore, remote::RemoteStore};
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
@@ -61,7 +61,8 @@ impl S3Config {
 
     /// `storage_root` is appended to the configured prefix and must already contain the storage version and epoch.
     /// Credential aliases are resolved at opening; default credentials refresh during requests.
-    pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver) -> Result<Arc<dyn ObjectStore>> {
+    /// The owner closes and joins `io` after store consumers finish and before shutting down the runtime.
+    pub async fn open(&self, storage_root: &ObjectKey, remotes: &dyn S3CredentialResolver, io: Arc<IoRegion>) -> Result<Arc<dyn ObjectStore>> {
         if self.bucket.is_empty() { return Err(Anomaly::incorrect("xtdb.aws/invalid-config", "S3 bucket is empty")); }
         let prefix = self.object_prefix(storage_root)?;
         let credentials = self.resolve_credentials(remotes)?;
@@ -83,7 +84,7 @@ impl S3Config {
             builder = builder.with_credentials(Arc::new(credential::CredentialBridge::new(provider)));
         }
         let client = builder.build().map_err(|error| Anomaly::incorrect("xtdb.aws/invalid-config", error.to_string()))?;
-        Ok(Arc::new(RemoteStore::new(Arc::new(client), Some(prefix))))
+        Ok(Arc::new(RemoteStore::new_in(Arc::new(client), Some(prefix), io)))
     }
 
     fn endpoint_addressing(&self) -> Result<(Option<url::Url>, bool)> {
