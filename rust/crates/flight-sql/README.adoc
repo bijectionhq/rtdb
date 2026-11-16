@@ -1,0 +1,113 @@
+= Native Flight SQL and ADBC transport
+
+`rtdb-flight-sql` serves Arrow Flight SQL through native tonic HTTP/2 and Arrow IPC.
+ADBC Flight SQL drivers use the same `rtdb-node` sessions, SQL preparation, query cursors, transaction resolver, and authentication as the PostgreSQL frontend.
+The source and regression cases remain uncompiled and unexecuted during Phase 1.
+
+== Composition and ownership
+
+`ServerDriver::bind(FlightConfig, Node, Arc<Authenticator>)` binds an insecure listener and returns its `ServerHandle` and unstarted driver.
+The handle exposes the bound address, current status, status subscription, and shutdown request.
+The caller owns `run`, requests shutdown, and joins the driver before closing the node.
+Dropping a running driver future does not satisfy that join obligation.
+`bind_with_clock` injects the lease clock; the ordinary constructor uses the wall clock.
+
+The Active Object is the server driver, which selects listener completion and lease sweeps.
+Tonic owns its transport connection tasks and joins their connection watchers during shutdown.
+The driver's socket adapter observes cancellation during reads and writes, including a peer that stops consuming responses.
+The driver also waits for the admitted-call monitor to reach zero before reporting completion.
+
+Service methods and response streams are passive caller-owned work.
+An admission owner retains its semaphore permit through authentication, execution, and the final response stream.
+An acquired-session guard releases its in-use count even when a call is dropped during identity revalidation.
+Sessions own their catalog selection and per-database connections.
+A transaction handle owns a dedicated connection.
+A prepared handle owns SQL, its session/database or transaction scope, and the retained IPC parameter batch.
+A connection resource serializes access to its `NativeSession`; expiration cancels borrowed work and releases the connection when its final borrower leaves.
+`ServerStatus` is a separate monitor of call counts and live registry sizes.
+
+Session, transaction, and prepared registries retain expired tombstones for one further idle period.
+A presented session renews from its initial unclaimed timeout to its normal idle timeout.
+A session with an in-flight call cannot expire; releasing the call restarts its idle measurement.
+Transaction and prepared handle lookups renew their leases, and an end action claims a handle exactly once.
+Session closure leaves dedicated transaction handles independently owned.
+
+== Authentication and sessions
+
+Authentication accepts Basic, Client, Bearer, and anonymous trust calls according to `rtdb-auth` rules.
+The transport peer address comes from the accepted socket.
+Each authenticated session retains a principal and an HMAC of the complete original authorization header, using a fresh service-lifetime secret.
+A repeated Basic or Client header must match that MAC.
+A cookie and bearer token supplied together must name the same session.
+Every presented session revalidates its principal before work begins.
+
+New sessions return the `arrow_flight_session_id` cookie.
+Authenticated sessions also return an `authorization: Bearer` header.
+Unknown or expired bearer sessions fail as unauthenticated; cookie sessions fail as not found.
+The per-call `x-xtdb-database` selector takes precedence over the session catalog, then `xtdb`.
+Session options expose catalog and the fixed `public` schema, with per-option invalid-name or invalid-value results.
+Playground mode attaches unknown databases locally on first use through the node catalog owner.
+
+The listener is insecure, matching `FlightSql.open` in the pinned implementation.
+The node's PostgreSQL TLS configuration does not apply to this endpoint.
+
+== Queries, writes, and metadata
+
+GetFlightInfo captures a query's SQL, database, optional parameter IPC, and explicit read basis into the Kotlin-compatible JSON ticket inside `TicketStatementQuery`.
+It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
+DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis through `NativeSession::query_context_at`.
+A ticket remains usable by a different authorized caller.
+Query streams retain their cursor, connection, session lease, cancellation scope, and Arrow allocation owners through completion or cancellation.
+
+DML and SET executed through GetFlightInfo run once when the ticket is issued.
+Their empty ticket sends an empty Arrow schema when redeemed and performs no further effect.
+SQL BEGIN, COMMIT, and ROLLBACK use the shared Flight SQL control rejection; transaction actions own those operations.
+Prepared handles are re-prepared against the current execution context on each use.
+Their parameter metadata uses positional unnamed nullable fields, and the source's field-4 `is_update` extension is retained.
+Prepared query binding retains the first Arrow batch.
+Prepared update binding accumulates all Arrow batches by column position.
+Zero columns mean an unbound execution; columns with zero rows preserve an empty execution batch.
+
+Bulk ingestion supports append-on-exists and create-if-missing, a separate schema field, and one native document operation per input record batch.
+A transaction handle buffers those operations together; an ordinary auto-commit connection submits each batch separately.
+
+BeginTransaction, EndTransaction, ClosePreparedStatement, GetSessionOptions, SetSessionOptions, CloseSession, and `xtdb.CommitTransaction` are implemented.
+The custom commit action sends the last submitted transaction result before a commit error and includes its await token.
+Catalogs, schemas, tables with optional IPC schemas, table types, and the five pinned SQL-info values are exposed.
+Schema and table patterns use the Arrow LIKE kernel, including escaped wildcard characters.
+SQL-info values use the standard dense-union string and int32 legs with child-local offsets.
+
+== Compatibility qualifications and resource accounting
+
+The `FlightSqlTransaction` prose in `dev/doc/tx.allium` describes a handle reachable from any session.
+The pinned `XtdbProducer` instead compares caller identity for transaction and prepared handles.
+The native implementation preserves authenticated-session ownership and the shared anonymous owner; the specification retains an open question about that distinction.
+Query tickets are independently transferable, as in the reference.
+
+Arrow Java 19 advertises eight standard actions through ListActions, including savepoint, Substrait, and CancelQuery actions that XTDB leaves unimplemented.
+The native server preserves that advertisement and returns unimplemented for those actions.
+Session actions and the custom commit action remain callable despite their absence from that list.
+Call or response-stream cancellation releases query work; the source does not implement a CancelQuery or CancelFlightInfo action.
+
+Transport message sizes and concurrent calls are bounded.
+Parameter IPC inspection checks metadata, body extents, buffer extents, and declared decompression sizes before Arrow decoding.
+Decoded Arrow owners and encoded `Bytes` retain their reservations through clones and transport delivery.
+Metadata enumeration reserves borrowed schema bounds before cloning table bindings; returned catalog snapshots retain those reservations.
+The schema and codec estimates are conservative allowances, not a demonstrated bound for every possible nested Arrow representation.
+HTTP/2, prost, TLS-free tonic buffers, parser scratch, and scalar-expression peak allocations still require full end-to-end accounting qualification.
+Leases use the shared microsecond clock and have not been compared with the JVM nanosecond clock at submicrosecond timeout boundaries.
+Native server-version metadata uses the Rust package version.
+Ticket timestamps use chrono's supported calendar range, which is narrower than the JVM Instant range.
+Query metrics count pull and Arrow-encoding failures; transport failures after an encoded message has been yielded are owned by tonic and do not currently increment the query consumer-error counter.
+
+== Regression source mapping
+
+`tests/flight.rs` uses an actual native Node and tonic Flight client in its test source.
+Cases cover captured read bases, effect-free empty-ticket redemption, positional and multi-batch parameters, rebind isolation, authenticated handle ownership, transferable tickets, anonymous cross-session transaction completion, immediate lease expiry, bulk ingestion, metadata union offsets, and shutdown while an upload waits for its first message.
+Internal cases cover idle leases and tombstones, nested session calls, credential parsing, cookie selection, Kotlin ticket JSON with required nullable fields, retained Arrow ownership, empty argument distinctions, and malformed IPC extents.
+The reserved metadata API has a source regression in `rtdb-query` for clone lifetime and reservation failure.
+
+These cases map to `core/src/test/kotlin/xtdb/flight_sql/LeaseTest.kt`, `src/test/kotlin/xtdb/FlightSqlAuthnTest.kt`, `src/test/kotlin/xtdb/FlightSqlAdbcTest.kt`, and the Flight SQL/ADBC Clojure tests under `src/test/clojure/xtdb`.
+The protocol references are https://arrow.apache.org/docs/format/FlightSql.html[Flight SQL] and https://github.com/apache/arrow/blob/main/format/Flight.proto[Flight session actions].
+The implementation uses https://docs.rs/arrow-flight/58.4.1/arrow_flight/[Arrow Flight 58.4.1] and https://docs.rs/tonic/0.14.5/tonic/[tonic 0.14.5].
+Interop with Java, Go, Python, R, and ADBC drivers, external authentication, flow-control cancellation races, concurrent expiry/claim races, and every test listed here remain unexecuted qualification work.

@@ -41,6 +41,7 @@ Spill files are scoped temporary resources with a retained-byte quota.
 * Distinct and set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
 * Sort writes stable runs and merges them with a bounded fan-in.
 * Grouping assigns group IDs before spooling input and computes count, sum, average, min/max, boolean, variance, standard deviation, and ordered array aggregates.
+* Window execution assigns first-seen partition IDs, stably sorts each partition, and computes ROW_NUMBER, LEAD, and LAG with sequential readers over a shared spill file.
 * Apply implements inner, left, scalar, exists, pull, and pull-many results, including cardinality errors and empty dependent relations.
 
 Default valid time is the query clock.
@@ -90,6 +91,9 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 
 |`tests/operators.rs`: unnest order and ordinality
 |`xtdb.operator.unnest-test/test-simple-unnest`, `fix-ordinality-field-naming`
+
+|`tests/windows.rs`: partition order, shifted values, nonreflexive keys, cancellation, retained output, spill failure, and plan validation
+|`xtdb.operator.window-test` and `xtdb.operator.window/WindowFnCursor`; `GroupMapper` comparator behavior
 
 |`tests/operators.rs`: per-row apply parameters, cardinality errors, empty dependent relations
 |`xtdb.operator.apply-test/test-apply-operator`, `test-apply-single`, `test-apply-empty-rel-bug-237`; `xtdb.xtql.plan-test/test-pull`
@@ -144,5 +148,19 @@ Runtime user, role, and metric relations require an explicit `CatalogRuntime`; a
 `CatalogRows` retains each provider result's allocation lease while catalog conversion reserves its own rows.
 Primary role membership uses the runtime's current primary watermark independently of the outer query basis.
 The native node source tests retain the upstream catalog fixture identities.
-`xt` log and block inspection tables are not yet implemented by this producer.
 Catalog schema enumeration and parser metadata allocations remain within the resource qualifications above.
+
+== Bounded inspection sources
+
+Inspection scans extract literal or positional-parameter bounds from conjunctions of comparisons and retain the ordinary row filter.
+Direct-column projections translate bound column identities through aliases.
+Log tables require both `msg_id` bounds, `xt.block_files` requires both `block_idx` bounds, and table-block tables require equality predicates on `table_name` and `block_idx`.
+The runtime supplies passive finite cursors; each returned page owns its reservation, and projection acquires its own reservation before cloning selected values.
+`QueryCursor::from_rows` adopts pre-reserved scalar rows for shared SHOW execution and validates the complete retained row capacity before publishing the cursor.
+
+== Query observation
+
+Contexts may carry a passive `ExecutionObserver` for public connection queries.
+Each successfully opened cursor owns one duration sample through cancellation or drop, including time between client pulls.
+Failed pulls record query errors; frontends report failures while consuming a returned batch through `record_consumer_error`.
+Unobserved contexts keep internal transaction-result and role-membership queries outside connection metrics.

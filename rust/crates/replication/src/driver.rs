@@ -7,7 +7,7 @@ use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{catalog::{BlockCatalog, legacy_table_ref}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::TrieKey, log::proto::{self, resolved_tx::DbOp}};
-use rtdb_index::{CatalogTrie, PartitionState};
+use rtdb_index::{CatalogTrie, PartitionState, TrieCatalog};
 use rtdb_storage::log::{LogRecord, LogTail};
 use rtdb_tx::{ResolveContext, ResolvedTx, SourceTransaction, TransactionResult, TransactionWriter, TxResolver};
 use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, ReplicaPosition, Result, SourcePosition, TableRef, Term, TermSequence, Timestamp, TxId};
@@ -29,8 +29,10 @@ pub trait DatabaseEffects: Send + Sync {
 
 #[derive(Clone, Debug)]
 pub struct ReplicationConfig {
+    pub enabled: bool,
     pub may_lead: bool,
     pub external_source: bool,
+    pub skipped_transactions: BTreeSet<SourcePosition>,
     pub rows_per_block: u64,
     pub assertion_interval: Duration,
     pub flush_timeout: Duration,
@@ -40,7 +42,7 @@ pub struct ReplicationConfig {
 }
 impl Default for ReplicationConfig {
     fn default() -> Self {
-        Self { may_lead: true, external_source: false, rows_per_block: 100_000, assertion_interval: Duration::from_millis(100), flush_timeout: Duration::from_secs(4 * 60 * 60),
+        Self { enabled: true, may_lead: true, external_source: false, skipped_transactions: BTreeSet::new(), rows_per_block: 100_000, assertion_interval: Duration::from_millis(100), flush_timeout: Duration::from_secs(4 * 60 * 60),
             pending_block_records: 1024, pending_block_bytes: 64 * 1024 * 1024, election_seed: uuid::Uuid::new_v4().as_u128() as u64 }
     }
 }
@@ -54,6 +56,7 @@ pub struct DriverStatus {
     pub open_block: BlockIndex,
     pub adopted_block: Option<Arc<BlockCatalog>>,
     pub promotion_failure: Option<Anomaly>,
+    pub last_block_upload_epoch_seconds: i64,
 }
 
 #[derive(Clone)]
@@ -95,6 +98,14 @@ impl ReplicationHandle {
 pub struct TermHandle { handle: ReplicationHandle, term: Term }
 impl TermHandle {
     pub fn term(&self) -> Term { self.term }
+    /// Replaces a quiescent catalog and returns after its new block has been adopted in this term.
+    /// The caller must exclusively operate the database with compaction and GC disabled.
+    /// A failed receipt never permits deletion of the old catalog's files.
+    pub async fn reset_compactor(&self, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>) -> Result<BlockIndex> {
+        let (completion, receiver) = oneshot::channel();
+        self.handle.commands.send(Command::ResetCompactor { term: self.term, expected, expected_block, replacements, reservations, completion }).await.map_err(|_| term_ended())?;
+        receiver.await.map_err(|_| term_ended())?
+    }
     pub async fn publish_deletions(&self, table: TableRef, keys: Vec<TrieKey>) -> Result<ReplicaPosition> {
         let (sender, receiver) = oneshot::channel();
         self.handle.commands.send(Command::Delete { term: self.term, table, keys, completion: sender }).await.map_err(|_| term_ended())?;
@@ -119,15 +130,33 @@ impl ExternalReceipt {
 }
 
 enum Command {
+    ResetCompactor { term: Term, expected: Arc<TrieCatalog>, expected_block: BlockIndex, replacements: BTreeMap<TableRef, Vec<CatalogTrie>>, reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>, completion: oneshot::Sender<Result<BlockIndex>> },
     Delete { term: Term, table: TableRef, keys: Vec<TrieKey>, completion: oneshot::Sender<Result<Applied>> },
     External { term: Term, writer: Box<dyn TransactionWriter>, system_time: Option<Timestamp>, token: Option<Vec<u8>>, completion: oneshot::Sender<Result<Applied>> },
 }
 impl Command {
-    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::External { term, .. } => *term } }
-    fn fail(self, error: Anomaly) { let sender = match self { Self::Delete { completion, .. } | Self::External { completion, .. } => completion }; let _ = sender.send(Err(error)); }
+    fn term(&self) -> Term { match self { Self::Delete { term, .. } | Self::External { term, .. } | Self::ResetCompactor { term, .. } => *term } }
+    fn fail(self, error: Anomaly) {
+        match self {
+            Self::Delete { completion, .. } | Self::External { completion, .. } => { let _ = completion.send(Err(error)); }
+            Self::ResetCompactor { completion, .. } => { let _ = completion.send(Err(error)); }
+        }
+    }
 }
 
+struct CompactorReset {
+    block: BlockIndex,
+    completion: Option<oneshot::Sender<Result<BlockIndex>>>,
+    _reservations: Arc<[Arc<rtdb_columnar::MemoryReservation>]>,
+}
+impl CompactorReset {
+    fn complete(mut self) { if let Some(completion) = self.completion.take() { let _ = completion.send(Ok(self.block)); } }
+}
+impl Drop for CompactorReset { fn drop(&mut self) { if let Some(completion) = self.completion.take() { let _ = completion.send(Err(term_ended())); } } }
+
 type Poll = BoxFuture<'static, (Box<dyn LogTail>, Result<Vec<LogRecord>>)>;
+struct ArchivedPayload { bytes: Vec<u8>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
+impl AsRef<[u8]> for ArchivedPayload { fn as_ref(&self) -> &[u8] { &self.bytes } }
 fn start_poll(mut tail: Box<dyn LogTail>, timeout: Duration) -> Poll {
     Box::pin(async move { let result = tail.poll(timeout).await.map_err(Into::into); (tail, result) })
 }
@@ -173,6 +202,7 @@ struct LeaderState {
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
     deferred_commands: VecDeque<Command>,
+    compactor_reset: Option<CompactorReset>,
 }
 impl LeaderState {
     fn resolver(&self) -> Result<&TxResolver> { self.resolver.as_ref().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
@@ -202,7 +232,7 @@ impl ReplicationDriver {
         }
         let read_position = recovered.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?);
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
-            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None };
+            open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
         let (status, receiver) = watch::channel(initial);
         let (sender, commands) = mpsc::channel(128);
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone() };
@@ -224,6 +254,10 @@ impl ReplicationDriver {
         }
     }
     async fn run_inner(&mut self) -> Result<()> {
+        if !self.config.enabled {
+            self.cancellation.cancelled().await;
+            return Ok(());
+        }
         self.logs.validate_source_boundary(self.progress.current().source_position)?;
         self.replica_tail = Some(self.logs.replica_tail(self.read_position).await?);
         self.progress.driver_restarted();
@@ -341,7 +375,7 @@ impl ReplicationDriver {
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
             production: None, confirmed: self.pending_block.is_none(), held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), appender, job: Some(tokio::spawn(pump.run())), cancellation, deferred_commands: VecDeque::new() });
+            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), appender, job: Some(tokio::spawn(pump.run())), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
         if self.pending_block.is_some() {
             self.produce_pending()?;
         }
@@ -351,13 +385,14 @@ impl ReplicationDriver {
     async fn demote(&mut self) -> Result<VecDeque<ReplicaRecord>> {
         if let Some(mut leader) = self.leader.take() {
             leader.cancellation.cancel();
+            drop(leader.compactor_reset.take());
             fail_pending(&mut leader.pending, term_ended());
             for command in leader.deferred_commands.drain(..) { command.fail(term_ended()); }
             drop(leader.resolution.take());
             if let Some(resolver) = &mut leader.resolver { resolver.discard_staged(); }
             let result = if let Some(job) = leader.job.take() { job.await.map_err(join_error).and_then(|result| result) } else { Ok(()) };
             if let Some(production) = leader.production.take() {
-                match production { Production::Writing(future) => { let _ = future.await; }, Production::Appending(future) => { let _ = future.await; } }
+                match production { Production::Writing(future) => { if future.await.is_ok() { self.record_block_upload(); } }, Production::Appending(future) => { let _ = future.await; } }
             }
             self.publish_status(Role::Following);
             result?;
@@ -368,10 +403,11 @@ impl ReplicationDriver {
     fn role(&self) -> Role { self.leader.as_ref().filter(|leader| leader.confirmed).map_or(Role::Following, |leader| Role::Leading(leader.term)) }
     fn publish_status(&self, role: Role) {
         let value = self.partition.value();
-        let promotion_failure = self.status.borrow().promotion_failure.clone();
+        let (promotion_failure, last_block_upload_epoch_seconds) = { let status = self.status.borrow(); (status.promotion_failure.clone(), status.last_block_upload_epoch_seconds) };
         self.status.send_replace(DriverStatus { role, highest_term: self.fence.highest_term(), replica_position: self.read_position,
-            open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure });
+            open_block: value.live().block_index(), adopted_block: value.table_catalog().block().cloned().map(Arc::new), promotion_failure, last_block_upload_epoch_seconds });
     }
+    fn record_block_upload(&self) { self.status.send_modify(|status| status.last_block_upload_epoch_seconds = now().0.div_euclid(1_000_000)); }
     async fn consume(&mut self, raw: LogRecord) -> Result<()> {
         let position = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, raw.metadata.offset.0)?;
         if position <= self.read_position { return Err(invalid("Replica reader did not advance")); }
@@ -418,7 +454,7 @@ impl ReplicationDriver {
             };
             if closes {
                 if let Some(production) = self.leader.as_mut().and_then(|leader| leader.production.take()) {
-                    match production { Production::Writing(future) => { future.await?; }, Production::Appending(future) => { future.await?; } }
+                    match production { Production::Writing(future) => { future.await?; self.record_block_upload(); }, Production::Appending(future) => { future.await?; } }
                     if let Some(leader) = &mut self.leader { leader.confirmed = true; }
                 }
                 let ReplicaBody::BlockUploaded(message) = &record.envelope.message else { return Err(invalid("Matching upload changed type")); };
@@ -444,6 +480,11 @@ impl ReplicationDriver {
                     })), now()).await?;
                 }
                 self.publish_status(self.role());
+                if let Some(leader) = &mut self.leader {
+                    if leader.compactor_reset.as_ref().is_some_and(|reset| reset.block == self.partition.value().table_catalog().block_index().unwrap_or(BlockIndex(-1))) {
+                        leader.compactor_reset.take().expect("matched reset block").complete();
+                    }
+                }
                 continue;
             }
             if let Some(pending) = &mut self.pending_block { pending.hold(record)?; continue; }
@@ -564,6 +605,7 @@ impl ReplicationDriver {
         match result {
             ProductionResult::Written(result) => {
                 let produced = result?;
+                self.status.send_modify(|status| status.last_block_upload_epoch_seconds = now().0.div_euclid(1_000_000));
                 let pending = self.pending_block.as_ref().ok_or_else(|| invalid("Produced block has no retained boundary"))?;
                 let ReplicaBody::BlockBoundary(boundary) = &pending.boundary.envelope.message else { return Err(invalid("Pending boundary changed type")); };
                 let message = ReplicaBody::BlockUploaded(proto::BlockUploaded {
@@ -609,11 +651,23 @@ impl ReplicationDriver {
         let resolved = match message {
             Some(message @ (SourceMessage::LegacyTransaction(_) | SourceMessage::Protobuf(SourceBody::Tx(_)))) => {
                 if self.config.external_source { return Err(Anomaly::incorrect("xtdb/external-source-transaction", "Client transactions are disabled for an external-source database")); }
-                let request = SourceTransaction::decode(&message, &self.resolve.memory)?;
+                let skipped = self.config.skipped_transactions.contains(&position);
+                let request = if skipped { None } else { Some(SourceTransaction::decode(&message, &self.resolve.memory)?) };
                 let mut resolver = leader.resolver.take().ok_or_else(|| invalid("Source resolution has no idle resolver"))?;
                 let context = Arc::clone(&self.resolve);
                 leader.resolution = Some(Resolution { completion: Completion(None), future: Box::pin(async move {
-                    let result = resolver.resolve_source(durable, position, raw.metadata.timestamp, request, &context).await;
+                    let _decoded_reservation = _decoded_reservation;
+                    let result = match request {
+                        Some(request) => resolver.resolve_source(durable, position, raw.metadata.timestamp, request, &context).await,
+                        None => async {
+                            let digits = position.0.to_string();
+                            let key = rtdb_storage::ObjectKey::new(format!("skipped-txs/{}{digits}", digits.len() - 1))?;
+                            let reservation = context.memory.reserve(message.encoded_len().checked_add(128).ok_or_else(|| invalid("Skipped payload exceeds allocation range"))?)?;
+                            let payload = bytes::Bytes::from_owner(ArchivedPayload { bytes: message.encode()?, _reservation: reservation });
+                            context.storage.object_store().put(&key, payload).await?;
+                            resolver.resolve_skipped(durable, position, raw.metadata.timestamp, &context)
+                        }.await,
+                    };
                     (resolver, result)
                 }) });
                 None
@@ -676,6 +730,21 @@ impl ReplicationDriver {
         if leader.term != command.term() { command.fail(term_ended()); return Ok(()); }
         if !leader.accepting() { leader.deferred_commands.push_back(command); return Ok(()); }
         match command {
+            Command::ResetCompactor { expected, expected_block, replacements, reservations, completion, .. } => {
+                let value = self.partition.value();
+                if !leader.confirmed || !leader.pending.is_empty() || self.pending_block.is_some() || leader.production.is_some() || leader.compactor_reset.is_some()
+                    || value.live().block_index() != expected_block || !Arc::ptr_eq(value.trie_catalog(), &expected) {
+                    let _ = completion.send(Err(Anomaly::new(AnomalyCategory::Conflict, "rtdb.compactor-reset/catalog-moved", "Database changed while the reset was being prepared; prepare it again")));
+                    return Ok(());
+                }
+                if value.live().latest_completed_tx().is_none() {
+                    let _ = completion.send(Err(Anomaly::incorrect("rtdb.compactor-reset/no-transactions", "Compactor reset requires a completed transaction")));
+                    return Ok(());
+                }
+                if let Err(error) = self.partition.reset_to_l0(replacements) { let _ = completion.send(Err(error)); return Ok(()); }
+                leader.compactor_reset = Some(CompactorReset { block: expected_block, completion: Some(completion), _reservations: reservations });
+                self.cut().await
+            }
             Command::Delete { table, keys, completion, .. } => {
                 let message = proto::TriesDeleted { table_name: Some(table.schema_and_table()), trie_keys: keys.into_iter().map(|key| key.to_string()).collect() };
                 leader.enqueue(WriteBody::Message(ReplicaBody::TriesDeleted(message)), self.partition.value().live().block_index(), Some(completion), &self.resolve.memory)

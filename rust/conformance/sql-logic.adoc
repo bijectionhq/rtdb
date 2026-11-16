@@ -1,0 +1,101 @@
+= SQL logic conformance
+
+`run_sql_logic.py` retains paired SQL logic observations from the pinned JVM implementation and the native production Node.
+The implementation is source-only until the Phase 2 completeness gate authorizes execution.
+Writing an adapter or a test source does not count as an executed counterpart.
+
+== Selection and identity
+
+The default selection contains the original `slt-test`, `slt-test-2`, and `xtdb.sql.logic-test.direct-sql-test` variants.
+The selected files and task allowances are checked against the pinned Gradle and Clojure declarations before execution.
+`slt-test-dir` requires an explicit directory below `sqlite-test` and retains the original directory task's file ordering.
+Every other tracked SQL logic file appears in `selection.json` with an explicit unselected disposition.
+The original task failure allowances are recorded; they do not turn individual failures into passing assertions.
+
+Records are streamed into immutable JSONL artifacts without rewriting their expected values.
+Each identity retains the reference revision, source path and digest, requested selection and options, physical source line, all-record ordinal, and statement/query ordinal.
+Control records keep their own identities.
+Malformed statement/query records retain their assertion ordinal.
+The JVM adapter reparses each block with the pinned `parse-record` and checks the independent streaming parser's result.
+A malformed script produces unavailable receipts for every record, matching the pinned runner's eager parse before execution.
+
+== Execution boundaries
+
+Each script gets a new production node and connection.
+Native scripts use the real Session, transaction resolver, logs, index, planner, and query cursor.
+The invocation owns the NodeDriver task and joins it before publishing a completed script receipt.
+The JVM adapter uses the pinned test fixture, `xtdb-engine`, and `execute-record` methods.
+Externally terminated processes cannot publish completed execution evidence.
+
+The native source log decorator reproduces the pinned mock clock: transaction messages receive successive days starting at `2020-01-01T00:00:00Z`; other messages use their actual supplied time.
+Queries use the actual wall clock unless the script sets `CURRENT_TIMESTAMP`.
+The query timezone is UTC, and both formatter processes use the English/US decimal convention.
+Repeated JVM execution exposes unstable outputs; the harness does not replace unstable values with expected values.
+
+In non-direct mode, CREATE TABLE and CREATE VIEW mutate only invocation-owned bookkeeping.
+Index definitions are ignored by the pinned engine before its direct/non-direct branch.
+INSERT VALUES creates random UUID identities and real document transactions using the synthetic column list.
+Literal values, arrays, dictionaries, and supported typed strings follow the expression-data path.
+Arithmetic/function/cast expression lists containing symbols fail as values, matching the pinned value writer's rejection of unsupported symbols.
+Unqualified expression-data forms are explicit harness gaps.
+INSERT from a query goes through production SQL.
+Other successfully parsed statements follow the pinned visitor's nil-engine result, including subsequent protocol-dispatch failures.
+Synthetic views are retained but are not installed in the production catalog.
+
+Non-direct query binding hides `_id` from table information, including explicit references.
+After binding, the adapter restores the captured dependency metadata for the production stale-plan check without adding `_id` to the projection or lexical scope.
+Missing tables and columns remain production errors.
+Direct mode submits original SQL unchanged.
+Both requested `decorrelate?` variants execute separately through the native production Apply operators.
+The native engine has no decorrelation optimizer; these result assertions establish no optimizer, performance, or plan-golden parity.
+
+== Pinned validation rules
+
+`skipif` and `onlyif` affect statements and queries; skipped queries still consume the query limit.
+Once the query limit is reached, subsequent statements and directives also remain unexecuted.
+Labels are retained and are not used for cross-query assertions.
+Hash thresholds affect completion-mode printing, while this harness runs validation mode.
+MD5 validation compares the exact lower-case computed digest with the source digest and does not enforce the declared value count.
+Formatting zips each row with the type string, so excess values or type letters are ignored as in the reference.
+An empty result formats as one newline.
+Rowsort orders the joined formatted row strings; valuesort orders formatted cells using Java UTF-16 lexical order.
+Integers use the pinned long coercion, strings under `I` become `0`, nulls become `NULL`, and empty strings under `T` become `(empty)`.
+Real numbers use three fractional digits and the Java formatter's half-up rule after decimal conversion.
+The source contracts are https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/java/util/Formatter.java[OpenJDK 25 Formatter] and https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/jdk/internal/math/FormattedFPDecimal.java[FormattedFPDecimal].
+
+The pinned `halt` method returns a `Reduced` context, which the surrounding runner passes to `update`.
+The resulting error is retained as `halt_error`, and later records remain reachable.
+The source regression for this behavior awaits runtime confirmation.
+Exceptions on records marked `skipif postgresql`, and exceptions containing the pinned duplicate-projection message, retain distinct suppressed-error dispositions.
+Suppression does not earn passing evidence.
+
+== Evidence and remaining qualification
+
+Every script has an ordered observation artifact and digest.
+Receipts retain actual formatted text, MD5, returned row/value counts, expected-exception details, runner counters, and non-execution reasons.
+The native receipt also retains query schema and basis diagnostics.
+The comparator replays source selection counters independently, validates reported outcomes against unchanged expectations, and compares actual formatted query bytes.
+Matching source failures remain failures; skips, suppressions, resource limits, and harness gaps remain in the denominator.
+The selected-record report never sets complete repository parity or assertion-ledger reconciliation.
+
+The owner retains source/driver/native-binary digests, the actual JVM classpath and JRE artifact closure, process-group completion, stdout/stderr, and comparison digests.
+It checks protected inputs again after all executions.
+The same original JVM selection runs twice before native comparison.
+Native result row/byte limits and the JVM retained-result limits are explicit requested options; exceeding them cannot produce a passing receipt.
+The JVM's pinned query method materializes its result before the adapter can apply the retained-result limit.
+Its formatted-byte limit fails the enclosing script after the query cursor has closed; it does not produce a per-record passing result.
+The plan reader accepts at most 16 MiB, and record readers enforce a bounded line size.
+The native adapter caps accumulated synthetic bookkeeping and variable state at 16 MiB each; these harness limits qualify the selected execution rather than the production engine's capabilities.
+These limits do not prove a strict peak memory bound for the pinned JVM query materialization or either formatter's temporary allocations.
+
+Native `T` formatting qualifies common scalars, UTC/local temporal values, and collection values.
+Unsupported temporal zones, nested JVM-specific object printing, binary identity strings, and unqualified extension objects produce harness gaps.
+Collection field order and floating-point decimal conversion are not normalized to hide differences.
+Full runtime coverage of floating-point boundary cases, synthetic visitor edge cases, and the original corpus remains pending.
+
+After Phase 2 is authorized, run the owner with `--reference`, `--native`, and a new `--output` directory.
+Keep the output directory outside both clean source checkouts so retained artifacts do not invalidate their provenance checks.
+Optional `--selection` flags choose original task groups; `--query-limit` is recorded as an exclusion mechanism rather than coverage.
+Python regression sources are `test_sql_logic_records.py` and `test_sql_logic_results.py`.
+Native regression sources are in `conformance/tests/sql_logic.rs` and the formatter module.
+The pinned JVM adapter regression task is `rtdbConformanceSqlLogicAdapterTest` through `reference.init.gradle`.

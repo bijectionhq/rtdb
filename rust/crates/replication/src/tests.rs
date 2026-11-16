@@ -36,7 +36,7 @@ async fn fixture(config: ReplicationConfig, replica_message_limit: usize) -> Fix
     let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
     let recovered = blocks.recover(TrieConfig::new(2, 2).unwrap(), SourcePosition(-1), Timestamp(0)).await.unwrap();
     let progress = ProgressMonitor::new(recovered.progress.clone());
-    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles) });
+    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory: Arc::clone(&memory), query_options: Default::default(), cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles), execution_observer: None, tracer: None });
     let (handle, driver) = ReplicationDriver::new(config, Arc::clone(&logs), Arc::clone(&blocks), recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap();
     Fixture { driver, handle, logs, store, blocks, memory, replica }
 }
@@ -48,6 +48,41 @@ fn boundary(index: i64, source: i64) -> ReplicaBody { ReplicaBody::BlockBoundary
 fn resolved(id: i64, source: i64) -> ReplicaBody { ReplicaBody::ResolvedTx(proto::ResolvedTx { tx_id: Some(id), system_time_micros: Some(id * 100 + 100), committed: Some(true), src_msg_id: Some(source), ..Default::default() }) }
 fn upload(index: i64, source: i64) -> ReplicaBody {
     ReplicaBody::BlockUploaded(proto::BlockUploaded { storage_version: Some(CURRENT_STORAGE_VERSION.0), storage_epoch: Some(0), block_index: Some(index), latest_processed_msg_id: Some(source), tries: Vec::new(), external_source_token: None })
+}
+
+#[tokio::test]
+async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
+    let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
+    let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
+        tx_ops: Some(vec![1, 2, 3]), default_tz: Some("UTC".into()), system_time_micros: Some(-100), ..Default::default()
+    }));
+    let expected = message.encode().unwrap();
+    let handle = fixture.handle.clone();
+    let driver = tokio::spawn(fixture.driver.run());
+    let position = handle.submit_source(&message, Timestamp(100)).await.unwrap();
+    assert_eq!(position, SourcePosition(0));
+    let result = tokio::time::timeout(Duration::from_secs(5), handle.await_tx(TxId(0), &CancellationToken::new())).await.unwrap().unwrap().unwrap();
+    assert_eq!(result.error().unwrap().code, "xtdb/skipped-tx");
+    assert_eq!(result.tx_key().system_time, Timestamp(100));
+    assert_eq!(fixture.store.get(&rtdb_storage::ObjectKey::new("skipped-txs/00").unwrap()).await.unwrap().as_ref(), expected.as_slice());
+    handle.shutdown();
+    driver.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn disabled_indexing_retains_submission_without_starting_replica_consumption() {
+    let fixture = fixture(ReplicationConfig { enabled: false, ..Default::default() }, 1 << 27).await;
+    let handle = fixture.handle.clone();
+    let driver = tokio::spawn(fixture.driver.run());
+    let source = SourceTransaction::new(Vec::new(), SubmitOptions::default(), &fixture.memory).unwrap();
+    let position = handle.submit_source_encoded(source.encode().unwrap().into_bytes(), Timestamp(1)).await.unwrap();
+    assert_eq!(position, SourcePosition(0));
+    let cancellation = CancellationToken::new();
+    assert!(tokio::time::timeout(Duration::from_millis(20), handle.await_source(position, &cancellation)).await.is_err());
+    assert_eq!(handle.progress().current().source_position, SourcePosition(-1));
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(-1));
+    handle.shutdown();
+    driver.await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -149,8 +184,10 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop { if status.borrow_and_update().adopted_block.is_some() { break; } status.changed().await.unwrap(); }
     }).await.unwrap();
+    assert!(status.borrow().last_block_upload_epoch_seconds > 0);
     handle.shutdown();
     writer.await.unwrap().unwrap();
+    assert!(status.borrow().last_block_upload_epoch_seconds > 0);
     let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(1000)).await.unwrap();
     assert_eq!(recovered.progress.tx_key.unwrap().tx_id, TxId(position.0));
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
@@ -201,6 +238,24 @@ async fn demotion_fails_queued_gc_publication_without_failing_the_progress_monit
     fixture.driver.command(super::Command::Delete { term: Term(1), table: TableRef::new("public", "docs"), keys: vec![rtdb_format::keys::TrieKey::l0(BlockIndex(0)).unwrap()], completion }).await.unwrap();
     fixture.driver.consume(raw(0, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
     assert_eq!(result.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
+    assert!(fixture.handle.progress().fault().is_none());
+}
+
+#[tokio::test]
+async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss() {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    fixture.driver.consume(raw(0, 1, 0, resolved(1, 0))).await.unwrap();
+    fixture.driver.promote().await.unwrap();
+    let value = fixture.driver.partition.value();
+    let (completion, mut receipt) = tokio::sync::oneshot::channel();
+    fixture.driver.command(super::Command::ResetCompactor {
+        term: Term(1), expected: Arc::clone(value.trie_catalog()), expected_block: value.live().block_index(),
+        replacements: BTreeMap::new(), reservations: vec![fixture.memory.reserve(8192).unwrap()].into(), completion,
+    }).await.unwrap();
+    assert!(matches!(receipt.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+    assert!(fixture.driver.leader.as_ref().unwrap().compactor_reset.is_some());
+    fixture.driver.consume(raw(1, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }))).await.unwrap();
+    assert_eq!(receipt.await.unwrap().unwrap_err().code, "xtdb/leader-term-ended");
     assert!(fixture.handle.progress().fault().is_none());
 }
 

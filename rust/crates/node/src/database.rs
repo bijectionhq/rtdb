@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::{Clock, DatabaseCatalog, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
+use crate::{Clock, DatabaseCatalog, ExternalSource, ExternalSourceFactory, ExternalSources, NodeOptions, ResourceDriver, ResourceFactory, catalog::{CatalogCommand, CatalogEffects}};
 
 pub struct Database {
     name: String,
@@ -66,6 +66,8 @@ pub(crate) struct DatabaseFactory {
     pub clock: Arc<dyn Clock>,
     pub authorization: Arc<dyn TransactionAuthorization>,
     pub observer: Arc<dyn CollectionObserver>,
+    pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
+    pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
     pub external_sources: ExternalSources,
 }
 
@@ -78,7 +80,9 @@ pub(crate) struct OpenedDatabase {
 impl DatabaseFactory {
     pub fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> {
         self.resources.validate(name, configuration)?;
-        if let Some(source) = &configuration.external_source { self.external_factory(source)?.validate(source)?; }
+        if self.options.replication.enabled && self.options.replication.may_lead && !self.options.read_only && configuration.mode.unwrap_or(0) != 1 {
+            if let Some(source) = &configuration.external_source { self.external_factory(source)?.validate(source)?; }
+        }
         Ok(())
     }
     fn external_factory(&self, source: &prost_types::Any) -> Result<Arc<dyn ExternalSourceFactory>> {
@@ -90,7 +94,8 @@ impl DatabaseFactory {
         let read_only = self.options.read_only || configuration.mode.unwrap_or(0) == 1;
         let cancellation = parent.child_token();
         let log_cancellation = CancellationToken::new();
-        let resources = self.resources.open(&name, &configuration, read_only, log_cancellation.clone()).await?;
+        let access = if read_only { crate::LogAccess::ReadOnly } else if self.options.replication.may_lead { crate::LogAccess::ReadWrite } else { crate::LogAccess::SourceWriter };
+        let resources = self.resources.open(&name, &configuration, access, log_cancellation.clone()).await?;
         let storage = Arc::new(BufferPool::with_budget(Arc::clone(&resources.store), Arc::clone(&self.cache)));
         let logs = PartitionLogs::new(resources.logs.source, resources.logs.replica, resources.logs.source_epoch, resources.logs.replica_epoch,
             resources.storage_version, resources.storage_epoch, Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory))?;
@@ -100,22 +105,24 @@ impl DatabaseFactory {
         let partition = Arc::clone(&recovered.partition);
         let progress = ProgressMonitor::new(recovered.progress.clone());
         let resolve = Arc::new(ResolveContext { database: name.clone(), storage: Arc::clone(&storage), memory: Arc::clone(&self.memory),
-            query_options: self.options.query.clone(), cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization) });
+            query_options: self.options.query.clone(), cancellation: cancellation.clone(), default_tz: self.options.default_timezone.clone(), authorization: Arc::clone(&self.authorization), execution_observer: self.execution_observer.clone(), tracer: self.tracer.clone() });
         let effects = Arc::new(CatalogEffects { catalog, commands, primary: name == "xtdb" });
         let mut replication_options = self.options.replication.clone();
         replication_options.may_lead &= !read_only;
         replication_options.external_source = configuration.external_source.is_some();
         let (replication, replica_driver) = ReplicationDriver::new(replication_options, Arc::clone(&logs), blocks, recovered, progress, resolve, effects, cancellation.clone())?;
         let snapshots: Arc<dyn SnapshotSource> = partition.clone();
-        let (compactor, compaction) = if read_only { (None, None) } else {
+        let (compactor, compaction) = if read_only || self.options.compaction_threads == 0 { (None, None) } else {
             let executor = Arc::new(SegmentCompactor::new(Arc::clone(&resources.store), Arc::clone(&snapshots), Arc::clone(&self.memory), resources.storage_version, resources.storage_epoch, self.options.compaction.clone())?);
             let publisher = Arc::new(PublishCompaction { replication: replication.clone(), cancellation: cancellation.clone() });
             let (driver, handle) = CompactionDriver::new(Arc::clone(&snapshots), executor, publisher, self.options.compaction_threads, self.options.command_capacity, !self.options.automatic_compaction)?;
             (Some(driver), Some(handle))
         };
-        let source_factory = configuration.external_source.as_ref().map(|source| self.external_factory(source)).transpose()?;
-        let supervisor = MaintenanceSupervisor { name: name.clone(), store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
-            observer: Arc::clone(&self.observer), options: self.options.clone(), source_factory, source_configuration: configuration.external_source.clone() };
+        let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
+            match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name).await?), None => None }
+        } else { None };
+        let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
+            observer: Arc::clone(&self.observer), options: self.options.clone(), source };
         let database = Arc::new(Database { name, configuration, read_only, partition, storage, logs, replication, compaction, cancellation: cancellation.clone() });
         let driver = DatabaseDriver { database: Arc::clone(&database), replication: replica_driver, compactor, supervisor, logs: resources.logs.drivers, log_cancellation };
         Ok(OpenedDatabase { database, driver, secondaries })
@@ -180,28 +187,25 @@ impl TermRegion {
 }
 
 struct MaintenanceSupervisor {
-    name: String,
     store: Arc<dyn ObjectStore>,
     snapshots: Arc<dyn SnapshotSource>,
     replication: ReplicationHandle,
     compaction: Option<CompactionHandle>,
     observer: Arc<dyn CollectionObserver>,
     options: NodeOptions,
-    source_factory: Option<Arc<dyn ExternalSourceFactory>>,
-    source_configuration: Option<prost_types::Any>,
+    source: Option<Box<dyn ExternalSource>>,
 }
 
 impl MaintenanceSupervisor {
-    async fn start_term(&self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
+    async fn start_term(&mut self, handle: TermHandle, parent: &CancellationToken) -> Result<TermRegion> {
         let cancellation = parent.child_token();
         let publisher = Arc::new(PublishDeletions(handle.clone()));
         let trie_collector = Arc::new(TrieCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), publisher, Arc::clone(&self.observer), self.options.garbage.clone())?);
         let block_collector = Arc::new(BlockCollector::new(Arc::clone(&self.store), Arc::clone(&self.snapshots), Arc::clone(&self.observer), self.options.garbage.clone())?);
         let (trie_driver, trie) = CycleDriver::new(trie_collector, self.options.automatic_gc, self.options.command_capacity)?;
         let (block_driver, blocks) = CycleDriver::new(block_collector, self.options.automatic_gc, self.options.command_capacity)?;
-        let source = match (&self.source_factory, &self.source_configuration) {
-            (Some(factory), Some(configuration)) => Some(factory.open(configuration, &self.name).await?),
-            _ => None,
+        let source = match &mut self.source {
+            Some(source) => Some(source.assign().await?), None => None,
         };
         let mut tasks = JoinSet::new();
         tasks.spawn(trie_driver.run(cancellation.clone()));
@@ -215,7 +219,7 @@ impl MaintenanceSupervisor {
         }
         Ok(TermRegion { term: handle.term(), cancellation, trie, blocks, tasks })
     }
-    async fn run(self, cancellation: CancellationToken) -> Result<()> {
+    async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         let mut status = self.replication.watch_status();
         let mut region: Option<TermRegion> = None;
         let mut adopted = None;

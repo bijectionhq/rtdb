@@ -38,6 +38,39 @@ async fn adbc_prepared_parameters_are_unnamed_and_each_execution_binds_actual_ty
 }
 
 #[tokio::test]
+async fn inline_xtql_prepared_query_rebinds_external_parameters_through_sql() {
+    let context = context(None,&MemoryBudget::new(1<<26));
+    let statement = PreparedSql::prepare("SELECT ? AS prefix,t.* FROM (XTQL $$#(rel [{:value %}] [value])$$) t",&context,PrepareOptions::default(),ResultSignaturePolicy::Dynamic).unwrap();
+    assert_eq!(statement.parameter_count(),2);
+    for value in [Value::I32(7),Value::Utf8("next".into())] {
+        let mut cursor = statement.open_query(Arc::clone(&context),vec![Value::I64(9),value.clone()]).unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(read_value(page.batch().schema().field(0),page.batch().column(0).as_ref(),0).unwrap(),Value::I64(9));
+        assert_eq!(read_value(page.batch().schema().field(1),page.batch().column(1).as_ref(),0).unwrap(),value);
+    }
+}
+
+#[tokio::test]
+async fn prepared_unqualified_decimal_rebinds_scale_and_preserves_annotated_decimal_parameters() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let statement = PreparedSql::prepare("SELECT $1::DECIMAL AS value", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    for scale in [2, 4] {
+        let value = Value::Decimal(rtdb_types::DecimalValue::new(125i128.to_be_bytes().to_vec(), 10, scale, 128).unwrap());
+        let mut cursor = statement.open_query(Arc::clone(&context), vec![value.clone()]).unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(rtdb_columnar::from_field(page.batch().schema().field(0)).unwrap(), value.logical_type());
+        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), value);
+    }
+    let data_type = LogicalType::Scalar(ScalarType::Decimal { precision: 10, scale: 4, bit_width: 128 });
+    let options = PrepareOptions { parameter_types: BTreeMap::from([(0, data_type.clone())]), ..Default::default() };
+    let annotated = PreparedSql::prepare("SELECT $1::DECIMAL AS value", &context, options, ResultSignaturePolicy::Exact).unwrap();
+    assert_eq!(annotated.prepared_schema().unwrap().fields()[0].data_type, data_type);
+    let mut cursor = annotated.open_query(context, vec![Value::Utf8("1.25".into())]).unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Decimal(rtdb_types::DecimalValue::new(12500i128.to_be_bytes().to_vec(), 10, 4, 128).unwrap()));
+}
+
+#[tokio::test]
 async fn pgwire_prepared_query_out_of_date_detects_current_snapshot_type_changes() {
     let memory = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(Default::default()).unwrap();

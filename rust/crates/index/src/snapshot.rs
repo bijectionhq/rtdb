@@ -38,6 +38,21 @@ impl Snapshot {
     pub fn tables(&self) -> BTreeSet<TableRef> {
         self.table_catalog.tables().keys().chain(self.durable.tables().keys()).chain(self.layered.keys()).cloned().collect()
     }
+    /// Conservative allocation allowance for enumerating and merging this snapshot's table schemas.
+    /// It borrows the schema sources and allocates nothing; event buffers and HLLs are excluded.
+    pub fn schema_allocation_bound(&self, database: &str) -> Result<usize> {
+        let overflow = || Anomaly::incorrect("rtdb.index/schema-size", "Schema allocation bound exceeds addressable memory");
+        let mut bytes = 4096usize;
+        let mut include = |table: &TableRef, types: &BTreeMap<String, LogicalType>| -> Result<()> {
+            bytes = bytes.checked_add(database.len()).and_then(|n| n.checked_add(table.schema.len())).and_then(|n| n.checked_add(table.table.len())).and_then(|n| n.checked_add(1024)).ok_or_else(overflow)?;
+            for (name, ty) in types { let retained = ty.retained_bytes()?; bytes = bytes.checked_add(name.len()).and_then(|n| n.checked_add(512)).and_then(|n| n.checked_add(retained)).ok_or_else(overflow)?; }
+            Ok(())
+        };
+        for (table, metadata) in self.table_catalog.tables() { include(table, &metadata.column_types)?; }
+        for (table, live) in self.durable.tables() { include(table, live.column_types())?; }
+        for (table, segments) in &self.layered { for segment in segments { include(table, segment.column_types())?; } }
+        bytes.checked_mul(16).ok_or_else(overflow)
+    }
     pub fn column_names(&self, table: &TableRef) -> BTreeSet<String> {
         let mut names = BTreeSet::new();
         if let Some(metadata) = self.table_catalog.metadata(table) { names.extend(metadata.column_types.keys().cloned()); }

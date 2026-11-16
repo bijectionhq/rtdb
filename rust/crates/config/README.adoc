@@ -1,0 +1,78 @@
+= Offline configuration qualification
+
+`rtdb-config` is a read-only companion to the native server.
+Its report implements the configuration inventory in `dev/doc/xtdb-rust-rewrite.md`, sections 6 and 9.
+The release image and extracted artifacts include the binary with the same backend feature selection as the server.
+This source has not been compiled or executed during Phase 1.
+
+The command reads exactly three explicitly supplied files and writes JSON to standard output.
+It opens no node, log, object store, credential provider, TLS keystore, Kafka properties file, registry, subprocess or network connection.
+It creates no configuration or storage files and changes no deployment state.
+The supplied environment JSON is the entire environment used by the production decoder; the tool does not inherit deployment credentials or options from its own process environment.
+The caller must provide any implicit settings, such as `XTDB_PASSWORD`, `XTDB_SKIP_DBS`, and `XTDB_COMPACTOR_THREADS`, that apply to the deployment.
+
+[source,shell]
+----
+rtdb-config yaml deployment.yaml environment.json provenance.json
+rtdb-config ingest-yaml databases.yaml environment.json provenance.json
+rtdb-config edn deployment.edn environment.json provenance.json
+----
+
+`environment.json` is an object of unique string keys and string values.
+An empty object selects production defaults for implicit environment settings.
+`provenance.json` has exactly the following fields; revision values are full 40-digit Git object IDs and artifact values are 64-digit SHA256 digests.
+The package manifest contains digests of the extracted server and migrator binaries.
+
+[source,json]
+----
+{
+  "reference_revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "implementation_revision": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "server_artifact_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "migrator_artifact_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+}
+----
+
+The report retains SHA256 digests of the exact configuration, environment and provenance input bytes.
+It includes the declared provenance, compiled backend capabilities, databases, partition counts, auth methods and rules, remote aliases, module registrations, source and replica identities, and storage roots including native storage version and epoch.
+PostgreSQL CDC reports its remote, publication and slot; Kafka Connect reports the remote, topic, Docs table and option names.
+Passwords, hashes, keys, connection strings, Kafka option values and URL userinfo/query/fragment values are omitted or replaced with `[redacted]`.
+Decoder errors use fixed messages because parser diagnostics can contain secret values.
+Paths, usernames, database names, hosts and other deployment identifiers remain visible; protect the report as deployment metadata.
+Whole-input digests can still reveal equality between secret-bearing files, so retain reports under the deployment's access and retention policy.
+
+`configuration_compatible` means the inspected configuration had no reported static gap.
+`cutover_eligible` remains false: neither a parsed configuration nor a supplied artifact digest proves any of the cutover evidence.
+A completed report exits with status 2, including when its static configuration is compatible.
+Status 1 means an input, allocation or output failure; `--help` exits with status 0.
+No report is an authorization to grant writer credentials.
+
+YAML uses the production bounded parser, environment expansion and semantic decoder.
+The structural inventory lists unknown fields and provider tags before semantic decoding can reject the first one.
+The report retains reservations for its own allocations and derived decoded values; each input is limited to one MiB.
+A path beyond the inventory limit or more than 10,000 findings makes the report incomplete and ineligible.
+Duplicate environment keys and duplicate YAML keys are rejected.
+The CLI accepts regular files and bounds reads; on Unix it opens inputs without blocking on a FIFO.
+
+The data-only production EDN adapter can ignore nested JVM options when projecting recognized fields.
+Every EDN report therefore contains a blocking projection qualification finding, even if decoding succeeds.
+Convert to explicit YAML and compare every original setting before treating that deployment's configuration as compatible.
+Executable reader forms, custom JVM objects, programmatic module factories, custom indexers, converter classes and credential-provider callbacks require a native adapter, bridge or explicit migration.
+Kafka Connect option validation that would instantiate plugin or registry clients is reported as unqualified; this tool never creates those clients.
+
+Ordinary node YAML names the primary database while attached database configurations live in its durable catalog.
+That report explicitly blocks an uninventoried attached-database set.
+An operator can supply a separately captured fixed database inventory using the production ingest YAML shape, including each database's exact log, storage and external source description.
+The tool does not claim that the supplied list is complete or that it reflects the current durable catalog.
+Relative local paths, uninspected Kafka properties files, unknown remote aliases, invalid epoch/root descriptions and missing compiled features are blocking findings.
+Absolute local paths are lexical: the tool does not resolve symlinks, read files under those roots or verify permissions and capacity.
+Cloud credential chains, endpoint overrides supplied outside the explicit configuration, backend behavior and token rotation require separate qualification.
+
+The report carries the remaining section 9 obligations: deployment inventory, write-pause and recovery targets, protected retention, matched-basis shadow reads, accepted-write drain, publisher fencing, finalized per-partition handoff manifests, restore verification, canary read-back, restart and historical reads, and reverse recovery through acknowledged Rust writes and interrupted compaction uploads.
+Mixed JVM/Rust writers require a separate qualification.
+Those observations must be retained with their own reproducible inputs and artifact provenance before an operator transfers ownership.
+
+The library's request inputs, parsed document and report are passive values.
+A single caller owns the transient inventory builder; the report owns its memory reservations after decoding returns.
+The synchronous CLI only reads requested inputs and streams the report to the caller's output; it owns no tasks, monitors or persistent service state.
+The server dependency supplies the exact production decoder and feature selection; the CLI calls none of its service-opening functions.

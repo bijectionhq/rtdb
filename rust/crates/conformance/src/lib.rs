@@ -2,6 +2,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub mod controls;
+pub mod faults;
+pub mod history;
+pub mod sql_logic;
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CaseIdentity {
     pub reference_revision: String,

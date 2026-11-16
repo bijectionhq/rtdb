@@ -15,13 +15,72 @@ impl TransactionAuthorization for Denied {
     fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Err(Anomaly::new(rtdb_types::AnomalyCategory::Forbidden, "xtdb/forbidden", "Not authorized")) }
 }
 fn context() -> ResolveContext {
-    ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied) }
+    ResolveContext { database: "xtdb".into(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)), memory: MemoryBudget::new(1 << 29), query_options: QueryOptions { batch_rows: 1, ..Default::default() }, cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(Denied), execution_observer: None, tracer: None }
 }
 fn table() -> TableRef { TableRef::new("public", "docs") }
 fn document(value: i64) -> BTreeMap<String, Value> { BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(value)), ("keep".into(), Value::Utf8("retained".into()))]) }
 fn request(ops: Vec<TxOp>, context: &ResolveContext) -> SourceTransaction { SourceTransaction::new(ops, SubmitOptions::default(), &context.memory).unwrap() }
 fn put(context: &ResolveContext, value: i64, from: i64, to: i64) -> TxOp { TxOp::PutDocs { table: table(), documents: Documents::new(vec![document(value)], &context.memory).unwrap(), valid_from: Some(Timestamp(from)), valid_to: Some(Timestamp(to)) } }
 fn sql(text: &str) -> TxOp { TxOp::Sql { sql: text.into(), args: None } }
+
+#[tokio::test]
+async fn transaction_trace_contains_one_sql_span_per_operation_and_skipped_zero_count() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let mut context = context();
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, false, true).unwrap();
+    context.tracer = Some(tracer.clone());
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let arguments = SqlArguments::from_rows(vec![vec![Value::Bool(true)], vec![Value::Bool(true)]], &context.memory).unwrap();
+    let request = request(vec![TxOp::Sql { sql: "ASSERT ?".into(), args: Some(arguments) }], &context);
+    assert!(resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request, &context).await.unwrap().result().committed());
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    tracer.close();
+    let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
+    assert_eq!(spans.len(), 3);
+    let sql = spans.iter().find(|span| span.name == "xtdb.transaction.sql").unwrap();
+    let transaction = spans.iter().find(|span| span.attributes().any(|attribute| attribute == ("operations.count", "1"))).unwrap();
+    assert_eq!(sql.parent, Some(transaction.context));
+    assert!(sql.attributes().any(|attribute| attribute == ("query.text", "ASSERT ?")));
+    assert!(spans.iter().any(|span| span.attributes().any(|attribute| attribute == ("operations.count", "0"))));
+}
+
+#[derive(Default)]
+struct Metrics(std::sync::atomic::AtomicUsize);
+impl rtdb_plan::ExecutionObserver for Metrics {
+    fn record_duration(&self, _: rtdb_plan::ExecutionTimer, _: std::time::Duration) {}
+    fn record_error(&self, error: rtdb_plan::ExecutionError) { assert_eq!(error, rtdb_plan::ExecutionError::Transaction); self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+}
+
+#[tokio::test]
+async fn ingestion_metrics_count_abort_and_invalid_time_but_exclude_skipped_transaction() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let metrics = Arc::new(Metrics::default()); let mut context = context(); context.execution_observer = Some(metrics.clone());
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![sql("ASSERT FALSE")], &context), &context).await.unwrap();
+    resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(101), &context).unwrap();
+    let request = SourceTransaction::new(vec![], SubmitOptions { system_time: Some(Timestamp(100)), ..Default::default() }, &context.memory).unwrap();
+    resolver.resolve_source(state.value().snapshot(), SourcePosition(2), Timestamp(102), request, &context).await.unwrap();
+    assert_eq!(metrics.0.load(std::sync::atomic::Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn skipped_transaction_stages_only_its_aborted_row_and_smooths_time() {
+    let state = PartitionState::empty(Default::default()).unwrap();
+    let context = context();
+    let mut resolver = TxResolver::new(None, SourcePosition(-1), None, &context.memory).unwrap();
+    let first = resolver.resolve_source(state.value().snapshot(), SourcePosition(0), Timestamp(100), request(vec![put(&context, 9, 0, i64::MAX)], &context), &context).await.unwrap();
+    let skipped = resolver.resolve_skipped(state.value().snapshot(), SourcePosition(1), Timestamp(50), &context).unwrap();
+    assert_eq!(skipped.result().error().unwrap().code, "xtdb/skipped-tx");
+    assert_eq!(skipped.result().tx_key().system_time, Timestamp(101));
+    assert_eq!(skipped.writes().tables().keys().collect::<Vec<_>>(), [&TableRef::new("xt", "txs")]);
+    assert_eq!(resolver.source_position(), SourcePosition(1));
+    assert_eq!(state.value().live().latest_completed_tx(), None);
+    assert_eq!(resolver.take_head().unwrap().result().tx_key(), first.result().tx_key());
+    state.apply(first.writes()).unwrap();
+    assert_eq!(resolver.take_head().unwrap().result().tx_key(), skipped.result().tx_key());
+    state.apply(skipped.writes()).unwrap();
+    assert_eq!(state.value().live().latest_completed_tx(), Some(skipped.result().tx_key()));
+}
 
 #[tokio::test]
 async fn staged_txs_read_your_writes_across_a_batch_and_each_argument_row() {

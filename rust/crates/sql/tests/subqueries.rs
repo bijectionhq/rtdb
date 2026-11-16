@@ -1,0 +1,128 @@
+use std::{collections::BTreeMap, sync::Arc};
+use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_plan::{Relation, RelationNode, Statement};
+use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
+use rtdb_sql::{PrepareOptions, prepare};
+use rtdb_storage::{MemoryStore, cache::BufferPool};
+use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
+use tokio_util::sync::CancellationToken;
+
+fn context() -> Arc<QueryContext> {
+    let database = DatabaseSnapshot { partitions: Vec::new(), storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 24)) };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(100), "UTC", QueryOptions { batch_rows: 1, ..Default::default() }, &CancellationToken::new()).unwrap()
+}
+
+async fn query(sql: &str, parameters: Vec<Value>) -> Result<Vec<Vec<Value>>> {
+    let context = context();
+    let options = PrepareOptions { parameter_types: parameters.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
+    let prepared = prepare(sql, &context.catalog, &options)?;
+    let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters)?;
+    let mut result = Vec::new();
+    while let Some(batch) = cursor.next_batch().await? {
+        let schema = batch.batch().schema();
+        for row in 0..batch.batch().num_rows() {
+            result.push(schema.fields().iter().zip(batch.batch().columns()).map(|(field, array)| read_value(field, array.as_ref(), row)).collect::<Result<_>>()?);
+        }
+    }
+    Ok(result)
+}
+
+#[tokio::test]
+async fn scalar_subquery_in_select_and_where_preserves_empty_and_single_row_results() {
+    assert_eq!(query("SELECT (SELECT 42) AS answer", vec![]).await.unwrap(), vec![vec![Value::I64(42)]]);
+    assert_eq!(query("SELECT (SELECT x FROM (VALUES (1)) AS t(x) WHERE FALSE) AS answer", vec![]).await.unwrap(), vec![vec![Value::Null]]);
+    assert_eq!(query("SELECT x FROM (VALUES (1), (2), (3)) AS t(x) WHERE x = (SELECT MAX(y) FROM (VALUES (1), (2)) AS u(y))", vec![]).await.unwrap(), vec![vec![Value::I64(2)]]);
+    assert!(query("SELECT (SELECT x FROM (VALUES (1), (2)) AS t(x))", vec![]).await.is_err());
+    assert!(query("SELECT (SELECT 1, 2)", vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn correlated_scalar_subquery_in_select_and_nested_cte_keep_lexical_captures() {
+    let expected = vec![vec![Value::I64(1), Value::I64(11)], vec![Value::I64(2), Value::I64(12)]];
+    assert_eq!(query("SELECT t.x, (SELECT t.x + 10) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), expected);
+    assert_eq!(query("SELECT t.x, (SELECT (SELECT t.x + 10)) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), expected);
+    assert_eq!(query("SELECT t.x, (WITH c AS (SELECT t.x + 10 AS v) SELECT (SELECT v FROM c)) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), expected);
+    assert_eq!(query("SELECT (SELECT t.x FROM (VALUES (9)) AS t(x)) FROM (VALUES (1)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::I64(9)]]);
+}
+
+#[tokio::test]
+async fn exists_and_not_exists_work_in_predicates_and_select_without_evaluating_unused_projections() {
+    assert_eq!(query("SELECT t.x, EXISTS (SELECT u.y FROM (VALUES (2)) AS u(y) WHERE u.y = t.x) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::Bool(false)], vec![Value::I64(2), Value::Bool(true)]]);
+    assert_eq!(query("SELECT t.x FROM (VALUES (1), (2)) AS t(x) WHERE NOT EXISTS (SELECT u.y FROM (VALUES (2)) AS u(y) WHERE u.y = t.x)", vec![]).await.unwrap(), vec![vec![Value::I64(1)]]);
+    assert_eq!(query("SELECT EXISTS (SELECT 1 / 0), EXISTS (SELECT (SELECT x FROM (VALUES (1), (2)) AS u(x)))", vec![]).await.unwrap(), vec![vec![Value::Bool(true), Value::Bool(true)]]);
+    assert_eq!(query("SELECT EXISTS (SELECT DISTINCT x FROM (VALUES (1), (1)) AS t(x) OFFSET 1)", vec![]).await.unwrap(), vec![vec![Value::Bool(false)]]);
+}
+
+#[tokio::test]
+async fn quantified_subquery_truth_tables_keep_nulls_and_empty_sets() {
+    for (haystack, any_one, all_one, any_null, all_null) in [
+        ("SELECT 1 WHERE FALSE", Value::Bool(false), Value::Bool(true), Value::Bool(false), Value::Bool(true)),
+        ("VALUES (1), (NULL)", Value::Bool(true), Value::Null, Value::Null, Value::Null),
+        ("VALUES (2), (NULL)", Value::Null, Value::Bool(false), Value::Null, Value::Null),
+        ("VALUES (1), (1)", Value::Bool(true), Value::Bool(true), Value::Null, Value::Null),
+    ] {
+        let sql = format!("SELECT 1 = ANY ({haystack}), 1 = ALL ({haystack}), NULL = ANY ({haystack}), NULL = ALL ({haystack})");
+        assert_eq!(query(&sql, vec![]).await.unwrap(), vec![vec![any_one, all_one, any_null, all_null]], "{sql}");
+    }
+    assert_eq!(query("SELECT 1 IN (VALUES (1), (NULL)), 1 NOT IN (VALUES (2), (NULL)), 3 > ALL (VALUES (1), (2)), 1 <> SOME (VALUES (1), (2))", vec![]).await.unwrap(), vec![vec![Value::Bool(true), Value::Null, Value::Bool(true), Value::Bool(true)]]);
+}
+
+#[tokio::test]
+async fn quantified_arrays_keep_null_and_empty_distinct_and_capture_each_outer_row() {
+    assert_eq!(query("SELECT 1 = ANY (ARRAY[]), 1 = ALL (ARRAY[]), 1 = ANY (NULL), 1 = ALL (NULL)", vec![]).await.unwrap(), vec![vec![Value::Bool(false), Value::Bool(true), Value::Null, Value::Null]]);
+    assert_eq!(query("SELECT 2 = ANY (t.x) FROM (VALUES (ARRAY[1, 2]), (ARRAY[3, NULL]), (NULL)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::Bool(true)], vec![Value::Null], vec![Value::Null]]);
+}
+
+#[tokio::test]
+async fn subqueries_in_values_aggregates_having_and_order_by_use_the_correct_input() {
+    assert_eq!(query("VALUES ((SELECT 1)), ((SELECT 2))", vec![]).await.unwrap(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+    assert_eq!(query("SELECT SUM((SELECT t.x)) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::I64(3)]]);
+    assert_eq!(query("SELECT t.x, (SELECT t.x) FROM (VALUES (1), (1), (2)) AS t(x) GROUP BY t.x HAVING t.x = (SELECT 2)", vec![]).await.unwrap(), vec![vec![Value::I64(2), Value::I64(2)]]);
+    assert_eq!(query("SELECT x FROM (VALUES (1), (2)) AS t(x) ORDER BY (SELECT -x)", vec![]).await.unwrap(), vec![vec![Value::I64(2)], vec![Value::I64(1)]]);
+    assert!(query("SELECT 1 ORDER BY (SELECT 2), 2", vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn subquery_join_conditions_filter_before_outer_null_extension_and_keep_column_order() {
+    let on = "EXISTS (SELECT 1 WHERE l.x = r.y)";
+    assert_eq!(query(&format!("SELECT * FROM (VALUES (1), (2)) AS l(x) LEFT JOIN (VALUES (2)) AS r(y) ON {on}"), vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::Null], vec![Value::I64(2), Value::I64(2)]]);
+    assert_eq!(query(&format!("SELECT * FROM (VALUES (2)) AS l(x) RIGHT JOIN (VALUES (1), (2)) AS r(y) ON {on}"), vec![]).await.unwrap(), vec![vec![Value::Null, Value::I64(1)], vec![Value::I64(2), Value::I64(2)]]);
+    assert!(query("SELECT * FROM (VALUES (1)) AS l(x) JOIN (VALUES (1)) AS r(x) ON x = 1 AND EXISTS (SELECT 1)", vec![]).await.is_err());
+}
+
+#[test]
+fn subquery_captures_do_not_increase_external_parameter_arity_or_leak_wildcard_columns() {
+    let context = context();
+    let prepared = prepare("SELECT t.*, (SELECT ? + t.x) AS y FROM (VALUES (?)) AS t(x) WHERE t.x IN (SELECT ?)", &context.catalog, &PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(ScalarType::I64)), (1, LogicalType::Scalar(ScalarType::I64)), (2, LogicalType::Scalar(ScalarType::I64))]), ..Default::default() }).unwrap();
+    assert_eq!(prepared.parameter_types.len(), 3);
+    let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
+    assert_eq!(relation.parameter_count(), 3);
+    assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["x", "y"]);
+    fn applies(input: &Relation) -> usize { usize::from(matches!(input.node(), RelationNode::Apply { .. })) + input.children().into_iter().map(|child| applies(child)).sum::<usize>() }
+    assert_eq!(applies(&relation), 2);
+}
+
+#[tokio::test]
+async fn lexical_parameters_remain_distinct_from_subquery_captures() {
+    assert_eq!(query("SELECT t.x, (SELECT ? + t.x) FROM (VALUES (?)) AS t(x) WHERE t.x IN (SELECT ?)", vec![Value::I64(10), Value::I64(2), Value::I64(2)]).await.unwrap(), vec![vec![Value::I64(2), Value::I64(12)]]);
+    assert_eq!(query("SELECT (SELECT $3 + t.x) FROM (VALUES ($1)) AS t(x)", vec![Value::I64(2), Value::Null, Value::I64(10)]).await.unwrap(), vec![vec![Value::I64(12)]]);
+}
+
+#[tokio::test]
+async fn subquery_helper_ids_are_hidden_from_current_and_outer_name_resolution() {
+    fn helper(input: &Relation) -> Option<String> {
+        if let RelationNode::Apply { output: Some(field), .. } = input.node() { return Some(field.name.clone()); }
+        input.children().into_iter().find_map(|child| helper(child))
+    }
+    let context = context();
+    let prepared = prepare("SELECT (SELECT 1)", &context.catalog, &PrepareOptions::default()).unwrap();
+    let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
+    let name = helper(&relation).unwrap();
+    for sql in [format!("SELECT (SELECT 1), {name}"), format!("SELECT (SELECT 1), (SELECT {name})")] {
+        let error = prepare(&sql, &context.catalog, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb/column-not-found", "{sql}");
+    }
+    assert_eq!(query(&format!("SELECT (SELECT 1), {name}, (SELECT t.{name}) FROM (VALUES (42)) AS t({name})"), vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::I64(42), Value::I64(42)]]);
+}

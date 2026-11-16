@@ -4,7 +4,9 @@
 `parse_query` produces query, clause, binding, temporal-filter, and expression values.
 `compile` binds those values against one supplied catalog and produces `rtdb-plan::PreparedStatement`.
 The reader, parser, and compiler are passive.
-The compiler owns a transient column-ID allocator and nested parameter bindings; the supplied catalog retains the visibility basis.
+Standalone compilation owns a transient column-ID allocator and nested parameter bindings; embedded compilation borrows the enclosing SQL preparation's allocators.
+The supplied catalog retains the visibility basis.
+`compile_query` binds a parsed query with explicit external parameter positions and advances the caller-owned internal parameter cursor for nested applies.
 
 Native lowering covers scans, explicit and parameter relations, pipelines, unification, joins, left joins, projections, filters, unnest, ordering, limits, offsets, union-all, ordinary aggregates, and scalar/existence/pull subqueries.
 Shared variables produce SQL equality predicates.
@@ -21,12 +23,21 @@ Compilation and all execution remain pending for Phase 2.
 The following surfaces remain outside this checkpoint's implementation.
 
 * Percentile and `vec-agg` aggregation do not have a complete shared-plan/executor representation.
-* The shared scalar function registry does not yet cover every JVM expression function, cast syntax, temporal operation, or collection operation reachable from XTQL.
-* The EDN reader does not implement reader conditionals, namespaced-map shorthand, arbitrary tagged Java objects, regex objects, ratios, or variadic anonymous functions.
+* The shared scalar function registry does not yet cover every JVM expression function, cast option, temporal operation, or collection operation reachable from XTQL.
+* The EDN reader does not implement reader conditionals, automatic namespace aliases, arbitrary tagged Java objects, regex objects, ratios, or variadic anonymous functions.
 * Temporal scan filters containing relational subqueries are rejected.
 * Untyped prepared relation parameters require concrete argument types before they can produce their correct output schema.
-* Protocol submission, SQL-inline XTQL routing, result-key conversion, and transaction submission require the production frontend and session owners.
+* Protocol submission, result-key conversion, and transaction submission require the production frontend and session owners.
 
 Supported literal tags include UUIDs, hexadecimal bytes, URIs, dates, local timestamps, zoned/offset timestamps, instants, local times, durations, intervals, period-duration values, and timestamp ranges.
 Unsupported tags fail during preparation.
+Explicit `#:namespace` maps follow Clojure 1.12's EDN reader: immediate unqualified keyword and symbol keys acquire the namespace, `_` removes it, and already-qualified keys remain unchanged.
+Key spans retain the original source spelling; collisions are checked after namespace expansion.
+The reader remains a caller-owned transient and returns the existing passive map representation.
 Literal object compatibility, normalization collisions, exact failure signatures, and all result observations still require paired JVM/native execution.
+
+Cast forms accept `#xt/type` scalar and list targets with decimal `:precision` and `:scale` options.
+Unspecified precision preserves existing decimal legs; explicit precision and scale apply recursively to list elements.
+The parser retains the target as the shared passive `CastTarget` value, and binding tracks cast operands through unification and aggregate extraction.
+`tests/casts.rs` maps the reference expression list-cast, array-text, and recursive decimal-option assertions.
+Struct, map, run-end, and fixed-size collection type specifications, non-decimal cast options, signed 32-bit decimal scales, and negative precision metadata remain outside this cast parser's supported surface.

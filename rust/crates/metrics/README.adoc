@@ -1,0 +1,75 @@
+= Native telemetry source
+
+`Registry` is a passive allocation owner shared by node services and frontend sessions.
+Its fixed counter and timer accumulators are updated synchronously under one lock.
+Metric snapshots retain their own execution-budget reservation after the registry or a source registration is dropped.
+Kafka source registrations own their identity, status receiver and allocation charge; dropping the returned guard removes that registration.
+No registry operation starts a task.
+`register_provider` returns a region-owned guard and samples each passive provider only when a caller requests metrics.
+`CatalogMetrics::sample` awaits live observations on the requesting future; cancellation releases provider I/O and snapshot scratch reservations.
+Snapshots add the common `node-id` tag and retain the first metric registered with an identical name and tag set.
+
+`query.timer` spans a successfully opened cursor's lifetime, including client pauses between pulls.
+Dropping or cancelling the cursor records the timer once; a failed pull increments `query.error`.
+`node.tx.submit` records asynchronous connection submission.
+`node.tx.execute` records synchronous submission and waiting, while `node.tx.await` records that wait alone.
+Submission failures, synchronous abort results and ingestion aborts increment `tx.error` at their respective source call sites.
+An ingestion skip does not increment it.
+Internal transaction-result and role-membership queries use unobserved contexts.
+PostgreSQL callbacks count authenticated connections, known-target cancellations and refused sockets.
+Connection gauges observe authenticated registrations and the bounded pending-socket queue.
+`pgwire.tx.latency` measures protocol commit calls, including COPY's implicit batch commits.
+
+Timer count and elapsed-time sum retain the reference signed-long accumulation.
+The native histogram implements the precision-one HdrHistogram double layout for the timer's nonnegative signed-long nanosecond domain.
+Its fixed arrays retain the full representable timer domain, while range admission, recorder swaps and snapshot accumulation follow HdrHistogram's auto-ranging rules.
+Percentiles rotate three slots every twenty seconds; maximum slots rotate every sixty seconds.
+Rotation uses wall-clock milliseconds, including backward clock changes and the reference histogram's bounded catch-up after long idle periods.
+The exported snapshot retains all six configured quantiles and the cumulative sum independently of the catalog's truncated integer-duration fields.
+Empty timers report zero values.
+Source-derived fixtures cover fractional quantization, recorder draining, distinct expiration periods, rank rounding, range rejection and signed-long accumulation.
+Executable comparison with the pinned Micrometer 1.17.1 and HdrHistogram implementation remains behind the implementation execution gate.
+The source references are https://github.com/micrometer-metrics/micrometer/tree/v1.17.1/micrometer-core/src/main/java/io/micrometer/core/instrument/distribution[Micrometer's distribution implementations] and https://github.com/HdrHistogram/HdrHistogram/tree/HdrHistogram-2.2.2/src/main/java/org/HdrHistogram[HdrHistogram 2.2.2].
+The supplied execution budget is exported under the root allocator gauge names; JVM heap, GC, thread and Netty metrics have no native equivalents here.
+
+The Kafka feature implements the existing configuration-warning and source-registration interfaces.
+Kafka source counters and instantaneous gauges retain the reference names and tags.
+Each successful indexer batch records every retained record's positive timestamp into the commit-lag distribution summary, using one wall-clock sample for the batch.
+Timestamp copies retain their allocation charge through the indexer call.
+The summary retains cumulative count and total, p50/p95/p99 rolling percentiles and a rolling maximum in seconds; negative lag observations are excluded as in Micrometer.
+The PostgreSQL feature retains counters and the commit-lag summary for the database source's lifetime.
+Assignment guards reset connection and last-event gauges on demotion while preserving those accumulators.
+Live samples query upstream WAL lag only while assigned, returning NaN for unavailable slots or failed queries.
+An in-flight sample retains charged source configuration and ends when either its caller or source assignment is cancelled.
+Collection failures and Kafka configuration warnings also reach the process standard-error stream.
+Disk-cache registrations observe pinned, evictable, free and maximum bytes without extending the cache's lifetime.
+Free bytes retain a negative result while pinned files exceed configured capacity.
+CloudWatch and Azure Monitor publishers run under the server's exporter owner.
+`CatalogMetrics::roll_step` advances sixty-second counter and count/total accumulators independently of cumulative catalog observations.
+`sample_step` returns the previous completed step and samples live gauges on the requesting future.
+Skipped polling resets a counter's current supplier, while the timer and summary tuple suppliers remain accumulated until the next consecutive poll, matching Micrometer's `StepValue` and `StepTuple2` distinction.
+The final rollover exposes a partial step once without resetting cumulative observations.
+Providers with cumulative meters must implement this step capability; the default permits gauges only.
+
+`TraceRecorder` is a passive tracer capability backed by a bounded queue monitor.
+Active spans and copied attributes acquire reservations before allocation, and finished records retain those reservations until the exporter releases them.
+The queue discards excess completed spans and exposes dropped, exported and failed counts.
+Closing admission wakes its receiver, drains admitted records and rejects late completions without extending the exporter lifetime.
+Query and transaction flags independently control span creation.
+SQL and document-patch operation spans parent their query spans explicitly, without thread-local async context.
+
+Query spans retain their SQL text and a peak reservation count from a child of the shared execution budget.
+Each operator span starts on its first pull and records elapsed work excluding downstream consumption, its row count and its final scan attributes.
+Native operators pull individual rows, so their `cursor.pull_count` and `cursor.time_to_first_pull_ms` are separate from the output cursor's actual Arrow page count and first-page timing.
+These internal pull boundaries and reserved-byte peaks are not asserted equivalent to JVM Arrow page boundaries and allocator-byte peaks.
+Every operator span is a child of its query span, including operators below other operators.
+Cancellation and close end owned spans once and retain any independently exported Arrow allocation leases.
+
+The server exporter uses the https://opentelemetry.io/docs/specs/otlp/[OTLP HTTP JSON mapping] with configured endpoint and service name, hexadecimal trace identifiers and string-valued Micrometer tags.
+It publishes the native SDK language, name and version in resource attributes.
+Its bounded queue and single in-flight request are a native lifetime choice; the reference configures Java `SimpleSpanProcessor`.
+The exporter retries transient HTTP failures within a ten-second request deadline, reports partial rejection without retrying and drains for at most thirty seconds after node shutdown.
+Transport/TLS internals remain owned by reqwest; payloads, decoded response trees, queued records and copied configuration retain explicit memory reservations.
+
+Fixtures cover accumulator windows, missed and backward step polling, final partial steps, counter sharing, snapshot retention, provider deduplication, common labels, source registration lifetime, cancellation during live sampling, trace parentage, queue saturation and retained export payloads.
+They are source only under the implementation execution gate.

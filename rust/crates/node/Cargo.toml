@@ -9,11 +9,12 @@ publish.workspace = true
 [features]
 default = []
 kafka = ["dep:rtdb-kafka"]
+kafka-connect = ["kafka"]
 s3 = ["dep:rtdb-s3"]
 azure = ["dep:rtdb-azure"]
 gcs = ["dep:rtdb-gcs"]
 pg-source = ["dep:rtdb-pg-source"]
-all-backends = ["kafka", "s3", "azure", "gcs", "pg-source"]
+all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source"]
 
 [dependencies]
 rtdb-types.workspace = true

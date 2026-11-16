@@ -11,6 +11,7 @@ remote = ["dep:object_store", "dep:futures"]
 
 [dependencies]
 rtdb-types.workspace = true
+rtdb-columnar.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 fs2.workspace = true

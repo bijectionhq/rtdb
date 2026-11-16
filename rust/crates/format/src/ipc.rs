@@ -81,6 +81,7 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
     bytes.resize(footer_length, 0);
     reader.read_exact(&mut bytes).map_err(invalid)?;
     let footer = arrow_ipc::root_as_footer(&bytes).map_err(invalid)?;
+    validate_decimal_metadata(footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?)?;
     let size = |block: &arrow_ipc::Block| -> Result<usize> {
         let metadata = usize::try_from(block.metaDataLength()).map_err(invalid)?;
         let body = usize::try_from(block.bodyLength()).map_err(invalid)?;
@@ -116,6 +117,7 @@ pub struct ArrowStream {
 
 impl ArrowStream {
     pub fn open(bytes: Arc<[u8]>, projection: Option<Vec<usize>>) -> Result<Self> {
+        validate_decimal_metadata(schema_message_metadata(&bytes)?)?;
         Ok(Self { reader: StreamReader::try_new(Cursor::new(bytes), projection).map_err(invalid)? })
     }
 
@@ -133,6 +135,87 @@ pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let schema = reader.schema();
     Ok((schema, reader.collect::<Result<Vec<_>>>()?))
 }
+
+/// Bounds message decoding scratch, including declared row descriptors and compressed buffer lengths.
+/// Reserve the returned byte count before invoking the Arrow reader and retain it through decoded-buffer use.
+pub fn message_allocation_bound(header: &[u8], body: &[u8]) -> Result<usize> {
+    let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+    if let Some(schema) = message.header_as_schema() { validate_decimal_metadata(schema)?; }
+    let mut bound = allocation_add(8192, allocation_add(allocation_mul(header.len(), 64)?, allocation_mul(body.len(), 4)?)?)?;
+    if usize::try_from(message.bodyLength()).map_err(invalid)? > body.len() { return Err(invalid("Arrow message body is truncated")); }
+    if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
+        if let Some(nodes) = batch.nodes() {
+            for node in nodes { bound = allocation_add(bound, allocation_mul(allocation_add(usize::try_from(node.length()).map_err(invalid)?, 1)?, 4096)?)?; }
+        }
+        if let Some(buffers) = batch.buffers() {
+            for buffer in buffers {
+                let start = usize::try_from(buffer.offset()).map_err(invalid)?;
+                let length = usize::try_from(buffer.length()).map_err(invalid)?;
+                let bytes = body.get(start..allocation_add(start, length)?).ok_or_else(|| invalid("Arrow buffer exceeds its message body"))?;
+                let decoded = if batch.compression().is_some() && !bytes.is_empty() {
+                    let prefix: [u8; 8] = bytes.get(..8).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
+                    let length = i64::from_le_bytes(prefix);
+                    if length == -1 { bytes.len() - 8 } else { usize::try_from(length).map_err(invalid)? }
+                } else { length };
+                bound = allocation_add(bound, allocation_add(allocation_mul(decoded, 4)?, 512)?)?;
+            }
+        }
+    }
+    Ok(bound)
+}
+
+/// Bounds all messages retained by a decoded IPC stream, including dictionaries.
+/// The encoded input has a separate lifetime and must retain its own allocation charge.
+pub fn stream_allocation_bound(bytes: &[u8]) -> Result<usize> {
+    let mut position = 0;
+    let mut bound = 8192;
+    while position < bytes.len() {
+        let mut length = inspection_i32(bytes, &mut position)?;
+        if length == -1 { length = inspection_i32(bytes, &mut position)?; }
+        if length == 0 { break; }
+        let end = allocation_add(position, usize::try_from(length).map_err(invalid)?)?;
+        let header = bytes.get(position..end).ok_or_else(|| invalid("Arrow stream metadata is truncated"))?;
+        let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+        let body_end = allocation_add(end, usize::try_from(message.bodyLength()).map_err(invalid)?)?;
+        let body = bytes.get(end..body_end).ok_or_else(|| invalid("Arrow stream body is truncated"))?;
+        bound = allocation_add(bound, message_allocation_bound(header, body)?)?;
+        position = body_end;
+    }
+    Ok(bound)
+}
+
+/// Bounds the footer, dictionaries and all record batches decoded from an immutable IPC file.
+/// The encoded input has a separate lifetime and must retain its own allocation charge.
+pub fn file_allocation_bound(bytes: &[u8]) -> Result<usize> {
+    let tail = bytes.get(bytes.len().checked_sub(10).ok_or_else(|| invalid("Arrow file is shorter than its footer"))?..).ok_or_else(|| invalid("Arrow footer is truncated"))?;
+    let footer_length = arrow_ipc::reader::read_footer_length(tail.try_into().map_err(invalid)?).map_err(invalid)?;
+    let footer_start = bytes.len().checked_sub(allocation_add(10, footer_length)?).ok_or_else(|| invalid("Arrow footer exceeds its file"))?;
+    let footer = arrow_ipc::root_as_footer(&bytes[footer_start..bytes.len() - 10]).map_err(invalid)?;
+    validate_decimal_metadata(footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?)?;
+    let mut bound = allocation_add(allocation_mul(footer_length, 64)?, 65_536)?;
+    for block in footer.dictionaries().into_iter().flat_map(|blocks| blocks.iter()).chain(footer.recordBatches().into_iter().flat_map(|blocks| blocks.iter())) {
+        let start = usize::try_from(block.offset()).map_err(invalid)?;
+        let metadata_end = allocation_add(start, usize::try_from(block.metaDataLength()).map_err(invalid)?)?;
+        let body_end = allocation_add(metadata_end, usize::try_from(block.bodyLength()).map_err(invalid)?)?;
+        if body_end > footer_start { return Err(invalid("Arrow block exceeds its data region")); }
+        let mut header_start = start;
+        let mut length = inspection_i32(bytes, &mut header_start)?;
+        if length == -1 { length = inspection_i32(bytes, &mut header_start)?; }
+        let header_end = allocation_add(header_start, usize::try_from(length).map_err(invalid)?)?;
+        if header_end > metadata_end { return Err(invalid("Arrow block header exceeds its metadata")); }
+        bound = allocation_add(bound, message_allocation_bound(&bytes[header_start..header_end], &bytes[metadata_end..body_end])?)?;
+    }
+    Ok(bound)
+}
+
+fn inspection_i32(bytes: &[u8], position: &mut usize) -> Result<i32> {
+    let end = allocation_add(*position, 4)?;
+    let value = i32::from_le_bytes(bytes.get(*position..end).ok_or_else(|| invalid("Arrow IPC prefix is truncated"))?.try_into().map_err(invalid)?);
+    *position = end;
+    Ok(value)
+}
+fn allocation_add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| invalid("Arrow allocation exceeds addressable memory")) }
+fn allocation_mul(left: usize, right: usize) -> Result<usize> { left.checked_mul(right).ok_or_else(|| invalid("Arrow allocation exceeds addressable memory")) }
 
 pub fn write_file(schema: &Schema, pages: &[RecordBatch]) -> Result<Vec<u8>> {
     let mut writer = FileWriter::try_new_with_options(Vec::new(), schema, write_options()?).map_err(invalid)?;
@@ -259,7 +342,35 @@ impl<W: Write> Write for TailWriter<W> {
 }
 
 pub fn read_schema_message(bytes: &[u8]) -> Result<Schema> {
+    validate_decimal_metadata(schema_message_metadata(bytes)?)?;
     try_schema_from_ipc_buffer(bytes).map_err(invalid)
+}
+
+/// Checks decimal metadata recursively before Arrow converts a FlatBuffer schema.
+/// Values outside the native precision, scale, or bit-width representation return Unsupported.
+/// This does not validate other Arrow field kinds or decimal coefficients.
+pub fn validate_decimal_metadata(schema: arrow_ipc::Schema<'_>) -> Result<()> {
+    fn validate_decimal_field(field: arrow_ipc::Field<'_>) -> Result<()> {
+        if field.type_type() == arrow_ipc::Type::Decimal {
+            let decimal = field.type_as_decimal().ok_or_else(|| invalid("Arrow decimal field has no metadata"))?;
+            if u8::try_from(decimal.precision()).is_err() || i8::try_from(decimal.scale()).is_err() || !matches!(decimal.bitWidth(), 32 | 64 | 128 | 256) {
+                return Err(Anomaly::unsupported("rtdb.format/decimal-metadata", format!("Native Arrow cannot represent decimal precision {}, scale {}, and bit width {}", decimal.precision(), decimal.scale(), decimal.bitWidth())));
+            }
+        }
+        if let Some(children) = field.children() { for child in children { validate_decimal_field(child)?; } }
+        Ok(())
+    }
+    if let Some(fields) = schema.fields() { for item in fields { validate_decimal_field(item)?; } }
+    Ok(())
+}
+
+fn schema_message_metadata(bytes: &[u8]) -> Result<arrow_ipc::Schema<'_>> {
+    let mut position = 0;
+    let mut length = inspection_i32(bytes, &mut position)?;
+    if length == -1 { length = inspection_i32(bytes, &mut position)?; }
+    let end = allocation_add(position, usize::try_from(length).map_err(invalid)?)?;
+    let header = bytes.get(position..end).ok_or_else(|| invalid("Arrow schema message is truncated"))?;
+    arrow_ipc::root_as_message(header).map_err(invalid)?.header_as_schema().ok_or_else(|| invalid("Arrow message has no schema"))
 }
 
 pub fn write_schema_message(schema: &Schema) -> Result<Vec<u8>> {

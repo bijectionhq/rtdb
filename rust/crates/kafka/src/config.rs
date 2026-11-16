@@ -45,17 +45,7 @@ pub fn producer_properties(properties: &BTreeMap<String, String>, pipelined: boo
 pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
     let mut properties = properties.clone();
     if let Some(jaas) = properties.remove("sasl.jaas.config") {
-        let mut tokens = jaas_tokens(&jaas)?.into_iter();
-        let Some(JaasToken::Value(module)) = tokens.next() else { return Err(jaas_error()); };
-        if !matches!(tokens.next(), Some(JaasToken::Value(flag)) if flag == "required") { return Err(jaas_error()); }
-        let mut options = BTreeMap::new();
-        loop {
-            let key = match tokens.next() { Some(JaasToken::End) => break, Some(JaasToken::Value(key)) => key, _ => return Err(jaas_error()) };
-            if !matches!(tokens.next(), Some(JaasToken::Equals)) { return Err(jaas_error()); }
-            let Some(JaasToken::Value(value)) = tokens.next() else { return Err(jaas_error()); };
-            if options.insert(key, value).is_some() { return Err(jaas_error()); }
-        }
-        if tokens.next().is_some() { return Err(jaas_error()); }
+        let (module, mut options) = parse_jaas(&jaas)?;
         match module.as_str() {
             "org.apache.kafka.common.security.plain.PlainLoginModule" | "org.apache.kafka.common.security.scram.ScramLoginModule" => {
                 for (jaas, native) in [("username", "sasl.username"), ("password", "sasl.password")] {
@@ -69,6 +59,21 @@ pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeM
         }
     }
     Ok(properties)
+}
+
+pub(crate) fn parse_jaas(jaas: &str) -> Result<(String, BTreeMap<String, String>)> {
+    let mut tokens = jaas_tokens(jaas)?.into_iter();
+    let Some(JaasToken::Value(module)) = tokens.next() else { return Err(jaas_error()); };
+    if !matches!(tokens.next(), Some(JaasToken::Value(flag)) if flag == "required") { return Err(jaas_error()); }
+    let mut options = BTreeMap::new();
+    loop {
+        let key = match tokens.next() { Some(JaasToken::End) => break, Some(JaasToken::Value(key)) => key, _ => return Err(jaas_error()) };
+        if !matches!(tokens.next(), Some(JaasToken::Equals)) { return Err(jaas_error()); }
+        let Some(JaasToken::Value(value)) = tokens.next() else { return Err(jaas_error()); };
+        if options.insert(key, value).is_some() { return Err(jaas_error()); }
+    }
+    if tokens.next().is_some() { return Err(jaas_error()); }
+    Ok((module, options))
 }
 
 fn jaas_error() -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka JAAS requires one supported login module, required control flag, and quoted username/password options") }

@@ -6,6 +6,73 @@ use tokio_util::sync::CancellationToken;
 
 fn options() -> LocalLogOptions { LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 10 } }
 
+#[test]
+fn cancelled_local_log_reader_offloads_are_joined_after_writer_shutdown() {
+    use std::{future::{Future, poll_fn}, pin::Pin, task::Poll};
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        for mode in 0..3 {
+            let directory = tempfile::tempdir().unwrap(); let (log, driver) = LocalLog::open(directory.path().join("LOG"), options()).unwrap();
+            let cancellation = CancellationToken::new(); let writer = tokio::spawn(driver.run(cancellation.clone()));
+            let first = log.enqueue(Bytes::from_static(b"record"), Timestamp(1)).await.unwrap().durable().await.unwrap();
+            let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+            let (started, waiting) = tokio::sync::oneshot::channel(); let (resume, paused) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || { started.send(()).unwrap(); paused.recv().unwrap(); }); waiting.await.unwrap();
+            let mut read: Pin<Box<dyn Future<Output = rtdb_storage::Result<()>> + '_>> = match mode {
+                0 => Box::pin(async { log.tail(first.offset).await.map(|_| ()) }),
+                1 => Box::pin(async { log.read_range(LogOffset(0), LogOffset(i64::MAX)).await.map(|_| ()) }),
+                _ => Box::pin(async { tail.poll(Duration::ZERO).await.map(|_| ()) }),
+            };
+            poll_fn(|context| { assert!(read.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await; drop(read);
+            cancellation.cancel(); writer.await.unwrap().unwrap();
+            let mut close = Box::pin(log.close_and_wait());
+            poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+            resume.send(()).unwrap(); blocker.await.unwrap(); close.await;
+        }
+    });
+}
+
+#[tokio::test]
+async fn timestamp_source_is_sampled_in_the_writer_after_enqueue() {
+    use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+    struct Clock(AtomicI64);
+    impl rtdb_storage::log::LocalTimestampSource for Clock {
+        fn timestamp(&self, _: &[u8], _: Timestamp) -> rtdb_storage::Result<Timestamp> { Ok(Timestamp(self.0.fetch_add(1, Ordering::SeqCst))) }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let clock = Arc::new(Clock(AtomicI64::new(1)));
+    let (log, driver) = LocalLog::open_with_timestamp_source(directory.path().join("LOG"), options(), clock.clone()).unwrap();
+    let first = log.enqueue(Bytes::from_static(b"one"), Timestamp(5)).await.unwrap();
+    let second = log.enqueue(Bytes::from_static(b"two"), Timestamp(5)).await.unwrap();
+    clock.0.store(100, Ordering::SeqCst);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn(driver.run(shutdown.clone()));
+    assert_eq!(first.durable().await.unwrap().timestamp, Timestamp(100));
+    assert_eq!(second.durable().await.unwrap().timestamp, Timestamp(101));
+    shutdown.cancel();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn timestamp_failure_rolls_back_every_record_in_the_write_batch() {
+    use std::sync::Arc;
+    struct FailSecond;
+    impl rtdb_storage::log::LocalTimestampSource for FailSecond {
+        fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> rtdb_storage::Result<Timestamp> {
+            if payload == b"fail" { Err(Error::Task("clock failed".into())) } else { Ok(supplied) }
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("LOG");
+    let (log, driver) = LocalLog::open_with_timestamp_source(&path, options(), Arc::new(FailSecond)).unwrap();
+    let first = log.enqueue(Bytes::from_static(b"good"), Timestamp(5)).await.unwrap();
+    let second = log.enqueue(Bytes::from_static(b"fail"), Timestamp(6)).await.unwrap();
+    assert!(driver.run(CancellationToken::new()).await.is_err());
+    assert!(first.durable().await.is_err());
+    assert!(second.durable().await.is_err());
+    assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+}
+
 #[tokio::test]
 async fn local_offsets_are_byte_positions_and_reopen_preserves_them() {
     let directory = tempfile::tempdir().unwrap();

@@ -4,11 +4,14 @@ mod cursor;
 mod operators;
 mod join;
 mod sort;
+mod window;
 mod scan;
 mod spill;
 mod patch;
 mod system_schema;
 mod system;
+mod inspection;
+mod trace;
 
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};

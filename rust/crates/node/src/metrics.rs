@@ -1,0 +1,40 @@
+use std::collections::BTreeMap;
+use std::sync::{Arc, Weak};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_plan::{CatalogMetric, CatalogMetrics, CatalogRows};
+use rtdb_types::{Anomaly, Result};
+use crate::{DatabaseCatalog, database::DatabaseFactory};
+
+pub(crate) struct NodeMetrics { catalog: Weak<DatabaseCatalog>, factory: Weak<DatabaseFactory>, memory: Arc<MemoryBudget>, _reservation: Arc<MemoryReservation> }
+impl NodeMetrics {
+    pub fn new(catalog: Weak<DatabaseCatalog>, factory: Weak<DatabaseFactory>, memory: Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(512)?;
+        Ok(Self { catalog, factory, memory, _reservation: reservation })
+    }
+}
+impl CatalogMetrics for NodeMetrics {
+    fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> {
+        let (Some(catalog), Some(factory)) = (self.catalog.upgrade(), self.factory.upgrade()) else { return Ok(CatalogRows::new(Vec::new(), self.memory.reserve(0)?)); };
+        let databases = catalog.open_database_snapshot(&self.memory)?;
+        let bound = databases.rows().iter().try_fold(4096usize, |bytes, database| database.name().len().checked_add(1024).and_then(|size| size.checked_mul(6)).and_then(|size| bytes.checked_add(size)).ok_or_else(overflow))?;
+        let reservation = self.memory.reserve(bound)?;
+        let mut rows = Vec::with_capacity(2 + databases.rows().len() * 6);
+        for database in databases.rows() {
+            let completed = database.partition.value().live().latest_completed_tx().map_or(-1.0, |key| key.tx_id.0 as f64);
+            let processed = database.progress().current().source_position.0;
+            let submitted = database.latest_submitted_position();
+            let lag = submitted.as_ref().map_or(f64::NAN, |position| position.0.wrapping_sub(processed).max(0) as f64);
+            let status = database.status();
+            let leader = if matches!(status.role, rtdb_replication::Role::Leading(_)) { 1.0 } else { 0.0 };
+            for (name, value) in [("node.tx.latestCompletedTxId", completed), ("node.tx.latestSubmittedMsgId", submitted.map_or(f64::NAN, |position| position.0 as f64)),
+                ("node.tx.latestProcessedMsgId", processed as f64), ("node.tx.lag.MsgId", lag), ("xtdb.log.leader", leader), ("xtdb.block.last_upload_time", status.last_block_upload_epoch_seconds as f64)] {
+                let unit = (name == "xtdb.block.last_upload_time").then_some(rtdb_plan::CatalogMetricUnit::Seconds);
+                rows.push(CatalogMetric::Gauge { name: name.into(), tags: BTreeMap::from([("db".into(), database.name().into())]), unit, value });
+            }
+        }
+        rows.push(CatalogMetric::Gauge { name: "rtdb.cache.retained.bytes".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: factory.cache.retained_bytes() as f64 });
+        rows.push(CatalogMetric::Gauge { name: "rtdb.cache.limit.bytes".into(), tags: BTreeMap::new(), unit: Some(rtdb_plan::CatalogMetricUnit::Bytes), value: factory.cache.limit_bytes() as f64 });
+        Ok(CatalogRows::new(rows, reservation))
+    }
+}
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.node/metric-allocation", "Node metric allocation exceeds addressable memory") }

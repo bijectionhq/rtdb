@@ -1,0 +1,45 @@
+[package]
+name = "rtdb-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+kafka = ["rtdb-server/kafka", "dep:rtdb-kafka"]
+kafka-connect = ["kafka", "rtdb-server/kafka-connect"]
+s3 = ["rtdb-server/s3", "dep:rtdb-s3"]
+azure = ["rtdb-server/azure", "dep:rtdb-azure"]
+gcs = ["rtdb-server/gcs", "dep:rtdb-gcs"]
+pg-source = ["rtdb-server/pg-source", "dep:rtdb-pg-source"]
+cloudwatch = ["rtdb-server/cloudwatch"]
+all-backends = ["kafka", "kafka-connect", "s3", "azure", "gcs", "pg-source", "cloudwatch"]
+
+[dependencies]
+rtdb-server.workspace = true
+rtdb-types.workspace = true
+rtdb-format.workspace = true
+rtdb-columnar.workspace = true
+rtdb-storage.workspace = true
+rtdb-auth.workspace = true
+rtdb-kafka = { workspace = true, optional = true }
+rtdb-s3 = { workspace = true, optional = true }
+rtdb-azure = { workspace = true, optional = true }
+rtdb-gcs = { workspace = true, optional = true }
+rtdb-pg-source = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+prost.workspace = true
+prost-types.workspace = true
+url.workspace = true
+zeroize = "1.8"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

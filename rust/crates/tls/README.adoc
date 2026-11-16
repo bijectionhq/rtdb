@@ -1,0 +1,34 @@
+= TLS key material
+
+`KeyStore` and its borrowed `Identity` values are passive immutable key material.
+Decoding completes on the caller and retains the caller's preallocated memory reservation.
+Private PKCS8 buffers and temporary PEM encodings are zeroized on release.
+Transport-specific certificate selection, TLS policy, and connection lifetime belong to the server or client adapter.
+A transport that copies key material retains the store's reservation until those copies are released.
+`IssuerNames` and `PemIdentity` are passive result owners with separate reservations for each conversion call.
+Their borrowed slices remain valid until the result drops; copying those slices requires another reservation.
+
+The codec reads JKS and PKCS12 stores, PEM trust certificates, and plain or encrypted PKCS8 PEM identities.
+JKS store integrity and private-key protection use independent passwords.
+A missing JKS store password skips the integrity check while retaining bounded framing checks.
+Trust loading does not require decrypting JKS private keys.
+JKS loading retains the last entry for each stored alias, comparing modified UTF-8 aliases as exact UTF-16 code-unit sequences.
+Certificates are validated while loading, and private keys are decrypted after duplicate entries have been replaced.
+PKCS12 decoding preserves separate integrity and key passwords, multiple private-key bags, local-key identifiers, certificate chains, and Java trusted-certificate attributes.
+BER constructed octets and indefinite lengths are bounded by the encoded input and a nesting limit.
+PBES2 uses PBKDF2 with SHA-1/224/256/384/512 and AES or 3DES CBC.
+Legacy PKCS12 SHA-1 protection supports RC4, RC2, and two- or three-key 3DES through the native OpenSSL provider.
+MAC and password-based encryption iterations are capped at the pinned JVM's 5,000,000 limit.
+Certificate-chain expansion beyond the retained material reservation fails before copying the next certificate.
+A missing PKCS12 store password skips encrypted certificate sections and the integrity check, matching the JVM load contract.
+Raw private-key and non-TLS bags are skipped; public-key-protected stores and unrecognized cryptographic algorithms fail explicitly.
+
+The JKS source mapping is OpenJDK `JavaKeyStore` and `KeyProtector` at `jdk-21+35`.
+Registry configuration semantics are mapped to Confluent 7.8.0 `SslFactory`.
+The server retains the existing `ServerConfig` keystore surface and pinned PostgreSQL TLS fixtures.
+Independent pyjks vectors cover protected keys, Unicode and separate passwords, and tampering.
+The PKCS12 derivation vectors are the published Stephen Henson vectors also used by Bouncy Castle `PKCS12Test` at `r1rv78`.
+The native transport adapters select identities using the requested signature schemes, with the client adapter also matching the peer's acceptable issuer names.
+Registry chain verification always runs; its configured endpoint-identification policy determines hostname verification.
+Native crypto and system trust-store allocation bounds remain source estimates pending execution and measurement.
+No codec or TLS test has been compiled or executed during Phase 1.

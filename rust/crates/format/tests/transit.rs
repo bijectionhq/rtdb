@@ -105,3 +105,34 @@ fn legacy_exception_info_normalizes_to_the_public_unknown_fault() {
     let wire = V::Tagged { tag: "xtdb/exception-info".into(), representation: Box::new(V::Array(vec![V::String("old exception".into()), V::Map(vec![(V::Keyword("old/data".into()), V::Integer(42))])])) };
     assert_eq!(decode_anomaly(&encode_msgpack(&wire).unwrap()).unwrap(), Anomaly::fault("xtdb.error/unknown", "old exception"));
 }
+
+#[test]
+fn transit_json_wire_quotes_scalars_and_preserves_large_integer_map_keys() {
+    use rtdb_format::transit::{encode_json, decode_json, TransitValue as T};
+    assert_eq!(encode_json(&T::String("~escape".into())).unwrap(), br#"["~#'","~~escape"]"#);
+    assert_eq!(encode_json(&T::Integer(i64::MAX)).unwrap(), br#"["~#'","~i9223372036854775807"]"#);
+    let value = T::Map(vec![(T::Null, T::Bool(true)), (T::Integer(7), T::Bytes(vec![0, 255])), (T::Bool(false), T::Keyword("kind".into()))]);
+    let bytes = encode_json(&value).unwrap();
+    assert_eq!(bytes, br#"["^ ","~_",true,"~i7","~bAP8=","~?f","~:kind"]"#);
+    assert_eq!(decode_json(&bytes).unwrap(), value);
+}
+
+#[test]
+fn transit_json_composite_map_and_tagged_values_round_trip() {
+    use rtdb_format::transit::{encode_json, decode_json, TransitValue as T};
+    let value = T::Map(vec![(T::Array(vec![T::Integer(1)]), T::Tagged { tag: "xt/custom".into(), representation: Box::new(T::String("^literal".into())) })]);
+    assert_eq!(decode_json(&encode_json(&value).unwrap()).unwrap(), value);
+}
+
+#[test]
+fn transit_sequences_reset_cache_per_top_level_and_reject_partial_tail() {
+    use rtdb_format::transit::{decode_json_sequence, decode_msgpack_sequence, encode_msgpack, TransitValue as T};
+    let values = vec![T::Array(vec![T::Keyword("alpha".into()), T::Keyword("alpha".into())]), T::Array(vec![T::Keyword("bravo".into()), T::Keyword("bravo".into())])];
+    assert_eq!(decode_json_sequence(br#"["~:alpha","^0"] ["~:bravo","^0"]"#).unwrap(), values);
+    let mut bytes = encode_msgpack(&values[0]).unwrap(); bytes.extend(encode_msgpack(&values[1]).unwrap());
+    assert_eq!(decode_msgpack_sequence(&bytes).unwrap(), values);
+    bytes.push(0xd9);
+    assert!(decode_msgpack_sequence(&bytes).is_err());
+    assert!(decode_json_sequence(br#"["~:alpha"] ["unfinished"#).is_err());
+    assert!(decode_json_sequence(b"").unwrap().is_empty());
+}

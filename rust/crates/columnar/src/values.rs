@@ -162,9 +162,7 @@ fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> 
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            let array = Decimal32Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
-            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
-            Ok(Arc::new(array))
+            finish_decimal(Decimal32Array::from(values), precision, scale)
         }
         64 => {
             let values = values.iter().map(|value| match value {
@@ -174,9 +172,7 @@ fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> 
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            let array = Decimal64Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
-            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
-            Ok(Arc::new(array))
+            finish_decimal(Decimal64Array::from(values), precision, scale)
         }
         128 => {
             let values = values.iter().map(|value| match value {
@@ -186,9 +182,7 @@ fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> 
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            let array = Decimal128Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
-            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
-            Ok(Arc::new(array))
+            finish_decimal(Decimal128Array::from(values), precision, scale)
         }
         256 => {
             let values = values.iter().map(|value| match value {
@@ -198,12 +192,17 @@ fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> 
                 }
                 _ => Ok(None),
             }).collect::<Result<Vec<_>>>()?;
-            let array = Decimal256Array::from(values).with_precision_and_scale(precision, scale).map_err(super::arrow_error)?;
-            array.validate_decimal_precision(precision).map_err(super::arrow_error)?;
-            Ok(Arc::new(array))
+            finish_decimal(Decimal256Array::from(values), precision, scale)
         }
         _ => Err(decimal_width()),
     }
+}
+
+fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: u8, scale: i8) -> Result<ArrayRef> {
+    if array.iter().flatten().any(|coefficient| precision == 0 || !T::is_valid_decimal_precision(coefficient, precision)) {
+        return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
+    }
+    Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(precision, scale))))
 }
 
 fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value]) -> Result<ArrayRef> {

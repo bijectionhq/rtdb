@@ -1,0 +1,40 @@
+[package]
+name = "rtdb-ffi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["rlib", "cdylib", "staticlib"]
+
+[features]
+default = []
+all-backends = ["rtdb-server/all-backends"]
+
+[dependencies]
+rtdb-server.workspace = true
+rtdb-node.workspace = true
+rtdb-auth.workspace = true
+rtdb-query.workspace = true
+rtdb-columnar.workspace = true
+rtdb-types.workspace = true
+rtdb-plan.workspace = true
+rtdb-sql.workspace = true
+rtdb-tx.workspace = true
+rtdb-format.workspace = true
+rtdb-expr.workspace = true
+rtdb-pg-codec.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-data.workspace = true
+arrow-buffer.workspace = true
+serde.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

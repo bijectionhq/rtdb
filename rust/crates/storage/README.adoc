@@ -10,6 +10,24 @@ The remote bridge uploads sequential multipart chunks to a unique private name, 
 The provider must implement conditional copy; unsupported providers return an error without overwriting the destination.
 Existing remote objects are compared through bounded range reads.
 The memory adapter retains the whole object by definition.
+Every local store offload belongs to an `IoRegion` monitor.
+Standalone stores create a region and expose `close_and_wait`; node stores share the region supplied by `NativeResources`.
+The node's local source and replica log reader offloads share that same region.
+Closing a region rejects new work and waits for queued and running I/O after its caller has been cancelled.
+File uploads open their source before offloading so an unlinked temporary source remains available to admitted work.
+
+`DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
+Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.
+Cancelled or failed loads release their temporary files and allow a later reader to retry.
+Concurrent readers share successful loads; cancellation of the loading caller permits a waiting reader to restart that load.
+Pinned files can exceed the disk capacity; releasing their final lease evicts idle files until the capacity is met.
+Existing complete files are reused at startup, with access/modification timestamps supplying their initial eviction order.
+The cache acquires an exclusive directory lock before removing staging files left by a previous process.
+The lock remains held until the final cache owner or lease is released.
+File uploads warm the cache after durable remote publication; remote deletion leaves cached immutable files available until eviction.
+Blocking range reads retain both their disk lease and allocation reservation until the I/O task finishes, including after caller cancellation.
+The region owner calls `close_and_wait` to reject new work, cancel downloads, and join admitted operations and blocking reads before shutting down the runtime.
+The native node closes this shared resource region after its database workers join, and after an ordinary startup failure.
 
 Normal upload failures attempt multipart cleanup.
 An upload future that is forcibly dropped, a failed cleanup request, or a process crash can leave private objects or multipart parts behind.
@@ -18,3 +36,13 @@ Shutdown owners must allow in-flight publication calls to finish before joining 
 Provider lifecycle policies and orphan cleanup remain operational obligations; hiding a temporary object does not reclaim it.
 
 All implementation and test source remains uncompiled and unexecuted during Phase 1.
+
+`Log::range` captures a finite half-open offset range for inspection and returns a passive `LogRange` cursor.
+Each `next` call requires its advertised allocation reservation before reading one record.
+Returned `Bytes` clones retain that charge.
+Local log ranges use byte-position record starts; interior malformed starts fail, while starts beyond the captured durable tip return an empty range.
+Range reads never wait for later appends.
+
+`LocalLog::open_with_timestamp_source` samples its passive timestamp policy for each record in the ordered writer.
+Policy errors roll back the whole current write batch and fail its receipts.
+`LocalLog::open` retains the caller-supplied timestamp contract for raw log consumers.

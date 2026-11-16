@@ -65,7 +65,7 @@ impl Log for MemoryLog {
         self.shared.progress.advance(metadata.offset);
         let (sender, durable) = oneshot::channel();
         let _ = sender.send(Ok(metadata));
-        Ok(AppendReceipt { durable })
+        Ok(AppendReceipt::new(durable))
     }
 
     fn latest(&self) -> Result<LogOffset> { self.shared.progress.latest() }
@@ -78,6 +78,28 @@ impl Log for MemoryLog {
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
         read(&self.shared, from.0, to.0)
+    }
+
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
+        if to < from { return Err(Error::Task("log range end precedes its start".into())); }
+        let records = self.shared.records.lock();
+        if from.0 < records.first { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: records.first }); }
+        let end = records.next.min(to.0);
+        drop(records);
+        Ok(Box::new(MemoryRange { shared: Arc::clone(&self.shared), next: from.0, end }))
+    }
+}
+
+struct MemoryRange { shared: Arc<Shared>, next: i64, end: i64 }
+#[async_trait]
+impl super::LogRange for MemoryRange {
+    fn allocation_bound(&self) -> usize { self.shared.maximum_message_bytes.saturating_add(256) }
+    async fn next(&mut self, reservation: crate::object_store::ReadReservation) -> Result<Option<LogRecord>> {
+        if reservation.length() < self.allocation_bound() { return Err(Error::Task("log read reservation is too small".into())); }
+        if self.next >= self.end { return Ok(None); }
+        let record = read(&self.shared, self.next, self.next + 1)?.pop().ok_or_else(|| Error::UnavailableLogRange { requested: self.next, first_retained: self.end })?;
+        self.next += 1;
+        record.retain(reservation).map(Some)
     }
 }
 

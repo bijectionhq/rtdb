@@ -28,7 +28,7 @@ impl SystemCursor {
             ("pg_catalog", "pg_user") => RuntimeRows::Users(runtime()?.users()?),
             ("pg_catalog", "pg_roles") => RuntimeRows::Roles { users: runtime()?.users()?, memberships: runtime()?.memberships().await? },
             ("pg_catalog", "pg_auth_members") => RuntimeRows::Memberships(runtime()?.memberships().await?),
-            ("xt", "metrics_timers" | "metrics_gauges" | "metrics_counters") => RuntimeRows::Metrics(runtime()?.metrics()?),
+            ("xt", "metrics_timers" | "metrics_gauges" | "metrics_counters") => RuntimeRows::Metrics(runtime()?.sample().await?),
             _ => RuntimeRows::None,
         };
         context.check_cancelled()?;

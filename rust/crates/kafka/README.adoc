@@ -40,3 +40,58 @@ Source references are `modules/kafka/src/main/kotlin/xtdb/api/log/KafkaCluster.k
 The Rust test sources cover configuration precedence, JAAS credentials, acknowledgements, topic partition validation, read-back, read-only handles, and cancellation while admission is backpressured.
 They have not been compiled or executed during Phase 1.
 Real broker failover, retained-range truncation, authentication, and native shutdown qualification remain required before backend compatibility can be claimed.
+
+== Kafka Connect ingestion
+
+`connect::SourceDriver` owns one explicit partition assignment and its consumer, converters, transform chain, indexer, and cancellation choice.
+`SourceConfig`, `ConnectConfig`, schema/value descriptions, and resume tokens are immutable values.
+Converters, predicates, transforms, and record indexers are passive capabilities opened for that assignment.
+The status channel is a monitor with one writer.
+The node registers `KafkaConnectSourceFactory` under the existing external-source protobuf type.
+The durable configuration stores a Kafka remote alias, topic, Connect plugin options, and an indexer `Any`.
+Node-local native plugin and indexer registries provide extension points.
+Converter options are retained in the durable source configuration.
+
+A first assignment seeks to the first retained Kafka offset.
+A resumed assignment seeks immediately after the last admitted XTDB transaction token.
+No consumer offsets are committed to Kafka.
+The driver converts and transforms an entire bounded fetched batch before submitting any record from that batch.
+Filtered records create no transaction; an entirely filtered tail is replayed after reassignment.
+The document indexer obtains `_id` from the key, unwraps a single-field Connect Struct key, overwrites any document `_id`, and writes a delete for tombstones.
+Document valid time defaults to the smoothed transaction system time through the end of time.
+Decoder, transform, or indexer errors stop the assignment without an aborted placeholder transaction.
+The current submission adapter waits for admitted read-back per record; the reference document indexer hands off after resolution and can pipeline read-back.
+
+Native converters cover String, ByteArray, numeric, Boolean, schema-bearing or schemaless JSON, and the core Confluent Avro and JSON Schema wire paths.
+Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
+Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
+JSON Schema payload validation follows `json.fail.invalid.schema`, whose default is false.
+The transform implementation covers ExtractField, ReplaceField, HoistField, ValueToKey, Filter, DropHeaders, HeaderFrom, InsertField, InsertHeader, Cast, MaskField, Flatten, RegexRouter, TimestampConverter, TimestampRouter, and SetSchemaMetadata, with the three shipped predicates.
+Header and InsertHeader literal parsing retains Kafka numeric widths, collection schema inference, top-level quoting, and millisecond temporal types.
+Recursive Avro and JSON Schema definitions use immutable node graphs; detached field views retain their graph without ownership cycles.
+Enhanced Avro unions retain full named-type namespaces; generalized unions/enums and singleton-union configuration follow the converter-specific naming rules.
+Avro union values follow the pinned converter's candidate matching and destination-field validation, including generalized unions whose null positions cause a different field selection or a conversion error.
+JSON union matching distinguishes integral numbers and counts nested Struct-property matches.
+Schema default conversion runs after child metadata has been completed.
+Registry authentication supports explicit URL, USER_INFO, SASL_INHERIT, STATIC_TOKEN, OAUTHBEARER, and SASL_OAUTHBEARER_INHERIT sources.
+OAuth refresh runs on the request caller, retains a charged token cache, and applies the reference expiry threshold and end buffer.
+Registry TLS uses the shared `rtdb-tls` codec for JKS, PKCS12, PEM trust/client identity files or inline material, and encrypted PKCS8 PEM keys.
+Protocol selection, hostname policy, and HTTP proxy settings remain client-owned.
+As in the pinned registry client, absent, empty, or `none` endpoint-identification policy disables hostname checks; configure `schema.registry.ssl.endpoint.identification.algorithm: HTTPS` to require them.
+Reader-schema migration/rules, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
+Client certificate selection retains all keystore identities and matches signature schemes and acceptable issuer names.
+PKCS12 store and private-key passwords are independent.
+System trust roots retain an 8 MiB reservation; configured trust material retains its keystore decode reservation.
+The native trust-store allocation bound requires runtime qualification.
+Date patterns support numeric calendar/time fields, English month names, quoted literals, and UTC/offset zones; locale/week fields and two-digit-year parsing require further implementation.
+Java regex, charset, float formatting, Gregorian cutover behavior, and header inference edge cases remain to be matched against their reference assertions.
+Source metrics expose an assignment-scoped registration guard and status channel, including native high-watermark minus application-offset lag.
+The guard receives every retained record's timestamp lag after a successful indexer batch, using the same millisecond clock observation for the entire batch.
+The native registry exports the reference commit-lag distribution summary; executable sample-timing parity remains unqualified.
+Raw fetch batches and conversion retention have explicit limits and reservations.
+JSON schema/default expansion has a pre-allocation decode budget; transform and document conversion reserve additional retained charges before cloning.
+Custom plugin ownership and native decoder/prefetch allocations still require a complete memory-bound audit.
+No Kafka Connect compatibility or memory-bound qualification is claimed before those paths and the unexecuted reference-mapped test sources pass Phase 2.
+
+The source mapping is `KafkaConnectSource.kt`, `ConnectConfig.kt`, `RecordIndexer.kt`, `DocsIndexer.kt`, their Kotlin tests, and `kafka_connect_source.proto`.
+Native converter and transform behavior is also traced to the Kafka 4.4.0 source artifacts, and registry conversion work targets Confluent 7.8.0.

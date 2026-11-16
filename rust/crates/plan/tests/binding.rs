@@ -70,7 +70,7 @@ fn scope_rejects_ambiguous_names_and_preserves_qualifiers() {
 
 #[test]
 fn schema_and_deserialization_reject_duplicate_column_ids() {
-    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, data_type: LogicalType::Null };
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
     assert!(Schema::new(vec![field.clone(), field.clone()]).is_err());
     let encoded = serde_json::to_string(&vec![field.clone(), field]).unwrap();
     assert!(serde_json::from_str::<Schema>(&encoded).is_err());
@@ -78,7 +78,7 @@ fn schema_and_deserialization_reject_duplicate_column_ids() {
 
 #[test]
 fn projection_cannot_reference_a_column_outside_its_input() {
-    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, data_type: LogicalType::Null };
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
     let projection = Arc::new(Relation::unit()).project(vec![NamedExpr { field: field.clone(), expr: field.expression() }]);
     assert_eq!(projection.unwrap_err().code, "rtdb.plan/unbound-column");
 }
@@ -107,4 +107,17 @@ fn nonconstant_filter_remains_above_temporal_scan() {
     let simplified = simplify(filtered.clone()).unwrap();
     assert_eq!(simplified, filtered);
     assert!(matches!(simplified.node(), RelationNode::Filter { input, .. } if input == &scan));
+}
+
+#[test]
+fn qualified_only_columns_keep_wildcard_order_and_qualified_resolution() {
+    let mut binder = Binder::default();
+    let left = binder.field("id", Some("l".into()), LogicalType::Scalar(ScalarType::I64)).unwrap();
+    let mut right = binder.field("id", Some("r".into()), LogicalType::Scalar(ScalarType::I64).maybe()).unwrap();
+    right.qualified_only = true;
+    let schema = Schema::new(vec![left.clone(), right.clone()]).unwrap();
+    assert_eq!(schema.resolve(&[Identifier::unquoted("id")]).unwrap(), &left);
+    assert_eq!(schema.resolve(&[Identifier::unquoted("r"), Identifier::unquoted("id")]).unwrap(), &right);
+    assert_eq!(schema.fields(), &[left, right]);
+    assert_eq!(serde_json::from_slice::<Schema>(&serde_json::to_vec(&schema).unwrap()).unwrap(), schema);
 }

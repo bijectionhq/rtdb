@@ -27,12 +27,17 @@ pub struct ResolveContext {
     pub cancellation: CancellationToken,
     pub default_tz: String,
     pub authorization: Arc<dyn TransactionAuthorization>,
+    pub execution_observer: Option<Arc<dyn rtdb_plan::ExecutionObserver>>,
+    pub tracer: Option<Arc<dyn rtdb_plan::Tracer>>,
 }
 
 impl ResolveContext {
-    fn query_context(&self, snapshot: Snapshot, time: Timestamp, timezone: &str) -> Result<Arc<QueryContext>> {
+    fn query_context(&self, snapshot: Snapshot, time: Timestamp, timezone: &str, parent: Option<rtdb_plan::SpanContext>) -> Result<Arc<QueryContext>> {
         let catalog = CatalogSnapshot::new(self.database.clone(), BTreeMap::from([(self.database.clone(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&self.storage) })]), true)?;
-        QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)
+        Ok(QueryContext::new(catalog, Arc::clone(&self.memory), time, timezone, self.query_options.clone(), &self.cancellation)?.with_tracer(self.tracer.clone(), parent))
+    }
+    fn transaction_span(&self, parent: Option<rtdb_plan::SpanContext>, name: &str, attributes: &[(&str, rtdb_plan::TraceValue<'_>)]) -> Option<Box<dyn rtdb_plan::TraceSpan>> {
+        self.tracer.as_ref().filter(|tracer| tracer.transaction_enabled()).and_then(|tracer| tracer.start(parent, name, attributes))
     }
     fn check_cancelled(&self) -> Result<()> {
         if self.cancellation.is_cancelled() { Err(Anomaly::new(AnomalyCategory::Interrupted, "xtdb/transaction-cancelled", "Transaction resolution was cancelled")) } else { Ok(()) }
@@ -122,13 +127,29 @@ impl TxResolver {
         Ok(snapshot)
     }
 
+    /// Stages the skipped transaction outcome after its source payload has been persisted for inspection.
+    pub fn resolve_skipped(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let _span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(0))]);
+        context.check_cancelled()?;
+        let base = self.resolving_snapshot(durable)?;
+        let key = TransactionKey { tx_id: TxId(position.0), system_time: self.smooth(log_time)? };
+        let options = SubmitOptions { default_tz: context.default_tz.clone(), ..SubmitOptions::default() };
+        let mut tx = OpenTransaction::new(base, key, &options, context)?;
+        let error = crate::RetainedAnomaly::new(Anomaly::fault("xtdb/skipped-tx", "Transaction was skipped"), &context.memory)?;
+        let result = TransactionResult::Aborted { tx_key: key, error: Some(error) };
+        tx.write_result(&result, None)?;
+        self.stage(tx.buffer.stage()?, result, position, None, None, context)
+    }
+
     pub async fn resolve_source(&mut self, durable: Snapshot, position: SourcePosition, log_time: Timestamp, request: SourceTransaction, context: &ResolveContext) -> Result<Arc<ResolvedTx>> {
+        let span = context.transaction_span(None, "xtdb.transaction", &[("operations.count", rtdb_plan::TraceValue::Unsigned(request.operations.len() as u64))]);
         context.check_cancelled()?;
         let base = self.resolving_snapshot(durable)?;
         let default_time = self.smooth(log_time)?;
         let invalid_time = request.options.system_time.zip(self.resolved_head).filter(|(time, previous)| *time <= previous.system_time);
         let key = TransactionKey { tx_id: TxId(position.0), system_time: if invalid_time.is_some() { default_time } else { request.options.system_time.unwrap_or(default_time) } };
         let mut tx = OpenTransaction::new(base.clone(), key, &request.options, context)?;
+        tx.trace_parent = span.as_ref().map(|span| span.context());
         let outcome = if let Some((requested, previous)) = invalid_time {
             Err(Anomaly::incorrect("invalid-system-time", "specified system-time must be later than current tx")
                 .with_context("tx-key", tx_key_context(TransactionKey { tx_id: TxId(position.0), system_time: requested })?)
@@ -146,6 +167,7 @@ impl TxResolver {
         let result = match outcome {
             Ok(()) => TransactionResult::Committed { tx_key: key },
             Err(error) if error.is_caller_error() => {
+                if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
                 drop(tx);
                 tx = OpenTransaction::new(base, key, &request.options, context)?;
                 TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }
@@ -167,6 +189,7 @@ impl TxResolver {
         let (result, metadata) = match writer.write(&mut tx).await? {
             WriterResult::Committed { user_metadata } => (TransactionResult::Committed { tx_key: key }, user_metadata),
             WriterResult::Aborted { error, user_metadata } => {
+                if let Some(observer) = &context.execution_observer { observer.record_error(rtdb_plan::ExecutionError::Transaction); }
                 drop(tx); tx = OpenTransaction::new(base, key, &options, context)?;
                 (TransactionResult::Aborted { tx_key: key, error: Some(crate::RetainedAnomaly::new(error, &context.memory)?) }, user_metadata)
             }
@@ -223,10 +246,10 @@ pub trait TransactionWriter: Send {
 }
 pub enum WriterResult { Committed { user_metadata: Option<UserMetadata> }, Aborted { error: Anomaly, user_metadata: Option<UserMetadata> } }
 
-pub struct OpenTransaction<'a> { buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext }
+pub struct OpenTransaction<'a> { buffer: TransactionBuffer, options: &'a SubmitOptions, context: &'a ResolveContext, trace_parent: Option<rtdb_plan::SpanContext> }
 impl<'a> OpenTransaction<'a> {
     fn new(base: Snapshot, key: TransactionKey, options: &'a SubmitOptions, context: &'a ResolveContext) -> Result<Self> {
-        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context })
+        Ok(Self { buffer: TransactionBuffer::new(base, key, Arc::clone(&context.memory))?, options, context, trace_parent: None })
     }
     pub fn tx_key(&self) -> TransactionKey { self.buffer.tx_key() }
     pub fn snapshot(&self) -> Result<Snapshot> { self.buffer.snapshot() }
@@ -234,11 +257,11 @@ impl<'a> OpenTransaction<'a> {
     pub fn declare_table(&mut self, table: TableRef, columns: impl IntoIterator<Item = String>) -> Result<()> { check_table(&table)?; self.buffer.declare_table(table, columns) }
 
     pub fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
         let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
         let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/expected-query", "Expected a query statement")); };
-        PreparedQuery::new(relation)?.execute(context, arguments)
+        PreparedQuery::new(relation)?.execute_with_text(context, arguments, Some(sql))
     }
 
     pub async fn execute_sql(&mut self, sql: &str, arguments: Option<&[Value]>) -> Result<()> {
@@ -247,7 +270,7 @@ impl<'a> OpenTransaction<'a> {
 
     async fn execute_sql_typed(&mut self, sql: &str, arguments: Option<&[Value]>, types: Option<&[rtdb_types::LogicalType]>) -> Result<()> {
         self.context.check_cancelled()?;
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let parameter_types = match types {
             Some(types) => types.iter().cloned().enumerate().collect(),
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(),
@@ -307,6 +330,18 @@ impl<'a> OpenTransaction<'a> {
     }
 
     async fn apply(&mut self, operation: &Operation) -> Result<()> {
+        let span = match operation {
+            Operation::Public(TxOp::Sql { sql, .. } | TxOp::SqlBytes { sql, .. }) => self.context.transaction_span(self.trace_parent, "xtdb.transaction.sql", &[("query.text", rtdb_plan::TraceValue::Text(sql))]),
+            Operation::Public(TxOp::PatchDocs { table, .. }) | Operation::PatchIids { table, .. } => self.context.transaction_span(self.trace_parent, "xtdb.transaction.patch-docs", &[("db", rtdb_plan::TraceValue::Text(&self.context.database)), ("schema", rtdb_plan::TraceValue::Text(&table.schema)), ("table", rtdb_plan::TraceValue::Text(&table.table))]),
+            _ => None,
+        };
+        let parent = self.trace_parent;
+        self.trace_parent = span.as_ref().map(|span| span.context()).or(parent);
+        let result = self.apply_inner(operation).await;
+        self.trace_parent = parent;
+        result
+    }
+    async fn apply_inner(&mut self, operation: &Operation) -> Result<()> {
         self.context.check_cancelled()?;
         match operation {
             Operation::Public(TxOp::Sql { sql, args }) => match args {
@@ -353,7 +388,7 @@ impl<'a> OpenTransaction<'a> {
         let mut binder = Binder::default();
         let fields = vec![binder.field("_iid", None, LogicalType::Scalar(ScalarType::FixedSizeBinary(16)))?, binder.field("doc", None, document_type)?];
         let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
-        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz)?;
+        let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let mutation = rtdb_sql::prepare_patch(QualifiedTable { database: self.context.database.clone(), table: table.clone() }, input, TemporalFilter::FromTo { from: Expr::Literal(time_value(interval.lower())), to: Expr::Literal(time_value(interval.upper())) }, &context.catalog)?;
         self.execute_mutation(mutation, context, None).await
     }

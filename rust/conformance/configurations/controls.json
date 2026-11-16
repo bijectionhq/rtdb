@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "applied_basis": null,
+  "valid_time": null,
+  "system_time": null,
+  "clock": "pure-fixture/no-clock-access",
+  "timezone": "UTC",
+  "storage_version": 6,
+  "features": ["production-codec-controls"]
+}

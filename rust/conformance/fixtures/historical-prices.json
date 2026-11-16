@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "kind": "historical_prices",
+  "source": "dev/doc/xtdb-rust-rewrite.md#10-read-only-follower-acceptance-fixture",
+  "timezone": "UTC",
+  "transactions": [
+    {"system_time": "2026-04-01T00:00:00Z", "operation": "put", "prices": {"A": 12, "B": 7}, "valid_from": "2026-04-01T00:00:00Z"},
+    {"system_time": "2026-06-01T00:00:00Z", "operation": "put", "prices": {"A": 15}, "valid_from": "2026-06-01T00:00:00Z"},
+    {"system_time": "2026-07-01T00:00:00Z", "operation": "put", "prices": {"A": 11}, "valid_from": "2026-05-01T00:00:00Z", "valid_to": "2026-06-01T00:00:00Z"},
+    {"system_time": "2026-08-01T00:00:00Z", "operation": "delete", "id": "A", "valid_from": "2026-08-01T00:00:00Z"},
+    {"system_time": "2026-09-01T00:00:00Z", "operation": "erase", "id": "A"}
+  ],
+  "prefixes": [
+    {"id": "june", "transactions": 2},
+    {"id": "july", "transactions": 3},
+    {"id": "august", "transactions": 4},
+    {"id": "september", "transactions": 5}
+  ],
+  "queries": [
+    {"id": "prior-valid", "prefix": "june", "valid_time": "2026-05-15T12:00:00Z", "system_time": "2026-06-01T00:00:00Z", "expected_prices": {"A": 12, "B": 7}},
+    {"id": "prior-system", "prefix": "july", "valid_time": "2026-05-15T12:00:00Z", "system_time": "2026-05-15T12:00:00Z", "expected_prices": {"A": 12, "B": 7}},
+    {"id": "corrected", "prefix": "july", "valid_time": "2026-05-15T12:00:00Z", "system_time": "2026-07-01T00:00:00Z", "expected_prices": {"A": 11, "B": 7}},
+    {"id": "exclusive-end", "prefix": "july", "valid_time": "2026-06-01T00:00:00Z", "system_time": "2026-07-01T00:00:00Z", "expected_prices": {"A": 15, "B": 7}},
+    {"id": "deleted", "prefix": "august", "valid_time": "2026-08-02T12:00:00Z", "system_time": "2026-08-01T00:00:00Z", "expected_prices": {"A": null, "B": 7}},
+    {"id": "history-survives-delete", "prefix": "august", "valid_time": "2026-05-15T12:00:00Z", "system_time": "2026-08-01T00:00:00Z", "expected_prices": {"A": 11, "B": 7}},
+    {"id": "history-erased", "prefix": "september", "valid_time": "2026-05-15T12:00:00Z", "system_time": "2026-05-15T12:00:00Z", "expected_prices": {"A": null, "B": 7}}
+  ],
+  "execution": "not_run",
+  "projected_temporal_bounds": "pending_reference_capture"
+}

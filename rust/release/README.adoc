@@ -1,0 +1,67 @@
+= Release packaging
+
+Packaging source is written for Phase 2.
+No image, binary, native library or JVM binding has been built or qualified.
+`matrix.json` lists the intended Linux platforms and feature selections; each requires its own execution evidence before it is advertised as supported.
+Local packaging includes the native server, offline configuration migrator, shared and static embedded libraries, C header and build metadata.
+The all-backends selection enables Kafka, Kafka Connect, S3, Azure, GCS and PostgreSQL CDC in the server, migrator and embedded library.
+It also includes the server's CloudWatch module and the migrator's matching capability check.
+The pinned JVM selections are `standalone`, `aws`, `azure`, and `google-cloud`, each built by its matching `:docker:<variant>:shadowJar` task.
+Standalone includes local storage and PostgreSQL CDC; each cloud selection also includes Kafka, Kafka Connect, and its own storage provider.
+The reference has no combined all-backends image in this matrix.
+The Java/Clojure adapter is built separately through the `:xtdb-rust-bindings` Gradle project with JDK 25.
+
+`build.py` requires the source completeness gate, a clean checkout and a committed Cargo lockfile for native builds.
+The build driver owns its subprocess region and temporary artifact container; source manifests, selections and package records are passive values.
+The Docker context comes from a Git archive of the selected revision, including the unchanged protobuf sources used by the Rust codecs.
+The original JVM package uses the pinned reference's Gradle shadow-JAR task and Docker recipe, with an explicitly pinned runtime base.
+The source checkout is checked for modifications before and after packaging.
+Driver provenance captures the implementation revision and driver, matrix, Docker recipe, default configuration, and imported harness digests before building.
+Those inputs are checked again before publication, including when the JVM source is a separate pinned checkout.
+Every command writes separate stdout, stderr and process-status files; Gradle logs follow the repository's `xtdb-testing` review workflow.
+
+Provide immutable repository digests for both base images.
+For Rust, use an official Rust 1.94.1 Bookworm image and a Debian Bookworm runtime image for the selected architecture.
+The recipe resolves additional build and runtime packages from a dated, signed Debian snapshot and records that timestamp.
+For the JVM reference, use the pinned XTDB custom-JRE builder image and Alpine 3.23.7 runtime image.
+Both must be passed by digest even when their human-readable tags are retained in the reference.
+Container builds require Docker Buildx and a builder capable of the selected architecture.
+
+[source,shell]
+----
+python3 rust/release/build.py --phase-two --engine rust \
+  --variant local --platform linux/amd64 \
+  --builder-image "$PINNED_RUST_BOOKWORM_IMAGE" \
+  --runtime-image "$PINNED_DEBIAN_BOOKWORM_IMAGE" \
+  --output build/release/rust-local-amd64-001
+
+python3 rust/release/build.py --phase-two --engine jvm \
+  --reference /absolute/path/to/pinned-reference \
+  --variant standalone --platform linux/amd64 \
+  --builder-image "$PINNED_XTDB_JRE_IMAGE" \
+  --runtime-image "$PINNED_ALPINE_IMAGE" \
+  --output build/release/jvm-amd64-001
+----
+
+The output directory must not exist.
+`package.json` records the actual image ID, source revision and manifest, build arguments, platform, extracted artifact hashes and saved image archive hash.
+The driver creates and removes an unstarted container to extract artifacts; it never starts the database during packaging.
+The extraction owner captures the container's anonymous volume names, removes the container and volumes separately, and checks that each resource is gone.
+`extraction-lifecycle.json` retains the primary failure and every cleanup failure; incomplete cleanup cannot publish a package manifest.
+The image archive can be loaded using `docker image load --input` and selected by the recorded image ID.
+Build success leaves qualification at `built_unqualified`; the package makes no compatibility claim.
+Reproducibility requires rerunning the same selection and comparing artifacts; a recorded recipe alone does not establish byte-identical builds.
+
+The default native image starts a local persistent node using `/var/lib/rtdb/log` and `/var/lib/rtdb/storage`.
+Mount persistent storage at `/var/lib/rtdb` with ownership for UID/GID 20000.
+Set `RTDB_ROOT_PASSWORD` for the default root account or mount an explicit configuration and select it with `node --file`.
+The image serves pgwire on 5432, Flight SQL on 3000 and health/metrics on 8080.
+`playground --port 5439 --flight-sql-port 3000` selects the original client-suite mode.
+The process receives SIGTERM directly and drains its database and listener owners before returning.
+
+Use the link:../conformance/README.adoc[packaged client runner] against the produced image and manifest.
+Backend, fault, storage-interoperability, performance and rollback receipts remain separate release requirements in the matrix.
+Use the paired `rtdb-config` artifact for link:../crates/config/README.adoc[offline configuration qualification] before cutover.
+Its feature selection matches the server, and its extracted digest is retained alongside the server digest.
+The command reads explicit configuration/environment/provenance files and prints a redacted report; it opens no node or backend and never grants cutover eligibility by configuration alone.
+The complete release-matrix orchestrator remains under implementation.

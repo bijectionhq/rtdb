@@ -12,6 +12,7 @@ Workspace editor settings disable Rust checks, build scripts, and procedural mac
 See link:../dev/doc/rtdb-crates-and-test-parity.md[crate contracts] and link:../dev/doc/xtdb-rust-rewrite.md[migration and rollback contracts].
 Implementation status and evidence are tracked in link:implementation-status.json[the status manifest].
 The link:source-review.adoc[source review record] identifies concrete paths, source discrepancies, and missing production traces.
+The link:../dev/doc/rtdb-native-runtime.adoc[native runtime reference] connects the client, operational, packaging and comparison surfaces to their detailed documentation.
 
 == Ownership
 

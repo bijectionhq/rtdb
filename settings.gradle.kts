@@ -7,6 +7,9 @@ project(":api").name = "xtdb-api"
 project(":core").name = "xtdb-core"
 project(":main").name = "xtdb-main"
 
+include("bindings:jvm")
+project(":bindings:jvm").name = "xtdb-rust-bindings"
+
 if (file("lang/test-harness").isDirectory) {
     include("lang:test-harness")
     project(":lang:test-harness").name = "test-harness"

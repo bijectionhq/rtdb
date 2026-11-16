@@ -1,4 +1,4 @@
-use crate::{arithmetic, cast, compare, functions::scalar_call, null_eq, sql_eq};
+use crate::{arithmetic_in_timezone, compare, functions::scalar_call, null_eq, sql_eq};
 use crate::compare::nullish;
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
@@ -70,6 +70,7 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
                 UnaryOp::Not => Ok(boolean(truth(&value)?.map(|value| !value))),
                 _ if nullish(&value) => Ok(Value::Null),
                 UnaryOp::Negate => {
+                    if let Some(result) = crate::temporal::negate(&value) { return result; }
                     if let Some(integer) = integer(&value) {
                         let LogicalType::Scalar(ty) = value.logical_type() else { return Err(inapplicable("negate", &[&value])); };
                         integer_value(integer.checked_neg().ok_or_else(overflow)?, &ty)
@@ -113,7 +114,7 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
                     (Value::List(mut a), Value::List(b)) => { a.extend(b); Ok(Value::List(a)) }
                     (a, b) => Err(inapplicable("concat", &[&a, &b])),
                 },
-                _ => arithmetic(*op, &left, &right),
+                _ => arithmetic_in_timezone(*op, &left, &right, context.timezone),
             }
         }
         Expr::Call { name, args, .. } if name == "coalesce" => {
@@ -121,7 +122,7 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
             Ok(Value::Null)
         }
         Expr::Call { name, args, .. } => scalar_call(name, &args.iter().map(eval).collect::<Result<Vec<_>>>()?, context),
-        Expr::Cast { expr, data_type } => cast(&eval(expr)?, data_type, context.timezone),
+        Expr::Cast { expr, target } => crate::cast::cast_target(&eval(expr)?, target, context.timezone),
         Expr::Case { branches, otherwise } => {
             for (condition, value) in branches { if is_true(&eval(condition)?)? { return eval(value); } }
             eval(otherwise)

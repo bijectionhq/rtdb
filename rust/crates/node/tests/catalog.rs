@@ -31,7 +31,7 @@ impl CatalogUsers for Runtime {
 }
 impl CatalogMetrics for Runtime {
     fn metrics(&self) -> Result<CatalogRows<CatalogMetric>> {
-        Ok(CatalogRows::new(vec![CatalogMetric::Gauge { name: "xtdb.query.open".into(), tags: BTreeMap::from([("db".into(), "xtdb".into())]), value: 2.0 }], self.0.reserve(4096)?))
+        Ok(CatalogRows::new(vec![CatalogMetric::Gauge { name: "xtdb.query.open".into(), tags: BTreeMap::from([("db".into(), "xtdb".into())]), unit: None, value: 2.0 }], self.0.reserve(4096)?))
     }
 }
 #[async_trait]

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "qualification": "pending_phase_two",
+  "rust_version": "1.94.1",
+  "platforms": ["linux/amd64", "linux/arm64"],
+  "variants": {
+    "local": [],
+    "kafka": ["rtdb-server/kafka", "rtdb-config/kafka"],
+    "kafka-connect": ["rtdb-server/kafka-connect", "rtdb-config/kafka-connect"],
+    "s3": ["rtdb-server/s3", "rtdb-config/s3"],
+    "azure": ["rtdb-server/azure", "rtdb-config/azure"],
+    "gcs": ["rtdb-server/gcs", "rtdb-config/gcs"],
+    "pg-source": ["rtdb-server/pg-source", "rtdb-config/pg-source"],
+    "all-backends": ["rtdb-server/all-backends", "rtdb-config/all-backends", "rtdb-ffi/all-backends"]
+  },
+  "jvm_variants": {
+    "standalone": {"gradle_task": ":docker:standalone:shadowJar", "docker_variant": "standalone", "capabilities": ["local", "pg-source"]},
+    "aws": {"gradle_task": ":docker:aws:shadowJar", "docker_variant": "aws", "capabilities": ["local", "kafka", "kafka-connect", "s3", "pg-source"]},
+    "azure": {"gradle_task": ":docker:azure:shadowJar", "docker_variant": "azure", "capabilities": ["local", "kafka", "kafka-connect", "azure", "pg-source"]},
+    "google-cloud": {"gradle_task": ":docker:google-cloud:shadowJar", "docker_variant": "google-cloud", "capabilities": ["local", "kafka", "kafka-connect", "gcs", "pg-source"]}
+  },
+  "required_evidence": [
+    "workspace-production-and-test-target-compilation",
+    "original-unit-integration-property-sql-logic-cloud-and-client-assertions",
+    "embedded-binding-abi-and-resource-lifetimes",
+    "packaged-client-selection",
+    "matched-performance-and-recovery",
+    "jvm-to-rust-and-rust-to-jvm-recovery",
+    "acknowledged-rust-write-and-jvm-fallback",
+    "full-ledger-comparison"
+  ]
+}

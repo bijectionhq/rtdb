@@ -49,6 +49,69 @@ pub fn decode_json(bytes: &[u8]) -> Result<TransitValue> {
     unpack_value(packed.0, false, &mut Vec::new(), 0)
 }
 
+/// Reads consecutive top-level values, resetting Transit cache indices for each value.
+pub fn decode_json_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
+    serde_json::Deserializer::from_slice(bytes).into_iter::<JsonPacked>()
+        .map(|packed| unpack_value(packed.map_err(invalid)?.0, false, &mut Vec::new(), 0)).collect()
+}
+
+/// Reads consecutive top-level values; a truncated trailing value is an error.
+pub fn decode_msgpack_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
+    let mut cursor = Cursor { bytes, offset: 0 };
+    let mut values = Vec::new();
+    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut Vec::new(), 0)?); }
+    Ok(values)
+}
+
+/// Encodes Transit JSON with array maps and top-level quoting; cache substitution is optional on the wire.
+pub fn encode_json(value: &TransitValue) -> Result<Vec<u8>> {
+    let encoded = json_wire(value, false, 0)?;
+    let encoded = match value {
+        TransitValue::Array(_) | TransitValue::Map(_) => encoded,
+        TransitValue::Tagged { tag, .. } if tag.chars().count() > 1 => encoded,
+        _ => serde_json::Value::Array(vec![serde_json::Value::String("~#'".into()), encoded]),
+    };
+    serde_json::to_vec(&encoded).map_err(invalid)
+}
+
+fn json_wire(value: &TransitValue, key: bool, depth: usize) -> Result<serde_json::Value> {
+    use serde_json::Value as Json;
+    if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+    Ok(match value {
+        TransitValue::Null if key => Json::String("~_".into()),
+        TransitValue::Null => Json::Null,
+        TransitValue::Bool(value) if key => Json::String(if *value { "~?t" } else { "~?f" }.into()),
+        TransitValue::Bool(value) => Json::Bool(*value),
+        TransitValue::Integer(value) if key || !(-9_007_199_254_740_991..=9_007_199_254_740_991).contains(value) => Json::String(format!("~i{value}")),
+        TransitValue::Integer(value) => Json::Number((*value).into()),
+        TransitValue::Float(value) if !value.is_finite() => Json::String(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }.into()),
+        TransitValue::Float(value) if key => Json::String(format!("~d{value}")),
+        TransitValue::Float(value) => Json::Number(serde_json::Number::from_f64(*value).ok_or_else(|| invalid("Invalid JSON number"))?),
+        TransitValue::String(value) => Json::String(if value.starts_with(['~', '^', '`']) { format!("~{value}") } else { value.clone() }),
+        TransitValue::Keyword(value) => Json::String(format!("~:{value}")),
+        TransitValue::Symbol(value) => Json::String(format!("~${value}")),
+        TransitValue::Bytes(value) => Json::String(format!("~b{}", STANDARD.encode(value))),
+        TransitValue::Array(values) => Json::Array(values.iter().map(|value| json_wire(value, false, depth + 1)).collect::<Result<_>>()?),
+        TransitValue::Map(entries) => {
+            let simple = entries.iter().all(|(key, _)| stringable(key));
+            let mut values = Vec::with_capacity(entries.len().checked_mul(2).and_then(|size| size.checked_add(1)).ok_or_else(|| invalid("Transit map length overflow"))?);
+            if simple { values.push(Json::String("^ ".into())); }
+            for (key, value) in entries { values.push(json_wire(key, simple, depth + 1)?); values.push(json_wire(value, false, depth + 1)?); }
+            if simple { Json::Array(values) } else { Json::Array(vec![Json::String("~#cmap".into()), Json::Array(values)]) }
+        }
+        TransitValue::Tagged { tag, representation } => {
+            if tag.is_empty() { return Err(invalid("Transit tag is empty")); }
+            if tag.chars().count() == 1 && matches!(representation.as_ref(), TransitValue::String(_)) {
+                let TransitValue::String(text) = representation.as_ref() else { unreachable!() };
+                Json::String(format!("~{tag}{text}"))
+            } else {
+                if key { return Err(invalid("Compound Transit tags cannot be map keys")); }
+                Json::Array(vec![Json::String(format!("~#{tag}")), json_wire(representation, false, depth + 1)?])
+            }
+        }
+    })
+}
+
 struct JsonPacked(Packed);
 
 impl<'de> serde::Deserialize<'de> for JsonPacked {

@@ -9,11 +9,80 @@ use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
 
 fn scalar(ty: ScalarType) -> LogicalType { LogicalType::Scalar(ty) }
-fn field(id: u32, name: &str, ty: LogicalType) -> Field { Field { id: ColumnId(id), name: name.into(), qualifier: None, data_type: ty } }
+fn field(id: u32, name: &str, ty: LogicalType) -> Field { Field { id: ColumnId(id), name: name.into(), qualifier: None, qualified_only: false, data_type: ty } }
 fn query_context(options: QueryOptions) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 24)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(100), "UTC", options, &CancellationToken::new()).unwrap()
+}
+
+#[derive(Default)]
+struct Metrics { durations: std::sync::Mutex<Vec<rtdb_plan::ExecutionTimer>>, errors: std::sync::Mutex<Vec<rtdb_plan::ExecutionError>> }
+
+#[tokio::test]
+async fn tracing_cursor_parentage_distinguishes_operator_pulls_from_arrow_output_pages() {
+    let context = query_context(QueryOptions { batch_rows: 2, ..Default::default() });
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, true, true).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let prepared = PreparedQuery::new(numbers(0, "n", &[1, 2, 3])).unwrap();
+    let mut cursor = prepared.execute_with_text(Arc::clone(&context), vec![], Some("VALUES (1), (2), (3)")).unwrap();
+    assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 2);
+    assert_eq!(cursor.next_batch().await.unwrap().unwrap().batch().num_rows(), 1);
+    assert!(cursor.next_batch().await.unwrap().is_none()); drop(cursor); tracer.close();
+    let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
+    let root = spans.iter().find(|span| span.name == "xtdb.query").unwrap();
+    let output = spans.iter().find(|span| span.name == "query.cursor.output").unwrap();
+    let table = spans.iter().find(|span| span.name == "query.cursor.table").unwrap();
+    assert_eq!(output.parent, Some(root.context)); assert_eq!(table.parent, Some(root.context));
+    assert!(root.attributes().any(|(name, value)| name == "query.peak_memory_bytes" && value.parse::<usize>().unwrap() > 0));
+    assert!(output.attributes().any(|attribute| attribute == ("cursor.page_count", "2")));
+    assert!(table.attributes().any(|attribute| attribute == ("cursor.pull_count", "3")));
+    assert!(!table.attributes().any(|(name, _)| name == "cursor.page_count"));
+    assert!(spans.iter().all(|span| span.ended >= span.started));
+}
+
+#[tokio::test]
+async fn cancelled_query_closes_started_operator_spans_and_unpulled_query_has_no_operator_spans() {
+    let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, true, true).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let prepared = PreparedQuery::new(numbers(0, "n", &[1, 2])).unwrap();
+    drop(prepared.execute(Arc::clone(&context), vec![]).unwrap());
+    let mut cursor = prepared.execute(Arc::clone(&context), vec![]).unwrap();
+    let batch = cursor.next_batch().await.unwrap().unwrap();
+    cursor.cancel(); drop(cursor); tracer.close();
+    let mut spans = Vec::new(); while let Some(span) = receiver.next().await { spans.push(span); }
+    assert_eq!(spans.iter().filter(|span| span.name == "xtdb.query").count(), 2);
+    assert_eq!(spans.iter().filter(|span| span.name == "query.cursor.table").count(), 1);
+    assert_eq!(spans.iter().filter(|span| span.name == "query.cursor.output").count(), 1);
+    assert_eq!(batch.batch().num_rows(), 1);
+    assert!(!context.cancellation.is_cancelled());
+}
+impl rtdb_plan::ExecutionObserver for Metrics {
+    fn record_duration(&self, timer: rtdb_plan::ExecutionTimer, _: std::time::Duration) { self.durations.lock().unwrap().push(timer); }
+    fn record_error(&self, error: rtdb_plan::ExecutionError) { self.errors.lock().unwrap().push(error); }
+}
+
+#[tokio::test]
+async fn metered_cursor_records_lifetime_once_and_counts_pull_and_consumer_errors() {
+    let metrics = Arc::new(Metrics::default());
+    let context = query_context(Default::default()).with_observer(Some(metrics.clone()));
+    let prepared = PreparedQuery::new(numbers(0, "n", &[1])).unwrap();
+    let mut first = prepared.execute(Arc::clone(&context), vec![]).unwrap();
+    let mut second = prepared.execute(Arc::clone(&context), vec![]).unwrap();
+    assert!(first.next_batch().await.unwrap().is_some());
+    assert!(first.next_batch().await.unwrap().is_none());
+    assert!(metrics.durations.lock().unwrap().is_empty());
+    first.record_consumer_error();
+    first.cancel(); drop(first);
+    assert_eq!(*metrics.durations.lock().unwrap(), [rtdb_plan::ExecutionTimer::Query]);
+    assert!(second.next_batch().await.unwrap().is_some());
+    context.cancellation.cancel();
+    assert!(second.next_batch().await.is_err()); drop(second);
+    assert_eq!(metrics.durations.lock().unwrap().len(), 2);
+    assert_eq!(*metrics.errors.lock().unwrap(), [rtdb_plan::ExecutionError::Query, rtdb_plan::ExecutionError::Query]);
+    drop(prepared.execute(query_context(Default::default()), vec![]).unwrap());
+    assert_eq!(metrics.durations.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -280,4 +349,12 @@ async fn scalar_apply_rejects_multiple_rows_and_pull_many_distinguishes_empty_do
         let plan = Arc::new(Relation::new(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent, arguments: vec![], kind: ApplyKind::PullMany, output: Some(output) }).unwrap());
         assert_eq!(collect(plan, query_context(QueryOptions::default())).await.unwrap(), vec![vec![expected]]);
     }
+}
+
+#[test]
+fn catalog_bindings_reserve_before_enumeration_and_clones_retain_the_charge() {
+    let context = query_context(Default::default()); let memory = MemoryBudget::new(8 << 20);
+    let tables = context.catalog.tables_reserved("xtdb", &memory).unwrap(); assert!(!tables.rows().is_empty()); let used = memory.used_bytes(); assert!(used > 0);
+    let retained = tables.clone(); drop(tables); assert_eq!(memory.used_bytes(), used); drop(retained); assert_eq!(memory.used_bytes(), 0);
+    let exhausted = MemoryBudget::new(1); assert!(context.catalog.tables_reserved("xtdb", &exhausted).is_err()); assert_eq!(exhausted.used_bytes(), 0);
 }

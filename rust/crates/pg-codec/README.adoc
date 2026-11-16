@@ -1,0 +1,42 @@
+= PostgreSQL value codecs
+
+`rtdb-pg-codec` supplies native PostgreSQL text and binary conversions for the `rtdb-types::PgType` registry.
+The frontend and PostgreSQL CDC source share the text decoder.
+No source or test in this crate has been compiled or executed during Phase 1.
+
+== Ownership
+
+The codecs are passive functions.
+`decode` reserves before constructing the value and returns `DecodedValue`; `into_parts` transfers the value together with the reservation that must accompany it.
+`encode` returns an optional `EncodedValue`, with SQL null represented by absence and payload storage charged until that owner is dropped.
+`SessionEnvironment::new` reserves before copying session parameters and the effective timezone.
+`read_text`, `from_transit`, `encode_value`, and `encode_error` are allocation-producing primitives for callers that already hold a decoding or serialization reservation.
+Their output allocations must remain covered until transferred into another charged owner.
+
+== Compatibility
+
+Text input follows `core/src/main/kotlin/xtdb/pgwire/PgType.kt`, `PgTypes.kt`, and the Arrow object writer's value-type choices.
+Binary numerics follow `core/src/main/kotlin/xtdb/pg/codec/NumericBin.kt`, including the pinned sign bit for zero.
+Timestamp and date binary values use PostgreSQL's 2000 epoch.
+Local timestamp output truncates submicrosecond fractions toward zero; zoned timestamp output floors them.
+Numeric conversion preserves decimal coefficients without a floating-point intermediate.
+JSON preserves integer and decimal digits, while JSON-LD and Transit use the pinned scalar and container representations.
+
+Several pinned encoders differ from PostgreSQL's usual binary representations.
+Interval and timestamp-range output remain textual in both formats, and OID/regclass/regproc output remains unsigned decimal ASCII in both formats.
+Duration has no binary writer, JSONB has no writer, and integer binary arrays reject null elements.
+The text-array binary writer can emit null elements, while the pinned array reader rejects them.
+Known types without a pinned reader fail explicitly; unknown CDC OIDs remain strings.
+
+`tests/wire_values.rs` records numeric bytes, temporal rounding, the textual binary writers, array null handling, JSONB versioning, exact JSON digits, float exponent boundaries, malformed inputs, and reservation lifetimes.
+The cases map to `PgType.kt`, `NumericBin.kt`, `xtdb.pgwire-test`, and `PostgresSourceTypesPropertyTest`.
+Protocol framing is specified by https://www.postgresql.org/docs/17/protocol-message-formats.html[PostgreSQL frontend/backend message formats].
+
+== Remaining qualification
+
+Runtime compatibility and property coverage remain unexecuted.
+Chrono's representable calendar range is smaller than Java's date/time range.
+The native decoder rejects trailing fixed-width binary bytes, malformed arrays, and excessive interval/numeric exponents that the JVM may consume differently.
+Java floating-point text conventions are reproduced around the decimal/scientific thresholds and subnormal minima; exhaustive shortest-decimal parity is pending.
+The broad JVM object families carried by JSON-LD and Transit still require fixture qualification, including exception metadata and form values.
+Reservation estimates bound ordinary decoded payloads, but a proof covering every nested JSON/Transit amplification and library-internal temporary remains outstanding.

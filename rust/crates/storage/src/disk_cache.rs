@@ -1,0 +1,271 @@
+use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Seek, SeekFrom, Write}, ops::Range, path::{Path, PathBuf}, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}, time::SystemTime};
+use async_trait::async_trait;
+use bytes::Bytes;
+use fs2::FileExt;
+use parking_lot::Mutex;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use tokio_util::{sync::CancellationToken, task::TaskTrackerToken};
+
+use crate::{Error, IoRegion, ObjectKey, ObjectStore, ReadReservation, Result, RetainedBytes, StoredObject};
+
+struct CachedFile { path: PathBuf, size: u64 }
+struct Entry {
+    file: OnceLock<CachedFile>,
+    loading: Arc<tokio::sync::Mutex<()>>,
+    accessed: AtomicU64,
+    _reservation: Arc<MemoryReservation>,
+}
+struct State { entries: BTreeMap<ObjectKey, Arc<Entry>>, clock: u64 }
+
+pub struct DiskCache {
+    root: PathBuf,
+    maximum_bytes: u64,
+    memory: Arc<MemoryBudget>,
+    state: Mutex<State>,
+    operations: Arc<IoRegion>,
+    cancellation: CancellationToken,
+    _directory_lock: File,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DiskCacheStats { pub maximum_bytes: u64, pub pinned_bytes: u64, pub evictable_bytes: u64 }
+
+pub struct DiskLease { cache: Arc<DiskCache>, entry: Arc<Entry> }
+impl DiskLease {
+    pub fn path(&self) -> &Path { &self.entry.file.get().expect("published disk lease").path }
+    pub fn size(&self) -> u64 { self.entry.file.get().expect("published disk lease").size }
+}
+impl Drop for DiskLease { fn drop(&mut self) { self.cache.trim(Some(&self.entry)); } }
+
+impl DiskCache {
+    /// Reuses complete files and evicts the oldest idle entries to fit the configured cache capacity.
+    /// Pinned files may exceed capacity until their final lease is released; metadata and download chunks use `memory`.
+    /// Holds an exclusive directory lock until all cache owners and leases are released.
+    /// The region owner must call `close_and_wait` before dropping the cache or shutting down its Tokio runtime.
+    pub fn open(root: impl AsRef<Path>, maximum_bytes: u64, memory: Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        if maximum_bytes == 0 { return Err(Error::Task("Disk cache capacity must be positive".into())); }
+        fs::create_dir_all(root.as_ref()).map_err(|error| Error::io(root.as_ref(), error))?;
+        let root = fs::canonicalize(root.as_ref()).map_err(|error| Error::io(root.as_ref(), error))?;
+        let temporary = root.join(".tmp");
+        match fs::create_dir(&temporary) {
+            Ok(()) => {},
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(Error::io(&temporary, error)),
+        }
+        let temporary_metadata = fs::symlink_metadata(&temporary).map_err(|error| Error::io(&temporary, error))?;
+        if !temporary_metadata.is_dir() || temporary_metadata.is_symlink() { return Err(Error::InvalidKey(temporary.display().to_string())); }
+        let lock_path = temporary.join(".owner-lock");
+        let create_lock = match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.is_file() && !metadata.is_symlink() => false,
+            Ok(_) => return Err(Error::InvalidKey(lock_path.display().to_string())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(Error::io(&lock_path, error)),
+        };
+        let directory_lock = OpenOptions::new().create_new(create_lock).read(true).write(true).open(&lock_path).map_err(|error| Error::io(&lock_path, error))?;
+        directory_lock.try_lock_exclusive().map_err(|error| Error::io(&lock_path, error))?;
+        for item in fs::read_dir(&temporary).map_err(|error| Error::io(&temporary, error))? {
+            let item = item.map_err(|error| Error::io(&temporary, error))?;
+            if item.file_name() == ".owner-lock" { continue; }
+            let path = item.path();
+            if item.file_type().map_err(|error| Error::io(&path, error))?.is_dir() { fs::remove_dir_all(&path) } else { fs::remove_file(&path) }.map_err(|error| Error::io(&path, error))?;
+        }
+        let cache = Arc::new(Self { root, maximum_bytes, memory, state: Mutex::new(State { entries: BTreeMap::new(), clock: 0 }),
+            operations: IoRegion::new(), cancellation: CancellationToken::new(), _directory_lock: directory_lock });
+        cache.discover(&cache.root)?;
+        cache.trim(None);
+        Ok(cache)
+    }
+    fn begin_operation(&self) -> Result<TaskTrackerToken> {
+        self.operations.admit()
+    }
+    /// Rejects new cache work, cancels downloads, and joins all admitted work, including blocking reads whose callers were cancelled.
+    /// Existing leases remain pinned and keep the directory lock until released.
+    pub async fn close_and_wait(&self) {
+        self.operations.close();
+        self.cancellation.cancel();
+        self.operations.wait().await;
+    }
+    fn discover(&self, directory: &Path) -> Result<()> {
+        for item in fs::read_dir(directory).map_err(|error| Error::io(directory, error))? {
+            let item = item.map_err(|error| Error::io(directory, error))?;
+            let path = item.path();
+            let metadata = fs::symlink_metadata(&path).map_err(|error| Error::io(&path, error))?;
+            if metadata.file_type().is_symlink() { continue; }
+            if item.file_name() == ".tmp" { continue; }
+            if metadata.is_dir() { self.discover(&path)?; continue; }
+            if !metadata.is_file() { continue; }
+            let relative = path.strip_prefix(&self.root).map_err(|error| Error::Task(error.to_string()))?;
+            let key = ObjectKey::new(relative.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"))?;
+            let entry = self.new_entry(&key)?;
+            let accessed = metadata.accessed().unwrap_or(SystemTime::UNIX_EPOCH).max(metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH))
+                .duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_micros().min(u64::MAX as u128) as u64;
+            entry.accessed.store(accessed, Ordering::Relaxed);
+            let _ = entry.file.set(CachedFile { path, size: metadata.len() });
+            let mut state = self.state.lock();
+            state.clock = state.clock.max(accessed);
+            state.entries.insert(key, Arc::new(entry));
+        }
+        Ok(())
+    }
+    fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.memory.reserve(bytes).map_err(|_| Error::MemoryLimit { requested: bytes, limit: self.memory.limit_bytes(), retained: self.memory.used_bytes() })
+    }
+    fn new_entry(&self, key: &ObjectKey) -> Result<Entry> {
+        let bytes = key.as_str().len().checked_mul(3).and_then(|bytes| bytes.checked_add(self.root.as_os_str().len())).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| Error::Task("Disk cache metadata allocation exceeds range".into()))?;
+        Ok(Entry { file: OnceLock::new(), loading: Arc::new(tokio::sync::Mutex::new(())), accessed: AtomicU64::new(0), _reservation: self.reserve(bytes)? })
+    }
+    fn entry(&self, key: &ObjectKey) -> Result<Arc<Entry>> {
+        let mut state = self.state.lock();
+        let entry = match state.entries.get(key) { Some(entry) => Arc::clone(entry), None => { let entry = Arc::new(self.new_entry(key)?); state.entries.insert(key.clone(), Arc::clone(&entry)); entry } };
+        state.clock = state.clock.saturating_add(1);
+        entry.accessed.store(state.clock, Ordering::Relaxed);
+        Ok(entry)
+    }
+    pub fn stats(&self) -> DiskCacheStats {
+        let state = self.state.lock();
+        let mut result = DiskCacheStats { maximum_bytes: self.maximum_bytes, pinned_bytes: 0, evictable_bytes: 0 };
+        for entry in state.entries.values() {
+            let size = entry.file.get().map_or(0, |file| file.size);
+            if Arc::strong_count(entry) > 1 { result.pinned_bytes = result.pinned_bytes.saturating_add(size); } else { result.evictable_bytes = result.evictable_bytes.saturating_add(size); }
+        }
+        result
+    }
+    fn trim(&self, releasing: Option<&Arc<Entry>>) {
+        let mut state = self.state.lock();
+        state.entries.retain(|_, entry| entry.file.get().is_some() || !idle(entry, releasing));
+        let mut bytes = state.entries.values().filter_map(|entry| entry.file.get()).fold(0u64, |bytes, file| bytes.saturating_add(file.size));
+        while bytes > self.maximum_bytes {
+            let candidate = state.entries.iter().filter(|(_, entry)| {
+                entry.file.get().is_some() && idle(entry, releasing)
+            }).min_by_key(|(_, entry)| entry.accessed.load(Ordering::Relaxed)).map(|(key, _)| key.clone());
+            let Some(key) = candidate else { break; };
+            let Some(entry) = state.entries.remove(&key) else { break; };
+            if let Some(file) = entry.file.get() {
+                match fs::remove_file(&file.path) {
+                    Ok(()) => bytes = bytes.saturating_sub(file.size),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => bytes = bytes.saturating_sub(file.size),
+                    Err(error) => { eprintln!("RTDB disk cache eviction failed at {}: {error}", file.path.display()); state.entries.insert(key, entry); break; }
+                }
+            }
+        }
+    }
+    fn cached_size(&self, key: &ObjectKey) -> Option<u64> { self.state.lock().entries.get(key).and_then(|entry| entry.file.get()).map(|file| file.size) }
+
+    /// Concurrent readers share a load; cancellation discards its temporary file and leaves the next caller able to retry.
+    pub async fn get(self: &Arc<Self>, cache_key: &ObjectKey, store: &dyn ObjectStore, remote_key: &ObjectKey) -> Result<DiskLease> {
+        let _operation = self.begin_operation()?;
+        let entry = self.entry(cache_key)?;
+        let lease = DiskLease { cache: Arc::clone(self), entry };
+        let guard = self.cancellation.run_until_cancelled(lease.entry.loading.lock()).await.ok_or_else(cache_closed)?;
+        if lease.entry.file.get().is_none() {
+            let object = self.cancellation.run_until_cancelled(store.head(remote_key)).await.ok_or_else(cache_closed)??;
+            let mut temporary = tempfile::NamedTempFile::new_in(self.root.join(".tmp")).map_err(|error| Error::io(&self.root, error))?;
+            let chunk_size = (1024 * 1024).min(self.memory.limit_bytes().saturating_sub(self.memory.used_bytes()) / 2).max(1);
+            let mut offset = 0;
+            while offset < object.size {
+                let end = object.size.min(offset.saturating_add(chunk_size as u64));
+                let length = usize::try_from(end - offset).map_err(|error| Error::Task(error.to_string()))?;
+                let reservation = ReadReservation::new(length, self.reserve(length)?);
+                let bytes = self.cancellation.run_until_cancelled(store.get_reserved_range(remote_key, offset..end, reservation)).await.ok_or_else(cache_closed)??;
+                temporary.write_all(bytes.as_slice()).map_err(|error| Error::io(temporary.path(), error))?;
+                offset = end;
+            }
+            let path = self.root.join(cache_key.as_str());
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(cache_key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+            lease.entry.file.set(CachedFile { path, size: object.size }).map_err(|_| Error::Task("Disk cache load published twice".into()))?;
+        }
+        drop(guard);
+        self.trim(None);
+        Ok(lease)
+    }
+    pub fn scope(self: &Arc<Self>, namespace: ObjectKey, remote: Arc<dyn ObjectStore>) -> Result<Arc<dyn ObjectStore>> {
+        Ok(Arc::new(DiskCachedStore { cache: Arc::clone(self), namespace, remote }))
+    }
+
+    /// Caches a completed immutable upload; the caller keeps `source` unchanged until this returns.
+    /// The source file remains at its original path.
+    pub async fn put_file(self: &Arc<Self>, key: &ObjectKey, source: &Path) -> Result<()> {
+        let operation = self.begin_operation()?;
+        let lease = DiskLease { cache: Arc::clone(self), entry: self.entry(key)? };
+        let guard = self.cancellation.run_until_cancelled(Arc::clone(&lease.entry.loading).lock_owned()).await.ok_or_else(cache_closed)?;
+        if lease.entry.file.get().is_some() { return Ok(()); }
+        let input = File::open(source).map_err(|error| Error::io(source, error))?;
+        let paths = self.reserve(source.as_os_str().len().checked_add(key.as_str().len()).and_then(|size| size.checked_add(1024)).ok_or_else(|| Error::Task("Cache copy path allocation exceeds range".into()))?)?;
+        let (cache, source, key) = (Arc::clone(self), source.to_owned(), key.clone());
+        IoRegion::run_admitted(operation, move || {
+            let (cache, source, key, lease, _guard, mut input, _paths) = (cache, source, key, lease, guard, input, paths);
+            let size = input.metadata().map_err(|error| Error::io(&source, error))?.len();
+            let chunk_size = (64 * 1024).min(cache.memory.limit_bytes().saturating_sub(cache.memory.used_bytes()) / 2).max(1);
+            let _reservation = cache.reserve(chunk_size)?;
+            let mut chunk = vec![0u8; chunk_size];
+            let mut temporary = tempfile::NamedTempFile::new_in(cache.root.join(".tmp")).map_err(|error| Error::io(&cache.root, error))?;
+            let mut remaining = size;
+            while remaining > 0 {
+                if cache.cancellation.is_cancelled() { return Err(cache_closed()); }
+                let length = remaining.min(chunk_size as u64) as usize;
+                input.read_exact(&mut chunk[..length]).map_err(|error| Error::io(&source, error))?;
+                temporary.write_all(&chunk[..length]).map_err(|error| Error::io(temporary.path(), error))?;
+                remaining -= length as u64;
+            }
+            let path = cache.root.join(key.as_str());
+            let parent = path.parent().ok_or_else(|| Error::InvalidKey(key.to_string()))?;
+            fs::create_dir_all(parent).map_err(|error| Error::io(parent, error))?;
+            temporary.persist(&path).map_err(|error| Error::io(&path, error.error))?;
+            lease.entry.file.set(CachedFile { path, size }).map_err(|_| Error::Task("Disk cache upload published twice".into()))?;
+            Ok(())
+        }).await
+    }
+}
+
+fn idle(entry: &Arc<Entry>, releasing: Option<&Arc<Entry>>) -> bool {
+    let count = Arc::strong_count(entry);
+    count == 1 || count == 2 && releasing.is_some_and(|released| Arc::ptr_eq(released, entry))
+}
+fn cache_closed() -> Error { Error::Closed("disk cache is closed".into()) }
+
+struct DiskCachedStore { cache: Arc<DiskCache>, namespace: ObjectKey, remote: Arc<dyn ObjectStore> }
+struct OwnedRead(RetainedBytes);
+impl AsRef<[u8]> for OwnedRead { fn as_ref(&self) -> &[u8] { self.0.as_slice() } }
+impl DiskCachedStore {
+    fn key(&self, key: &ObjectKey) -> Result<ObjectKey> { ObjectKey::new(format!("{}/{key}", self.namespace)) }
+}
+#[async_trait]
+impl ObjectStore for DiskCachedStore {
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let _operation = self.cache.begin_operation()?;
+        match self.cache.cached_size(&self.key(key)?) { Some(size) => Ok(StoredObject { key: key.clone(), size }), None => self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)? }
+    }
+    async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
+        self.get_range(key, 0..self.head(key).await?.size).await
+    }
+    async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
+        let length = usize::try_from(range.end.checked_sub(range.start).ok_or_else(|| Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: 0 })?).map_err(|error| Error::Task(error.to_string()))?;
+        let reservation = ReadReservation::new(length, self.cache.reserve(length)?);
+        self.get_reserved_range(key, range, reservation).await.map(|bytes| Bytes::from_owner(OwnedRead(bytes)))
+    }
+    async fn get_reserved_range(&self, key: &ObjectKey, range: Range<u64>, reservation: ReadReservation) -> Result<RetainedBytes> {
+        let cache_key = self.key(key)?;
+        let lease = self.cache.get(&cache_key, self.remote.as_ref(), key).await?;
+        if range.end.checked_sub(range.start) != Some(reservation.length() as u64) || range.end > lease.size() {
+            return Err(Error::InvalidRange { key: key.to_string(), start: range.start, end: range.end, length: lease.size() });
+        }
+        self.cache.operations.run(move || {
+            let lease = lease;
+            let mut file = File::open(lease.path()).map_err(|error| Error::io(lease.path(), error))?;
+            file.seek(SeekFrom::Start(range.start)).map_err(|error| Error::io(lease.path(), error))?;
+            let mut bytes = vec![0; reservation.length()];
+            file.read_exact(&mut bytes).map_err(|error| Error::io(lease.path(), error))?;
+            reservation.finish(Bytes::from(bytes))
+        }).await
+    }
+    async fn put(&self, key: &ObjectKey, bytes: Bytes) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.put(key, bytes).await }
+    async fn put_file(&self, key: &ObjectKey, source: &Path) -> Result<()> {
+        let _operation = self.cache.begin_operation()?;
+        self.remote.put_file(key, source).await?;
+        self.cache.put_file(&self.key(key)?, source).await
+    }
+    async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { let _operation = self.cache.begin_operation()?; self.cache.cancellation.run_until_cancelled(self.remote.list(directory)).await.ok_or_else(cache_closed)? }
+    async fn delete(&self, key: &ObjectKey) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.delete(key).await }
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> { let _operation = self.cache.begin_operation()?; self.remote.copy(source, destination).await }
+}

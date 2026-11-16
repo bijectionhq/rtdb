@@ -56,19 +56,33 @@ struct PartitionScan {
     heads: BinaryHeap<Head>,
     resolver: HistoryResolver,
     output: VecDeque<ResolvedRow<RowSource>>,
+    counts: ScanCounts,
 }
 
-pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan> }
+#[derive(Clone, Copy, Default)]
+struct ScanCounts { files_pruned: u64, files_used: u64, pages_pruned: u64, pages_used: u64, rows_read: u64 }
+impl ScanCounts {
+    fn add(&mut self, other: Self) {
+        self.files_pruned = self.files_pruned.saturating_add(other.files_pruned); self.files_used = self.files_used.saturating_add(other.files_used);
+        self.pages_pruned = self.pages_pruned.saturating_add(other.pages_pruned); self.pages_used = self.pages_used.saturating_add(other.pages_used);
+        self.rows_read = self.rows_read.saturating_add(other.rows_read);
+    }
+}
+pub(crate) struct ScanCursor { partitions: VecDeque<PartitionScan>, completed: ScanCounts, database: String, source: String, _reservation: Arc<MemoryReservation> }
 impl ScanCursor {
     pub fn new(scan: Scan, execution: Execution) -> Result<Self> {
+        let bytes = scan.table.name.database.len().checked_add(scan.table.name.table.schema.len()).and_then(|bytes| bytes.checked_add(scan.table.name.table.table.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| invalid("scan-size", "Scan labels exceed allocation range"))?;
+        let reservation = execution.context.memory.reserve(bytes)?;
+        let name = scan.table.name.database.clone();
+        let source = format!("{}.{}", scan.table.name.table.schema, scan.table.name.table.table);
         let database = execution.context.catalog.database(&scan.table.name.database)?;
         let partitions = database.partitions.iter().map(|snapshot| {
             let bounds = bounds(&scan, snapshot, &execution)?;
             Ok(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
                 initialized: false, files: Vec::new(), pages: VecDeque::new(), active: BTreeMap::new(), next_active: 0, heads: BinaryHeap::new(),
-                resolver: HistoryResolver::new(bounds, scan.clamp_valid_time), output: VecDeque::new() })
+                resolver: HistoryResolver::new(bounds, scan.clamp_valid_time), output: VecDeque::new(), counts: ScanCounts::default() })
         }).collect::<Result<_>>()?;
-        Ok(Self { partitions })
+        Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, _reservation: reservation })
     }
 }
 
@@ -77,9 +91,16 @@ impl RowCursor for ScanCursor {
     async fn next(&mut self) -> Result<Option<OwnedRow>> {
         while let Some(partition) = self.partitions.front_mut() {
             if let Some(row) = partition.next().await? { return Ok(Some(row)); }
+            self.completed.add(partition.counts);
             self.partitions.pop_front();
         }
         Ok(None)
+    }
+    fn trace_attributes(&self, span: &mut dyn rtdb_plan::TraceSpan) {
+        let mut counts = self.completed; for partition in &self.partitions { counts.add(partition.counts); }
+        span.attribute("scan_db", rtdb_plan::TraceValue::Text(&self.database));
+        span.attribute("scan_source", rtdb_plan::TraceValue::Text(&self.source));
+        for (name, value) in [("scan_files_pruned", counts.files_pruned), ("scan_files_used", counts.files_used), ("scan_pages_pruned", counts.pages_pruned), ("scan_pages_used", counts.pages_used), ("scan_rows_read", counts.rows_read)] { span.attribute(name, rtdb_plan::TraceValue::Unsigned(value)); }
     }
 }
 
@@ -129,6 +150,8 @@ impl PartitionScan {
             combined.push(summary);
         }
         let selected: Vec<_> = select_pages(&combined, self.pruning(), |_| true).iter().map(|summary| summary.page_index as usize).filter(|index| *index < tries.len()).collect();
+        self.counts.files_pruned = (tries.len() - selected.len()) as u64;
+        self.counts.files_used = selected.len() as u64;
         for index in selected {
             let trie = &tries[index];
             let (lower, upper) = path_range(trie.key.part())?;
@@ -164,6 +187,8 @@ impl PartitionScan {
         for (index, page) in pages.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
         let summaries: Vec<_> = pages.iter().map(|page| page.summary.clone()).collect();
         let selected: std::collections::BTreeSet<_> = select_pages(&summaries, self.pruning(), |_| true).iter().map(|summary| summary.page_index).collect();
+        self.counts.pages_pruned = (pages.len() - selected.len()) as u64;
+        self.counts.pages_used = selected.len() as u64;
         pages.retain(|page| selected.contains(&page.summary.page_index));
         pages.sort_by(|left, right| left.lower.cmp(&right.lower).then_with(|| left.priority.cmp(&right.priority)));
         self.pages = pages.into();
@@ -196,6 +221,7 @@ impl PartitionScan {
                 ActiveRows::File(batch)
             }
         };
+        self.counts.rows_read = self.counts.rows_read.saturating_add(rows.len() as u64);
         let mut previous: Option<EventHeader> = None;
         for index in 0..rows.len() {
             let source = rows.row(index)?;

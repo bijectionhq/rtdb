@@ -14,6 +14,28 @@ pub enum SourceMessage {
 }
 
 impl SourceMessage {
+    /// Classifies the source envelope without allocating its transaction payload.
+    /// Validates outer protobuf framing; nested message validation belongs to `decode`.
+    pub fn is_transaction_encoded(bytes: &[u8]) -> Result<bool> {
+        let (&header, mut payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
+        match header {
+            LEGACY_TX_HEADER => return Ok(true),
+            LEGACY_FLUSH_HEADER => return Ok(false),
+            PROTOBUF_LOG_HEADER => (),
+            _ => return Err(invalid(format!("Unknown source message header: {header}"))),
+        }
+        let mut transaction = false;
+        while !payload.is_empty() {
+            let (field, wire) = wire_key(&mut payload)?;
+            if matches!(field, 1..=4 | 6) {
+                if wire != 2 { return Err(invalid("Source message body must be length-delimited")); }
+                transaction = field == 6;
+            }
+            skip_wire(&mut payload, field, wire, 0)?;
+        }
+        Ok(transaction)
+    }
+
     pub fn encoded_len(&self) -> usize {
         match self { Self::LegacyTransaction(bytes) => bytes.len(), Self::Protobuf(message) => 1 + message.encoded_len() }
     }
@@ -46,6 +68,44 @@ impl SourceMessage {
             Self::Protobuf(message) => Ok(headered(&SourceLogMessage { message: Some(message.clone()) })),
         }
     }
+}
+
+fn wire_varint(bytes: &mut &[u8]) -> Result<u64> {
+    let mut value = 0;
+    for index in 0..10 {
+        let (&byte, remaining) = bytes.split_first().ok_or_else(|| invalid("Truncated protobuf varint"))?;
+        *bytes = remaining;
+        if index == 9 && byte > 1 { return Err(invalid("Protobuf varint exceeds 64 bits")); }
+        value |= u64::from(byte & 127) << (index * 7);
+        if byte < 128 { return Ok(value); }
+    }
+    Err(invalid("Unterminated protobuf varint"))
+}
+fn wire_key(bytes: &mut &[u8]) -> Result<(u32, u8)> {
+    let key = wire_varint(bytes)?;
+    let field = u32::try_from(key >> 3).ok().filter(|field| (1..=0x1fff_ffff).contains(field)).ok_or_else(|| invalid("Invalid protobuf field number"))?;
+    Ok((field, (key & 7) as u8))
+}
+fn skip_wire(bytes: &mut &[u8], field: u32, wire: u8, depth: usize) -> Result<()> {
+    let length = match wire {
+        0 => { wire_varint(bytes)?; return Ok(()); }
+        1 => 8,
+        2 => usize::try_from(wire_varint(bytes)?).map_err(|_| invalid("Protobuf field exceeds addressable memory"))?,
+        3 => {
+            if depth >= 100 { return Err(invalid("Protobuf group nesting exceeds limit")); }
+            loop {
+                let (nested_field, nested_wire) = wire_key(bytes)?;
+                if nested_wire == 4 {
+                    return if nested_field == field { Ok(()) } else { Err(invalid("Mismatched protobuf end group")) };
+                }
+                skip_wire(bytes, nested_field, nested_wire, depth + 1)?;
+            }
+        }
+        5 => 4,
+        _ => return Err(invalid("Invalid protobuf wire type")),
+    };
+    *bytes = bytes.get(length..).ok_or_else(|| invalid("Truncated protobuf field"))?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq)]

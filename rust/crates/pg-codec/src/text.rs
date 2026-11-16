@@ -1,21 +1,23 @@
 use std::collections::BTreeMap;
 use std::str::FromStr;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use bigdecimal::BigDecimal;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
 
+/// The caller covers decoding allocations and the returned value with its own reservation.
+/// Unknown OIDs remain UTF-8 strings; known types without a text reader return an unsupported anomaly.
 pub fn read_text(oid: u32, text: &str) -> Result<Value> {
     if rtdb_types::PgType::from_oid(oid as i32).is_none() { return Ok(Value::Utf8(text.to_owned())); }
     Ok(match oid {
         16 => Value::Bool(match text.trim().to_ascii_lowercase().as_str() { "tr" | "yes" | "tru" | "true" | "on" | "ye" | "t" | "y" | "1" => true, "f" | "fa" | "fal" | "fals" | "false" | "no" | "n" | "off" | "0" => false, _ => return Err(invalid("Invalid PostgreSQL boolean")) }),
         21 => Value::I16(text.parse().map_err(invalid)?), 23 => Value::I32(text.parse().map_err(invalid)?), 20 => Value::I64(text.parse().map_err(invalid)?),
-        700 => Value::F32(float(text)? as f32), 701 => Value::F64(float(text)?),
+        700 => Value::F32(match text { "Infinity" | "+Infinity" => f32::INFINITY, "-Infinity" => f32::NEG_INFINITY, "NaN" => f32::NAN, _ => text.parse().map_err(invalid)? }), 701 => Value::F64(float(text)?),
         1700 => decimal(text)?,
         17 => Value::Binary(if let Some(hex) = text.strip_prefix("\\x") { if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); } hex.as_bytes().chunks_exact(2).map(|pair| { let text = std::str::from_utf8(pair).map_err(invalid)?; u8::from_str_radix(text, 16).map_err(invalid) }).collect::<Result<_>>()? } else { text.as_bytes().to_vec() }),
         2950 => Value::Uuid(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes()),
         1082 => { let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(invalid)?; let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| invalid("Missing epoch"))?; Value::DateDay(i32::try_from(date.signed_duration_since(epoch).num_days()).map_err(invalid)?) },
-        1083 => { let time = NaiveTime::parse_from_str(text, "%H:%M:%S%.f").map_err(invalid)?; Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond()), unit: TimeUnit::Nanosecond, bit_width: 64 } },
-        1114 => { let time = ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f"].into_iter().find_map(|format| NaiveDateTime::parse_from_str(text, format).ok()).ok_or_else(|| invalid("Invalid PostgreSQL local timestamp"))?; Value::Timestamp { value: time.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None } },
+        1083 => { let time = ["%H:%M:%S%.f", "%H:%M"].into_iter().find_map(|format| NaiveTime::parse_from_str(text, format).ok()).filter(|time| time.nanosecond() < 1_000_000_000).ok_or_else(|| invalid("Invalid PostgreSQL local time"))?; Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond()), unit: TimeUnit::Nanosecond, bit_width: 64 } },
+        1114 => { let time = local_timestamp(text)?; Value::Timestamp { value: time.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None } },
         1184 => timestamp(text)?,
         1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
         11112 => { let (months, days, nanos) = interval(text)?; if months != 0 { return Err(invalid("Duration cannot contain years or months")); } Value::Duration { value: i64::from(days).checked_mul(86_400_000_000_000).and_then(|value| value.checked_add(nanos)).ok_or_else(|| invalid("Duration overflow"))?.div_euclid(1000), unit: TimeUnit::Microsecond } },
@@ -33,7 +35,7 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
     })
 }
 fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
-fn decimal(text: &str) -> Result<Value> {
+pub(crate) fn decimal(text: &str) -> Result<Value> {
     let decimal = BigDecimal::from_str(text).map_err(invalid)?;
     let (coefficient, scale) = decimal.as_bigint_and_exponent();
     let digits = coefficient.to_string().trim_start_matches('-').len().max(1);
@@ -45,10 +47,20 @@ fn decimal(text: &str) -> Result<Value> {
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 0xff } else { 0 }; length - bytes.len()]; unscaled.extend_from_slice(&bytes);
     Ok(Value::Decimal(DecimalValue::new(unscaled, precision, scale, width)?))
 }
+fn local_timestamp(text: &str) -> Result<NaiveDateTime> {
+    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"].into_iter().find_map(|format| NaiveDateTime::parse_from_str(text, format).ok())
+        .or_else(|| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok().and_then(|date| date.and_hms_opt(0, 0, 0)))
+        .filter(|time| time.nanosecond() < 1_000_000_000).ok_or_else(|| invalid("Invalid PostgreSQL local timestamp"))
+}
 fn timestamp(text: &str) -> Result<Value> {
-    let normalized = if text.len() >= 3 && matches!(text.as_bytes()[text.len() - 3], b'+' | b'-') { format!("{text}:00") } else { text.to_owned() };
-    let time = DateTime::parse_from_rfc3339(&normalized).ok().or_else(|| ["%Y-%m-%d %H:%M:%S%.f%:z", "%Y-%m-%d %H:%M:%S%.f %:z", "%Y-%m-%d %H:%M:%S%.f%::z"].into_iter().find_map(|format| DateTime::parse_from_str(&normalized, format).ok())).ok_or_else(|| invalid("Invalid PostgreSQL zoned timestamp"))?;
-    Ok(Value::Timestamp { value: time.timestamp_micros(), unit: TimeUnit::Microsecond, timezone: Some(if time.offset().local_minus_utc() == 0 { "Z".to_owned() } else { time.offset().to_string() }) })
+    let (text, region) = if text.ends_with(']') { let (text, region) = text.rsplit_once('[').ok_or_else(|| invalid("Invalid zoned timestamp"))?; (text, Some(&region[..region.len() - 1])) } else { (text, None) };
+    let offset_at = text.char_indices().rev().find(|(index, character)| *index >= 10 && matches!(character, '+' | '-' | 'Z')).map(|(index, _)| index);
+    let (local, offset) = offset_at.map_or((text, None), |index| (&text[..index], Some(&text[index..])));
+    let local = Value::Timestamp { value: local_timestamp(local)?.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None };
+    let zone = region.or(offset).ok_or_else(|| invalid("Zoned timestamp requires an offset or region"))?;
+    let value = rtdb_expr::timestamp_micros(&local, offset.unwrap_or(zone))?.0;
+    if region.is_some() { rtdb_expr::timestamp_micros(&local, zone)?; }
+    Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(rtdb_expr::normalize_timezone(zone)?) })
 }
 fn array(text: &str) -> Result<Vec<Option<String>>> {
     let text = text.trim(); if text.is_empty() || text == "{}" { return Ok(Vec::new()); }
@@ -73,6 +85,7 @@ fn interval(text: &str) -> Result<(i32, i32, i64)> {
         if character == 'S' && time {
             let value = BigDecimal::from_str(number).map_err(invalid)? * BigDecimal::from(1_000_000_000i64);
             let (coefficient, scale) = value.as_bigint_and_exponent();
+            if scale.unsigned_abs() > 128 { return Err(invalid("Interval seconds exceed supported precision")); }
             let coefficient = if scale > 0 { coefficient / num_bigint::BigInt::from(10).pow(u32::try_from(scale).map_err(invalid)?) } else { coefficient * num_bigint::BigInt::from(10).pow(u32::try_from(-scale).map_err(invalid)?) };
             nanos = nanos.checked_add(coefficient.to_string().parse::<i128>().map_err(invalid)?).ok_or_else(|| invalid("Interval overflow"))?;
             continue;
@@ -123,12 +136,11 @@ fn read_json(text: &str) -> Result<Value> {
     })
 }
 fn zoned_timestamp(text: &str) -> Result<Value> {
-    let (text, zone) = if text.ends_with(']') { let (text, zone) = text.rsplit_once('[').ok_or_else(|| invalid("Invalid zoned timestamp"))?; (text, Some(&zone[..zone.len()-1])) } else { (text, None) };
-    let mut value = timestamp(text)?;
-    if let (Some(zone), Value::Timestamp { timezone, .. }) = (zone, &mut value) { *timezone = Some(zone.to_owned()); }
-    Ok(value)
+    timestamp(text)
 }
 fn unique(values: Vec<Value>) -> Vec<Value> { let mut result = Vec::new(); for value in values { if !result.contains(&value) { result.push(value); } } result }
+/// The caller retains a reservation covering both the consumed Transit graph and its native conversion.
+pub fn from_transit(value: rtdb_format::transit::TransitValue) -> Result<Value> { transit(value) }
 fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     Ok(match value {

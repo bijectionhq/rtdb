@@ -1,5 +1,5 @@
 use super::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, await_tip};
-use crate::{Error, Result};
+use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use fs2::FileExt;
@@ -21,6 +21,16 @@ pub struct LocalLogOptions {
     pub queue_capacity: usize,
 }
 
+pub trait LocalTimestampSource: Send + Sync {
+    /// Called once per record in the ordered writer before publication.
+    /// Errors roll back the current write batch and fail its outstanding receipts.
+    fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> Result<Timestamp>;
+}
+struct SuppliedTimestamp;
+impl LocalTimestampSource for SuppliedTimestamp {
+    fn timestamp(&self, _: &[u8], supplied: Timestamp) -> Result<Timestamp> { Ok(supplied) }
+}
+
 struct Queued { payload: Bytes, timestamp: Timestamp, durable: oneshot::Sender<Result<LogMetadata>> }
 
 pub struct LocalLog {
@@ -28,6 +38,7 @@ pub struct LocalLog {
     queue: mpsc::Sender<Queued>,
     progress: Arc<Progress>,
     maximum_message_bytes: usize,
+    reads: Arc<IoRegion>,
 }
 
 pub struct LocalLogDriver {
@@ -36,7 +47,7 @@ pub struct LocalLogDriver {
     progress: Arc<Progress>,
 }
 
-struct Writer { file: File, path: Arc<PathBuf> }
+struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn LocalTimestampSource> }
 
 pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
@@ -79,8 +90,20 @@ fn inspect(file: &mut File, path: &Path, maximum: usize) -> Result<LogOffset> {
 
 impl LocalLog {
     /// Opens the exact LOG/REPLICA_LOG file selected by the caller.
-    /// The database owner must run the returned driver and cancel then join it before releasing the log.
+    /// The database owner runs the returned driver, cancels and joins it, then calls `close_and_wait` before runtime shutdown.
     pub fn open(path: impl AsRef<Path>, options: LocalLogOptions) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_with_timestamp_source(path, options, Arc::new(SuppliedTimestamp))
+    }
+
+    /// Uses `timestamps` in the writer; enqueued timestamps remain available to that policy.
+    /// The returned driver has the same run/cancel/join obligation as `open`.
+    pub fn open_with_timestamp_source(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn LocalTimestampSource>) -> Result<(Arc<Self>, LocalLogDriver)> {
+        Self::open_with_timestamp_source_in(path, options, timestamps, IoRegion::new())
+    }
+
+    /// Uses a caller-owned reader I/O region; the caller closes that region after consumers and the writer join.
+    pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn LocalTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
+        let _operation = reads.admit()?;
         let path = path.as_ref();
         if options.queue_capacity == 0 || options.maximum_message_bytes > i32::MAX as usize {
             return Err(Error::Task("local log requires a positive queue and an i32 payload limit".into()));
@@ -97,9 +120,13 @@ impl LocalLog {
         let path = Arc::new(path.to_path_buf());
         let progress = Arc::new(Progress::new(latest));
         let (send, queue) = mpsc::channel(options.queue_capacity);
-        let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes });
-        Ok((log, LocalLogDriver { writer: Some(Writer { file, path }), queue, progress }))
+        let log = Arc::new(Self { path: path.clone(), queue: send, progress: progress.clone(), maximum_message_bytes: options.maximum_message_bytes, reads });
+        Ok((log, LocalLogDriver { writer: Some(Writer { file, path, timestamps }), queue, progress }))
     }
+
+    /// Closes and drains reader I/O; the caller must cancel and join the writer driver first.
+    /// When the region is shared, this closes admission for every store and log using it.
+    pub async fn close_and_wait(&self) { self.reads.close_and_wait().await; }
 }
 
 impl Writer {
@@ -108,6 +135,7 @@ impl Writer {
         let result = (|| {
             let mut metadata = Vec::with_capacity(records.len());
             for record in records {
+                let timestamp = self.timestamps.timestamp(&record.payload, record.timestamp)?;
                 let offset = self.file.stream_position().map_err(|error| Error::io(self.path.as_ref(), error))?;
                 let end = offset.checked_add(HEADER_BYTES + record.payload.len() as u64 + TRAILER_BYTES)
                     .filter(|end| *end < 1 << 48)
@@ -115,11 +143,11 @@ impl Writer {
                 let mut bytes = Vec::with_capacity((end - offset) as usize);
                 bytes.push(RECORD_SEPARATOR);
                 bytes.extend_from_slice(&(record.payload.len() as i32).to_be_bytes());
-                bytes.extend_from_slice(&record.timestamp.0.to_be_bytes());
+                bytes.extend_from_slice(&timestamp.0.to_be_bytes());
                 bytes.extend_from_slice(&record.payload);
                 bytes.extend_from_slice(&(offset as i64).to_be_bytes());
                 self.file.write_all(&bytes).map_err(|error| Error::io(self.path.as_ref(), error))?;
-                metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp: record.timestamp });
+                metadata.push(LogMetadata { offset: LogOffset(offset as i64), timestamp });
             }
             self.file.sync_all().map_err(|error| Error::io(self.path.as_ref(), error))?;
             Ok(metadata)
@@ -190,6 +218,9 @@ impl Drop for LocalLogDriver {
 
 #[async_trait]
 impl Log for LocalLog {
+    async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn super::LogRange>> {
+        super::read_only::file_range(Arc::clone(&self.path), self.maximum_message_bytes, from, to, Some(self.progress.latest()?))
+    }
     async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> Result<AppendReceipt> {
         if payload.len() > self.maximum_message_bytes {
             return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.maximum_message_bytes });
@@ -198,7 +229,7 @@ impl Log for LocalLog {
         let (send, durable) = oneshot::channel();
         self.queue.send(Queued { payload, timestamp, durable: send }).await
             .map_err(|_| Error::Closed("local append queue ended".into()))?;
-        Ok(AppendReceipt { durable })
+        Ok(AppendReceipt::new(durable))
     }
 
     fn latest(&self) -> Result<LogOffset> { self.progress.latest() }
@@ -211,14 +242,14 @@ impl Log for LocalLog {
         }
         let next = if after.0 < 0 { 0 } else {
             let path = path.clone();
-            tokio::task::spawn_blocking(move || {
+            self.reads.run(move || {
                 let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
                 file.seek(SeekFrom::Start(after.0 as u64)).map_err(|error| Error::io(path.as_ref(), error))?;
                 read_record(&mut file, &path, maximum)?;
                 file.stream_position().map_err(|error| Error::io(path.as_ref(), error))
-            }).await.map_err(|error| Error::Task(error.to_string()))??
+            }).await?
         };
-        Ok(Box::new(LocalTail { path, progress, maximum, after, next }))
+        Ok(Box::new(LocalTail { path, progress, maximum, after, next, reads: Arc::clone(&self.reads) }))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
@@ -226,7 +257,7 @@ impl Log for LocalLog {
         let (path, maximum) = (self.path.clone(), self.maximum_message_bytes);
         if from.0 < 0 { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         if to < from { return Err(Error::Task("log range end precedes its start".into())); }
-        tokio::task::spawn_blocking(move || {
+        self.reads.run(move || {
             let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
             if from > latest {
                 let end = if latest.0 < 0 { 0 } else {
@@ -248,12 +279,13 @@ impl Log for LocalLog {
                 result.push(read_record(&mut file, &path, maximum)?);
             }
             Ok(result)
-        }).await.map_err(|error| Error::Task(error.to_string()))?
+        }).await
     }
 }
 
 struct LocalTail {
     path: Arc<PathBuf>, progress: Arc<Progress>, maximum: usize, after: LogOffset, next: u64,
+    reads: Arc<IoRegion>,
 }
 
 #[async_trait]
@@ -262,7 +294,7 @@ impl LogTail for LocalTail {
         let tip = await_tip(&self.progress, self.after, timeout).await?;
         if tip <= self.after { return Ok(Vec::new()); }
         let (path, maximum, next) = (self.path.clone(), self.maximum, self.next);
-        let (records, next) = tokio::task::spawn_blocking(move || {
+        let (records, next) = self.reads.run(move || {
             let mut file = File::open(path.as_ref()).map_err(|error| Error::io(path.as_ref(), error))?;
             file.seek(SeekFrom::Start(next)).map_err(|error| Error::io(path.as_ref(), error))?;
             let mut records = Vec::new();
@@ -271,7 +303,7 @@ impl LogTail for LocalTail {
             }
             let next = file.stream_position().map_err(|error| Error::io(path.as_ref(), error))?;
             Ok::<_, Error>((records, next))
-        }).await.map_err(|error| Error::Task(error.to_string()))??;
+        }).await?;
         let last = records.last().ok_or_else(|| corrupt(&self.path, self.next, "durable tip yielded no record"))?;
         self.after = last.metadata.offset;
         self.next = next;

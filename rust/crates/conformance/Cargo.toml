@@ -7,10 +7,38 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+rtdb-format.workspace = true
+rtdb-temporal.workspace = true
+rtdb-types.workspace = true
+rtdb-storage.workspace = true
+rtdb-node.workspace = true
+rtdb-columnar.workspace = true
+rtdb-maintenance.workspace = true
+rtdb-plan.workspace = true
+rtdb-query.workspace = true
+rtdb-sql.workspace = true
+rtdb-expr.workspace = true
+rtdb-tx.workspace = true
+sqlparser.workspace = true
+regex.workspace = true
+uuid.workspace = true
+bigdecimal.workspace = true
+num-bigint.workspace = true
+num-traits.workspace = true
+md-5 = "0.10"
+chrono.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

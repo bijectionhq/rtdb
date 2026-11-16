@@ -8,6 +8,7 @@ pub struct ParsedStatement {
     parameter_count: usize,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
+    pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,18 +63,8 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
     for slice in tokens.split(|token| token.token == Token::SemiColon) {
         if slice.is_empty() { continue; }
         let span = source_span(sql, Span::new(slice[0].span.start, slice[slice.len() - 1].span.end));
-        let mut tokens = slice.to_vec();
-        let mut next = 1usize;
-        let mut parameter_count = 0;
-        for token in &mut tokens {
-            if let Token::Placeholder(value) = &mut token.token {
-                if value == "?" { *value = format!("${next}"); next += 1; }
-                else if !value.starts_with('$') || value[1..].parse::<usize>().ok().filter(|index| *index > 0).is_none() {
-                    return Err(sql_error("SQL parameters use ? or a positive $n index", sql, token.span));
-                }
-                parameter_count = parameter_count.max(value[1..].parse::<usize>().map_err(|_| sql_error("Invalid parameter index", sql, token.span))?);
-            }
-        }
+        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(slice, sql)?;
+        let tokens = quantified_values(tokens, sql)?;
         let (mut tokens, temporal) = extract_temporal(tokens, sql)?;
         let statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
             let patch = word(tokens.first(), "PATCH");
@@ -130,9 +121,40 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
             Syntax::Set { name, value, local }
         } else { Syntax::Standard(standard(tokens, sql)?) };
-        statements.push(ParsedStatement { span, parameter_count, statement, temporal });
+        statements.push(ParsedStatement { span, parameter_count, statement, temporal, inline_xtql });
     }
     Ok(statements)
+}
+
+fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {
+    let mut insertions = std::collections::BTreeMap::new();
+    for index in 0..tokens.len() {
+        if !["ANY", "ALL", "SOME"].into_iter().any(|name| word(tokens.get(index), name))
+            || tokens.get(index + 1).is_none_or(|token| token.token != Token::LParen)
+            || !word(tokens.get(index + 2), "VALUES") { continue; }
+        let mut depth = 1usize;
+        let mut end = index + 2;
+        while end < tokens.len() {
+            match tokens[end].token {
+                Token::LParen => depth += 1,
+                Token::RParen => { depth -= 1; if depth == 0 { break; } },
+                _ => {},
+            }
+            end += 1;
+        }
+        if end == tokens.len() { return Err(sql_error("Unclosed quantified subquery", source, tokens[index].span)); }
+        for (at, text) in [(index + 2, "SELECT * FROM ("), (end, ") AS _rtdb_quantified_values")] {
+            let injected = Tokenizer::new(&GenericDialect {}, text).tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
+            insertions.insert(at, injected.into_iter().filter(|token| !matches!(token, Token::Whitespace(_))).map(|token| TokenWithSpan { token, span: tokens[at].span }).collect::<Vec<_>>());
+        }
+    }
+    if insertions.is_empty() { return Ok(tokens); }
+    let mut result = Vec::new();
+    for (index, token) in tokens.into_iter().enumerate() {
+        if let Some(inserted) = insertions.remove(&index) { result.extend(inserted); }
+        result.push(token);
+    }
+    Ok(result)
 }
 
 fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> {

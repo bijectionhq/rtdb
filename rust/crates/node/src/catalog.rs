@@ -43,6 +43,16 @@ impl DatabaseCatalog {
     pub fn open_databases(&self) -> BTreeMap<String, Arc<Database>> {
         self.value.read().entries.iter().filter_map(|(name, entry)| match entry { Entry::Open { database, .. } => Some((name.clone(), Arc::clone(database))), _ => None }).collect()
     }
+    /// Captures open database owners under one catalog read and reserves the result container before allocation.
+    /// Returned database owners and the reservation remain live through every clone of the snapshot.
+    pub fn open_database_snapshot(&self, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<rtdb_plan::CatalogRows<Arc<Database>>> {
+        let value = self.value.read();
+        let bound = value.entries.len().checked_mul(std::mem::size_of::<Arc<Database>>() * 2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| Anomaly::incorrect("rtdb.node/catalog-allocation", "Database snapshot exceeds addressable memory"))?;
+        let reservation = memory.reserve(bound)?;
+        let mut databases = Vec::with_capacity(value.entries.len());
+        for entry in value.entries.values() { if let Entry::Open { database, .. } = entry { databases.push(Arc::clone(database)); } }
+        Ok(rtdb_plan::CatalogRows::new(databases, reservation))
+    }
     pub fn secondary_databases(&self) -> BTreeMap<String, DatabaseConfig> {
         if matches!(self.membership, Membership::Fixed(_)) { return BTreeMap::new(); }
         self.value.read().entries.iter().filter_map(|(name, entry)| {

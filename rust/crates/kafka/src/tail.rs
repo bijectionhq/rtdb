@@ -8,6 +8,21 @@ use crate::{KafkaLogOptions, Progress, metadata, transport_error};
 
 pub(crate) struct KafkaTail { consumer: BaseConsumer, options: KafkaLogOptions, progress: Arc<Progress>, next: i64 }
 
+pub(crate) struct KafkaRange { tail: KafkaTail, end: i64, maximum: usize, timeout: Duration }
+impl KafkaRange {
+    pub fn new(tail: KafkaTail, end: i64, maximum: usize, timeout: Duration) -> Self { Self { tail, end, maximum, timeout } }
+}
+#[async_trait]
+impl rtdb_storage::log::LogRange for KafkaRange {
+    fn allocation_bound(&self) -> usize { self.maximum.saturating_add(256) }
+    async fn next(&mut self, reservation: rtdb_storage::object_store::ReadReservation) -> Result<Option<LogRecord>> {
+        if reservation.length() < self.allocation_bound() { return Err(Error::Task("log read reservation is too small".into())); }
+        if self.tail.next_offset() >= self.end { return Ok(None); }
+        let record = self.tail.poll(self.timeout).await?.pop().ok_or_else(|| Error::Remote { key: self.tail.options.topic.clone(), message: "Kafka range ended before its captured tip".into() })?;
+        record.retain(reservation).map(Some)
+    }
+}
+
 impl KafkaTail {
     pub fn new(consumer: BaseConsumer, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset) -> Result<Self> {
         progress.check()?;

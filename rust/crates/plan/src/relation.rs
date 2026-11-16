@@ -62,6 +62,30 @@ pub struct AggregateExpr {
     pub order_by: Vec<SortExpr>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFunction {
+    RowNumber,
+    Lead { column: ColumnId, offset: u64 },
+    Lag { column: ColumnId, offset: u64 },
+}
+
+impl WindowFunction {
+    /// LEAD/LAG retain the input type with nullability, including at offset zero.
+    /// An absent column or an offset above the signed 64-bit range is an error.
+    pub fn result_type(&self, input: &Schema) -> Result<LogicalType> {
+        match self {
+            Self::RowNumber => Ok(LogicalType::Scalar(ScalarType::I64)),
+            Self::Lead { column, offset } | Self::Lag { column, offset } => {
+                if *offset > i64::MAX as u64 { return Err(Anomaly::incorrect("xtdb/window-offset", "Window offset exceeds signed 64 bits")); }
+                input.get(*column).map(|field| field.data_type.clone().maybe()).ok_or_else(|| Anomaly::incorrect("xtdb/window-column", "Window input column is absent"))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowExpr { pub field: Field, pub function: WindowFunction }
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
@@ -71,6 +95,7 @@ pub enum RelationNode {
     Join { left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Option<Expr> },
     Apply { input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, output: Option<Field> },
     Aggregate { input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr> },
+    Window { input: Arc<Relation>, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr> },
     Sort { input: Arc<Relation>, order_by: Vec<SortExpr> },
     Limit { input: Arc<Relation>, offset: Option<Expr>, fetch: Option<Expr> },
     Distinct { input: Arc<Relation> },
@@ -116,7 +141,7 @@ impl Relation {
         match &self.node {
             RelationNode::Values { .. } | RelationNode::Scan(_) => vec![],
             RelationNode::Project { input, .. } | RelationNode::Filter { input, .. }
-            | RelationNode::Aggregate { input, .. } | RelationNode::Sort { input, .. }
+            | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
             | RelationNode::Unnest { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => vec![left, right],
@@ -136,6 +161,7 @@ impl Relation {
                 agg.argument.iter().chain(agg.filter.iter()).chain(agg.order_by.iter().map(|order| &order.expr))
             })).collect(),
             RelationNode::Sort { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
+            RelationNode::Window { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
             RelationNode::Unnest { expr, .. } => vec![expr],
             RelationNode::PatchGaps { from, to, .. } => vec![from, to],
@@ -237,6 +263,14 @@ impl Relation {
                     if (aggregate.function == AggregateFunction::CountStar) != aggregate.argument.is_none() {
                         return invalid("Only COUNT(*) omits its input expression");
                     }
+                }
+            }
+            RelationNode::Window { input, partition_by, expressions, .. } => {
+                if partition_by.iter().any(|id| input.schema.get(*id).is_none()) { return invalid("Window partition column is absent from input"); }
+                if expressions.is_empty() { return invalid("Window requires at least one result"); }
+                if !self.schema.fields().iter().eq(input.schema.fields().iter().chain(expressions.iter().map(|expression| &expression.field))) { return invalid("Window schema differs from its input and results"); }
+                for expression in expressions {
+                    if expression.field.data_type != expression.function.result_type(&input.schema)? { return invalid("Window result type differs from its function"); }
                 }
             }
             RelationNode::Set { left, right, .. } => {

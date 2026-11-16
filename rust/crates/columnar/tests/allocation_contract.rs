@@ -21,6 +21,23 @@ fn retains_within_bound(logical: LogicalType, values: Vec<Value>) {
 }
 
 #[test]
+fn scoped_budgets_share_one_limit_and_keep_independent_peaks_until_last_lease() {
+    let root = MemoryBudget::new(100);
+    let first = root.scope(); let second = root.scope();
+    let retained = first.reserve(60).unwrap();
+    assert!(second.reserve(41).is_err());
+    assert_eq!(second.used_bytes(), 0);
+    let temporary = second.reserve(40).unwrap();
+    assert_eq!(root.used_bytes(), 100);
+    assert_eq!(first.peak_bytes(), 60); assert_eq!(second.peak_bytes(), 40);
+    drop(temporary); drop(first);
+    assert_eq!(root.used_bytes(), 60);
+    let cloned = retained.clone(); drop(retained);
+    assert_eq!(root.used_bytes(), 60);
+    drop(cloned); assert_eq!(root.used_bytes(), 0); assert_eq!(root.peak_bytes(), 100);
+}
+
+#[test]
 fn builder_bounds_cover_variable_data_and_run_end_children() {
     let values = vec![Value::Utf8("x".repeat(65_537)), Value::Null, Value::Utf8("y".repeat(65_538))];
     let logical = LogicalType::Scalar(ScalarType::Utf8).maybe();

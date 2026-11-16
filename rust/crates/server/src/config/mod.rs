@@ -1,0 +1,274 @@
+mod authentication;
+mod remotes;
+mod node;
+mod edn;
+mod bounded;
+
+use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, time::Duration};
+use rtdb_auth::{AuthConfig, Secret};
+use rtdb_format::{config::{Yaml, YamlFields, default_database_config, decode_database_value, decode_log, decode_storage, parse_yaml, resolve_env_vars, scalar_string}, database::proto::DatabaseConfig};
+use rtdb_types::{Anomaly, Result, SourcePosition};
+
+pub use remotes::RemoteConfig;
+pub use bounded::{ConfigurationEnvironment, EnvironmentValue, ParsedConfiguration, ParsedYamlDocument, ProcessEnvironment};
+
+#[derive(Clone, Debug)]
+pub struct PgwireSettings { pub host: String, pub port: i32, pub read_only_port: i32, pub connections: usize, pub ssl: Option<KeyStoreSettings> }
+impl Default for PgwireSettings { fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, read_only_port: -1, connections: 42, ssl: None } } }
+#[derive(Clone, Debug)]
+pub struct KeyStoreSettings { pub path: PathBuf, pub password: Secret }
+
+#[derive(Clone, Debug)]
+pub struct FlightSettings {
+    pub host: String, pub port: i32, pub transaction_idle_timeout: Duration, pub prepared_statement_idle_timeout: Duration,
+    pub session_idle_timeout: Duration, pub session_unclaimed_timeout: Duration,
+}
+impl Default for FlightSettings {
+    fn default() -> Self { Self { host: "127.0.0.1".into(), port: 0, transaction_idle_timeout: Duration::from_secs(1800), prepared_statement_idle_timeout: Duration::from_secs(1800), session_idle_timeout: Duration::from_secs(1800), session_unclaimed_timeout: Duration::from_secs(60) } }
+}
+#[derive(Clone, Debug)]
+pub struct HealthSettings { pub host: String, pub port: i32 }
+#[derive(Clone, Debug)]
+pub struct MemoryCacheSettings { pub maximum_bytes: Option<usize>, pub maximum_ratio: f64 }
+impl Default for MemoryCacheSettings { fn default() -> Self { Self { maximum_bytes: None, maximum_ratio: 0.5 } } }
+#[derive(Clone, Debug)]
+pub struct DiskCacheSettings { pub path: PathBuf, pub maximum_bytes: Option<u64>, pub maximum_ratio: f64 }
+#[derive(Clone, Debug)]
+pub struct IndexerSettings { pub log_limit: usize, pub page_limit: usize, pub rows_per_block: u64, pub flush_duration: Duration, pub skip_transactions: BTreeSet<SourcePosition>, pub enabled: bool }
+#[derive(Clone, Debug)]
+pub struct CompactorSettings { pub threads: usize, pub run_end_encoded_iids: bool, pub within_file_recency_branching: bool }
+#[derive(Clone, Debug)]
+pub struct GarbageSettings { pub enabled: bool, pub blocks_to_keep: usize, pub garbage_lifetime: Duration }
+#[derive(Clone, Debug)]
+pub struct TracingSettings { pub enabled: bool, pub endpoint: String, pub service_name: String, pub query_tracing: bool, pub transaction_tracing: bool }
+#[derive(Clone, Debug)]
+pub enum ModuleSettings { CloudWatch { namespace: String }, AzureMonitor { connection_string: Secret } }
+
+#[derive(Clone)]
+pub struct NodeConfiguration {
+    pub playground: bool,
+    pub server: Option<PgwireSettings>,
+    pub flight_sql: Option<FlightSettings>,
+    pub health: Option<HealthSettings>,
+    pub remotes: BTreeMap<String, RemoteConfig>,
+    pub primary: DatabaseConfig,
+    pub fixed_databases: Option<BTreeMap<String, DatabaseConfig>>,
+    pub memory_cache: MemoryCacheSettings,
+    pub disk_cache: Option<DiskCacheSettings>,
+    pub default_timezone: String,
+    pub indexer: IndexerSettings,
+    pub compactor: CompactorSettings,
+    pub garbage: GarbageSettings,
+    pub auth: AuthConfig,
+    pub tracing: TracingSettings,
+    pub modules: Vec<ModuleSettings>,
+    pub read_only_databases: bool,
+    pub skipped_databases: BTreeSet<String>,
+    pub node_id: String,
+    pub local_log_uses_clock: bool,
+    pub kafka_auto_create_topic: bool,
+}
+impl std::fmt::Debug for NodeConfiguration {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("NodeConfiguration").field("node_id", &self.node_id).field("remote_aliases", &self.remotes.keys()).field("ingest", &self.fixed_databases.is_some()).finish_non_exhaustive()
+    }
+}
+
+impl NodeConfiguration {
+    pub fn from_yaml(text: &str) -> Result<Self> { Self::from_yaml_with_environment(text, &|name| std::env::var(name).ok(), false) }
+    pub fn from_ingest_yaml(text: &str) -> Result<Self> { Self::from_yaml_with_environment(text, &|name| std::env::var(name).ok(), true) }
+    pub fn from_yaml_with_environment(text: &str, environment: &impl Fn(&str) -> Option<String>, ingest: bool) -> Result<Self> {
+        let mut value = if text.trim().is_empty() { Yaml::Mapping(Default::default()) } else { parse_yaml(text)? };
+        resolve_env_vars(&mut value, environment)?;
+        Self::from_value(value, environment, ingest)
+    }
+    fn from_value(value: Yaml, environment: &impl Fn(&str) -> Option<String>, ingest: bool) -> Result<Self> {
+        let mut fields = YamlFields::new(value, "node")?;
+        let mut primary = default_database_config();
+        let mut local_log_uses_clock = false;
+        let mut kafka_auto_create_topic = true;
+        if let Some(log) = fields.take("log") {
+            if ingest { return Err(invalid("Ingest node configuration uses 'databases', not a primary 'log'")); }
+            if let Yaml::Tagged(tagged) = &log {
+                if let Yaml::Mapping(values) = &tagged.value {
+                    if let Some(value) = values.get(Yaml::String("useInstantSourceForNonTx".into())) { local_log_uses_clock = boolean(value, "useInstantSourceForNonTx")?; }
+                    if let Some(value) = values.get(Yaml::String("autoCreateTopic".into())) { kafka_auto_create_topic = boolean(value, "autoCreateTopic")?; }
+                }
+            }
+            primary.log = Some(decode_log(log)?);
+        }
+        if let Some(storage) = fields.take("storage") {
+            if ingest { return Err(invalid("Ingest node configuration uses 'databases', not primary 'storage'")); }
+            primary.storage = Some(decode_storage(storage)?);
+        }
+        let remotes = remotes::decode_maps(fields.take("logClusters"), fields.take("remotes"))?;
+        let memory_cache = fields.take("memoryCache").map(memory_cache).transpose()?.unwrap_or_default();
+        let disk_cache = fields.take_nullable("diskCache").map(disk_cache).transpose()?;
+        let health = fields.take_nullable("healthz").map(health).transpose()?;
+        let indexer = indexer(fields.take("indexer"), environment)?;
+        let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
+        let configuration = if ingest {
+            let fixed_databases = match fields.take("databases") {
+                Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
+                None => BTreeMap::new(),
+            };
+            Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
+                default_timezone: "UTC".into(), indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic }
+        } else {
+            let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
+            let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
+            let default_timezone = rtdb_expr::normalize_timezone(fields.string("defaultTz")?.as_deref().unwrap_or("UTC"))?;
+            let compactor = compactor(fields.take("compactor"), environment)?;
+            let garbage = garbage(fields.take("garbageCollector"))?;
+            let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
+            let tracing = tracing(fields.take("tracer"))?;
+            let modules = fields.sequence("modules")?.unwrap_or_default().into_iter().map(module).collect::<Result<_>>()?;
+            let read_only_databases = fields.boolean("readOnlyDatabases")?.unwrap_or(false);
+            let skipped_databases = match fields.sequence("skipDbs")? {
+                Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
+                None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
+            };
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic }
+        };
+        fields.finish()?;
+        Ok(configuration)
+    }
+}
+
+fn pgwire(value: Yaml) -> Result<PgwireSettings> {
+    let mut fields = YamlFields::new(value, "server")?;
+    let host = bind_host(&mut fields)?;
+    let port = decode_port(&mut fields, "port", 0)?;
+    let read_only_port = decode_port(&mut fields, "readOnlyPort", -1)?;
+    let connections = positive(fields.integer("numThreads")?.unwrap_or(42) as i64, "numThreads")?;
+    let ssl = fields.take_nullable("ssl").map(|value| {
+        let mut fields = YamlFields::new(value, "ssl")?;
+        let ssl = KeyStoreSettings { path: fields.required_string("keyStore")?.into(), password: Secret::new(fields.required_string("keyStorePassword")?) };
+        fields.finish()?;
+        Ok::<_, Anomaly>(ssl)
+    }).transpose()?;
+    fields.finish()?;
+    Ok(PgwireSettings { host, port, read_only_port, connections, ssl })
+}
+fn flight(value: Yaml) -> Result<FlightSettings> {
+    let mut fields = YamlFields::new(value, "flightSql")?;
+    let config = FlightSettings { host: fields.string("host")?.unwrap_or_else(|| "127.0.0.1".into()), port: decode_port(&mut fields, "port", 0)?,
+        transaction_idle_timeout: duration(&mut fields, "transactionIdleTimeout", 1800)?, prepared_statement_idle_timeout: duration(&mut fields, "preparedStatementIdleTimeout", 1800)?,
+        session_idle_timeout: duration(&mut fields, "sessionIdleTimeout", 1800)?, session_unclaimed_timeout: duration(&mut fields, "sessionUnclaimedTimeout", 60)? };
+    fields.finish()?;
+    Ok(config)
+}
+fn health(value: Yaml) -> Result<HealthSettings> {
+    let mut fields = YamlFields::new(value, "healthz")?;
+    let settings = HealthSettings { host: bind_host(&mut fields)?, port: decode_port(&mut fields, "port", 0)? };
+    fields.finish()?;
+    Ok(settings)
+}
+fn memory_cache(value: Yaml) -> Result<MemoryCacheSettings> {
+    let mut fields = YamlFields::new(value, "memoryCache")?;
+    let maximum_bytes = nullable_i64(&mut fields, "maxSizeBytes")?.map(|bytes| positive(bytes, "memoryCache.maxSizeBytes")).transpose()?;
+    let maximum_ratio = ratio(&mut fields, "maxSizeRatio", 0.5)?;
+    fields.finish()?;
+    Ok(MemoryCacheSettings { maximum_bytes, maximum_ratio })
+}
+fn disk_cache(value: Yaml) -> Result<DiskCacheSettings> {
+    let mut fields = YamlFields::new(value, "diskCache")?;
+    let path = fields.required_string("path")?.into();
+    let maximum_bytes = nullable_i64(&mut fields, "maxSizeBytes")?.map(|bytes| positive(bytes, "diskCache.maxSizeBytes").map(|bytes| bytes as u64)).transpose()?;
+    let maximum_ratio = ratio(&mut fields, "maxSizeRatio", 0.75)?;
+    fields.finish()?;
+    Ok(DiskCacheSettings { path, maximum_bytes, maximum_ratio })
+}
+fn indexer(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<IndexerSettings> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "indexer")?;
+    let log_limit = positive(integer(&mut fields, "logLimit", 64)?, "logLimit")?;
+    let page_limit = positive(integer(&mut fields, "pageLimit", 1024)?, "pageLimit")?;
+    let rows_per_block = positive(integer(&mut fields, "rowsPerBlock", 102400)?, "rowsPerBlock")? as u64;
+    let flush_duration = duration(&mut fields, "flushDuration", 15 * 60)?;
+    let skip_transactions = match fields.sequence("skipTxs")? {
+        Some(values) => values.iter().map(|value| scalar_string(value, "skipTxs")?.parse::<i64>().map(SourcePosition).map_err(|_| invalid("skipTxs must contain message IDs"))).collect::<Result<_>>()?,
+        None => environment("XTDB_SKIP_TXS").into_iter().flat_map(|value| value.split(',').map(str::trim).map(str::to_owned).collect::<Vec<_>>()).map(|value| value.parse::<i64>().map(SourcePosition).map_err(|_| invalid("XTDB_SKIP_TXS must contain message IDs"))).collect::<Result<_>>()?,
+    };
+    let enabled = fields.boolean("enabled")?.unwrap_or(true);
+    fields.finish()?;
+    Ok(IndexerSettings { log_limit, page_limit, rows_per_block, flush_duration, skip_transactions, enabled })
+}
+fn compactor(value: Option<Yaml>, environment: &impl Fn(&str) -> Option<String>) -> Result<CompactorSettings> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "compactor")?;
+    let default_threads = environment("XTDB_COMPACTOR_THREADS").and_then(|value| value.parse::<i32>().ok()).unwrap_or_else(|| (std::thread::available_parallelism().map_or(1, usize::from) / 2).max(1) as i32);
+    let threads = fields.integer("threads")?.unwrap_or(default_threads).max(0) as usize;
+    let run_end_encoded_iids = fields.boolean("reeIids")?.unwrap_or_else(|| env_boolean(environment, "XTDB_REE_IIDS"));
+    let within_file_recency_branching = fields.boolean("withinFileRecencyBranching")?.unwrap_or_else(|| env_boolean(environment, "XTDB_WITHIN_FILE_RECENCY_BRANCHING"));
+    fields.finish()?;
+    Ok(CompactorSettings { threads, run_end_encoded_iids, within_file_recency_branching })
+}
+fn garbage(value: Option<Yaml>) -> Result<GarbageSettings> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "garbageCollector")?;
+    let result = GarbageSettings { enabled: fields.boolean("enabled")?.unwrap_or(true), blocks_to_keep: positive(fields.integer("blocksToKeep")?.unwrap_or(10) as i64, "blocksToKeep")?, garbage_lifetime: duration(&mut fields, "garbageLifetime", 24 * 3600)? };
+    fields.finish()?;
+    Ok(result)
+}
+fn tracing(value: Option<Yaml>) -> Result<TracingSettings> {
+    let mut fields = YamlFields::new(value.unwrap_or_else(empty), "tracer")?;
+    let result = TracingSettings { enabled: fields.boolean("enabled")?.unwrap_or(false), endpoint: fields.string("endpoint")?.unwrap_or_else(|| "http://localhost:4318/v1/traces".into()),
+        service_name: fields.string("serviceName")?.unwrap_or_else(|| "xtdb".into()), query_tracing: fields.boolean("queryTracing")?.unwrap_or(true), transaction_tracing: fields.boolean("transactionTracing")?.unwrap_or(true) };
+    fields.finish()?;
+    Ok(result)
+}
+fn module(value: Yaml) -> Result<ModuleSettings> {
+    let (tag, mut fields) = YamlFields::tagged(value, "module")?;
+    let result = match tag.as_str() {
+        "!CloudWatch" => ModuleSettings::CloudWatch { namespace: fields.string("namespace")?.unwrap_or_else(|| "xtdb.metrics".into()) },
+        "!AzureMonitor" => ModuleSettings::AzureMonitor { connection_string: Secret::new(fields.required_string("connectionString")?) },
+        _ => return Err(invalid(format!("Unknown module configuration tag '{tag}'"))),
+    };
+    fields.finish()?;
+    Ok(result)
+}
+fn empty() -> Yaml { Yaml::Mapping(Default::default()) }
+fn bind_host(fields: &mut YamlFields) -> Result<String> {
+    match fields.take("host") {
+        None => Ok("127.0.0.1".into()),
+        Some(Yaml::Null) => Ok("0.0.0.0".into()),
+        Some(value) => scalar_string(&value, "host").map(|host| if host == "*" { "0.0.0.0".into() } else { host }),
+    }
+}
+fn env_boolean(environment: &impl Fn(&str) -> Option<String>, key: &str) -> bool { environment(key).is_some_and(|value| value.eq_ignore_ascii_case("true")) }
+fn decode_port(fields: &mut YamlFields, key: &str, default: i32) -> Result<i32> {
+    let port = fields.integer(key)?.unwrap_or(default);
+    if !(-1..=65535).contains(&port) { return Err(invalid(format!("{key} must be between -1 and 65535"))); }
+    Ok(port)
+}
+fn positive(value: i64, key: &str) -> Result<usize> { usize::try_from(value).ok().filter(|value| *value > 0).ok_or_else(|| invalid(format!("{key} must be positive"))) }
+fn integer(fields: &mut YamlFields, key: &str, default: i64) -> Result<i64> { fields.string(key)?.map(|value| value.parse().map_err(|_| invalid(format!("{key} must be an integer")))).transpose().map(|value| value.unwrap_or(default)) }
+fn nullable_i64(fields: &mut YamlFields, key: &str) -> Result<Option<i64>> { fields.nullable_string(key)?.map(|value| value.parse().map_err(|_| invalid(format!("{key} must be an integer")))).transpose() }
+fn ratio(fields: &mut YamlFields, key: &str, default: f64) -> Result<f64> {
+    let value = fields.string(key)?.map(|value| value.parse::<f64>().map_err(|_| invalid(format!("{key} must be a ratio")))).transpose()?.unwrap_or(default);
+    if !value.is_finite() || !(0.0..=1.0).contains(&value) || value == 0.0 { return Err(invalid(format!("{key} must be greater than zero and at most one"))); }
+    Ok(value)
+}
+fn boolean(value: &Yaml, key: &str) -> Result<bool> { match scalar_string(value, key)?.as_str() { "true" => Ok(true), "false" => Ok(false), _ => Err(invalid(format!("{key} must be a boolean"))) } }
+fn duration(fields: &mut YamlFields, key: &str, seconds: u64) -> Result<Duration> { fields.string(key)?.map(|value| parse_duration(&value)).transpose().map(|value| value.unwrap_or(Duration::from_secs(seconds))) }
+
+pub fn parse_duration(value: &str) -> Result<Duration> {
+    let regex = regex::Regex::new(r"(?i)^([+-]?)P(?:([+-]?\d+)D)?(?:T(?:([+-]?\d+)H)?(?:([+-]?\d+)M)?(?:([+-]?\d+)(?:[.,](\d{0,9}))?S)?)?$").map_err(|error| invalid(error.to_string()))?;
+    let captures = regex.captures(value).ok_or_else(|| invalid("Duration must use ISO-8601 days, hours, minutes and seconds"))?;
+    if (2..=5).all(|index| captures.get(index).is_none()) || (value.to_ascii_uppercase().contains('T') && (3..=5).all(|index| captures.get(index).is_none())) { return Err(invalid("Duration has no components")); }
+    let mut nanos = 0i128;
+    for (index, factor) in [(2, 86400i128), (3, 3600), (4, 60), (5, 1)] {
+        if let Some(value) = captures.get(index) { nanos = nanos.checked_add(value.as_str().parse::<i128>().map_err(|_| invalid("Duration exceeds range"))?.checked_mul(factor * 1_000_000_000).ok_or_else(|| invalid("Duration exceeds range"))?).ok_or_else(|| invalid("Duration exceeds range"))?; }
+    }
+    if let Some(fraction) = captures.get(6) {
+        if !fraction.is_empty() {
+            let fraction_value = fraction.as_str().parse::<i128>().map_err(|_| invalid("Invalid duration fraction"))? * 10i128.pow((9 - fraction.len()) as u32);
+            let sign = if captures.get(5).is_some_and(|seconds| seconds.as_str().starts_with('-')) { -1 } else { 1 };
+            nanos = nanos.checked_add(fraction_value * sign).ok_or_else(|| invalid("Duration exceeds range"))?;
+        }
+    }
+    if captures.get(1).is_some_and(|sign| sign.as_str() == "-") { nanos = nanos.checked_neg().ok_or_else(|| invalid("Duration exceeds range"))?; }
+    let seconds = u64::try_from(nanos / 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
+    let fraction = u32::try_from(nanos % 1_000_000_000).map_err(|_| invalid("Duration must be nonnegative"))?;
+    Ok(Duration::new(seconds, fraction))
+}
+fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-node-config", message) }

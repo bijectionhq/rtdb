@@ -13,8 +13,21 @@ Additional source tests cover declared result schemas, zero-row batches, binding
 The `_patch` scalar retains the observations from `xtdb.expression-test/test-patch`, replacing a whole field only when the patch supplies a non-null value and preserving existing fields otherwise.
 These are source mappings and do not cover every assertion in the upstream expression family.
 
-The prepared-statement layer still needs parameter rebinding when the initial type is unknown.
-Timestamp/duration arithmetic, interval and duration text casts, full cast options, PostgreSQL array literal parsing, and the complete scalar function catalog remain outstanding.
+The native prepared-statement layer rebinds unknown parameters before each execution.
+Decimal casts distinguish fixed metadata from an unspecified precision, preserving each existing decimal leg in the latter case.
+List casts recursively apply decimal options and retain null elements; PostgreSQL array text uses the reference quoting, escaping, and null-sentinel rules.
+The source tests in `tests/decimal_casts.rs` map the reference's list-cast and array-text assertions and add union and negative-scale cases.
+Temporal arithmetic preserves the reference's result units, checked integer operations, calendar month/day components, and duration components.
+Calendar intervals clamp month ends and preserve the original offset when resolving an overlapping local time; duration components advance the instant.
+Unqualified interval casts retain existing interval metadata, choose month-day-nano for nanosecond durations, and use month-day-micro for text and other durations.
+The default text-to-interval cast follows the pinned unanchored parser, including its zero result for unmatched text; literal tagged intervals have a separate reader contract.
+Duration text accepts Java ISO forms and the reference's millisecond-truncated unit fallback.
+The ISO parser's component overflow order and signed fractional representation follow https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/time/Duration.java[OpenJDK 21 Duration].
+`tests/temporal.rs` retains observations from `test-temporal-arithmetic`, `interval-arithmetic-matches-java-time`, `test-interval-arithmetic`, `cast-duration-test`, `cast-interval-to-duration`, and `cast-interval-to-string`.
+The temporal modules are passive transforms; `IntervalParts` is an immutable component value with no owner task or retained state.
+Temporal comparison across local/zoned/date types, qualified intervals, remaining cast options, and the complete scalar function catalog remain outstanding.
+Named-zone calendar arithmetic beyond Chrono's date range remains narrower than the reference's Java time range; fixed-offset and local calendar arithmetic use checked Gregorian civil-day conversion.
+Decimal scales outside the signed-byte native Arrow representation remain unsupported, although the reference accepts signed 32-bit scale metadata.
 Temporal lexical formats, time-zone labels, numeric result schemas, and diagnostics require full reference comparison.
 Fixed offsets accept the spellings defined by https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneOffset.html[Java ZoneOffset] and the `UTC`, `GMT`, and `UT` prefixes from https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneId.html[Java ZoneId].
 Named-zone rules still require qualification against the reference JVM's time-zone database version and available zone IDs.

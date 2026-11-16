@@ -27,7 +27,8 @@ async fn memory_objects_are_immutable_and_ranges_are_exact() {
 #[tokio::test]
 async fn local_objects_are_immutable_and_ranges_are_exact() {
     let directory = tempfile::tempdir().unwrap();
-    immutable_objects(Arc::new(LocalStore::open(directory.path()).unwrap())).await;
+    let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+    immutable_objects(store.clone()).await; store.close_and_wait().await;
 }
 
 async fn immutable_file_upload(store: Arc<dyn ObjectStore>) {
@@ -55,7 +56,8 @@ async fn immutable_file_upload(store: Arc<dyn ObjectStore>) {
 #[tokio::test]
 async fn local_streamed_publication_accepts_exact_retries_and_rejects_same_size_conflicts() {
     let directory = tempfile::tempdir().unwrap();
-    immutable_file_upload(Arc::new(LocalStore::open(directory.path()).unwrap())).await;
+    let store = Arc::new(LocalStore::open(directory.path()).unwrap());
+    immutable_file_upload(store.clone()).await; store.close_and_wait().await;
 }
 
 #[tokio::test]
@@ -79,6 +81,7 @@ async fn concurrent_local_file_publishers_never_replace_the_winner() {
     assert!(store.get(&key).await.unwrap().iter().all(|byte| *byte == winner));
     let error = if let Err(error) = a { error } else { b.unwrap_err() };
     assert!(matches!(error, Error::ConflictingObject(_)));
+    store.close_and_wait().await;
 }
 
 #[tokio::test]
@@ -135,9 +138,11 @@ async fn local_objects_survive_reopening() {
     {
         let store = LocalStore::open(directory.path()).unwrap();
         store.put(&key, Bytes::from_static(b"persisted")).await.unwrap();
+        store.close_and_wait().await;
     }
     let reopened = LocalStore::open(directory.path()).unwrap();
     assert_eq!(reopened.get(&key).await.unwrap().as_ref(), b"persisted");
+    reopened.close_and_wait().await;
 }
 
 #[test]
@@ -181,10 +186,45 @@ fn cancelled_local_reads_retain_the_charge_until_the_blocking_read_finishes() {
         }).await;
         drop(read);
         assert!(retained.load(Ordering::Acquire));
+        let mut close = Box::pin(store.close_and_wait());
+        poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        assert!(matches!(store.head(&key).await, Err(Error::Closed(_))));
         resume.send(()).unwrap();
         blocker.await.unwrap();
+        close.await;
         release.await.unwrap();
         assert!(!retained.load(Ordering::Acquire));
+    });
+}
+
+#[tokio::test]
+async fn sibling_local_stores_close_through_their_shared_region() {
+    let first = tempfile::tempdir().unwrap(); let second = tempfile::tempdir().unwrap();
+    let region = rtdb_storage::IoRegion::new(); let a = LocalStore::open_in(first.path(), region.clone()).unwrap(); let b = LocalStore::open_in(second.path(), region.clone()).unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    a.put(&key, Bytes::from_static(b"first")).await.unwrap(); b.put(&key, Bytes::from_static(b"second")).await.unwrap();
+    region.close_and_wait().await;
+    assert!(matches!(a.get(&key).await, Err(Error::Closed(_)))); assert!(matches!(b.get(&key).await, Err(Error::Closed(_))));
+    assert!(LocalStore::open_in(first.path(), region).is_err());
+}
+
+#[test]
+fn cancelled_file_publication_keeps_its_open_source_until_region_drain() {
+    use std::{future::{Future, poll_fn}, task::Poll};
+    let directory = tempfile::tempdir().unwrap(); let store = LocalStore::open(directory.path()).unwrap();
+    let source = tempfile::NamedTempFile::new().unwrap(); std::fs::write(source.path(), b"published after unlink").unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (started, waiting) = tokio::sync::oneshot::channel(); let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || { started.send(()).unwrap(); paused.recv().unwrap(); }); waiting.await.unwrap();
+        let mut upload = Box::pin(store.put_file(&key, source.path()));
+        poll_fn(|context| { assert!(upload.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        drop(upload); std::fs::remove_file(source.path()).unwrap();
+        let mut close = Box::pin(store.close_and_wait());
+        poll_fn(|context| { assert!(close.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        resume.send(()).unwrap(); blocker.await.unwrap(); close.await;
+        assert_eq!(std::fs::read(directory.path().join("object")).unwrap(), b"published after unlink");
     });
 }
 

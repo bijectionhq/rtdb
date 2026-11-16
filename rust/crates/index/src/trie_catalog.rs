@@ -167,6 +167,9 @@ impl TrieCatalog {
         self.tables.get(table).and_then(|table| table.shards.get(shard)).map_or(BlockIndex(-1), |state| state.max_block_index)
     }
     pub fn l0_max_block_index(&self, table: &TableRef) -> BlockIndex { self.max_block_index(table, &Shard::root(0, None)) }
+    pub fn iter_tries(&self, table: &TableRef) -> impl Iterator<Item = &CatalogTrie> {
+        self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values())
+    }
     pub fn all_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         let mut result: Vec<_> = self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values()).collect();
         result.sort_by(|left, right| {

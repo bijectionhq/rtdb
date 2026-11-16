@@ -12,22 +12,40 @@ use crate::spill::{SpillReader, SpillWriter};
 use crate::{invalid, QueryContext};
 
 pub(crate) fn build(relation: Arc<Relation>, execution: Execution) -> Result<BoxCursor> {
-    Ok(match relation.node() {
+    build_constrained(relation, execution, crate::inspection::Constraints::default())
+}
+
+fn build_constrained(relation: Arc<Relation>, execution: Execution, constraints: crate::inspection::Constraints) -> Result<BoxCursor> {
+    let traced_relation = Arc::clone(&relation);
+    let traced_context = Arc::clone(&execution.context);
+    let input: BoxCursor = match relation.node() {
         RelationNode::Values { .. } => Box::new(Values { relation, execution, row: 0 }),
-        RelationNode::Scan(scan) => if crate::system_schema::definition(&scan.table.name.table).is_some() {
+        RelationNode::Scan(scan) => if crate::inspection::is_inspection(&scan.table.name.table) {
+            Box::new(crate::inspection::InspectionCursor::new(scan.clone(), execution, &constraints)?)
+        } else if crate::system_schema::definition(&scan.table.name.table).is_some() {
             Box::new(crate::system::SystemCursor::new(scan.clone(), execution))
         } else { Box::new(crate::scan::ScanCursor::new(scan.clone(), execution)?) },
-        RelationNode::Project { input, expressions } => Box::new(Project { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), expressions: expressions.clone(), execution }),
-        RelationNode::Filter { input, predicate } => Box::new(Filter { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), predicate: predicate.clone(), execution }),
+        RelationNode::Project { input, expressions } => Box::new(Project { input: build_constrained(Arc::clone(input), execution.clone(), constraints.through_project(expressions))?, schema: input.schema().clone(), expressions: expressions.clone(), execution }),
+        RelationNode::Filter { input, predicate } => {
+            let mut constraints = constraints; constraints.add(predicate);
+            Box::new(Filter { input: build_constrained(Arc::clone(input), execution.clone(), constraints)?, schema: input.schema().clone(), predicate: predicate.clone(), execution })
+        }
         RelationNode::Limit { input, offset, fetch } => {
             let offset = row_limit(offset.as_ref(), &execution)?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(), &execution)?;
             Box::new(Limit { input: Some(build(Arc::clone(input), execution.clone())?), offset, remaining, execution })
         }
         RelationNode::Distinct { input } => Box::new(Distinct { input: build(Arc::clone(input), execution.clone())?, seen: SeenRows::new(&execution.context)?, execution }),
-        RelationNode::Sort { input, order_by } => Box::new(crate::sort::SortCursor::new(build(Arc::clone(input), execution.clone())?, input.schema().clone(), order_by.clone(), execution)),
-        RelationNode::Join { left, right, kind, condition } => Box::new(crate::join::JoinCursor::new(build(Arc::clone(left), execution.clone())?, build(Arc::clone(right), execution.clone())?, left.schema().clone(), right.schema().clone(), *kind, condition.clone(), execution)?),
+        RelationNode::Sort { input, order_by } => {
+            let mut constraints = constraints; for order in order_by { constraints.require(&order.expr); }
+            Box::new(crate::sort::SortCursor::new(build_constrained(Arc::clone(input), execution.clone(), constraints)?, input.schema().clone(), order_by.clone(), execution))
+        }
+        RelationNode::Join { left, right, kind, condition } => {
+            let mut constraints = constraints; if let Some(condition) = condition { constraints.require(condition); }
+            Box::new(crate::join::JoinCursor::new(build_constrained(Arc::clone(left), execution.clone(), constraints.clone())?, build_constrained(Arc::clone(right), execution.clone(), constraints)?, left.schema().clone(), right.schema().clone(), *kind, condition.clone(), execution)?)
+        }
         RelationNode::Aggregate { input, groups, aggregates } => Box::new(crate::aggregate::AggregateCursor::new(build(Arc::clone(input), execution.clone())?, input.schema().clone(), groups.clone(), aggregates.clone(), execution)),
+        RelationNode::Window { input, partition_by, order_by, expressions } => Box::new(crate::window::WindowCursor::new(build(Arc::clone(input), execution.clone())?, input.schema().clone(), partition_by.clone(), order_by.clone(), expressions.clone(), execution)),
         RelationNode::Set { left, right, operator, all } => {
             let left = build(Arc::clone(left), execution.clone())?;
             let right = build(Arc::clone(right), execution.clone())?;
@@ -39,7 +57,8 @@ pub(crate) fn build(relation: Arc<Relation>, execution: Execution) -> Result<Box
         RelationNode::Unnest { input, expr, ordinality, outer, .. } => Box::new(Unnest { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), expr: expr.clone(), ordinality: ordinality.is_some(), outer: *outer, current: None, elements: None, index: 0, execution }),
         RelationNode::Apply { input, dependent, arguments, kind, .. } => Box::new(Apply { input: build(Arc::clone(input), execution.clone())?, schema: input.schema().clone(), dependent: Arc::clone(dependent), arguments: arguments.clone(), kind: *kind, execution, current: None, cursor: None, matched: false }),
         RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } => Box::new(crate::patch::PatchGaps::new(build(Arc::clone(input), execution.clone())?, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution)?),
-    })
+    };
+    Ok(crate::trace::wrap(input, &traced_relation, &traced_context))
 }
 
 fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<u64>> {

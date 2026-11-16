@@ -21,4 +21,155 @@ Compilation and execution are pending under the Phase 1 work order.
 The initial `assertion-ledger.json` maps the two mandatory comparison controls.
 It is an incomplete ledger: the source inventory remains the record of unmapped files and candidate cases.
 Fixture `expected_observations` are transcribed assertions, not reference execution receipts.
-The JVM runner, native runner, runtime inventory reconciliation, and fault-injection integration remain to be implemented.
+The control runners call the production JVM and Rust temporal calculators and replica envelope codecs.
+Fixture selection names the event index and observable field; expected observations are never inputs to either implementation.
+The JVM adapter is loaded through an external Gradle init script against the clean pinned reference checkout.
+Its artifact manifest hashes the actual runtime classpath, adapter, Java executable, and runtime modules.
+The native runner hashes its running executable and reports its embedded build revision and source-cleanliness flag.
+The orchestrator rejects an executable built from another revision or a dirty tree.
+The orchestrator hashes fixtures, configuration, process logs, execution output, and its own sources into each receipt's trace.
+
+The fixture descriptors, execution records, and receipts are passive values.
+The process runner is an Active Object whose subprocess region owns the selected command, timeout, cancellation, and process-group termination.
+`owned_cancellation()` scopes catchable SIGTERM handling to an owner and restores the previous signal handlers when that scope ends.
+The owner calls `begin_cleanup()` before draining resources; nested subprocess owners inherit suppression of repeated cancellation during that drain.
+Each JVM process finishes before the next Gradle invocation begins.
+The orchestrator owns a newly created result directory and atomically replaces only its own receipt snapshots.
+
+After the source completeness gate opens, build `rtdb-conformance` and execute:
+
+[source,shell]
+----
+python3 rust/conformance/run_controls.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --native /absolute/path/to/rtdb-conformance \
+  --output build/conformance/controls-001
+----
+
+The output directory must not exist, and both checkouts must be clean.
+The runner executes the reference twice to check deterministic observations, compares the native observations, and then changes one copied reference observation per control.
+It independently checks both engines against the immutable transcribed upstream assertions, preserving JSON value types.
+Each negative control must produce exactly one mismatch at its designated case, observation, and JSON pointer.
+The original fixture and execution receipts remain unchanged.
+The process owner requires POSIX process groups and drains the owned group even when its leader exits before a child.
+Linux runs enable descendant reaping; the runner treats an undrained group or unexpected surviving child as failed evidence.
+`controls_verified` establishes the control harness only; the incomplete inventory still blocks `complete_parity`.
+No runner or test in this directory has executed during Phase 1.
+`inventory.init.gradle` adds a passive, callback-driven JUnit recorder without changing the reference test sources.
+The recorder serializes each worker's plan, dynamic registrations, skips, outcomes, and report entries into its own event stream.
+A recording error omits the terminal event, so reconciliation rejects the stream even when JUnit logs and suppresses a listener exception.
+The unfiltered discovery command retains templates omitted by normal task tags; concrete parameterized invocations come from execution.
+The recorder uses the https://docs.junit.org/current/api/org.junit.platform.launcher/org/junit/platform/launcher/TestExecutionListener.html[JUnit launcher listener contract].
+
+[source,shell]
+----
+./gradlew --init-script /absolute/path/to/rust/conformance/inventory.init.gradle \
+  -Prtdb.adapterRoot=/absolute/path/to/rust/conformance \
+  -Prtdb.inventoryOutput=/absolute/path/to/build/conformance/reference-001 \
+  rtdbDiscoverTests test integration-test property-test \
+  -Piterations=500 -PsimulationIterations=1000 > build/test-run.log 2>&1
+----
+
+Run that command from the pinned reference checkout after Phase 2 begins, following `xtdb-testing` and delegating the resulting log for review.
+Use separate, newly created evidence directories for additional cloud, Docker, and tagged lanes.
+`list_native.py` reads Cargo JSON build messages and lists the already-built test executables, preserving target, feature configuration, binary digest, and exact test name.
+It requires a single terminal successful `build-finished` record and a `--selection` JSON manifest with `schema_version: 1`, the absolute `workspace`, `implementation_revision`, `configuration`, build `command` argv, and `targets`.
+Each target declares the exact Cargo `package_id`, `target` name and kind, and enabled `features`; missing or additional test artifacts fail selection validation.
+The selection is declared build provenance, retained with its digest alongside the Cargo log digest; the discovery tool does not infer whole-workspace coverage from the executables present in a partial log.
+Native counterpart IDs include the target name for binary, integration, example, and benchmark targets so they cannot collide with a package's library tests.
+`runtime_inventory.py` joins those records to source candidates and assertion mappings.
+Unmapped dynamic cases, missing native counterparts, zero-case lanes, interrupted recordings, and unexecuted source candidates keep reconciliation incomplete.
+Aliases for a framework-specific source name are explicit mappings keyed by the complete JUnit unique ID.
+The reconciler's `--invocations` file is an array of bindings, each containing `project`, `task`, `unique_id`, the exact ledger `identity`, and `native_configuration`.
+Every executed or skipped runtime test needs its own binding, including parameterized invocations of the same method.
+The ledger identity supplies the reference revision, source, qualified name, parameter fixture, and reference configuration; `native_configuration` selects the configuration recorded by `list_native.py` for every required counterpart.
+Bindings without a recorded invocation, missing bindings, unknown discovered tests, and absent counterpart configurations keep the inventory incomplete.
+The source inventory and assertion ledger are never modified by reconciliation.
+Complete assertion mappings, external-lane receipts, and fault-injection integration remain in progress.
+
+`rtdb_conformance::faults` wraps the real `Log` and `ObjectStore` interfaces with before/after checkpoints.
+`FaultSchedule` is a Monitor Object holding the replay rules, matching-call counts, release gates, and bounded event trace.
+Rules, points, and trace events are passive values; each adapter and call guard is passive and retains no independent task.
+The scenario owns the actual database/resource drivers, closes the schedule on cancellation, and joins all users before accepting the trace.
+Unreached rules, active calls, and trace overflow fail the scenario.
+Receipt interception preserves the backend's ownership of an accepted append even when its observer is paused or cancelled.
+Provider calls retain one trace hit from `provider_started` through `provider_returned`, `provider_failure`, or `provider_abandoned`, including cancellation while the provider future is pending.
+The source fixtures cover publication before/after errors, immutable retries, accepted writes with lost receipts, local recovery, interrupted read delivery, gate release, and gate shutdown.
+These fixtures have not executed.
+
+`run_clients.py` builds the unchanged JavaScript, Python, Elixir, Rust and .NET client images from the pinned reference.
+Its build contexts are Git archives, excluding ignored local caches and untracked files; framework adapters are captured before either engine starts.
+It reuses the resulting immutable client image IDs against separate packaged JVM and native playgrounds in isolated Compose projects.
+The language order follows the original CI lane; Rust's two integration targets run separately so each libtest report has an unambiguous target identity.
+The empty Rust library, binary and documentation targets are not counted as assertion executions.
+The runner requires a server-image build manifest matching each actual image ID and clean source revision.
+It checks the image's source labels, retained source/artifact digests and the provenance artifact copied from the running container.
+The native artifact contains embedded build metadata; the reference artifact is the JVM JAR.
+Those manifests are declared build provenance; the link:../release/README.adoc[release driver] retains the commands and artifact hashes behind them.
+
+Framework adapters retain JUnit XML, TRX, ExUnit event streams and libtest output with their hashes.
+Case identity retains framework, source information, suite, test name and parameters encoded by the framework.
+Ambiguous duplicate identities are rejected; missing, failed, skipped, excluded and interrupted cases remain visible.
+The Elixir formatter follows the https://github.com/elixir-lang/elixir/blob/v1.17.3/lib/ex_unit/lib/ex_unit/event_manager.ex[ExUnit 1.17.3 formatter event contract] and is mounted beside the unchanged client source.
+JavaScript's reporter includes pending cases, including the original disabled cases that the framework collects.
+Source-only declarations that the framework never collects still require inventory reconciliation.
+The comparator requires successful processes and a nonempty report for every selected lane.
+Matching failures or skips do not establish successful assertions.
+Passing original client cases establish only that selected client coverage; the assertion ledger remains unreconciled until each invocation has an explicit mapping.
+
+The engine-run owner retains its Compose project name, selected images, report directory and subprocess region until shutdown completes.
+It captures server logs, removes containers and volumes, and verifies that no project-labeled containers, networks or volumes remain.
+Cancellation enters that same drain path; nested subprocess scopes suppress repeated interruption during cleanup.
+Client and server image artifacts remain available for reproduction.
+
+[source,shell]
+----
+python3 rust/conformance/run_clients.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --reference-image "$JVM_IMAGE_ID" \
+  --reference-provenance build/release/jvm-amd64-001/package.json \
+  --native-image "$RUST_IMAGE_ID" \
+  --native-provenance build/release/rust-local-amd64-001/package.json \
+  --output build/conformance/clients-001
+----
+
+The output directory must not exist.
+Docker builds, packaged servers, client suites, adapter tests and release tools remain unexecuted during Phase 1.
+
+== Historical-price lifecycle
+
+`fixtures/historical-prices.json` retains the five user transactions and seven query points from the migration design.
+The native `history` command creates a separate local database for each prefix and physical layout.
+Its node drivers are joined before artifact hashes are captured; an ordinary fixture error still drains the active node.
+The live receipt requires unflushed products, the flushed receipt requires adopted L0 products, and compacted/restarted receipts require a live products trie above level zero.
+Restart closes the original node and opens fresh native resources against the retained local logs and files.
+Each receipt records its user transaction basis separately from the physical source/replica positions, block boundary, term/sequence and live trie inventory.
+
+The 112 observations retain price and all four projected valid/system bounds, schema types, query instants, pruning mode and product identity.
+An unbounded upper temporal column remains a typed NULL; it is not rewritten into an integer timestamp sentinel.
+Temporal pruning bypass leaves the IID predicate and history resolver active.
+`history_results.py` checks the independently stated prices in each engine, requires every observation and layout, and compares schemas and complete typed rows across both engines and across layouts.
+Equal wrong prices, missing cases, duplicate receipts and unexecuted observations cannot pass.
+Checkpoint verification requires the exact retained file set, sizes and SHA256 digests.
+
+Read measurements identify their accounting boundary on every observation.
+Native measurements count successful object-store payload bytes behind the cache; JVM measurements count successful logical buffer-pool payloads, including cache hits, and exclude footer-only reads.
+Caches remain warm between sequential queries.
+These measurements describe the fixture's reads and are not matched physical-I/O or performance evidence.
+
+[source,shell]
+----
+python3 rust/conformance/run_history.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --native /absolute/path/to/rtdb-conformance \
+  --output build/conformance/history-001
+----
+
+The output directory must not exist.
+The runner retains a repeated JVM reference, native observations, source/binary identities, process results, closed database artifacts and comparisons.
+The JVM adapter opens real local nodes from the pinned test runtime and closes each node before retaining its files.
+Its query-local BufferPool proxy borrows the node pool, counts each successful sync or suspend read once, and closes only its own metadata factory after the cursor.
+The adapter captures runtime artifacts before execution and checks them again before publishing its receipt.
+The separate `rtdbConformanceHistoryAdapterTest` Gradle task exercises measurement ownership, successful/failed read accounting, canonical type tags and fixture identity validation.
+The runner and adapter sources remain under review, and no history runner, adapter test or comparison test has executed.
+Successful history selection does not reconcile the complete assertion ledger.

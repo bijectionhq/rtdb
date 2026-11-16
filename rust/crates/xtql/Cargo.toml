@@ -19,5 +19,8 @@ bigdecimal.workspace = true
 num-bigint.workspace = true
 num-traits.workspace = true
 
+[dev-dependencies]
+rtdb-expr.workspace = true
+
 [lints]
 workspace = true
