@@ -260,6 +260,24 @@ async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss(
 }
 
 #[tokio::test]
+async fn retained_leader_does_not_claim_again_while_confirmed_or_producing_an_inherited_block() {
+    for pending_block in [false, true] {
+        let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
+        let body = if pending_block { boundary(0, 0) } else { ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        fixture.driver.consume(raw(0, 1, 0, body)).await.unwrap();
+        fixture.driver.promote().await.unwrap();
+        assert_eq!(fixture.driver.role(), if pending_block { Role::Following } else { Role::Leading(Term(1)) });
+        assert!(fixture.driver.leader.is_some());
+        fixture.driver.start_claim().unwrap();
+        assert!(fixture.driver.claiming.is_none());
+        assert!(fixture.driver.claim.is_none());
+        fixture.driver.demote().await.unwrap();
+        fixture.driver.start_claim().unwrap();
+        assert_eq!(fixture.driver.claiming.as_ref().unwrap().term, Term(2));
+    }
+}
+
+#[tokio::test]
 async fn stalled_claim_keeps_replica_admission_and_shutdown_live() {
     let mut fixture = fixture(ReplicationConfig::default(), 1 << 27).await;
     fixture.driver.claiming = Some(super::Claim { term: Term(1), observed: None, future: Box::pin(futures::future::pending()) });

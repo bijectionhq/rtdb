@@ -51,6 +51,7 @@ An admitted oversized envelope is fetched and checked against its outer term and
 Held records replay below the fence that already admitted them.
 
 A claim is a durable sequence-zero no-op in the next observed term.
+Only a driver without a retained leader can claim, including while an inherited-block leader has not yet published its leading role.
 Leadership is confirmed by reading back that node's own claim at a position that opened a strictly newer term.
 The append pump assigns subsequent term sequences, fixes each append's order before accepting the next one, and emits heartbeat assertions independently of transaction resolution.
 Ordinary transaction writes do not wait for durability before the pump accepts the next write.

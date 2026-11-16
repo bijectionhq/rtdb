@@ -335,7 +335,7 @@ impl ReplicationDriver {
         }
     }
     fn start_claim(&mut self) -> Result<()> {
-        if !self.config.may_lead || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
+        if !self.config.may_lead || self.leader.is_some() || self.claim.is_some() || self.claiming.is_some() { return Ok(()); }
         let term = self.fence.claim_term()?;
         let envelope = ReplicaEnvelope { term, term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
         let logs = Arc::clone(&self.logs);
