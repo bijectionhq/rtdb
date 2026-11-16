@@ -405,3 +405,7 @@ Array aggregates retain every input ordering key and sort the full column before
 Aggregate columns finish in specification order, and their complete result is published as one nonempty page.
 `src/aggregate/page_tests.rs` retains page/spec error precedence, empty-page filter preparation, full-hash grouping, cross-page distinct state and returned-result ownership assertions.
 Its primitive regressions also cover complete-vector admission, runtime-width narrowing, duration conversion and null-slot failures, SUM-before-COUNT ordering, variance input classes, and boolean reducer setter boundaries.
+
+Boolean aggregate factories admit unsigned 32-bit and 64-bit vector metadata through the corresponding signed vector setters.
+An entirely false filter mask still requires factory admission.
+The first selected nonnull value must be Boolean for the accumulator setter, while subsequent values use Clojure truthiness.

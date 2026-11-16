@@ -151,6 +151,31 @@ async fn primitive_result(mut cursor: AggregateCursor) -> Value {
 }
 
 #[tokio::test]
+async fn boolean_reducer_admits_unsigned_vector_kinds_before_applying_the_filter() {
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    for (input, value) in [
+        (LogicalType::Scalar(ScalarType::U32), Value::U32(0)),
+        (LogicalType::Scalar(ScalarType::U64), Value::U64(0)),
+    ] {
+        for function in [AggregateFunction::Every, AggregateFunction::Any] {
+            for pages in [vec![vec![]], vec![vec![value.clone()]]] {
+                let filtered = primitive_cursor(&execution, function.clone(), input.clone(), input.clone(), pages, Some(Expr::Literal(Value::Bool(false))));
+                assert_eq!(primitive_result(filtered).await, Value::Null);
+            }
+            let mixed = input.join(&LogicalType::Scalar(ScalarType::Bool));
+            let initialized = primitive_cursor(&execution, function.clone(), mixed.clone(), mixed.clone(), vec![vec![Value::Bool(function == AggregateFunction::Every), value.clone()]], None);
+            assert_eq!(primitive_result(initialized).await, Value::Bool(true));
+            let mut first = primitive_cursor(&execution, function, mixed.clone(), mixed, vec![vec![value.clone(), Value::Bool(true)]], None);
+            assert_eq!(first.next_page().await.err().unwrap().code, "rtdb.query/boolean-setter");
+            drop(first);
+            assert_eq!(execution.context.memory.used_bytes(), baseline);
+            assert_eq!(execution.context.spill_bytes(), 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn sum_factory_admits_complete_vectors_before_reading_the_mask() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
     let integer = LogicalType::Scalar(ScalarType::I64);
