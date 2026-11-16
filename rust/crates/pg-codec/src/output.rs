@@ -66,7 +66,15 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
                 i64::try_from(micros).map_err(invalid)?.wrapping_sub(PG_EPOCH_MICROS).to_be_bytes().to_vec()
             } else { timestamp_text(*value, *unit, timezone.as_deref().filter(|_| ty == PgType::TimestampTz), environment.parameter("datestyle") == Some("iso8601"), true)?.into_bytes() }
         }
-        PgType::Date => { let days = match value { Value::DateDay(days) => *days, Value::DateMilli(value) => i32::try_from(value.div_euclid(86_400_000)).map_err(invalid)?, _ => return Err(incompatible(ty, value)) }; if binary { days.wrapping_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec() } else { date_text(days)?.into_bytes() } }
+        PgType::Date => {
+            let days = match value {
+                Value::DateDay(days) => *days,
+                Value::DateMilli(_) if binary => return Err(Anomaly::fault("xtdb.arrow/unsupported-vector-operation", "getInt unsupported on DateMilliVector")),
+                Value::DateMilli(value) => i32::try_from(value / 86_400_000).map_err(invalid)?,
+                _ => return Err(incompatible(ty, value)),
+            };
+            if binary { days.wrapping_sub(PG_EPOCH_DAYS).to_be_bytes().to_vec() } else { date_text(days)?.into_bytes() }
+        }
         PgType::Time => { let Value::Time { value, unit, .. } = value else { return Err(incompatible(ty, value)); }; let value = nanos(*value, *unit); if binary { i64::try_from(value / 1000).map_err(invalid)?.to_be_bytes().to_vec() } else { time_text(value, true)?.into_bytes() } }
         PgType::Interval => { let (months, days, nanos) = interval_parts(value)?; interval_text(months, days, nanos / 1000 * 1000).into_bytes() }
         PgType::Duration => { if binary { return Err(unsupported(ty, "binary writer")); } let Value::Duration { value, unit } = value else { return Err(incompatible(ty, value)); }; duration_text(nanos(*value, *unit)).into_bytes() }
@@ -202,7 +210,7 @@ fn tagged_json(tag: &str, text: &str, output: &mut String) -> Result<()> { outpu
 fn scalar_text(value: &Value) -> Result<(&'static str, String)> {
     Ok(match value {
         Value::Keyword(value) => ("xt:keyword", value.as_str().into()), Value::Uuid(value) => ("xt:uuid", uuid::Uuid::from_bytes(*value).to_string()),
-        Value::DateDay(days) => ("xt:date", date_text(*days)?), Value::DateMilli(value) => ("xt:date", date_text(i32::try_from(value.div_euclid(86_400_000)).map_err(invalid)?)?),
+        Value::DateDay(days) => ("xt:date", date_text(*days)?), Value::DateMilli(value) => ("xt:date", date_text(i32::try_from(value / 86_400_000).map_err(invalid)?)?),
         Value::Time { value, unit, .. } => ("xt:time", time_text(nanos(*value, *unit), false)?),
         Value::Timestamp { value, unit, timezone } => (if timezone.is_some() { "xt:timestamptz" } else { "xt:timestamp" }, timestamp_text(*value, *unit, timezone.as_deref(), true, true)?),
         Value::Duration { value, unit } => ("xt:duration", duration_text(nanos(*value, *unit))),
