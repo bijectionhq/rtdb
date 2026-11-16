@@ -1,4 +1,8 @@
 mod error;
+mod calendar;
+mod zone;
+mod legacy_zone;
+mod instant_text;
 mod id;
 mod logical;
 mod position;
@@ -10,6 +14,9 @@ mod uri;
 mod utf8;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
+pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
+pub use zone::{FixedOffset, ZoneId, timezone_names, TZDB_VERSION, TZDB_SHA256};
+pub use legacy_zone::LegacyTimeZone;
 pub use id::{EntityId, Iid, Keyword, TableRef};
 pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, TimeUnit};
 pub use position::*;
