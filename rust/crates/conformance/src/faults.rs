@@ -373,12 +373,16 @@ impl rtdb_node::ResourceFactory for FaultResources {
     fn validate(&self, name: &str, configuration: &rtdb_format::database::proto::DatabaseConfig) -> rtdb_types::Result<()> {
         self.inner.validate(name, configuration)
     }
-    async fn open(&self, name: &str, configuration: &rtdb_format::database::proto::DatabaseConfig, access: rtdb_node::LogAccess, cancellation: CancellationToken) -> rtdb_types::Result<rtdb_node::DatabaseResources> {
-        let mut resources = self.inner.open(name, configuration, access, cancellation).await?;
-        resources.logs.source = FaultLog::new(resources.logs.source, format!("{name}/source"), Arc::clone(&self.schedule));
-        resources.logs.replica = FaultLog::new(resources.logs.replica, format!("{name}/replica"), Arc::clone(&self.schedule));
+    async fn open_storage(&self, name: &str, configuration: &rtdb_format::database::proto::DatabaseConfig) -> rtdb_types::Result<rtdb_node::DatabaseStorage> {
+        let mut resources = self.inner.open_storage(name, configuration).await?;
         resources.store = FaultStore::new(resources.store, format!("{name}/store"), Arc::clone(&self.schedule));
         Ok(resources)
+    }
+    async fn open_logs(&self, name: &str, configuration: &rtdb_format::database::proto::DatabaseConfig, access: rtdb_node::LogAccess, cancellation: CancellationToken, storage: &rtdb_node::DatabaseStorage) -> rtdb_types::Result<rtdb_node::OpenedLogs> {
+        let mut logs = self.inner.open_logs(name, configuration, access, cancellation, storage).await?;
+        logs.source = FaultLog::new(logs.source, format!("{name}/source"), Arc::clone(&self.schedule));
+        logs.replica = FaultLog::new(logs.replica, format!("{name}/replica"), Arc::clone(&self.schedule));
+        Ok(logs)
     }
     async fn close(&self) -> rtdb_types::Result<()> { self.inner.close().await }
 }

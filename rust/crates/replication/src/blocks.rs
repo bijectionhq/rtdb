@@ -19,6 +19,13 @@ pub struct RecoveredPartition {
     pub progress: AppliedProgress,
     pub fence: TermFence,
 }
+impl RecoveredPartition {
+    /// Selects initial source progress for the configured log epoch while retaining persisted identities.
+    pub fn with_source_floor(mut self, source_floor: SourcePosition) -> Self {
+        self.progress.source_position = self.progress.source_position.max(source_floor);
+        self
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ProducedBlock {
@@ -56,7 +63,7 @@ impl BlockStore {
             external_token: block.as_ref().and_then(BlockCatalog::external_source_token).map(Arc::from),
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
-        Ok(RecoveredPartition { partition, block, progress, fence })
+        Ok(RecoveredPartition { partition, block, progress, fence }.with_source_floor(source_floor))
     }
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;

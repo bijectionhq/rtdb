@@ -2,7 +2,7 @@ use super::*;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_format::{database::proto::DatabaseConfig, keys::TrieKey};
-use rtdb_node::{DatabaseResources, LogAccess, NativeResources, ResourceFactory};
+use rtdb_node::{DatabaseStorage, LogAccess, NativeResources, OpenedLogs, ResourceFactory};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation, RetainedBytes, StoredObject};
 use std::{ops::Range, path::PathBuf, sync::atomic::AtomicBool};
 use tokio_util::sync::CancellationToken;
@@ -109,11 +109,12 @@ struct PartialResources { inner: Arc<dyn ResourceFactory>, fault: Arc<PartialUpl
 #[async_trait]
 impl ResourceFactory for PartialResources {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> rtdb_types::Result<()> { self.inner.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> rtdb_types::Result<DatabaseResources> {
-        let mut resources = self.inner.open(name, configuration, access, cancellation).await?;
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> rtdb_types::Result<DatabaseStorage> {
+        let mut resources = self.inner.open_storage(name, configuration).await?;
         resources.store = Arc::new(PartialStore { inner: resources.store, fault: self.fault.clone() });
         Ok(resources)
     }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> rtdb_types::Result<OpenedLogs> { self.inner.open_logs(name, configuration, access, cancellation, storage).await }
     async fn close(&self) -> rtdb_types::Result<()> { self.inner.close().await }
 }
 struct PartialStore { inner: Arc<dyn ObjectStore>, fault: Arc<PartialUpload> }

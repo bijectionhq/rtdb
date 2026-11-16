@@ -4,7 +4,7 @@ use regex::Regex;
 use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_value};
 use rtdb_format::database::proto::DatabaseConfig;
 use rtdb_maintenance::CollectionObserver;
-use rtdb_node::{AutonomousTxOptions, DatabaseAccess, DatabaseResources, LogAccess, NativeResources, NativeSession, Node, NodeOptions, NodeServices, ResourceFactory, SessionIdentity};
+use rtdb_node::{AutonomousTxOptions, DatabaseAccess, LogAccess, NativeResources, NativeSession, Node, NodeOptions, NodeServices, ResourceFactory, SessionIdentity};
 use rtdb_plan::{Catalog, CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers, Identifier, QualifiedTable, Relation, Statement, TableBinding};
 use rtdb_query::{PreparedQuery, QueryContext};
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail};
@@ -55,10 +55,11 @@ struct Resources(NativeResources);
 #[async_trait]
 impl ResourceFactory for Resources {
     fn validate(&self, name: &str, configuration: &DatabaseConfig) -> Result<()> { self.0.validate(name, configuration) }
-    async fn open(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken) -> Result<DatabaseResources> {
-        let mut resources = self.0.open(name, configuration, access, cancellation).await?;
-        resources.logs.source = Arc::new(ClockedLog { delegate: resources.logs.source, next: AtomicI64::new(1_577_836_800_000_000) });
-        Ok(resources)
+    async fn open_storage(&self, name: &str, configuration: &DatabaseConfig) -> Result<rtdb_node::DatabaseStorage> { self.0.open_storage(name, configuration).await }
+    async fn open_logs(&self, name: &str, configuration: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &rtdb_node::DatabaseStorage) -> Result<rtdb_node::OpenedLogs> {
+        let mut logs = self.0.open_logs(name, configuration, access, cancellation, storage).await?;
+        logs.source = Arc::new(ClockedLog { delegate: logs.source, next: AtomicI64::new(1_577_836_800_000_000) });
+        Ok(logs)
     }
     async fn close(&self) -> Result<()> { self.0.close().await }
 }

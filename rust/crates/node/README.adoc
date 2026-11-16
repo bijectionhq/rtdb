@@ -15,6 +15,11 @@ A database whose driver has already failed remains a queryable member until an e
 It retains one passive `ExternalSource` for the database lifetime and asks it for a fresh assignment driver after each previous term has joined.
 
 `NativeResources` opens independent memory or local source and replica logs plus the configured storage root.
+It opens the storage provider and scoped cache before opening logs, so a provider-opening failure does not create Kafka topics or acquire local-log writers.
+The passive `DatabaseStorage` capability owns the opened store and its child I/O region.
+`DatabaseFactory` recovers persisted block and table catalogs before asking `ResourceFactory::open_logs` to open logs in that region.
+The factory's `open` convenience method composes both resource phases for direct backend inspection without recovering catalogs between them.
+Storage recovery or later log-opening failures drain the partial region before database opening returns.
 The passive `LogAccess` value distinguishes read-only logs, a writable source with a read-only replica, and two writable logs.
 An eligible leader opens both writers; a writable follower opens only the source writer, allowing compaction publication without replica-writer ownership.
 Source owners are created only on nodes eligible to lead.

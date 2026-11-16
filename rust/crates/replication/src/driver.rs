@@ -230,6 +230,9 @@ impl ReplicationDriver {
         if applied.tx_key != recovered.progress.tx_key || applied.source_position != recovered.progress.source_position || applied.external_token != recovered.progress.external_token {
             return Err(invalid("Progress monitor does not describe the recovered partition"));
         }
+        if let Some(boundary) = recovered.block.as_ref().and_then(BlockCatalog::latest_source_position) {
+            logs.validate_source_boundary(boundary)?;
+        }
         let read_position = recovered.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?);
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
             open_block: recovered.partition.value().live().block_index(), adopted_block: recovered.block.clone().map(Arc::new), promotion_failure: None, last_block_upload_epoch_seconds: 0 };
@@ -258,7 +261,6 @@ impl ReplicationDriver {
             self.cancellation.cancelled().await;
             return Ok(());
         }
-        self.logs.validate_source_boundary(self.progress.current().source_position)?;
         self.replica_tail = Some(self.logs.replica_tail(self.read_position).await?);
         self.progress.driver_restarted();
         if self.config.may_lead && self.fence.highest_term() == Term(0) { self.start_claim()?; }

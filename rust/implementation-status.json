@@ -24,11 +24,11 @@
   "required_production_traces": {
     "client_read": "pgwire_flight_and_embedded_native_session_query_server_source_written; language_surface_completion_and_source_audit_in_progress",
     "data_dependent_write": "native_submission_resolver_replica_readback_apply_source_written; source_audit_in_progress",
-    "replica_recovery": "native_log_recovery_block_adoption_driver_source_written; source_audit_in_progress",
+    "replica_recovery": "public_startup_catalog_before_logs_replay_adoption_read_visibility_failure_restart_source_traced; independent_source_review_clear; execution_qualification_pending",
     "compaction_retry": "native_streaming_publication_observable_actual_job_failures_and_bidirectional_packaged_backend_retry_runner_source_written; complete_public_entry_trace_audit_pending",
     "cdc_restart": "native_postgresql_snapshot_pgoutput_resume_and_database_lifetime_metrics_source_written; source_audit_in_progress",
     "database_shutdown": "native_database_admission_and_retained_local_remote_io_drains_source_written_and_source_reviewed; complete_public_entry_trace_audit_pending"
   },
   "phase_2_authorized_by_completeness_gate": false,
-  "last_source_checkpoint_revision": "8adf990e0219cf953cf78ffc689305cf5b60005e"
+  "last_source_checkpoint_revision": "f39c62fc7170802a8d2ba4dba652c45f7a9cf27b"
 }
