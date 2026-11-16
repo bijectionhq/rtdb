@@ -107,8 +107,9 @@ A nested null can therefore prevent two otherwise identical compound keys from g
 An equality-compatible total ordering cannot silently replace that behavior.
 
 The Rust object key excludes parent traversal.
-The reference storage tests also exercise copies to a parent path and cross-root destinations.
-An explicit destination capability and its original assertions remain to be implemented; those tests are not mapped as covered.
+Local and remote copies accept explicit destination roots, retaining immutable publication and bounded payload buffers.
+The source tests cover cross-root and cross-prefix destinations, exact retries, conflicts, missing sources and joined local cancellation.
+Remote copies require a shared provider client; physical provider limits and the original direct multipart assertions remain qualification work.
 
 The pinned `compactor` command initializes `xtdb/base` through `open-compactor`, and the inspected path creates no database-specific compactor registrations.
 The command therefore appears idle in this revision.

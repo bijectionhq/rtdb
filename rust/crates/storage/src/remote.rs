@@ -15,6 +15,34 @@ impl RemoteStore {
     /// The prefix scopes all keys to one configured database partition and storage generation.
     pub fn new(client: Arc<dyn ProviderStore>, prefix: Option<ObjectKey>) -> Self { Self { client, prefix } }
 
+    /// Copies between explicit roots backed by the same provider client.
+    /// Distinct client instances are rejected before I/O, even when they name the same bucket.
+    /// The provider must support conditional copy; existing destinations are accepted only when their bytes match.
+    /// Missing sources return MissingObject and different destination bytes return ConflictingObject.
+    /// Incompatible clients, unsupported copy operations and provider failures return Remote; a failed request may have published the destination.
+    pub async fn copy_to(&self, source: &ObjectKey, destination: &RemoteStore, key: &ObjectKey) -> Result<()> {
+        if !Arc::ptr_eq(&self.client, &destination.client) {
+            return Err(Error::Remote { key: key.to_string(), message: "object copy requires a shared provider client".into() });
+        }
+        match self.client.copy_if_not_exists(&self.path(source), &destination.path(key)).await {
+            Ok(()) => Ok(()),
+            Err(object_store::Error::AlreadyExists { .. } | object_store::Error::Precondition { .. }) => {
+                let length = self.head(source).await?.size;
+                if destination.head(key).await?.size != length { return Err(Error::ConflictingObject(key.to_string())); }
+                let mut offset = 0;
+                while offset < length {
+                    let end = offset.saturating_add(1024 * 1024).min(length);
+                    let source_bytes = self.get_range(source, offset..end).await?;
+                    let destination_bytes = destination.get_range(key, offset..end).await?;
+                    if source_bytes != destination_bytes { return Err(Error::ConflictingObject(key.to_string())); }
+                    offset = end;
+                }
+                Ok(())
+            }
+            Err(error) => Err(provider_error(source, error)),
+        }
+    }
+
     fn path(&self, key: &ObjectKey) -> Path {
         Path::from(match &self.prefix { Some(prefix) => format!("{prefix}/{key}"), None => key.to_string() })
     }
@@ -125,6 +153,10 @@ impl ObjectStore for RemoteStore {
         };
         let cleanup = self.client.delete(&temporary).await.map_err(|error| provider_error(key, error));
         published.and(cleanup)
+    }
+
+    async fn copy(&self, source: &ObjectKey, destination: &ObjectKey) -> Result<()> {
+        self.copy_to(source, self, destination).await
     }
 
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> {

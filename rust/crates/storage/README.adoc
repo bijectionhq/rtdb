@@ -15,6 +15,12 @@ Standalone stores create a region and expose `close_and_wait`; node stores share
 The node's local source and replica log reader offloads share that same region.
 Closing a region rejects new work and waits for queued and running I/O after its caller has been cancelled.
 File uploads open their source before offloading so an unlinked temporary source remains available to admitted work.
+Local object copies stream through the destination's immutable file publication path.
+`LocalStore::copy_to` accepts an explicit destination store for copies across filesystem roots.
+The open source file retains admission in the source region until the destination operation finishes, including after caller cancellation.
+`RemoteStore::copy_to` accepts an explicit destination prefix backed by the same provider client.
+Remote copies use provider-side conditional publication and compare existing destinations in one-MiB ranges.
+The ordinary `ObjectStore::copy` method uses these paths within its configured root.
 
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
 Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.

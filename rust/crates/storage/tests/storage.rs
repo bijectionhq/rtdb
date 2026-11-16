@@ -12,6 +12,8 @@ async fn immutable_objects(store: Arc<dyn ObjectStore>) {
     assert!(matches!(store.get_range(&key, 0..7).await, Err(Error::InvalidRange { .. })));
     let copied = ObjectKey::new("tables/products/data/copy.arrow").unwrap();
     store.copy(&key, &copied).await.unwrap();
+    store.copy(&key, &copied).await.unwrap();
+    store.copy(&key, &key).await.unwrap();
     assert_eq!(store.get(&copied).await.unwrap(), store.get(&key).await.unwrap());
     store.delete(&key).await.unwrap();
     store.delete(&key).await.unwrap();
@@ -206,6 +208,62 @@ async fn sibling_local_stores_close_through_their_shared_region() {
     region.close_and_wait().await;
     assert!(matches!(a.get(&key).await, Err(Error::Closed(_)))); assert!(matches!(b.get(&key).await, Err(Error::Closed(_))));
     assert!(LocalStore::open_in(first.path(), region).is_err());
+}
+
+#[tokio::test]
+async fn local_copies_publish_into_an_explicit_sibling_root_and_preserve_conflicts() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = LocalStore::open(directory.path().join("source")).unwrap();
+    let destination = LocalStore::open(directory.path().join("outside")).unwrap();
+    let key = ObjectKey::new("original.arrow").unwrap();
+    let target = ObjectKey::new("subdir/copy.arrow").unwrap();
+    let mut data = vec![7u8; 2 * 1024 * 1024 + 17];
+    source.put(&key, Bytes::copy_from_slice(&data)).await.unwrap();
+    source.copy_to(&key, &destination, &target).await.unwrap();
+    source.copy_to(&key, &destination, &target).await.unwrap();
+    assert_eq!(std::fs::read(directory.path().join("outside/subdir/copy.arrow")).unwrap(), data);
+    assert_eq!(source.list(None).await.unwrap().len(), 1);
+    data[1024 * 1024] = 8;
+    let different = ObjectKey::new("different.arrow").unwrap();
+    source.put(&different, Bytes::from(data)).await.unwrap();
+    assert!(matches!(source.copy_to(&different, &destination, &target).await, Err(Error::ConflictingObject(_))));
+    assert_eq!(destination.get_range(&target, 1024 * 1024..1024 * 1024 + 1).await.unwrap().as_ref(), &[7]);
+    assert!(matches!(source.copy_to(&ObjectKey::new("missing").unwrap(), &destination, &target).await, Err(Error::MissingObject(_))));
+    source.close_and_wait().await;
+    destination.close_and_wait().await;
+}
+
+#[test]
+fn cancelled_cross_root_copy_is_retained_by_both_regions_until_publication() {
+    use std::{future::{Future, poll_fn}, task::Poll};
+    let directory = tempfile::tempdir().unwrap();
+    let source = LocalStore::open(directory.path().join("source")).unwrap();
+    let destination = LocalStore::open(directory.path().join("destination")).unwrap();
+    let key = ObjectKey::new("object").unwrap();
+    std::fs::write(directory.path().join("source/object"), b"copied after unlink").unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || { started.send(()).unwrap(); paused.recv().unwrap(); });
+        waiting.await.unwrap();
+        let mut copy = Box::pin(source.copy_to(&key, &destination, &key));
+        poll_fn(|context| { assert!(copy.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        drop(copy);
+        std::fs::remove_file(directory.path().join("source/object")).unwrap();
+        let mut close_source = Box::pin(source.close_and_wait());
+        let mut close_destination = Box::pin(destination.close_and_wait());
+        poll_fn(|context| {
+            assert!(close_source.as_mut().poll(context).is_pending());
+            assert!(close_destination.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        }).await;
+        resume.send(()).unwrap();
+        blocker.await.unwrap();
+        close_source.await;
+        close_destination.await;
+        assert_eq!(std::fs::read(directory.path().join("destination/object")).unwrap(), b"copied after unlink");
+    });
 }
 
 #[test]

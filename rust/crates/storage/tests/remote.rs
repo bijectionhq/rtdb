@@ -62,3 +62,33 @@ async fn multipart_file_publication_uses_an_immutable_destination_and_hides_stag
     store.put_file(&empty, &path).await.unwrap();
     assert_eq!(store.head(&empty).await.unwrap().size, 0);
 }
+
+#[tokio::test]
+async fn remote_copy_preserves_immutable_bytes_across_explicit_prefixes() {
+    let provider = Arc::new(object_store::memory::InMemory::new());
+    let source = RemoteStore::new(provider.clone(), Some(ObjectKey::new("source").unwrap()));
+    let destination = RemoteStore::new(provider, Some(ObjectKey::new("outside").unwrap()));
+    let key = ObjectKey::new("original.arrow").unwrap();
+    let target = ObjectKey::new("subdir/copy.arrow").unwrap();
+    let mut data = vec![7u8; 2 * 1024 * 1024 + 17];
+    source.put(&key, Bytes::copy_from_slice(&data)).await.unwrap();
+    source.copy(&key, &key).await.unwrap();
+    source.copy_to(&key, &destination, &target).await.unwrap();
+    source.copy_to(&key, &destination, &target).await.unwrap();
+    assert_eq!(destination.get(&target).await.unwrap().as_ref(), data.as_slice());
+    assert_eq!(source.list(None).await.unwrap().len(), 1);
+    data[1024 * 1024] = 8;
+    let different = ObjectKey::new("different.arrow").unwrap();
+    source.put(&different, Bytes::from(data)).await.unwrap();
+    assert!(matches!(source.copy_to(&different, &destination, &target).await, Err(Error::ConflictingObject(_))));
+    assert_eq!(destination.get_range(&target, 1024 * 1024..1024 * 1024 + 1).await.unwrap().as_ref(), &[7]);
+    assert!(matches!(source.copy_to(&ObjectKey::new("missing").unwrap(), &destination, &target).await, Err(Error::MissingObject(_))));
+    let empty = ObjectKey::new("empty").unwrap();
+    source.put(&empty, Bytes::new()).await.unwrap();
+    source.copy_to(&empty, &destination, &empty).await.unwrap();
+    source.copy_to(&empty, &destination, &empty).await.unwrap();
+    assert_eq!(destination.head(&empty).await.unwrap().size, 0);
+    let other = RemoteStore::new(Arc::new(object_store::memory::InMemory::new()), None);
+    assert!(matches!(source.copy_to(&key, &other, &target).await, Err(Error::Remote { .. })));
+    assert!(other.list(None).await.unwrap().is_empty());
+}
