@@ -89,8 +89,15 @@ def invocation_key(value):
     return value.get("project"), value.get("task"), value.get("unique_id")
 
 
-def reconcile(source, ledger, runtime, native, aliases, invocations=()):
+def reconcile(source, ledger, runtime, native, aliases, invocations=(), external=None, external_root=None):
     errors = []
+    external_result = {"groups": set(), "cases": [], "resolved_files": set(), "all_passed": True}
+    if external is not None:
+        from external_inventory import reconcile_external
+        try:
+            external_result = reconcile_external(external, external_root, source, ledger)
+        except (ValueError, KeyError, TypeError, OSError, StopIteration) as error:
+            errors.append("external evidence: " + str(error))
     if ledger["inventory_revision"] != source["reference"]:
         errors.append("ledger and source inventory belong to different reference revisions")
     selections = []
@@ -165,7 +172,7 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=()):
         if key in bindings:
             errors.append(f"duplicate invocation binding: {key}")
         bindings[key] = binding
-    observed_invocations, bound_groups = set(), set()
+    observed_invocations, bound_groups = set(), set(external_result["groups"])
     missing_native_by_group = defaultdict(set)
     for case in runtime_cases:
         key = invocation_key({**case, "unique_id": case["descriptor"]["unique_id"]})
@@ -210,6 +217,12 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=()):
         name = identity["name"]
         qualified_name = name.replace("/", ".", 1) if candidate["kind"] == "junit_template_candidate" else name
         matches = mappings.get((identity["source"], qualified_name), [])
+        external_cases = [case for case in external_result["cases"] if case["source_candidate"] == candidate["id"]]
+        if external_cases:
+            candidate_results.append({"source_candidate": candidate["id"], "identity": identity,
+                "mapping": "mapped", "mapped_groups": [case["binding"]["identity"] for case in external_cases],
+                "missing_counterparts": [], "runtime_cases": external_cases, "discovered_templates": [], "runtime_status": "observed"})
+            continue
         execution = runtime_by_name.get(name, [])
         discovery = discovered_by_name.get(name, [])
         missing_counterparts = sorted({counterpart for mapping in matches for counterpart in missing_native_by_group[case_key(mapping["identity"])]})
@@ -230,10 +243,15 @@ def reconcile(source, ledger, runtime, native, aliases, invocations=()):
     unmapped_discovery = [case for case in discovered
                          if (case["descriptor"]["is_test"] or source_name(case["descriptor"]) is not None)
                          and aliases.get(case["descriptor"]["unique_id"], source_name(case["descriptor"])) not in mapped_source_names]
-    external = [file for file in source["files"] if file["lane"] in ("sql_logic", "language_client")]
+    external = [file for file in source["files"] if (file["lane"] in ("sql_logic", "language_client")
+                or file["path"].startswith("src/test/resources/xtdb/sql/logic_test/") and file["path"].endswith(".test"))
+                and file["path"] not in external_result["resolved_files"]]
     unreconciled = [value for value in candidate_results if value["mapping"] != "mapped" or value["runtime_status"] != "observed"]
     complete = not errors and not unreconciled and not unmapped_runtime and not unmapped_discovery and not external and bool(candidate_results)
+    assertions_passed = complete and external_result["all_passed"] and all(case["outcome"].get("event") == "execution_finished"
+        and case["outcome"].get("status") == "SUCCESSFUL" for case in runtime_cases)
     return {"schema_version": 1, "reference_revision": source["reference"], "complete": complete,
+            "all_assertions_passed": assertions_passed, "external_cases": external_result["cases"],
             "assertion_denominator": len(ledger["cases"]) if complete else None,
             "errors": errors, "selections": selections, "candidates": candidate_results,
             "unmapped_runtime": unmapped_runtime,
@@ -250,11 +268,13 @@ def main():
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--aliases", type=Path)
     parser.add_argument("--invocations", type=Path)
+    parser.add_argument("--external", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     read = lambda path: json.loads(path.read_bytes())
     report = reconcile(read(args.source), read(args.ledger), args.runtime, read(args.native), read(args.aliases) if args.aliases else {},
-                       read(args.invocations) if args.invocations else [])
+                       read(args.invocations) if args.invocations else [], read(args.external) if args.external else None,
+                       args.external.resolve().parent if args.external else None)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
     return 0 if report["complete"] else 1
 

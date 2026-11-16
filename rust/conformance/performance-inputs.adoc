@@ -1,0 +1,144 @@
+= Packaged performance inputs, version 1
+
+`run_performance.py --phase-two --plan PLAN.json --reference PINNED_CHECKOUT --output NEW_DIRECTORY [--timeout SECONDS]` consumes the following contract.
+Execution requires the Phase 2 gate and clean pinned checkouts.
+The output directory must not exist; the per-command timeout defaults to 1800 seconds.
+Exit `0` means every selected case qualifies, `1` means comparison requirements remain unmet, and invalid input, execution or cleanup failures raise an error with retained failure evidence when available.
+The driver retains per-repetition `execution.json`, per-case requests/results/checkpoints/lifecycle receipts, command logs, resources, input digests and `comparison.json`.
+
+All fields are required unless marked optional.
+Numbers are finite; integers exclude booleans.
+An `Artifact` is `{path, sha256, bytes?}`: a relative, nonescaping, nonsymlink file beneath the plan's parent, with 64 lowercase hexadecimal digest and optional nonnegative byte count.
+Server configurations, package closures and credentials must already exist.
+
+== Plan
+
+[cols="1,2,4",options="header"]
+|===
+|Field |Type |Contract
+|`schema_version` |integer |`1`.
+|`id` |nonempty string |Stable plan identity.
+|`fixture` |Artifact |Output of `performance_fixture.py`; its original typed expectations remain unchanged.
+|`fixture_sha256` |SHA256 |Equal to the fixture artifact digest.
+|`package_capabilities` |sorted unique nonempty string array |Available capability intersection of the selected package pair; equal to the matrix lane selection when invoked by the matrix.
+|`resources` |Resource object |Common container and placement contract below.
+|`jvm_repetitions`, `native_repetitions` |integers >= 2 |Exact measured repetition denominator.
+|`engines` |object |Exactly `jvm` and `rust`, each an Engine object.
+|`cases` |nonempty Case array |Unique IDs; every fixture trace must match its retained fixture entry, including the optional overlap observer.
+|===
+
+A `Resource` has `memory_bytes` (positive integer, also the memory+swap limit), `cpu_count` (positive integer), `cpu_set` (Docker CPU-set string), `storage_placement` (nonempty physical backend/zone description), `architecture` (`linux/amd64` or `linux/arm64`) and `host_page_cache` (`uncontrolled`, `isolated_cold` or `warm`).
+The Docker host and actual inspected resource limits must match.
+
+An `Engine` has `package` (Artifact naming `build.py`'s complete `package.json`), `engine_memory_configuration` (nonempty allocator/heap configuration description), `nodes` (nonempty Node array with the same unique names on both engines), and optional `provider_measurement` (Provider object).
+Missing provider measurement leaves qualification unmet.
+Package metadata and every relative source/binary/image artifact must be retained beside the package manifest.
+
+== Nodes and provider
+
+[cols="1,2,4",options="header"]
+|===
+|Node field |Type |Contract
+|`name` |string |Matches `[a-z][a-z0-9-]{0,40}`; Docker service name and client hostname.
+|`command` |nonempty string array |Actual server argv, including a separate `/configuration.yaml` argument.
+|`configuration` |Artifact |YAML mounted read-only at `/configuration.yaml`.
+|`data_path` |absolute container path string |Mount point for the owned persistent volume.
+|`data_volume_group` |optional string |Matches `[a-z][a-z0-9-]{0,50}`; defaults to `name + "-data"`; equal groups intentionally share a volume.
+|`pg_port`, `flight_port`, `health_port` |positive integers |Actual internal listener ports; no public port mapping is required.
+|`database`, `user` |strings |Client database and authentication user.
+|`environment` |optional string-to-string object |Server environment; `RTDB_RUN_ID` is owner-supplied and cannot be overridden. Secret values belong in files.
+|`credential_files` |optional array |Artifact objects with additional `target` absolute container paths; mounted read-only.
+|`client_password` |optional Artifact |Password file; trailing newlines are removed, and the retained plan stores only its path/digest.
+|===
+
+The supported owned `Provider` object has `kind: "owned_http_observer"`, `observer_artifact` (Artifact matching committed `clients/provider_observer.py`), `configuration` (below), and optional `ca_file` (Artifact with trusted PEM certificates).
+Both actual server backend endpoints must route through `http://object-observer:PORT` using their original request/signing semantics.
+An observer with no successful workload requests cannot qualify the case.
+
+[cols="1,2,4",options="header"]
+|===
+|Provider configuration field |Type |Contract
+|`upstream` |HTTP(S) origin string |Host/optional port only, no credentials, query or fragment; HTTPS validates hostname/certificates.
+|`port` |integer 1..65535 |Sidecar listener.
+|`workers` |integer 1..256 |Maximum admitted connections.
+|`request_timeout_seconds` |integer 1..300 |Whole-request deadline and socket timeout.
+|`max_request_bytes` |integer 1..1099511627776 |Maximum streamed request body size.
+|`request_path_prefix` |string |Unencoded path beginning and ending with `/`; `{namespace}` occurs once as a complete component, for example `/bucket/{namespace}/`; empty interior and dot components are rejected.
+|`list_paths` |optional array |Objects `{path, prefix_parameter, prefix}`; `path` is an absolute unencoded route, `prefix_parameter` is nonempty, and `prefix` ends with `/` and contains one complete `{namespace}` component, for example `{namespace}/`.
+|===
+
+The owner adds `namespace`, `storage_placement`, observer source digest and optional mounted CA path.
+The namespace uses ASCII letters, digits, `_` and `-` within one path component.
+Admission compares decoded paths and listing prefixes with the complete namespace scope.
+Literal or decoded dot segments, backslashes, control characters and malformed UTF-8/percent escapes are rejected.
+Decoded paths must reach a stable representation within eight admission passes.
+Accepted request targets and signed headers are forwarded unchanged; decoding is used only for admission.
+An explicitly configured listing route also permits a query-free `HEAD` for provider metadata.
+Listing queries accept at most 128 fields and exactly one value for the configured prefix parameter.
+Counters use `successful_object_http_payload_and_requests`, with successful read/write request and byte totals, failure totals, rejection totals and `in_flight_requests`.
+Both measurement boundaries require zero admitted in-flight requests.
+Local filesystem provider measurement remains unimplemented and cannot be replaced by process I/O counters.
+
+== Cases
+
+[cols="1,2,4",options="header"]
+|===
+|Field |Type |Contract
+|`id` |unique nonempty string |Fixture case identity.
+|`workload` |string |`id_lookup`, `bitemporal_range`, `mixed_type_join`, `bulk_ingest`, `replicated_commit`, `compaction_under_load` or `restore`; all seven must be selected.
+|`protocol` |string |`pgwire` or `flight_sql`; the complete plan contains both.
+|`setup_protocol` |optional protocol |Defaults to `protocol`; the source fixture uses pgwire for explicit transaction-time setup.
+|`node` |string |Selected node name.
+|`applied_prefix`, `layout` |nonempty strings |Descriptive identities; the actual checkpoint below proves the prefix/layout.
+|`cache_mode` |string |`warm` or `process_cold`; ID lookups include both as separate cases.
+|`samples` |integer 1..1000000 |Rounds per worker; fixed even if compaction is too slow to overlap.
+|`setup`, `checkpoint`, `warmup`, `checks` |Operation arrays |Ordered phases; checks are nonempty, warmup is nonempty for warm cases, checkpoint has actual basis plus `logical_prefix` and `physical_layout` query roles.
+|`workers` |array of 1..64 nonempty Operation arrays |Concurrent ordered client traces; each executes all rounds.
+|`restart_before_measurement` |optional boolean |Must be true for restore; process-cold cases also restart before each sample round.
+|`overlap_observer` |conditional CatalogObserver |Required only for compaction; observed by a joined client during ingestion, as defined below.
+|`acceptance_budgets` |object |Exactly `p95_ns` (finite >= 1), `minimum_throughput` (finite >= 0.001 operations/second), `peak_rss_bytes` (positive integer).
+|===
+
+Operation IDs are unique across case phases/workers/observer.
+Process-cold measured operations are queries only, preserving the restored prefix across rounds.
+Compaction requires warm mode, at least two rounds and an explicitly timed mutating operation; adoption must be observed after one commit and before another measured write begins.
+Replicated commit must use another actual node and verify its read-back.
+Explicit measured system-time sequences require one ordered pgwire worker.
+
+A `CatalogObserver` has `id` (distinct nonempty string), `kind: "catalog_adoption"`, `sql`, `timeout_seconds` (positive finite number) and `minimum_system_time` (zoned ISO instant equal to the first measured mutation's sequence start).
+Its query returns exactly `trie_key` and `max_system_from`, selecting live higher-level tries whose temporal metadata covers a measured write.
+The owner captures an initial catalog before releasing the ingestion barrier.
+An observation must contain a new trie key absent from that baseline and a nonnull timestamp at or above `minimum_system_time`.
+Baseline and observed rows, monotonic capture times, new trie identities and committed-write boundaries remain in the receipt.
+An already-present unchanged higher-level trie and a new trie containing only seed transactions both fail the overlap requirement.
+
+== Operations and typed cells
+
+Each Operation has `id` and `kind`, optional `role` (checkpoint/observer semantic role), and these kind-specific fields:
+
+[cols="1,4",options="header"]
+|===
+|Kind |Fields
+|`query` |`sql` string, `expected_rows` array of typed rows, optional ordered `parameters` array.
+|`await_query` |Query fields plus positive finite `timeout_seconds`; repeatedly evaluates until exact expected rows or deadline.
+|`capture_basis` |`expected_system_time` string in the client's ISO timestamp rendering; captures snapshot/completed rows for the selected database.
+|`transaction` |Nonempty `statements` array of `{sql, parameters?}`; optional `begin_sql` for explicit pgwire transaction options.
+|`bulk` |`sql` string and nonempty `rows` array of ordered JSON parameter arrays; optional `begin_sql`.
+|`replicated_transaction` |Transaction fields plus `read_node`, `verification_sql`, `expected_rows`; transfers the actual await token and reads on that node.
+|`flush` |`database` string and `barrier` Operation of kind `await_query`; the HTTP enqueue response alone is not completion.
+|===
+
+Mutating operations may have `system_time_sequence: {start, step_microseconds}` where `start` is a zoned ISO instant and the step is a positive integer.
+Iteration `i` supplies `start + i * step_microseconds` as explicit transaction system time.
+Plain JSON SQL parameters preserve JSON null, boolean, number, text, list and object values; the fixture supplies no credential parameters.
+
+A typed row is an array of cells, matching the result column order.
+Supported cell objects are `{kind: "null"}`, `{kind: "bool", value: boolean}`, `{kind: "integer", value: signed decimal string}`, `{kind: "float64", bits: 16 lowercase hex characters}`, `{kind: "decimal", sign: 0-or-1, digits: integer-array, exponent: integer}`, `{kind: "timestamp", value: ISO-string, timezone: string-or-null}`, `{kind: "date"|"time", value: ISO-string}`, `{kind: "text", value: string}`, `{kind: "binary", hex: string}`, `{kind: "list", value: cell-array}`, or `{kind: "map", entries: array-of-[key-cell,value-cell]}`.
+Map entry order and result row order are retained.
+PG schema receipts retain column name/OID; Flight schemas retain names, Arrow type rendering, nullability and metadata bytes.
+Expected rows are compared before cross-engine schema/result comparison.
+
+`performance_fixture.py --rows 1000 --samples 100 --output NEW_FIXTURE.json` generates all traces and expectations without opening an engine.
+Construct a plan by copying its `cases`, assigning explicit per-case budgets, and providing the package/configuration/resource objects above.
+Its `traces` map must remain byte-equivalent under canonical JSON to each case's `setup`, `checkpoint`, `warmup`, `workers`, `checks` and `overlap_observer` (absent observer represented as an empty array).
+Generated fixtures contain no backend credentials or passing observations.

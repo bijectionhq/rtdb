@@ -1,0 +1,17 @@
+import org.gradle.api.tasks.testing.Test
+
+gradle.projectsEvaluated {
+    gradle.rootProject.allprojects { project ->
+        def baseline = project.tasks.findByName("test")
+        if (baseline instanceof Test) {
+            project.tasks.register("rtdbUnselectedTags", Test) {
+                testClassesDirs = baseline.testClassesDirs
+                classpath = baseline.classpath
+                javaLauncher = baseline.javaLauncher
+                jvmArgs baseline.jvmArgs
+                useJUnitPlatform { includeTags("jdbc", "timescale", "docker") }
+                outputs.upToDateWhen { false }
+            }
+        }
+    }
+}

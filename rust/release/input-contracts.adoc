@@ -1,0 +1,161 @@
+= Release evidence input contracts, version 1
+
+This reference describes the JSON supplied to `run_matrix.py`, `verify_matrix.py` and `cutover_evidence.py`.
+Execution remains gated by `rust/implementation-status.json`; these contracts do not assert that a lane has run.
+All fields below are required unless marked optional.
+An integer excludes JSON booleans; a number must be finite.
+SHA256 values are 64 lowercase hexadecimal characters.
+
+== Artifact paths
+
+An `Artifact` is an object with `path` (nonempty relative path), `sha256` and optional `bytes` (nonnegative integer).
+The file must exist with the recorded digest and size.
+Paths must stay beneath the stated root and cannot traverse symlinks.
+Matrix and cutover artifact roots are their plan file's parent directory.
+A matrix input can instead be `{ "from_lane": "LANE_ID", "path": "relative/path" }`, where the producer is a declared, successful dependency.
+That path is relative to the producer's retained lane directory.
+The recovery `history` input names a directory; use a predecessor reference because an external `Artifact` names a file.
+Package consumers retain or reference the entire producer closure, including package metadata, source manifests, binaries and image archives.
+Copying a selected package into another input root preserves its exact package bytes and relative artifact layout.
+
+== Matrix plan
+
+[cols="1,2,4",options="header"]
+|===
+|Field |Type |Contract
+|`schema_version` |integer |Exactly `1`.
+|`matrix` |Artifact |Byte-identical to committed `rust/release/matrix.json`.
+|`bindings` |array of Binding |Exactly one for every lane returned by `matrix_plan.expand(matrix)`; both architectures are included even on a single-architecture worker.
+|===
+
+A `Binding` has `id` (expanded lane ID), `runner` (expanded runner name), `selection` (the exact expanded JSON object), `inputs` (object described below) and optional `required_environment` (array of nonempty environment variable names).
+The expansion fixes platform, dependency, variant, feature, capability, original task and SQL selection identities.
+Workers execute only their native architecture; unmatched or unavailable lanes receive unmet receipts.
+
+[cols="1,3,4",options="header"]
+|===
+|Runner |Input keys |Format and selected producer
+|`package` |`builder_image`, `runtime_image` |Digest-pinned image strings accepted by `build.py`; the exact engine, variant and platform come from the lane.
+|`cargo-production` |None |Builds the workspace's production targets with the lane's feature selection.
+|`native-tests` |`native_build_selection` |Artifact containing the Native build selection object below.
+|`gradle` |None |Uses the expanded original Gradle task and explicit property/simulation counts; backend prerequisites are supplied by the operator environment.
+|`controls` |`native`, `ledger`, `configuration` |`native` is the selected production dependency's retained `rtdb-conformance` executable; the other artifacts are the assertion ledger and the control runner's JSON configuration.
+|`history` |`native` |Selected production conformance executable.
+|`sql-logic` |`native` |Selected production conformance executable; original test/directory selection comes from the lane.
+|`recovery` |`native`, `history` |Selected production executable and the selected history dependency's `run` directory.
+|`embedded` |`native_library` |The selected native package dependency's `artifacts/librtdb_ffi.so`.
+|`clients` |`native_package`, `jvm_package` |Artifacts or predecessor references to the two selected package dependencies' `run/package.json` files.
+|`performance` |`performance_plan` |Artifact conforming to link:../conformance/performance-inputs.adoc[Performance plan version 1]; its packages must be byte-identical to the selected dependencies, its architecture must equal the lane, and its `package_capabilities` must equal the lane's capabilities.
+|`inventory` |`source_inventory`, `ledger`, `native_inventory`, `aliases`, `invocations`; optional `external` |Artifacts described under Runtime inventory inputs; `native_inventory` must be the selected native-tests dependency's `run/native-inventory.json`.
+|`required-recovery-adapter` |None |Reserved required lane; currently reports an implementation gap for the selected remote/external capability.
+|===
+
+Each executable/package/library input is checked against the actual selected producer bytes before invocation.
+`artifact-bindings.json` records those producer and consumed identities for independent verification.
+`package_capabilities` identifies the available package pair; actual remote-backend coverage additionally requires its original integration and recovery lanes.
+
+=== Native build selection
+
+The `native_build_selection` JSON has `schema_version: 1`, `workspace` (absolute `rust` workspace path), `implementation_revision` (clean checkout SHA), `configuration` (native-tests lane ID), `command` (exact Cargo argv) and nonempty `targets`.
+Each target has `package_id` (Cargo package ID string), `target: {name, kind}` (`kind` is an array of Cargo kind strings), and `features` (array of enabled feature strings for that target).
+The target/feature denominator must match the successful Cargo message stream exactly.
+The command is `cargo test --manifest-path ABSOLUTE/rust/Cargo.toml --locked --workspace --all-targets --no-default-features --message-format=json --no-run`, followed by `--features` and the comma-joined lane features when nonempty.
+
+The control configuration is the JSON object exemplified by link:../conformance/configurations/controls.json[the retained pure-control configuration]: `schema_version: 1`, `applied_basis`, `valid_time`, `system_time` (null for pure controls), `clock`, `timezone`, `storage_version` and `features`.
+Those values become the exact observation configuration and must agree with the control ledger identities.
+
+=== Runtime inventory inputs
+
+The source inventory and assertion ledger conform to link:../conformance/README.adoc[Compatibility evidence]; `source_inventory.py` records original file digests and declaration candidates, while `assertion-ledger.json` supplies reviewed exact identities and assertions.
+`aliases` is a JSON object mapping complete JUnit unique IDs to qualified source names.
+`invocations` is an array of `{project, task, unique_id, identity, native_configuration}` objects.
+Each `identity` contains `reference_revision`, `source`, `qualified_name`, `parameter_fixture` and `configuration`, exactly matching a ledger case.
+`native_configuration` selects the actual native-tests configuration for every required counterpart.
+`external` conforms to link:../conformance/external-inventory.adoc[External runtime inventory evidence].
+The runtime Gradle roots contain `requested-lanes.json` with `schema_version: 1` and `lanes`, plus the discovery JSON and event JSONL files emitted by `inventory.init.gradle`.
+The matrix supplies those roots from its selected Gradle predecessors.
+`merge_runtime(destination, sources)` requires a nonexistent destination with an existing parent and returns that destination as a `Path`.
+Duplicate task artifacts fail; shared discovery paths must have identical bytes.
+Failure may leave a partial destination for inspection.
+
+=== Commands and results
+
+`run_matrix.py --phase-two --plan PLAN --reference CHECKOUT --output NEW_DIRECTORY [--timeout SECONDS]` requires clean pinned implementation/reference checkouts and a nonexistent output directory.
+Timeout defaults to 7200 seconds per subprocess; timeout does not waive process-group drain.
+It retains `selection.json`, `inputs.json`, each lane's closure and receipt, and `result.json`.
+Exit `0` means the complete matrix is verified; `1` means required lanes remain unmet; invalid plans or cancellation raise an error and may leave failure evidence.
+`verify_matrix.py --matrix FILE --worker DIRECTORY ... --plan-sha256 SHA --implementation-revision SHA --reference-revision SHA --output NEW_FILE` combines retained workers from the same plan and revisions.
+It returns `0` for complete verified evidence, `1` for unmet lanes, and an error for invalid or ambiguous evidence.
+No result authorizes production mutation.
+
+== Cutover plan
+
+`cutover_evidence.py PLAN.json NEW_REPORT.json` reads evidence only.
+Exit `0` means rehearsal prerequisites are satisfied; `2` means some are absent/failed/expired; invalid input raises an error without a successful report.
+
+[cols="1,2,4",options="header"]
+|===
+|Field |Type |Contract
+|`schema_version` |integer |`1`.
+|`deployment`, `control_plane_owner` |nonempty strings |Stable deployment and observing authority identities.
+|`evidence_scope` |string |`isolated_preproduction_rehearsal`.
+|`publishers` |nonempty Publisher array |Exact publisher inventory.
+|`partitions` |nonempty Boundary array |Final JVM handoff boundaries, one per configured database partition.
+|`artifacts` |object |Exactly `deployed_jvm`, `native`, `fallback_jvm`, `migrator`; each value is an Artifact plus a nonempty `revision` string.
+|`configuration_report` |Artifact |`rtdb-config` report with valid `configuration_sha256`, compatible status, empty gaps, actual database partition/source descriptions and server/migrator provenance digests matching `artifacts`.
+|`runtime_publisher_inventory` |Artifact, optional |Required for satisfied prerequisites; object with `deployment`, `control_plane_owner`, `complete: true`, valid `configuration_sha256` equal to the report, exact `publishers` array and complete `database_names` array.
+|`write_pause_budget_seconds`, `recovery_target_seconds` |positive finite numbers |At least 0.001.
+|`rollback_deadline_unix_seconds`, `assessment_time_unix_seconds` |positive integers |Assessment is explicit; a deadline at or before it is expired.
+|`simultaneous_writers` |boolean |Must be `false` for this qualification.
+|`receipts` |Artifact array |At most one of each stage below; missing stages remain unmet.
+|===
+
+A `Publisher` has `id` and `database` strings and `kind` from `writer`, `compactor`, `trie_gc`, `block_gc`, `cdc_acknowledger`.
+A `Boundary` has exactly these fields:
+
+[cols="1,3",options="header"]
+|===
+|Field |Type and meaning
+|`database`, `partition` |Nonempty database name and nonnegative partition integer.
+|`storage_version`, `storage_epoch` |Nonnegative signed-32-bit integers.
+|`finalized_block`, `source_position`, `replica_position`, `term` |Signed-64-bit integers at least `-1`; source and replica positions remain distinct.
+|`transaction` |Null, or exactly `{tx_id, system_time_micros}`; ID is signed-64-bit and at least `-1`, system time is signed-64-bit epoch microseconds.
+|`term_sequence` |Null or nonnegative signed-64-bit integer; null differs from zero.
+|`external_token` |Null or SHA256 of the opaque upstream token bytes.
+|===
+
+Every stage receipt has `stage`, matching `deployment` and `control_plane_owner`, `artifact_digests` (the exact four artifact-name/SHA pairs), `observed_at_unix_seconds` (positive integer), `verified: true`, and nonempty `evidence` (Artifact array).
+Evidence paths are relative to the cutover plan root, including evidence referenced inside stage receipts.
+Observation times must follow this stage order and cannot exceed assessment time.
+The additional stage fields are:
+
+[cols="1,4",options="header"]
+|===
+|Stage |Required fields
+|`inventory` |Exact `publishers`; nonempty `client_versions` array and `restore_procedure` string; `partitions` containing every `{database, partition}` identity (initial positions need not equal the later handoff).
+|`retention` |`protected_until_unix_seconds` at least the rollback deadline; `logs_and_object_versions_protected: true`.
+|`shadow` |`semantic_agreement`, `history_checked`, `read_only_credentials`, `publishers_disabled`, `matched_durable_basis`, all `true`.
+|`pause_and_drain` |`ingress_paused`, `upstream_paused`, `ambiguous_outcomes_reconciled`, `outstanding_blocks_confirmed`, all `true`; nonnegative finite `elapsed_seconds` within pause budget.
+|`fence_jvm` |`fenced_publishers` (all publisher IDs), `publication_denied: true`, nonempty `writer_lease_id`.
+|`handoff` |`partitions` exactly equal to the plan's final handoff Boundaries.
+|`restore_rust` |`partitions` exactly equal to the plan's final handoff Boundaries.
+|`canary` |`semantic_agreement`, `history_checked`, `second_node_read`, `read_back_committed`, all `true`; `origin` (`client` or `external`); `acknowledged_partitions` (complete Boundary array); `acknowledged_transaction` exactly `{database, partition, tx_id, system_time_micros}` with nonnegative tx ID; conditional `external_progress` below.
+|`restart` |`semantic_agreement`, `history_checked`, both `true`; `acknowledged_partitions` exactly equal to canary's complete vector.
+|`reverse_rehearsal` |`semantic_agreement`, `history_checked`, `performed_on_clone_before_production_mutation`, `shared_key_bytes_unchanged`, all `true`; `fault_boundaries` exactly `after_acknowledged_canary_crash` and `after_partial_compaction_upload`.
+|`fence_rust` |Same fence fields as `fence_jvm`.
+|`restore_fallback` |`semantic_agreement`, `history_checked`, both `true`; `last_acknowledged_partitions` equal to restart's complete vector; `recovered_partitions` equal to that vector; nonnegative finite `elapsed_seconds` within recovery budget.
+|===
+
+All canary partitions preserve storage identity and do not regress finalized block, source/replica position, term, transaction ID or transaction time.
+A known sequence cannot disappear/regress within the same term.
+Transaction ID/time advance together; the selected canary strictly advances both and its replica position.
+Client origin requires no configured external source and a strict source-position advance.
+External origin requires the configured external source and a changed durable token; its source-log position may remain unchanged, matching `TxResolver.indexTx`.
+
+For every changed external token, `external_progress` contains one object with `database`, `partition`, `source` (exact configured `external_source` descriptor), `previous_token` (handoff digest or null), `durable_token` (current digest), `previous_position` (integer at least `-1`), `durable_position` (nonnegative integer strictly greater), and `confirmed_position`.
+The current finalized block must also advance.
+For PostgreSQL, positions are decoded unsigned-64-bit LSNs and `confirmed_position` is nonnegative and no greater than the durable LSN.
+This rehearsal uses the conservative durable confirmation boundary; it does not qualify the optional unrelated-WAL gap exception from `pgsrc.allium`.
+For Kafka Connect, positions are decoded signed-64-bit source offsets and `confirmed_position` is null because the pinned source never commits offsets upstream.
+Decoded token/confirmation observations are supplied by the stated control-plane authority and backed by its retained evidence; digest comparison does not independently decode upstream state.
+The report retains missing requirements, rollback-window status and `production_actions_authorized: false` even when rehearsal prerequisites hold.

@@ -1,0 +1,49 @@
+= External runtime inventory evidence
+
+`runtime_inventory.py --external EXTERNAL.json` reconciles original SQL-logic and language-client invocations alongside the JUnit runtime inventory.
+It is a passive reader and performs no test discovery, builds or engine execution.
+Without this argument, all external source files remain unresolved.
+Direct SQL-logic fixtures under `src/test/resources/xtdb/sql/logic_test/` remain external assertions even though the source inventory classifies them as fixtures.
+
+The external document records schema version, pinned reference revision, implementation revision, explicit runs and file bindings.
+Each run has an `id`, `kind` (`sql_logic` or `language_client`), a relative `root`, the original `recorded_root`, and an `artifacts` closure of `{path, sha256, bytes}` records beneath that root.
+Paths cannot escape the root or traverse symlinks.
+Absolute receipt paths can be preserved after archival using explicit `relocations` entries `{original, artifact}`.
+Runtime binaries, JVM classpath files, framework reports, source files and lifecycle traces must remain in that closure; a digest pointing at discarded bytes is insufficient.
+
+`sources` binds each original repository path to its retained `artifact` reference.
+Its digest must match the pinned source inventory.
+Every actual assertion has one exact `bindings` entry containing `runtime_identity`, the complete ledger `identity`, `native_configuration`, and the ledger's explicit `counterparts` array.
+Language-client bindings also name `source_candidate`.
+Parameter/configuration identities are not inferred from test names, suite exits or neighboring cases.
+Bindings omitted from execution, duplicated bindings and unbound runtime invocations fail validation.
+Client helper declarations without a reviewed assertion mapping remain unresolved; the validator does not infer that a source candidate is merely a helper.
+
+SQL-logic evidence includes the existing runner's plan, original record streams, both JVM repetitions, native observations, process traces and executed-artifact closure.
+`native_build` identifies the retained production-artifact manifest, its exact Cargo command/process/messages and copied executable bytes.
+`native_binary` names that retained executable, and native configuration additionally binds the build configuration, feature selection and actual SQL-logic options.
+The validator reparses retained original source bytes and compares every recorded identity, line, expectation and query-limit counter.
+The binding's configuration is the canonical sorted compact JSON object `{adapter: "sql_logic", selection: ..., options: ...}` using the actual recorded selection/options.
+An expected-error assertion only passes when the original statement required an error and each engine retained an actual exception.
+Matching unexpected failures, query mismatches, skips, suppression, parse failures and query limits remain unverified.
+They cannot contribute passing coverage.
+
+Client evidence includes the actual packaged server identities, copied original client sources, immutable client images, raw JUnit/TRX/ExUnit/libtest reports, container inspection, and drained owner receipts.
+The run's `packages` entries name the original reference/native package manifests and their retained source/artifact closure.
+The validator reparses the original framework reports and checks that stored cases match them exactly.
+Both engines must execute identical framework/suite/name/source identities in the same explicit original lane.
+The recorded reference/native configurations must match the ledger binding.
+Both original assertions must pass; matching failed or skipped outcomes cannot qualify the file.
+
+Each `files` entry records the original source path/digest and its exact `required_invocations` array of `{run, identity}` values.
+Every original source candidate and every recorded parameter/configuration invocation must be accounted for.
+A source file with no candidate declarations may be explicitly classified `support_input` only when its exact path is in the reviewed support-role allowlist for the pinned reference revision, with its retained original artifact.
+SQL `.test` files cannot use that classification.
+Unknown candidate-free code remains unresolved.
+Missing files remain in `external_lanes_requiring_receipts`.
+
+`complete` reports exact inventory reconciliation.
+`all_assertions_passed` separately requires successful JUnit outcomes and passing original external assertions.
+The release matrix requires both fields.
+No source-only candidate count, suite process exit code or aggregate comparison flag becomes an assertion denominator by itself.
+This validator and its regression sources have not executed during Phase 1.
