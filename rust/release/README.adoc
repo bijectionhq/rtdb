@@ -9,7 +9,8 @@ It also includes the server's CloudWatch module and the migrator's matching capa
 The pinned JVM selections are `standalone`, `aws`, `azure`, and `google-cloud`, each built by its matching `:docker:<variant>:shadowJar` task.
 Standalone includes local storage and PostgreSQL CDC; each cloud selection also includes Kafka, Kafka Connect, and its own storage provider.
 The reference has no combined all-backends image in this matrix.
-The Java/Clojure adapter is built separately through the `:xtdb-rust-bindings` Gradle project with JDK 25.
+The Java/Clojure adapter is built separately through the `:bindings:xtdb-rust-bindings` Gradle project with JDK 25.
+Its test task receives the native library through `-Dxtdb.native.library=/absolute/path/librtdb_ffi.so`.
 
 `build.py` requires the source completeness gate, a clean checkout and a committed Cargo lockfile for native builds.
 The build driver owns its subprocess region and temporary artifact container; source manifests, selections and package records are passive values.
@@ -64,4 +65,62 @@ Backend, fault, storage-interoperability, performance and rollback receipts rema
 Use the paired `rtdb-config` artifact for link:../crates/config/README.adoc[offline configuration qualification] before cutover.
 Its feature selection matches the server, and its extracted digest is retained alongside the server digest.
 The command reads explicit configuration/environment/provenance files and prints a redacted report; it opens no node or backend and never grants cutover eligibility by configuration alone.
-The complete release-matrix orchestrator remains under implementation.
+
+== Matrix execution evidence
+
+link:input-contracts.adoc[Release evidence input contracts, version 1] lists every runner input, producer binding, artifact path root and CLI result contract.
+
+`matrix_plan.py` expands both native Linux architectures, all eight native feature selections, and all four pinned JVM package variants.
+It retains the original unit, integration, property, cloud, excluded-tag, client and scheduled SQL-logic selections.
+The property lane requests 500 property and 1000 simulation iterations.
+The nine scheduled SQL-logic directories remain separate invocations; the commented-out expression directory receives no coverage credit.
+The embedded lane uses `:bindings:xtdb-rust-bindings:test --rerun-tasks -Dxtdb.native.library=...`, as declared by `settings.gradle.kts` and `bindings/jvm/build.gradle.kts`.
+Its reports come from `bindings/jvm/build/test-results/test`.
+
+`run_matrix.py --phase-two --plan PLAN.json --reference PINNED_CHECKOUT --output NEW_DIRECTORY` is the active invocation owner.
+The plan names the retained `matrix.json` artifact and one explicit binding per expanded lane, preserving its exact `id`, `runner`, and `selection`.
+Each binding supplies its own `inputs` and any required environment variable names.
+The driver does not invent credentials, backend endpoints, native target inventories, expected assertions or mappings.
+An artifact input is `{path, sha256, bytes}` relative to the plan; a predecessor input is `{from_lane, path}` beneath a declared, successfully verified dependency's output.
+Missing inputs leave the lane unmet and independent lanes continue.
+Cancellation propagates after the current invocation owner drains; it cannot become a successful missing-input receipt.
+
+Native builds record Cargo's terminal successful build message and the exact declared package, target and feature selection.
+Test execution must match the discovered names exactly, including ignored tests selected for execution.
+The original Gradle task recordings are copied into one inventory bundle; duplicate task executions or conflicting discovery artifacts fail reconciliation.
+The invocation manifest must explicitly bind every parameter/configuration identity to the ledger.
+The link:../conformance/external-inventory.adoc[external evidence validator] handles retained client and SQL-logic invocations separately from JUnit descriptors.
+A complete inventory and passing original assertions are different report fields, and both are required by the matrix.
+
+Every lane retains its command logs, process receipts, input digests and complete output-file closure.
+`verify_matrix.py` can combine workers only when they used the same exact plan, matrix bytes, implementation revision and pinned reference revision.
+It checks every retained artifact and process drain again, requires native execution on the selected architecture, and rejects ambiguous duplicate successful lane receipts.
+One architecture's result cannot stand in for the other.
+Successful builds remain unqualified until every required lane is present.
+
+Remote and external-source reverse-recovery/fault adapters are explicit required lanes that currently report an implementation gap.
+The existing recovery runner exercises local storage only.
+These adapters remain source-completeness obligations before Phase 2; the matrix does not treat local execution as remote recovery evidence.
+The shared packaged performance runner is described in link:../conformance/performance.adoc[matched performance evidence].
+The new orchestration, observer, fixtures and regression tests are source-only and have not run.
+
+== Cutover prerequisites
+
+The link:input-contracts.adoc#_cutover_plan[version 1 cutover contract] defines complete partition and per-stage receipt fields.
+
+`cutover_evidence.py PLAN.json REPORT.json` is a passive validator over an isolated preproduction rehearsal's retained evidence.
+The plan must declare `evidence_scope: isolated_preproduction_rehearsal`.
+It opens no node, uses no credentials, pauses no producer, changes no publication authority and grants no production authorization.
+The operator or control plane supplies the observations and their evidence artifacts.
+Artifact integrity cannot prove that a credential or writer lease was revoked; the report keeps that authority boundary explicit.
+
+The validator requires independently pinned deployed JVM, native server, fallback JVM and migrator artifacts, a compatible configuration report, and every attached database partition.
+Partition boundaries retain storage version/epoch, finalized block, distinct source and replica positions, transaction/system time, term, optional term sequence and opaque external-token digest.
+An absent sequence remains distinct from zero.
+The rehearsal receipts cover publisher/client inventory, protected retention, read-only shadow queries, pause/drain and ambiguous outcomes, JVM fencing, exact handoff, native restore, acknowledged canary read-back and second-node observation, restart, reverse recovery after the canary and partial compaction, native fencing, and exact fallback recovery within the declared budget.
+Matching historical observations are mandatory.
+The plan supplies an explicit assessment time; expired rollback deadlines remain expired in the report.
+Canary, restart and fallback receipts must identify the same latest acknowledged partition/transaction boundaries, including external tokens.
+Publisher completeness needs a retained runtime inventory tied to the configuration and authority; its absence remains unresolved.
+A live deployment still needs its own controlled handoff after the rehearsal.
+Neither a successful subprocess exit nor a compatible configuration alone satisfies these prerequisites.

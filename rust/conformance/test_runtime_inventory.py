@@ -161,6 +161,23 @@ class RuntimeEvidenceTests(unittest.TestCase):
                 self.assertFalse(report["complete"])
                 self.assertTrue(any("no exact ledger case" in error for error in report["errors"]))
 
+    def test_complete_identity_inventory_does_not_turn_failed_assertions_into_passing_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = inventory_fixture(directory)
+            path = Path(directory) / "plan.jsonl"
+            path.write_text(path.read_text().replace('"SUCCESSFUL"', '"FAILED"'))
+            report = reconcile(*inputs)
+            self.assertTrue(report["complete"])
+            self.assertFalse(report["all_assertions_passed"])
+
+    def test_direct_sql_fixture_remains_external_without_exact_runtime_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            inputs = inventory_fixture(directory)
+            inputs[0]["files"].append({"path": "src/test/resources/xtdb/sql/logic_test/sample.test", "lane": "fixture"})
+            report = reconcile(*inputs)
+            self.assertFalse(report["complete"])
+            self.assertEqual(1, len(report["external_lanes_requiring_receipts"]))
+
 
 if __name__ == "__main__":
     unittest.main()
