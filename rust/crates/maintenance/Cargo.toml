@@ -28,5 +28,8 @@ tempfile.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 
+[dev-dependencies]
+arrow-ipc.workspace = true
+
 [lints]
 workspace = true

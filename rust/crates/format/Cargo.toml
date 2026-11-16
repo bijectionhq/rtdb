@@ -16,6 +16,7 @@ arrow-schema.workspace = true
 arrow-ipc.workspace = true
 base64.workspace = true
 chrono.workspace = true
+lz4_flex.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 serde.workspace = true

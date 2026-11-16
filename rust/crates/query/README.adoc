@@ -123,8 +123,8 @@ Sort currently writes runs even when its whole input could fit in memory.
 There is no hash join, top-k optimization, bloom pushdown, predicate pushdown, parallel partition scheduling, or coordinated scan-page spilling.
 A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
 
-The implemented scan accepts uncompressed Arrow trie files and explicitly rejects compressed pages before using encoded-size allocation estimates.
-The format crate can read compressed Arrow data; query accounting for its decompressed sizes remains missing.
+The scan accepts uncompressed, LZ4 and Zstandard Arrow trie data and metadata.
+It reserves inspected dictionary, row-descriptor and decoded-buffer bounds before opening the corresponding data.
 
 Memory reservations cover retained rows, output Arrow buffers, staged parameter values, decoded page bounds, and scoped spill work.
 Several bounds are conservative estimates rather than proven physical-allocation limits.

@@ -18,6 +18,7 @@ pub struct ArrowFile {
     blocks: Vec<arrow_ipc::Block>,
     next_page: usize,
     encoded_page_sizes: Vec<usize>,
+    page_decoding_bounds: Vec<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -25,7 +26,21 @@ pub struct FileLayout {
     pub footer_encoded_bytes: usize,
     pub dictionary_encoded_bytes: usize,
     pub page_encoded_bytes: Vec<usize>,
+    pub dictionary_decoding_bound: usize,
+    pub page_decoding_bounds: Vec<usize>,
     pub uncompressed: bool,
+}
+
+impl FileLayout {
+    /// Reserve this bound while the reader, its dictionaries or its schema remain reachable.
+    pub fn opening_allocation_bound(&self) -> Result<usize> {
+        allocation_add(allocation_add(allocation_mul(self.footer_encoded_bytes, 64)?, 65_536)?, self.dictionary_decoding_bound)
+    }
+
+    /// Reserve this bound while retaining every decoded batch, dictionary and schema from the file.
+    pub fn full_allocation_bound(&self) -> Result<usize> {
+        self.page_decoding_bounds.iter().try_fold(self.opening_allocation_bound()?, |bytes, page| allocation_add(bytes, *page))
+    }
 }
 
 trait RetainedReader: Read + Seek + Send {}
@@ -62,7 +77,7 @@ impl ArrowFile {
             for block in dictionaries { let buffer = read_block(reader.as_mut(), block)?; decoder.read_dictionary(block, &buffer).map_err(invalid)?; }
         }
         let blocks = footer.recordBatches().ok_or_else(|| invalid("Arrow footer has no record-batch inventory"))?.iter().copied().collect();
-        Ok(Self { reader, decoder, schema, blocks, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes })
+        Ok(Self { reader, decoder, schema, blocks, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -71,6 +86,11 @@ impl ArrowFile {
     /// Encoded metadata and body bytes; compressed pages can require a larger decoded allocation.
     pub fn encoded_page_size(&self, page: usize) -> Result<usize> {
         self.encoded_page_sizes.get(page).copied().ok_or_else(|| invalid("Arrow page exceeds its file"))
+    }
+
+    /// Reserve before reading the page and retain the charge through the returned buffers' lifetime.
+    pub fn page_allocation_bound(&self, page: usize) -> Result<usize> {
+        self.page_decoding_bounds.get(page).copied().ok_or_else(|| invalid("Arrow page exceeds its file"))
     }
 
     /// Returned batches retain their buffers independently of this reader.
@@ -98,6 +118,13 @@ fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Resu
     let size = allocation_add(usize::try_from(block.metaDataLength()).map_err(invalid)?, usize::try_from(block.bodyLength()).map_err(invalid)?)?;
     reader.seek(SeekFrom::Start(u64::try_from(block.offset()).map_err(invalid)?)).map_err(invalid)?;
     let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).map_err(invalid)?;
+    let metadata_end = usize::try_from(block.metaDataLength()).map_err(invalid)?;
+    let mut prefix = 0;
+    let mut length = inspection_i32(&bytes[..metadata_end], &mut prefix)?;
+    if length == -1 { length = inspection_i32(&bytes[..metadata_end], &mut prefix)?; }
+    let header_end = allocation_add(prefix, usize::try_from(length).map_err(invalid)?)?;
+    let header = bytes.get(prefix..header_end).filter(|_| header_end <= metadata_end).ok_or_else(|| invalid("Arrow block header exceeds its metadata"))?;
+    validate_lz4_lengths(&arrow_ipc::root_as_message(header).map_err(invalid)?, &bytes[metadata_end..])?;
     Ok(Buffer::from(bytes))
 }
 
@@ -127,8 +154,8 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
         let body = usize::try_from(block.bodyLength()).map_err(invalid)?;
         metadata.checked_add(body).ok_or_else(|| invalid("Arrow page length overflow"))
     };
-    let mut layout = FileLayout { footer_encoded_bytes: footer_length + 10, dictionary_encoded_bytes: 0, page_encoded_bytes: Vec::new(), uncompressed: true };
-    for block in footer.dictionaries().into_iter().flat_map(|blocks| blocks.iter()).chain(footer.recordBatches().into_iter().flat_map(|blocks| blocks.iter())) {
+    let mut layout = FileLayout { footer_encoded_bytes: footer_length + 10, dictionary_encoded_bytes: 0, page_encoded_bytes: Vec::new(), dictionary_decoding_bound: 0, page_decoding_bounds: Vec::new(), uncompressed: true };
+    for (block, dictionary) in footer.dictionaries().into_iter().flat_map(|blocks| blocks.iter().map(|block| (block, true))).chain(footer.recordBatches().into_iter().flat_map(|blocks| blocks.iter().map(|block| (block, false)))) {
         let offset = u64::try_from(block.offset()).map_err(invalid)?;
         let block_size = size(block)?;
         if offset.checked_add(block_size as u64).is_none_or(|end| end > footer_start) { return Err(invalid("Arrow block exceeds data region")); }
@@ -137,17 +164,31 @@ pub fn inspect_file_reserved<R: Read + Seek + ?Sized, G>(reader: &mut R, mut res
         let mut metadata = vec![0; metadata_length];
         reader.seek(SeekFrom::Start(offset)).map_err(invalid)?;
         reader.read_exact(&mut metadata).map_err(invalid)?;
-        let prefix = if metadata.starts_with(&[0xff; 4]) { 8 } else { 4 };
-        let message = arrow_ipc::root_as_message(metadata.get(prefix..).ok_or_else(|| invalid("Arrow message has no body"))?).map_err(invalid)?;
-        if let Some(batch) = message.header_as_record_batch() { layout.uncompressed &= batch.compression().is_none(); }
-        else if let Some(dictionary) = message.header_as_dictionary_batch() {
+        let mut prefix = 0;
+        let mut length = inspection_i32(&metadata, &mut prefix)?;
+        if length == -1 { length = inspection_i32(&metadata, &mut prefix)?; }
+        let header_end = allocation_add(prefix, usize::try_from(length).map_err(invalid)?)?;
+        let header = metadata.get(prefix..header_end).ok_or_else(|| invalid("Arrow block header exceeds its metadata"))?;
+        let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
+        if dictionary != message.header_as_dictionary_batch().is_some() { return Err(invalid("Arrow block type differs from its footer inventory")); }
+        let body_length = usize::try_from(block.bodyLength()).map_err(invalid)?;
+        if usize::try_from(message.bodyLength()).map_err(invalid)? != body_length { return Err(invalid("Arrow block and message body lengths differ")); }
+        let body_start = offset.checked_add(metadata_length as u64).ok_or_else(|| invalid("Arrow body offset overflow"))?;
+        let bound = message_bound(&message, metadata_length, body_length, |start| {
+            reader.seek(SeekFrom::Start(body_start.checked_add(start as u64).ok_or_else(|| invalid("Arrow buffer offset overflow"))?)).map_err(invalid)?;
+            let mut bytes = [0; 8]; reader.read_exact(&mut bytes).map_err(invalid)?;
+            Ok(i64::from_le_bytes(bytes))
+        })?;
+        if let Some(batch) = message.header_as_record_batch() {
+            layout.uncompressed &= batch.compression().is_none();
+            layout.page_encoded_bytes.push(block_size);
+            layout.page_decoding_bounds.push(bound);
+        } else if let Some(dictionary) = message.header_as_dictionary_batch() {
             layout.uncompressed &= dictionary.data().ok_or_else(|| invalid("Arrow dictionary has no batch"))?.compression().is_none();
+            layout.dictionary_encoded_bytes = allocation_add(layout.dictionary_encoded_bytes, block_size)?;
+            layout.dictionary_decoding_bound = allocation_add(layout.dictionary_decoding_bound, bound)?;
         } else { return Err(invalid("Arrow data block has no record batch")); }
     }
-    if let Some(dictionaries) = footer.dictionaries() {
-        for block in dictionaries { layout.dictionary_encoded_bytes = layout.dictionary_encoded_bytes.checked_add(size(block)?).ok_or_else(|| invalid("Arrow dictionary size overflow"))?; }
-    }
-    if let Some(blocks) = footer.recordBatches() { layout.page_encoded_bytes = blocks.iter().map(size).collect::<Result<_>>()?; }
     Ok(layout)
 }
 
@@ -179,6 +220,7 @@ impl<R: Read> ArrowStream<R> {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         while let Some((metadata, body)) = read_message(&mut self.reader)? {
             let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
+            validate_lz4_lengths(&message, &body)?;
             let body = Buffer::from(body);
             if let Some(batch) = message.header_as_record_batch() {
                 return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(&self.schema), &self.dictionaries, self.projection.as_deref(), &message.version()).map(Some).map_err(invalid);
@@ -220,11 +262,30 @@ pub fn read_stream(bytes: Arc<[u8]>) -> Result<(SchemaRef, Vec<RecordBatch>)> {
 /// Bounds message decoding scratch, including declared row descriptors and compressed buffer lengths.
 /// Reserve the returned byte count before invoking the Arrow reader and retain it through decoded-buffer use.
 pub fn message_allocation_bound(header: &[u8], body: &[u8]) -> Result<usize> {
+    framed_message_allocation_bound(header, body, header.len())
+}
+
+fn framed_message_allocation_bound(header: &[u8], body: &[u8], metadata_length: usize) -> Result<usize> {
     let message = arrow_ipc::root_as_message(header).map_err(invalid)?;
     if let Some(schema) = message.header_as_schema() { validate_decimal_metadata(schema)?; }
-    let mut bound = allocation_add(8192, allocation_add(allocation_mul(header.len(), 64)?, allocation_mul(body.len(), 4)?)?)?;
-    if usize::try_from(message.bodyLength()).map_err(invalid)? > body.len() { return Err(invalid("Arrow message body is truncated")); }
+    message_bound(&message, metadata_length, body.len(), |start| {
+        let prefix: [u8; 8] = body.get(start..allocation_add(start, 8)?).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
+        Ok(i64::from_le_bytes(prefix))
+    })
+}
+
+fn message_bound(message: &arrow_ipc::Message<'_>, header_length: usize, body_length: usize, mut compressed_length: impl FnMut(usize) -> Result<i64>) -> Result<usize> {
+    let mut bound = allocation_add(8192, allocation_add(allocation_mul(header_length, 64)?, allocation_mul(body_length, 4)?)?)?;
+    if usize::try_from(message.bodyLength()).map_err(invalid)? > body_length { return Err(invalid("Arrow message body is truncated")); }
     if let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) {
+        if let Some(compression) = batch.compression() {
+            let scratch = match compression.codec() {
+                arrow_ipc::CompressionType::LZ4_FRAME => 64 << 20,
+                arrow_ipc::CompressionType::ZSTD => 1 << 20,
+                _ => return Err(invalid("Unknown Arrow compression codec")),
+            };
+            bound = allocation_add(bound, scratch)?;
+        }
         if let Some(nodes) = batch.nodes() {
             for node in nodes { bound = allocation_add(bound, allocation_mul(allocation_add(usize::try_from(node.length()).map_err(invalid)?, 1)?, 4096)?)?; }
         }
@@ -232,17 +293,45 @@ pub fn message_allocation_bound(header: &[u8], body: &[u8]) -> Result<usize> {
             for buffer in buffers {
                 let start = usize::try_from(buffer.offset()).map_err(invalid)?;
                 let length = usize::try_from(buffer.length()).map_err(invalid)?;
-                let bytes = body.get(start..allocation_add(start, length)?).ok_or_else(|| invalid("Arrow buffer exceeds its message body"))?;
-                let decoded = if batch.compression().is_some() && !bytes.is_empty() {
-                    let prefix: [u8; 8] = bytes.get(..8).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
-                    let length = i64::from_le_bytes(prefix);
-                    if length == -1 { bytes.len() - 8 } else { usize::try_from(length).map_err(invalid)? }
+                if allocation_add(start, length)? > body_length { return Err(invalid("Arrow buffer exceeds its message body")); }
+                let decoded = if batch.compression().is_some() && length != 0 {
+                    if length < 8 { return Err(invalid("Compressed Arrow buffer has no length")); }
+                    let decoded = compressed_length(start)?;
+                    if decoded == -1 { length - 8 } else { usize::try_from(decoded).map_err(invalid)? }
                 } else { length };
                 bound = allocation_add(bound, allocation_add(allocation_mul(decoded, 4)?, 512)?)?;
             }
         }
     }
     Ok(bound)
+}
+
+fn validate_lz4_lengths(message: &arrow_ipc::Message<'_>, body: &[u8]) -> Result<()> {
+    let Some(batch) = message.header_as_record_batch().or_else(|| message.header_as_dictionary_batch().and_then(|batch| batch.data())) else { return Ok(()); };
+    if !batch.compression().is_some_and(|compression| compression.codec() == arrow_ipc::CompressionType::LZ4_FRAME) { return Ok(()); }
+    if let Some(buffers) = batch.buffers() {
+        for buffer in buffers {
+            let start = usize::try_from(buffer.offset()).map_err(invalid)?;
+            let length = usize::try_from(buffer.length()).map_err(invalid)?;
+            let bytes = body.get(start..allocation_add(start, length)?).ok_or_else(|| invalid("Arrow buffer exceeds its message body"))?;
+            if bytes.is_empty() { continue; }
+            let prefix: [u8; 8] = bytes.get(..8).ok_or_else(|| invalid("Compressed Arrow buffer has no length"))?.try_into().map_err(invalid)?;
+            let expected = i64::from_le_bytes(prefix);
+            if expected == -1 || expected == 0 { continue; }
+            let expected = usize::try_from(expected).map_err(invalid)?;
+            let mut decoder = lz4_flex::frame::FrameDecoder::new(&bytes[8..]);
+            let mut scratch = [0; 8192];
+            let mut decoded = 0;
+            loop {
+                let read = decoder.read(&mut scratch).map_err(invalid)?;
+                if read == 0 { break; }
+                decoded = allocation_add(decoded, read)?;
+                if decoded > expected { return Err(invalid("LZ4 data exceeds its declared Arrow buffer length")); }
+            }
+            if decoded != expected { return Err(invalid("LZ4 data differs from its declared Arrow buffer length")); }
+        }
+    }
+    Ok(())
 }
 
 /// Bounds all messages retained by a decoded IPC stream, including dictionaries.
@@ -284,7 +373,7 @@ pub fn file_allocation_bound(bytes: &[u8]) -> Result<usize> {
         if length == -1 { length = inspection_i32(bytes, &mut header_start)?; }
         let header_end = allocation_add(header_start, usize::try_from(length).map_err(invalid)?)?;
         if header_end > metadata_end { return Err(invalid("Arrow block header exceeds its metadata")); }
-        bound = allocation_add(bound, message_allocation_bound(&bytes[header_start..header_end], &bytes[metadata_end..body_end])?)?;
+        bound = allocation_add(bound, framed_message_allocation_bound(&bytes[header_start..header_end], &bytes[metadata_end..body_end], metadata_end - start)?)?;
     }
     Ok(bound)
 }

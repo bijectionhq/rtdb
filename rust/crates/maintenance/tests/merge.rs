@@ -55,6 +55,39 @@ async fn l0_merge_splits_recency_retries_identically_and_removes_temporary_files
     assert_eq!(memory.used_bytes(), 0);
 }
 
+#[tokio::test]
+async fn compressed_data_and_metadata_compact_with_identical_retry_bytes() {
+    use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
+    for codec in [arrow_ipc::CompressionType::LZ4_FRAME, arrow_ipc::CompressionType::ZSTD] {
+        let temporary = tempfile::tempdir().unwrap();
+        let table = TableRef::new("public", "compressed"); let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+        let input = TrieKey::l0(BlockIndex(0)).unwrap(); let store = Arc::new(MemoryStore::default());
+        let rows = vec![StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL, operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::I64(42))])), recency: None }];
+        let data = build_event_batch(&rows, Some(BTreeMap::from([("value".into(), LogicalType::Scalar(ScalarType::I64))])), None).unwrap();
+        let mut metadata = MetadataBuilder::new(false, true); metadata.write_leaf(&data).unwrap(); let (metadata, _) = metadata.finish().unwrap();
+        for (key, bytes) in [(ObjectKey::new(slug.data_key(&input)).unwrap(), write_file(&data.schema(), &[data]).unwrap()), (ObjectKey::new(slug.metadata_key(&input)).unwrap(), metadata.write().unwrap())] {
+            let mut reader = ArrowFile::open(bytes.into(), None).unwrap();
+            let options = IpcWriteOptions::default().try_with_compression(Some(codec)).unwrap();
+            let mut writer = FileWriter::try_new_with_options(Vec::new(), &reader.schema(), options).unwrap();
+            for page in 0..reader.page_count() { writer.write(&reader.read_page(page).unwrap()).unwrap(); }
+            writer.finish().unwrap(); store.put(&key, writer.into_inner().unwrap().into()).await.unwrap();
+        }
+        let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+        let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+        let memory = MemoryBudget::new(1 << 29);
+        let executor = SegmentCompactor::new(store.clone(), state, Arc::clone(&memory), StorageVersion(6), StorageEpoch(0), MergeConfig { temporary_directory: temporary.path().into(), ..Default::default() }).unwrap();
+        let job = CompactionJob { table, inputs: vec![input], part: vec![], output: TrieKey::new(1, None, vec![], BlockIndex(0)).unwrap(), recency_mode: RecencyMode::Partition };
+        let first = executor.execute(&job, &CancellationToken::new()).await.unwrap();
+        let output: TrieKey = first.tries[0].trie_key.as_ref().unwrap().parse().unwrap();
+        let key = ObjectKey::new(slug.data_key(&output)).unwrap(); let bytes = store.get(&key).await.unwrap();
+        let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+        assert_eq!(EventBatch::new(reader.read_page(0).unwrap()).unwrap().read_event(0).unwrap(), rows[0]);
+        assert_eq!(executor.execute(&job, &CancellationToken::new()).await.unwrap(), first);
+        assert_eq!(store.get(&key).await.unwrap(), bytes);
+        assert_eq!(memory.used_bytes(), 0); assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+    }
+}
+
 #[test]
 fn recency_partition_boundaries_are_inclusive() {
     let monday = chrono::NaiveDate::from_ymd_opt(2020, 1, 6).unwrap();
