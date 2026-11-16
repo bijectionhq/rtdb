@@ -147,13 +147,13 @@ mod tests {
         let mut input = file.reopen().unwrap(); assert!(arrow_allocation(&mut input, false, &memory).is_err()); assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
-    fn copy_arrow_inspection_and_readers_preserve_full_decimal_scales() {
-        for scale in [i32::MIN, i32::MAX] {
+    fn copy_arrow_inspection_and_readers_preserve_signed_decimal_parameters() {
+        for (precision, scale) in [(3, i32::MIN), (3, i32::MAX), (i32::MIN, 0), (256, 129), (i32::MAX, i32::MAX)] {
             let memory = MemoryBudget::new(1 << 24);
-            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
-            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision, scale, bit_width: 128 });
+            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), precision, scale, 128).unwrap());
             let schema = Arc::new(arrow_schema::Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]));
-            let page = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            let page = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::copy_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
             for is_file in [false, true] {
                 let bytes = if is_file { rtdb_format::ipc::write_file(&schema, std::slice::from_ref(&page)).unwrap() } else { rtdb_format::ipc::write_stream(&schema, std::slice::from_ref(&page)).unwrap() };
                 let mut file = NamedTempFile::new().unwrap(); file.write_all(&bytes).unwrap();

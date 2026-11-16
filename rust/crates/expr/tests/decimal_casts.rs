@@ -2,7 +2,7 @@ use rtdb_expr::{EvalContext, cast_target, evaluate};
 use rtdb_plan::{CastTarget, Expr, Schema};
 use rtdb_types::{DecimalValue, LogicalType as T, ScalarType as S, Value as V};
 
-fn decimal(coefficient: i128, precision: u8, scale: i32) -> V {
+fn decimal(coefficient: i128, precision: i32, scale: i32) -> V {
     V::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128).unwrap())
 }
 

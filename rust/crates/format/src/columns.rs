@@ -38,7 +38,7 @@ pub fn type_from_proto(ty: &pb::VecType) -> Result<LogicalType> {
         },
         Type::FixedSizeBinary(width) => scalar(ScalarType::FixedSizeBinary(*width)),
         Type::Decimal(decimal) => scalar(ScalarType::Decimal {
-            precision: u8::try_from(decimal.precision.unwrap_or_default()).map_err(invalid)?,
+            precision: decimal.precision.unwrap_or_default(),
             scale: decimal.scale.unwrap_or_default(),
             bit_width: u16::try_from(decimal.bit_width.unwrap_or_default()).map_err(invalid)?,
         }),
@@ -144,7 +144,7 @@ fn scalar_to_proto(value: &ScalarType) -> Result<Type> {
         ScalarType::RegProc => Type::Simple(17),
         ScalarType::FixedSizeBinary(width) => Type::FixedSizeBinary(*width),
         ScalarType::Decimal { precision, scale, bit_width } => Type::Decimal(Box::new(pb::Decimal {
-            precision: Some(i32::from(*precision)), scale: Some(*scale), bit_width: Some(i32::from(*bit_width)),
+            precision: Some(*precision), scale: Some(*scale), bit_width: Some(i32::from(*bit_width)),
         })),
         ScalarType::Timestamp { unit, timezone } => Type::Timestamp(Box::new(pb::Timestamp { unit: Some(encode_unit(*unit)), timezone: timezone.clone() })),
         ScalarType::DateDay => Type::Date(Box::new(pb::Date { unit: Some(0) })),

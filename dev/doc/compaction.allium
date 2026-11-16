@@ -189,9 +189,10 @@ contract OutputSegmentLayout {
     -- What a compaction job's output data and meta files hold, and how the meta file's trie branches.
     -- See: compactor/OutWriter.kt, compactor/SegmentMerge.kt, trie/PageTrieWriter.kt, trie/RecencyCells.kt, trie/StreamingIidTrie.kt, trie/MetadataFileWriter.kt
 
-    @invariant DecimalFieldsCarryTheirLogicalScale
-        -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit scale, including decimal fields nested in containers.
+    @invariant DecimalFieldsCarryTheirLogicalParameters
+        -- Each decimal field in an output Arrow schema carries the merged field's signed 32-bit precision and scale, including decimal fields nested in containers.
         -- Its coefficient buffers represent values at that scale.
+        -- Copied cells retain their coefficient bytes and their decimal type leg in the merged schema.
 
     @invariant MillisecondDateStatisticsUseEpochDays
         -- A millisecond date's page statistics and value hash use its epoch day, obtained by truncating the stored milliseconds divided by milliseconds per day toward zero.

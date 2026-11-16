@@ -168,18 +168,19 @@ fn arrow_release_is_idempotent_and_retains_charge_through_imported_children() {
 }
 
 #[test]
-fn decimal_c_data_uses_real_full_scale_formats_and_retains_detached_schema_children() {
+fn decimal_c_data_uses_signed_parameters_and_retains_detached_schema_children() {
     for width in [32, 64, 128, 256] {
-        for scale in [i32::MIN, -129, 128, i32::MAX] {
+        for (precision, scale) in [(3, i32::MIN), (3, -129), (3, 128), (3, i32::MAX), (i32::MIN, 0), (-1, i32::MIN), (0, i32::MAX), (256, 1), (i32::MAX, i32::MAX)] {
             let memory = MemoryBudget::new(16 * 1024 * 1024);
-            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: width });
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision, scale, bit_width: width });
             let coefficient = arrow_buffer::i256::from_i128(-123).to_be_bytes();
-            let value = rtdb_types::Value::Decimal(rtdb_types::DecimalValue::new(coefficient[32-usize::from(width/8)..].to_vec(), 3, scale, width).unwrap());
-            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()])), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            let value = rtdb_types::Value::Decimal(rtdb_types::DecimalValue::new(coefficient[32-usize::from(width/8)..].to_vec(), precision, scale, width).unwrap());
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()])), vec![rtdb_columnar::copy_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
             let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
-            let expected = if width == 128 { format!("d:3,{scale}") } else { format!("d:3,{scale},{width}") };
+            let expected = if width == 128 { format!("d:{precision},{scale}") } else { format!("d:{precision},{scale},{width}") };
             assert_eq!(schema.child(0).format(), expected);
             assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY));
+            assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY));
             let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
             assert_eq!(imported.arguments.types(), &[ty.clone()]);
             assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
@@ -195,13 +196,15 @@ fn decimal_c_data_uses_real_full_scale_formats_and_retains_detached_schema_child
 
 #[test]
 fn foreign_decimal_scale_annotations_are_rejected_and_owned_inputs_released() {
+    for key in [rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY, rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY] {
     let memory = MemoryBudget::new(1 << 20);
-    let field = Field::new("value", DataType::Decimal128(3, 1), true).with_metadata(std::collections::HashMap::from([(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.to_owned(), i32::MAX.to_string())]));
+    let field = Field::new("value", DataType::Decimal128(3, 1), true).with_metadata(std::collections::HashMap::from([(key.to_owned(), i32::MAX.to_string())]));
     let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![field])));
     let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
     let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
     assert!(unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.is_err());
     assert!(array.release.is_none()); assert!(schema.release.is_none()); assert_eq!(memory.used_bytes(), 0);
+    }
 }
 
 #[test]

@@ -26,7 +26,9 @@ fn temporal_projection_resolves_hidden_columns_without_expanding_wildcards() {
 
 #[test]
 fn sql_to_static_ops_non_dml_5856_and_dynamic_expressions_remain_unexpanded() {
-    for sql in ["SELECT 1", "CREATE TABLE foo (_id, v)", "GRANT reader TO alice", "INSERT INTO foo (_id, v) VALUES (1, 1 + 2)"] {
+    for sql in ["SELECT 1", "CREATE TABLE foo (_id, v)", "GRANT reader TO alice", "INSERT INTO foo (_id, v) VALUES (1, 1 + 2)",
+        "INSERT INTO foo (_id, v) VALUES (1, '9'::DECIMAL(1,0))", "INSERT INTO foo (_id, v) VALUES (1, ?::DECIMAL)",
+        "INSERT INTO foo (_id, v) VALUES (1, ARRAY[?]::DECIMAL(1,0)[])"] {
         assert!(rtdb_sql::prepare_static(sql, &Fixture, &PrepareOptions::default()).unwrap().is_none());
     }
     assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, v) VALUES (1, 12.34)", &Fixture, &PrepareOptions::default()).unwrap().is_some());
@@ -146,8 +148,8 @@ fn update_subqueries_preserve_target_fields_without_persisting_apply_helpers() {
     let mutation = rtdb_sql::prepare_tx("UPDATE foo AS f SET price = (SELECT f.price + 1) WHERE EXISTS (SELECT 1 WHERE f._id = 1)", &Fixture, &PrepareOptions::default()).unwrap();
     let rtdb_sql::Mutation::Put { input, .. } = mutation else { panic!("expected put mutation") };
     let RelationNode::Project { expressions, .. } = input.node() else { panic!("expected canonical projection") };
-    let Expr::Struct(fields) = &expressions.iter().find(|expression| expression.field.name == "doc").unwrap().expr else { panic!("expected document") };
-    assert_eq!(fields.iter().map(|(name, _)| name.as_str()).collect::<BTreeSet<_>>(), BTreeSet::from(["_id", "ExactName", "price", "region"]));
+    let Expr::RowCopy(fields) = &expressions.iter().find(|expression| expression.field.name == "doc").unwrap().expr else { panic!("expected document") };
+    assert_eq!(fields.iter().map(|field| field.name.as_str()).collect::<BTreeSet<_>>(), BTreeSet::from(["_id", "ExactName", "price", "region"]));
     assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, price) VALUES (1, (SELECT 2))", &Fixture, &PrepareOptions::default()).unwrap().is_none());
 }
 

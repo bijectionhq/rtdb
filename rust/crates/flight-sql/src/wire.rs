@@ -174,18 +174,20 @@ mod tests {
         assert!(parameter_batch(&Bytes::from_static(&[255,255,255,255,127,255,255,127]), &memory).is_err()); assert_eq!(memory.used_bytes(), before);
     }
     #[test]
-    fn flight_schema_batches_and_parameters_preserve_full_decimal_scale() {
-        for scale in [i32::MIN, -129, 128, i32::MAX] {
+    fn flight_schema_batches_and_parameters_preserve_signed_decimal_parameters() {
+        for (precision, scale) in [(3, i32::MIN), (3, -129), (3, 128), (3, i32::MAX), (i32::MIN, 0), (-1, i32::MIN), (0, i32::MAX), (256, 1), (i32::MAX, i32::MAX)] {
             let memory = MemoryBudget::new(16 * 1024 * 1024);
-            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
-            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision, scale, bit_width: 128 });
+            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), precision, scale, 128).unwrap());
             let schema = Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]));
-            let batch = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            let batch = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::copy_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
             let header = schema_data(&schema, &memory).unwrap();
             let message = arrow_ipc::root_as_message(&header.data_header).unwrap();
             let field = message.header_as_schema().unwrap().fields().unwrap().get(0);
             assert_eq!(field.type_as_decimal().unwrap().scale(), scale);
+            assert_eq!(field.type_as_decimal().unwrap().precision(), precision);
             assert!(field.custom_metadata().is_none_or(|entries| entries.iter().all(|entry| entry.key() != Some(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY))));
+            assert!(field.custom_metadata().is_none_or(|entries| entries.iter().all(|entry| entry.key() != Some(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY))));
             let bytes = schema_message(&schema, &memory).unwrap();
             assert_eq!(from_field(rtdb_format::ipc::read_schema_message(&bytes).unwrap().field(0)).unwrap(), ty);
             drop(bytes);

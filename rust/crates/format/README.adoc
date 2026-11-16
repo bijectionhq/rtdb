@@ -15,14 +15,17 @@ Legacy source transaction bytes and obsolete flush records retain the JVM dispat
 
 The Arrow readers accept files and streams through Arrow IPC, including multiple pages and run-end encoded IIDs.
 Decimal metadata is checked recursively before Arrow's native schema conversion in file, stream, standalone schema, COPY, and Flight input paths.
-Precision outside an unsigned byte and unsupported bit widths return an Unsupported anomaly before Arrow 58.4.1's schema conversion.
-Decimal scales retain the complete signed 32-bit JVM and Arrow IPC range.
-Native Arrow arrays use a signed-byte scale and a reserved field annotation for wider values; coefficient buffers retain their original width and bytes.
-Ingress derives that annotation from the real IPC decimal metadata and rejects external uses of the reserved key.
-Egress removes the annotation and writes the true signed 32-bit scale in the IPC schema and file footer.
-Precision zero and scale greater than precision remain representable metadata; coefficient validation belongs to the column writer.
+Unsupported bit widths return an Unsupported anomaly before Arrow 58.4.1's schema conversion.
+Decimal precision and scale retain the complete signed 32-bit JVM and Arrow IPC range.
+Native Arrow arrays use byte-sized parameters and reserved field annotations for wider values; coefficient buffers retain their original width and bytes.
+Ingress derives those annotations from the real IPC decimal metadata and rejects external uses of either reserved key.
+Egress removes the annotations and writes the true signed 32-bit parameters in the IPC schema and file footer.
+Nonpositive precision and scale greater than precision remain representable metadata; ordinary column writes validate coefficients against the declared precision and physical width.
+Typed event and metadata copies preserve existing coefficients with exact decimal parameters, including coefficients larger than their declared precision.
+Captured event schemas reject values outside their declared type legs.
 `tests/ipc_decimal_metadata.rs` changes nested FlatBuffer metadata directly and retains those accepted and rejected boundaries as unexecuted regression source.
 `tests/decimal_scales.rs` covers all physical widths, nested fields, independent union scales, empty/null zero-precision pages, protobuf column metadata and incremental sinks.
+`tests/decimal_precisions.rs` extends those boundaries to signed precision, raw coefficients, run-end fields, reservation release and unchanged narrow-parameter bytes.
 Narrow-scale standard Arrow streams retain their original bytes in regression source.
 These guards do not validate every other Arrow schema kind.
 Event operations are selected by union leg name because type IDs can differ across file schemas.
@@ -31,7 +34,7 @@ The standard Arrow stream and schema APIs retain caller-selected options for Fli
 Schema translation and the initial schema-frame buffer belong to the caller's reserved codec scratch; incremental sinks retain no complete stream.
 Budgeted file writers retain schema and block-inventory reservations and acquire footer scratch before finalization.
 Production block and compaction writers use those constructors; raw constructors require a caller-owned reservation.
-Writers check every page's complete native schema, including nested full-scale decimal annotations, before encoding it.
+Writers check every page's complete native schema, including nested full-width decimal annotations, before encoding it.
 Cross-process writer identity remains an unexecuted acceptance check, including FlatBuffer construction, schema ordering, and metadata encoding.
 The metadata codec retains column statistics and traverses IID and recency branches.
 Imported metadata retains its nested Arrow schema when written again.

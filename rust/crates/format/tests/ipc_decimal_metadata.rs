@@ -28,8 +28,8 @@ fn file_positions(bytes: &[u8]) -> [usize;3] {
 }
 
 #[test]
-fn nested_decimal_wire_metadata_is_rejected_before_native_unchecked_narrowing() {
-    for (field,value) in [(0,-1),(0,256),(2,512)] {
+fn nested_invalid_decimal_width_is_rejected_before_native_unchecked_narrowing() {
+    for (field,value) in [(2,0i32),(2,512)] {
         let mut stream = ipc::write_stream(&schema(),&[]).unwrap();
         let position = stream_positions(&stream)[field];
         stream[position..position+4].copy_from_slice(&value.to_le_bytes());
@@ -63,7 +63,7 @@ fn nested_external_decimal_scales_are_derived_from_real_wire_metadata() {
 
 #[test]
 fn reserved_scale_metadata_cannot_override_external_decimal_metadata() {
-    let key = rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY;
+    for key in [rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY, rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY] {
     for schema_level in [false, true] {
         let metadata = std::collections::HashMap::from([(key.to_owned(), i32::MAX.to_string())]);
         let field = Field::new("value", DataType::Decimal128(3, 1), true);
@@ -75,6 +75,22 @@ fn reserved_scale_metadata_cannot_override_external_decimal_metadata() {
         let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &schema).unwrap();
         writer.finish().unwrap();
         assert!(ipc::ArrowFile::open(writer.into_inner().unwrap().into(), None).is_err());
+    }
+    }
+}
+
+#[test]
+fn nested_external_signed_precision_is_derived_from_real_wire_metadata() {
+    for precision in [i32::MIN, -1, 0, 77, 255, 256, i32::MAX] {
+        let mut message = ipc::write_schema_message(&schema()).unwrap();
+        let position = stream_positions(&message)[0];
+        message[position..position+4].copy_from_slice(&precision.to_le_bytes());
+        let decoded = ipc::read_schema_message(&message).unwrap();
+        let DataType::List(item) = decoded.field(0).data_type() else { panic!("Expected list") };
+        let DataType::Struct(children) = item.data_type() else { panic!("Expected struct") };
+        assert_eq!(rtdb_columnar::decimal_field_parameters(&children[0]).unwrap().unwrap().precision, precision);
+        assert_eq!(children[0].data_type(), &DataType::Decimal256(rtdb_columnar::decimal_storage_precision(precision), 1));
+        if precision != 0 { assert_eq!(ipc::write_schema_message(&decoded).unwrap(), message); }
     }
 }
 

@@ -324,7 +324,7 @@ fn build_field_values(field: &Field, values: &[Value]) -> Result<ArrayRef> {
         _ => {
             let ty = rtdb_columnar::from_field(field)?;
             let ty = if nulls.is_some() && ty != LogicalType::Nothing { ty.maybe() } else { ty };
-            rtdb_columnar::build_array(&ty, values)
+            rtdb_columnar::copy_array(&ty, values)
         }
     }
 }

@@ -46,6 +46,21 @@ fn metadata_roundtrip_retains_iid_and_recency_branch_order() {
 }
 
 #[test]
+fn imported_metadata_rewrites_raw_decimal_cells_without_declared_precision_validation() {
+    for precision in [-1, 1, 256, i32::MAX] {
+        let mut columns = columns();
+        let Value::Struct(column) = &mut columns[0] else { panic!("Expected column metadata") };
+        column.insert("decimal-value".into(), Value::Decimal(rtdb_types::DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap()));
+        let original = MetadataFile::from_nodes(vec![MetadataNode::Leaf { data_page_index: 0, columns }], false).unwrap();
+        let bytes = original.write().unwrap();
+        let loaded = MetadataFile::read(bytes.clone().into()).unwrap();
+        assert_eq!(loaded.nodes(), original.nodes());
+        assert_eq!(loaded.schema(), original.schema());
+        assert_eq!(loaded.write().unwrap(), bytes);
+    }
+}
+
+#[test]
 fn metadata_rejects_forward_children_and_unavailable_recency_leg() {
     assert!(MetadataFile::from_nodes(vec![MetadataNode::IidBranch(vec![Some(1), None, None, None])], false).is_err());
     assert!(MetadataFile::from_nodes(vec![MetadataNode::Nil, MetadataNode::RecencyBranch(vec![(Timestamp(100), 0)])], false).is_err());

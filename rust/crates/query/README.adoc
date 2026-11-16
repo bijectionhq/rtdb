@@ -63,7 +63,14 @@ The current source contains no planner override for that comparator choice; exec
 
 Integer SUM follows the wrapping accumulation in `IntVector.kt` and `LongVector.kt` at the declared accumulator width.
 The reference has no byte or short accumulator implementation, and this executor reports that unsupported case.
-Nullable decimal SUM follows `DecimalVector.sumInto`, where a null input contributes zero.
+Nullable decimal SUM follows `DecimalVector.sumInto`, where a null cell contributes scale-zero zero; a separate null union leg leaves the accumulator unchanged.
+`DecimalVector.increment` adds at the operands' preferred scale and stores the resulting coefficient under the output vector's existing metadata.
+SUM can exceed declared precision, while signed coefficient byte-width overflow fails.
+The width check follows https://github.com/apache/arrow-java/blob/v19.0.0/vector/src/main/java/org/apache/arrow/vector/util/DecimalUtility.java[Arrow Java 19 DecimalUtility].
+Decimal output does not accept integer input vectors, including an inactive integer union leg when its input batch is processed.
+Query output reconstructs typed cells through `copy_array`, preserving exact decimal metadata and coefficients without ordinary-write precision checks.
+Computed projections validate the selected result before that copy, including nested decimal cells; identity columns and canonical INSERT/UPDATE row packing retain raw cells.
+Default and explicit same-type decimal casts therefore reject an overprecision result when projected, while boolean or text results may consume the same scalar intermediate without writing it as a decimal.
 Variance and standard deviation use the reference `Variance.kt` formula based on sum, sum of squares, and count, including its floating-point cancellation behavior.
 Numeric average uses a double accumulator; duration average retains the duration unit and integer division.
 

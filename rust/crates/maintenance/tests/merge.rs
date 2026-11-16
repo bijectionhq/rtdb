@@ -62,3 +62,56 @@ fn recency_partition_boundaries_are_inclusive() {
     assert_eq!(recency_partition(Timestamp(micros), RecencyPartition::Week).unwrap(), monday);
     assert_eq!(recency_partition(Timestamp(micros + 1), RecencyPartition::Week).unwrap(), chrono::NaiveDate::from_ymd_opt(2020, 1, 13).unwrap());
 }
+
+#[tokio::test]
+async fn compaction_preserves_raw_decimal_coefficients_in_current_and_historical_pages() {
+    use rtdb_format::data::copy_event_batch;
+    use rtdb_types::DecimalValue;
+    let temporary = tempfile::tempdir().unwrap();
+    let table = TableRef::new("public", "decimals");
+    let slug = TableSlug::for_unrecorded_table(&table).unwrap();
+    let input = TrieKey::l0(BlockIndex(0)).unwrap();
+    let store = Arc::new(MemoryStore::default());
+    let ty = LogicalType::Scalar(ScalarType::Decimal { precision: -1, scale: i32::MAX, bit_width: 128 });
+    let fields = BTreeMap::from([("value".into(), ty)]);
+    let events: Vec<_> = [123i128, 456].into_iter().enumerate().map(|(index, coefficient)| StoredEvent {
+        iid: Iid([0; 16]), system_from: Timestamp(20 - index as i64), valid_time: Interval::ALL,
+        operation: StoredOperation::Put(BTreeMap::from([("value".into(), Value::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), -1, i32::MAX, 128).unwrap()))])), recency: None,
+    }).collect();
+    let data = copy_event_batch(&events, Some(fields), None).unwrap();
+    let mut metadata = MetadataBuilder::new(false, true);
+    metadata.write_leaf(&data).unwrap();
+    let (metadata, _) = metadata.finish().unwrap();
+    store.put(&ObjectKey::new(slug.data_key(&input)).unwrap(), Bytes::from(write_file(&data.schema(), &[data]).unwrap())).await.unwrap();
+    store.put(&ObjectKey::new(slug.metadata_key(&input)).unwrap(), Bytes::from(metadata.write().unwrap())).await.unwrap();
+    let tables = TableCatalog::default().with_seeded_table(table.clone(), ["value".into()]).unwrap();
+    let state = Arc::new(PartitionState::new(PartitionValue::loaded(TrieCatalog::default(), tables, TrieConfig::default()).unwrap()));
+    let memory = MemoryBudget::new(64 << 20);
+    let executor = SegmentCompactor::new(store.clone(), state, memory.clone(), StorageVersion(6), StorageEpoch(0), MergeConfig {
+        page_size: 1, run_end_encoded_iids: true, temporary_directory: temporary.path().into(), ..Default::default()
+    }).unwrap();
+    let job = CompactionJob { table, inputs: vec![input], part: vec![], output: TrieKey::new(1, None, vec![], BlockIndex(0)).unwrap(), recency_mode: RecencyMode::Partition };
+    let notification = executor.execute(&job, &CancellationToken::new()).await.unwrap();
+    let mut actual = BTreeMap::new();
+    let mut written = BTreeMap::new();
+    for detail in &notification.tries {
+        let key: TrieKey = detail.trie_key.as_ref().unwrap().parse().unwrap();
+        let object = ObjectKey::new(slug.data_key(&key)).unwrap();
+        let bytes = store.get(&object).await.unwrap();
+        written.insert(object, bytes.clone());
+        let mut file = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+        for page in 0..file.page_count() {
+            let batch = EventBatch::new(file.read_page(page).unwrap()).unwrap();
+            for row in 0..batch.len() {
+                let event = batch.read_event(row).unwrap();
+                assert_eq!(event.valid_time, Interval::ALL);
+                actual.insert((key.recency().is_some(), event.system_from), event.operation);
+            }
+        }
+    }
+    assert_eq!(actual, BTreeMap::from([((false, events[0].system_from), events[0].operation.clone()), ((true, events[1].system_from), events[1].operation.clone())]));
+    assert_eq!(executor.execute(&job, &CancellationToken::new()).await.unwrap(), notification);
+    for (object, bytes) in written { assert_eq!(store.get(&object).await.unwrap(), bytes); }
+    assert_eq!(std::fs::read_dir(temporary.path()).unwrap().count(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+}

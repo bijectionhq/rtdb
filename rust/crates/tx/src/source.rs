@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, UnionFields, UnionMode};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, estimate_builder_bytes, from_field, read_value, to_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, build_array, copy_array, estimate_builder_bytes, from_field, read_value, to_field};
 use rtdb_format::envelope::{SourceBody, SourceMessage};
 use prost::Message;
 use rtdb_types::{Anomaly, EntityId, Iid, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
@@ -215,7 +215,7 @@ fn named_union(values: &[(String, Value)], documents: Option<&[DocumentValue]>) 
         } else if let LogicalType::List { element, .. } = &mut ty {
             if **element == LogicalType::Nothing { **element = LogicalType::Struct(BTreeMap::new()); }
         }
-        let mut array = build_array(&ty, &values)?;
+        let mut array = copy_array(&ty, &values)?;
         if !docs.is_empty() {
             let structs = array.as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("Document operation is not a struct"))?;
             let docs = named_union(&docs, None)?;
@@ -285,7 +285,7 @@ pub(crate) fn encode_arguments(arguments: &SqlArguments, memory: &Arc<MemoryBudg
     let mut arrays = Vec::new();
     for (index, ty) in arguments.types().iter().enumerate() {
         fields.push(to_field(&format!("${}", index + 1), ty)?);
-        arrays.push(build_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
+        arrays.push(copy_array(ty, &arguments.rows().map(|row| row[index].clone()).collect::<Vec<_>>())?);
     }
     let options = arrow_array::RecordBatchOptions::new().with_row_count(Some(arguments.row_count()));
     let batch = RecordBatch::try_new_with_options(Arc::new(Schema::new(fields)), arrays, &options).map_err(|error| invalid(error.to_string()))?;
@@ -418,6 +418,20 @@ mod tests {
         assert!(matches!(&decoded.operations[0], Operation::Public(TxOp::Sql { args: None, .. })));
         assert!(matches!(&decoded.operations[1], Operation::Public(TxOp::Sql { args: Some(args), .. }) if args.row_count() == 0));
         assert!(matches!(&decoded.operations[2], Operation::Public(TxOp::Sql { args: Some(args), .. }) if args.row_count() == 1 && args.types().is_empty()));
+    }
+
+    #[test]
+    fn raw_decimal_sql_arguments_retain_metadata_and_coefficients_through_the_source_codec() {
+        let memory = budget();
+        for precision in [i32::MIN, -1, 0, 1, 256, i32::MAX] {
+            let value = Value::Decimal(rtdb_types::DecimalValue::new(18i128.to_be_bytes().to_vec(), precision, 129, 128).unwrap());
+            let args = SqlArguments::new(vec![value.logical_type()], vec![vec![value.clone()]], &memory).unwrap();
+            let source = SourceTransaction::new(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (2, ?)".into(), args: Some(args) }], SubmitOptions::default(), &memory).unwrap();
+            let decoded = roundtrip(&source);
+            let Operation::Public(TxOp::Sql { args: Some(args), .. }) = &decoded.operations[0] else { panic!("Expected SQL arguments") };
+            assert_eq!(args.types(), &[value.logical_type()]);
+            assert_eq!(args.rows().collect::<Vec<_>>(), vec![std::slice::from_ref(&value)]);
+        }
     }
 
     #[test]

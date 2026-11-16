@@ -206,7 +206,7 @@ fn decimal_value_at_scale(bytes: Vec<u8>, scale: i32) -> Result<Value> {
     let width = precision / 2; let bytes = coefficient.to_signed_bytes_be();
     if bytes.len() > width { return Err(error("avro-decode", "Decimal coefficient exceeds its width")); }
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; width]; unscaled[width - bytes.len()..].copy_from_slice(&bytes);
-    Ok(Value::Decimal(DecimalValue::new(unscaled, precision as u8, scale, precision as u16 * 4)?))
+    Ok(Value::Decimal(DecimalValue::new(unscaled, precision as i32, scale, precision as u16 * 4)?))
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
 use chrono::{Datelike, Days, NaiveDate};
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
-use rtdb_format::{data::{EventBatch, StoredEvent, build_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
+use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
 use rtdb_storage::{ObjectKey, ObjectStore, ReadReservation};
 use rtdb_temporal::PolygonCalculator;
@@ -68,7 +68,7 @@ struct OutputSchema { put: Option<BTreeMap<String, LogicalType>>, iid_encoding: 
 
 impl OutputSchema {
     fn batch(&self, events: &[StoredEvent]) -> Result<arrow_array::RecordBatch> {
-        build_event_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
+        copy_event_batch_with_recency(events, self.put.clone(), self.iid_encoding, self.recency)
     }
     fn schema(&self) -> Result<SchemaRef> { Ok(self.batch(&[])?.schema()) }
 }

@@ -21,8 +21,31 @@ pub fn parse_decimal(text: &str) -> Result<BigDecimal> {
     Ok(value)
 }
 
-pub(crate) fn from_coefficient(value: BigInt, precision: u8, scale: i32, bit_width: u16) -> Result<DecimalValue> {
-    if digits(&value) > usize::from(precision) { return Err(overflow()); }
+fn physical_digits(bit_width: u16) -> Result<usize> {
+    match bit_width { 32 => Ok(10), 64 => Ok(19), 128 => Ok(39), 256 => Ok(77), _ => Err(overflow()) }
+}
+
+fn write_digits(precision: i32, bit_width: u16) -> Result<usize> {
+    if precision <= 0 { return Err(overflow()); }
+    Ok((precision as usize).min(physical_digits(bit_width)?))
+}
+
+pub(crate) fn from_coefficient(value: BigInt, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    if digits(&value) > write_digits(precision, bit_width)? { return Err(overflow()); }
+    store_coefficient(value, precision, scale, bit_width)
+}
+
+pub(crate) fn validate_write(value: &DecimalValue) -> Result<()> {
+    physical_digits(value.bit_width)?;
+    if value.unscaled.len() != usize::from(value.bit_width / 8) { return Err(overflow()); }
+    if value.precision <= 0 || digits(&coefficient(value)) > value.precision as usize {
+        return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
+    }
+    Ok(())
+}
+
+fn store_coefficient(value: BigInt, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    physical_digits(bit_width)?;
     let bytes = value.to_signed_bytes_be();
     let width = usize::from(bit_width / 8);
     if bytes.len() > width { return Err(overflow()); }
@@ -46,13 +69,13 @@ fn round_quotient(quotient: BigInt, remainder: &BigInt, divisor: &BigInt, sign: 
     if increment { quotient + if sign == Sign::Minus { -1 } else { 1 } } else { quotient }
 }
 
-pub(crate) fn rescale_coefficient(value: BigInt, source_scale: i64, target_scale: i32, precision: u8, mode: RoundingMode) -> Result<BigInt> {
+pub(crate) fn rescale_coefficient(value: BigInt, source_scale: i64, target_scale: i32, maximum_digits: usize, mode: RoundingMode) -> Result<BigInt> {
     if value.is_zero() { return Ok(value); }
     let shift = i64::from(target_scale).checked_sub(source_scale).ok_or_else(overflow)?;
     if shift.unsigned_abs() > i32::MAX as u64 { return Err(overflow()); }
     let count = i64::try_from(digits(&value)).map_err(|_| overflow())?;
     if shift >= 0 {
-        if count.checked_add(shift).ok_or_else(overflow)? > i64::from(precision) { return Err(overflow()); }
+        if count.checked_add(shift).ok_or_else(overflow)? > maximum_digits as i64 { return Err(overflow()); }
         return Ok(value * power(shift)?);
     }
     if shift < -count {
@@ -67,20 +90,58 @@ pub(crate) fn rescale_coefficient(value: BigInt, source_scale: i64, target_scale
     Ok(round_quotient(&value / &divisor, &(&value % &divisor), &divisor, value.sign(), mode))
 }
 
-pub(crate) fn from_bigdecimal(value: BigDecimal, precision: u8, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+pub(crate) fn from_bigdecimal(value: BigDecimal, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
     let (value, source_scale) = value.into_bigint_and_scale();
     let source_scale = i32::try_from(source_scale).map_err(|_| overflow())?;
-    from_coefficient(rescale_coefficient(value, i64::from(source_scale), scale, precision, RoundingMode::HalfEven)?, precision, scale, bit_width)
+    from_coefficient(rescale_coefficient(value, i64::from(source_scale), scale, write_digits(precision, bit_width)?, RoundingMode::HalfEven)?, precision, scale, bit_width)
 }
 
 /// Applies Java HALF_EVEN scaling and checks the requested vector precision and coefficient width.
 /// Work is bounded by coefficient digits; distant scales return zero or overflow without allocating their exponent.
-pub fn decimal_rescale(value: &DecimalValue, precision: u8, scale: i32, bit_width: u16) -> Result<DecimalValue> {
-    from_coefficient(rescale_coefficient(coefficient(value), i64::from(value.scale), scale, precision, RoundingMode::HalfEven)?, precision, scale, bit_width)
+pub fn decimal_rescale(value: &DecimalValue, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    from_coefficient(rescale_coefficient(coefficient(value), i64::from(value.scale), scale, write_digits(precision, bit_width)?, RoundingMode::HalfEven)?, precision, scale, bit_width)
+}
+
+/// Infers the reference object writer's 32/128 or 64/256 precision/width pair from coefficient digits.
+/// The scale is retained; invalid source widths and coefficients above 64 digits fail.
+/// The caller reserves 4096 bytes for coefficient scratch and the returned allocation before calling.
+pub fn infer_decimal(value: &DecimalValue) -> Result<DecimalValue> {
+    physical_digits(value.bit_width)?;
+    if value.unscaled.len() != usize::from(value.bit_width / 8) { return Err(overflow()); }
+    let coefficient = coefficient(value);
+    let count = digits(&coefficient);
+    let (precision, bit_width) = match count {
+        0..=32 => (32, 128),
+        33..=64 => (64, 256),
+        _ => return Err(Anomaly::unsupported("", format!("Unsupported precision: {count}"))),
+    };
+    store_coefficient(coefficient, precision, value.scale, bit_width)
+}
+
+/// Accumulates one DecimalVector cell, retaining the output vector's metadata without precision validation.
+/// An absent previous cell starts at coefficient zero at the output scale; an absent input contributes scale-zero zero.
+/// The coefficient of the addition is stored without rescaling to the output scale, matching vector SUM.
+/// Input coefficients must fill their declared widths; signed output-width overflow returns an error.
+/// A previous cell must have exactly the requested precision, scale, and bit width.
+pub fn decimal_sum(previous: Option<&DecimalValue>, input: Option<&DecimalValue>, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    let maximum = physical_digits(bit_width)?;
+    for value in [previous, input].into_iter().flatten() {
+        physical_digits(value.bit_width)?;
+        if value.unscaled.len() != usize::from(value.bit_width / 8) { return Err(overflow()); }
+    }
+    if previous.is_some_and(|value| value.precision != precision || value.scale != scale || value.bit_width != bit_width) { return Err(overflow()); }
+    let left = previous.map(coefficient).unwrap_or_default();
+    let right = input.map(coefficient).unwrap_or_default();
+    let input_scale = input.map_or(0, |value| value.scale);
+    let result_scale = scale.max(input_scale);
+    let maximum = maximum.max(digits(&left)).max(digits(&right)) + 1;
+    let result = align(left, i64::from(result_scale) - i64::from(scale), maximum)?
+        + align(right, i64::from(result_scale) - i64::from(input_scale), maximum)?;
+    store_coefficient(result, precision, scale, bit_width)
 }
 
 pub(crate) fn rounded(value: &DecimalValue, scale: i32, mode: RoundingMode) -> Result<DecimalValue> {
-    from_coefficient(rescale_coefficient(coefficient(value), i64::from(value.scale), scale, value.precision, mode)?, value.precision, scale, value.bit_width)
+    from_coefficient(rescale_coefficient(coefficient(value), i64::from(value.scale), scale, write_digits(value.precision, value.bit_width)?, mode)?, value.precision, scale, value.bit_width)
 }
 
 /// Formats the canonical Java BigDecimal representation, including its scale and scientific exponent.
@@ -157,7 +218,7 @@ fn factors(mut value: BigInt, factor: u8) -> i64 {
     count
 }
 
-fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, precision: u8) -> Result<BigInt> {
+fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, output_digits: usize) -> Result<BigInt> {
     if b.is_zero() { return Err(division_by_zero()); }
     let (left, right) = (a.abs(), b.abs());
     let (mut remainder, mut result_scale) = if compare_parts(&left, ls, &right, rs) == Ordering::Less {
@@ -182,7 +243,7 @@ fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, precision: u8) ->
     };
     if !remainder.is_zero() && a.sign() != b.sign() {
         let scale = result_scale.max(rs);
-        let maximum = digits(&remainder).max(digits(&b)).max(usize::from(precision)) + 1;
+        let maximum = digits(&remainder).max(digits(&b)).max(output_digits) + 1;
         remainder = align(remainder, scale - result_scale, maximum)? + align(b, scale - rs, maximum)?;
         result_scale = scale;
     }
@@ -190,12 +251,13 @@ fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, precision: u8) ->
     Ok(remainder)
 }
 
-pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue, precision: u8, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue, precision: i32, scale: i32, bit_width: u16) -> Result<DecimalValue> {
+    let output_digits = physical_digits(bit_width)?;
     let (a, b) = (coefficient(left), coefficient(right));
     let (ls, rs, target) = (i64::from(left.scale), i64::from(right.scale), i64::from(scale));
     let result = match op {
         BinaryOp::Add | BinaryOp::Subtract => {
-            let maximum = digits(&a).max(digits(&b)).max(usize::from(precision)) + 1;
+            let maximum = digits(&a).max(digits(&b)).max(output_digits) + 1;
             let (a, b) = (align(a, target - ls, maximum)?, align(b, target - rs, maximum)?);
             if op == BinaryOp::Add { a + b } else { a - b }
         }
@@ -208,7 +270,7 @@ pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue
                 let shift = target + rs - ls;
                 if shift.unsigned_abs() > i32::MAX as u64 { return Err(overflow()); }
                 let magnitude = digits(&a) as i64 - digits(&b) as i64 + shift;
-                if magnitude > i64::from(precision) { return Err(overflow()); }
+                if magnitude > i64::from(precision).min(output_digits as i64) { return Err(overflow()); }
                 if magnitude < -1 { BigInt::zero() } else {
                     let (a, b) = if shift >= 0 { (a * power(shift)?, b) } else { (a, b * power(-shift)?) };
                     let sign = if a.sign() == b.sign() { Sign::Plus } else { Sign::Minus };
@@ -217,7 +279,7 @@ pub(crate) fn arithmetic(op: BinaryOp, left: &DecimalValue, right: &DecimalValue
             }
         }
         BinaryOp::Modulo => {
-            modulo(a, ls, b, rs, target, precision)?
+            modulo(a, ls, b, rs, target, output_digits)?
         }
         _ => return Err(inapplicable("decimal arithmetic", &[])),
     };

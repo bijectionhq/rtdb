@@ -35,16 +35,18 @@ fn arrow_inspection_preserves_duplicate_columns_typed_nulls_and_file_batches() {
 }
 
 #[test]
-fn decimal_inspection_renders_real_wire_scale_without_native_annotation() {
-    for scale in [i32::MIN, i32::MAX] {
-        let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
-        let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+fn decimal_inspection_renders_real_wire_parameters_without_native_annotations() {
+    for (precision, scale) in [(3, i32::MIN), (3, i32::MAX), (i32::MIN, 0), (256, 129), (i32::MAX, i32::MAX)] {
+        let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision, scale, bit_width: 128 });
+        let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), precision, scale, 128).unwrap());
         let schema = Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]));
-        let page = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+        let page = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::copy_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
         for (kind, bytes) in [(FileKind::ArrowFile, rtdb_format::ipc::write_file(&schema, std::slice::from_ref(&page)).unwrap()), (FileKind::ArrowStream, rtdb_format::ipc::write_stream(&schema, std::slice::from_ref(&page)).unwrap())] {
             let inspected = inspect_bytes(kind, &bytes, 1 << 24).unwrap();
             assert_eq!(inspected["schema"]["fields"][0]["data_type"]["Decimal128"][1], serde_json::Value::from(scale));
+            assert_eq!(inspected["schema"]["fields"][0]["data_type"]["Decimal128"][0], serde_json::Value::from(precision));
             assert!(inspected["schema"]["fields"][0]["metadata"].get(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY).is_none());
+            assert!(inspected["schema"]["fields"][0]["metadata"].get(rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY).is_none());
             let batch = if kind == FileKind::ArrowFile { &inspected["batches"][0] } else { &inspected["batch"] };
             assert_eq!(serde_json::from_value::<Vec<Vec<Value>>>(batch.clone()).unwrap(), vec![vec![value.clone()]]);
         }

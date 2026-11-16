@@ -2,7 +2,7 @@ use crate::{arithmetic_in_timezone, compare, functions::scalar_call, null_eq, sq
 use crate::compare::nullish;
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, OwnedBatch, build_array, estimate_builder_bytes, read_value, to_field};
+use rtdb_columnar::{MemoryBudget, OwnedBatch, copy_array, estimate_builder_bytes, read_value, to_field};
 use rtdb_plan::{BinaryOp, Expr, Schema, UnaryOp};
 use rtdb_types::{Anomaly, LogicalType, Result, Timestamp, Value};
 use std::cmp::Ordering;
@@ -138,6 +138,11 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
         Expr::Subscript { expr, index, .. } => scalar_call("nth", &[eval(expr)?, eval(index)?], context),
         Expr::List(items) => Ok(Value::List(items.iter().map(eval).collect::<Result<Vec<_>>>()?)),
         Expr::Struct(fields) => Ok(Value::Struct(fields.iter().map(|(name, expr)| Ok((name.clone(), eval(expr)?))).collect::<Result<_>>()?)),
+        Expr::RowCopy(fields) => Ok(Value::Struct(fields.iter().map(|field| {
+            let value = schema.position(field.id).and_then(|index| row.get(index)).cloned()
+                .ok_or_else(|| Anomaly::fault("rtdb.expr/missing-column", format!("Input does not contain column {}", field.id.0)))?;
+            Ok((field.name.clone(), value))
+        }).collect::<Result<_>>()?)),
         Expr::In { expr, values, negated } => {
             let value = eval(expr)?;
             let mut unknown = false;
@@ -165,7 +170,28 @@ pub fn evaluate(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalConte
     }
 }
 
+/// Evaluates one vector projection, copying columns or RowCopy records and validating computed decimal outputs.
+/// Validation includes nested cells, but excludes intermediate scalar results and unselected branches.
+/// The caller reserves 4096 bytes of validation scratch and charges the returned value before retaining it.
+/// Scalar evaluation can allocate before its result is measured and charged.
+pub fn evaluate_projection(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>) -> Result<Value> {
+    let value = evaluate(expr, schema, row, context)?;
+    if !matches!(expr, Expr::Column { .. } | Expr::RowCopy(_)) { validate_projection_value(&value)?; }
+    Ok(value)
+}
+
+fn validate_projection_value(value: &Value) -> Result<()> {
+    match value {
+        Value::Decimal(value) => crate::decimal::validate_write(value),
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_for_each(validate_projection_value),
+        Value::Struct(fields) => fields.values().try_for_each(validate_projection_value),
+        Value::Map { entries, .. } => entries.iter().try_for_each(|(key, value)| { validate_projection_value(key)?; validate_projection_value(value) }),
+        _ => Ok(()),
+    }
+}
+
 /// The input batch remains borrowed; returned Arrow buffers retain their budget reservation.
+/// Bare columns retain raw coefficients; computed outputs follow ordinary decimal vector-write validation.
 pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalContext<'_>, budget: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
     if batch.num_columns() != expr.schema.len() { return Err(Anomaly::fault("rtdb.expr/input-schema", "Batch width differs from bound expression input")); }
     for (actual, expected) in batch.schema().fields().iter().zip(expr.schema.fields()) {
@@ -176,14 +202,15 @@ pub fn evaluate_batch(expr: &CompiledExpr, batch: &RecordBatch, context: &EvalCo
     let mut values = Vec::with_capacity(batch.num_rows());
     let mut scratch = Vec::new();
     for index in 0..batch.num_rows() {
+        let _decimal_validation = budget.reserve(4096)?;
         let row = batch.columns().iter().zip(batch.schema().fields()).map(|(array, field)| read_value(field, array.as_ref(), index)).collect::<Result<Vec<_>>>()?;
-        let value = expr.evaluate(&row, context)?;
+        let value = evaluate_projection(&expr.expr, &expr.schema, &row, context)?;
         scratch.push(budget.reserve(value.retained_bytes()?)?);
         values.push(value);
     }
     let logical = expr.data_type();
     let reservation = budget.reserve(estimate_builder_bytes(&logical, &values)?)?;
-    let array = build_array(&logical, &values)?;
+    let array = copy_array(&logical, &values)?;
     let schema = Arc::new(arrow_schema::Schema::new(vec![to_field("result", &logical)?]));
     let batch = RecordBatch::try_new(schema, vec![array]).map_err(|error| Anomaly::fault("rtdb.expr/output-schema", error.to_string()))?;
     OwnedBatch::with_reservation(batch, reservation)

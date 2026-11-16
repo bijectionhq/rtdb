@@ -148,8 +148,9 @@ pub(crate) struct Execution {
 impl Execution {
     pub fn evaluate(&self, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, row: &[Value]) -> Result<Value> {
         self.context.check_cancelled()?;
+        let _decimal_validation = self.context.memory.reserve(4096)?;
         let outer_rows: Vec<_> = self.outer.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
         let context = rtdb_expr::EvalContext { parameters: &self.parameters.values, current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows };
-        rtdb_expr::evaluate(expression, schema, row, &context)
+        rtdb_expr::evaluate_projection(expression, schema, row, &context)
     }
 }

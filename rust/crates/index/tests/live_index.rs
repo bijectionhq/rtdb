@@ -19,6 +19,35 @@ fn stage(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64) -> StagedW
     tx.stage().unwrap()
 }
 
+#[test]
+fn stored_event_copy_preserves_raw_decimal_and_retains_charge_after_index_release() {
+    use rtdb_index::{IndexBatch, StoredEvent};
+    use rtdb_types::{DecimalValue, Iid};
+    let memory = MemoryBudget::new(16 << 20);
+    for precision in [i32::MIN, 0, 1, 256, i32::MAX] {
+        let value = Value::Decimal(DecimalValue::new(123i128.to_be_bytes().to_vec(), precision, i32::MAX, 128).unwrap());
+        let declared = BTreeMap::from([("v".into(), value.logical_type())]);
+        let events = [StoredEvent { iid: Iid([0; 16]), system_from: Timestamp(10), valid_time: Interval::ALL,
+            operation: StoredOperation::Put(BTreeMap::from([("v".into(), value)])), recency: None }];
+        if precision < 3 { assert!(IndexBatch::from_events(&events, &declared, &memory).is_err()); }
+        let copied = IndexBatch::copy_events_with_put_schema(&events, &declared, &memory).unwrap();
+        assert_eq!(copied.put_types(), &declared);
+        assert_eq!(copied.view().read_event(0).unwrap(), events[0]);
+        let held = copied.arrow().clone();
+        drop(copied);
+        assert!(memory.used_bytes() > 0);
+        drop(held);
+        assert_eq!(memory.used_bytes(), 0);
+        assert!(IndexBatch::copy_events_with_put_schema(&events, &BTreeMap::new(), &memory).is_err());
+        let changed = BTreeMap::from([("v".into(), LogicalType::Scalar(ScalarType::Decimal { precision: precision.wrapping_add(1), scale: i32::MAX, bit_width: 128 }))]);
+        assert!(IndexBatch::copy_events_with_put_schema(&events, &changed, &memory).is_err());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    let exhausted = MemoryBudget::new(1);
+    assert!(IndexBatch::copy_events_with_put_schema(&[], &BTreeMap::new(), &exhausted).is_err());
+    assert_eq!(exhausted.used_bytes(), 0);
+}
+
 fn block(prepared: &BlockPreparation) -> BlockCatalog {
     let catalog = prepared.table_catalog().unwrap();
     let basis = prepared.value().live().latest_completed_tx();

@@ -34,7 +34,7 @@ Array buffers and release-callback metadata retain their reservations independen
 Each child release owner carries the lease, including when a consumer moves a child out of a parent array.
 Bind imports consume valid Arrow structs and copy values into native ownership before returning.
 The caller may then close its original vectors and allocator.
-Decimal C formats carry the true signed 32-bit scale for all four coefficient widths.
+Decimal C formats carry true signed 32-bit precision and scale for all four coefficient widths.
 Native carrier metadata is absent from exports and rejected on imports.
 Replacement C format strings share each schema child's retained release owner, so moving a child out of its parent preserves both its format and reservation.
 
@@ -58,7 +58,7 @@ Absent SQL arguments and a present empty row batch remain distinct.
 
 The crate and JVM adapter have not been compiled or executed.
 Test source covers released identities, duplicate unnamed arguments, copied foreign binds, retained Arrow batches after parent close, idempotent Arrow release callbacks, independent stream cancellation and concurrent shutdown.
-Decimal fixtures cover full-scale import/export, reserved-key rejection and detached schema-child lifetimes.
+Decimal fixtures cover signed-parameter import/export, reserved-key rejection and detached schema-child lifetimes.
 JVM and Clojure fixtures retain the upstream `AdbcTest` and `api-adbc-test` case identities.
 Executable ABI, allocator, parity and concurrency verification belongs to the implementation gate described in the project handoff.
 

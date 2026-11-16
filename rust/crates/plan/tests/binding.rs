@@ -84,6 +84,20 @@ fn projection_cannot_reference_a_column_outside_its_input() {
 }
 
 #[test]
+fn raw_record_packing_requires_existing_columns_and_unique_output_names() {
+    let field = Field { id: ColumnId(1), name: "x".into(), qualifier: None, qualified_only: false, data_type: LogicalType::Null };
+    let expression = Expr::RowCopy(vec![field.clone()]);
+    assert_eq!(expression.referenced_columns(), BTreeSet::from([field.id]));
+    assert_eq!(expression.validate_columns(&BTreeSet::new()).unwrap_err().code, "rtdb.plan/unbound-column");
+    assert_eq!(expression.data_type(), LogicalType::Struct(BTreeMap::from([("x".into(), LogicalType::Null)])));
+    expression.validate_columns(&BTreeSet::from([field.id])).unwrap();
+    let duplicate = Expr::RowCopy(vec![field.clone(), field.clone()]);
+    assert_eq!(duplicate.validate_columns(&BTreeSet::from([field.id])).unwrap_err().code, "rtdb.plan/duplicate-record-field");
+    let encoded = serde_json::to_vec(&expression).unwrap();
+    assert_eq!(serde_json::from_slice::<Expr>(&encoded).unwrap(), expression);
+}
+
+#[test]
 fn constant_filter_elimination_keeps_schema_and_multiplicity() {
     let unit = Arc::new(Relation::unit());
     let pass = simplify(Arc::new(unit.clone().filter(Expr::Literal(Value::Bool(true))).unwrap())).unwrap();

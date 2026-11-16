@@ -62,22 +62,24 @@ pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mu
 }
 
 fn schema_json(schema: &arrow_schema::Schema) -> Result<Value> {
-    fn patch_type(value: &mut Value, scale: i32) -> Result<()> {
+    fn patch_type(value: &mut Value, index: usize, parameter: i32) -> Result<()> {
         let object = value.as_object_mut().ok_or_else(|| invalid("Invalid Arrow datatype JSON"))?;
         for name in ["Decimal32", "Decimal64", "Decimal128", "Decimal256"] {
-            if let Some(Value::Array(parameters)) = object.get_mut(name) { parameters[1] = Value::from(scale); return Ok(()); }
+            if let Some(Value::Array(parameters)) = object.get_mut(name) { parameters[index] = Value::from(parameter); return Ok(()); }
         }
-        if let Some(Value::Array(parameters)) = object.get_mut("Dictionary") { return patch_type(&mut parameters[1], scale); }
-        Err(invalid("Decimal scale annotation requires decimal JSON storage"))
+        if let Some(Value::Array(parameters)) = object.get_mut("Dictionary") { return patch_type(&mut parameters[1], index, parameter); }
+        Err(invalid("Decimal annotation requires decimal JSON storage"))
     }
     fn patch(value: &mut Value) -> Result<()> {
         match value {
             Value::Array(values) => for value in values { patch(value)?; },
             Value::Object(object) => {
-                let scale = object.get_mut("metadata").and_then(Value::as_object_mut).and_then(|metadata| metadata.remove(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY));
-                if let Some(scale) = scale {
-                    let scale = scale.as_str().ok_or_else(|| invalid("Invalid decimal scale JSON"))?.parse::<i32>().map_err(invalid)?;
-                    patch_type(object.get_mut("data_type").ok_or_else(|| invalid("Missing decimal JSON datatype"))?, scale)?;
+                for (index, key) in [(0, rtdb_columnar::INTERNAL_DECIMAL_PRECISION_KEY), (1, rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY)] {
+                    let parameter = object.get_mut("metadata").and_then(Value::as_object_mut).and_then(|metadata| metadata.remove(key));
+                    if let Some(parameter) = parameter {
+                        let parameter = parameter.as_str().ok_or_else(|| invalid("Invalid decimal parameter JSON"))?.parse::<i32>().map_err(invalid)?;
+                        patch_type(object.get_mut("data_type").ok_or_else(|| invalid("Missing decimal JSON datatype"))?, index, parameter)?;
+                    }
                 }
                 for value in object.values_mut() { patch(value)?; }
             }

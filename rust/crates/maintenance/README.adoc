@@ -7,6 +7,8 @@ Only live inputs participate, and every recorded output shard contributes its hi
 `SegmentCompactor` is a passive capability executing one immutable `CompactionJob` on the caller's task.
 It downloads immutable input files into an owned temporary directory, merges IID/system-time ordered pages, resolves L0 same-transaction overlap, partitions historical output by recency, and writes data and metadata files.
 The final layout supports IID branches, bounded recency cells, single-entity recency pages, and optional run-end encoded historical IIDs.
+Data page copies retain signed decimal precision and scale and preserve raw coefficients under the merged field schema.
+They reject parameter relabeling and check physical coefficient width without imposing ordinary writer precision limits on stored cells.
 Data and metadata files are published through `ObjectStore::put_file` before a notification is returned.
 Repeated publication accepts only identical bytes at an existing object key.
 An upload in progress must finish before the job's temporary files are released.
@@ -38,7 +40,7 @@ An administrative awaiter receives a cycle started after its request; automatic 
 Selection follows `job_calculator.clj` and `job_calculator_test.clj`, including the nascent-output case in issue #4930.
 Merge and layout follow `SegmentMerge.kt`, `PageTrieWriter.kt`, `StreamingIidTrie.kt`, and the compactor tests.
 Collection follows `TrieGarbageCollector.kt`, `BlockGarbageCollector.kt`, and their test classes.
-The executable test sources in this crate cover selection, historical splitting, deterministic retries within the Rust writer, temporary-file cleanup, failure retention, concurrent cycle awaiters, block retention, deletion ordering, and L0 preservation.
+The executable test sources in this crate cover selection, historical splitting, raw decimal preservation in current and historical pages, deterministic retries within the Rust writer, temporary-file cleanup, failure retention, concurrent cycle awaiters, block retention, deletion ordering, and L0 preservation.
 No Rust compilation, test execution, JVM comparison, or simulation has run during Phase 1.
 
 Cross-JVM Arrow byte identity remains unverified, including schema child order, dictionary encoding, FlatBuffer allocation order, and exact page boundaries.
