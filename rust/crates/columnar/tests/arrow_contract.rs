@@ -136,6 +136,13 @@ fn decimal_vector_zero_precision_accepts_only_empty_and_null_arrays() {
 }
 
 #[test]
+fn date_millisecond_hash_truncates_to_days_before_seconds_conversion() {
+    for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
+        assert_eq!(rtdb_columnar::hash_value(&Value::DateMilli(millis), 0).unwrap(), rtdb_columnar::hash_value(&Value::DateDay(day), 0).unwrap());
+    }
+}
+
+#[test]
 fn timestamps_and_durations_preserve_unit_and_zone() {
     for unit in [TimeUnit::Second, TimeUnit::Millisecond, TimeUnit::Microsecond, TimeUnit::Nanosecond] {
         for timezone in [None, Some("UTC".to_owned()), Some("Europe/London".to_owned())] {

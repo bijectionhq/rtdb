@@ -171,7 +171,7 @@ fn numeric_value(value: &Value) -> Result<f64> {
         Value::U8(value) => f64::from(*value as i8), Value::U16(value) => f64::from(*value as i16), Value::U32(value) => f64::from(*value as i32), Value::U64(value) => (*value as i64) as f64,
         Value::F32(value) => f64::from(*value), Value::F64(value) => *value,
         Value::DateDay(value) => i64::from(*value).wrapping_mul(86_400) as f64,
-        Value::DateMilli(value) => value.wrapping_mul(86_400) as f64,
+        Value::DateMilli(value) => (value / 86_400_000).wrapping_mul(86_400) as f64,
         Value::Time { value, unit, .. } | Value::Timestamp { value, unit, .. } | Value::Duration { value, unit } => *value as f64 / unit.units_per_second() as f64,
         Value::Decimal(value) => {
             let bytes = value.unscaled.as_slice();
@@ -190,3 +190,14 @@ fn numeric_value(value: &Value) -> Result<f64> {
 
 fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(|| invalid("Metadata array and field disagree")) }
 fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.format/invalid-column-metadata", error.to_string()) }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn date_millisecond_statistics_truncate_partial_days_before_seconds_conversion() {
+        for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
+            assert_eq!(numeric_value(&Value::DateMilli(millis)).unwrap(), numeric_value(&Value::DateDay(day)).unwrap());
+        }
+    }
+}
