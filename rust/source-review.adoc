@@ -242,3 +242,12 @@ The pinned reference worktree remained clean.
 Git whitespace checks ran over the changes.
 An independent whole-wave comment/spec review found allocation-contract and lifecycle wording issues; the source owners corrected them, and implementation-status prose moved out of the policy questions.
 No Rust compiler, formatter, build script, test runner, server, benchmark, Gradle task, or executable test-discovery command ran.
+
+== Filesystem observer source checkpoint
+
+The Linux filesystem observer measures successful backing payload syscalls through one mounted FUSE boundary shared by both packaged engines.
+Configuration and workload proofs bind retained YAML, the exact explicit environment and production-parsed SQL to actual container mount routing.
+Normal shutdown requires verified removal of node containers, followed by unmount and join; unresolved mounts retain failed cleanup evidence and their backing namespace.
+Independent source review covered append/mmap offsets, mode inheritance, bounded ownership, canonical paths, environment/workload binding and offline evidence checks.
+Regression sources include mounted filesystem behavior, failed cleanup and falsified receipts.
+No mount, executable, compiler or test ran; Linux provisioning and all runtime qualification remain pending.

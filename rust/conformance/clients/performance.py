@@ -43,6 +43,17 @@ def rows(values):
     return [[cell(value) for value in row] for row in values]
 
 
+def sequenced_begin(sequence, iteration):
+    """Return the actual SQL BEGIN for one zero-based explicit system-time sequence iteration."""
+    instant = datetime.datetime.fromisoformat(sequence["start"].replace("Z", "+00:00")) + datetime.timedelta(microseconds=iteration * sequence["step_microseconds"])
+    return "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '" + instant.isoformat() + "')"
+
+
+def await_token_sql(token):
+    """Quote one server-returned await token as a SQL string literal."""
+    return "SET AWAIT_TOKEN = '" + token.replace("'", "''") + "'"
+
+
 def adoption_catalog(value, operation):
     names = [field["name"] for field in value["schema"]]
     if names != ["trie_key", "max_system_from"]:
@@ -219,7 +230,7 @@ class Execution:
         with self.lock:
             self.clients.add(replica)
         try:
-            replica.execute("SET AWAIT_TOKEN = '" + token["value"].replace("'", "''") + "'")
+            replica.execute(await_token_sql(token["value"]))
             result = replica.query(operation["verification_sql"])
             if result["rows"] != operation["expected_rows"]:
                 raise ValueError("second node did not observe the acknowledged write")
@@ -245,9 +256,7 @@ class Execution:
                     self.cancelled()
                     operation = dict(operation)
                     if operation.get("system_time_sequence"):
-                        sequence = operation["system_time_sequence"]
-                        instant = datetime.datetime.fromisoformat(sequence["start"].replace("Z", "+00:00")) + datetime.timedelta(microseconds=iteration * sequence["step_microseconds"])
-                        operation["begin_sql"] = "BEGIN READ WRITE WITH (SYSTEM_TIME = TIMESTAMP '" + instant.isoformat() + "')"
+                        operation["begin_sql"] = sequenced_begin(operation["system_time_sequence"], iteration)
                     started = time.perf_counter_ns()
                     value = self.operation(client, operation)
                     completed = time.perf_counter_ns()

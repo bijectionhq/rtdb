@@ -6,6 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "release"))
 from evidence import canonical, digest_value, index, integer, number, text
 from performance_plan import operation_trace_digest, validate_plan
 from clients.performance import adoption_catalog
+from filesystem_observer import FILESYSTEM_BOUNDARY, verify_evidence, verify_interval, workload_request
 
 
 PROVIDER_BOUNDARY = "successful_object_http_payload_and_requests"
@@ -96,7 +97,7 @@ def inspect_case(case, receipt, resources):
             if value.get("peak_boundary") != "engine_process_lifetime_through_sample":
                 errors.append("unknown process peak measurement boundary")
         measurement = round_.get("provider")
-        if not isinstance(measurement, dict) or measurement.get("boundary") != PROVIDER_BOUNDARY:
+        if not isinstance(measurement, dict) or measurement.get("boundary") not in {PROVIDER_BOUNDARY, FILESYSTEM_BOUNDARY}:
             errors.append("missing comparable successful provider measurement")
         else:
             digest_value(measurement.get("observer_artifact_sha256"), "provider observer artifact")
@@ -106,6 +107,12 @@ def inspect_case(case, receipt, resources):
             for name in ("successful_read_bytes", "successful_read_requests", "successful_write_bytes", "successful_write_requests"):
                 integer(measurement.get(name), name)
             storage.append(measurement)
+            if measurement["boundary"] == FILESYSTEM_BOUNDARY:
+                digest_value(measurement.get("measurement_configuration_sha256"), "filesystem observer limits")
+                integer(measurement.get("successful_metadata_requests"), "filesystem metadata requests")
+                evidence = receipt.get("filesystem_observer")
+                if not isinstance(evidence, dict):
+                    errors.append("filesystem provider lacks routing and joined lifetime evidence")
     expected = {(worker, iteration, operation["id"]) for worker, operations in enumerate(case["workers"])
                 for iteration in range(case["samples"]) for operation in operations}
     if set(observed) != expected:
@@ -199,6 +206,25 @@ def compare(plan, runs):
         for engine, repetition in sorted(expected):
             receipt = next(value for value in identities[engine, repetition]["cases"] if value["case"] == case["id"])
             failures, samples, statistics = inspect_case(case, receipt, plan["resources"])
+            selection = plan["engines"][engine].get("provider_measurement")
+            if selection and selection["kind"] == "owned_filesystem_observer":
+                evidence = receipt.get("filesystem_observer")
+                if not isinstance(evidence, dict):
+                    errors.append(f"{engine}/{repetition}: missing filesystem observer evidence")
+                else:
+                    verify_evidence(evidence, selection, plan["engines"][engine]["nodes"], workload_request(case, plan["engines"][engine]["nodes"]))
+                    for round_ in receipt["rounds"]:
+                        verify_interval(round_, evidence)
+                    configs = {node["name"]:node["configuration"]["sha256"] for node in plan["engines"][engine]["nodes"]}
+                    if {value.get("node"):value.get("configuration_sha256") for value in evidence["configurations"]} != configs:
+                        errors.append("filesystem configuration evidence differs from selected server configurations")
+                    for provider in statistics["provider"]:
+                        if provider["boundary"] != FILESYSTEM_BOUNDARY or provider["observer_artifact_sha256"] != selection["observer_artifact"]["sha256"] or provider["measurement_configuration_sha256"] != evidence["ready"]["measurement_configuration_sha256"]:
+                            errors.append("filesystem interval counters differ from selected mounted observer")
+            for provider in statistics["provider"]:
+                expected_boundary = FILESYSTEM_BOUNDARY if selection and selection["kind"] == "owned_filesystem_observer" else PROVIDER_BOUNDARY
+                if not selection or provider["boundary"] != expected_boundary or provider["observer_artifact_sha256"] != selection["observer_artifact"]["sha256"]:
+                    errors.append("provider measurement differs from selected observation capability")
             actual_prefix = inspect_checkpoint(case, receipt)
             if prefix is None:
                 prefix = actual_prefix
@@ -211,7 +237,7 @@ def compare(plan, runs):
             elif canonical(logical) != canonical(baseline):
                 errors.append(f"{engine}/{repetition}: semantic or schema divergence")
             for provider in statistics["provider"]:
-                identity = {key: provider.get(key) for key in ("boundary", "observer_artifact_sha256", "storage_placement")}
+                identity = {key: provider.get(key) for key in ("boundary", "observer_artifact_sha256", "storage_placement", "measurement_configuration_sha256", "physical_placement")}
                 if provider_identity is None:
                     provider_identity = identity
                 elif identity != provider_identity:

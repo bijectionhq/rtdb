@@ -13,11 +13,12 @@ from run_clients import Commands, image_record, materialize_clients, validate_pa
 from performance_plan import operation_trace_digest, validate_plan
 from performance_results import PROVIDER_BOUNDARY, compare
 from packaged_lifecycle import validate_stopped
+from filesystem_observer import FILESYSTEM_BOUNDARY, FilesystemObserver, nonoverlapping_target, verify_evidence
 sys.path.insert(0, str(HERE.parent / "release"))
 from evidence import artifact, read_json, retained
 
 
-def compose_plan(plan, selected, package, client_image, directory, adapters, project, root):
+def compose_plan(plan, selected, package, client_image, directory, adapters, project, root, filesystem_mount=None):
     services = {}
     volumes = {}
     endpoints = {}
@@ -34,6 +35,10 @@ def compose_plan(plan, selected, package, client_image, directory, adapters, pro
                   {"type": "volume", "source": volume, "target": node["data_path"]}]
         for credential in node.get("credential_files", []):
             mounts.append({"type": "bind", "source": str(artifact(root, credential)), "target": credential["target"], "read_only": True})
+        if filesystem_mount is not None:
+            for mount in mounts:
+                nonoverlapping_target(mount["target"])
+            mounts.append({"type": "bind", "source": str(filesystem_mount), "target": "/measured-objects"})
         environment = {"TZ": "UTC", "RTDB_RUN_ID": project, **node.get("environment", {})}
         if environment["RTDB_RUN_ID"] != project:
             raise ValueError("benchmark namespace cannot override its invocation identity")
@@ -111,9 +116,13 @@ def resources(commands, client_image, adapters, identifier, project):
     return read_json(output)
 
 
-def provider_sample(commands, compose, measurement, project):
+def provider_sample(commands, compose, measurement, project, filesystem=None):
     if measurement is None:
         return None
+    if measurement["kind"] == "owned_filesystem_observer":
+        if filesystem is None:
+            raise ValueError("filesystem measurement has no owning mounted observer")
+        return filesystem.sample()
     url = (f"http://object-observer:{measurement['configuration']['port']}/__rtdb_observer__" if measurement.get("kind") == "owned_http_observer"
            else measurement["url"].replace("{namespace}", project))
     if not url.startswith(("http://", "https://")) or "@" in url:
@@ -138,7 +147,10 @@ def provider_delta(before, after, plan):
         return None
     if before.get("storage_placement") != plan["resources"]["storage_placement"] or after.get("storage_placement") != before["storage_placement"]:
         raise ValueError("provider observer placement differs from matched resource contract")
-    result = {"boundary": PROVIDER_BOUNDARY, "observer_artifact_sha256": before["observer_artifact_sha256"], "storage_placement": before["storage_placement"]}
+    identity_fields = ("boundary", "observer_artifact_sha256", "storage_placement", "measurement_configuration_sha256", "physical_placement")
+    if any(before.get(key) != after.get(key) for key in identity_fields) or before["boundary"] not in {PROVIDER_BOUNDARY, FILESYSTEM_BOUNDARY}:
+        raise ValueError("provider identity changed across measurement")
+    result = {key: before.get(key) for key in identity_fields}
     for field in ("successful_read_bytes", "successful_read_requests", "successful_write_bytes", "successful_write_requests",
                   "failed_requests", "failed_request_bytes", "failed_response_bytes"):
         if type(before.get(field)) is not int or type(after.get(field)) is not int or not 0 <= before[field] <= after[field]:
@@ -147,6 +159,13 @@ def provider_delta(before, after, plan):
     for field in ("rejected_requests", "rejected_connections"):
         if type(before.get(field)) is not int or type(after.get(field)) is not int or not 0 <= before[field] <= after[field]:
             raise ValueError("provider rejection counter regressed or is missing")
+        result[field] = after[field] - before[field]
+    if before["boundary"] == FILESYSTEM_BOUNDARY:
+        if before.get("overflowed") is not False or after.get("overflowed") is not False:
+            raise ValueError("filesystem payload counters overflowed")
+        field = "successful_metadata_requests"
+        if type(before.get(field)) is not int or type(after.get(field)) is not int or not 0 <= before[field] <= after[field]:
+            raise ValueError("filesystem metadata counter regressed")
         result[field] = after[field] - before[field]
     return result
 
@@ -167,21 +186,32 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
     directory.mkdir()
     project = "rtdb-perf-" + uuid.uuid4().hex[:20]
     selected = plan["engines"][engine]
-    manifest, endpoints = compose_plan(plan, selected, package, client_image, directory, adapters, project, args.plan.parent)
+    measurement = selected.get("provider_measurement")
+    filesystem = None
+    if measurement and measurement["kind"] == "owned_filesystem_observer":
+        filesystem = FilesystemObserver(measurement, artifact(args.plan.parent, measurement["observer_artifact"]), directory / "filesystem-observer",
+                                        project, plan["resources"]["storage_placement"], git(REPOSITORY, "rev-parse", "HEAD"), plan["resources"]["architecture"], selected["nodes"], case)
+    manifest, endpoints = compose_plan(plan, selected, package, client_image, directory, adapters, project, args.plan.parent,
+                                      filesystem.mount if filesystem else None)
     write_json(directory / "compose.json", manifest)
     compose = ["docker", "compose", "--project-name", project, "--file", str(directory / "compose.json")]
     commands = Commands(directory / "commands", args.timeout)
     names = [node["name"] for node in selected["nodes"]]
     owners = names + (["object-observer"] if "object-observer" in manifest["services"] else [])
     sequence, rounds, primary, cleanup = 0, [], None, []
+    node_containers_removed = False
     recovery_ns = None
     with owned_cancellation() as owner:
         try:
+            if filesystem:
+                filesystem.start(commands, args.plan.parent, artifact)
             commands.run("start-server-owners", compose + ["up", "--detach", "--no-build", *owners])
             for name in names:
                 sequence += 1
                 call_client(commands, compose, directory, {**case, "node": name}, endpoints, "ready", sequence)
-                inspect_server(commands, compose, name, package, plan["resources"], directory, sequence)
+                identifier = inspect_server(commands, compose, name, package, plan["resources"], directory, sequence)
+                if filesystem:
+                    filesystem.route(commands, client_image, adapters, identifier, name, project)
             sequence += 1
             setup = call_client(commands, compose, directory, case, endpoints, "setup", sequence)
             write_json(directory / "setup.json", setup)
@@ -205,18 +235,21 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
                         call_client(commands, compose, directory, case, endpoints, "checks", sequence)
                         recovery_ns = time.perf_counter_ns() - started
                 ids = [inspect_server(commands, compose, name, package, plan["resources"], directory, sequence + index) for index, name in enumerate(names)]
+                if filesystem:
+                    for name, identifier in zip(names, ids):
+                        filesystem.route(commands, client_image, adapters, identifier, name, project)
                 measurement = selected.get("provider_measurement")
-                before = provider_sample(commands, compose, measurement, project)
+                before = provider_sample(commands, compose, measurement, project, filesystem)
                 sequence += 1
                 measured = {**case, "samples": 1} if case["cache_mode"] == "process_cold" else case
                 client = call_client(commands, compose, directory, measured, endpoints, "measure", sequence)
-                after = provider_sample(commands, compose, measurement, project)
+                after = provider_sample(commands, compose, measurement, project, filesystem)
                 rounds.append({"client": client, "processes": [resources(commands, client_image, adapters, identifier, project) for identifier in ids],
-                               "provider": provider_delta(before, after, plan)})
+                               "provider": provider_delta(before, after, plan), "provider_snapshots": {"before": before, "after": after}})
             sequence += 1
             checks = call_client(commands, compose, directory, case, endpoints, "checks", sequence)
             write_json(directory / "checks.json", checks)
-            provider_final = provider_sample(commands, compose, selected.get("provider_measurement"), project)
+            provider_final = provider_sample(commands, compose, selected.get("provider_measurement"), project, filesystem)
             if provider_final is not None and provider_final["successful_read_requests"] + provider_final["successful_write_requests"] == 0:
                 raise ValueError("selected workload never exercised its claimed measured provider path")
             write_json(directory / "provider-final.json", provider_final)
@@ -241,7 +274,22 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
                 try:
                     _, output = commands.run("drain-" + resource, command + ["--filter", "label=com.docker.compose.project=" + project], timeout=30)
                     if output.read_text().strip():
+                        if filesystem and resource == "containers":
+                            identifiers = output.read_text().split()
+                            if all(re.fullmatch(r"[0-9a-f]{12,64}", identifier) for identifier in identifiers):
+                                commands.run("force-remove-node-mounts", ["docker", "rm", "--force", *identifiers], timeout=180)
+                                _, remaining = commands.run("verify-removed-node-mounts", command + ["--filter", "label=com.docker.compose.project=" + project], timeout=30)
+                                if remaining.read_text().strip():
+                                    raise ValueError("node containers still own filesystem bind mounts")
+                                node_containers_removed = True
                         raise ValueError("benchmark project retained " + resource)
+                    if resource == "containers":
+                        node_containers_removed = True
+                except BaseException as error:
+                    cleanup.append(error)
+            if filesystem:
+                try:
+                    filesystem_evidence = filesystem.close(commands, node_containers_removed)
                 except BaseException as error:
                     cleanup.append(error)
             write_json(directory / "lifecycle.json", {"project": project, "drained": not cleanup, "primary_error": str(primary) if primary else None, "cleanup_errors": list(map(str, cleanup))})
@@ -251,6 +299,9 @@ def run_case(args, plan, engine, package, client_image, adapters, case, director
                "execution_complete": True, "drained": True, "rounds": rounds, "recovery_ns": recovery_ns, "checkpoint": checkpoint,
                "setup_sha256": digest(directory / "setup.json"), "checks_sha256": digest(directory / "checks.json"),
                "lifecycle_sha256": digest(directory / "lifecycle.json")}
+    if filesystem:
+        verify_evidence(filesystem_evidence, measurement, selected["nodes"], filesystem.workload_request, project)
+        receipt["filesystem_observer"] = filesystem_evidence
     write_json(directory / "receipt.json", receipt)
     return receipt
 
@@ -280,7 +331,7 @@ def run(args):
         if host != plan["resources"]["architecture"]:
             raise ValueError("matched performance requires a native worker architecture, without CPU emulation")
         inputs = [args.plan, fixture_path, Path(__file__), HERE / "performance_plan.py", HERE / "performance_results.py", HERE / "run_clients.py", HERE / "run_controls.py",
-                  HERE / "client_results.py", HERE / "packaged_lifecycle.py", HERE.parent / "release/evidence.py"]
+                  HERE / "client_results.py", HERE / "packaged_lifecycle.py", HERE / "filesystem_observer.py", HERE.parent / "release/evidence.py"]
         packages = {}
         for engine, selected in plan["engines"].items():
             path = artifact(args.plan.parent, selected["package"])
@@ -313,7 +364,7 @@ def run(args):
         write_json(args.output / "client-image.json", client)
         adapters = args.output / "adapters"
         adapters.mkdir()
-        for filename in ("performance.py", "resources.py", "provider_observer.py"):
+        for filename in ("performance.py", "resources.py", "provider_observer.py", "filesystem_route.py"):
             source = HERE / "clients" / filename
             (adapters / filename).write_bytes(source.read_bytes())
             inputs.append(source)

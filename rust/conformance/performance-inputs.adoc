@@ -51,7 +51,7 @@ Package metadata and every relative source/binary/image artifact must be retaine
 |`client_password` |optional Artifact |Password file; trailing newlines are removed, and the retained plan stores only its path/digest.
 |===
 
-The supported owned `Provider` object has `kind: "owned_http_observer"`, `observer_artifact` (Artifact matching committed `clients/provider_observer.py`), `configuration` (below), and optional `ca_file` (Artifact with trusted PEM certificates).
+The HTTP `Provider` object has `kind: "owned_http_observer"`, `observer_artifact` (Artifact matching committed `clients/provider_observer.py`), `configuration` (below), and optional `ca_file` (Artifact with trusted PEM certificates).
 Both actual server backend endpoints must route through `http://object-observer:PORT` using their original request/signing semantics.
 An observer with no successful workload requests cannot qualify the case.
 
@@ -77,7 +77,57 @@ An explicitly configured listing route also permits a query-free `HEAD` for prov
 Listing queries accept at most 128 fields and exactly one value for the configured prefix parameter.
 Counters use `successful_object_http_payload_and_requests`, with successful read/write request and byte totals, failure totals, rejection totals and `in_flight_requests`.
 Both measurement boundaries require zero admitted in-flight requests.
-Local filesystem provider measurement remains unimplemented and cannot be replaced by process I/O counters.
+For local-only workloads, Provider may instead select `owned_filesystem_observer` below.
+Process I/O counters never substitute for either provider boundary.
+
+=== Filesystem Provider version 1
+
+Both Engine selections must contain the identical Filesystem Provider object, and `package_capabilities` must be `["local"]`.
+The worker requires Linux, a local Docker daemon, `/dev/fuse`, mount and `allow_other` permission, and an exclusive backing parent on the selected device.
+The observer also needs permission to apply the container's UID/GID to created backing objects.
+Unavailable privileges or devices are explicit execution prerequisites; the runner does not substitute another measurement.
+
+[source,json]
+----
+{
+  "kind": "owned_filesystem_observer",
+  "observer_artifact": {"path": "artifacts/rtdb-filesystem-observer", "sha256": "<64 lowercase hex digits>"},
+  "backing_parent": "/benchmark-object-storage",
+  "configuration": {"max_inodes": 100000, "max_handles": 8192, "max_io_bytes": 1048576}
+}
+----
+
+The executable must be a clean build of the selected native revision for the actual Linux worker architecture, without optional backend features.
+The runner retains the binary and checks its executable hash, embedded revision and clean-state marker.
+`backing_parent` is an existing canonical absolute host directory; each invocation creates and removes its own empty child namespace.
+Limits accept `max_inodes` from 16 through 1,000,000, `max_handles` from 16 through 65,536, and `max_io_bytes` from 4096 through 1,048,576.
+Unknown or missing fields are rejected.
+
+Every ordinary node YAML must configure `storage: !Local {path: /measured-objects}` or a descendant and a local log beneath its separate `data_path` volume.
+Other runtime/credential binds must be disjoint from `/measured-objects`.
+The production bounded decoder emits hash-bound storage/log path proof using the explicit container environment.
+Live and offline verification compare `environment_sha256` with sorted compact UTF-8 JSON for `{TZ: "UTC", RTDB_RUN_ID: namespace, ...node.environment}`.
+Default in-memory storage/logs, remote storage, external sources, disk caches, ingest/playground configurations and runtime database attachment are outside this local-only selection.
+Before mounting, the observer's bounded production SQL parser validates an ordered selection of every executable fixture SQL field, all generated system-time BEGIN statements and fixed client controls.
+It permits reads/table mutations, BEGIN and fixed controls, while rejecting ATTACH/DETACH, management, role grants, named execution, arbitrary SET and multiple statements.
+The proof binds exact request/source/wire-SQL digests and both false policy flags; offline verification reconstructs the selection from the actual case.
+Psycopg positional placeholder conversion is recorded separately from source text; named mappings are ineligible in this measurement selection.
+Endpoint and flush database selections must remain `xtdb`.
+
+The host FUSE mount is ready before Docker creates node binds, so shared-mount propagation is unnecessary.
+Each actual server namespace must report the same FUSE device/source rooted at `/measured-objects`, with no nested mount hiding object paths.
+`successful_backing_filesystem_payload_and_requests` counts successful backing `pread`/`pwrite` bytes and calls, including reads caused by mmap faults.
+Metadata requests are separate; kernel page-cache hits cause no backing payload operation.
+The observer never enables kernel passthrough or substitutes process I/O counters.
+Common FUSE overhead qualifies this instrumented boundary rather than physical device transfers or uninstrumented local-storage performance.
+
+Raw cumulative snapshots before and after each round must have zero dispatched instrumented callbacks.
+This is not a flush of dirty mappings or a kernel request queue drain; later backing calls belong to a later interval.
+The verifier recomputes deltas and binds them to the joined observer lifetime, executable/settings hashes, host boot ID and backing device.
+At least one successful payload operation must occur over the workload lifetime.
+The owner removes node containers before unmounting and joining the observer; forced termination remains failed evidence.
+If container removal cannot be verified, it kills and waits only the owned observer group, retains unresolved mounts/backing data, and fails the case without attempting normal unmount or namespace deletion.
+Readiness, decoded configuration proofs, routes, final counters and shutdown errors remain in `filesystem-observer/evidence.json` and the case receipt.
 
 == Cases
 

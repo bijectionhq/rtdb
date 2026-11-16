@@ -16,6 +16,23 @@ pub enum StatementKind { Query, Dml, Session }
 
 impl ParsedStatement {
     pub fn parameter_count(&self) -> usize { self.parameter_count }
+    /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
+    /// This is a syntax classification, not authorization, binding, or proof that referenced tables exist.
+    /// Session controls require their separate typed control parser.
+    pub fn is_local_workload_statement(&self) -> bool {
+        fn standard(statement: &ast::Statement) -> bool {
+            match statement {
+                ast::Statement::Query(_) | ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_) => true,
+                ast::Statement::Explain { statement, .. } => standard(statement),
+                _ => false,
+            }
+        }
+        match &self.statement {
+            Syntax::Standard(statement) => standard(statement),
+            Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Records { .. } | Syntax::CreateTable { .. } => true,
+            _ => false,
+        }
+    }
     pub fn kind(&self) -> StatementKind {
         match &self.statement {
             Syntax::Standard(ast::Statement::Query(_)) => StatementKind::Query,

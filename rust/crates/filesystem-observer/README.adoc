@@ -1,0 +1,123 @@
+= Local filesystem provider observation
+
+`rtdb-filesystem-observer` mounts an isolated Linux FUSE filesystem over an empty backing directory and exposes cumulative counters on a loopback listener.
+Both packaged engines use this same measurement artifact.
+
+== Boundary and ownership
+
+`successful_backing_filesystem_payload_and_requests` counts bytes returned by successful backing `pread` calls and accepted by successful backing `pwrite` calls, and counts those calls.
+Zero-byte EOF reads count as successful requests.
+Partial syscall successes remain counted if a later syscall makes the enclosing FUSE request fail.
+Successful metadata requests and failures in instrumented callbacks have separate counters.
+`failed_requests` excludes inherited unsupported FUSE operations and the intentional `copy_file_range` fallback.
+`failed_request_bytes`, `failed_response_bytes` and `rejected_connections` are schema-compatible zero fields on this boundary, not a census of failed traffic.
+Hardlink, rename, attributes, directory enumeration, truncation, allocation and fsync contribute no payload bytes.
+This boundary does not claim physical device transfers, filesystem-cache misses, application logical bytes or process I/O.
+
+Normal kernel page caching remains enabled.
+Mmap page faults reaching FUSE use the counted read handler; kernel cache hits produce no backing read.
+Passthrough, writeback caching and FUSE direct-I/O reply flags are not enabled; client `O_DIRECT` opens are explicitly rejected.
+`copy_file_range` returns `ENOSYS` to select the kernel's ordinary read/write fallback.
+Process-cold and warm labels remain explicit; process restart does not imply cold kernel or backing-filesystem caches.
+Serial FUSE dispatch and copies add measurement overhead common to both engines.
+Results qualify this instrumented boundary, not uninstrumented local-disk performance.
+
+The passive filesystem belongs to one FUSE event thread.
+Its bounded inode table retains `O_PATH` descriptors and its bounded handle table retains opened files/directories.
+Hardlinks share inode identity; rename and unlink preserve existing handles and mappings.
+Directory enumeration uses a fixed 16 KiB buffer and backing directory cookies.
+Regular files and directories are supported; symlink creation, special files and backing-device crossings are unsupported.
+The backing directory must remain exclusive to this observer.
+The observer requires permission to apply the requesting container UID/GID to created backing files and directories, typically a root-owned worker or the corresponding ownership capabilities.
+Client-requested mode is restored independently of the daemon umask, preserving parent directory setgid inheritance.
+Backing descriptions omit `O_APPEND`: the client kernel supplies append positions, while mmap writes retain their explicit page offsets.
+
+Payload buffers are bounded by `max_io_bytes`.
+Fuser 0.16.0 separately owns one fixed 16 MiB plus 4096-byte kernel request buffer.
+Inode/handle limits count retained descriptors; rejection increments `rejected_requests` and fails qualification.
+Counter overflow latches `overflowed` and fails qualification.
+Kernel and backing-filesystem caches are outside the observer's allocation bounds.
+
+The active driver owns the event thread and listener.
+Shutdown closes the listener, attempts normal unmount, invokes fuser's unmount fallback, and joins the thread before writing the final receipt.
+A failed normal unmount remains a failure even if fallback detaches the mount.
+An uninterruptible backing syscall can delay join; forced termination never qualifies as a clean drain.
+The harness removes node containers before requesting observer shutdown and retains cleanup failures.
+If Docker cannot prove container removal, the emergency path kills and waits only the owned observer process group, retaining the unresolved mount and backing directory.
+That path never invokes normal unmount, deletes the namespace, or claims successful join.
+
+== Commands
+
+Build the separate observer artifact from the same clean native source revision as the server, for the actual Linux worker target, without optional backend features.
+The server dependency uses default-features=false and supplies the existing production bounded configuration decoder; no runtime service is opened by the decoder command.
+`observer_features: []` describes this crate's empty optional-feature set, not Cargo's unified dependency feature set.
+`identity` returns embedded revision, dirty-state, target, fuser version/ABI and the running executable's SHA-256.
+The harness retains a copy and checks this identity before mounting.
+These commands have not been executed during Phase 1.
+
+[source,shell]
+----
+cargo build --manifest-path rust/Cargo.toml --release -p rtdb-filesystem-observer
+rust/target/release/rtdb-filesystem-observer identity
+rust/target/release/rtdb-filesystem-observer validate-config validation.json
+rust/target/release/rtdb-filesystem-observer validate-workload workload.json
+rust/target/release/rtdb-filesystem-observer run observer.json
+----
+
+`validate-config` accepts `configuration` (YAML path) and `environment` (the explicit container string map).
+The request is bounded to 2 MiB, YAML to 1 MiB, and expansion/decoding to a 256 MiB allocation budget.
+Ordinary local-only nodes must place storage beneath `/measured-objects` and absolute local logs outside it.
+Remote aliases, external sources, disk caches, ingest/playground modes and default in-memory databases are rejected.
+The returned proof records configuration/environment hashes and decoded paths; actual routing is verified from the running container separately.
+The environment digest hashes sorted compact UTF-8 JSON, including the exact owner-supplied `TZ` and `RTDB_RUN_ID` plus explicit node overrides.
+The harness checks that digest against the selected node environment both live and offline.
+
+`validate-workload` enforces the fixture's local storage policy through the production SQL/control parsers.
+Its request is `{"schema_version":1,"statements":[{"location":"workers/0/0/sql","kind":"read","sql":"SELECT 1","psycopg_parameters":false}]}`.
+`location` is a unique source identity of at most 1024 bytes; `kind` is `read`, `mutation`, `transaction_statement`, `begin` or `generated`.
+The input is limited to 16 MiB, 10,000 SQL sources and 64 KiB per source, with parser scratch reserved before parsing.
+Exactly one statement must classify as a read/table mutation, BEGIN, or the permitted fixed client control for its declared role.
+Database management, role grants, named PREPARE/EXECUTE, arbitrary SET, and multiple statements are rejected.
+The proof retains ordered source and wire-SQL hashes and the exact request hash.
+
+The collector includes query, batch, transaction, custom BEGIN, verification, flush-barrier and overlap SQL, plus every derived system-time BEGIN and fixed client control.
+Endpoint and flush database selections must name the configured primary `xtdb` database.
+Actual execution and collection share the system-time BEGIN and literal-escaped await-token constructors.
+For psycopg parameter binding, the proof reproduces the positional `%s`/`%b`/`%t` and `%%` conversion used by https://github.com/psycopg/psycopg/blob/3.3.6/psycopg/psycopg/_queries.py[psycopg 3.3.6], before parsing server SQL.
+It retains the original SQL hash separately and rejects named parameter mappings in this measurement selection.
+Flight SQL source text is unchanged.
+This is an eligibility check, not a catalog binding or execution result.
+
+The `run` JSON object contains exactly these fields:
+
+[cols="1,2"]
+|===
+|Field |Contract
+|`namespace` |One to 128 ASCII letters, digits or hyphens; FUSE source identity.
+|`storage_placement` |Nonempty placement label, at most 1024 bytes.
+|`backing`, `mount` |Canonical, absolute, empty, disjoint owned directories.
+|`ready`, `final_receipt` |New receipt paths outside object directories.
+|`expected_binary_sha256` |Lowercase SHA-256 of the selected executable.
+|`max_inodes` |16 through 1,000,000.
+|`max_handles` |16 through 65,536.
+|`max_io_bytes` |4096 through 1,048,576.
+|===
+
+The listener binds `127.0.0.1` on an ephemeral port reported in readiness.
+`GET /__rtdb_observer__` returns a cumulative snapshot; `POST /__rtdb_stop__` requests shutdown.
+Control headers are limited to 4096 bytes and three seconds total, with a two-second response write timeout.
+Readiness records host mountinfo, mount device, backing parent/device, host boot ID, artifact identity and settings digest.
+The settings digest hashes UTF-8 `v1:<max_inodes>:<max_handles>:<max_io_bytes>:normal_page_cache:no_passthrough`.
+Final receipts add `unmounted`, `joined` and `errors` after joining.
+`in_flight_requests == 0` means no instrumented callback is currently dispatched.
+It does not flush dirty mmap pages or drain kernel queues; payload calls dispatched after a measurement interval belong to a later interval.
+The final joined receipt proves the stronger observer lifetime boundary.
+
+== Validation sources
+
+Configuration tests cover neighboring roots, lexical escape, unresolved environment values and log/cache overlap.
+Mounted sources exercise mmap, hardlinks, replacement rename, unlink while open, fsync, directory cookies, repeated handle release, differing daemon/client umasks, setgid inheritance, append-open writable mappings and cancellation during a partial HTTP header.
+They are explicitly ignored until a Linux worker with `/dev/fuse`, mount privileges and `allow_other` permission is provisioned; the differing-umask case also requires `unshare(CLONE_FS)`.
+Phase 2 must select those ignored tests explicitly and retain results; ignored results are no evidence of mounted behavior.
+Python evidence tests reject wrong devices, submounts, absent activity, forced termination, changed settings, fabricated deltas and incomplete joins.
+All validation remains source-only until the global completeness gate authorizes execution.
