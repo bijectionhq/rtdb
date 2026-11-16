@@ -21,24 +21,39 @@ impl UnionOptions {
         super::member_name(schema)
     }
 }
-struct Decoration { raw: Json, default: Option<Json>, doc: Option<String>, root: bool }
+struct Decoration { raw: Json, default: Option<Json>, default_source: Option<(String, String)>, doc: Option<String>, root: bool }
 struct Builder<'a> {
     graph: GraphBuilder, names: BTreeMap<String, NodeId>, decorations: BTreeMap<NodeId, Decoration>,
     definitions: &'a BTreeMap<String, Schema>, metadata: &'a metadata::Metadata, unions: UnionOptions, next_union: &'a mut i32,
 }
-pub(super) fn build(schema: &Schema, definitions: &BTreeMap<String, Schema>, metadata: &metadata::Metadata, unions: UnionOptions, next_union: &mut i32) -> Result<Arc<ConnectSchema>> {
+pub(super) fn build_at(schema: &Schema, raw: &Json, definitions: &BTreeMap<String, Schema>, metadata: &metadata::Metadata, defaults: &super::default_json::Defaults, unions: UnionOptions, version: Option<i32>, next_union: &mut i32) -> Result<Arc<ConnectSchema>> {
     let mut builder = Builder { graph: GraphBuilder::new(), names: BTreeMap::new(), decorations: BTreeMap::new(), definitions, metadata, unions, next_union };
-    let root = builder.schema(schema, metadata.root(), 0)?;
+    let root = builder.schema(schema, raw, 0)?;
     if let Some(decoration) = builder.decorations.get_mut(&root) { decoration.root = true; }
     builder.graph.finish_with(root, |id, schema| match builder.decorations.get(&id) {
-        Some(decoration) => metadata.decorate_node(schema, &decoration.raw, decoration.default.as_ref(), decoration.doc.as_deref(), decoration.root),
+        Some(decoration) => {
+            let default = decoration.default_source.as_ref().and_then(|(record, field)| defaults.get(record, field));
+            let class = match (&decoration.default_source, default) {
+                (Some((record, field)), Some(default)) => {
+                    let source = definitions.get(record).and_then(|schema| if let Schema::Record(record) = schema { record.lookup.get(field).and_then(|index| record.fields.get(*index)).map(|field| &field.schema) } else { None }).ok_or_else(|| error("avro-schema", "Default field schema is absent"))?;
+                    super::default_json::field_default_class(default, source, definitions)?
+                }
+                _ => None,
+            };
+            let mut metadata = metadata.decorate_node_at_version(schema, &decoration.raw, if default.is_none() || class.is_some() { decoration.default.as_ref() } else { None }, decoration.doc.as_deref(), decoration.root, version)?;
+            if let (Some(default), Some(valid)) = (default, class) {
+                let view = metadata::before_declared_logical_name(metadata.clone().schema(schema.kind.clone()), &decoration.raw);
+                metadata.default = if valid { metadata::raw_default_value(default, &view, true).ok().filter(|value| *value != rtdb_types::Value::Null && super::super::data::validate_value(&view, value, 0).is_ok()) } else { None };
+            }
+            Ok(metadata)
+        }
         None => Ok(Metadata::from_schema(schema)),
     })
 }
 impl Builder<'_> {
-    fn alias(&mut self, target: NodeId, optional: bool, raw: &Json, default: Option<&Json>, doc: Option<&str>) -> NodeId {
+    fn alias(&mut self, target: NodeId, optional: bool, raw: &Json, default: Option<&Json>, default_source: Option<(String, String)>, doc: Option<&str>) -> NodeId {
         let id = self.graph.insert(Node { kind: NodeKind::Alias(target), metadata: Metadata { optional, ..Default::default() } });
-        self.decorations.insert(id, Decoration { raw: raw.clone(), default: default.cloned(), doc: doc.map(str::to_owned), root: false }); id
+        self.decorations.insert(id, Decoration { raw: raw.clone(), default: default.cloned(), default_source, doc: doc.map(str::to_owned), root: false }); id
     }
     fn schema(&mut self, schema: &Schema, raw: &Json, depth: usize) -> Result<NodeId> {
         if depth > 128 { return Err(error("avro-schema", "Avro schema nesting limit exceeded")); }
@@ -94,7 +109,7 @@ impl Builder<'_> {
                 for field in &record.fields {
                     let raw_field = raw["fields"].as_array().and_then(|fields| fields.iter().find(|raw| raw["name"].as_str() == Some(&field.name))).ok_or_else(|| error("avro-schema", "Record field metadata is absent"))?;
                     let target = self.schema(&field.schema, &raw_field["type"], depth + 1)?;
-                    let field = (field.name.clone(), self.alias(target, false, &raw_field["type"], raw_field.get("default"), raw_field.get("doc").and_then(Json::as_str)));
+                    let field = (field.name.clone(), self.alias(target, false, &raw_field["type"], raw_field.get("default"), Some((record.name.fullname(None), field.name.clone())), raw_field.get("doc").and_then(Json::as_str)));
                     fields.push(field);
                 }
                 NodeKind::Struct(fields)
@@ -114,7 +129,7 @@ impl Builder<'_> {
                     let mut fields = Vec::new();
                     for (index, member) in variants.iter().enumerate().filter(|(_, member)| !matches!(member, Schema::Null)) {
                         let target = self.schema(member, &raw_variants[index], depth + 1)?;
-                        fields.push((self.unions.field_name(super::resolve(member, self.definitions)?, index), self.alias(target, true, &raw_variants[index], None, None)));
+                        fields.push((self.unions.field_name(super::resolve(member, self.definitions)?, index), self.alias(target, true, &raw_variants[index], None, None, None)));
                     }
                     NodeKind::Struct(fields)
                 }
@@ -122,6 +137,6 @@ impl Builder<'_> {
             Schema::Ref { .. } => unreachable!("references resolve before node construction"),
         };
         self.graph.define(id, Node { kind, metadata })?;
-        self.decorations.insert(id, Decoration { raw: raw.clone(), default: None, doc: None, root: false }); Ok(id)
+        self.decorations.insert(id, Decoration { raw: raw.clone(), default: None, default_source: None, doc: None, root: false }); Ok(id)
     }
 }

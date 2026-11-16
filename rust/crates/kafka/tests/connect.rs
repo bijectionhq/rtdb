@@ -3,6 +3,13 @@ use prost_types::Any;
 use rtdb_kafka::connect::{ConnectConfig, ConnectData, PluginRegistry, ResumeToken, SinkRecord, SourceConfig, SOURCE_TYPE};
 use rtdb_types::Value;
 
+fn environment() -> std::sync::Arc<rtdb_kafka::connect::DateEnvironment> {
+    use rtdb_kafka::connect::{DateEnvironment,DateEnvironmentInput};
+    DateEnvironment::from_inputs(DateEnvironmentInput {
+        language: "en".into(),script: String::new(),region: "US".into(),variant: String::new(),unicode: BTreeMap::new(),timezone: "UTC".into(),
+        initialized_at: 1_600_000_000_000,observed_at: 1_600_000_000_000,constructed_at: 1_600_000_000_000,
+    },&rtdb_columnar::MemoryBudget::new(256 << 20)).unwrap()
+}
 fn properties() -> BTreeMap<String, String> { BTreeMap::from([
     ("key.converter".into(), "org.apache.kafka.connect.storage.StringConverter".into()),
     ("value.converter".into(), "org.apache.kafka.connect.json.JsonConverter".into()),
@@ -78,7 +85,7 @@ async fn transforms_run_in_declared_order_and_predicate_negation_preserves_tombs
         ("predicates".into(), "deleted".into()), ("predicates.deleted.type".into(), "org.apache.kafka.connect.transforms.predicates.RecordIsTombstone".into()),
     ]);
     let config = ConnectConfig::parse(&values).unwrap(); let plugins = PluginRegistry::default();
-    let mut converter = plugins.converter(&config.value, false).unwrap(); let mut chain = plugins.chain(&config).unwrap();
+    let mut converter = plugins.converter(&config.value, false).unwrap(); let mut chain = plugins.chain_with_environment(&config,environment()).unwrap();
     let data = converter.decode("events", Some(br#"{"payload":{"old":42}}"#), &mut context).await.unwrap();
     let record = SinkRecord::new("events".into(), 0, 7, ConnectData::schemaless(Value::Utf8("id".into())), data);
     let record = chain.apply(record).unwrap().unwrap();
@@ -106,7 +113,7 @@ fn regex_router_uses_full_match_and_java_numeric_replacement_groups() {
         ("transforms.route.regex".into(), "(a|ab)".into()),
         ("transforms.route.replacement".into(), "$1suffix".into()),
     ]);
-    let mut chain = PluginRegistry::default().chain(&ConnectConfig::parse(&values).unwrap()).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&ConnectConfig::parse(&values).unwrap(),environment()).unwrap();
     let record = SinkRecord::new("ab".into(), 0, 0, ConnectData::null(), ConnectData::null());
     assert_eq!(chain.apply(record).unwrap().unwrap().topic, "absuffix");
 }
@@ -134,7 +141,7 @@ fn header_from_moves_fields_and_insert_field_preserves_source_metadata() {
         ("transforms.headers.fields".into(), "origin".into()), ("transforms.headers.headers".into(), "x-origin".into()),
         ("transforms.headers.operation".into(), "move".into()),
     ]);
-    let mut chain = PluginRegistry::default().chain(&ConnectConfig::parse(&values).unwrap()).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&ConnectConfig::parse(&values).unwrap(),environment()).unwrap();
     let record = SinkRecord::new("events".into(), 2, 17, ConnectData::null(), ConnectData::schemaless(Value::Map { entries: Vec::new(), sorted: false }));
     let record = chain.apply(record).unwrap().unwrap();
     assert_eq!(record.headers[0].0, "x-origin"); assert_eq!(record.headers[0].1.value, Value::Utf8("source".into()));
@@ -154,7 +161,7 @@ fn converter_limit_counts_all_charges_and_shared_owners_once() {
 #[test]
 fn cast_uses_java_numeric_narrowing_and_string_range_checks() {
     let mut values = properties(); values.extend([("transforms".into(), "cast".into()), ("transforms.cast.type".into(), "org.apache.kafka.connect.transforms.Cast$Value".into()), ("transforms.cast.spec".into(), "int8".into())]);
-    let mut chain = PluginRegistry::default().chain(&ConnectConfig::parse(&values).unwrap()).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&ConnectConfig::parse(&values).unwrap(),environment()).unwrap();
     let record = |value| SinkRecord::new("events".into(), 0, 1, ConnectData::null(), ConnectData::schemaless(value));
     assert_eq!(chain.apply(record(Value::I64(257))).unwrap().unwrap().value.value, Value::I8(1));
     assert_eq!(chain.apply(record(Value::F64(f64::INFINITY))).unwrap().unwrap().value.value, Value::I8(-1));
@@ -168,7 +175,7 @@ async fn flatten_propagates_ancestor_optional_defaults_and_preserves_arrays() {
     values.extend([("transforms".into(), "flatten".into()), ("transforms.flatten.type".into(), "org.apache.kafka.connect.transforms.Flatten$Value".into())]);
     let config = ConnectConfig::parse(&values).unwrap(); let mut converter = PluginRegistry::default().converter(&config.value, false).unwrap();
     let value = converter.decode("events", Some(br#"{"schema":{"type":"struct","fields":[{"field":"nested","type":"struct","optional":true,"fields":[{"field":"n","type":"int64","default":9},{"field":"xs","type":"array","items":{"type":"string"}}]}]},"payload":{"nested":{"n":null,"xs":["a","b"]}}}"#), &mut context).await.unwrap();
-    let mut chain = PluginRegistry::default().chain(&config).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&config,environment()).unwrap();
     let record = chain.apply(SinkRecord::new("events".into(), 0, 1, ConnectData::null(), value)).unwrap().unwrap();
     assert_eq!(record.value.value, Value::Struct(BTreeMap::from([("nested.n".into(), Value::I64(9)), ("nested.xs".into(), Value::List(vec![Value::Utf8("a".into()), Value::Utf8("b".into())]))])));
     let schema = record.value.schema.unwrap(); assert!(schema.field("nested.n").unwrap().schema.optional); assert_eq!(schema.field("nested.n").unwrap().schema.default, Some(Value::I64(9)));
@@ -177,7 +184,7 @@ async fn flatten_propagates_ancestor_optional_defaults_and_preserves_arrays() {
 #[test]
 fn mask_field_adds_missing_schemaless_fields_as_null_and_rejects_binary_masks() {
     let mut values = properties(); values.extend([("transforms".into(), "mask".into()), ("transforms.mask.type".into(), "org.apache.kafka.connect.transforms.MaskField$Value".into()), ("transforms.mask.fields".into(), "secret,missing".into())]);
-    let mut chain = PluginRegistry::default().chain(&ConnectConfig::parse(&values).unwrap()).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&ConnectConfig::parse(&values).unwrap(),environment()).unwrap();
     let record = |value| SinkRecord::new("events".into(), 0, 1, ConnectData::null(), ConnectData::schemaless(Value::Map { entries: vec![(Value::Utf8("secret".into()), value)], sorted: false }));
     assert_eq!(chain.apply(record(Value::Utf8("sensitive".into()))).unwrap().unwrap().value.value, Value::Map { entries: vec![(Value::Utf8("missing".into()), Value::Null), (Value::Utf8("secret".into()), Value::Utf8(String::new()))], sorted: false });
     assert!(chain.apply(record(Value::Binary(vec![1, 2]))).is_err());
@@ -190,7 +197,7 @@ fn timestamp_router_replaces_timestamp_placeholders_inserted_from_topic_and_head
         ("transforms.header.header".into(), "sequence".into()), ("transforms.header.value.literal".into(), "128".into()),
         ("transforms.route.type".into(), "org.apache.kafka.connect.transforms.TimestampRouter".into()),
     ]);
-    let mut chain = PluginRegistry::default().chain(&ConnectConfig::parse(&values).unwrap()).unwrap();
+    let mut chain = PluginRegistry::default().chain_with_environment(&ConnectConfig::parse(&values).unwrap(),environment()).unwrap();
     let mut record = SinkRecord::new("events-${timestamp}".into(), 0, 1, ConnectData::null(), ConnectData::null()); record.timestamp_millis = Some(86_400_000);
     let record = chain.apply(record).unwrap().unwrap(); assert_eq!(record.topic, "events-19700102-19700102"); assert_eq!(record.headers[0].1.value, Value::I16(128));
 }

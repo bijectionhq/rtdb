@@ -43,6 +43,8 @@ pub(super) fn relayout(array: ArrayRef, source: &Field, target: &Field) -> Resul
             DataType::RunEndEncoded(Arc::new(ends), Arc::new(values))
         }
         (source, target) if source == target => target.clone(),
+        (DataType::Int8, DataType::UInt8) | (DataType::Int16, DataType::UInt16)
+        | (DataType::Int32, DataType::UInt32) | (DataType::Int64, DataType::UInt64) => target.data_type().clone(),
         _ => return Err(incompatible()),
     };
     let field = target.clone().with_data_type(data_type.clone()).with_nullable(target.is_nullable() || source.is_nullable());

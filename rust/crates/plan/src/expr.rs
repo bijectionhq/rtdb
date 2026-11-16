@@ -18,7 +18,77 @@ pub enum BinaryOp {
 pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalType> {
     use ScalarType as S;
     let name = name.to_lowercase().replace('-', "_");
+    if crate::equality::call(&name) && arguments.len() == 2 { crate::validate_equality_types(&arguments[0], &arguments[1])?; }
     if name == "_patch" { return patch_type(arguments); }
+    if name == "get_field" {
+        if arguments.len() != 1 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "get_field requires one argument")); }
+        return Ok(field_type(&arguments[0], ""));
+    }
+    if let Some(result) = crate::comparison::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::period::predicate_type(&name, arguments) { return result; }
+    if let Some(result) = crate::string::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::regex::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::session_info::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::collection::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::bitwise::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::series::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::temporal_functions::signature(&name, arguments) { return result; }
+    if let Some(result) = crate::interval_constructor::signature(&name, arguments) { return result; }
+    if name == "_meta_double" {
+        if arguments.len() != 1 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "_meta_double requires one argument")); }
+        if arguments[0].legs().contains(&LogicalType::Scalar(S::F16)) { return Err(Anomaly::unsupported("rtdb/jvm-half-float", "The pinned JVM vector factory rejects half-precision floats")); }
+        return Ok(LogicalType::join_all(&arguments[0].legs().into_iter().map(|ty| match ty {
+            LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F32 | S::F64 | S::Decimal { .. }
+                | S::DateDay | S::DateMilli | S::Timestamp { .. } | S::Time { .. } | S::Duration(_)) => LogicalType::Scalar(S::F64),
+            _ => LogicalType::Null,
+        }).collect::<Vec<_>>()));
+    }
+    if name == "distinct_from" {
+        if arguments.len() != 2 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", "distinct_from requires two arguments")); }
+        return Ok(Expr::binary(BinaryOp::IsDistinctFrom, Expr::Parameter { index: 0, data_type: arguments[0].clone() }, Expr::Parameter { index: 1, data_type: arguments[1].clone() }).data_type());
+    }
+    if matches!(name.as_str(), "uri_scheme" | "uri_user_info" | "uri_host" | "uri_port" | "uri_path" | "uri_query" | "uri_fragment") {
+        if arguments.len() != 1 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}: {}", arguments.len()))); }
+        let mut result = LogicalType::Nothing;
+        for leg in arguments[0].legs() {
+            result = result.join(&match leg {
+                LogicalType::Null => LogicalType::Null,
+                LogicalType::Scalar(S::Uri) => LogicalType::Scalar(if name == "uri_port" { S::I32 } else { S::Utf8 }).maybe(),
+                _ => return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} requires a URI"))),
+            });
+        }
+        return Ok(result);
+    }
+    if matches!(name.as_str(), "log10" | "sinh" | "cosh" | "tanh" | "double" | "mod") {
+        let arity = if name == "mod" { 2 } else { 1 };
+        if arguments.len() != arity { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}: {}", arguments.len()))); }
+        let numeric = |ty: &LogicalType| matches!(ty, LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 | S::F32 | S::F64 | S::Decimal { .. }));
+        let mut output = LogicalType::Nothing;
+        for first in arguments[0].legs() {
+            for second in if arity == 2 { arguments[1].legs() } else { BTreeSet::from([LogicalType::Scalar(S::I64)]) } {
+                let ty = if first == LogicalType::Null || second == LogicalType::Null { LogicalType::Null }
+                    else if numeric(&first) && numeric(&second) {
+                        if name == "mod" { LogicalType::least_upper_bound(&[first.clone(), second]).ok_or_else(|| Anomaly::incorrect("xtdb.expression/function-type-mismatch", "Incomparable MOD types"))? }
+                        else { LogicalType::Scalar(S::F64) }
+                    } else { return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))); };
+                output = output.join(&ty);
+            }
+        }
+        return Ok(output);
+    }
+    if matches!(name.as_str(), "col_description" | "pg_indexam_has_property") {
+        if arguments.len() != 2 { return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}: {}", arguments.len()))); }
+        let signed = |ty: &LogicalType| matches!(ty, LogicalType::Scalar(S::I8 | S::I16 | S::I32 | S::I64));
+        for first in arguments[0].legs() {
+            for second in arguments[1].legs() {
+                if first == LogicalType::Null || second == LogicalType::Null { continue; }
+                let valid = if name == "col_description" { (signed(&first) || first == LogicalType::Scalar(S::Oid)) && signed(&second) }
+                    else { signed(&first) && second == LogicalType::Scalar(S::Utf8) };
+                if !valid { return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))); }
+            }
+        }
+        return Ok(LogicalType::Null);
+    }
     let numeric = || LogicalType::least_upper_bound(arguments).unwrap_or_else(|| LogicalType::join_all(arguments));
     let (ty, arity, nullable) = match name.as_str() {
         "lower" | "upper" => {
@@ -30,53 +100,44 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
                         if name == "upper" { instant.maybe() } else { instant }
                     }
                     LogicalType::Null => LogicalType::Null,
-                    _ => LogicalType::Scalar(S::Utf8),
+                    LogicalType::Scalar(S::Utf8) => LogicalType::Scalar(S::Utf8),
+                    _ => return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument type"))),
                 });
             }
             (LogicalType::join_all(&outputs), 1..=1, true)
         }
-        "str" => (LogicalType::Scalar(S::Utf8), 1..=1, true),
         "format_type" => (LogicalType::Scalar(S::Utf8), 2..=2, false),
-        "trim" | "trim_leading" | "trim_trailing" => (LogicalType::Scalar(S::Utf8), 1..=2, true),
-        "substring" | "substr" => (LogicalType::Scalar(S::Utf8), 2..=3, true),
-        "replace" => (LogicalType::Scalar(S::Utf8), 3..=3, true),
-        "concat" => (LogicalType::Scalar(S::Utf8), 0..=usize::MAX, true),
-        "character_length" | "char_length" | "length" | "octet_length" | "bit_length" | "cardinality" => (LogicalType::Scalar(S::I32), 1..=1, true),
-        "position" => (LogicalType::Scalar(S::I32), 2..=2, true),
+        "length" | "cardinality" => (LogicalType::Scalar(S::I32), 1..=1, true),
         "abs" => (numeric(), 1..=1, true),
         "floor" | "ceil" | "ceiling" => (LogicalType::Scalar(S::F64), 1..=1, true),
         "round" => (round_type(arguments.first().unwrap_or(&LogicalType::Nothing), None, arguments.len() == 2)?, 1..=2, true),
-        "trunc" => (arguments.first().cloned().unwrap_or(LogicalType::Null), 1..=2, true),
-        "greatest" | "least" => (LogicalType::join_all(arguments), 1..=usize::MAX, true),
-        "power" | "atan2" => (LogicalType::Scalar(S::F64), 2..=2, true),
-        "sqrt" | "exp" | "ln" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "degrees" | "radians" => (LogicalType::Scalar(S::F64), 1..=1, true),
+        "greatest" | "least" => (if arguments.is_empty() { LogicalType::Null } else { LogicalType::join_all(arguments) }, 0..=usize::MAX, true),
+        "power" => (LogicalType::Scalar(S::F64), 2..=2, true),
+        "sqrt" | "exp" | "ln" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" => (LogicalType::Scalar(S::F64), 1..=1, true),
         "log" => (LogicalType::Scalar(S::F64), 1..=2, true),
-        "current_timestamp" | "now" => (LogicalType::Scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }), 0..=0, false),
-        "localtimestamp" => (LogicalType::Scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: None }), 0..=0, false),
-        "current_date" => (LogicalType::Scalar(S::DateDay), 0..=0, false),
-        "current_time" | "localtime" => (LogicalType::Scalar(S::Time { unit: rtdb_types::TimeUnit::Microsecond, bit_width: 64 }), 0..=0, false),
+        "random" => (LogicalType::Scalar(S::F64), 0..=0, false),
+        "sleep" => (LogicalType::Null, 1..=1, true),
+        "snapshot_token" => (LogicalType::Scalar(S::Utf8).maybe(), 0..=0, false),
         "_iid" => (LogicalType::Scalar(S::FixedSizeBinary(16)), 1..=1, true),
         "keyword" => (LogicalType::Scalar(S::Keyword), 1..=1, true),
-        "uuid" => (LogicalType::Scalar(S::Uuid), 1..=1, true),
-        "uri" => (LogicalType::Scalar(S::Uri), 1..=1, true),
         "namespace" => (LogicalType::Scalar(S::Utf8).maybe(), 1..=1, true),
         "local_name" => (LogicalType::Scalar(S::Utf8), 1..=1, true),
-        "boolean" | "true?" | "false?" | "nil?" | "is_null" | "boolean?" | "number?" | "integer?" | "float?" | "string?" | "keyword?" | "uuid?" | "list?" | "set?" | "map?" => (LogicalType::Scalar(S::Bool), 1..=1, false),
-        "null_eq" => (LogicalType::Scalar(S::Bool), 2..=2, false),
-        "like_regex" => (LogicalType::Scalar(S::Bool), 2..=3, true),
+        "boolean" | "true?" | "false?" | "nil?" | "is_true" | "is_false" | "is_null" => (LogicalType::Scalar(S::Bool), 1..=1, false),
+        "null_eq" | "===" => (LogicalType::Scalar(S::Bool), 2..=2, false),
         "nullif" => (arguments.first().cloned().unwrap_or(LogicalType::Null).maybe(), 2..=2, true),
         "coalesce" => (LogicalType::join_all(arguments), 0..=usize::MAX, false),
         "set" => (LogicalType::List { kind: rtdb_types::ListKind::Set, element: Box::new(LogicalType::join_all(arguments)) }, 0..=usize::MAX, false),
         "period" => (LogicalType::List { kind: rtdb_types::ListKind::TimestampTzRange, element: Box::new(LogicalType::Scalar(S::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) })) }, 2..=2, false),
         "lower_inf" | "upper_inf" => (LogicalType::Scalar(S::Bool), 1..=1, true),
-        "nth" => (arguments.first().map(|ty| {
-            let elements: Vec<_> = ty.legs().into_iter().filter_map(|ty| match ty { LogicalType::List { element, .. } => Some(*element), _ => None }).collect();
-            LogicalType::join_all(&elements).maybe()
-        }).unwrap_or(LogicalType::Null), 2..=2, true),
-        _ => return Err(Anomaly::unsupported("xtdb/unknown-function", format!("Unknown scalar function: {name}"))),
+        _ => return if arguments.iter().any(|ty| ty.legs().is_empty()) { Ok(LogicalType::Nothing) }
+            else if arguments.iter().any(|ty| ty.legs() == BTreeSet::from([LogicalType::Null])) { Ok(LogicalType::Null) }
+            else { Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))) },
     };
     if !arity.contains(&arguments.len()) {
         return Err(Anomaly::incorrect("xtdb/invalid-function-arity", format!("Wrong argument count for {name}: {}", arguments.len())));
+    }
+    if name == "sleep" && arguments[0].legs().iter().any(|ty| !matches!(ty, LogicalType::Nothing | LogicalType::Null | LogicalType::Scalar(S::Duration(_)))) {
+        return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", "sleep requires a duration"));
     }
     if name == "format_type" {
         for (index, ty) in arguments.iter().enumerate() {
@@ -154,8 +215,14 @@ pub enum Expr {
     Unary { op: UnaryOp, expr: Box<Expr> },
     Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
     Call { name: String, args: Vec<Expr>, return_type: LogicalType },
+    /// Keeps raw replacement metadata outside the source expression's argument evaluation.
+    RegexReplace { source: Box<Expr>,recipe: crate::RegexReplacement,return_type: LogicalType },
     Cast { expr: Box<Expr>, target: crate::CastTarget },
     Case { branches: Vec<(Expr, Expr)>, otherwise: Box<Expr> },
+    /// Evaluates the operand once before testing ordered equality alternatives, including a null operand.
+    SimpleCase { operand: Box<Expr>, branches: Vec<(Expr, Expr)>, otherwise: Box<Expr> },
+    /// Binds a complex operand once before short-circuiting the ordered bound checks.
+    Between { operand: Box<Expr>,low: Box<Expr>,high: Box<Expr>,symmetric: bool },
     Coalesce(Vec<Expr>),
     Field { expr: Box<Expr>, name: String, data_type: LogicalType },
     Subscript { expr: Box<Expr>, index: Box<Expr>, data_type: LogicalType },
@@ -169,9 +236,38 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// Retains raw replacement metadata with its declared source type; metadata is admitted when the expression is emitted.
+    pub fn regex_replace(source: Self,recipe: crate::RegexReplacement) -> Self {
+        let return_type = recipe.declared_type(&source.data_type());
+        Self::RegexReplace { source: Box::new(source),recipe,return_type }
+    }
+    /// Reports whether an evaluated branch can suspend; unused branches still determine this capability.
+    pub fn requires_suspension(&self) -> bool {
+        let mut required = false;
+        self.visit(&mut |expr| { if let Self::Call { name, .. } = expr { required |= name.eq_ignore_ascii_case("sleep"); } });
+        required
+    }
+    /// Reports calls whose repeated evaluation can change their result or produce a delay.
+    /// Submission-time expansion and independently evaluated pruning keys must not pre-evaluate these calls.
+    pub fn is_volatile(&self) -> bool {
+        let mut volatile = false;
+        self.visit(&mut |expr| { if let Self::Call { name, .. } = expr { volatile |= name.eq_ignore_ascii_case("random") || name.eq_ignore_ascii_case("sleep"); } });
+        volatile
+    }
     pub fn column(id: ColumnId, data_type: LogicalType) -> Self { Self::Column { id, data_type } }
     pub fn binary(op: BinaryOp, left: Self, right: Self) -> Self { Self::Binary { op, left: Box::new(left), right: Box::new(right) } }
     pub fn unary(op: UnaryOp, expr: Self) -> Self { Self::Unary { op, expr: Box::new(expr) } }
+
+    /// Lowers BETWEEN, retaining inline comparisons for literal and input references used by pruning.
+    /// Other operands are bound exactly once, including null-producing operands.
+    pub fn between(operand: Self,low: Self,high: Self,symmetric: bool) -> Self {
+        if !matches!(operand,Self::Literal(_) | Self::Column {..} | Self::Parameter {..} | Self::Correlated {..}) {
+            return Self::Between { operand: Box::new(operand),low: Box::new(low),high: Box::new(high),symmetric };
+        }
+        let forward = Self::binary(BinaryOp::And,Self::binary(BinaryOp::GtEq,operand.clone(),low.clone()),Self::binary(BinaryOp::LtEq,operand.clone(),high.clone()));
+        if symmetric { Self::binary(BinaryOp::Or,forward,Self::binary(BinaryOp::And,Self::binary(BinaryOp::GtEq,operand.clone(),high),Self::binary(BinaryOp::LtEq,operand,low))) }
+        else { forward }
+    }
 
     pub fn data_type(&self) -> LogicalType {
         use BinaryOp as B;
@@ -180,11 +276,13 @@ impl Expr {
             Self::Literal(value) => value.logical_type(),
             Self::Column { data_type, .. } | Self::Parameter { data_type, .. }
             | Self::Correlated { data_type, .. }
-            | Self::Field { data_type, .. } | Self::Subscript { data_type, .. } => data_type.clone(),
+            | Self::Field { data_type, .. } => data_type.clone(),
+            Self::Subscript { expr, index, .. } => function_type("nth", &[expr.data_type(), index.data_type()]).unwrap_or(LogicalType::Nothing),
             Self::Cast { expr, target } => target.result_type(&expr.data_type()),
-            Self::Call { return_type, .. } => return_type.clone(),
+            Self::Call { return_type, .. } | Self::RegexReplace { return_type,.. } => return_type.clone(),
             Self::Unary { op: U::IsNull | U::IsNotNull | U::IsTrue | U::IsFalse | U::IsUnknown, .. } => LogicalType::Scalar(ScalarType::Bool),
             Self::Unary { op: U::Not, expr } => boolean_type(expr.data_type().nullable()),
+            Self::Unary { op: U::BitNot, expr } => crate::bitwise::signature("bit_not", &[expr.data_type()]).unwrap().unwrap_or(LogicalType::Nothing),
             Self::Unary { expr, .. } => expr.data_type(),
             Self::Binary { op: B::IsDistinctFrom | B::IsNotDistinctFrom, left, right } => {
                 let mut nullable = false;
@@ -198,13 +296,14 @@ impl Expr {
             Self::Binary { op: B::Eq | B::NotEq, left, right } => boolean_type(equality_nullable(&left.data_type(), &right.data_type())),
             Self::Binary { op: B::Lt | B::LtEq | B::Gt | B::GtEq | B::And | B::Or, left, right } => boolean_type(left.data_type().nullable() || right.data_type().nullable()),
             Self::In { expr, values, .. } => boolean_type(values.iter().any(|value| equality_nullable(&expr.data_type(), &value.data_type()))),
-            Self::Like { expr, pattern, .. } => boolean_type(expr.data_type().nullable() || pattern.data_type().nullable()),
+            Self::Like { expr, pattern, case_insensitive,.. } => function_type(if *case_insensitive { "ilike" } else { "like" }, &[expr.data_type(),pattern.data_type()]).unwrap_or(LogicalType::Nothing),
             Self::Binary { op: B::Concat, left, right } => {
                 let mut results = Vec::new();
                 for left in left.data_type().legs() {
                     for right in right.data_type().legs() {
                         results.push(match (&left, &right) {
                             (LogicalType::Null, _) | (_, LogicalType::Null) => LogicalType::Null,
+                            (LogicalType::Scalar(ScalarType::Binary), LogicalType::Scalar(ScalarType::Binary)) => LogicalType::Scalar(ScalarType::Binary),
                             (LogicalType::List { kind: rtdb_types::ListKind::List, element: left }, LogicalType::List { kind: rtdb_types::ListKind::List, element: right }) => LogicalType::list(left.join(right)),
                             _ => LogicalType::Scalar(ScalarType::Utf8),
                         });
@@ -217,10 +316,11 @@ impl Expr {
                 let result = arithmetic_type(*op, &types[0], &types[1]);
                 if types.iter().any(LogicalType::nullable) { result.maybe() } else { result }
             }
-            Self::Case { branches, otherwise } => {
+            Self::Case { branches, otherwise } | Self::SimpleCase { branches, otherwise, .. } => {
                 let types: Vec<_> = branches.iter().map(|(_, value)| value.data_type()).chain([otherwise.data_type()]).collect();
                 LogicalType::join_all(&types)
             }
+            Self::Between { operand,low,high,.. } => boolean_type(operand.data_type().nullable() || low.data_type().nullable() || high.data_type().nullable()),
             Self::Coalesce(args) => {
                 let types: Vec<_> = args.iter().map(Self::data_type).collect();
                 LogicalType::join_all(&types)
@@ -239,7 +339,10 @@ impl Expr {
             Self::Unary { expr, .. } | Self::Cast { expr, .. } | Self::Field { expr, .. } => vec![expr],
             Self::Binary { left, right, .. } => vec![left, right],
             Self::Call { args, .. } | Self::Coalesce(args) | Self::List(args) => args.iter().collect(),
+            Self::RegexReplace { source,.. } => vec![source],
             Self::Case { branches, otherwise } => branches.iter().flat_map(|(condition, value)| [condition, value]).chain([otherwise.as_ref()]).collect(),
+            Self::Between { operand,low,high,.. } => vec![operand,low,high],
+            Self::SimpleCase { operand, branches, otherwise } => std::iter::once(operand.as_ref()).chain(branches.iter().flat_map(|(candidate, value)| [candidate, value])).chain([otherwise.as_ref()]).collect(),
             Self::Subscript { expr, index, .. } => vec![expr, index],
             Self::Struct(fields) => fields.iter().map(|(_, value)| value).collect(),
             Self::In { expr, values, .. } => std::iter::once(expr.as_ref()).chain(values).collect(),
@@ -270,6 +373,7 @@ impl Expr {
     }
 
     pub fn validate_columns(&self, columns: &BTreeSet<ColumnId>) -> Result<()> {
+        crate::validate_equality_expression(self)?;
         for missing in self.referenced_columns().difference(columns) {
             return Err(Anomaly::fault("rtdb.plan/unbound-column", format!("Column {} is outside the input schema", missing.0)));
         }
@@ -282,11 +386,27 @@ impl Expr {
                 }
             }
             if let Self::Binary { op, left, right } = expr {
+                if matches!(op,BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) { if let Err(error) = crate::validate_ordered_predicate_types(&left.data_type(),&right.data_type()) { failure = Some(error); } }
+                if let Some(name) = crate::bitwise::binary_name(*op) {
+                    if let Err(error) = function_type(name, &[left.data_type(), right.data_type()]) { failure = Some(error); }
+                }
                 for left in left.data_type().legs() { for right in right.data_type().legs() {
                     if let (LogicalType::Scalar(ScalarType::Decimal { scale: left, .. }), LogicalType::Scalar(ScalarType::Decimal { scale: right, .. })) = (left, right) {
                         if let Err(error) = decimal_arithmetic_scale(*op, left, right) { failure = Some(error); }
                     }
                 } }
+            }
+            if let Self::Between { operand,low,high,.. } = expr {
+                for bound in [low,high] { if let Err(error) = crate::validate_ordered_predicate_types(&operand.data_type(),&bound.data_type()) { failure = Some(error); } }
+            }
+            if let Self::Unary { op: UnaryOp::BitNot, expr } = expr {
+                if let Err(error) = function_type("bit_not", &[expr.data_type()]) { failure = Some(error); }
+            }
+            if let Self::Like { expr,pattern,case_insensitive,.. } = expr {
+                if let Err(error) = function_type(if *case_insensitive { "ilike" } else { "like" }, &[expr.data_type(),pattern.data_type()]) { failure = Some(error); }
+            }
+            if let Self::Subscript { expr, index, .. } = expr {
+                if let Err(error) = function_type("nth", &[expr.data_type(), index.data_type()]) { failure = Some(error); }
             }
             if let Self::Call { name, args, .. } = expr { if let Err(error) = function_type_with_args(name, args) { failure = Some(error); } }
         });
@@ -295,15 +415,26 @@ impl Expr {
     }
 }
 
+/// Returns a struct field's type, nullable Transit for Transit objects, and Null for absent or unsupported fields.
+/// Field spelling is used directly; callers perform their frontend's name normalization first.
+pub fn field_type(source: &LogicalType, name: &str) -> LogicalType {
+    LogicalType::join_all(&source.legs().into_iter().map(|ty| match ty {
+        LogicalType::Struct(fields) => fields.get(name).cloned().unwrap_or(LogicalType::Null),
+        LogicalType::Scalar(ScalarType::Transit) => LogicalType::Scalar(ScalarType::Transit).maybe(),
+        _ => LogicalType::Null,
+    }).collect::<Vec<_>>())
+}
+
 fn boolean_type(nullable: bool) -> LogicalType {
     let ty = LogicalType::Scalar(ScalarType::Bool);
     if nullable { ty.maybe() } else { ty }
 }
 
-/// Computes literal-dependent result metadata; ROUND requires a constant scale for decimal and integer inputs.
+/// Computes literal-dependent function metadata and validates constant fields, precisions, and scales.
 pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<LogicalType> {
     let types = arguments.iter().map(Expr::data_type).collect::<Vec<_>>();
-    let result = function_type(name, &types)?;
+    let result = crate::temporal_functions::with_args(name, arguments, function_type(name, &types)?)?;
+    let result = crate::interval_constructor::with_args(name, arguments, result)?;
     if !name.eq_ignore_ascii_case("round") { return Ok(result); }
     let source = types.first().unwrap_or(&LogicalType::Nothing);
     let needs_constant = source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::Decimal { .. } | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)));
@@ -352,16 +483,21 @@ fn equality_nullable(left: &LogicalType, right: &LogicalType) -> bool {
     if left.nullable() || right.nullable() { return true; }
     left.legs().iter().any(|left| right.legs().iter().any(|right| match (left, right) {
         (LogicalType::Struct(left), LogicalType::Struct(right)) => left.keys().eq(right.keys()),
-        (LogicalType::List { .. }, LogicalType::List { .. }) => true,
+        (LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), .. },
+         LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::FixedSizeList(_), .. }) => true,
         _ => false,
     }))
 }
 
 pub fn arithmetic_type(op: BinaryOp, left: &LogicalType, right: &LogicalType) -> LogicalType {
-    if matches!(op, BinaryOp::ShiftLeft | BinaryOp::ShiftRight) { return left.unencoded(); }
+    if let Some(name) = crate::bitwise::binary_name(op) { return function_type(name, &[left.clone(), right.clone()]).unwrap_or(LogicalType::Nothing); }
     let mut results = Vec::new();
     for left in left.legs() {
         for right in right.legs() {
+            if op == BinaryOp::Multiply && crate::period::is_range(&left) && crate::period::is_range(&right) {
+                results.push(left.clone().maybe());
+                continue;
+            }
             if let (LogicalType::Scalar(left), LogicalType::Scalar(right)) = (&left, &right) {
                 if let Some(result) = crate::temporal_arithmetic_type(op, left, right) {
                     results.push(LogicalType::Scalar(result));

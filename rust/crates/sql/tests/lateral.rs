@@ -32,7 +32,7 @@ async fn query(sql: &str, parameters: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     let options = PrepareOptions { parameter_types: parameters.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
     let prepared = prepare(sql, &context.catalog, &options)?;
     let Statement::Query(relation) = prepared.statement else { panic!("Expected query") };
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters)?;
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters).await?;
     let mut rows = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         for row in 0..batch.batch().num_rows() {
@@ -123,7 +123,7 @@ async fn lateral_cursor_cancellation_releases_dependent_state_but_retains_return
     let baseline = context.memory.used_bytes();
     let Statement::Query(relation) = prepare("SELECT r.y FROM (VALUES (1), (2)) AS l(x) CROSS JOIN LATERAL (SELECT l.x + y AS y FROM (VALUES (10), (20)) AS t(y)) AS r", &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("Expected query") };
     let prepared = PreparedQuery::new(relation).unwrap();
-    let mut cursor = prepared.execute(context.clone(), vec![]).unwrap();
+    let mut cursor = prepared.execute(context.clone(), vec![]).await.unwrap();
     let batch = cursor.next_batch().await.unwrap().unwrap();
     let retained = batch.batch().clone();
     drop(batch);
@@ -134,7 +134,7 @@ async fn lateral_cursor_cancellation_releases_dependent_state_but_retains_return
     assert_eq!(read_value(retained.schema().field(0), retained.column(0).as_ref(), 0).unwrap(), Value::I64(11));
     drop(retained);
     assert_eq!(context.memory.used_bytes(), baseline);
-    let mut next = prepared.execute(context.clone(), vec![]).unwrap();
+    let mut next = prepared.execute(context.clone(), vec![]).await.unwrap();
     assert!(next.next_batch().await.unwrap().is_some());
 }
 

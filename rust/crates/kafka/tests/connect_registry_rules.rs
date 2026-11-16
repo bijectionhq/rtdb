@@ -9,7 +9,11 @@ async fn registry(schema: &str, format: &str, rules: Json) -> (Box<dyn Converter
     registry_options(schema, format, rules, BTreeMap::new()).await
 }
 
-async fn registry_options(schema: &str, format: &str, rules: Json, mut options: BTreeMap<String, String>) -> (Box<dyn Converter>, JoinHandle<Vec<(String, Json)>>) {
+async fn registry_options(schema: &str, format: &str, rules: Json, options: BTreeMap<String, String>) -> (Box<dyn Converter>, JoinHandle<Vec<(String, Json)>>) {
+    registry_role(schema, format, rules, options, false).await
+}
+
+async fn registry_role(schema: &str, format: &str, rules: Json, mut options: BTreeMap<String, String>, is_key: bool) -> (Box<dyn Converter>, JoinHandle<Vec<(String, Json)>>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let body = json!({"schema":schema,"schemaType":format,"metadata":{"properties":{"application":"ledger"}},"ruleSet":rules}).to_string();
@@ -34,7 +38,7 @@ async fn registry_options(schema: &str, format: &str, rules: Json, mut options: 
     let class = if format == "AVRO" { "io.confluent.connect.avro.AvroConverter" } else { "io.confluent.connect.json.JsonSchemaConverter" };
     options.insert("schema.registry.url".into(), format!("http://{address}"));
     let spec = PluginSpec { class_name: class.into(), options };
-    (PluginRegistry::default().converter(&spec, false).unwrap(), server)
+    (PluginRegistry::default().converter(&spec, is_key).unwrap(), server)
 }
 
 fn framed(datum: &[u8]) -> Vec<u8> { let mut bytes = vec![0, 0, 0, 0, 7]; bytes.extend_from_slice(datum); bytes }
@@ -63,7 +67,9 @@ async fn read_ignored_rules_are_cached_and_subject_lookup_preserves_metadata() {
 async fn avro_null_skips_read_rules_and_bad_datum_fails_before_rules() {
     let (mut converter, server) = registry(r#"["null","long"]"#, "AVRO", json!({"domainRules":[{"name":"read-guard","type":"absent"}]})).await;
     let memory = MemoryBudget::new(1 << 26);
-    assert_eq!(converter.decode("events", Some(&framed(&[0])), &mut context(&memory)).await.unwrap().value, Value::Null);
+    let error = converter.decode("events", Some(&framed(&[0])), &mut context(&memory)).await.unwrap_err();
+    assert!(error.to_string().contains("no schema and value"));
+    assert!(!error.to_string().contains("read-guard"));
     server.await.unwrap();
     let error = converter.decode("events", Some(&framed(&[2, 14])), &mut context(&memory)).await.unwrap_err();
     assert!(error.to_string().contains("read-guard"));
@@ -120,4 +126,62 @@ async fn cached_rule_reservation_covers_repeated_failures_until_last_context_dro
     assert!(memory.used_bytes() > 0);
     drop(retained);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dlq_read_publishes_original_frames_and_close_drains_after_rule_failure() {
+    use std::time::Duration;
+    use rdkafka::{ClientConfig, Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, message::Headers, mocking::MockCluster};
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("failures", 1, 1).unwrap();
+    let options = BTreeMap::from([
+        ("bootstrap.servers".into(), cluster.bootstrap_servers()),
+        ("dlq.topic".into(), "failures".into()),
+        ("buffer.memory".into(), (1 << 20).to_string()),
+    ]);
+    let (mut key, key_server) = registry_role(r#""long""#, "AVRO", json!({}), BTreeMap::new(), true).await;
+    let (mut value, value_server) = registry_options(r#"{"type":"integer"}"#, "JSON", json!({"domainRules":[{"name":"guard","type":"missing","onFailure":"DLQ"}]}), options).await;
+    let memory = MemoryBudget::new(1 << 28);
+    let mut context = context(&memory);
+    let key_frame = framed(&[14]); let value_frame = framed(b"9");
+    key.decode("events", Some(&key_frame), &mut context).await.unwrap();
+    let failure = value.decode("events", Some(&value_frame), &mut context).await.unwrap_err();
+    assert!(failure.to_string().contains("Rule failed: guard"));
+    key_server.await.unwrap(); value_server.await.unwrap();
+    drop(context);
+    tokio::time::timeout(Duration::from_secs(10), value.close()).await.unwrap().unwrap();
+    key.close().await.unwrap();
+    let consumer: BaseConsumer = ClientConfig::new().set("bootstrap.servers", cluster.bootstrap_servers()).set("group.id", "dlq-observation").set("enable.auto.commit", "false").create().unwrap();
+    let mut assignment = TopicPartitionList::new(); assignment.add_partition_offset("failures", 0, Offset::Beginning).unwrap(); consumer.assign(&assignment).unwrap();
+    let message = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(message) = consumer.poll(Duration::ZERO) { break message.unwrap().detach(); }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(message.key(), Some(key_frame.as_slice()));
+    assert_eq!(message.payload(), Some(value_frame.as_slice()));
+    let headers = message.headers().unwrap();
+    assert_eq!(headers.count(), 5);
+    assert_eq!(headers.get(0).key, "__rule.name"); assert_eq!(headers.get(0).value, Some(b"guard".as_slice()));
+    assert_eq!(headers.get(1).value, Some(b"READ".as_slice()));
+    assert_eq!(headers.get(2).value, Some(b"events-value".as_slice()));
+    assert_eq!(headers.get(3).value, Some(b"events".as_slice()));
+    assert_eq!(headers.get(4).value, Some(b"Could not find rule executor of type missing".as_slice()));
+    drop(key); drop(value); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn dlq_missing_topic_precedes_producer_open_and_send_errors_preserve_rule_failure() {
+    let rules = json!({"domainRules":[{"name":"guard","type":"missing","onFailure":"DLQ"}]});
+    let (mut no_topic, server) = registry(r#""long""#, "AVRO", rules.clone()).await;
+    let memory = MemoryBudget::new(1 << 27);
+    let failure = no_topic.decode("events", Some(&framed(&[14])), &mut context(&memory)).await.unwrap_err();
+    assert!(failure.to_string().contains("no topic is configured")); server.await.unwrap();
+    no_topic.close().await.unwrap();
+    let (mut no_broker, server) = registry_options(r#""long""#, "AVRO", rules, BTreeMap::from([("dlq.topic".into(), "failures".into())])).await;
+    let failure = no_broker.decode("events", Some(&framed(&[14])), &mut context(&memory)).await.unwrap_err();
+    assert!(failure.to_string().contains("Rule failed: guard")); server.await.unwrap();
+    no_broker.close().await.unwrap();
+    drop(no_broker); drop(no_topic); assert_eq!(memory.used_bytes(), 0);
 }

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
-use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, Schema, UnaryOp};
-use rtdb_types::{LogicalType, Result, ScalarType, Value};
+use rtdb_plan::{AggregateExpr, AggregateFunction, BinaryOp, Expr, Field, PercentileFraction, PercentileKind, Schema, SqlNotice, UnaryOp};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
 use crate::bind::{Context, error, identifier, identifiers, unsupported};
@@ -9,25 +9,32 @@ use crate::subquery::{ExpressionInput, negated_operator};
 use std::sync::Arc;
 use rtdb_plan::Relation;
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ReplacementKey { Expression(String), Aggregate(sqlparser::tokenizer::Span) }
+pub(crate) type Replacements = BTreeMap<ReplacementKey, Field>;
+
 impl Context<'_> {
-    pub(crate) fn expr(&mut self, expression: &ast::Expr, schema: &Schema, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
+    pub(crate) fn expr(&mut self, expression: &ast::Expr, schema: &Schema, replacements: &Replacements) -> Result<Expr> {
         self.expr_bound(expression, &mut ExpressionInput::Scalar(schema), replacements)
     }
 
-    pub(crate) fn relational_expr(&mut self, expression: &ast::Expr, input: &mut Arc<Relation>, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
+    pub(crate) fn relational_expr(&mut self, expression: &ast::Expr, input: &mut Arc<Relation>, replacements: &Replacements) -> Result<Expr> {
         self.expr_bound(expression, &mut ExpressionInput::Relational(input), replacements)
     }
 
-    pub(crate) fn expr_bound(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
+    pub(crate) fn expr_bound(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
         self.expr_inner(expression, input, replacements).map_err(|anomaly| {
             if anomaly.context.contains_key("span") { anomaly }
             else { let span = crate::parse::source_span(self.source, expression.span()); anomaly.with_context("span", serde_json::json!({"start":span.start,"end":span.end})).with_context("position", serde_json::json!(span.start + 1)) }
         })
     }
 
-    fn expr_inner(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
-        if let Some(field) = replacements.get(&expression.to_string()) { return Ok(field.expression()); }
-        Ok(match expression {
+    fn expr_inner(&mut self, expression: &ast::Expr, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
+        if matches!(expression, ast::Expr::Function(_)) {
+            if let Some(field) = replacements.get(&ReplacementKey::Aggregate(expression.span())) { return Ok(field.expression()); }
+        }
+        if let Some(field) = replacements.get(&ReplacementKey::Expression(expression.to_string())) { return Ok(field.expression()); }
+        let expression = match expression {
             ast::Expr::Subquery(query) => self.scalar_subquery(query, input, false)?,
             ast::Expr::Exists { subquery, negated } => {
                 let expression = self.scalar_subquery(subquery, input, true)?;
@@ -44,22 +51,16 @@ impl Context<'_> {
             }
             ast::Expr::Identifier(name) => {
                 let name = identifier(name);
-                if !name.quoted && ["current_timestamp", "current_date", "current_time", "localtimestamp", "localtime"].contains(&name.normalized().as_str()) { call(name.normalized(), Vec::new())? }
+                if !name.quoted && ["current_timestamp", "current_date", "current_time", "current_timezone", "localtimestamp", "localtime", "localdate", "local_timestamp", "local_time", "local_date", "snapshot_token", "current_user", "current_schema", "current_catalog"].contains(&name.normalized().as_str()) {
+                    call(if name.normalized() == "current_catalog" { "current_database".into() } else { name.normalized() }, Vec::new())?
+                }
                 else { self.resolve_column(&[name], input.schema())? }
             }
             ast::Expr::CompoundIdentifier(names) => {
                 let names: Vec<_> = names.iter().map(identifier).collect();
-                let mut found = None;
-                for width in (1..=names.len().min(2)).rev() {
-                    match self.resolve_column(&names[..width], input.schema()) {
-                        Ok(expr) => { found = Some((expr, width)); break; }
-                        Err(error) if error.code == "xtdb/ambiguous-column" => return Err(error),
-                        Err(_) => {},
-                    }
-                }
-                let (mut expr, consumed) = found.ok_or_else(|| error(format!("Unbound column: {expression}")))?;
-                for name in &names[consumed..] { expr = field_access(expr, name.normalized()); }
-                expr
+                if names.len() == 2 && !names[1].quoted && ["current_user", "current_schema", "current_catalog"].contains(&names[1].normalized().as_str()) {
+                    call(if names[1].normalized() == "current_catalog" { "current_database".into() } else { names[1].normalized() }, Vec::new())?
+                } else { self.resolve_column(&names, input.schema())? }
             }
             ast::Expr::Value(value) => match &value.value {
                 ast::Value::Placeholder(parameter) => {
@@ -68,7 +69,25 @@ impl Context<'_> {
                 }
                 value => Expr::Literal(crate::types::literal(value)?),
             },
-            ast::Expr::TypedString(value) => Expr::Cast { expr: Box::new(Expr::Literal(crate::types::literal(&value.value.value)?)), target: crate::types::cast_target(&value.data_type)? },
+            ast::Expr::TypedString(value) => {
+                let literal = crate::types::literal(&value.value.value)?;
+                match (&value.data_type, &literal) {
+                    (ast::DataType::Date, Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_date_literal(text).map_err(|failure| error(format!("Cannot parse date: {text} - failed with message {}", failure.message)))?),
+                    (ast::DataType::Timestamp(..), Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_timestamp_literal(text).map_err(|failure| error(format!("Cannot parse timestamp: {text} - failed with message {}", failure.message)))?),
+                    (ast::DataType::Time(..), Value::Utf8(text)) => {
+                        rtdb_types::validate_sql_time_literal(text).map_err(|failure| error(format!("Cannot parse time: {text} - failed with message {}", failure.message)))?;
+                        Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? }
+                    }
+                    _ => {
+                        let target = self.cast_target(&value.data_type)?;
+                        if target.result_type(&literal.logical_type()) == LogicalType::Scalar(ScalarType::Uri) {
+                            let Value::Utf8(text) = literal else { return Err(error("URI literal requires a string")); };
+                            rtdb_types::UriParts::parse(&text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message)))?;
+                            Expr::Literal(Value::Uri(text))
+                        } else { Expr::Cast { expr: Box::new(Expr::Literal(literal)), target } }
+                    },
+                }
+            },
             ast::Expr::Nested(expr) => self.expr_bound(expr, input, replacements)?,
             ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if matches!(expr.as_ref(), ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if value == "9223372036854775808")) => Expr::Literal(Value::I64(i64::MIN)),
             ast::Expr::UnaryOp { op, expr } => {
@@ -76,6 +95,33 @@ impl Context<'_> {
                 match op { ast::UnaryOperator::Plus => expr, ast::UnaryOperator::Minus => Expr::unary(UnaryOp::Negate, expr), ast::UnaryOperator::Not => Expr::unary(UnaryOp::Not, expr), ast::UnaryOperator::BitwiseNot => Expr::unary(UnaryOp::BitNot, expr), _ => return Err(unsupported(format!("Unary operator: {op}"))) }
             }
             ast::Expr::BinaryOp { left, op, right } => {
+                if let Some(access) = crate::json_access::JsonAccess::operator(op) {
+                    let object = self.expr_bound(left,input,replacements)?;
+                    self.expr_bound(right,input,replacements)?;
+                    return access.lower(object,right);
+                }
+                if let ast::BinaryOperator::Custom(name) = op {
+                    if matches!(name.as_str(),"rtdb.sql/between/symmetric" | "rtdb.sql/between/not-symmetric") {
+                        let ast::Expr::BinaryOp { left: low,op: ast::BinaryOperator::Custom(marker),right: high } = right.as_ref() else { return Err(error("Invalid BETWEEN bounds")); };
+                        if marker != "rtdb.sql/between/bounds" { return Err(error("Invalid BETWEEN bounds")); }
+                        let expression = Expr::between(self.expr_bound(left,input,replacements)?,self.expr_bound(low,input,replacements)?,self.expr_bound(high,input,replacements)?,true);
+                        return Ok(if name == "rtdb.sql/between/not-symmetric" { Expr::unary(UnaryOp::Not,expression) } else { expression });
+                    }
+                    if matches!(name.as_str(),"rtdb.sql/regex/match" | "rtdb.sql/regex/not") {
+                        let ast::Expr::BinaryOp { left: pattern,op: ast::BinaryOperator::Custom(flags_marker),right: flags } = right.as_ref() else { return Err(error("Invalid regex predicate")); };
+                        if flags_marker != "rtdb.sql/regex/flags" { return Err(error("Invalid regex predicate flags")); }
+                        let expression = call("like_regex".into(),vec![self.expr_bound(left,input,replacements)?,self.expr_bound(pattern,input,replacements)?,self.expr_bound(flags,input,replacements)?])?;
+                        return Ok(if name == "rtdb.sql/regex/not" { Expr::unary(UnaryOp::Not,expression) } else { expression });
+                    }
+                    if let Some(name) = name.strip_prefix("rtdb.sql/string/") {
+                        return call(name.into(), vec![self.expr_bound(left, input, replacements)?, self.expr_bound(right, input, replacements)?]);
+                    }
+                    if let Some(name) = name.strip_prefix("rtdb.sql/period/") {
+                        let left = self.expr_bound(left, input, replacements)?;
+                        let right = self.expr_bound(right, input, replacements)?;
+                        return crate::period::predicate(name, left, right);
+                    }
+                }
                 let left = self.expr_bound(left, input, replacements)?;
                 let right = self.expr_bound(right, input, replacements)?;
                 Expr::binary(binary_operator(op)?, left, right)
@@ -92,43 +138,99 @@ impl Context<'_> {
             ast::Expr::IsNotDistinctFrom(left, right) => Expr::binary(BinaryOp::IsNotDistinctFrom, self.expr_bound(left, input, replacements)?, self.expr_bound(right, input, replacements)?),
             ast::Expr::Between { expr, low, high, negated } => {
                 let expr = self.expr_bound(expr, input, replacements)?;
-                let predicate = Expr::binary(BinaryOp::And, Expr::binary(BinaryOp::GtEq, expr.clone(), self.expr_bound(low, input, replacements)?), Expr::binary(BinaryOp::LtEq, expr, self.expr_bound(high, input, replacements)?));
+                let predicate = Expr::between(expr,self.expr_bound(low,input,replacements)?,self.expr_bound(high,input,replacements)?,false);
                 if *negated { Expr::unary(UnaryOp::Not, predicate) } else { predicate }
             }
-            ast::Expr::InList { expr, list, negated } => Expr::In { expr: Box::new(self.expr_bound(expr, input, replacements)?), values: list.iter().map(|value| self.expr_bound(value, input, replacements)).collect::<Result<_>>()?, negated: *negated },
-            ast::Expr::Like { expr, pattern, escape_char, negated, any } | ast::Expr::ILike { expr, pattern, escape_char, negated, any } => {
+            ast::Expr::InList { expr, list, negated } => {
+                let needle = self.expr_bound(expr, input, replacements)?;
+                let predicate = self.in_list(needle, list, input)?;
+                if *negated { Expr::unary(UnaryOp::Not, predicate) } else { predicate }
+            }
+            ast::Expr::Like { expr, pattern, negated, any,.. } | ast::Expr::ILike { expr, pattern, negated, any,.. } => {
                 if *any { return Err(unsupported("LIKE ANY")); }
-                let escape = escape_char.as_ref().map(|escape| {
-                    let Expr::Literal(Value::Utf8(value)) = self.expr_bound(escape, input, replacements)? else { return Err(error("LIKE escape must be a literal character")); };
-                    let mut chars = value.chars(); let first = chars.next().ok_or_else(|| error("LIKE escape must contain one character"))?;
-                    if chars.next().is_some() { return Err(error("LIKE escape must contain one character")); }
-                    Ok(first)
-                }).transpose()?;
-                Expr::Like { expr: Box::new(self.expr_bound(expr, input, replacements)?), pattern: Box::new(self.expr_bound(pattern, input, replacements)?), escape, case_insensitive: matches!(expression, ast::Expr::ILike { .. }), negated: *negated }
+                Expr::Like { expr: Box::new(self.expr_bound(expr, input, replacements)?), pattern: Box::new(self.expr_bound(pattern, input, replacements)?), escape: None, case_insensitive: matches!(expression, ast::Expr::ILike { .. }), negated: *negated }
             }
             ast::Expr::Cast { expr, data_type, kind, format } => {
                 if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(unsupported("TRY_CAST or cast format")); }
-                Expr::Cast { expr: Box::new(self.expr_bound(expr, input, replacements)?), target: crate::types::cast_target(data_type)? }
+                Expr::Cast { expr: Box::new(self.expr_bound(expr, input, replacements)?), target: self.cast_target(data_type)? }
             }
             ast::Expr::Case { operand, conditions, else_result, .. } => {
                 let operand = operand.as_ref().map(|value| self.expr_bound(value, input, replacements)).transpose()?;
                 let branches = conditions.iter().map(|when| {
-                    let condition = self.expr_bound(&when.condition, input, replacements)?;
-                    Ok((match &operand { Some(operand) => Expr::binary(BinaryOp::Eq, operand.clone(), condition), None => condition }, self.expr_bound(&when.result, input, replacements)?))
+                    let candidate = self.expr_bound(&when.condition, input, replacements)?;
+                    Ok((if operand.is_some() { candidate } else { Expr::unary(UnaryOp::IsTrue, candidate) }, self.expr_bound(&when.result, input, replacements)?))
                 }).collect::<Result<_>>()?;
-                Expr::Case { branches, otherwise: Box::new(else_result.as_ref().map(|value| self.expr_bound(value, input, replacements)).transpose()?.unwrap_or(Expr::Literal(Value::Null))) }
+                let otherwise = Box::new(else_result.as_ref().map(|value| self.expr_bound(value, input, replacements)).transpose()?.unwrap_or(Expr::Literal(Value::Null)));
+                match operand { Some(operand) => Expr::SimpleCase { operand: Box::new(operand),branches,otherwise }, None => Expr::Case { branches,otherwise } }
             }
             ast::Expr::Function(function) => {
-                if aggregate_function(&function.name.to_string()).is_some() { return Err(error("Aggregate is not valid in this expression scope")); }
+                if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregate is not valid in this expression scope")); }
                 if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
                 if let ast::FunctionArguments::List(arguments) = &function.args {
                     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(unsupported("Scalar function argument modifiers")); }
                 }
-                let args = function_arguments(function)?.iter().map(|arg| match arg { ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => self.expr_bound(expr, input, replacements), _ => Err(unsupported("Named function arguments or scalar wildcard")) }).collect::<Result<Vec<_>>>()?;
-                let names = identifiers(&function.name)?;
-                let name = names.iter().map(|name| name.normalized()).collect::<Vec<_>>().join(".");
-                if name == "coalesce" { Expr::Coalesce(args) } else { call(name, args)? }
+                let name = scalar_name(function)?;
+                if name == "regexp_replace" {
+                    let arguments = function_arguments(function)?;
+                    crate::settings::regexp_arguments(&arguments)?;
+                    let argument = |index| match &arguments[index] { ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr), _ => Err(error("REGEXP_REPLACE requires expressions")) };
+                    let metadata = |index| -> Result<rtdb_plan::RegexForm> {
+                        let expr = argument(index)?;
+                        if let ast::Expr::Value(value) = expr {
+                            if let Ok(Value::Utf8(value)) = crate::types::literal(&value.value) { return Ok(rtdb_plan::RegexForm::Literal(Value::Utf8(value))); }
+                        }
+                        let (sign,value) = match expr {
+                            ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus,expr } => ("-",expr.as_ref()),
+                            ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus,expr } => ("+",expr.as_ref()),
+                            expr => ("",expr),
+                        };
+                        let ast::Expr::Value(value) = value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
+                        let ast::Value::Number(value,_) = &value.value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
+                        let value = format!("{sign}{value}").parse::<i64>().map_err(|_|error("REGEXP_REPLACE integer literal exceeds signed 64-bit range"))?;
+                        Ok(rtdb_plan::RegexForm::Literal(Value::I64(value)))
+                    };
+                    let mut recipe = rtdb_plan::RegexReplacement { pattern: metadata(1)?,replacement: metadata(2)?,..Default::default() };
+                    for index in 3..arguments.len() {
+                        let value = metadata(index)?;
+                        if matches!(&value,rtdb_plan::RegexForm::Literal(Value::Utf8(_))) { recipe.flags = value; }
+                        else if index == 3 { recipe.start = value; } else { recipe.occurrence = value; }
+                    }
+                    return Ok(Expr::regex_replace(self.expr_bound(argument(0)?,input,replacements)?,recipe));
+                }
+                if matches!(name.as_str(),"date_bin" | "range_bins") && !matches!(function_arguments(function)?.first(),Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Interval(_))))) {
+                    return Err(error("Temporal bin functions require an interval literal stride"));
+                }
+                let args = function_arguments(function)?.iter().enumerate().map(|(index,arg)| match arg {
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => {
+                        if name == "date_trunc" && index == 0 {
+                            Ok(Expr::Literal(Value::Utf8(crate::temporal_syntax::trunc_field(expr)?)))
+                        } else { self.expr_bound(expr,input,replacements) }
+                    }
+                    _ => Err(unsupported("Named function arguments or scalar wildcard")),
+                }).collect::<Result<Vec<_>>>()?;
+                if matches!(name.as_str(), "pg_sleep" | "pg_sleep_for") {
+                    if args.len() != 1 { return Err(error(format!("Function {name} requires one argument"))); }
+                    call("sleep".into(), vec![Expr::Cast { expr: Box::new(args.into_iter().next().unwrap()), target: rtdb_plan::CastTarget::Fixed(LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Millisecond))) }])?
+                }
+                else if name == "concat" {
+                    if args.is_empty() { return Err(error("Function concat arity mismatch: expected at least 1 argument")); }
+                    let mut parts = args.into_iter().map(|arg| Ok(Expr::Coalesce(vec![call("str".into(), vec![arg])?, Expr::Literal(Value::Utf8(String::new()))]))).collect::<Result<Vec<_>>>()?;
+                    if parts.len() == 1 { parts.pop().unwrap() } else { call(name, parts)? }
+                }
+                else if name == "str" && args.is_empty() { return Err(error("Function str arity mismatch: expected at least 1 argument")); }
+                else if name == "coalesce" { Expr::Coalesce(args) }
+                else if matches!(name.as_str(), "generate_series" | "range") { self.series(&name, args)? }
+                else if name == "overlaps" { crate::period::overlaps(args)? }
+                else if name == "range_bins" {
+                    if !(2..=3).contains(&args.len()) { return Err(error("RANGE_BINS requires a stride, period and optional origin")); }
+                    let mut args = args.into_iter();let stride = args.next().unwrap();let period = args.next().unwrap();
+                    let mut lowered = vec![stride,call("lower".into(),vec![period.clone()])?,call("upper".into(),vec![period])?];
+                    if let Some(origin) = args.next() { lowered.push(origin); }
+                    call(name,lowered)?
+                }
+                else { call(if name == "tstzrange" { "period".into() } else { name }, args)? }
             }
+            ast::Expr::Extract { field,expr,syntax } => call("extract".into(),vec![Expr::Literal(Value::Utf8(crate::temporal_syntax::extract_field(field,syntax)?)),self.expr_bound(expr,input,replacements)?])?,
             ast::Expr::Array(array) => Expr::List(array.elem.iter().map(|expr| self.expr_bound(expr, input, replacements)).collect::<Result<_>>()?),
             ast::Expr::Dictionary(fields) => Expr::Struct(fields.iter().map(|field| Ok((identifier(&field.key).normalized(), self.expr_bound(&field.value, input, replacements)?))).collect::<Result<_>>()?),
             ast::Expr::CompoundFieldAccess { root, access_chain } => {
@@ -138,8 +240,7 @@ impl Context<'_> {
                         ast::AccessExpr::Dot(ast::Expr::Identifier(name)) => expr = field_access(expr, identifier(name).normalized()),
                         ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => {
                             let index = Expr::binary(BinaryOp::Subtract, self.expr_bound(index, input, replacements)?, Expr::Literal(Value::I64(1)));
-                            let types: Vec<_> = expr.data_type().legs().into_iter().filter_map(|ty| match ty { LogicalType::List { element, .. } => Some(*element), _ => None }).collect();
-                            let data_type = LogicalType::join_all(&types).maybe();
+                            let data_type = rtdb_plan::function_type("nth", &[expr.data_type(), index.data_type()])?;
                             expr = Expr::Subscript { expr: Box::new(expr), index: Box::new(index), data_type };
                         }
                         _ => return Err(unsupported("Nested field access or array slices")),
@@ -153,51 +254,134 @@ impl Context<'_> {
                 if let Some(length) = substring_for { args.push(self.expr_bound(length, input, replacements)?); }
                 call("substring".into(), args)?
             }
+            ast::Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => {
+                let target = self.expr_bound(expr, input, replacements)?;
+                let placing = self.expr_bound(overlay_what, input, replacements)?;
+                let start = self.expr_bound(overlay_from, input, replacements)?;
+                let length = match overlay_for { Some(expr) => self.expr_bound(expr, input, replacements)?, None => call("default_overlay_length".into(), vec![placing.clone()])? };
+                call("overlay".into(), vec![target, placing, start, length])?
+            }
             ast::Expr::Trim { expr, trim_where, trim_what, trim_characters } => {
                 if trim_characters.is_some() { return Err(unsupported("TRIM character list")); }
                 let mut args = vec![self.expr_bound(expr, input, replacements)?];
-                if let Some(what) = trim_what { args.push(self.expr_bound(what, input, replacements)?); }
+                args.push(match trim_what { Some(what) => self.expr_bound(what, input, replacements)?, None => Expr::Literal(Value::Utf8(" ".into())) });
                 let name = match trim_where { Some(ast::TrimWhereField::Leading) => "trim_leading", Some(ast::TrimWhereField::Trailing) => "trim_trailing", _ => "trim" };
                 call(name.into(), args)?
             }
             _ => return Err(unsupported(format!("SQL expression: {expression}"))),
-        })
+        };
+        rtdb_plan::bind_clock_timezone(expression,self.cast_timezone)
+    }
+
+    pub(crate) fn series(&self, name: &str, mut args: Vec<Expr>) -> Result<Expr> {
+        if !matches!(name, "generate_series" | "range") { return Err(error(format!("Unknown series function: {name}"))); }
+        if !(2..=3).contains(&args.len()) { return Err(error(format!("Function {name} requires two or three arguments"))); }
+        if args.len() == 2 { args.push(Expr::Literal(Value::I64(1))); }
+        args.push(Expr::Literal(Value::Bool(name == "generate_series" && !self.options.generate_series_end_exclusive)));
+        call("generate_series".into(), args)
     }
 
     pub(crate) fn aggregate(&mut self, function: &ast::Function, input: &mut Arc<Relation>, index: usize) -> Result<AggregateExpr> {
         if function.over.is_some() || function.null_treatment.is_some() { return Err(unsupported("Aggregate window or null treatment")); }
+        if let Some(kind) = percentile_kind(&function.name.to_string()) { return self.percentile(function, kind, input, index); }
         let mut kind = aggregate_function(&function.name.to_string()).ok_or_else(|| error("Unknown aggregate"))?;
+        if !function.within_group.is_empty() { return Err(unsupported("WITHIN GROUP requires an ordered-set aggregate")); }
         let args = function_arguments(function)?;
         let argument = match args.as_slice() {
             [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard)] if kind == AggregateFunction::Count => { kind = AggregateFunction::CountStar; None }
             [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr))] => Some(self.relational_expr(expr, input, &BTreeMap::new())?),
             _ => return Err(error("Aggregate requires one expression or COUNT(*)")),
         };
+        let argument = argument.map(|expr| self.aggregate_input(input, expr, format!("_aggregate_in_{index}"))).transpose()?;
         let mut order_by = function.within_group.iter().map(|order| self.relational_sort_expr(order, input, &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
         let distinct = if let ast::FunctionArguments::List(arguments) = &function.args {
             for clause in &arguments.clauses {
-                match clause { ast::FunctionArgumentClause::OrderBy(order) => for expression in order { order_by.push(self.relational_sort_expr(expression, input, &BTreeMap::new())?); }, _ => return Err(unsupported("Aggregate argument modifier")) }
+                match clause { ast::FunctionArgumentClause::OrderBy(order) if kind == AggregateFunction::ArrayAgg => for expression in order { order_by.push(self.relational_sort_expr(expression, input, &BTreeMap::new())?); }, _ => return Err(unsupported("Aggregate argument modifier")) }
             }
+            if kind == AggregateFunction::ArrayAgg && arguments.duplicate_treatment.is_some() { return Err(unsupported("SQL ARRAY_AGG does not accept a set quantifier")); }
             arguments.duplicate_treatment == Some(ast::DuplicateTreatment::Distinct)
         } else { false };
+        if distinct && !matches!(kind.canonical(), AggregateFunction::Count | AggregateFunction::Sum | AggregateFunction::Average | AggregateFunction::Min | AggregateFunction::Max | AggregateFunction::ArrayAgg) {
+            return Err(unsupported("The aggregate factory does not support DISTINCT"));
+        }
+        for (order_index, order) in order_by.iter_mut().enumerate() {
+            order.expr = self.aggregate_input(input, order.expr.clone(), format!("_aggregate_sort_{index}_{order_index}"))?;
+        }
         let argument_type = argument.as_ref().map(Expr::data_type).unwrap_or(LogicalType::Nothing);
-        let data_type = aggregate_type(kind, &argument_type)?;
+        let data_type = aggregate_type(&kind, &argument_type)?;
         Ok(AggregateExpr { field: self.binder.field(format!("_aggregate_{index}"), None, data_type)?, function: kind, argument, distinct,
             filter: function.filter.as_ref().map(|expr| self.relational_expr(expr, input, &BTreeMap::new())).transpose()?, order_by })
     }
+
+    fn aggregate_input(&mut self, input: &mut Arc<Relation>, expression: Expr, name: String) -> Result<Expr> {
+        if matches!(expression, Expr::Column { .. }) { return Ok(expression); }
+        let field = self.binder.field(name, None, expression.data_type())?;
+        let mut projections = input.schema().fields().iter().map(|field| rtdb_plan::NamedExpr { field: field.clone(), expr: field.expression() }).collect::<Vec<_>>();
+        projections.push(rtdb_plan::NamedExpr { field: field.clone(), expr: expression });
+        *input = Arc::new(Arc::clone(input).project(projections)?);
+        Ok(field.expression())
+    }
+
+    fn percentile(&mut self, function: &ast::Function, kind: PercentileKind, input: &mut Arc<Relation>, index: usize) -> Result<AggregateExpr> {
+        let ast::FunctionArguments::List(arguments) = &function.args else { return Err(error("Percentile requires one fraction")); };
+        if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) {
+            return Err(error("Percentile does not accept argument modifiers"));
+        }
+        let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(fraction))] = arguments.args.as_slice() else { return Err(error("Percentile requires one fraction")); };
+        let numeric = |expr: &ast::Expr| matches!(expr, ast::Expr::Value(value) if matches!(value.value, ast::Value::Number(_, _)));
+        let allowed = match fraction {
+            ast::Expr::Value(value) => matches!(value.value, ast::Value::Number(_, _) | ast::Value::Placeholder(_)),
+            ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus | ast::UnaryOperator::Minus, expr } => numeric(expr),
+            _ => false,
+        };
+        if !allowed { return Err(error("Percentile fraction must be a numeric literal or parameter")); }
+        let fraction = self.expr(fraction, &Schema::default(), &BTreeMap::new())?;
+        let fraction = match &fraction {
+            Expr::Parameter { index, .. } => PercentileFraction::Parameter { index: *index },
+            Expr::Literal(Value::I64(value)) => PercentileFraction::Integer(*value),
+            Expr::Literal(Value::F64(value)) => PercentileFraction::Literal(*value),
+            Expr::Unary { op: UnaryOp::Negate, expr } => match expr.as_ref() {
+                Expr::Literal(Value::I64(value)) => PercentileFraction::Integer(value.checked_neg().ok_or_else(|| error("Percentile fraction integer overflow"))?),
+                Expr::Literal(Value::F64(value)) => PercentileFraction::Literal(-value),
+                _ => return Err(error("Percentile fraction must be numeric")),
+            },
+            _ => return Err(error("Percentile fraction must be numeric")),
+        };
+        let [order] = function.within_group.as_slice() else { return Err(error("Percentile requires WITHIN GROUP with exactly one ORDER BY expression")); };
+        if order.with_fill.is_some() { return Err(error("Percentile ordering does not accept WITH FILL")); }
+        let descending = crate::bind::sort_descending(&order.options)?;
+        let mut argument = self.relational_expr(&order.expr, input, &BTreeMap::new())?;
+        if !matches!(argument, Expr::Column { .. }) {
+            let field = self.binder.field(format!("_percentile_sort_{index}"), None, argument.data_type())?;
+            let mut projections = input.schema().fields().iter().map(|field| rtdb_plan::NamedExpr { field: field.clone(), expr: field.expression() }).collect::<Vec<_>>();
+            projections.push(rtdb_plan::NamedExpr { field: field.clone(), expr: argument });
+            *input = Arc::new(Arc::clone(input).project(projections)?);
+            argument = field.expression();
+        }
+        let function_kind = AggregateFunction::Percentile { kind, fraction, descending };
+        Ok(AggregateExpr {
+            field: self.binder.field(format!("_aggregate_{index}"), None, aggregate_type(&function_kind, &argument.data_type())?)?,
+            function: function_kind, argument: Some(argument), distinct: false, order_by: Vec::new(),
+            filter: function.filter.as_ref().map(|expr| self.relational_expr(expr, input, &BTreeMap::new())).transpose()?,
+        })
+    }
 }
 
-fn aggregate_type(function: AggregateFunction, argument: &LogicalType) -> Result<LogicalType> {
+fn aggregate_type(function: &AggregateFunction, argument: &LogicalType) -> Result<LogicalType> {
     use AggregateFunction as A;
     use LogicalType as T;
     use ScalarType as S;
     let promoted = || T::least_upper_bound(std::slice::from_ref(argument))
         .ok_or_else(|| error(format!("Incomparable types in {function:?} aggregate: {argument:?}")));
-    Ok(match function {
+    Ok(match function.canonical() {
+        A::Alias(_) | A::Named(_) => unreachable!(),
         A::Count | A::CountStar => T::Scalar(S::I64),
         A::VariancePopulation | A::VarianceSample | A::StddevPopulation | A::StddevSample => T::Scalar(S::F64).maybe(),
         A::Every | A::Any => T::Scalar(S::Bool).maybe(),
         A::ArrayAgg => T::list(argument.clone()).maybe(),
+        A::VecAgg => T::list(argument.clone()),
+        A::Percentile { kind: PercentileKind::Continuous, .. } => T::Scalar(S::F64).maybe(),
+        A::Percentile { kind: PercentileKind::Discrete, .. } => argument.clone().maybe(),
         A::Sum => promoted()?.maybe(),
         A::Average => match promoted()? {
             ty @ T::Scalar(S::Duration(_)) => ty.maybe(),
@@ -212,14 +396,70 @@ fn aggregate_type(function: AggregateFunction, argument: &LogicalType) -> Result
     })
 }
 
+pub(crate) fn scalar_name(function: &ast::Function) -> Result<String> {
+    let names = identifiers(&function.name)?;
+    let unknown = || error(format!("Unknown function: {}", function.name));
+    if names.is_empty() || names.len() > 2 { return Err(unknown()); }
+    let last = names.last().unwrap();
+    let name = last.normalized();
+    crate::temporal_syntax::function(&name,function)?;
+    let count = match &function.args {
+        ast::FunctionArguments::None => 0,
+        ast::FunctionArguments::List(arguments) => arguments.args.len(),
+        _ => return Err(unsupported("Function subquery arguments")),
+    };
+    if let Some(arity) = generic_function_arity(&name) {
+        if !arity.contains(&count) { return Err(error(format!("Function {name} arity mismatch: expected {}-{}, got {count}", arity.start(), arity.end()))); }
+        return Ok(name);
+    }
+    if last.quoted { return Err(unknown()); }
+    match name.as_str() {
+        "version" => return Ok(if names.len() == 2 && names[0].normalized() == "xt" { "xt.version".into() } else { name }),
+        "current_schema" | "current_schemas" => return Ok(name),
+        "current_catalog" => return Ok("current_database".into()),
+        "current_user" if matches!(function.args, ast::FunctionArguments::None) => return Ok(name),
+        "generate_series" | "range" => {
+            if !(2..=3).contains(&count) { return Err(error(format!("Function {name} requires two or three arguments"))); }
+            return Ok(name);
+        }
+        _ => {},
+    }
+    if names.len() != 1 { return Err(unknown()); }
+    match name.as_str() {
+        "char_length" => Ok("character_length".into()),
+        "nullif" | "coalesce" | "character_length" | "period" | "tstzrange"
+        | "substring" | "trim" | "overlay" | "replace" | "regexp_replace"
+        | "uri_scheme" | "uri_user_info" | "uri_host" | "uri_port" | "uri_path" | "uri_query" | "uri_fragment"
+        | "pg_sleep" | "pg_sleep_for" | "current_timestamp" | "now" | "current_date"
+        | "current_time" | "current_timezone" | "localtime" | "localtimestamp" | "localdate" | "local_date" | "local_time" | "local_timestamp" | "snapshot_token"
+        | "current_setting" | "date_trunc" | "date_bin" | "range_bins" | "overlaps" | "trim_array" => Ok(name),
+        _ => Err(unknown()),
+    }
+}
+
+fn generic_function_arity(name: &str) -> Option<std::ops::RangeInclusive<usize>> {
+    Some(match name {
+        "current_database" => 0..=0,
+        "octet_length" | "length" | "cardinality" | "abs" | "log10" | "ln" | "exp" | "sqrt"
+        | "floor" | "ceil" | "ceiling" | "sin" | "cos" | "tan" | "sinh" | "cosh" | "tanh"
+        | "asin" | "acos" | "atan" | "lower_inf" | "lower" | "upper" | "upper_inf"
+        | "namespace" | "local_name" | "reverse" | "quote_ident" | "parse_ident" => 1..=1,
+        "array_upper" | "array_lower" | "array_length" | "mod" | "log" | "power" | "age"
+        | "string_to_array" | "col_description" | "pg_indexam_has_property" | "format_type" => 2..=2,
+        "round" => 1..=2,
+        "least" | "greatest" | "str" | "format" | "concat" => 1..=usize::MAX,
+        _ => return None,
+    })
+}
+
 fn call(name: String, args: Vec<Expr>) -> Result<Expr> {
     let return_type = rtdb_plan::function_type_with_args(&name, &args)?;
     Ok(Expr::Call { name, args, return_type })
 }
 
 fn field_access(expr: Expr, name: String) -> Expr {
-    let types: Vec<_> = expr.data_type().legs().iter().filter_map(|ty| match ty { LogicalType::Struct(fields) => Some(fields.get(&name).cloned().unwrap_or(LogicalType::Null)), _ => None }).collect();
-    Expr::Field { expr: Box::new(expr), name, data_type: LogicalType::join_all(&types).maybe() }
+    let data_type = rtdb_plan::field_type(&expr.data_type(), &name);
+    Expr::Field { expr: Box::new(expr), name, data_type }
 }
 
 fn function_arguments(function: &ast::Function) -> Result<Vec<ast::FunctionArg>> {
@@ -242,31 +482,65 @@ fn aggregate_function(name: &str) -> Option<AggregateFunction> {
     Some(match name.to_lowercase().as_str() {
         "count" => AggregateFunction::Count, "sum" => AggregateFunction::Sum, "avg" => AggregateFunction::Average,
         "min" => AggregateFunction::Min, "max" => AggregateFunction::Max, "array_agg" => AggregateFunction::ArrayAgg,
-        "every" | "bool_and" => AggregateFunction::Every, "any" | "some" | "bool_or" => AggregateFunction::Any,
-        "var_pop" => AggregateFunction::VariancePopulation, "var_samp" | "variance" => AggregateFunction::VarianceSample,
-        "stddev_pop" => AggregateFunction::StddevPopulation, "stddev_samp" | "stddev" => AggregateFunction::StddevSample,
+        "every" => AggregateFunction::Every, "bool_and" => AggregateFunction::Alias(rtdb_plan::AggregateAlias::BoolAnd), "bool_or" => AggregateFunction::Any,
+        "var_pop" => AggregateFunction::VariancePopulation, "var_samp" => AggregateFunction::VarianceSample,
+        "stddev_pop" => AggregateFunction::StddevPopulation, "stddev_samp" => AggregateFunction::StddevSample,
         _ => return None,
     })
 }
 
-pub(crate) fn aggregate_calls(expr: &ast::Expr, output: &mut BTreeMap<String, ast::Function>) -> Result<()> {
+fn percentile_kind(name: &str) -> Option<PercentileKind> {
+    match name.to_lowercase().as_str() { "percentile_cont" => Some(PercentileKind::Continuous), "percentile_disc" => Some(PercentileKind::Discrete), _ => None }
+}
+
+pub(crate) fn aggregate_notices(expr: &ast::Expr, output: &mut Vec<SqlNotice>) {
     if let ast::Expr::Function(function) = expr {
-        if function.over.is_none() && aggregate_function(&function.name.to_string()).is_some() { output.insert(expr.to_string(), function.clone()); return Ok(()); }
+        if percentile_kind(&function.name.to_string()).is_some() && function.within_group.iter().any(|order| order.options.nulls_first.is_some()) {
+            output.push(SqlNotice { message: format!("NULL ordering is ignored for {} (nulls are excluded from ordered-set aggregates)", function.name.to_string().to_lowercase()) });
+        }
+    }
+    for child in children(expr) { aggregate_notices(child, output); }
+}
+
+pub(crate) fn aggregate_calls(expr: &ast::Expr, output: &mut Vec<(sqlparser::tokenizer::Span, ast::Function)>) -> Result<()> {
+    if let ast::Expr::InList { expr, .. } = expr { return aggregate_calls(expr, output); }
+    if let ast::Expr::Function(function) = expr {
+        if function.over.is_none() && (aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some()) { output.push((expr.span(), function.clone())); return Ok(()); }
     }
     for child in children(expr) { aggregate_calls(child, output)?; }
     Ok(())
 }
 
 pub(crate) fn window_calls(expr: &ast::Expr, output: &mut Vec<(String, ast::Function)>) {
+    if let ast::Expr::InList { expr, .. } = expr { window_calls(expr, output); return; }
     if let ast::Expr::Function(function) = expr {
         if function.over.is_some() { output.push((expr.to_string(), function.clone())); return; }
     }
     for child in children(expr) { window_calls(child, output); }
 }
 
+pub(crate) fn validate_in_list_item(expr: &ast::Expr) -> Result<()> {
+    if contains_subquery(expr) { return Err(error("Subqueries are not allowed in this context")); }
+    if let ast::Expr::Function(function) = expr {
+        if function.over.is_some() { return Err(error("Window functions are not allowed in this context")); }
+        if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregates are not allowed in this context")); }
+    }
+    for child in children(expr) { validate_in_list_item(child)?; }
+    Ok(())
+}
+
 pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } | ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. })
+        || matches!(expr, ast::Expr::InList { list, .. } if list.len() > 8 || list.iter().any(row_constructor))
         || children(expr).into_iter().any(contains_subquery)
+}
+
+fn row_constructor(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Tuple(_) => true,
+        ast::Expr::Function(function) => identifiers(&function.name).is_ok_and(|names| names.len() == 1 && !names[0].quoted && names[0].normalized() == "row"),
+        _ => false,
+    }
 }
 
 pub(crate) fn references_unqualified_names(expr: &ast::Expr, names: &std::collections::BTreeSet<String>) -> bool {
@@ -275,7 +549,7 @@ pub(crate) fn references_unqualified_names(expr: &ast::Expr, names: &std::collec
 }
 
 pub(crate) fn reject_ambiguous_columns(expr: &ast::Expr, schema: &Schema) -> Result<()> {
-    let names = match expr { ast::Expr::Identifier(name) => Some(vec![identifier(name)]), ast::Expr::CompoundIdentifier(names) => Some(names.iter().take(2).map(identifier).collect()), _ => None };
+    let names = match expr { ast::Expr::Identifier(name) => Some(vec![identifier(name)]), ast::Expr::CompoundIdentifier(names) => Some(names.iter().map(identifier).collect()), _ => None };
     if let Some(names) = names {
         if let Err(error) = schema.resolve(&names) { if error.code == "xtdb/ambiguous-column" { return Err(error); } }
     }
@@ -283,20 +557,22 @@ pub(crate) fn reject_ambiguous_columns(expr: &ast::Expr, schema: &Schema) -> Res
     Ok(())
 }
 
-fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
+pub(crate) fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
     match expr {
         ast::Expr::Nested(expr) | ast::Expr::UnaryOp { expr, .. } | ast::Expr::Cast { expr, .. } | ast::Expr::IsNull(expr) | ast::Expr::IsNotNull(expr) | ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) | ast::Expr::IsNotTrue(expr) | ast::Expr::IsNotFalse(expr) | ast::Expr::IsNotUnknown(expr) => vec![expr],
         ast::Expr::BinaryOp { left, right, .. } | ast::Expr::IsDistinctFrom(left, right) | ast::Expr::IsNotDistinctFrom(left, right) | ast::Expr::AnyOp { left, right, .. } | ast::Expr::AllOp { left, right, .. } => vec![left, right],
         ast::Expr::Between { expr, low, high, .. } => vec![expr, low, high],
         ast::Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),
         ast::Expr::InSubquery { expr, .. } => vec![expr],
-        ast::Expr::Like { expr, pattern, escape_char, .. } | ast::Expr::ILike { expr, pattern, escape_char, .. } => [expr.as_ref(), pattern.as_ref()].into_iter().chain(escape_char.as_deref()).collect(),
+        ast::Expr::Like { expr, pattern, .. } | ast::Expr::ILike { expr, pattern, .. } => vec![expr,pattern],
         ast::Expr::Case { operand, conditions, else_result, .. } => operand.as_deref().into_iter().chain(conditions.iter().flat_map(|when| [&when.condition, &when.result])).chain(else_result.as_deref()).collect(),
         ast::Expr::Function(function) => if let ast::FunctionArguments::List(args) = &function.args { args.args.iter().filter_map(|arg| match arg { ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Some(expr), _ => None }).collect() } else { Vec::new() },
         ast::Expr::Array(array) => array.elem.iter().collect(),
         ast::Expr::Dictionary(fields) => fields.iter().map(|field| field.value.as_ref()).collect(),
         ast::Expr::Position { expr, r#in } => vec![expr, r#in],
+        ast::Expr::Extract { expr,.. } => vec![expr],
         ast::Expr::Substring { expr, substring_from, substring_for, .. } => std::iter::once(expr.as_ref()).chain(substring_from.as_deref()).chain(substring_for.as_deref()).collect(),
+        ast::Expr::Overlay { expr, overlay_what, overlay_from, overlay_for } => [expr.as_ref(), overlay_what.as_ref(), overlay_from.as_ref()].into_iter().chain(overlay_for.as_deref()).collect(),
         ast::Expr::Trim { expr, trim_what, .. } => std::iter::once(expr.as_ref()).chain(trim_what.as_deref()).collect(),
         ast::Expr::CompoundFieldAccess { root, access_chain } => std::iter::once(root.as_ref()).chain(access_chain.iter().filter_map(|access| match access {
             ast::AccessExpr::Subscript(ast::Subscript::Index { index }) => Some(index), _ => None,

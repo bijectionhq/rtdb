@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
-use rtdb_types::{Result, Value, TimeUnit};
+use rtdb_types::{Result, Value};
 use serde_json::Value as Json;
 use super::{ConnectSchema, SchemaKind, error};
 
@@ -14,9 +14,12 @@ impl Metadata {
     pub fn root(&self) -> &Json { &self.root }
     pub fn named(&self, name: &str) -> Option<&Json> { self.names.get(name) }
     pub fn decorate_node(&self, schema: &ConnectSchema, raw: &Json, default: Option<&Json>, field_doc: Option<&str>, root: bool) -> Result<super::super::schema_graph::Metadata> {
+        self.decorate_node_at_version(schema, raw, default, field_doc, root, self.version)
+    }
+    pub fn decorate_node_at_version(&self, schema: &ConnectSchema, raw: &Json, default: Option<&Json>, field_doc: Option<&str>, root: bool, version: Option<i32>) -> Result<super::super::schema_graph::Metadata> {
         let mut schema = self.schema(Arc::new(schema.clone()), raw, default, field_doc, 0)?;
         if root && raw.get("connect.version").is_none() && !raw.is_array() && !raw.get("type").is_some_and(Json::is_array) {
-            if let Some(version) = self.version.filter(|version| *version >= 0) {
+            if let Some(version) = version.filter(|version| *version >= 0) {
                 if schema.version.is_some_and(|current| current != version) { return Err(error("avro-schema", "Registry version disagrees with logical type version")); }
                 Arc::make_mut(&mut schema).version = Some(version);
             }
@@ -31,7 +34,7 @@ impl Metadata {
             }
         }
         if raw.is_array() || raw.get("type").is_some_and(Json::is_array) { return Ok(schema); }
-        let mut result = schema.as_ref().clone();
+        let mut result = before_declared_logical_name(schema.as_ref().clone(), raw);
         let kind = raw.as_str().or_else(|| raw.get("type").and_then(Json::as_str)).unwrap_or_default();
         if kind == "record" && self.connect && !self.discard_docs {
             if let Some(fields) = raw.get("fields").and_then(Json::as_array) { for field in fields {
@@ -91,6 +94,13 @@ impl Metadata {
         Ok(Arc::new(result))
     }
 }
+pub(super) fn before_declared_logical_name(mut schema: ConnectSchema, raw: &Json) -> ConnectSchema {
+    let raw = raw.as_array().or_else(|| raw.get("type").and_then(Json::as_array)).and_then(|variants| variants.first()).unwrap_or(raw);
+    let logical_name = raw.get("connect.name").and_then(Json::as_str).filter(|name| matches!(*name, "org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp" | "org.apache.kafka.connect.data.Decimal"));
+    let physical_logical = raw.get("logicalType").and_then(Json::as_str).is_some_and(|name| ["date", "time-millis", "timestamp-millis", "decimal"].iter().any(|logical| name.eq_ignore_ascii_case(logical)));
+    if logical_name.is_some() && schema.name.as_deref() == logical_name && !physical_logical { schema.name = None; }
+    schema
+}
 fn collect(raw: &Json, namespace: &str, names: &mut BTreeMap<String, Json>) {
     if let Some(variants) = raw.as_array() { for variant in variants { collect(variant, namespace, names); } return; }
     let namespace = raw.get("namespace").and_then(Json::as_str).unwrap_or(namespace);
@@ -123,19 +133,29 @@ pub(super) fn coerce(value: Value, schema: &ConnectSchema) -> Result<Value> {
         (value, _) => value,
     })
 }
+fn logical_date_default(schema: &ConnectSchema, int: i32, long: i64) -> Result<Option<Value>> {
+    let millis = match schema.name.as_deref() {
+        Some("org.apache.kafka.connect.data.Date") if matches!(schema.kind, SchemaKind::I32) => i64::from(int) * 86_400_000,
+        Some("org.apache.kafka.connect.data.Time") if matches!(schema.kind, SchemaKind::I32) => {
+            if !(0..=86_400_000).contains(&int) { return Err(error("avro-schema", "Time default is outside one day")); }
+            i64::from(int)
+        }
+        Some("org.apache.kafka.connect.data.Timestamp") if matches!(schema.kind, SchemaKind::I64) => long,
+        Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp") => return Err(error("avro-schema", "Logical date default has an incompatible primitive schema")),
+        _ => return Ok(None),
+    };
+    Ok(Some(super::super::data::date_value(millis)))
+}
+
 fn default_value(value: &Json, schema: &ConnectSchema, field_default: bool) -> Result<Value> {
     let schema = schema.resolved();
     if value.is_null() { return Ok(Value::Null); }
     let integer = || value.as_i64().or_else(|| value.as_u64().map(|value| value as i64)).unwrap_or(0);
+    if let Some(value) = logical_date_default(&schema, integer() as i32, integer())? { return Ok(value); }
     let bytes = || value.as_str().map(|value| value.chars().map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?')).collect::<Vec<_>>()).ok_or_else(|| error("avro-schema", "Binary default must be a string"));
     match schema.name.as_deref() {
-        Some("org.apache.kafka.connect.data.Date") => return Ok(Value::DateDay(integer() as i32)),
-        Some("org.apache.kafka.connect.data.Time") => return Ok(Value::Time { value: integer(), unit: TimeUnit::Millisecond, bit_width: 32 }),
-        Some("org.apache.kafka.connect.data.Timestamp") => return Ok(Value::Timestamp { value: integer(), unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }),
         Some("org.apache.kafka.connect.data.Decimal") => {
-            let scale = schema.parameters.get("scale").ok_or_else(|| error("avro-schema", "Decimal default has no schema scale"))?
-                .parse().map_err(|cause| error("avro-schema", cause))?;
-            return super::decimal_value_at_scale(bytes()?, scale);
+            return super::decimal_value(bytes()?, &schema);
         }
         _ => (),
     }
@@ -161,9 +181,52 @@ fn default_value(value: &Json, schema: &ConnectSchema, field_default: bool) -> R
     })
 }
 
+pub(super) fn raw_default_value(value: &super::default_json::DefaultJson, schema: &ConnectSchema, field_default: bool) -> Result<Value> {
+    let schema = schema.resolved();
+    if value.is_null() { return Ok(Value::Null); }
+    let integer = || value.long_value().unwrap_or(0);
+    if let Some(value) = logical_date_default(&schema, value.int_value().unwrap_or(0), integer())? { return Ok(value); }
+    let bytes = || value.as_str().map(|value| value.chars().map(|character| u8::try_from(u32::from(character)).unwrap_or(b'?')).collect::<Vec<_>>()).ok_or_else(|| error("avro-schema", "Binary default must be a string"));
+    match schema.name.as_deref() {
+        Some("org.apache.kafka.connect.data.Decimal") => return super::decimal_value(bytes()?, &schema),
+        _ => {}
+    }
+    Ok(match &schema.kind {
+        SchemaKind::Bool => Value::Bool(value.as_bool().unwrap_or(false)),
+        SchemaKind::I8 => Value::I8(value.int_value().unwrap_or(0) as i8), SchemaKind::I16 => Value::I16(value.int_value().unwrap_or(0) as i16), SchemaKind::I32 => Value::I32(value.int_value().unwrap_or(0)), SchemaKind::I64 => Value::I64(integer()),
+        SchemaKind::F32 => Value::F32(value.float_value().unwrap_or(0.0)), SchemaKind::F64 => Value::F64(value.double_value().unwrap_or(0.0)),
+        SchemaKind::String => Value::Utf8(value.as_str().map(str::to_owned).ok_or_else(|| error("avro-schema", "String default is not textual"))?), SchemaKind::Bytes => Value::Binary(bytes()?),
+        SchemaKind::Array(element) => Value::List(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| raw_default_value(value, element, field_default)).collect::<Result<_>>()?),
+        SchemaKind::Map(_, element) => Value::Map { entries: value.as_object().ok_or_else(|| error("avro-schema", "Map default is not an object"))?.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), raw_default_value(value, element, field_default)?))).collect::<Result<_>>()?, sorted: false },
+        SchemaKind::Struct(fields) => {
+            value.as_object().ok_or_else(|| error("avro-schema", "Record default is not an object"))?;
+            Value::Struct(fields.iter().map(|field| {
+                let value = match value.get(&field.name) { Some(value) => raw_default_value(value, &field.schema, field_default)?, None if field_default => field.schema.default.clone().unwrap_or(Value::Null), None => Value::Null };
+                super::super::data::validate_value(&field.schema, &value, 0)?; Ok((field.name.clone(), value))
+            }).collect::<Result<_>>()?)
+        }
+        _ => return Err(error("avro-schema", "Default requires a concrete Connect schema")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn logical_date_defaults_use_raw_dates_and_the_primitive_number_accessor() {
+        use super::super::default_json::DefaultJson;
+        let mut date = ConnectSchema::new(SchemaKind::I32);
+        date.name = Some("org.apache.kafka.connect.data.Date".into());
+        assert_eq!(raw_default_value(&DefaultJson::Number("1e50".into()), &date, false).unwrap(), super::super::super::data::date_value(i64::from(i32::MAX) * 86_400_000));
+        assert_eq!(raw_default_value(&DefaultJson::Number("-1".into()), &date, false).unwrap(), super::super::super::data::date_value(-86_400_000));
+        let mut time = ConnectSchema::new(SchemaKind::I32);
+        time.name = Some("org.apache.kafka.connect.data.Time".into());
+        assert_eq!(raw_default_value(&DefaultJson::Number("86400000".into()), &time, false).unwrap(), super::super::super::data::date_value(86_400_000));
+        assert!(raw_default_value(&DefaultJson::Number("86400001".into()), &time, false).is_err());
+        assert!(raw_default_value(&DefaultJson::Number("-1".into()), &time, false).is_err());
+        time.kind = SchemaKind::I8;
+        assert!(raw_default_value(&DefaultJson::Number("0".into()), &time, false).is_err());
+    }
     #[test]
     fn decimal_defaults_preserve_full_scale_and_reject_invalid_schema_scales() {
         let mut schema = ConnectSchema::new(SchemaKind::Bytes);

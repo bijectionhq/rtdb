@@ -18,7 +18,7 @@ async fn query(sql: &str, parameters: Vec<Value>) -> Result<Vec<Vec<Value>>> {
     let options = PrepareOptions { parameter_types: parameters.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
     let prepared = prepare(sql, &context.catalog, &options)?;
     let Statement::Query(relation) = prepared.statement else { panic!("expected query") };
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters)?;
+    let mut cursor = PreparedQuery::new(relation)?.execute(context, parameters).await?;
     let mut result = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         let schema = batch.batch().schema();
@@ -52,6 +52,7 @@ async fn exists_and_not_exists_work_in_predicates_and_select_without_evaluating_
     assert_eq!(query("SELECT t.x, EXISTS (SELECT u.y FROM (VALUES (2)) AS u(y) WHERE u.y = t.x) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), vec![vec![Value::I64(1), Value::Bool(false)], vec![Value::I64(2), Value::Bool(true)]]);
     assert_eq!(query("SELECT t.x FROM (VALUES (1), (2)) AS t(x) WHERE NOT EXISTS (SELECT u.y FROM (VALUES (2)) AS u(y) WHERE u.y = t.x)", vec![]).await.unwrap(), vec![vec![Value::I64(1)]]);
     assert_eq!(query("SELECT EXISTS (SELECT 1 / 0), EXISTS (SELECT (SELECT x FROM (VALUES (1), (2)) AS u(x)))", vec![]).await.unwrap(), vec![vec![Value::Bool(true), Value::Bool(true)]]);
+    assert_eq!(query("SELECT EXISTS (SELECT n FROM (SELECT 1 / 0 AS n) AS derived)", vec![]).await.unwrap(), vec![vec![Value::Bool(true)]]);
     assert_eq!(query("SELECT EXISTS (SELECT DISTINCT x FROM (VALUES (1), (1)) AS t(x) OFFSET 1)", vec![]).await.unwrap(), vec![vec![Value::Bool(false)]]);
 }
 

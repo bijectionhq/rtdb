@@ -1,5 +1,5 @@
 use crate::{ColumnId, Expr, Identifier, QualifiedTable, Relation, TemporalFilter};
-use rtdb_types::LogicalType;
+use rtdb_types::{LogicalType, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -28,7 +28,51 @@ pub enum Statement {
     Rollback,
     Set { name: Vec<Identifier>, value: Expr, local: bool },
     Show { name: Vec<Identifier> },
-    Explain { statement: Box<Statement> },
+    Explain { relation: Arc<Relation>, mode: crate::ExplainMode },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// A planning warning, rendered by PostgreSQL as WARNING with SQLSTATE 01000.
+pub struct SqlNotice { pub message: String }
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct QuerySettings {
+    pub clock_time: Option<SettingValue>,
+    pub snapshot_token: Option<SettingValue>,
+    pub snapshot_time: Option<SettingValue>,
+}
+
+/// Prepared query metadata resolves literal values and parameters without evaluating scalar forms.
+/// Unevaluated forms retain their parameter count after syntax and literal validation.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SettingValue {
+    Literal(Value),
+    /// A SQL timestamp literal retained before Arrow admission for CLOCK_TIME resolution.
+    TimestampLiteral(String),
+    Parameter { index: usize },
+    Unevaluated { parameter_count: usize },
+}
+
+impl SettingValue {
+    pub fn parameter_count(&self) -> usize {
+        match self { Self::Literal(_) | Self::TimestampLiteral(_) => 0, Self::Parameter { index } => index + 1, Self::Unevaluated { parameter_count } => *parameter_count }
+    }
+}
+
+impl QuerySettings {
+    /// Bounds owned setting values, including unadmitted literal text, for the lifetime of the prepared query.
+    /// Size overflow returns an allocation anomaly.
+    pub fn retained_bytes(&self) -> rtdb_types::Result<usize> {
+        let overflow = || rtdb_types::Anomaly::incorrect("rtdb.plan/settings-size", "Query setting allocation overflow");
+        [&self.clock_time,&self.snapshot_token,&self.snapshot_time].into_iter().flatten().try_fold(std::mem::size_of::<Self>(),|bytes,value| {
+            let retained = match value { SettingValue::Literal(value) => value.retained_bytes()?,SettingValue::TimestampLiteral(text) => text.capacity(),_ => 0 };
+            bytes.checked_add(retained).ok_or_else(overflow)
+        })
+    }
+    pub fn parameter_count(&self) -> usize {
+        [&self.clock_time, &self.snapshot_token, &self.snapshot_time].into_iter().flatten()
+            .map(SettingValue::parameter_count).max().unwrap_or(0)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -36,4 +80,8 @@ pub struct PreparedStatement {
     pub statement: Statement,
     pub parameter_types: BTreeMap<usize, LogicalType>,
     pub source: String,
+    #[serde(default)]
+    pub notices: Vec<SqlNotice>,
+    #[serde(default)]
+    pub settings: QuerySettings,
 }

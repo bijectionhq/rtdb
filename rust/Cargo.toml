@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
+exclude = ["vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys"]
 
 [workspace.package]
 version = "0.1.0"
@@ -57,7 +58,9 @@ bigdecimal = "0.4.10"
 num-bigint = "0.4.8"
 num-traits = "0.2.19"
 regex = "1"
+regex-syntax = "=0.8.11"
 unicode-normalization = { version = "=0.1.24", default-features = false }
+fancy-regex = { version = "=0.16.2", path = "vendor/fancy-regex" }
 futures = "0.3"
 fs2 = "0.4"
 half = "2"
@@ -70,7 +73,7 @@ prost-build = "0.14.3"
 protoc-bin-vendored = "3"
 roaring = "0.11.5"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 serde_yaml = "=0.9.34"
 sha2 = "0.10"
 subtle = "2.6.1"

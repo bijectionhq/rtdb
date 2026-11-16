@@ -1,4 +1,4 @@
-use crate::{Anomaly, EntityId, IntervalUnit, Keyword, ListKind, LogicalType, Result, ScalarType, TimeUnit};
+use crate::{Anomaly, CalendarDate, CivilDate, DateUnit, EntityId, IntervalUnit, Keyword, ListKind, LogicalType, Result, ScalarType, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -29,7 +29,7 @@ pub enum Value {
     U8(u8), U16(u16), U32(u32), U64(u64),
     F16(u16), F32(#[serde(with = "float32_bits")] f32), F64(#[serde(with = "float64_bits")] f64),
     Utf8(String), Binary(Vec<u8>), FixedSizeBinary(Vec<u8>), Decimal(DecimalValue),
-    DateDay(i32), DateMilli(i64),
+    Date(CalendarDate), DateDay(i32), DateMilli(i64),
     Time { value: i64, unit: TimeUnit, bit_width: u8 },
     Timestamp { value: i64, unit: TimeUnit, timezone: Option<String> },
     Duration { value: i64, unit: TimeUnit },
@@ -64,6 +64,70 @@ mod float64_bits {
 }
 
 impl Value {
+    /// Preserves calendar days and unit, using physical storage only when that representation is lossless.
+    /// Wide values remain calendar objects until an explicit object or expression admission boundary.
+    pub fn calendar_date(date: CivilDate, unit: DateUnit) -> Self {
+        match unit {
+            DateUnit::Day => i32::try_from(date.epoch_day()).map(Self::DateDay).unwrap_or_else(|_| Self::Date(CalendarDate::new(date, unit))),
+            DateUnit::Millisecond => date.epoch_day().checked_mul(86_400_000).map(Self::DateMilli).unwrap_or_else(|| Self::Date(CalendarDate::new(date, unit))),
+        }
+    }
+
+    /// Returns epoch days for calendar objects and physical date cells.
+    /// Millisecond storage truncates toward zero, matching the reference vector reader.
+    pub fn date_days(&self) -> Option<i64> {
+        match self { Self::Date(value) => Some(value.date().epoch_day()), Self::DateDay(days) => Some(i64::from(*days)), Self::DateMilli(millis) => Some(millis / 86_400_000), _ => None }
+    }
+
+    /// Admits calendar objects in a completed expression result, recursively and without allocation.
+    /// Errors leave earlier siblings admitted; the caller must discard the result on failure.
+    pub fn admit_expression_dates(&mut self) -> Result<()> {
+        match self {
+            Self::Date(value) => *self = value.expression_value()?,
+            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => for value in values { value.admit_expression_dates()?; },
+            Self::Struct(fields) => for value in fields.values_mut() { value.admit_expression_dates()?; },
+            Self::Map { entries, .. } => for (key, value) in entries { key.admit_expression_dates()?; value.admit_expression_dates()?; },
+            _ => (),
+        }
+        Ok(())
+    }
+
+    /// Admits calendar objects recursively using the vector object writer's narrowing rules.
+    /// This consumes no allocations; day storage truncates to i32 and millisecond storage wraps.
+    pub fn admit_object_dates(&mut self) {
+        match self {
+            Self::Date(value) => *self = value.object_value(),
+            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter_mut().for_each(Self::admit_object_dates),
+            Self::Struct(fields) => fields.values_mut().for_each(Self::admit_object_dates),
+            Self::Map { entries, .. } => for (key, value) in entries { key.admit_object_dates(); value.admit_object_dates(); },
+            _ => (),
+        }
+    }
+
+    /// Applies one typed ValueBox write without traversing collection readers.
+    /// Day values check signed32 narrowing; millisecond dates retain epoch days until Arrow output.
+    /// Physical millisecond input drops its sub-day component using the vector's truncating day read.
+    /// An out-of-range day returns an overflow anomaly without changing the value; this allocates no storage.
+    pub fn admit_box_date(&mut self) -> Result<()> {
+        match self {
+            Self::Date(value) if value.unit() == DateUnit::Day => *self = value.expression_value()?,
+            Self::DateMilli(millis) => *millis = (*millis / 86_400_000) * 86_400_000,
+            _ => (),
+        }
+        Ok(())
+    }
+
+    /// Reports any calendar object still awaiting physical admission, including nested cells.
+    pub fn has_calendar_object(&self) -> bool {
+        match self {
+            Self::Date(_) => true,
+            Self::List(values) | Self::Set(values) | Self::FixedSizeList(values) => values.iter().any(Self::has_calendar_object),
+            Self::Struct(fields) => fields.values().any(Self::has_calendar_object),
+            Self::Map { entries, .. } => entries.iter().any(|(key,value)| key.has_calendar_object() || value.has_calendar_object()),
+            _ => false,
+        }
+    }
+
     /// Charges owned payload capacities plus a conservative allowance for each B-tree node.
     /// The result excludes allocator bookkeeping and includes this value's inline storage.
     pub fn retained_bytes(&self) -> Result<usize> {
@@ -128,6 +192,7 @@ impl Value {
             Self::Utf8(_) => S::Utf8, Self::Binary(_) => S::Binary,
             Self::FixedSizeBinary(bytes) => S::FixedSizeBinary(i32::try_from(bytes.len()).unwrap_or(i32::MAX)),
             Self::Decimal(decimal) => S::Decimal { precision: decimal.precision, scale: decimal.scale, bit_width: decimal.bit_width },
+            Self::Date(value) => match value.unit() { DateUnit::Day => S::DateDay, DateUnit::Millisecond => S::DateMilli },
             Self::DateDay(_) => S::DateDay, Self::DateMilli(_) => S::DateMilli,
             Self::Time { unit, bit_width, .. } => S::Time { unit: *unit, bit_width: *bit_width },
             Self::Timestamp { unit, timezone, .. } => S::Timestamp { unit: *unit, timezone: timezone.clone() },

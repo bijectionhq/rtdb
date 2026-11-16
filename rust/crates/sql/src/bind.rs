@@ -2,27 +2,41 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_plan::*;
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit, Value};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, Value};
 use sqlparser::ast as ast;
 
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
 use crate::PrepareOptions;
+use crate::expression::{ReplacementKey, Replacements};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HiddenColumn { ExplicitOnly, Internal }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TablePurpose { Query, Mutation, Erase }
 
 pub(crate) struct Context<'a> {
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
     pub options: &'a PrepareOptions,
+    pub cast_timezone: Option<&'a str>,
     pub binder: Binder,
     temporal: Vec<TemporalClause>,
     inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
-    ctes: BTreeMap<String, Arc<Relation>>,
+    pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
+    ctes: BTreeMap<String, Cte>,
+    next_symbol: u64,
     pub(crate) hidden_columns: BTreeMap<ColumnId, HiddenColumn>,
     pub(crate) outer_scopes: Vec<crate::subquery::CorrelationScope>,
     pub(crate) next_parameter: usize,
+    period_columns: BTreeSet<String>,
+    notices: Vec<SqlNotice>,
+    default_valid: Option<TemporalExtent>,
+    default_system: Option<TemporalExtent>,
 }
+
+#[derive(Clone)]
+enum Cte { Inline(Arc<Relation>), Materialized(Arc<MaterializedBinding>) }
 
 pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions) -> Result<Expr> {
     struct ScalarCatalog;
@@ -32,7 +46,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { source, catalog: &ScalarCatalog, options, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), ctes: BTreeMap::new(), hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0 };
+    let mut context = Context { source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
     context.expr(expression, &Schema::default(), &BTreeMap::new())
 }
 
@@ -40,9 +54,12 @@ pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog,
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();
-    let mut context = Context { source, catalog, options, binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, ctes: BTreeMap::new(), hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter };
+    let mut context = Context { source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let (settings, valid, system) = parsed.settings.bind(&mut context)?;
+    context.default_valid = valid;
+    context.default_system = system;
     let statement = context.statement(&parsed.statement)?;
-    Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: source.to_owned() })
+    Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: source.to_owned(), notices: context.notices, settings })
 }
 
 struct TransactionCatalog<'a>(&'a dyn Catalog);
@@ -62,6 +79,12 @@ impl Catalog for TransactionCatalog<'_> {
 }
 
 impl Context<'_> {
+    fn row_count(&mut self,expression: &ast::Expr) -> Result<Expr> {
+        let valid = matches!(expression,ast::Expr::Value(value) if matches!(&value.value,ast::Value::Placeholder(_)) || matches!(&value.value,ast::Value::Number(text,_) if !text.is_empty() && text.bytes().all(|byte|byte.is_ascii_digit())));
+        if !valid { return Err(error("LIMIT and OFFSET require an unsigned integer or parameter")); }
+        self.expr(expression,&Schema::default(),&BTreeMap::new())
+    }
+    pub(crate) fn cast_target(&self, target: &ast::DataType) -> Result<CastTarget> { crate::types::cast_target(target, self.cast_timezone) }
     fn statement(&mut self, statement: &Syntax) -> Result<Statement> {
         match statement {
             Syntax::Standard(statement) => self.standard(statement),
@@ -125,7 +148,7 @@ impl Context<'_> {
                 if update.from.is_some() || update.returning.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(unsupported("UPDATE FROM, joined targets, ordering, or RETURNING")); }
                 let mut input = self.mutation_table(&update.table.relation, false)?;
                 let (target, valid_time) = scan_target(&input)?;
-                let target_columns = input.schema().ids();
+                let target_columns = input.schema().fields().iter().filter(|field| !matches!(field.name.as_str(), "_valid_time" | "_system_time")).map(|field| field.id).collect();
                 if let Some(predicate) = &update.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
                 let assignments = update.assignments.iter().map(|assignment| {
                     let ast::AssignmentTarget::ColumnName(name) = &assignment.target else { return Err(unsupported("Tuple assignments")); };
@@ -152,7 +175,11 @@ impl Context<'_> {
             }
             ast::Statement::Commit { chain, .. } if !chain => Statement::Commit,
             ast::Statement::Rollback { chain, savepoint, .. } if !chain && savepoint.is_none() => Statement::Rollback,
-            ast::Statement::Explain { statement, analyze, .. } if !analyze => Statement::Explain { statement: Box::new(self.standard(statement)?) },
+            ast::Statement::Explain { statement, analyze, describe_alias, verbose, query_plan, estimate, format, options } => {
+                if *describe_alias != ast::DescribeAlias::Explain || *verbose || *query_plan || *estimate || format.is_some() || options.is_some() { return Err(unsupported("EXPLAIN options other than ANALYZE")); }
+                let Statement::Query(relation) = self.standard(statement)? else { return Err(error("EXPLAIN requires a query expression")); };
+                Statement::Explain { relation, mode: if *analyze { ExplainMode::Analyze } else { ExplainMode::Plan } }
+            }
             _ => return Err(unsupported(format!("SQL statement: {statement}"))),
         })
     }
@@ -171,12 +198,21 @@ impl Context<'_> {
     pub(crate) fn query(&mut self, query: &ast::Query) -> Result<Arc<Relation>> {
         if !query.locks.is_empty() || query.for_clause.is_some() || !query.pipe_operators.is_empty() || query.settings.is_some() { return Err(unsupported("Query locking, output clauses, pipes, or settings")); }
         let old_ctes = self.ctes.clone();
+        let mut bindings = Vec::new();
         if let Some(with) = &query.with {
             if with.recursive { return Err(Anomaly::unsupported("xtdb.sql/recursive-ctes", "Recursive CTEs are not supported yet")); }
             for cte in &with.cte_tables {
+                if !cte.alias.columns.is_empty() { return Err(unsupported("CTE column aliases")); }
+                if cte.materialized == Some(ast::CteAsMaterialized::NotMaterialized) { return Err(unsupported("AS NOT MATERIALIZED")); }
                 let input = self.query(&cte.query)?;
-                let input = self.alias(input, &cte.alias)?;
-                self.ctes.insert(identifier(&cte.alias.name).normalized(), input);
+                let name = identifier(&cte.alias.name).normalized();
+                let symbol = self.symbol(&name)?;
+                let cte = if cte.materialized == Some(ast::CteAsMaterialized::Materialized) {
+                    let binding = Arc::new(MaterializedBinding { name: symbol, relation: input });
+                    bindings.push(Arc::clone(&binding));
+                    Cte::Materialized(binding)
+                } else { Cte::Inline(input) };
+                self.ctes.insert(name, cte);
             }
         }
         let integrated_order = matches!(query.body.as_ref(), ast::SetExpr::Select(_));
@@ -190,7 +226,7 @@ impl Context<'_> {
             let order = expressions.iter().map(|order| {
                 if let Some(index) = ordinal(&order.expr)? {
                     let expr = fields.get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression();
-                    let descending = order.options.asc == Some(false);
+                    let descending = sort_descending(&order.options)?;
                     Ok(SortExpr { expr, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
                 } else { self.relational_sort_expr(order, &mut input, &BTreeMap::new()) }
             }).collect::<Result<_>>()?;
@@ -203,17 +239,21 @@ impl Context<'_> {
             match limit {
                 ast::LimitClause::LimitOffset { limit, offset: value, limit_by } => {
                     if !limit_by.is_empty() { return Err(unsupported("LIMIT BY")); }
-                    fetch = limit.as_ref().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).transpose()?;
-                    offset = value.as_ref().map(|offset| self.expr(&offset.value, &Schema::default(), &BTreeMap::new())).transpose()?;
+                    fetch = limit.as_ref().map(|expr| self.row_count(expr)).transpose()?;
+                    offset = value.as_ref().map(|offset| self.row_count(&offset.value)).transpose()?;
                 }
                 ast::LimitClause::OffsetCommaLimit { .. } => return Err(unsupported("Comma LIMIT syntax")),
             }
         }
         if let Some(value) = &query.fetch {
+            if fetch.is_some() { return Err(error("LIMIT and FETCH cannot both specify the row count")); }
             if value.percent || value.with_ties { return Err(unsupported("FETCH PERCENT or WITH TIES")); }
-            fetch = Some(value.quantity.as_ref().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).transpose()?.unwrap_or(Expr::Literal(Value::I64(1))));
+            fetch = Some(value.quantity.as_ref().map(|expr| self.row_count(expr)).transpose()?.unwrap_or(Expr::Literal(Value::I64(1))));
         }
         if offset.is_some() || fetch.is_some() { input = Arc::new(input.limit(offset, fetch)?); }
+        for binding in bindings.into_iter().rev() {
+            input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Let { binding, body: input })?);
+        }
         self.ctes = old_ctes;
         Ok(input)
     }
@@ -276,11 +316,11 @@ impl Context<'_> {
         }
         if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
-        let mut aggregate_calls = BTreeMap::new();
+        let mut aggregate_calls = Vec::new();
         for item in &select.projection {
-            if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; }
+            if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; crate::expression::aggregate_notices(expr, &mut self.notices); }
         }
-        if let Some(having) = &select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; }
+        if let Some(having) = &select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
         let mut replacements = BTreeMap::new();
         if !groups.is_empty() || !aggregate_calls.is_empty() {
             let mut named_groups = Vec::new();
@@ -288,14 +328,15 @@ impl Context<'_> {
                 let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
                 let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
                 let qualifier = match &expr { Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()), _ => None };
-                let field = self.binder.field(expression_name(group, index), qualifier, expr.data_type())?;
-                replacements.insert(group.to_string(), field.clone());
+                let mut field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
+                field.qualifier = qualifier;
+                replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
                 named_groups.push(NamedExpr { field, expr });
             }
             let mut aggregates = Vec::new();
             for (key, function) in aggregate_calls {
                 let aggregate = self.aggregate(&function, &mut input, aggregates.len())?;
-                replacements.insert(key, aggregate.field.clone());
+                replacements.insert(ReplacementKey::Aggregate(key), aggregate.field.clone());
                 aggregates.push(aggregate);
             }
             let schema = Schema::new(named_groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|agg| agg.field.clone())).collect())?;
@@ -310,23 +351,20 @@ impl Context<'_> {
         if let Some((key, function)) = windows.pop() {
             let (window, field) = self.window(input, &function, &replacements)?;
             input = window;
-            replacements.insert(key, field);
+            replacements.insert(ReplacementKey::Expression(key), field);
         }
         let mut projected = Vec::new();
         for (index, item) in select.projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
                     let expression = self.relational_expr(expr, &mut input, &replacements)?;
-                    let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else { expression_name(expr, index) };
+                    let unnamed = matches!(&expression, Expr::Column { id, .. } if input.schema().get(*id).is_some_and(|field| field.unnamed));
+                    let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else if unnamed { format!("_column_{}", index + 1) } else { expression_name(expr, index) };
                     let field = self.binder.field(name, None, expression.data_type())?;
                     projected.push(NamedExpr { field, expr: expression });
                 }
                 ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
-                    if !wildcard_plain(options) { return Err(unsupported("Wildcard modifiers")); }
-                    let qualifier = identifiers(name)?.last().map(Identifier::normalized).ok_or_else(|| error("Empty wildcard qualifier"))?;
-                    let matching: Vec<_> = input.schema().fields().iter().filter(|field| field.qualifier.as_ref() == Some(&qualifier)).collect();
-                    if matching.is_empty() { return Err(error(format!("Unknown wildcard qualifier: {qualifier}"))); }
-                    for field in matching.into_iter().filter(|field| !self.hidden_columns.contains_key(&field.id)) { projected.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() }); }
+                    projected.extend(self.wildcard(input.schema(), Some(name), options, &BTreeSet::new())?);
                 }
                 _ => return Err(unsupported("Projection shape")),
             }
@@ -334,12 +372,8 @@ impl Context<'_> {
         let wildcards = select.projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
         if let Some((index, options)) = wildcards.first() {
             if wildcards.len() != 1 || (*index != 0 && *index + 1 != select.projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
-            if !wildcard_plain(options) { return Err(unsupported("Wildcard modifiers")); }
             let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
-            let mut expanded = Vec::new();
-            for field in input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id) && !explicit_names.contains(&field.name)) {
-                expanded.push(NamedExpr { field: self.binder.field(field.name.clone(), None, field.data_type.clone())?, expr: field.expression() });
-            }
+            let mut expanded = self.wildcard(input.schema(), None, options, &explicit_names)?;
             expanded.extend(projected);
             projected = expanded;
         }
@@ -360,17 +394,17 @@ impl Context<'_> {
             let mut order_replacements = replacements.clone();
             for group in groups {
                 let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
-                if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&group.to_string()); }
+                if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&ReplacementKey::Expression(group.to_string())); }
             }
             let mut order = Vec::new();
             for expression in expressions {
-                let mut aggregates = BTreeMap::new();
+                let mut aggregates = Vec::new();
                 crate::expression::aggregate_calls(&expression.expr, &mut aggregates)?;
                 if !aggregates.is_empty() { return Err(error("Aggregate functions are not allowed directly in ORDER BY")); }
                 let expr = if let Some(index) = ordinal(&expression.expr)? {
                     fields.get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression()
                 } else { self.relational_expr(&expression.expr, &mut input, &order_replacements)? };
-                let descending = expression.options.asc == Some(false);
+                let descending = sort_descending(&expression.options)?;
                 order.push(SortExpr { expr, descending, nulls_first: expression.options.nulls_first.unwrap_or(descending) });
             }
             input = Arc::new(input.sort(order)?);
@@ -384,7 +418,7 @@ impl Context<'_> {
     }
 
     fn joined_table(&mut self, table: &ast::TableWithJoins, lateral_start: usize) -> Result<Arc<Relation>> {
-        let mut left = self.table(&table.relation, lateral_start)?;
+        let mut left = self.table_for(&table.relation, TablePurpose::Query, lateral_start)?;
         for joined in &table.joins {
             let (kind, constraint) = match &joined.join_operator {
                 ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => (JoinKind::Inner, Some(constraint)),
@@ -396,7 +430,7 @@ impl Context<'_> {
             };
             let (right, mut arguments) = self.from_scope(left.schema().clone(), |context, start| {
                 let start = if kind == JoinKind::Cross || matches!(constraint, Some(ast::JoinConstraint::Natural)) { start } else { lateral_start };
-                context.table(&joined.relation, start)
+                context.table_for(&joined.relation, TablePurpose::Query, start)
             })?;
             if !arguments.is_empty() && matches!(kind, JoinKind::Right | JoinKind::Full) { return Err(unsupported("Correlated LATERAL in RIGHT or FULL OUTER JOIN")); }
             let schema = left.schema().concat(right.schema())?;
@@ -471,13 +505,26 @@ impl Context<'_> {
         Ok(left)
     }
 
-    fn table(&mut self, table: &ast::TableFactor, lateral_start: usize) -> Result<Arc<Relation>> {
+    fn table_for(&mut self, table: &ast::TableFactor, purpose: TablePurpose, lateral_start: usize) -> Result<Arc<Relation>> {
         match table {
-            ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, .. } => {
-                if args.is_some() || version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() { return Err(unsupported("Table function, sample, or dialect-specific version")); }
+            ast::TableFactor::Table { name, alias, args, version, with_hints, partitions, sample, with_ordinality, json_path, index_hints } => {
+                if version.is_some() || !with_hints.is_empty() || !partitions.is_empty() || sample.is_some() || json_path.is_some() || !index_hints.is_empty() { return Err(unsupported("Table sample or dialect-specific modifier")); }
+                if let Some(arguments) = args {
+                    if purpose != TablePurpose::Query || arguments.settings.is_some() { return Err(unsupported("Table function modifier")); }
+                    let names = identifiers(name)?;
+                    let function = names.last().filter(|name| !name.quoted).map(Identifier::normalized).ok_or_else(|| error("Expected series function"))?;
+                    if names.len() > 2 || !matches!(function.as_str(), "generate_series" | "range") { return Err(unsupported("Table function")); }
+                    let args = self.lateral_scope(lateral_start, |context| arguments.args.iter().map(|argument| match argument {
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => context.expr(expr, &Schema::default(), &BTreeMap::new()),
+                        _ => Err(error("Series arguments must be expressions")),
+                    }).collect::<Result<Vec<_>>>())?;
+                    let expression = self.series(&function, args)?;
+                    return self.list_table(expression, alias.as_ref(), *with_ordinality, "_genseries");
+                }
+                if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
-                    let relation = rtdb_xtql::compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments).map_err(|error| inline.error(error,self.source))?;
+                    let relation = rtdb_xtql::compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments,&self.options.default_timezone).map_err(|error| inline.error(error,self.source))?;
                     return match alias { Some(alias) => self.alias(relation,alias),None => Ok(relation) };
                 }
                 let names = identifiers(name)?;
@@ -485,23 +532,65 @@ impl Context<'_> {
                     if let Some(cte) = self.ctes.get(&names[0].normalized()).cloned() {
                         let end = name.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
                         if self.temporal.iter().any(|clause| Some(clause.owner_end) == end) { return Err(error("Temporal clauses are not allowed on CTE references")); }
-                        return match alias { Some(alias) => self.alias(cte, alias), None => self.rename(cte, Some(names[0].normalized()), None) };
+                        let input = match cte {
+                            Cte::Inline(input) => input,
+                            Cte::Materialized(binding) => Arc::new(Relation::new(binding.relation.schema().clone(), RelationNode::Reference { binding })?),
+                        };
+                        return match alias { Some(alias) => self.alias(input, alias), None => self.rename(input, Some(names[0].normalized()), None) };
                     }
                 }
                 let binding = resolve_table(self.catalog, &names, &self.options.search_path)?;
                 let qualifier = alias.as_ref().map(|alias| identifier(&alias.name).normalized()).unwrap_or_else(|| binding.name.table.table.clone());
-                let mut columns = binding.columns.iter().map(|(name, ty)| self.binder.field(name.clone(), Some(qualifier.clone()), ty.clone())).collect::<Result<Vec<_>>>()?;
-                if !matches!(binding.name.table.schema.as_str(), "information_schema" | "pg_catalog" | "xt") || binding.name.table == TableRef::new("xt", "txs") {
-                    for (name, ty) in [("_iid", LogicalType::Scalar(ScalarType::FixedSizeBinary(16))), ("_valid_from", crate::mutation::instant_type()), ("_system_from", crate::mutation::instant_type()), ("_valid_to", crate::mutation::instant_type().maybe()), ("_system_to", crate::mutation::instant_type().maybe())] {
-                        if columns.iter().any(|field| field.name == name) { continue; }
-                        let field = self.binder.field(name, Some(qualifier.clone()), ty)?;
-                        self.hidden_columns.insert(field.id,HiddenColumn::ExplicitOnly);
-                        columns.push(field);
+                if purpose != TablePurpose::Query && alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { return Err(error("Mutation targets do not accept column lists")); }
+                let mut visible = alias.as_ref().filter(|alias| !alias.columns.is_empty()).map(|alias| alias.columns.iter().map(|column| identifier(&column.name).normalized()).collect::<Vec<_>>())
+                    .unwrap_or_else(|| binding.columns.keys().cloned().collect());
+                let mut seen = BTreeSet::new();
+                visible.retain(|name| seen.insert(name.clone()));
+                let mut requested = visible.clone();
+                for name in ["_iid", "_valid_from", "_valid_to", "_system_from", "_system_to"] {
+                    if !requested.iter().any(|column| column == name) { requested.push(name.into()); }
+                }
+                if purpose != TablePurpose::Erase {
+                    for name in &self.period_columns { if !requested.contains(name) { requested.push(name.clone()); } }
+                }
+                let mut columns = Vec::new();
+                let mut periods = Vec::new();
+                let mut output = Vec::new();
+                for name in requested {
+                    let period = matches!(name.as_str(), "_valid_time" | "_system_time");
+                    let ty = match name.as_str() {
+                        "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+                        "_valid_from" | "_system_from" => crate::mutation::instant_type(),
+                        "_valid_to" | "_system_to" => crate::mutation::instant_type().maybe(),
+                        "_valid_time" | "_system_time" if purpose == TablePurpose::Query => rtdb_plan::function_type("period", &[crate::mutation::instant_type(), crate::mutation::instant_type().maybe()])?,
+                        _ => binding.columns.get(&name).cloned().unwrap_or(LogicalType::Null),
+                    };
+                    let mut field = self.binder.field(name.clone(), Some(qualifier.clone()), ty)?;
+                    if purpose == TablePurpose::Query {
+                        field.qualifier = Some(ColumnQualifier::BaseTable { database: binding.name.database.clone(), schema: binding.name.table.schema.clone(), alias: qualifier.clone() });
                     }
+                    if !visible.contains(&name) { self.hidden_columns.insert(field.id, HiddenColumn::ExplicitOnly); }
+                    if period && purpose == TablePurpose::Query { periods.push(field.clone()); }
+                    else { columns.push(field.clone()); }
+                    output.push(field);
                 }
                 let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;
-                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None })?);
-                if alias.as_ref().is_some_and(|alias| !alias.columns.is_empty()) { self.alias(relation, alias.as_ref().ok_or_else(|| error("Missing alias"))?) } else { Ok(relation) }
+                let relation = Arc::new(Relation::scan(Scan { table: binding, columns, valid_time, system_time, clamp_valid_time, iids: None, predicates: Vec::new() })?);
+                let relation = if purpose == TablePurpose::Query {
+                    let prefix = self.symbol(&qualifier)?;
+                    let expressions = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+                    Arc::new(Relation::new(relation.schema().clone(), RelationNode::Rename { input: relation, prefix, expressions })?)
+                } else { relation };
+                if periods.is_empty() { return Ok(relation); }
+                let expressions = output.into_iter().map(|field| {
+                    let expr = if periods.iter().any(|period| period.id == field.id) {
+                        let (from, to) = if field.name == "_valid_time" { ("_valid_from", "_valid_to") } else { ("_system_from", "_system_to") };
+                        let endpoint = |name| relation.schema().fields().iter().find(|field| field.name == name).map(Field::expression).ok_or_else(|| error("Period endpoint is unavailable"));
+                        crate::period::call("period", vec![endpoint(from)?, endpoint(to)?])?
+                    } else { field.expression() };
+                    Ok(NamedExpr { field, expr })
+                }).collect::<Result<_>>()?;
+                Ok(Arc::new(relation.project(expressions)?))
             }
             ast::TableFactor::Derived { subquery, alias, lateral, .. } => {
                 if *lateral && alias.is_none() { return Err(error("LATERAL derived tables require an alias")); }
@@ -515,19 +604,35 @@ impl Context<'_> {
             ast::TableFactor::UNNEST { array_exprs, alias, with_ordinality, with_offset, .. } => {
                 if array_exprs.len() != 1 || *with_offset { return Err(unsupported("Multi-array UNNEST or OFFSET")); }
                 let expr = self.lateral_scope(lateral_start, |context| context.expr(&array_exprs[0], &Schema::default(), &BTreeMap::new()))?;
-                let ty = match expr.data_type().unencoded() { LogicalType::Nothing | LogicalType::Null => LogicalType::Null, LogicalType::List { element, .. } => *element, LogicalType::Maybe(value) => match *value { LogicalType::List { element, .. } => *element, _ => return Err(error("UNNEST requires an array")) }, _ => return Err(error("UNNEST requires an array")) };
-                let element = self.binder.field("unnest", None, ty)?;
-                let ordinality = if *with_ordinality { Some(self.binder.field("ordinality", None, LogicalType::Scalar(ScalarType::I64))?) } else { None };
-                let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
-                let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input: Arc::new(Relation::unit()), expr, element, ordinality, outer: false })?);
-                match alias { Some(alias) => self.alias(relation, alias), None => Ok(relation) }
+                self.list_table(expr, alias.as_ref(), *with_ordinality, "_unnest")
             }
             _ => Err(unsupported("Table source")),
         }
     }
 
+    fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, element_prefix: &str) -> Result<Arc<Relation>> {
+        let alias = alias.ok_or_else(|| error("List tables require an alias"))?;
+        let elements = expr.data_type().legs().into_iter().map(|ty| match ty.unencoded() {
+            LogicalType::Nothing | LogicalType::Null => Ok(LogicalType::Null),
+            LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => Ok(*element),
+            _ => Ok(LogicalType::Null),
+        }).collect::<Result<Vec<_>>>()?;
+        let element_name = self.symbol(element_prefix)?;
+        let mut element = self.binder.field(element_name, None, LogicalType::join_all(&elements))?;
+        element.unnamed = true;
+        let ordinality = if with_ordinality {
+            let name = self.symbol("_ordinal")?;
+            let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I64))?;
+            field.unnamed = true;
+            Some(field)
+        } else { None };
+        let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
+        let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input: Arc::new(Relation::unit()), expr, element, ordinality, outer: false })?);
+        self.alias(relation, alias)
+    }
+
     fn mutation_table(&mut self, table: &ast::TableFactor, erase: bool) -> Result<Arc<Relation>> {
-        let input = self.table(table, self.outer_scopes.len())?;
+        let input = self.table_for(table, if erase { TablePurpose::Erase } else { TablePurpose::Mutation }, self.outer_scopes.len())?;
         let RelationNode::Scan(source) = input.node() else { return Err(error("Mutation target must be a base table")); };
         let mut scan = source.clone();
         if scan.system_time != TemporalFilter::Default { return Err(error("Mutation targets do not accept SYSTEM_TIME clauses")); }
@@ -544,7 +649,11 @@ impl Context<'_> {
         }
         let qualifier = scan.columns.first().and_then(|field| field.qualifier.clone());
         for (name, ty) in [("_iid", LogicalType::Scalar(ScalarType::FixedSizeBinary(16))), ("_valid_from", crate::mutation::instant_type()), ("_valid_to", crate::mutation::instant_type().maybe())] {
-            if !scan.columns.iter().any(|field| field.name == name) { scan.columns.push(self.binder.field(name, qualifier.clone(), ty)?); }
+            if !scan.columns.iter().any(|field| field.name == name) {
+                let mut field = self.binder.field(name, None, ty)?;
+                field.qualifier = qualifier.clone();
+                scan.columns.push(field);
+            }
         }
         Ok(Arc::new(Relation::scan(scan)?))
     }
@@ -552,21 +661,14 @@ impl Context<'_> {
     fn temporal_filters(&mut self, table: &ast::ObjectName) -> Result<(TemporalFilter, TemporalFilter, bool)> {
         let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
         let clauses: Vec<_> = self.temporal.iter().filter(|clause| Some(clause.owner_end) == end).cloned().collect();
-        let mut valid = TemporalFilter::Default;
-        let mut system = TemporalFilter::Default;
+        let mut valid = self.default_valid.clone();
+        let mut system = self.default_system.clone();
         let mut clamp = false;
         for clause in clauses {
-            let extent = match clause.extent {
-                TemporalExtent::All => TemporalFilter::All,
-                TemporalExtent::At(at) => TemporalFilter::At(self.expr(&at, &Schema::default(), &BTreeMap::new())?),
-                TemporalExtent::FromTo(from, to) => TemporalFilter::FromTo {
-                    from: self.expr(&from, &Schema::default(), &BTreeMap::new())?,
-                    to: to.as_ref().map(|to| self.expr(to, &Schema::default(), &BTreeMap::new())).transpose()?.unwrap_or(Expr::Literal(Value::Timestamp { value: i64::MAX, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) })),
-                },
-                TemporalExtent::Between(from, to) => TemporalFilter::Between { from: self.expr(&from, &Schema::default(), &BTreeMap::new())?, to: self.expr(&to, &Schema::default(), &BTreeMap::new())? },
-            };
-            if clause.system { system = extent; } else { valid = extent; clamp = clause.clamp; }
+            if clause.system { system = Some(clause.extent); } else { valid = Some(clause.extent); clamp = clause.clamp; }
         }
+        let valid = valid.map(|extent| self.bind_extent(extent)).transpose()?.unwrap_or(TemporalFilter::Default);
+        let system = system.map(|extent| self.bind_extent(extent)).transpose()?.unwrap_or(TemporalFilter::Default);
         Ok((valid, system, clamp))
     }
 
@@ -586,6 +688,7 @@ impl Context<'_> {
     }
 
     fn rename(&mut self, input: Arc<Relation>, qualifier: Option<String>, columns: Option<Vec<String>>) -> Result<Arc<Relation>> {
+        let prefix = self.symbol(qualifier.as_deref().unwrap_or("_table"))?;
         let visible = input.schema().fields().iter().filter(|field| !self.hidden_columns.contains_key(&field.id)).count();
         if columns.as_ref().is_some_and(|columns| columns.len() != visible) { return Err(error("Alias column count differs from relation")); }
         let mut index = 0;
@@ -597,19 +700,29 @@ impl Context<'_> {
                 index += 1;
                 name
             };
-            let renamed = self.binder.field(name, qualifier.clone(), field.data_type.clone())?;
+            let mut renamed = self.binder.field(name, qualifier.clone(), field.data_type.clone())?;
+            renamed.unnamed = field.unnamed && (hidden.is_some() || columns.is_none());
             if let Some(hidden) = hidden { self.hidden_columns.insert(renamed.id,hidden); }
             expressions.push(NamedExpr { field: renamed, expr: field.expression() });
         }
-        Ok(Arc::new(input.project(expressions)?))
+        Ok(Arc::new(Relation::new(Schema::new(expressions.iter().map(|expression| expression.field.clone()).collect())?, RelationNode::Rename { input, prefix, expressions })?))
     }
 
-    pub(crate) fn relational_sort_expr(&mut self, order: &ast::OrderByExpr, input: &mut Arc<Relation>, replacements: &BTreeMap<String, Field>) -> Result<SortExpr> {
+    fn symbol(&mut self, name: &str) -> Result<String> {
+        self.next_symbol = self.next_symbol.checked_add(1).ok_or_else(|| error("SQL symbol counter overflow"))?;
+        Ok(format!("{name}.{}", self.next_symbol))
+    }
+
+    pub(crate) fn relational_sort_expr(&mut self, order: &ast::OrderByExpr, input: &mut Arc<Relation>, replacements: &Replacements) -> Result<SortExpr> {
         let expr = if let Some(index) = ordinal(&order.expr)? { input.schema().fields().get(index).ok_or_else(|| error("ORDER BY position is out of range"))?.expression() } else { self.relational_expr(&order.expr, input, replacements)? };
-        let descending = order.options.asc == Some(false);
+        let descending = sort_descending(&order.options)?;
         Ok(SortExpr { expr, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
     }
 
+}
+
+pub(crate) fn sort_descending(options: &ast::OrderByOptions) -> Result<bool> {
+    match &options.sort { Some(ast::OrderBySort::Desc) => Ok(true), None | Some(ast::OrderBySort::Asc) => Ok(false), Some(ast::OrderBySort::Using(_)) => Err(unsupported("ORDER BY USING")) }
 }
 
 pub(crate) fn identifier(identifier: &ast::Ident) -> Identifier { Identifier { text: identifier.value.clone(), quoted: identifier.quote_style.is_some() } }
@@ -639,10 +752,9 @@ fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Op
     Ok(Arc::new(Relation::new(schema, RelationNode::Join { left, right, kind, condition })?))
 }
 
-fn wildcard_plain(options: &ast::WildcardAdditionalOptions) -> bool { options.to_string().is_empty() }
 
 pub(crate) fn expression_name(expr: &ast::Expr, index: usize) -> String {
-    match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) if function.over.is_none() => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
+    match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) if function.over.is_none() && !function.name.0.last().and_then(ast::ObjectNamePart::as_ident).is_some_and(|name| name.quote_style.is_none() && matches!(name.value.to_ascii_lowercase().as_str(), "generate_series" | "range")) => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
 }
 
 fn ordinal(expr: &ast::Expr) -> Result<Option<usize>> {

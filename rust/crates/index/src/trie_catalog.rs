@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use chrono::{DateTime, NaiveDate, Utc};
+use rtdb_types::calendar::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 
@@ -51,11 +51,11 @@ impl CatalogTrie {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Shard { pub level: i64, pub recency: Option<NaiveDate>, pub part: Vec<u8> }
+pub struct Shard { pub level: i64, pub recency: Option<CivilDate>, pub part: Vec<u8> }
 
 impl Shard {
     pub fn of(key: &TrieKey) -> Self { Self { level: key.level(), recency: key.recency(), part: key.part().to_vec() } }
-    fn root(level: i64, recency: Option<NaiveDate>) -> Self { Self { level, recency, part: Vec::new() } }
+    fn root(level: i64, recency: Option<CivilDate>) -> Self { Self { level, recency, part: Vec::new() } }
 }
 
 #[derive(Clone, Debug)]
@@ -85,7 +85,7 @@ impl ShardValue {
 #[derive(Clone, Debug, Default)]
 struct TableTries {
     shards: BTreeMap<Shard, ShardValue>,
-    l1h_recencies: BTreeMap<BlockIndex, BTreeSet<NaiveDate>>,
+    l1h_recencies: BTreeMap<BlockIndex, BTreeSet<CivilDate>>,
 }
 
 impl TableTries {
@@ -173,8 +173,8 @@ impl TrieCatalog {
     pub fn all_tries(&self, table: &TableRef) -> Vec<&CatalogTrie> {
         let mut result: Vec<_> = self.tables.get(table).into_iter().flat_map(|table| table.shards.values()).flat_map(|shard| shard.tries.values()).collect();
         result.sort_by(|left, right| {
-            (left.key.level(), left.key.block_index(), left.key.recency().unwrap_or(NaiveDate::MAX), left.key.part())
-                .cmp(&(right.key.level(), right.key.block_index(), right.key.recency().unwrap_or(NaiveDate::MAX), right.key.part()))
+            (left.key.level(), left.key.block_index(), left.key.recency().unwrap_or(CivilDate::MAX), left.key.part())
+                .cmp(&(right.key.level(), right.key.block_index(), right.key.recency().unwrap_or(CivilDate::MAX), right.key.part()))
         });
         result
     }
@@ -299,9 +299,9 @@ fn table_partitions(block: &TableBlock) -> Result<Vec<block_pb::Partition>> {
 
 fn decode_shard(partition: &block_pb::Partition) -> Result<Shard> {
     Ok(Shard { level: i64::from(partition.level.unwrap_or_default()), part: partition.part.clone().unwrap_or_default(),
-        recency: partition.recency.map(|micros| DateTime::<Utc>::from_timestamp_micros(micros).map(|time| time.date_naive()).ok_or_else(|| invalid("Trie recency exceeds supported date range"))).transpose()? })
+        recency: partition.recency.map(|micros| CivilDate::from_epoch_day(micros.div_euclid(86_400_000_000))).transpose()? })
 }
-fn date_micros(date: NaiveDate) -> Result<i64> {
-    date.and_hms_opt(0, 0, 0).map(|date| date.and_utc().timestamp_micros()).ok_or_else(|| invalid("Invalid trie recency date"))
+fn date_micros(date: CivilDate) -> Result<i64> {
+    date.epoch_day().checked_mul(86_400_000_000).ok_or_else(|| invalid("Trie recency exceeds microsecond range"))
 }
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-trie-catalog", message.to_string()) }

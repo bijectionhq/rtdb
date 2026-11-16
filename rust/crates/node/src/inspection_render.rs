@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use chrono::Offset;
 
 use rtdb_format::transit::TransitValue;
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
@@ -12,6 +11,17 @@ pub(crate) fn vector(values: impl IntoIterator<Item = String>) -> String { forma
 pub(crate) fn instant(micros: i64) -> String { format!("#time/instant {}", quoted(&datetime(i128::from(micros) * 1000, true))) }
 pub(crate) fn document(fields: &BTreeMap<String, Value>) -> Result<String> {
     Ok(format!("{{{}}}", fields.iter().filter(|(_, value)| !matches!(value, Value::Null | Value::Undefined)).map(|(key, value)| Ok(format!("{} {}", key_name(key), render(value)?))).collect::<Result<Vec<_>>>()?.join(", ")))
+}
+pub(crate) fn operation_allocation_bound(value: &rtdb_tx::OperationValue) -> Result<usize> {
+    use rtdb_tx::OperationValue as O;
+    let add = |left: usize,right: usize| left.checked_add(right).ok_or_else(|| invalid("Operation rendering exceeds addressable memory"));
+    match value {
+        O::Scalar(value) => rtdb_expr::text_allocation_bound(value),
+        O::Tagged { value, .. } => operation_allocation_bound(value),
+        O::Struct(fields) => fields.values().try_fold(0, |bytes,value| add(bytes,operation_allocation_bound(value)?)),
+        O::List { values, .. } => values.iter().try_fold(0, |bytes,value| add(bytes,operation_allocation_bound(value)?)),
+        O::Map(entries) => entries.iter().try_fold(0, |bytes,(key,value)| add(add(bytes,operation_allocation_bound(key)?)?,operation_allocation_bound(value)?)),
+    }
 }
 pub(crate) fn operation(value: &rtdb_tx::OperationValue) -> Result<String> {
     use rtdb_tx::OperationValue as O;
@@ -42,9 +52,10 @@ pub(crate) fn render(value: &Value) -> Result<String> {
         Value::Utf8(value) => quoted(value), Value::Keyword(value) => format!(":{}", value.as_str()),
         Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => format!("#bytes {}", quoted(&hex(bytes))),
         Value::Uuid(bytes) => { let hex = hex(bytes); format!("#uuid {}", quoted(&format!("{}-{}-{}-{}-{}", &hex[..8], &hex[8..12], &hex[12..16], &hex[16..20], &hex[20..]))) }
-        Value::Uri(value) => format!("#xt/uri {}", quoted(value)),
+        Value::Uri(value) => format!("#xt/uri {}", quoted(&rtdb_types::UriParts::parse(value)?.to_ascii_string())),
         Value::Oid(value) => format!("#xt/oid {value}"), Value::RegClass(value) => format!("#xt/regclass {value}"), Value::RegProc(value) => format!("#xt/regproc {value}"),
         Value::Decimal(value) => decimal(value),
+        Value::Date(value) => format!("#time/date {}", quoted(&value.date().to_string())),
         Value::DateDay(days) => format!("#time/date {}", quoted(&date(i64::from(*days)))),
         Value::DateMilli(millis) => format!("#time/date {}", quoted(&date(millis / 86_400_000))),
         Value::Time { value, unit, .. } => format!("#time/time {}", quoted(&time(nanos(*value, *unit), false))),
@@ -53,7 +64,7 @@ pub(crate) fn render(value: &Value) -> Result<String> {
             if let Some(zone) = timezone {
                 let text = zoned(nanos, zone)?;
                 format!("#time/zoned-date-time {}", quoted(&text))
-            } else { format!("#time/date-time {}", quoted(&datetime(nanos, false))) }
+            } else { rtdb_types::CivilDateTime::from_epoch_nanos(nanos)?; format!("#time/date-time {}", quoted(&datetime(nanos, false))) }
         }
         Value::Duration { value, unit } => format!("#time/duration {}", quoted(&duration(nanos(*value, *unit)))),
         Value::IntervalYearMonth(months) => interval(*months, 0, 0),
@@ -73,10 +84,15 @@ pub(crate) fn render(value: &Value) -> Result<String> {
 fn transit(value: &TransitValue) -> Result<String> {
     Ok(match value {
         TransitValue::Null => "nil".into(), TransitValue::Bool(value) => value.to_string(), TransitValue::Integer(value) => value.to_string(), TransitValue::Float(value) => float(*value),
+        TransitValue::Float32(value) => if value.is_finite() { rtdb_types::java_f32_text(*value) } else { float(f64::from(*value)) },
         TransitValue::String(value) => quoted(value), TransitValue::Keyword(value) => format!(":{value}"), TransitValue::Symbol(value) => value.clone(),
         TransitValue::Bytes(value) => format!("#bytes {}", quoted(&hex(value))),
         TransitValue::Array(values) => vector(values.iter().map(transit).collect::<Result<Vec<_>>>()?),
         TransitValue::Map(entries) => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", transit(key)?, transit(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
+        TransitValue::Tagged { tag, representation } if tag == "r" => {
+            let TransitValue::String(text) = representation.as_ref() else { return Err(invalid("URI Transit representation must be text")); };
+            format!("#xt/uri {}", quoted(&rtdb_types::UriParts::parse(text)?.to_ascii_string()))
+        }
         TransitValue::Tagged { tag, representation } => format!("#{tag} {}", transit(representation)?),
     })
 }
@@ -91,20 +107,12 @@ fn decimal(value: &DecimalValue) -> String {
 fn nanos(value: i64, unit: TimeUnit) -> i128 { i128::from(value) * match unit { TimeUnit::Second => 1_000_000_000, TimeUnit::Millisecond => 1_000_000, TimeUnit::Microsecond => 1000, TimeUnit::Nanosecond => 1 } }
 fn zoned(nanos: i128, zone: &str) -> Result<String> {
     let zone = rtdb_expr::normalize_timezone(zone)?;
-    let prefixed = ["UTC", "GMT", "UT"].into_iter().find_map(|prefix| zone.strip_prefix(prefix).map(|offset| (prefix, offset)));
-    let fixed = prefixed.map_or(zone.as_str(), |(_, offset)| offset);
-    let offset = if fixed.is_empty() || fixed == "Z" { 0 }
-        else if fixed.starts_with(['+', '-']) {
-            let parts = fixed[1..].split(':').map(str::parse::<i32>).collect::<std::result::Result<Vec<_>, _>>().map_err(|_| invalid("Invalid fixed timestamp zone"))?;
-            (parts.first().copied().unwrap_or(0) * 3600 + parts.get(1).copied().unwrap_or(0) * 60 + parts.get(2).copied().unwrap_or(0)) * if fixed.starts_with('-') { -1 } else { 1 }
-        } else {
-            let micros = i64::try_from(nanos.div_euclid(1000)).map_err(|_| invalid("Timestamp exceeds formatter range"))?;
-            let instant = chrono::DateTime::from_timestamp_micros(micros).ok_or_else(|| invalid("Timestamp zone is outside the inspection formatter domain"))?;
-            instant.with_timezone(&zone.parse::<chrono_tz::Tz>().map_err(|_| invalid("Unknown timestamp zone"))?).offset().fix().local_minus_utc()
-        };
-    let offset_text = if offset == 0 { "Z".into() } else { let absolute = offset.abs(); format!("{}{:02}:{:02}{}", if offset < 0 { '-' } else { '+' }, absolute / 3600, absolute / 60 % 60, if absolute % 60 == 0 { String::new() } else { format!(":{:02}", absolute % 60) }) };
-    let bracket = prefixed.is_some() || !(zone == "Z" || zone.starts_with(['+', '-']));
-    Ok(format!("{}{}{}", datetime(nanos + i128::from(offset) * 1_000_000_000, false), offset_text, if bracket { format!("[{zone}]") } else { String::new() }))
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).map_err(|_| invalid("Timestamp exceeds formatter range"))?;
+    let offset = rtdb_types::ZoneId::parse(&zone)?.offset_at(seconds)?;
+    let local = nanos + i128::from(offset.seconds()) * 1_000_000_000;
+    rtdb_types::CivilDateTime::from_epoch_nanos(local)?;
+    let bracket = !(zone == "Z" || zone.starts_with(['+', '-']));
+    Ok(format!("{}{}{}", datetime(local, false), offset, if bracket { format!("[{zone}]") } else { String::new() }))
 }
 fn time(nanos: i128, seconds_required: bool) -> String {
     let seconds = nanos.div_euclid(1_000_000_000);
@@ -118,20 +126,8 @@ fn datetime(nanos: i128, utc: bool) -> String {
     let days = nanos.div_euclid(86_400_000_000_000);
     format!("{}T{}{}", date(days as i64), time(nanos.rem_euclid(86_400_000_000_000), utc), if utc { "Z" } else { "" })
 }
-// Howard Hinnant's civil_from_days: https://howardhinnant.github.io/date_algorithms.html#civil_from_days
 pub(crate) fn date(days: i64) -> String {
-    let shifted = days + 719_468;
-    let era = shifted.div_euclid(146_097);
-    let day_of_era = shifted - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let mut year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    year += i64::from(month <= 2);
-    let year = if year > 9999 { format!("+{year}") } else if year < 0 { format!("-{:04}", -year) } else { format!("{year:04}") };
-    format!("{year}-{month:02}-{day:02}")
+    rtdb_types::CivilDate::from_epoch_day(days).expect("validated calendar date or physical Arrow date").to_string()
 }
 fn duration(nanos: i128) -> String {
     if nanos == 0 { return "PT0S".into(); }
@@ -156,6 +152,18 @@ fn invalid(message: &str) -> Anomaly { Anomaly::incorrect("rtdb.node/inspection-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn operation_uri_rendering_reserves_nfc_scratch_and_decodes_transit_uri_objects() {
+        let uri = Value::Uri("/e\u{301}".into());
+        let operation_value = rtdb_tx::OperationValue::Scalar(uri.clone());
+        let bound = operation_allocation_bound(&operation_value).unwrap();
+        assert!(bound >= rtdb_types::UriParts::parse("/e\u{301}").unwrap().ascii_allocation_bound().unwrap());
+        assert_eq!(operation(&operation_value).unwrap(),"#xt/uri \"/%C3%A9\"");
+        let tagged = TransitValue::Tagged { tag: "r".into(), representation: Box::new(TransitValue::String("/e\u{301}".into())) };
+        let value = Value::Transit(rtdb_format::transit::encode_msgpack(&tagged).unwrap());
+        assert_eq!(render(&value).unwrap(),render(&uri).unwrap());
+    }
+
     #[test]
     fn log_tables_edn_preserves_tagged_operations_keyword_names_and_negative_instants() {
         let value = rtdb_tx::OperationValue::Tagged { tag: "put-docs".into(), value: Box::new(rtdb_tx::OperationValue::Struct([

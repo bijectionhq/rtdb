@@ -1,13 +1,23 @@
 = Transaction resolution
 
+SQL containing PG_SLEEP or PG_SLEEP_FOR remains a SQL source operation through submission-time static expansion.
+The resolving transaction evaluates it through its ordinary asynchronous query path, under transaction/database cancellation.
+`tests/submission.rs` checks that sleep and query-clock operations retain the SQL union leg in the actual encoded source payload and that an unregistered RANDOM call fails SQL admission; the tests have not run.
+
 `rtdb-tx` prepares source transactions, reads current and legacy source payloads, resolves operations against an explicit partition snapshot, and emits staged commit or abort values.
 The caller owns source-log submission, leadership, replica append order, durable read-back, catalog effects, completion handles, and publication.
 The crate starts no tasks.
 
 `prepare_submission` expands literal and parameter INSERT VALUES/RECORDS and PATCH RECORDS through SQL-owned binding.
 It preserves raw SQL for data-dependent statements and distinguishes absent arguments from an explicitly empty argument batch.
+INSERT, UPDATE, and DELETE RETURNING clauses are syntax-checked and ignored by shared SQL preparation, including during static INSERT expansion.
+`tests/returning.rs` maps `ignore-returning-keys-3668` through staged mutation, parameter binding, committed reads, and static source encoding; its assertions have not run.
 Source replay decodes its recorded operations without repeating submit-time expansion.
 Each SQL statement and each argument row binds against durable rows, resolved predecessors, and the current transaction's preceding writes.
+SQL argument payloads retain their physical Arrow fields and raw values through source encoding and replay.
+Binding uses their signed execution field view, and parameter evaluation admits unsigned cells at the same signed width.
+Static SQL expansion applies that admission before producing logical documents.
+Replica event decoding and durable page copying retain their physical representations.
 
 Canonical SQL mutations emit IID, valid bounds, and a document for puts, or IID and bounds for deletes.
 UPDATE keeps unassigned columns and evaluates assignments simultaneously.
@@ -47,3 +57,13 @@ Database attach/detach validation and application belong to the node catalog cap
 The pinned database-operation resolver uses the source message timestamp directly, whereas document transactions smooth their default clock and reject a nonadvancing explicit clock.
 An earlier database-operation timestamp can therefore fail index predecessor validation; this source/spec disagreement requires a separate decision.
 `allium/live-index.allium` records the unresolved specification question about zero-row declarations.
+
+`prepare_submission_with_sql_options` uses the submitting node's captured SQL preparation settings during static SQL expansion.
+The node also supplies its endpoint policy to transaction-time SQL resolution.
+The endpoint setting remains process configuration and adds no field to the source log.
+Submission and resolution regressions cover both GENERATE_SERIES endpoint modes as unexecuted source.
+
+Static PATCH expansion distinguishes literal NULL or FALSE clause endpoints from parameter values.
+Either literal becomes the corresponding time sentinel; a null parameter leaves the optional document-operation bound absent and a FALSE parameter fails datetime conversion.
+Non-null endpoint objects use `TimeConversions` semantics, including string date fallback and typed local-date midnight resolution.
+The `submission::patch_endpoint_tests` sources record these conversions and retained-memory release; they have not run.

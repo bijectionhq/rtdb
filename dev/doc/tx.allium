@@ -24,7 +24,7 @@
 --   1. pgwire: BEGIN / START TRANSACTION [modes], BEGIN [READ ONLY | READ WRITE] WITH (...),
 --      COMMIT [SYNC | ASYNC] and ROLLBACK sent as SQL are pgwire's alone.
 --      pgwire parses them itself.
---      BEGIN calls Connection.begin() then applies its characteristics through the entry point SQL SET TRANSACTION uses, rolling the transaction back if they are rejected.
+--      BEGIN evaluates and validates its characteristics, then publishes the open transaction with those characteristics atomically.
 --      COMMIT and ROLLBACK call the connection's commit and rollback.
 --   2. ADBC and Flight SQL: a caller handing the connection SQL text has BEGIN, START TRANSACTION, COMMIT and ROLLBACK rejected with xtdb.adbc/tx-control-as-sql, which names the transaction API.
 --      These callers open and end transactions through their API: ADBC autocommit / commit / rollback, Flight SQL BeginTransaction / EndTransaction, and Xtdb.Connection.begin / commitSync / commitAsync / rollbackTx.
@@ -123,7 +123,7 @@ value ReadBasis {
     --                    latest-completed system-times). Distinct from the await_token, which
     --                    is a TxBasisToken of message-ids the read awaits before snapshotting.
     --   snapshot_time  — observe state as of a wall-clock instant.
-    --   clock_time     — pin the transaction's notion of "now".
+    --   clock_time     — pin the transaction's notion of "now", retaining nanosecond precision.
     snapshot_token: TimeBasisToken?
     snapshot_time: Timestamp?
     clock_time: Timestamp?
@@ -321,8 +321,9 @@ config {
 --
 -- pgwire's BEGIN / START TRANSACTION take the same list of modes as SET TRANSACTION.
 -- BEGIN also takes `READ ONLY WITH (...)` / `READ WRITE WITH (...)`, whose WITH list holds that access mode's options and TIMEZONE.
--- Either way, pgwire's BEGIN opens a transaction with the session default access mode, then applies SET TRANSACTION with BEGIN's characteristics (see Rules: Setting Transaction Characteristics).
--- If applying them is rejected, the transaction is rolled back, so a failed BEGIN leaves none open.
+-- BEGIN evaluates its option expressions on the initiating call and validates their values before publishing the transaction.
+-- The published transaction combines the session defaults with BEGIN's characteristics using the SET TRANSACTION merge rules.
+-- Rejection or cancellation during evaluation leaves the connection without an open transaction.
 --
 -- No BEGIN pins a read basis: that happens at the transaction's first query. The phase a
 -- BEGIN opens depends on the session default access mode:
@@ -331,12 +332,9 @@ config {
 --   no default         → Pending(Unspecified), resolved by the first statement
 
 rule BeginOpensTransaction {
-    -- begin(): opens the transaction in the phase the session default access mode gives.
-    -- A connection with default_access_mode set (via SET SESSION CHARACTERISTICS) opens
-    -- Pending(ReadOnly with no options) / Writing directly; with no default set it opens
-    -- Pending(Unspecified), resolved by the first statement (the common case).
-    -- tx_default_tz and session_default_tz are the connection's default_tz.
-    -- pgwire applies BEGIN's own characteristics, if any, through SET TRANSACTION.
+    -- The event carries successfully evaluated and validated characteristics.
+    -- Transaction creation and the characteristic merge form one publication.
+    -- Session defaults supply the phase and timezone before BEGIN's supplied characteristics are merged.
     when: BeginTransaction(frontend, connection, access_mode, read_only_opts, commit_opts, tz_override)
     requires: connection.tx = null
 
@@ -386,11 +384,9 @@ rule BeginOpensTransaction {
         )
 }
 
-rule BeginRollsBackOnRejectedCharacteristics {
-    -- BEGIN's SET TRANSACTION was rejected (for instance, a malformed AWAIT_TOKEN): the
-    -- transaction BEGIN opened is rolled back, so a failed BEGIN leaves no transaction open.
+rule BeginRejectedCharacteristicsLeaveConnectionIdle {
     when: BeginCharacteristicsRejected(frontend, connection, error_code)
-    requires: connection.tx != null
+    requires: connection.tx = null
 
     ensures:
         not exists connection.tx
@@ -753,6 +749,7 @@ rule BufferDml {
     -- An explicit transaction is open: buffer the DML into it, even when auto_commit is
     -- on. Rejected if the open tx is read-only (see DmlInReadOnlyRejected) or failed
     -- (see FailedTransactionRejectsStatements).
+    -- The buffer accepts the supplied SQL argument width; submission and transaction resolution validate it when the transaction commits.
     when: ExecuteStatement(frontend, connection, kind, statement)
     requires: kind = dml
     requires: connection.tx != null
@@ -1103,6 +1100,12 @@ invariant ReadBasisPinnedAtFirstQuery {
     true
 }
 
+@invariant ExactQueryClock
+    -- The read basis retains the accepted clock instant, including its nanosecond fraction, across subsequent queries and frontend ticket serialization.
+    -- Typed local timestamps resolve in the transaction's effective timezone before the clock is pinned.
+    -- Clock functions apply their requested result precision to that retained instant.
+    -- A microsecond scan boundary or output column converts the retained instant at that boundary.
+
 invariant EffectiveAwaitToken {
     -- The await token SHOW reports for an open tx is the Reading tx's override, or the
     -- Pending(ReadOnly) tx's, else the connection's.
@@ -1153,6 +1156,11 @@ surface PgwireTxControl {
         RollbackTransaction(frontend, conn)
             when conn.tx != null
         ResetSession(frontend, conn)
+
+    @guarantee BeginAtomicPublication
+        -- Option evaluation and validation complete before BEGIN publishes an open transaction.
+        -- A suspended option evaluation belongs to its initiating command; cancellation ends it and leaves the connection idle.
+        -- The published transaction includes every accepted characteristic.
 }
 
 surface SqlStatements {
@@ -1242,6 +1250,11 @@ open question "AutoCommitDml stamps opts with user and default_tz only (no syste
 open question "Which token does AutoCommitQuery supply as snapshot_token?"
     -- ReadBasis declares a TimeBasisToken, while AutoCommitQuery supplies the connection's TxBasisToken.
     -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, Connection.queryBasis uses Database.Catalog.snapshotToken after preparation has awaited the connection's writes.
+
+open question "What isolation does a null partition time in a pinned read basis provide?"
+    -- A Reading transaction retains the token captured by its first query, including null entries for partitions with no completed transaction.
+    -- At c84f9334eb060ceb92d28ecdd4a06e6b625932fd, query.clj retains those entries and operator/scan.clj leaves their system-time dimension unconstrained.
+    -- A later query can therefore observe transactions applied after the first query while retaining the same null token entry.
 
 open question "Does a read-only pgwire server reject COPY IN as well as DML?"
     -- The pinned pgwire verify-permissibility checks the server flag for DML, while copy-exec-op checks the connection's transaction access mode.

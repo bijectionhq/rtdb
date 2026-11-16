@@ -1,5 +1,9 @@
 = Native embedded ABI
 
+Bound Arrow arguments retain raw imported fields and cells until query or DML admission.
+Execution uses signed integer widths for unsigned storage and preserves field types for nulls and empty containers.
+Bulk ingestion applies the same cell admission before constructing logical documents.
+
 `rtdb-ffi` exports the versioned blocking C interface in `include/rtdb.h`.
 It opens the Rust server composition, including configured storage, logs, authentication, source ingestion and listeners.
 For an embedded node without network listeners, set `server: null` and `flightSql: null` in the native YAML configuration.
@@ -37,6 +41,13 @@ The caller may then close its original vectors and allocator.
 Decimal C formats carry true signed 32-bit precision and scale for all four coefficient widths.
 Native carrier metadata is absent from exports and rejected on imports.
 Replacement C format strings share each schema child's retained release owner, so moving a child out of its parent preserves both its format and reservation.
+
+ADBC cursor schemas retain the advertised result layout.
+Each runtime page passes through the passive `rtdb-columnar::DeclaredBatch` adapter before C export, following `ResultCursor.toArrowReader` and `ConformingUnloader`.
+Present NULL vectors acquire the target physical layout while the exported schema preserves its advertised nullability flags.
+The Rust batch retains nullable physical fields and uses checked Arrow constructors.
+Schema alignment reserves decoded values and rebuilt buffers, and preserves exact decimal parameters.
+The virtual-endpoint regression source checks the advertised timestamp field and emitted null buffers; it has not been executed.
 
 The execution budget is shared with authentication, queries, transactions and startup configuration.
 The configured cache split remains a separate cache budget within the same process allocation ceiling.

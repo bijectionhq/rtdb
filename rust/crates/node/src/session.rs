@@ -7,7 +7,7 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::basis::{decode_time_basis, decode_tx_basis, encode_time_basis, encode_tx_basis};
 use rtdb_plan::AccessMode;
 use rtdb_tx::{SubmitOptions, SubmittedTx, TransactionResult, TxOp, UserMetadata};
-use rtdb_types::{Anomaly, Result, TimeBasis, Timestamp, TxBasis, TxId};
+use rtdb_types::{Anomaly, Result, TimeBasis, Instant, Timestamp, TxBasis, TxId};
 use tokio_util::sync::CancellationToken;
 
 #[async_trait]
@@ -18,6 +18,8 @@ pub trait SessionService: Send + Sync {
     fn check_open(&self) -> Result<()>;
     async fn revalidate(&self) -> Result<()>;
     fn now(&self) -> Timestamp;
+    /// Supplies the query clock; implementations with finer precision override the microsecond clock lift.
+    fn query_instant(&self) -> Instant { self.now().into() }
     fn snapshot_basis(&self) -> Result<TimeBasis>;
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()>;
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx>;
@@ -28,7 +30,7 @@ pub trait SessionService: Send + Sync {
 pub struct QueryBasis {
     pub snapshot: TimeBasis,
     pub snapshot_time: Option<Timestamp>,
-    pub current_time: Timestamp,
+    pub current_time: Instant,
     pub timezone: String,
 }
 impl QueryBasis {
@@ -48,7 +50,7 @@ impl<T: Clone> OptionUpdate<T> {
 pub struct ReadOnlySettings {
     pub snapshot_token: OptionUpdate<String>,
     pub snapshot_time: OptionUpdate<Timestamp>,
-    pub clock_time: OptionUpdate<Timestamp>,
+    pub clock_time: OptionUpdate<Instant>,
     pub await_token: OptionUpdate<String>,
 }
 
@@ -95,7 +97,7 @@ pub struct AutonomousTxOptions {
 struct ReadOptions {
     snapshot_token: Option<RetainedText>,
     snapshot_time: Option<Timestamp>,
-    clock_time: Option<Timestamp>,
+    clock_time: Option<Instant>,
     await_token: Option<RetainedText>,
 }
 
@@ -253,14 +255,18 @@ impl Session {
         parameters
     }
     pub fn begin(&mut self) -> Result<()> {
-        self.ensure_open()?;
-        if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-open", "transaction already started")); }
+        self.check_begin()?;
         let phase = match self.default_access_mode {
             Some(AccessMode::ReadOnly) => Phase::Pending(Some(ReadOptions::default())),
             Some(AccessMode::ReadWrite) => Phase::Writing { buffer: DmlBuffer::default(), options: WriteOptions::default() },
             None => Phase::Pending(None),
         };
         self.lifecycle = Lifecycle::Open(Some(Transaction::new(phase, &self.timezone)));
+        Ok(())
+    }
+    pub(crate) fn check_begin(&self) -> Result<()> {
+        self.ensure_open()?;
+        if self.transaction().is_some() { return Err(Anomaly::incorrect("xtdb/tx-already-open", "transaction already started")); }
         Ok(())
     }
     pub fn begin_with(&mut self, settings: TransactionSettings) -> Result<()> {
@@ -335,7 +341,7 @@ impl Session {
         let token = options.await_token.as_deref().or(self.await_token.as_deref());
         self.service.await_basis(token.map(decode_tx_basis).transpose()?, Duration::from_secs(60), &self.cancellation).await?;
         let snapshot = match &options.snapshot_token { Some(token) => decode_time_basis(token)?, None => self.service.snapshot_basis()? };
-        Ok(QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.now()), timezone: self.effective_timezone().to_owned() })
+        Ok(QueryBasis { snapshot, snapshot_time: options.snapshot_time, current_time: options.clock_time.unwrap_or_else(|| self.service.query_instant()), timezone: self.effective_timezone().to_owned() })
     }
     pub async fn read_basis(&mut self) -> Result<QueryBasis> {
         self.revalidate().await?;
@@ -387,7 +393,7 @@ impl Session {
             basis.timezone = self.effective_timezone().to_owned();
             return Ok(basis);
         }
-        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time: self.service.now(), timezone: self.effective_timezone().to_owned() })
+        Ok(QueryBasis { snapshot: self.service.snapshot_basis()?, snapshot_time: None, current_time: self.service.query_instant(), timezone: self.effective_timezone().to_owned() })
     }
     pub async fn execute_operation(&mut self, operation: TxOp) -> Result<Option<TransactionResult>> {
         self.revalidate().await?;

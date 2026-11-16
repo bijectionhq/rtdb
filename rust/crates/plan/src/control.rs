@@ -2,7 +2,12 @@ use crate::{AccessMode, Expr, Identifier};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum ControlValue { Default, Expression(Expr) }
+pub enum ControlValue {
+    Default,
+    Expression(Expr),
+    /// A CLOCK_TIME timestamp literal resolved in the transaction's effective timezone before Arrow admission.
+    TimestampLiteral(String),
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ReadOnlyOptions {
@@ -80,6 +85,6 @@ impl TransactionOptions {
             Some(ControlAccessOptions::ReadWrite(options)) => values.extend([options.system_time.as_ref(), options.metadata.as_ref(), options.asynchronous.as_ref()]),
             None => (),
         }
-        values.into_iter().flatten().filter_map(|value| match value { ControlValue::Expression(expr) => Some(expr), ControlValue::Default => None }).collect()
+        values.into_iter().flatten().filter_map(|value| match value { ControlValue::Expression(expr) => Some(expr), ControlValue::Default | ControlValue::TimestampLiteral(_) => None }).collect()
     }
 }

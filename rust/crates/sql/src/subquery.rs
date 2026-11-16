@@ -1,8 +1,9 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, error};
+use crate::expression::Replacements;
 
 pub(crate) struct CorrelationScope { schema: Schema, captures: BTreeMap<ColumnId, (usize, Expr)>, visible: bool }
 impl CorrelationScope {
@@ -38,22 +39,46 @@ impl Context<'_> {
             let schema = Schema::new(self.outer_scopes[scope].schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
             match schema.resolve(names) {
                 Ok(field) => {
-                    let field = field.clone();
-                    let index = match self.outer_scopes[scope].captures.get(&field.id) {
-                        Some((index, _)) => *index,
-                        None => {
-                            let index = self.internal_parameter()?;
-                            self.outer_scopes[scope].captures.insert(field.id, (index, field.expression()));
-                            index
-                        }
-                    };
-                    return Ok(Expr::Parameter { index, data_type: field.data_type });
+                    return self.capture_outer(scope, field);
                 }
                 Err(error) if error.code != "xtdb/column-not-found" => return Err(error),
                 Err(_) => {},
             }
         }
         Err(missing)
+    }
+
+    fn capture_outer(&mut self, scope: usize, field: &Field) -> Result<Expr> {
+        let index = match self.outer_scopes[scope].captures.get(&field.id) {
+            Some((index, _)) => *index,
+            None => {
+                let index = self.internal_parameter()?;
+                self.outer_scopes[scope].captures.insert(field.id, (index, field.expression()));
+                index
+            }
+        };
+        Ok(Expr::Parameter { index, data_type: field.data_type.clone() })
+    }
+
+    pub(crate) fn wildcard_columns(&mut self, schema: &Schema, qualifier: Option<&str>, excludes: &BTreeSet<String>) -> Result<Vec<(Field, Expr)>> {
+        let selected = wildcard_fields(schema, qualifier, excludes, &self.hidden_columns);
+        if !selected.is_empty() { return Ok(selected.into_iter().map(|field| { let expr = field.expression(); (field, expr) }).collect()); }
+        for scope in (0..self.outer_scopes.len()).rev() {
+            if !self.outer_scopes[scope].visible { continue; }
+            let selected = wildcard_fields(&self.outer_scopes[scope].schema, qualifier, excludes, &self.hidden_columns);
+            if !selected.is_empty() { return selected.into_iter().map(|field| { let expr = self.capture_outer(scope, &field)?; Ok((field, expr)) }).collect(); }
+        }
+        Ok(Vec::new())
+    }
+
+    pub(crate) fn wildcard_source_id(&self, names: &[Identifier], schema: &Schema) -> Result<Option<ColumnId>> {
+        let find = |schema: &Schema| -> Result<Option<ColumnId>> {
+            let schema = Schema::new(schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
+            match schema.resolve(names) { Ok(field) => Ok(Some(field.id)), Err(error) if error.code == "xtdb/column-not-found" => Ok(None), Err(error) => Err(error) }
+        };
+        if let Some(id) = find(schema)? { return Ok(Some(id)); }
+        for scope in self.outer_scopes.iter().rev().filter(|scope| scope.visible) { if let Some(id) = find(&scope.schema)? { return Ok(Some(id)); } }
+        Ok(None)
     }
 
     fn internal_parameter(&mut self) -> Result<usize> {
@@ -124,7 +149,35 @@ impl Context<'_> {
         Ok(field)
     }
 
-    pub(crate) fn quantified_subquery(&mut self, needle: &ast::Expr, query: &ast::Query, op: BinaryOp, negate: bool, input: &mut ExpressionInput<'_>, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
+    pub(crate) fn in_list(&mut self, needle: Expr, values: &[ast::Expr], input: &mut ExpressionInput<'_>) -> Result<Expr> {
+        if values.is_empty() { return Err(error("IN requires at least one candidate")); }
+        for value in values { crate::expression::validate_in_list_item(value)?; }
+        let constructors = values.iter().map(in_row).collect::<Result<Vec<_>>>()?;
+        let scalar = values.len() <= 8 && constructors.iter().all(Option::is_none);
+        if scalar {
+            let values = values.iter().map(|value| self.expr(value, input.schema(), &Replacements::new())).collect::<Result<Vec<_>>>()?;
+            return Ok(values.into_iter().map(|value| Expr::binary(BinaryOp::Eq, needle.clone(), value))
+                .reduce(|left, right| Expr::binary(BinaryOp::Or, left, right)).unwrap());
+        }
+        let needle = self.materialize(needle, input)?;
+        self.outer_scopes.push(CorrelationScope::new(input.schema().clone()));
+        let rows = values.iter().zip(constructors).map(|(value, constructor)| {
+            let value = constructor.unwrap_or(value);
+            self.expr(value, &Schema::default(), &Replacements::new()).map(|expr| vec![expr])
+        }).collect::<Result<Vec<_>>>();
+        let arguments = self.outer_scopes.pop().ok_or_else(|| error("IN correlation scope is unavailable"))?.arguments();
+        let rows = rows?;
+        let candidate = self.hidden_field(LogicalType::join_all(&rows.iter().map(|row| row[0].data_type()).collect::<Vec<_>>()))?;
+        let comparison = Expr::binary(BinaryOp::Eq, needle.expression(), candidate.expression());
+        let dependent = Arc::new(Relation::new(Schema::new(vec![candidate])?, RelationNode::Values { rows })?);
+        let output = self.hidden_field(LogicalType::Scalar(ScalarType::Bool).maybe())?;
+        let relation = input.relation()?;
+        let schema = relation.schema().concat(&Schema::new(vec![output.clone()])?)?;
+        input.replace(Arc::new(Relation::new(schema, RelationNode::Mark { input: relation, dependent, arguments, comparison, output: output.clone() })?))?;
+        Ok(output.expression())
+    }
+
+    pub(crate) fn quantified_subquery(&mut self, needle: &ast::Expr, query: &ast::Query, op: BinaryOp, negate: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
         let needle = self.expr_bound(needle, input, replacements)?;
         let needle = self.materialize(needle, input)?;
         let (dependent, mut arguments) = self.dependent(query, input)?;
@@ -133,7 +186,7 @@ impl Context<'_> {
         self.quantified_result(needle, dependent, arguments, op, negate, input)
     }
 
-    pub(crate) fn quantified_array(&mut self, needle: &ast::Expr, array: &ast::Expr, op: BinaryOp, all: bool, input: &mut ExpressionInput<'_>, replacements: &BTreeMap<String, Field>) -> Result<Expr> {
+    pub(crate) fn quantified_array(&mut self, needle: &ast::Expr, array: &ast::Expr, op: BinaryOp, all: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
         let needle = self.expr_bound(needle, input, replacements)?;
         let needle = self.materialize(needle, input)?;
         let array = self.expr_bound(array, input, replacements)?;
@@ -179,6 +232,31 @@ impl Context<'_> {
     }
 }
 
+fn in_row(value: &ast::Expr) -> Result<Option<&ast::Expr>> {
+    let arity = |count| error(format!("Subquery arity error: expected a single column, got {count}"));
+    match value {
+        ast::Expr::Tuple(values) => match values.as_slice() { [value] => Ok(Some(value)), _ => Err(arity(values.len())) },
+        ast::Expr::Function(function) => {
+            let names = crate::bind::identifiers(&function.name)?;
+            if names.len() != 1 || names[0].quoted || names[0].normalized() != "row" { return Ok(None); }
+            if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(error("ROW constructor does not accept function modifiers")); }
+            let ast::FunctionArguments::List(arguments) = &function.args else { return Err(arity(0)); };
+            if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(error("ROW constructor does not accept argument modifiers")); }
+            if arguments.args.len() != 1 { return Err(arity(arguments.args.len())); }
+            match &arguments.args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(Some(expr)),
+                _ => Err(error("ROW constructor requires an expression")),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn wildcard_fields(schema: &Schema, qualifier: Option<&str>, excludes: &BTreeSet<String>, hidden: &BTreeMap<ColumnId, HiddenColumn>) -> Vec<Field> {
+    schema.fields().iter().filter(|field| !hidden.contains_key(&field.id) && !excludes.contains(&field.name)
+        && qualifier.is_none_or(|qualifier| field.qualifier.as_ref().is_some_and(|scope| scope.alias() == qualifier))).cloned().collect()
+}
+
 pub(crate) fn negated_operator(op: BinaryOp) -> Result<BinaryOp> {
     Ok(match op {
         BinaryOp::Eq => BinaryOp::NotEq, BinaryOp::NotEq => BinaryOp::Eq,
@@ -190,7 +268,8 @@ pub(crate) fn negated_operator(op: BinaryOp) -> Result<BinaryOp> {
 
 fn existence_rows(relation: Arc<Relation>) -> Result<Arc<Relation>> {
     match relation.node() {
-        RelationNode::Project { input, .. } | RelationNode::Sort { input, .. }
+        RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Sort { input, .. }
+        | RelationNode::Mark { input, .. }
         | RelationNode::Apply { input, kind: ApplyKind::Scalar | ApplyKind::Exists | ApplyKind::Pull | ApplyKind::PullMany, .. } => existence_rows(Arc::clone(input)),
         RelationNode::Limit { input, offset, fetch } => Ok(Arc::new(existence_rows(Arc::clone(input))?.limit(offset.clone(), fetch.clone())?)),
         RelationNode::Values { rows } => Ok(Arc::new(Relation::new(Schema::default(), RelationNode::Values { rows: vec![Vec::new(); rows.len()] })?)),

@@ -17,6 +17,24 @@ class PackagedClientTests(unittest.TestCase):
                     "build_command": ["docker", "build"], "source_manifest_sha256": "3" * 64}
         return image, manifest
 
+    def package_files(self, root, manifest):
+        sources = json.dumps({"revision": manifest["revision"]}).encode()
+        (root / "source-manifest.json").write_bytes(sources)
+        (root / "artifacts").mkdir()
+        timezone = b"selected database"
+        manifest.update(source_manifest_sha256=hashlib.sha256(sources).hexdigest(), version="0.1.0", features=[], platform="linux/amd64",
+                        tzdb={"sha256": hashlib.sha256(timezone).hexdigest(), "bytes": len(timezone), "selection": "bundled"})
+        report = {"schema_version": 1, "engine": "rust", "version": manifest["version"], "revision": manifest["revision"],
+                  "tzdb_version": "2025b", "tzdb_sha256": manifest["tzdb"]["sha256"]}
+        (root / "artifacts/build.json").write_text(json.dumps(manifest))
+        (root / "artifacts/tzdb.dat").write_bytes(timezone)
+        for name in ["rtdb", "rtdb-config"]:
+            (root / "artifacts" / name).write_bytes(name.encode())
+            (root / "artifacts" / (name + "-build-info.json")).write_text(json.dumps(report))
+        manifest["compiled_build_info"] = report
+        manifest["artifacts"] = [{"path": str(path.relative_to(root)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size}
+                                 for path in sorted((root / "artifacts").iterdir())]
+
     def test_package_requires_matching_clean_source_and_actual_image(self):
         image, manifest = self.package()
         validate_package(image, manifest, "2" * 40, "rust")
@@ -38,19 +56,45 @@ class PackagedClientTests(unittest.TestCase):
         _, manifest = self.package()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            sources = json.dumps({"revision": manifest["revision"]}).encode()
-            (root / "source-manifest.json").write_bytes(sources)
-            (root / "artifacts").mkdir()
+            self.package_files(root, manifest)
             artifact = root / "artifacts/build.json"
-            artifact.write_bytes(b"{}")
-            manifest["source_manifest_sha256"] = hashlib.sha256(sources).hexdigest()
-            manifest["artifacts"] = [{"path": "artifacts/build.json", "sha256": hashlib.sha256(b"{}").hexdigest(), "bytes": 2}]
             self.assertEqual(validate_package_files(root / "package.json", manifest), manifest["artifacts"][0])
             artifact.write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 validate_package_files(root / "package.json", manifest)
             manifest["artifacts"][0]["path"] = "../outside"
             with self.assertRaises(ValueError):
+                validate_package_files(root / "package.json", manifest)
+
+    def test_native_package_requires_both_executable_reports_and_selected_timezone_bytes(self):
+        _, manifest = self.package()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.package_files(root, manifest)
+            for artifact in manifest["artifacts"]:
+                missing = copy.deepcopy(manifest)
+                missing["artifacts"] = [item for item in missing["artifacts"] if item["path"] != artifact["path"]]
+                with self.subTest(missing=artifact["path"]), self.assertRaises(ValueError):
+                    validate_package_files(root / "package.json", missing)
+            changed = copy.deepcopy(manifest)
+            changed["compiled_build_info"]["tzdb_version"] = "wrong"
+            with self.assertRaisesRegex(ValueError, "compiled executable reports"):
+                validate_package_files(root / "package.json", changed)
+            changed = copy.deepcopy(manifest)
+            changed["tzdb"]["sha256"] = "f" * 64
+            with self.assertRaisesRegex(ValueError, "metadata differs at tzdb"):
+                validate_package_files(root / "package.json", changed)
+
+    def test_refreshed_artifact_digest_cannot_hide_disagreeing_executable_build_information(self):
+        _, manifest = self.package()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.package_files(root, manifest)
+            report = root / "artifacts/rtdb-config-build-info.json"
+            report.write_text(json.dumps({**manifest["compiled_build_info"], "revision": "a" * 40}))
+            record = next(item for item in manifest["artifacts"] if item["path"] == "artifacts/rtdb-config-build-info.json")
+            record.update(sha256=hashlib.sha256(report.read_bytes()).hexdigest(), bytes=report.stat().st_size)
+            with self.assertRaisesRegex(ValueError, "compiled metadata differs"):
                 validate_package_files(root / "package.json", manifest)
 
     def test_runtime_services_pin_shared_client_images_without_host_ports_or_builds(self):

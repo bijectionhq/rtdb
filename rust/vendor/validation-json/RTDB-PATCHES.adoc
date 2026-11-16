@@ -1,0 +1,10 @@
+= Isolated validation JSON values
+
+This is serde_json 1.0.151, renamed to `rtdb-validation-json` for the Connect validator dependency chain.
+The library name remains `serde_json` for upstream source compatibility.
+Only the package manifest is changed; parsing and serialization source files remain upstream copies.
+`UPSTREAM.json` records the registry archive checksum and original file hashes.
+Both upstream licenses and `Cargo.toml.orig` are retained.
+
+The isolated validator enables `arbitrary_precision` on this package.
+Ordinary workspace serde_json remains a separate package and type.

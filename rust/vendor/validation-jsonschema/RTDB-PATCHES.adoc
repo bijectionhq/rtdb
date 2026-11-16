@@ -1,0 +1,35 @@
+= Isolated Connect JSON Schema validation
+
+This package is based on jsonschema 0.33.0 and is renamed `rtdb-validation-jsonschema`.
+`UPSTREAM.json` records the registry archive checksum and the original source-file hashes.
+The upstream MIT license and original manifest are retained.
+
+The local dependency chain uses `rtdb-validation-referencing` 0.33.0 and `rtdb-validation-json` 1.0.151.
+Only the renamed JSON package enables `arbitrary_precision`.
+The workspace's ordinary `serde_json::Value` and its features are independent.
+The Connect adapter constructs the isolated value tree directly, preserving user object keys that resemble serde's private numeric marker.
+Connect disables HTTP and file reference retrieval and supplies Registry resources explicitly.
+
+The numeric core stores normalized coefficient digits and an arbitrary signed decimal exponent.
+Comparison aligns digits without expanding powers of ten.
+Divisibility uses modular exponentiation for positive scale differences and coefficient divisibility for negative differences.
+Minimum, maximum, exclusive bounds, multipleOf, numeric const/enum equality, uniqueItems hashing and integer classification use this core.
+Count bounds saturate above u64 because addressable Rust strings and containers have fewer than u64::MAX elements.
+MultipleOf errors retain the original exact JSON number.
+The Connect conversion region reserves scratch for both payload and compiled-schema numeric operands before adapting or validating a record.
+
+The copied upstream tests remain available alongside source regressions added to the numeric core and Connect boundary.
+No executable verification has been performed during the source-only implementation phase.
+
+Connect selects `with_jvm_registry_semantics` to retain the pinned Confluent 7.8 numeric loader and validator behavior.
+The option keeps generic meta-schema validation and adapts only numeric annotations at actual schema nodes for that validation pass.
+Original count and multipleOf values remain available to their keyword compilers.
+Everit draft4/6/7 uses integral Java node classes for integer types and preserves BigDecimal scale in same-class equality.
+Modern json-sKema uses BigDecimal text for integer classification and Java scalar/collection hashes for uniqueItems lookup.
+Legacy uniqueness indexes compatible decimal-scale signatures with Roaring posting sets; modern uniqueness uses ordered hash/value keys.
+Neither path scans growing native hash-collision buckets.
+Count predicates retain signed Java narrowing, including modern contains' distinction between an actual integer zero and a wrapped or decimal zero on empty arrays.
+Source regressions cover the five supported drafts and retain existing nonnumeric meta-schema structure checks.
+
+Broader JVM boundaries remain open for isolated UTF16 surrogates, Connect Decimal carriers beyond 64 digits, and nonnumeric schema-loader/format parity.
+The numeric compatibility option does not claim those boundaries complete.

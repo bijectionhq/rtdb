@@ -10,6 +10,7 @@ use crate::{from_field, to_field};
 
 /// Builds arrays with exact logical value types; numeric coercions belong to expressions.
 /// Undefined cells are accepted only for bottom-typed fields.
+/// Calendar objects use the vector object writer's truncating day and wrapping millisecond conversions.
 pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
     build_values(logical, values, true)
 }
@@ -17,8 +18,12 @@ pub fn build_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> 
 /// Reconstructs typed cells without revalidating decimal precision against their stored coefficients.
 /// Every nonnull value must belong to its target logical type, including exact decimal parameters.
 /// Coefficient width is checked; values are neither rescaled nor relabeled.
+/// Unadmitted calendar objects are rejected, including nested cells.
 /// The caller reserves `estimate_builder_bytes` before invoking this function.
 pub fn copy_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
+    if values.iter().any(Value::has_calendar_object) {
+        return Err(Anomaly::incorrect("rtdb/unadmitted-calendar-value", "Stored-cell copies require admitted calendar values"));
+    }
     build_values(logical, values, false)
 }
 
@@ -88,12 +93,17 @@ fn build_scalar(scalar: &ScalarType, values: &[Value], check_precision: bool) ->
         F16 => primitive!(values, Float16Array, Value::F16(v) => half::f16::from_bits(*v)),
         F32 => primitive!(values, Float32Array, Value::F32(v) => *v),
         F64 => primitive!(values, Float64Array, Value::F64(v) => *v),
-        DateDay => primitive!(values, Date32Array, Value::DateDay(v) => *v),
-        DateMilli => primitive!(values, Date64Array, Value::DateMilli(v) => *v),
+        DateDay => Ok(Arc::new(Date32Array::from(values.iter().map(|value| match value {
+            Value::DateDay(value) => Some(*value), Value::Date(value) => Some(value.date().epoch_day() as i32), _ => None,
+        }).collect::<Vec<_>>()))),
+        DateMilli => Ok(Arc::new(Date64Array::from(values.iter().map(|value| match value {
+            Value::DateMilli(value) => Some(*value), Value::Date(value) => Some(value.date().epoch_day().wrapping_mul(86_400_000)), _ => None,
+        }).collect::<Vec<_>>()))),
         Oid => primitive!(values, Int32Array, Value::Oid(v) => *v),
         RegClass => primitive!(values, Int32Array, Value::RegClass(v) => *v),
         RegProc => primitive!(values, Int32Array, Value::RegProc(v) => *v),
         Utf8 | Uri | Keyword => {
+            if *scalar == Uri { for value in values { if let Value::Uri(text) = value { rtdb_types::UriParts::parse(text)?; } } }
             let strings = values.iter().map(|value| match value {
                 Value::Utf8(value) | Value::Uri(value) => Some(value.as_str()),
                 Value::Keyword(value) => Some(value.as_str()),
@@ -374,7 +384,7 @@ fn read_scalar(scalar: &ScalarType, array: &dyn Array, row: usize) -> Result<Val
         Oid => cell!(array, row, Int32Array, Oid), RegClass => cell!(array, row, Int32Array, RegClass), RegProc => cell!(array, row, Int32Array, RegProc),
         Utf8 => Ok(Value::Utf8(downcast::<StringArray>(array)?.value(row).to_owned())),
         Keyword => Ok(Value::Keyword(rtdb_types::Keyword::from_name(downcast::<StringArray>(array)?.value(row)))),
-        Uri => Ok(Value::Uri(downcast::<StringArray>(array)?.value(row).to_owned())),
+        Uri => { let text = downcast::<StringArray>(array)?.value(row); rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.to_owned())) },
         Binary => Ok(Value::Binary(downcast::<BinaryArray>(array)?.value(row).to_vec())),
         Transit => Ok(Value::Transit(downcast::<BinaryArray>(array)?.value(row).to_vec())),
         FixedSizeBinary(_) => Ok(Value::FixedSizeBinary(downcast::<FixedSizeBinaryArray>(array)?.value(row).to_vec())),

@@ -67,6 +67,8 @@ pub struct NodeConfiguration {
     pub node_id: String,
     pub local_log_uses_clock: bool,
     pub kafka_auto_create_topic: bool,
+    pub join_build_rows: i64,
+    pub generate_series_end_exclusive: bool,
 }
 impl std::fmt::Debug for NodeConfiguration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,6 +109,8 @@ impl NodeConfiguration {
         let health = fields.take_nullable("healthz").map(health).transpose()?;
         let indexer = indexer(fields.take("indexer"), environment)?;
         let node_id = fields.string("nodeId")?.or_else(|| environment("XTDB_NODE_ID")).unwrap_or_else(|| uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("rtdb").into());
+        let join_build_rows = environment("XTDB_JOIN_SPILL_THRESHOLD").as_deref().and_then(join_threshold).unwrap_or(100_000);
+        let generate_series_end_exclusive = environment("XTDB_GENERATE_SERIES_END_EXCLUSIVE").is_some_and(|value|value.eq_ignore_ascii_case("true"));
         let configuration = if ingest {
             let fixed_databases = match fields.take("databases") {
                 Some(value) => YamlFields::new(value, "databases")?.into_entries().into_iter().map(|(name, value)| Ok((name, decode_database_value(value)?))).collect::<Result<_>>()?,
@@ -114,7 +118,7 @@ impl NodeConfiguration {
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: "UTC".into(), indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -129,11 +133,18 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic }
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive }
         };
         fields.finish()?;
         Ok(configuration)
     }
+}
+
+fn join_threshold(value: &str) -> Option<i64> {
+    let (negative, digits) = match value.as_bytes().first() { Some(b'-') => (true, &value[1..]), Some(b'+') => (false, &value[1..]), _ => (false, value) };
+    if digits.is_empty() { return None; }
+    let magnitude = digits.chars().try_fold(0i64, |value, digit| value.checked_mul(10)?.checked_sub(i64::from(rtdb_types::decimal_digit(digit)?)))?;
+    if negative { Some(magnitude) } else { magnitude.checked_neg() }
 }
 
 fn pgwire(value: Yaml) -> Result<PgwireSettings> {

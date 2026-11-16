@@ -1,0 +1,7 @@
+= Isolated validation references
+
+This is referencing 0.33.0, renamed to `rtdb-validation-referencing` for the Connect validator dependency chain.
+Its `serde_json` dependency points to `rtdb-validation-json` 1.0.151, keeping every resource and validator value in the same isolated type family.
+Source files remain upstream copies.
+`UPSTREAM.json` records the registry archive checksum and original file hashes.
+The upstream MIT license and `Cargo.toml.orig` are retained.

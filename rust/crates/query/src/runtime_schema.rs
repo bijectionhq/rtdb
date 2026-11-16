@@ -1,0 +1,396 @@
+use std::{collections::BTreeMap, sync::Arc};
+
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_plan::{ApplyKind, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_types::{LogicalType as L, Result, ScalarType};
+
+use crate::{CatalogSnapshot, invalid};
+
+pub(crate) struct RuntimeSchema { root: Arc<RuntimeRelation> }
+
+pub(crate) struct RuntimeRelation {
+    schema: Schema,
+    node: RuntimeNode,
+    _reservation: Arc<MemoryReservation>,
+}
+
+enum RuntimeNode {
+    Leaf,
+    Unary(Arc<RuntimeRelation>),
+    Binary(Arc<RuntimeRelation>, Arc<RuntimeRelation>),
+    Aggregate { input: Arc<RuntimeRelation>, types: Vec<crate::aggregate::AggregateTypes> },
+}
+
+impl RuntimeRelation {
+    pub fn schema(&self) -> &Schema { &self.schema }
+    pub fn child(&self, index: usize) -> Result<Arc<Self>> {
+        match (&self.node, index) {
+            (RuntimeNode::Unary(input) | RuntimeNode::Aggregate { input, .. } | RuntimeNode::Binary(input, _), 0) => Ok(Arc::clone(input)),
+            (RuntimeNode::Binary(_, right), 1) => Ok(Arc::clone(right)),
+            _ => Err(invalid("runtime-plan", "Runtime relation child is absent")),
+        }
+    }
+    pub fn aggregates(&self) -> Result<&[crate::aggregate::AggregateTypes]> {
+        match &self.node { RuntimeNode::Aggregate { types, .. } => Ok(types), _ => Err(invalid("runtime-plan", "Runtime relation is not an aggregate")) }
+    }
+}
+
+impl RuntimeSchema {
+    pub fn derive(relation: &Relation, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bound = parameters.iter().try_fold(allocation_bound(relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 32)?, 512)?))?;
+        let reservation = memory.reserve(bound)?;
+        let parameters = parameters.iter().enumerate().map(|(index, ty)| (index, ty.clone())).collect();
+        let root = relation_types(relation, catalog, &parameters, &[], &reservation)?;
+        Ok(Self { root })
+    }
+    pub fn fixed(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(schema_bound(schema)?)?;
+        Ok(Self { root: Arc::new(RuntimeRelation { schema: schema.clone(), node: RuntimeNode::Leaf, _reservation: reservation }) })
+    }
+    pub fn schema(&self) -> &Schema { self.root.schema() }
+    pub fn root(&self) -> Arc<RuntimeRelation> { Arc::clone(&self.root) }
+}
+
+fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| invalid("runtime-schema-size", "Runtime schema allocation exceeds addressable memory")) }
+fn multiply(value: usize, factor: usize) -> Result<usize> { value.checked_mul(factor).ok_or_else(|| invalid("runtime-schema-size", "Runtime schema allocation exceeds addressable memory")) }
+fn field_bound(field: &Field) -> Result<usize> {
+    let qualifier = field.qualifier.as_ref().map(|qualifier| qualifier.retained_bytes()).transpose()?.unwrap_or(0);
+    add(multiply(field.data_type.retained_bytes()?, 32)?, add(multiply(add(field.name.len(), qualifier)?, 8)?, 2048)?)
+}
+pub(crate) fn schema_bound(schema: &Schema) -> Result<usize> {
+    schema.fields().iter().try_fold(4096, |bytes, field| add(bytes, field_bound(field)?))
+}
+pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
+    let mut bytes = 2048;
+    match expr {
+        Expr::Literal(value) => bytes = add(bytes, multiply(value.retained_bytes()?, 32)?)?,
+        Expr::Column { data_type, .. } | Expr::Parameter { data_type, .. } | Expr::Correlated { data_type, .. } => bytes = add(bytes, multiply(data_type.retained_bytes()?, 32)?)?,
+        Expr::Unary { expr, .. } => bytes = add(bytes, expression_bound(expr)?)?,
+        Expr::Cast { expr, target } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, cast_bound(target)?)?; }
+        Expr::Field { expr, name, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(data_type.retained_bytes()?, 32)?)?)?; }
+        Expr::Binary { left, right, .. } => { bytes = add(bytes, expression_bound(left)?)?; bytes = add(bytes, expression_bound(right)?)?; }
+        Expr::Call { name, args, return_type } => { bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(return_type.retained_bytes()?, 32)?)?)?; for arg in args { bytes = add(bytes, expression_bound(arg)?)?; } }
+        Expr::RegexReplace { source,recipe,return_type } => { bytes = add(bytes,add(multiply(recipe.retained_bytes()?,8)?,multiply(return_type.retained_bytes()?,32)?)?)?;bytes = add(bytes,expression_bound(source)?)?; }
+        Expr::Coalesce(args) | Expr::List(args) => for arg in args { bytes = add(bytes, expression_bound(arg)?)?; },
+        Expr::Between { operand,low,high,.. } => { bytes = add(bytes,add(expression_bound(operand)?,add(expression_bound(low)?,expression_bound(high)?)?)?)?; }
+        Expr::SimpleCase { operand, branches, otherwise } => { bytes = add(bytes, expression_bound(operand)?)?; for (candidate, value) in branches { bytes = add(bytes, add(expression_bound(candidate)?, expression_bound(value)?)?)?; } bytes = add(bytes, expression_bound(otherwise)?)?; }
+        Expr::Case { branches, otherwise } => { for (condition, value) in branches { bytes = add(bytes, add(expression_bound(condition)?, expression_bound(value)?)?)?; } bytes = add(bytes, expression_bound(otherwise)?)?; }
+        Expr::Subscript { expr, index, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, expression_bound(index)?)?; bytes = add(bytes, multiply(data_type.retained_bytes()?, 32)?)?; }
+        Expr::Struct(fields) => for (name, expr) in fields { bytes = add(bytes, add(multiply(name.len(), 8)?, expression_bound(expr)?)?)?; },
+        Expr::RowCopy(fields) => for field in fields { bytes = add(bytes, field_bound(field)?)?; },
+        Expr::In { expr, values, .. } => { bytes = add(bytes, expression_bound(expr)?)?; for value in values { bytes = add(bytes, expression_bound(value)?)?; } }
+        Expr::Like { expr, pattern, .. } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, expression_bound(pattern)?)?; }
+    }
+    Ok(bytes)
+}
+fn cast_bound(target: &rtdb_plan::CastTarget) -> Result<usize> {
+    Ok(match target {
+        rtdb_plan::CastTarget::Fixed(ty) => multiply(ty.retained_bytes()?, 32)?,
+        rtdb_plan::CastTarget::List(element) => add(2048, cast_bound(element)?)?,
+        rtdb_plan::CastTarget::Checked { requested, target } => add(multiply(requested.retained_bytes()?, 32)?, cast_bound(target)?)?,
+        rtdb_plan::CastTarget::Temporal(target) => add(2048, match &target.kind { rtdb_plan::TemporalKind::TimestampZone(rtdb_plan::CastTimezone::Explicit(zone)) => multiply(zone.capacity(), 32)?, _ => 0 })?,
+        rtdb_plan::CastTarget::Deferred(target) => add(2048, multiply(target.retained_bytes()?, 32)?)?,
+        _ => 2048,
+    })
+}
+pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
+    let mut bytes = schema_bound(relation.schema())?;
+    let mut expression = |expr: &Expr| { bytes = add(bytes, expression_bound(expr)?)?; Ok::<_, rtdb_types::Anomaly>(()) };
+    match relation.node() {
+        RelationNode::Values { rows } => for row in rows { for expr in row { expression(expr)?; } },
+        RelationNode::Scan(scan) => {
+            for filter in [&scan.valid_time, &scan.system_time] {
+                match filter {
+                    rtdb_plan::TemporalFilter::At(at) => expression(at)?,
+                    rtdb_plan::TemporalFilter::FromTo { from, to } => { expression(from)?; expression(to)?; }
+                    rtdb_plan::TemporalFilter::Between { from, to } => { expression(from)?; expression(to)?; }
+                    rtdb_plan::TemporalFilter::Default | rtdb_plan::TemporalFilter::All => {}
+                }
+            }
+            for predicate in &scan.predicates { expression(predicate)?; }
+            for name in [&scan.table.name.database, &scan.table.name.table.schema, &scan.table.name.table.table] { bytes = add(bytes, multiply(name.len(), 8)?)?; }
+            for (name, ty) in &scan.table.columns { bytes = add(bytes, add(add(1024, multiply(name.len(), 8)?)?, multiply(ty.retained_bytes()?, 32)?)?)?; }
+            if let Some(iids) = &scan.iids { bytes = add(bytes, multiply(iids.len(), 64)?)?; }
+        }
+        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => for named in expressions { expression(&named.expr)?; },
+        RelationNode::Aggregate { groups, aggregates, .. } => {
+            for group in groups { expression(&group.expr)?; }
+            for aggregate in aggregates {
+                if let Some(argument) = &aggregate.argument { expression(argument)?; }
+                if let Some(filter) = &aggregate.filter { expression(filter)?; }
+                for order in &aggregate.order_by { expression(&order.expr)?; }
+            }
+        }
+        RelationNode::Unnest { expr, .. } => expression(expr)?,
+        RelationNode::Join { condition, .. } => if let Some(condition) = condition { expression(condition)?; },
+        RelationNode::Apply { arguments, .. } => for (_, expr) in arguments { expression(expr)?; },
+        RelationNode::Mark { arguments, comparison, .. } => { for (_, expr) in arguments { expression(expr)?; } expression(comparison)?; },
+        RelationNode::Filter { predicate, .. } => expression(predicate)?,
+        RelationNode::Sort { order_by, .. } | RelationNode::Window { order_by, .. } => for order in order_by { expression(&order.expr)?; },
+        RelationNode::SortLimit { order_by, offset, fetch, .. } => {
+            for order in order_by { expression(&order.expr)?; }
+            for bound in [offset, fetch].into_iter().flatten() { expression(bound)?; }
+        }
+        RelationNode::Limit { offset, fetch, .. } => for bound in [offset, fetch].into_iter().flatten() { expression(bound)?; },
+        RelationNode::PatchGaps { from, to, .. } => { expression(from)?; expression(to)?; }
+        RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Set { .. } | RelationNode::Distinct { .. } => {}
+    }
+    match relation.node() {
+        RelationNode::Aggregate { aggregates, .. } => for aggregate in aggregates { bytes = add(bytes, multiply(aggregate.function.retained_bytes()?, 8)?)?; },
+        RelationNode::Rename { prefix, .. } => bytes = add(bytes, multiply(prefix.len(), 8)?)?,
+        RelationNode::Let { binding, .. } | RelationNode::Reference { binding } => bytes = add(bytes, multiply(binding.name.len(), 8)?)?,
+        _ => {}
+    }
+    Ok(bytes)
+}
+pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
+    let mut bytes = local_allocation_bound(relation)?;
+    for child in relation.children() { bytes = add(bytes, allocation_bound(child)?)?; }
+    if let RelationNode::Reference { binding } = relation.node() { bytes = add(bytes, allocation_bound(&binding.relation)?)?; }
+    Ok(bytes)
+}
+
+fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
+fn relation_types(relation: &Relation, catalog: &CatalogSnapshot, parameters: &BTreeMap<usize, L>, outer: &[Schema], reservation: &Arc<MemoryReservation>) -> Result<Arc<RuntimeRelation>> {
+    let mut children = Vec::new();
+    let mut aggregates = Vec::new();
+    let mut child = |input: &Relation| {
+        let runtime = relation_types(input, catalog, parameters, outer, reservation)?;
+        let schema = runtime.schema().clone();
+        children.push(runtime);
+        Ok::<_, rtdb_types::Anomaly>(schema)
+    };
+    let schema = match relation.node() {
+        RelationNode::Values { rows } => {
+            Schema::new(relation.schema().fields().iter().enumerate().map(|(index, field)| {
+                let types = rows.iter().map(|row| expression_type(&row[index], &Schema::default(), parameters, outer)).collect::<Result<Vec<_>>>()?;
+                Ok(if rows.iter().map(|row| row[index].data_type()).eq(types.iter().cloned()) { field.clone() } else { field_type(field, L::join_all(&types)) })
+            }).collect::<Result<_>>()?)?
+        }
+        RelationNode::Scan(scan) => {
+            let schema = Schema::new(scan.columns.iter().map(|field| field_type(field, catalog.runtime_scan_type(&scan.table, field))).collect())?;
+            for filter in [&scan.valid_time, &scan.system_time] {
+                match filter {
+                    rtdb_plan::TemporalFilter::At(at) => { expression_type(at, &Schema::default(), parameters, outer)?; }
+                    rtdb_plan::TemporalFilter::FromTo { from, to } | rtdb_plan::TemporalFilter::Between { from, to } => {
+                        expression_type(from, &Schema::default(), parameters, outer)?;
+                        expression_type(to, &Schema::default(), parameters, outer)?;
+                    }
+                    rtdb_plan::TemporalFilter::Default | rtdb_plan::TemporalFilter::All => {}
+                }
+            }
+            for predicate in &scan.predicates { expression_type(predicate, &schema, parameters, outer)?; }
+            schema
+        }
+        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+            let input = child(input)?;
+            Schema::new(expressions.iter().map(|expr| {
+                let ty = expression_type(&expr.expr, &input, parameters, outer)?;
+                Ok(if ty == expr.expr.data_type() { expr.field.clone() } else { field_type(&expr.field, ty) })
+            }).collect::<Result<_>>()?)?
+        }
+        RelationNode::Let { binding, body } => { child(&binding.relation)?; child(body)? }
+        RelationNode::Reference { binding } => relation_types(&binding.relation, catalog, parameters, outer, reservation)?.schema().clone(),
+        RelationNode::Filter { input, predicate } => {
+            let input = child(input)?;
+            expression_type(predicate, &input, parameters, outer)?;
+            input
+        }
+        RelationNode::Sort { input, order_by } | RelationNode::SortLimit { input, order_by, .. } => {
+            let input = child(input)?;
+            for order in order_by { expression_type(&order.expr, &input, parameters, outer)?; }
+            input
+        }
+        RelationNode::Limit { input, .. } | RelationNode::Distinct { input } => child(input)?,
+        RelationNode::PatchGaps { input, document, .. } => {
+            let input = child(input)?;
+            Schema::new(input.fields().iter().map(|field| {
+                if field.id == *document { field_type(field, field.data_type.clone().maybe()) } else { field.clone() }
+            }).collect())?
+        }
+        RelationNode::Join { left, right, kind, condition } => {
+            let (left, right) = (child(left)?, child(right)?);
+            if let Some(condition) = condition { expression_type(condition, &left.concat(&right)?, parameters, outer)?; }
+            match kind {
+                JoinKind::Semi | JoinKind::Anti => left,
+                JoinKind::Left => left.concat(&right.nullable()?)?,
+                JoinKind::Right => left.nullable()?.concat(&right)?,
+                JoinKind::Full => left.nullable()?.concat(&right.nullable()?)?,
+                _ => left.concat(&right)?,
+            }
+        }
+        RelationNode::Set { left, right, .. } => {
+            let (left, right) = (child(left)?, child(right)?);
+            Schema::new(relation.schema().fields().iter().zip(left.fields().iter().zip(right.fields())).map(|(field, (left, right))| field_type(field, left.data_type.join(&right.data_type))).collect())?
+        }
+        RelationNode::Aggregate { input, groups, aggregates: expressions } => {
+            let input = child(input)?;
+            let mut fields = groups.iter().map(|group| Ok(field_type(&group.field, expression_type(&group.expr, &input, parameters, outer)?))).collect::<Result<Vec<_>>>()?;
+            for expression in expressions {
+                let input_type = expression.argument.as_ref().map(|argument| expression_type(argument, &input, parameters, outer)).transpose()?.unwrap_or(L::Nothing);
+                if let Some(filter) = &expression.filter { expression_type(filter, &input, parameters, outer)?; }
+                for order in &expression.order_by { expression_type(&order.expr, &input, parameters, outer)?; }
+                let types = crate::aggregate::AggregateTypes::derive(expression, input_type, groups.is_empty())?;
+                fields.push(field_type(&expression.field, types.output_type().clone()));
+                aggregates.push(types);
+            }
+            Schema::new(fields)?
+        }
+        RelationNode::Window { input, expressions, order_by, .. } => {
+            let input = child(input)?;
+            for order in order_by { expression_type(&order.expr, &input, parameters, outer)?; }
+            let mut fields = input.fields().to_vec();
+            for expr in expressions { fields.push(field_type(&expr.field, expr.function.result_type(&input)?)); }
+            Schema::new(fields)?
+        }
+        RelationNode::Unnest { input, expr, element, ordinality, outer: nullable } => {
+            let input = child(input)?;
+            let types = expression_type(expr, &input, parameters, outer)?.legs().into_iter().map(|ty| match ty { L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element, _ => L::Null }).collect::<Vec<_>>();
+            let ty = if types.is_empty() { L::Null } else { L::join_all(&types) };
+            let mut fields = input.fields().to_vec();
+            fields.push(field_type(element, if *nullable { ty.maybe() } else { ty }));
+            fields.extend(ordinality.iter().cloned());
+            Schema::new(fields)?
+        }
+        RelationNode::Mark { input, dependent, arguments, comparison, output } => {
+            let input = child(input)?;
+            let mut bound = parameters.clone();
+            for (index, expr) in arguments { bound.insert(*index, expression_type(expr, &input, parameters, outer)?); }
+            let mut scopes = outer.to_vec(); scopes.push(input.clone());
+            let dependent_types = relation_types(dependent, catalog, &bound, &scopes, reservation)?;
+            expression_type(comparison, &input.concat(dependent_types.schema())?, parameters, outer)?;
+            children.push(dependent_types);
+            input.concat(&Schema::new(vec![field_type(output, L::Scalar(ScalarType::Bool).maybe())])?)?
+        }
+        RelationNode::Apply { input, dependent, arguments, kind, output } => {
+            let input = child(input)?;
+            let mut bound = parameters.clone();
+            for (index, expr) in arguments { bound.insert(*index, expression_type(expr, &input, parameters, outer)?); }
+            let mut scopes = outer.to_vec(); scopes.push(input.clone());
+            let dependent_types = relation_types(dependent, catalog, &bound, &scopes, reservation)?;
+            let dependent = dependent_types.schema().clone();
+            children.push(dependent_types);
+            match kind {
+                ApplyKind::Inner => input.concat(&dependent)?,
+                ApplyKind::Left => input.concat(&dependent.nullable()?)?,
+                _ => {
+                    let output = output.as_ref().ok_or_else(|| invalid("runtime-apply", "Scalar apply has no output field"))?;
+                    let ty = match kind {
+                        ApplyKind::Scalar => dependent.fields()[0].data_type.clone().maybe(),
+                        ApplyKind::Exists => L::Scalar(ScalarType::Bool),
+                        _ => { let document = L::Struct(dependent.fields().iter().map(|field| (field.name.clone(), field.data_type.clone())).collect()); if *kind == ApplyKind::PullMany { L::list(document).maybe() } else { document.maybe() } }
+                    };
+                    input.concat(&Schema::new(vec![field_type(output, ty)])?)?
+                }
+            }
+        }
+    };
+    let node = match (relation.node(), children.as_slice()) {
+        (RelationNode::Values { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => RuntimeNode::Leaf,
+        (RelationNode::Aggregate { .. }, [input]) => RuntimeNode::Aggregate { input: Arc::clone(input), types: aggregates },
+        (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => RuntimeNode::Binary(Arc::clone(left), Arc::clone(right)),
+        (RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
+            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PatchGaps { .. }, [input]) => RuntimeNode::Unary(Arc::clone(input)),
+        _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
+    };
+    Ok(Arc::new(RuntimeRelation { schema, node, _reservation: Arc::clone(reservation) }))
+}
+
+fn coalesce_type(args: &[Expr],input: &Schema,parameters: &BTreeMap<usize,L>,outer: &[Schema]) -> Result<L> {
+    let mut result = L::Nothing;
+    for (index,arg) in args.iter().enumerate() {
+        let ty = expression_type(arg,input,parameters,outer)?;
+        for leg in ty.legs() { if leg != L::Null || index + 1 == args.len() { result = result.join(&leg); } }
+        if !ty.nullable() { break; }
+    }
+    Ok(if result == L::Nothing { L::Null } else { result })
+}
+
+fn typed(data_type: L) -> Expr { Expr::column(ColumnId(0), data_type) }
+fn expression_type(expr: &Expr, input: &Schema, parameters: &BTreeMap<usize, L>, outer: &[Schema]) -> Result<L> {
+    let child = |expr: &Expr| expression_type(expr, input, parameters, outer);
+    Ok(match expr {
+        Expr::Literal(value) => value.logical_type(),
+        Expr::RegexReplace { source,recipe,.. } => recipe.output_type(&child(source)?)?,
+        Expr::Column { id, .. } => input.get(*id).ok_or_else(|| invalid("runtime-column", "Runtime input column is absent"))?.data_type.clone(),
+        Expr::Parameter { index, data_type } => parameters.get(index).cloned().unwrap_or_else(|| if *data_type == L::Nothing { L::Null } else { rtdb_columnar::execution_type(data_type) }),
+        Expr::Correlated { depth, id, data_type } => outer.iter().rev().nth(*depth).and_then(|schema| schema.get(*id)).map_or_else(|| data_type.clone(), |field| field.data_type.clone()),
+        Expr::Cast { expr, target } => {
+            let source = child(expr)?;
+            target.validate_source(&source)?;
+            target.result_type(&source)
+        }
+        Expr::Unary { op, expr } => {
+            let ty = child(expr)?;
+            if *op == UnaryOp::BitNot { return rtdb_plan::function_type("bit_not", &[ty]); }
+            if ty == expr.data_type() { return Ok(Expr::unary(*op, typed(ty)).data_type()); }
+            if ty == L::Null && matches!(op, UnaryOp::Negate | UnaryOp::BitNot | UnaryOp::Not) { L::Null }
+            else { Expr::unary(*op, typed(ty)).data_type() }
+        }
+        Expr::Binary { op, left, right } => {
+            let (left_type, right_type) = (child(left)?, child(right)?);
+            if matches!(op,BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) { rtdb_plan::validate_ordered_predicate_types(&left_type,&right_type)?; }
+            if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) { rtdb_plan::validate_equality_types(&left_type, &right_type)?; }
+            if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::ShiftLeft | BinaryOp::ShiftRight) {
+                let expression = Expr::binary(*op, Expr::Parameter { index: 0,data_type: left_type }, Expr::Parameter { index: 1,data_type: right_type });
+                expression.validate_columns(&Default::default())?;
+                return Ok(expression.data_type());
+            }
+            if left_type == left.data_type() && right_type == right.data_type() { return Ok(expr.data_type()); }
+            if (left_type == L::Null || right_type == L::Null) && !matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) { L::Null }
+            else { Expr::binary(*op, typed(left_type), typed(right_type)).data_type() }
+        }
+        Expr::Call { name, args, return_type } => {
+            if name.eq_ignore_ascii_case("coalesce") { return coalesce_type(args,input,parameters,outer); }
+            let types = args.iter().map(child).collect::<Result<Vec<_>>>()?;
+            if ["null_eq", "null-eq", "distinct_from", "distinct-from", "nullif"].iter().any(|candidate| name.eq_ignore_ascii_case(candidate)) && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0], &types[1])?; }
+            if args.iter().map(Expr::data_type).eq(types.iter().cloned()) { return Ok(return_type.clone()); }
+            let normalized = name.to_lowercase().replace('-', "_");
+            let nullable_call = !matches!(normalized.as_str(), "_patch" | "coalesce" | "nullif" | "period" | "set" | "str" | "string_to_array" | "format" | "format_type" | "nil?" | "is_null" | "true?" | "false?" | "is_true" | "is_false" | "distinct_from" | "compare_nulls_first" | "compare_nulls_last" | "boolean" | "null_eq" | "===" | "boolean?" | "number?" | "integer?" | "float?" | "string?" | "keyword?" | "uuid?" | "list?" | "set?" | "map?");
+            if nullable_call && types.contains(&L::Null) { L::Null }
+            else if normalized == "nullif" { types[0].clone().maybe() }
+            else {
+                let args = args.iter().zip(types).map(|(arg, ty)| if ty == arg.data_type() { arg.clone() } else { typed(ty) }).collect::<Vec<_>>();
+                rtdb_plan::function_type_with_args(name, &args)?
+            }
+        }
+        Expr::Between { operand,low,high,symmetric } => {
+            let (operand,low,high) = (child(operand)?,child(low)?,child(high)?);
+            rtdb_plan::validate_ordered_predicate_types(&operand,&low)?;
+            rtdb_plan::validate_ordered_predicate_types(&operand,&high)?;
+            Expr::Between { operand: Box::new(typed(operand)),low: Box::new(typed(low)),high: Box::new(typed(high)),symmetric: *symmetric }.data_type()
+        },
+        Expr::SimpleCase { operand, branches, otherwise } => {
+            let operand = child(operand)?;
+            let mut types = Vec::with_capacity(branches.len() + 1);
+            for (candidate,value) in branches { rtdb_plan::validate_equality_types(&operand,&child(candidate)?)?;types.push(child(value)?); }
+            types.push(child(otherwise)?);
+            L::join_all(&types)
+        }
+        Expr::Case { branches, otherwise } => {
+            let mut types = branches.iter().map(|(condition, value)| { child(condition)?; child(value) }).collect::<Result<Vec<_>>>()?; types.push(child(otherwise)?); L::join_all(&types)
+        }
+        Expr::Coalesce(args) => coalesce_type(args,input,parameters,outer)?,
+        Expr::List(args) => L::list(L::join_all(&args.iter().map(child).collect::<Result<Vec<_>>>()?)),
+        Expr::Struct(fields) => L::Struct(fields.iter().map(|(name, expr)| Ok((name.clone(), child(expr)?))).collect::<Result<_>>()?),
+        Expr::RowCopy(fields) => L::Struct(fields.iter().map(|field| {
+            let actual = input.get(field.id).ok_or_else(|| invalid("runtime-column", "Raw record input column is absent"))?;
+            Ok((field.name.clone(), actual.data_type.clone()))
+        }).collect::<Result<_>>()?),
+        Expr::Field { expr, name, data_type } => {
+            let ty = child(expr)?;
+            if ty == expr.data_type() { return Ok(data_type.clone()); }
+            rtdb_plan::field_type(&ty, name)
+        }
+        Expr::Subscript { expr, index, .. } => rtdb_plan::function_type("nth", &[child(expr)?, child(index)?])?,
+        Expr::In { expr, values, negated } => {
+            let expression = Expr::In { expr: Box::new(typed(child(expr)?)), values: values.iter().map(|value| child(value).map(typed)).collect::<Result<_>>()?, negated: *negated };
+            rtdb_plan::validate_equality_expression(&expression)?;
+            expression.data_type()
+        }
+        Expr::Like { expr: value, pattern, case_insensitive, .. } => {
+            let (value_type, pattern_type) = (child(value)?, child(pattern)?);
+            rtdb_plan::function_type(if *case_insensitive { "ilike" } else { "like" }, &[value_type, pattern_type])?
+        }
+    })
+}

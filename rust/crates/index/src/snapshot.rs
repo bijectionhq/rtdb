@@ -22,7 +22,17 @@ impl Snapshot {
     }
     pub fn tx_basis(&self) -> Option<TransactionKey> { self.basis }
     pub fn system_time_cap(&self) -> Option<Timestamp> { self.system_time_cap }
-    /// Keeps this generation's catalog and live buffers; `None` selects the empty, pre-ingestion basis.
+    /// Bounds a clone's owned overlay map, table names and segment references; immutable index buffers stay shared.
+    pub fn clone_allocation_bound(&self) -> Result<usize> {
+        let overflow = || Anomaly::incorrect("rtdb.index/snapshot-size", "Snapshot clone metadata exceeds addressable memory");
+        self.layered.iter().try_fold(std::mem::size_of::<Self>(), |bytes, (table, segments)| {
+            bytes.checked_add(table.schema.len()).and_then(|bytes| bytes.checked_add(table.table.len()))
+                .and_then(|bytes| segments.len().checked_mul(std::mem::size_of::<Arc<LiveTable>>()).and_then(|segments| bytes.checked_add(segments)))
+                .and_then(|bytes| bytes.checked_add(512)).ok_or_else(overflow)
+        })
+    }
+    /// Keeps this generation's catalog and live buffers; `None` leaves system time uncapped.
+    /// A supplied cap beyond the captured transaction head returns an error.
     pub fn with_system_time_cap(mut self, cap: Option<Timestamp>) -> Result<Self> {
         if cap.is_some_and(|cap| self.basis.is_none_or(|basis| cap > basis.system_time)) {
             return Err(Anomaly::incorrect("rtdb.index/future-read-basis", "Query basis exceeds the captured partition head"));

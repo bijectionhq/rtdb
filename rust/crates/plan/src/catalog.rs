@@ -74,14 +74,49 @@ pub fn resolve_table(catalog: &dyn Catalog, name: &[Identifier], search_path: &[
     Err(Anomaly::incorrect("xtdb/table-not-found", format!("Table not found: {}{suffix}", normalized.join("."))))
 }
 
+/// Identifier components are normalized before construction.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColumnQualifier {
+    BaseTable { database: String, schema: String, alias: String },
+    Alias(String),
+}
+
+impl ColumnQualifier {
+    pub fn alias(&self) -> &str { match self { Self::BaseTable { alias, .. } | Self::Alias(alias) => alias } }
+
+    /// Includes this descriptor and its owned string capacities.
+    pub fn retained_bytes(&self) -> Result<usize> {
+        let mut bytes = std::mem::size_of::<Self>();
+        let parts: &[&String] = match self {
+            Self::BaseTable { database, schema, alias } => &[database, schema, alias],
+            Self::Alias(alias) => &[alias],
+        };
+        for part in parts { bytes = bytes.checked_add(part.capacity()).ok_or_else(|| Anomaly::incorrect("rtdb.plan/qualifier-size", "Column qualifier exceeds addressable memory"))?; }
+        Ok(bytes)
+    }
+
+    fn matches(&self, parts: &[String]) -> bool {
+        let Some(alias) = parts.last() else { return true; };
+        if alias != self.alias() { return false; }
+        match self {
+            Self::BaseTable { database, schema, .. } => parts.iter().rev().nth(1).is_none_or(|part| part == schema)
+                && parts.iter().rev().nth(2).is_none_or(|part| part == database),
+            Self::Alias(_) => true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Field {
     pub id: ColumnId,
     pub name: String,
-    pub qualifier: Option<String>,
+    pub qualifier: Option<ColumnQualifier>,
     /// Retained in wildcards and qualified lookup, excluded from one-part name lookup.
     #[serde(default)]
     pub qualified_only: bool,
+    /// An internal table-column name; SQL projection assigns its public label.
+    #[serde(default)]
+    pub unnamed: bool,
     pub data_type: LogicalType,
 }
 
@@ -109,12 +144,14 @@ impl Schema {
     pub fn ids(&self) -> BTreeSet<ColumnId> { self.0.iter().map(|field| field.id).collect() }
     pub fn get(&self, id: ColumnId) -> Option<&Field> { self.0.iter().find(|field| field.id == id) }
     pub fn position(&self, id: ColumnId) -> Option<usize> { self.0.iter().position(|field| field.id == id) }
+    /// Accepts left-to-right identifiers, matching up to database.schema.alias.column for base tables or alias.column for alias scopes.
+    /// Earlier components are ignored; missing or multiple matches return a name-resolution anomaly.
     pub fn resolve(&self, name: &[Identifier]) -> Result<&Field> {
         let parts: Vec<_> = name.iter().map(Identifier::normalized).collect();
-        let matches: Vec<_> = self.0.iter().filter(|field| match parts.as_slice() {
-            [column] => !field.qualified_only && &field.name == column,
-            [qualifier, column] => &field.name == column && field.qualifier.as_ref() == Some(qualifier),
-            _ => false,
+        let matches: Vec<_> = self.0.iter().filter(|field| match parts.split_last() {
+            Some((column, [])) => !field.qualified_only && &field.name == column,
+            Some((column, qualifiers)) => &field.name == column && field.qualifier.as_ref().is_some_and(|qualifier| qualifier.matches(qualifiers)),
+            None => false,
         }).collect();
         match matches.as_slice() {
             [field] => Ok(field),
@@ -142,7 +179,7 @@ impl Binder {
     pub fn field(&mut self, name: impl Into<String>, qualifier: Option<String>, data_type: LogicalType) -> Result<Field> {
         let id = ColumnId(self.next_column);
         self.next_column = self.next_column.checked_add(1).ok_or_else(|| Anomaly::incorrect("xtdb/query-too-large", "Column identifier space is exhausted"))?;
-        Ok(Field { id, name: name.into(), qualifier, qualified_only: false, data_type })
+        Ok(Field { id, name: name.into(), qualifier: qualifier.map(ColumnQualifier::Alias), qualified_only: false, unnamed: false, data_type })
     }
     pub fn parameter(&mut self, index: usize, data_type: LogicalType) -> Expr {
         let data_type = self.parameter_types.entry(index).and_modify(|old| *old = old.join(&data_type)).or_insert(data_type).clone();

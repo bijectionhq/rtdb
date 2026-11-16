@@ -31,6 +31,13 @@ impl BloomFilter {
         for hash in hashes(hash1, hash2) { self.bitmap.insert(hash); }
     }
 
+    /// Adds the five JVM vector hashes, including the null vector's zero hashes.
+    /// Struct values must retain the source vector's field order.
+    pub fn insert_value(&mut self, value: &Value) -> Result<()> {
+        self.insert_hashes(rtdb_columnar::hash_value(value, 0)?, rtdb_columnar::hash_value_murmur3(value, 0)?);
+        Ok(())
+    }
+
     pub fn insert_cell(&mut self, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
         let (first, second) = byte_hashes(&rtdb_columnar::read_value(field, array, row)?)?;
         self.insert_hashes(first, second);

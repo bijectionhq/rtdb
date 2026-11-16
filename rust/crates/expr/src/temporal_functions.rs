@@ -1,0 +1,226 @@
+use crate::{EvalContext, cast, numeric::{division_by_zero, inapplicable, integer}, temporal::{IntervalParts, timestamp_units}};
+use rtdb_plan::{BinaryOp, TemporalField as F};
+use rtdb_types::{CivilDate, DateUnit, LogicalType as L, Result, ScalarType as S, TimeUnit as U, Value, ZoneId};
+
+fn temporal_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
+    if error.code == "xtdb/numeric-value-out-of-range" { overflow() } else { error }
+}
+fn overflow() -> rtdb_types::Anomaly { rtdb_types::Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error") }
+
+pub(crate) fn strict_call(name: &str) -> bool {
+    ["extract","date_trunc","date-trunc","age","current_timestamp","current-timestamp","now","current_date","current-date","current_time","current-time","current_timezone","current-timezone","local_date","local-date","localdate","local_time","local-time","localtime","local_timestamp","local-timestamp","localtimestamp"].iter().any(|candidate|name.eq_ignore_ascii_case(candidate))
+}
+
+fn canonical(name: &str) -> &str {
+    match name { "now" => "current_timestamp", "localdate" => "local_date", "localtime" => "local_time", "localtimestamp" => "local_timestamp", other => other }
+}
+fn timestamp(value: i64, unit: U, timezone: Option<String>) -> Value { Value::Timestamp { value, unit, timezone } }
+fn instant_type() -> L { L::Scalar(S::Timestamp { unit: U::Microsecond, timezone: Some("UTC".into()) }) }
+fn origin() -> Value { timestamp(0,U::Microsecond,Some("UTC".into())) }
+
+pub(crate) fn call(name: &str,args: &[Value],context: &EvalContext<'_>) -> Option<Result<Value>> {
+    let name = canonical(name);
+    if !matches!(name,"extract" | "date_trunc" | "age" | "date_bin" | "range_bins" | "current_timestamp" | "current_date" | "current_time" | "current_timezone" | "local_date" | "local_time" | "local_timestamp") { return None; }
+    Some((|| {
+        if args.iter().any(crate::compare::nullish) { return Ok(Value::Null); }
+        match name {
+            "extract" | "date_trunc" => {
+                let Value::Utf8(field) = &args[0] else { return Err(inapplicable(name,&[])); };
+                let field = F::parse(field)?;
+                let L::Scalar(source) = args[1].logical_type() else { return Err(inapplicable(name,&[])); };
+                if !field.supports(name,&source) { return Err(rtdb_types::Anomaly::unsupported("xtdb.expression/extract-not-supported",format!("{field:?} is not supported for {source:?}"))); }
+                if name == "extract" { extract(field,&args[1]) }
+                else {
+                    let zone = args.get(2).map(|value| match value { Value::Utf8(zone) => ZoneId::parse(zone), _ => Err(inapplicable(name,&[])) }).transpose()?;
+                    truncate(field,&args[1],zone)
+                }
+            }
+            "age" => age(&args[0],&args[1],context.timezone),
+            "date_bin" => {
+                let default_origin = origin();
+                let origin = args.get(2).unwrap_or(&default_origin);
+                let difference = crate::arithmetic_in_timezone(BinaryOp::Subtract,&args[1],origin,context.timezone)?;
+                let quotient = crate::arithmetic_in_timezone(BinaryOp::Divide,&difference,&args[0],context.timezone)?;
+                let offset = crate::arithmetic_in_timezone(BinaryOp::Multiply,&args[0],&quotient,context.timezone)?;
+                crate::arithmetic_in_timezone(BinaryOp::Add,origin,&offset,context.timezone)
+            }
+            "range_bins" => match RangeBins::prepare(args,context)? { Some(bins) => bins.materialize(context), None => Ok(Value::Null) },
+            _ => clock(name,args,context),
+        }
+    })().map_err(temporal_error))
+}
+
+fn clock(name: &str,args: &[Value],context: &EvalContext<'_>) -> Result<Value> {
+    if name == "current_timezone" { return Ok(Value::Utf8(ZoneId::parse(context.timezone)?.to_string())); }
+    let precision = args.first().map(|value| integer(value).map(|n|n.clamp(0,9) as u8).ok_or_else(||inapplicable(name,&[value]))).transpose()?.unwrap_or(6);
+    let unit = match precision { 0 => U::Second, 1..=3 => U::Millisecond, 4..=6 => U::Microsecond, _ => U::Nanosecond };
+    let hz = unit.units_per_second();
+    let instant = context.current_time;
+    let seconds = if name.starts_with("local_") { instant.seconds().checked_add(i64::from(ZoneId::parse(context.timezone)?.offset_at(instant.seconds())?.seconds())).ok_or_else(overflow)? } else { instant.seconds() };
+    if name.ends_with("date") { return Ok(Value::calendar_date(CivilDate::from_epoch_day(seconds.div_euclid(86_400))?,DateUnit::Day)); }
+    let modulus = [1,100,10,1,100,10,1,100,10,1][usize::from(precision)];
+    let seconds = if name.ends_with("timestamp") { seconds } else { seconds.rem_euclid(86_400) };
+    let value = seconds.checked_mul(hz).and_then(|value|value.checked_add(i64::from(instant.nanos()) / (1_000_000_000 / hz))).ok_or_else(overflow)?;
+    let value = (value / modulus) * modulus;
+    Ok(if name.ends_with("timestamp") { timestamp(value,unit,if name == "current_timestamp" { Some("UTC".into()) } else { None }) }
+        else { Value::Time { value,unit,bit_width: if hz <= 1000 { 32 } else { 64 } } })
+}
+
+fn date_field(field: F,date: CivilDate) -> Result<i64> {
+    let (year,month,day) = date.ymd();
+    Ok(match field {
+        F::Year => i64::from(year), F::Month => i64::from(month), F::Day => i64::from(day),
+        F::Dow => i64::from(date.iso_day_of_week() % 7), F::IsoDow => i64::from(date.iso_day_of_week()), F::Doy => i64::from(date.day_of_year()),
+        F::Quarter => i64::from((month - 1) / 3 + 1),
+        F::Week => {
+            let thursday = date.plus_days(4 - i64::from(date.iso_day_of_week()))?;
+            i64::from((thursday.day_of_year() - 1) / 7 + 1)
+        }
+        _ => return Err(inapplicable("extract",&[])),
+    })
+}
+fn clock_field(field: F,seconds: i64) -> Result<i64> {
+    match field { F::Hour => Ok(seconds / 3600),F::Minute => Ok((seconds / 60) % 60),F::Second => Ok(seconds % 60),_ => Err(inapplicable("extract",&[])) }
+}
+fn extract(field: F,value: &Value) -> Result<Value> {
+    let result = if let Some(day) = value.date_days() { date_field(field,CivilDate::from_epoch_day(day)?)? }
+    else if let Some(interval) = IntervalParts::of(value) {
+        match field { F::Year => i64::from(interval.months / 12), F::Month => i64::from(interval.months % 12), F::Day => i64::from(interval.days), _ => clock_field(field,interval.nanos.div_euclid(1_000_000_000))? }
+    } else {
+        match value {
+            Value::Time { value,unit,.. } => {
+                let nanos = value.checked_mul(1_000_000_000 / unit.units_per_second()).ok_or_else(overflow)?;
+                if !(0..86_400_000_000_000).contains(&nanos) { return Err(inapplicable("extract",&[])); }
+                clock_field(field,nanos / 1_000_000_000)?
+            }
+            Value::Timestamp { value,unit,timezone } => {
+                let seconds = value.div_euclid(unit.units_per_second());
+                let offset = timezone.as_deref().map(ZoneId::parse).transpose()?.map(|zone|zone.offset_at(seconds)).transpose()?.map_or(0,|offset|offset.seconds());
+                match field {
+                    F::TimezoneHour if timezone.is_some() => i64::from(offset / 3600), F::TimezoneMinute if timezone.is_some() => i64::from((offset / 60) % 60), F::Epoch if timezone.is_some() => seconds,
+                    _ => {
+                        let local = seconds.checked_add(i64::from(offset)).ok_or_else(overflow)?;
+                        if matches!(field,F::Hour | F::Minute | F::Second) { clock_field(field,local.rem_euclid(86_400))? }
+                        else { date_field(field,CivilDate::from_epoch_day(local.div_euclid(86_400))?)? }
+                    }
+                }
+            }
+            _ => return Err(inapplicable("extract",&[value])),
+        }
+    };
+    Ok(Value::I32(i32::try_from(result).map_err(|_|overflow())?))
+}
+
+fn truncated_date(field: F,date: CivilDate) -> Result<CivilDate> {
+    let (year,month,_) = date.ymd();
+    match field {
+        F::Millennium | F::Century | F::Decade | F::Year => {
+            let multiple = match field { F::Millennium => 1000,F::Century => 100,F::Decade => 10,_ => 1 };
+            CivilDate::from_ymd(year / multiple * multiple,1,1)
+        }
+        F::Quarter => CivilDate::from_ymd(year,(month - 1) / 3 * 3 + 1,1), F::Month => CivilDate::from_ymd(year,month,1),
+        F::Week => date.plus_days(1 - i64::from(date.iso_day_of_week())), _ => Ok(date),
+    }
+}
+fn trunc_local(field: F,value: i64,hz: i64) -> Result<i64> {
+    let calendar = matches!(field,F::Millennium | F::Century | F::Decade | F::Year | F::Quarter | F::Month | F::Week | F::Day);
+    if calendar { return truncated_date(field,CivilDate::from_epoch_day(value.div_euclid(hz * 86_400))?)?.epoch_day().checked_mul(86_400).and_then(|value|value.checked_mul(hz)).ok_or_else(overflow); }
+    let quantum = match field { F::Hour => hz * 3600,F::Minute => hz * 60,F::Second => hz,F::Millisecond => hz / 1000,F::Microsecond => hz / 1_000_000,_ => return Err(inapplicable("date_trunc",&[])) };
+    if quantum <= 1 { Ok(value) } else { value.div_euclid(quantum).checked_mul(quantum).ok_or_else(overflow) }
+}
+fn truncate(field: F,value: &Value,override_zone: Option<ZoneId>) -> Result<Value> {
+    if let Some(day) = value.date_days() {
+        let unit = if value.logical_type() == L::Scalar(S::DateDay) { DateUnit::Day } else { DateUnit::Millisecond };
+        return Ok(Value::calendar_date(truncated_date(field,CivilDate::from_epoch_day(day)?)?,unit));
+    }
+    if let Some(mut interval) = IntervalParts::of(value) {
+        match field {
+            F::Millennium | F::Century | F::Decade | F::Year => {
+                let multiple = match field { F::Millennium => 12000,F::Century => 1200,F::Decade => 120,_ => 12 };
+                interval.months = interval.months / multiple * multiple;interval.days = 0;interval.nanos = 0;
+            }
+            F::Quarter => { interval.months = interval.months / 3 * 3;interval.days = 0;interval.nanos = 0; }
+            F::Month => { interval.days = 0;interval.nanos = 0; }
+            F::Week => { interval.days = interval.days / 7 * 7;interval.nanos = 0; }
+            F::Day => interval.nanos = 0,
+            _ => { let quantum = match field { F::Hour => 3_600_000_000_000,F::Minute => 60_000_000_000,F::Second => 1_000_000_000,F::Millisecond => 1_000_000,F::Microsecond => 1000,_ => return Err(inapplicable("date_trunc",&[])) };interval.nanos = interval.nanos / quantum * quantum; }
+        }
+        let L::Scalar(ty) = value.logical_type() else { return Err(inapplicable("date_trunc",&[])); };
+        return interval.into_value(&ty);
+    }
+    let Value::Timestamp { value,unit,timezone } = value else { return Err(inapplicable("date_trunc",&[value])); };
+    let hz = unit.units_per_second();
+    let result = if timezone.is_none() || matches!(field,F::Millisecond | F::Microsecond) { trunc_local(field,*value,hz)? }
+    else {
+        let zone = override_zone.map(Ok).unwrap_or_else(||ZoneId::parse(timezone.as_deref().unwrap_or("UTC")))?;
+        let seconds = value.div_euclid(hz);
+        let offset = zone.offset_at(seconds)?;
+        let local = seconds.checked_add(i64::from(offset.seconds())).ok_or_else(overflow)?;
+        let truncated = trunc_local(field,local,1)?;
+        truncated.checked_sub(i64::from(zone.offset_for_local(truncated,Some(offset))?.seconds())).and_then(|value|value.checked_mul(hz)).ok_or_else(overflow)?
+    };
+    Ok(timestamp(result,*unit,timezone.clone()))
+}
+
+fn age(end: &Value,start: &Value,timezone: &str) -> Result<Value> {
+    let local = |value: &Value| -> Result<(CivilDate,i64)> {
+        let unit = match value { Value::Timestamp { unit,.. } => *unit,_ => U::Microsecond };
+        let value = timestamp_units(value,unit,true,timezone)?;
+        let hz = unit.units_per_second();
+        Ok((CivilDate::from_epoch_day(value.div_euclid(hz * 86_400))?,value.rem_euclid(hz * 86_400) * (1_000_000_000 / hz)))
+    };
+    let (end_date,end_nano) = local(end)?;let (start_date,start_nano) = local(start)?;
+    let (ey,em,ed) = end_date.ymd();let (sy,sm,sd) = start_date.ymd();
+    let mut months = (i64::from(ey) - i64::from(sy)) * 12 + i64::from(em) - i64::from(sm);
+    let mut days = i64::from(ed) - i64::from(sd);
+    if months > 0 && days < 0 { months -= 1;days = end_date.epoch_day() - start_date.plus_months(months)?.epoch_day(); }
+    else if months < 0 && days > 0 { months += 1;days -= i64::from(CivilDate::month_length(ey,em)); }
+    let negative = months < 0 || days < 0;
+    if negative && start_nano < end_nano { days += 1; }
+    else if !negative && days != 0 && start_nano > end_nano { days -= 1; }
+    let total_nanos = i128::from(end_date.epoch_day() - start_date.epoch_day()) * 86_400_000_000_000 + i128::from(end_nano) - i128::from(start_nano);
+    let duration_days = total_nanos.div_euclid(1_000_000_000) / 86_400;
+    let mut nanos = (total_nanos - duration_days * 86_400_000_000_000) as i64;
+    let nano = [start,end].iter().any(|value|matches!(value,Value::Timestamp { unit: U::Nanosecond,.. }));
+    if !nano { nanos = nanos.div_euclid(1000) * 1000; }
+    IntervalParts { months: i32::try_from(months).map_err(|_|overflow())?,days: i32::try_from(days).map_err(|_|overflow())?,nanos }.into_value(&if nano { S::Interval(rtdb_types::IntervalUnit::MonthDayNano) } else { S::IntervalMonthDayMicro })
+}
+
+#[derive(Clone,Copy)]
+pub(crate) struct RangeBins { stride: i64, from: i64, to: i64, base: i64, size: i64 }
+impl RangeBins {
+    pub(crate) fn prepare(args: &[Value],context: &EvalContext<'_>) -> Result<Option<Self>> {
+        context.reserve(args.iter().try_fold(4096usize,|bytes,value|bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?.checked_mul(8).ok_or_else(overflow)?)?;
+        rtdb_plan::function_type("range_bins",&args.iter().map(Value::logical_type).collect::<Vec<_>>())?;
+        if args.iter().any(crate::compare::nullish) { return Ok(None); }
+        let Value::Duration { value: stride,.. } = cast(&args[0],&L::Scalar(S::Duration(U::Microsecond)),context.timezone).map_err(temporal_error)? else { return Err(inapplicable("range_bins",&[])); };
+        if stride == 0 { return Err(division_by_zero()); }
+        let convert = |value: &Value| -> Result<i64> { let Value::Timestamp { value,.. } = cast(value,&instant_type(),context.timezone).map_err(temporal_error)? else { return Err(inapplicable("range_bins",&[])); };Ok(value) };
+        let from = convert(&args[1])?;let to = convert(&args[2])?;let origin = args.get(3).map(convert).transpose()?.unwrap_or(0);
+        let base = from.wrapping_sub(origin).wrapping_div(stride).wrapping_mul(stride).wrapping_add(origin);
+        let top = to.wrapping_sub(origin).wrapping_sub(1).wrapping_div(stride).wrapping_add(1).wrapping_mul(stride).wrapping_add(origin);
+        let size = top.wrapping_sub(base).wrapping_div(stride);
+        Ok(Some(Self { stride,from,to,base,size }))
+    }
+    pub(crate) fn size(self) -> Result<i32> { i32::try_from(self.size).map_err(|_|overflow()) }
+    pub(crate) fn len(self) -> Result<usize> { Ok(self.size()?.max(0) as usize) }
+    pub(crate) fn nth(self,index: usize) -> Value {
+        let from = self.base.wrapping_add((index as i64).wrapping_mul(self.stride));
+        let to = self.base.wrapping_add((index as i64).wrapping_add(1).wrapping_mul(self.stride));
+        let weight = (to.min(self.to).wrapping_sub(from.max(self.from))) as f64 / self.to.wrapping_sub(self.from) as f64;
+        Value::Struct(std::collections::BTreeMap::from([("_from".into(),timestamp(from,U::Microsecond,Some("UTC".into()))),("_to".into(),timestamp(to,U::Microsecond,Some("UTC".into()))),("_weight".into(),Value::F64(weight))]))
+    }
+    pub(crate) fn reserve(self,context: &EvalContext<'_>) -> Result<Vec<Value>> {
+        let length = self.len()?;
+        context.reserve(length.checked_mul(4096).ok_or_else(overflow)?)?;
+        let mut out = Vec::new();out.try_reserve_exact(length).map_err(|_|overflow())?;Ok(out)
+    }
+    pub(crate) fn materialize(self,context: &EvalContext<'_>) -> Result<Value> {
+        let mut out = self.reserve(context)?;out.extend((0..self.len()?).map(|index|self.nth(index)));Ok(Value::List(out))
+    }
+    pub(crate) async fn materialize_async(self,context: &EvalContext<'_>) -> Result<Value> {
+        let mut out = self.reserve(context)?;
+        for index in 0..self.len()? { out.push(self.nth(index));if index % 1024 == 1023 { tokio::task::yield_now().await; } }
+        Ok(Value::List(out))
+    }
+}

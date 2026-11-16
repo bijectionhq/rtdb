@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{Relation, RelationNode, SpanContext, TraceSpan, TraceValue, Tracer};
 use rtdb_types::Result;
-use crate::{QueryContext, cursor::{BoxCursor, OwnedRow, RowCursor}};
+use crate::{QueryContext, pages::{BoxPageCursor, OwnedPage, PageCursor}};
 
 pub(crate) struct QueryTrace { span: Box<dyn TraceSpan>, memory: Arc<rtdb_columnar::MemoryBudget> }
 impl QueryTrace {
@@ -53,28 +53,25 @@ impl Drop for CursorTrace {
         }
     }
 }
-pub(crate) fn wrap(input: BoxCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxCursor {
+pub(crate) fn wrap(input: BoxPageCursor, relation: &Relation, context: &Arc<QueryContext>) -> BoxPageCursor {
     if context.trace_parent.is_none() { return input; }
-    let kind = match relation.node() {
-        RelationNode::Values { .. } => "table", RelationNode::Scan(_) => "scan", RelationNode::Project { .. } => "project",
-        RelationNode::Filter { .. } => "select", RelationNode::Limit { .. } => "top", RelationNode::Distinct { .. } => "distinct",
-        RelationNode::Sort { .. } => "order-by", RelationNode::Join { .. } => "join", RelationNode::Aggregate { .. } => "group-by", RelationNode::Window { .. } => "window",
-        RelationNode::Set { .. } => "set", RelationNode::Unnest { .. } => "unnest", RelationNode::Apply { .. } => "apply", RelationNode::PatchGaps { .. } => "patch-gaps",
-    };
+    let kind = crate::analysis::operator(relation);
     let extra = match relation.node() { RelationNode::Scan(scan) => scan.table.name.table.schema.len().saturating_add(scan.table.name.table.table.len()), _ => 0 };
     let Ok(_name) = context.memory.reserve(extra.saturating_add(1024)) else { return input; };
     let name = match relation.node() { RelationNode::Scan(scan) => format!("query.cursor.scan.{}.{}", scan.table.name.table.schema, scan.table.name.table.table), _ => format!("query.cursor.{kind}") };
-    match CursorTrace::new(context, kind, &name, false) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
+    match CursorTrace::new(context, kind, &name, true) { Some(trace) => Box::new(TracedCursor { input: Some(input), trace }), None => input }
 }
-struct TracedCursor { input: Option<BoxCursor>, trace: CursorTrace }
+struct TracedCursor { input: Option<BoxPageCursor>, trace: CursorTrace }
 #[async_trait]
-impl RowCursor for TracedCursor {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
+impl PageCursor for TracedCursor {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
         self.trace.start(); let started = Instant::now();
-        let result = self.input.as_mut().expect("open traced cursor owns input").next().await;
-        if let Ok(row) = &result { self.trace.completed(started.elapsed(), row.as_ref().map(|_| 1)); }
+        let result = self.input.as_mut().expect("open traced cursor owns input").next_page().await;
+        if let Ok(page) = &result { self.trace.completed(started.elapsed(), page.as_ref().map(OwnedPage::len)); }
         result
     }
+    fn scan_counts(&self) -> Option<crate::analysis::ScanCounts> { self.input.as_ref().and_then(|input| input.scan_counts()) }
+    fn trace_attributes(&self, span: &mut dyn TraceSpan) { if let Some(input) = &self.input { input.trace_attributes(span); } }
 }
 impl Drop for TracedCursor {
     fn drop(&mut self) {

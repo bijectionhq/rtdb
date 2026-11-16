@@ -9,9 +9,9 @@ fn invalid_duration(text: &str) -> Anomaly {
 fn regex(pattern: &str) -> Result<Regex> { Regex::new(pattern).map_err(|error| Anomaly::fault("rtdb.expr/temporal-pattern", error.to_string())) }
 
 pub(crate) fn iso_duration(text: &str) -> Result<i128> {
-    let pattern = regex(r"(?i)^([+-]?)P(?:([+-]?[0-9]+)D)?(?:T(?:([+-]?[0-9]+)H)?(?:([+-]?[0-9]+)M)?(?:([+-]?[0-9]+)(?:[.,]([0-9]{0,9}))?S)?)?$")?;
+    let pattern = regex(r"(?i-u)^([+-]?)P(?:([+-]?[0-9]+)D)?(?:T(?:([+-]?[0-9]+)H)?(?:([+-]?[0-9]+)M)?(?:([+-]?[0-9]+)(?:[.,]([0-9]{0,9}))?S)?)?$")?;
     let captures = pattern.captures(text).ok_or_else(|| invalid_duration(text))?;
-    if (2..=5).all(|index| captures.get(index).is_none()) || (text.to_ascii_uppercase().contains('T') && (3..=5).all(|index| captures.get(index).is_none()) { return Err(invalid_duration(text)); }
+    if (2..=5).all(|index| captures.get(index).is_none()) || (text.contains('T') && (3..=5).all(|index| captures.get(index).is_none()) { return Err(invalid_duration(text)); }
     let mut components = [0i64; 4];
     for (index, factor) in [(2, 86_400i64), (3, 3600), (4, 60), (5, 1)] {
         if let Some(value) = captures.get(index) {
@@ -31,19 +31,22 @@ pub(crate) fn iso_duration(text: &str) -> Result<i128> {
 }
 
 pub(crate) fn duration(text: &str) -> Result<i64> {
-    if let Ok(nanos) = iso_duration(text) { return i64::try_from(nanos).map_err(|_| overflow()); }
+    i64::try_from(duration_nanos(text)?).map_err(|_| overflow())
+}
+
+pub(crate) fn duration_nanos(text: &str) -> Result<i128> {
+    if let Ok(nanos) = iso_duration(text) { return Ok(nanos); }
     let pattern = regex(r"(?i)^'?([0-9.]+)\s+(microsecond|millisecond|second|minute|hour|day|week|month|year)s?'?$")?;
     let captures = pattern.captures(text).ok_or_else(|| invalid_duration(text))?;
     let amount = captures[1].parse::<f64>().map_err(|_| invalid_duration(text))?;
-    let factor = match captures[2].to_ascii_lowercase().as_str() {
-        "microsecond" => 0.001, "millisecond" => 1.0, "second" => 1000.0, "minute" => 60_000.0,
-        "hour" => 3_600_000.0, "day" => 86_400_000.0, "week" => 604_800_000.0,
-        "month" => 2_628_000_000.0, "year" => 31_536_000_000.0,
+    let milliseconds = match captures[2].to_ascii_lowercase().as_str() {
+        "microsecond" => amount / 1000.0, "millisecond" => amount, "second" => amount * 1000.0, "minute" => amount * 60_000.0,
+        "hour" => amount * 3_600_000.0, "day" => amount * 86_400_000.0, "week" => amount * 604_800_000.0,
+        "month" => amount * 2_628_000_000.0, "year" => amount * 31_536_000_000.0,
         _ => return Err(invalid_duration(text)),
     };
-    let milliseconds = amount * factor;
     if !milliseconds.is_finite() || milliseconds < i64::MIN as f64 || milliseconds >= -(i64::MIN as f64) { return Err(overflow()); }
-    (milliseconds as i64).checked_mul(1_000_000).ok_or_else(overflow)
+    Ok(i128::from(milliseconds as i64) * 1_000_000)
 }
 
 pub(crate) fn interval(text: &str) -> Result<IntervalParts> {
@@ -53,16 +56,18 @@ pub(crate) fn interval(text: &str) -> Result<IntervalParts> {
     let period = captures.as_ref().and_then(|captures| captures.get(1)).map_or("", |capture| capture.as_str());
     let duration = captures.as_ref().and_then(|captures| captures.get(2)).map_or("", |capture| capture.as_str());
     let mut parts = IntervalParts { months: 0, days: 0, nanos: 0 };
+    let mut months = 0i64;
     for capture in regex(r"(-?[0-9]+)([YMWD])")?.captures_iter(period) {
         let value = capture[1].parse::<i32>().map_err(|_| overflow())?;
         match &capture[2] {
-            "Y" => parts.months = parts.months.checked_add(value.checked_mul(12).ok_or_else(overflow)?).ok_or_else(overflow)?,
-            "M" => parts.months = parts.months.checked_add(value).ok_or_else(overflow)?,
+            "Y" => months += i64::from(value) * 12,
+            "M" => months += i64::from(value),
             "W" => parts.days = parts.days.checked_add(value.checked_mul(7).ok_or_else(overflow)?).ok_or_else(overflow)?,
             "D" => parts.days = parts.days.checked_add(value).ok_or_else(overflow)?,
             _ => unreachable!(),
         }
     }
+    parts.months = i32::try_from(months).map_err(|_| overflow())?;
     if !duration.is_empty() {
         let nanos = iso_duration(&format!("PT{duration}"))?;
         parts.nanos = i64::try_from(nanos.div_euclid(1000) * 1000).map_err(|_| overflow())?;

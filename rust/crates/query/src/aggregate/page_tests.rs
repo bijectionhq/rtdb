@@ -1,0 +1,292 @@
+use super::*;
+use std::{collections::{BTreeMap,VecDeque},sync::atomic::{AtomicUsize,Ordering}};
+use rtdb_columnar::MemoryBudget;
+use rtdb_plan::{BinaryOp,ColumnId,Expr,Field,Relation,RelationNode};
+use rtdb_storage::{MemoryStore,cache::BufferPool};
+use rtdb_types::{Anomaly,TimeUnit,Timestamp};
+use tokio_util::sync::CancellationToken;
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+
+struct Input { pages: VecDeque<Vec<Vec<Value>>>,fail_after: Option<usize>,polls: Arc<AtomicUsize>,memory: Arc<MemoryBudget> }
+#[async_trait]
+impl PageCursor for Input {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        let poll = self.polls.fetch_add(1,Ordering::SeqCst);
+        if self.fail_after == Some(poll) { return Err(Anomaly::fault("test/later-page","Later input page failed")); }
+        let Some(rows) = self.pages.pop_front() else { return Ok(None); };
+        let mut page = PageBuilder::new(rows.len(),&self.memory)?;
+        for row in rows { page.push(OwnedRow::new(row,&self.memory)?)?; }
+        Ok(Some(page.finish()))
+    }
+}
+fn execution(batch_rows: usize) -> Execution {
+    let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
+    let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
+    let context = QueryContext::new(catalog,MemoryBudget::new(1 << 27),Timestamp(0),"UTC",QueryOptions { batch_rows,..Default::default() },&CancellationToken::new()).unwrap();
+    Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context,bindings: None,analysis: None }
+}
+fn field(id: u32,ty: LogicalType) -> Field { Field { id: ColumnId(id),name: format!("c{id}"),qualifier: None,qualified_only: false,unnamed: false,data_type: ty } }
+fn schema() -> Schema { Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64)),field(1,LogicalType::Scalar(ScalarType::I64))]).unwrap() }
+fn count(id: u32,filter: Option<Expr>) -> AggregateExpr {
+    AggregateExpr { field: field(id,LogicalType::Scalar(ScalarType::I64)),function: AggregateFunction::CountStar,argument: None,distinct: false,filter,order_by: vec![] }
+}
+fn divide_filter() -> Expr {
+    Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,Expr::Literal(Value::I64(1)),Expr::Literal(Value::I64(0))),Expr::Literal(Value::I64(1)))
+}
+fn bad_regex() -> Expr {
+    Expr::binary(BinaryOp::Eq,Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),rtdb_plan::RegexReplacement { pattern: rtdb_plan::RegexForm::Literal(Value::Utf8("[".into())),replacement: rtdb_plan::RegexForm::Literal(Value::Utf8("x".into())),..Default::default() }),Expr::Literal(Value::Utf8("x".into())))
+}
+fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,groups: Vec<NamedExpr>,aggregates: Vec<AggregateExpr>,fail_after: Option<usize>) -> (AggregateCursor,Arc<AtomicUsize>) {
+    let input = Arc::new(Relation::new(schema.clone(),RelationNode::Values { rows: vec![] }).unwrap());
+    let output = Schema::new(groups.iter().map(|group|group.field.clone()).chain(aggregates.iter().map(|aggregate|aggregate.field.clone())).collect()).unwrap();
+    let relation = Relation::new(output,RelationNode::Aggregate { input,groups: groups.clone(),aggregates: aggregates.clone() }).unwrap();
+    let runtime = RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap().root();
+    let polls = Arc::new(AtomicUsize::new(0));
+    let input = Box::new(Input { pages: pages.into(),fail_after,polls: Arc::clone(&polls),memory: Arc::clone(&execution.context.memory) });
+    (AggregateCursor::new(input,schema,groups,aggregates,runtime,execution.clone()).unwrap(),polls)
+}
+fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
+
+#[tokio::test]
+async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {
+    for batch_rows in [1,1024] {
+        let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
+        let schema = schema();
+        let filter = Expr::Case { branches: vec![(Expr::binary(BinaryOp::Eq,schema.fields()[0].expression(),Expr::Literal(Value::I64(1))),Expr::Literal(Value::Bool(true)))],otherwise: Box::new(divide_filter()) };
+        let groups = vec![NamedExpr { field: field(2,LogicalType::Scalar(ScalarType::I64)),expr: schema.fields()[0].expression() }];
+        let (mut cursor,_) = cursor(&execution,schema,vec![vec![row(1,1),row(2,2)]],groups,vec![count(3,Some(filter)),count(4,Some(bad_regex()))],None);
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+        assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
+
+#[tokio::test]
+async fn aggregate_page_failure_precedes_the_next_input_pull() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let (mut cursor,polls) = cursor(&execution,schema(),vec![vec![row(1,1)]],vec![],vec![count(2,Some(divide_filter()))],Some(1));
+    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");
+    assert_eq!(polls.load(Ordering::SeqCst),1);drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn complete_filter_mask_precedes_the_inner_accumulator_factory() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let schema = Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64)),field(1,LogicalType::Scalar(ScalarType::I8))]).unwrap();
+    let filter = Expr::Case { branches: vec![(Expr::binary(BinaryOp::Eq,schema.fields()[0].expression(),Expr::Literal(Value::I64(1))),Expr::Literal(Value::Bool(true)))],otherwise: Box::new(divide_filter()) };
+    let aggregate = AggregateExpr { field: field(2,LogicalType::Scalar(ScalarType::I8).maybe()),function: AggregateFunction::Sum,argument: Some(schema.fields()[1].expression()),distinct: false,filter: Some(filter),order_by: vec![] };
+    let (mut cursor,_) = cursor(&execution,schema,vec![vec![vec![Value::I64(1),Value::I8(1)],vec![Value::I64(2),Value::I8(2)]]],vec![],vec![aggregate],None);
+    assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/division-by-zero");drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn empty_semantic_pages_prepare_filters_and_absent_input_preserves_global_count() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let (mut empty,_) = cursor(&execution,schema(),vec![vec![]],vec![],vec![count(2,Some(bad_regex()))],None);
+    assert_eq!(empty.next_page().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");drop(empty);
+    let (mut absent,_) = cursor(&execution,schema(),vec![],vec![],vec![count(2,Some(bad_regex()))],None);
+    let mut page = absent.next_page().await.unwrap().unwrap();assert_eq!(page.next().unwrap().values,[Value::I64(0)]);
+    assert!(absent.next_page().await.unwrap().is_none());drop(absent);drop(page);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn grouping_full_hash_avoids_unreachable_cross_unit_equality() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let first = Value::Timestamp { value: i64::MAX,unit: TimeUnit::Second,timezone: Some("UTC".into()) };
+    let second = Value::Timestamp { value: 0,unit: TimeUnit::Millisecond,timezone: Some("UTC".into()) };
+    let ty = first.logical_type().join(&second.logical_type());
+    let schema = Schema::new(vec![field(0,ty.clone())]).unwrap();
+    let groups = vec![NamedExpr { field: field(1,ty),expr: schema.fields()[0].expression() }];
+    let (mut cursor,_) = cursor(&execution,schema,vec![vec![vec![first.clone()],vec![second.clone()]]],groups,vec![count(2,None)],None);
+    let mut page = cursor.next_page().await.unwrap().unwrap();drop(cursor);
+    assert_eq!(page.next().unwrap().values,[first,Value::I64(1)]);
+    assert_eq!(page.next().unwrap().values,[second,Value::I64(1)]);
+    drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn aggregate_output_is_complete_and_retains_distinct_state_across_pages() {
+    for batch_rows in [1,1024] {
+        let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
+        let schema = schema();let argument = schema.fields()[1].expression();
+        let groups = vec![NamedExpr { field: field(2,LogicalType::Scalar(ScalarType::I64)),expr: schema.fields()[0].expression() }];
+        let mut array = AggregateExpr { field: field(3,LogicalType::list(LogicalType::Scalar(ScalarType::I64))),function: AggregateFunction::ArrayAgg,argument: Some(argument.clone()),distinct: true,filter: None,order_by: vec![SortExpr { expr: argument.clone(),descending: true,nulls_first: false }] };
+        array.filter = Some(Expr::binary(BinaryOp::NotEq,argument.clone(),Expr::Literal(Value::I64(0))));
+        let sum = AggregateExpr { field: field(4,LogicalType::Scalar(ScalarType::I64).maybe()),function: AggregateFunction::Sum,argument: Some(argument),distinct: true,filter: None,order_by: vec![] };
+        let (mut cursor,_) = cursor(&execution,schema,vec![vec![row(1,2),row(2,5)],vec![],vec![row(1,1),row(1,2),row(2,0)]],groups,vec![array,sum],None);
+        let mut page = cursor.next_page().await.unwrap().unwrap();assert_eq!(page.len(),2);
+        assert!(cursor.next_page().await.unwrap().is_none());drop(cursor);assert_eq!(execution.context.spill_bytes(),0);
+        assert_eq!(page.next().unwrap().values,[Value::I64(1),Value::List(vec![Value::I64(2),Value::I64(1)]),Value::I64(3)]);
+        assert_eq!(page.next().unwrap().values,[Value::I64(2),Value::List(vec![Value::I64(5)]),Value::I64(5)]);
+        drop(page);assert_eq!(execution.context.memory.used_bytes(),baseline);
+    }
+}
+
+#[tokio::test]
+async fn array_order_admission_includes_filtered_and_empty_input() {
+    for pages in [vec![vec![vec![Value::I64(1),Value::Set(vec![Value::I64(1)])]]],vec![]] {
+        let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+        let schema = Schema::new(vec![field(0,LogicalType::Scalar(ScalarType::I64)),field(1,LogicalType::List { kind: rtdb_types::ListKind::Set,element: Box::new(LogicalType::Scalar(ScalarType::I64)) })]).unwrap();
+        let aggregate = AggregateExpr { field: field(2,LogicalType::list(LogicalType::Scalar(ScalarType::I64)).maybe()),function: AggregateFunction::ArrayAgg,argument: Some(schema.fields()[0].expression()),distinct: false,filter: Some(Expr::Literal(Value::Bool(false))),order_by: vec![SortExpr { expr: schema.fields()[1].expression(),descending: false,nulls_first: false }] };
+        let (mut cursor,_) = cursor(&execution,schema,pages,vec![],vec![aggregate],None);
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/function-type-mismatch");drop(cursor);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
+
+fn primitive_cursor(execution: &Execution,function: AggregateFunction,declared: LogicalType,input: LogicalType,pages: Vec<Vec<Value>>,filter: Option<Expr>) -> AggregateCursor {
+    let schema = Schema::new(vec![field(0,input.clone())]).unwrap();
+    let argument = field(0,declared).expression();
+    let mut aggregate = AggregateExpr { field: field(1,LogicalType::Null),function,argument: Some(argument),distinct: false,filter,order_by: vec![] };
+    aggregate.field.data_type = AggregateTypes::derive(&aggregate,input,true).unwrap().output_type().clone();
+    cursor(execution,schema,pages.into_iter().map(|page|page.into_iter().map(|value|vec![value]).collect()).collect(),vec![],vec![aggregate],None).0
+}
+async fn primitive_result(mut cursor: AggregateCursor) -> Value {
+    let mut page = cursor.next_page().await.unwrap().unwrap();
+    assert!(cursor.next_page().await.unwrap().is_none());
+    page.next().unwrap().values.remove(0)
+}
+
+#[tokio::test]
+async fn sum_factory_admits_complete_vectors_before_reading_the_mask() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    for (declared,input,value,code) in [
+        (integer.clone(),integer.join(&LogicalType::Scalar(ScalarType::Utf8)),Value::I64(3),"rtdb.query/sum-input"),
+        (LogicalType::Scalar(ScalarType::I32),LogicalType::Scalar(ScalarType::F64),Value::F64(3.0),"rtdb.query/sum-input"),
+        (LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 0,bit_width: 128 }),integer.clone(),Value::I64(3),"rtdb.query/decimal-sum-input"),
+        (integer.clone(),LogicalType::RunEndEncoded { width: rtdb_types::RunEndWidth::I32,value: Box::new(integer.clone()) },Value::I64(3),"rtdb.query/sum-input"),
+        (LogicalType::Scalar(ScalarType::Duration(TimeUnit::Second)),LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond)),Value::Duration { value: 1,unit: TimeUnit::Millisecond },"rtdb.query/sum-input"),
+    ] {
+        for pages in [vec![vec![value]],vec![vec![]]] {
+            let mut cursor = primitive_cursor(&execution,AggregateFunction::Sum,declared.clone(),input.clone(),pages,Some(Expr::Literal(Value::Bool(false))));
+            assert_eq!(cursor.next_page().await.err().unwrap().code,code);drop(cursor);
+            assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+        }
+        assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,declared,input,vec![],None)).await,Value::Null);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);
+    }
+}
+
+#[tokio::test]
+async fn sum_uses_vector_narrowing_and_float_accumulator_width() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,LogicalType::Scalar(ScalarType::I32),LogicalType::Scalar(ScalarType::I64),vec![vec![Value::I64(i64::MAX),Value::I64(2)]],None)).await,Value::I32(1));
+    let near_midpoint = (1i64 << 54) + (1i64 << 30) + 1;
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,LogicalType::Scalar(ScalarType::F32),LogicalType::Scalar(ScalarType::I64),vec![vec![Value::I64(near_midpoint)]],None)).await,Value::F32(((1u64 << 54) + (1u64 << 31)) as f32));
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,LogicalType::Scalar(ScalarType::F32),LogicalType::Scalar(ScalarType::F32),vec![vec![Value::F32(16_777_216.0),Value::F32(1.0)],vec![Value::F32(-16_777_216.0)]],None)).await,Value::F32(0.0));
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn duration_sum_wraps_conversion_and_distinguishes_null_vector_slots() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let second = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Second));
+    let milli = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),second.clone(),vec![vec![Value::Duration { value: i64::MAX,unit: TimeUnit::Second }],vec![Value::Duration { value: 1,unit: TimeUnit::Second }]],None)).await,Value::Duration { value: 0,unit: TimeUnit::Millisecond });
+    let mut cursor = primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),milli.clone().maybe(),vec![vec![Value::Duration { value: 5,unit: TimeUnit::Millisecond },Value::Null]],None);
+    let error = cursor.next_page().await.err().unwrap();assert_eq!(error.code,"xtdb.error/unknown");assert_eq!(error.message,"null at index 1");drop(cursor);
+    for input in [LogicalType::Null,second.join(&milli).maybe()] {
+        assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),input,vec![vec![Value::Null]],None)).await,Value::Null);
+    }
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),milli.maybe(),vec![vec![Value::Null]],Some(Expr::Literal(Value::Bool(false))))).await,Value::Null);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn average_uses_vector_sums_and_counts_nonnull_cells_after_each_sum_pass() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let double = LogicalType::Scalar(ScalarType::F64);
+    let value = primitive_result(primitive_cursor(&execution,AggregateFunction::Average,double.clone(),double.maybe(),vec![vec![Value::Null,Value::F64(-0.0)]],None)).await;
+    let Value::F64(value) = value else { panic!("Expected double average"); };assert_eq!(value.to_bits(),(-0.0f64).to_bits());
+    let decimal = LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 1,bit_width: 128 }).maybe();
+    let decimal_value = |coefficient: i128|Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(),32,1,128).unwrap());
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Average,decimal.clone(),decimal,vec![vec![Value::Null,decimal_value(10)],vec![decimal_value(20)]],None)).await,Value::F64(1.5));
+    let duration = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Average,duration.clone(),LogicalType::Null,vec![vec![Value::Null]],None)).await,Value::Null);
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Average,duration.clone(),duration.clone(),vec![vec![Value::Duration { value: 10,unit: TimeUnit::Millisecond }],vec![Value::Duration { value: 15,unit: TimeUnit::Millisecond }]],None)).await,Value::Duration { value: 12,unit: TimeUnit::Millisecond });
+    let union = duration.clone().join(&LogicalType::Scalar(ScalarType::Duration(TimeUnit::Second))).maybe();
+    assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Average,duration.clone(),union,vec![vec![Value::Null,Value::Duration { value: 1,unit: TimeUnit::Second }],vec![Value::Duration { value: 500,unit: TimeUnit::Millisecond }]],None)).await,Value::Duration { value: 750,unit: TimeUnit::Millisecond });
+    for pages in [vec![vec![]],vec![vec![Value::Utf8("excluded".into())]]] {
+        let mut cursor = primitive_cursor(&execution,AggregateFunction::Average,LogicalType::Scalar(ScalarType::I64),LogicalType::Scalar(ScalarType::Utf8),pages,Some(Expr::Literal(Value::Bool(false))));
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/sum-input");drop(cursor);
+    }
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[test]
+fn failing_duration_average_sum_does_not_start_the_count_pass() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let input = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond)).maybe();
+    let argument = field(0,input.clone()).expression();
+    let aggregate = AggregateExpr { field: field(1,input.clone()),function: AggregateFunction::Average,argument: Some(argument),distinct: false,filter: None,order_by: vec![] };
+    let types = AggregateTypes::derive(&aggregate,input,true).unwrap();
+    let mut page = PageBuilder::new(2,&execution.context.memory).unwrap();
+    for value in [Value::Duration { value: 10,unit: TimeUnit::Millisecond },Value::Null] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
+    let page = page.finish();let scope = execution.scope().unwrap();
+    let mut states = ScalarGroups::new(&execution).unwrap();
+    assert_eq!(states.aggregate(&page,&[0,0],&[true,true],1,Some(0),&aggregate,&types,&scope,&execution).unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(states.values[0].count,0);
+    assert_eq!(states.values[0].accumulator.as_ref().unwrap().values,[Value::Duration { value: 10,unit: TimeUnit::Millisecond }]);
+    drop(states);drop(scope);drop(page);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);
+}
+
+#[tokio::test]
+async fn variance_admits_only_concrete_square_vector_factories_even_without_selected_rows() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    let integer = LogicalType::Scalar(ScalarType::I64);
+    for input in [LogicalType::Scalar(ScalarType::I8),LogicalType::Scalar(ScalarType::F32),LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 0,bit_width: 128 }),LogicalType::Null,integer.join(&LogicalType::Scalar(ScalarType::F64)),LogicalType::RunEndEncoded { width: rtdb_types::RunEndWidth::I32,value: Box::new(integer.clone()) }] {
+        for function in [AggregateFunction::VariancePopulation,AggregateFunction::VarianceSample,AggregateFunction::StddevPopulation,AggregateFunction::StddevSample] {
+            let mut cursor = primitive_cursor(&execution,function.clone(),input.clone(),input.clone(),vec![vec![]],Some(Expr::Literal(Value::Bool(false))));
+            assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
+            assert_eq!(primitive_result(primitive_cursor(&execution,function,input.clone(),input.clone(),vec![],None)).await,Value::Null);
+        }
+    }
+    let ty = LogicalType::Scalar(ScalarType::F32);
+    let mut cursor = primitive_cursor(&execution,AggregateFunction::VariancePopulation,ty.clone(),ty,vec![vec![Value::F32(1.0)]],Some(Expr::Literal(Value::Bool(false))));
+    assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/variance-input");drop(cursor);
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}
+
+#[tokio::test]
+async fn variance_preserves_full_column_square_values_and_nullable_group_counts() {
+    for batch_rows in [1,1024] {
+        let execution = execution(batch_rows);let baseline = execution.context.memory.used_bytes();
+        let ty = LogicalType::Scalar(ScalarType::I64).maybe();
+        for (function,expected) in [(AggregateFunction::VariancePopulation,Value::F64(2.0 / 3.0)),(AggregateFunction::VarianceSample,Value::F64(1.0)),(AggregateFunction::StddevSample,Value::F64(1.0))] {
+            assert_eq!(primitive_result(primitive_cursor(&execution,function,ty.clone(),ty.clone(),vec![vec![Value::I64(1),Value::Null],vec![],vec![Value::I64(2),Value::I64(3)]],None)).await,expected);
+        }
+        let page = {
+            let mut page = PageBuilder::new(3,&execution.context.memory).unwrap();
+            for value in [Value::I64(3),Value::Null,Value::I64(4)] { page.push(OwnedRow::new(vec![value],&execution.context.memory).unwrap()).unwrap(); }
+            page.finish()
+        };
+        let scope = execution.scope().unwrap();
+        assert_eq!(square_column(&page,Some(0),&ty,&scope,&execution).unwrap(),[Some(9.0),None,Some(16.0)]);
+        drop(scope);drop(page);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
+
+#[tokio::test]
+async fn boolean_reducer_separates_emitted_setter_admission_from_selected_first_value() {
+    let execution = execution(1);let baseline = execution.context.memory.used_bytes();
+    for function in [AggregateFunction::Every,AggregateFunction::Any] {
+        for input in [LogicalType::Scalar(ScalarType::I8),LogicalType::Scalar(ScalarType::Utf8),LogicalType::Scalar(ScalarType::Decimal { precision: 32,scale: 0,bit_width: 128 })] {
+            let mut cursor = primitive_cursor(&execution,function.clone(),input.clone(),input.clone(),vec![vec![]],Some(Expr::Literal(Value::Bool(false))));
+            assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
+            assert_eq!(primitive_result(primitive_cursor(&execution,function.clone(),input.clone(),input,vec![],None)).await,Value::Null);
+        }
+        let ty = LogicalType::Scalar(ScalarType::Bool).join(&LogicalType::Scalar(ScalarType::I64));
+        assert_eq!(primitive_result(primitive_cursor(&execution,function.clone(),ty.clone(),ty.clone(),vec![vec![Value::Bool(true)],vec![Value::I64(0)]],None)).await,Value::Bool(true));
+        let mut cursor = primitive_cursor(&execution,function.clone(),ty.clone(),ty,vec![vec![Value::I64(0),Value::Bool(true)]],None);
+        assert_eq!(cursor.next_page().await.err().unwrap().code,"rtdb.query/boolean-setter");drop(cursor);
+        let ty = LogicalType::Scalar(ScalarType::I64);
+        assert_eq!(primitive_result(primitive_cursor(&execution,function,ty.clone(),ty,vec![vec![Value::I64(0)]],Some(Expr::Literal(Value::Bool(false))))).await,Value::Null);
+    }
+    assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+}

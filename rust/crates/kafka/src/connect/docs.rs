@@ -89,6 +89,16 @@ fn convert_schema_value(value: Value, schema: Option<&super::ConnectSchema>, dep
     if value == Value::Null { return Ok(Value::Null); }
     let schema = schema.map(super::ConnectSchema::resolved);
     let schema = schema.as_deref();
+    if let Some(name) = schema.and_then(|schema|schema.name.as_deref()) {
+        if matches!(name,"org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp") {
+            let millis = super::data::date_millis(&value).ok_or_else(||error("conversion-error","Logical date value is not a java.util.Date representation"))?;
+            return Ok(match name {
+                "org.apache.kafka.connect.data.Date" => Value::calendar_date(rtdb_types::CivilDate::from_epoch_day(millis.div_euclid(86_400_000))?,rtdb_types::DateUnit::Day),
+                "org.apache.kafka.connect.data.Time" => Value::Time { value: millis.rem_euclid(86_400_000) * 1_000_000,unit: rtdb_types::TimeUnit::Nanosecond,bit_width: 64 },
+                _ => return convert_document(super::data::date_value(millis)),
+            });
+        }
+    }
     match (value, schema.map(|schema| &schema.kind)) {
         (Value::Struct(mut values), Some(SchemaKind::Struct(fields))) => {
             let mut result = BTreeMap::new();
@@ -143,6 +153,30 @@ mod tests {
         assert!(indexer.writer(record(ConnectData::schemaless(Value::I64(8)), Value::I64(9))).is_err());
         assert!(indexer.writer(record(ConnectData::schemaless(Value::I64(8)), Value::Null)).is_ok());
         assert_eq!(convert_document(Value::Map { entries: vec![(Value::I32(7), Value::Bool(true))], sorted: false }).unwrap(), Value::Struct(BTreeMap::from([("7".into(), Value::Bool(true))])));
+    }
+    fn logical(name: &str) -> super::super::ConnectSchema {
+        let mut schema = super::super::ConnectSchema::new(if name == "Timestamp" { SchemaKind::I64 } else { SchemaKind::I32 });
+        schema.name = Some(format!("org.apache.kafka.connect.data.{name}"));schema
+    }
+    #[test]
+    fn logical_dates_are_projected_by_schema_only_at_document_admission() {
+        let raw = super::super::data::date_value(-1);
+        assert_eq!(convert_with_schema(raw.clone(),Some(&logical("Date"))).unwrap(),Value::DateDay(-1));
+        assert_eq!(convert_with_schema(raw.clone(),Some(&logical("Time"))).unwrap(),Value::Time { value: 86_399_999_000_000,unit: rtdb_types::TimeUnit::Nanosecond,bit_width: 64 });
+        assert_eq!(convert_with_schema(raw.clone(),Some(&logical("Timestamp"))).unwrap(),Value::Timestamp { value: -1000,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) });
+        assert_eq!(convert_with_schema(raw,None).unwrap(),Value::Timestamp { value: -1000,unit: rtdb_types::TimeUnit::Microsecond,timezone: Some("UTC".into()) });
+        let end = super::super::data::date_value(86_400_000);
+        assert_eq!(convert_with_schema(end,Some(&logical("Time"))).unwrap(),Value::Time { value: 0,unit: rtdb_types::TimeUnit::Nanosecond,bit_width: 64 });
+    }
+    #[test]
+    fn logical_date_document_conversion_preserves_full_days_before_the_object_writer() {
+        for millis in [i64::MIN,i64::MAX] {
+            let mut date = convert_with_schema(super::super::data::date_value(millis),Some(&logical("Date"))).unwrap();
+            assert_eq!(date.date_days(),Some(millis.div_euclid(86_400_000)));
+            date.admit_object_dates();
+            assert_eq!(date,Value::DateDay(millis.div_euclid(86_400_000) as i32));
+            assert!(convert_with_schema(super::super::data::date_value(millis),Some(&logical("Timestamp"))).is_err());
+        }
     }
 }
 

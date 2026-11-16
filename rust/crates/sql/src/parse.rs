@@ -1,6 +1,7 @@
 use rtdb_plan::{Identifier, SourceSpan};
 use rtdb_types::{Anomaly, Result};
 use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer}};
+use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
 pub struct ParsedStatement {
@@ -9,6 +10,9 @@ pub struct ParsedStatement {
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
     pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
+    pub(crate) period_columns: std::collections::BTreeSet<String>,
+    pub(crate) settings: crate::settings::ParsedSettings,
+    pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,7 +39,7 @@ impl ParsedStatement {
     }
     pub fn kind(&self) -> StatementKind {
         match &self.statement {
-            Syntax::Standard(ast::Statement::Query(_)) => StatementKind::Query,
+            Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. }) => StatementKind::Query,
             Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. }
             | Syntax::Erase(_) | Syntax::Assert(_, _)
             | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_)) => StatementKind::Dml,
@@ -73,23 +77,43 @@ pub(crate) enum TemporalExtent {
 }
 
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
-    let dialect = GenericDialect {};
+    let dialect = SqlDialect::default();
     let tokens = Tokenizer::new(&dialect, sql).tokenize_with_location().map_err(|error| sql_error(error.to_string(), sql, Span::new(error.location, error.location)))?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
+    for pair in tokens.windows(2) {
+        if word(pair.first(),"LIMIT") && word(pair.get(1),"ALL") { return Err(sql_error("LIMIT requires an unsigned integer or parameter",sql,pair[1].span)); }
+    }
     let mut statements = Vec::new();
     for slice in tokens.split(|token| token.token == Token::SemiColon) {
         if slice.is_empty() { continue; }
         let span = source_span(sql, Span::new(slice[0].span.start, slice[slice.len() - 1].span.end));
-        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(slice, sql)?;
-        let tokens = quantified_values(tokens, sql)?;
+        let (prefix, returning) = crate::returning::split(slice, sql)?;
+        if let Some(returning) = returning { returning.validate(sql)?; }
+        let period_columns = prefix.iter().filter_map(|token| match &token.token {
+            Token::Word(word) => {
+                let name = if word.quote_style.is_some() { word.value.clone() } else { word.value.to_lowercase() };
+                matches!(name.as_str(), "_valid_time" | "_system_time").then_some(name)
+            }
+            _ => None,
+        }).collect();
+        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(prefix, sql)?;
+        let (tokens, settings) = crate::settings::extract(tokens, sql)?;
+        let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
+        let tokens = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
         let (mut tokens, temporal) = extract_temporal(tokens, sql)?;
         let statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
             let patch = word(tokens.first(), "PATCH");
             let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
             let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
             let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            if patch {
+                let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
+                if temporal.iter().any(|clause| Some(clause.owner_end) == end && matches!(clause.extent, TemporalExtent::All)) {
+                    return Err(sql_error("PATCH valid time requires FROM with an optional TO", sql, slice[0].span));
+                }
+            }
             if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
-            let records = parser.parse_comma_separated(|parser| parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
             if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
             Syntax::Records { patch, table, records }
         } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
@@ -118,7 +142,7 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             Syntax::Erase(delete)
         } else if word(tokens.first(), "ASSERT") {
             let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[1..].to_vec());
-            let expression = parser.parse_expr().map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+            let expression = dialect.checked(parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
             let message = if parser.consume_token(&Token::Comma) {
                 match parser.next_token().token { Token::SingleQuotedString(message) => Some(message), _ => return Err(sql_error("ASSERT message must be a string", sql, slice[0].span)) }
             } else { None };
@@ -138,12 +162,15 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
             Syntax::Set { name, value, local }
         } else { Syntax::Standard(standard(tokens, sql)?) };
-        statements.push(ParsedStatement { span, parameter_count, statement, temporal, inline_xtql });
+        if !settings.is_empty() && !matches!(&statement, Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. })) {
+            return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
+        }
+        statements.push(ParsedStatement { span, parameter_count, statement, temporal, inline_xtql, period_columns, settings, wildcard_renames });
     }
     Ok(statements)
 }
 
-fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {
+pub(crate) fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {
     let mut insertions = std::collections::BTreeMap::new();
     for index in 0..tokens.len() {
         if !["ANY", "ALL", "SOME"].into_iter().any(|name| word(tokens.get(index), name))
@@ -176,12 +203,13 @@ fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<Tok
 
 fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> {
     let at = tokens.first().map(|token| token.span).unwrap_or_else(Span::empty);
-    let mut statements = Parser::new(&GenericDialect {}).with_tokens_with_locations(tokens).parse_statements().map_err(|error| sql_error(error.to_string(), source, at))?;
+    let dialect = SqlDialect::default();
+    let mut statements = dialect.checked(Parser::new(&dialect).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| sql_error(error.to_string(), source, at))?;
     if statements.len() != 1 { return Err(sql_error("Expected one SQL statement", source, at)); }
     Ok(statements.remove(0))
 }
 
-fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<TokenWithSpan>, Vec<TemporalClause>)> {
+pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<TokenWithSpan>, Vec<TemporalClause>)> {
     let mut output: Vec<TokenWithSpan> = Vec::new();
     let mut temporal = Vec::new();
     let mut index = 0;
@@ -228,14 +256,14 @@ fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Result<(Vec<Tok
     Ok((output, temporal))
 }
 
-fn expression(tokens: &[TokenWithSpan], source: &str, precedence: u8) -> Result<(ast::Expr, usize)> {
-    let dialect = GenericDialect {};
+pub(crate) fn expression(tokens: &[TokenWithSpan], source: &str, precedence: u8) -> Result<(ast::Expr, usize)> {
+    let dialect = SqlDialect::default();
     let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens.to_vec());
-    let expression = parser.parse_subexpr(precedence).map_err(|error| sql_error(error.to_string(), source, parser.peek_token().span))?;
+    let expression = dialect.checked(parser.parse_subexpr(precedence)).map_err(|error| sql_error(error.to_string(), source, parser.peek_token().span))?;
     Ok((expression, parser.index()))
 }
 
-fn word(token: Option<&TokenWithSpan>, expected: &str) -> bool {
+pub(crate) fn word(token: Option<&TokenWithSpan>, expected: &str) -> bool {
     token.is_some_and(|token| matches!(&token.token, Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case(expected)))
 }
 

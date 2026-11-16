@@ -1,6 +1,5 @@
 use crate::{Edn, EdnKind, error};
 use bigdecimal::BigDecimal;
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use num_bigint::{BigInt, Sign};
 use num_traits::ToPrimitive;
 use rtdb_types::{DecimalValue, Keyword, Result, TimeUnit, Value};
@@ -50,24 +49,27 @@ fn tagged(tag: &str, form: &Edn) -> Result<Value> {
             if value.len() % 2 != 0 || !value.is_ascii() { return Err(error("xtql/invalid-literal", "Byte literal must contain pairs of hexadecimal digits")); }
             Ok(Value::Binary((0..value.len()).step_by(2).map(|index| u8::from_str_radix(&value[index..index + 2], 16).map_err(|e| error("xtql/invalid-literal", e.to_string()))).collect::<Result<_>>()?))
         }
-        "xt/uri" => Ok(Value::Uri(string(form)?.into())),
+        "xt/uri" => { let text = string(form)?; rtdb_types::UriParts::parse(text)?; Ok(Value::Uri(text.into())) },
         "xt/date" | "xt/local-date" => {
-            let date = NaiveDate::parse_from_str(string(form)?, "%Y-%m-%d").map_err(|e| error("xtql/invalid-literal", e.to_string()))?;
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| error("xtql/invalid-literal", "Invalid epoch"))?;
-            Ok(Value::DateDay(i32::try_from(date.signed_duration_since(epoch).num_days()).map_err(|_| error("xtql/invalid-literal", "Date exceeds Arrow day representation"))?))
+            let date = rtdb_types::CivilDate::parse_iso(string(form)?)?;
+            Ok(Value::calendar_date(date, rtdb_types::DateUnit::Day))
         }
         "xt/date-time" | "xt/local-date-time" | "xt/ldt" => {
-            let timestamp = NaiveDateTime::parse_from_str(string(form)?, "%Y-%m-%dT%H:%M:%S%.f").map_err(|e| error("xtql/invalid-literal", e.to_string()))?;
-            Ok(Value::Timestamp { value: timestamp.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None })
+            let timestamp = rtdb_types::parse_sql_local_datetime(string(form)?)?;
+            let value = rtdb_types::Instant::new(timestamp.epoch_second(), timestamp.nano())?.as_micros()?.0;
+            Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: None })
         }
         "xt/time" => {
-            let time = NaiveTime::parse_from_str(string(form)?, "%H:%M:%S%.f").map_err(|e| error("xtql/invalid-literal", e.to_string()))?;
-            Ok(Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond()), unit: TimeUnit::Nanosecond, bit_width: 64 })
+            Ok(Value::Time { value: rtdb_types::parse_iso_local_time(string(form)?)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 })
         }
         "inst" | "xt/instant" | "xt/zoned-date-time" | "xt/zdt" | "xt/offset-date-time" | "xt/odt" => {
             let text = string(form)?;
-            let (timestamp, timezone) = timestamp(text, tag == "inst")?;
-            let timestamp = if tag == "inst" { timestamp.div_euclid(1000) * 1000 } else { timestamp };
+            let (timestamp, timezone) = if tag == "inst" { (crate::legacy_inst::parse(text)?, "UTC".into()) }
+                else {
+                    let (instant, zone) = rtdb_types::parse_sql_zoned_datetime(text)?;
+                    let timezone = if matches!(tag, "xt/offset-date-time" | "xt/odt") { zone.offset_at(instant.seconds())?.to_string() } else { zone.to_string() };
+                    (instant.as_micros()?.0, timezone)
+                };
             Ok(Value::Timestamp { value: timestamp, unit: TimeUnit::Microsecond, timezone: Some(if tag == "inst" || tag == "xt/instant" { "UTC".into() } else { timezone }) })
         }
         "xt/duration" => {
@@ -94,7 +96,7 @@ fn tagged(tag: &str, form: &Edn) -> Result<Value> {
             let values = form.vector().filter(|values| values.len() == 2).ok_or_else(|| error("xtql/invalid-literal", "Timestamp range requires two endpoints"))?;
             let endpoint = |form: &Edn, default| -> Result<i64> {
                 if matches!(form.kind, EdnKind::Nil) { return Ok(default); }
-                if let EdnKind::String(value) = &form.kind { return timestamp(value, false).map(|value| value.0); }
+                if let EdnKind::String(value) = &form.kind { return rtdb_types::parse_sql_zoned_datetime(value)?.0.as_micros().map(|value| value.0); }
                 match value(form)? { Value::Timestamp { value, .. } => Ok(value), _ => Err(error("xtql/invalid-literal", "Timestamp range endpoint must be temporal")) }
             };
             let lower = endpoint(&values[0], i64::MIN)?;
@@ -104,20 +106,6 @@ fn tagged(tag: &str, form: &Edn) -> Result<Value> {
         }
         _ => Err(error("xtql/unknown-tag", format!("No supported XTDB value reader for #{tag}"))),
     }
-}
-
-fn timestamp(text: &str, partial: bool) -> Result<(i64, String)> {
-    let (text, zone) = if let Some((timestamp, zone)) = text.split_once('[') {
-        let zone = zone.strip_suffix(']').ok_or_else(|| error("xtql/invalid-literal", "Invalid zone suffix"))?;
-        zone.parse::<chrono_tz::Tz>().map_err(|e| error("xtql/invalid-literal", e.to_string()))?;
-        (timestamp, Some(zone.to_owned()))
-    } else { (text, None) };
-    let text = if partial {
-        match text.len() { 4 => format!("{text}-01-01T00:00:00Z"), 7 => format!("{text}-01T00:00:00Z"), 10 => format!("{text}T00:00:00Z"), _ => text.into() }
-    } else { text.into() };
-    let timestamp = DateTime::parse_from_rfc3339(&text).map_err(|e| error("xtql/invalid-literal", e.to_string()))?;
-    let offset = if timestamp.offset().local_minus_utc() == 0 { "Z".into() } else { timestamp.offset().to_string() };
-    Ok((timestamp.timestamp_micros(), zone.unwrap_or(offset)))
 }
 
 fn interval(months: i32, days: i32, nanoseconds: i64) -> Value {

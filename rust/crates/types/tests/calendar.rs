@@ -1,11 +1,14 @@
 use rtdb_types::{CivilDate as Date, CivilDateTime as DateTime, FixedOffset, Instant, ZoneId, MAX_EPOCH_DAY, MIN_EPOCH_DAY, NANOS_PER_DAY, TZDB_SHA256, TZDB_VERSION};
 
 #[test]
-fn calendar_serde_uses_validated_iso_dates() {
+fn calendar_serde_uses_validated_iso_dates_and_retains_wide_admission_values() {
     let date = Date::from_ymd(280_000,2,29).unwrap();
     assert_eq!(serde_json::to_string(&date).unwrap(),"\"+280000-02-29\"");
     assert_eq!(serde_json::from_str::<Date>("\"+280000-02-29\"").unwrap(),date);
     assert!(serde_json::from_str::<Date>("\"+280001-02-29\"").is_err());
+    let value = rtdb_types::Value::calendar_date(Date::MAX,rtdb_types::DateUnit::Day);
+    let encoded = serde_json::to_string(&value).unwrap();
+    assert_eq!(serde_json::from_str::<rtdb_types::Value>(&encoded).unwrap(),value);
 }
 
 fn local(year: i32, month: u32, day: u32, hour: u64, minute: u64) -> DateTime {

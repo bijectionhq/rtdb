@@ -16,6 +16,9 @@ The source and replica envelopes retain the source header, optional term sequenc
 The Transit codec retains tagged values, legacy error tags, and cache substitutions while decoding MessagePack.
 The current schema writer records version 6; other storage generations must be qualified and registered before recovery accepts them.
 Legacy source transaction bytes and obsolete flush records retain the JVM dispatch behavior.
+Trie recency keys use `CivilDate` across the nonnegative Java calendar range through year 999999999, rendering unsigned years of at least four digits.
+The key format retains its two-digit month and day fields.
+Parsing follows the reference formatter's lenient year width and SMART date resolution: one through nine year digits with an optional plus sign, valid month and day ranges, and clamping to the month's last day.
 
 The Arrow readers accept files and streams through Arrow IPC, including multiple pages and run-end encoded IIDs.
 Decimal metadata is checked recursively before Arrow's native schema conversion in file, stream, standalone schema, COPY, and Flight input paths.
@@ -73,3 +76,22 @@ Custom YAML registration, exact parser error text and input allocation qualifica
 
 The codec tests also read the tracked `compactor-reset-node` Arrow fixture without modifying it.
 These source mappings are not runtime discovery, execution receipts, or a claim of parity.
+
+Transit writer values can retain single precision through `TransitValue::Float32`.
+MessagePack emits its 32-bit payload while the existing `Float` variant emits 64 bits; both wire widths decode as `Float`, matching the reference reader.
+Internal JSON retains an explicit `float32` wrapper for writer values, and Transit JSON uses the single-precision decimal spelling.
+`tests/transit_float_width.rs` records raw payload, map-key, decoder and internal-JSON contracts as unexecuted regression source.
+
+`TransitReadBuilder` constructs values before the Transit read cache records them.
+Cache references clone the caller's constructed value, allowing semantic readers to preserve reference identity within one decode.
+`decode_with` chooses valid MessagePack or JSON syntax before construction and returns semantic construction errors without trying another wire format.
+The existing wire-tree decoders retain their value representation and per-value cache reset behavior.
+`tests/transit_read_builder.rs` records cache identity, decode isolation and semantic-failure behavior as unexecuted regression source.
+
+Read builders can override binary representation handling before bytes enter the cache.
+The wire-tree builder retains its canonical Base64 validation; the stored-object builder applies the reference Java decoder's padding and unused-bit rules.
+
+Read builders own array and map construction states and receive each decoded entry before later entries are decoded.
+A selected array handler constructs raw array contents directly; a nested tag or JSON map marker can select another constructor.
+Read-cache rollover overwrites slots from index zero while retaining unwritten old slots, matching references in the same top-level value.
+Fresh top-level values still begin with an empty cache.

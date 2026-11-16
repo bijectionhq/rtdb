@@ -15,7 +15,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "conformance"))
 from run_controls import REFERENCE, REPOSITORY, digest, git, owned_cancellation, write_json
-from run_clients import Commands, image_record
+from run_clients import Commands, image_record, verify_native_build_info
 
 
 RUST_SOURCE = ["rust", "core/src/main/proto", "api/src/main/proto", "modules/aws/src/main/proto",
@@ -90,13 +90,26 @@ def jvm_recipe(original, runtime_image):
     return source.replace(old, "FROM " + immutable_image(runtime_image))
 
 
+def retain_tzdb(context, override=None):
+    source = override if override is not None else context / "rust/crates/types/data/tzdb/2025b.dat"
+    if not source.is_file():
+        raise ValueError("selected TZDB input must be a regular file")
+    with source.open("rb") as stream:
+        data = stream.read(1024 * 1024 + 1)
+    if not data or len(data) > 1024 * 1024:
+        raise ValueError("selected TZDB input must contain at most one MiB")
+    selected = context / "release-tzdb.dat"
+    selected.write_bytes(data)
+    return {"sha256": digest(selected), "bytes": len(data), "selection": "override" if override is not None else "bundled"}
+
+
 def extract_artifacts(commands, image, engine, output):
     name = "rtdb-release-" + uuid.uuid4().hex
     destination = output / "artifacts"
     destination.mkdir()
     paths = {"rtdb": "/usr/local/bin/rtdb", "rtdb-config": "/usr/local/bin/rtdb-config", "librtdb_ffi.so": "/usr/local/lib/librtdb_ffi.so",
              "librtdb_ffi.a": "/usr/local/lib/librtdb_ffi.a", "rtdb.h": "/usr/local/include/rtdb.h",
-             "build.json": "/usr/share/rtdb/build.json"} if engine == "rust" else {"xtdb.jar": "/usr/local/lib/xtdb/xtdb.jar"}
+             "build.json": "/usr/share/rtdb/build.json", "tzdb.dat": "/usr/share/rtdb/tzdb.dat"} if engine == "rust" else {"xtdb.jar": "/usr/local/lib/xtdb/xtdb.jar"}
     volumes, inspected = set(), False
     primary, cleanup_errors = None, []
     def capture_container():
@@ -110,14 +123,25 @@ def extract_artifacts(commands, image, engine, output):
                 if not isinstance(volume, str) or not volume:
                     raise ValueError("artifact container has an unnamed volume")
                 volumes.add(volume)
+        return containers[0]
     with owned_cancellation() as owner:
         try:
-            commands.run("artifact-container", ["docker", "create", "--name", name, "--label", "io.rtdb.release=" + name,
-                                                 "--entrypoint", "/bin/true", image["Id"]])
+            entrypoint = ["--entrypoint", "/bin/sh", image["Id"], "-ec", "/usr/local/bin/rtdb --build-info\n/usr/local/bin/rtdb-config --build-info"] if engine == "rust" else ["--entrypoint", "/bin/true", image["Id"]]
+            commands.run("artifact-container", ["docker", "create", "--name", name, "--label", "io.rtdb.release=" + name, *entrypoint])
             capture_container()
             inspected = True
             for filename, source in paths.items():
                 commands.run("extract-" + filename.replace(".", "-"), ["docker", "cp", name + ":" + source, str(destination / filename)])
+            if engine == "rust":
+                _, report = commands.run("artifact-build-info", ["docker", "start", "--attach", name])
+                state = capture_container().get("State", {})
+                if state.get("Running") is not False or state.get("Status") != "exited" or state.get("ExitCode") != 0:
+                    raise ValueError("packaged build-information commands did not complete successfully")
+                lines = report.read_text().splitlines()
+                if len(lines) != 2:
+                    raise ValueError("packaged executables must emit two build-information records")
+                for executable, line in zip(["rtdb", "rtdb-config"], lines):
+                    write_json(destination / (executable + "-build-info.json"), json.loads(line))
         except BaseException as error:
             primary = error
         finally:
@@ -207,6 +231,8 @@ def build(args):
                         "builder_image": args.builder_image, "runtime_image": args.runtime_image,
                         "debian_snapshot": args.debian_snapshot if args.engine == "rust" else None,
                         "source_date_epoch": int(epoch), "test_hooks": False}
+            if args.engine == "rust":
+                metadata["tzdb"] = retain_tzdb(source_directory, getattr(args, "tzdb", None))
             if jvm is not None:
                 metadata.update(capabilities=jvm["capabilities"], gradle_task=jvm["gradle_task"], docker_variant=jvm["docker_variant"])
             write_json(source_directory / "release-input.json", metadata)
@@ -246,6 +272,7 @@ def build(args):
             if image.get("Config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != revision:
                 raise ValueError("packaged image revision label differs from build source")
             artifacts = extract_artifacts(commands, image, args.engine, output)
+            compiled = verify_native_build_info({item["path"]: output / item["path"] for item in artifacts}, metadata) if args.engine == "rust" else None
             archive = output / f"rtdb-{args.engine}-{args.variant}-{expected_arch}.docker.tar"
             commands.run("save-server-image", ["docker", "image", "save", "--output", str(archive), image["Id"]])
             if git(repository, "rev-parse", "HEAD") != revision or git(repository, "status", "--porcelain", "--untracked-files=all"):
@@ -256,6 +283,8 @@ def build(args):
                         "build_driver_sha256": input_digests["rust/release/build.py"], "qualification": "built_unqualified",
                         "driver_revision": driver_inputs["revision"], "driver_inputs_sha256": digest(output / "driver-inputs.json"),
                         "compatibility_claim": "none", "release_matrix_sha256": input_digests["rust/release/matrix.json"]}
+            if compiled is not None:
+                manifest["compiled_build_info"] = compiled
             write_json(output / "package.json", manifest)
             return manifest
     except BaseException as error:
@@ -273,11 +302,14 @@ def main():
     parser.add_argument("--builder-image", required=True)
     parser.add_argument("--runtime-image", required=True)
     parser.add_argument("--debian-snapshot", default="20261115T000000Z")
+    parser.add_argument("--tzdb", type=Path, help="Native OpenJDK TZDB data to retain and compile instead of the bundled data")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=3600)
     args = parser.parse_args()
     if args.engine == "jvm" and args.reference is None:
         parser.error("--reference is required for a JVM package")
+    if args.engine == "jvm" and args.tzdb is not None:
+        parser.error("--tzdb selects native compiled data only")
     build(args)
 
 

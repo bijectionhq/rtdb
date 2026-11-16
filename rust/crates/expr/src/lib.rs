@@ -1,17 +1,40 @@
 mod cast;
 mod compare;
+mod ordered;
 mod evaluate;
 mod functions;
 mod numeric;
 mod timezone;
 mod temporal;
+mod temporal_functions;
 mod temporal_text;
+mod temporal_cast;
+mod interval_cast;
+mod interval_constructor;
 mod decimal;
+mod period;
+mod string;
+mod allocation;
+mod pg_catalog;
+mod session_info;
+mod collection;
+mod bitwise;
+mod series;
+mod volatile;
 
-pub use cast::{cast, cast_target, parse_timestamp, timestamp_micros};
-pub use compare::{compare, null_eq, sql_eq};
-pub use evaluate::{CompiledExpr, EvalContext, OuterRow, evaluate, evaluate_batch, evaluate_projection, is_true};
-pub use functions::{function_type, scalar_call};
+pub use allocation::EvaluationScope;
+pub use pg_catalog::{PgCatalogLookup, requires_pg_catalog};
+pub use string::render::allocation_bound as text_allocation_bound;
+
+pub use cast::{cast, cast_target, parse_timestamp, query_clock_instant, timestamp_micros};
+pub use compare::{compare, compare_in_timezone, equality_allocation_bound, null_eq, null_eq_in_timezone, sql_eq, sql_eq_in_timezone, sql_not_eq_in_timezone, strict_eq};
+pub use ordered::{ordered_compare_in_timezone, validate_order_type};
+pub use evaluate::{CompiledExpr, EvalContext, EvaluatedList, ExpressionInvocation, OuterRow, expression_type, evaluate_list_async, evaluate, evaluate_async, evaluate_batch, evaluate_projection, evaluate_projection_async, is_true};
+pub use functions::{function_type, scalar_call, scalar_call_async};
 pub use numeric::{arithmetic, arithmetic_in_timezone, integer, number};
 pub use timezone::normalize_timezone;
 pub use decimal::{decimal_text, decimal_long_value, decimal_rescale, decimal_to_f64, parse_decimal, decimal_sum, infer_decimal};
+
+mod field;
+mod transit_object;
+mod jvm_number;

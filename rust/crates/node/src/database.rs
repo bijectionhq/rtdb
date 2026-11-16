@@ -125,7 +125,7 @@ impl DatabaseFactory {
                 (Some(driver), Some(handle))
             };
             let source = if self.options.replication.enabled && self.options.replication.may_lead && !read_only {
-                match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name).await?), None => None }
+                match &configuration.external_source { Some(source) => Some(self.external_factory(source)?.open(source, &name, Arc::clone(&io)).await?), None => None }
             } else { None };
             let supervisor = MaintenanceSupervisor { store: resources.store, snapshots, replication: replication.clone(), compaction: compaction.clone(),
                 observer: Arc::clone(&self.observer), options: self.options.clone(), source };

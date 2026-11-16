@@ -1,11 +1,11 @@
 use std::{sync::Arc, time::Duration};
 use rdkafka::{Message, Offset, TopicPartitionList, client::ClientContext, consumer::{BaseConsumer, Consumer, ConsumerContext}, error::KafkaError, message::{Headers, Timestamp as KafkaTimestamp}, statistics::Statistics};
-use rtdb_columnar::MemoryBudget;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_replication::{DriverStatus, TermHandle};
 use rtdb_types::{Anomaly, Result};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use super::{ConnectConfig, ConversionContext, PluginRegistry, RecordIndexer, ResumeToken, SinkRecord, SourceConfig, SourceTransactions, error};
+use super::{ConnectConfig, ConversionContext, Converter, DateEnvironment, PluginRegistry, RecordIndexer, ResumeToken, SinkRecord, SourceConfig, SourceTransactions, error};
 use crate::{KafkaClusterConfig, client_config, native_properties};
 
 #[derive(Clone, Debug)]
@@ -77,15 +77,16 @@ pub struct SourceDriver {
     plugins: PluginRegistry,
     indexer: Box<dyn RecordIndexer>,
     memory: Arc<MemoryBudget>,
+    environment: Arc<DateEnvironment>,
     progress: Arc<SourceProgress>,
     metrics: Option<(SourceIdentity, Arc<dyn SourceObserver>)>,
 }
 impl SourceDriver {
     /// The assignment owner must await `run`; all converter, consumer, and transform state ends with that future.
-    pub fn new(cluster: KafkaClusterConfig, source: SourceConfig, options: SourceOptions, plugins: PluginRegistry, indexer: Box<dyn RecordIndexer>, memory: Arc<MemoryBudget>) -> Result<Self> {
+    pub fn new(cluster: KafkaClusterConfig, source: SourceConfig, options: SourceOptions, plugins: PluginRegistry, indexer: Box<dyn RecordIndexer>, memory: Arc<MemoryBudget>, environment: Arc<DateEnvironment>) -> Result<Self> {
         options.validate()?;
         let config = source.validate()?;
-        Ok(Self { cluster, source, config, options, plugins, indexer, memory, progress: Arc::new(SourceProgress(watch::channel(SourceStatus::default()).0)), metrics: None })
+        Ok(Self { cluster, source, config, options, plugins, indexer, memory, environment, progress: Arc::new(SourceProgress(watch::channel(SourceStatus::default()).0)), metrics: None })
     }
     pub fn with_observer(mut self, database: String, observer: Arc<dyn SourceObserver>) -> Self {
         self.metrics = Some((SourceIdentity { database, topic: self.source.topic.clone(), partition: self.options.partition }, observer)); self
@@ -94,11 +95,17 @@ impl SourceDriver {
     pub async fn run(mut self, term: TermHandle, after: Option<Arc<[u8]>>, _blocks: watch::Receiver<DriverStatus>, cancellation: CancellationToken) -> Result<()> {
         if cancellation.is_cancelled() { return Ok(()); }
         let token = after.as_deref().map(ResumeToken::decode).transpose()?;
-        let work = self.ingest(&term, token);
-        tokio::pin!(work);
-        tokio::select! { result = &mut work => result, _ = cancellation.cancelled() => Ok(()) }
+        let configuration_bytes = self.source.connect_config.iter().try_fold(0usize, |size, (key, value)| size.checked_add(key.len()).and_then(|size| size.checked_add(value.len())).ok_or_else(overflow))?;
+        let plugin_charge = self.memory.reserve(configuration_bytes.checked_mul(512).and_then(|size| size.checked_add(65_536)).ok_or_else(overflow)?)?;
+        let mut converters = Converters::open(&self.plugins, &self.config).await?;
+        let result = {
+            let work = self.ingest(&term, token, &mut converters, &plugin_charge);
+            tokio::pin!(work);
+            tokio::select! { result = &mut work => result, _ = cancellation.cancelled() => Ok(()) }
+        };
+        after_close(result, converters.close().await)
     }
-    async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>) -> Result<()> {
+    async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {
         let registration = self.metrics.as_ref().map(|(identity, observer)| observer.register(identity, self.subscribe())).transpose()?;
         let mut properties = native_properties(&self.cluster.properties()?)?;
         if let Some(maximum) = properties.remove("max.poll.records") {
@@ -123,11 +130,7 @@ impl SourceDriver {
         let mut assignment = TopicPartitionList::new();
         assignment.add_partition_offset(&self.source.topic, self.options.partition, Offset::Offset(next)).map_err(transport)?;
         consumer.assign(&assignment).map_err(transport)?;
-        let configuration_bytes = self.source.connect_config.iter().try_fold(0usize, |size, (key, value)| size.checked_add(key.len()).and_then(|size| size.checked_add(value.len())).ok_or_else(overflow))?;
-        let plugin_charge = self.memory.reserve(configuration_bytes.checked_mul(512).and_then(|size| size.checked_add(65_536)).ok_or_else(overflow)?)?;
-        let mut key = self.plugins.converter(&self.config.key, true)?;
-        let mut value = self.plugins.converter(&self.config.value, false)?;
-        let mut chain = self.plugins.chain(&self.config)?;
+        let mut chain = self.plugins.chain_with_environment(&self.config, Arc::clone(&self.environment))?;
         self.progress.0.send_modify(|state| state.connected = true);
         let _connected = ConnectionGuard(Arc::clone(&self.progress));
         let mut transactions = SourceTransactions { term };
@@ -158,13 +161,13 @@ impl SourceDriver {
             let mut records = Vec::new();
             for raw in raw {
                 let mut context = ConversionContext::with_limit(Arc::clone(&self.memory), self.options.maximum_decoded_bytes);
-                context.retain(Arc::clone(&plugin_charge))?;
+                context.retain(Arc::clone(plugin_charge))?;
                 let mut record = SinkRecord::new(self.source.topic.clone(), self.options.partition, raw.offset,
-                    key.decode(&self.source.topic, raw.key.as_deref(), &mut context).await?, value.decode(&self.source.topic, raw.value.as_deref(), &mut context).await?);
+                    converters.key.decode(&self.source.topic, raw.key.as_deref(), &mut context).await?, converters.value.decode(&self.source.topic, raw.value.as_deref(), &mut context).await?);
                 record.timestamp_millis = raw.timestamp;
                 record.headers = raw.headers.into_iter().map(|(name, bytes)| {
                     context.reserve(bytes.as_ref().map_or(0, Vec::len).checked_mul(512).and_then(|size| size.checked_add(4096)).ok_or_else(overflow)?)?;
-                    Ok((name, super::header::decode(bytes.as_deref())?))
+                    Ok((name, super::header::decode_with_environment(bytes.as_deref(), &self.environment)?))
                 }).collect::<Result<_>>()?;
                 record.reservations = context.into_charges();
                 if let Some(record) = chain.apply(record)? { records.push(record); }
@@ -191,6 +194,27 @@ impl SourceDriver {
         }
     }
 }
+struct Converters { key: Box<dyn Converter>, value: Box<dyn Converter> }
+impl Converters {
+    async fn open(plugins: &PluginRegistry, config: &ConnectConfig) -> Result<Self> {
+        let mut key = plugins.converter(&config.key, true)?;
+        match plugins.converter(&config.value, false) {
+            Ok(value) => Ok(Self { key, value }),
+            Err(error) => after_close(Err(error), key.close().await),
+        }
+    }
+    async fn close(mut self) -> Result<()> {
+        let value = self.value.close().await;
+        after_close(value, self.key.close().await)
+    }
+}
+fn after_close<T>(result: Result<T>, close: Result<()>) -> Result<T> {
+    match (result, close) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(error), Err(close)) => Err(error.with_context("converter-close-error", close.to_string().into())),
+    }
+}
 struct RawRecord { offset: i64, timestamp: Option<i64>, key: Option<Vec<u8>>, value: Option<Vec<u8>>, headers: Vec<(String, Option<Vec<u8>>)> }
 fn kafka_timestamp(timestamp: KafkaTimestamp) -> i64 {
     match timestamp { KafkaTimestamp::NotAvailable => -1, KafkaTimestamp::CreateTime(value) | KafkaTimestamp::LogAppendTime(value) => value }
@@ -206,5 +230,50 @@ mod tests {
         assert_eq!(kafka_timestamp(KafkaTimestamp::NotAvailable), -1);
         assert_eq!(kafka_timestamp(KafkaTimestamp::CreateTime(123)), 123);
         assert_eq!(kafka_timestamp(KafkaTimestamp::LogAppendTime(456)), 456);
+    }
+}
+
+#[cfg(test)]
+mod converter_lifetime_tests {
+    use super::*;
+    use std::{collections::BTreeMap, sync::Mutex};
+    use super::super::{ConnectData, ConverterFactory};
+
+    struct Factory { events: Arc<Mutex<Vec<String>>>, fail_value_open: bool, fail_value_close: bool }
+    struct Opened { events: Arc<Mutex<Vec<String>>>, role: &'static str, fail_close: bool }
+    impl ConverterFactory for Factory {
+        fn open(&self, _: &BTreeMap<String, String>, is_key: bool) -> Result<Box<dyn Converter>> {
+            if !is_key && self.fail_value_open { return Err(error("value-open", "value open failed")); }
+            Ok(Box::new(Opened { events: Arc::clone(&self.events), role: if is_key { "key" } else { "value" }, fail_close: !is_key && self.fail_value_close }))
+        }
+    }
+    #[async_trait::async_trait]
+    impl Converter for Opened {
+        async fn decode(&mut self, _: &str, _: Option<&[u8]>, _: &mut ConversionContext) -> Result<ConnectData> { Ok(ConnectData::null()) }
+        async fn close(&mut self) -> Result<()> {
+            tokio::task::yield_now().await;
+            self.events.lock().unwrap().push(self.role.into());
+            if self.fail_close { Err(error("value-close", "value close failed")) } else { Ok(()) }
+        }
+    }
+    fn config() -> ConnectConfig {
+        ConnectConfig::parse(&BTreeMap::from([("key.converter".into(), "owned".into()), ("value.converter".into(), "owned".into())])).unwrap()
+    }
+    #[tokio::test]
+    async fn failed_value_open_awaits_the_already_opened_key_close() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let plugins = PluginRegistry::default().with_converter("owned".into(), Arc::new(Factory { events: Arc::clone(&events), fail_value_open: true, fail_value_close: false })).unwrap();
+        let result = Converters::open(&plugins, &config()).await;
+        assert!(matches!(result, Err(error) if error.code.ends_with("value-open")));
+        assert_eq!(*events.lock().unwrap(), ["key"]);
+    }
+    #[tokio::test]
+    async fn both_converters_close_after_an_error_and_the_decode_error_remains_primary() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let plugins = PluginRegistry::default().with_converter("owned".into(), Arc::new(Factory { events: Arc::clone(&events), fail_value_open: false, fail_value_close: true })).unwrap();
+        let converters = Converters::open(&plugins, &config()).await.unwrap();
+        let result: Result<()> = after_close(Err(error("decode", "decode failed")), converters.close().await);
+        assert!(result.unwrap_err().code.ends_with("decode"));
+        assert_eq!(*events.lock().unwrap(), ["value", "key"]);
     }
 }

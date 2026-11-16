@@ -15,10 +15,13 @@ chrono.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+rtdb-format.workspace = true
+rtdb-index.workspace = true
+rtdb-trie.workspace = true
 rtdb-query.workspace = true
 rtdb-columnar.workspace = true
 rtdb-storage.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tokio-util.workspace = true
 
 [lints]

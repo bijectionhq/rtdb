@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use rtdb_types::{Anomaly, DecimalValue, Result, TimeUnit, Value};
 use crate::interval::parse as interval;
 
@@ -14,9 +13,9 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
         1700 => decimal(text)?,
         17 => Value::Binary(if let Some(hex) = text.strip_prefix("\\x") { if hex.len() % 2 != 0 { return Err(invalid("Odd-length bytea hexadecimal value")); } hex.as_bytes().chunks_exact(2).map(|pair| { let text = std::str::from_utf8(pair).map_err(invalid)?; u8::from_str_radix(text, 16).map_err(invalid) }).collect::<Result<_>>()? } else { text.as_bytes().to_vec() }),
         2950 => Value::Uuid(*uuid::Uuid::parse_str(text).map_err(invalid)?.as_bytes()),
-        1082 => { let date = NaiveDate::parse_from_str(text, "%Y-%m-%d").map_err(invalid)?; let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).ok_or_else(|| invalid("Missing epoch"))?; Value::DateDay(i32::try_from(date.signed_duration_since(epoch).num_days()).map_err(invalid)?) },
-        1083 => { let time = ["%H:%M:%S%.f", "%H:%M"].into_iter().find_map(|format| NaiveTime::parse_from_str(text, format).ok()).filter(|time| time.nanosecond() < 1_000_000_000).ok_or_else(|| invalid("Invalid PostgreSQL local time"))?; Value::Time { value: i64::from(time.num_seconds_from_midnight()) * 1_000_000_000 + i64::from(time.nanosecond()), unit: TimeUnit::Nanosecond, bit_width: 64 } },
-        1114 => { let time = local_timestamp(text)?; Value::Timestamp { value: time.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None } },
+        1082 => Value::calendar_date(rtdb_types::CivilDate::parse_iso(text)?, rtdb_types::DateUnit::Day),
+        1083 => Value::Time { value: rtdb_types::parse_iso_local_time(text)? as i64, unit: TimeUnit::Nanosecond, bit_width: 64 },
+        1114 => { let value = rtdb_types::parse_sql_timestamp_literal(text)?; if !matches!(&value, Value::Timestamp { timezone: None, .. }) { return Err(invalid("Invalid PostgreSQL local timestamp")); } value },
         1184 => timestamp(text)?,
         1186 => { let (months, days, nanoseconds) = interval(text)?; if nanoseconds % 1000 != 0 { Value::IntervalMonthDayNano { months, days, nanoseconds } } else if nanoseconds != 0 || days != 0 { Value::IntervalMonthDayMicro { months, days, nanoseconds } } else { Value::IntervalYearMonth(months) } },
         11112 => Value::Duration { value: crate::interval::duration_micros(text)?, unit: TimeUnit::Microsecond },
@@ -48,20 +47,9 @@ pub(crate) fn decimal_parts(coefficient: num_bigint::BigInt, scale: i32) -> Resu
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 0xff } else { 0 }; length - bytes.len()]; unscaled.extend_from_slice(&bytes);
     Ok(Value::Decimal(DecimalValue::new(unscaled, precision, scale, width)?))
 }
-fn local_timestamp(text: &str) -> Result<NaiveDateTime> {
-    ["%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M"].into_iter().find_map(|format| NaiveDateTime::parse_from_str(text, format).ok())
-        .or_else(|| NaiveDate::parse_from_str(text, "%Y-%m-%d").ok().and_then(|date| date.and_hms_opt(0, 0, 0)))
-        .filter(|time| time.nanosecond() < 1_000_000_000).ok_or_else(|| invalid("Invalid PostgreSQL local timestamp"))
-}
 fn timestamp(text: &str) -> Result<Value> {
-    let (text, region) = if text.ends_with(']') { let (text, region) = text.rsplit_once('[').ok_or_else(|| invalid("Invalid zoned timestamp"))?; (text, Some(&region[..region.len() - 1])) } else { (text, None) };
-    let offset_at = text.char_indices().rev().find(|(index, character)| *index >= 10 && matches!(character, '+' | '-' | 'Z')).map(|(index, _)| index);
-    let (local, offset) = offset_at.map_or((text, None), |index| (&text[..index], Some(&text[index..])));
-    let local = Value::Timestamp { value: local_timestamp(local)?.and_utc().timestamp_micros(), unit: TimeUnit::Microsecond, timezone: None };
-    let zone = region.or(offset).ok_or_else(|| invalid("Zoned timestamp requires an offset or region"))?;
-    let value = rtdb_expr::timestamp_micros(&local, offset.unwrap_or(zone))?.0;
-    if region.is_some() { rtdb_expr::timestamp_micros(&local, zone)?; }
-    Ok(Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some(rtdb_expr::normalize_timezone(zone)?) })
+    let Value::Timestamp { value, unit, timezone: Some(zone) } = rtdb_types::parse_sql_timestamp_literal(text)? else { return Err(invalid("Zoned timestamp requires an offset or region")); };
+    Ok(Value::Timestamp { value, unit, timezone: Some(rtdb_expr::normalize_timezone(&zone)?) })
 }
 fn array(text: &str) -> Result<Vec<Option<String>>> {
     let text = text.trim(); if text.is_empty() || text == "{}" { return Ok(Vec::new()); }
@@ -123,6 +111,7 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
     use rtdb_format::transit::{TransitValue as T, encode_msgpack};
     Ok(match value {
         T::Null => Value::Null, T::Bool(value) => Value::Bool(value), T::Integer(value) => Value::I64(value), T::Float(value) => Value::F64(value), T::String(value) => Value::Utf8(value), T::Keyword(value) => Value::Keyword(rtdb_types::Keyword::from_name(&value)), T::Bytes(value) => Value::Binary(value), T::Array(values) => Value::List(values.into_iter().map(transit).collect::<Result<_>>()?),
+        T::Float32(value) => Value::F64(f64::from(value)),
         T::Map(entries) => {
             let mut fields = BTreeMap::new();
             for (key, value) in entries { let key = match key { T::String(key) => key, T::Keyword(key) => normalize_keyword(&key), _ => return Err(Anomaly::unsupported("xtdb.postgres/unsupported-map-key", "Source maps require string or keyword keys")) }; fields.insert(key, transit(value)?); }
@@ -131,7 +120,8 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Tagged { tag, representation } => {
             let string = || match representation.as_ref() { T::String(text) => Ok(text.as_str()), _ => Err(invalid("Transit tag requires text")) };
             match tag.as_str() {
-                "u" => read_text(2950, string()?)?, "f" => decimal(string()?)?, "r" => Value::Uri(string()?.to_owned()),
+                "u" => read_text(2950, string()?)?, "f" => decimal(string()?)?,
+                "r" => { let text = string()?; rtdb_types::UriParts::parse(text)?; Value::Uri(text.to_owned()) },
                 "m" => Value::Timestamp { value: string()?.parse::<i64>().map_err(invalid)?.checked_mul(1000).ok_or_else(|| invalid("Transit date overflow"))?, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
                 "time/instant" => { let mut value = timestamp(string()?)?; if let Value::Timestamp { timezone, .. } = &mut value { *timezone = Some("UTC".into()); } value },
                 "time/zoned-date-time" => zoned_timestamp(string()?)?, "time/offset-date-time" => timestamp(string()?)?,

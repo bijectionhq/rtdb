@@ -14,30 +14,38 @@ ASCII object rendering applies Unicode 16 NFC and percent-encodes non-ASCII UTF-
 The parser, decoding, equality and ASCII rendering source regressions are unexecuted.
 Isolated UTF-16 surrogate inputs remain outside the current UTF-8 string carrier and require a wider representation for complete Java parity.
 
-`UriParts::java_hash_code` provides the URI object hash beside object equality, including UTF-16 hashing and component-specific case folding.
-`tests/uri.rs` records numeric and equivalent-spelling fixtures as unexecuted regression source.
-
-`decode_java_utf8` applies Java replacement grouping to byte sequences, including encoded surrogate triples.
-URI percent decoding uses the indexed decoder without copying percent-byte runs.
-`tests/utf8.rs` records malformed-prefix, surrogate and supplementary decoding as unexecuted regression source.
+Runtime version metadata is one immutable process value initialized on the first version or revision lookup.
+The initialization monitor captures a nonblank `XTDB_VERSION` override or the Cargo package version, plus `GIT_SHA` or the build-time `RTDB_REVISION` when available.
+The command-line version and SQL session-information functions share that value.
+Release builds embed their recorded source revision in the native executable.
+`compiled_build_info()` returns the full build revision, crate version and selected TZDB version and digest without consulting runtime overrides.
+The server and configuration migrator expose that same immutable report through `--build-info` for release-package validation.
 
 == Calendar and timezone values
 
 `CivilDate` and `CivilDateTime` are immutable ISO proleptic Gregorian values covering Java LocalDate's year range, −999,999,999 through +999,999,999.
 Their constructors validate calendar fields; Arrow unit conversion and narrowing remain caller responsibilities.
 `Instant::parse_iso` and `to_iso_string` cover Java Instant's additional boundary years, using checked final instant limits and grouped fractional output.
+SQL timestamp parsing has its separate SMART calendar rules and accepts the pinned offset and region suffixes.
+Local field extraction, zoned resolution and query-clock date fallback are distinct entry points.
 
 `CalendarDate` couples a validated date to its selected day or millisecond unit.
 Object admission truncates day counts to signed 32 bits; expression admission checks that narrowing.
 Both millisecond admissions use wrapping multiplication.
 `tests/calendar_value.rs` covers these boundaries and serialization as unexecuted regression source.
 
+`Value::calendar_date` preserves calendar dates that cannot be represented losslessly as physical day or millisecond cells.
+Its `CalendarDate` retains the validated date and selected unit until an explicit admission boundary.
+Expression output checks signed 32-bit day narrowing, while object input truncates days to signed 32 bits; both use wrapping multiplication for millisecond storage.
+Admission recursively visits nested values without allocating.
+Durable Arrow schemas retain their existing physical date types.
+
 `ZoneId` uses immutable tables compiled from the selected OpenJDK TZDB input, including historical offsets and recurring future rules.
 Overlaps prefer the earlier offset unless a valid preferred offset is supplied; gaps move forward, and start-of-day uses the first valid instant of the date.
 `ZoneId::offset_at` accepts every signed 64-bit second for fixed offsets and fixed-rule regions; regions with transitions retain Java Instant and calendar bounds.
 The default bundle, source archive checksum, license files and override contract are in link:data/tzdb/README.adoc[timezone data provenance].
 The selected version and SHA-256 are embedded as constants; qualification must compare them with the actual reference JVM's installed data.
-Calendar and zone regression sources remain unexecuted.
+Calendar, parser and zone regression sources remain unexecuted.
 
 `LegacyTimeZone` supplies the separate OpenJDK25 `java.util.TimeZone` interpretation of the same selected database.
 Its historical table uses the final raw offset before the retained transition range and its future tail follows the `ZoneInfoFile` conversion to `SimpleTimeZone`.
@@ -48,3 +56,10 @@ Building the legacy view retains standard-offset transitions and aliases from th
 The derived tables are limited to one million entries before generation; an oversized custom input fails decoding explicitly.
 Existing `ZoneId` lookup and local resolution remain independent of the legacy view.
 `tests/legacy_zone.rs` exercises historical, recurring, overlap, custom-ID and signed64-boundary cases as unexecuted source.
+
+`UriParts::java_hash_code` provides the URI object hash beside object equality, including UTF-16 hashing and component-specific case folding.
+`tests/uri.rs` records numeric and equivalent-spelling fixtures as unexecuted regression source.
+
+`decode_java_utf8` applies Java replacement grouping to byte sequences, including encoded surrogate triples.
+URI percent decoding and stored Unix Path rendering share that decoder without copying URI percent-byte runs.
+`tests/utf8.rs` records malformed-prefix, surrogate and supplementary decoding as unexecuted regression source.

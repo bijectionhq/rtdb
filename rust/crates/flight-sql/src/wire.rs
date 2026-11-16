@@ -51,6 +51,13 @@ impl Encoder {
     }
     pub fn batch(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
         if batch.schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
+        self.encode(batch, memory)
+    }
+    pub fn declared_batch(&mut self, batch: &rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
+        if batch.declared_schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
+        self.encode(batch.batch(), memory)
+    }
+    fn encode(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
         let charge = memory.reserve(add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)?).map_err(status)?;
         let (dictionaries, data) = IpcDataGenerator::default().encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression).map_err(arrow)?;
         Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
@@ -152,6 +159,26 @@ mod tests {
     use super::*;
     use arrow_array::Int64Array;
     use arrow_schema::{DataType, Field};
+    #[test]
+    fn declared_flight_schema_keeps_nonnullable_timestamp_with_conformed_null_buffers() {
+        let memory = MemoryBudget::new(1 << 22);
+        let target = Schema::new(vec![Field::new("v", DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, Some("UTC".into())), false)]);
+        let source = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("v", DataType::Null, true)])), vec![Arc::new(arrow_array::NullArray::new(1))]).unwrap();
+        let page = rtdb_columnar::conform_batch(OwnedBatch::new(source, &memory).unwrap(), &target, &memory).unwrap();
+        let header = schema_data(&target, &memory).unwrap();
+        let message = arrow_ipc::root_as_message(&header.data_header).unwrap();
+        assert!(!message.header_as_schema().unwrap().fields().unwrap().get(0).nullable());
+        let mut encoder = Encoder::new(&target, &memory).unwrap();
+        assert!(encoder.batch(page.batch(), &memory).is_err());
+        let data = encoder.declared_batch(&page, &memory).unwrap();
+        let message = arrow_ipc::root_as_message(&data[0].data_header).unwrap();
+        let record = message.header_as_record_batch().unwrap();
+        assert_eq!(record.length(), 1);
+        assert_eq!(record.nodes().unwrap().get(0).null_count(), 1);
+        assert_eq!(record.buffers().unwrap().len(), 2);
+        drop(page); drop(data); drop(header); drop(encoder);
+        assert_eq!(memory.used_bytes(), 0);
+    }
     #[test]
     fn streaming_arrow_buffers_remain_charged_after_encoder_and_batch_drop() {
         let memory = MemoryBudget::new(1 << 20); let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));

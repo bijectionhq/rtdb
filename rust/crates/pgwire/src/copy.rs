@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
 use rtdb_node::{AccessSettings, CommitResult, NativeSession, Node, TransactionSettings, TransactionStatus};
 use rtdb_pg_codec::Format;
 use rtdb_plan::{CopyFormat, Identifier};
@@ -53,7 +53,7 @@ impl CopyInput {
                     let mut bound = 8192usize;
                     for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
                     let _values = node.memory().reserve(bound)?;
-                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), read_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
+                    let rows = (0..batch.num_rows()).map(|row| schema.fields().iter().enumerate().map(|(column, field)| Ok((field.name().clone(), rtdb_columnar::read_execution_value(field, batch.column(column).as_ref(), row)?))).collect::<Result<BTreeMap<_, _>>>()).collect::<Result<Vec<_>>>()?;
                     count = count.checked_add(rows.len() as u64).ok_or_else(|| protocol("COPY row count overflow"))?;
                     self.submit(rows, session, node, cancellation).await?;
                 }
@@ -161,7 +161,7 @@ mod tests {
                 let reservation = memory.reserve(bound).unwrap(); input.seek(SeekFrom::Start(0)).unwrap();
                 let page = if is_file { rtdb_format::ipc::ArrowFile::from_reader(input, None).unwrap().next().unwrap().unwrap() }
                     else { rtdb_format::ipc::ArrowStream::from_reader(input, None).unwrap().next().unwrap().unwrap() };
-                assert_eq!(read_value(page.schema().field(0), page.column(0).as_ref(), 0).unwrap(), value);
+                assert_eq!(rtdb_columnar::read_value(page.schema().field(0), page.column(0).as_ref(), 0).unwrap(), value);
                 drop(page); drop(reservation); assert_eq!(memory.used_bytes(), 0);
             }
         }

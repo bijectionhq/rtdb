@@ -1,5 +1,4 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
-use chrono::{DateTime, Utc};
 use rtdb_columnar::MemoryReservation;
 use rtdb_format::keys::{CURRENT_STORAGE_VERSION, TrieKey, block_key, lex_hex, storage_root};
 use rtdb_index::{CatalogTrie, TrieCatalog, TrieState};
@@ -134,8 +133,13 @@ impl Node {
         let database = self.catalog().database(database)?;
         let value = database.partition.value();
         let Some(block_index) = value.table_catalog().block_index() else { return Ok(None); };
-        let date = DateTime::<Utc>::from_timestamp_micros(now.0).ok_or_else(|| invalid("Export timestamp exceeds the calendar range"))?;
-        let directory = ObjectKey::new(format!("exports/b{}_{}", lex_hex(u64::try_from(block_index.0).map_err(invalid)?), date.format("%Y%m%dT%H%M%SZ")))?;
+        let date = rtdb_types::CivilDateTime::from_epoch_second(now.epoch_parts().0, 0)?;
+        let (year, month, day) = date.date().ymd();
+        let year_of_era = if year <= 0 { 1 - year } else { year };
+        let year = if year_of_era > 9999 { format!("+{year_of_era}") } else { format!("{year_of_era:04}") };
+        let second = date.second_of_day();
+        let date = format!("{year}{month:02}{day:02}T{:02}{:02}{:02}Z", second / 3600, second / 60 % 60, second % 60);
+        let directory = ObjectKey::new(format!("exports/b{}_{}", lex_hex(u64::try_from(block_index.0).map_err(invalid)?), date))?;
         let root = ObjectKey::new(format!("{directory}/{}", storage_root(CURRENT_STORAGE_VERSION, StorageEpoch(0), 0, 1)?))?;
         let mut bound = 4096usize;
         let mut table_count = 0;

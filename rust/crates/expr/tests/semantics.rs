@@ -70,7 +70,7 @@ fn fixed_timezones_apply_to_local_timestamp_casts_and_current_time() {
     assert_eq!(parse_timestamp("1970-01-01T00:00:00", "Z").unwrap(), Timestamp(0));
     let context = EvalContext { timezone: "UTC+02:30", ..Default::default() };
     let value = scalar_call("localtimestamp", &[], &context).unwrap();
-    assert_eq!(value, V::Timestamp { value: context.current_time.0 + 9_000_000_000, unit: TimeUnit::Microsecond, timezone: None });
+    assert_eq!(value, V::Timestamp { value: context.current_time.as_micros().unwrap().0 + 9_000_000_000, unit: TimeUnit::Microsecond, timezone: None });
 }
 
 #[test]
@@ -258,7 +258,7 @@ fn batch_evaluation_retains_unobserved_union_legs_and_empty_batch_type() {
     use rtdb_plan::{ColumnId, Field};
 
     let ty = T::Scalar(S::Bool);
-    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "flag".into(), qualifier: None, qualified_only: false, data_type: ty.clone() }]).unwrap();
+    let schema = Schema::new(vec![Field { id: ColumnId(0), name: "flag".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: ty.clone() }]).unwrap();
     let expression = Expr::Case { branches: vec![(Expr::column(ColumnId(0), ty.clone()), Expr::Literal(V::I64(1)))], otherwise: Box::new(Expr::Literal(V::Utf8("fallback".into()))) };
     let compiled = CompiledExpr::compile(&expression, &schema).unwrap();
     let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![to_field("flag", &ty).unwrap()]));

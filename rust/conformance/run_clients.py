@@ -78,6 +78,41 @@ def validate_package(record, manifest, revision, engine):
         raise ValueError("server image provenance lacks its build selection or source manifest digest")
 
 
+def verify_native_build_info(artifacts, metadata):
+    selected = metadata.get("tzdb")
+    if not isinstance(selected, dict) or not isinstance(selected.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", selected["sha256"]) or type(selected.get("bytes")) is not int or not 1 <= selected["bytes"] <= 1024 * 1024:
+        raise ValueError("native build metadata lacks its bounded TZDB input digest")
+    if digest(artifacts["artifacts/tzdb.dat"]) != selected["sha256"] or artifacts["artifacts/tzdb.dat"].stat().st_size != selected["bytes"]:
+        raise ValueError("packaged TZDB bytes differ from the selected build input")
+    reports = []
+    for executable in ["rtdb", "rtdb-config"]:
+        report = json.loads(artifacts["artifacts/" + executable + "-build-info.json"].read_bytes())
+        expected = {"schema_version": 1, "engine": "rust", "revision": metadata["revision"], "version": metadata["version"], "tzdb_sha256": metadata["tzdb"]["sha256"]}
+        if not isinstance(report, dict) or any(report.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"{executable} compiled metadata differs from the selected build input")
+        if not isinstance(report.get("tzdb_version"), str) or not 1 <= len(report["tzdb_version"]) <= 128:
+            raise ValueError(f"{executable} does not identify its compiled TZDB version")
+        reports.append(report)
+    if reports[0] != reports[1]:
+        raise ValueError("packaged executable build information differs")
+    return reports[0]
+
+
+def validate_native_package_artifacts(artifacts, manifest):
+    required = {"artifacts/" + name for name in ["build.json", "rtdb", "rtdb-config", "tzdb.dat", "rtdb-build-info.json", "rtdb-config-build-info.json"]}
+    if not required <= artifacts.keys():
+        raise ValueError("native package lacks its executables or compiled provenance artifacts")
+    metadata = json.loads(artifacts["artifacts/build.json"].read_bytes())
+    if not isinstance(metadata, dict):
+        raise ValueError("native package build metadata is not an object")
+    for field in ("revision", "engine", "version", "source_dirty", "source_manifest_sha256", "features", "platform", "test_hooks", "tzdb"):
+        if field not in metadata or metadata[field] != manifest.get(field):
+            raise ValueError(f"native package build metadata differs at {field}")
+    compiled = verify_native_build_info(artifacts, metadata)
+    if compiled != manifest.get("compiled_build_info"):
+        raise ValueError("native package manifest differs from its compiled executable reports")
+
+
 def validate_package_files(path, manifest):
     directory = path.resolve().parent
     sources = directory / "source-manifest.json"
@@ -97,6 +132,8 @@ def validate_package_files(path, manifest):
     required = "artifacts/build.json" if manifest["engine"] == "rust" else "artifacts/xtdb.jar"
     if required not in artifacts:
         raise ValueError("package lacks its embedded provenance artifact")
+    if manifest["engine"] == "rust":
+        validate_native_package_artifacts({name: directory / name for name in artifacts}, manifest)
     return artifacts[required]
 
 
@@ -110,7 +147,7 @@ def verify_running_artifact(commands, container_id, package, directory):
         raise ValueError("running server artifact differs from its recorded package")
     if native:
         metadata = json.loads(output.read_bytes())
-        for field in ("revision", "engine", "source_dirty", "source_manifest_sha256", "features", "platform", "test_hooks"):
+        for field in ("revision", "engine", "source_dirty", "source_manifest_sha256", "features", "platform", "test_hooks", "tzdb"):
             if field not in metadata or metadata[field] != package[field]:
                 raise ValueError(f"running native build metadata differs at {field}")
 

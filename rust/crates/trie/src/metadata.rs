@@ -96,10 +96,11 @@ pub struct ColumnSummary {
 pub enum Comparison { Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual }
 
 impl ColumnSummary {
-    /// False proves that no value matches; incomparable types and NaNs return true.
+    /// False proves that no value matches; incomparable types, NaNs and unsigned physical bounds return true.
     pub fn may_match(&self, comparison: Comparison, value: &Value) -> bool {
         if self.value_count == Some(0) || matches!(value, Value::Null | Value::Undefined) { return false; }
         let Some(bounds) = &self.bounds else { return true; };
+        if [&bounds.minimum, &bounds.maximum].iter().any(|value| matches!(value, Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_))) { return true; }
         let Some(minimum) = scalar_compare(&bounds.minimum, value) else { return true; };
         let Some(maximum) = scalar_compare(&bounds.maximum, value) else { return true; };
         match comparison {

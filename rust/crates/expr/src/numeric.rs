@@ -57,27 +57,19 @@ pub(crate) fn inapplicable(name: &str, values: &[&Value]) -> Anomaly {
     Anomaly::incorrect("xtdb/invalid-argument-types", format!("{name} not applicable to types {:?}", values.iter().map(|value| value.logical_type()).collect::<Vec<_>>()))
 }
 
+/// Computes a scalar intermediate using UTC; calendar results await explicit vector admission.
 pub fn arithmetic(op: BinaryOp, left: &Value, right: &Value) -> Result<Value> {
     arithmetic_in_timezone(op, left, right, "UTC")
 }
 
 /// Temporal operations interpret mixed local/zoned operands using the supplied session time zone.
+/// Calendar results remain scalar intermediates until the caller admits their output.
 pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezone: &str) -> Result<Value> {
     use BinaryOp as B;
     if matches!(left, Value::Null | Value::Undefined) || matches!(right, Value::Null | Value::Undefined) { return Ok(Value::Null); }
+    if let Some(result) = crate::bitwise::binary(op, left, right) { return result; }
+    if op == B::Multiply { if let Some(result) = crate::period::intersection(left, right) { return Ok(result); } }
     if let Some(result) = crate::temporal::arithmetic(op, left, right, timezone) { return result; }
-    if matches!(op, B::ShiftLeft | B::ShiftRight) {
-        let a = integer(left).ok_or_else(|| inapplicable("bit shift", &[left, right]))? as i64;
-        let b = integer(right).ok_or_else(|| inapplicable("bit shift", &[left, right]))? as u32 & 63;
-        let shifted = if op == B::ShiftLeft { a.wrapping_shl(b) } else { a >> b };
-        return Ok(match left {
-            Value::I8(_) => Value::I8(shifted as i8), Value::I16(_) => Value::I16(shifted as i16),
-            Value::I32(_) => Value::I32(shifted as i32), Value::I64(_) => Value::I64(shifted),
-            Value::U8(_) => Value::U8(shifted as u8), Value::U16(_) => Value::U16(shifted as u16),
-            Value::U32(_) => Value::U32(shifted as u32), Value::U64(_) => Value::U64(shifted as u64),
-            _ => return Err(inapplicable("bit shift", &[left, right])),
-        });
-    }
     if op == B::Modulo && (matches!(left, Value::Decimal(_)) || matches!(right, Value::Decimal(_))) {
         if let (Some(a), Some(b)) = (exact_decimal(left), exact_decimal(right)) {
             let Some(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width })) = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]) else { return Err(overflow()); };
@@ -106,7 +98,6 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
         let result = match op {
             B::Add => a.checked_add(b), B::Subtract => a.checked_sub(b), B::Multiply => a.checked_mul(b),
             B::Divide => a.checked_div(b), B::Modulo => { let r = a % b; Some(if r != 0 && (r < 0) != (b < 0) { r + b } else { r }) },
-            B::BitAnd => Some(a & b), B::BitOr => Some(a | b), B::BitXor => Some(a ^ b),
             _ => None,
         }.ok_or_else(overflow)?;
         return integer_value(result, &ty);

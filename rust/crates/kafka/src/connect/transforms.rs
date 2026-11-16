@@ -26,15 +26,15 @@ fn regex_full(pattern: &str) -> Result<Regex> { regex(&format!("\\A(?:{pattern})
 fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> { options.get(key).map(String::as_str).ok_or_else(|| error("invalid-plugin-config", format!("Missing '{key}'"))) }
 fn list(options: &BTreeMap<String, String>, key: &str) -> Vec<String> { options.get(key).map_or(Vec::new(), |value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect()) }
 
-pub(super) fn open(spec: &PluginSpec) -> Result<Box<dyn Transform>> {
+pub(super) fn open(spec: &PluginSpec, environment: Arc<super::DateEnvironment>) -> Result<Box<dyn Transform>> {
     let class = spec.class_name.strip_prefix("org.apache.kafka.connect.transforms.").ok_or_else(|| error("plugin-class-not-found", &spec.class_name))?;
     let (name, key) = class.strip_suffix("$Key").map(|name| (name, true)).or_else(|| class.strip_suffix("$Value").map(|name| (name, false))).unwrap_or((class, false));
     if matches!(name, "ExtractField" | "HoistField" | "ReplaceField" | "SetSchemaMetadata" | "HeaderFrom" | "InsertField" | "Cast" | "Flatten" | "MaskField" | "TimestampConverter") && name == class { return Err(error("plugin-class-not-found", "Transform requires its concrete Key or Value class")); }
     let options = &spec.options;
-    if name == "Cast" { return cast::open(options, key); }
+    if name == "Cast" { return cast::open(options, key, environment); }
     if name == "Flatten" { return Ok(Box::new(flatten::Flatten::new(options.get("delimiter").cloned().unwrap_or_else(|| ".".into()), key))); }
-    if name == "TimestampConverter" { return timestamp::converter(options, key); }
-    if name == "TimestampRouter" { return timestamp::router(options); }
+    if name == "TimestampConverter" { return timestamp::converter(options, key, environment); }
+    if name == "TimestampRouter" { return timestamp::router(options, environment); }
     let action = match name {
         "Filter" => Action::Filter,
         "ExtractField" => {
@@ -53,7 +53,7 @@ pub(super) fn open(spec: &PluginSpec) -> Result<Box<dyn Transform>> {
         }
         "ValueToKey" => { let fields = list(options, "fields"); if fields.is_empty() { return Err(error("invalid-plugin-config", "ValueToKey fields must be nonempty")); } Action::ValueToKey(fields) }
         "DropHeaders" => Action::DropHeaders(list(options, "headers").into_iter().collect()),
-        "InsertHeader" => Action::InsertHeader(required(options, "header")?.into(), super::header::literal(required(options, "value.literal")?)?),
+        "InsertHeader" => Action::InsertHeader(required(options, "header")?.into(), super::header::literal_with_environment(required(options, "value.literal")?, &environment)?),
         "MaskField" => {
             let fields = list(options, "fields");
             if fields.is_empty() || fields.iter().collect::<BTreeSet<_>>().len() != fields.len() { return Err(error("invalid-plugin-config", "MaskField requires nonempty distinct field names")); }

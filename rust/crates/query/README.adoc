@@ -1,8 +1,20 @@
 = Query execution source checkpoint
 
+Scalar waits remain inside the cursor's active pull or opening future.
+Query and database cancellation each interrupt SLEEP; dropping a pull releases its timer without cancelling sibling cursors.
+Projection, filters, scan bounds, ordering, aggregates, correlated arguments and UNNEST use the same asynchronous evaluator.
+`tests/volatile.rs` retains current-thread cancellation, scope-release and sibling-cursor assertions as source only.
+Optimizer expression-count equivalence remains unqualified: the pinned selection rewrites do not declare a general volatility barrier.
+
 This crate is Phase 1 implementation source.
 It has not been compiled or executed, and the tests below are test source rather than passing parity evidence.
 The crate does not establish that the complete RTDB implementation or its required production traces exist.
+
+Physical unsigned scan cells and external query parameters enter execution as signed integers of the same width.
+Runtime fields carry the corresponding recursive signed types, including typed nulls and empty lists, while advertised fields retain the prepared declaration.
+Aggregate factories retain their declared setter target separately from their opened output-vector type.
+This preserves declared MIN/MAX setter failures while SUM, AVG, percentiles, grouping, comparisons, and string conversion consume the admitted values.
+Physical unsigned metadata bounds retain pages conservatively because signed reinterpretation does not preserve unsigned interval order.
 
 == Ownership and calls
 
@@ -10,19 +22,52 @@ The crate does not establish that the complete RTDB implementation or its requir
 A transaction catalog accepts exactly one database and exactly its resolving partition, following `core/src/main/kotlin/xtdb/api/tx/OpenTx.kt`.
 Normal query catalogs may contain several databases and partitions.
 The caller must complete its basis barrier before constructing these snapshots.
-There is currently no independent requested system-time cap per partition: execution uses each retained `Snapshot::tx_basis()` as its upper bound.
+Each retained snapshot keeps its captured transaction head separately from the requested system-time cap.
 
 `QueryContext` is a passive execution region containing the query clock, timezone, memory budget, spill quota, and parent cancellation token.
 `PreparedQuery::execute` makes a child cancellation token for that cursor, so dropping or cancelling one cursor does not cancel its siblings.
 Executions made from the same context share its memory budget and spill quota.
 `QueryCursor` owns the operator tree and advances it on the caller's coroutine.
 Dropping a cursor releases its operator state and spill files.
+The passive Mark cursor completes its shared candidate build in memory or under the query spill quota before producing a nullable Boolean result.
+An uncorrelated build precedes input evaluation and is shared across input rows; correlated builds retain their input row only while constructing and comparing that row's candidates.
+Uncorrelated comparisons stop at true, while correlated VALUES comparisons demand the complete candidate batch.
+Uncorrelated scalar equality keys select candidates by vector hash and retain whole-build null facts; Listy and struct candidate types compare every row.
+Scalar keyed spills follow the ordinary hash join partition schedule after fully consuming the probe input.
+Keyless and nested-key spills retain one probe page and visit every build partition, skipping rows already marked true.
+Candidate files and temporary rows are released with the cursor or the current correlated evaluation, including failure and cancellation.
 Returned `OwnedBatch` values and cloned Arrow arrays retain their own allocation reservations after the cursor has gone away.
 
-`PreparedQuery` contains an immutable relation and captured table dependencies.
+`QueryCursor::schema` retains the advertised result fields.
+Its passive `RuntimeSchema` value owns a tree of immutable `RuntimeRelation` values containing execution-derived batch fields.
+The tree and any aggregate or correlated-apply cursor retaining a subtree share the schema allocation reservation.
+The recursive derivation reserves its transient schema work before construction and uses the execution's pinned `CatalogSnapshot`, after dependency validation.
+Exact virtual-table definitions supply NULL types for absent scan columns; ordinary tables retain their validated scan types, including `xt.txs` and persisted tables in the `xt` schema.
+Projection, correlation, joins, grouping keys, sets, and windows propagate these runtime fields without inspecting observed row values.
+Each aggregate node owns passive `AggregateTypes` descriptors shared by its output schema and executor.
+The descriptor keeps the actual input type for vector dispatch and the emitted factory type for numeric output; array elements retain their emitted types with runtime nullability promotion.
+Physical data pages can have narrower fields than the snapshot schema; this derivation retains the snapshot's declared union legs for those scans.
+`BoundParameters` retains parameter cells and their complete declared vector types as one immutable charged value.
+Apply and Mark derive capture types from the runtime independent schema before evaluating the selected row, preserving unselected union legs through nested dependent queries.
+The dependent runtime schema and scalar evaluator consume that same type vector; a stale preparation annotation does not narrow a capture.
+
+The prepared/runtime distinction follows `scan-vec-types`, `with-absent-cols`, `ProjectionSpec.Identity`, and `expression/->expression-projection-spec` in the pinned implementation.
+Virtual temporal endpoints prepare as timestamp fields and produce NULL vectors; periods built from two absent endpoints produce the unbounded range.
+`rtdb-sql/tests/periods.rs` retains direct, correlated, nested, outer-join, and ordinary-table counterexamples as unexecuted source assertions.
+
+`PreparedQuery` contains an immutable relation, query settings and captured table dependencies.
 Execution rejects changed table OIDs or column types with `rtdb.query/stale-plan`.
 A caller must bind and prepare again against the new snapshot rather than reusing a schema that lacks newly introduced union legs.
 Parameters are positional `Value` values and remain charged while their execution retains them.
+SQL callers construct it with `from_prepared` to retain query-level `SETTING` metadata.
+The passive `ReadBasis` value retains the effective per-partition basis, encoded snapshot token, independent API snapshot-time cap, exact engine-clock fallback and allocation reservation.
+`QueryContext.current_time` retains seconds and nanoseconds through scalar execution.
+Default valid-time points and null AT fallbacks convert it to microseconds only when the scan requests that boundary.
+Opening a query resolves literal/parameter settings, validates requested times against captured heads, then caps visibility within those same snapshots.
+An unevaluated setting form reaches query opening without a scalar result type; opening rejects it only when the setting is consumed.
+`SNAPSHOT_TOKEN` reads the effective basis, preserving nanoseconds and unrecognized database entries from supplied tokens.
+The source intentionally retains `query.clj`'s ignored planned `SNAPSHOT_TIME`; the API cap remains effective after a SQL token override.
+No setting opens a newer catalog or changes a sibling execution's clock or basis.
 Correlated apply holds the independent row while its dependent cursor executes and restores the previous parameter scope on the next independent row.
 
 The operator states are passive, single-writer transients.
@@ -31,17 +76,22 @@ Spill files are scoped temporary resources with a retained-byte quota.
 
 == Implemented source paths
 
-* Live trie leaves and persisted Arrow data pages merge in IID order and descending system time, with newer segments first at equal system times.
+* Visibility resolution merges each common trie task in IID order and descending system time, with newer segments first at equal system times.
+  Emitted rows are grouped by contributing source page, with persisted pages before live pages.
 * The temporal resolver sees puts, deletes, and erases before a projected document reaches a value predicate.
 * Temporal file selection includes live candidates before dropping persisted files.
 * Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.
+  Trie recency dates retain the Java calendar range; UTC midnight scan ceilings require a representable signed 64-bit microsecond value.
+  `xt.trie_stats.recency` narrows the epoch day to its stored Date32 value at the system-table boundary.
 * Metadata IID paths begin at the metadata root; a trie key's partition is a coarse file filter rather than an additional root prefix.
 * Projection, filters, offset/fetch, union-all, and unnest advance incrementally.
-* Inner, outer, semi, anti, and cross joins use a spill-backed nested loop.
+* Inner, outer, semi, and anti joins accumulate complete build pages and use in-memory hashing or shuffled spill partitions.
+* Cross joins retain left pages and publish each left/right page product in right-page, left-page order.
 * Distinct and set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
 * Sort writes stable runs and merges them with a bounded fan-in.
-* Grouping assigns group IDs before spooling input and computes count, sum, average, min/max, boolean, variance, standard deviation, and ordered array aggregates.
-* Window execution assigns first-seen partition IDs, stably sorts each partition, and computes ROW_NUMBER, LEAD, and LAG with sequential readers over a shared spill file.
+* Grouping assigns first-seen group IDs across complete input pages, then updates each aggregate column in specification order.
+  Count, sum, average, min/max, boolean, variance, standard deviation, ordered array aggregates, and `vec-agg` share that page schedule.
+* Window execution assigns first-seen partition IDs, stably sorts each partition, and completes each ROW_NUMBER, LEAD, and LAG output column over the retained sorted relation.
 * Apply implements inner, left, scalar, exists, pull, and pull-many results, including cardinality errors and empty dependent relations.
 
 Default valid time is the query clock.
@@ -61,9 +111,17 @@ Assigned group IDs keep each accepted input row in its own group even when its k
 Aggregate DISTINCT therefore uses ordinary SQL equality and retains repeated null arguments in ARRAY_AGG.
 The current source contains no planner override for that comparator choice; execution parity for this behavior remains pending.
 
+`vec-agg` shares array accumulation and preserves null input cells.
+An empty global input produces an empty vector, while an empty grouped input produces no rows.
+Both families retain allocation reservations for collected cells and release input spills when the cursor ends or is dropped.
+
 Integer SUM follows the wrapping accumulation in `IntVector.kt` and `LongVector.kt` at the declared accumulator width.
+Integer input narrows through the vector getter before addition, and floating accumulation rounds at the output vector width.
 The reference has no byte or short accumulator implementation, and this executor reports that unsupported case.
+SUM admits every input vector leg before reading a page's selection mask, including on empty callbacks and when every row is excluded.
+Run-end input has no SUM or square-vector implementation in the reference factories.
 Nullable decimal SUM follows `DecimalVector.sumInto`, where a null cell contributes scale-zero zero; a separate null union leg leaves the accumulator unchanged.
+An actual `NullVector` input also leaves nullable decimal output null, including a decimal cast of an absent virtual temporal endpoint.
 `DecimalVector.increment` adds at the operands' preferred scale and stores the resulting coefficient under the output vector's existing metadata.
 SUM can exceed declared precision, while signed coefficient byte-width overflow fails.
 The width check follows https://github.com/apache/arrow-java/blob/v19.0.0/vector/src/main/java/org/apache/arrow/vector/util/DecimalUtility.java[Arrow Java 19 DecimalUtility].
@@ -71,10 +129,25 @@ Decimal output does not accept integer input vectors, including an inactive inte
 Query output reconstructs typed cells through `copy_array`, preserving exact decimal metadata and coefficients without ordinary-write precision checks.
 Computed projections validate the selected result before that copy, including nested decimal cells; identity columns and canonical INSERT/UPDATE row packing retain raw cells.
 Default and explicit same-type decimal casts therefore reject an overprecision result when projected, while boolean or text results may consume the same scalar intermediate without writing it as a decimal.
-Variance and standard deviation use the reference `Variance.kt` formula based on sum, sum of squares, and count, including its floating-point cancellation behavior.
-Numeric average uses a double accumulator; duration average retains the duration unit and integer division.
+AVG completes the page's SUM pass before its COUNT pass.
+Numeric average uses a double accumulator, preserving a first negative zero; duration average retains the duration unit, wrapping unit conversion and integer division.
+With the reference's default null checks, SUM and AVG fail when a selected null slot belongs to a nullable Duration vector.
+A separate null union leg or NullVector contributes nothing, and FILTER can exclude the null slot.
+Variance and standard deviation first square the complete input vector, then run masked SUM, square-SUM and COUNT passes in that order.
+Their square factory accepts nullable or nonnullable IntVector, LongVector and DoubleVector inputs; FloatVector, decimal, union, NullVector and run-end inputs fail on an actual callback.
+The result uses the reference `Variance.kt` formula, including its floating-point cancellation behavior.
+EVERY and ANY admit the reducing expression's emitted setter types before masked payload updates.
+A first selected nonnull value must fit the boolean accumulator; subsequent values use the expression's boolean coercion.
+MIN/MAX reducing aggregates reject decimal, byte, short, unsigned, half-float, and time output setters when input reaches the aggregate, following the available `set-value-code` methods in `expression.clj`.
+Empty input does not invoke those setters and retains the nullable factory output.
+
+The reference resolves vector null checks once from `XTDB_VECTOR_NULL_CHECKS`, then the `xtdb.vector.null-checks` JVM property, then `true`.
+The explicit disabled-check configuration remains required native work.
+It needs a captured configuration owner and access to null cells' physical backing values at Arrow input and primitive-reader boundaries; materialized `Value::Null` alone does not retain that payload.
 
 ARRAY_AGG includes null arguments and returns null for an empty global group or a group excluded entirely by FILTER.
+`ArrayAggAggregateSpec` opens its accumulator from emitted input metadata and copies actual vectors into it; an absent timestamp endpoint therefore produces a nullable timestamp element, including inside nested lists.
+Filtered ARRAY_AGG and `vec-agg` groups can promote the list itself to nullable.
 PULL and scalar apply return null for zero rows and reject multiple rows.
 PULL-many returns null for zero rows and a one-element list for a single empty document, following `src/test/clojure/xtdb/xtql/plan_test.clj`'s `test-pull`.
 
@@ -95,6 +168,9 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 
 |`tests/operators.rs`: empty/global aggregates, excluded groups, ordered arrays, null arguments, variance, SUM width
 |`xtdb.operator.group-by-test/test-count-empty-null-behaviour`, `test-sum-empty-null-behaviour`, `test-array-agg-orders-each-group-by-its-sort-keys`, `test-aggregate-filter`; primitive aggregation source paths above
+
+|`tests/operators.rs`: filtered array/vec output nullability and unsupported reducing setters; `rtdb-sql/tests/periods.rs`: virtual NULL aggregate dispatch, nested lists, and correlation
+|`group_by.clj` factory emission, `ArrayAggAggregateSpec`, `reducing-agg-factory`; `NullVector.rowCopier`, `NullVector.sumInto`, `DecimalVector.sumInto`, and `expression.clj/set-value-code`
 
 |`tests/operators.rs`: unnest order and ordinality
 |`xtdb.operator.unnest-test/test-simple-unnest`, `fix-ordinality-field-naming`
@@ -118,9 +194,9 @@ PULL-many returns null for zero rows and a one-element list for a single empty d
 == Remaining execution and resource work
 
 The executor is row-oriented and does not establish vectorized execution or expected production throughput.
-Nested-loop joins, spill-backed membership checks, and repeated group scans can be quadratic or worse across several grouping and aggregate operations.
+Keyless joins, anti-join candidate scans, spill-backed membership checks, and repeated group scans can be quadratic or worse across several grouping and aggregate operations.
 Sort currently writes runs even when its whole input could fit in memory.
-There is no hash join, top-k optimization, bloom pushdown, predicate pushdown, parallel partition scheduling, or coordinated scan-page spilling.
+There is no hash join, top-k optimization, parallel partition scheduling, or coordinated scan-page spilling.
 A single large output row, aggregate array, or set of overlapping active pages can exhaust the configured memory budget and return an error.
 
 The scan accepts uncompressed, LZ4 and Zstandard Arrow trie data and metadata.
@@ -138,11 +214,23 @@ Spill file access uses synchronous filesystem calls on the caller's coroutine; c
 No claim is made about cancellation latency.
 
 External table providers, transaction-result shaping, network output, query preparation caches, and the required production traces are outside this source checkpoint.
-The declared aggregate IR does not yet include every upstream aggregate family, such as ordered-set percentiles.
+The declared aggregate IR includes ordered-set continuous and discrete percentiles.
+Their immutable passive descriptors carry the fraction and sort direction; the passive aggregate cursor resolves fraction parameters when it opens, including for empty input.
+The caller-owned percentile input cursor excludes nulls, sorts through the existing spill merge, and selects one rank or interpolates two ranks without retaining the group in memory.
+Empty groups emit NULL and remain present in the result.
+Percentiles construct the ordered-vector comparator after consuming input, so unsupported list, struct, or mixed type legs fail even on empty input.
+Ordinary sorting constructs that comparator for each nonempty run and skips it for empty input.
+Numeric vector ordering preserves signed integer comparisons and otherwise uses Java Double.compare, including decimal values; stable input ordinals resolve rounded ties across spill merges.
+Scalar predicates and MIN/MAX retain their separate comparison rules.
+`tests/percentiles.rs` maps `group_by_test.clj`'s trailing empty-group regression and adds spill, cancellation, quota, and plan-validation source assertions.
+The formulas, parameter coercion, and output types follow `operator/group_by.clj`'s percentile factories; numeric rank errors currently use a native anomaly code rather than the JVM exception diagnostic.
 Compilation, execution, differential checks, fixture validation, resource measurements, and the required complete-workspace checks remain deferred until the user's full-implementation gate is satisfied.
 
 `Snapshot::with_system_time_cap` gives each partition an independent query basis without changing its durable transaction key.
-It retains the captured catalog and live generations, rejects a basis beyond that captured head, and treats `None` as the empty pre-ingestion view.
+It retains the captured catalog and live generations, rejects a basis beyond that captured head, and leaves system time unconstrained for `None`.
+Missing and null partition entries in a snapshot token use that unconstrained dimension; explicit temporal filters still apply.
+An empty token can therefore expose several historical versions, and a transaction pinned before a database's first write can observe a later applied generation while retaining its null token entry.
+This follows the pinned query implementation; `tx.allium` records the unresolved isolation contract for that case.
 The source regressions in `tests/scan.rs` retain a capped live view across block adoption and exercise distinct caps in one multi-partition database snapshot.
 
 == System catalog source
@@ -171,3 +259,149 @@ Contexts may carry a passive `ExecutionObserver` for public connection queries.
 Each successfully opened cursor owns one duration sample through cancellation or drop, including time between client pulls.
 Failed pulls record query errors; frontends report failures while consuming a returned batch through `record_consumer_error`.
 Unobserved contexts keep internal transaction-result and role-membership queries outside connection metrics.
+
+== Explain and materialized queries
+
+`PreparedQuery::from_prepared` reserves retained preparation metadata from the supplied budget.
+Its passive preparation pass prunes unused scan columns, applies single-column predicates after temporal resolution, and combines compatible ordering and row bounds into a production sort cursor.
+`execute`, `execute_with_text`, and the node's shared prepared-query opening path are asynchronous.
+Referenced materialized relations open before they return; `EXPLAIN ANALYZE` also consumes and closes the underlying query before returning its result cursor.
+Materialized replay retains every bound input page, including empty pages, in one framed spill value shared by independent reference cursors.
+Each reference reconstructs the original page boundaries before the client batch size is applied.
+
+`EXPLAIN` returns typed `depth`, `op`, and `explain` columns derived from the production relation tree.
+`EXPLAIN ANALYZE` returns the reference's ten-column schema, actual produced-page and row counts, operator durations, direct-child time subtraction, scan counters, and a common execution allocation peak.
+An unadvanced branch has zero counts and a null first-page duration.
+The production page boundary applies to ordinary execution as well as analysis.
+Values, Scan, Project and Sort expose their own input-derived pages; standalone filters skip empty selections and coalesce small pages after the first 100 rows.
+An empty Values row table produces no callback; a unit table produces one zero-column row.
+Actual empty callbacks supplied by other cursors retain each operator's preparation and forwarding contract.
+Limit slices complete child pages, while Union, Distinct, Intersect and Except preserve each nonempty source-page selection.
+SortLimit preserves the source sort accumulation and limited-output page boundaries before applying its offset.
+Project evaluates one complete expression column before beginning the next column, retaining the unpublished output rows until every column succeeds.
+Project and Filter prepare expression metadata once for each input page, including empty pages; an exhausted input does not trigger preparation.
+Apply completes every dependent invocation for one independent input page before publishing its output, including an empty result page.
+Unnest prepares its collection expression once per input page, expands every row in order, and skips empty expansions.
+The per-column and per-page preparation scopes retain compiled expression metadata through all corresponding row evaluations.
+Computed sort keys use the same complete column-major page projection before rows enter the sort accumulator.
+Mark produces a complete probe-page result; a correlated mark consumes every comparison in its current dependent page and stops before later pages once that page contains a true result.
+Correlated marks retain empty independent pages, while shared-build marks skip empty outputs.
+Aggregate and Window finish their entire result before publishing one nonempty page; an empty global aggregate retains its normal single row.
+Window partition mapping preserves semantic input pages, including empty pages, through computed sort-key preparation.
+Window output columns are filled in specification order, and an error in a later column discards every unpublished result row.
+Sorted input and scratch spill files are released before the completed output page is returned.
+`window/page_tests.rs` records partition-page preservation, complete column results, offset failure cleanup and empty-page preparation as unexecuted regression source.
+Cross joins retain all left pages, then emit one Cartesian product for each right-page/left-page pair, including empty pairs, with left rows preceding right rows in the product loop.
+The client output adapter and remaining row-oriented operators use `QueryOptions::batch_rows`.
+Durations and whole-plan page counts have not been qualified as identical to JVM execution.
+
+`OwnedPage` is a passive bounded row container that owns its capacity reservation and the retained rows.
+`OuterRows` is an immutable, charged lexical environment shared by dependent cursors.
+`AnalysisNode` is a passive descriptor with counters written by its owning cursor and read after execution.
+`MaterializedBinding` is immutable plan data; each execution's replay binding is a monitor whose caller performs the first materialization while other callers wait.
+Replay readers share the completed spill-file owner and advance independently.
+Cancellation releases partially opened cursors, buffered pages, and incomplete spill files.
+An unused binding is never advanced.
+
+The source fixtures in `rtdb-sql/tests/explain.rs` and `rtdb-node/tests/explain.rs` retain the upstream API examples and exercise shared preparation, actual page counts, materialization replay, cancellation, and spill limits.
+Private page and replay tests cover retained-buffer lifetime and cancellation while materialization is suspended.
+These tests have not run.
+Full optimizer equivalence, including decorrelation, projection fusion, symbol allocation, and scan-column order, remains unqualified.
+Complete original-form retention for explanation strings remains a production gap.
+Aggregate descriptions retain supported factory spellings, explicit XTQL `all` spellings, and integer percentile literals.
+`AggregateAlias` and the validated owned `AggregateName` are immutable plan data with fixed canonical evaluators; each cursor normalizes its private descriptors without rewriting the retained plan.
+XTQL aggregate names preserve original case and separator spelling, with their retained string capacity included in plan and cursor allocation bounds.
+Computed aggregate arguments and ordering keys are projected before FILTER masks, including expressions that fail on a filtered-out row.
+The public relation validator requires those inputs to be columns.
+`rtdb-sql/tests/aggregate_forms.rs` and `rtdb-plan/tests/aggregate_forms.rs` retain spelling, execution-order, empty-input, and descriptor-validation cases from SQL `visitSetFunction`/`visitOrderedSetFunction` and XTQL aggregate planning.
+
+Inner joins build their left input and semi joins build their right input before opening the probe cursor.
+`DeferredInput` is a passive probe-opening descriptor; `PushdownBuilder` is a caller-owned transient that becomes an immutable, charged `Pushdowns` value.
+`JoinLayout` and its `JoinInput` descriptors are passive immutable values retaining charged schemas and computed equality-key expressions.
+Each side projects computed key columns over complete input pages in column order; the predicate and Bloom construction read the retained cells, and result rows exclude them.
+Extracted equality clauses precede residual predicates, retaining the pinned comparator's false-only short circuit.
+Inner, semi, and outer joins compare only pairs with the same composite key hash; anti joins scan every row of the loaded build partition, including unknown equality results.
+Only equality operands with nonempty column references contained in opposite inputs become keys, following `logical_plan.clj/as-equi-condition` and `join.clj/equi-spec`.
+Identity projections and renames map filter keys to scan columns.
+Row bounds and window evaluation stop inherited filters, preserving the selected prefix and window inputs.
+Persisted page Bloom filters participate in superseder-preserving page selection, and `_id`/`_iid` joins also restrict IID paths and selected events.
+The ordinary join predicate still determines matches.
+Empty IID sets remain descriptive and do not eliminate the probe scan.
+Normal outer and anti joins carry empty IID descriptors for probe `_id`/`_iid` keys without populating Bloom filters or IID restrictions.
+Statistics-flipped outer joins retain unmatched build rows and permit probe Bloom pushdown.
+The probe scan records the applied Bloom cardinality and IID count as Transit data for `EXPLAIN ANALYZE`.
+`BuildAccumulator` appends a complete page before comparing its row count with `QueryOptions::join_build_rows`; the default is 100,000, matching `xtdb.operator.join/*disk-join-threshold-rows*`.
+Crossing that threshold creates a framed spill; nonempty accumulated blocks determine the power-of-two partition count.
+Spilled joins disable their own probe filters and consume the complete probe input before publishing results.
+The disk cursor visits each build partition, then its corresponding probe partitions, then unmatched build rows.
+Each memory probe page or loaded probe partition completes before publication.
+`JoinPlan` is an immutable passive comparator/output descriptor; `JoinCursor` owns caller-driven phase state, and `BuildTable` owns rows, hashes, index and unmatched state together.
+`PartitionSpool` owns one query-scoped file and a charged span index; loading a partition preserves source block order.
+
+`rtdb-sql/tests/join_pushdowns.rs` maps the pushdown examples in `xtdb.api-test/test-explain-analyze-pushdowns` and covers aliases, empty builds, threshold crossing, unmatched outer rows, unadvanced joins, and cancellation.
+`tests/scan.rs` adds persisted Bloom pruning and newer-version supersession cases.
+`tests/join_keys.rs` covers cached-key output layouts, evaluation before an empty probe, hash-candidate and predicate error timing, and cancellation during key evaluation.
+The hash fixtures retain signed-width interpretation, IEEE byte order, null hashes, and persisted-byte interoperability.
+These sources have not run.
+Outer build-side selection uses Values counts and captured table-catalog row counts propagated through project, rename, filter, reference and let.
+Ties retain the normal build side; flipped outer joins use ordinary equality, while normal outer and full joins use the reference top-level null-equal key comparator.
+`src/join_page_tests.rs` and `src/join_storage.rs` retain memory/spill page order, build-statistics/null-key behavior, comparator preparation, partial-page failure and retained-resource assertions.
+The in-memory index follows `BuildSideMap` load factor and insertion order; the partition schedule follows `BuildSide`, `Shuffle` and `DiskHashJoin`.
+Native spill serialization remains query-private; identical physical-schema ordering of structured join-key hashes requires runtime qualification.
+Shared Mark joins use the same build/shuffle owner; correlated Mark retains its dependent-page evaluation boundary.
+The pinned JVM unary cursor wrapper forwards filter options through row-bound and window operators without a local barrier.
+Whether its optimizer prevents the corresponding top-level SQL shapes remains a Phase 2 differential characterization; native regression sources preserve the relational row-bound and window results.
+
+List-table cursors retain integer series as constant-size descriptors and charge that retained descriptor to the query budget.
+Materialized list cells retain their owned-memory reservation until the input advances or the cursor closes.
+Cancellation covers list construction through the query's existing owner and request cancellation tokens.
+
+URI equality in row deduplication, grouping, set membership, window partitions and DISTINCT aggregates first checks the raw vector key hash.
+Only matching full hashes reach Java URI component equality, matching the pinned relation-map candidate selection.
+URI MIN/MAX compares raw UTF-8 vector bytes independently of the scalar ordering path.
+The SQL URI regression source covers these boundaries; execution remains pending.
+EXPLAIN renders URI literals using the shared NFC ASCII encoder under its existing literal allocation bound.
+
+Equality admission checks the full declared collection type, including unpopulated Set alternatives.
+Explicit comparisons validate after runtime argument refinement; implicit key comparators validate when a row reaches DISTINCT, grouping, DISTINCT aggregation or set membership.
+Window partition comparators validate when an input page reaches the mapper, including an empty page.
+The implicit comparator owners retain their existing runtime schema values, and aggregate input type copies remain in the caller's reserved output scope.
+Direct value comparisons charge set-relevant metadata separately from retained rows.
+
+Limit and SortLimit retain nonnegative fixed-width integer literals or parameter descriptors as bounds.
+Their runtime parameter values must fit the nonnegative signed 64-bit domain.
+The plan and SQL row-limit regression sources remain unexecuted.
+
+PatchGaps endpoints admit omitted options, current-timestamp markers, datetime literals and direct parameters.
+Opening the cursor resolves endpoint objects in the captured query timezone and narrows their instants to microseconds; it does not evaluate scalar endpoint expressions.
+An omitted lower option uses the captured query clock and an omitted upper option is unbounded.
+A null parameter is a supplied value and fails datetime conversion.
+String parameter values retain the reference object-time parser's date fallback, while typed local dates resolve midnight through timezone gaps.
+Inverted endpoints fail with `xtdb.indexer/invalid-valid-times` and typed Instant context for both bounds; equal endpoints pass admission.
+`tests/patch_endpoints.rs` records these boundaries and clock precision as unexecuted regression source.
+PatchGaps emits one page for each input page and resets IID progression at that boundary.
+It copies each clipped row, including empty and inverted intervals, and advances subsequent gaps from the raw input upper bound.
+`src/patch_tests.rs` records explicit page boundaries, empty pages, clipping, cancellation and returned-page ownership as unexecuted source.
+Scan partitions source pages at their common trie paths, resolves visibility for each task, and retains one output page per contributing source page.
+Project preserves that page boundary.
+Sort observes complete source pages until their cumulative size exceeds 102400 rows: a single accumulation remains one output page, while a merged result emits 102401-row pages.
+Native memory spill thresholds do not change those Sort output boundaries.
+For a sort bound of at most 51200 rows, each overflowing initial accumulation reduces to that bound and the completed output remains one page.
+Larger bounds retain external merge page boundaries and cap the emitted row total; native sorting still spools and sorts its full input.
+`src/page_contract_tests.rs` covers source-page selection, set multiplicities, zero-limit polling, cancellation, retained ownership and production constructor paths with different client batch sizes.
+It also preserves complete Apply and Unnest expansion before a downstream limit can consume any result.
+`src/project_page_tests.rs` covers column-major payload and metadata error order, preparation of empty pages, cancellation, and retained output-cell charges.
+The source regressions include persisted plus live PATCH history across different client batch sizes and native spill thresholds.
+Persisted segment enumeration still has an engine-specific provenance: the reference catalog iterates Clojure map groups, while the native catalog orders its immutable trie entries.
+Exact cross-engine page placement for different catalog construction histories requires qualification; arbitrary raw PatchGaps inputs through remaining row-oriented operators also retain their existing page-layout obligations.
+
+Physical expression evaluation uses runtime relation schemas for projections, filters, sort keys, join keys, mark comparisons, apply bindings and list expansion.
+Computed join key fields retain their runtime alternatives when substituted into the join predicate.
+
+Aggregate FILTER masks finish across each semantic page before DISTINCT membership or scalar accumulator updates begin.
+DISTINCT membership finishes its complete mask before the inner aggregate runs; MIN/MAX retain the factory behavior that ignores the DISTINCT spelling.
+Grouping and aggregate DISTINCT narrow equality candidates by the full IndexHasher hash, including temporal and nested values.
+Array aggregates retain every input ordering key and sort the full column before selecting each group's included rows; percentile aggregates sort each group's included nonnull arguments.
+Aggregate columns finish in specification order, and their complete result is published as one nonempty page.
+`src/aggregate/page_tests.rs` retains page/spec error precedence, empty-page filter preparation, full-hash grouping, cross-page distinct state and returned-result ownership assertions.
+Its primitive regressions also cover complete-vector admission, runtime-width narrowing, duration conversion and null-slot failures, SUM-before-COUNT ordering, variance input classes, and boolean reducer setter boundaries.

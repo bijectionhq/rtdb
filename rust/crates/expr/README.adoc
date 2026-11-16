@@ -1,5 +1,9 @@
 = Expression source implementation
 
+`evaluate_batch` accepts expressions compiled against the execution field view from `rtdb_columnar::execution_field_type`.
+Its borrowed Arrow input can retain unsigned physical fields; decoded cells and external parameters are admitted at their signed vector widths before evaluation.
+Input buffers remain unchanged and returned output fields use the compiled execution types.
+
 Compiled expressions are passive values containing a bound expression and its input schema.
 Evaluation borrows the row, parameters, clock, time zone, and outer rows supplied by the query.
 Batch evaluation retains the declared result schema even for empty input or an input that contributes only one leg of a union.
@@ -7,6 +11,33 @@ Returned Arrow buffers retain their allocation reservation.
 
 The source implements three-valued predicates, conditional evaluation, nested values, comparisons, checked numeric arithmetic, decimal precision and scale rules, scalar functions, casts, timestamp conversion, and period construction.
 Every result and diagnostic remains unverified until Phase 2.
+Session-information scalars are caller-driven functions over the pinned constant user/database/search path and immutable process version metadata.
+Nullable CURRENT_SCHEMAS and CURRENT_SETTING arguments preserve null dispatch; other argument types fail signature validation.
+The native artifact's version and source revision are deployment identity, so paired version observations must bind each engine's own retained artifact metadata.
+
+The text catalog includes variadic STR, homogeneous text/binary CONCAT, character and octet positions, substring and overlay, byte and character trims, replacement, reversal, identifier quoting/parsing, string-to-array, and PostgreSQL FORMAT.
+SQL character positions count Unicode code points; octet functions count encoded bytes.
+The pinned trailing trim examines the last UTF-16 unit, so supplementary trim characters remain at the trailing edge.
+A null string-to-array delimiter splits UTF-16 units, with isolated surrogates written as the Java UTF-8 replacement byte `?`.
+FORMAT follows `PgFormat.kt` argument positions, width consumption, quoting, null values, and UTF-16 padding width.
+Evaluation reserves padding and replacement output before allocation.
+Scalar argument containers and batch output-value/reservation containers reserve their full capacity before allocation or row evaluation.
+`EvaluationScope` retains intermediate and returned-value charges until a query row, session value, or frontend result acquires ownership.
+Direct low-level evaluation with no scope requires an independently reserved caller; production query, transaction, control and metadata paths provide finite scopes.
+Control results carry their scope through pending protocol writes, and dropping the result or cancelled write releases it.
+
+STR and text casts share a native renderer for nested reader values, decimals, floating point, temporal values, binary, URI, and decoded Transit.
+Reader-based sets print as vectors and struct keys remain strings, as in `expression.clj/resolve-value`.
+DateMilli text casts and nested objects both use `DateVector.kt`'s truncating millisecond-to-day conversion; the `expression/temporal.clj` cast receives that normalized day value through `read-value-code`.
+FORMAT prints the primitive reader representation of temporal arguments, while STR and text casts produce Java temporal strings.
+`tests/strings.rs` preserves assertions from `test-str`, `test-cast-any-to-text`, `test-trim`, `test-binary-trim`, `test-format`, `test-like-regex`, and `PgFormatTest`, and adds allocation exhaustion and UTF-16 edge cases.
+The shared `rtdb_types::java_f32_text` and `java_f64_text` helpers retain fixed/scientific thresholds, signed zero, special values, and exponent changes in two-digit subnormal spelling.
+Shortest floating-point ties, collection order, and FORMAT arguments whose pinned reader prints JVM object identity still require reference qualification.
+Regular-expression syntax and flags use a native adapter; the Java Pattern compatibility corpus is recorded separately from the basic search and replacement assertions.
+RegClass casts and STR resolve names through a borrowed `PgCatalogLookup` over the captured evaluation catalog, using the pinned `pg_catalog, public` search path.
+RegProc uses the pinned `pg_catalog.array_in` procedure identity; unknown numeric identities retain decimal text and unknown names return the reference diagnostics.
+Controls capture a catalog only for expressions requiring it, and static transaction submission defers catalog-dependent casts to transaction snapshot resolution.
+The lookup enumerates schemas under the same finite evaluation scope as the returned text; it owns no cache or background work.
 
 The tests retain inputs from `xtdb.expression-test/test-numeric-errors-503`, `test-decimal-arithmetic-and-coersion`, `substring-test`, `negative-substring-length-test`, `test-character-length`, `test-coalesce`, `test-nullif`, and the compound equality cases.
 Additional source tests cover declared result schemas, zero-row batches, binding errors, temporal precision, and period bounds.
@@ -25,7 +56,31 @@ Duration text accepts Java ISO forms and the reference's millisecond-truncated u
 The ISO parser's component overflow order and signed fractional representation follow https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/time/Duration.java[OpenJDK 21 Duration].
 `tests/temporal.rs` retains observations from `test-temporal-arithmetic`, `interval-arithmetic-matches-java-time`, `test-interval-arithmetic`, `cast-duration-test`, `cast-interval-to-duration`, and `cast-interval-to-string`.
 The temporal modules are passive transforms; `IntervalParts` is an immutable component value with no owner task or retained state.
-Temporal comparison across local/zoned/date types, qualified intervals, remaining cast options, and the complete scalar function catalog remain outstanding.
+Temporal equality and ordering convert date/local/zoned operands in the session timezone and check overflow when refining timestamp, time, or duration units.
+Temporal scalar inequality compares raw reader values, while list and struct inequality negate recursive SQL equality.
+The separate passive ordered-vector comparator follows `expression/comparator.clj` and its temporal methods.
+It validates every type-leg pair, rejects collection ordering, and uses double precision for decimal ordering while scalar decimal comparisons remain exact.
+`tests/ordered.rs` records rounded decimal ties, signed zero, NaN, supported type families, and interval-unit failures as unexecuted source assertions.
+Strict `===` preserves temporal categories, zone labels, interval units and numeric categories, and treats nested nulls as equal.
+Month-day interval ordering uses the reference helper's wrapping nanosecond total, ignores negative month components, and rejects positive month components.
+`tests/temporal_comparison.rs` records these boundaries and literal-only date/time comparison casts; all observations remain unexecuted.
+Qualified intervals, remaining cast options, and the complete scalar function catalog remain outstanding.
+RANDOM returns a fresh double in `[0,1)` for each reached call, using the operating system random source.
+Its stream is not seeded or byte-matched to Java's shared `Math.random` generator.
+SLEEP accepts a duration and returns NULL after the wait.
+The pinned `expression.clj/sleep` computes milliseconds as `duration * (units-per-second / 1000)` under unchecked primitive arithmetic.
+This literal formula makes second-unit inputs zero, multiplies microseconds by 1000 and nanoseconds by 1,000,000, and rejects a negative result after wrapping multiplication.
+It is retained as a reference behavior requiring runtime differential confirmation, rather than treated as a conventional duration conversion.
+
+`evaluate_async` and `scalar_call_async` borrow the caller's future and require a Tokio time driver only when a nonzero SLEEP is reached.
+Their timers and intermediate values have no spawned task and are dropped with the evaluation future.
+The caller supplies cancellation and retains `EvaluationScope` until its output has another charged owner.
+Expressions without SLEEP use the synchronous evaluator and allocation path.
+Conditional, boolean and coalescing branches evaluate only their selected operands in either path.
+The synchronous scalar and batch APIs reject a reached nonzero SLEEP with `rtdb.expr/async-required`; they do not block a thread.
+Production query and session-option evaluation use the asynchronous API.
+The source fixtures in `tests/volatile.rs` and the private multiplier tests cover range, nulls, unit arithmetic, wrapping overflow, short-circuiting, dropped timers, and ordinary-path allocation equivalence.
+They have not run.
 Named-zone calendar arithmetic beyond Chrono's date range remains narrower than the reference's Java time range; fixed-offset and local calendar arithmetic use checked Gregorian civil-day conversion.
 Decimal values and result metadata retain signed 32-bit precision and scale.
 Declared precision is independent of physical coefficient width, including nonpositive metadata for empty or null vectors.
@@ -52,3 +107,326 @@ Temporal lexical formats, time-zone labels, numeric result schemas, and diagnost
 Fixed offsets accept the spellings defined by https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneOffset.html[Java ZoneOffset] and the `UTC`, `GMT`, and `UT` prefixes from https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneId.html[Java ZoneId].
 Named-zone rules still require qualification against the reference JVM's time-zone database version and available zone IDs.
 Scalar scratch values can allocate before their retained size is charged, so peak query memory is not yet bounded by this interface.
+
+Period intersection and predicates are passive transforms over the existing timestamp-range value.
+Intersection returns NULL for disjoint or adjacent half-open ranges.
+The predicate catalog includes the reference question-mark aliases, with point containment available through `contains?`.
+Point containment preserves the pinned raw timestamp-unit comparison in `expression/temporal.clj`; local timestamps convert to the session zone while retaining their unit, and dates convert through microseconds.
+`tests/periods.rs` retains endpoint, NULL, infinity, declared-type, alias, and time-zone source assertions; execution remains pending.
+
+Temporal cast descriptors retain fractional precision separately from their Arrow unit.
+Text-to-time, timestamp and duration casts apply precision before unit conversion; interval-to-duration casts apply it after adding days.
+Other temporal source casts ignore the precision option.
+Deferred XTQL options preserve that dispatch even when an ignored option has a malformed value.
+Negative duration precision floors its nonnegative nanosecond component, matching Java Duration.
+Timestamp text uses the shared SMART SQL grammar without first reducing nanosecond precision.
+Zoned timestamp casts require an explicit input offset or region, while local timestamp casts retain the parsed local clock.
+Time-to-timestamp evaluation reads the query clock's calendar date in the session zone through `EvalContext`; the context-free `cast_target` helper cannot perform that conversion.
+
+Qualified interval casts retain the requested fields and source-dependent precision checks.
+Single-field text SECOND casts retain nanoseconds with micro-interval metadata, irrespective of the requested fractional truncation.
+YEAR TO MONTH retains the reference's modulo behavior for negative months, and day-time normalization rejects positive month components while discarding negative ones.
+`tests/temporal_cast_options.rs` maps `expression.temporal-test/test-cast-string-and-temporal`, `cast-interval-to-duration`, `cast-duration-to-interval`, `cast-int-to-interval`, and the qualified interval text and interval-input assertions.
+The test sources also cover negative precision, overflow ordering, current-date casts, metadata selection and NULL propagation.
+Negative day-time text checks the positive duration's nanosecond range before negation; year-month text applies its sign before narrowing total months.
+ISO interval parsing narrows combined years and months once, while week-to-day multiplication retains its checked signed 32-bit range.
+Duration text retains Java's case-sensitive bare `T` guard and divides microsecond fallback quantities by 1000 before millisecond truncation.
+Consumed malformed options and absent required interval precisions return native typed errors; the corresponding JVM null-unboxing or class-cast diagnostics remain a qualification difference.
+No new cast assertions have been executed.
+
+Calendar operations and rendering use the shared Java-range `CivilDate` values and bundled OpenJDK timezone rules.
+Epoch-unit operations preserve their checked arithmetic before narrowing or changing units.
+DateDay expression output checks signed 32-bit day narrowing; DateMilli vector output retains the reference's wrapping day-to-millisecond multiplication.
+Scalar cast and arithmetic helpers retain wide calendar intermediates; the public evaluators admit the completed result recursively.
+An enclosing scalar text cast can therefore render a wide date even when projecting that date itself exceeds signed 32-bit day storage.
+Struct construction evaluates and boxes every field before field selection.
+Day-date box writes check signed 32-bit narrowing, while millisecond-date boxes retain their day count until vector output.
+List and set expressions retain passive element readers within one evaluator invocation.
+Size, null and type observations do not evaluate elements; `nth` evaluates and boxes its selected element on each read.
+List equality checks lengths first and stops reading after a definite inequality.
+List casts defer element conversion until a cell is read, and concatenation retains its input readers.
+An identity struct cast preserves nested readers.
+Final output materializes every remaining cell before physical date admission.
+These boundaries follow `xtdb.expression`'s struct, list, set, list-cast and equality emitters and the typed `ValueBox` writers.
+The suspended evaluator preserves the same intermediate until its caller-owned SLEEP completes.
+Dropping an evaluation drops its reader wrappers and current timer; readers retain no task, runtime or memoized child result.
+Ordinary scalar expressions keep the synchronous path; the collection path charges its caller-owned recursive futures and temporary type descriptions to the evaluation scope.
+Object ingestion has its separate truncating DateDay admission contract.
+`tests/calendar_range.rs` covers physical date endpoints, timestamps beyond Chrono's calendar range, recurring far-future offsets and source-unit overflow ordering.
+`tests/collection_readers.rs` covers eager struct boxing, lazy element demand, repeated suspension, cancellation and DateMilli box-versus-output narrowing.
+These regression sources have not been compiled or executed.
+
+== Array bounds and trimming
+
+`array_upper`, `array_lower` and `array_length` accept an ordinary list and an I64 dimension.
+Dimension one returns the element count, lower bound one, and element count respectively; an empty list keeps lower bound one.
+Other dimensions return `xtdb.expression/array-dimension-error`.
+`trim_array` accepts a signed integer count and keeps a lazy view of the input list.
+An overtrim returns `xtdb.expression/array-element-error` with the remaining length.
+Negative counts extend the declared view, and reading beyond the input fails.
+The view checks the signed 32-bit size limit when its size is observed; `array_lower` does not observe that size.
+A negative `nth` index returns null without observing the size.
+Trim prepares both argument continuations before consuming the list payload, and observes the input size before demanding the selected nonnull count payload.
+CASE conditions, COALESCE bindings, `nth` selection, LIKE operand controls and polymorphic boxing retain their reference ordering.
+Array bounds functions demand the dimension before the list payload, and `array_lower` discards that payload.
+A monomorphic arithmetic count can remain deferred while a polymorphic CASE result must be evaluated into its selected result kind.
+Null arguments short-circuit later argument evaluation.
+`tests/array_count_order.rs` covers competing failures, null payload effects, cancellation and admission through this count path.
+The ordinary `col_description`, `pg_indexam_has_property` and `mod` entries use the same continuation path.
+Equality uses that path for argument controls, null shortcuts and polymorphic payloads, including the equality disjunctions emitted for short SQL IN lists.
+Other scalar consumers still use the existing evaluator; their complete continuation timing remains open source work.
+Native type predicates such as `integer?` preserve their existing nonnullable Boolean and eager payload contract; admission of those names by the pinned JVM expression surface remains unqualified.
+`tests/arrays.rs` contains regression source; compilation and execution remain pending.
+
+`col_description` and `pg_indexam_has_property` return NULL with the signed integer, OID and text signatures exposed by the pinned reference.
+`tests/pg_null_functions.rs` retains the source assertions for those compatibility calls.
+`tests/scalar_continuations.rs` covers discarded inline arguments, control selection, polymorphic boxing and effects for those calls and MOD.
+`tests/equality_demand.rs` covers both public evaluation entry points, scalar and composite results, literal coercion, discarded payloads and retained control/effect demands.
+The numeric catalogue includes `log10`, `sinh`, `cosh`, `tanh` and `mod`; expression and XTQL callers also expose the `double` conversion.
+`tests/math_catalogue.rs` covers nulls, result types and native numeric dispatch as unexecuted source.
+
+== Temporal fields, bins and clocks
+
+`extract` accepts a literal uppercase field and returns a signed 32-bit value.
+Calendar fields include ISO week numbers and both Sunday-zero and Monday-one weekday numbers.
+Zoned timestamp extraction uses the value's timezone, including signed timezone-hour and timezone-minute components.
+`date_trunc` preserves the source date or timestamp unit and timezone metadata.
+Calendar truncation uses Monday weeks and signed year multiples truncated toward zero; clock truncation floors timestamps and truncates interval durations toward zero.
+An optional literal timezone applies only to zoned timestamps and resolves overlaps using the original offset.
+`age(end, start)` combines `Period.between` calendar adjustments with the remainder obtained after subtracting `Duration.toDays`.
+Zoned operands are localized through the execution timezone; nanosecond operands retain nanosecond interval output.
+
+`date_bin(stride, source[, origin])` retains the pinned arithmetic expansion and epoch default origin.
+The stride and origin are each evaluated once, in that order, before the source expression.
+Its integer quotient truncates toward zero, including before the origin.
+`range_bins(stride, from, to[, origin])` exposes a lazy list of `_from`, `_to` and `_weight` structures with microsecond UTC boundaries.
+The helper uses wrapping arithmetic and checks signed 32-bit narrowing when its reader size is requested; a negative size is observable through cardinality and produces no rows when iterated.
+All-zoned endpoints require microsecond units; mixed date/local endpoints pass through the shared instant casts.
+Size and individual-cell observations do not materialize the remaining bins.
+Table iteration retains a constant-size descriptor, and callers of `EvaluatedList::get` reserve `cell_allocation_bound()` before creating a generated structure.
+Materialization reserves cells and yields on the caller's future; cancellation drops the caller-owned evaluation region.
+
+Clock functions use the captured query time.
+`current_date` and `current_time` use UTC; `local_date`, `local_time` and `local_timestamp` use the execution timezone.
+The compact aliases `localdate`, `localtime` and `localtimestamp` are equivalent, and `current_timezone` returns the zone identifier.
+Clock precision is a literal integer clamped to 0 through 9, with default 6 and the reference's signed truncation.
+Query binders call `bind_clock_timezone` before advertising `current_timestamp` or `now` metadata; retained control expressions use its session-zone form.
+
+`tests/temporal_functions.rs` maps these contracts to `expression/temporal.clj` and `TemporalMath.kt`, including overflow, overlap offsets, negative duration remainders, null evaluation order, lazy allocation and cancellation.
+The current implementation emits `_from`, `_to` and `_weight`; the older JVM range-bin fixture still destructures `xt/from`, `xt/to` and `xt/weight`.
+That fixture discrepancy and runtime parity remain Phase 2 qualifications; the new regression sources have not executed.
+`EvalContext` retains a seconds-and-nanoseconds `Instant`; precision 7 through 9 uses the original fractional component.
+`query_clock_instant` preserves timestamp parameter units and resolves local values in the execution zone.
+String clock inputs follow `Time.asInstant`'s date fallback; typed SQL timestamp options retain their local clock.
+`tests/query_clock.rs` covers exact positive and pre-epoch clocks, all result precisions, timezone resolution and explicit microsecond narrowing.
+Temporal calls retain the strict continuation behavior: a null argument can discard a pending monomorphic payload, while CASE selection and polymorphic boxing remain demanded.
+Direct scalar field calls validate applicability, and checked arithmetic delegated by temporal functions reports the expression overflow anomaly.
+
+== Series readers
+
+`generate_series` accepts signed integer or compatible temporal endpoints, a stride, and an optional endpoint-inclusion Boolean.
+Three arguments exclude the endpoint.
+Integer results retain a checked signed 32-bit length and compute individual values with wrapping signed arithmetic.
+Array size and element consumers can read that view without allocating its other cells.
+Temporal results materialize eagerly, apply calendar months and days before duration fields, and yield on the caller's future during long construction.
+Date/month iteration clamps each successive month; timestamp iteration preserves the common endpoint zone or uses UTC for differing endpoint zones.
+`evaluate_list_async` retains a constant-size integer-series result for table iteration and applies ordinary projection validation to other materialized list results.
+The returned descriptor borrows no expression inputs; the caller transfers its retained charge before releasing the evaluation scope.
+`tests/series.rs` covers types, endpoint arithmetic, calendar stepping, lazy consumers, budget failure and cancellation as unexecuted regression source.
+
+== URI components
+
+`uri_scheme`, `uri_user_info`, `uri_host`, `uri_port`, `uri_path`, `uri_query` and `uri_fragment` accept URI values and propagate null inputs.
+The port is a nullable signed 32-bit integer; all other components are nullable text.
+UTF-8-to-URI casts validate Java URI syntax and retain the original spelling for text rendering.
+The shared parser preserves missing versus empty components, opaque URI behavior, registry-authority fallback and bracketed IPv6 hosts.
+Percent decoding replaces malformed UTF-8 byte sequences with Java's grouping and leaves plus signs unchanged.
+URI equality folds ASCII scheme and host case and hexadecimal escape case, while retaining raw paths, encoded octets and port presence.
+Nested reader and Transit rendering applies Unicode 16 NFC before percent-encoding non-ASCII text; direct URI text casts preserve the original spelling.
+The pinned scalar and ordered URI comparator passes URI objects to a byte-buffer function and fails when two nonnull URI values are compared.
+URI MIN/MAX remains a separate vector-byte operation.
+`tests/uri.rs` contains unexecuted cast, component, equality, comparison, rendering and allocation-admission regressions.
+Full isolated-surrogate input support requires a wider string carrier.
+
+== Bitwise scalar functions
+
+`bit_not`, `bit_and`, `bit_or`, `bit_xor`, `bit_shift_left` and `bit_shift_right` accept signed integer legs and their hyphenated aliases.
+NOT and shifts retain the source or left width; binary logic uses the signed least upper bound.
+Shift counts narrow to signed 32 bits for an 8-, 16- or 32-bit left operand before applying the JVM's low-six-bit shift mask.
+An out-of-range narrow count raises the reference arithmetic overflow anomaly, and left-shift output wraps to the left width.
+The shared continuation reader selects nulls and branch controls before consuming pending bitwise payloads.
+`tests/bitwise.rs` covers scalar and operator widths, count bounds and discarded versus boxed payloads; these regression sources remain unexecuted.
+
+Shared scalar aliases `is_true`, `is_false` and `distinct_from` preserve the truth-predicate and null-safe inequality contracts.
+`_meta_double` returns numeric values as doubles, dates and timestamps as epoch seconds, and times and durations as seconds; other types return null.
+Expression continuations select these constant outcomes before demanding monomorphic payloads, while branch controls and polymorphic boxes retain their evaluation order.
+`tests/scalar_aliases.rs` records these cases as unexecuted regression source.
+
+Generic `compare` returns a signed 32-bit comparison result, with null-propagating argument selection.
+`compare_nulls_first` and `compare_nulls_last` give null a fixed position and return zero for two nulls.
+Byte-backed values preserve the reference comparator's big-endian character-pair difference, trailing-byte difference or length difference; numeric and temporal pairs preserve their shared ordered-vector rules.
+The plan validates every pair of type legs before row evaluation, and reached URI pairs retain their comparator failure.
+`tests/comparison_calls.rs` records magnitudes, type admission, null demand and control evaluation as unexecuted regression source.
+
+Field access retains a Struct member's type and value, returning null for missing members and unsupported source types.
+Transit access checks keyword keys before string keys, falls back after null or false, and returns a truthy result as Transit.
+Stored errors expose their exception data, and transaction-key records expose their map fields.
+Error and transaction-key handlers reconstruct nested objects before selection, preserving constructor validation and canonical selected-object encoding.
+The generic `get_field` call has no field-name metadata: it selects the empty Struct member name, or a truthy nil Transit map key before the missing-name failure.
+The continuation reader discards unsupported monomorphic payloads while retaining branch controls, polymorphic boxes and Struct construction.
+`tests/field_access.rs` records lookup, constructor, demand-order and allocation regression sources; execution remains pending.
+
+Generic `like` and `ilike` share the SQL predicate matcher and strict null selection.
+Text matching uses the Java-compatible pattern owner, including Unicode case folding, supplementary characters and Java line terminators.
+Binary LIKE applies wildcards to the reference's hexadecimal pattern representation; ILIKE accepts text only.
+Pattern payloads are consumed before source payloads after argument controls select their types.
+`tests/like_calls.rs` supplies type, value, demand-order and allocation regression source; execution remains pending.
+
+SQL equality and inequality reject Set/Set type pairs before reading values, collection sizes or selected branches.
+Admission descends through ordinary list element alternatives and matching struct field sets; different struct field sets retain their constant result.
+Null-safe equality and distinctness share this admission, while strict `===` retains its object-equality contract.
+Direct equality callers reserve `equality_allocation_bound` for set-relevant temporary type metadata.
+`tests/set_equality.rs` retains direct API, nested union, empty typed list and unselected-branch regression sources; execution remains pending.
+
+`single_field_interval` and `multi_field_interval` expose the interval constructors used by the reference expression lowering, including hyphenated aliases.
+Their case-sensitive unit names and consumed precision metadata must be literals; single-field calls ignore fractional precision outside SECOND, while multi-field calls consume it for result metadata even outside SECOND.
+Argument continuations retain null short-circuiting and branch or polymorphic evaluation, and the constructor consumes only its source payload after those controls complete.
+The constructors share the qualified interval parsers and physical interval output types.
+`tests/interval_constructors.rs` covers metadata ordering, ignored payloads, nulls, field values and overflow as unexecuted regression source.
+
+`nth` and subscript expressions select their argument types through the continuation reader before consuming element payloads.
+Null arguments and unsupported monomorphic source types can return null without evaluating discarded scalar payloads; branch controls and polymorphic boxes still run in argument order.
+List cells remain lazy until a valid position is read.
+`tests/nth_dispatch.rs` records these demand boundaries as unexecuted regression source.
+
+The scalar continuation path selects argument types before consuming their payloads.
+A selected null discards earlier monomorphic payloads and skips later arguments, while selected controls and polymorphic boxes retain their demand.
+Null and truth predicates can return constants from the selected type.
+`if` coerces nonnull nonboolean types to true without consuming their payload; `and` and `or` consume their selected operands with boolean coercion.
+`coalesce` and `greatest` retain their nonnull bindings, and `nullif` evaluates its left binding even when it is null.
+`format` consumes null payloads.
+Floating `round` can discard the scale payload after a nonfinite input, `log` consumes its value before its base, and `string_to_array` discards the delimiter payload for a null input.
+
+Object-time conversion resolves typed local dates as midnight local datetimes in the supplied timezone.
+This retains the gap shift when midnight itself is absent, including a transition that began on the preceding date.
+`tests/query_clock.rs` records the shared exact-clock and microsecond-boundary conversion for that case as unexecuted source.
+
+Registered Transit scalar handlers are constructed recursively before field selection, including children of unknown tags and ignored fields.
+The decoded value retains numeric wrapper classes and byte-array/Throwable identities until the selected object is written.
+The initial adapter covers signed-width and floating-width casts, BigInt, BigDecimal, ratios, characters, URI, UUID, ByteBuffer, key functions and Clojure forms, together with the existing error and transaction-key handlers.
+Numeric widths use the default numeric writer form, UUIDs use their two signed 64-bit components, and ByteBuffer text is emitted with lowercase hexadecimal digits.
+Single-precision objects retain MessagePack's 32-bit float payload when selected, nested, or written as map keys; decoding either float width produces the reference double value.
+The pinned `xtdb/period-duration` registry entry is a plain function rather than a Transit `ReadHandler`, so encountering that tag fails construction.
+The time, type, path, table, legacy Date, metadata and link handler families, collection hash/equality behavior, and reuse by comparison and text consumers remain required source work before the Phase 1 gate can close.
+`tests/transit_objects.rs` and the public SQL/XTQL field-access tests record these scalar conversion, nested failure and allocation contracts as unexecuted regression sources.
+
+Simple CASE uses an explicit operand binding.
+It evaluates that operand once, including a null payload, before testing equality alternatives in order.
+A null operand skips the WHEN payloads; later alternatives and selected result boxes retain normal type admission and continuation rules.
+
+`nth` and subscript admission require a signed integer index for each nonnull argument combination.
+Ordinary lists expose nullable element types; other registered source kinds yield null, while fixed-size-list has no reference function hierarchy entry.
+
+Generic function admission follows registered reference methods.
+Unregistered names reject nonnull calls; a strict null specialization skips method lookup and discards pending monomorphic payloads.
+UUID and URI construction use typed casts, and generic string functions use `substring` and `character_length`.
+
+LIKE_REGEX selects three UTF8 arguments and compiles its selected pattern before consuming the input payload.
+Its flags come from literal expression metadata; nonliteral flag payloads are unused, while their control expressions and polymorphic boxes retain normal argument selection.
+A selected null argument discards earlier deferred payloads and skips later arguments.
+The direct scalar value API consumes its supplied flags value.
+LIKE and ILIKE also compile the selected pattern before consuming the input, and their compiled pattern stays on the caller's continuation through cancellation.
+
+`_patch` selects both argument controls before consuming its struct payloads.
+A null left argument contributes no payload, while Struct construction and polymorphic argument boxing retain their evaluation effects.
+Merged fields retain their existing nested list readers until a field consumer reads them.
+
+Stored Transit field access constructs semantic objects through the wire decoder's read cache.
+Repeated cached byte-array and NaN keys retain object identity during record construction, including NaN returned unchanged by ratio division.
+The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.
+
+Scalar emission derives every declared type alternative from the complete runtime input and outer schemas and bound parameter types before selecting a payload.
+`EvalContext::parameter_types` optionally supplies the complete execution vector type for each parameter and must match the value slice's width.
+Query execution supplies it for external arguments and correlated captures; direct callers omitting it use expression annotations and infer untyped parameters from their values.
+CASE boxing, nullable boolean control and lazy list metadata retain those alternatives even when a row selects only one leg.
+`expression_type` exposes the same admission step to page bindings and physical key layouts without evaluating row payloads.
+
+Transit default object handlers apply Java numeric string and binary decoding rules before field selection.
+Double representations accept decimal and hexadecimal literals with Java whitespace and suffixes; hexadecimal conversion rounds once to the nearest binary64 value, including subnormals and signed zero.
+Binary representations accept omitted padding and ignored unused bits, while partial padding and nonalphabet characters fail.
+`with-meta` validates a persistent collection or symbol and its metadata map; the default writer emits the underlying value.
+Transit links retain their map contents without validating link fields, and distinct link objects retain reference identity.
+`tests/transit_default_handlers.rs` records these contracts and nested failure ordering as unexecuted regression source.
+
+BETWEEN binds complex subjects once before evaluating bounds, including null-producing subjects.
+Symmetric BETWEEN tries the reversed bounds only after the forward comparison fails to return true; reached bound expressions may be evaluated again.
+Ordered predicate admission retains generic comparison pairs, rejects unregistered half-float and fixed-list heads, and checks specialized interval pairs before payload evaluation.
+A bound complex BETWEEN subject loses literal temporal coercion, while literal bounds retain it.
+
+Stored Transit temporal objects retain their registered Java object kind through parsing, equality, map-key hashing, and re-encoding.
+Local dates and clocks use strict ISO parsing; timestamp handlers use the reference SQL timestamp grammar and SMART calendar resolution.
+Periods retain separate year and month components, durations retain nanoseconds across the signed64 seconds range, and interval construction checks its signed32 months and signed64 nanoseconds.
+An interval representation outside the registered grammar decodes to null; malformed components inside that grammar fail.
+Timestamp ranges convert string, instant, zoned timestamp, and legacy Date endpoints through the reference time-conversion protocol and retain open bounds.
+Legacy millisecond Date representations accept Java `Long.decode` radix and sign spellings and write signed millisecond values.
+The verbose Date handler accepts JAXB XML calendar forms, including partial dates, and resolves them after replacing their validated lexical timezone with UTC.
+It preserves millisecond truncation, calendar normalization, signed32 calendar-year conversion and signed64 epoch-millisecond wrapping.
+Open timestamp ranges also accept empty string and byte-array representations.
+Month and weekday enum keys use canonical value equality; their reference hash bucket order depends on JVM object identity and remains a cross-runtime qualification.
+`tests/transit_time.rs` and the temporal adapter's unit cases record these contracts as unexecuted regression source.
+
+== Replacement metadata and invocations
+
+REGEXP_REPLACE retains raw metadata separately from its evaluated source child.
+Emitted-type admission checks replacement text, start/occurrence truthiness and raw seqable flags; null-only sources do not interpret them.
+`ExpressionInvocation` borrows one expression and input schema, retains its emitted output type and owns immutable compiled replacement bindings.
+The caller retains the preparation allocation scope until the invocation drops and supplies the same input and parameter vector types for every row.
+Row work uses a separate caller scope and future, so cancellation drops pending source evaluation while preparation charges remain owned by their invocation scope.
+Direct batch evaluation prepares once before reading rows, including zero-row batches.
+Patterns compile in emitted call order: a replacement call precedes its source bindings, and nullable COALESCE tails precede their earlier arguments.
+A statically non-null COALESCE input omits the remaining metadata bindings.
+The raw carrier preserves host pattern lists, symbols and other forms independently of scalar XTDB arguments.
+Native host compilation admits all emitted pattern programs before any pattern binding executes.
+Its initial lexical and string forms include simple-symbol `let`/`let*`, `if`, `do`, `quote`, `when`, `when-not`, `and`, `or`, vector evaluation, and `str`, `identity`, `name`, `namespace`, `subs`, `not` and `boolean` calls.
+Lexical function values preserve strict argument evaluation, and substring indexes count UTF16 units.
+Host numeric values share exact BigInt, BigDecimal and JVM primitive categories with stored Transit objects, retaining decimal scale and Java numeric text.
+Checked `byte`, `short`, `int`, `long`, `float` and `double` calls preserve primitive inline overloads and boxed function invocation; substring indexes use boxed RT integer conversion.
+Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.
+The host admission limits are 128 nested forms and 65536 instructions, with a 16MiB limit per computed text temporary.
+General host arithmetic, interop and effects, namespace state, destructuring/functions/macros, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
+Forms outside the implemented host subset report `rtdb.expr/regex-host-form` explicitly.
+`tests/regex_host.rs` records lexical, phase, empty-input and ownership regressions as unexecuted source.
+`tests/regex_replace_metadata.rs` contains unexecuted source regressions for phase, full vector types, empty batches, per-row scope release and cancellation.
+
+Stored Transit maps insert decoded entries in wire order and retain the first equal key object when replacing its value.
+Small maps compare keys before crossing the eight-entry hash-map threshold; sets use hash candidates from their first member.
+Java object hashes and Clojure collection hashes preserve their distinct numeric-class, decimal-scale, URI and nested-collection contracts.
+TxKey values keep fixed fields before extension entries and compare those fields before their extension maps.
+Hash and equality failures occur during reached collection insertions, including collections outside the selected field.
+List, set and composite-map array handlers can be bypassed by nested tags or JSON map markers, and composite maps discard a final unmatched key.
+Opaque reference-identity objects retain identity within one decode; their exact bucket enumeration across processes remains qualified.
+`tests/transit_collections.rs` records collection construction, hash admission, key retention and canonical writing as unexecuted regression source.
+
+== Java UTF16 graph dispatch
+
+SQL Java patterns select the existing UTF16 node graph for every pattern, including patterns without grapheme-boundary or line-ending atoms.
+Escaped surrogate atoms and ranges retain integer code points, and lookbehind captures retain code-unit intervals.
+Replacement advances one UTF16 unit after an empty match and assembles the complete output before encoding valid pairs and replacing unpaired units with `?`.
+The native vendor's ordinary defaults remain unchanged; its explicit `java_utf16` builder method enables Java matching and the graph.
+Disabling Java matching clears that selection, and borrowed UTF8 capture APIs continue to reject intervals that split a surrogate pair.
+Graph compile, delegate and retained matching state are reserved before construction; per-input UTF16 scratch and completed output use the caller's allocation scope.
+The shared analyzer's checked cumulative-width admission and existing finite pattern, nesting, repetition, step and stack limits remain in force.
+`tests/java_pattern.rs` and vendor `tests/java_utf16.rs` retain the unexecuted matcher and ownership regressions.
+The ordinary matcher dispatch gaps covered here are separate from the wider UTF16 text-carrier and raw host-form evaluator work.
+
+Stored Transit Path values retain Unix byte identity separately from runtime-image path identity.
+URI validation precedes path construction; Unix slash normalization preserves dot segments, and the exact `file:///` spelling selects raw escaped octets.
+Other file URI spellings decode text before constructing a path, while `jrt` paths use their registered module prefix and provider constraints.
+Canonical Path writing uses Java UTF-8 replacement for Unix bytes, so distinct objects can write the same text.
+The adapter currently represents the default UTF-8 Unix provider and the standard runtime-image provider; other default-platform encodings and externally installed filesystem providers remain explicit environment gaps.
+`tests/transit_paths.rs` records normalization, nested invalid paths and retained key identity as unexecuted regression source.
+
+Decoded Transit anomalies retain their complete normalized exception data and cause while their writer omits the cause.
+Their object equality compares message, Clojure map equivalence and recursive cause equality; their hash follows the Java message/data/cause hash.
+Explicitly present null or false error-code entries remain distinct from an absent entry during object comparison.
+ExceptionInfo retains object identity, including when used as an anomaly cause.

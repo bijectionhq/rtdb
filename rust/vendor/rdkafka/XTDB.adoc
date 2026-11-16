@@ -1,0 +1,28 @@
+= XTDB native TLS callback fork
+
+This directory contains rust-rdkafka 0.38.0, paired with `../rdkafka-sys` 4.9.0+2.10.0 and its bundled librdkafka 2.10.0.
+The upstream distributions and their license notices are retained.
+
+`SslContextConfigurer` is a passive, shared configuration capability.
+Its callback receives the linked OpenSSL `SSL_CTX` after native certificate and verification setup and before any connection starts.
+The callback may install per-connection callbacks that borrow its immutable state.
+`ClientConfig`, `NativeClientConfig` and every native configuration clone retain the capability.
+A successfully created `NativeClient` takes ownership until `rd_kafka_destroy` returns.
+The native pointer is destroyed before its retained callback capability.
+Failure from `rd_kafka_new` leaves the caller's C configuration owned by Rust and releases it before the capability.
+An already-created C client is under RAII ownership before log-queue setup can fail.
+The temporary main-queue reference is also released.
+
+The C API adds `rd_kafka_conf_set_ssl_ctx_configure_cb` with a borrowed opaque pointer and a bounded error buffer.
+Configuration duplication copies both callback and opaque fields.
+The Rust wrapper supplies ownership for that borrowed pointer through an `Arc` and catches setup callback unwinding at the C boundary.
+A native creation failure after TLS context setup destroys the context and loaded providers before librdkafka clears its copied configuration.
+The fork requires its bundled C source; dynamic linking and external prebuilt librdkafka are rejected by the build script because those binaries lack this callback ABI.
+
+The adapter uses OpenSSL's public context, certificate-selection and chain-checking APIs.
+It does not inspect private C layouts or locate callback state through a global registry.
+The consuming Kafka crate pins `openssl` 0.10.81 and `openssl-sys` 0.9.117, shared with the native dependency's OpenSSL linkage.
+
+Primary references are https://github.com/fede1024/rust-rdkafka/tree/v0.38.0[rust-rdkafka 0.38.0], https://github.com/confluentinc/librdkafka/tree/v2.10.0[librdkafka 2.10.0], https://docs.openssl.org/3.0/man3/SSL_CTX_set_cert_cb/[SSL_CTX_set_cert_cb] and https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
+Native ownership and handshake regression sources live in `../../crates/kafka/tests/native_tls_ownership.rs` and `../../crates/kafka/tests/connect_registry_tls.rs`.
+The fork and regression sources remain uncompiled and unexecuted in the source-only phase.

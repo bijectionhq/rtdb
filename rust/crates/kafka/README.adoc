@@ -83,12 +83,27 @@ As in the pinned registry client, absent, empty, or `none` endpoint-identificati
 Registry domain read rules execute after datum decoding and before Connect conversion; write-only, migration-only, disabled, and `NONE`-tolerated rules permit reads.
 Read rules run in reverse declaration order, use rule-name/type/default configuration override precedence, and distinguish a decoded Avro null from a JSON null node.
 The shipped converter classpath has no rule executor service; an active rule without an executor takes its configured failure action, which defaults to `ERROR`.
-Reader-schema migration, DLQ producer actions, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
+Reader selection supports the writer schema, the latest subject version, and latest metadata matches with a bounded cache and expiry.
+Upgrade migrations visit adjacent versions in ascending order; downgrade migrations reverse that order and use the target version's metadata for rule parameters.
+DLQ actions select a subject-qualified rule registration, a rule-name registration, then the first registration of that type.
+Action configuration merges converter options, default parameters, type parameters, and named parameters.
+READ failures send the original Confluent frame; migration failures send the current JSON value.
+JSON payloads and defaults preserve integral node identity and arbitrary integer digits through conversion and migration output.
+Integer Connect fields use Jackson's low-bit narrowing.
+Registry JSON retains BigDecimal precision and scale; generic JSON and Avro migration floats use Java double spelling.
+Value failures retain the Registry key frame, while key failures send a null value.
+The source uses headerless converter calls, so DLQ records carry the five generated rule headers.
+A missing DLQ topic fails before producer creation; producer failures leave the rule failure as the returned conversion error.
+The assignment owner awaits both converter drains after normal completion, errors, and cancellation.
+Native Kafka dead-letter producers support PLAIN/SCRAM credentials and JKS, PKCS12 or PEM client material, including multiple private-key entries selected during the TLS handshake.
+Java protocol and cipher-suite configuration uses the native OpenSSL client adapter; link:TLS.adoc[TLS configuration and open parity gaps] records its scope and pending qualification.
+Additional Java producer extensions, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
 Client certificate selection retains all keystore identities and matches signature schemes and acceptable issuer names.
 PKCS12 store and private-key passwords are independent.
 System trust roots retain an 8 MiB reservation; configured trust material retains its keystore decode reservation.
 The native trust-store allocation bound requires runtime qualification.
-Date patterns support numeric calendar/time fields, English month names, quoted literals, and UTC/offset zones; locale/week fields and two-digit-year parsing require further implementation.
+Date patterns use native hybrid Gregorian, Buddhist and five-era Japanese calendars with the pinned CLDR locale data, week fields, localized names/numbers, named zones and construction-time two-digit-year pivots.
+link:LEGACY-DATES.adoc[Connect date conversion] records the raw-millisecond boundary, process environment, resource ownership and remaining provider qualifications.
 Java regex, charset, float formatting, Gregorian cutover behavior, and header inference edge cases remain to be matched against their reference assertions.
 Source metrics expose an assignment-scoped registration guard and status channel, including native high-watermark minus application-offset lag.
 The guard receives every retained record's timestamp lag after a successful indexer batch, using the same millisecond clock observation for the entire batch.
@@ -100,3 +115,28 @@ No Kafka Connect compatibility or memory-bound qualification is claimed before t
 
 The source mapping is `KafkaConnectSource.kt`, `ConnectConfig.kt`, `RecordIndexer.kt`, `DocsIndexer.kt`, their Kotlin tests, and `kafka_connect_source.proto`.
 Native converter and transform behavior is also traced to the Kafka 4.4.0 source artifacts, and registry conversion work targets Confluent 7.8.0.
+
+Avro reader resolution is an immutable action graph over the writer and reader schemas.
+It applies named and field aliases, record projection and defaults, ordered reader-union selection, numeric and string/bytes promotions, enum defaults, and recursive schema pairs using Avro 1.11.4 `Resolver` rules.
+Incompatible writer-union branches fail when selected; selected reader defaults use the first union branch.
+Binary reader resolution skips projected-away fields directly from the wire and reserves space for selected values and defaults.
+Binary datum readers consume one value and ignore its suffix; the Confluent root-bytes path retains the complete payload.
+Selected collection blocks consume their item counts; projected negative-count blocks skip their declared byte lengths.
+Malformed skipped byte lengths may rewind within the datum slice and the pinned decoder's first-compaction window, with cumulative rewind distance limited to one datum length per decoding pass.
+Rewinds before that window, Java cursor integer wrapping, and rewinds into the Confluent framing prefix remain compatibility boundaries.
+The pinned byte-array decoder can expose that prefix for payloads of at least 16 bytes before its first compaction; the native decoder owns only the datum slice.
+Schema-only datum plans defer Connect graph construction until the output schema is selected.
+Reader output retains the writer Registry version and the converter's nonrecord writer-schema behavior.
+The physical decoder leaves logical values as their integer or byte representation until Connect conversion.
+Local raw JSON default descriptors retain oversized integer spelling and floating exponents without changing other JSON consumers.
+
+The Avro migration codec follows `AvroSchemaUtils.toJson` and Avro 1.11.4 `JsonDecoder`: nested union labels, ISO-8859-1 binary strings, record field reordering and aliases, and required JSON fields remain distinct from binary reader-default resolution.
+`AvroDatum` couples the physical datum with its actual schema; each passive `AvroMap` retains its raw keys, insertion history, and reader key class.
+Its caller-owned map replay follows OpenJDK 21 `HashMap` bucket order, resizing, collision trees, and duplicate replacement at every map depth.
+Collision trees use ordered lookup and linked iteration to preserve replacement and root movement without scanning entire buckets.
+Malformed binary strings retain their original bytes through string/bytes promotions and use Java UTF-8 replacement at text conversion.
+Distinct malformed `Utf8` map keys retain byte identity through reader selection; String reader keys, migration JSON properties, and Connect String keys collapse duplicates at their respective conversion boundaries.
+Resolution, selected Connect graphs, JSON expansion, and detached conversion results retain their admitted memory charges through their owners.
+The resolver, migration, output-selection, default-number, malformed UTF-8, and map-order regression sources have not been executed.
+Registry HTTP and dead-letter producer clients accept empty Java identity and trust stores; server identity admission still requires a usable key.
+Explicit empty trust stores retain no default roots and fail untrusted handshakes.

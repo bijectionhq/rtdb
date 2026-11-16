@@ -36,17 +36,17 @@ fn field_name(schema: &ConnectSchema, options: graph::UnionOptions, index: usize
 fn enumeration(schema: &ConnectSchema) -> Option<&str> {
     schema.parameters.get("org.apache.kafka.connect.data.Enum").or_else(|| schema.parameters.get("io.confluent.connect.avro.Enum")).map(String::as_str)
 }
-fn matches_member(candidate: &ConnectSchema, selected_connect: &ConnectSchema, selected: &Schema, value: &Avro, options: graph::UnionOptions, index: usize) -> Result<bool> {
+pub(super) fn matches_member(candidate: &ConnectSchema, selected_connect: &ConnectSchema, selected: &Schema, value: &Avro, options: graph::UnionOptions, index: usize) -> Result<bool> {
     if let Some(name) = enumeration(candidate) { return Ok(matches!(selected, Schema::Enum(schema) if schema.name.fullname(None) == name)); }
     Ok(match &candidate.kind {
-        SchemaKind::I32 => matches!(value, Avro::Int(_) | Avro::Date(_) | Avro::TimeMillis(_)),
-        SchemaKind::I64 => matches!(value, Avro::Long(_) | Avro::TimestampMillis(_)),
+        SchemaKind::I32 => matches!(value, Avro::Int(_)),
+        SchemaKind::I64 => matches!(value, Avro::Long(_)),
         SchemaKind::F32 => matches!(value, Avro::Float(_)), SchemaKind::F64 => matches!(value, Avro::Double(_)),
-        SchemaKind::Bool => matches!(value, Avro::Boolean(_)), SchemaKind::String => matches!(value, Avro::String(_)),
+        SchemaKind::Bool => matches!(value, Avro::Boolean(_)), SchemaKind::String => matches!(value, Avro::String(_) | Avro::Utf8(_)),
         SchemaKind::Array(_) => matches!(value, Avro::Array(_)), SchemaKind::Map(_, _) => matches!(value, Avro::Map(_)),
         SchemaKind::Struct(_) => matches!(value, Avro::Record(_)) && same_schema(candidate, selected_connect, &mut Default::default(), 0)?,
         SchemaKind::Bytes => {
-            if !matches!(value, Avro::Bytes(_) | Avro::Fixed(_, _) | Avro::Decimal(_) | Avro::Duration(_)) { false }
+            if !matches!(value, Avro::Bytes(_) | Avro::Fixed(_, _)) { false }
             else if let Some(size) = candidate.parameters.get("connect.fixed.size") {
                 let selected_physical = match selected { Schema::Decimal(decimal) => decimal.inner.as_ref(), other => other };
                 if matches!(selected_physical, Schema::Fixed(_)) {
@@ -55,8 +55,6 @@ fn matches_member(candidate: &ConnectSchema, selected_connect: &ConnectSchema, s
                     let size = size.parse::<usize>().map_err(|cause| error("avro-decode", cause))?;
                     match value {
                         Avro::Bytes(bytes) | Avro::Fixed(_, bytes) => bytes.len() == size,
-                        Avro::Decimal(decimal) => Vec::<u8>::try_from(decimal).map_err(|cause| error("avro-decode", cause))?.len() == size,
-                        Avro::Duration(_) => size == 12,
                         _ => false,
                     }
                 }
@@ -70,17 +68,9 @@ fn into_destination(value: Value, source: &ConnectSchema, destination: &ConnectS
     if depth > 128 { return Err(error("avro-decode", "Connect union validation nesting limit exceeded")); }
     let source = source.resolved(); let destination = destination.resolved();
     if value == Value::Null { return if destination.optional { Ok(value) } else { Err(error("avro-decode", "Null union value targets a required field")) }; }
-    if let Some(name @ ("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp")) = destination.name.as_deref() {
-        let millis = match value {
-            Value::DateDay(days) => i64::from(days) * 86_400_000,
-            Value::Time { value, unit: TimeUnit::Millisecond, .. } | Value::Timestamp { value, unit: TimeUnit::Millisecond, .. } => value,
-            _ => return Err(error("avro-decode", "Union field requires a Connect date value")),
-        };
-        return Ok(match name {
-            "org.apache.kafka.connect.data.Date" => Value::DateDay(i32::try_from(millis.div_euclid(86_400_000)).map_err(|cause| error("avro-decode", cause))?),
-            "org.apache.kafka.connect.data.Time" => Value::Time { value: millis.rem_euclid(86_400_000), unit: TimeUnit::Millisecond, bit_width: 32 },
-            _ => Value::Timestamp { value: millis, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) },
-        });
+    if matches!(destination.name.as_deref(), Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp")) {
+        let millis = super::super::data::date_millis(&value).ok_or_else(|| error("avro-decode", "Union field requires a Connect date value"))?;
+        return Ok(super::super::data::date_value(millis));
     }
     if destination.name.as_deref() == Some("org.apache.kafka.connect.data.Decimal") {
         return if matches!(value, Value::Decimal(_)) { Ok(value) } else { Err(error("avro-decode", "Union field requires a Connect decimal value")) };
@@ -94,6 +84,26 @@ fn into_destination(value: Value, source: &ConnectSchema, destination: &ConnectS
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn logical_union_destination_preserves_the_date_object_before_schema_admission() {
+        let mut source = ConnectSchema::new(SchemaKind::I64);
+        source.name = Some("org.apache.kafka.connect.data.Timestamp".into());
+        for logical in ["Date", "Time", "Timestamp"] {
+            let mut destination = ConnectSchema::new(if logical == "Timestamp" { SchemaKind::I64 } else { SchemaKind::I32 });
+            destination.name = Some(format!("org.apache.kafka.connect.data.{logical}"));
+            for millis in [i64::MIN, -1, 86_400_000, i64::MAX] {
+                let value = super::super::super::data::date_value(millis);
+                assert_eq!(into_destination(value.clone(), &source, &destination, 0).unwrap(), value);
+            }
+            assert!(into_destination(Value::I64(0), &source, &destination, 0).is_err());
+        }
+    }
+}
+
 fn same_schema(left: &ConnectSchema, right: &ConnectSchema, visited: &mut std::collections::BTreeSet<((usize, usize), (usize, usize))>, depth: usize) -> Result<bool> {
     if left == right { return Ok(true); }
     if let (SchemaKind::Reference(left), SchemaKind::Reference(right)) = (&left.kind, &right.kind) {
@@ -101,7 +111,7 @@ fn same_schema(left: &ConnectSchema, right: &ConnectSchema, visited: &mut std::c
     }
     if depth > 128 { return Err(error("avro-decode", "Connect schema comparison nesting limit exceeded")); }
     let left = left.resolved(); let right = right.resolved();
-    if left.optional != right.optional || left.name != right.name || left.version != right.version || left.doc != right.doc || left.parameters != right.parameters || left.default != right.default { return Ok(false); }
+    if left.optional != right.optional || left.name != right.name || left.version != right.version || left.doc != right.doc || left.parameters != right.parameters || !super::super::data::defaults_equal(left.default_value(), right.default_value()) { return Ok(false); }
     Ok(match (&left.kind, &right.kind) {
         (SchemaKind::Struct(left), SchemaKind::Struct(right)) => {
             if left.len() != right.len() { return Ok(false); }

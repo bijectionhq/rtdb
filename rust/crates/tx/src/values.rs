@@ -24,7 +24,8 @@ impl AsRef<[u8]> for RetainedBytes { fn as_ref(&self) -> &[u8] { self.as_slice()
 #[derive(Clone, Debug)]
 pub struct Documents { rows: Arc<Vec<BTreeMap<String, Value>>>, _reservation: Arc<MemoryReservation> }
 impl Documents {
-    pub fn new(rows: Vec<BTreeMap<String, Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn new(mut rows: Vec<BTreeMap<String, Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        for row in &mut rows { row.values_mut().for_each(Value::admit_object_dates); }
         let bytes = rows.iter().try_fold(rows.capacity().checked_mul(std::mem::size_of::<BTreeMap<String, Value>>()).ok_or_else(overflow)?, |bytes, row| {
             bytes.checked_add(Value::document_retained_bytes(row)?).ok_or_else(overflow)
         })?;
@@ -49,8 +50,9 @@ impl EntityIds {
 #[derive(Clone, Debug)]
 pub struct UserMetadata { value: Arc<Value>, _reservation: Arc<MemoryReservation> }
 impl UserMetadata {
-    pub fn new(value: Value, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn new(mut value: Value, memory: &Arc<MemoryBudget>) -> Result<Self> {
         if !matches!(value, Value::Struct(_)) { return Err(Anomaly::incorrect("xtdb/invalid-user-metadata", "Transaction metadata must be a document")); }
+        value.admit_object_dates();
         let reservation = memory.reserve(value.retained_bytes()?.checked_add(128).ok_or_else(overflow)?)?;
         Ok(Self { value: Arc::new(value), _reservation: reservation })
     }
@@ -70,9 +72,10 @@ pub struct SqlArguments {
 }
 impl SqlArguments {
     /// Explicit column types preserve typed nulls and the schema of an empty argument batch.
-    pub fn new(types: Vec<LogicalType>, rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn new(types: Vec<LogicalType>, mut rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         for ty in &types { ty.validate()?; }
         if rows.iter().any(|row| row.len() != types.len()) { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Argument rows have different widths")); }
+        for row in &mut rows { row.iter_mut().for_each(Value::admit_object_dates); }
         let mut bytes = rows.capacity().checked_mul(std::mem::size_of::<Vec<Value>>()).ok_or_else(overflow)?;
         for row in &rows {
             bytes = bytes.checked_add(row.capacity().checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?).ok_or_else(overflow)?;
@@ -93,6 +96,8 @@ impl SqlArguments {
         Self::new(types, rows, memory)
     }
     pub fn types(&self) -> &[LogicalType] { &self.types }
+    /// Opened-vector field types for query or DML binding; source payload fields remain available through `types`.
+    pub fn execution_types(&self) -> impl Iterator<Item = LogicalType> + '_ { self.types.iter().map(rtdb_columnar::execution_type) }
     pub fn row_count(&self) -> usize { self.row_count }
     pub fn rows(&self) -> impl Iterator<Item = &[Value]> { self.chunks.iter().flat_map(|(_, chunk)| chunk.rows.iter().map(Vec::as_slice)) }
     pub(crate) fn indexed_rows(&self) -> impl Iterator<Item = (usize, &[Value])> { self.chunks.iter().flat_map(|(start, chunk)| chunk.rows.iter().enumerate().map(move |(index, row)| (*start + index, row.as_slice()))) }

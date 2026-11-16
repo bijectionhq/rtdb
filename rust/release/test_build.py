@@ -18,6 +18,7 @@ class ExtractionCommands:
         self.fail_volume_remove = fail_volume_remove
         self.fail_create_ack = fail_create_ack
         self.name = None
+        self.exited = False
 
     def run(self, name, argv, required=True, timeout=None):
         self.calls.append((name, argv))
@@ -33,7 +34,11 @@ class ExtractionCommands:
             if not self.container:
                 raise RuntimeError("container absent")
             content = json.dumps([{"Image": "image", "Config": {"Labels": {"io.rtdb.release": self.name}},
+                                  "State": {"Running": False, "Status": "exited" if self.exited else "created", "ExitCode": 0},
                                   "Mounts": [{"Type": "volume", "Name": value} for value in self.volumes]}])
+        elif name == "artifact-build-info":
+            self.exited = True
+            content = json.dumps({"schema_version": 1}) + "\n" + json.dumps({"schema_version": 1}) + "\n"
         elif name.startswith("extract-"):
             if self.fail_copy:
                 raise RuntimeError("copy failed")
@@ -99,6 +104,56 @@ class ReleaseSelectionTests(unittest.TestCase):
             artifacts = extract_artifacts(ExtractionCommands(root), {"Id": "image"}, "rust", root)
             migrator = next(value for value in artifacts if value["path"] == "artifacts/rtdb-config")
             self.assertEqual(migrator["sha256"], release.digest(root / migrator["path"]))
+            self.assertIn("artifacts/tzdb.dat", {value["path"] for value in artifacts})
+            self.assertIn("artifacts/rtdb-build-info.json", {value["path"] for value in artifacts})
+            self.assertIn("artifacts/rtdb-config-build-info.json", {value["path"] for value in artifacts})
+
+    def test_tzdb_override_is_copied_and_bound_independently_of_later_source_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = root / "context"
+            context.mkdir()
+            source = root / "selected.dat"
+            source.write_bytes(b"original database")
+            selected = release.retain_tzdb(context, source)
+            source.write_bytes(b"changed database")
+            self.assertEqual((context / "release-tzdb.dat").read_bytes(), b"original database")
+            self.assertEqual(selected, {"sha256": release.digest(context / "release-tzdb.dat"), "bytes": 17, "selection": "override"})
+            source.write_bytes(b"x" * (1024 * 1024 + 1))
+            with self.assertRaisesRegex(ValueError, "at most one MiB"):
+                release.retain_tzdb(context, source)
+
+    def test_compiled_executable_reports_must_match_selected_tzdb_and_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "tzdb.dat").write_bytes(b"selected database")
+            metadata = {"revision": "a" * 40, "version": "0.1.0", "tzdb": {"sha256": release.digest(root / "tzdb.dat"), "bytes": 17}}
+            report = {"schema_version": 1, "engine": "rust", "version": "0.1.0", "revision": "a" * 40, "tzdb_version": "2025b", "tzdb_sha256": metadata["tzdb"]["sha256"]}
+            for executable in ["rtdb", "rtdb-config"]:
+                (root / (executable + "-build-info.json")).write_text(json.dumps(report))
+            self.assertEqual(release.verify_native_build_info({"artifacts/" + path.name: path for path in root.iterdir()}, metadata), report)
+            for field, value in [("revision", "b" * 40), ("tzdb_sha256", "b" * 64), ("tzdb_version", "")]:
+                (root / "rtdb-config-build-info.json").write_text(json.dumps({**report, field: value}))
+                with self.assertRaises(ValueError):
+                    release.verify_native_build_info({"artifacts/" + path.name: path for path in root.iterdir()}, metadata)
+            (root / "rtdb-config-build-info.json").write_text(json.dumps(report))
+            (root / "tzdb.dat").write_bytes(b"altered database")
+            with self.assertRaisesRegex(ValueError, "packaged TZDB bytes"):
+                release.verify_native_build_info({"artifacts/" + path.name: path for path in root.iterdir()}, metadata)
+
+    def test_failed_compiled_metadata_probe_still_drains_owned_extraction_resources(self):
+        class FailedProbe(ExtractionCommands):
+            def run(self, name, argv, required=True, timeout=None):
+                if name == "artifact-build-info":
+                    raise RuntimeError("probe failed")
+                return super().run(name, argv, required, timeout)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = FailedProbe(root)
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                extract_artifacts(commands, {"Id": "image"}, "rust", root)
+            self.assertFalse(commands.container)
+            self.assertFalse(commands.volumes)
 
     def test_jvm_variants_match_pinned_shadow_jar_projects_and_actual_backends(self):
         matrix = json.loads((HERE / "matrix.json").read_bytes())

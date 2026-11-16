@@ -244,7 +244,7 @@ pub unsafe extern "C" fn rtdb_v1_cursor_next(handle: u64, out_array: *mut FFI_Ar
         if out_array.release.is_some() || out_schema.release.is_some() { return Err(invalid("Output Arrow structs are still owned")); }
         let cursor = handles::cursor(handle)?; let _admitted = cursor.region.enter()?;
         if let Some(batch) = cursor.next()? {
-            let (array, schema) = arrow::export_batch(batch, cursor.region.memory()).inspect_err(|_| cursor.consumer_error())?;
+            let (array, schema) = arrow::export_declared_batch(batch, cursor.region.memory()).inspect_err(|_| cursor.consumer_error())?;
             *out_array = array; *out_schema = schema; *has_batch = 1;
         } Ok(())
     }) }

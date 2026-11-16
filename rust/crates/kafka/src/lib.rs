@@ -1,6 +1,7 @@
 mod config;
 mod driver;
 mod tail;
+mod tls;
 pub mod connect;
 
 pub use config::{KafkaClusterConfig, KafkaLogConfig, KafkaLogOptions, native_properties, parse_properties, producer_properties};

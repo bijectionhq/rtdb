@@ -13,7 +13,10 @@ RUN . /etc/os-release && test "$VERSION_CODENAME" = bookworm \
 WORKDIR /source
 COPY . .
 ARG RTDB_FEATURES
+ARG RTDB_REVISION
 ARG SOURCE_DATE_EPOCH
+ENV RTDB_REVISION=${RTDB_REVISION}
+ENV RTDB_TZDB_PATH=/source/release-tzdb.dat
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}
 RUN test "$(rustc --version | cut -d ' ' -f 2)" = 1.94.1 \
     && if [ -n "$RTDB_FEATURES" ]; then \
@@ -51,8 +54,10 @@ COPY --from=build /source/rust/target/release/librtdb_ffi.so /usr/local/lib/libr
 COPY --from=build /source/rust/target/release/librtdb_ffi.a /usr/local/lib/librtdb_ffi.a
 COPY rust/crates/ffi/include/rtdb.h /usr/local/include/rtdb.h
 COPY LICENSE /usr/share/licenses/rtdb/LICENSE
+COPY rust/crates/types/data/tzdb/LICENSE rust/crates/types/data/tzdb/ASSEMBLY_EXCEPTION rust/crates/types/data/tzdb/ADDITIONAL_LICENSE_INFO /usr/share/licenses/rtdb/tzdb/
 COPY rust/release/default.yaml /etc/rtdb/config.yaml
 COPY release-input.json /usr/share/rtdb/build.json
+COPY release-tzdb.dat /usr/share/rtdb/tzdb.dat
 
 USER rtdb
 WORKDIR /var/lib/rtdb

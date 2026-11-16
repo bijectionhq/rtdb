@@ -1,14 +1,43 @@
 use std::sync::Arc;
 use std::collections::BTreeMap;
 use rtdb_columnar::MemoryReservation;
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Anomaly, Result, TimeUnit, Value};
+
+pub(super) fn date_value(millis: i64) -> Value { Value::Timestamp { value: millis,unit: TimeUnit::Millisecond,timezone: Some("UTC".into()) } }
+
+pub(super) fn date_millis(value: &Value) -> Option<i64> {
+    match value {
+        Value::Timestamp { value,unit: TimeUnit::Millisecond,.. } => Some(*value),
+        Value::DateDay(days) => Some(i64::from(*days) * 86_400_000),
+        Value::Time { value,unit: TimeUnit::Millisecond,.. } => Some(*value),
+        _ => None,
+    }
+}
+
+pub(super) fn encode_logical_date(schema: &ConnectSchema,value: &Value) -> Result<Option<Value>> {
+    let schema = schema.resolved();
+    let name = schema.name.as_deref();
+    if !matches!(name,Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp")) { return Ok(None); }
+    let millis = date_millis(value).ok_or_else(||super::error("transform-error","Logical date value is not a java.util.Date representation"))?;
+    Ok(Some(match name {
+        Some("org.apache.kafka.connect.data.Date") => {
+            if millis.rem_euclid(86_400_000) != 0 { return Err(super::error("transform-error","Connect Date contains nonzero time fields")); }
+            Value::I32((millis / 86_400_000) as i32)
+        }
+        Some("org.apache.kafka.connect.data.Time") => {
+            if !(0..=86_400_000).contains(&millis) { return Err(super::error("transform-error","Connect Time contains date fields")); }
+            Value::I32(millis as i32)
+        }
+        _ => Value::I64(millis),
+    }))
+}
 
 /// Graph-backed children use `Reference`; inspect their concrete kind through `ConnectSchema::resolved`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum SchemaKind { Bool, I8, I16, I32, I64, F32, F64, String, Bytes, Array(Arc<ConnectSchema>), ArrayOfNull, Map(Arc<ConnectSchema>, Arc<ConnectSchema>), MapWithNullValues(Arc<ConnectSchema>), MapOfNull, Struct(Vec<ConnectField>), Reference(super::SchemaReference) }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectField { pub name: String, pub schema: Arc<ConnectSchema> }
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct ConnectSchema {
     pub kind: SchemaKind,
     pub optional: bool,
@@ -18,8 +47,34 @@ pub struct ConnectSchema {
     pub parameters: BTreeMap<String, String>,
     pub default: Option<Value>,
 }
+impl PartialEq for ConnectSchema {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.optional == other.optional && self.name == other.name
+            && self.version == other.version && self.doc == other.doc && self.parameters == other.parameters
+            && defaults_equal(self.default_value(), other.default_value())
+    }
+}
+pub(super) fn defaults_equal(left: Option<&Value>, right: Option<&Value>) -> bool {
+    match (left.filter(|value| **value != Value::Null), right.filter(|value| **value != Value::Null)) {
+        (None, None) => true,
+        (Some(left), Some(right)) => default_objects_equal(left, right),
+        _ => false,
+    }
+}
+fn default_objects_equal(left: &Value, right: &Value) -> bool {
+    match (left, right) {
+        (Value::F32(left), Value::F32(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
+        (Value::F64(left), Value::F64(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
+        (Value::List(left), Value::List(right)) => left.len() == right.len() && left.iter().zip(right).all(|(left, right)| default_objects_equal(left, right)),
+        (Value::Struct(left), Value::Struct(right)) => left.len() == right.len() && left.iter().zip(right).all(|((left_key, left), (right_key, right))| left_key == right_key && default_objects_equal(left, right)),
+        (Value::Map { entries: left, .. }, Value::Map { entries: right, .. }) => left.len() == right.len() && left.iter().all(|(left_key, left)| right.iter().find(|(right_key, _)| default_objects_equal(left_key, right_key)).is_some_and(|(_, right)| default_objects_equal(left, right))),
+        _ => left == right,
+    }
+}
 impl ConnectSchema {
     pub fn new(kind: SchemaKind) -> Self { Self { kind, optional: false, name: None, version: None, doc: None, parameters: BTreeMap::new(), default: None } }
+    /// Returns the non-null default; Java's null default is equivalent to an absent default.
+    pub fn default_value(&self) -> Option<&Value> { self.default.as_ref().filter(|value| **value != Value::Null) }
     /// Expands one graph node; the returned view retains every referenced node's immutable graph.
     pub fn resolved(&self) -> std::borrow::Cow<'_, Self> {
         match &self.kind { SchemaKind::Reference(reference) => std::borrow::Cow::Owned(super::schema_graph::Metadata::from_schema(self).schema(reference.resolve().kind)), _ => std::borrow::Cow::Borrowed(self) }
@@ -61,7 +116,7 @@ pub(crate) fn validate_value(schema: &ConnectSchema, value: &Value, depth: usize
     if *value == Value::Null { return if schema.optional { Ok(()) } else { Err(invalid()) }; }
     let logical = match schema.name.as_deref() {
         Some("org.apache.kafka.connect.data.Decimal") => Some(matches!(value, Value::Decimal(_))),
-        Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp") => Some(matches!(value, Value::DateDay(_) | Value::Time { .. } | Value::Timestamp { .. })),
+        Some("org.apache.kafka.connect.data.Date" | "org.apache.kafka.connect.data.Time" | "org.apache.kafka.connect.data.Timestamp") => Some(date_millis(value).is_some()),
         _ => None,
     };
     if let Some(valid) = logical { return if valid { Ok(()) } else { Err(invalid()) }; }
@@ -71,12 +126,14 @@ pub(crate) fn validate_value(schema: &ConnectSchema, value: &Value, depth: usize
         (SchemaKind::Map(key, element), Value::Map { entries, .. }) => entries.iter().try_for_each(|(k, v)| { validate_value(key, k, depth + 1)?; validate_value(element, v, depth + 1) }),
         (SchemaKind::Struct(fields), Value::Struct(values)) => fields.iter().try_for_each(|field| {
             let value = values.get(&field.name).unwrap_or(&Value::Null);
-            if *value == Value::Null && (field.schema.optional || field.schema.default.is_some()) { return Ok(()); }
+            if *value == Value::Null && (field.schema.optional || field.schema.default_value().is_some()) { return Ok(()); }
             validate_value(&field.schema, value, depth + 1)
         }),
         _ => Err(invalid()),
     }
 }
+/// Schema-aware Connect value; logical Date, Time and Timestamp share a raw millisecond Timestamp carrier.
+/// Keep the schema with the value through transforms; document indexing performs the logical date/time conversion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConnectData { pub schema: Option<Arc<ConnectSchema>>, pub value: Value }
 impl ConnectData {

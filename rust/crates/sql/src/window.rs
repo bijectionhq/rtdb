@@ -1,11 +1,12 @@
 use std::{collections::BTreeMap, sync::Arc};
-use rtdb_plan::{ColumnId, Expr, Field, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
+use rtdb_plan::{ColumnId, Expr, Field, NamedExpr, Relation, RelationNode, Schema, SortExpr, WindowExpr, WindowFunction};
 use rtdb_types::{Anomaly, Result};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, error, identifiers, unsupported};
+use crate::expression::Replacements;
 
 impl Context<'_> {
-    pub(crate) fn window(&mut self, input: Arc<Relation>, function: &ast::Function, replacements: &BTreeMap<String, Field>) -> Result<(Arc<Relation>, Field)> {
+    pub(crate) fn window(&mut self, input: Arc<Relation>, function: &ast::Function, replacements: &Replacements) -> Result<(Arc<Relation>, Field)> {
         let Some(ast::WindowType::WindowSpec(specification)) = &function.over else { return Err(unsupported("Named windows")); };
         if specification.window_frame.is_some() { return Err(unsupported("Window frames")); }
         if function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) || function.uses_odbc_syntax { return Err(unsupported("Window function modifiers")); }
@@ -37,12 +38,19 @@ impl Context<'_> {
                 _ => Err(error("Window partitions require column references")),
             }
         }).collect::<Result<Vec<ColumnId>>>()?;
+        let mut projections: Vec<_> = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(),expr: field.expression() }).collect();
         let order_by = specification.order_by.iter().map(|order| {
             if matches!(&order.expr, ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if !value.contains(['.', 'e', 'E']))) { return Err(error("Window ORDER BY has no output ordinal positions")); }
             let expr = self.expr(&order.expr, input.schema(), &BTreeMap::new())?;
-            let descending = order.options.asc == Some(false);
-            Ok(SortExpr { expr, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
+            let descending = crate::bind::sort_descending(&order.options)?;
+            let mut field = self.binder.field("",None,expr.data_type())?;
+            field.name = format!("_window_order_{}",field.id.0);
+            self.hidden_columns.insert(field.id,HiddenColumn::Internal);
+            let key = field.expression();
+            projections.push(NamedExpr { field,expr });
+            Ok(SortExpr { expr: key, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
         }).collect::<Result<Vec<_>>>()?;
+        let input = if order_by.is_empty() { input } else { Arc::new(input.project(projections)?) };
         let mut field = self.binder.field("", None, function.result_type(input.schema())?)?;
         field.name = format!("_window_{}", field.id.0);
         self.hidden_columns.insert(field.id,HiddenColumn::Internal);

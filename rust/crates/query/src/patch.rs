@@ -1,59 +1,67 @@
 use async_trait::async_trait;
-use rtdb_plan::{ColumnId, Expr, Schema};
-use rtdb_types::{Iid, Result, TimeUnit, Timestamp, Value};
+use rtdb_plan::{ColumnId, Expr, PatchEndpoint, Schema};
+use rtdb_types::{Anomaly, Iid, Result, TimeUnit, Timestamp, Value};
 
-use crate::{context::Execution, cursor::{BoxCursor, OwnedRow, RowCursor}, invalid};
+use crate::{context::Execution, cursor::OwnedRow, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, invalid};
 
 pub(crate) struct PatchGaps {
-    input: BoxCursor,
+    input: BoxPageCursor,
     columns: [usize; 4],
     width: usize,
     from: Timestamp,
     to: Timestamp,
     execution: Execution,
-    pending: Option<OwnedRow>,
-    current: Option<(Iid, Timestamp)>,
-    previous_end: Option<Timestamp>,
-    ended: bool,
 }
 
 impl PatchGaps {
-    pub fn new(input: BoxCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
-        let bound = |expr: &Expr, fallback| -> Result<Timestamp> {
-            let value = execution.evaluate(expr, &Schema::default(), &[])?;
-            if matches!(value, Value::Null | Value::Undefined) { Ok(fallback) } else { rtdb_expr::timestamp_micros(&value, &execution.context.timezone) }
-        };
-        let from = bound(from, Timestamp::MIN)?;
-        let to = bound(to, Timestamp::MAX)?;
-        if from >= to { return Err(invalid("patch-valid-time", "PATCH requires lower valid time before upper valid time")); }
+    pub async fn new(input: BoxPageCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
+        let scope = execution.scope()?;
+        fn bound(expr: &Expr, lower: bool, execution: &Execution, scope: &rtdb_expr::EvaluationScope) -> Result<Timestamp> {
+            let value = match PatchEndpoint::from_expr(expr)? {
+                PatchEndpoint::Default if !lower => return Ok(Timestamp::MAX),
+                PatchEndpoint::Default | PatchEndpoint::CurrentTime => return execution.context.current_time.as_micros(),
+                PatchEndpoint::DateTime(value) => value,
+                PatchEndpoint::Parameter(index) => execution.parameters.values().get(index).ok_or_else(|| invalid("patch-parameter", "Patch endpoint parameter is absent"))?,
+            };
+            scope.reserve(value.retained_bytes()?.checked_add(execution.context.timezone.len()).and_then(|bytes|bytes.checked_mul(8)).and_then(|bytes|bytes.checked_add(16_384)).ok_or_else(||invalid("patch-endpoint-size", "Patch endpoint conversion exceeds addressable memory"))?)?;
+            rtdb_expr::query_clock_instant(value, &execution.context.timezone)?.as_micros()
+        }
+        let from = bound(from, true, &execution, &scope)?;
+        let to = bound(to, false, &execution, &scope)?;
+        if from > to {
+            scope.reserve(4096)?;
+            let instant = |value: Timestamp| {
+                use rtdb_format::transit::{TransitValue, to_json_value};
+                to_json_value(&TransitValue::Tagged { tag: "time/instant".into(), representation: Box::new(TransitValue::String(rtdb_types::Instant::from(value).to_iso_string()?)) })
+            };
+            return Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "Invalid valid times")
+                .with_context("valid-from", instant(from)?).with_context("valid-to", instant(to)?));
+        }
         let columns = columns.map(|id| schema.position(id).ok_or_else(|| invalid("patch-column", "Patch column is absent")));
         let [iid, vf, vt, doc] = columns;
-        Ok(Self { input, columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution, pending: None, current: None, previous_end: None, ended: false })
+        Ok(Self { input, columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution })
     }
     fn gap(&self, iid: Iid, from: Timestamp, to: Timestamp) -> Result<OwnedRow> {
+        let bytes = self.width.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?;
+        let reservation = self.execution.context.memory.reserve(bytes)?;
         let mut values = vec![Value::Null; self.width];
         values[self.columns[0]] = Value::FixedSizeBinary(iid.0.to_vec());
         values[self.columns[1]] = timestamp(from, false);
         values[self.columns[2]] = timestamp(to, true);
-        OwnedRow::new(values, &self.execution.context.memory)
+        OwnedRow::with_reservation(values, reservation)
     }
 }
 
 #[async_trait]
-impl RowCursor for PatchGaps {
-    async fn next(&mut self) -> Result<Option<OwnedRow>> {
-        loop {
+impl PageCursor for PatchGaps {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.execution.context.check_cancelled()?;
+        let Some(mut page) = self.input.next_page().await? else { return Ok(None); };
+        let capacity = page.len().checked_mul(3).ok_or_else(|| invalid("patch-size", "Patch page row count exceeds addressable memory"))?;
+        let mut output = PageBuilder::new(capacity, &self.execution.context.memory)?;
+        let mut current: Option<(Iid, Timestamp)> = None;
+        while let Some(mut row) = page.next() {
             self.execution.context.check_cancelled()?;
-            if self.pending.is_none() && !self.ended {
-                self.pending = self.input.next().await?;
-                self.ended = self.pending.is_none();
-            }
-            let Some(row) = self.pending.as_ref() else {
-                if let Some((iid, cursor)) = self.current.take() {
-                    if cursor < self.to { return self.gap(iid, cursor, self.to).map(Some); }
-                }
-                return Ok(None);
-            };
             let iid = match &row.values[self.columns[0]] {
                 Value::FixedSizeBinary(bytes) | Value::Binary(bytes) => Iid::from_slice(bytes)?,
                 Value::Uuid(bytes) => Iid(*bytes), _ => return Err(invalid("patch-iid", "Patch input IID is not sixteen bytes")),
@@ -63,33 +71,22 @@ impl RowCursor for PatchGaps {
                 Value::Null | Value::Undefined => Timestamp::MAX,
                 value => rtdb_expr::timestamp_micros(value, &self.execution.context.timezone)?,
             };
-            if from >= to { return Err(invalid("patch-order", "Patch input contains an empty or inverted interval")); }
-            if let Some((previous, cursor)) = self.current {
-                if iid < previous { return Err(invalid("patch-order", "Patch input IIDs are not sorted")); }
+            let mut cursor = self.from;
+            if let Some((previous, previous_to)) = current {
                 if iid != previous {
-                    self.current = Some((iid, self.from));
-                    self.previous_end = None;
-                    if cursor < self.to { return self.gap(previous, cursor, self.to).map(Some); }
-                    continue;
-                }
-            } else { self.current = Some((iid, self.from)); }
-            if self.previous_end.is_some_and(|end| from < end) { return Err(invalid("patch-order", "Patch input intervals overlap or are not sorted")); }
-            let lower = from.max(self.from);
-            let upper = to.min(self.to);
-            let cursor = self.current.map(|(_, cursor)| cursor).unwrap_or(self.from);
-            if cursor < self.to && lower > cursor {
-                let end = lower.min(self.to);
-                self.current = Some((iid, end));
-                return self.gap(iid, cursor, end).map(Some);
+                    if previous_to < self.to { output.push(self.gap(previous, previous_to, self.to)?)?; }
+                } else { cursor = previous_to; }
             }
-            let mut row = self.pending.take().ok_or_else(|| invalid("patch-state", "Pending patch row disappeared"))?;
-            self.previous_end = Some(to);
-            self.current = Some((iid, cursor.max(upper)));
-            if lower >= upper { continue; }
-            row.values[self.columns[1]] = timestamp(lower, false);
-            row.values[self.columns[2]] = timestamp(upper, true);
-            return Ok(Some(row));
+            if from > cursor { output.push(self.gap(iid, cursor, from.min(self.to))?)?; }
+            let reservation = self.execution.context.memory.reserve(row.bytes().checked_add(64).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?)?;
+            for (index, value) in row.values.iter_mut().enumerate() { if !self.columns.contains(&index) { *value = Value::Null; } }
+            row.values[self.columns[1]] = timestamp(from.max(self.from), false);
+            row.values[self.columns[2]] = timestamp(to.min(self.to), true);
+            output.push(OwnedRow::with_reservation(std::mem::take(&mut row.values), reservation)?)?;
+            current = Some((iid, to));
         }
+        if let Some((iid, cursor)) = current { if cursor < self.to { output.push(self.gap(iid, cursor, self.to)?)?; } }
+        Ok(Some(output.finish()))
     }
 }
 
@@ -97,3 +94,7 @@ fn timestamp(value: Timestamp, upper: bool) -> Value {
     if upper && value == Timestamp::MAX { Value::Null }
     else { Value::Timestamp { value: value.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 }
+
+#[cfg(test)]
+#[path = "patch_tests.rs"]
+mod tests;

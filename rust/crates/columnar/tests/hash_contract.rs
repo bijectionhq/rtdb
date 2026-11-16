@@ -64,3 +64,19 @@ fn murmur3_x86_vectors_include_nonempty_tails() {
     assert_eq!(rtdb_columnar::murmur3_32(b"foo", 0), 0xf6a5_c420);
     assert_eq!(rtdb_columnar::murmur3_32(b"hello", 0), 0x248b_fa47);
 }
+
+#[test]
+fn murmur_vector_hash_uses_signed_widths_ieee_bytes_and_null_zero() {
+    use rtdb_columnar::{hash_value_murmur3, murmur3_32};
+    assert_eq!(hash_value_murmur3(&Value::Null, 91).unwrap(), 0);
+    assert_eq!(hash_value_murmur3(&Value::Bool(true), 91).unwrap(), 17);
+    assert_eq!(hash_value_murmur3(&Value::Bool(false), 91).unwrap(), 19);
+    assert_eq!(hash_value_murmur3(&Value::Utf8("foo".into()), 0).unwrap() as u32, 0xf6a5_c420);
+    let minus_one = murmur3_32(&(-1.0f64).to_bits().to_be_bytes(), 7) as i32;
+    for value in [Value::U8(255), Value::U16(65535), Value::U32(u32::MAX), Value::U64(u64::MAX), Value::I64(-1), Value::F64(-1.0)] {
+        assert_eq!(hash_value_murmur3(&value, 7).unwrap(), minus_one);
+    }
+    assert_eq!(hash_value_murmur3(&Value::List(vec![Value::Bool(true), Value::Bool(false)]), 0).unwrap(), 17 * 31 + 19);
+    assert_eq!(hash_value_murmur3(&Value::Time { value: 1234, unit: TimeUnit::Microsecond, bit_width: 64 }, 0).unwrap(), murmur3_32(&1234i64.to_le_bytes(), 0) as i32);
+    assert_ne!(hash_value_murmur3(&Value::F64(-0.0), 0).unwrap(), hash_value_murmur3(&Value::F64(0.0), 0).unwrap());
+}

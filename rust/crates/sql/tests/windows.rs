@@ -17,7 +17,7 @@ async fn query(sql: &str) -> Result<(Schema, Vec<Vec<V>>)> {
     let context = context();
     let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default())?.statement else { panic!("Expected query") };
     let schema = relation.schema().clone();
-    let mut cursor = PreparedQuery::new(relation)?.execute(Arc::clone(&context), vec![])?;
+    let mut cursor = PreparedQuery::new(relation)?.execute(Arc::clone(&context), vec![]).await?;
     let mut rows = Vec::new();
     while let Some(page) = cursor.next_batch().await? {
         let batch = page.batch();

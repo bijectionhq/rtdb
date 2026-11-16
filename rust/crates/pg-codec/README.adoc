@@ -46,10 +46,13 @@ Protocol framing is specified by https://www.postgresql.org/docs/17/protocol-mes
 == Remaining qualification
 
 Runtime compatibility and property coverage remain unexecuted.
-Chrono's representable calendar range is smaller than Java's date/time range.
+Temporal text uses the shared Java-range calendar and OpenJDK timezone tables; the selected TZDB version must match the reference artifact during qualification.
 The native decoder rejects trailing non-numeric fixed-width binary bytes and malformed arrays that the JVM may consume differently.
 `tests/interval_text.rs` covers interval/duration grammar, overflow order, nanosecond endpoints and allocation-owner release; exact Java exception messages remain runtime qualification.
 Decimal text follows OpenJDK 21's BMP decimal-digit grammar in both coefficients and exponents.
 Java floating-point text conventions are reproduced around the decimal/scientific thresholds and subnormal minima; exhaustive shortest-decimal parity is pending.
 The broad JVM object families carried by JSON-LD and Transit still require fixture qualification, including exception metadata and form values.
 Reservation estimates bound ordinary decoded payloads, but a proof covering every nested JSON/Transit amplification and library-internal temporary remains outstanding.
+
+Transit URI imports validate Java URI syntax before constructing the native URI value and preserve its original spelling.
+`tests/uri.rs` retains valid registry-authority cases and invalid input rejection as unexecuted regression source.

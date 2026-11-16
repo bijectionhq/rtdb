@@ -7,10 +7,10 @@ use futures::future::try_join_all;
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_format::{database::proto::DatabaseConfig, envelope::{SourceBody, SourceMessage}, log::proto::{AttachDatabase, DetachDatabase, resolved_tx::DbOp}};
 use rtdb_maintenance::CollectionObserver;
-use rtdb_plan::{CatalogMetrics, CatalogUsers, Statement};
+use rtdb_plan::{CatalogMetrics, CatalogUsers};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor};
 use rtdb_storage::cache::CacheBudget;
-use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission};
+use rtdb_tx::{RetainedAnomaly, SubmitOptions, SubmittedTx, TransactionAuthorization, TransactionResult, TxOp, prepare_submission_with_sql_options};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, Result, SourcePosition, TimeBasis, TimeUnit, Timestamp, TransactionKey, TxBasis, TxId, Value};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
@@ -134,6 +134,8 @@ impl Node {
     pub fn memory(&self) -> &Arc<MemoryBudget> { &self.factory.memory }
     pub fn cache_budget(&self) -> &Arc<CacheBudget> { &self.factory.cache }
     pub fn now(&self) -> Timestamp { self.factory.clock.now() }
+    /// Captures the query clock without narrowing to the durable timestamp unit.
+    pub fn query_instant(&self) -> rtdb_types::Instant { self.factory.clock.query_instant() }
     pub fn shutdown(&self) { self.cancellation.cancel(); }
     pub fn cancellation(&self) -> &CancellationToken { &self.cancellation }
     pub fn critical_ingestion_error(&self) -> Option<Anomaly> {
@@ -216,7 +218,8 @@ impl Node {
             snapshots.insert(name, DatabaseSnapshot { partitions: vec![snapshot.with_system_time_cap(cap)?], storage: Arc::clone(&database.storage) });
         }
         let catalog = CatalogSnapshot::new(database, snapshots, false)?.with_runtime(Arc::new(crate::runtime::NodeCatalogRuntime::new(self.clone(), cancellation.clone())));
-        QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)
+        QueryContext::with_owner(catalog, Arc::clone(&self.factory.memory), basis.current_time, basis.timezone.clone(), self.factory.options.query.clone(), cancellation, &self.cancellation)?
+            .with_read_options(&basis.snapshot, basis.snapshot_time, self.query_instant())
     }
 
     async fn submit(&self, database: &str, operations: Vec<TxOp>, mut options: SubmitOptions, identity: &dyn SessionIdentity, cancellation: &CancellationToken) -> Result<SubmittedTx> {
@@ -226,7 +229,8 @@ impl Node {
         if database.external_source() { return Err(Anomaly::incorrect("xtdb/submit-tx-to-external-source-db", "Cannot submit transactions to an external-source database").with_context("db-name", database.name().into())); }
         options.user = identity.user().map(str::to_owned);
         options.default_tz = rtdb_expr::normalize_timezone(&options.default_tz)?;
-        let source = prepare_submission(operations, options, database.name(), &self.factory.memory)?;
+        let sql_options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: self.factory.options.query.generate_series_end_exclusive, ..Default::default() };
+        let source = prepare_submission_with_sql_options(operations, options, database.name(), &self.factory.memory, &sql_options)?;
         let payload = source.encode()?.into_bytes();
         let position = cancellation.run_until_cancelled(database.replication.submit_source_encoded(payload, self.now())).await.ok_or_else(cancelled)??;
         Ok(SubmittedTx { tx_id: TxId(position.0) })
@@ -235,12 +239,11 @@ impl Node {
         self.admit(database, DatabaseAccess::Read, identity, cancellation).await?;
         let db = self.catalog.database(database)?;
         if let Some(result) = db.replication.await_tx(tx_id, cancellation).await? { return Ok(result.as_ref().clone()); }
-        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.now(), timezone: self.factory.options.default_timezone.clone() };
+        let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context(database, &basis, identity, cancellation).await?;
-        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), ..Default::default() };
+        let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let prepared = rtdb_sql::prepare("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context.catalog, &options)?;
-        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::fault("rtdb.node/tx-result-query", "Transaction result query did not produce a query plan")); };
-        let mut cursor = PreparedQuery::new(relation)?.execute(context, vec![Value::I64(tx_id.0)])?;
+        let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, vec![Value::I64(tx_id.0)]).await?;
         let batch = cursor.next_batch().await?.ok_or_else(|| Anomaly::fault("xtdb/tx-await-missing", format!("tx {tx_id} not found after await")))?;
         let schema = batch.batch().schema();
         let cell = |name: &str| -> Result<Value> {
@@ -393,17 +396,15 @@ impl NativeSession {
     }
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
-        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, value.logical_type())).collect(), ..Default::default() };
+        let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
         let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
-        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce a query result")); };
-        PreparedQuery::new(relation)?.execute(context, arguments)
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
     }
     pub async fn query_xtql(&mut self, source: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
-        let options = rtdb_xtql::CompileOptions { parameter_types: arguments.iter().map(Value::logical_type).collect(), ..Default::default() };
+        let options = rtdb_xtql::CompileOptions { parameter_types: arguments.iter().map(|value| rtdb_columnar::execution_type(&value.logical_type())).collect(), default_timezone: context.timezone.clone(), ..Default::default() };
         let prepared = rtdb_xtql::compile(source, &context.catalog, &options)?;
-        let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement does not produce a query result")); };
-        PreparedQuery::new(relation)?.execute(context, arguments)
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
     }
 }
 
@@ -416,6 +417,7 @@ impl SessionService for NativeSessionService {
     fn check_open(&self) -> Result<()> { self.node.ensure_open() }
     async fn revalidate(&self) -> Result<()> { self.node.ensure_open()?; self.identity.revalidate(self.node.now()).await }
     fn now(&self) -> Timestamp { self.node.now() }
+    fn query_instant(&self) -> rtdb_types::Instant { self.node.query_instant() }
     fn snapshot_basis(&self) -> Result<TimeBasis> { self.node.snapshot_basis() }
     async fn await_basis(&self, basis: Option<TxBasis>, timeout: Duration, cancellation: &CancellationToken) -> Result<()> { self.node.await_basis(basis, timeout, cancellation).await }
     async fn submit(&self, database: &str, operations: Vec<TxOp>, options: SubmitOptions, cancellation: &CancellationToken) -> Result<SubmittedTx> { self.node.submit(database, operations, options, self.identity.as_ref(), cancellation).await }

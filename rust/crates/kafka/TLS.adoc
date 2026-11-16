@@ -1,0 +1,54 @@
+= Native Kafka producer TLS
+
+Registry dead-letter action options use Kafka's Java configuration names.
+`ssl.keystore.location` accepts JKS or PKCS12 private-key stores and PEM files; PEM material also accepts `ssl.keystore.key` and `ssl.keystore.certificate.chain`.
+Store and private-key passwords are independent.
+`ssl.truststore.location` accepts the same store formats, and PEM roots also accept `ssl.truststore.certificates`.
+A store file is limited to 4 MiB.
+Java and librdkafka-native identity or trust inputs cannot both supply the same role.
+The Kafka log and Connect source consumer continue to accept librdkafka-native properties, including OpenSSL cipher expressions.
+They do not invoke the Java TLS configuration decoder.
+
+The producer retains every decoded private-key entry.
+An empty Java identity store supplies no client certificate.
+An empty explicit Java truststore replaces default roots with an empty trust set; certificate acceptance is decided during the handshake.
+A per-connection certificate callback checks the peer's certificate types, signature algorithms, curves and acceptable issuer names through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
+The first compatible retained entry supplies its key and certificate chain.
+A request with no compatible entry sends no client certificate.
+All parsed keys, chains, roots and their memory reservations belong to one immutable TLS value retained by the native client.
+Native client destruction joins librdkafka's activity and destroys its OpenSSL objects before releasing that value.
+Configuration duplication retains the same value, and creation failures release both the native configuration and its TLS ownership.
+The vendored callback contract is documented in link:../../vendor/rdkafka/XTDB.adoc[the rdkafka fork].
+
+`ssl.enabled.protocols` restricts negotiation to the configured protocols.
+TLS 1.2 and TLS 1.3 are usable under the pinned OpenJDK 25.0.1 defaults; SSLv3, TLSv1 and TLSv1.1 remain disabled.
+An empty protocol list uses the SSL context's default protocols, as in Kafka's https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/common/security/ssl/DefaultSslEngineFactory.java[DefaultSslEngineFactory].
+`ssl.protocol` selects SSL context defaults.
+For `TLSv1.2`, the default cipher set contains TLS 1.2 suites; explicit enabled protocols and cipher suites can still select TLS 1.3 because https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/classes/sun/security/ssl/SSLContextImpl.java[the Java context supports it].
+
+`ssl.cipher.suites` accepts comma-separated Java names and their IANA aliases.
+Each configured name is validated, including entries following a valid name.
+TLS 1.2 and TLS 1.3 cipher sets are installed independently because https://docs.openssl.org/3.0/man3/SSL_CTX_set_cipher_list/[OpenSSL configures them separately].
+Selecting only TLS 1.3 suites also prevents TLS 1.2 fallback.
+The supported names and default preference order come from https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/classes/sun/security/ssl/CipherSuite.java[OpenJDK 25.0.1 CipherSuite].
+The adapter filters the disabled cipher families named by that release's https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/conf/security/java.security[java.security].
+A list containing only disabled suites or protocols produces no usable handshake.
+
+== Open parity gaps
+
+Several simultaneously compatible identities can select a different alias from SunX509, whose choice depends on its credential map and requested key-type ordering.
+The shared keystore codec does not retain aliases for reproducing that ordering.
+OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
+Unconfigured trust uses native system roots rather than the JRE's `cacerts` contents.
+Alternative built-in key-manager and trust-manager algorithm selection remains unfinished.
+These are open standard-configuration gaps.
+Configured Java providers and credential extensions also require native implementations.
+The conservative material reservation bound still requires allocator measurement with large stores and concurrent handshakes.
+
+== Regression sources
+
+`tests/connect_registry_tls.rs` exercises public converter construction, Registry rule failure, the native dead-letter producer and an authenticated TLS listener.
+It covers nonfirst issuer selection, EC signature selection, Java TLS 1.2 and TLS 1.3 cipher names, explicit overrides of context defaults, rejected protocol fallback, unmatched issuers and converter cleanup.
+`tests/native_tls_ownership.rs` covers native configuration duplication, producer/consumer/admin retention, pre-TLS errors and setup callback errors or panics.
+Unit sources cover admission before material loading, independent JKS passwords and mixed invalid cipher lists.
+These sources have not been compiled or executed during the source-only phase.

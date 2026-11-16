@@ -16,7 +16,7 @@ fn zoned(text: &str, timezone: &str, unit: U) -> V {
 }
 fn duration(nanos: i64) -> V { V::Duration { value: nanos, unit: U::Nanosecond } }
 fn mdm(months: i32, days: i32, nanoseconds: i64) -> V { V::IntervalMonthDayMicro { months, days, nanoseconds } }
-fn context(timezone: &str) -> EvalContext<'_> { EvalContext { parameters: &[], outer_rows: &[], current_time: Timestamp(0), timezone } }
+fn context(timezone: &str) -> EvalContext<'_> { EvalContext { timezone, ..Default::default() } }
 fn arithmetic(op: B, left: V, right: V, expected: V) {
     let expression = Expr::binary(op, Expr::Literal(left), Expr::Literal(right));
     assert_eq!(expression.data_type(), expected.logical_type());

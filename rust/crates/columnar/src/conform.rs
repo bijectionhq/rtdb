@@ -10,7 +10,8 @@ mod physical;
 
 /// A page in a declared wire layout, retaining its schema and allocation charges.
 /// The safe Rust batch marks null-bearing fields nullable; the declared wire schema preserves the caller's flags.
-/// No values are cast, and decimal precision, scale, and width must match an admitted declared leg.
+/// Integer buffers may retain signed execution bits under a same-width unsigned declared field.
+/// Decimal precision, scale, and width must match an admitted declared leg.
 pub struct DeclaredBatch { batch: OwnedBatch, declared: SchemaRef, _reservation: Arc<MemoryReservation> }
 
 impl DeclaredBatch {
@@ -79,6 +80,10 @@ fn layout(target: &L, source: &L) -> Result<L> {
         return Ok(target.clone().maybe());
     }
     Ok(match (target, source) {
+        (L::Scalar(rtdb_types::ScalarType::U8), L::Scalar(rtdb_types::ScalarType::I8))
+        | (L::Scalar(rtdb_types::ScalarType::U16), L::Scalar(rtdb_types::ScalarType::I16))
+        | (L::Scalar(rtdb_types::ScalarType::U32), L::Scalar(rtdb_types::ScalarType::I32))
+        | (L::Scalar(rtdb_types::ScalarType::U64), L::Scalar(rtdb_types::ScalarType::I64)) => source.clone(),
         (L::Maybe(target), L::Maybe(source)) => layout(target, source)?.maybe(),
         (L::Maybe(target), source) => layout(target, source)?.maybe(),
         (target, L::Maybe(source)) if !matches!(target, L::Union(_)) => layout(target, source)?.maybe(),

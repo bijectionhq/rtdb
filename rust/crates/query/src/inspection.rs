@@ -35,9 +35,13 @@ impl Constraints {
         constraints.used = Some(used);
         constraints
     }
-    fn values(&self, scan: &Scan, name: &str, execution: &Execution) -> Result<Vec<(BinaryOp, Value)>> {
+    async fn values(&self, scan: &Scan, name: &str, execution: &Execution, scope: &rtdb_expr::EvaluationScope) -> Result<Vec<(BinaryOp, Value)>> {
         let Some(column) = scan.columns.iter().find(|field| field.name == name) else { return Ok(Vec::new()); };
-        self.bounds.get(&column.id).into_iter().flatten().map(|(op, value)| Ok((*op, execution.evaluate(value, &Schema::default(), &[])?))).collect()
+        let mut values = Vec::new();
+        for (op, expression) in self.bounds.get(&column.id).into_iter().flatten() {
+            values.push((*op, execution.evaluate(scope, expression, &Schema::default(), &[]).await?));
+        }
+        Ok(values)
     }
 }
 
@@ -52,34 +56,38 @@ pub(crate) struct InspectionCursor {
     input: Option<Box<dyn CatalogInspection>>,
     rows: VecDeque<OwnedRow>,
     done: bool,
+    _request_reservation: Arc<rtdb_columnar::MemoryReservation>,
 }
 
 impl InspectionCursor {
-    pub fn new(scan: Scan, execution: Execution, constraints: &Constraints) -> Result<Self> {
+    pub async fn new(scan: Scan, execution: Execution, constraints: &Constraints) -> Result<Self> {
+        let scope = execution.scope()?;
+        let mut request_reservation = execution.context.memory.reserve(256)?;
         let request = match scan.table.name.table.table.as_str() {
             "source_log_msgs" | "replica_log_msgs" => {
-                let (from, to) = range(&constraints.values(&scan, "msg_id", &execution)?, integer)?
+                let (from, to) = range(&constraints.values(&scan, "msg_id", &execution, &scope).await?, integer)?
                     .ok_or_else(|| Anomaly::incorrect("xtdb/missing-log-bounds", "Queries on log tables require msg_id bounds (e.g. WHERE msg_id = N or WHERE msg_id BETWEEN x AND y)"))?;
                 if scan.table.name.table.table == "source_log_msgs" { InspectionRequest::SourceLog { from, to, tx_ops: scan.columns.iter().any(|field| field.name == "tx_ops" && constraints.used.as_ref().is_none_or(|used| used.contains(&field.id))) } }
                 else { InspectionRequest::ReplicaLog { from, to } }
             }
             "block_files" => {
-                let (from, to) = range(&constraints.values(&scan, "block_idx", &execution)?, block_index)?
+                let (from, to) = range(&constraints.values(&scan, "block_idx", &execution, &scope).await?, block_index)?
                     .ok_or_else(|| Anomaly::incorrect("xtdb/missing-block-idx-bounds", "Queries on xt.block_files require block_idx bounds (e.g. WHERE block_idx = '...' or WHERE block_idx BETWEEN '...' AND '...')"))?;
                 InspectionRequest::BlockFiles { from, to }
             }
             name => {
-                let table_values = constraints.values(&scan, "table_name", &execution)?;
-                let block_values = constraints.values(&scan, "block_idx", &execution)?;
+                let table_values = constraints.values(&scan, "table_name", &execution, &scope).await?;
+                let block_values = constraints.values(&scan, "block_idx", &execution, &scope).await?;
                 let table = equality(&table_values);
                 let block = equality(&block_values);
                 let (Some(Value::Utf8(table)), Some(block)) = (table, block) else {
                     return Err(Anomaly::incorrect("xtdb/missing-table-block-predicates", format!("Queries on xt.{name} require table_name = '...' AND block_idx = '...'")));
                 };
+                request_reservation = execution.context.memory.reserve(table.len().checked_add(256).ok_or_else(|| invalid("inspection-size", "Inspection request exceeds addressable memory"))?)?;
                 InspectionRequest::TableBlock { table: table.clone(), block: block_index(block)?, tries: name == "table_block_file_tries" }
             }
         };
-        Ok(Self { scan, execution, request: Some(request), input: None, rows: VecDeque::new(), done: false })
+        Ok(Self { scan, execution, request: Some(request), _request_reservation: request_reservation, input: None, rows: VecDeque::new(), done: false })
     }
 }
 

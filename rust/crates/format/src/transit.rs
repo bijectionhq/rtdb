@@ -13,6 +13,8 @@ pub enum TransitValue {
     Bool(bool),
     Integer(i64),
     Float(f64),
+    /// Requests single-precision output; wire decoders return `Float` for either width.
+    Float32(f32),
     String(String),
     Keyword(String),
     Symbol(String),
@@ -22,10 +24,70 @@ pub enum TransitValue {
     Tagged { tag: String, representation: Box<TransitValue> },
 }
 
+/// Constructs decoded values before they enter the Transit cache; cache hits clone `Value`.
+/// Array and map states remain caller-owned until completion; item insertion runs in wire order and may fail.
+/// Sizes are allocation hints for raw containers, whose tags or JSON map markers can select another constructor.
+pub trait TransitReadBuilder {
+    type Value: Clone;
+    type Array;
+    type Map;
+    fn null(&mut self) -> Result<Self::Value>;
+    fn boolean(&mut self, value: bool) -> Result<Self::Value>;
+    fn integer(&mut self, value: i64) -> Result<Self::Value>;
+    fn float(&mut self, value: f64) -> Result<Self::Value>;
+    fn string(&mut self, value: String) -> Result<Self::Value>;
+    fn keyword(&mut self, value: String) -> Result<Self::Value>;
+    fn symbol(&mut self, value: String) -> Result<Self::Value>;
+    fn bytes(&mut self, value: Vec<u8>) -> Result<Self::Value>;
+    /// Receives Base64 text; the default requires canonical padding and zero unused bits.
+    fn binary(&mut self, representation: String) -> Result<Self::Value> { self.bytes(STANDARD.decode(representation).map_err(invalid)?) }
+    /// Selects direct array construction for this tag; nested tags and JSON map markers bypass it.
+    fn array_handler(&self, _tag: &str) -> bool { false }
+    fn start_array(&mut self, tag: Option<&str>, size: usize) -> Result<Self::Array>;
+    fn array_item(&mut self, array: &mut Self::Array, value: Self::Value) -> Result<()>;
+    fn finish_array(&mut self, array: Self::Array) -> Result<Self::Value>;
+    fn start_map(&mut self, size: usize) -> Result<Self::Map>;
+    fn map_entry(&mut self, map: &mut Self::Map, key: Self::Value, value: Self::Value) -> Result<()>;
+    fn finish_map(&mut self, map: Self::Map) -> Result<Self::Value>;
+    fn tagged(&mut self, tag: String, representation: Self::Value) -> Result<Self::Value>;
+}
+
+struct WireValues;
+impl TransitReadBuilder for WireValues {
+    type Value = TransitValue;
+    type Array = Vec<TransitValue>;
+    type Map = Vec<(TransitValue,TransitValue)>;
+    fn null(&mut self) -> Result<TransitValue> { Ok(TransitValue::Null) }
+    fn boolean(&mut self, value: bool) -> Result<TransitValue> { Ok(TransitValue::Bool(value)) }
+    fn integer(&mut self, value: i64) -> Result<TransitValue> { Ok(TransitValue::Integer(value)) }
+    fn float(&mut self, value: f64) -> Result<TransitValue> { Ok(TransitValue::Float(value)) }
+    fn string(&mut self, value: String) -> Result<TransitValue> { Ok(TransitValue::String(value)) }
+    fn keyword(&mut self, value: String) -> Result<TransitValue> { Ok(TransitValue::Keyword(value)) }
+    fn symbol(&mut self, value: String) -> Result<TransitValue> { Ok(TransitValue::Symbol(value)) }
+    fn bytes(&mut self, value: Vec<u8>) -> Result<TransitValue> { Ok(TransitValue::Bytes(value)) }
+    fn start_array(&mut self, _tag: Option<&str>, size: usize) -> Result<Self::Array> { Ok(Vec::with_capacity(size)) }
+    fn array_item(&mut self, array: &mut Self::Array, value: TransitValue) -> Result<()> { array.push(value);Ok(()) }
+    fn finish_array(&mut self, array: Self::Array) -> Result<TransitValue> { Ok(TransitValue::Array(array)) }
+    fn start_map(&mut self, size: usize) -> Result<Self::Map> { Ok(Vec::with_capacity(size)) }
+    fn map_entry(&mut self, map: &mut Self::Map, key: TransitValue, value: TransitValue) -> Result<()> { map.push((key,value));Ok(()) }
+    fn finish_map(&mut self, map: Self::Map) -> Result<TransitValue> { Ok(TransitValue::Map(map)) }
+    fn tagged(&mut self, tag: String, representation: TransitValue) -> Result<TransitValue> { tagged(tag, representation) }
+}
+
 #[derive(Clone, Debug, PartialEq)]
-enum Decoded {
-    Value(TransitValue),
+enum Decoded<V> {
+    Value(V),
     Tag(String),
+}
+
+struct ReadCache<V> { slots: Vec<Decoded<V>>,next: usize }
+impl<V: Clone> ReadCache<V> {
+    fn new() -> Self { Self { slots: Vec::new(),next: 0 } }
+    fn insert(&mut self,value: Decoded<V>) {
+        if self.next == CACHE_LIMIT { self.next = 0; }
+        if self.next < self.slots.len() { self.slots[self.next] = value; } else { self.slots.push(value); }
+        self.next += 1;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -35,31 +97,45 @@ enum Packed {
 }
 
 pub fn decode_msgpack(bytes: &[u8]) -> Result<TransitValue> {
+    unpack_value(packed_msgpack(bytes)?, false, &mut ReadCache::new(), 0, &mut WireValues)
+}
+
+fn packed_msgpack(bytes: &[u8]) -> Result<Packed> {
     let mut cursor = Cursor { bytes, offset: 0 };
     let packed = cursor.value(0)?;
     if cursor.offset != bytes.len() { return Err(invalid("Trailing bytes after Transit value")); }
-    unpack_value(packed, false, &mut Vec::new(), 0)
+    Ok(packed)
 }
 
 /// Decodes Transit JSON, retaining object entry order for Transit cache references.
 pub fn decode_json(bytes: &[u8]) -> Result<TransitValue> {
+    unpack_value(packed_json(bytes)?, false, &mut ReadCache::new(), 0, &mut WireValues)
+}
+
+fn packed_json(bytes: &[u8]) -> Result<Packed> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     let packed = <JsonPacked as serde::Deserialize>::deserialize(&mut decoder).map_err(invalid)?;
     decoder.end().map_err(invalid)?;
-    unpack_value(packed.0, false, &mut Vec::new(), 0)
+    Ok(packed.0)
+}
+
+/// Chooses MessagePack or JSON syntax before constructing values, preserving builder failures.
+pub fn decode_with<B: TransitReadBuilder>(bytes: &[u8], builder: &mut B) -> Result<B::Value> {
+    let packed = packed_msgpack(bytes).or_else(|_| packed_json(bytes))?;
+    unpack_value(packed, false, &mut ReadCache::new(), 0, builder)
 }
 
 /// Reads consecutive top-level values, resetting Transit cache indices for each value.
 pub fn decode_json_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
     serde_json::Deserializer::from_slice(bytes).into_iter::<JsonPacked>()
-        .map(|packed| unpack_value(packed.map_err(invalid)?.0, false, &mut Vec::new(), 0)).collect()
+        .map(|packed| unpack_value(packed.map_err(invalid)?.0, false, &mut ReadCache::new(), 0, &mut WireValues)).collect()
 }
 
 /// Reads consecutive top-level values; a truncated trailing value is an error.
 pub fn decode_msgpack_sequence(bytes: &[u8]) -> Result<Vec<TransitValue>> {
     let mut cursor = Cursor { bytes, offset: 0 };
     let mut values = Vec::new();
-    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut Vec::new(), 0)?); }
+    while cursor.offset < bytes.len() { values.push(unpack_value(cursor.value(0)?, false, &mut ReadCache::new(), 0, &mut WireValues)?); }
     Ok(values)
 }
 
@@ -87,6 +163,11 @@ fn json_wire(value: &TransitValue, key: bool, depth: usize) -> Result<serde_json
         TransitValue::Float(value) if !value.is_finite() => Json::String(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }.into()),
         TransitValue::Float(value) if key => Json::String(format!("~d{value}")),
         TransitValue::Float(value) => Json::Number(serde_json::Number::from_f64(*value).ok_or_else(|| invalid("Invalid JSON number"))?),
+        TransitValue::Float32(value) => {
+            if !value.is_finite() { Json::String(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }.into()) }
+            else if key { Json::String(format!("~d{}",rtdb_types::java_f32_text(*value))) }
+            else { serde_json::from_str(&rtdb_types::java_f32_text(*value)).map_err(invalid)? }
+        }
         TransitValue::String(value) => Json::String(if value.starts_with(['~', '^', '`']) { format!("~{value}") } else { value.clone() }),
         TransitValue::Keyword(value) => Json::String(format!("~:{value}")),
         TransitValue::Symbol(value) => Json::String(format!("~${value}")),
@@ -163,7 +244,7 @@ fn cacheable(value: &str, key: bool) -> bool {
         && (key || value.starts_with("~:") || value.starts_with("~$") || value.starts_with("~#"))
 }
 
-fn string_value(value: String, key: bool, cache: &mut Vec<Decoded>) -> Result<Decoded> {
+fn string_value<B: TransitReadBuilder>(value: String, key: bool, cache: &mut ReadCache<B::Value>, builder: &mut B) -> Result<Decoded<B::Value>> {
     if value.starts_with('^') && value != "^ " {
         let code = &value.as_bytes()[1..];
         let index = match code {
@@ -171,88 +252,100 @@ fn string_value(value: String, key: bool, cache: &mut Vec<Decoded>) -> Result<De
             [high, low] if (48..92).contains(high) && (48..92).contains(low) => usize::from(*high - 48) * 44 + usize::from(*low - 48),
             _ => return Err(invalid("Invalid Transit cache code")),
         };
-        return cache.get(index).cloned().ok_or_else(|| invalid("Transit cache code references an unwritten entry"));
+        return cache.slots.get(index).cloned().ok_or_else(|| invalid("Transit cache code references an unwritten entry"));
     }
     let decoded = if let Some(tag) = value.strip_prefix("~#") {
         Decoded::Tag(tag.into())
     } else if value.starts_with("~~") || value.starts_with("~^") || value.starts_with("~`") {
-        Decoded::Value(TransitValue::String(value[1..].into()))
+        Decoded::Value(builder.string(value[1..].into())?)
     } else if let Some(keyword) = value.strip_prefix("~:") {
-        Decoded::Value(TransitValue::Keyword(keyword.into()))
+        Decoded::Value(builder.keyword(keyword.into())?)
     } else if let Some(symbol) = value.strip_prefix("~$") {
-        Decoded::Value(TransitValue::Symbol(symbol.into()))
+        Decoded::Value(builder.symbol(symbol.into())?)
     } else if let Some(binary) = value.strip_prefix("~b") {
-        Decoded::Value(TransitValue::Bytes(STANDARD.decode(binary).map_err(invalid)?))
+        Decoded::Value(builder.binary(binary.into())?)
     } else if value.starts_with('~') && value.len() >= 2 {
         let mut chars = value[1..].chars();
         let tag = chars.next().ok_or_else(|| invalid("Missing Transit string tag"))?.to_string();
-        Decoded::Value(tagged(tag, TransitValue::String(chars.collect()))?)
+        let representation = builder.string(chars.collect())?;
+        Decoded::Value(builder.tagged(tag, representation)?)
     } else {
-        Decoded::Value(TransitValue::String(value.clone()))
+        Decoded::Value(builder.string(value.clone())?)
     };
     if cacheable(&value, key) {
-        if cache.len() == CACHE_LIMIT { cache.clear(); }
-        cache.push(decoded.clone());
+        cache.insert(decoded.clone());
     }
     Ok(decoded)
 }
 
-fn unpack_value(packed: Packed, key: bool, cache: &mut Vec<Decoded>, depth: usize) -> Result<TransitValue> {
-    match unpack(packed, key, cache, depth)? {
+fn unpack_value<B: TransitReadBuilder>(packed: Packed, key: bool, cache: &mut ReadCache<B::Value>, depth: usize, builder: &mut B) -> Result<B::Value> {
+    match unpack(packed, key, cache, depth, builder)? {
         Decoded::Value(value) => Ok(value),
         Decoded::Tag(_) => Err(invalid("Transit tag has no representation")),
     }
 }
 
-fn unpack(packed: Packed, key: bool, cache: &mut Vec<Decoded>, depth: usize) -> Result<Decoded> {
+fn unpack<B: TransitReadBuilder>(packed: Packed, key: bool, cache: &mut ReadCache<B::Value>, depth: usize, builder: &mut B) -> Result<Decoded<B::Value>> {
     if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
     let value = match packed {
-        Packed::Null => TransitValue::Null,
-        Packed::Bool(value) => TransitValue::Bool(value),
-        Packed::Integer(value) => TransitValue::Integer(value),
-        Packed::Float(value) => TransitValue::Float(value),
-        Packed::String(value) => return string_value(value, key, cache),
-        Packed::Array(values) => {
-            let mut values = values.into_iter();
-            if let Some(first) = values.next() {
-                if matches!(&first, Packed::String(marker) if marker == "^ ") {
-                    let mut entries = Vec::new();
-                    while let Some(key) = values.next() {
-                        let value = values.next().ok_or_else(|| invalid("Transit map has an unmatched key"))?;
-                        entries.push((unpack_value(key, true, cache, depth + 1)?, unpack_value(value, false, cache, depth + 1)?));
-                    }
-                    return Ok(Decoded::Value(TransitValue::Map(entries)));
-                }
-                match unpack(first, false, cache, depth + 1)? {
-                    Decoded::Tag(tag) => {
-                        let rep = values.next().ok_or_else(|| invalid("Transit tag has no representation"))?;
-                        if values.next().is_some() { return Err(invalid("Tagged Transit array has more than two entries")); }
-                        tagged(tag, unpack_value(rep, false, cache, depth + 1)?)?
-                    }
-                    Decoded::Value(first) => {
-                        let mut array = vec![first];
-                        for value in values { array.push(unpack_value(value, false, cache, depth + 1)?); }
-                        TransitValue::Array(array)
-                    }
-                }
-            } else { TransitValue::Array(Vec::new()) }
-        }
+        Packed::Null => builder.null()?,
+        Packed::Bool(value) => builder.boolean(value)?,
+        Packed::Integer(value) => builder.integer(value)?,
+        Packed::Float(value) => builder.float(value)?,
+        Packed::String(value) => return string_value(value, key, cache, builder),
+        Packed::Array(values) => return unpack_array(values,None,cache,depth,builder).map(Decoded::Value),
         Packed::Map(entries) => {
             let count = entries.len();
-            let mut map = Vec::with_capacity(count);
+            let mut map = builder.start_map(count)?;
             for (key, value) in entries {
-                match unpack(key, true, cache, depth + 1)? {
+                match unpack(key, true, cache, depth + 1, builder)? {
                     Decoded::Tag(tag) => {
                         if count != 1 { return Err(invalid("Tagged Transit map has more than one entry")); }
-                        return Ok(Decoded::Value(tagged(tag, unpack_value(value, false, cache, depth + 1)?)?));
+                        return unpack_tagged(tag,value,cache,depth + 1,builder).map(Decoded::Value);
                     }
-                    Decoded::Value(key) => map.push((key, unpack_value(value, false, cache, depth + 1)?)),
+                    Decoded::Value(key) => { let value = unpack_value(value,false,cache,depth + 1,builder)?;builder.map_entry(&mut map,key,value)?; }
                 }
             }
-            TransitValue::Map(map)
+            builder.finish_map(map)?
         }
     };
     Ok(Decoded::Value(value))
+}
+
+fn unpack_tagged<B: TransitReadBuilder>(tag: String,representation: Packed,cache: &mut ReadCache<B::Value>,depth: usize,builder: &mut B) -> Result<B::Value> {
+    if builder.array_handler(&tag) {
+        if let Packed::Array(values) = representation { return unpack_array(values,Some(&tag),cache,depth,builder); }
+    }
+    let representation = unpack_value(representation,false,cache,depth,builder)?;
+    builder.tagged(tag,representation)
+}
+
+fn unpack_array<B: TransitReadBuilder>(values: Vec<Packed>,tag: Option<&str>,cache: &mut ReadCache<B::Value>,depth: usize,builder: &mut B) -> Result<B::Value> {
+    if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+    let size = values.len();let mut values = values.into_iter();
+    let mut array = builder.start_array(tag,size)?;
+    if let Some(first) = values.next() {
+        if matches!(&first,Packed::String(marker) if marker == "^ ") {
+            let mut map = builder.start_map(size / 2)?;
+            while let Some(key) = values.next() {
+                let value = values.next().ok_or_else(||invalid("Transit map has an unmatched key"))?;
+                let key = unpack_value(key,true,cache,depth + 1,builder)?;
+                let value = unpack_value(value,false,cache,depth + 1,builder)?;
+                builder.map_entry(&mut map,key,value)?;
+            }
+            return builder.finish_map(map);
+        }
+        match unpack(first,false,cache,depth + 1,builder)? {
+            Decoded::Tag(tag) => {
+                let representation = values.next().ok_or_else(||invalid("Transit tag has no representation"))?;
+                if values.next().is_some() { return Err(invalid("Tagged Transit array has more than two entries")); }
+                return unpack_tagged(tag,representation,cache,depth + 1,builder);
+            }
+            Decoded::Value(first) => builder.array_item(&mut array,first)?,
+        }
+        for value in values { let value = unpack_value(value,false,cache,depth + 1,builder)?;builder.array_item(&mut array,value)?; }
+    }
+    builder.finish_array(array)
 }
 
 fn tagged(tag: String, representation: TransitValue) -> Result<TransitValue> {
@@ -401,6 +494,10 @@ impl Encoder {
                 if value.is_finite() { self.bytes.push(0xcb); self.bytes.extend_from_slice(&value.to_bits().to_be_bytes()); }
                 else { self.string(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }, key)?; }
             }
+            TransitValue::Float32(value) => {
+                if value.is_finite() { self.bytes.push(0xca); self.bytes.extend_from_slice(&value.to_bits().to_be_bytes()); }
+                else { self.string(if value.is_nan() { "~zNaN" } else if value.is_sign_positive() { "~zINF" } else { "~z-INF" }, key)?; }
+            }
             TransitValue::String(value) => {
                 if value.starts_with(['~', '^', '`']) { self.string(&format!("~{value}"), key)?; }
                 else { self.string(value, key)?; }
@@ -513,6 +610,7 @@ fn to_json(value: &TransitValue, depth: usize) -> Result<serde_json::Value> {
         TransitValue::Integer(value) => (*value).into(),
         TransitValue::Float(value) => serde_json::Number::from_f64(*value).map(serde_json::Value::Number)
             .unwrap_or_else(|| serde_json::json!({"$transit/type":"float", "value":if value.is_nan() { "NaN" } else if value.is_sign_positive() { "INF" } else { "-INF" }})),
+        TransitValue::Float32(value) => serde_json::json!({"$transit/type":"float32", "value":rtdb_types::java_f32_text(*value)}),
         TransitValue::String(value) => value.clone().into(),
         TransitValue::Keyword(value) => serde_json::json!({"$transit/type":"keyword", "value":value}),
         TransitValue::Symbol(value) => serde_json::json!({"$transit/type":"symbol", "value":value}),
@@ -554,6 +652,7 @@ fn from_json(value: &serde_json::Value, depth: usize) -> Result<TransitValue> {
                     "keyword" => TransitValue::Keyword(text()?.into()), "symbol" => TransitValue::Symbol(text()?.into()),
                     "bytes" => TransitValue::Bytes(STANDARD.decode(text()?).map_err(invalid)?),
                     "float" => TransitValue::Float(match text()? { "NaN" => f64::NAN, "INF" => f64::INFINITY, "-INF" => f64::NEG_INFINITY, _ => return Err(invalid("Invalid special float")) }),
+                    "float32" => TransitValue::Float32(match text()? { "NaN" => f32::NAN,"Infinity" => f32::INFINITY,"-Infinity" => f32::NEG_INFINITY,value => value.parse().map_err(invalid)? }),
                     "tagged" => TransitValue::Tagged { tag: values.get("tag").and_then(serde_json::Value::as_str).ok_or_else(|| invalid("Transit JSON wrapper has no tag"))?.into(), representation: Box::new(from_json(representation, depth + 1)?) },
                     "map" => {
                         let entries = representation.as_array().ok_or_else(|| invalid("Transit JSON map representation is not an array"))?;

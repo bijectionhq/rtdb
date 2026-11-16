@@ -67,6 +67,15 @@ pub(crate) fn export_batch(batch: OwnedBatch, memory: &Arc<MemoryBudget>) -> Res
     Ok((exported, schema))
 }
 
+pub(crate) fn export_declared_batch(batch: rtdb_columnar::DeclaredBatch, memory: &Arc<MemoryBudget>) -> Result<(FFI_ArrowArray, FFI_ArrowSchema)> {
+    let reservation = memory.reserve(super::add(schema_bound(batch.declared_schema())?, batch.batch().get_array_memory_size())?)?;
+    let schema = export_schema(batch.declared_schema(), memory)?;
+    let array = StructArray::from(batch.batch().clone());
+    let mut exported = FFI_ArrowArray::new(&array.to_data());
+    retain_array(&mut exported, reservation);
+    Ok((exported, schema))
+}
+
 struct ArrayLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowArray)>, _reservation: Arc<MemoryReservation> }
 struct SchemaLease { private: *mut c_void, release: Option<unsafe extern "C" fn(*mut FFI_ArrowSchema)>, format: *const c_char, _full_format: Option<CString>, _reservation: Arc<MemoryReservation> }
 

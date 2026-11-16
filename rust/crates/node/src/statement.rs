@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rtdb_columnar::MemoryReservation;
-use rtdb_plan::{ColumnId, Field, Schema, Statement};
+use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor};
 use rtdb_sql::{PrepareOptions, StatementKind};
 use rtdb_tx::{SqlArguments, TxOp};
@@ -14,6 +14,7 @@ struct PreparedData {
     source: String,
     options: PrepareOptions,
     parameters: Vec<LogicalType>,
+    notices: Vec<SqlNotice>,
     result: PreparedResult,
     policy: ResultSignaturePolicy,
     _reservation: Arc<MemoryReservation>,
@@ -27,13 +28,15 @@ pub struct PreparedSql(Arc<PreparedData>);
 
 impl PreparedSql {
     pub fn prepare(source: &str, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy) -> Result<Self> {
-        Self::prepare_inner(source, context, options, policy, false)
+        Self::prepare_inner(source, context, options, policy, false, false)
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
         let parsed = one_statement(source)?;
+        if parsed.kind() == StatementKind::Dml {
+            return Self::prepare_inner(source, context, PrepareOptions { search_path, ..Default::default() }, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty());
+        }
         let count = parsed.parameter_count();
-        if parameter_oids.len() > count { return Err(parameter_error("More parameter OIDs than SQL parameters")); }
         let _parameters = context.memory.reserve(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?)?;
         let mut options = PrepareOptions { search_path, ..Default::default() };
         let mut dynamic = false;
@@ -43,11 +46,13 @@ impl PreparedSql {
                 None => { dynamic = true; }
             }
         }
-        Self::prepare_inner(source, context, options, ResultSignaturePolicy::PostgreSql, dynamic)
+        Self::prepare_inner(source, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty())
     }
 
-    fn prepare_inner(source: &str, context: &Arc<QueryContext>, options: PrepareOptions, policy: ResultSignaturePolicy, dynamic_pg: bool) -> Result<Self> {
+    fn prepare_inner(source: &str, context: &Arc<QueryContext>, mut options: PrepareOptions, policy: ResultSignaturePolicy, dynamic_pg: bool, dml_notices: bool) -> Result<Self> {
         context.check_cancelled()?;
+        options.default_timezone = context.timezone.clone();
+        options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
         let source_reservation = context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)?;
         let parsed = one_statement(source)?;
         let count = parsed.parameter_count();
@@ -55,74 +60,87 @@ impl PreparedSql {
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
         let _parameters = context.memory.reserve(parameter_bytes)?;
         let mut parameters = (0..count).map(|index| options.parameter_types.get(&index).cloned().unwrap_or(LogicalType::Null)).collect::<Vec<_>>();
+        let mut notices = Vec::new();
         let result = match parsed.kind() {
-            StatementKind::Dml => PreparedResult::Dml,
+            StatementKind::Dml => {
+                if dml_notices { notices = rtdb_sql::prepare(source, &context.catalog, &options).map(|prepared| prepared.notices).unwrap_or_default(); }
+                PreparedResult::Dml
+            }
             StatementKind::Query => {
                 let prepared = rtdb_sql::prepare(source, &context.catalog, &options)?;
                 for (index, ty) in &prepared.parameter_types {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
-                let Statement::Query(relation) = prepared.statement else { return Err(kind_error()); };
-                let schema = relation.schema().clone();
+                notices = prepared.notices.clone();
+                let schema = PreparedQuery::from_prepared(prepared, &context.memory)?.schema().clone();
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
                 PreparedResult::Query { schema, pg_types }
             }
             StatementKind::Session => return Err(Anomaly::unsupported("rtdb.node/prepared-session-statement", "Session-control statements execute through the session API")),
         };
         let source = source.to_owned();
-        let bytes = retained_bytes(&source, &options, &parameters, &result)?;
+        let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
         let reservation = context.memory.reserve(bytes)?;
         drop(source_reservation);
-        Ok(Self(Arc::new(PreparedData { source, options, parameters, result, policy, _reservation: reservation })))
+        Ok(Self(Arc::new(PreparedData { source, options, parameters, notices, result, policy, _reservation: reservation })))
     }
 
     pub fn source(&self) -> &str { &self.0.source }
     pub fn parameter_count(&self) -> usize { self.0.parameters.len() }
     pub fn parameter_types(&self) -> &[LogicalType] { &self.0.parameters }
+    /// Planning warnings in source traversal order; repeated occurrences are retained.
+    /// Execution-time rebinding does not append warnings to this immutable preparation.
+    pub fn notices(&self) -> &[SqlNotice] { &self.0.notices }
     pub fn is_dml(&self) -> bool { matches!(&self.0.result, PreparedResult::Dml) }
     pub fn prepared_schema(&self) -> Option<&Schema> { match &self.0.result { PreparedResult::Query { schema, .. } => Some(schema), PreparedResult::Dml => None } }
     pub fn postgres_types(&self) -> Option<&[PgType]> { match &self.0.result { PreparedResult::Query { pg_types, .. } => Some(pg_types), PreparedResult::Dml => None } }
 
     /// ADBC parameters are positional, have empty field names, and publish unknown nullable types.
     pub fn parameter_schema(&self) -> Result<Schema> {
-        Schema::new((0..self.parameter_count()).map(|index| Ok(Field { id: ColumnId(u32::try_from(index).map_err(|_| size_error())?), name: String::new(), qualifier: None, qualified_only: false, data_type: LogicalType::Null })).collect::<Result<_>>()?)
+        Schema::new((0..self.parameter_count()).map(|index| Ok(Field { id: ColumnId(u32::try_from(index).map_err(|_| size_error())?), name: String::new(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Null })).collect::<Result<_>>()?)
     }
 
-    /// Returns the current Arrow signature without opening an execution cursor.
+    /// Returns the current Arrow signature from supplied physical parameter fields without opening vectors.
     pub fn result_schema(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType]) -> Result<Schema> {
-        Ok(self.bind(context, argument_types)?.schema().clone())
+        Ok(self.bind(context, argument_types, false)?.schema().clone())
     }
 
-    pub fn open_query(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>) -> Result<QueryCursor> {
-        if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
-        for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], ty, &context.timezone)?; }
+    pub async fn open_query(&self, context: Arc<QueryContext>, arguments: Vec<Value>) -> Result<QueryCursor> {
+        let bound = arguments.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?.checked_mul(8).ok_or_else(size_error)?).ok_or_else(size_error))?;
+        let _types = context.memory.reserve(bound)?;
         let types = arguments.iter().map(Value::logical_type).collect::<Vec<_>>();
-        let query = self.bind(&context, &types)?;
+        self.open_query_typed(context, arguments, &types).await
+    }
+
+    /// Opens one argument row using its vector field types, preserving typed nulls and empty containers.
+    /// Unsigned storage types and values enter execution at the corresponding signed width.
+    pub async fn open_query_typed(&self, context: Arc<QueryContext>, mut arguments: Vec<Value>, types: &[LogicalType]) -> Result<QueryCursor> {
+        if arguments.len() != self.parameter_count() { return Err(parameter_error("Argument count differs from the prepared statement")); }
+        arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
+        for (index, ty) in &self.0.options.parameter_types { arguments[*index] = rtdb_expr::cast(&arguments[*index], &rtdb_columnar::execution_type(ty), &context.timezone)?; }
+        let query = self.bind(&context, types, true)?;
         self.check_signature(query.schema())?;
-        query.execute_with_text(context, arguments, Some(self.source()))
+        query.execute_with_text(context, arguments, Some(self.source())).await
     }
 
     /// Preserves absent arguments and an explicitly empty argument batch as distinct source operations.
-    /// DML planning and table lookup occur during transaction resolution.
+    /// SQL argument-width validation belongs to submission and transaction resolution.
+    /// Table lookup occurs during transaction resolution.
     pub fn dml_operation(&self, arguments: Option<SqlArguments>) -> Result<TxOp> {
         if !self.is_dml() { return Err(kind_error()); }
-        match &arguments {
-            Some(arguments) if arguments.types().len() != self.parameter_count() => return Err(parameter_error("Argument width differs from the prepared statement")),
-            None if self.parameter_count() != 0 => return Err(parameter_error("Prepared DML requires arguments")),
-            _ => {}
-        }
         Ok(TxOp::Sql { sql: self.0.source.clone(), args: arguments })
     }
 
-    fn bind(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType]) -> Result<PreparedQuery> {
+    fn bind(&self, context: &Arc<QueryContext>, argument_types: &[LogicalType], execution: bool) -> Result<PreparedQuery> {
         context.check_cancelled()?;
         if self.is_dml() { return Err(kind_error()); }
         if argument_types.len() != self.parameter_count() { return Err(parameter_error("Parameter field count differs from the prepared statement")); }
         let mut options = self.0.options.clone();
-        for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| ty.clone()); }
+        options.default_timezone = context.timezone.clone();
+        if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
+        for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
         let prepared = rtdb_sql::prepare(&self.0.source, &context.catalog, &options)?;
-        let Statement::Query(relation) = prepared.statement else { return Err(kind_error()); };
-        PreparedQuery::new(relation)
+        PreparedQuery::from_prepared(prepared, &context.memory)
     }
 
     fn check_signature(&self, actual: &Schema) -> Result<()> {
@@ -146,11 +164,13 @@ fn one_statement(source: &str) -> Result<rtdb_sql::ParsedStatement> {
 fn parameter_error(message: &str) -> Anomaly { Anomaly::incorrect("xtdb/parameter-count-mismatch", message) }
 fn kind_error() -> Anomaly { Anomaly::incorrect("rtdb.node/statement-kind", "Prepared statement has the wrong execution kind") }
 fn size_error() -> Anomaly { Anomaly::incorrect("rtdb.node/preparation-size", "Prepared statement retained size exceeds usize") }
-fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<LogicalType>, result: &PreparedResult) -> Result<usize> {
-    let mut bytes = 1024usize.checked_add(source.capacity()).ok_or_else(size_error)?;
+fn retained_bytes(source: &String, options: &PrepareOptions, parameters: &Vec<LogicalType>, notices: &Vec<SqlNotice>, result: &PreparedResult) -> Result<usize> {
+    let mut bytes = 1024usize.checked_add(source.capacity()).and_then(|bytes| bytes.checked_add(options.default_timezone.capacity())).ok_or_else(size_error)?;
     for path in &options.search_path { bytes = bytes.checked_add(path.capacity()).and_then(|n| n.checked_add(64)).ok_or_else(size_error)?; }
     for ty in options.parameter_types.values().chain(parameters) { bytes = bytes.checked_add(ty.retained_bytes()?).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }
     bytes = bytes.checked_add(options.search_path.capacity().checked_mul(std::mem::size_of::<String>()).ok_or_else(size_error)?).and_then(|n| n.checked_add(parameters.capacity().checked_mul(std::mem::size_of::<LogicalType>())?)).ok_or_else(size_error)?;
+    bytes = bytes.checked_add(notices.capacity().checked_mul(std::mem::size_of::<SqlNotice>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
+    for notice in notices { bytes = bytes.checked_add(notice.message.capacity()).ok_or_else(size_error)?; }
     if let PreparedResult::Query { schema, pg_types } = result {
         bytes = bytes.checked_add(pg_types.capacity().checked_mul(std::mem::size_of::<PgType>()).ok_or_else(size_error)?).ok_or_else(size_error)?;
         for field in schema.fields() { bytes = bytes.checked_add(field.data_type.retained_bytes()?).and_then(|n| n.checked_add(field.name.capacity())).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?; }

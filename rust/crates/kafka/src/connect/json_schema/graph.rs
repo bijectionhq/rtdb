@@ -1,6 +1,6 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_types::Result;
-use serde_json::Value as Json;
+use super::super::json_value::JsonValue as Json;
 use super::super::{ConnectSchema, error, schema_graph::{GraphBuilder, Metadata, Node, NodeId, NodeKind, Scalar}};
 
 struct Builder<'a> {
@@ -24,7 +24,7 @@ pub(super) fn build(root: &Json, references: &BTreeMap<String, Json>, options: &
         let mut metadata = Metadata::from_schema(schema);
         if let Some(index) = reference_ids.get(&id) { metadata.parameters.insert("io.confluent.connect.json.Id".into(), format!("#id{index}")); }
         if let Some(default) = defaults.get(&id) {
-            let limit = default.to_string().len().saturating_add(1).saturating_mul(512usize.saturating_add(schema.view_allocation_bound())).saturating_add(schema.retained_bytes()?.saturating_mul(4)).saturating_add(65_536);
+            let limit = default.encoded_bound()?.saturating_add(1).saturating_mul(512usize.saturating_add(schema.view_allocation_bound())).saturating_add(schema.retained_bytes()?.saturating_mul(4)).saturating_add(65_536);
             let value = super::super::converter::convert_registry(&Arc::new(schema.clone()), default, limit)?;
             super::super::data::validate_value(schema, &value, 0)?;
             metadata.default = Some(value);
@@ -79,7 +79,7 @@ impl<'a> Builder<'a> {
                         let parameter = if self.generalized { "org.apache.kafka.connect.data.Enum" } else { "io.confluent.connect.json.Enum" };
                         metadata.parameters.insert(parameter.into(), String::new());
                         for (index, symbol) in symbols.into_iter().enumerate() {
-                            let symbol = if symbol.is_null() { "<NULL>".into() } else { symbol.as_str().map(str::to_owned).unwrap_or_else(|| symbol.to_string()) };
+                            let symbol = if symbol.is_null() { "<NULL>".into() } else { if let Some(text) = symbol.as_str() { text.to_owned() } else { String::from_utf8(symbol.to_vec()?).expect("JSON is UTF-8") } };
                             metadata.parameters.insert(format!("{parameter}.{symbol}"), if self.generalized { index.to_string() } else { symbol });
                         }
                     }
@@ -101,7 +101,7 @@ impl<'a> Builder<'a> {
                         for (name, property) in properties {
                             let target = self.schema(property, document, None, None, depth + 1)?;
                             let optional = self.optional_fields && !required.is_some_and(|required| required.iter().any(|value| value.as_str() == Some(name)));
-                            let index = property.get("connect.index").and_then(Json::as_i64).unwrap_or(fields.len() as i64);
+                            let index = integer_annotation(property, "connect.index")?.map(i64::from).unwrap_or(fields.len() as i64);
                             fields.insert(index, (name.clone(), if optional { self.alias(target, true) } else { target }));
                         }
                     }
@@ -165,9 +165,16 @@ impl<'a> Builder<'a> {
     }
 }
 fn annotations(raw: &Json, version: Option<i32>) -> Result<Metadata> {
-    let mut metadata = Metadata { name: raw.get("title").and_then(Json::as_str).map(str::to_owned), doc: raw.get("description").and_then(Json::as_str).map(str::to_owned), version: raw.get("connect.version").and_then(Json::as_i64).map(|value| value as i32).or(version), ..Default::default() };
+    let mut metadata = Metadata { name: raw.get("title").and_then(Json::as_str).map(str::to_owned), doc: raw.get("description").and_then(Json::as_str).map(str::to_owned), version: integer_annotation(raw, "connect.version")?.or(version), ..Default::default() };
     if let Some(parameters) = raw.get("connect.parameters") {
         metadata.parameters = parameters.as_object().ok_or_else(|| error("json-schema", "Connect parameters must be an object"))?.iter().map(|(name, value)| Ok((name.clone(), value.as_str().ok_or_else(|| error("json-schema", "Connect parameter must be a string"))?.to_owned()))).collect::<Result<_>>()?;
     }
     Ok(metadata)
+}
+fn integer_annotation(raw: &Json, name: &str) -> Result<Option<i32>> {
+    match raw.get(name).filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(value) if value.is_int() => Ok(value.int_value()),
+        Some(_) => Err(error("json-schema", format!("{name} requires a Java Integer value"))),
+    }
 }

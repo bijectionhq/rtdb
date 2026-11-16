@@ -44,6 +44,45 @@ fn trie_keys_and_recorded_slugs_retain_existing_object_paths() {
 }
 
 #[test]
+fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
+    use rtdb_types::calendar::CivilDate;
+    for (date, text) in [
+        (CivilDate::from_ymd(0, 1, 1).unwrap(), "l01-r00000101-b00"),
+        (CivilDate::from_ymd(280_000, 2, 29).unwrap(), "l01-r2800000229-b00"),
+        (CivilDate::MAX, "l01-r9999999991231-b00"),
+    ] {
+        let key = TrieKey::new(1, Some(date), vec![], BlockIndex(0)).unwrap();
+        assert_eq!(key.to_string(), text);
+        assert_eq!(text.parse::<TrieKey>().unwrap(), key);
+        assert_eq!(serde_json::to_value(&key).unwrap()["recency"], serde_json::Value::String(date.to_string()));
+    }
+    assert!(TrieKey::new(1, Some(CivilDate::MIN), vec![], BlockIndex(0)).is_err());
+    for key in ["l01-r10000000000101-b00", "l01-r-00010101-b00"] {
+        assert!(key.parse::<TrieKey>().is_err(), "{key}");
+    }
+}
+
+#[test]
+fn trie_recency_parser_keeps_lenient_year_width_and_smart_month_ends() {
+    use rtdb_types::calendar::CivilDate;
+    for (encoded, year) in [("0", 0), ("1", 1), ("01", 1), ("001", 1), ("0001", 1), ("00001", 1), ("280000", 280_000), ("999999999", 999_999_999)] {
+        for sign in ["", "+"] {
+            let key: TrieKey = format!("l01-r{sign}{encoded}0101-b00").parse().unwrap();
+            assert_eq!(key.recency(), Some(CivilDate::from_ymd(year, 1, 1).unwrap()));
+            assert_eq!(key.to_string(), format!("l01-r{year:04}0101-b00"));
+        }
+    }
+    for (input, normalized) in [("20200230", "20200229"), ("20210229", "20210228"), ("19000229", "19000228"),
+        ("20000231", "20000229"), ("20200431", "20200430"), ("2800000231", "2800000229")] {
+        let key: TrieKey = format!("l01-r{input}-b00").parse().unwrap();
+        assert_eq!(key.to_string(), format!("l01-r{normalized}-b00"));
+    }
+    for recency in ["0101", "00000000010101", "20200001", "20201301", "20200100", "20200132", "20200299", "2020+101", "202001+1", "++20200101", "-20200101", "+", " 20200101", "20200101 ", "2020a101"] {
+        assert!(format!("l01-r{recency}-b00").parse::<TrieKey>().is_err(), "{recency}");
+    }
+}
+
+#[test]
 fn old_source_headers_and_empty_flush_requests_remain_ignored() {
     assert_eq!(SourceMessage::decode(&[2]).unwrap(), None);
     let empty_flush = pb::SourceLogMessage { message: Some(pb::source_log_message::Message::FlushBlock(pb::FlushBlock { expected_block_idx: None })) };

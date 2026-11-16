@@ -192,7 +192,7 @@ def sql_cases(evidence, run, revision, implementation):
 
 
 def client_cases(evidence, run, revision, implementation):
-    from run_clients import LANES, validate_package
+    from run_clients import LANES, validate_native_package_artifacts, validate_package
     comparison = evidence.read("comparison.json")
     if comparison.get("reference_revision") != revision or comparison.get("implementation_revision") != implementation or comparison.get("selection") != LANES:
         raise ValueError("client provenance or original selection differs")
@@ -212,8 +212,9 @@ def client_cases(evidence, run, revision, implementation):
             raise ValueError("client package manifest differs from retained build evidence")
         package_root = Path(package_reference["path"]).parent
         evidence.recorded({"path": str(package_root / "source-manifest.json"), "sha256": package["manifest"]["source_manifest_sha256"]})
-        for item in package["manifest"]["artifacts"]:
-            evidence.recorded({**item, "path": str(package_root / item["path"])})
+        retained = {item["path"]: evidence.recorded({**item, "path": str(package_root / item["path"])}) for item in package["manifest"]["artifacts"]}
+        if engine == "rust":
+            validate_native_package_artifacts(retained, package["manifest"])
         running = side + ("/running-build.json" if engine == "rust" else "/running-xtdb.jar")
         artifact_name = "artifacts/build.json" if engine == "rust" else "artifacts/xtdb.jar"
         claimed = next(entry for entry in package["manifest"]["artifacts"] if entry["path"] == artifact_name)

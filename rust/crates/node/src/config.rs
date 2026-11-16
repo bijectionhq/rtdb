@@ -42,9 +42,19 @@ impl Default for NodeOptions {
     }
 }
 
-pub trait Clock: Send + Sync { fn now(&self) -> Timestamp; }
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Timestamp;
+    /// Supplies an exact query-clock reading; the default lifts the durable microsecond clock.
+    fn query_instant(&self) -> rtdb_types::Instant { self.now().into() }
+}
 pub struct SystemClock;
-impl Clock for SystemClock { fn now(&self) -> Timestamp { Timestamp(chrono::Utc::now().timestamp_micros()) } }
+impl Clock for SystemClock {
+    fn now(&self) -> Timestamp { Timestamp(chrono::Utc::now().timestamp_micros()) }
+    fn query_instant(&self) -> rtdb_types::Instant {
+        let now = chrono::Utc::now();
+        rtdb_types::Instant::new(now.timestamp(), now.timestamp_subsec_nanos()).expect("system clock has normalized nanoseconds")
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DatabaseAccess { Read, Write }
@@ -73,7 +83,8 @@ pub trait ExternalSource: Send {
 pub trait ExternalSourceFactory: Send + Sync {
     fn validate(&self, configuration: &Any) -> Result<()>;
     /// Opens one database-scoped source; its assignment-independent state survives leader changes.
-    async fn open(&self, configuration: &Any, database: &str) -> Result<Box<dyn ExternalSource>>;
+    /// Retained I/O must use `io`; database teardown drains this region after source workers join, including cancelled callers' work.
+    async fn open(&self, configuration: &Any, database: &str, io: Arc<rtdb_storage::IoRegion>) -> Result<Box<dyn ExternalSource>>;
 }
 
 pub type ExternalSources = BTreeMap<String, Arc<dyn ExternalSourceFactory>>;

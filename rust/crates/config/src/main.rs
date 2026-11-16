@@ -22,8 +22,16 @@ impl Input {
 fn run() -> Result<ExitCode, &'static str> {
     let mut args = std::env::args_os().skip(1);
     let Some(format) = args.next() else { return Err("Usage: rtdb-config <yaml|ingest-yaml|edn> CONFIG ENVIRONMENT.json PROVENANCE.json"); };
+    if format == "--build-info" {
+        if args.next().is_some() { return Err("--build-info accepts no arguments"); }
+        let mut output = std::io::stdout().lock();
+        serde_json::to_writer(&mut output, &rtdb_types::compiled_build_info()).map_err(|_| "Cannot write build information")?;
+        writeln!(output).map_err(|_| "Cannot write build information")?;
+        output.flush().map_err(|_| "Cannot flush build information")?;
+        return Ok(ExitCode::SUCCESS);
+    }
     if format == "--help" {
-        writeln!(std::io::stdout().lock(), "Usage: rtdb-config <yaml|ingest-yaml|edn> CONFIG ENVIRONMENT.json PROVENANCE.json\nReads only explicit inputs; prints a redacted JSON qualification report.\nExit 2 means not eligible for cutover; exit 1 means input or output failure.").map_err(|_| "Cannot write help")?;
+        writeln!(std::io::stdout().lock(), "Usage: rtdb-config <yaml|ingest-yaml|edn> CONFIG ENVIRONMENT.json PROVENANCE.json\n       rtdb-config --build-info\nReads only explicit inputs; prints a redacted JSON qualification report.\nExit 2 means not eligible for cutover; exit 1 means input or output failure.").map_err(|_| "Cannot write help")?;
         return Ok(ExitCode::SUCCESS);
     }
     let format = match format.to_str() { Some("yaml") => InputFormat::Yaml, Some("ingest-yaml") => InputFormat::IngestYaml, Some("edn") => InputFormat::Edn, _ => return Err("Unknown input format") };

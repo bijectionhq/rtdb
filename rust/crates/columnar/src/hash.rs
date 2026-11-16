@@ -64,11 +64,23 @@ pub fn xxhash32(bytes: &[u8], seed: u32) -> u32 {
 }
 
 fn combine(current: i32, next: i32) -> i32 { current.wrapping_mul(31).wrapping_add(next) }
-fn float_hash(value: f64, seed: u32) -> i32 { xxhash32(&value.to_bits().to_be_bytes(), seed) as i32 }
 
 /// Hashes the JVM vector interpretation of one semantic value.
 /// Struct children follow this value's key order; use `hash_cell` for an existing physical schema.
+/// Unadmitted calendar objects are rejected.
 pub fn hash_value(value: &Value, seed: u32) -> Result<i32> {
+    hash_value_with(value, seed, xxhash32)
+}
+
+/// Uses the JVM Murmur3 vector hash; struct fields follow this value's key order.
+/// Unadmitted calendar objects are rejected.
+pub fn hash_value_murmur3(value: &Value, seed: u32) -> Result<i32> {
+    hash_value_with(value, seed, murmur3_32)
+}
+
+fn hash_value_with(value: &Value, seed: u32, hash_bytes: fn(&[u8], u32) -> u32) -> Result<i32> {
+    let float_hash = |value: f64, seed| hash_bytes(&value.to_bits().to_be_bytes(), seed) as i32;
+    let nested = |value: &Value, seed| hash_value_with(value, seed, hash_bytes);
     Ok(match value {
         Value::Undefined | Value::Null => 0,
         Value::Bool(value) => if *value { 17 } else { 19 },
@@ -84,35 +96,36 @@ pub fn hash_value(value: &Value, seed: u32) -> Result<i32> {
         Value::F32(value) => float_hash(f64::from(*value), seed),
         Value::F64(value) => float_hash(*value, seed),
         Value::Decimal(value) => float_hash(decimal_double(value)?, seed),
-        Value::Utf8(value) | Value::Uri(value) => xxhash32(value.as_bytes(), seed) as i32,
-        Value::Keyword(value) => xxhash32(value.as_str().as_bytes(), seed) as i32,
-        Value::Binary(value) | Value::FixedSizeBinary(value) | Value::Transit(value) => xxhash32(value, seed) as i32,
-        Value::Uuid(value) => xxhash32(value, seed) as i32,
+        Value::Utf8(value) | Value::Uri(value) => hash_bytes(value.as_bytes(), seed) as i32,
+        Value::Keyword(value) => hash_bytes(value.as_str().as_bytes(), seed) as i32,
+        Value::Binary(value) | Value::FixedSizeBinary(value) | Value::Transit(value) => hash_bytes(value, seed) as i32,
+        Value::Uuid(value) => hash_bytes(value, seed) as i32,
+        Value::Date(_) => return Err(Anomaly::incorrect("rtdb/unadmitted-calendar-value", "Vector hashing requires admitted calendar values")),
         Value::DateDay(value) => float_hash(i64::from(*value).wrapping_mul(86_400) as f64, seed),
         Value::DateMilli(value) => float_hash((value / 86_400_000).wrapping_mul(86_400) as f64, seed),
-        Value::Time { value, bit_width: 32, .. } => xxhash32(&(*value as i32).to_le_bytes(), seed) as i32,
-        Value::Time { value, bit_width: 64, .. } => xxhash32(&value.to_le_bytes(), seed) as i32,
+        Value::Time { value, bit_width: 32, .. } => hash_bytes(&(*value as i32).to_le_bytes(), seed) as i32,
+        Value::Time { value, bit_width: 64, .. } => hash_bytes(&value.to_le_bytes(), seed) as i32,
         Value::Time { .. } => return Err(Anomaly::incorrect("rtdb/time-width", "Time vectors require 32 or 64 bits")),
         Value::Timestamp { value, unit, .. } | Value::Duration { value, unit } => float_hash(*value as f64 / unit.units_per_second() as f64, seed),
-        Value::IntervalYearMonth(value) => xxhash32(&value.to_le_bytes(), seed) as i32,
+        Value::IntervalYearMonth(value) => hash_bytes(&value.to_le_bytes(), seed) as i32,
         Value::IntervalDayTime { days, milliseconds } => {
             let mut bytes = [0; 8];
             bytes[..4].copy_from_slice(&days.to_le_bytes());
             bytes[4..].copy_from_slice(&milliseconds.to_le_bytes());
-            xxhash32(&bytes, seed) as i32
+            hash_bytes(&bytes, seed) as i32
         }
         Value::IntervalMonthDayNano { months, days, nanoseconds } | Value::IntervalMonthDayMicro { months, days, nanoseconds } => {
             let mut bytes = [0; 16];
             bytes[..4].copy_from_slice(&months.to_le_bytes());
             bytes[4..8].copy_from_slice(&days.to_le_bytes());
             bytes[8..].copy_from_slice(&nanoseconds.to_le_bytes());
-            xxhash32(&bytes, seed) as i32
+            hash_bytes(&bytes, seed) as i32
         }
-        Value::List(values) | Value::FixedSizeList(values) => values.iter().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, hash_value(value, seed)?)))?,
-        Value::Set(values) => values.iter().try_fold(0i32, |hash, value| Ok::<i32, Anomaly>(hash.wrapping_add(hash_value(value, seed)?)))?,
-        Value::Struct(fields) => fields.values().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, hash_value(value, seed)?)))?,
+        Value::List(values) | Value::FixedSizeList(values) => values.iter().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value, seed)?)))?,
+        Value::Set(values) => values.iter().try_fold(0i32, |hash, value| Ok::<i32, Anomaly>(hash.wrapping_add(nested(value, seed)?)))?,
+        Value::Struct(fields) => fields.values().try_fold(0, |hash, value| Ok::<i32, Anomaly>(combine(hash, nested(value, seed)?)))?,
         Value::Map { entries, .. } => entries.iter().try_fold(0, |hash, (key, value)| {
-            Ok::<i32, Anomaly>(combine(hash, combine(hash_value(key, seed)?, hash_value(value, seed)?)))
+            Ok::<i32, Anomaly>(combine(hash, combine(nested(key, seed)?, nested(value, seed)?)))
         })?,
         Value::TimestampTzRange { lower, upper } => combine(float_hash(*lower as f64 / 1_000_000.0, seed), float_hash(*upper as f64 / 1_000_000.0, seed)),
     })
