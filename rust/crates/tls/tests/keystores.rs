@@ -129,6 +129,22 @@ fn jks_store(entries: &[Vec<u8>]) -> Vec<u8> {
     hash.update(b"Mighty Aphrodite"); hash.update(&bytes); bytes.extend_from_slice(&hash.finalize()); bytes
 }
 #[test]
+fn empty_java_stores_keep_client_and_server_identity_admission_separate() {
+    let bytes = jks_store(&[]);
+    for usage in [StoreUse::Trust, StoreUse::OptionalIdentity] {
+        let store = decode(&bytes, Some("12345678"), None, usage).unwrap();
+        assert!(store.identities().is_empty());
+        assert!(store.trusted_certificates().is_empty());
+    }
+    assert!(decode(&bytes, Some("12345678"), None, StoreUse::Identity).is_err());
+    let (_, chain) = fixture_key();
+    let bytes = jks_store(&[certificate_entry(b"trusted", &chain[0])]);
+    let store = decode(&bytes, Some("12345678"), None, StoreUse::OptionalIdentity).unwrap();
+    assert!(store.identities().is_empty());
+    assert_eq!(store.trusted_certificates().len(), 1);
+    assert!(decode(&bytes, Some("12345678"), None, StoreUse::Identity).is_err());
+}
+#[test]
 fn jks_duplicate_aliases_discard_overwritten_encrypted_keys_before_decryption() {
     let (key, chain) = fixture_key();
     for (first, second) in [(b"a".as_slice(), b"a".as_slice()), (b"\xc1\xa1", b"a"), (b"\x00", b"\xc0\x80"), (b"\xed\xa0\x80", b"\xed\xa0\x80")] {

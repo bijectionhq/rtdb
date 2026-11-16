@@ -32,3 +32,9 @@ The native transport adapters select identities using the requested signature sc
 Registry chain verification always runs; its configured endpoint-identification policy determines hostname verification.
 Native crypto and system trust-store allocation bounds remain source estimates pending execution and measurement.
 No codec or TLS test has been compiled or executed during Phase 1.
+
+`StoreUse::Identity` requires at least one usable key and chain for the server.
+`StoreUse::OptionalIdentity` decodes available keys for a client and permits an empty Java identity store.
+An empty explicit Java truststore remains an empty trust set until handshake validation.
+`tests/fixtures/empty.jks` is a version-two JKS header with zero entries and the SHA-1 integrity digest for password `12345678`.
+The fixture was written directly from its wire framing; no JVM or project code was executed to produce it.
