@@ -1,0 +1,17 @@
+= Columnar values and retained pages
+
+Columnar builders and readers are passive call-owned transforms.
+`OwnedBatch`, `OwnedColumn`, and cloned Arrow arrays retain their allocation reservations independently of the query cursor.
+Schema codecs preserve native logical types and the full signed decimal precision and scale at external boundaries.
+
+`DeclaredBatch` retains a wire schema and a page conformed to that schema's physical layout.
+`conform_batch` reserves schema work, decoded values, and builders before allocating them.
+It preserves nonnull logical values and exact decimal metadata, fills nullable missing fields, and rejects fields outside the target layout.
+Adaptation preserves declared nested field order, child names, metadata and dense union type IDs.
+Set and timestamp-range extensions retain their declared child layouts while validating the extension's storage container.
+Single typed columns are wrapped in declared unions, and nullable rows select the union's NULL leg.
+Exact-schema pages pass through with their original physical layout.
+Present NULL values can promote physical field nullability while the declared wire flags stay unchanged, following `core/src/main/kotlin/xtdb/arrow/ConformingUnloader.kt`.
+The internal RecordBatch uses checked constructors; Flight IPC and C exports supply the separate declared schema.
+This adapter's source tests cover null promotion, nested layouts, union remapping, column order, retained memory, missing required columns and decimal metadata mismatch.
+All compilation, execution, and cross-runtime qualification remain pending.
