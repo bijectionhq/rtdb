@@ -128,6 +128,8 @@ config {
 --
 -- == Stage 1: Merge pages to disk ==
 --
+-- Input data and metadata files may use Arrow LZ4-frame or Zstandard buffer compression.
+-- Decompression preserves the rows and metadata supplied to the merge.
 -- Similarly to the scan operator, we calculate a list of merge tasks.
 -- An input page from an unresolved segment (an L0 file, or the live index) first has its same-system-time events resolved against each other.
 -- Their order holds only within their page, and the recency split separates them into different files.

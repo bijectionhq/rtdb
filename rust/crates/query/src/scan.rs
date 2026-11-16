@@ -7,7 +7,7 @@ use arrow_array::{Array, StructArray, UnionArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
 use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field, read_value};
-use rtdb_format::{ipc::{ArrowFile, inspect_file}, metadata::{MetadataFile, MetadataNode}};
+use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{IndexBatch, LiveTable, RowSource, Snapshot};
 use rtdb_plan::{Scan, Schema, TemporalFilter};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
@@ -159,10 +159,9 @@ impl PartitionScan {
             let slug = slug.as_ref().ok_or_else(|| invalid("missing-table-slug", "Persisted trie has no recorded table registry entry"))?;
             let key = ObjectKey::new(slug.metadata_key(&trie.key))?;
             let lease = self.storage.get(&key).await?;
-            let bound = lease.as_slice().len().checked_mul(64).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("metadata-size", "Metadata allocation bound overflow"))?;
-            let _reservation = self.execution.context.memory.reserve(bound)?;
             let mut cursor = Cursor::new(lease);
-            if !inspect_file(&mut cursor)?.uncompressed { return Err(Anomaly::unsupported("rtdb.query/compressed-trie", "JVM trie storage uses uncompressed Arrow pages")); }
+            let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+            let _reservation = self.execution.context.memory.reserve(layout.full_allocation_bound()?)?;
             let metadata = MetadataFile::read_reader(cursor)?;
             let file = self.files.len();
             self.files.push(DataFile { storage: Arc::clone(&self.storage), key: ObjectKey::new(slug.data_key(&trie.key))?, state: DataState::Unopened });
@@ -204,15 +203,12 @@ impl PartitionScan {
                 if matches!(&data.state, DataState::Unopened) {
                     let lease = data.storage.get(&data.key).await?;
                     let mut cursor = Cursor::new(lease);
-                    let layout = inspect_file(&mut cursor)?;
-                    if !layout.uncompressed { return Err(Anomaly::unsupported("rtdb.query/compressed-trie", "JVM trie storage uses uncompressed Arrow pages")); }
-                    let bound = layout.dictionary_encoded_bytes.checked_mul(4).and_then(|bytes| layout.footer_encoded_bytes.checked_mul(64).and_then(|footer| bytes.checked_add(footer)))
-                        .and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("file-size", "Arrow file allocation bound overflow"))?;
-                    let reservation = self.execution.context.memory.reserve(bound)?;
-                    data.state = DataState::Open { reader: ArrowFile::from_reader(cursor, None)?, _reservation: reservation };
+                    let layout = inspect_file_reserved(&mut cursor, |bytes| self.execution.context.memory.reserve(bytes))?;
+                    let reservation = self.execution.context.memory.reserve(layout.opening_allocation_bound()?)?;
+                    data.state = DataState::Open { reader: ArrowFile::from_inspected_reader(cursor, None, layout)?, _reservation: reservation };
                 }
                 let DataState::Open { reader, .. } = &mut data.state else { return Err(invalid("file-state", "Data file failed to open")); };
-                let mut bound = reader.encoded_page_size(page_index)?.checked_mul(4).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("page-size", "Arrow page allocation bound overflow"))?;
+                let mut bound = reader.page_allocation_bound(page_index)?;
                 for field in reader.schema().fields() {
                     bound = bound.checked_add(estimate_builder_bytes(&from_field(field)?, &[])?).ok_or_else(|| invalid("page-size", "Arrow schema allocation bound overflow"))?;
                 }

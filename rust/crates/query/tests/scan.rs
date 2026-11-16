@@ -17,6 +17,49 @@ fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) 
     TransactionBuffer::new(state.value().snapshot(), TransactionKey { tx_id: TxId(id), system_time: Timestamp(system) }, Arc::clone(budget)).unwrap()
 }
 fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
+#[tokio::test]
+async fn compressed_trie_metadata_and_pages_preserve_history_and_release_decode_charges() {
+    use rtdb_format::ipc::ArrowFile;
+    use arrow_ipc::writer::{FileWriter, IpcWriteOptions};
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    for (id, time, value) in [(0, 10, "old"), (1, 20, "new")] {
+        let mut transaction = tx(&state, &memory, id, time);
+        transaction.put(table(), document(1, Value::Utf8(value.into())), Interval::ALL).unwrap();
+        state.apply(&transaction.stage().unwrap()).unwrap();
+    }
+    let original = MemoryStore::default(); persist(&state, &original).await;
+    for codec in [arrow_ipc::CompressionType::LZ4_FRAME, arrow_ipc::CompressionType::ZSTD] {
+        let store = Arc::new(MemoryStore::default());
+        for object in original.list(None).await.unwrap() {
+            let bytes = original.get(&object.key).await.unwrap();
+            let bytes = if object.key.as_str().ends_with(".arrow") {
+                let mut reader = ArrowFile::open(Arc::from(bytes.as_ref()), None).unwrap();
+                let options = IpcWriteOptions::default().try_with_compression(Some(codec)).unwrap();
+                let mut writer = FileWriter::try_new_with_options(Vec::new(), &reader.schema(), options).unwrap();
+                for page in 0..reader.page_count() { writer.write(&reader.read_page(page).unwrap()).unwrap(); }
+                writer.finish().unwrap(); writer.into_inner().unwrap().into()
+            } else { bytes };
+            store.put(&object.key, bytes).await.unwrap();
+        }
+        for (time, expected) in [(15, "old"), (25, "new")] {
+            let context = query_context(state.value().snapshot(), Arc::clone(&store), false);
+            let relation = scan(&context, &["v"], TemporalFilter::All, at(time), None);
+            assert_eq!(collect(relation, Arc::clone(&context)).await.unwrap(), vec![vec![Value::Utf8(expected.into())]]);
+            assert_eq!(context.memory.used_bytes(), 0);
+        }
+        if codec == arrow_ipc::CompressionType::LZ4_FRAME {
+            let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+            let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+            let budget = MemoryBudget::new(64 << 20);
+            let context = QueryContext::new(catalog, Arc::clone(&budget), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+            let relation = scan(&context, &["v"], TemporalFilter::All, at(25), None);
+            assert_eq!(collect(relation, context).await.unwrap_err().code, "rtdb/memory-budget-exceeded");
+            assert_eq!(budget.used_bytes(), 0);
+        }
+    }
+}
+
 fn at(value: i64) -> TemporalFilter { TemporalFilter::At(Expr::Literal(timestamp(value))) }
 fn query_context(snapshot: Snapshot, store: Arc<MemoryStore>, bypass: bool) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::new(BufferPool::new(store, 1 << 26)) };

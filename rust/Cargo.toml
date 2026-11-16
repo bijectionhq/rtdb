@@ -60,6 +60,7 @@ regex = "1"
 futures = "0.3"
 fs2 = "0.4"
 half = "2"
+lz4_flex = { version = "=0.13.1", default-features = false, features = ["std", "frame"] }
 parking_lot = "0.12"
 object_store = { version = "=0.13.2", default-features = false }
 prost = "0.14.3"

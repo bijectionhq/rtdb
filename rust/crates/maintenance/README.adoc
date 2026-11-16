@@ -63,7 +63,7 @@ The executable test sources in this crate cover selection, historical splitting,
 No Rust compilation, test execution, JVM comparison, or simulation has run during Phase 1.
 
 Cross-JVM Arrow byte identity remains unverified, including schema child order, dictionary encoding, FlatBuffer allocation order, and exact page boundaries.
-Compressed compaction inputs return an explicit unsupported error until their decoded allocation bounds are available.
+Compressed data and metadata inputs reserve their declared decoded buffers before opening dictionaries or pages.
 The job enforces temporary disk growth before writes and holds memory reservations for input pages, decoded rows, output pages, and retained metadata.
 Those conservative estimates are not a proof of bounded peak allocation for every nested Arrow schema.
 Catalog enumeration, object-store listings, and protobuf decoding still need complete peak-memory accounting.

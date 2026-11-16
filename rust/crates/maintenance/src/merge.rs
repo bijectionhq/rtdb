@@ -132,15 +132,13 @@ async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &Obj
 
 fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
-    if !layout.uncompressed { return Err(rtdb_types::Anomaly::unsupported("rtdb.maintenance/compressed-input", "Compaction requires uncompressed Arrow input until decoded buffer allocation bounds are available")); }
-    let bytes = layout.dictionary_encoded_bytes.checked_mul(8).and_then(|bytes| layout.footer_encoded_bytes.checked_mul(64).and_then(|footer| bytes.checked_add(footer))).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| crate::invalid("Arrow opening allocation overflow"))?;
-    let reservation = memory.reserve(bytes)?;
+    let reservation = memory.reserve(layout.opening_allocation_bound()?)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
 }
 
 fn read_page(reader: &mut ArrowFile, index: usize, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch> {
-    let bound = reader.encoded_page_size(index)?.checked_mul(8).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| crate::invalid("Arrow page allocation overflow"))?;
+    let bound = reader.page_allocation_bound(index)?;
     let reservation = memory.reserve(bound)?;
     OwnedBatch::with_reservation(reader.read_page(index)?, reservation)
 }
@@ -233,10 +231,8 @@ impl CompactionExecutor for SegmentCompactor {
             check_disk(directory.path(), self.config.temporary_byte_limit, size)?;
             let data = download(self.store.as_ref(), &self.memory, &data_key, &directory.path().join(format!("input-{index}.arrow")), cancellation).await?;
             let mut metadata = download(self.store.as_ref(), &self.memory, &meta_key, &directory.path().join(format!("meta-{index}.arrow")), cancellation).await?;
-            if !inspect_file_reserved(&mut metadata, |bytes| self.memory.reserve(bytes))?.uncompressed {
-                return Err(rtdb_types::Anomaly::unsupported("rtdb.maintenance/compressed-input", "Compaction requires uncompressed Arrow metadata"));
-            }
-            let metadata_charge = self.memory.reserve(usize::try_from(metadata.metadata().map_err(crate::invalid)?.len()).map_err(crate::invalid)?.checked_mul(64).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| crate::invalid("Metadata allocation overflow"))?)?;
+            let metadata_layout = inspect_file_reserved(&mut metadata, |bytes| self.memory.reserve(bytes))?;
+            let metadata_charge = self.memory.reserve(metadata_layout.full_allocation_bound()?)?;
             let metadata = MetadataFile::read_reader(metadata)?;
             let (reader, reservation) = open_input(data, &self.memory)?;
             inputs.push(InputSegment { key: key.clone(), metadata, reader, _reservations: vec![reservation, metadata_charge] });
