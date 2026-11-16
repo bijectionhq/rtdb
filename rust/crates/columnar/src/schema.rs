@@ -190,7 +190,7 @@ pub fn from_field(field: &Field) -> Result<LogicalType> {
             },
             _ => return Err(Anomaly::unsupported("rtdb/unknown-arrow-extension", format!("Unknown Arrow extension {extension}"))),
         };
-        if to_field(field.name(), &expected)?.data_type() != field.data_type() {
+        if matches!(&expected, LogicalType::Scalar(_)) && to_field(field.name(), &expected)?.data_type() != field.data_type() {
             return Err(extension_layout_error(extension));
         }
         expected
