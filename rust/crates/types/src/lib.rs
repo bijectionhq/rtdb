@@ -6,6 +6,8 @@ mod pg;
 mod type_edn;
 mod time;
 mod value;
+mod uri;
+mod utf8;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
 pub use id::{EntityId, Iid, Keyword, TableRef};
@@ -14,6 +16,8 @@ pub use position::*;
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
 pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds, Timestamp};
 pub use value::{DecimalValue, Value};
+pub use uri::UriParts;
+pub use utf8::decode_java_utf8;
 
 mod decimal_text;
 pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};

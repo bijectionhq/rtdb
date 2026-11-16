@@ -1,0 +1,16 @@
+= Logical types and physical encodings
+
+`UriParts` validates OpenJDK 25 URI syntax and borrows the original component spelling without normalization or network access.
+It distinguishes opaque URIs, hierarchical paths, registry authorities and server authorities, including bracketed IPv6 scope identifiers.
+Decoded accessors preserve empty components and use Java UTF-8 replacement grouping for percent-escaped bytes; a plus sign remains literal.
+Object equality folds ASCII scheme and host case and raw percent-escape hexadecimal case without decoding octets or normalizing path segments.
+ASCII object rendering applies Unicode 16 NFC and percent-encodes non-ASCII UTF-8 bytes after callers admit its allocation bound.
+The parser, decoding, equality and ASCII rendering source regressions are unexecuted.
+Isolated UTF-16 surrogate inputs remain outside the current UTF-8 string carrier and require a wider representation for complete Java parity.
+
+`UriParts::java_hash_code` provides the URI object hash beside object equality, including UTF-16 hashing and component-specific case folding.
+`tests/uri.rs` records numeric and equivalent-spelling fixtures as unexecuted regression source.
+
+`decode_java_utf8` applies Java replacement grouping to byte sequences, including encoded surrogate triples.
+URI percent decoding uses the indexed decoder without copying percent-byte runs.
+`tests/utf8.rs` records malformed-prefix, surrogate and supplementary decoding as unexecuted regression source.
