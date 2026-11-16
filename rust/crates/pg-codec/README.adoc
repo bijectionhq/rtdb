@@ -25,6 +25,12 @@ Millisecond date text truncates epoch milliseconds to days toward zero, includin
 Binary date output accepts day vectors; the pinned millisecond vector has no integer reader and fails with an internal-error category.
 Local timestamp output truncates submicrosecond fractions toward zero; zoned timestamp output floors them.
 Numeric conversion preserves decimal coefficients without a floating-point intermediate.
+Interval text follows the pinned `Time.kt/asInterval` grammar, including ordered components, nine fractional digits, checked Java period/duration arithmetic and empty `P`/`PT` values.
+Duration text uses Java's separate case-insensitive grammar with optional plus signs and comma fractions, then enters the microsecond vector with the pinned wrapping conversion.
+The reference accepts a day component followed by bare lowercase `t`, while bare uppercase `T` fails.
+Both parsers borrow their input and use fixed-width component storage without decimal-power allocation.
+Transit period-duration values parse their two components independently, retain wrapping month/day admission, and normalize oversized durations into days after the reference vector-type selection.
+The Transit interval reader returns null when its outer lexical grammar does not match; component parsing failures still raise errors.
 JSON preserves integer and decimal digits, while JSON-LD and Transit use the pinned scalar and container representations.
 
 Several pinned encoders differ from PostgreSQL's usual binary representations.
@@ -41,7 +47,8 @@ Protocol framing is specified by https://www.postgresql.org/docs/17/protocol-mes
 
 Runtime compatibility and property coverage remain unexecuted.
 Chrono's representable calendar range is smaller than Java's date/time range.
-The native decoder rejects trailing non-numeric fixed-width binary bytes, malformed arrays, and excessive interval exponents that the JVM may consume differently.
+The native decoder rejects trailing non-numeric fixed-width binary bytes and malformed arrays that the JVM may consume differently.
+`tests/interval_text.rs` covers interval/duration grammar, overflow order, nanosecond endpoints and allocation-owner release; exact Java exception messages remain runtime qualification.
 Decimal text follows OpenJDK 21's BMP decimal-digit grammar in both coefficients and exponents.
 Java floating-point text conventions are reproduced around the decimal/scientific thresholds and subnormal minima; exhaustive shortest-decimal parity is pending.
 The broad JVM object families carried by JSON-LD and Transit still require fixture qualification, including exception metadata and form values.

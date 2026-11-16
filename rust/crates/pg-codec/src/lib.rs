@@ -1,4 +1,5 @@
 mod binary;
+mod interval;
 mod output;
 mod text;
 
