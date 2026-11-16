@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use super::{ConnectData, ConversionContext, Converter, PluginSpec, error};
 mod security;
+mod rules;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RegistryFormat { Avro, Json }
@@ -23,7 +24,7 @@ pub(super) struct RegistryConverter {
     maximum_schema_bytes: usize,
     next_avro_union: i32,
 }
-struct CachedSchema { plan: Plan, _charges: Vec<Arc<MemoryReservation>> }
+struct CachedSchema { plan: Plan, read_rules: rules::ReadRules, _charges: Vec<Arc<MemoryReservation>> }
 enum Plan { Avro(super::avro::AvroPlan), Json(super::json_schema::JsonPlan) }
 #[derive(Deserialize, Serialize)]
 struct RegistrySchema {
@@ -34,6 +35,8 @@ struct RegistrySchema {
     references: Vec<Reference>,
     #[serde(rename = "ruleSet", default, skip_serializing_if = "Option::is_none")]
     rule_set: Option<Json>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metadata: Option<Json>,
 }
 #[derive(Deserialize, Serialize)]
 struct Reference { name: String, subject: String, version: i32 }
@@ -45,6 +48,7 @@ impl RegistryConverter {
             if !matches!(url.scheme(), "http" | "https") { return Err(error("invalid-plugin-config", "Schema Registry URL must use HTTP or HTTPS")); } Ok(url)
         }).collect::<Result<Vec<_>>>()?;
         let security = security::Security::open(options)?;
+        rules::validate_plugins(options)?;
         let capacity = options.get("max.schemas.per.subject").map(|value| value.parse::<usize>().map_err(|cause| error("invalid-plugin-config", cause))).transpose()?.unwrap_or(1000);
         if capacity == 0 { return Err(error("invalid-plugin-config", "Schema cache capacity must be positive")); }
         for key in ["scrub.invalid.names"] {
@@ -98,9 +102,6 @@ impl RegistryConverter {
         }
         while self.schemas.len() >= self.capacity { if let Some(id) = self.order.pop_front() { self.schemas.remove(&id); } }
         let root = self.fetch(&["schemas".into(), "ids".into(), id.to_string()], context).await?;
-        if root.rule_set.as_ref().and_then(Json::as_object).is_some_and(|rules| rules.values().any(|rules| rules.as_array().is_some_and(|rules| !rules.is_empty()))) {
-            return Err(rtdb_types::Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-registry-rules", "Schema Registry read rules require a native rule executor"));
-        }
         let expected = match self.format { RegistryFormat::Avro => "AVRO", RegistryFormat::Json => "JSON" };
         if root.schema_type.as_deref().unwrap_or("AVRO") != expected { return Err(error("schema-registry", "Schema Registry format differs from the configured converter")); }
         let subject = self.subject(topic, &root.schema)?;
@@ -115,13 +116,16 @@ impl RegistryConverter {
             let fetched = self.fetch(&["subjects".into(), reference.subject, "versions".into(), reference.version.to_string()], context).await?;
             pending.extend(fetched.references); references.insert(reference.name, fetched.schema);
         }
-        let bytes = references.values().try_fold(root.schema.len(), |bytes, text| bytes.checked_add(text.len()).ok_or_else(|| error("allocation-overflow", "Schema graph size overflow")))?;
-        let charge = context.reserve(bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)?;
+        let rule_bytes = root.rule_set.as_ref().map_or(0, |rules| rules.to_string().len());
+        let bytes = references.values().try_fold(root.schema.len().checked_add(rule_bytes).ok_or_else(|| error("allocation-overflow", "Schema rule size overflow"))?, |bytes, text| bytes.checked_add(text.len()).ok_or_else(|| error("allocation-overflow", "Schema graph size overflow")))?;
+        let rule_bound = rules::ReadRules::allocation_bound(root.rule_set.as_ref(), &self.options)?;
+        let charge = context.reserve(bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)?;
+        let read_rules = rules::ReadRules::compile(root.rule_set.as_ref(), &self.options)?;
         let plan = match self.format {
             RegistryFormat::Avro => Plan::Avro(super::avro::AvroPlan::parse_version_index(&root.schema, &references.values().cloned().collect::<Vec<_>>(), &self.options, Some(version), &mut self.next_avro_union)?),
             RegistryFormat::Json => Plan::Json(super::json_schema::JsonPlan::parse_version(&root.schema, &references, &self.options, Some(version))?),
         };
-        let schema = Arc::new(CachedSchema { plan, _charges: vec![charge] }); self.schemas.insert(cache_key.clone(), Arc::clone(&schema)); self.order.push_back(cache_key); Ok(schema)
+        let schema = Arc::new(CachedSchema { plan, read_rules, _charges: vec![charge] }); self.schemas.insert(cache_key.clone(), Arc::clone(&schema)); self.order.push_back(cache_key); Ok(schema)
     }
     fn subject(&self, topic: &str, schema: &str) -> Result<String> {
         let key = if self.is_key { "key.subject.name.strategy" } else { "value.subject.name.strategy" };
@@ -146,6 +150,19 @@ impl Converter for RegistryConverter {
         if bytes.len() < 5 || bytes[0] != 0 { return Err(error("conversion-error", "Invalid Confluent framing header")); }
         let id = u32::from_be_bytes(bytes[1..5].try_into().expect("fixed schema ID"));
         let schema = self.schema(topic, id, context).await?;
-        match &schema.plan { Plan::Avro(plan) => plan.decode(&bytes[5..], context), Plan::Json(plan) => plan.decode(&bytes[5..], context) }
+        match &schema.plan {
+            Plan::Avro(plan) => {
+                let datum = plan.decode_datum(&bytes[5..], context)?;
+                let mut value = &datum;
+                while let apache_avro::types::Value::Union(_, nested) = value { value = nested; }
+                schema.read_rules.check(matches!(value, apache_avro::types::Value::Null))?;
+                plan.convert(datum)
+            }
+            Plan::Json(plan) => {
+                let datum = plan.decode_datum(&bytes[5..], context)?;
+                schema.read_rules.check(false)?;
+                plan.convert(datum)
+            }
+        }
     }
 }

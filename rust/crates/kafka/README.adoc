@@ -80,7 +80,10 @@ OAuth refresh runs on the request caller, retains a charged token cache, and app
 Registry TLS uses the shared `rtdb-tls` codec for JKS, PKCS12, PEM trust/client identity files or inline material, and encrypted PKCS8 PEM keys.
 Protocol selection, hostname policy, and HTTP proxy settings remain client-owned.
 As in the pinned registry client, absent, empty, or `none` endpoint-identification policy disables hostname checks; configure `schema.registry.ssl.endpoint.identification.algorithm: HTTPS` to require them.
-Reader-schema migration/rules, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
+Registry domain read rules execute after datum decoding and before Connect conversion; write-only, migration-only, disabled, and `NONE`-tolerated rules permit reads.
+Read rules run in reverse declaration order, use rule-name/type/default configuration override precedence, and distinguish a decoded Avro null from a JSON null node.
+The shipped converter classpath has no rule executor service; an active rule without an executor takes its configured failure action, which defaults to `ERROR`.
+Reader-schema migration, DLQ producer actions, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
 Client certificate selection retains all keystore identities and matches signature schemes and acceptable issuer names.
 PKCS12 store and private-key passwords are independent.
 System trust roots retain an 8 MiB reservation; configured trust material retains its keystore decode reservation.

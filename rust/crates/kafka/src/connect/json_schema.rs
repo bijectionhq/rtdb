@@ -6,6 +6,7 @@ use super::{ConnectData, ConnectSchema, ConversionContext, error};
 mod graph;
 
 pub(super) struct JsonPlan { schema: Arc<ConnectSchema>, validator: Option<jsonschema::Validator> }
+pub(super) struct JsonDatum { pub value: Json, allocation_limit: usize }
 impl JsonPlan {
     #[cfg(test)]
     pub fn parse(text: &str, references: &BTreeMap<String, String>, options: &BTreeMap<String, String>) -> Result<Self> {
@@ -21,12 +22,19 @@ impl JsonPlan {
         let schema = graph::build(&root, &references, options, version)?;
         Ok(Self { schema, validator })
     }
+    #[cfg(test)]
     pub fn decode(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<ConnectData> {
+        self.convert(self.decode_datum(bytes, context)?)
+    }
+    pub fn decode_datum(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<JsonDatum> {
         let bound = bytes.len().checked_add(1).and_then(|nodes| nodes.checked_mul(512usize.saturating_add(self.schema.view_allocation_bound()))).and_then(|bytes| bytes.checked_add(self.schema.retained_bytes().ok()?.checked_mul(4)?)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "JSON Schema decoded size overflow"))?;
         context.reserve(bound)?;
         let json = serde_json::from_slice(bytes).map_err(|cause| error("conversion-error", cause))?;
-        if let Some(validator) = &self.validator { validator.validate(&json).map_err(|cause| error("conversion-error", cause))?; }
-        let value = super::converter::convert_registry(&self.schema, &json, bound)?;
+        Ok(JsonDatum { value: json, allocation_limit: bound })
+    }
+    pub fn convert(&self, datum: JsonDatum) -> Result<ConnectData> {
+        if let Some(validator) = &self.validator { validator.validate(&datum.value).map_err(|cause| error("conversion-error", cause))?; }
+        let value = super::converter::convert_registry(&self.schema, &datum.value, datum.allocation_limit)?;
         Ok(ConnectData { schema: Some(Arc::clone(&self.schema)), value })
     }
 }

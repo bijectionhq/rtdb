@@ -25,11 +25,14 @@ impl AvroPlan {
         let connect = graph::build(&root, &names, &metadata, unions, next_union)?;
         Ok(Self { root, references, names, connect, unions })
     }
+    #[cfg(test)]
     pub fn decode(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<ConnectData> {
+        self.convert(self.decode_datum(bytes, context)?)
+    }
+    pub fn decode_datum(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<Avro> {
         if matches!(&self.root, Schema::Bytes) || matches!(&self.root, Schema::Decimal(value) if matches!(value.inner.as_ref(), Schema::Bytes)) {
             context.reserve(bytes.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Avro byte value allocation overflow"))?)?;
-            let value = match &self.root { Schema::Decimal(value) => decimal_value(bytes.to_vec(), value.scale)?, _ => Value::Binary(bytes.to_vec()) };
-            return Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value });
+            return Ok(Avro::Bytes(bytes.to_vec()));
         }
         let mut preflight = Preflight { bytes, offset: 0, allocated: 4096, limit: context.allocation_limit(), names: &self.names, view_bytes: self.connect.view_allocation_bound() };
         preflight.value(&self.root, 0)?;
@@ -37,7 +40,9 @@ impl AvroPlan {
         context.reserve(preflight.allocated)?;
         let mut reader = Cursor::new(bytes);
         let mut schemata = self.references.iter().collect::<Vec<_>>(); schemata.push(&self.root);
-        let value = apache_avro::from_avro_datum_schemata(&self.root, schemata, &mut reader, None).map_err(|cause| error("avro-decode", cause))?;
+        apache_avro::from_avro_datum_schemata(&self.root, schemata, &mut reader, None).map_err(|cause| error("avro-decode", cause))
+    }
+    pub fn convert(&self, value: Avro) -> Result<ConnectData> {
         let value = metadata::coerce(convert(&self.root, value, &self.names, self.unions, &self.connect, 0)?, &self.connect)?;
         Ok(ConnectData { schema: Some(Arc::clone(&self.connect)), value })
     }
