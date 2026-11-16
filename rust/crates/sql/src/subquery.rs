@@ -4,9 +4,10 @@ use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, error};
 
-pub(crate) struct CorrelationScope { schema: Schema, captures: BTreeMap<ColumnId, (usize, Expr)> }
+pub(crate) struct CorrelationScope { schema: Schema, captures: BTreeMap<ColumnId, (usize, Expr)>, visible: bool }
 impl CorrelationScope {
-    pub fn new(schema: Schema) -> Self { Self { schema, captures: BTreeMap::new() } }
+    pub fn new(schema: Schema) -> Self { Self { schema, captures: BTreeMap::new(), visible: true } }
+    fn from(schema: Schema) -> Self { Self { schema, captures: BTreeMap::new(), visible: false } }
     pub fn arguments(self) -> Vec<(usize, Expr)> { self.captures.into_values().collect() }
 }
 
@@ -33,6 +34,7 @@ impl Context<'_> {
             Err(error) => error,
         };
         for scope in (0..self.outer_scopes.len()).rev() {
+            if !self.outer_scopes[scope].visible { continue; }
             let schema = Schema::new(self.outer_scopes[scope].schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
             match schema.resolve(names) {
                 Ok(field) => {
@@ -60,9 +62,26 @@ impl Context<'_> {
         Ok(index)
     }
 
-    fn parameter_capture(&mut self, field: &Field) -> Result<(Expr, (usize, Expr))> {
+    pub(crate) fn parameter_capture(&mut self, field: &Field) -> Result<(Expr, (usize, Expr))> {
         let index = self.internal_parameter()?;
         Ok((Expr::Parameter { index, data_type: field.data_type.clone() }, (index, field.expression())))
+    }
+
+    pub(crate) fn from_scope<T>(&mut self, schema: Schema, bind: impl FnOnce(&mut Self, usize) -> Result<T>) -> Result<(T, Vec<(usize, Expr)>)> {
+        let start = self.outer_scopes.len();
+        self.outer_scopes.push(CorrelationScope::from(schema));
+        let result = bind(self, start);
+        let arguments = self.outer_scopes.pop().ok_or_else(|| error("FROM correlation scope is unavailable"))?.arguments();
+        Ok((result?, arguments))
+    }
+
+    pub(crate) fn lateral_scope<T>(&mut self, start: usize, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        if start == self.outer_scopes.len() { return bind(self); }
+        let previous = self.outer_scopes.iter().map(|scope| scope.visible).collect::<Vec<_>>();
+        for (index, scope) in self.outer_scopes.iter_mut().enumerate() { scope.visible = index >= start; }
+        let result = bind(self);
+        for (scope, visible) in self.outer_scopes.iter_mut().zip(previous) { scope.visible = visible; }
+        result
     }
 
     fn hidden_field(&mut self, data_type: LogicalType) -> Result<Field> {

@@ -17,7 +17,8 @@ Canonical mutation lowering preserves unassigned document fields, derives valid-
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.
 
-The relational binder currently rejects lateral relations, recursive CTEs, DML RETURNING, query SETTING clauses, and interval qualifiers.
+The relational binder currently rejects DML RETURNING, query SETTING clauses, and interval qualifiers.
+`WITH RECURSIVE` retains the pinned planner's Unsupported anomaly `xtdb.sql/recursive-ctes`, including when the body does not refer to itself.
 Prepared-statement commands, COPY, and database lifecycle commands use the separate shared control parser described below.
 The parser uses sqlparser's keyword classification, so XTDB's complete semi-reserved keyword grammar still requires qualification.
 ORDER BY expressions can use projected aliases and retained input columns; unqualified output names take precedence, including inside expressions.
@@ -78,6 +79,19 @@ The source mapping is `xtdb.sql-test/test-subqueries`, `test-in-subquery`, `test
 Full upstream plan golden comparison and optimizer-dependent error elision remain qualification work.
 The lowering preserves dependent evaluation without implementing the reference decorrelation optimizer.
 Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone control values still reject relational subqueries.
+LATERAL derived tables and implicitly lateral UNNEST capture preceding FROM columns in the existing Apply operator.
+Comma-separated sources, CROSS and inner joins emit every matching dependent row; left joins filter their dependent rows before adding one null-extended row when none match.
+USING and NATURAL joins retain their ordinary common-column and qualified-column visibility.
+Binding scopes distinguish lexical outer queries from preceding FROM items, so an ordinary derived table cannot expose a sibling merely by containing a nested LATERAL query.
+The preceding FROM scope replaces the enclosing-query scope for LATERAL and UNNEST, following `TableRefVisitor`; first-position sources retain the enclosing-query scope.
+Each binding owns its mutable capture map, and the completed plan contains immutable parameter arguments.
+The query's existing cancellation scope and batch reservations own dependent cursor work and returned Arrow allocations.
+
+`tests/lateral.rs` preserves query forms from `xtdb.sql-test/lateral-derived-table`, `join-lateral`, `test-select-star-lateral-join`, and `test-lateral-with-unnest-4009`.
+It also covers lexical boundaries, nested CTE captures, implicit UNNEST, left-join filtering, parameter arity, cancellation, retained output batches, and the explicit recursive-CTE rejection in `WithVisitor`.
+Uncorrelated LATERAL inputs support ordinary right and full outer joins.
+Correlated right and full outer inputs are rejected: the pinned planner swaps the right-join inputs after binding the lateral captures and does not bind full-join captures.
+The precise reference failure after optimization remains an execution qualification; no correlated right/full success semantics are inferred from that source.
 ORDER BY subqueries can capture both projected aliases and retained input columns.
 
 == Named joins and ordering
