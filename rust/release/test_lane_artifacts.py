@@ -67,5 +67,40 @@ class SelectedArtifacts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bind_inputs(lane, root, root, lambda _: other, lambda _: (producer, root))
 
+    def test_packaged_recovery_binds_both_packages_and_exact_production_helper(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            producers = {}
+            paths = {}
+            for engine, variant in (("rust", "gcs"), ("jvm", "google-cloud")):
+                identity = "linux-amd64/" + engine + "/" + variant + "/package"
+                directory = root / engine
+                (directory / "run").mkdir(parents=True)
+                selected = {"engine": engine, "variant": variant, **({"features": ["rtdb-server/gcs"]} if engine == "rust" else {"capabilities": ["local", "gcs"]})}
+                path = directory / "run/package.json"
+                path.write_text(json.dumps({**selected, "platform": "linux/amd64", "image_id": engine}))
+                producers[identity] = ({"platform": "linux/amd64", "selection": selected}, directory)
+                paths[engine] = retained(root, path)
+            identity = "linux-amd64/rust/gcs/production"
+            binary = root / "rtdb-conformance"
+            binary.write_bytes(b"selected gcs production helper")
+            producer = {"id": identity, "platform": "linux/amd64", "selection": {"variant": "gcs", "features": ["rtdb-server/gcs"]}}
+            (root / "production-artifacts.json").write_text(json.dumps({"configuration": identity, "selection": producer["selection"],
+                "binaries": [{"retained_artifact": retained(root, binary), "compiler_artifact": {"target": {"name": "rtdb-conformance"}, "profile": {"test": False}}}]}))
+            producers[identity] = (producer, root)
+            lane = {"runner": "packaged-recovery", "platform": "linux/amd64", "selection": {"variant": "gcs", "jvm_variant": "google-cloud", "capability": "gcs"}, "dependencies": list(producers)}
+            value = {"platform": "linux/amd64", "capability": "gcs", "native": retained(root, binary),
+                     "engines": {engine: {"package": reference} for engine, reference in paths.items()}}
+            path = root / "plan.json"
+            path.write_text(json.dumps(value))
+            records = bind_inputs(lane, root, root, lambda _: path, producers.__getitem__)
+            self.assertEqual({"native", "native_package", "jvm_package", "recovery_plan"}, {item["role"] for item in records})
+            other = root / "other-helper"
+            other.write_bytes(b"same revision without gcs")
+            for changed in ({"capability": "local"}, {"platform": "linux/arm64"}, {"native": retained(root, other)}):
+                path.write_text(json.dumps({**value, **changed}))
+                with self.assertRaises(ValueError):
+                    bind_inputs(lane, root, root, lambda _: path, producers.__getitem__)
+
 if __name__ == "__main__":
     unittest.main()

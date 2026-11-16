@@ -7,7 +7,13 @@ use rtdb_storage::disk_cache::DiskCache;
 
 use crate::config::{NodeConfiguration, RemoteConfig};
 
-pub(crate) fn open(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metrics: &Arc<Registry>) -> Result<(NativeResources, ExternalSources, Vec<rtdb_metrics::MetricRegistration>)> {
+/// Constructs backend factories without opening a node or starting any driver.
+/// - Inputs: validated node configuration, shared allocation budget, and metric registry.
+/// - Ownership: returned factories own their configuration and memory-budget references.
+///   Retain returned metric registrations while their samples are required.
+///   Close the resource factory after its consumers and drivers join, including failed startup.
+/// - Errors: credential resolution and local disk-cache initialization can fail with a provider or configuration anomaly.
+pub fn open_backend_resources(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metrics: &Arc<Registry>) -> Result<(NativeResources, ExternalSources, Vec<rtdb_metrics::MetricRegistration>)> {
     let mut resources = NativeResources::default().with_local_log_clock(Arc::new(rtdb_node::SystemClock), config.local_log_uses_clock);
     let mut sources = ExternalSources::new();
     let mut registrations = Vec::new();
@@ -68,6 +74,8 @@ pub(crate) fn open(config: &NodeConfiguration, memory: &Arc<MemoryBudget>, metri
     }
     Ok((resources, sources, registrations))
 }
+
+pub(crate) use open_backend_resources as open;
 
 fn disk_error(error: std::io::Error) -> rtdb_types::Anomaly {
     rtdb_types::Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "rtdb.server/disk-cache", error.to_string())

@@ -86,8 +86,6 @@ class Run:
             if record.get("qualification") != "built_unqualified" or record.get("platform") != lane["platform"] or record.get("variant") != selection["variant"]:
                 raise ValueError("package receipt differs from selected build")
             return [output / "package.json"]
-        if runner == "required-recovery-adapter":
-            raise ValueError("remote/external-source reverse recovery and fault adapter is not implemented for " + selection["capability"])
         if runner in {"cargo-production", "native-tests"}:
             features = selection["features"]
             command = ["cargo", "build" if runner == "cargo-production" else "test", "--manifest-path", str(REPOSITORY / "rust/Cargo.toml"),
@@ -199,6 +197,9 @@ class Run:
         elif runner == "performance":
             argv = [sys.executable, CONFORMANCE / "run_performance.py", *common, "--plan", source("performance_plan")]
             result, field = "comparison.json", "packaged_performance_qualified"
+        elif runner == "packaged-recovery":
+            argv = [sys.executable, CONFORMANCE / "run_packaged_recovery.py", *common, "--plan", source("recovery_plan")]
+            result, field = "comparison.json", "packaged_recovery_qualified"
         elif runner == "inventory":
             runtime = merge_runtime(directory / "runtime", [self.directories[item["id"]] / "run" for item in self.lanes
                 if item["runner"] == "gradle" and item["id"] in lane["dependencies"]])

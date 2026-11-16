@@ -9,3 +9,4 @@ pub mod metric_export;
 mod runtime;
 mod resources;
 pub use runtime::{ServerDriver, ServerHandle, ListenerAddresses};
+pub use resources::open_backend_resources;
