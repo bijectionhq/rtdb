@@ -1,0 +1,14 @@
+= Pinned Java default trust anchors
+
+`temurin-25.0.1.p12` is the unchanged `lib/security/cacerts` resource from Eclipse Temurin 25.0.1+8.
+The source archive is https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jre_x64_linux_hotspot_25.0.1_8.tar.gz[the Linux x64 JRE release].
+Its SHA-256 is `126c7f59b91df97b2e930b0a456422ce29af7f2385117e1c04297eba962b0b1c`.
+The resource is 189920 bytes; its SHA-256 is `7a33aaf51d8460f3e57956e90a8fe179188e9c82578555020881f5cd48c4274b`.
+The resource uses PKCS12 despite its extensionless upstream filename.
+It contains 146 certificate entries with distinct aliases.
+The adjacent license files are copied from the same archive's `legal/java.base` directory.
+
+Kafka dead-letter producers use these anchors when neither a Java truststore nor an explicit native CA source is configured.
+Updating the reference runtime requires replacing this resource and updating its recorded digest together.
+Regression sources pin the resource digest, decode its certificates under the memory budget, and check explicit truststore precedence.
+Execution remains pending during Phase 1.

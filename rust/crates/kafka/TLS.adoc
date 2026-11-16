@@ -12,6 +12,9 @@ They do not invoke the Java TLS configuration decoder.
 The producer retains every decoded private-key entry.
 An empty Java identity store supplies no client certificate.
 An empty explicit Java truststore replaces default roots with an empty trust set; certificate acceptance is decided during the handshake.
+Absent Java and native CA configuration uses the pinned Temurin 25.0.1+8 `cacerts` resource, retained with its provenance and license files in `src/tls/cacerts`.
+The native client receives a fresh trust store containing exactly those decoded anchors.
+Explicit `ssl.ca.location` or `ssl.ca.pem` retains native CA loading; an explicit Java truststore, including an empty store, replaces the pinned anchors.
 A per-connection certificate callback checks the peer's certificate types, signature algorithms, curves and acceptable issuer names through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
 The first compatible retained entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
@@ -39,7 +42,7 @@ A list containing only disabled suites or protocols produces no usable handshake
 Several simultaneously compatible identities can select a different alias from SunX509, whose choice depends on its credential map and requested key-type ordering.
 The shared keystore codec does not retain aliases for reproducing that ordering.
 OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
-Unconfigured trust uses native system roots rather than the JRE's `cacerts` contents.
+JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 Alternative built-in key-manager and trust-manager algorithm selection remains unfinished.
 These are open standard-configuration gaps.
 Configured Java providers and credential extensions also require native implementations.

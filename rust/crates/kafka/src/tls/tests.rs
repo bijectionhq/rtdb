@@ -55,3 +55,20 @@ fn empty_java_client_stores_survive_native_client_creation_and_release_on_close(
     assert_eq!(memory.used_bytes(), 0);
 }
 
+#[test]
+fn java_default_roots_replace_host_trust_unless_native_roots_are_explicit() {
+    let memory = MemoryBudget::new(32 << 20);
+    let defaults = NativeTls::from_java(&options(), &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
+    assert_eq!(defaults.trust.as_ref().unwrap().len(), 146);
+    drop(defaults);
+    assert_eq!(memory.used_bytes(), 0);
+    for name in ["ssl.ca.location", "ssl.ca.pem"] {
+        let mut options = options();
+        options.insert(name.into(), "native-owned".into());
+        let explicit = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
+        assert!(explicit.trust.is_none());
+        drop(explicit);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
