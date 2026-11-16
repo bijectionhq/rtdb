@@ -34,7 +34,7 @@ pub(super) fn client(options: &BTreeMap<String, String>, context: &mut Conversio
         if !host.is_empty() && port > 0 { builder = builder.proxy(reqwest::Proxy::all(format!("http://{host}:{port}")).map_err(|_| error("invalid-plugin-config", "Registry proxy host is invalid"))?); }
     }
     let trust = material(&tls, &files, "truststore", StoreUse::Trust, Arc::clone(&charge))?;
-    let identity = material(&tls, &files, "keystore", StoreUse::Identity, Arc::clone(&charge))?;
+    let identity = material(&tls, &files, "keystore", StoreUse::OptionalIdentity, Arc::clone(&charge))?;
     builder = builder.tls_backend_preconfigured(transport::configuration(&tls, trust.as_ref(), identity.as_ref(), registry_hostname_policy, Arc::clone(&charge))?);
     Ok((builder.build().map_err(|cause| error("invalid-plugin-config", cause.without_url()))?, charge))
 }
@@ -44,7 +44,7 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
     let location = tls.get(location_key.as_str()); let inline = tls.get(inline_key.as_str());
     let password = tls.get(format!("{store}.password").as_str()).copied();
     let key_password = tls.get("key.password").copied();
-    let chain = if usage == StoreUse::Identity { tls.get("keystore.certificate.chain") } else { None };
+    let chain = if usage != StoreUse::Trust { tls.get("keystore.certificate.chain") } else { None };
     if location.is_none() && inline.is_none() {
         if password.is_some() || chain.is_some() { return Err(error("invalid-plugin-config", "Registry store password or chain requires a store")); }
         return Ok(None);
@@ -56,7 +56,7 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
     if inline.is_some() && format != StoreFormat::Pem { return Err(error("invalid-plugin-config", "Inline registry material requires PEM format")); }
     if format == StoreFormat::Pem && password.is_some() { return Err(error("invalid-plugin-config", "Registry PEM stores accept a private-key password, not a store password")); }
     if location.is_some() && (inline.is_some() || chain.is_some()) { return Err(error("invalid-plugin-config", "Registry keystore location and inline content are mutually exclusive")); }
-    if format == StoreFormat::Java && usage == StoreUse::Identity && password.is_none() { return Err(error("invalid-plugin-config", "Registry private-key stores require a store password")); }
+    if format == StoreFormat::Java && usage != StoreUse::Trust && password.is_none() { return Err(error("invalid-plugin-config", "Registry private-key stores require a store password")); }
     let mut bytes = if let Some(inline) = inline {
         let capacity = inline.len().checked_add(chain.map_or(0, |chain| chain.len())).and_then(|length| length.checked_add(1)).ok_or_else(|| error("allocation-overflow", "Registry inline key size overflow"))?;
         let mut bytes = Zeroizing::new(Vec::with_capacity(capacity)); bytes.extend_from_slice(inline.as_bytes()); bytes
@@ -65,7 +65,7 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
         let mut bytes = Zeroizing::new(Vec::with_capacity(length + 1)); std::fs::File::open(path).map_err(|cause| error("invalid-plugin-config", cause))?.take(length as u64 + 1).read_to_end(&mut bytes).map_err(|cause| error("invalid-plugin-config", cause))?;
         if bytes.len() != length { return Err(error("invalid-plugin-config", "Registry keystore file changed while opening")); } bytes
     };
-    if inline.is_some() && usage == StoreUse::Identity {
+    if inline.is_some() && usage != StoreUse::Trust {
         let chain = chain.ok_or_else(|| error("invalid-plugin-config", "Inline registry private key requires a certificate chain"))?;
         bytes.push(b'\n'); bytes.extend_from_slice(chain.as_bytes());
     }
@@ -74,6 +74,22 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_java_registry_stores_are_retained_until_the_client_closes() {
+        let path = format!("{}/../tls/tests/fixtures/empty.jks", env!("CARGO_MANIFEST_DIR"));
+        let mut options = BTreeMap::new();
+        for store in ["keystore", "truststore"] {
+            options.insert(format!("schema.registry.ssl.{store}.location"), path.clone());
+            options.insert(format!("schema.registry.ssl.{store}.password"), "12345678".into());
+        }
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 26);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let (client, charge) = client(&options, &mut context, true).unwrap();
+        drop(context); drop(charge);
+        assert!(memory.used_bytes() > 0);
+        drop(client);
+        assert_eq!(memory.used_bytes(), 0);
+    }
     #[test]
     fn registry_tls_rejects_ambiguous_or_unimplemented_keystores() {
         let memory = rtdb_columnar::MemoryBudget::new(1 << 24); let mut context = ConversionContext::new(memory);

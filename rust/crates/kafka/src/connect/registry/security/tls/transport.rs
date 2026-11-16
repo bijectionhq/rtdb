@@ -28,7 +28,6 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
         let (accepted, _) = roots.add_parsable_certificates(native.certs);
         if accepted == 0 { return Err(error("invalid-plugin-config", "Native trust store contains no usable certificates")); }
     }
-    if roots.is_empty() { return Err(error("invalid-plugin-config", "Registry truststore contains no certificates")); }
     let verify_names = !options.get("endpoint.identification.algorithm").map_or(registry_hostname_policy, |algorithm| matches!(*algorithm, "" | "none"));
     let verifier = ChainVerifier { roots, algorithms: provider.signature_verification_algorithms, verify_names, _charge: Arc::clone(&charge) };
     let resolver = ClientKeys::new(identities, &provider, charge)?;

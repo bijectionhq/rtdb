@@ -11,7 +11,14 @@ mod pkcs12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreUse { Identity, Trust }
+pub enum StoreUse {
+    /// Decodes private keys and requires at least one usable identity.
+    Identity,
+    /// Decodes available private keys; an empty Java store supplies no client certificate.
+    OptionalIdentity,
+    /// Reads trusted certificates without decrypting private keys.
+    Trust,
+}
 pub struct KeyStore { identities: Vec<Identity>, trusted: Vec<Vec<u8>>, reservation: Arc<MemoryReservation> }
 pub struct Identity { private_key: Zeroizing<Vec<u8>>, certificates: Vec<Vec<u8>> }
 pub struct IssuerNames { names: Vec<Vec<u8>>, _reservation: Arc<MemoryReservation> }
@@ -38,7 +45,7 @@ impl KeyStore {
     /// The reservation must cover `allocation_bound_with_passwords` for these inputs before this call.
     pub fn decode(bytes: &[u8], format: StoreFormat, usage: StoreUse, store_password: Option<&str>, key_password: Option<&str>, reservation: Arc<MemoryReservation>) -> Result<Self> {
         if reservation.bytes() < Self::allocation_bound_with_passwords(bytes.len(), store_password, key_password)? { return Err(invalid("Keystore decode reservation is too small")); }
-        let private_keys = usage == StoreUse::Identity;
+        let private_keys = usage != StoreUse::Trust;
         let parts = match format {
             StoreFormat::Java if bytes.starts_with(&0xfeedfeedu32.to_be_bytes()) => jks(bytes, store_password, key_password, private_keys)?,
             StoreFormat::Java => pkcs12::decode(bytes, store_password, key_password, private_keys)?,
@@ -49,7 +56,7 @@ impl KeyStore {
         };
         for certificate in &parts.trusted { X509::from_der(certificate).map_err(invalid)?; }
         for identity in &parts.identities { for certificate in &identity.certificates { X509::from_der(certificate).map_err(invalid)?; } }
-        if private_keys && parts.identities.is_empty() { return Err(invalid("Keystore contains no private key and certificate chain")); }
+        if usage == StoreUse::Identity && parts.identities.is_empty() { return Err(invalid("Keystore contains no private key and certificate chain")); }
         Ok(Self { identities: parts.identities, trusted: parts.trusted, reservation })
     }
     pub fn identities(&self) -> &[Identity] { &self.identities }
