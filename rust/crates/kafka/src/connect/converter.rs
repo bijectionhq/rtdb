@@ -4,9 +4,9 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use rtdb_types::{DecimalValue, Result, TimeUnit, Value};
 use super::json_value::JsonValue as Json;
 use super::{ConnectData, ConnectField, ConnectSchema, ConversionContext, Converter, PluginSpec, SchemaKind, error};
+mod charset;
 
 pub(super) fn open(spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>> {
-    if let Some(role) = spec.options.get("converter.type") { if !matches!(role.as_str(), "key" | "value" | "header") { return Err(error("invalid-plugin-config", "Invalid converter.type")); } }
     match spec.class_name.as_str() {
         "io.confluent.connect.avro.AvroConverter" => Ok(Box::new(super::registry::RegistryConverter::open(spec, super::registry::RegistryFormat::Avro, is_key)?)),
         "io.confluent.connect.json.JsonSchemaConverter" => Ok(Box::new(super::registry::RegistryConverter::open(spec, super::registry::RegistryFormat::Json, is_key)?)),
@@ -20,14 +20,12 @@ pub(super) fn open(spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>
         }
         class if matches!(class, "org.apache.kafka.connect.storage.StringConverter" | "org.apache.kafka.connect.converters.ByteArrayConverter" | "org.apache.kafka.connect.converters.BooleanConverter" | "org.apache.kafka.connect.converters.ShortConverter" | "org.apache.kafka.connect.converters.IntegerConverter" | "org.apache.kafka.connect.converters.LongConverter" | "org.apache.kafka.connect.converters.FloatConverter" | "org.apache.kafka.connect.converters.DoubleConverter") => {
             let kind = match class.rsplit('.').next().unwrap_or_default() {
-                "StringConverter" => Scalar::String, "ByteArrayConverter" => Scalar::Bytes, "BooleanConverter" => Scalar::Bool,
+                "StringConverter" => Scalar::String(charset::Charset::configured(&spec.options, is_key)?), "ByteArrayConverter" => Scalar::Bytes, "BooleanConverter" => Scalar::Bool,
                 "ShortConverter" => Scalar::I16, "IntegerConverter" => Scalar::I32, "LongConverter" => Scalar::I64,
                 "FloatConverter" => Scalar::F32, "DoubleConverter" => Scalar::F64,
                 _ => return Err(error("plugin-class-not-found", class)),
             };
-            let encoding = spec.options.get("converter.encoding").cloned().unwrap_or_else(|| "UTF-8".into());
-            if matches!(kind, Scalar::String) && !matches!(encoding.to_ascii_uppercase().as_str(), "UTF-8" | "UTF8" | "UTF-16" | "UTF-16BE" | "UTF-16LE" | "ISO-8859-1" | "US-ASCII") { return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{encoding}'"))); }
-            Ok(Box::new(ScalarConverter { kind, encoding }))
+            Ok(Box::new(ScalarConverter { kind }))
         }
         class => Err(error("plugin-class-not-found", format!("No native converter registered for '{class}'"))),
     }
@@ -35,18 +33,18 @@ pub(super) fn open(spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>
 pub(super) fn option_bool(options: &BTreeMap<String, String>, key: &str, default: bool) -> Result<bool> {
     options.get(key).map(|value| super::config::boolean(value).ok_or_else(|| error("invalid-plugin-config", format!("Invalid boolean '{key}'")))).unwrap_or(Ok(default))
 }
-#[derive(Clone, Copy)] enum Scalar { String, Bytes, Bool, I16, I32, I64, F32, F64 }
-struct ScalarConverter { kind: Scalar, encoding: String }
+#[derive(Clone, Copy)] enum Scalar { String(charset::Charset), Bytes, Bool, I16, I32, I64, F32, F64 }
+struct ScalarConverter { kind: Scalar }
 #[async_trait]
 impl Converter for ScalarConverter {
     async fn decode(&mut self, _: &str, bytes: Option<&[u8]>, context: &mut ConversionContext) -> Result<ConnectData> {
         context.reserve(bytes.map_or(0, <[u8]>::len).checked_mul(4).and_then(|size| size.checked_add(16_384)).ok_or_else(|| error("allocation-overflow", "Scalar conversion allocation overflow"))?)?;
-        let kind = match self.kind { Scalar::String => SchemaKind::String, Scalar::Bytes => SchemaKind::Bytes, Scalar::Bool => SchemaKind::Bool, Scalar::I16 => SchemaKind::I16, Scalar::I32 => SchemaKind::I32, Scalar::I64 => SchemaKind::I64, Scalar::F32 => SchemaKind::F32, Scalar::F64 => SchemaKind::F64 };
+        let kind = match self.kind { Scalar::String(_) => SchemaKind::String, Scalar::Bytes => SchemaKind::Bytes, Scalar::Bool => SchemaKind::Bool, Scalar::I16 => SchemaKind::I16, Scalar::I32 => SchemaKind::I32, Scalar::I64 => SchemaKind::I64, Scalar::F32 => SchemaKind::F32, Scalar::F64 => SchemaKind::F64 };
         let mut schema = ConnectSchema::new(kind); schema.optional = true;
         let Some(bytes) = bytes else { return Ok(ConnectData { schema: Some(Arc::new(schema)), value: Value::Null }); };
         let wrong_size = || error("conversion-error", "Kafka scalar payload has the wrong byte count");
         let value = match self.kind {
-            Scalar::String => Value::Utf8(decode_string(bytes, &self.encoding)), Scalar::Bytes => Value::Binary(bytes.to_vec()),
+            Scalar::String(charset) => Value::Utf8(charset.decode(bytes)), Scalar::Bytes => Value::Binary(bytes.to_vec()),
             Scalar::Bool => { let [byte] = bytes else { return Err(wrong_size()); }; if *byte > 1 { return Err(error("conversion-error", "Invalid boolean byte")); } Value::Bool(*byte == 1) },
             Scalar::I16 => Value::I16(i16::from_be_bytes(bytes.try_into().map_err(|_| wrong_size())?)),
             Scalar::I32 => Value::I32(i32::from_be_bytes(bytes.try_into().map_err(|_| wrong_size())?)),
@@ -55,20 +53,6 @@ impl Converter for ScalarConverter {
             Scalar::F64 => Value::F64(f64::from_be_bytes(bytes.try_into().map_err(|_| wrong_size())?)),
         };
         Ok(ConnectData { schema: Some(Arc::new(schema)), value })
-    }
-}
-fn decode_string(bytes: &[u8], encoding: &str) -> String {
-    match encoding.to_ascii_uppercase().as_str() {
-        "ISO-8859-1" => bytes.iter().map(|byte| char::from(*byte)).collect(),
-        "US-ASCII" => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
-        "UTF-16" | "UTF-16LE" | "UTF-16BE" => {
-            let (little, bytes) = if encoding.eq_ignore_ascii_case("UTF-16") {
-                if bytes.starts_with(&[0xff, 0xfe]) { (true, &bytes[2..]) } else if bytes.starts_with(&[0xfe, 0xff]) { (false, &bytes[2..]) } else { (false, bytes) }
-            } else { (encoding.eq_ignore_ascii_case("UTF-16LE"), bytes) };
-            let units = bytes.chunks(2).map(|chunk| if chunk.len() != 2 { 0xfffd } else if little { u16::from_le_bytes([chunk[0], chunk[1]]) } else { u16::from_be_bytes([chunk[0], chunk[1]]) });
-            char::decode_utf16(units).map(|value| value.unwrap_or('\u{fffd}')).collect()
-        }
-        _ => String::from_utf8_lossy(bytes).into_owned(),
     }
 }
 struct JsonConverter { enabled: bool, replace: bool, schema: Option<Arc<ConnectSchema>> }
