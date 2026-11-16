@@ -1,10 +1,12 @@
 mod driver;
+mod failure;
 mod gc;
 mod job;
 mod merge;
 mod publication;
 
 pub use driver::{CompactionDriver, CompactionHandle, CompactionExecutor, CycleDriver, CycleHandle, CycleWorker};
+pub use failure::{CompactionFailure, CompactionObserver, StderrCompactionObserver};
 pub use gc::{BlockCollector, CollectionObserver, GarbageConfig, TrieCollector, block_is_garbage};
 pub use job::{CompactionJob, RecencyMode, available_jobs};
 pub use merge::{MergeConfig, RecencyPartition, SegmentCompactor, recency_partition};

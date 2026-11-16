@@ -307,9 +307,13 @@ impl CompactionExecutor for SegmentCompactor {
             let meta_path = directory.path().join(format!("output-{index}.meta.arrow"));
             let (size, metadata) = layout::normalize(output, &put, &self.config, &self.memory, &data_path, &meta_path, cancellation)?;
             check_disk(directory.path(), self.config.temporary_byte_limit, 0)?;
-            self.store.put_file(&ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?, &data_path).await.map_err(crate::invalid)?;
+            let data_key = ObjectKey::new(entry.slug.data_key(&key)).map_err(crate::invalid)?;
+            self.store.put_file(&data_key, &data_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+                .with_context("key", data_key.to_string().into()).with_context("operation", "put_file".into()))?;
             if cancellation.is_cancelled() { return Err(crate::closed()); }
-            self.store.put_file(&ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?, &meta_path).await.map_err(crate::invalid)?;
+            let metadata_key = ObjectKey::new(entry.slug.metadata_key(&key)).map_err(crate::invalid)?;
+            self.store.put_file(&metadata_key, &meta_path).await.map_err(|error| rtdb_types::Anomaly::from(error)
+                .with_context("key", metadata_key.to_string().into()).with_context("operation", "put_file".into()))?;
             tries.push(TrieDetails { table_name: Some(entry.table.schema_and_table()), trie_key: Some(key.to_string()), data_file_size: Some(i64::try_from(size).map_err(crate::invalid)?), trie_metadata: Some(metadata), ..Default::default() });
         }
         Ok(TriesAdded { storage_version: Some(self.version.0), storage_epoch: Some(self.epoch.0), tries, ..Default::default() })

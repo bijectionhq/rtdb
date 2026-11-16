@@ -12,6 +12,7 @@ They reject parameter relabeling and check physical coefficient width without im
 Data and metadata files are published through `ObjectStore::put_file` before a notification is returned.
 Repeated publication accepts only identical bytes at an existing object key.
 An upload in progress must finish before the job's temporary files are released.
+Publication errors retain the storage anomaly's category, code, message, and context, and add the requested relative object key and `put_file` operation.
 
 `CompactionDriver` and `CycleDriver` are active objects whose `run` methods own their event choices.
 The database owner runs and joins them.
@@ -27,6 +28,22 @@ These capabilities own publication and progress waiting; maintenance never write
 An executor or publication failure records that job as failed for the driver's lifetime, and later `compact_all` callers receive the failure without an automatic retry.
 A new database lifetime may retry the deterministic object keys.
 
+`CompactionObserver` is a passive synchronous diagnostic capability retained by `CompactionDriver`.
+The driver reports each non-cancellation worker failure once, including a failure returned while shutdown drains that worker.
+The exact `rtdb.maintenance/closed` code and the `Interrupted` category are excluded, following the cancellation and interrupt exclusions in `Compactor.kt`.
+Cancellation of the owner does not suppress an actual storage or publication error returned during draining.
+Later signals and `compact_all` requests that encounter the retained failure do not emit it again.
+`CompactionFailure` is a passive event value containing the job's `schema/table` name, output trie key, typed anomaly code/category, operation, relative object key, and message digest.
+The default `StderrCompactionObserver` writes one JSON object per line without an exporter or background task.
+`with_observer` replaces that sink before the driver starts.
+Observers return promptly and do not panic; an unavailable stderr does not alter the worker result.
+
+The JSON event is `compaction_failed`, with `table`, `output_trie_key`, `anomaly_code`, `anomaly_category`, `operation`, `object_key`, `permission_denied`, and `message_sha256` fields.
+Missing operation or object-key context is serialized as null.
+`permission_denied` comes only from the typed `rtdb.storage/permission-denied` code.
+`message_sha256` is lowercase SHA-256 of the original message's UTF-8 bytes; the event omits the raw message, provider URL, local root path, and arbitrary anomaly context.
+Operation context accepts lowercase ASCII identifiers and object-key context passes `ObjectKey` validation.
+
 `TrieCollector` and `BlockCollector` are passive cycle capabilities.
 Trie collection uses one immutable snapshot, bounded table/delete concurrency, and chunks containing at most 1024 trie keys.
 It removes data before metadata, drains started deletes, then publishes one deletion record per completed chunk.
@@ -40,6 +57,8 @@ An administrative awaiter receives a cycle started after its request; automatic 
 Selection follows `job_calculator.clj` and `job_calculator_test.clj`, including the nascent-output case in issue #4930.
 Merge and layout follow `SegmentMerge.kt`, `PageTrieWriter.kt`, `StreamingIidTrie.kt`, and the compactor tests.
 Collection follows `TrieGarbageCollector.kt`, `BlockGarbageCollector.kt`, and their test classes.
+Failure reporting follows `Compactor.kt`'s job/output identity and caught exception; the native event retains classification and a message digest rather than the JVM exception text.
+`tests/failures.rs` covers exact-once reporting, retained failure suppression, publication errors, shutdown draining, JSON sanitization, and actual data-success/metadata-denial publication for local and remote storage anomalies.
 The executable test sources in this crate cover selection, historical splitting, raw decimal preservation in current and historical pages, deterministic retries within the Rust writer, temporary-file cleanup, failure retention, concurrent cycle awaiters, block retention, deletion ordering, and L0 preservation.
 No Rust compilation, test execution, JVM comparison, or simulation has run during Phase 1.
 

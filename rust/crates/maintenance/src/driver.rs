@@ -3,10 +3,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use rtdb_format::{keys::TrieKey, log::proto::TriesAdded};
-use rtdb_types::{Anomaly, Result, TableRef};
+use rtdb_types::{Anomaly, AnomalyCategory, Result, TableRef};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use crate::{CompactionJob, CompactionPublisher, SnapshotSource, available_jobs};
+use crate::{CompactionFailure, CompactionJob, CompactionObserver, CompactionPublisher, SnapshotSource, StderrCompactionObserver, available_jobs};
 
 #[async_trait]
 pub trait CompactionExecutor: Send + Sync {
@@ -36,6 +36,7 @@ pub struct CompactionDriver {
     snapshots: Arc<dyn SnapshotSource>,
     executor: Arc<dyn CompactionExecutor>,
     publisher: Arc<dyn CompactionPublisher>,
+    observer: Arc<dyn CompactionObserver>,
     parallelism: usize,
     signals: mpsc::Receiver<()>,
     requests: mpsc::Receiver<Completion>,
@@ -52,8 +53,16 @@ impl CompactionDriver {
         if parallelism == 0 || request_capacity == 0 { return Err(crate::invalid("Maintenance concurrency and request capacity must be positive")); }
         let (signals, signal_receiver) = mpsc::channel(1);
         let (requests, request_receiver) = mpsc::channel(request_capacity);
-        Ok((Self { snapshots, executor, publisher, parallelism, signals: signal_receiver, requests: request_receiver },
+        Ok((Self { snapshots, executor, publisher, observer: Arc::new(StderrCompactionObserver), parallelism, signals: signal_receiver, requests: request_receiver },
             CompactionHandle { signals, requests, capacity: Arc::new(Semaphore::new(request_capacity)), ignore_signal }))
+    }
+
+    /// Replaces the default stderr observer before the driver starts; the driver retains it until all workers finish.
+    pub fn with_observer(mut self, observer: Arc<dyn CompactionObserver>) -> Self { self.observer = observer; self }
+
+    fn report_failure(&self, key: &JobKey, error: &Anomaly) {
+        if error.code == "rtdb.maintenance/closed" || error.category == AnomalyCategory::Interrupted { return; }
+        self.observer.failed(&CompactionFailure::new(&key.0, &key.1, error));
     }
 
     /// The owner must cancel and join this run before releasing its storage or publication capabilities.
@@ -98,7 +107,7 @@ impl CompactionDriver {
                 _ = cancellation.cancelled() => break Ok(()),
                 Some((key, result)) = running.next(), if !running.is_empty() => {
                     active.remove(&key);
-                    if let Err(error) = result { failed.insert(key, error); }
+                    if let Err(error) = result { self.report_failure(&key, &error); failed.insert(key, error); }
                 }
                 Some(request) = self.requests.recv() => pending.push(request),
                 Some(()) = self.signals.recv() => (),
@@ -108,7 +117,9 @@ impl CompactionDriver {
         self.requests.close();
         self.signals.close();
         workers.cancel();
-        while running.next().await.is_some() {}
+        while let Some((key, result)) = running.next().await {
+            if let Err(error) = result { self.report_failure(&key, &error); }
+        }
         while let Ok(request) = self.requests.try_recv() { pending.push(request); }
         let error = outcome.as_ref().err().cloned().unwrap_or_else(crate::closed);
         for request in pending { let _ = request.send(Err(error.clone())); }
