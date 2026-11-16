@@ -22,12 +22,80 @@ fn numeric_base_10000_matches_pinned_numeric_bin_including_negative_zero_sign() 
 }
 
 #[test]
-fn numeric_decoding_rejects_special_signs_truncated_digits_and_excessive_scale() {
+fn numeric_decoding_rejects_truncated_digits_and_excessive_coefficients() {
     let memory = MemoryBudget::new(1 << 20);
-    for words in [vec![1i16, 0, -16384, 0, 0], vec![2, 0, 0, 0, 1], vec![1, 0, 0, 128, 1], vec![1, 0, 0, 0, 10000]] {
+    for words in [vec![2i16, 0, 0, 0, 1], vec![1, 0, 0, 128, 1]] {
         let bytes: Vec<_> = words.into_iter().flat_map(i16::to_be_bytes).collect();
         assert!(decode(PgType::Numeric, Format::Binary, &bytes, &memory).is_err());
         assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn numeric_reader_keeps_pinned_short_header_and_digit_semantics() {
+    for (words, expected) in [
+        (vec![0i16], "0"),
+        (vec![0, 123], "0"),
+        (vec![-1, 0, 0, -129], "0E+129"),
+        (vec![1, 0, -16384, 0, 1], "-1"),
+        (vec![1, 0, 0, 0, 10000], "10000"),
+        (vec![1, 0, 0, 0, -1], "-1"),
+        (vec![1, -33, 0, 129, 1000], "1E-129"),
+        (vec![1, -32768, 0, 32767, 1], "0E-32767"),
+    ] {
+        let bytes: Vec<_> = words.into_iter().flat_map(i16::to_be_bytes).collect();
+        let decoded = decode(PgType::Numeric, Format::Binary, &bytes, &MemoryBudget::new(1 << 20)).unwrap();
+        assert_eq!(output(PgType::Numeric, Format::Text, decoded.value()), expected.as_bytes());
+    }
+}
+
+#[test]
+fn numeric_output_keeps_full_scale_and_wrapped_wire_fields() {
+    let value = read_text(1700, "1E-129").unwrap();
+    assert_eq!(output(PgType::Numeric, Format::Binary, &value), [1i16, -33, 0, 129, 1000].into_iter().flat_map(i16::to_be_bytes).collect::<Vec<_>>());
+    assert_eq!(output(PgType::Numeric, Format::Text, &value), b"1E-129");
+    let value = read_text(1700, "1E-2147483647").unwrap();
+    assert_eq!(output(PgType::Numeric, Format::Binary, &value), [1i16, -1, 0, -1, 10].into_iter().flat_map(i16::to_be_bytes).collect::<Vec<_>>());
+    assert_eq!(output(PgType::Numeric, Format::Text, &value), b"1E-2147483647");
+    let value = read_text(1700, "1E+131072").unwrap();
+    let bytes = output(PgType::Numeric, Format::Binary, &value);
+    assert_eq!(&bytes[..10], [-32767i16, -32768, 0, 0, 1].into_iter().flat_map(i16::to_be_bytes).collect::<Vec<_>>());
+    assert_eq!(bytes.len(), 8 + 2 * 32769);
+    assert!(bytes[10..].iter().all(|byte| *byte == 0));
+}
+
+#[test]
+fn negative_scale_binary_output_reserves_expansion_before_encoding() {
+    let value = read_text(1700, "1E+100000").unwrap();
+    let small = MemoryBudget::new(16 << 10);
+    assert!(encode(PgType::Numeric, Format::Binary, &value, &SessionEnvironment::default(), &small).is_err());
+    assert_eq!(small.used_bytes(), 0);
+    let memory = MemoryBudget::new(1 << 20);
+    let encoded = encode(PgType::Numeric, Format::Binary, &value, &SessionEnvironment::default(), &memory).unwrap().unwrap();
+    assert_eq!(encoded.as_slice().len(), 8 + 2 * 25001);
+    assert!(memory.used_bytes() >= encoded.as_slice().len());
+    drop(encoded);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn decimal_text_and_tagged_values_keep_full_scale_without_zero_expansion() {
+    for (text, scale) in [("1E+129", -129), ("1E-129", 129), ("1E+2147483648", i32::MIN), ("1E-2147483647", i32::MAX)] {
+        let value = read_text(1700, text).unwrap();
+        assert!(matches!(&value, Value::Decimal(value) if value.scale == scale));
+        assert_eq!(output(PgType::Numeric, Format::Text, &value), text.as_bytes());
+        let tagged = serde_json::json!({"@type":"xt:decimal","@value":text}).to_string();
+        assert_eq!(read_text(114, &tagged).unwrap(), value);
+        let transit = rtdb_format::transit::TransitValue::Tagged { tag: "f".into(), representation: Box::new(rtdb_format::transit::TransitValue::String(text.into())) };
+        assert_eq!(rtdb_pg_codec::from_transit(transit).unwrap(), value);
+    }
+    for text in ["1E-2147483648", "1E+2147483649", "1_0"] { assert!(read_text(1700, text).is_err()); }
+    assert_eq!(read_text(1700, "١.٢٥").unwrap(), read_text(1700, "1.25").unwrap());
+    assert_eq!(read_text(1700, "１E+２１４７４８３６４８").unwrap(), read_text(1700, "1E+2147483648").unwrap());
+    assert!(read_text(1700, "𝟙").is_err());
+    for coefficient in ["0", "1"] {
+        let value = read_text(1700, &format!("{coefficient}E+2147483648")).unwrap();
+        assert!(encode_value(PgType::Numeric, Format::Binary, &value, &SessionEnvironment::default()).is_err());
     }
 }
 

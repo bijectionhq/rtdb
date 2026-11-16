@@ -132,7 +132,11 @@ fn default_value(value: &Json, schema: &ConnectSchema, field_default: bool) -> R
         Some("org.apache.kafka.connect.data.Date") => return Ok(Value::DateDay(integer() as i32)),
         Some("org.apache.kafka.connect.data.Time") => return Ok(Value::Time { value: integer(), unit: TimeUnit::Millisecond, bit_width: 32 }),
         Some("org.apache.kafka.connect.data.Timestamp") => return Ok(Value::Timestamp { value: integer(), unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }),
-        Some("org.apache.kafka.connect.data.Decimal") => return super::decimal_value(bytes()?, schema.parameters.get("scale").and_then(|value| value.parse().ok()).unwrap_or(0)),
+        Some("org.apache.kafka.connect.data.Decimal") => {
+            let scale = schema.parameters.get("scale").ok_or_else(|| error("avro-schema", "Decimal default has no schema scale"))?
+                .parse().map_err(|cause| error("avro-schema", cause))?;
+            return super::decimal_value_at_scale(bytes()?, scale);
+        }
         _ => (),
     }
     Ok(match &schema.kind {
@@ -155,4 +159,28 @@ fn default_value(value: &Json, schema: &ConnectSchema, field_default: bool) -> R
         SchemaKind::ArrayOfNull | SchemaKind::MapOfNull | SchemaKind::MapWithNullValues(_) => return Err(error("avro-schema", "Avro default requires an element schema")),
         SchemaKind::Reference(_) => unreachable!("schema references resolve before defaults"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn decimal_defaults_preserve_full_scale_and_reject_invalid_schema_scales() {
+        let mut schema = ConnectSchema::new(SchemaKind::Bytes);
+        schema.name = Some("org.apache.kafka.connect.data.Decimal".into());
+        for scale in [i32::MIN, -129, 129, i32::MAX] {
+            schema.parameters.insert("scale".into(), scale.to_string());
+            let Value::Decimal(value) = default_value(&Json::String("\u{1}".into()), &schema, false).unwrap() else { panic!("expected Decimal") };
+            assert_eq!(value.scale, scale);
+            assert_eq!(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), 1.into());
+        }
+        for scale in ["2147483648", "invalid"] {
+            schema.parameters.insert("scale".into(), scale.into());
+            assert!(default_value(&Json::String("\u{1}".into()), &schema, false).is_err());
+        }
+        schema.parameters.remove("scale");
+        assert!(default_value(&Json::String("\u{1}".into()), &schema, false).is_err());
+        schema.parameters.insert("scale".into(), "0".into());
+        assert!(default_value(&Json::String(String::new()), &schema, false).is_err());
+    }
 }

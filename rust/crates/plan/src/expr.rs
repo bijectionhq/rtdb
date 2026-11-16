@@ -43,8 +43,10 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
         "concat" => (LogicalType::Scalar(S::Utf8), 0..=usize::MAX, true),
         "character_length" | "char_length" | "length" | "octet_length" | "bit_length" | "cardinality" => (LogicalType::Scalar(S::I32), 1..=1, true),
         "position" => (LogicalType::Scalar(S::I32), 2..=2, true),
-        "abs" | "floor" | "ceil" | "ceiling" => (numeric(), 1..=1, true),
-        "round" | "trunc" => (arguments.first().cloned().unwrap_or(LogicalType::Null), 1..=2, true),
+        "abs" => (numeric(), 1..=1, true),
+        "floor" | "ceil" | "ceiling" => (LogicalType::Scalar(S::F64), 1..=1, true),
+        "round" => (round_type(arguments.first().unwrap_or(&LogicalType::Nothing), None, arguments.len() == 2)?, 1..=2, true),
+        "trunc" => (arguments.first().cloned().unwrap_or(LogicalType::Null), 1..=2, true),
         "greatest" | "least" => (LogicalType::join_all(arguments), 1..=usize::MAX, true),
         "power" | "atan2" => (LogicalType::Scalar(S::F64), 2..=2, true),
         "sqrt" | "exp" | "ln" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "degrees" | "radians" => (LogicalType::Scalar(S::F64), 1..=1, true),
@@ -263,6 +265,18 @@ impl Expr {
         for missing in self.referenced_columns().difference(columns) {
             return Err(Anomaly::fault("rtdb.plan/unbound-column", format!("Column {} is outside the input schema", missing.0)));
         }
+        let mut failure = None;
+        self.visit(&mut |expr| {
+            if let Self::Binary { op, left, right } = expr {
+                for left in left.data_type().legs() { for right in right.data_type().legs() {
+                    if let (LogicalType::Scalar(ScalarType::Decimal { scale: left, .. }), LogicalType::Scalar(ScalarType::Decimal { scale: right, .. })) = (left, right) {
+                        if let Err(error) = decimal_arithmetic_scale(*op, left, right) { failure = Some(error); }
+                    }
+                } }
+            }
+            if let Self::Call { name, args, .. } = expr { if let Err(error) = function_type_with_args(name, args) { failure = Some(error); } }
+        });
+        if let Some(error) = failure { return Err(error); }
         Ok(())
     }
 }
@@ -270,6 +284,54 @@ impl Expr {
 fn boolean_type(nullable: bool) -> LogicalType {
     let ty = LogicalType::Scalar(ScalarType::Bool);
     if nullable { ty.maybe() } else { ty }
+}
+
+/// Computes literal-dependent result metadata; ROUND requires a constant scale for decimal and integer inputs.
+pub fn function_type_with_args(name: &str, arguments: &[Expr]) -> Result<LogicalType> {
+    let types = arguments.iter().map(Expr::data_type).collect::<Vec<_>>();
+    let result = function_type(name, &types)?;
+    if !name.eq_ignore_ascii_case("round") { return Ok(result); }
+    let source = types.first().unwrap_or(&LogicalType::Nothing);
+    let needs_constant = source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::Decimal { .. } | ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)));
+    let scale = if arguments.len() == 2 && needs_constant {
+        let value = match &arguments[1] {
+            Expr::Literal(Value::I8(value)) => i64::from(*value), Expr::Literal(Value::I16(value)) => i64::from(*value),
+            Expr::Literal(Value::I32(value)) => i64::from(*value), Expr::Literal(Value::I64(value)) => *value,
+            Expr::Unary { op: UnaryOp::Negate, expr } => match expr.as_ref() { Expr::Literal(Value::I64(value)) => value.checked_neg().ok_or_else(decimal_scale_error)?, _ => return Err(non_literal_round_scale()) },
+            _ => return Err(non_literal_round_scale()),
+        };
+        Some(i32::try_from(value).map_err(|_| decimal_scale_error())?)
+    } else { None };
+    let result = round_type(source, scale, arguments.len() == 2)?;
+    Ok(if types.iter().any(LogicalType::nullable) { result.maybe() } else { result })
+}
+
+fn non_literal_round_scale() -> Anomaly { Anomaly::unsupported("xtdb.expression/non-literal-scale", "ROUND with decimal or integer input requires a constant scale") }
+fn decimal_scale_error() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal scale exceeds signed 32 bits") }
+fn round_type(source: &LogicalType, scale: Option<i32>, explicit: bool) -> Result<LogicalType> {
+    if explicit && source.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16))) {
+        return Err(Anomaly::unsupported("xtdb.expression/unsupported-round-type", "ROUND with a scale requires i32 or i64 integer input"));
+    }
+    let result = source.legs().into_iter().map(|leg| match leg {
+        LogicalType::Scalar(ScalarType::Decimal { precision, bit_width, .. }) => LogicalType::Scalar(ScalarType::Decimal { precision, scale: scale.unwrap_or(0), bit_width }),
+        LogicalType::Scalar(ty @ (ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64)) => {
+            if explicit { LogicalType::Scalar(ScalarType::Decimal { precision: if ty == ScalarType::I64 { 19 } else { 10 }, scale: scale.unwrap_or(0), bit_width: 128 }) } else { LogicalType::Scalar(ty) }
+        }
+        LogicalType::Null | LogicalType::Nothing => leg,
+        _ => LogicalType::Scalar(ScalarType::F64),
+    }).collect::<Vec<_>>();
+    Ok(LogicalType::join_all(&result))
+}
+
+/// Returns the decimal arithmetic scale, rejecting results outside signed 32 bits before coefficient evaluation.
+/// Multiplication uses `left + right`, division uses `max(6, left + right + 1)`, and other operators use `max(left, right)`.
+pub fn decimal_arithmetic_scale(op: BinaryOp, left: i32, right: i32) -> Result<i32> {
+    let scale = match op {
+        BinaryOp::Multiply => i64::from(left) + i64::from(right),
+        BinaryOp::Divide => 6.max(i64::from(left) + i64::from(right) + 1),
+        _ => i64::from(left.max(right)),
+    };
+    i32::try_from(scale).map_err(|_| decimal_scale_error())
 }
 
 fn equality_nullable(left: &LogicalType, right: &LogicalType) -> bool {
@@ -298,15 +360,10 @@ pub fn arithmetic_type(op: BinaryOp, left: &LogicalType, right: &LogicalType) ->
                 _ => None,
             };
             let has_decimal = [&left, &right].iter().any(|ty| matches!(ty, LogicalType::Scalar(ScalarType::Decimal { .. })));
-            let result = if has_decimal {
+            let result = if op == BinaryOp::Modulo { LogicalType::least_upper_bound(&[left.clone(), right.clone()]) } else if has_decimal {
                 if let (Some((lp, ls)), Some((rp, rs))) = (decimal_parts(&left), decimal_parts(&right)) {
                     let precision = if lp <= 32 && rp <= 32 { 32 } else { 64 };
-                    let scale = match op {
-                        BinaryOp::Multiply => i16::from(ls) + i16::from(rs),
-                        BinaryOp::Divide => 6.max(i16::from(ls) + i16::from(rs) + 1),
-                        _ => i16::from(ls.max(rs)),
-                    };
-                    i8::try_from(scale).ok().map(|scale| LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width: if precision <= 38 { 128 } else { 256 } }))
+                    decimal_arithmetic_scale(op, ls, rs).ok().map(|scale| LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width: if precision <= 32 { 128 } else { 256 } }))
                 } else { LogicalType::least_upper_bound(&[left.clone(), right.clone()]) }
             } else { LogicalType::least_upper_bound(&[left.clone(), right.clone()]) };
             results.push(result.unwrap_or_else(|| left.join(&right)));

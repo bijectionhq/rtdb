@@ -114,7 +114,7 @@ impl Service {
         let stream: Output<FlightData> = Box::pin(async_stream::try_stream! {
             let _connection = connection; let _token = token_guard; let _call = call;
             yield wire::schema_data(&schema, service.memory())?;
-            let mut encoder = wire::Encoder::new();
+            let mut encoder = match wire::Encoder::new(&schema, service.memory()) { Ok(encoder) => encoder, Err(error) => { cursor.record_consumer_error(); Err(error)?; unreachable!() } };
             loop {
                 let batch = _call.cancellation.run_until_cancelled(cursor.next_batch()).await.ok_or_else(cancelled)?.map_err(status)?;
                 let Some(batch) = batch else { break; };

@@ -218,7 +218,7 @@ pub(super) fn normalize(input: &MergeFile, put: &Option<BTreeMap<String, Logical
     let (mut reader, _reader_charge) = open_input(File::open(&input.path).map_err(crate::invalid)?, memory)?;
     let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && input.recency.is_some()).then_some(RunEndWidth::I32), recency: input.carries_recency };
     let directory = data_path.parent().ok_or_else(|| crate::invalid("Output path has no parent"))?;
-    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded(create_file(data_path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
+    let mut output = FinalWriter { data: ArrowFileWriter::new_bounded_reserved(create_file(data_path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?, memory)?, metadata: MetadataBuilder::new(input.carries_recency, true), schema, memory, metadata_charges: Vec::new(), cancellation, directory, disk_limit: config.temporary_byte_limit };
     if !input.carries_recency {
         output.tree(&mut reader, &input.leaves, 0, config.page_size)?;
     } else if input.leaves.is_empty() { output.metadata.write_nil()?; }

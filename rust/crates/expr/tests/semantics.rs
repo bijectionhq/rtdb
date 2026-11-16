@@ -5,7 +5,7 @@ use rtdb_types::{DecimalValue, LogicalType as T, ScalarType as S, TimeUnit, Time
 
 fn expr(op: B, left: V, right: V) -> Expr { Expr::binary(op, Expr::Literal(left), Expr::Literal(right)) }
 fn run(expr: &Expr) -> V { evaluate(expr, &Schema::default(), &[], &EvalContext::default()).unwrap() }
-fn decimal(coefficient: i128, scale: i8) -> V {
+fn decimal(coefficient: i128, scale: i32) -> V {
     V::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), 32, scale, 128).unwrap())
 }
 

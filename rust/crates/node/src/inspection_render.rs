@@ -86,17 +86,7 @@ fn float(value: f64) -> String {
 fn finite_float(text: String) -> String { if text.contains(['.', 'e', 'E']) { text } else { format!("{text}.0") } }
 fn hex(bytes: &[u8]) -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() }
 fn decimal(value: &DecimalValue) -> String {
-    let negative = value.unscaled.first().is_some_and(|byte| byte & 0x80 != 0);
-    let mut bytes = value.unscaled.clone();
-    if negative { for byte in &mut bytes { *byte = !*byte; } for byte in bytes.iter_mut().rev() { let (next, carry) = byte.overflowing_add(1); *byte = next; if !carry { break; } } }
-    let mut digits = vec![0_u8];
-    for byte in bytes { let mut carry = u16::from(byte); for digit in &mut digits { let next = u16::from(*digit) * 256 + carry; *digit = (next % 10) as u8; carry = next / 10; } while carry != 0 { digits.push((carry % 10) as u8); carry /= 10; } }
-    let mut text: String = digits.into_iter().rev().map(|digit| char::from(b'0' + digit)).collect();
-    let adjusted = text.len() as i32 - i32::from(value.scale) - 1;
-    if value.scale >= 0 && adjusted >= -6 {
-        if value.scale > 0 { let scale = value.scale as usize; if text.len() <= scale { text = format!("{}{}", "0".repeat(scale + 1 - text.len()), text); } text.insert(text.len() - scale, '.'); }
-    } else { if text.len() > 1 { text.insert(1, '.'); } text.push_str(&format!("E{adjusted:+}")); }
-    format!("{}{text}M", if negative { "-" } else { "" })
+    format!("{}M", rtdb_expr::decimal_text(value))
 }
 fn nanos(value: i64, unit: TimeUnit) -> i128 { i128::from(value) * match unit { TimeUnit::Second => 1_000_000_000, TimeUnit::Millisecond => 1_000_000, TimeUnit::Microsecond => 1000, TimeUnit::Nanosecond => 1 } }
 fn zoned(nanos: i128, zone: &str) -> Result<String> {
@@ -183,6 +173,8 @@ mod tests {
         assert_eq!(render(&Value::Timestamp { value: 1, unit: TimeUnit::Nanosecond, timezone: Some("+01:00:01".into()) }).unwrap(), "#time/zoned-date-time \"1970-01-01T01:00:01.000000001+01:00:01\"");
         assert_eq!(render(&Value::Timestamp { value: 0, unit: TimeUnit::Microsecond, timezone: Some("Europe/Paris".into()) }).unwrap(), "#time/zoned-date-time \"1970-01-01T01:00+01:00[Europe/Paris]\"");
         assert_eq!(decimal(&DecimalValue { unscaled: vec![123], precision: 3, scale: -2, bit_width: 128 }), "1.23E+4M");
+        assert_eq!(decimal(&DecimalValue { unscaled: vec![123], precision: 3, scale: i32::MIN, bit_width: 128 }), "1.23E+2147483650M");
+        assert_eq!(decimal(&DecimalValue { unscaled: vec![123], precision: 3, scale: i32::MAX, bit_width: 128 }), "1.23E-2147483645M");
         assert_eq!(render(&Value::IntervalMonthDayMicro { months: 13, days: -2, nanoseconds: 1_500_000_000 }).unwrap(), "#xt/interval \"P1Y1M-2DT1.5S\"");
     }
 }

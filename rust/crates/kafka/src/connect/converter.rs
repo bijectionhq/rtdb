@@ -197,6 +197,7 @@ fn decimal(json: &Json, schema: &ConnectSchema) -> Result<Value> {
     } else {
         let scale = schema.parameters.get("scale").ok_or_else(|| error("conversion-error", "Decimal schema has no scale"))?.parse::<i64>().map_err(|cause| error("conversion-error", cause))?;
         let bytes = STANDARD.decode(json.as_str().ok_or_else(|| error("conversion-error", "Decimal must be numeric or base64"))?).map_err(|cause| error("conversion-error", cause))?;
+        if bytes.is_empty() { return Err(error("conversion-error", "Decimal coefficient bytes are empty")); }
         (num_bigint::BigInt::from_signed_bytes_be(&bytes), scale)
     };
     let digits = coefficient.to_str_radix(10).trim_start_matches('-').len().max(1);
@@ -206,7 +207,7 @@ fn decimal(json: &Json, schema: &ConnectSchema) -> Result<Value> {
     if bytes.len() > width { return Err(error("conversion-error", "Decimal coefficient exceeds its width")); }
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; width];
     unscaled[width - bytes.len()..].copy_from_slice(&bytes);
-    Ok(Value::Decimal(DecimalValue::new(unscaled, if bit_width == 128 { 32 } else { 64 }, i8::try_from(scale).map_err(|cause| error("conversion-error", cause))?, bit_width)?))
+    Ok(Value::Decimal(DecimalValue::new(unscaled, if bit_width == 128 { 32 } else { 64 }, i32::try_from(scale).map_err(|cause| error("conversion-error", cause))?, bit_width)?))
 }
 
 struct DecodeBudget { remaining: usize }

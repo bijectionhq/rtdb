@@ -54,14 +54,14 @@ impl Parser<'_> {
         let token = self.take()?.to_owned();
         if token.trim().is_empty() { return Ok(typed(SchemaKind::String, Value::Utf8(token))); }
         let token = token.trim();
-        if token.starts_with(|character: char| character.is_ascii_digit()) {
+        if token.starts_with(|character: char| rtdb_types::decimal_digit(character).is_some()) {
             if self.next + 4 <= self.tokens.len() {
                 let extended = format!("{token}{}", self.tokens[self.next..self.next + 4].concat());
                 if let Some(value) = temporal(&extended) { self.next += 4; return Ok(value); }
             }
             if let Some(value) = temporal(token) { return Ok(value); }
         }
-        if token.starts_with(|character: char| character.is_ascii_digit() || character == '+' || character == '-') { if let Ok(value) = number(token) { return Ok(value); } }
+        if token.starts_with(|character: char| rtdb_types::decimal_digit(character).is_some() || character == '+' || character == '-') { if let Ok(value) = number(token) { return Ok(value); } }
         if embedded { Err(error("header-parse", "Invalid embedded header literal")) } else { Ok(typed(SchemaKind::String, Value::Utf8(self.original.into()))) }
     }
     fn array(&mut self, depth: usize) -> Result<ConnectData> {
@@ -118,13 +118,14 @@ fn align(value: Value, schema: &ConnectSchema) -> Result<Value> {
     Ok(value)
 }
 fn number(text: &str) -> Result<ConnectData> {
+    let spelling = rtdb_types::decimal_spelling(text).map_err(|cause| error("header-parse", cause))?;
+    let text = spelling.ascii();
     let decimal = bigdecimal::BigDecimal::from_str(text).map_err(|cause| error("header-parse", cause))?;
     let (coefficient, scale) = decimal.as_bigint_and_exponent();
-    if scale.unsigned_abs() > 1024 { return Err(error("header-parse", "Decimal exponent exceeds its representation limit")); }
-    let whole = decimal.with_scale(0);
-    if whole == decimal { if let Ok(integer) = whole.to_string().parse::<i64>() {
+    let scale = i32::try_from(scale).map_err(|cause| error("header-parse", cause))?;
+    if let Some(integer) = exact_integer(&coefficient, scale) {
         return Ok(if let Ok(value) = i8::try_from(integer) { typed(SchemaKind::I8, Value::I8(value)) } else if let Ok(value) = i16::try_from(integer) { typed(SchemaKind::I16, Value::I16(value)) } else if let Ok(value) = i32::try_from(integer) { typed(SchemaKind::I32, Value::I32(value)) } else { typed(SchemaKind::I64, Value::I64(integer)) });
-    } }
+    }
     if scale != 0 {
         if let Ok(value) = text.parse::<f32>() { if value.is_finite() { return Ok(typed(SchemaKind::F32, Value::F32(value))); } }
         if let Ok(value) = text.parse::<f64>() { if value.is_finite() { return Ok(typed(SchemaKind::F64, Value::F64(value))); } }
@@ -134,9 +135,25 @@ fn number(text: &str) -> Result<ConnectData> {
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; usize::from(precision / 2)];
     if bytes.len() > unscaled.len() { return Err(error("header-parse", "Decimal coefficient exceeds its width")); }
     let start = unscaled.len() - bytes.len(); unscaled[start..].copy_from_slice(&bytes);
-    let value = Value::Decimal(DecimalValue::new(unscaled, precision, i8::try_from(scale).map_err(|cause| error("header-parse", cause))?, u16::from(precision) * 4)?);
+    let value = Value::Decimal(DecimalValue::new(unscaled, precision, scale, u16::from(precision) * 4)?);
     let mut schema = ConnectSchema::new(SchemaKind::Bytes); schema.name = Some("org.apache.kafka.connect.data.Decimal".into()); schema.version = Some(1); schema.parameters.insert("scale".into(), scale.to_string());
     Ok(ConnectData { schema: Some(Arc::new(schema)), value })
+}
+fn exact_integer(coefficient: &num_bigint::BigInt, scale: i32) -> Option<i64> {
+    if coefficient.sign() == num_bigint::Sign::NoSign { return Some(0); }
+    let signed = coefficient.to_str_radix(10);
+    let digits = signed.trim_start_matches('-');
+    let integer_digits = i64::try_from(digits.len()).ok()?.checked_sub(i64::from(scale))?;
+    if !(1..=19).contains(&integer_digits) { return None; }
+    if scale >= 0 {
+        let end = signed.len().checked_sub(scale as usize)?;
+        if signed.as_bytes()[end..].iter().any(|byte| *byte != b'0') { return None; }
+        signed[..end].parse().ok()
+    } else {
+        let mut integer = signed;
+        integer.extend(std::iter::repeat_n('0', scale.unsigned_abs() as usize));
+        integer.parse().ok()
+    }
 }
 fn temporal(text: &str) -> Option<ConnectData> {
     let text = text.replace("\\:", ":");
@@ -159,6 +176,24 @@ mod tests {
         assert_eq!(literal("true}").unwrap().value, Value::Utf8("true}".into()));
         assert_eq!(literal("127").unwrap().value, Value::I8(127)); assert_eq!(literal("128").unwrap().value, Value::I16(128));
         assert_eq!(literal("1.0").unwrap().value, Value::I8(1)); assert_eq!(literal("1.25").unwrap().value, Value::F32(1.25));
+    }
+    #[test]
+    fn header_numeric_inference_handles_full_scales_without_expanding_powers() {
+        let value = literal("1E+2147483648").unwrap();
+        assert_eq!(value.schema.as_ref().unwrap().parameters["scale"], i32::MIN.to_string());
+        let Value::Decimal(value) = value.value else { panic!("expected Decimal") };
+        assert_eq!(value.scale, i32::MIN);
+        assert_eq!(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), 1.into());
+        assert_eq!(literal("1E-2147483647").unwrap().value, Value::F32(0.0));
+        assert_eq!(literal("0E+2147483648").unwrap().value, Value::I8(0));
+        assert_eq!(literal("9223372036854775807.0").unwrap().value, Value::I64(i64::MAX));
+        assert_eq!(literal("-9223372036854775808.0").unwrap().value, Value::I64(i64::MIN));
+        assert!(matches!(literal("9223372036854775808").unwrap().value, Value::Decimal(_)));
+        for text in ["1E-2147483648", "1_0"] { assert_eq!(literal(text).unwrap().value, Value::Utf8(text.into())); }
+        assert_eq!(literal("１２７").unwrap().value, Value::I8(127));
+        assert_eq!(literal("١.٢٥").unwrap().value, Value::F32(1.25));
+        assert_eq!(literal("١E-٢١٤٧٤٨٣٦٤٧").unwrap().value, Value::F32(0.0));
+        assert_eq!(literal("𝟙").unwrap().value, Value::Utf8("𝟙".into()));
     }
     #[test]
     fn header_collections_align_numbers_and_preserve_mixed_schema_absence() {

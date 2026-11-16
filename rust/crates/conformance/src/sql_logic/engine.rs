@@ -175,10 +175,14 @@ impl Engine {
         let Statement::Query(relation) = statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement is not a query")); };
         let relation = if options.direct_sql { relation } else { restore_dependencies(&relation, &context)? };
         let mut cursor = PreparedQuery::new(relation)?.execute(context.clone(), vec![])?;
+        let mut bytes = cursor.schema().fields().iter().try_fold(8192usize, |bytes, field| {
+            let field = field.data_type.retained_bytes()?.checked_add(field.name.len()).and_then(|bytes| bytes.checked_mul(32)).ok_or_else(|| gap("SLT schema size overflow"))?;
+            bytes.checked_add(field).ok_or_else(|| gap("SLT schema size overflow"))
+        })?;
+        if bytes > options.max_result_bytes { return Err(gap("SLT schema exceeded configured byte retention limit")); }
+        let mut charges: Vec<Arc<MemoryReservation>> = vec![context.memory.reserve(bytes)?];
         let schema = cursor.schema().fields().iter().map(|field| json!({"name":field.name,"type":field.data_type})).collect::<Vec<_>>();
         let mut rows = Vec::new();
-        let mut charges: Vec<Arc<MemoryReservation>> = Vec::new();
-        let mut bytes = 0usize;
         let mut actual_values = 0usize;
         let types = record.type_string.as_deref().unwrap_or("").as_bytes();
         while let Some(batch) = cursor.next_batch().await? {
@@ -196,7 +200,11 @@ impl Engine {
                 actual_values += batch.num_columns();
                 for ((kind, field), array) in types.iter().zip(batch.schema().fields()).zip(batch.columns()) {
                     let value = read_value(field, array.as_ref(), row)?;
-                    output.push(format::cell(*kind, &value)?);
+                    let bound = format::allocation_bound(*kind, &value)?.checked_mul(4).ok_or_else(|| gap("SLT formatted size overflow"))?;
+                    bytes = bytes.checked_add(bound).ok_or_else(|| gap("SLT result size overflow"))?;
+                    if bytes > options.max_result_bytes { return Err(gap("SLT result exceeded configured byte retention limit")); }
+                    charges.push(context.memory.reserve(bound)?);
+                    output.push(format::cell(*kind, &value, bound / 4)?);
                 }
                 rows.push(output);
             }
@@ -293,5 +301,24 @@ mod tests {
         let state = Bookkeeping::Ready { tables: BTreeMap::new(), views: BTreeMap::from([("v".into(), "x".repeat(16 * 1024 * 1024))]) };
         assert_eq!(state.validate_size().unwrap_err().code, "rtdb.conformance/slt-harness-gap");
         assert!(Bookkeeping::Nil.validate_size().is_ok());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn empty_query_results_retain_and_limit_schema_allocations() {
+        let running = Running::open().await.unwrap();
+        let mut engine = Engine::new(running.node.clone()).unwrap();
+        let record: Record = serde_json::from_value(json!({"type":"query","sql":"SELECT 1 AS value WHERE FALSE","type_string":"I","sort":"nosort"})).unwrap();
+        let mut options = Options { direct_sql: true, decorrelate: true, query_limit: None, max_rows: 10, max_result_bytes: 1 };
+        let small = engine.query(&record, &BTreeMap::new(), &options).await;
+        options.max_result_bytes = 1024 * 1024;
+        let large = engine.query(&record, &BTreeMap::new(), &options).await;
+        drop(engine);
+        running.close().await.unwrap();
+        assert_eq!(small.unwrap_err().code, "rtdb.conformance/slt-harness-gap");
+        let (result, charges) = large.unwrap();
+        assert_eq!(result["rows"], 0);
+        assert_eq!(result["schema"].as_array().unwrap().len(), 1);
+        assert!(charges.iter().map(|charge| charge.bytes()).sum::<usize>() >= 8192);
+        drop(result);
+        drop(charges);
     }
 }

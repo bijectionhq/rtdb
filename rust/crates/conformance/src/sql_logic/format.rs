@@ -1,4 +1,4 @@
-use bigdecimal::{BigDecimal, RoundingMode};
+use bigdecimal::BigDecimal;
 use chrono::Timelike;
 use num_bigint::BigInt;
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
@@ -7,36 +7,90 @@ use std::{cmp::Ordering, str::FromStr};
 fn unsupported() -> Anomaly { Anomaly::unsupported("rtdb.conformance/slt-format", "Value has no qualified pinned SLT formatter") }
 fn java_order(left: &str, right: &str) -> Ordering { left.encode_utf16().cmp(right.encode_utf16()) }
 
-fn real(value: &Value) -> Result<String> {
+fn limit() -> Anomaly { super::engine::gap("SLT formatted value exceeded its retained byte limit") }
+
+fn real_parts(value: &Value) -> Result<(BigInt, i64, bool)> {
     let (decimal, negative) = match value {
         Value::F32(value) => {
-            if !value.is_finite() { return Ok(if value.is_nan() { "NaN" } else if value.is_sign_negative() { "-Infinity" } else { "Infinity" }.into()); }
             (BigDecimal::from_str(&f64::from(*value).to_string()).map_err(|_| unsupported())?, value.is_sign_negative())
         }
         Value::F64(value) => {
-            if !value.is_finite() { return Ok(if value.is_nan() { "NaN" } else if value.is_sign_negative() { "-Infinity" } else { "Infinity" }.into()); }
             (BigDecimal::from_str(&value.to_string()).map_err(|_| unsupported())?, value.is_sign_negative())
         }
         Value::Decimal(value) => (BigDecimal::new(BigInt::from_signed_bytes_be(&value.unscaled), i64::from(value.scale)), value.unscaled.first().is_some_and(|byte| byte & 0x80 != 0)),
         _ => return Err(Anomaly::incorrect("rtdb.conformance/slt-real-format", "Pinned %f formatter requires a floating-point or decimal value")),
     };
-    let rounded = format!("{:.3}", decimal.with_scale_round(3, RoundingMode::HalfUp));
-    Ok(if negative && !rounded.starts_with('-') { format!("-{rounded}") } else { rounded })
+    let (coefficient, scale) = decimal.into_bigint_and_scale();
+    Ok((coefficient, scale, negative))
+}
+
+pub(super) fn allocation_bound(kind: u8, value: &Value) -> Result<usize> {
+    if kind == b'R' && !matches!(value, Value::Null | Value::Undefined)
+        && !matches!(value, Value::F32(value) if !value.is_finite())
+        && !matches!(value, Value::F64(value) if !value.is_finite()) {
+        let (coefficient, scale, _) = real_parts(value)?;
+        let digits = coefficient.to_str_radix(10);
+        let length = if digits == "0" { 1 } else { digits.trim_start_matches('-').len() as i64 + (3 - scale).max(0) };
+        return usize::try_from(length.max(4)).ok().and_then(|length| length.checked_add(3)).ok_or_else(limit);
+    }
+    value.retained_bytes()?.checked_mul(8).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(limit)
+}
+
+fn real(value: &Value, maximum: usize) -> Result<String> {
+    let nonfinite = match value { Value::F32(value) => Some(f64::from(*value)), Value::F64(value) => Some(*value), _ => None };
+    if let Some(value) = nonfinite.filter(|value| !value.is_finite()) {
+        return Ok(if value.is_nan() { "NaN" } else if value.is_sign_negative() { "-Infinity" } else { "Infinity" }.into());
+    }
+    if allocation_bound(b'R', value)? > maximum { return Err(limit()); }
+    let (coefficient, scale, negative) = real_parts(value)?;
+    let coefficient = coefficient.to_str_radix(10);
+    let mut digits = coefficient.trim_start_matches('-').as_bytes().to_vec();
+    let shift = 3 - scale;
+    if shift >= 0 {
+        if digits != b"0" { digits.resize(digits.len() + shift as usize, b'0'); }
+    } else {
+        let removed = (-shift) as u64;
+        if removed > digits.len() as u64 { digits = vec![b'0']; }
+        else {
+            let kept = digits.len() - removed as usize;
+            let increment = digits[kept] >= b'5';
+            digits.truncate(kept);
+            if increment {
+                let mut carry = true;
+                for digit in digits.iter_mut().rev() {
+                    if *digit < b'9' { *digit += 1; carry = false; break; }
+                    *digit = b'0';
+                }
+                if carry { digits.insert(0, b'1'); }
+            }
+            if digits.is_empty() { digits.push(b'0'); }
+        }
+    }
+    let mut result = String::with_capacity(digits.len().max(4) + 2);
+    if negative { result.push('-'); }
+    if digits.len() <= 3 {
+        result.push_str("0.");
+        result.extend(std::iter::repeat_n('0', 3 - digits.len()));
+        result.push_str(std::str::from_utf8(&digits).expect("decimal digits"));
+    } else {
+        let split = digits.len() - 3;
+        result.push_str(std::str::from_utf8(&digits[..split]).expect("decimal digits"));
+        result.push('.');
+        result.push_str(std::str::from_utf8(&digits[split..]).expect("decimal digits"));
+    }
+    Ok(result)
 }
 
 fn integer(value: &Value) -> Result<String> {
     if matches!(value, Value::Utf8(_)) { return Ok("0".into()); }
     if let Some(value) = rtdb_expr::integer(value) { return Ok((value as i64).to_string()); }
     match value {
-        Value::F32(value) => Ok((*value as i64).to_string()),
-        Value::F64(value) => Ok((*value as i64).to_string()),
-        Value::Decimal(value) => {
-            let value = BigDecimal::new(BigInt::from_signed_bytes_be(&value.unscaled), i64::from(value.scale)).with_scale(0);
-            let coefficient = value.as_bigint_and_exponent().0;
-            let bytes = coefficient.to_signed_bytes_le();
-            let mut low = [if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; 8];
-            for (left, right) in low.iter_mut().zip(bytes) { *left = right; }
-            Ok(i64::from_le_bytes(low).to_string())
+        Value::F32(_) | Value::F64(_) | Value::Decimal(_) => {
+            let number = rtdb_expr::number(value).ok_or_else(unsupported)?;
+            if number < i64::MIN as f64 || number > i64::MAX as f64 {
+                return Err(Anomaly::incorrect("rtdb.conformance/slt-integer-format", "Pinned long coercion exceeds signed 64 bits"));
+            }
+            Ok((number as i64).to_string())
         }
         _ => Err(Anomaly::incorrect("rtdb.conformance/slt-integer-format", "Pinned long coercion does not accept this value")),
     }
@@ -62,8 +116,7 @@ fn text(value: &Value, nested: bool) -> Result<String> {
         Value::U8(value) => value.to_string(), Value::U16(value) => value.to_string(), Value::U32(value) => value.to_string(), Value::U64(value) => value.to_string(),
         Value::F32(value) => java_float(f64::from(*value), value.to_string(), format!("{value:e}")), Value::F64(value) => float_text(*value),
         Value::Decimal(value) => {
-            let decimal = BigDecimal::new(BigInt::from_signed_bytes_be(&value.unscaled), i64::from(value.scale));
-            let text = decimal_text(&decimal);
+            let text = rtdb_expr::decimal_text(value);
             if nested { format!("{text}M") } else { text }
         }
         Value::Keyword(value) => format!(":{}", value.as_str()),
@@ -119,33 +172,16 @@ fn local_time(seconds: u32, nanos: u32) -> String {
     }
     value
 }
-fn decimal_text(value: &BigDecimal) -> String {
-    let (coefficient, scale) = value.as_bigint_and_exponent();
-    let digits = coefficient.to_string();
-    let magnitude = digits.trim_start_matches('-');
-    let adjusted = magnitude.len() as i64 - scale - 1;
-    if scale >= 0 && adjusted >= -6 {
-        let sign = if digits.starts_with('-') { "-" } else { "" };
-        if scale == 0 { return digits; }
-        if magnitude.len() > scale as usize {
-            let split = magnitude.len() - scale as usize;
-            return format!("{sign}{}.{}", &magnitude[..split], &magnitude[split..]);
+pub(super) fn cell(kind: u8, value: &Value, maximum: usize) -> Result<String> {
+    if allocation_bound(kind, value)? > maximum { return Err(limit()); }
+    let result = if matches!(value, Value::Null | Value::Undefined) { "NULL".into() } else { match kind {
+        b'R' => real(value, maximum)?, b'I' => integer(value)?, b'T' => {
+            if matches!(value, Value::Utf8(value) if value.is_empty()) { "(empty)".into() } else { text(value, false)? }
         }
-        return format!("{sign}0.{}{magnitude}", "0".repeat(scale as usize - magnitude.len()));
-    }
-    let sign = if digits.starts_with('-') { "-" } else { "" };
-    let coefficient = if magnitude.len() == 1 { magnitude.to_owned() } else { format!("{}.{}", &magnitude[..1], &magnitude[1..]) };
-    format!("{sign}{coefficient}E{}{adjusted}", if adjusted >= 0 { "+" } else { "" })
-}
-
-pub(super) fn cell(kind: u8, value: &Value) -> Result<String> {
-    if matches!(value, Value::Null | Value::Undefined) { return Ok("NULL".into()); }
-    match kind {
-        b'R' => real(value), b'I' => integer(value), b'T' => {
-            if matches!(value, Value::Utf8(value) if value.is_empty()) { Ok("(empty)".into()) } else { text(value, false) }
-        }
-        _ => Err(unsupported()),
-    }
+        _ => return Err(unsupported()),
+    } };
+    if result.len() > maximum { return Err(limit()); }
+    Ok(result)
 }
 
 pub(super) fn finish(mut rows: Vec<Vec<String>>, sort: &str) -> Result<String> {
@@ -159,6 +195,7 @@ pub(super) fn finish(mut rows: Vec<Vec<String>>, sort: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn cell(kind: u8, value: &Value) -> Result<String> { super::cell(kind, value, 1024 * 1024) }
     #[test] fn pinned_integer_string_null_and_empty_rules() {
         assert_eq!(cell(b'I', &Value::Utf8("123".into())).unwrap(), "0");
         assert_eq!(cell(b'R', &Value::Null).unwrap(), "NULL");
@@ -169,6 +206,26 @@ mod tests {
         assert_eq!(cell(b'R', &Value::F64(1.2345)).unwrap(), "1.235");
         assert_eq!(cell(b'R', &Value::F64(-0.0001)).unwrap(), "-0.000");
         assert_eq!(cell(b'R', &Value::F64(f64::NAN)).unwrap(), "NaN");
+    }
+    fn decimal(coefficient: i128, scale: i32) -> Value {
+        Value::Decimal(rtdb_types::DecimalValue::new(coefficient.to_be_bytes().to_vec(), 32, scale, 128).unwrap())
+    }
+    #[test] fn decimal_fixed_format_checks_expansion_before_rounding() {
+        for (coefficient, scale, expected) in [(1, i32::MAX, "0.000"), (-1, i32::MAX, "-0.000"), (0, i32::MIN, "0.000"), (99995, 4, "10.000"), (-5, 4, "-0.001"), (4, 4, "0.000")] {
+            assert_eq!(cell(b'R', &decimal(coefficient, scale)).unwrap(), expected);
+        }
+        assert_eq!(cell(b'R', &decimal(1, -129)).unwrap(), format!("1{}.000", "0".repeat(129)));
+        assert_eq!(cell(b'T', &decimal(1, i32::MIN)).unwrap(), "1E+2147483648");
+        assert_eq!(super::cell(b'R', &decimal(1, i32::MIN), 1024).unwrap_err().code, "rtdb.conformance/slt-harness-gap");
+        assert!(allocation_bound(b'R', &decimal(1, i32::MIN)).unwrap() > i32::MAX as usize);
+    }
+    #[test] fn integer_formatter_uses_clojure_checked_long_coercion() {
+        assert_eq!(cell(b'I', &decimal(9_007_199_254_740_993, 0)).unwrap(), "9007199254740992");
+        assert_eq!(cell(b'I', &decimal(1, i32::MAX)).unwrap(), "0");
+        assert!(cell(b'I', &decimal(1, i32::MIN)).is_err());
+        assert!(cell(b'I', &Value::F64(f64::INFINITY)).is_err());
+        assert_eq!(cell(b'I', &Value::F64(f64::NAN)).unwrap(), "0");
+        assert_eq!(cell(b'I', &Value::F64(i64::MAX as f64)).unwrap(), i64::MAX.to_string());
     }
     #[test] fn row_sort_uses_joined_text_and_java_utf16_order() {
         assert_eq!(finish(vec![vec!["2".into(), "0".into()], vec!["10".into(), "9".into()]], "rowsort").unwrap(), "10\n9\n2\n0\n");

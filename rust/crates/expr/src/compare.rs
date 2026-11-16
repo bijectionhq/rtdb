@@ -7,7 +7,10 @@ pub(crate) fn nullish(value: &Value) -> bool { matches!(value, Value::Null | Val
 pub fn sql_eq(left: &Value, right: &Value) -> Result<Option<bool>> {
     if nullish(left) || nullish(right) { return Ok(None); }
     if let (Some(left), Some(right)) = (integer(left), integer(right)) { return Ok(Some(left == right)); }
-    if let (Some(left), Some(right)) = (exact_decimal(left), exact_decimal(right)) { return Ok(Some(left == right)); }
+    if let (Some(left), Some(right)) = (exact_decimal(left), exact_decimal(right)) {
+        let (left, ls) = left.into_bigint_and_scale(); let (right, rs) = right.into_bigint_and_scale();
+        return Ok(Some(crate::decimal::compare_parts(&left, ls, &right, rs) == Ordering::Equal));
+    }
     if let (Some(left), Some(right)) = (number(left), number(right)) { return Ok(Some(left == right)); }
     match (left, right) {
         (Value::List(left), Value::List(right)) | (Value::FixedSizeList(left), Value::FixedSizeList(right)) => {
@@ -47,7 +50,10 @@ pub fn compare(left: &Value, right: &Value, nulls_first: bool) -> Result<Orderin
         _ => (),
     }
     if let (Some(left), Some(right)) = (integer(left), integer(right)) { return Ok(left.cmp(&right)); }
-    if let (Some(left), Some(right)) = (exact_decimal(left), exact_decimal(right)) { return Ok(left.cmp(&right)); }
+    if let (Some(left), Some(right)) = (exact_decimal(left), exact_decimal(right)) {
+        let (left, ls) = left.into_bigint_and_scale(); let (right, rs) = right.into_bigint_and_scale();
+        return Ok(crate::decimal::compare_parts(&left, ls, &right, rs));
+    }
     if let (Some(left), Some(right)) = (number(left), number(right)) {
         return Ok(if left.is_nan() { if right.is_nan() { Ordering::Equal } else { Ordering::Greater } }
             else if right.is_nan() { Ordering::Less } else { left.total_cmp(&right) });

@@ -1,0 +1,7 @@
+= Decimal spelling fixtures
+
+`openjdk21-bmp-decimal-zeroes.txt` contains the BMP decimal-zero records from https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/data/unicodedata/UnicodeData.txt[OpenJDK jdk-21+35 UnicodeData].
+Each zero starts a contiguous range of ten decimal digits in Unicode 15.0.
+The fixture retains the original semicolon-separated fields and pins the accepted digit ranges independently of the host's Unicode tables.
+`tests/decimal_text.rs` maps these records to the https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/lang/Character.java[Character.digit(char, 10)] boundary used by https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/math/BigDecimal.java[BigDecimal's constructor and parseExp].
+These are source assertions; they have not been executed during Phase 1.

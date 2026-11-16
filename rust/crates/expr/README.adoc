@@ -27,7 +27,17 @@ The ISO parser's component overflow order and signed fractional representation f
 The temporal modules are passive transforms; `IntervalParts` is an immutable component value with no owner task or retained state.
 Temporal comparison across local/zoned/date types, qualified intervals, remaining cast options, and the complete scalar function catalog remain outstanding.
 Named-zone calendar arithmetic beyond Chrono's date range remains narrower than the reference's Java time range; fixed-offset and local calendar arithmetic use checked Gregorian civil-day conversion.
-Decimal scales outside the signed-byte native Arrow representation remain unsupported, although the reference accepts signed 32-bit scale metadata.
+Decimal values and result metadata retain the full signed 32-bit scale.
+Rescaling, exact arithmetic, comparison, canonical text, and integer conversion bound work by coefficient digits before allocating powers of ten.
+`decimal_text`, `decimal_long_value`, `decimal_rescale`, `decimal_to_f64`, and `parse_decimal` are passive transforms shared with protocol adapters.
+Canonical text, scale-difference overflow, and truncating low-64-bit integer conversion follow https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/classes/java/math/BigDecimal.java[OpenJDK 21 BigDecimal].
+Decimal ROUND retains the requested constant scale, while FLOOR and CEIL return doubles.
+Decimal modulo retains the least-upper-bound result type and the reference vector-write failures when a remainder carries a different scale.
+`tests/decimal_scales.rs` covers coefficient bounds, rounding ties, extreme-scale metadata, canonical text, integer conversion, and source-compatible overflow; all assertions remain unexecuted.
+Text parsing accepts OpenJDK 21's Unicode 15.0 BMP decimal digits in coefficients and exponents, including mixed alphabets, while retaining ASCII signs, points, and exponent markers.
+The shared `rtdb_types::DecimalSpelling` value borrows ASCII input or owns normalized text bounded by input bytes and couples that spelling to its validated signed 32-bit scale.
+Its range table and `types/tests/fixtures/openjdk21-bmp-decimal-zeroes.txt` follow https://github.com/openjdk/jdk/blob/jdk-21%2B35/src/java.base/share/data/unicodedata/UnicodeData.txt[OpenJDK 21 UnicodeData].
+Supplementary-plane digits are rejected because the reference BigDecimal constructor reads UTF-16 `char` values.
 Temporal lexical formats, time-zone labels, numeric result schemas, and diagnostics require full reference comparison.
 Fixed offsets accept the spellings defined by https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneOffset.html[Java ZoneOffset] and the `UTC`, `GMT`, and `UT` prefixes from https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/time/ZoneId.html[Java ZoneId].
 Named-zone rules still require qualification against the reference JVM's time-zone database version and available zone IDs.

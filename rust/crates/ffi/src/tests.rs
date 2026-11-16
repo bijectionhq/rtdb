@@ -168,6 +168,57 @@ fn arrow_release_is_idempotent_and_retains_charge_through_imported_children() {
 }
 
 #[test]
+fn decimal_c_data_uses_real_full_scale_formats_and_retains_detached_schema_children() {
+    for width in [32, 64, 128, 256] {
+        for scale in [i32::MIN, -129, 128, i32::MAX] {
+            let memory = MemoryBudget::new(16 * 1024 * 1024);
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: width });
+            let coefficient = arrow_buffer::i256::from_i128(-123).to_be_bytes();
+            let value = rtdb_types::Value::Decimal(rtdb_types::DecimalValue::new(coefficient[32-usize::from(width/8)..].to_vec(), 3, scale, width).unwrap());
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()])), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(batch, &memory).unwrap(), &memory).unwrap();
+            let expected = if width == 128 { format!("d:3,{scale}") } else { format!("d:3,{scale},{width}") };
+            assert_eq!(schema.child(0).format(), expected);
+            assert!(!schema.child(0).metadata().unwrap().contains_key(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY));
+            let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
+            assert_eq!(imported.arguments.types(), &[ty.clone()]);
+            assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
+            drop(imported); assert_eq!(memory.used_bytes(), 0);
+            let mut schema = arrow::export_schema(&Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]), &memory).unwrap();
+            let mut child = unsafe { std::mem::replace(&mut **schema.children, FFI_ArrowSchema::empty()) };
+            drop(schema); assert!(memory.used_bytes() > 0); assert_eq!(child.format(), expected);
+            let release = child.release.unwrap(); unsafe { release(&mut child); release(&mut child); }
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn foreign_decimal_scale_annotations_are_rejected_and_owned_inputs_released() {
+    let memory = MemoryBudget::new(1 << 20);
+    let field = Field::new("value", DataType::Decimal128(3, 1), true).with_metadata(std::collections::HashMap::from([(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY.to_owned(), i32::MAX.to_string())]));
+    let batch = RecordBatch::new_empty(Arc::new(Schema::new(vec![field])));
+    let mut schema = FFI_ArrowSchema::try_from(batch.schema().as_ref()).unwrap();
+    let mut array = FFI_ArrowArray::new(&StructArray::from(batch).to_data());
+    assert!(unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.is_err());
+    assert!(array.release.is_none()); assert!(schema.release.is_none()); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn nested_decimal_c_data_restores_each_union_child_scale() {
+    use rtdb_types::{DecimalValue, LogicalType, ScalarType, Value};
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let decimal = |scale| LogicalType::Scalar(ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
+    let ty = LogicalType::list(LogicalType::from_legs([decimal(i32::MIN), decimal(i32::MAX)]));
+    let value = Value::List([i32::MIN, i32::MAX].into_iter().map(|scale| Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap())).collect());
+    let page = RecordBatch::try_new(Arc::new(Schema::new(vec![rtdb_columnar::to_field("values", &ty).unwrap()])), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+    let (mut array, mut schema) = arrow::export_batch(OwnedBatch::new(page, &memory).unwrap(), &memory).unwrap();
+    let imported = unsafe { arrow::import_rows(&mut array, &mut schema, &memory) }.unwrap();
+    assert_eq!(imported.arguments.types(), &[ty]); assert_eq!(imported.arguments.rows().next().unwrap(), &[value]);
+    drop(imported); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn cancelling_one_stream_preserves_the_session_and_sibling_stream() {
     let mut native = Native::open();
     let first = native.statement("SELECT 1 AS v"); let first_operation = native.operation(); let first = native.query(first, first_operation);

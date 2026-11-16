@@ -103,7 +103,7 @@ fn decimal_coefficients_preserve_signed_big_endian_width_and_scale() {
 #[test]
 fn decimal_vector_scale_can_exceed_precision_without_relaxing_coefficient_checks() {
     for width in [32, 64, 128, 256] {
-        for scale in [i8::MIN, -3, 3, i8::MAX] {
+        for scale in [i32::MIN, -129, -128, -3, 3, 127, 128, i32::MAX] {
             let ty = scalar(ScalarType::Decimal { precision: 1, scale, bit_width: width }).maybe();
             for coefficient in [-9i128, 0, 1, 9] {
                 let bytes = arrow_buffer::i256::from_i128(coefficient).to_be_bytes();
@@ -132,6 +132,14 @@ fn decimal_vector_zero_precision_accepts_only_empty_and_null_arrays() {
             let zero = Value::Decimal(DecimalValue::new(vec![0; usize::from(width / 8)], 0, scale, width).unwrap());
             assert!(build_array(&ty, &[zero]).is_err());
         }
+    }
+}
+
+#[test]
+fn decimal_hash_uses_java_double_value_at_full_scale_limits() {
+    for (scale, expected) in [(i32::MIN, f64::NEG_INFINITY), (i32::MAX, -0.0)] {
+        let value = Value::Decimal(DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+        assert_eq!(rtdb_columnar::hash_value(&value, 0).unwrap(), rtdb_columnar::hash_value(&Value::F64(expected), 0).unwrap());
     }
 }
 

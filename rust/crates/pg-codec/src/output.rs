@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use bigdecimal::BigDecimal;
 use chrono::{DateTime, FixedOffset, NaiveDate, Offset, Timelike, Utc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_format::transit::TransitValue;
@@ -31,7 +30,10 @@ impl SessionEnvironment {
 /// Null and undefined produce no payload; other values retain their serialization reservation in the result.
 pub fn encode(ty: PgType, format: Format, value: &Value, environment: &SessionEnvironment, memory: &Arc<MemoryBudget>) -> Result<Option<EncodedValue>> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(None); }
-    let bound = value.retained_bytes()?.checked_mul(32).and_then(|n| n.checked_add(8192)).ok_or_else(size_error)?;
+    let mut bound = value.retained_bytes()?.checked_mul(32).and_then(|n| n.checked_add(8192)).ok_or_else(size_error)?;
+    if ty == PgType::Numeric && format == Format::Binary {
+        if let Value::Decimal(value) = value { bound = bound.checked_add(crate::binary::numeric_allocation_bound(value)?).ok_or_else(size_error)?; }
+    }
     let reservation = memory.reserve(bound)?;
     let bytes = encode_value(ty, format, value, environment)?;
     if bytes.capacity() > reservation.bytes() { return Err(size_error()); }
@@ -143,7 +145,7 @@ fn duration_text(nanos: i128) -> String {
 }
 fn interval_parts(value: &Value) -> Result<(i32, i32, i64)> { match value { Value::IntervalYearMonth(months) => Ok((*months, 0, 0)), Value::IntervalDayTime { days, milliseconds } => Ok((0, *days, i64::from(*milliseconds) * 1_000_000)), Value::IntervalMonthDayNano { months, days, nanoseconds } | Value::IntervalMonthDayMicro { months, days, nanoseconds } => Ok((*months, *days, *nanoseconds)), _ => Err(incompatible(PgType::Interval, value)) } }
 fn interval_text(months: i32, days: i32, nanos: i64) -> String { let mut text = String::from("P"); if months / 12 != 0 { text.push_str(&format!("{}Y", months / 12)); } if months % 12 != 0 { text.push_str(&format!("{}M", months % 12)); } if days != 0 { text.push_str(&format!("{days}D")); } if nanos != 0 { text.push_str(&duration_text(i128::from(nanos))[1..]); } text }
-fn decimal_text(value: &rtdb_types::DecimalValue) -> String { BigDecimal::new(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), i64::from(value.scale)).to_string() }
+fn decimal_text(value: &rtdb_types::DecimalValue) -> String { rtdb_expr::decimal_text(value) }
 fn float_text(value: f64, single: Option<f32>) -> String {
     if value.is_nan() { return "NaN".into(); }
     if value == f64::INFINITY { return "Infinity".into(); }

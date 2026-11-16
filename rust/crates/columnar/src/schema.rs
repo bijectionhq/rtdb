@@ -86,7 +86,8 @@ pub fn to_field(name: impl Into<String>, logical: &LogicalType) -> Result<Field>
         }
         LogicalType::Scalar(scalar) => {
             let (data_type, extension) = scalar_layout(scalar)?;
-            Ok(with_extension(Field::new(name, data_type, false), extension))
+            let field = with_extension(Field::new(name, data_type, false), extension);
+            match scalar { ScalarType::Decimal { scale, .. } => crate::with_decimal_scale(field, *scale), _ => Ok(field) }
         }
     }
 }
@@ -131,10 +132,10 @@ fn scalar_layout(scalar: &ScalarType) -> Result<(DataType, Option<&'static str>)
         Utf8 => (DataType::Utf8, None), Binary => (DataType::Binary, None),
         FixedSizeBinary(width) if *width >= 0 => (DataType::FixedSizeBinary(*width), None),
         FixedSizeBinary(_) => return Err(Anomaly::incorrect("rtdb/binary-width", "Fixed-size binary width must be nonnegative")),
-        Decimal { precision, scale, bit_width: 32 } => (DataType::Decimal32(*precision, *scale), None),
-        Decimal { precision, scale, bit_width: 64 } => (DataType::Decimal64(*precision, *scale), None),
-        Decimal { precision, scale, bit_width: 128 } => (DataType::Decimal128(*precision, *scale), None),
-        Decimal { precision, scale, bit_width: 256 } => (DataType::Decimal256(*precision, *scale), None),
+        Decimal { precision, scale, bit_width: 32 } => (DataType::Decimal32(*precision, crate::decimal_storage_scale(*scale)), None),
+        Decimal { precision, scale, bit_width: 64 } => (DataType::Decimal64(*precision, crate::decimal_storage_scale(*scale)), None),
+        Decimal { precision, scale, bit_width: 128 } => (DataType::Decimal128(*precision, crate::decimal_storage_scale(*scale)), None),
+        Decimal { precision, scale, bit_width: 256 } => (DataType::Decimal256(*precision, crate::decimal_storage_scale(*scale)), None),
         Decimal { .. } => return Err(Anomaly::unsupported("rtdb/decimal-width", "XTDB decimal storage requires 32, 64, 128, or 256 bits")),
         DateDay => (DataType::Date32, None), DateMilli => (DataType::Date64, None),
         Time { unit, bit_width: 32 } if matches!(unit, TimeUnit::Second | TimeUnit::Millisecond) => (DataType::Time32(arrow_unit(*unit)), None),
@@ -166,7 +167,9 @@ fn validate_map_entries(field: &Field) -> Result<()> {
 }
 
 /// Decodes the physical field without treating non-nullable Arrow Null as SQL NULL.
+/// External metadata must pass the IPC or C Data ingress codec before this native-field API.
 pub fn from_field(field: &Field) -> Result<LogicalType> {
+    crate::decimal_scale(field)?;
     let base = if let Some(extension) = field.metadata().get(EXTENSION_NAME_KEY) {
         let expected = match extension.as_str() {
             "xt/clj-keyword" => LogicalType::Scalar(ScalarType::Keyword),
@@ -212,10 +215,10 @@ fn plain_field_type(field: &Field) -> Result<LogicalType> {
         UInt8 => ScalarType::U8, UInt16 => ScalarType::U16, UInt32 => ScalarType::U32, UInt64 => ScalarType::U64,
         Float16 => ScalarType::F16, Float32 => ScalarType::F32, Float64 => ScalarType::F64,
         Utf8 => ScalarType::Utf8, Binary => ScalarType::Binary, FixedSizeBinary(n) => ScalarType::FixedSizeBinary(*n),
-        Decimal32(precision, scale) => ScalarType::Decimal { precision: *precision, scale: *scale, bit_width: 32 },
-        Decimal64(precision, scale) => ScalarType::Decimal { precision: *precision, scale: *scale, bit_width: 64 },
-        Decimal128(precision, scale) => ScalarType::Decimal { precision: *precision, scale: *scale, bit_width: 128 },
-        Decimal256(precision, scale) => ScalarType::Decimal { precision: *precision, scale: *scale, bit_width: 256 },
+        Decimal32(precision, _) => ScalarType::Decimal { precision: *precision, scale: crate::decimal_scale(field)?.expect("decimal field"), bit_width: 32 },
+        Decimal64(precision, _) => ScalarType::Decimal { precision: *precision, scale: crate::decimal_scale(field)?.expect("decimal field"), bit_width: 64 },
+        Decimal128(precision, _) => ScalarType::Decimal { precision: *precision, scale: crate::decimal_scale(field)?.expect("decimal field"), bit_width: 128 },
+        Decimal256(precision, _) => ScalarType::Decimal { precision: *precision, scale: crate::decimal_scale(field)?.expect("decimal field"), bit_width: 256 },
         Date32 => ScalarType::DateDay, Date64 => ScalarType::DateMilli,
         Time32(unit) => ScalarType::Time { unit: logical_unit(unit), bit_width: 32 },
         Time64(unit) => ScalarType::Time { unit: logical_unit(unit), bit_width: 64 },

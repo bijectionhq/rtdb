@@ -24,7 +24,7 @@ pub enum ScalarType {
     U8, U16, U32, U64,
     F16, F32, F64,
     Utf8, Binary, FixedSizeBinary(i32),
-    Decimal { precision: u8, scale: i8, bit_width: u16 },
+    Decimal { precision: u8, scale: i32, bit_width: u16 },
     DateDay, DateMilli,
     Time { unit: TimeUnit, bit_width: u8 },
     Timestamp { unit: TimeUnit, timezone: Option<String> },
@@ -243,8 +243,8 @@ impl ScalarType {
             (left, Self::Decimal { .. }) if left.float_width().is_some() => Some(left.clone()),
             (Self::Decimal { precision: lp, scale: ls, .. }, Self::Decimal { precision: rp, scale: rs, .. }) => {
                 let scale = (*ls).max(*rs);
-                let integer_digits = (i16::from(*lp) - i16::from(*ls)).max(i16::from(*rp) - i16::from(*rs));
-                let precision = u8::try_from(integer_digits + i16::from(scale)).ok()?;
+                let integer_digits = (i64::from(*lp) - i64::from(*ls)).max(i64::from(*rp) - i64::from(*rs));
+                let precision = u8::try_from(integer_digits + i64::from(scale)).ok()?;
                 if precision > 76 { return None; }
                 let bit_width = match precision { 0..=9 => 32, 10..=18 => 64, 19..=38 => 128, _ => 256 };
                 Some(Self::Decimal { precision, scale, bit_width })

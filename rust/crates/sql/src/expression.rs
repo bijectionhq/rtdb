@@ -213,8 +213,7 @@ fn aggregate_type(function: AggregateFunction, argument: &LogicalType) -> Result
 }
 
 fn call(name: String, args: Vec<Expr>) -> Result<Expr> {
-    let types: Vec<_> = args.iter().map(Expr::data_type).collect();
-    let return_type = rtdb_plan::function_type(&name, &types)?;
+    let return_type = rtdb_plan::function_type_with_args(&name, &args)?;
     Ok(Expr::Call { name, args, return_type })
 }
 

@@ -22,11 +22,11 @@ impl CastTarget {
 
     /// An absent precision preserves existing decimal legs and uses decimal(64,9) for other values.
     /// Scale without precision has no effect, matching the expression cast options.
-    /// Explicit precision above 64 and scales outside the native signed-byte metadata return an error.
+    /// Explicit precision above 64 and scales outside signed 32 bits return an error.
     pub fn decimal(precision: Option<u64>, scale: Option<i64>) -> Result<Self> {
         let Some(precision) = precision else { return Ok(Self::DecimalDefault); };
         if precision > 64 { return Err(Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
-        let scale = i8::try_from(scale.unwrap_or(0)).map_err(|_| Anomaly::unsupported("xtdb.expression/unsupported-scale", "Decimal scale exceeds the native Arrow representation"))?;
+        let scale = i32::try_from(scale.unwrap_or(0)).map_err(|_| Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Decimal scale exceeds signed 32 bits"))?;
         Ok(Self::Fixed(LogicalType::Scalar(ScalarType::Decimal { precision: precision as u8, scale, bit_width: if precision <= 32 { 128 } else { 256 } })))
     }
 

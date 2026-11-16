@@ -152,7 +152,7 @@ fn build_binary(width: i32, values: &[Value]) -> Result<ArrayRef> {
     Ok(Arc::new(builder.finish()))
 }
 
-fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> Result<ArrayRef> {
+fn build_decimal(precision: u8, scale: i32, bit_width: u16, values: &[Value]) -> Result<ArrayRef> {
     match bit_width {
         32 => {
             let values = values.iter().map(|value| match value {
@@ -198,11 +198,11 @@ fn build_decimal(precision: u8, scale: i8, bit_width: u16, values: &[Value]) -> 
     }
 }
 
-fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: u8, scale: i8) -> Result<ArrayRef> {
+fn finish_decimal<T: arrow_array::types::DecimalType>(array: arrow_array::PrimitiveArray<T>, precision: u8, scale: i32) -> Result<ArrayRef> {
     if array.iter().flatten().any(|coefficient| precision == 0 || !T::is_valid_decimal_precision(coefficient, precision)) {
         return Err(Anomaly::incorrect("rtdb/decimal-precision", "Decimal coefficient exceeds its declared precision"));
     }
-    Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(precision, scale))))
+    Ok(Arc::new(array.with_data_type(T::TYPE_CONSTRUCTOR(precision, crate::decimal_storage_scale(scale)))))
 }
 
 fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, values: &[Value]) -> Result<ArrayRef> {

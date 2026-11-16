@@ -56,8 +56,10 @@ Scales larger than precision are valid when the unscaled coefficient fits, such 
 Native prepared statements rebind that target against the current parameter types on each execution.
 
 `tests/decimal_casts.rs` maps `xtdb.sql-test/decimal-casting`; expression and XTQL cast sources also map `test-cast-list-elementwise`, `test-cast-pg-array-text-to-list`, and `test-cast-list-applies-element-cast-opts`.
-The native Arrow schema and decimal values store scale as a signed byte; the JVM stores a signed 32-bit scale.
-Scales outside the native range fail explicitly and remain an implementation gap requiring a wider value and Arrow IPC boundary.
+Decimal values, explicit SQL scale arguments, and result metadata retain the full signed 32-bit scale; the SQL grammar still requires unsigned scale arguments.
+ROUND over a decimal or integer requires a constant scale and derives its result metadata from that scale, while FLOOR and CEIL return doubles.
+The expression implementation bounds coefficient work before rescaling and preserves the reference's rounding and overflow boundaries.
+The source tests include wide-scale casts, aggregates, recursive arrays, and dynamic prepared-parameter rebinding.
 Exact failure timing, diagnostic equivalence, and all execution observations remain unverified.
 
 == Subqueries

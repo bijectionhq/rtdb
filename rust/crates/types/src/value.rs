@@ -7,12 +7,12 @@ pub struct DecimalValue {
     /// Signed two's-complement coefficient, most significant byte first.
     pub unscaled: Vec<u8>,
     pub precision: u8,
-    pub scale: i8,
+    pub scale: i32,
     pub bit_width: u16,
 }
 
 impl DecimalValue {
-    pub fn new(unscaled: Vec<u8>, precision: u8, scale: i8, bit_width: u16) -> Result<Self> {
+    pub fn new(unscaled: Vec<u8>, precision: u8, scale: i32, bit_width: u16) -> Result<Self> {
         ScalarType::Decimal { precision, scale, bit_width }.validate()?;
         if unscaled.len() != usize::from(bit_width / 8) {
             return Err(Anomaly::incorrect("xtdb/invalid-decimal", "Decimal coefficient width does not match its type"));

@@ -36,6 +36,29 @@ fn output_limit_rejects_growth_before_touching_the_file() {
 }
 
 #[test]
+fn reserved_file_writer_precharges_schema_inventory_and_footer_before_writes() {
+    let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 1, scale: i32::MAX, bit_width: 128 });
+    let schema = Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]);
+    let schema_bound = rtdb_format::ipc::schema_translation_bound(&schema).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(schema_bound - 1);
+    let file = tempfile::tempfile().unwrap(); let observer = file.try_clone().unwrap();
+    assert!(ArrowFileWriter::new_reserved(file, &schema, &memory).is_err());
+    assert_eq!(observer.metadata().unwrap().len(), 0); assert_eq!(memory.used_bytes(), 0);
+    let memory = rtdb_columnar::MemoryBudget::new(schema_bound + 512);
+    let mut writer = ArrowFileWriter::new_reserved(tempfile::tempfile().unwrap(), &schema, &memory).unwrap();
+    assert_eq!(memory.used_bytes(), schema_bound);
+    let page = RecordBatch::new_empty(Arc::new(schema.clone())); writer.write(&page).unwrap();
+    assert_eq!(memory.used_bytes(), schema_bound + 512);
+    assert!(writer.finish().is_err()); assert_eq!(memory.used_bytes(), 0);
+    let memory = rtdb_columnar::MemoryBudget::new(8 * schema_bound);
+    let mut writer = ArrowFileWriter::new_reserved(tempfile::tempfile().unwrap(), &schema, &memory).unwrap();
+    writer.write(&page).unwrap(); let file = writer.finish().unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+    let decoded = rtdb_format::ipc::ArrowFile::from_reader(file, None).unwrap();
+    assert_eq!(rtdb_columnar::from_field(decoded.schema().field(0)).unwrap(), ty);
+}
+
+#[test]
 fn inspection_must_acquire_a_guard_before_allocating_a_footer() {
     let batch = page();
     let bytes = write_file(&batch.schema(), &[batch]).unwrap();

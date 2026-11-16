@@ -1,4 +1,3 @@
-use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
 use num_traits::{Signed, ToPrimitive, Zero};
 use rtdb_types::{Anomaly, DecimalValue, PgType, Result, TimeUnit, Value};
@@ -26,7 +25,7 @@ pub(crate) fn read(ty: PgType, bytes: &[u8]) -> Result<Value> {
         PgType::Json | PgType::JsonLd | PgType::Transit | PgType::TsTzRange => return crate::text::read_text(ty.descriptor().oid as u32, std::str::from_utf8(bytes).map_err(invalid)?),
         PgType::Duration | PgType::Oid | PgType::RegClass | PgType::RegProc => return Err(Anomaly::unsupported("xtdb.pgwire/unsupported-binary-type", "This PostgreSQL type has no binary reader")),
     };
-    if !matches!(ty, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword | PgType::Bytes) && !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
+    if !matches!(ty, PgType::Default | PgType::Null | PgType::Text | PgType::VarChar | PgType::Keyword | PgType::Bytes | PgType::Numeric) && !input.0.is_empty() { return Err(invalid("Trailing bytes in PostgreSQL binary value")); }
     Ok(value)
 }
 
@@ -50,41 +49,61 @@ fn array_read(ty: PgType, input: &mut Input<'_>) -> Result<Value> {
 }
 
 fn numeric_read(input: &mut Input<'_>) -> Result<Value> {
-    let count = usize::try_from(input.i16()?).map_err(invalid)?;
+    let count = i32::from(input.i16()?);
+    if count == 0 { return crate::text::decimal("0"); }
     let weight = i32::from(input.i16()?);
     let sign = input.i16()?;
-    let scale = input.i16()?;
-    if count > input.0.len() / 2 || count > 1024 || !matches!(sign, 0 | 0x4000) || !(0..=127).contains(&scale) { return Err(invalid("Unsupported PostgreSQL numeric header")); }
+    let scale = i32::from(input.i16()?);
+    if count > 0 && count as usize > input.0.len() / 2 { return Err(invalid("Truncated PostgreSQL numeric digits")); }
     let mut coefficient = BigInt::zero();
-    for _ in 0..count { let digit = input.i16()?; if !(0..10000).contains(&digit) { return Err(invalid("Invalid PostgreSQL numeric digit")); } coefficient = coefficient * 10000 + digit; }
-    if count == 0 { return crate::text::decimal("0"); }
-    let exponent = (weight - i32::try_from(count).map_err(invalid)? + 1).checked_mul(4).and_then(|n| n.checked_add(i32::from(scale))).ok_or_else(|| invalid("Numeric exponent overflow"))?;
-    if exponent.unsigned_abs() > 4096 { return Err(invalid("Numeric exponent exceeds Arrow decimal range")); }
-    let factor = BigInt::from(10).pow(exponent.unsigned_abs());
-    coefficient = if exponent >= 0 { coefficient * factor } else { coefficient / factor };
+    for _ in 0..count { coefficient = coefficient * 10000 + input.i16()?; }
+    let exponent = (weight - count + 1) * 4 + scale;
+    if !coefficient.is_zero() {
+        let digits = coefficient.to_str_radix(10).trim_start_matches('-').len();
+        if exponent >= 0 {
+            if digits + exponent as usize > 64 { return Err(invalid("Decimal exceeds the pinned value writer precision")); }
+            coefficient *= BigInt::from(10).pow(exponent as u32);
+        } else if exponent.unsigned_abs() as usize >= digits {
+            coefficient = BigInt::zero();
+        } else {
+            coefficient /= BigInt::from(10).pow(exponent.unsigned_abs());
+        }
+    }
     if sign != 0 { coefficient = -coefficient; }
-    crate::text::decimal(&BigDecimal::new(coefficient, i64::from(scale)).to_string())
+    crate::text::decimal_parts(coefficient, scale)
+}
+
+pub(crate) fn numeric_allocation_bound(value: &DecimalValue) -> Result<usize> {
+    if value.scale == i32::MIN { return Err(invalid("PostgreSQL numeric scale magnitude exceeds signed integer range")); }
+    let zero_groups = if value.scale < 0 && value.unscaled.iter().any(|byte| *byte != 0) { value.scale.unsigned_abs() as usize / 4 } else { 0 };
+    zero_groups.checked_add(value.unscaled.len()).and_then(|groups| groups.checked_mul(2)).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)
 }
 
 pub(crate) fn numeric_write(value: &DecimalValue) -> Result<Vec<u8>> {
+    numeric_allocation_bound(value)?;
     let signed = BigInt::from_signed_bytes_be(&value.unscaled);
     let negative = signed <= BigInt::zero();
     let mut coefficient = signed.abs();
-    let scale = i32::from(value.scale);
-    let fraction_groups = if scale > 0 { (scale + 3) / 4 } else { 0 };
+    let scale = value.scale;
+    let fraction_groups = if scale > 0 { scale.wrapping_add(3) / 4 } else { 0 };
+    let zero_groups = if scale < 0 && !coefficient.is_zero() { scale.unsigned_abs() as usize / 4 } else { 0 };
     let mut digits = Vec::<u16>::new();
     if scale > 0 && scale % 4 != 0 {
         let factor = BigInt::from(10).pow((scale % 4) as u32);
         digits.push(((&coefficient % &factor) * BigInt::from(10).pow((4 - scale % 4) as u32)).to_u16().ok_or_else(|| invalid("Numeric digit overflow"))?);
         coefficient /= factor;
-    } else if scale < 0 { coefficient *= BigInt::from(10).pow(scale.unsigned_abs()); }
+    } else if scale < 0 { coefficient *= BigInt::from(10).pow(scale.unsigned_abs() % 4); }
     while !coefficient.is_zero() { digits.push((&coefficient % 10000u32).to_u16().ok_or_else(|| invalid("Numeric digit overflow"))?); coefficient /= 10000u32; }
-    let mut bytes = Vec::with_capacity(8 + digits.len() * 2);
-    bytes.extend_from_slice(&i16::try_from(digits.len()).map_err(invalid)?.to_be_bytes());
-    bytes.extend_from_slice(&i16::try_from(digits.len() as i32 - fraction_groups - 1).map_err(invalid)?.to_be_bytes());
+    let count = digits.len().checked_add(zero_groups).ok_or_else(crate::size_error)?;
+    let length = count.checked_mul(2).and_then(|bytes| bytes.checked_add(8)).ok_or_else(crate::size_error)?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(length).map_err(invalid)?;
+    bytes.extend_from_slice(&(count as i16).to_be_bytes());
+    bytes.extend_from_slice(&((count as i32).wrapping_sub(fraction_groups).wrapping_sub(1) as i16).to_be_bytes());
     bytes.extend_from_slice(&(if negative { 0x4000i16 } else { 0 }).to_be_bytes());
     bytes.extend_from_slice(&(scale.max(0) as i16).to_be_bytes());
     for digit in digits.into_iter().rev() { bytes.extend_from_slice(&digit.to_be_bytes()); }
+    bytes.resize(length, 0);
     Ok(bytes)
 }
 

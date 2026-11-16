@@ -1,6 +1,5 @@
-use bigdecimal::{BigDecimal, RoundingMode};
+use bigdecimal::BigDecimal;
 use num_bigint::BigInt;
-use num_traits::{ToPrimitive, Zero};
 use rtdb_plan::BinaryOp;
 use rtdb_types::{Anomaly, DecimalValue, LogicalType, Result, ScalarType, Value};
 
@@ -19,7 +18,7 @@ pub fn number(value: &Value) -> Option<f64> {
     match value {
         Value::F16(bits) => Some(half::f16::from_bits(*bits).to_f64()),
         Value::F32(v) => Some(f64::from(*v)), Value::F64(v) => Some(*v),
-        Value::Decimal(value) => decimal(value).to_f64(),
+        Value::Decimal(value) => Some(crate::decimal_to_f64(value)),
         _ => None,
     }
 }
@@ -33,17 +32,8 @@ pub(crate) fn exact_decimal(value: &Value) -> Option<BigDecimal> {
     else { integer(value).map(|value| BigDecimal::new(BigInt::from(value), 0)) }
 }
 
-pub(crate) fn decimal_value(value: BigDecimal, precision: u8, scale: i8, bit_width: u16) -> Result<Value> {
-    let value = value.with_scale_round(i64::from(scale), RoundingMode::HalfEven);
-    let (coefficient, _) = value.as_bigint_and_exponent();
-    let digit_count = coefficient.to_str_radix(10).trim_start_matches('-').len();
-    if digit_count > usize::from(precision) { return Err(overflow()); }
-    let bytes = coefficient.to_signed_bytes_be();
-    let width = usize::from(bit_width / 8);
-    if bytes.len() > width { return Err(overflow()); }
-    let mut padded = vec![if coefficient < BigInt::zero() { 0xff } else { 0 }; width - bytes.len()];
-    padded.extend(bytes);
-    Ok(Value::Decimal(DecimalValue::new(padded, precision, scale, bit_width)?))
+pub(crate) fn decimal_value(value: BigDecimal, precision: u8, scale: i32, bit_width: u16) -> Result<Value> {
+    crate::decimal::from_bigdecimal(value, precision, scale, bit_width).map(Value::Decimal)
 }
 
 pub(crate) fn integer_value(value: i128, ty: &ScalarType) -> Result<Value> {
@@ -88,6 +78,14 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
             _ => return Err(inapplicable("bit shift", &[left, right])),
         });
     }
+    if op == B::Modulo && (matches!(left, Value::Decimal(_)) || matches!(right, Value::Decimal(_))) {
+        if let (Some(a), Some(b)) = (exact_decimal(left), exact_decimal(right)) {
+            let Some(LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width })) = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]) else { return Err(overflow()); };
+            let a = if let Value::Decimal(value) = left { value.clone() } else { crate::decimal::from_bigdecimal(a, 32, 0, 128)? };
+            let b = if let Value::Decimal(value) = right { value.clone() } else { crate::decimal::from_bigdecimal(b, 32, 0, 128)? };
+            return crate::decimal::arithmetic(op, &a, &b, precision, scale, bit_width).map(Value::Decimal);
+        }
+    }
     if matches!(left, Value::Decimal(_)) && integer(right).is_some() {
         let right = decimal_value(exact_decimal(right).ok_or_else(overflow)?, 32, 0, 128)?;
         return arithmetic(op, left, &right);
@@ -98,20 +96,8 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
     }
     if let (Value::Decimal(left), Value::Decimal(right)) = (left, right) {
         let precision = if left.precision <= 32 && right.precision <= 32 { 32 } else { 64 };
-        let scale = match op {
-            B::Multiply => i16::from(left.scale) + i16::from(right.scale),
-            B::Divide => 6.max(i16::from(left.scale) + i16::from(right.scale) + 1),
-            _ => i16::from(left.scale.max(right.scale)),
-        };
-        let scale = i8::try_from(scale).map_err(|_| overflow())?;
-        let (a, b) = (decimal(left), decimal(right));
-        if matches!(op, B::Divide | B::Modulo) && b.is_zero() { return Err(division_by_zero()); }
-        let value = match op {
-            B::Add => a + b, B::Subtract => a - b, B::Multiply => a * b,
-            B::Divide => a / b, B::Modulo => { let remainder = &a % &b; if !remainder.is_zero() && (remainder < BigDecimal::zero()) != (b < BigDecimal::zero()) { remainder + b } else { remainder } },
-            _ => return Err(inapplicable("arithmetic", &[])),
-        };
-        return decimal_value(value, precision, scale, if precision <= 38 { 128 } else { 256 });
+        let scale = rtdb_plan::decimal_arithmetic_scale(op, left.scale, right.scale)?;
+        return crate::decimal::arithmetic(op, left, right, precision, scale, if precision <= 32 { 128 } else { 256 }).map(Value::Decimal);
     }
     let ty = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]);
     let Some(LogicalType::Scalar(ty)) = ty else { return Err(inapplicable("arithmetic", &[left, right])); };

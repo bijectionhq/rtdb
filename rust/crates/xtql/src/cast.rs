@@ -58,7 +58,7 @@ fn data_type(form: &Edn) -> Result<LogicalType> {
         "oid" => S::Oid, "regclass" => S::RegClass, "regproc" => S::RegProc,
         "decimal" => S::Decimal {
             precision: u8::try_from(integer(arg(0)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal precision exceeds native metadata"))?,
-            scale: i8::try_from(integer(arg(1)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal scale exceeds native metadata"))?,
+            scale: i32::try_from(integer(arg(1)?)?).map_err(|_| error("xtdb/invalid-type", "Decimal scale exceeds signed 32 bits"))?,
             bit_width: integer(arg(2)?)?.try_into().map_err(|_| error("xtdb/invalid-type", "Invalid decimal bit width"))?,
         },
         "date" => match arg(0)?.keyword() { Some("day") => S::DateDay, Some("milli") => S::DateMilli, _ => return Err(error("xtdb/invalid-type", "Unknown date unit")) },

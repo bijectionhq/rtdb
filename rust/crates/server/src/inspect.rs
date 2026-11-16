@@ -23,7 +23,7 @@ pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mu
             let _decoded = memory.reserve(ipc::file_allocation_bound(&bytes)?)?;
             let mut reader = ArrowFile::open(bytes.into(), None)?;
             output.write_all(b"{\"schema\":").map_err(invalid)?;
-            write_json(output, reader.schema().as_ref())?;
+            write_json(output, &schema_json(reader.schema().as_ref())?)?;
             output.write_all(b",\"batches\":[").map_err(invalid)?;
             for page in 0..reader.page_count() {
                 if page > 0 { output.write_all(b",").map_err(invalid)?; }
@@ -35,7 +35,7 @@ pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mu
             let _decoded = memory.reserve(ipc::stream_allocation_bound(&bytes)?)?;
             let mut reader = ArrowStream::open(bytes.into(), None)?;
             output.write_all(b"{\"schema\":").map_err(invalid)?;
-            write_json(output, reader.schema().as_ref())?;
+            write_json(output, &schema_json(reader.schema().as_ref())?)?;
             output.write_all(b",\"batch\":").map_err(invalid)?;
             match reader.next().transpose()? { Some(page) => batch(output, &page, memory)?, None => output.write_all(b"[]").map_err(invalid)? }
             output.write_all(b"}\n").map_err(invalid)
@@ -59,6 +59,35 @@ pub fn file(kind: FileKind, path: &Path, memory: &Arc<MemoryBudget>, output: &mu
             output.write_all(b"\n").map_err(invalid)
         }
     }
+}
+
+fn schema_json(schema: &arrow_schema::Schema) -> Result<Value> {
+    fn patch_type(value: &mut Value, scale: i32) -> Result<()> {
+        let object = value.as_object_mut().ok_or_else(|| invalid("Invalid Arrow datatype JSON"))?;
+        for name in ["Decimal32", "Decimal64", "Decimal128", "Decimal256"] {
+            if let Some(Value::Array(parameters)) = object.get_mut(name) { parameters[1] = Value::from(scale); return Ok(()); }
+        }
+        if let Some(Value::Array(parameters)) = object.get_mut("Dictionary") { return patch_type(&mut parameters[1], scale); }
+        Err(invalid("Decimal scale annotation requires decimal JSON storage"))
+    }
+    fn patch(value: &mut Value) -> Result<()> {
+        match value {
+            Value::Array(values) => for value in values { patch(value)?; },
+            Value::Object(object) => {
+                let scale = object.get_mut("metadata").and_then(Value::as_object_mut).and_then(|metadata| metadata.remove(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY));
+                if let Some(scale) = scale {
+                    let scale = scale.as_str().ok_or_else(|| invalid("Invalid decimal scale JSON"))?.parse::<i32>().map_err(invalid)?;
+                    patch_type(object.get_mut("data_type").ok_or_else(|| invalid("Missing decimal JSON datatype"))?, scale)?;
+                }
+                for value in object.values_mut() { patch(value)?; }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    let mut json = serde_json::to_value(schema).map_err(invalid)?;
+    patch(&mut json)?;
+    Ok(json)
 }
 
 fn batch(output: &mut impl Write, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<()> {

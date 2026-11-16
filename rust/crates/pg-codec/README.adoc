@@ -17,6 +17,9 @@ Their output allocations must remain covered until transferred into another char
 
 Text input follows `core/src/main/kotlin/xtdb/pgwire/PgType.kt`, `PgTypes.kt`, and the Arrow object writer's value-type choices.
 Binary numerics follow `core/src/main/kotlin/xtdb/pg/codec/NumericBin.kt`, including the pinned sign bit for zero.
+The signed-short fields wrap on output, and a zero digit count returns zero before reading the remaining header.
+Numeric text retains the signed 32-bit scale and Java's bounded canonical scientific notation.
+Negative-scale binary output reserves its expanded base-10000 representation before encoding; the minimum signed scale fails like the pinned power conversion.
 Timestamp and date binary values use PostgreSQL's 2000 epoch.
 Local timestamp output truncates submicrosecond fractions toward zero; zoned timestamp output floors them.
 Numeric conversion preserves decimal coefficients without a floating-point intermediate.
@@ -36,7 +39,8 @@ Protocol framing is specified by https://www.postgresql.org/docs/17/protocol-mes
 
 Runtime compatibility and property coverage remain unexecuted.
 Chrono's representable calendar range is smaller than Java's date/time range.
-The native decoder rejects trailing fixed-width binary bytes, malformed arrays, and excessive interval/numeric exponents that the JVM may consume differently.
+The native decoder rejects trailing non-numeric fixed-width binary bytes, malformed arrays, and excessive interval exponents that the JVM may consume differently.
+Decimal text follows OpenJDK 21's BMP decimal-digit grammar in both coefficients and exponents.
 Java floating-point text conventions are reproduced around the decimal/scientific thresholds and subnormal minima; exhaustive shortest-decimal parity is pending.
 The broad JVM object families carried by JSON-LD and Transit still require fixture qualification, including exception metadata and form values.
 Reservation estimates bound ordinary decoded payloads, but a proof covering every nested JSON/Transit amplification and library-internal temporary remains outstanding.

@@ -126,7 +126,7 @@ fn decimal_double(value: &DecimalValue) -> Result<f64> {
         256 => arrow_buffer::i256::from_be_bytes(value.unscaled.as_slice().try_into().map_err(|_| decimal_width())?).to_string(),
         _ => return Err(decimal_width()),
     };
-    format!("{coefficient}e{}", -i16::from(value.scale)).parse().map_err(|_| Anomaly::incorrect("rtdb/decimal-double", "Decimal could not be represented as a floating-point statistic"))
+    format!("{coefficient}e{}", -i64::from(value.scale)).parse().map_err(|_| Anomaly::incorrect("rtdb/decimal-double", "Decimal could not be represented as a floating-point statistic"))
 }
 
 /// Hashes in physical schema order, matching vector hashes used in JVM HLL metadata.

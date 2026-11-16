@@ -30,7 +30,7 @@ impl CompiledExpr {
         let mut error = None;
         expr.visit(&mut |expr| {
             if let Expr::Call { name, args, .. } = expr {
-                if let Err(failure) = rtdb_plan::function_type(name, &args.iter().map(Expr::data_type).collect::<Vec<_>>()) { error = Some(failure); }
+                if let Err(failure) = rtdb_plan::function_type_with_args(name, args) { error = Some(failure); }
             }
         });
         if let Some(error) = error { return Err(error); }
