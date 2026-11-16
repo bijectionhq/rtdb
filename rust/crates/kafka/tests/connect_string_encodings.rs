@@ -78,6 +78,14 @@ fn selected_serializer_and_deserializer_encodings_are_both_validated() {
 }
 
 #[tokio::test]
+async fn encoding_config_trims_java_control_characters_but_not_unicode_spaces() {
+    assert_eq!(decode("\0\tUTF-8\r\u{1f}", b"text").await, "text");
+    for encoding in ["\u{a0}UTF-8", "UTF-8\u{2003}"] {
+        assert!(PluginRegistry::default().converter(&spec(&[("converter.encoding", encoding)]), false).is_err());
+    }
+}
+
+#[tokio::test]
 async fn utf8_replacement_consumes_java_malformed_sequences() {
     for (bytes, expected) in [
         (&[0xed, 0xa0, 0x80][..], "\u{fffd}"),

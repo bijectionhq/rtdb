@@ -15,7 +15,7 @@ pub(super) enum Utf16Order { Big, Little, BomBig, BomLittle }
 
 impl Charset {
     pub(super) fn configured(options: &BTreeMap<String, String>, is_key: bool) -> Result<Self> {
-        let fallback = options.get("converter.encoding").map_or("UTF-8", |value| value.trim());
+        let fallback = options.get("converter.encoding").map_or("UTF-8", |value| value.trim_matches(|ch| ch <= '\u{20}'));
         let (serializer, deserializer) = if is_key {
             ("key.serializer.encoding", "key.deserializer.encoding")
         } else {
