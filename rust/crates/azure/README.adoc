@@ -8,15 +8,30 @@ The native store creates its container idempotently before returning.
 Object keys include the configured prefix and the supplied storage-version and epoch root.
 Shared immutable publication retains conditional creation and exact retry comparisons.
 
-The passive default-credential bridge uses official Azure Identity clients.
+The passive default-credential bridge uses official Azure Identity clients for application, workload, and development credentials.
 It selects configured environment client secrets or certificates, workload federation, managed identity, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
 Credential refresh occurs inside the selected provider on each request; the bridge has no background loop.
 Credential commands run in owned process groups with a 30-second deadline, bounded output, and joined output readers.
 Command execution occupies the caller's thread until the group exits or is terminated.
 `AZURE_TOKEN_CREDENTIALS` restricts production, development, or an individual supported provider; unsupported selections return errors.
 A configured service identity failure does not switch to a different principal.
-Default credential coverage is not yet identical to the Java SDK: Azure Arc, Azure ML, Cloud Shell, Service Fabric, IntelliJ, and shared desktop token caches need explicit implementation or qualification.
+The native managed-identity credential implements the endpoint selection of Azure Identity Java 1.18.7 and its MSAL4J 1.26.0 dependency.
+App Service, Service Fabric, Cloud Shell, Azure Arc, and IMDS use their selected endpoint, API version, secret or metadata headers, and supported client-ID selector.
+The pinned MSAL selector treats `MSI_ENDPOINT` as Cloud Shell even when the older `MSI_SECRET` variable is present; it has no separate Azure ML protocol branch.
+Cloud Shell and Service Fabric report a user-assigned client ID as unavailable during token acquisition, allowing the default chain to try its next provider.
+Arc accepts a bounded challenge file in its token directory and requires the response to confirm a requested client ID.
+Challenge reads run in the database's existing I/O region; shutdown retains cancelled reads through worker completion and result destruction.
+Unix challenge files are opened nonblocking and checked for a regular-file type before reading, including when the challenge names a symbolic link.
+HTTP responses are bounded to one MiB, challenge files to 4096 bytes, and requests have connect and total deadlines.
+The credential is passive: HTTP attempts, retry delays, and serialized cache refresh run on the caller's future.
+The bridge continues after a classified unavailable managed identity, while an authentication failure from a reachable endpoint stops principal selection.
+Error-envelope classification preserves null responses, nested errors, field order, duplicate fields, scalar string coercions, and the default JSON reader's token position when a known string field contains a container.
+Only fields included in the pinned provider's error message can supply its unavailable marker.
+IMDS availability probes precede default-chain calls, including cached-token calls; explicit `ManagedIdentityCredential` selection skips the probe.
+Service Fabric requests retain normal HTTPS trust and hostname checks, matching the reachable return path in the pinned `DefaultHttpClientManagedIdentity.openConnection`.
+That method returns any `HttpURLConnection`, including its HTTPS subclass, before its thumbprint-specific branch.
+IntelliJ, Visual Studio Code, and broker/shared desktop token-cache credentials remain source-completeness work.
 
 Source references are `modules/azure/src/main/kotlin/xtdb/azure/BlobStorage.kt`, `azure.proto`, and the shared remote-storage contract.
-Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, and failure precedence.
+Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, failure precedence, actual HTTP credential requests, IMDS probes, Arc challenge exchange, FIFO rejection, closed-region admission, and error-envelope classification.
 No Azure requests, credential commands, compilation, or tests have been run during Phase 1.
