@@ -497,11 +497,19 @@ fn validate_aggregate_input(aggregate: &AggregateExpr, types: &AggregateTypes) -
         && types.declared_output.legs().iter().any(|leg| matches!(leg, LogicalType::Scalar(ScalarType::Decimal { .. } | ScalarType::I8 | ScalarType::I16 | ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::F16 | ScalarType::Time { .. }))) {
         return Err(rtdb_types::Anomaly::unsupported("rtdb.query/min-max-setter", "Reference MIN/MAX does not implement the output vector setter"));
     }
-    if matches!(aggregate.function,AggregateFunction::Every | AggregateFunction::Any)
-        && types.input.legs().iter().any(|leg| !matches!(leg,LogicalType::Null | LogicalType::Scalar(ScalarType::Bool | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Duration(_) | ScalarType::Timestamp { .. } | ScalarType::DateDay | ScalarType::DateMilli))) {
-        return Err(rtdb_types::Anomaly::unsupported("rtdb.query/boolean-setter","Reference reducing aggregate has no setter for this emitted type"));
-    }
+    if matches!(aggregate.function,AggregateFunction::Every | AggregateFunction::Any) { validate_boolean_factory(&types.input)?; }
     Ok(())
+}
+
+fn validate_boolean_factory(input: &LogicalType) -> Result<()> {
+    use LogicalType as T;
+    use ScalarType as S;
+    match input {
+        T::Nothing | T::Null | T::Scalar(S::Bool | S::I32 | S::I64 | S::U32 | S::U64 | S::F32 | S::F64 | S::Duration(_) | S::Timestamp { .. } | S::DateDay | S::DateMilli) => Ok(()),
+        T::Maybe(inner) | T::RunEndEncoded { value: inner,.. } => validate_boolean_factory(inner),
+        T::Union(legs) => { for leg in legs { validate_boolean_factory(leg)?; }Ok(()) }
+        _ => Err(rtdb_types::Anomaly::unsupported("rtdb.query/boolean-setter","Reference reducing aggregate has no setter for this emitted type")),
+    }
 }
 
 struct SumFactory<'a> { input: &'a LogicalType, output: &'a LogicalType }
