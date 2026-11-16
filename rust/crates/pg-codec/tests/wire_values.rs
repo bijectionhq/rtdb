@@ -110,6 +110,33 @@ fn timestamp_binary_writers_keep_local_truncation_and_zoned_flooring() {
 }
 
 #[test]
+fn millisecond_date_text_uses_truncated_epoch_days_in_each_output_family() {
+    for (millis, expected) in [(-86_400_001, "1969-12-31"), (-86_399_999, "1970-01-01"), (-1, "1970-01-01"), (0, "1970-01-01"), (86_399_999, "1970-01-01"), (86_400_001, "1970-01-02")] {
+        let value = Value::DateMilli(millis);
+        assert_eq!(output(PgType::Date, Format::Text, &value), expected.as_bytes());
+        for format in [Format::Text, Format::Binary] {
+            assert_eq!(output(PgType::Json, format, &value), serde_json::to_vec(expected).unwrap());
+            assert_eq!(serde_json::from_slice::<serde_json::Value>(&output(PgType::JsonLd, format, &value)).unwrap(), serde_json::json!({"@type": "xt:date", "@value": expected}));
+            assert_eq!(rtdb_format::transit::decode_json(&output(PgType::Transit, format, &value)).unwrap(), rtdb_format::transit::TransitValue::Tagged {
+                tag: "time/date".into(), representation: Box::new(rtdb_format::transit::TransitValue::String(expected.into())),
+            });
+        }
+    }
+}
+
+#[test]
+fn binary_millisecond_date_has_no_integer_reader_and_releases_its_reservation() {
+    let memory = MemoryBudget::new(1 << 20);
+    let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(0), &SessionEnvironment::default(), &memory).unwrap_err();
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Fault);
+    assert_eq!(error.message, "getInt unsupported on DateMilliVector");
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(output(PgType::Date, Format::Binary, &Value::DateDay(0)), (-10_957i32).to_be_bytes());
+    assert!(encode(PgType::Date, Format::Binary, &Value::Null, &SessionEnvironment::default(), &memory).unwrap().is_none());
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn local_time_date_only_timestamps_and_region_offsets_follow_sql_timestamp_parser() {
     assert_eq!(read_text(1083, "12:34").unwrap(), Value::Time { value: 45_240_000_000_000, unit: TimeUnit::Nanosecond, bit_width: 64 });
     assert_eq!(read_text(1114, "1970-01-01").unwrap(), Value::Timestamp { value: 0, unit: TimeUnit::Microsecond, timezone: None });
