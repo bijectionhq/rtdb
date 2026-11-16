@@ -89,7 +89,7 @@ pub fn hash_value(value: &Value, seed: u32) -> Result<i32> {
         Value::Binary(value) | Value::FixedSizeBinary(value) | Value::Transit(value) => xxhash32(value, seed) as i32,
         Value::Uuid(value) => xxhash32(value, seed) as i32,
         Value::DateDay(value) => float_hash(i64::from(*value).wrapping_mul(86_400) as f64, seed),
-        Value::DateMilli(value) => float_hash(value.wrapping_mul(86_400) as f64, seed),
+        Value::DateMilli(value) => float_hash((value / 86_400_000).wrapping_mul(86_400) as f64, seed),
         Value::Time { value, bit_width: 32, .. } => xxhash32(&(*value as i32).to_le_bytes(), seed) as i32,
         Value::Time { value, bit_width: 64, .. } => xxhash32(&value.to_le_bytes(), seed) as i32,
         Value::Time { .. } => return Err(Anomaly::incorrect("rtdb/time-width", "Time vectors require 32 or 64 bits")),
