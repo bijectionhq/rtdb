@@ -9,6 +9,7 @@ import sys
 import time
 from pathlib import Path
 
+from source_gate import require_phase_two
 from history_results import inspect_execution, verify_artifacts, verify_runtime_artifacts
 from recovery_results import clone_closed, compare_recovery, manifest, verify_files, verify_partial
 from run_controls import (HERE, REFERENCE, REPOSITORY, ProcessCancelled, digest, enable_child_reaping, git, group_alive,
@@ -186,9 +187,7 @@ def history_input(args, engine):
 
 
 def run(args):
-    state = read_json(REPOSITORY / "rust/implementation-status.json")
-    if not args.phase_two or state.get("phase_2_authorized_by_completeness_gate") is not True:
-        raise ValueError("recovery execution requires the Phase 2 completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     if args.timeout <= 0:
         raise ValueError("recovery timeout must be positive")
     args.revision = git(REPOSITORY, "rev-parse", "HEAD")

@@ -6,6 +6,7 @@ import json
 import tomllib
 from pathlib import Path
 
+from source_gate import require_phase_two
 from run_controls import REPOSITORY, digest, git, run_process, write_json
 
 
@@ -81,9 +82,7 @@ def main():
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--timeout", type=float, default=60)
     args = parser.parse_args()
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not args.phase_two or not state["phase_2_authorized_by_completeness_gate"]:
-        raise ValueError("native test discovery belongs to Phase 2 after the source completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     revision = git(REPOSITORY, "rev-parse", "HEAD")
     if git(REPOSITORY, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("native test discovery requires a clean implementation checkout")

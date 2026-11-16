@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from source_gate import require_phase_two
 from history_results import compare_history, verify_artifacts, verify_runtime_artifacts
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, run_process, validate_native_revision, write_json
 
@@ -59,9 +60,7 @@ def execute(args, engine, directory, revision):
 
 
 def run(args):
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not args.phase_two or state.get("phase_2_authorized_by_completeness_gate") is not True:
-        raise ValueError("history execution belongs to Phase 2 after the source completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     if args.timeout <= 0:
         raise ValueError("history runner timeout must be positive")
     if git(args.reference, "rev-parse", "HEAD") != REFERENCE or git(args.reference, "status", "--porcelain", "--untracked-files=all"):
