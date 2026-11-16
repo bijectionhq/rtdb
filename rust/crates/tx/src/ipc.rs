@@ -21,6 +21,7 @@ impl Write for Sink {
 }
 
 pub(crate) fn encode<'a>(schema: &Schema, pages: impl IntoIterator<Item = &'a RecordBatch>, memory: &Arc<MemoryBudget>) -> Result<RetainedBytes> {
+    let _schema = memory.reserve(rtdb_format::ipc::schema_translation_bound(schema)?)?;
     let sink = Sink { chunks: Vec::new(), memory: Arc::clone(memory), length: 0 };
     let sink = rtdb_format::ipc::write_stream_to(schema, pages, sink)?;
     let reservation = memory.reserve(sink.length.checked_add(128).ok_or_else(overflow)?)?;

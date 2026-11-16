@@ -40,4 +40,8 @@ Cast forms accept `#xt/type` scalar and list targets with decimal `:precision` a
 Unspecified precision preserves existing decimal legs; explicit precision and scale apply recursively to list elements.
 The parser retains the target as the shared passive `CastTarget` value, and binding tracks cast operands through unification and aggregate extraction.
 `tests/casts.rs` maps the reference expression list-cast, array-text, and recursive decimal-option assertions.
-Struct, map, run-end, and fixed-size collection type specifications, non-decimal cast options, signed 32-bit decimal scales, and negative precision metadata remain outside this cast parser's supported surface.
+Decimal literals and cast targets preserve the full signed 32-bit scale, including recursive lists.
+ROUND with integer or decimal input requires a constant scale and retains it in result metadata.
+String-to-decimal casts accept OpenJDK 21's BMP decimal digits; decimal literal tokens retain the ASCII grammar from https://github.com/clojure/clojure/blob/clojure-1.12.0/src/jvm/clojure/lang/EdnReader.java[Clojure 1.12 EdnReader].
+The reader classifies BMP digit prefixes as numeric tokens and rejects Unicode decimal literals at that grammar boundary.
+Struct, map, run-end, and fixed-size collection type specifications, non-decimal cast options, and negative precision metadata remain outside this cast parser's supported surface.

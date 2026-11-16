@@ -20,7 +20,7 @@ fn project(expression: &str) -> (T, V) {
     (expression.data_type(), evaluate(expression, input.schema(), &[], &EvalContext::default()).unwrap())
 }
 
-fn decimal(coefficient: i128, precision: u8, scale: i8) -> V {
+fn decimal(coefficient: i128, precision: u8, scale: i32) -> V {
     V::Decimal(DecimalValue::new(coefficient.to_be_bytes().to_vec(), precision, scale, 128).unwrap())
 }
 
@@ -59,5 +59,33 @@ fn casts_retain_unification_dependencies_and_aggregate_rewriting() {
         "(-> (rel [{:x 1} {:x 2}] [x]) (aggregate {:total (cast (sum x) #xt/type [:decimal 64 9 256] {:precision 5 :scale 2})}))",
     ] {
         assert!(compile(source, &EmptyCatalog, &CompileOptions::default()).is_ok(), "{source}");
+    }
+}
+
+#[test]
+fn decimal_literals_casts_and_round_keep_signed32_scale() {
+    for (expression, coefficient, scale) in [
+        ("1E-2147483647M", 1, i32::MAX),
+        ("1E+2147483648M", 1, i32::MIN),
+        ("(cast 1E-1000M #xt/type [:decimal 64 9 256] {:precision 32 :scale 1000})", 1, 1000),
+        ("(cast 0 #xt/type [:decimal 32 -2147483648 128] {:precision 32 :scale -2147483648})", 0, i32::MIN),
+        ("(round 1.25E-1000M 1001)", 13, 1001),
+    ] {
+        assert_eq!(project(expression), (T::Scalar(S::Decimal { precision: 32, scale, bit_width: 128 }), decimal(coefficient, 32, scale)), "{expression}");
+    }
+    assert_eq!(project("(cast [1E-1000M 2E-1000M] #xt/type [:list [:decimal 64 9 256]] {:precision 32 :scale 1000})").1,
+        V::List(vec![decimal(1, 32, 1000), decimal(2, 32, 1000)]));
+}
+
+#[test]
+fn java_unicode_decimal_string_casts_keep_clojure_ascii_literal_grammar() {
+    assert_eq!(project("(cast \"١२.３४\" #xt/type [:decimal 32 2 128] {:precision 32 :scale 2})").1, decimal(1234, 32, 2));
+    assert_eq!(project("(cast \"١E+٢١٤٧٤٨٣٦٤٨\" #xt/type [:decimal 32 -2147483648 128] {:precision 32 :scale -2147483648})").1, decimal(1, 32, i32::MIN));
+    for source in ["١M", "+१M", "1.٢M", "1e२M", "1M.0", "1eM", "1_0M"] {
+        assert!(rtdb_xtql::read(source).is_err(), "{source}");
+    }
+    assert!(matches!(rtdb_xtql::read("𝟙M").unwrap().kind, rtdb_xtql::EdnKind::Symbol(_)));
+    for source in ["1M", "+1.M", "1.e2M", "1E+2147483648M"] {
+        assert!(matches!(rtdb_xtql::read(source).unwrap().kind, rtdb_xtql::EdnKind::Decimal(_)), "{source}");
     }
 }

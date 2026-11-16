@@ -45,6 +45,25 @@ async fn json_converter_struct_defaults_logical_types_and_tombstones() {
     assert_eq!(converter.decode("topic", None, &mut context).await.unwrap(), ConnectData::null());
     assert!(converter.decode("topic", Some(b"not json"), &mut context).await.is_err());
 }
+
+#[tokio::test]
+async fn json_decimal_converter_preserves_signed_full_scale_and_rejects_empty_coefficients() {
+    let mut context = context();
+    let mut values = properties(); values.insert("value.converter.schemas.enable".into(), "true".into());
+    let config = ConnectConfig::parse(&values).unwrap();
+    let mut converter = PluginRegistry::default().converter(&config.value, false).unwrap();
+    for scale in [i32::MIN, -129, 129, i32::MAX] {
+        let payload = serde_json::json!({"schema":{"type":"bytes","name":"org.apache.kafka.connect.data.Decimal","parameters":{"scale":scale.to_string()}},"payload":"AQ=="}).to_string();
+        let value = converter.decode("topic", Some(payload.as_bytes()), &mut context).await.unwrap();
+        let Value::Decimal(value) = value.value else { panic!("expected Decimal") };
+        assert_eq!(value.scale, scale);
+        assert_eq!(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), 1.into());
+    }
+    for (scale, payload) in [("2147483648", "AQ=="), ("0", "")] {
+        let payload = serde_json::json!({"schema":{"type":"bytes","name":"org.apache.kafka.connect.data.Decimal","parameters":{"scale":scale}},"payload":payload}).to_string();
+        assert!(converter.decode("topic", Some(payload.as_bytes()), &mut context).await.is_err());
+    }
+}
 #[tokio::test]
 async fn transforms_run_in_declared_order_and_predicate_negation_preserves_tombstones() {
     let mut context = context();

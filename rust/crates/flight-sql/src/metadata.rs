@@ -80,7 +80,7 @@ impl Service {
             let _call = call;
             if _call.cancellation.is_cancelled() { Err(cancelled())?; }
             yield wire::schema_data(batch.batch().schema().as_ref(), &memory)?;
-            for data in wire::Encoder::new().batch(batch.batch(), &memory)? { yield data; }
+            for data in wire::Encoder::new(batch.batch().schema().as_ref(), &memory)?.batch(batch.batch(), &memory)? { yield data; }
         });
         let mut response = Response::new(stream); *response.metadata_mut() = headers; Ok(response)
     }

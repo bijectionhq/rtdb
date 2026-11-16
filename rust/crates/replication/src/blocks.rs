@@ -161,7 +161,7 @@ fn write_node<'a>(node: &'a TrieNode, live: &'a LiveTable, memory: &'a Arc<Memor
             let scratch = memory.reserve(bound)?;
             let events = rows.iter().map(|row| live.row(*row)?.event()).collect::<Result<Vec<_>>>()?;
             let batch = IndexBatch::from_events_with_put_schema(&events, live.column_types(), memory)?;
-            if writer.is_none() { *writer = Some(ArrowFileWriter::new(temporary.reopen().map_err(io_error)?, batch.arrow().schema().as_ref())?); }
+            if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.reopen().map_err(io_error)?, batch.arrow().schema().as_ref(), memory)?); }
             writer.as_mut().ok_or_else(|| invalid("Missing page writer"))?.write(batch.arrow())?;
             let metadata_charge = memory.reserve(rtdb_format::metadata::page_metadata_reservation(batch.arrow())?)?;
             let node = metadata.write_leaf(batch.arrow())?;

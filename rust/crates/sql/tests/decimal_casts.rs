@@ -25,7 +25,7 @@ async fn query(sql: &str) -> Result<(LogicalType, Value)> {
     Ok((data_type, value))
 }
 
-fn decimal(coefficient: i128, precision: u8, scale: i8, bit_width: u16) -> Value {
+fn decimal(coefficient: i128, precision: u8, scale: i32, bit_width: u16) -> Value {
     let width = usize::from(bit_width / 8);
     let mut bytes = vec![if coefficient < 0 { 255 } else { 0 }; width];
     bytes[width - 16..].copy_from_slice(&coefficient.to_be_bytes());
@@ -84,4 +84,28 @@ async fn unqualified_decimal_cast_preserves_mixed_decimal_union_metadata() {
         for row in 0..page.batch().num_rows() { actual.push(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), row).unwrap()); }
     }
     assert_eq!(actual, expected);
+}
+
+#[tokio::test]
+async fn decimal_casts_retain_signed32_scale_and_round_result_metadata() {
+    for (sql, coefficient, precision, scale) in [
+        ("SELECT '1E-1000'::DECIMAL(32,1000)", 1, 32, 1000),
+        ("SELECT '1E-2147483647'::DECIMAL(32,2147483647)", 1, 32, i32::MAX),
+        ("SELECT '0'::DECIMAL(1,2147483647)", 0, 1, i32::MAX),
+        ("SELECT ROUND('1.25E-1000'::DECIMAL(32,1002),1001)", 13, 32, 1001),
+        ("SELECT ROUND('1.25'::DECIMAL(32,2))", 1, 32, 0),
+    ] {
+        assert_eq!(query(sql).await.unwrap(), (LogicalType::Scalar(ScalarType::Decimal { precision, scale, bit_width: 128 }), decimal(coefficient, precision, scale, 128)), "{sql}");
+    }
+    assert_eq!(query("SELECT FLOOR('1.25'::DECIMAL(32,2))").await.unwrap(), (LogicalType::Scalar(ScalarType::F64), Value::F64(1.0)));
+    assert!(query("SELECT '1'::DECIMAL(32,2147483647)").await.is_err());
+    assert!(query("SELECT '0'::DECIMAL(32,2147483648)").await.is_err());
+    let context = context();
+    assert!(prepare("SELECT ROUND('1.25'::DECIMAL(32,2), ?)", &context.catalog, &PrepareOptions::default()).is_err());
+}
+
+#[tokio::test]
+async fn decimal_aggregates_use_bounded_full_scale_values() {
+    assert_eq!(query("SELECT SUM(v) FROM (VALUES ('1E-1000'::DECIMAL(32,1000)), ('2E-1000'::DECIMAL(32,1000))) t(v)").await.unwrap().1, decimal(3, 32, 1000, 128));
+    assert_eq!(query("SELECT AVG(v) FROM (VALUES ('1E-2147483647'::DECIMAL(32,2147483647)), ('2E-2147483647'::DECIMAL(32,2147483647))) t(v)").await.unwrap().1, Value::F64(0.0));
 }

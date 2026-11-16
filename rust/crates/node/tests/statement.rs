@@ -54,7 +54,7 @@ async fn inline_xtql_prepared_query_rebinds_external_parameters_through_sql() {
 async fn prepared_unqualified_decimal_rebinds_scale_and_preserves_annotated_decimal_parameters() {
     let context = context(None, &MemoryBudget::new(1 << 26));
     let statement = PreparedSql::prepare("SELECT $1::DECIMAL AS value", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
-    for scale in [2, 4] {
+    for scale in [2, 4, -1000, 1000, i32::MIN, i32::MAX] {
         let value = Value::Decimal(rtdb_types::DecimalValue::new(125i128.to_be_bytes().to_vec(), 10, scale, 128).unwrap());
         let mut cursor = statement.open_query(Arc::clone(&context), vec![value.clone()]).unwrap();
         let page = cursor.next_batch().await.unwrap().unwrap();

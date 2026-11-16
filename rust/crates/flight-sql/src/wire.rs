@@ -1,7 +1,7 @@
 use std::{collections::HashMap, io::Cursor, sync::Arc};
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_buffer::Buffer;
-use arrow_flight::{FlightData, SchemaAsIpc, SchemaResult};
+use arrow_flight::FlightData;
 use arrow_ipc::writer::{CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow_schema::{Schema, SchemaRef};
 use bytes::Bytes;
@@ -37,18 +37,20 @@ pub(crate) fn plan_schema(schema: &rtdb_plan::Schema, memory: &Arc<MemoryBudget>
 }
 pub(crate) fn schema_message(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
     let charge = memory.reserve(schema_bound(schema)?).map_err(status)?;
-    let result: SchemaResult = SchemaAsIpc::new(schema, &IpcWriteOptions::default()).try_into().map_err(arrow)?;
-    Ok(retain(result.schema, charge))
+    Ok(retain(rtdb_format::ipc::write_schema_message_with_options(schema, &IpcWriteOptions::default()).map_err(status)?, charge))
 }
 pub(crate) fn schema_data(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<FlightData, Status> {
     let charge = memory.reserve(schema_bound(schema)?).map_err(status)?;
-    let mut result: FlightData = SchemaAsIpc::new(schema, &IpcWriteOptions::default()).into();
-    result.data_header = retain(result.data_header, charge); Ok(result)
+    Ok(FlightData { data_header: retain(rtdb_format::ipc::write_schema_header_with_options(schema, &IpcWriteOptions::default()).map_err(status)?, charge), ..Default::default() })
 }
-pub(crate) struct Encoder { dictionaries: DictionaryTracker, compression: CompressionContext }
+pub(crate) struct Encoder { schema: SchemaRef, _reservation: Arc<MemoryReservation>, dictionaries: DictionaryTracker, compression: CompressionContext }
 impl Encoder {
-    pub fn new() -> Self { Self { dictionaries: DictionaryTracker::new(false), compression: CompressionContext::default() } }
+    pub fn new(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self, Status> {
+        let reservation = memory.reserve(schema_bound(schema)?).map_err(status)?;
+        Ok(Self { schema: Arc::new(schema.clone()), _reservation: reservation, dictionaries: DictionaryTracker::new(false), compression: CompressionContext::default() })
+    }
     pub fn batch(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Vec<FlightData>, Status> {
+        if batch.schema().as_ref() != self.schema.as_ref() { return Err(invalid("Flight batch schema differs from its declared schema")); }
         let charge = memory.reserve(add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)?).map_err(status)?;
         let (dictionaries, data) = IpcDataGenerator::default().encode(batch, &mut self.dictionaries, &IpcWriteOptions::default(), &mut self.compression).map_err(arrow)?;
         Ok(dictionaries.into_iter().chain(std::iter::once(data)).map(|encoded| { let mut data: FlightData = encoded.into(); data.data_header = retain(data.data_header, Arc::clone(&charge)); data.data_body = retain(data.data_body, Arc::clone(&charge)); data }).collect())
@@ -66,7 +68,7 @@ impl Decoder {
             arrow_ipc::MessageHeader::NONE => Ok(None),
             arrow_ipc::MessageHeader::Schema => {
                 if self.schema.is_some() { return Err(invalid("Flight upload contains more than one schema")); }
-                self.schema = Some(Arc::new(Schema::try_from(&data).map_err(arrow)?)); self.permanent.push(charge); Ok(None)
+                self.schema = Some(Arc::new(rtdb_format::ipc::read_schema_header(&data.data_header).map_err(status)?)); self.permanent.push(charge); Ok(None)
             }
             arrow_ipc::MessageHeader::DictionaryBatch => {
                 let schema = self.schema.as_ref().ok_or_else(|| invalid("Dictionary arrived before schema"))?;
@@ -110,14 +112,13 @@ fn message_slices_bound(header: &[u8], body: &[u8]) -> Result<usize, Status> {
 pub(crate) fn parameter_ipc(batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<Option<Bytes>, Status> {
     if batch.num_columns() == 0 { return Ok(None); }
     let charge = memory.reserve(add(mul(batch.get_array_memory_size(), 4)?, schema_bound(batch.schema().as_ref())?)?).map_err(status)?;
-    let mut output = Vec::new();
-    { let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut output, batch.schema().as_ref()).map_err(arrow)?; writer.write(batch).map_err(arrow)?; writer.finish().map_err(arrow)?; }
+    let output = rtdb_format::ipc::write_arrow_stream(batch.schema().as_ref(), std::slice::from_ref(batch), IpcWriteOptions::default()).map_err(status)?;
     Ok(Some(retain(output, charge)))
 }
 pub(crate) fn parameter_batch(bytes: &Bytes, memory: &Arc<MemoryBudget>) -> Result<OwnedBatch, Status> {
     let charge = memory.reserve(ipc_bound(bytes)?).map_err(status)?;
-    let mut reader = arrow_ipc::reader::StreamReader::try_new(Cursor::new(bytes.as_ref()), None).map_err(arrow)?;
-    let batch = reader.next().transpose().map_err(arrow)?.unwrap_or_else(|| RecordBatch::new_empty(reader.schema()));
+    let mut reader = rtdb_format::ipc::ArrowStream::from_reader(Cursor::new(bytes.as_ref()), None).map_err(status)?;
+    let batch = reader.next().transpose().map_err(status)?.unwrap_or_else(|| RecordBatch::new_empty(reader.schema()));
     OwnedBatch::with_reservation(batch, charge).map_err(status)
 }
 fn ipc_bound(bytes: &[u8]) -> Result<usize, Status> {
@@ -155,7 +156,7 @@ mod tests {
     fn streaming_arrow_buffers_remain_charged_after_encoder_and_batch_drop() {
         let memory = MemoryBudget::new(1 << 20); let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)]));
         let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![Some(42), None]))]).unwrap();
-        let mut encoder = Encoder::new(); let data = encoder.batch(&batch, &memory).unwrap(); drop(batch); drop(encoder); assert!(memory.used_bytes() > 0);
+        let mut encoder = Encoder::new(&schema, &memory).unwrap(); let data = encoder.batch(&batch, &memory).unwrap(); drop(batch); drop(encoder); assert!(memory.used_bytes() > 0);
         let mut decoder = Decoder::new(memory.clone()); decoder.decode(schema_data(&schema, &memory).unwrap()).unwrap(); let batch = decoder.decode(data.into_iter().next().unwrap()).unwrap().unwrap();
         let cloned = batch.batch().column(0).clone(); drop(batch); drop(decoder); assert!(memory.used_bytes() > 0); assert_eq!(cloned.as_any().downcast_ref::<Int64Array>().unwrap().value(0), 42);
         drop(cloned); assert_eq!(memory.used_bytes(), 0);
@@ -171,5 +172,51 @@ mod tests {
     fn truncated_parameter_stream_cannot_allocate_from_untrusted_body_length() {
         let memory = MemoryBudget::new(1 << 20); let before = memory.used_bytes();
         assert!(parameter_batch(&Bytes::from_static(&[255,255,255,255,127,255,255,127]), &memory).is_err()); assert_eq!(memory.used_bytes(), before);
+    }
+    #[test]
+    fn flight_schema_batches_and_parameters_preserve_full_decimal_scale() {
+        for scale in [i32::MIN, -129, 128, i32::MAX] {
+            let memory = MemoryBudget::new(16 * 1024 * 1024);
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
+            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+            let schema = Arc::new(Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]));
+            let batch = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            let header = schema_data(&schema, &memory).unwrap();
+            let message = arrow_ipc::root_as_message(&header.data_header).unwrap();
+            let field = message.header_as_schema().unwrap().fields().unwrap().get(0);
+            assert_eq!(field.type_as_decimal().unwrap().scale(), scale);
+            assert!(field.custom_metadata().is_none_or(|entries| entries.iter().all(|entry| entry.key() != Some(rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY))));
+            let bytes = schema_message(&schema, &memory).unwrap();
+            assert_eq!(from_field(rtdb_format::ipc::read_schema_message(&bytes).unwrap().field(0)).unwrap(), ty);
+            drop(bytes);
+            let mut decoder = Decoder::new(memory.clone()); decoder.decode(header).unwrap();
+            let encoded = Encoder::new(&schema, &memory).unwrap().batch(&batch, &memory).unwrap();
+            let decoded = decoder.decode(encoded.into_iter().next().unwrap()).unwrap().unwrap();
+            assert_eq!(read_value(decoded.batch().schema().field(0), decoded.batch().column(0).as_ref(), 0).unwrap(), value);
+            let bytes = parameter_ipc(&batch, &memory).unwrap().unwrap(); let parameters = parameter_batch(&bytes, &memory).unwrap();
+            let args = arguments(parameters.batch(), &memory).unwrap();
+            assert_eq!(args.types(), &[ty]); assert_eq!(args.rows().next().unwrap(), &[value]);
+            drop(args); drop(parameters); drop(bytes); drop(decoded); drop(decoder); assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+    #[test]
+    fn flight_encoder_rejects_a_different_full_scale_before_allocating_output() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = |scale| Schema::new(vec![rtdb_columnar::to_field("value", &rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 })).unwrap()]);
+        let mut encoder = Encoder::new(&schema(129), &memory).unwrap();
+        let before = memory.used_bytes();
+        assert!(encoder.batch(&RecordBatch::new_empty(Arc::new(schema(130))), &memory).is_err());
+        assert_eq!(memory.used_bytes(), before); drop(encoder); assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
+    fn narrow_flight_schema_bytes_match_arrow_schema_as_ipc() {
+        let memory = MemoryBudget::new(1 << 20);
+        let schema = Schema::new(vec![Field::new("value", DataType::Decimal128(3, 1), true)]);
+        let options = IpcWriteOptions::default();
+        let expected: arrow_flight::SchemaResult = arrow_flight::SchemaAsIpc::new(&schema, &options).try_into().unwrap();
+        assert_eq!(schema_message(&schema, &memory).unwrap().as_ref(), expected.schema.as_ref());
+        let expected: FlightData = arrow_flight::SchemaAsIpc::new(&schema, &options).into();
+        assert_eq!(schema_data(&schema, &memory).unwrap().data_header, expected.data_header);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

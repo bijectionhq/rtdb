@@ -133,7 +133,7 @@ async fn download(store: &dyn ObjectStore, memory: &Arc<MemoryBudget>, key: &Obj
 fn open_input(mut file: File, memory: &Arc<MemoryBudget>) -> Result<(ArrowFile, Arc<MemoryReservation>)> {
     let layout = inspect_file_reserved(&mut file, |bytes| memory.reserve(bytes))?;
     if !layout.uncompressed { return Err(rtdb_types::Anomaly::unsupported("rtdb.maintenance/compressed-input", "Compaction requires uncompressed Arrow input until decoded buffer allocation bounds are available")); }
-    let bytes = layout.dictionary_encoded_bytes.checked_add(layout.footer_encoded_bytes).and_then(|bytes| bytes.checked_mul(8)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| crate::invalid("Arrow opening allocation overflow"))?;
+    let bytes = layout.dictionary_encoded_bytes.checked_mul(8).and_then(|bytes| layout.footer_encoded_bytes.checked_mul(64).and_then(|footer| bytes.checked_add(footer))).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| crate::invalid("Arrow opening allocation overflow"))?;
     let reservation = memory.reserve(bytes)?;
     let reader = ArrowFile::from_inspected_reader(file, None, layout)?;
     Ok((reader, reservation))
@@ -246,7 +246,7 @@ impl CompactionExecutor for SegmentCompactor {
         let tasks = planner::plan(&inputs, &job.part)?;
         let initial_recency = if job.recency_mode == RecencyMode::Partition { None } else { job.output.recency() };
         let initial_carry = job.recency_mode == RecencyMode::Preserve && carry;
-        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, &self.config)?];
+        let mut outputs = vec![MergeFile::new(directory.path().join("merged-0.arrow"), initial_recency, initial_carry, &job.part, &put, &self.config, &self.memory)?];
         for task in tasks {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             let mut rows = Vec::new();
@@ -280,7 +280,7 @@ impl CompactionExecutor for SegmentCompactor {
                     if let Some(index) = outputs.iter().position(|output| output.recency == Some(date)) { index }
                     else {
                         let index = outputs.len();
-                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, &self.config)?);
+                        outputs.push(MergeFile::new(directory.path().join(format!("merged-{index}.arrow")), Some(date), self.config.within_file_recency_branching, &job.part, &put, &self.config, &self.memory)?);
                         index
                     }
                 } else { 0 };
@@ -317,10 +317,10 @@ impl CompactionExecutor for SegmentCompactor {
 }
 
 impl MergeFile {
-    fn new(path: PathBuf, recency: Option<NaiveDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig) -> Result<Self> {
+    fn new(path: PathBuf, recency: Option<NaiveDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
-        let writer = ArrowFileWriter::new_bounded(create_file(&path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?)?;
+        let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
     fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig) -> Result<()> {

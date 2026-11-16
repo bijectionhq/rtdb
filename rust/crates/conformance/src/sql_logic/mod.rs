@@ -85,8 +85,8 @@ async fn script(plan: &Plan, entry: &Script, input: &Path, output: &Path) -> Res
                 if ordinal != assertions { return Err("SLT assertion ordinal differs from original record order".into()); }
             }
             count += 1;
-            let mut receipt = json!({"identity":original.identity,"executed":false,"engine_executed":false,"disposition":"pending","result":null,"error":null,"query_count_before":queries,"hash_threshold":threshold});
             let mut charges = Vec::new();
+            let mut receipt = json!({"identity":original.identity,"executed":false,"engine_executed":false,"disposition":"pending","result":null,"error":null,"query_count_before":queries,"hash_threshold":threshold});
             if entry.options.query_limit == Some(queries) {
                 receipt["disposition"] = "query_limit".into();
             } else if let Some(record) = original.record {
@@ -144,6 +144,7 @@ async fn script(plan: &Plan, entry: &Script, input: &Path, output: &Path) -> Res
             *dispositions.entry(receipt["disposition"].as_str().expect("disposition").into()).or_default() += 1;
             receipt["query_count_after"] = queries.into();
             serde_json::to_writer(&mut output, &receipt)?; output.write_all(b"\n")?;
+            drop(receipt);
             drop(charges);
         }
         if count != entry.records || assertions != entry.assertions { return Err("SLT record or assertion count differs from the retained plan".into()); }

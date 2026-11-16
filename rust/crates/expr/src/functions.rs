@@ -158,22 +158,34 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         }
         "abs" | "floor" | "ceil" | "ceiling" | "round" | "trunc" => {
             let scale = args.get(1).map(|value| integer(value).ok_or_else(|| inapplicable(&name, &[value]))).transpose()?.unwrap_or(0);
+            if matches!(name.as_str(), "floor" | "ceil" | "ceiling") {
+                let value = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
+                return Ok(Value::F64(if name == "floor" { value.floor() } else { value.ceil() }));
+            }
             if let Value::Decimal(value) = &args[0] {
-                let decimal = decimal(value);
-                let decimal = match name.as_str() {
-                    "abs" => decimal.abs(),
-                    "floor" => decimal.with_scale_round(0, bigdecimal::RoundingMode::Floor),
-                    "ceil" | "ceiling" => decimal.with_scale_round(0, bigdecimal::RoundingMode::Ceiling),
-                    "round" => decimal.with_scale_round(i64::try_from(scale).map_err(|_| overflow())?, bigdecimal::RoundingMode::HalfUp),
-                    _ => decimal.with_scale_round(i64::try_from(scale).map_err(|_| overflow())?, bigdecimal::RoundingMode::Down),
-                };
-                return decimal_value(decimal, value.precision, value.scale, value.bit_width);
+                if name == "abs" { return decimal_value(decimal(value).abs(), value.precision, value.scale, value.bit_width); }
+                let rounded = crate::decimal::rounded(value, i32::try_from(scale).map_err(|_| overflow())?, if name == "round" { bigdecimal::RoundingMode::HalfUp } else { bigdecimal::RoundingMode::Down })?;
+                return if name == "round" { Ok(Value::Decimal(rounded)) }
+                    else { crate::decimal_rescale(&rounded, value.precision, value.scale, value.bit_width).map(Value::Decimal) };
             }
             let LogicalType::Scalar(ty) = args[0].logical_type() else { return Err(inapplicable(&name, &[&args[0]])); };
             if let Some(integer) = integer(&args[0]) {
+                if name == "round" && args.len() == 2 {
+                    let precision = match ty { ScalarType::I32 => 10, ScalarType::I64 => 19, _ => return Err(inapplicable(&name, &[&args[0]])) };
+                    let value = crate::decimal::from_coefficient(integer.into(), precision, 0, 128)?;
+                    return crate::decimal::rounded(&value, i32::try_from(scale).map_err(|_| overflow())?, bigdecimal::RoundingMode::HalfUp).map(Value::Decimal);
+                }
                 return integer_value(if name == "abs" { integer.checked_abs().ok_or_else(overflow)? } else { integer }, &ty);
             }
             let x = number(&args[0]).ok_or_else(|| inapplicable(&name, &[&args[0]]))?;
+            if name == "round" {
+                if !x.is_finite() { return Ok(Value::F64(x)); }
+                let scale = i64::try_from(scale).map_err(|_| overflow())?;
+                let factor = 10.0_f64.powf((scale as f64).abs());
+                let value = if scale >= 0 { x * factor } else { x / factor };
+                if !value.is_finite() { return Err(overflow()); }
+                return Ok(Value::F64(if scale >= 0 { value.round() / factor } else { value.round() * factor }));
+            }
             let factor = 10.0_f64.powi(i32::try_from(scale).map_err(|_| overflow())?);
             Ok(floating_value(match name.as_str() { "abs" => x.abs(), "floor" => x.floor(), "ceil" | "ceiling" => x.ceil(), "round" => (x * factor).round() / factor, _ => (x * factor).trunc() / factor }, &ty))
         }

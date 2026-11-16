@@ -574,7 +574,7 @@ fn scalar_call(name: &str, args: Vec<PExpr>) -> Result<PExpr> {
         return Ok(PExpr::Case { branches: vec![(args[0].clone(), args[1].clone())], otherwise: Box::new(args[2].clone()) });
     }
     let name = normal(name);
-    let return_type = rtdb_plan::function_type(&name, &args.iter().map(PExpr::data_type).collect::<Vec<_>>())?;
+    let return_type = rtdb_plan::function_type_with_args(&name, &args)?;
     Ok(PExpr::Call { name, args, return_type })
 }
 fn required_expr(expr: &Expr, parameters: &Parameters, result: &mut BTreeSet<String>) {

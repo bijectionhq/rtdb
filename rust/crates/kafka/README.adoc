@@ -68,6 +68,8 @@ Avro conversion retains narrow integer annotations, field defaults, Connect meta
 JSON Schema payload validation follows `json.fail.invalid.schema`, whose default is false.
 The transform implementation covers ExtractField, ReplaceField, HoistField, ValueToKey, Filter, DropHeaders, HeaderFrom, InsertField, InsertHeader, Cast, MaskField, Flatten, RegexRouter, TimestampConverter, TimestampRouter, and SetSchemaMetadata, with the three shipped predicates.
 Header and InsertHeader literal parsing retains Kafka numeric widths, collection schema inference, top-level quoting, and millisecond temporal types.
+Decimal converters, defaults, header literals, and masks retain signed 32-bit scales.
+Integer inference and mask conversion bound their work by coefficient digits, including at the scale limits.
 Recursive Avro and JSON Schema definitions use immutable node graphs; detached field views retain their graph without ownership cycles.
 Enhanced Avro unions retain full named-type namespaces; generalized unions/enums and singleton-union configuration follow the converter-specific naming rules.
 Avro union values follow the pinned converter's candidate matching and destination-field validation, including generalized unions whose null positions cause a different field selection or a conversion error.

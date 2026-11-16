@@ -5,7 +5,7 @@ fn scalar(scalar: S) -> T { T::Scalar(scalar) }
 
 #[test]
 fn decimal_metadata_accepts_zero_precision_and_scales_larger_than_precision() {
-    for (precision, scale) in [(0, 3), (1, 3), (32, -128), (32, 127)] {
+    for (precision, scale) in [(0, 3), (1, 3), (32, -128), (32, 127), (1, i32::MIN), (1, i32::MAX)] {
         assert!(S::Decimal { precision, scale, bit_width: 128 }.validate().is_ok());
     }
     assert!(S::Decimal { precision: 39, scale: 0, bit_width: 128 }.validate().is_err());

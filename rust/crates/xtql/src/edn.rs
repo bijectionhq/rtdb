@@ -210,11 +210,15 @@ impl<'a> Reader<'a> {
 
 fn numeric_token(value: &str) -> bool {
     let value = value.strip_prefix(['+', '-']).unwrap_or(value);
-    value.as_bytes().first().is_some_and(u8::is_ascii_digit)
+    value.chars().next().and_then(rtdb_types::decimal_digit).is_some()
 }
 
 fn parse_number(value: &str) -> std::result::Result<EdnKind, &'static str> {
-    if let Some(value) = value.strip_suffix('M') { return Ok(EdnKind::Decimal(value.into())); }
+    if !value.is_ascii() { return Err("Invalid numeric literal"); }
+    if let Some(value) = value.strip_suffix('M') {
+        if rtdb_types::decimal_text_scale(value).is_err() { return Err("Invalid decimal literal"); }
+        return Ok(EdnKind::Decimal(value.into()));
+    }
     if let Some(value) = value.strip_suffix('N') { return Ok(EdnKind::BigInteger(value.into())); }
     if value.contains(['.', 'e', 'E']) { return value.parse().map(EdnKind::Float).map_err(|_| "Invalid floating-point literal"); }
     let (negative, unsigned) = if let Some(value) = value.strip_prefix('-') { (true, value) } else { (false, value.strip_prefix('+').unwrap_or(value)) };

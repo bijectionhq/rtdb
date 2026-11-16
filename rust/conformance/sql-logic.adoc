@@ -60,6 +60,8 @@ Formatting zips each row with the type string, so excess values or type letters 
 An empty result formats as one newline.
 Rowsort orders the joined formatted row strings; valuesort orders formatted cells using Java UTF-16 lexical order.
 Integers use the pinned long coercion, strings under `I` become `0`, nulls become `NULL`, and empty strings under `T` become `(empty)`.
+Decimal `I` coercion follows Clojure's checked double-to-long conversion; `R` rounds half up to three fractional digits and reserves fixed-point expansion before rendering.
+Scientific decimal text retains the full signed 32-bit scale without exponent-sized padding.
 Real numbers use three fractional digits and the Java formatter's half-up rule after decimal conversion.
 The source contracts are https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/java/util/Formatter.java[OpenJDK 25 Formatter] and https://raw.githubusercontent.com/openjdk/jdk/jdk-25-ga/src/java.base/share/classes/jdk/internal/math/FormattedFPDecimal.java[FormattedFPDecimal].
 

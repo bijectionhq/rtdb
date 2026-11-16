@@ -29,7 +29,7 @@ fn file_positions(bytes: &[u8]) -> [usize;3] {
 
 #[test]
 fn nested_decimal_wire_metadata_is_rejected_before_native_unchecked_narrowing() {
-    for (field,value) in [(0,-1),(0,256),(1,-129),(1,128),(1,i32::MAX),(2,512)] {
+    for (field,value) in [(0,-1),(0,256),(2,512)] {
         let mut stream = ipc::write_stream(&schema(),&[]).unwrap();
         let position = stream_positions(&stream)[field];
         stream[position..position+4].copy_from_slice(&value.to_le_bytes());
@@ -43,6 +43,38 @@ fn nested_decimal_wire_metadata_is_rejected_before_native_unchecked_narrowing() 
         assert_eq!(ipc::file_allocation_bound(&file).unwrap_err().code,"rtdb.format/decimal-metadata");
         assert_eq!(ipc::inspect_file(&mut Cursor::new(&file)).unwrap_err().code,"rtdb.format/decimal-metadata");
         assert_eq!(ipc::ArrowFile::open(file.into(),None).err().unwrap().code,"rtdb.format/decimal-metadata");
+    }
+}
+
+#[test]
+fn nested_external_decimal_scales_are_derived_from_real_wire_metadata() {
+    for scale in [i32::MIN, -129, 128, i32::MAX] {
+        let mut message = ipc::write_schema_message(&schema()).unwrap();
+        let position = stream_positions(&message)[1];
+        message[position..position+4].copy_from_slice(&scale.to_le_bytes());
+        let decoded = ipc::read_schema_message(&message).unwrap();
+        let DataType::List(item) = decoded.field(0).data_type() else { panic!("Expected list") };
+        let DataType::Struct(children) = item.data_type() else { panic!("Expected struct") };
+        assert_eq!(rtdb_columnar::decimal_scale(&children[0]).unwrap(), Some(scale));
+        assert_eq!(children[0].data_type(), &DataType::Decimal256(2, 1));
+        assert_eq!(ipc::write_schema_message(&decoded).unwrap(), message);
+    }
+}
+
+#[test]
+fn reserved_scale_metadata_cannot_override_external_decimal_metadata() {
+    let key = rtdb_columnar::INTERNAL_DECIMAL_SCALE_KEY;
+    for schema_level in [false, true] {
+        let metadata = std::collections::HashMap::from([(key.to_owned(), i32::MAX.to_string())]);
+        let field = Field::new("value", DataType::Decimal128(3, 1), true);
+        let schema = if schema_level { Schema::new_with_metadata(vec![field], metadata) } else { Schema::new(vec![field.with_metadata(metadata)]) };
+        let writer = arrow_ipc::writer::StreamWriter::try_new(Vec::new(), &schema).unwrap();
+        let bytes = writer.into_inner().unwrap();
+        assert!(ipc::read_schema_message(&bytes).is_err());
+        assert!(ipc::stream_allocation_bound(&bytes).is_err());
+        let mut writer = arrow_ipc::writer::FileWriter::try_new(Vec::new(), &schema).unwrap();
+        writer.finish().unwrap();
+        assert!(ipc::ArrowFile::open(writer.into_inner().unwrap().into(), None).is_err());
     }
 }
 

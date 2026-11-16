@@ -36,11 +36,13 @@ pub fn read_text(oid: u32, text: &str) -> Result<Value> {
 }
 fn float(text: &str) -> Result<f64> { match text { "Infinity" | "+Infinity" => Ok(f64::INFINITY), "-Infinity" => Ok(f64::NEG_INFINITY), "NaN" => Ok(f64::NAN), _ => text.parse().map_err(invalid) } }
 pub(crate) fn decimal(text: &str) -> Result<Value> {
-    let decimal = BigDecimal::from_str(text).map_err(invalid)?;
+    let decimal = rtdb_expr::parse_decimal(text).map_err(invalid)?;
     let (coefficient, scale) = decimal.as_bigint_and_exponent();
+    decimal_parts(coefficient, i32::try_from(scale).map_err(invalid)?)
+}
+pub(crate) fn decimal_parts(coefficient: num_bigint::BigInt, scale: i32) -> Result<Value> {
     let digits = coefficient.to_string().trim_start_matches('-').len().max(1);
     let precision = if digits <= 32 { 32 } else if digits <= 64 { 64 } else { return Err(invalid("Decimal exceeds the pinned value writer precision")); };
-    let scale = i8::try_from(scale).map_err(invalid)?;
     let width = if precision == 32 { 128 } else { 256 };
     let bytes = coefficient.to_signed_bytes_be(); let length = usize::from(width / 8);
     if bytes.len() > length { return Err(invalid("Decimal coefficient exceeds its Arrow width")); }

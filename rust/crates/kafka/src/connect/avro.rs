@@ -196,13 +196,17 @@ fn convert(schema: &Schema, value: Avro, names: &BTreeMap<String, Schema>, union
     })
 }
 fn decimal_value(bytes: Vec<u8>, scale: usize) -> Result<Value> {
+    decimal_value_at_scale(bytes, i32::try_from(scale).map_err(|cause| error("avro-decode", cause))?)
+}
+fn decimal_value_at_scale(bytes: Vec<u8>, scale: i32) -> Result<Value> {
+    if bytes.is_empty() { return Err(error("avro-decode", "Decimal coefficient bytes are empty")); }
     let coefficient = num_bigint::BigInt::from_signed_bytes_be(&bytes);
     let digits = coefficient.to_str_radix(10).trim_start_matches('-').len().max(1);
     let precision = if digits <= 32 { 32 } else if digits <= 64 { 64 } else { return Err(error("avro-decode", "Decimal precision exceeds the reference writer limit")); };
     let width = precision / 2; let bytes = coefficient.to_signed_bytes_be();
     if bytes.len() > width { return Err(error("avro-decode", "Decimal coefficient exceeds its width")); }
     let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; width]; unscaled[width - bytes.len()..].copy_from_slice(&bytes);
-    Ok(Value::Decimal(DecimalValue::new(unscaled, precision as u8, i8::try_from(scale).map_err(|cause| error("avro-decode", cause))?, precision as u16 * 4)?))
+    Ok(Value::Decimal(DecimalValue::new(unscaled, precision as u8, scale, precision as u16 * 4)?))
 }
 
 #[cfg(test)]

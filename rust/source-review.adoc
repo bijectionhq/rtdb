@@ -176,7 +176,10 @@ Their source review follows the pinned occurrence-based parameter numbering and 
 Explicit and correlated temporal endpoint columns resolve without exposing those columns through wildcard expansion.
 Lateral relations, recursive CTEs, query settings, interval qualifiers and the outstanding shared scalar-function catalog remain reachable language gaps.
 Shared decimal cast targets distinguish default decimal preservation from explicit precision/scale and recurse through list element unions.
-The JVM's wider decimal metadata, additional XTQL target/options syntax and exact decimal diagnostics remain gaps; their narrower native paths are not declared equivalent.
+Decimal values and logical fields retain the full signed 32-bit scale through protobuf, Arrow files/streams, Flight, COPY and the C Data interface.
+Native Arrow carriers retain validated full-scale annotations internally; external schemas carry the actual Arrow scale and reject those reserved annotations on ingress.
+Decimal arithmetic, comparison, canonical text and integer conversion bound powers by coefficient digits; expanding PostgreSQL binary and SQL logic fixed-point output reserves its expansion first.
+Additional decimal precision metadata, XTQL target/options syntax and exact decimal diagnostics remain gaps; those paths are not declared equivalent.
 XTQL percentile/vec-agg and its documented EDN reader extensions remain gaps as well.
 These source assertions have not run and do not establish plan, error or result parity.
 

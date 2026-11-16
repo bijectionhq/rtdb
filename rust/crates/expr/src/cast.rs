@@ -124,6 +124,11 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             let value = match value {
                 Value::Utf8(text) => text.parse::<i128>().map_err(|_| inapplicable("integer", &[value]))?,
                 Value::Bool(value) => i128::from(*value),
+                Value::Decimal(value) => {
+                    let number = crate::decimal_to_f64(value);
+                    if number < i64::MIN as f64 || number > i64::MAX as f64 { return Err(overflow()); }
+                    i128::from(number as i64)
+                }
                 value => if let Some(value) = integer(value) { value } else {
                     let number = number(value).ok_or_else(|| inapplicable("integer", &[value]))?;
                     if !number.is_finite() || number < i128::MIN as f64 || number >= i128::MAX as f64 { return Err(overflow()); }
@@ -139,7 +144,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         S::Decimal { precision, scale, bit_width } => {
             let decimal = match value {
                 Value::Decimal(value) => decimal(value),
-                Value::Utf8(text) => bigdecimal::BigDecimal::from_str(text).map_err(|_| inapplicable("decimal", &[value]))?,
+                Value::Utf8(text) => crate::parse_decimal(text).map_err(|_| inapplicable("decimal", &[value]))?,
                 value => if let Some(integer) = integer(value) { bigdecimal::BigDecimal::new(BigInt::from(integer), 0) }
                     else { bigdecimal::BigDecimal::from_str(&number(value).ok_or_else(|| inapplicable("decimal", &[value]))?.to_string()).map_err(|_| overflow())? },
             };
@@ -154,7 +159,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             let text = match value {
                 Value::Utf8(text) | Value::Uri(text) => text.clone(), Value::Bool(value) => value.to_string(),
                 Value::Keyword(value) => value.to_string(), Value::Uuid(value) => uuid::Uuid::from_bytes(*value).to_string(),
-                Value::Decimal(value) => decimal(value).to_string(),
+                Value::Decimal(value) => crate::decimal_text(value),
                 value if integer(value).is_some() => integer(value).ok_or_else(overflow)?.to_string(),
                 value if number(value).is_some() => number(value).ok_or_else(overflow)?.to_string(),
                 Value::Timestamp { .. } => DateTime::from_timestamp_micros(timestamp_micros(value, timezone)?.0).ok_or_else(overflow)?.to_rfc3339(),

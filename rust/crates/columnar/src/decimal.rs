@@ -1,0 +1,77 @@
+use std::sync::Arc;
+use arrow_schema::{DataType, Field, Schema, UnionFields};
+use rtdb_types::{Anomaly, Result};
+
+/// Reserved native field metadata; external Arrow schemas must reject this key on ingress.
+pub const INTERNAL_DECIMAL_SCALE_KEY: &str = "rtdb:internal:decimal-scale-i32";
+
+/// Physical Arrow scale used with an independently retained full-scale field annotation.
+pub fn decimal_storage_scale(scale: i32) -> i8 { i8::try_from(scale).unwrap_or(1) }
+
+pub fn decimal_parameters(data_type: &DataType) -> Option<(u8, i8, u16)> {
+    match data_type {
+        DataType::Decimal32(p, s) => Some((*p, *s, 32)),
+        DataType::Decimal64(p, s) => Some((*p, *s, 64)),
+        DataType::Decimal128(p, s) => Some((*p, *s, 128)),
+        DataType::Decimal256(p, s) => Some((*p, *s, 256)),
+        DataType::Dictionary(_, value) => decimal_parameters(value),
+        _ => None,
+    }
+}
+
+/// Reads the true scale of a native field and checks its physical carrier.
+pub fn decimal_scale(field: &Field) -> Result<Option<i32>> {
+    let annotation = field.metadata().get(INTERNAL_DECIMAL_SCALE_KEY);
+    let Some((_, stored, _)) = decimal_parameters(field.data_type()) else {
+        return if annotation.is_some() { Err(invalid("Decimal scale annotation requires decimal storage")) } else { Ok(None) };
+    };
+    let Some(annotation) = annotation else { return Ok(Some(i32::from(stored))); };
+    let scale = annotation.parse::<i32>().map_err(|_| invalid("Invalid full-width decimal scale"))?;
+    if i8::try_from(scale).is_ok() || stored != decimal_storage_scale(scale) || annotation != &scale.to_string() {
+        return Err(invalid("Decimal scale annotation disagrees with its carrier"));
+    }
+    Ok(Some(scale))
+}
+
+/// Attaches a true scale after the caller has established matching physical decimal storage.
+pub fn with_decimal_scale(mut field: Field, scale: i32) -> Result<Field> {
+    if decimal_parameters(field.data_type()).is_none_or(|(_, stored, _)| stored != decimal_storage_scale(scale)) {
+        return Err(invalid("Decimal storage scale disagrees with its logical scale"));
+    }
+    let mut metadata = field.metadata().clone();
+    metadata.remove(INTERNAL_DECIMAL_SCALE_KEY);
+    if i8::try_from(scale).is_err() { metadata.insert(INTERNAL_DECIMAL_SCALE_KEY.into(), scale.to_string()); }
+    field.set_metadata(metadata);
+    Ok(field)
+}
+
+/// Rebuilds a schema's fields bottom-up, preserving container layouts and schema metadata.
+/// The caller reserves space for the cloned field tree before invoking this function.
+pub fn map_schema_fields(schema: &Schema, mut map: impl FnMut(Field) -> Result<Field>) -> Result<Schema> {
+    fn child(value: &Arc<Field>, map: &mut impl FnMut(Field) -> Result<Field>) -> Result<Arc<Field>> { field(value.as_ref(), map).map(Arc::new) }
+    fn data_type(value: &DataType, map: &mut impl FnMut(Field) -> Result<Field>) -> Result<DataType> {
+        Ok(match value {
+            DataType::Struct(fields) => DataType::Struct(fields.iter().map(|value| child(value, map)).collect::<Result<Vec<_>>>()?.into()),
+            DataType::Union(fields, mode) => {
+                let (ids, fields): (Vec<_>, Vec<_>) = fields.iter().map(|(id, value)| Ok((id, child(value, map)?))).collect::<Result<Vec<_>>>()?.into_iter().unzip();
+                DataType::Union(UnionFields::try_new(ids, fields).map_err(crate::arrow_error)?, *mode)
+            }
+            DataType::List(value) => DataType::List(child(value, map)?),
+            DataType::LargeList(value) => DataType::LargeList(child(value, map)?),
+            DataType::ListView(value) => DataType::ListView(child(value, map)?),
+            DataType::LargeListView(value) => DataType::LargeListView(child(value, map)?),
+            DataType::FixedSizeList(value, size) => DataType::FixedSizeList(child(value, map)?, *size),
+            DataType::Map(value, sorted) => DataType::Map(child(value, map)?, *sorted),
+            DataType::RunEndEncoded(ends, values) => DataType::RunEndEncoded(child(ends, map)?, child(values, map)?),
+            DataType::Dictionary(key, value) => DataType::Dictionary(Box::new(data_type(key, map)?), Box::new(data_type(value, map)?)),
+            value => value.clone(),
+        })
+    }
+    fn field(value: &Field, map: &mut impl FnMut(Field) -> Result<Field>) -> Result<Field> {
+        let data_type = data_type(value.data_type(), map)?;
+        map(value.clone().with_data_type(data_type))
+    }
+    Ok(Schema::new_with_metadata(schema.fields().iter().map(|value| field(value, &mut map)).collect::<Result<Vec<_>>>()?, schema.metadata().clone()))
+}
+
+fn invalid(message: &str) -> Anomaly { Anomaly::incorrect("rtdb/decimal-scale", message) }

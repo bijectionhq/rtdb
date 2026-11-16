@@ -103,17 +103,21 @@ pub(super) fn mask(value: Value, replacement: Option<&str>) -> Result<Value> {
     if let Some(replacement) = replacement {
         if matches!(value, Value::Utf8(_)) { return Ok(Value::Utf8(replacement.into())); }
         use std::str::FromStr;
-        let decimal = bigdecimal::BigDecimal::from_str(replacement).map_err(|cause| error("transform-error", cause))?;
+        let spelling = rtdb_types::decimal_spelling(replacement).map_err(|cause| error("transform-error", cause))?;
+        let decimal = bigdecimal::BigDecimal::from_str(spelling.ascii()).map_err(|cause| error("transform-error", cause))?;
         let (coefficient, scale) = decimal.as_bigint_and_exponent();
         if matches!(value, Value::Decimal(_)) {
             let digits = coefficient.to_str_radix(10).trim_start_matches('-').len(); let precision = if digits <= 32 { 32u8 } else if digits <= 64 { 64 } else { return Err(error("transform-error", "Decimal mask exceeds the document writer width")); };
             let bytes = coefficient.to_signed_bytes_be(); let mut unscaled = vec![if coefficient.sign() == num_bigint::Sign::Minus { 255 } else { 0 }; usize::from(precision / 2)];
             if bytes.len() > unscaled.len() { return Err(error("transform-error", "Decimal mask exceeds its coefficient width")); }
             let start = unscaled.len() - bytes.len(); unscaled[start..].copy_from_slice(&bytes);
-            return Ok(Value::Decimal(rtdb_types::DecimalValue::new(unscaled, precision, i8::try_from(scale).map_err(|cause| error("transform-error", cause))?, u16::from(precision) * 4)?));
+            return Ok(Value::Decimal(rtdb_types::DecimalValue::new(unscaled, precision, i32::try_from(scale).map_err(|cause| error("transform-error", cause))?, u16::from(precision) * 4)?));
         }
         let target = match value { Value::I8(_) => Target::I8, Value::I16(_) => Target::I16, Value::I32(_) => Target::I32, Value::I64(_) => Target::I64, Value::F32(_) => Target::F32, Value::F64(_) => Target::F64, Value::Utf8(_) => Target::String, _ => return Err(error("transform-error", "Custom mask requires numeric or string input")) };
-        if matches!(target, Target::F32 | Target::F64) { return cast(&Value::Utf8(replacement.into()), target); }
+        if matches!(target, Target::F32 | Target::F64) {
+            return if coefficient.sign() == num_bigint::Sign::NoSign { Ok(if matches!(target, Target::F32) { Value::F32(0.0) } else { Value::F64(0.0) }) }
+                else { cast(&Value::Utf8(spelling.ascii().into()), target) };
+        }
         let coefficient = if scale > 0 {
             if scale as u64 > coefficient.to_str_radix(10).len() as u64 { num_bigint::BigInt::from(0) }
             else { coefficient / num_bigint::BigInt::from(10).pow(scale as u32) }
@@ -140,5 +144,21 @@ mod tests {
         assert_eq!(mask(Value::I8(1), Some("256.9")).unwrap(), Value::I8(0));
         assert_eq!(mask(Value::I64(1), Some("18446744073709551617")).unwrap(), Value::I64(1));
         assert_eq!(mask(Value::Bool(true), Some("true")).unwrap_err().code, "xtdb.kafka-connect-source/transform-error");
+    }
+    #[test]
+    fn decimal_masks_keep_full_scale_and_integer_masks_bound_large_powers() {
+        for (text, scale) in [("1E+129", -129), ("1E-129", 129), ("1E+2147483648", i32::MIN), ("1E-2147483647", i32::MAX)] {
+            let source = Value::Decimal(rtdb_types::DecimalValue::new(vec![0; 16], 32, 0, 128).unwrap());
+            let Value::Decimal(value) = mask(source, Some(text)).unwrap() else { panic!("expected Decimal") };
+            assert_eq!(value.scale, scale);
+            assert_eq!(num_bigint::BigInt::from_signed_bytes_be(&value.unscaled), 1.into());
+            assert_eq!(mask(Value::I64(5), Some(text)).unwrap(), Value::I64(0));
+        }
+        assert!(mask(Value::I64(1), Some("1_0")).is_err());
+        assert!(mask(Value::I64(1), Some("1E-2147483648")).is_err());
+        assert_eq!(mask(Value::I64(1), Some("１２８.９")).unwrap(), Value::I64(128));
+        assert_eq!(mask(Value::F32(1.0), Some("١.٢٥")).unwrap(), Value::F32(1.25));
+        let Value::F64(zero) = mask(Value::F64(1.0), Some("-0.0")).unwrap() else { panic!("expected F64") };
+        assert_eq!(zero.to_bits(), 0.0f64.to_bits());
     }
 }

@@ -69,7 +69,7 @@ fn decimal_type(info: &ast::ExactNumberInfo) -> Result<ScalarType> {
     };
     if precision > 64 { return Err(rtdb_types::Anomaly::incorrect("xtdb.expression/unsupported-precision", format!("Unsupported precision: {precision}"))); }
     if scale < 0 { return Err(error("SQL decimal scale must be unsigned")); }
-    Ok(ScalarType::Decimal { precision: precision as u8, scale: i8::try_from(scale).map_err(error)?, bit_width: if precision <= 32 { 128 } else { 256 } })
+    Ok(ScalarType::Decimal { precision: precision as u8, scale: i32::try_from(scale).map_err(error)?, bit_width: if precision <= 32 { 128 } else { 256 } })
 }
 
 fn time_unit(precision: Option<u64>) -> Result<TimeUnit> {

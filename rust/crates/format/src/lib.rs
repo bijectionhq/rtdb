@@ -7,6 +7,7 @@ pub mod data;
 pub mod envelope;
 pub mod hll;
 pub mod ipc;
+mod ipc_decimal;
 pub mod keys;
 pub mod memory_trie;
 pub mod metadata;

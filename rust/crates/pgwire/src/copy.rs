@@ -43,13 +43,13 @@ impl CopyInput {
                 let bound = arrow_allocation(&mut file, self.format == CopyFormat::ArrowFile, node.memory())?;
                 let _arrow = node.memory().reserve(bound)?;
                 file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-                let reader: Box<dyn Iterator<Item = std::result::Result<RecordBatch, arrow_schema::ArrowError>> + Send> = if self.format == CopyFormat::ArrowFile {
-                    Box::new(arrow_ipc::reader::FileReader::try_new(file, None).map_err(io_error)?)
-                } else { Box::new(arrow_ipc::reader::StreamReader::try_new(file, None).map_err(io_error)?) };
+                let reader: Box<dyn Iterator<Item = Result<RecordBatch>> + Send> = if self.format == CopyFormat::ArrowFile {
+                    Box::new(rtdb_format::ipc::ArrowFile::from_reader(file, None)?)
+                } else { Box::new(rtdb_format::ipc::ArrowStream::from_reader(file, None)?) };
                 let mut count = 0u64;
                 for batch in reader {
                     if cancellation.is_cancelled() { return Err(cancelled()); }
-                    let batch = batch.map_err(io_error)?; let schema = batch.schema();
+                    let batch = batch?; let schema = batch.schema();
                     let mut bound = 8192usize;
                     for row in 0..batch.num_rows() { for column in 0..batch.num_columns() { bound = bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.column(column).as_ref(), row)?).ok_or_else(|| protocol("COPY row allocation overflow"))?; } }
                     let _values = node.memory().reserve(bound)?;
@@ -145,5 +145,25 @@ mod tests {
         let memory = MemoryBudget::new(1 << 20); let mut file = NamedTempFile::new().unwrap();
         file.write_all(&(-1i32).to_le_bytes()).unwrap(); file.write_all(&i32::MAX.to_le_bytes()).unwrap();
         let mut input = file.reopen().unwrap(); assert!(arrow_allocation(&mut input, false, &memory).is_err()); assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
+    fn copy_arrow_inspection_and_readers_preserve_full_decimal_scales() {
+        for scale in [i32::MIN, i32::MAX] {
+            let memory = MemoryBudget::new(1 << 24);
+            let ty = rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::Decimal { precision: 3, scale, bit_width: 128 });
+            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+            let schema = Arc::new(arrow_schema::Schema::new(vec![rtdb_columnar::to_field("value", &ty).unwrap()]));
+            let page = RecordBatch::try_new(schema.clone(), vec![rtdb_columnar::build_array(&ty, std::slice::from_ref(&value)).unwrap()]).unwrap();
+            for is_file in [false, true] {
+                let bytes = if is_file { rtdb_format::ipc::write_file(&schema, std::slice::from_ref(&page)).unwrap() } else { rtdb_format::ipc::write_stream(&schema, std::slice::from_ref(&page)).unwrap() };
+                let mut file = NamedTempFile::new().unwrap(); file.write_all(&bytes).unwrap();
+                let mut input = file.reopen().unwrap(); let bound = arrow_allocation(&mut input, is_file, &memory).unwrap();
+                let reservation = memory.reserve(bound).unwrap(); input.seek(SeekFrom::Start(0)).unwrap();
+                let page = if is_file { rtdb_format::ipc::ArrowFile::from_reader(input, None).unwrap().next().unwrap().unwrap() }
+                    else { rtdb_format::ipc::ArrowStream::from_reader(input, None).unwrap().next().unwrap().unwrap() };
+                assert_eq!(read_value(page.schema().field(0), page.column(0).as_ref(), 0).unwrap(), value);
+                drop(page); drop(reservation); assert_eq!(memory.used_bytes(), 0);
+            }
+        }
     }
 }

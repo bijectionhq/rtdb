@@ -23,12 +23,13 @@ pub(crate) fn value(form: &Edn) -> Result<Value> {
 }
 
 fn decimal(text: &str) -> Result<Value> {
-    let decimal = BigDecimal::from_str(text).map_err(|error_value| error("xtql/invalid-literal", error_value.to_string()))?;
-    let (coefficient, scale) = decimal.as_bigint_and_exponent();
+    let spelling = rtdb_types::decimal_spelling(text)?;
+    let scale = spelling.scale();
+    let decimal = BigDecimal::from_str(spelling.ascii()).map_err(|error_value| error("xtql/invalid-literal", error_value.to_string()))?;
+    let (coefficient, _) = decimal.as_bigint_and_exponent();
     let digits = coefficient.to_str_radix(10).trim_start_matches('-').len();
     let precision: u8 = if digits <= 32 { 32 } else if digits <= 64 { 64 } else { return Err(error("xtql/invalid-literal", "Decimal precision exceeds the JVM vector limit of 64")); };
     let bit_width = u16::from(precision) * 4;
-    let scale = i8::try_from(scale).map_err(|_| error("xtql/invalid-literal", "Decimal scale exceeds Arrow's signed byte representation"))?;
     let coefficient_bytes = coefficient.to_signed_bytes_be();
     let mut bytes = vec![if coefficient.sign() == Sign::Minus { 255 } else { 0 }; usize::from(bit_width / 8)];
     if coefficient_bytes.len() > bytes.len() { return Err(error("xtql/invalid-literal", "Decimal coefficient exceeds physical width")); }

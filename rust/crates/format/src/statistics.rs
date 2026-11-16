@@ -182,7 +182,7 @@ fn numeric_value(value: &Value) -> Result<f64> {
                 256 => arrow_buffer::i256::from_be_bytes(bytes.try_into().map_err(invalid)?).to_string(),
                 _ => return Err(invalid("Invalid decimal coefficient width")),
             };
-            format!("{coefficient}e{}", -i16::from(value.scale)).parse().map_err(invalid)?
+            format!("{coefficient}e{}", -i64::from(value.scale)).parse().map_err(invalid)?
         }
         _ => return Err(invalid("Metadata numeric flavour yielded a non-numeric value")),
     })
@@ -194,6 +194,13 @@ fn invalid(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn decimal_statistics_handle_full_scale_without_exponent_sized_allocation() {
+        for (scale, expected) in [(i32::MIN, f64::NEG_INFINITY), (i32::MAX, -0.0)] {
+            let value = Value::Decimal(rtdb_types::DecimalValue::new((-123i128).to_be_bytes().to_vec(), 3, scale, 128).unwrap());
+            assert_eq!(numeric_value(&value).unwrap().to_bits(), expected.to_bits());
+        }
+    }
     #[test]
     fn date_millisecond_statistics_truncate_partial_days_before_seconds_conversion() {
         for (millis, day) in [(-86_400_001, -1), (-86_400_000, -1), (-1, 0), (0, 0), (86_400_001, 1)] {
