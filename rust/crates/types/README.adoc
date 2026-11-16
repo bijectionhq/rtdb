@@ -1,5 +1,11 @@
 = Logical types and physical encodings
 
+Logical types are passive immutable values.
+`LogicalType::run_end_encoded` replaces the outer run-end width while preserving nested child encodings and nullability.
+Null and bottom types reject run-end encoding.
+`unencoded` removes encodings recursively, and type joins operate on these plain value types.
+The source regressions distinguish outer layout replacement from recursive removal; execution remains pending for Phase 2.
+
 `UriParts` validates OpenJDK 25 URI syntax and borrows the original component spelling without normalization or network access.
 It distinguishes opaque URIs, hierarchical paths, registry authorities and server authorities, including bracketed IPv6 scope identifiers.
 Decoded accessors preserve empty components and use Java UTF-8 replacement grouping for percent-escaped bytes; a plus sign remains literal.

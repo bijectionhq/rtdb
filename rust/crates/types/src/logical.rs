@@ -123,8 +123,10 @@ impl LogicalType {
         }
     }
 
+    /// Replaces the outer layout while retaining child encodings and nullability.
+    /// Null and bottom return an unsupported-run-end-type error.
     pub fn run_end_encoded(self, width: RunEndWidth) -> Result<Self> {
-        let value = self.unencoded();
+        let value = match self { Self::RunEndEncoded { value, .. } => *value, value => value };
         if matches!(value, Self::Nothing | Self::Null) {
             return Err(Anomaly::unsupported("xtdb/unsupported-run-end-type", "Null and bottom have no run-end encoding"));
         }
