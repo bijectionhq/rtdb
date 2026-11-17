@@ -681,11 +681,40 @@ Execution vectors retain native container descriptors independently of Arrow SDK
 Native union descriptors retain every child and its ordinal, including ordinals whose narrowed signed byte is negative.
 Checked SDK projection reports unrepresentable union declarations without discarding their native descriptors.
 Descriptor construction admits depth-weighted Struct-join allocations before cloning metadata, with retained-child and release regression sources.
-Logical-type failure demand, reader nullability, partial native container storage, run-reader hint identity, recursive writers/copies and production adoption remain required implementation work.
+Partial native container storage, recursive writers/copies and production adoption remain required implementation work.
 
 The private SQL grammar graph retains the pinned serialized automaton, checked owner-bound links and its rule-return edges.
 Expected-token traversal implements local epsilon results, full-context EOF results and source-ordered invocation returns without recursive native traversal.
 Its visited configurations, invocation contexts and traversal frames retain their caller-owned allocation region through destruction.
 The graph and expected-token increments have independent source review and unexecuted regression sources.
 Adaptive prediction, generated rule control, diagnostic integration, raw UTF16 literal consumers and whole-batch production parsing remain incomplete.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+
+== Metadata, reader identity and text source checkpoint
+
+Native descriptors keep logical-type failures as typed values, independently of physical field projection and concrete reader nullability.
+Scalar descriptors guarantee their logical type; container metadata propagates the first source-ordered child failure.
+Run-end type admission preserves signed integer class identity and native extension fields retain their empty metadata value.
+Independent source review covers these boundaries and all 11 new regression sources remain unexecuted.
+
+Run-end readers retain the reference's signed lookup hint across aliases and selections.
+Their lookup checks the current run, its successor and then binary search, with successful hint publication before delegated value access.
+Private snapshots recursively create fresh reader identities, share retained buffers and descriptors, and retain their own admitted metadata lease.
+Nonempty variable and list snapshots preserve terminal-offset construction demand; a failed copy leaves the original readers and cursors unchanged.
+Independent source review covers these boundaries and all 13 new regression sources remain unexecuted.
+Native partial-container publication, writer trees, copying, full object reads, transport and production reader adoption remain incomplete.
+
+`types::java_text` provides retained Java strings and borrowed views of exact UTF16 units, including isolated surrogate units and slices through a pair.
+Copies made with a memory budget retain their own lease; code-point iteration and explicit Java UTF8 byte emission preserve their separate encoding boundaries.
+Independent source review covers the carrier and all 14 regression sources remain unexecuted.
+Regex input, semantic literals, host strings, serialized trees and raw diagnostic consumers remain required implementation work.
+
+== Prediction-context source checkpoint
+
+The private parser prediction-context owner retains flat completed graph values and admitted iterative traversal storage under an invariant owner lifetime.
+It preserves Empty, null-parent and Array class distinctions, source merge identity, round-local memo membership and canonical-context identity.
+Context equality and canonicalization remain fallible allocation operations; failure seals the owner while completed nonallocating views remain available.
+Independent source review covers the pinned ANTLR algorithms and all 25 regression sources remain unexecuted.
+Ordered configurations, actual adaptive prediction, shared parser-cache ownership, generated rule schedules and production parsing remain required implementation work.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
