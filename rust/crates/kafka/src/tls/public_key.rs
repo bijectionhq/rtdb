@@ -26,7 +26,10 @@ impl<'a> Key<'a> {
         let mut input = Der(contents);
         let mut algorithm = Der(input.value(0x30)?);
         let identifier = algorithm.value(6)?;
-        let parameters = match algorithm.0 { [] | [5, 0] => &[][..], other => other };
+        let parameters = if algorithm.0.first() == Some(&5) {
+            if !algorithm.value(5)?.is_empty() || !algorithm.0.is_empty() { return Err(invalid("TLS public key has invalid NULL parameters")); }
+            &[][..]
+        } else { algorithm.0 };
         let bits = input.value(3)?;
         if !input.0.is_empty() || bits.first() != Some(&0) { return Err(invalid("TLS public key has an invalid bit-string encoding")); }
         Ok(Self { algorithm: identifier, parameters, bits })
@@ -45,7 +48,7 @@ impl<'a> Der<'a> {
         let length = self.take(1)?[0];
         let length = if length < 128 { usize::from(length) } else {
             let count = usize::from(length & 127);
-            if count == 0 || count > std::mem::size_of::<usize>() { return Err(invalid("TLS public-key encoding has an invalid length")); }
+            if count == 0 || count > 4 { return Err(invalid("TLS public-key encoding has an invalid length")); }
             self.take(count)?.iter().try_fold(0usize, |value, byte| value.checked_mul(256).and_then(|value| value.checked_add(usize::from(*byte))).ok_or_else(|| invalid("TLS public-key length exceeds allocation range")))?
         };
         self.take(length)
@@ -110,5 +113,19 @@ mod tests {
         let defaults = pss(&[0x30, 0], &[0x30, 0]);
         assert!(parsed(&absent) == parsed(&null));
         assert!(parsed(&absent) != parsed(&defaults));
+        for count in 1..=4 {
+            let mut parameters = vec![5, 0x80 | count];
+            parameters.resize(usize::from(count) + 2, 0);
+            assert!(parsed(&absent) == parsed(&pss(&[0x30, 0], &parameters)));
+        }
+    }
+
+    #[test]
+    fn java_public_key_null_parameters_reject_content_extra_values_and_invalid_lengths() {
+        for parameters in [vec![5, 1, 0], vec![5, 0, 5, 0], vec![5, 0x81, 0, 5, 0],
+            vec![5, 0x80, 0, 0], vec![5, 0x82, 0], vec![5, 0x85, 0, 0, 0, 0, 0]] {
+            let key = pss(&[0x30, 0], &parameters);
+            assert!(Key::read(Der(&key).value(0x30).unwrap()).is_err(), "{parameters:?}");
+        }
     }
 }
