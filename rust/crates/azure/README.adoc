@@ -9,7 +9,7 @@ Object keys include the configured prefix and the supplied storage-version and e
 Shared immutable publication retains conditional creation and exact retry comparisons.
 
 The passive default-credential bridge uses official Azure Identity clients for application, workload, and development credentials.
-It selects configured environment client secrets or certificates, workload federation, managed identity, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
+It selects configured environment client secrets or certificates, workload federation, managed identity, IntelliJ, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
 Credential refresh occurs inside the selected provider on each request; the bridge has no background loop.
 Credential commands run in owned process groups with a 30-second deadline, bounded output, and joined output readers.
 Command execution occupies the caller's thread until the group exits or is terminated.
@@ -30,8 +30,29 @@ Only fields included in the pinned provider's error message can supply its unava
 IMDS availability probes precede default-chain calls, including cached-token calls; explicit `ManagedIdentityCredential` selection skips the probe.
 Service Fabric requests retain normal HTTPS trust and hostname checks, matching the reachable return path in the pinned `DefaultHttpClientManagedIdentity.openConnection`.
 That method returns any `HttpURLConnection`, including its HTTPS subclass, before its thumbprint-specific branch.
-IntelliJ, Visual Studio Code, and broker/shared desktop token-cache credentials remain source-completeness work.
+The passive IntelliJ credential reads the Azure Toolkit cache from macOS Keychain, Linux libsecret, or the Windows DPAPI-protected cache file.
+Each native cache read belongs to the database's existing I/O region; shutdown joins admitted reads even after their callers cancel.
+Cache reads and token responses have a one MiB byte limit.
+The immutable authority and cache reader belong to the passive credential.
+One serialized monitor owns the last account and its access-token, refresh-token, and account-cache values.
+The cache limits each collection to 64 entries and retained credential text to eight MiB.
+Refresh uses the Azure developer single-sign-on client and the storage scope with the MSAL OpenID scopes.
+An expired session with an authenticated account tries its retained refresh token before rereading the Toolkit cache.
+Account-free responses reuse only unexpired tokens whose returned scopes include the requested storage scope.
+ID-token and client-info payloads are parsed before publishing a session, and blank refresh-token responses retain an existing cached refresh token for that account.
+Short-lived silent-refresh results trigger one forced refresh before falling back to the Toolkit cache.
+A proactive refresh rejected by the token service preserves a still-usable access token.
+The configured tenant and authority host select the token endpoint.
+AAD instance discovery validates custom authorities and selects the advertised preferred network host before token exchange.
+Authority alias metadata is retained in one process-wide cache with explicit byte and entry limits.
+Development fallback follows the pinned order: IntelliJ, Visual Studio Code, Azure CLI, PowerShell, Azure Developer CLI, then OS broker.
+The pinned distribution does not include `azure-identity-broker`; Visual Studio Code and OS broker credentials therefore report unavailable, matching their Java classpath checks.
+`IntelliJCredential` and `VisualStudioCodeCredential` are valid individual `AZURE_TOKEN_CREDENTIALS` selections.
+`SharedTokenCacheCredential` is absent from the pinned default chain and is not an accepted selector.
+Native desktop APIs and authority-specific sign-in behavior require Phase 2 qualification on each platform.
+The pinned Rust certificate credential reads `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` and includes the leaf and retained CA chain when requested.
+The deprecated environment username/password branch remains source-completeness work.
 
 Source references are `modules/azure/src/main/kotlin/xtdb/azure/BlobStorage.kt`, `azure.proto`, and the shared remote-storage contract.
-Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, failure precedence, actual HTTP credential requests, IMDS probes, Arc challenge exchange, FIFO rejection, closed-region admission, and error-envelope classification.
+Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, failure precedence, actual HTTP credential requests, IMDS probes, Arc challenge exchange, FIFO rejection, closed-region admission, desktop cache parsing, refresh-token rotation and fallback, and error-envelope classification.
 No Azure requests, credential commands, compilation, or tests have been run during Phase 1.

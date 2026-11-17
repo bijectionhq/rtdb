@@ -4,6 +4,7 @@ mod process;
 mod powershell;
 mod managed;
 mod managed_error;
+mod desktop;
 
 use std::sync::Arc;
 use std::time::Duration;

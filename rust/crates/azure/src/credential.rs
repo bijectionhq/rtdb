@@ -23,10 +23,14 @@ impl std::fmt::Debug for CredentialBridge {
 
 impl CredentialBridge {
     pub fn new(managed_identity_client_id: Option<&str>, io: Arc<rtdb_storage::IoRegion>) -> Result<Self> {
-        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "IDENTITY_HEADER", "IDENTITY_SERVER_THUMBPRINT", "IMDS_ENDPOINT", "MSI_ENDPOINT", "AZURE_POD_IDENTITY_AUTHORITY_HOST", "ProgramData"]
+        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_AUTHORITY_HOST", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "IDENTITY_HEADER", "IDENTITY_SERVER_THUMBPRINT", "IMDS_ENDPOINT", "MSI_ENDPOINT", "AZURE_POD_IDENTITY_AUTHORITY_HOST", "ProgramData"]
             .into_iter().filter_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()).map(|value| (name, value))).collect();
+        Self::from_environment(&environment, managed_identity_client_id, io)
+    }
+
+    fn from_environment(environment: &BTreeMap<&str, String>, managed_identity_client_id: Option<&str>, io: Arc<rtdb_storage::IoRegion>) -> Result<Self> {
         let selection = environment.get("AZURE_TOKEN_CREDENTIALS").map(|value| value.trim().to_ascii_lowercase()).unwrap_or_default();
-        if !matches!(selection.as_str(), "" | "prod" | "dev" | "environmentcredential" | "workloadidentitycredential" | "managedidentitycredential" | "azureclicredential" | "azurepowershellcredential" | "azuredeveloperclicredential") {
+        if !matches!(selection.as_str(), "" | "prod" | "dev" | "environmentcredential" | "workloadidentitycredential" | "managedidentitycredential" | "intellijcredential" | "visualstudiocodecredential" | "azureclicredential" | "azurepowershellcredential" | "azuredeveloperclicredential") {
             return Err(Anomaly::unsupported("xtdb.azure/credential-selector", "Selected Azure credential has no native adapter"));
         }
         let mut sources = Vec::new();
@@ -49,8 +53,14 @@ impl CredentialBridge {
         if matches!(selection.as_str(), "" | "prod" | "managedidentitycredential") {
             let managed: Arc<dyn TokenCredential> = if environment.contains_key("AZURE_TENANT_ID") && environment.contains_key("AZURE_FEDERATED_TOKEN_FILE") {
                 WorkloadIdentityCredential::new(Some(WorkloadIdentityCredentialOptions { client_id: managed_id, ..Default::default() })).map_err(invalid)?
-            } else { crate::managed::ManagedCredential::new(&environment, managed_id, io).map_err(invalid)? };
+            } else { crate::managed::ManagedCredential::new(environment, managed_id, Arc::clone(&io)).map_err(invalid)? };
             sources.push(Candidate { credential: managed, failure: FailurePolicy::ManagedUnavailable });
+        }
+        if matches!(selection.as_str(), "" | "dev" | "intellijcredential") {
+            sources.push(Candidate { credential: crate::desktop::IntelliJCredential::new(environment, io).map_err(invalid)?, failure: FailurePolicy::Continue });
+        }
+        if matches!(selection.as_str(), "" | "dev" | "visualstudiocodecredential") {
+            sources.push(Candidate { credential: Arc::new(crate::desktop::MissingBroker), failure: FailurePolicy::Continue });
         }
         let executor: Arc<dyn azure_identity::Executor> = Arc::new(crate::process::JoinedExecutor);
         if matches!(selection.as_str(), "" | "dev" | "azureclicredential") {
@@ -60,7 +70,10 @@ impl CredentialBridge {
             sources.push(Candidate { credential: crate::powershell::PowerShellCredential::new(Arc::clone(&executor), environment.get("AZURE_TENANT_ID").cloned()).map_err(invalid)?, failure: if selection != "azurepowershellcredential" { FailurePolicy::Continue } else { FailurePolicy::Stop } });
         }
         if matches!(selection.as_str(), "" | "dev" | "azuredeveloperclicredential") {
-            sources.push(Candidate { credential: AzureDeveloperCliCredential::new(Some(AzureDeveloperCliCredentialOptions { executor: Some(executor), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, failure: FailurePolicy::Stop });
+            sources.push(Candidate { credential: AzureDeveloperCliCredential::new(Some(AzureDeveloperCliCredentialOptions { executor: Some(executor), tenant_id: environment.get("AZURE_TENANT_ID").cloned(), ..Default::default() })).map_err(invalid)?, failure: if selection != "azuredeveloperclicredential" { FailurePolicy::Continue } else { FailurePolicy::Stop } });
+        }
+        if matches!(selection.as_str(), "" | "dev") {
+            sources.push(Candidate { credential: Arc::new(crate::desktop::MissingBroker), failure: FailurePolicy::Continue });
         }
         Ok(Self { sources, selected: Mutex::new(None) })
     }
@@ -143,6 +156,38 @@ mod tests {
         assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-1"));
         assert_eq!(unavailable.load(Ordering::SeqCst), 1);
         assert_eq!(available.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn desktop_selectors_use_the_reference_default_chain_without_shared_cache_selection() {
+        let io = rtdb_storage::IoRegion::new();
+        for name in [" IntelliJCredential ", "VISUALSTUDIOCODECREDENTIAL"] {
+            let environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", name.into())]);
+            let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+            assert_eq!(bridge.sources.len(), 1);
+        }
+        let environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", "dev".into())]);
+        let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+        assert_eq!(bridge.sources.len(), 6);
+        assert!(format!("{:?}", bridge.sources[0].credential).starts_with("IntelliJCredential"));
+        assert_eq!(format!("{:?}", bridge.sources[1].credential), "MissingBroker");
+        assert_eq!(format!("{:?}", bridge.sources[5].credential), "MissingBroker");
+        for name in ["SharedTokenCacheCredential", "BrokerCredential"] {
+            let environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", name.into())]);
+            assert!(CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).is_err());
+        }
+        io.close_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn broker_free_reference_credentials_allow_developer_fallback() {
+        let available = Arc::new(AtomicUsize::new(0));
+        let bridge = CredentialBridge { sources: vec![
+            Candidate { credential: Arc::new(crate::desktop::MissingBroker), failure: FailurePolicy::Continue },
+            Candidate { credential: Arc::new(Source { calls: Arc::clone(&available), available: true }), failure: FailurePolicy::Stop },
+        ], selected: Mutex::new(None) };
+        assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-0"));
+        assert_eq!(available.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
