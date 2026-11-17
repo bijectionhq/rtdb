@@ -10,6 +10,8 @@ mod pkcs12;
 mod aliases;
 mod x500;
 pub use x500::DistinguishedName;
+mod identifiers;
+pub use identifiers::CertificateIdentifiers;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }

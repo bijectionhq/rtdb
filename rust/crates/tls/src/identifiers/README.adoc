@@ -1,0 +1,28 @@
+= Certificate identifiers
+
+`CertificateIdentifiers` is a passive immutable value decoded from an already parsed X.509 certificate's encoding.
+It owns an independent memory reservation covering parsing scratch and retained identifier bytes.
+It validates certificate identifier framing, not certificate signatures, validity, other extension contents or trust.
+The shared value is intended for Java PKCS12 issuer-chain recovery and transport-owned PKIX path selection.
+
+The source contract is Eclipse Temurin 25.0.1+8 `CertificateExtensions`, `X509CertImpl.getExtensionValue`, `SubjectKeyIdentifierExtension`, `AuthorityKeyIdentifierExtension`, `KeyIdentifier`, `SerialNumber`, and the `GeneralNames` implementations in `lib/src.zip`.
+SKID access preserves the original inner extension encoding, including accepted BER forms.
+AKI access returns a canonical DER OCTET STRING only after every AKI field parses successfully.
+Serial numbers preserve arbitrary signed Java `BigInteger` values as minimal two's-complement bytes.
+Malformed noncritical AKI is absent; malformed noncritical SKID remains available through Java's last-unparseable-extension fallback.
+A successfully parsed SKID takes precedence over malformed copies regardless of input order.
+Two successfully parsed copies of either identifier fail, while an unparseable noncritical copy does not displace a parsed copy.
+Malformed critical identifier extensions fail.
+
+General-name validation follows the constructor selected by `GeneralName`, including the permissive DER DNS constructor, opaque X400 values, EDI primitive context tags, and registered `OIDMap` extension classes that fail `OtherName`'s interface cast.
+URI syntax uses the shared Java `UriParts` parser.
+Numeric IPv6 scopes are supported through the signed 32-bit scope limit, and IPv4-mapped addresses with any scope are invalid.
+Named IPv6 scopes, decimal scopes exceeding that limit, and trailing-dot URI hosts that reach Java's `InetAddress` fallback currently return `rtdb.tls/unsupported-identifier`.
+These environmental resolution cases remain explicit errors even inside noncritical AKI; they are not classified as malformed extensions.
+A passive local-interface and host-resolution adapter remains required for those cases.
+
+The ASN.1 reader follows pinned `DerValue`, `DerInputStream`, and `DerIndefLenConverter`, including opaque definite bodies and zero padding produced when scanned length headers shrink.
+Constructed OCTET STRING processing is iterative, with temporary ownership bounded by input size.
+Admission failures propagate without becoming identifier absence, and the reservation releases when decoding fails or the result drops.
+The regression sources cover signed serials, canonical versus original encodings, all general-name choices, malformed and duplicate extensions, BER forms, deep constructed octets, environmental URI errors, and allocation release.
+No identifier regression has been compiled or executed during Phase 1.
