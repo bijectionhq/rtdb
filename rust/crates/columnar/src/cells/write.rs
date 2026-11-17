@@ -7,6 +7,8 @@ mod tests;
 mod count_tests;
 #[cfg(test)]
 mod count_constructor_tests;
+#[cfg(test)]
+mod time_factory_tests;
 
 use super::*;
 use crate::MemoryBudget;
@@ -16,7 +18,7 @@ pub(crate) use owner::{ScalarReader, ScalarWriter, VectorWriter};
 pub(crate) use copy::{ScalarCopier, ScalarSource};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReferenceFailure { Unsupported(&'static str), InvalidCopySource, CheckFailed, RequireFailed, Bounds, NegativeArraySize(i32), NegativeAllocationSize(i64), CannotPromoteUnionLeg, RunEndReceiverClass, CannotSetUnionNullable }
+pub(crate) enum ReferenceFailure { Unsupported(&'static str), InvalidCopySource, CheckFailed, RequireFailed, Bounds, NegativeArraySize(i32), NegativeAllocationSize(i64), AbsentTimeUnit, CannotPromoteUnionLeg, RunEndReceiverClass, CannotSetUnionNullable }
 #[derive(Debug)]
 pub(crate) enum WriteError { Reference(ReferenceFailure), Native(Anomaly) }
 pub(crate) type WriteResult<T> = std::result::Result<T, WriteError>;

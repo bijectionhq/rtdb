@@ -1,5 +1,5 @@
 use super::*;
-use rtdb_types::{IntervalUnit, ScalarType};
+use rtdb_types::{IntervalUnit, ScalarType, TimeUnit};
 use super::super::getters::Getter;
 
 mod tree;
@@ -46,6 +46,17 @@ impl ScalarState {
         };
         let validity = (field.is_nullable() && field.data_type() != &DataType::Null).then(|| MutableBits::new(&memory));
         Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Sdk { ingress, field, logical, reservation: metadata } })
+    }
+    fn source_time_factory(name: &str, nullable: bool, unit: Option<TimeUnit>, _declared_bit_width: i32, memory: &Arc<MemoryBudget>) -> WriteResult<Self> {
+        let unit = match unit { Some(unit) => unit, None => return Err(WriteError::Reference(ReferenceFailure::AbsentTimeUnit)) };
+        let declaration = match unit {
+            TimeUnit::Second | TimeUnit::Millisecond => SourceScalarDeclaration::Time32(unit),
+            TimeUnit::Microsecond | TimeUnit::Nanosecond => SourceScalarDeclaration::Time64(unit),
+        };
+        let metadata = SourceScalarMetadata::new(name, nullable, declaration, memory)?;
+        let validity = nullable.then(|| MutableBits::new(memory));
+        let data = MutableScalarData::Fixed { width: declaration.fixed_width(), data: MutableBytes::new(memory) };
+        Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Source(metadata) })
     }
     fn source_null(name: &str, nullable: bool, initial_count: i32, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let metadata = CountScalarMetadata::new(name, nullable, CountScalarClass::Null, memory)?;
@@ -291,6 +302,9 @@ pub(crate) struct ScalarWriter {
     state: PublicationState,
 }
 impl ScalarWriter {
+    pub(crate) fn source_time_factory(name: &str, nullable: bool, unit: Option<TimeUnit>, declared_bit_width: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { scalar: ScalarState::source_time_factory(name, nullable, unit, declared_bit_width, &memory)?, state: PublicationState::Ready })
+    }
     pub(crate) fn source_null(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
         Ok(Self { scalar: ScalarState::source_null(name, nullable, initial_count, &memory)?, state: PublicationState::Ready })
     }
@@ -396,6 +410,9 @@ impl ScalarReader<'_> {
 
 pub(crate) struct VectorWriter { root: tree::WriterNode, state: PublicationState }
 impl VectorWriter {
+    pub(crate) fn source_time_factory(name: &str, nullable: bool, unit: Option<TimeUnit>, declared_bit_width: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { root: tree::WriterNode::Scalar(ScalarState::source_time_factory(name, nullable, unit, declared_bit_width, &memory)?), state: PublicationState::Ready })
+    }
     pub(crate) fn source_null(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
         Ok(Self { root: tree::WriterNode::Scalar(ScalarState::source_null(name, nullable, initial_count, &memory)?), state: PublicationState::Ready })
     }

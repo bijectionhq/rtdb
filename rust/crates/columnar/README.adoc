@@ -359,3 +359,28 @@ Caller custom rounding policies, default page/order overrides, allocator backend
 Arrow unsafe-memory-access properties and environment initialization can disable source bounds checking and require their own retained behavior or reviewed compatible migration.
 This named default profile does not admit those environments.
 Existing-inner adoption, full Field factories, raw getter/object/hash behavior, custom Java ZoneRulesProvider/rules, independent signed Slice semantics, routed writers and recursive copies, relations, physical transport and production adoption remain required increments.
+
+== Childless Time factory dispatch
+
+`ScalarWriter::source_time_factory` and `VectorWriter::source_time_factory` implement the childless factory branch for concrete stored-parameter Arrow Java 19 Time types with a nonnull native name.
+SECOND and MILLISECOND select the actual Time32 class; MICROSECOND and NANOSECOND select Time64.
+The factory ignores every signed i32 declared width and derives its field, logical metadata and physical width from that selected class.
+A SECOND input declaring width 64 therefore writes four-byte lanes, while a MICROSECOND input declaring width 32 writes eight-byte lanes.
+Direct source Time declarations retain their explicit class and unit independently of this factory normalization.
+A null unit preserves the source message-less NullPointerException producer as `ReferenceFailure::AbsentTimeUnit` before metadata or buffer admission.
+This outcome has no implicit anomaly conversion.
+Strict SDK field and logical validation continue rejecting mismatched Time unit/width pairs.
+
+Both factory entry points call the same private scalar constructor under their existing single publication gate.
+The constructor admits one complete `SourceScalarMetadata` value, followed by empty validity and data buffers with count and all cursors zero.
+Construction and empty consuming capture share that one metadata lease; the factory creates no intermediate descriptor or second metadata reservation.
+The existing parameterized descriptor origin, common write and copy kernels, nullable promotion, typed native capture, snapshots and descriptor rebuilds retain the actual selected declaration.
+Time32 long writes narrow before appending four bytes; Time64 long writes append eight bytes and its Int writer remains unsupported.
+Existing source byte readers expose pointer facts and delayed native demand, while Time getBytes stays unsupported.
+Existing checked primitive and object reader boundaries remain separate.
+
+`cells/write/time_factory_tests.rs` records ignored-width normalization, null-unit timing, exact single-header budgets, actual lane and copy behavior, direct-declaration controls, aborted prefix inspection and retained ownership.
+These tests remain unexecuted source under the Phase 1 gate.
+Full Field recursion still requires eager child construction and cleanup before parent dispatch, including unused scalar children, null entries and names, duplicate children and Java UTF16 names outside Rust String.
+Other visitor cases, extension type identity and inner adoption, changing type-getter callbacks, custom ZoneRulesProvider/rules and allocator/bounds/listener/liveness environments remain mandatory work.
+Raw Time primitive/NPE/object/metadata/hash and ByteBuffer behavior, mutable aliases, independent signed Slice semantics, routed promotion and copying, Relations, transport and production adoption remain required increments.
