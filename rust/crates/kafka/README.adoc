@@ -101,6 +101,8 @@ Avro union values follow the pinned converter's candidate matching and destinati
 JSON union matching distinguishes integral numbers and counts nested Struct-property matches.
 Schema default conversion runs after child metadata has been completed.
 Registry authentication supports explicit URL, USER_INFO, SASL_INHERIT, STATIC_TOKEN, OAUTHBEARER, and SASL_OAUTHBEARER_INHERIT sources.
+`CUSTOM` delegates to the shipped `StaticTokenCredentialProvider`, `OauthCredentialProvider` or `SaslOauthCredentialProvider` named by `bearer.auth.custom.provider.class`.
+The delegate retains its token, target-header and refresh behavior; other provider classes require a native adapter.
 OAuth refresh runs on the request caller, retains a charged token cache, and applies the reference expiry threshold and end buffer.
 Registry TLS uses the shared `rtdb-tls` codec for JKS, PKCS12, PEM trust/client identity files or inline material, and encrypted PKCS8 PEM keys.
 Protocol selection, hostname policy, and HTTP proxy settings remain client-owned.

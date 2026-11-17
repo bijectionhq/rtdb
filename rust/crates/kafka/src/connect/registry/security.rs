@@ -33,6 +33,7 @@ impl Security {
             }
             _ => return Err(error("invalid-plugin-config", "Registry basic credential source requires a native adapter")),
         } } else if let Some(source) = bearer {
+            let source = if source == "CUSTOM" { custom_bearer_source(&options)? } else { source };
             for (name, config) in [("target-sr-cluster", "bearer.auth.logical.cluster"), ("confluent-identity-pool-id", "bearer.auth.identity.pool.id")] {
                 if let Some(value) = options.get(config) { insert_header(&mut headers, name, value.trim())?; }
             }
@@ -142,6 +143,17 @@ fn refresh_time(now: i64, expiration: i64, issued_at: Option<i64>, buffer_second
     start.wrapping_add(((expiration.wrapping_sub(start) as f32) * 0.8) as i64).min(expiration.wrapping_sub(buffer))
 }
 fn now_millis() -> Result<i64> { i64::try_from(SystemTime::now().duration_since(UNIX_EPOCH).map_err(|_| error("schema-registry-auth", "Clock is before the Unix epoch"))?.as_millis()).map_err(|_| error("schema-registry-auth", "Clock exceeds millisecond range")) }
+fn custom_bearer_source(options: &BTreeMap<String, String>) -> Result<&'static str> {
+    let class = options.get("bearer.auth.custom.provider.class").map(|value| value.trim_matches(|character| character <= '\u{20}'))
+        .filter(|value| !value.is_empty()).ok_or_else(|| error("invalid-plugin-config", "bearer.auth.custom.provider.class must be nonempty"))?;
+    match class {
+        "io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider" => Ok("STATIC_TOKEN"),
+        "io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.OauthCredentialProvider" => Ok("OAUTHBEARER"),
+        "io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.SaslOauthCredentialProvider" => Ok("SASL_OAUTHBEARER_INHERIT"),
+        _ => Err(error("invalid-plugin-config", "Registry custom bearer provider class requires a native adapter")),
+    }
+}
+
 fn basic_header(value: &str) -> String { format!("Basic {}", STANDARD.encode(value)) }
 fn required_raw<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> { options.get(key).map(String::as_str).filter(|value| !value.is_empty()).ok_or_else(|| error("invalid-plugin-config", format!("{key} must be nonempty"))) }
 fn required<'a>(options: &'a BTreeMap<String, String>, key: &str) -> Result<&'a str> { nonempty(options.get(key).map(String::as_str), key) }
@@ -159,28 +171,39 @@ mod tests {
     use super::*;
     #[tokio::test]
     async fn oauth_refresh_runs_on_the_request_and_cached_tokens_retain_their_charge() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
-        let token = format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::json!({"sub":"subject","exp":now_millis().unwrap()/1000+3600}).to_string()));
-        let body = serde_json::json!({"access_token":token}).to_string();
-        let server = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap(); let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") { let mut byte = [0]; socket.read_exact(&mut byte).await.unwrap(); request.push(byte[0]); assert!(request.len() < 8192); }
-            let request = String::from_utf8(request).unwrap();
-            let length = request.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap())).unwrap();
-            let mut form = vec![0; length]; socket.read_exact(&mut form).await.unwrap();
-            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
-            (request, String::from_utf8(form).unwrap())
-        });
-        let config = BTreeMap::from([("bearer.auth.credentials.source".into(), "OAUTHBEARER".into()), ("bearer.auth.client.id".into(), "client".into()), ("bearer.auth.client.secret".into(), "secret".into()), ("bearer.auth.issuer.endpoint.url".into(), format!("http://{address}/token")), ("bearer.auth.scope".into(), "read write".into()), ("bearer.auth.logical.cluster".into(), "registry".into())]);
-        let memory = rtdb_columnar::MemoryBudget::new(1 << 27); let mut context = ConversionContext::new(Arc::clone(&memory));
-        let mut security = Security::open(&config).unwrap(); let url = Url::parse("http://registry.invalid").unwrap();
-        let first = security.headers(&url, &mut context).await.unwrap();
-        let (request, form) = server.await.unwrap(); assert!(request.starts_with("POST /token ")); assert!(request.to_ascii_lowercase().contains("authorization: basic y2xpzw50onnly3jlda==")); assert_eq!(form, "grant_type=client_credentials&scope=read+write");
-        drop(context); assert!(memory.used_bytes() > 0);
-        let mut context = ConversionContext::new(Arc::clone(&memory));
-        assert_eq!(security.headers(&url, &mut context).await.unwrap(), first); assert_eq!(first["target-sr-cluster"], "registry");
-        drop(context); drop(security); assert_eq!(memory.used_bytes(), 0);
+        for (source, provider) in [
+            ("OAUTHBEARER", None),
+            ("CUSTOM", Some("io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.OauthCredentialProvider")),
+            ("SASL_OAUTHBEARER_INHERIT", None),
+            ("CUSTOM", Some("io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.SaslOauthCredentialProvider")),
+        ] {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap(); let address = listener.local_addr().unwrap();
+            let token = format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(serde_json::json!({"sub":"subject","exp":now_millis().unwrap()/1000+3600}).to_string()));
+            let body = serde_json::json!({"access_token":token}).to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap(); let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") { let mut byte = [0]; socket.read_exact(&mut byte).await.unwrap(); request.push(byte[0]); assert!(request.len() < 8192); }
+                let request = String::from_utf8(request).unwrap();
+                let length = request.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").map(|value| value.trim().parse::<usize>().unwrap())).unwrap();
+                let mut form = vec![0; length]; socket.read_exact(&mut form).await.unwrap();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                (request, String::from_utf8(form).unwrap())
+            });
+            let mut config = BTreeMap::from([("bearer.auth.credentials.source".into(), source.into()), ("bearer.auth.client.id".into(), "client".into()), ("bearer.auth.client.secret".into(), "secret".into()), ("bearer.auth.issuer.endpoint.url".into(), format!("http://{address}/token")), ("bearer.auth.scope".into(), "read write".into()), ("bearer.auth.logical.cluster".into(), "registry".into())]);
+            if let Some(provider) = provider { config.insert("bearer.auth.custom.provider.class".into(), provider.into()); }
+            config.insert("sasl.jaas.config".into(), "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule required clientId=client clientSecret=secret extension_identityPoolId=pool;".into());
+            let memory = rtdb_columnar::MemoryBudget::new(1 << 27); let mut context = ConversionContext::new(Arc::clone(&memory));
+            let mut security = Security::open(&config).unwrap(); let url = Url::parse("http://registry.invalid").unwrap();
+            let first = security.headers(&url, &mut context).await.unwrap();
+            let (request, form) = server.await.unwrap(); assert!(request.starts_with("POST /token ")); assert!(request.to_ascii_lowercase().contains("authorization: basic y2xpzw50onnly3jlda==")); assert_eq!(form, "grant_type=client_credentials&scope=read+write");
+            drop(context); assert!(memory.used_bytes() > 0);
+            let mut context = ConversionContext::new(Arc::clone(&memory));
+            assert_eq!(security.headers(&url, &mut context).await.unwrap(), first); assert_eq!(first["target-sr-cluster"], "registry");
+            let inherited = source == "SASL_OAUTHBEARER_INHERIT" || provider.is_some_and(|provider| provider.ends_with(".SaslOauthCredentialProvider"));
+            assert_eq!(first.get("confluent-identity-pool-id").map(|value| value.to_str().unwrap()), inherited.then_some("pool"));
+            drop(context); drop(security); assert_eq!(memory.used_bytes(), 0);
+        }
     }
     #[test]
     fn registry_basic_auth_sources_are_explicit_and_mutually_exclusive() {
@@ -201,5 +224,54 @@ mod tests {
         let token = |claims: Json| format!("e30.{}.signature", URL_SAFE_NO_PAD.encode(claims.to_string()));
         assert_eq!(token_lifetime(&token(serde_json::json!({"sub":"subject","exp":100})), "scope", "sub").unwrap(), (100_000, None));
         assert!(token_lifetime(&token(serde_json::json!({"sub":"subject","exp":100,"scope":["a"," a "]})), "scope", "sub").is_err());
+    }
+}
+
+#[cfg(test)]
+mod custom_bearer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn custom_static_provider_preserves_token_bytes_and_target_headers() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        for prefix in ["", "schema.registry."] {
+            let options = [
+                ("bearer.auth.credentials.source", "CUSTOM"),
+                ("bearer.auth.custom.provider.class", " io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider "),
+                ("bearer.auth.token", " token "),
+                ("bearer.auth.logical.cluster", " cluster "),
+                ("bearer.auth.identity.pool.id", " pool "),
+            ].into_iter().map(|(key, value)| (format!("{prefix}{key}"), value.into())).collect();
+            let mut security = Security::open(&options).unwrap();
+            let mut context = ConversionContext::new(Arc::clone(&memory));
+            let headers = security.headers(&Url::parse("https://registry.invalid/").unwrap(), &mut context).await.unwrap();
+            assert_eq!(headers["authorization"], "Bearer  token ");
+            assert_eq!(headers["target-sr-cluster"], "cluster");
+            assert_eq!(headers["confluent-identity-pool-id"], "pool");
+            drop(headers); drop(context); drop(security);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn custom_provider_requires_a_known_class_and_the_delegates_configuration() {
+        let mut options = BTreeMap::from([("bearer.auth.credentials.source".into(), "CUSTOM".into())]);
+        assert!(Security::open(&options).is_err());
+        for class in ["", " ", "custom.Provider", "io.confluent.kafka.schemaregistry.client.security.bearerauth.CustomBearerAuthCredentialProvider",
+            "\u{a0}io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider"] {
+            options.insert("bearer.auth.custom.provider.class".into(), class.into());
+            assert!(Security::open(&options).is_err());
+        }
+        for class in ["io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider",
+            "io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.OauthCredentialProvider",
+            "io.confluent.kafka.schemaregistry.client.security.bearerauth.oauth.SaslOauthCredentialProvider"] {
+            options.insert("bearer.auth.custom.provider.class".into(), class.into());
+            assert!(Security::open(&options).is_err());
+        }
+        options.insert("bearer.auth.custom.provider.class".into(), "io.confluent.kafka.schemaregistry.client.security.bearerauth.StaticTokenCredentialProvider".into());
+        options.insert("bearer.auth.token".into(), "token".into());
+        assert!(Security::open(&options).is_ok());
+        options.insert("basic.auth.credentials.source".into(), "URL".into());
+        assert!(Security::open(&options).is_err());
     }
 }
