@@ -1,0 +1,37 @@
+= NetworkClient least-loaded node selection
+
+The selector borrows the retained shuffled `Cluster.nodes()` list and reads the serialized network owner's live observations.
+The returned borrow identifies the original node, including its address, and can be used by the network owner to acquire a request slot or start a connection.
+The selector itself only reads the network state and consumes an offset observation.
+
+`NetworkClient.leastLoadedNode` makes one bounded `Random.nextInt` call for a nonempty list and scans from that offset in Java integer order.
+It returns immediately for a sendable node with zero in-flight requests.
+Otherwise the first sendable minimum wins, followed by the last preparing node, then the first connectable node whose last attempt is oldest.
+`ClusterConnectionStates.lastConnectAttemptMs` reports zero for a node it has never seen.
+The connecting class includes a connection awaiting its API versions.
+
+The independent ready flag follows the connection's READY state, throttle deadline and active channel readiness.
+A request also needs capacity and a completed last send when the queue is nonempty.
+The Java scan makes separate short-circuit reads for the ready flag and the send check until the ready flag becomes true.
+A saturated ready connection can prevent rebootstrap even when there is no selected destination.
+An empty list consults the source bootstrap configuration and current updater status without drawing an offset.
+
+The borrow-only implementation has no retained allocation or timer.
+The network owner supplies observations from the same connection inventory during the call.
+An unavailable or invalid observation ends selection with a native failure at its demand point.
+The signed Java list length and wraparound index are checked before accessing a native slice.
+Transport targeting, native connection observations, production cluster-list ownership and request scheduling remain separate prerequisites for activation.
+
+== Source profile
+
+`sources.sha256` pins the consulted Kafka 4.4.0 source archive members.
+The Kafka clients source archive SHA256 is `5782400b3bf0ee4b92d45478b075194e9539bad9cbec9ed2caba992b4deee0c4`.
+Read `NetworkClient.java` lines 439–441, 595–598 and 835–915 for state checks, ranking and empty-list behavior, plus lines 1450–1483 for the rebootstrap decision.
+`ClusterConnectionStates.java` lines 77–84, 135–139, 286–292 and 426–429 supply the connection observations.
+`InFlightRequests.java` lines 96–110 supplies queue observations, and `Selector.java` lines 980–983 supplies active channel readiness.
+`LeastLoadedNode.java` lines 20–43 defines the independent availability verdict.
+`COPYRIGHT` retains the complete source notices and the sibling producer metadata state directory retains the identical Apache license and notice.
+
+The standalone fixture imports the same selector source.
+Its cases cover rotated call order, early return, tie priorities, readiness without a send slot, bootstrap emptiness and invalid observation boundaries.
+Source regressions remain unexecuted under the Phase 1 work order.
