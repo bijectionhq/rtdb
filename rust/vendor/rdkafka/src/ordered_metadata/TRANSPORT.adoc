@@ -85,7 +85,8 @@ Copying a response retains both the source frame and completion capacity until t
 Validation does not allocate an output collection or grow a buffer.
 The caller owns the topic-input array, any application result, and runtime timer/task allocation used by wait.
 
-This account does not bound native client construction, bootstrap/discovered broker growth, broker threads or stacks, automatic Metadata decode/caches, ApiVersions state, TLS/SASL, ordinary outbound requests, allocator overhead or the account monitor itself.
+The attached account also tracks the broker's decoded and fallback ApiVersions array payloads through replacement or final teardown.
+Native client construction, bootstrap/discovered broker growth, broker threads and stacks, automatic Metadata decode/caches, ApiVersions request and sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
 A whole-producer bound still requires a separately pre-admitted construction/background domain or admission interception for every reachable owner in that domain.
 Neither the completion cap nor borrowed validation establishes that bound.
 Java snapshot retention and partial/full merge, UUID/leader-epoch state, HashMap encounter order, metadata refresh/throttle scheduling, per-topic signed RoundRobin counters and once-per-send explicit partition binding remain separate integration work.

@@ -89,10 +89,15 @@ int rd_kafka_get_legacy_ApiVersions(const char *broker_version,
                                     size_t *api_cntp,
                                     const char *fallback);
 int rd_kafka_ApiVersion_is_queryable(const char *broker_version);
-void rd_kafka_ApiVersions_copy(const struct rd_kafka_ApiVersion *src,
-                               size_t src_cnt,
-                               struct rd_kafka_ApiVersion **dstp,
-                               size_t *dst_cntp);
+struct rd_kafka_ApiVersion *rd_kafka_ApiVersions_alloc(rd_kafka_t *rk,
+                                                      size_t count);
+/* Release the array with the same client and count used to allocate it. */
+void rd_kafka_ApiVersions_destroy(rd_kafka_t *rk,
+                                  struct rd_kafka_ApiVersion *apis,
+                                  size_t count);
+rd_kafka_resp_err_t rd_kafka_ApiVersions_copy(
+    rd_kafka_t *rk, const struct rd_kafka_ApiVersion *src, size_t count,
+    struct rd_kafka_ApiVersion **dstp);
 int rd_kafka_features_check(rd_kafka_broker_t *rkb,
                             struct rd_kafka_ApiVersion *broker_apis,
                             size_t broker_api_cnt);

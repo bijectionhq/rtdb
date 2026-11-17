@@ -12,8 +12,12 @@ Completed ordered Metadata requests also retain it, including when they outlive 
 The final account release drains native owners before releasing its Rust capacity guard.
 
 The selected ceiling covers native receive-frame storage and the implemented accounted request, completion and queue-owner classes.
+It also admits decoded ApiVersions range arrays and stored legacy fallback copies before allocation for attached producers.
+The old and candidate arrays keep separate charges until the broker installs the replacement and frees the old array.
+Parser failure and downgrade discard their ranges through the same release path, and the broker releases its final stored ranges during teardown.
+Admission denial leaves an existing array intact and ends the current connection setup with the native resource error.
 It does not establish a complete producer allocation bound.
-Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
+Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions request and sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 

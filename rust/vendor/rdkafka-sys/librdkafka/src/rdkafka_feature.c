@@ -415,16 +415,48 @@ int rd_kafka_features_check(rd_kafka_broker_t *rkb,
 
 
 
-/**
- * @brief Make an allocated and sorted copy of \p src.
- */
-void rd_kafka_ApiVersions_copy(const struct rd_kafka_ApiVersion *src,
-                               size_t src_cnt,
-                               struct rd_kafka_ApiVersion **dstp,
-                               size_t *dst_cntp) {
-        *dstp     = rd_memdup(src, sizeof(*src) * src_cnt);
-        *dst_cntp = src_cnt;
-        qsort(*dstp, *dst_cntp, sizeof(**dstp), rd_kafka_ApiVersion_key_cmp);
+static size_t rd_kafka_ApiVersions_accounted_size(size_t count) {
+        return count ? count * sizeof(struct rd_kafka_ApiVersion) : 1;
+}
+
+struct rd_kafka_ApiVersion *rd_kafka_ApiVersions_alloc(rd_kafka_t *rk,
+                                                      size_t count) {
+        struct rd_kafka_ApiVersion *apis;
+        size_t bytes;
+        if (count > SIZE_MAX / sizeof(*apis))
+                return NULL;
+        if (!rk->rk_byte_account)
+                return rd_malloc(count * sizeof(*apis));
+        bytes = rd_kafka_ApiVersions_accounted_size(count);
+        if (!rd_kafka_byte_account_acquire(rk->rk_byte_account, bytes))
+                return NULL;
+        apis = malloc(bytes);
+        if (!apis)
+                rd_kafka_byte_account_release(rk->rk_byte_account, bytes);
+        return apis;
+}
+
+void rd_kafka_ApiVersions_destroy(rd_kafka_t *rk,
+                                  struct rd_kafka_ApiVersion *apis,
+                                  size_t count) {
+        if (!apis)
+                return;
+        rd_free(apis);
+        if (rk->rk_byte_account)
+                rd_kafka_byte_account_release(
+                    rk->rk_byte_account, rd_kafka_ApiVersions_accounted_size(count));
+}
+
+rd_kafka_resp_err_t rd_kafka_ApiVersions_copy(
+    rd_kafka_t *rk, const struct rd_kafka_ApiVersion *src, size_t count,
+    struct rd_kafka_ApiVersion **dstp) {
+        *dstp = rd_kafka_ApiVersions_alloc(rk, count);
+        if (!*dstp)
+                return RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+        if (count)
+                memcpy(*dstp, src, count * sizeof(*src));
+        qsort(*dstp, count, sizeof(**dstp), rd_kafka_ApiVersion_key_cmp);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 

@@ -2580,45 +2580,42 @@ static void rd_kafka_broker_connect_auth(rd_kafka_broker_t *rkb) {
 /**
  * @brief Specify API versions to use for this connection.
  *
- * @param apis is an allocated list of supported partitions.
- *        If NULL the default set will be used based on the
- *        \p broker.version.fallback property.
- * @param api_cnt number of elements in \p apis
+ * @param apis is a non-NULL ApiVersions allocation for this broker's client.
+ * @param api_cnt is the element count used to allocate \p apis.
  *
  * @remark \p rkb takes ownership of \p apis.
  *
  * @locality Broker thread
  * @locks_required rkb
  */
-static void rd_kafka_broker_set_api_versions(rd_kafka_broker_t *rkb,
-                                             struct rd_kafka_ApiVersion *apis,
-                                             size_t api_cnt) {
-
-        if (rkb->rkb_ApiVersions)
-                rd_free(rkb->rkb_ApiVersions);
-
-
-        if (!apis) {
-                rd_rkb_dbg(
-                    rkb, PROTOCOL | RD_KAFKA_DBG_BROKER, "APIVERSION",
-                    "Using (configuration fallback) %s protocol features",
-                    rkb->rkb_rk->rk_conf.broker_version_fallback);
-
-
-                rd_kafka_get_legacy_ApiVersions(
-                    rkb->rkb_rk->rk_conf.broker_version_fallback, &apis,
-                    &api_cnt, rkb->rkb_rk->rk_conf.broker_version_fallback);
-
-                /* Make a copy to store on broker. */
-                rd_kafka_ApiVersions_copy(apis, api_cnt, &apis, &api_cnt);
-        }
-
+static void rd_kafka_broker_set_api_versions(
+    rd_kafka_broker_t *rkb, struct rd_kafka_ApiVersion *apis, size_t api_cnt) {
+        rd_kafka_ApiVersions_destroy(rkb->rkb_rk, rkb->rkb_ApiVersions,
+                                     rkb->rkb_ApiVersions_cnt);
         rkb->rkb_ApiVersions     = apis;
         rkb->rkb_ApiVersions_cnt = api_cnt;
 
-        /* Update feature set based on supported broker APIs. */
         rd_kafka_broker_features_set(
             rkb, rd_kafka_features_check(rkb, apis, api_cnt));
+}
+
+static rd_kafka_resp_err_t
+rd_kafka_broker_set_fallback_api_versions(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
+        const char *version = rk->rk_conf.broker_version_fallback;
+        struct rd_kafka_ApiVersion *defaults, *apis;
+        size_t count;
+        rd_kafka_resp_err_t err;
+
+        rd_rkb_dbg(rkb, PROTOCOL | RD_KAFKA_DBG_BROKER, "APIVERSION",
+                   "Using (configuration fallback) %s protocol features",
+                   version);
+        rd_kafka_get_legacy_ApiVersions(version, &defaults, &count, version);
+        err = rd_kafka_ApiVersions_copy(rk, defaults, count, &apis);
+        if (err)
+                return err;
+        rd_kafka_broker_set_api_versions(rkb, apis, count);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
 
@@ -2675,8 +2672,8 @@ static void rd_kafka_broker_handle_ApiVersion(rd_kafka_t *rk,
                 retry_ApiVersion = 0;
         }
 
-        if (err && apis)
-                rd_free(apis);
+        if (err)
+                rd_kafka_ApiVersions_destroy(rk, apis, api_cnt);
 
         if (retry_ApiVersion != -1) {
                 /* Retry request with a lower version */
@@ -2695,7 +2692,12 @@ static void rd_kafka_broker_handle_ApiVersion(rd_kafka_t *rk,
 
 
         if (err) {
-                if (rkb->rkb_transport)
+                if (!rkb->rkb_transport)
+                        return;
+                if (err == RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE)
+                        rd_kafka_broker_fail(rkb, LOG_WARNING, err,
+                                             "ApiVersions storage admission failed");
+                else
                         rd_kafka_broker_fail(
                             rkb, LOG_WARNING, RD_KAFKA_RESP_ERR__TRANSPORT,
                             "ApiVersionRequest failed: %s: "
@@ -2749,13 +2751,20 @@ void rd_kafka_broker_connect_done(rd_kafka_broker_t *rkb, const char *errstr) {
         }
 
         if (!(rkb->rkb_features & RD_KAFKA_FEATURE_APIVERSION)) {
+                rd_kafka_resp_err_t err;
                 /* Use configured broker.version.fallback to
                  * figure out API versions.
                  * In case broker.version.fallback indicates a version
                  * that supports ApiVersionRequest it will update
                  * rkb_features to have FEATURE_APIVERSION set which will
                  * trigger an ApiVersionRequest below. */
-                rd_kafka_broker_set_api_versions(rkb, NULL, 0);
+                err = rd_kafka_broker_set_fallback_api_versions(rkb);
+                if (err) {
+                        rd_kafka_broker_unlock(rkb);
+                        rd_kafka_broker_fail(rkb, LOG_WARNING, err,
+                                             "ApiVersions fallback storage admission failed");
+                        return;
+                }
         }
 
         if (rkb->rkb_features & RD_KAFKA_FEATURE_APIVERSION) {
@@ -4863,8 +4872,8 @@ void rd_kafka_broker_destroy_final(rd_kafka_broker_t *rkb) {
         if (rkb->rkb_rsal)
                 rd_sockaddr_list_destroy(rkb->rkb_rsal);
 
-        if (rkb->rkb_ApiVersions)
-                rd_free(rkb->rkb_ApiVersions);
+        rd_kafka_ApiVersions_destroy(rkb->rkb_rk, rkb->rkb_ApiVersions,
+                                     rkb->rkb_ApiVersions_cnt);
         rd_free(rkb->rkb_origname);
 
         rd_kafka_q_purge(rkb->rkb_ops);
@@ -6280,6 +6289,7 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 #include "rdkafka_byte_account_test.h"
 #include "rdkafka_ordered_metadata.h"
 #include "rdkafka_ordered_metadata_test.h"
+#include "rdkafka_api_versions_account_test.h"
 
 /**
  * @name Unit tests

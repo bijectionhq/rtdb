@@ -3148,10 +3148,17 @@ rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
                  * code is ERR_UNSUPPORTED_VERSION, previous versions don't */
                 goto err;
         }
+        if (ApiArrayCnt < 0)
+                rd_kafka_buf_parse_fail(rkbuf, "ApiVersions array is absent");
 
         rd_rkb_dbg(rkb, FEATURE, "APIVERSION", "Broker API support:");
 
-        *apis = rd_malloc(sizeof(**apis) * ApiArrayCnt);
+        *apis = rd_kafka_ApiVersions_alloc(rk, (size_t)ApiArrayCnt);
+        if (!*apis) {
+                err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                goto err;
+        }
+        *api_cnt = (size_t)ApiArrayCnt;
 
         for (i = 0; i < ApiArrayCnt; i++) {
                 struct rd_kafka_ApiVersion *api = &(*apis)[i];
@@ -3175,7 +3182,6 @@ rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
         /* Discard end tags */
         rd_kafka_buf_skip_tags(rkbuf);
 
-        *api_cnt = ApiArrayCnt;
         qsort(*apis, *api_cnt, sizeof(**apis), rd_kafka_ApiVersion_key_cmp);
 
         goto done;
@@ -3191,8 +3197,7 @@ err_parse:
 err:
         /* There are no retryable errors. */
 
-        if (*apis)
-                rd_free(*apis);
+        rd_kafka_ApiVersions_destroy(rk, *apis, *api_cnt);
 
         *apis    = NULL;
         *api_cnt = 0;
