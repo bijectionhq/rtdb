@@ -231,3 +231,5 @@ fn sun_pkcs12_initial_transient_and_retained_material_have_separate_admission() 
     let loaded = load(&bytes, Some("key"), &memory).unwrap(); assert!(memory.used_bytes() > bound);
     assert!(memory.used_bytes() < bound + 192 * bytes.len()); drop(loaded); assert_eq!(memory.used_bytes(), 0);
 }
+
+mod ordering;

@@ -1,8 +1,9 @@
 = Java private-key factory admission
 
-`PrivateKey::decode` checks recovered PKCS8 through the pinned Java 25 default private-key factory rules before a SunX509 PKCS12 entry can be filtered for an empty certificate chain.
-The caller owns decryption, the recovered-key algorithm preparse, and empty-password retry.
-The preparse accepts one or two AlgorithmIdentifier fields, so this module retains that restriction when reading the identifier even though the DH factory alone ignores later identifier fields.
+`FactoryInput::pkcs12` prepares recovered PKCS8 for the pinned Java 25 default private-key factory before a SunX509 PKCS12 entry can be filtered for an empty certificate chain.
+The caller owns decryption and empty-password retry and prepares the input before factory admission.
+The OID-only preparse accepts one or two AlgorithmIdentifier fields; it does not initialize their parameters or inspect private material.
+`PrivateKey::from_pkcs12` admits provider generation from that prepared input, with no raw-key fallback.
 Generic `KeyStore`, deferred NewSunX509 recovery, and SunX509 JKS recovery have separate entrypoints.
 This decoder never imports a key into OpenSSL and never compares it with a certificate.
 
@@ -15,6 +16,7 @@ Copies made by a transport require separate admission.
 == Default provider behavior
 
 The provider and helper sources are pinned in link:sources.sha256[the source manifest] from Eclipse Temurin OpenJDK `25.0.1+8` for Linux x64.
+link:COPYRIGHT[The retained notices] include the complete upstream pre-package prefix for each of the 59 pinned source files.
 The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`, and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
 The built-in SUN, SunRsaSign, SunEC, and SunJCE registrations determine algorithm dispatch and parameter services.
 Installed providers, configured PKCS11 providers, and Java system-property overrides remain outside this source-owned decoder.
@@ -180,7 +182,7 @@ Only a pending SpecifiedSHA2 child catch can consume `JavaIo`; every `Propagate`
 == Factory failure boundaries
 
 The private typed factory attempt returns encoded bytes or a passive `FactoryFailure` value: `NoSuchAlgorithm`, `InvalidKeySpec`, or `Fatal`, each retaining its original anomaly.
-The strict `PrivateKey::decode` entrypoint returns every failure with that original diagnostic and does not apply raw-key fallback.
+Strict prepared PKCS12 recovery returns every failure with its diagnostic and does not apply raw-key fallback.
 Missing default factories produce `NoSuchAlgorithm`, while the registered HSS/LMS factory's private-key rejection produces `InvalidKeySpec`.
 Provider PKCS8 framing, parameter requirements, material checks, and Java IO failures produce `InvalidKeySpec` through their checked factory exception paths.
 The provider-specific parameter validator maps its service evaluator's `JavaIo` to `InvalidKeySpec` and `Propagate` to `Fatal` with an exhaustive match.
@@ -205,6 +207,36 @@ For an admitted input of at most Java's signed array length, normalization retai
 The adapter cannot convert an admitted native size overflow into a key-specification rejection.
 No general anomaly conversion or message-based classification is used.
 
+== Strict PKCS12 preparation and generation
+
+`FactoryInput` is a passive call-local request containing borrowed encoded bytes and their complete selected `FactoryTarget`.
+The available target contains the selected `Family`; generation consumes that target without another lookup.
+Strict preparation borrows original plaintext, while JKS supplies its admitted normalized raw encoding.
+The prepared request owns no decoder state, password or independently allocated byte buffer.
+
+The PKCS12 preparse follows `PKCS12KeyStore.internalGetKey`: one complete BER-enabled outer value, SEQUENCE or SET, then a signed 32-bit INTEGER whose numeric value is ignored, then an AlgorithmIdentifier SEQUENCE.
+It frames every direct child before checking cardinality one or two and interpreting the first child's OID.
+The optional second child remains opaque, including nonempty NULL content and malformed inner bytes inside a complete definite constructed value.
+Only the OID selects the default factory.
+PBES2, OAEP and SpecifiedSHA2 parameters are not initialized here, and SpecifiedSHA2 does not acquire a digest-derived suffix.
+The preparse does not read remaining outer fields.
+
+Missing factories fail lookup, and HSS/LMS rejects private generation, before provider PKCS8 version, parameters or material are interpreted.
+An available provider receives the original plaintext and checks outer SEQUENCE and its numeric version before full AlgorithmIdentifier parsing and initialization.
+DH therefore retains original BER lengths, integer padding and its original identifier; original version-zero attributes still fail DH's complete outer consumption.
+A SET with an unknown OID reports the missing factory, while a SET selecting RSA reaches that provider's format rejection.
+
+`PreparationFailure` distinguishes shared DER diagnostics, invalid shape/integer values and unchecked magnitude failures.
+The production preparse maps those at its SunPKCS12 boundary; test-only strict conveniences retain the existing private-factory diagnostic and checked/unchecked categories.
+No anomaly-message matching or broad fallback catch is used.
+`PrivateKey::decode` and the unadmitted decode/attempt conveniences are test-only and preserve their existing reserve-before-preparation admission order.
+
+Production preparation completes under the caller's existing recovery scratch before the separate `384 * original_bytes + 65,536` factory reservation.
+Every preparation view and BER conversion owner drops before that factory lease is created; the resulting request borrows the still-live plaintext.
+Generation returns after its parameter, DER and fragment temporaries drop, then the output lease shrinks to encoded capacity and owner overhead.
+The existing plaintext/retry and recovery scratch lifetimes are unchanged.
+link:pkcs12/README.adoc[The strict ordering source mapping] records the exact pinned methods and fixture derivation.
+
 == JKS raw-first recovery
 
 `PrivateKey::parse_jks` implements the separate `PKCS8Key.parseKey` path used after SunX509 JKS protection recovery.
@@ -216,8 +248,8 @@ Missing EC/DH parameters therefore pass raw initialization and can fall back aft
 Named-family non-NULL parameters remain a provider requirement and can select fallback after valid raw construction.
 
 The raw owner holds zeroizing normalized bytes, its complete default factory target, and its admission lease.
-The target is `Available`, `NoSuchAlgorithm`, or the known HSS/LMS `InvalidKeySpec` rejection.
-Available targets have ordinary OID-backed names accepted by the existing family lookup; the typed attempt selects the same immutable default family from the normalized encoding.
+The target is `Available(Family)`, `NoSuchAlgorithm`, or the known HSS/LMS `InvalidKeySpec` rejection.
+Available targets retain the complete selected default family from their initialized name and carry it beside normalized bytes into the same generation operation used by strict recovery.
 Initialized PBES2 names and SpecifiedSHA2 derived or fallback names have no default private-key factory and retain the raw key.
 The existing iterative evaluator supplies those name observations; raw construction does not use the family-specific provider requirement validator.
 Stored SpecifiedSHA2 parameter bytes remain in raw output.
@@ -293,3 +325,6 @@ Typed parameter regressions cover signed padding, signed 32-bit limits, the allo
 SpecifiedSHA2 regressions cover all five known signature OIDs, unmapped and PBES2 names, absent and NULL parameters, caught malformed children, fatal outer identifiers, nested catch boundaries, propagated failures, fixed-service descendants, MGF rejection, duplicate hashes, BER retention, context tails, deep mixed nesting, and reservation cleanup.
 Typed factory regressions cover missing versus rejecting factories, strict parse ordering, provider material and parameter rejection, fatal non-CRT PSS encoding, signed and unsigned integer classes, parameter-failure propagation, and allocation-free BIT STRING backing boundaries.
 JKS regressions cover raw normalization, unknown and HSS fallback, absent versus malformed registered parameters, top-level derived names, checked material rejection, successful RSA/EC re-encoding, DH input distinctions, fatal PSS encoding, deep initialization, separate raw/factory admission, repeated-alias validation, entry sharing, empty-chain ordering, and once-only retained charges.
+
+Strict PKCS12 regressions cover all 27 source-derived fixture bytes, child-framing/cardinality before OID interpretation, signed integer boundaries, OID-only missing/HSS selection, original DH encoding, separate preparation/admission order, eager empty-chain errors and last-attempt retry diagnostics.
+A paired known-PSS input with truncated nested parameter framing distinguishes version-zero initialization failure from version-two rejection before initialization through their existing native diagnostics.

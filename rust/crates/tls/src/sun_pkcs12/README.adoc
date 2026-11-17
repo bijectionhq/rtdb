@@ -42,7 +42,11 @@ With one, the first exact encoded identifier match wins; otherwise the last issu
 Different subject identifiers and different issuer names cannot provide that fallback.
 
 SunX509 recovers each final key entry before filtering secret keys and private entries without chains.
-Private recovery includes the Java signed-version and AlgorithmIdentifier preparse followed by link:../private_factory/README.adoc[private-factory admission].
+Private recovery prepares one complete SEQUENCE or SET with a signed 32-bit INTEGER, frames all AlgorithmIdentifier children, checks one-or-two-field cardinality, and selects the factory from the first OID alone.
+The integer value is ignored at this preparse stage; inner parameters and private material remain unread.
+Missing factories and HSS/LMS private rejection therefore precede provider PKCS8 version, parameter and material checks.
+The prepared passive input borrows original plaintext and carries its selected factory into link:../private_factory/README.adoc[private-factory admission] without another lookup.
+Preparation precedes that factory reservation under the existing recovery scratch; a successful DH factory retains original plaintext bytes.
 There is no generic-key fallback on this PKCS12 path.
 Secret recovery accepts any signed 32-bit version, one or two algorithm-identifier fields, and nonempty primitive key octets.
 It ignores the inner algorithm parameters and trailing inner fields as Java does.

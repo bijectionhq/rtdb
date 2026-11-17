@@ -62,7 +62,8 @@ Source regressions cover raw alias translation, duplicate and enumeration behavi
 `SunX509Pkcs12Store` is the separate passive immutable owner for eager SunX509 PKCS12 credentials.
 It loads provider aliases and issuer chains, then recovers each final private or secret entry before filtering secrets and empty private-key chains.
 Its single-writer construction transient retains all private bags for load-time chain assembly and shares source certificate owners.
-Private recovery calls the pinned Java private-factory admission layer; unknown factories fail without a generic-key fallback.
+Private recovery selects the pinned Java factory from an OID-only preparse before provider version, parameter and private-material checks.
+The prepared input carries its selected family and original bytes into provider generation; unknown factories fail without a generic-key fallback, and successful DH generation retains original encoding.
 Secret-key recovery preserves registered PBE factory rules and permits Java's nonempty opaque non-PBE SecretKeySpec values before discarding them.
 The Sun-only protection services implement the pinned PBE/MAC password, parameter and retry rules without changing generic or deferred recovery.
 Loading uses the JKS-compatible initial bound plus a separately admitted construction transient, section/recovery scratch, chain expansion and retained key owners.

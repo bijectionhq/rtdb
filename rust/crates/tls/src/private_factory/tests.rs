@@ -329,3 +329,5 @@ fn provider_decode_admits_before_parsing_and_releases_failed_and_retained_alloca
 }
 
 fn key_bytes_with_wrong_length() -> Vec<u8> { named(&[0x2b, 0x65, 112], 31) }
+
+mod pkcs12_order;

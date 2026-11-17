@@ -1,17 +1,14 @@
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FactoryTarget { Available, NoSuchAlgorithm, InvalidKeySpec }
-
 struct RawPrivateKey { encoded: Zeroizing<Vec<u8>>, target: FactoryTarget, reservation: Arc<MemoryReservation> }
 
 pub(super) fn parse_key(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<PrivateKey> {
     let raw = RawPrivateKey::parse(encoded, memory)?;
     match raw.target {
         FactoryTarget::NoSuchAlgorithm | FactoryTarget::InvalidKeySpec => raw.into_private_key(),
-        FactoryTarget::Available => {
+        FactoryTarget::Available(_) => {
             let reservation = memory.reserve(allocation_bound(raw.encoded.len())?)?;
-            match attempt(&raw.encoded) {
+            match (FactoryInput { encoded: &raw.encoded, target: raw.target }).generate() {
                 Ok(encoded) => {
                     drop(raw);
                     PrivateKey::from_admitted(encoded, reservation)

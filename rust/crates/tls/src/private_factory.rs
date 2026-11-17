@@ -8,12 +8,18 @@ mod curves;
 mod failure;
 mod integer;
 mod parameters;
+mod pkcs12;
 mod raw;
 
 pub(crate) struct PrivateKey { encoded: Zeroizing<Vec<u8>>, _reservation: Arc<MemoryReservation> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Family { Rsa, Pss, Dsa, Dh, Ec, Xdh(usize), EdDsa(usize), Named }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FactoryTarget { Available(Family), NoSuchAlgorithm, InvalidKeySpec }
+
+pub(crate) struct FactoryInput<'a> { encoded: &'a [u8], target: FactoryTarget }
 
 const RSA: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 1];
 const PSS: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 10];
@@ -22,6 +28,7 @@ const DH: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 3, 1];
 const EC: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 2, 1];
 
 impl PrivateKey {
+    #[cfg(test)]
     pub(crate) fn decode(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut reservation = memory.reserve(allocation_bound(encoded.len())?)?;
         let encoded = decode(encoded)?;
@@ -30,13 +37,19 @@ impl PrivateKey {
         Ok(Self { encoded, _reservation: reservation })
     }
 
+    pub(crate) fn from_pkcs12(input: FactoryInput<'_>, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let reservation = memory.reserve(allocation_bound(input.encoded.len())?)?;
+        let encoded = input.generate().map_err(FactoryFailure::into_anomaly)?;
+        Self::from_admitted(encoded, reservation)
+    }
+
     pub(crate) fn encoded_pkcs8(&self) -> &[u8] { &self.encoded }
 
     pub(crate) fn parse_jks(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> { raw::parse_key(encoded, memory) }
 
     fn from_admitted(encoded: Zeroizing<Vec<u8>>, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
         let retained = encoded.capacity().checked_add(std::mem::size_of::<Self>()).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
-        Arc::get_mut(&mut reservation).expect("unpublished JKS private key reservation").shrink_to(retained)?;
+        Arc::get_mut(&mut reservation).expect("unpublished private key reservation").shrink_to(retained)?;
         Ok(Self { encoded, _reservation: reservation })
     }
 
@@ -46,83 +59,103 @@ impl PrivateKey {
 
 fn allocation_bound(bytes: usize) -> Result<usize> { bytes.checked_mul(384).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow) }
 
-fn family(oid: &[u8]) -> FactoryResult<Family> {
-    Ok(match oid {
-        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1] | [0x55, 8, 1, 1] => Family::Rsa,
-        RSA => Family::Rsa,
-        PSS => Family::Pss,
-        DSA | [0x2b, 0x0e, 3, 2, 12] => Family::Dsa,
-        DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => Family::Dh,
-        EC => Family::Ec,
-        [0x2b, 0x65, 110] => Family::Xdh(32),
-        [0x2b, 0x65, 111] => Family::Xdh(56),
-        [0x2b, 0x65, 112] => Family::EdDsa(32),
-        [0x2b, 0x65, 113] => Family::EdDsa(57),
-        [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 3, 17..=19] | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 4, 1..=3] => Family::Named,
-        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 17] => return Err(FactoryFailure::InvalidKeySpec(invalid("Java HSS/LMS does not generate private keys"))),
-        _ => return Err(FactoryFailure::NoSuchAlgorithm(invalid("Unsupported Java private-key factory"))),
-    })
+impl FactoryTarget {
+    fn for_oid(oid: &[u8]) -> Self {
+        let family = match oid {
+            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1] | [0x55, 8, 1, 1] => Family::Rsa,
+            RSA => Family::Rsa,
+            PSS => Family::Pss,
+            DSA | [0x2b, 0x0e, 3, 2, 12] => Family::Dsa,
+            DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => Family::Dh,
+            EC => Family::Ec,
+            [0x2b, 0x65, 110] => Family::Xdh(32),
+            [0x2b, 0x65, 111] => Family::Xdh(56),
+            [0x2b, 0x65, 112] => Family::EdDsa(32),
+            [0x2b, 0x65, 113] => Family::EdDsa(57),
+            [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 3, 17..=19] | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 4, 1..=3] => Family::Named,
+            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 17] => return Self::InvalidKeySpec,
+            _ => return Self::NoSuchAlgorithm,
+        };
+        Self::Available(family)
+    }
 }
 
+#[cfg(test)]
 fn decode(encoded: &[u8]) -> Result<Zeroizing<Vec<u8>>> { attempt(encoded).map_err(FactoryFailure::into_anomaly) }
 
+#[cfg(test)]
 fn attempt(encoded: &[u8]) -> FactoryResult<Zeroizing<Vec<u8>>> {
-    if encoded.len() > i32::MAX as usize { return Err(FactoryFailure::Fatal(malformed())); }
-    let mut input = Der(encoded);
-    let outer = failure::expect(&mut input, 0x30)?;
-    failure::end(input)?;
-    let mut fields = Der(&outer);
-    let version = failure::int(&mut fields)?;
-    let mut algorithm = failure::algorithm(&mut fields)?;
-    let family = family(&algorithm.oid)?;
-    if !matches!(version, 0 | 1) || family == Family::Dh && version != 0 { return Err(failure::malformed()); }
-    let canonical_parameters = parameters::validate(&algorithm, family)?;
-    let private_key = failure::expect(&mut fields, 4)?;
-    if family == Family::Dh {
-        failure::end(fields)?;
-        failure::signed(&failure::expect(&mut Der(&private_key), 2)?)?;
-        return Ok(Zeroizing::new(encoded.to_vec()));
-    }
-    let mut optional = if fields.0.is_empty() { None } else { Some(failure::next(&mut fields)?) };
-    let attributes = if optional.as_ref().is_some_and(|value| value.tag & 0xdf == 0x80) {
-        let attributes = optional.take().expect("present PKCS8 attributes").content;
-        optional = if fields.0.is_empty() { None } else { Some(failure::next(&mut fields)?) };
-        Some(attributes)
-    } else { None };
-    let mut public_key = if let Some(value) = optional {
-        if version != 1 || value.tag & 0xdf != 0x81 { return Err(failure::malformed()); }
-        Some(bits(&value.content, fields.0.len())?)
-    } else { None };
-    failure::end(fields)?;
+    pkcs12::prepare(encoded).map_err(pkcs12::PreparationFailure::into_factory)?.generate()
+}
 
-    let replacement = match family {
-        Family::Rsa | Family::Pss => rsa(&private_key)?,
-        Family::Dsa => { failure::signed(&failure::expect(&mut Der(&private_key), 2)?)?; None }
-        Family::Ec => { if let Some(bits) = ec(&private_key)? { public_key = Some(bits); } None }
-        Family::Xdh(length) | Family::EdDsa(length) => {
-            if failure::expect(&mut Der(&private_key), 4)?.len() != length { return Err(failure::malformed()); }
-            None
-        }
-        Family::Named => { failure::expect(&mut Der(&private_key), 4)?; None }
-        Family::Dh => unreachable!("DH retains its input encoding"),
-    };
-    let mut parts = Vec::with_capacity(5);
-    if let Some(private_key) = replacement {
-        let canonical_parameters = canonical_parameters.map(|parameters| parameters.encode()).transpose().map_err(FactoryFailure::Fatal)?;
-        algorithm = make_algorithm_checked(if family == Family::Pss { PSS } else { RSA }, canonical_parameters.as_deref().map(Vec::as_slice))?;
-        parts.push(encode(2, &[0]));
-        parts.push(algorithm.encoded);
-        parts.push(encode(4, &private_key));
-    } else {
-        parts.push(encode(2, &[version as u8]));
-        parts.push(algorithm.encoded);
-        parts.push(encode(4, &private_key));
-        if version == 1 {
-            if let Some(attributes) = attributes { parts.push(encode(0xa0, &attributes)); }
-            if let Some(public_key) = public_key { parts.push(encode(0x81, &public_key)); }
-        }
+impl<'a> FactoryInput<'a> {
+    pub(crate) fn pkcs12(encoded: &'a [u8]) -> Result<Self> {
+        pkcs12::prepare(encoded).map_err(pkcs12::PreparationFailure::into_pkcs12)
     }
-    Ok(encode(0x30, &failure::concatenate(&parts)?))
+
+    fn generate(self) -> FactoryResult<Zeroizing<Vec<u8>>> {
+        let Self { encoded, target } = self;
+        if encoded.len() > i32::MAX as usize { return Err(FactoryFailure::Fatal(malformed())); }
+        let family = match target {
+            FactoryTarget::Available(family) => family,
+            FactoryTarget::NoSuchAlgorithm => return Err(FactoryFailure::NoSuchAlgorithm(invalid("Unsupported Java private-key factory"))),
+            FactoryTarget::InvalidKeySpec => return Err(FactoryFailure::InvalidKeySpec(invalid("Java HSS/LMS does not generate private keys"))),
+        };
+        let mut input = Der(encoded);
+        let outer = failure::expect(&mut input, 0x30)?;
+        failure::end(input)?;
+        let mut fields = Der(&outer);
+        let version = failure::int(&mut fields)?;
+        if !matches!(version, 0 | 1) || family == Family::Dh && version != 0 { return Err(failure::malformed()); }
+        let mut algorithm = failure::algorithm(&mut fields)?;
+        let canonical_parameters = parameters::validate(&algorithm, family)?;
+        let private_key = failure::expect(&mut fields, 4)?;
+        if family == Family::Dh {
+            failure::end(fields)?;
+            failure::signed(&failure::expect(&mut Der(&private_key), 2)?)?;
+            return Ok(Zeroizing::new(encoded.to_vec()));
+        }
+        let mut optional = if fields.0.is_empty() { None } else { Some(failure::next(&mut fields)?) };
+        let attributes = if optional.as_ref().is_some_and(|value| value.tag & 0xdf == 0x80) {
+            let attributes = optional.take().expect("present PKCS8 attributes").content;
+            optional = if fields.0.is_empty() { None } else { Some(failure::next(&mut fields)?) };
+            Some(attributes)
+        } else { None };
+        let mut public_key = if let Some(value) = optional {
+            if version != 1 || value.tag & 0xdf != 0x81 { return Err(failure::malformed()); }
+            Some(bits(&value.content, fields.0.len())?)
+        } else { None };
+        failure::end(fields)?;
+
+        let replacement = match family {
+            Family::Rsa | Family::Pss => rsa(&private_key)?,
+            Family::Dsa => { failure::signed(&failure::expect(&mut Der(&private_key), 2)?)?; None }
+            Family::Ec => { if let Some(bits) = ec(&private_key)? { public_key = Some(bits); } None }
+            Family::Xdh(length) | Family::EdDsa(length) => {
+                if failure::expect(&mut Der(&private_key), 4)?.len() != length { return Err(failure::malformed()); }
+                None
+            }
+            Family::Named => { failure::expect(&mut Der(&private_key), 4)?; None }
+            Family::Dh => unreachable!("DH retains its input encoding"),
+        };
+        let mut parts = Vec::with_capacity(5);
+        if let Some(private_key) = replacement {
+            let canonical_parameters = canonical_parameters.map(|parameters| parameters.encode()).transpose().map_err(FactoryFailure::Fatal)?;
+            algorithm = make_algorithm_checked(if family == Family::Pss { PSS } else { RSA }, canonical_parameters.as_deref().map(Vec::as_slice))?;
+            parts.push(encode(2, &[0]));
+            parts.push(algorithm.encoded);
+            parts.push(encode(4, &private_key));
+        } else {
+            parts.push(encode(2, &[version as u8]));
+            parts.push(algorithm.encoded);
+            parts.push(encode(4, &private_key));
+            if version == 1 {
+                if let Some(attributes) = attributes { parts.push(encode(0xa0, &attributes)); }
+                if let Some(public_key) = public_key { parts.push(encode(0x81, &public_key)); }
+            }
+        }
+        Ok(encode(0x30, &failure::concatenate(&parts)?))
+    }
 }
 
 fn rsa(bytes: &[u8]) -> FactoryResult<Option<Zeroizing<Vec<u8>>>> {

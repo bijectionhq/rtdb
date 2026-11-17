@@ -8,16 +8,11 @@ enum DigestName { Oid(Zeroizing<Vec<u8>>), Pbes2(pbes2::Name), Unmapped }
 
 pub(super) struct Pss { digest: DigestName, mgf_digest: Zeroizing<Vec<u8>>, salt: i32 }
 
-pub(super) fn factory_target(algorithm: &Algorithm) -> Result<raw::FactoryTarget> {
-    match recursive::initialize(algorithm).map_err(Failure::into_anomaly)? {
-        DigestName::Oid(oid) => match family(&oid) {
-            Ok(_) => Ok(raw::FactoryTarget::Available),
-            Err(FactoryFailure::NoSuchAlgorithm(_)) => Ok(raw::FactoryTarget::NoSuchAlgorithm),
-            Err(FactoryFailure::InvalidKeySpec(_)) => Ok(raw::FactoryTarget::InvalidKeySpec),
-            Err(FactoryFailure::Fatal(error)) => Err(error),
-        },
-        DigestName::Pbes2(_) | DigestName::Unmapped => Ok(raw::FactoryTarget::NoSuchAlgorithm),
-    }
+pub(super) fn factory_target(algorithm: &Algorithm) -> Result<FactoryTarget> {
+    Ok(match recursive::initialize(algorithm).map_err(Failure::into_anomaly)? {
+        DigestName::Oid(oid) => FactoryTarget::for_oid(&oid),
+        DigestName::Pbes2(_) | DigestName::Unmapped => FactoryTarget::NoSuchAlgorithm,
+    })
 }
 
 pub(super) fn validate(algorithm: &Algorithm, family: Family) -> FactoryResult<Option<Pss>> {

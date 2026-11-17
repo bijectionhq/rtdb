@@ -1,0 +1,32 @@
+= Strict SunPKCS12 source mapping
+
+The implementation uses the existing Temurin 25.0.1+8 link:../sources.sha256[source manifest] and link:../COPYRIGHT[retained upstream headers].
+The source archive SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+The retained notices include all 59 pinned source files' complete pre-package prefixes; the strict slice adds 40 previously missing labeled prefixes without changing the existing notice bytes.
+No additional upstream source file or license is required for this slice.
+
+`sun/security/pkcs12/PKCS12KeyStore.java:376-390` constructs the complete outer DerValue, exposes SEQUENCE/SET members, reads a signed int, frames all AlgorithmIdentifier children, checks cardinality, constructs a parameterless AlgorithmId and selects KeyFactory before passing original keyInfo into its key spec.
+`sun/security/util/DerValue.java:345-440,1183-1186,1298-1307` supplies exact outer-value framing, accepted outer tags and direct-child scanning.
+`sun/security/util/DerInputStream.java:109-127,207-208` supplies integer consumption and the getSequence capacity hint.
+`sun/security/util/DerValue.java:600-608,638-651` supplies signed integer conversion and its checked range errors.
+`sun/security/util/DerIndefLenConverter.java:372-386` retains unused bytes after conversion, so the complete outer-value check still rejects an external BER tail.
+
+`sun/security/x509/AlgorithmId.java:94-96,247-277` leaves encodedParams and algParams null for the OID-only constructor.
+PBES2, OAEP and SpecifiedSHA2 therefore retain their ordinary names during strict lookup even when a complete second parameter TLV contains invalid nested data.
+The known provider aliases come from KnownOIDs and the already pinned SUN, SunRsaSign, SunEC and SunJCE registrations.
+The closed target mapping owns that selection and generation consumes its retained Family.
+
+`sun/security/provider/HSS.java:689-692` rejects every private generation request without parsing key bytes.
+`sun/security/pkcs/PKCS8Key.java:123-138` checks an available common provider's outer SEQUENCE and version before parsing and initializing AlgorithmIdentifier.
+`com/sun/crypto/provider/DHPrivateKey.java:97-148,247-259,279-280` defines the separate DH parser and its original-byte retention.
+`java/security/KeyFactory.java:136-142,386-410` defines missing lookup and checked/unchecked generation outcomes.
+`PKCS12KeyStore.java:252-263,452-457` retries the full operation for empty passwords and wraps the final attempt's failure.
+The native path retains its existing anomaly vocabulary and resource-error retry policy.
+
+link:../tests/pkcs12_order.rs[The private regression source] embeds 27 hand-constructed hex fixtures with source-derived preparation, missing-factory, HSS, provider-rejection or original-byte success expectations.
+It includes four diagnostic corrections: SET plus unknown OID, unknown OID plus nonempty NULL, HSS plus nonempty NULL, and SET plus HSS/version two.
+The original fixture bytes include valid and invalid outer tails/tags, integer shape/range/padding, AlgorithmIdentifier cardinality/framing, opaque bodies, ordinary Specified/PBES2/OAEP names, known-provider rejection and original DH encodings.
+Companion inputs with a wrong first-child tag make direct-child framing/cardinality-before-OID order observable through the existing native diagnostics.
+A known-PSS parameter SEQUENCE containing a truncated nested field produces the shared DER diagnostic for version zero, while version two produces the private-key version diagnostic before parameter initialization.
+The store regression source protects those malformed or unsupported inputs and checks eager unchained errors, original DH identity bytes and empty-password retry/lease behavior.
+These are regression sources; source-only preparation does not establish execution or native TLS acceptance.

@@ -3,7 +3,7 @@ use openssl::x509::X509;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
 use zeroize::Zeroizing;
-use crate::{CertificateIdentifiers, DistinguishedName, invalid, java_der::{Der, valid_oid}, private_factory::PrivateKey, secret_der::{self, SecretBytes, Value, next}, x500::{equals_ignore_case_utf16, lowercase_utf16}};
+use crate::{CertificateIdentifiers, DistinguishedName, invalid, java_der::{Der, valid_oid}, private_factory::{FactoryInput, PrivateKey}, secret_der::{self, SecretBytes, Value, next}, x500::{equals_ignore_case_utf16, lowercase_utf16}};
 use super::{SunX509Pkcs12Identity, attributes::{self, Attributes}, der::{expect, fields, integer, malformed, octets, oid, values}, overflow, protection::{self, Protection}, scratch};
 
 const DATA: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x07\x01";
@@ -201,8 +201,8 @@ impl LoadedPkcs12 {
             let key = protection::retry(password, |password| {
                 let plaintext = protection.decrypt(&ciphertext, password)?;
                 if private.is_some() {
-                    private_algorithm(&plaintext)?;
-                    PrivateKey::decode(&plaintext, memory).map(Some)
+                    let input = FactoryInput::pkcs12(&plaintext)?;
+                    PrivateKey::from_pkcs12(input, memory).map(Some)
                 } else { protection::secret_key(&plaintext)?; Ok(None) }
             })?;
             let Some((key, index)) = key.zip(private) else { continue; };
@@ -218,15 +218,6 @@ impl LoadedPkcs12 {
         }
         Ok(identities)
     }
-}
-
-fn private_algorithm(encoded: &[u8]) -> Result<()> {
-    let mut input = Der(encoded); let value = next(&mut input)?; input.end()?;
-    let mut fields = fields(&value)?; integer(&mut fields)?;
-    let algorithm = expect(&mut fields, 0x30)?; let mut algorithm = Der(&algorithm);
-    oid(&mut algorithm)?;
-    if !algorithm.0.is_empty() { next(&mut algorithm)?; }
-    algorithm.end()
 }
 
 #[cfg(test)]
