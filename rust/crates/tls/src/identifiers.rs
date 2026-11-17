@@ -9,6 +9,8 @@ mod basic_constraints;
 pub use basic_constraints::CertificateBasicConstraints;
 mod key_usage;
 pub use key_usage::CertificateKeyUsage;
+mod extended_key_usage;
+pub use extended_key_usage::CertificateExtendedKeyUsage;
 mod public_key;
 pub use public_key::CertificatePublicKeyEncoding;
 

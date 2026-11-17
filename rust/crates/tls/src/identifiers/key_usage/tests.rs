@@ -80,3 +80,75 @@ fn key_usage_reservations_cover_success_absence_and_error_until_drop() {
     drop(parsed); assert_eq!(memory.used_bytes(), 0);
     assert_eq!(CertificateKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
 }
+
+#[test]
+fn java_usage_decisions_mask_every_bit_beyond_the_declared_length() {
+    for byte in 0..=255u8 {
+        for padding in 0..=7u8 {
+            let usage = decode(&[extension(true, &encoded(3, &[padding, byte]))]);
+            assert_eq!(usage.permits_digital_signatures(), byte & 0x80 != 0);
+            assert_eq!(usage.permits_certificate_signing(), padding <= 2 && byte & 4 != 0);
+            let primitive = (0..7u8).any(|bit| bit < 8 - padding && byte & (0x80 >> bit) != 0);
+            assert_eq!(usage.permits_cryptographic_primitive(), primitive);
+        }
+    }
+}
+
+#[test]
+fn algorithm_primitives_exclude_isolated_encipher_only_and_decipher_only() {
+    for (bits, signature, ca, primitive) in [
+        (vec![0], false, false, false),
+        (vec![0, 0x80], true, false, true),
+        (vec![0, 0x40], false, false, true),
+        (vec![0, 0x20], false, false, true),
+        (vec![0, 0x10], false, false, true),
+        (vec![0, 0x08], false, false, true),
+        (vec![0, 0x04], false, true, true),
+        (vec![0, 0x02], false, false, true),
+        (vec![0, 0x01], false, false, false),
+        (vec![0, 0, 0x80], false, false, false),
+        (vec![0, 0x09, 0x80], false, false, true),
+    ] {
+        let usage = decode(&[extension(true, &encoded(3, &bits))]);
+        assert_eq!(usage.permits_digital_signatures(), signature);
+        assert_eq!(usage.permits_certificate_signing(), ca);
+        assert_eq!(usage.permits_cryptographic_primitive(), primitive);
+    }
+    for extensions in [vec![], vec![extension(false, &[5, 0])]] {
+        let usage = decode(&extensions);
+        assert!(usage.permits_digital_signatures());
+        assert!(usage.permits_certificate_signing());
+        assert!(usage.permits_cryptographic_primitive());
+    }
+}
+
+#[test]
+fn usage_decisions_keep_wrapper_and_duplicate_semantics() {
+    let wrapped = encoded(4, &[3, 0x81, 2, 6, 0xff]);
+    for extensions in [
+        vec![extension(true, &wrapped)],
+        vec![extension(false, &[5, 0]), extension(false, &wrapped)],
+        vec![extension(false, &wrapped), extension(false, &[5, 0])],
+    ] {
+        let usage = decode(&extensions);
+        assert!(usage.permits_digital_signatures());
+        assert!(!usage.permits_certificate_signing());
+        assert!(usage.permits_cryptographic_primitive());
+    }
+}
+
+#[test]
+fn standalone_key_usage_array_capacity_uses_java_signed_wrapping() {
+    assert_eq!(declared_bit_length(0, 0).unwrap(), 0);
+    assert!(declared_bit_length(1, 0).is_err());
+    for padding in 0..=7 {
+        assert_eq!(declared_bit_length(padding, 268_435_455).unwrap(), 2_147_483_640 - usize::from(padding));
+        assert!(declared_bit_length(padding, 268_435_456).is_err());
+        assert!(declared_bit_length(padding, 536_870_911).is_err());
+        assert_eq!(declared_bit_length(padding, 536_870_913).unwrap(), 8 - usize::from(padding));
+    }
+    assert_eq!(declared_bit_length(0, 536_870_912).unwrap(), 0);
+    assert!(declared_bit_length(1, 536_870_912).is_err());
+    assert!(declared_bit_length(8, 1).is_err());
+    assert!(declared_bit_length(0, i32::MAX as usize + 1).is_err());
+}
