@@ -94,7 +94,7 @@ static int ut_ordered_complete(rd_kafka_broker_t *rkb, int mode) {
         if (mode==3) rd_kafka_ordered_metadata_destroy(result);
         rd_kafka_buf_callback(rk,rkb,mode==4 ? RD_KAFKA_RESP_ERR_TOPIC_AUTHORIZATION_FAILED : 0,frame,request);
         if (mode!=2) {
-                reply=rd_kafka_q_pop(rk->rk_ops,0,0);
+                reply=rd_kafka_q_pop_serve(rk->rk_ops,0,0,RD_KAFKA_Q_CB_FORCE_RETURN,NULL,NULL);
                 RD_UT_ASSERT(reply && reply->rko_type==RD_KAFKA_OP_RECV_BUF,"actual accounted reply queue");
                 rd_kafka_buf_handle_op(reply,reply->rko_err);
                 rd_kafka_op_destroy(reply);
@@ -316,10 +316,15 @@ int unittest_ordered_metadata(void) {
         mtx_init(&rkb.rkb_lock,mtx_plain);
         rd_refcnt_init(&rkb.rkb_refcnt,1);
         fails+=ut_ordered_encode();
+        RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"encoding retains no broker reference");
         fails+=ut_ordered_version_intersection(&rkb);
+        RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"version selection releases broker references");
         fails+=ut_ordered_header_boundary(&rkb);
+        RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"header cases release broker references: %d",rd_refcnt_get(&rkb.rkb_refcnt));
         fails+=ut_ordered_invalid_header_before_admission(&rkb);
+        RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"invalid headers retain no broker reference");
         fails+=ut_ordered_queue_cases_joined(&rkb);
+        RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"joined queue cases release broker references: %d",rd_refcnt_get(&rkb.rkb_refcnt));
         RD_UT_ASSERT(thrd_is_current(rkb.rkb_thread),"broker identity retained after joined queue cases");
         RD_UT_ASSERT(rd_refcnt_sub(&rkb.rkb_refcnt)==0,"last ordered broker reference");
         rd_refcnt_destroy(&rkb.rkb_refcnt); mtx_destroy(&rkb.rkb_logname_lock); mtx_destroy(&rkb.rkb_lock);
