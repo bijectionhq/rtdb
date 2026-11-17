@@ -366,6 +366,59 @@ impl Expr {
         for child in self.children() { child.visit(f); }
     }
 
+    /// Visits original subexpressions before applying each rewrite.
+    /// A replacement expression is not traversed during the same pass.
+    pub fn rewrite(&mut self, rewrite: &mut impl FnMut(&mut Self)) {
+        match self {
+            Self::Unary { expr, .. } | Self::Cast { expr, .. } | Self::Field { expr, .. }
+            | Self::RegexReplace { source: expr, .. } => expr.rewrite(rewrite),
+            Self::Binary { left, right, .. } => {
+                left.rewrite(rewrite);
+                right.rewrite(rewrite);
+            }
+            Self::Call { args, .. } | Self::Coalesce(args) | Self::List(args) => {
+                for arg in args { arg.rewrite(rewrite); }
+            }
+            Self::Case { branches, otherwise } => {
+                for (condition, value) in branches {
+                    condition.rewrite(rewrite);
+                    value.rewrite(rewrite);
+                }
+                otherwise.rewrite(rewrite);
+            }
+            Self::SimpleCase { operand, branches, otherwise } => {
+                operand.rewrite(rewrite);
+                for (candidate, value) in branches {
+                    candidate.rewrite(rewrite);
+                    value.rewrite(rewrite);
+                }
+                otherwise.rewrite(rewrite);
+            }
+            Self::Between { operand, low, high, .. } => {
+                operand.rewrite(rewrite);
+                low.rewrite(rewrite);
+                high.rewrite(rewrite);
+            }
+            Self::Subscript { expr, index, .. } => {
+                expr.rewrite(rewrite);
+                index.rewrite(rewrite);
+            }
+            Self::Struct(fields) => {
+                for (_, value) in fields { value.rewrite(rewrite); }
+            }
+            Self::In { expr, values, .. } => {
+                expr.rewrite(rewrite);
+                for value in values { value.rewrite(rewrite); }
+            }
+            Self::Like { expr, pattern, .. } => {
+                expr.rewrite(rewrite);
+                pattern.rewrite(rewrite);
+            }
+            Self::Literal(_) | Self::Column { .. } | Self::Parameter { .. } | Self::Correlated { .. } | Self::RowCopy(_) => {}
+        }
+        rewrite(self);
+    }
+
     pub fn parameter_count(&self) -> usize {
         let mut count = 0;
         self.visit(&mut |expr| { if let Self::Parameter { index, .. } = expr { count = count.max(index.saturating_add(1)); } });

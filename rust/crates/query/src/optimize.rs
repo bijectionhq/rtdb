@@ -149,23 +149,22 @@ fn bounds(input: Arc<Relation>, offset: Option<Expr>, fetch: Option<Expr>) -> Re
 }
 
 fn replace(mut expression: Expr, columns: &BTreeMap<ColumnId, (ColumnId, rtdb_types::LogicalType)>) -> Expr {
-    fn visit(expression: &mut Expr, columns: &BTreeMap<ColumnId, (ColumnId, rtdb_types::LogicalType)>) {
-        match expression {
-            Expr::Column { id, data_type } => if let Some((replacement, ty)) = columns.get(id) { *id = *replacement; *data_type = ty.clone(); },
-            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Field { expr, .. } => visit(expr, columns),
-            Expr::RegexReplace { source,.. } => visit(source,columns),
-            Expr::Binary { left, right, .. } => { visit(left, columns); visit(right, columns); }
-            Expr::Call { args, .. } | Expr::Coalesce(args) | Expr::List(args) => for arg in args { visit(arg, columns); },
-            Expr::Between { operand,low,high,.. } => { visit(operand,columns);visit(low,columns);visit(high,columns); }
-            Expr::SimpleCase { operand, branches, otherwise } => { visit(operand, columns); for (candidate, value) in branches { visit(candidate, columns); visit(value, columns); } visit(otherwise, columns); }
-            Expr::Case { branches, otherwise } => { for (condition, value) in branches { visit(condition, columns); visit(value, columns); } visit(otherwise, columns); }
-            Expr::Subscript { expr, index, .. } => { visit(expr, columns); visit(index, columns); }
-            Expr::Struct(fields) => for (_, expr) in fields { visit(expr, columns); },
-            Expr::RowCopy(fields) => for field in fields { if let Some((id, ty)) = columns.get(&field.id) { field.id = *id; field.data_type = ty.clone(); } },
-            Expr::In { expr, values, .. } => { visit(expr, columns); for value in values { visit(value, columns); } }
-            Expr::Like { expr, pattern, .. } => { visit(expr, columns); visit(pattern, columns); }
-            Expr::Literal(_) | Expr::Parameter { .. } | Expr::Correlated { .. } => {}
+    expression.rewrite(&mut |expression| match expression {
+        Expr::Column { id, data_type } => {
+            if let Some((replacement, ty)) = columns.get(id) {
+                *id = *replacement;
+                *data_type = ty.clone();
+            }
         }
-    }
-    visit(&mut expression, columns); expression
+        Expr::RowCopy(fields) => {
+            for field in fields {
+                if let Some((id, ty)) = columns.get(&field.id) {
+                    field.id = *id;
+                    field.data_type = ty.clone();
+                }
+            }
+        }
+        _ => {}
+    });
+    expression
 }
