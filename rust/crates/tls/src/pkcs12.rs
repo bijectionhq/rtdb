@@ -1,8 +1,10 @@
 use openssl::{hash::{Hasher, MessageDigest}, pkey::PKey, provider::Provider, sign::Signer, symm::{Cipher, Crypter, Mode}, x509::X509};
+use std::sync::Arc;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::Result;
 use subtle::ConstantTimeEq;
 use zeroize::{Zeroize, Zeroizing};
-use super::{Identity, Parts, invalid};
+use super::{CertificateIdentifiers, DistinguishedName, Identity, Parts, ProtectedIdentity, invalid, x500::{equals_ignore_case_utf16, lowercase_utf16}};
 mod ber;
 use ber::{Reader, Value};
 const MAXIMUM_ITERATIONS: usize = 5_000_000;
@@ -13,14 +15,22 @@ const PKCS12_PBE: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x0c\x01";
 const PBES2: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0d";
 const PBKDF2: &[u8] = b"\x2a\x86\x48\x86\xf7\x0d\x01\x05\x0c";
 #[derive(Default)]
-struct Attributes { alias: Option<String>, key_id: Option<Vec<u8>>, trusted: bool }
+struct Attributes { alias: Option<String>, java_alias: Option<Vec<u16>>, key_id: Option<Vec<u8>>, trusted: bool }
 struct KeyBag { encrypted: Zeroizing<Vec<u8>>, attributes: Attributes, order: usize }
 struct CertificateBag { der: Vec<u8>, certificate: X509, attributes: Attributes, order: usize }
 #[derive(Default)]
-struct Bags { keys: Vec<KeyBag>, certificates: Vec<CertificateBag>, private_keys_seen: usize, unfriendly_name: usize, next_order: usize }
+struct Bags { keys: Vec<KeyBag>, certificates: Vec<CertificateBag>, other_entries: Vec<(Attributes, usize)>, private_keys_seen: usize, unfriendly_name: usize, next_order: usize, java: bool }
 
 // RFC 7292 §§4–5; OpenJDK PKCS12KeyStore at jdk-21+35 supplies the Java password rules.
 pub(super) fn decode(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private_keys: bool) -> Result<Parts> {
+    load(bytes, password, false)?.finish(key_password.or(password), private_keys, bytes.len().checked_mul(4).ok_or_else(|| invalid("PKCS12 retained material exceeds range"))?)
+}
+
+pub(super) fn decode_protected(bytes: &[u8], password: Option<&str>, memory: &Arc<MemoryBudget>, reservations: &mut Vec<Arc<MemoryReservation>>) -> Result<Vec<ProtectedIdentity>> {
+    load(bytes, password, true)?.finish_protected(memory, reservations)
+}
+
+fn load(bytes: &[u8], password: Option<&str>, java: bool) -> Result<Bags> {
     let mut outer = Reader(bytes);
     let mut pfx = outer.expect(0x30)?.reader(); outer.end()?;
     if pfx.integer()? != 3 { return Err(invalid("Unsupported PKCS12 version")); }
@@ -34,7 +44,7 @@ pub(super) fn decode(bytes: &[u8], password: Option<&str>, key_password: Option<
     pfx.end()?;
     let mut authenticated_outer = Reader(&authenticated);
     let mut contents = authenticated_outer.expect(0x30)?.reader(); authenticated_outer.end()?;
-    let mut bags = Bags::default();
+    let mut bags = Bags { java, ..Bags::default() };
     while !contents.is_empty() {
         let mut info = contents.expect(0x30)?.reader();
         let kind = info.expect(6)?.content;
@@ -53,12 +63,86 @@ pub(super) fn decode(bytes: &[u8], password: Option<&str>, key_password: Option<
             }
         } else { return Err(invalid("Public-key protected PKCS12 content is unsupported")); }
     }
-    bags.finish(key_password.or(password), private_keys, bytes.len().checked_mul(4).ok_or_else(|| invalid("PKCS12 retained material exceeds range"))?)
+    Ok(bags)
 }
 fn explicit_octets(value: Value<'_>) -> Result<Zeroizing<Vec<u8>>> {
     let mut content = value.reader(); let value = content.next()?.octets(false)?; content.end()?; Ok(value)
 }
 impl Bags {
+    fn finish_protected(self, memory: &Arc<MemoryBudget>, reservations: &mut Vec<Arc<MemoryReservation>>) -> Result<Vec<ProtectedIdentity>> {
+        for certificate in &self.certificates { CertificateIdentifiers::decode(&certificate.der, memory)?; }
+        let mut entries = std::collections::BTreeMap::new();
+        for (attributes, order) in self.keys.iter().map(|key| (&key.attributes, key.order))
+            .chain(self.certificates.iter().filter(|certificate| certificate.attributes.trusted).map(|certificate| (&certificate.attributes, certificate.order)))
+            .chain(self.other_entries.iter().map(|(attributes, order)| (attributes, *order))) {
+            if let Some(alias) = attributes.java_alias.as_deref() {
+                entries.entry(lowercase_utf16(alias)).and_modify(|previous: &mut (usize, usize)| { previous.0 = previous.0.min(order); previous.1 = previous.1.max(order); }).or_insert((order, order));
+            }
+        }
+        let mut keys = self.keys.iter().filter_map(|key| {
+            let alias = lowercase_utf16(key.attributes.java_alias.as_deref()?);
+            let &(first, last) = entries.get(&alias)?;
+            (last == key.order).then_some((first, alias, key))
+        }).collect::<Vec<_>>();
+        keys.sort_by_key(|(first, _, _)| *first);
+        let mut identities = Vec::new();
+        for (_, alias, key) in keys {
+            let Some(certificate) = self.matched_certificate(key) else { continue; };
+            let chain = self.protected_chain(certificate, memory)?;
+            let bound = chain.iter().try_fold(65_536usize, |bytes, certificate| {
+                certificate.der.len().checked_mul(16).and_then(|length| length.checked_add(64)).and_then(|length| bytes.checked_add(length))
+                    .ok_or_else(|| invalid("Protected PKCS12 chain allocation exceeds range"))
+            })?;
+            reservations.push(memory.reserve(bound)?);
+            identities.push(ProtectedIdentity::pkcs12(alias, Zeroizing::new(key.encrypted.to_vec()), chain.into_iter().map(|certificate| certificate.der.clone()).collect()));
+        }
+        Ok(identities)
+    }
+
+    fn matched_certificate(&self, key: &KeyBag) -> Option<&CertificateBag> {
+        let mut key_id_match = None;
+        let mut alias_match = None;
+        for certificate in self.certificates.iter().filter(|certificate| !certificate.attributes.trusted) {
+            let alias_matches = key.attributes.java_alias.as_deref().zip(certificate.attributes.java_alias.as_deref())
+                .is_some_and(|(key, certificate)| equals_ignore_case_utf16(key, certificate));
+            if key.attributes.key_id == certificate.attributes.key_id {
+                key_id_match = Some(certificate);
+                if alias_matches { return Some(certificate); }
+            } else if alias_matches { alias_match = Some(certificate); }
+        }
+        key_id_match.or(alias_match)
+    }
+
+    fn protected_chain<'a>(&'a self, certificate: &'a CertificateBag, memory: &Arc<MemoryBudget>) -> Result<Vec<&'a CertificateBag>> {
+        let mut chain = Vec::new();
+        let mut next = Some(certificate);
+        while let Some(certificate) = next {
+            if chain.iter().any(|previous: &&CertificateBag| previous.der == certificate.der) { break; }
+            chain.push(certificate);
+            let issuer = DistinguishedName::decode(&certificate.certificate.issuer_name().to_der().map_err(invalid)?, memory)?;
+            let subject = DistinguishedName::decode(&certificate.certificate.subject_name().to_der().map_err(invalid)?, memory)?;
+            if issuer == subject && certificate.certificate.public_key().and_then(|key| certificate.certificate.verify(&key)).unwrap_or(false) { break; }
+            drop(subject);
+            let identifiers = CertificateIdentifiers::decode(&certificate.der, memory)?;
+            let authority = identifiers.authority_key_identifier();
+            next = None;
+            let mut fallback = None;
+            for candidate in &self.certificates {
+                let subject = DistinguishedName::decode(&candidate.certificate.subject_name().to_der().map_err(invalid)?, memory)?;
+                if subject != issuer { continue; }
+                let Some(authority) = authority else { next = Some(candidate); break; };
+                let identifiers = CertificateIdentifiers::decode(&candidate.der, memory)?;
+                match identifiers.subject_key_identifier() {
+                    Some(subject) if subject == authority => { next = Some(candidate); break; }
+                    Some(_) => {}
+                    None => fallback = Some(candidate),
+                }
+            }
+            if next.is_none() { next = fallback; }
+        }
+        Ok(chain)
+    }
+
     fn read(&mut self, bytes: &[u8], depth: usize) -> Result<()> {
         if depth > 64 { return Err(invalid("PKCS12 safe contents exceed nesting limit")); }
         let mut outer = Reader(bytes); let mut bags = outer.expect(0x30)?.reader(); outer.end()?;
@@ -68,7 +152,7 @@ impl Bags {
             let mut bag = bags.expect(0x30)?.reader();
             let oid = bag.expect(6)?.content;
             let mut value = bag.expect(0xa0)?.reader(); let value = value.next_and_end()?;
-            let mut attributes = if bag.is_empty() { Attributes::default() } else { attributes(bag.expect(0x31)?)? }; bag.end()?;
+            let mut attributes = if bag.is_empty() { Attributes::default() } else { attributes(bag.expect(0x31)?, self.java)? }; bag.end()?;
             let kind = oid.strip_prefix(BAG_PREFIX).and_then(|suffix| if suffix.len() == 1 { Some(suffix[0]) } else { None });
             match kind {
                 Some(2) => {
@@ -88,7 +172,15 @@ impl Bags {
                     if attributes.trusted { self.name_entry(&mut attributes); }
                     self.certificates.push(CertificateBag { der, certificate, attributes, order });
                 }
-                Some(6) => self.read(value.encoded, depth + 1)?,
+                Some(4) if self.java => {
+                    let mut value = value.sequence()?;
+                    value.expect(6)?;
+                    explicit_octets(value.expect(0xa0)?)?;
+                    value.end()?;
+                    self.name_entry(&mut attributes);
+                    self.other_entries.push((attributes, order));
+                }
+                Some(6) if !self.java => self.read(value.encoded, depth + 1)?,
                 _ => (),
             }
             index += 1;
@@ -96,7 +188,12 @@ impl Bags {
         Ok(())
     }
     fn name_entry(&mut self, attributes: &mut Attributes) {
-        if attributes.alias.is_none() { self.unfriendly_name += 1; attributes.alias = Some(self.unfriendly_name.to_string()); }
+        if attributes.alias.is_none() {
+            self.unfriendly_name += 1;
+            let alias = self.unfriendly_name.to_string();
+            if self.java { attributes.java_alias = Some(alias.encode_utf16().collect()); }
+            attributes.alias = Some(alias);
+        }
     }
     fn finish(self, password: Option<&str>, private_keys: bool, mut remaining: usize) -> Result<Parts> {
         let mut entries = std::collections::BTreeMap::new();
@@ -119,9 +216,7 @@ impl Bags {
             let Some(certificate) = certificate else { continue; };
             if !trusted.contains(&certificate.der) { trusted.push(certificate.der.clone()); }
             if !private_keys { continue; }
-            let mut encrypted = Reader(&key.encrypted); let mut encrypted_key = encrypted.expect(0x30)?.reader(); encrypted.end()?;
-            let algorithm = encrypted_key.expect(0x30)?; let ciphertext = encrypted_key.expect(4)?.content; encrypted_key.end()?;
-            let private_key = decrypt(algorithm, ciphertext, password.ok_or_else(|| invalid("PKCS12 private keys require a password"))?)?;
+            let private_key = recover_key(&key.encrypted, password)?;
             let mut chain = Vec::new(); let mut next = Some(certificate);
             while let Some(certificate) = next {
                 if chain.contains(&certificate.der) { break; }
@@ -146,7 +241,7 @@ impl Bags {
         Ok(Parts { identities, trusted })
     }
 }
-fn attributes(value: Value<'_>) -> Result<Attributes> {
+fn attributes(value: Value<'_>, java: bool) -> Result<Attributes> {
     let mut result = Attributes::default(); let mut attributes = value.reader();
     while !attributes.is_empty() {
         let mut attribute = attributes.expect(0x30)?.reader(); let oid = attribute.expect(6)?.content;
@@ -154,9 +249,15 @@ fn attributes(value: Value<'_>) -> Result<Attributes> {
         match oid {
             b"\x2a\x86\x48\x86\xf7\x0d\x01\x09\x14" => {
                 let bytes = values.expect(0x1e)?.content;
-                if bytes.len() % 2 != 0 { return Err(invalid("Invalid PKCS12 friendly name")); }
-                let units = bytes.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0],pair[1]])).collect::<Vec<_>>();
-                result.alias = Some(String::from_utf16(&units).map_err(invalid)?.to_lowercase());
+                if java {
+                    let units = java_bmp_units(bytes);
+                    result.alias = Some(String::from_utf16(&units).map_err(invalid)?);
+                    result.java_alias = Some(units);
+                } else {
+                    if bytes.len() % 2 != 0 { return Err(invalid("Invalid PKCS12 friendly name")); }
+                    let units = bytes.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0],pair[1]])).collect::<Vec<_>>();
+                    result.alias = Some(String::from_utf16(&units).map_err(invalid)?.to_lowercase());
+                }
             }
             b"\x2a\x86\x48\x86\xf7\x0d\x01\x09\x15" => result.key_id = Some(values.expect(4)?.content.to_vec()),
             b"\x60\x86\x48\x01\x86\xf9\x66\xad\xca\x7b\x01\x01" => { while !values.is_empty() { values.expect(6)?; } result.trusted = true; }
@@ -164,6 +265,30 @@ fn attributes(value: Value<'_>) -> Result<Attributes> {
         }
     }
     Ok(result)
+}
+
+pub(super) fn recover_key(bytes: &[u8], password: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+    let mut encrypted = Reader(bytes); let mut encrypted_key = encrypted.expect(0x30)?.reader(); encrypted.end()?;
+    let algorithm = encrypted_key.expect(0x30)?; let ciphertext = encrypted_key.expect(4)?.content; encrypted_key.end()?;
+    decrypt(algorithm, ciphertext, password.ok_or_else(|| invalid("PKCS12 private keys require a password"))?)
+}
+
+fn java_bmp_units(bytes: &[u8]) -> Vec<u16> {
+    let mut result = Vec::with_capacity(bytes.len().div_ceil(2));
+    let mut offset = 0;
+    while offset + 1 < bytes.len() {
+        let unit = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+        offset += 2;
+        if (0xd800..=0xdbff).contains(&unit) {
+            if offset + 1 >= bytes.len() { result.push(0xfffd); return result; }
+            let next = u16::from_be_bytes([bytes[offset], bytes[offset + 1]]);
+            offset += 2;
+            if (0xdc00..=0xdfff).contains(&next) { result.extend([unit, next]); } else { result.push(0xfffd); }
+        } else if (0xdc00..=0xdfff).contains(&unit) { result.push(0xfffd); }
+        else { result.push(unit); }
+    }
+    if offset < bytes.len() { result.push(0xfffd); }
+    result
 }
 fn verify_mac(value: Value<'_>, bytes: &[u8], password: &str) -> Result<()> {
     let mut mac = value.reader(); let mut digest = mac.expect(0x30)?.reader();
@@ -278,6 +403,7 @@ fn derive(hash: MessageDigest, password: &str, salt: &[u8], iterations: usize, p
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod protected;
     fn hex(value: &str) -> Vec<u8> { value.as_bytes().chunks_exact(2).map(|bytes| u8::from_str_radix(std::str::from_utf8(bytes).unwrap(),16).unwrap()).collect() }
     #[test]
     fn published_pkcs12_sha1_key_iv_and_mac_vectors() {
