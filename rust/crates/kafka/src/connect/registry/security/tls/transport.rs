@@ -2,8 +2,8 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::{IssuerNames, KeyStore};
 use rtdb_types::Result;
-use openssl::{asn1::Asn1Time, x509::X509};
-use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme, client::{ClientCertificateRequest, ResolvesClientCert, danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}}, crypto::{CryptoProvider, WebPkiSupportedAlgorithms}, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime}, server::ParsedCertificate, sign::CertifiedKey};
+use openssl::{asn1::Asn1Time, x509::{X509, store::{X509Store, X509StoreBuilder}}};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme, client::{ClientCertificateRequest, ResolvesClientCert, danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}}, crypto::{CryptoProvider, WebPkiSupportedAlgorithms}, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime}, server::ParsedCertificate, sign::CertifiedKey};
 use crate::tls::keys::{self, Algorithm, KeyManager, KeyType};
 use crate::tls::validation::{self, SimpleTrust};
 use super::error;
@@ -35,20 +35,25 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
     Ok(ClientConfig::builder_with_provider(provider).with_protocol_versions(&versions).map_err(|cause| error("invalid-plugin-config", cause))?
         .dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_client_cert_resolver(Arc::new(resolver)))
 }
-fn roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<RootCertStore> {
-    let defaults = if trust.is_none() { Some(crate::tls::trust::decode(charge)?) } else { None };
-    let trust = trust.or(defaults.as_ref()).expect("explicit or default trust store");
-    let mut roots = RootCertStore::empty();
-    for certificate in trust.trusted_certificates() { roots.add(CertificateDer::from(certificate.as_slice())).map_err(|cause| error("invalid-plugin-config", cause))?; }
-    Ok(roots)
+struct PkixRoots { store: X509Store, _charge: Arc<MemoryReservation> }
+fn roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<PkixRoots> {
+    let (anchors, charge) = decoded_roots(trust, charge)?;
+    let mut store = X509StoreBuilder::new().map_err(|cause| error("invalid-plugin-config", cause))?;
+    for certificate in anchors { store.add_cert(certificate).map_err(|cause| error("invalid-plugin-config", cause))?; }
+    Ok(PkixRoots { store: store.build(), _charge: charge })
 }
 fn simple_roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<SimpleTrust> {
+    let (anchors, charge) = decoded_roots(trust, charge)?;
+    SimpleTrust::new(anchors, charge).map_err(|cause| error("invalid-plugin-config", cause.message))
+}
+fn decoded_roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<(Vec<X509>, Arc<MemoryReservation>)> {
+    let explicit = trust.is_some();
     let defaults = if trust.is_none() { Some(crate::tls::trust::decode(Arc::clone(&charge))?) } else { None };
     let trust = trust.or(defaults.as_ref()).expect("explicit or default trust store");
     let bound = trust.trusted_certificates().iter().try_fold(65_536usize, |bytes, certificate| certificate.len().checked_mul(32).and_then(|length| bytes.checked_add(length)).ok_or_else(|| error("allocation-overflow", "Registry trust anchors exceed allocation range")))?;
-    let charge = charge.budget().reserve(bound)?;
+    let charge = if explicit { charge.budget().reserve(bound)? } else { charge };
     let anchors = trust.trusted_certificates().iter().map(|certificate| X509::from_der(certificate).map_err(|cause| error("invalid-plugin-config", cause))).collect::<Result<Vec<_>>>()?;
-    SimpleTrust::new(anchors, charge).map_err(|cause| error("invalid-plugin-config", cause.message))
+    Ok((anchors, charge))
 }
 struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames, chain: Vec<X509>, kind: KeyType, eligible: bool, _certificate_charge: Arc<MemoryReservation> }
 struct ClientKeys { identities: Vec<ClientIdentity>, manager: KeyManager, _charge: Arc<MemoryReservation> }
@@ -88,25 +93,27 @@ impl ResolvesClientCert for ClientKeys {
     }
     fn has_certs(&self) -> bool { !self.identities.is_empty() }
 }
-enum Trust { Pkix(RootCertStore), SunX509(SimpleTrust) }
+enum Trust { Pkix(PkixRoots), SunX509(SimpleTrust) }
 struct ChainVerifier { roots: Trust, algorithms: WebPkiSupportedAlgorithms, verify_names: bool, _charge: Arc<MemoryReservation> }
 impl std::fmt::Debug for ChainVerifier {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.debug_struct("ChainVerifier").field("verify_names", &self.verify_names).finish() }
 }
 impl ServerCertVerifier for ChainVerifier {
     fn verify_server_cert(&self, leaf: &CertificateDer<'_>, intermediates: &[CertificateDer<'_>], server: &ServerName<'_>, _ocsp: &[u8], now: UnixTime) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        let bound = std::iter::once(leaf).chain(intermediates).try_fold(65_536usize, |bytes, certificate| certificate.len().checked_mul(32).and_then(|length| bytes.checked_add(length)).ok_or_else(|| certificate_error("Registry peer chain exceeds allocation range")))?;
+        let _charge = self._charge.budget().reserve(bound).map_err(certificate_error)?;
+        let peer = std::iter::once(leaf).chain(intermediates).map(|certificate| X509::from_der(certificate).map_err(certificate_error)).collect::<std::result::Result<Vec<_>, _>>()?;
+        let seconds = i64::try_from(now.as_secs()).map_err(certificate_error)?;
+        let now = Asn1Time::from_unix(seconds).map_err(certificate_error)?;
         match &self.roots {
             Trust::Pkix(roots) => {
-                let certificate = ParsedCertificate::try_from(leaf)?;
-                rustls::client::verify_server_cert_signed_by_trust_anchor(&certificate, roots, intermediates, now, self.algorithms.all)?;
-                if self.verify_names { rustls::client::verify_server_name(&certificate, server)?; }
+                let verified = validation::pkix::verify_store(&roots.store, &peer, &now, &self._charge).map_err(certificate_error)?;
+                if self.verify_names {
+                    let leaf = CertificateDer::from(verified.certificates[0].to_der().map_err(certificate_error)?);
+                    rustls::client::verify_server_name(&ParsedCertificate::try_from(&leaf)?, server)?;
+                }
             }
             Trust::SunX509(trust) => {
-                let bound = std::iter::once(leaf).chain(intermediates).try_fold(65_536usize, |bytes, certificate| certificate.len().checked_mul(32).and_then(|length| bytes.checked_add(length)).ok_or_else(|| certificate_error("Registry peer chain exceeds allocation range")))?;
-                let _charge = self._charge.budget().reserve(bound).map_err(certificate_error)?;
-                let peer = std::iter::once(leaf).chain(intermediates).map(|certificate| X509::from_der(certificate).map_err(certificate_error)).collect::<std::result::Result<Vec<_>, _>>()?;
-                let seconds = i64::try_from(now.as_secs()).map_err(certificate_error)?;
-                let now = Asn1Time::from_unix(seconds).map_err(certificate_error)?;
                 let verified = trust.verify(&peer, &now, crate::tls::security::verify_server_chain).map_err(certificate_error)?;
                 if self.verify_names {
                     let leaf = CertificateDer::from(verified[0].to_der().map_err(certificate_error)?);
@@ -138,10 +145,10 @@ mod tests {
         let memory = MemoryBudget::new(1 << 25);
         let charge = memory.reserve(crate::tls::trust::allocation_bound().unwrap()).unwrap();
         let defaults = roots(None, Arc::clone(&charge)).unwrap();
-        assert_eq!(defaults.len(), 146);
+        assert_eq!(defaults.store.all_certificates().len(), 146);
         let empty = include_bytes!("../../../../../../../../rust/crates/tls/tests/fixtures/empty.jks");
         let empty = KeyStore::decode(empty, StoreFormat::Java, StoreUse::Trust, Some("12345678"), None, Arc::clone(&charge)).unwrap();
-        assert!(roots(Some(&empty), Arc::clone(&charge)).unwrap().is_empty());
+        assert!(roots(Some(&empty), Arc::clone(&charge)).unwrap().store.all_certificates().is_empty());
         drop(defaults); drop(empty); drop(charge);
         assert_eq!(memory.used_bytes(), 0);
     }
@@ -241,17 +248,17 @@ mod tests {
     }
     #[test]
     fn disabling_hostnames_preserves_chain_and_validity_verification() {
-        let (root,leaf) = certificates(); let leaf = CertificateDer::from(leaf); let mut roots = RootCertStore::empty(); roots.add(CertificateDer::from(root)).unwrap();
+        let (root,leaf) = certificates(); let leaf = CertificateDer::from(leaf); let mut roots = X509StoreBuilder::new().unwrap(); roots.add_cert(X509::from_der(&root).unwrap()).unwrap();
         let memory = MemoryBudget::new(1 << 24); let charge = memory.reserve(1 << 20).unwrap();
         let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let mut verifier = ChainVerifier { roots: Trust::Pkix(roots), algorithms: provider.signature_verification_algorithms, verify_names:false,_charge:charge };
+        let mut verifier = ChainVerifier { roots: Trust::Pkix(PkixRoots { store: roots.build(), _charge: Arc::clone(&charge) }), algorithms: provider.signature_verification_algorithms, verify_names:false,_charge:charge };
         let wrong_name = ServerName::try_from("wrong.test").unwrap(); let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
         assert!(verifier.verify_server_cert(&leaf,&[],&wrong_name,&[],now).is_ok());
         verifier.verify_names = true; assert!(verifier.verify_server_cert(&leaf,&[],&wrong_name,&[],now).is_err());
         assert!(verifier.verify_server_cert(&leaf,&[],&ServerName::try_from("registry.test").unwrap(),&[],now).is_ok());
         verifier.verify_names = false;
         assert!(verifier.verify_server_cert(&leaf,&[],&wrong_name,&[],UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_950_000_000))).is_err());
-        verifier.roots = Trust::Pkix(RootCertStore::empty()); assert!(verifier.verify_server_cert(&leaf,&[],&wrong_name,&[],now).is_err());
+        verifier.roots = Trust::Pkix(PkixRoots { store: X509StoreBuilder::new().unwrap().build(), _charge: Arc::clone(&verifier._charge) }); assert!(verifier.verify_server_cert(&leaf,&[],&wrong_name,&[],now).is_err());
     }
     #[test]
     fn sunx509_registry_verification_preserves_hostname_validity_and_empty_trust() {

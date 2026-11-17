@@ -5,6 +5,7 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use super::invalid;
 mod native;
+pub(crate) mod pkix;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Algorithm { Pkix, SunX509 }
@@ -97,6 +98,11 @@ fn ca_extensions(certificate: &X509Ref, mut maximum_path: usize) -> Result<usize
 }
 
 fn server_extensions(certificate: &X509Ref) -> Result<()> {
+    server_usage(certificate)?;
+    critical_extensions(certificate, &[Nid::BASIC_CONSTRAINTS, Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE, Nid::NETSCAPE_CERT_TYPE])
+}
+
+fn server_usage(certificate: &X509Ref) -> Result<()> {
     if !bit_extension(certificate, Nid::KEY_USAGE, 0x80)? { return Err(invalid("TLS server key usage excludes digital signatures")); }
     if !bit_extension(certificate, Nid::NETSCAPE_CERT_TYPE, 0x40)? { return Err(invalid("TLS server Netscape certificate type excludes SSL servers")); }
     let mut critical = -1;
@@ -109,7 +115,7 @@ fn server_extensions(certificate: &X509Ref) -> Result<()> {
             return Err(invalid("TLS server extended key usage excludes server authentication"));
         }
     }
-    critical_extensions(certificate, &[Nid::BASIC_CONSTRAINTS, Nid::SUBJECT_ALT_NAME, Nid::KEY_USAGE, Nid::EXT_KEY_USAGE, Nid::NETSCAPE_CERT_TYPE])
+    Ok(())
 }
 
 fn bit_extension(certificate: &X509Ref, extension: Nid, mask: u8) -> Result<bool> {

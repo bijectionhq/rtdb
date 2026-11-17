@@ -50,6 +50,23 @@ Reissued-anchor matching compares encoded public-key parameters with Java's NULL
 Its validation covers certificate signatures, validity, issuer chaining, CA path lengths, key usage, Netscape certificate types and unsupported critical extensions.
 Intermediate extended key usage does not constrain the simple validator.
 A directly trusted leaf bypasses certificate validity and usage checks while retaining explicit certificate distrust checks.
+`PKIX` follows Java's ordered-chain validation shortcut and otherwise builds a path from the supplied certificates.
+The builder retries candidates rejected by certificate policy and limits paths to five non-self-issued intermediate certificates; ordered validation has no builder depth limit.
+Search state and candidate validation are admitted against the connection's memory budget, and admission failures stop the search.
+An exactly trusted leaf takes Java's PKIX early return; other paths require a version-3 anchor to assert CA basic constraints and, when present, certificate-signing key usage.
+The native path validator uses a temporary anchor assertion with the original subject, issuer, serial number, public key and subject-key identifier, with unrestricted CA signing extensions.
+Its retained signature bytes are not signatures over the modified certificate and are never validated or transmitted.
+Original anchors supply Java's policy checks and the returned chain, keeping anchor path lengths, name constraints and critical extensions outside the validated certificate path.
+Certificate validity is checked on every non-anchor member, while intermediate extended key usage does not restrict the path.
+Leaf usage checks follow the Java TLS-server rules after path validation has consumed critical extensions.
+Critical ordinary-policy qualifiers are rejected while Java's policy tree remains live; an absent or exhausted policy tree leaves later qualifiers unchecked, and anyPolicy qualifiers do not trigger rejection.
+Policy processing starts with Java's default anyPolicy set and enforces explicit-policy, mapping and anyPolicy-inhibition counters, including the self-issued and final-certificate rules.
+The four policy extensions use Java's BER parsing and duplicate handling: malformed noncritical extensions are absent, malformed critical extensions fail, and two successfully parsed copies of one extension fail.
+Unknown critical extensions and certificate signatures remain subject to native path validation.
+The selected path is checked against the pinned blocked-certificate list, digest and key-size constraints, JDK-root SHA-1 restriction, and Symantec, Entrust and Camerfirma distrust cutoffs.
+Registry uses the same native PKIX path verifier while retaining Rustls handshake signature verification.
+Native handshake security uses OpenSSL level 1 with Java certificate key limits, the EC-224 minimum, and compression disabled.
+Certificate SHA-1 remains subject to the pinned path policy; SHA-1 handshake signatures remain disabled.
 Trusted certificates follow Java HashSet bucket and tree ordering; ties between distinct certificates with the same hash use native object identity and are specific to the process.
 The native simple validator checks the connection's configured DNS name or IP address and retains its peer-chain reservation until the connection is destroyed.
 `SunX509` uses the pinned roots or Java-style trust material; native `ssl.ca.location` and `ssl.ca.pem` overrides remain available with `PKIX`.
@@ -81,7 +98,7 @@ A list containing only disabled suites or protocols produces no usable handshake
 == Open parity gaps
 
 `NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
-OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
+OpenSSL's PKIX path-building choices, name constraints, and algorithm availability still require qualification against Java's validator.
 Distinguished-name matching still uses OpenSSL canonicalization; Java's Unicode case folding and NFKD normalization need a shared native adapter.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 These are open standard-configuration gaps.
