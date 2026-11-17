@@ -883,10 +883,13 @@ Existing-inner adoption, complete raw object and ByteBuffer behavior, selected r
 
 Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
 That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
-The current native exception projection carries no such cause capability.
-Before production parser integration or compatibility closure, preserve the required observable behavior or record a concrete migration consistent with the reviewed embedded-binding design.
-A private native cache may rely on its separately enforced nonescaping configuration boundary; that premise does not settle the embedded compatibility requirement.
-Serialized wire diagnostics and in-process exception capabilities require separate source assertions.
+The embedded Java and Clojure migration documents the diagnostic APIs and the changes required for applications that depend on a live JVM parser.
+`SqlParserCauseTest` pins both the shared recognizer access on `SELEC 1` and a null source cause on `extra SELECT 1`.
+`NativeAdbcTest.embeddedSqlErrorsExposeDiagnosticsAndKeepTheConnectionUsable` covers the same inputs through native Java preparation and the Clojure query path.
+The native fixtures check the existing diagnostic projection, including the Java null cause and the Clojure anomaly values, and leave source-to-native message parity open.
+Keep the live recognizer observation as an explicit migration difference in conformance.
+Production parser adoption still requires separately enforced native-cache ownership and nonescape.
+Serialized pgwire and Flight diagnostics require their own assertions.
 
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.

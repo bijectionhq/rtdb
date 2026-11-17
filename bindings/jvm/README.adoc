@@ -72,5 +72,21 @@ The new module does not invoke Cargo from Gradle and does not build or load a na
 The test sources require a separately built library at `xtdb.native.library` when the full implementation gate permits execution.
 No native, JVM or Clojure test has been run in the implementation phase.
 
+=== SQL parser errors
+
+The JVM parser can attach a live ANTLR `RecognitionException` to a SQL error.
+The cause can expose the recognizer, token stream and, for some errors, dead-end configurations.
+Parses of the same JVM parser class share the recognizer's decision DFA objects.
+The embedded native API treats a SQL error as a diagnostic value.
+`NativeException.getCause()` returns null, and Clojure anomaly wrapping preserves diagnostic values in the cause chain.
+
+Java callers can replace exception-cause inspection with `NativeException.category()`, `code()`, `getMessage()` and `transit()`, or read the corresponding ADBC error details.
+Clojure callers can match `:cognitect.anomalies/category` and `:xtdb.error/code` in `ex-data` and read the message with `ex-message`.
+For syntax errors, Java exposes the strings `incorrect` and `xtdb/sql-error`, and Clojure exposes the keywords `:cognitect.anomalies/incorrect` and `:xtdb/sql-error`.
+
+Tools that traverse recognizers or alter decision DFAs and configurations need to remove that dependency from embedded native calls before migrating.
+Keep JVM-specific parser inspection in separate tooling using the original JVM parser and pass diagnostic values to the application.
+Applications that depend on changing parser state to alter later parses need to remove that behavior before switching engines.
+
 `NativeException.getMessage()` preserves an absent native diagnostic message as Java null and an empty message as an empty string.
 The Clojure bridge retains that distinction when reading the diagnostic Transit payload.

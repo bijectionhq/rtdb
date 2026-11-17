@@ -1,9 +1,11 @@
 package xtdb.rust;
 
 import static org.junit.jupiter.api.Assertions.*;
+import clojure.java.api.Clojure;
 import java.io.IOException;
 import java.util.List;
 import org.apache.arrow.adbc.core.AdbcConnection.GetObjectsDepth;
+import org.apache.arrow.adbc.core.AdbcStatusCode;
 import org.apache.arrow.adbc.core.BulkIngestMode;
 import org.apache.arrow.adbc.core.StandardSchemas;
 import org.apache.arrow.memory.RootAllocator;
@@ -13,6 +15,7 @@ import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.junit.jupiter.api.Test;
+import xtdb.api.error.Incorrect;
 
 final class NativeAdbcTest {
     private static final String YAML = "server: null\nflightSql: null\nnodeId: jvm-binding-test\n";
@@ -39,6 +42,39 @@ final class NativeAdbcTest {
             try (var result = statement.executeQuery()) {
                 assertTrue(result.getReader().loadNextBatch());
                 assertEquals("native", result.getReader().getVectorSchemaRoot().getVector("v").getObject(0).toString());
+                assertFalse(result.getReader().loadNextBatch());
+            }
+        }
+    }
+
+    @Test void embeddedSqlErrorsExposeDiagnosticsAndKeepTheConnectionUsable() throws Exception {
+        Clojure.var("clojure.core", "require").invoke(Clojure.read("xtdb.rust"));
+        var query = Clojure.var("xtdb.api", "q");
+        try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect()) {
+            for (String sql : List.of("SELEC 1", "extra SELECT 1")) {
+                NativeException diagnostic;
+                try (var statement = connection.createStatement(sql)) {
+                    diagnostic = assertThrows(NativeException.class, statement::prepare);
+                }
+                assertEquals(AdbcStatusCode.INVALID_ARGUMENT, diagnostic.getStatus());
+                assertEquals("incorrect", diagnostic.category());
+                assertEquals("xtdb/sql-error", diagnostic.code());
+                assertNotNull(diagnostic.getMessage());
+                assertFalse(diagnostic.getMessage().isEmpty());
+                assertTrue(diagnostic.transit().length > 0);
+                assertNull(diagnostic.getCause());
+
+                var anomaly = assertThrows(Incorrect.class, () -> query.invoke(connection, sql));
+                assertEquals(diagnostic.getMessage(), anomaly.getMessage());
+                assertEquals(Clojure.read(":cognitect.anomalies/incorrect"), anomaly.getData().valAt(Clojure.read(":cognitect.anomalies/category")));
+                assertEquals(Clojure.read(":xtdb/sql-error"), anomaly.getData().valAt(Clojure.read(":xtdb.error/code")));
+                assertEquals(sql, anomaly.getData().valAt(Clojure.read(":sql")));
+                assertInstanceOf(Incorrect.class, anomaly.getCause());
+                assertNull(anomaly.getCause().getCause());
+            }
+            try (var statement = connection.createStatement("SELECT 42 AS answer"); var result = statement.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                assertEquals(42, ((Number) result.getReader().getVectorSchemaRoot().getVector("answer").getObject(0)).intValue());
                 assertFalse(result.getReader().loadNextBatch());
             }
         }
