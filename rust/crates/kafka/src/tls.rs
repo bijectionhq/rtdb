@@ -15,6 +15,7 @@ pub(crate) mod validation;
 pub(crate) mod security;
 pub(crate) mod request;
 mod public_key;
+mod names;
 pub(crate) mod random;
 mod registry;
 
@@ -110,10 +111,17 @@ impl NativeTls {
         let request = request::Request::of(ssl)?;
         let types = request.requested_types(ssl);
         let now = Asn1Time::days_from_now(0).map_err(invalid)?;
-        let required = CERT_PKEY_VALID | CERT_PKEY_ISSUER_NAME | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
+        let memory = self.reservations[0].budget();
+        let authorities = names::peer_authorities(ssl, memory)?;
+        let _matches_charge = memory.reserve(self.identities.len().checked_add(64).ok_or_else(overflow)?)?;
+        let mut issuer_matches = Vec::with_capacity(self.identities.len());
+        for identity in &self.identities {
+            issuer_matches.push(names::matches_issuer(std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()), &authorities, memory)?);
+        }
+        let required = CERT_PKEY_VALID | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
         let selected = self.key_manager.choose(&types, |index, kind| {
             let identity = &self.identities[index];
-            identity.eligible && identity.kind == kind
+            identity.eligible && identity.kind == kind && issuer_matches[index]
                 && (!self.key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
                 && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
         }, |index| keys::client_status(&self.identities[index].certificate, &now));
@@ -190,7 +198,6 @@ fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, re
 }
 
 const CERT_PKEY_VALID: i32 = 0x1;
-const CERT_PKEY_ISSUER_NAME: i32 = 0x200;
 const CERT_PKEY_CERT_TYPE: i32 = 0x400;
 
 unsafe extern "C" {

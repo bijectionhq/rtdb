@@ -55,6 +55,7 @@ A request with no compatible entry sends no client certificate.
 `SunX509` selects the built-in simple validator: it follows the supplied certificate order, replaces matching reissued trust anchors, and appends a trusted issuer when needed.
 Reissued-anchor matching compares encoded public-key parameters with Java's NULL-parameter normalization, retaining distinctions such as RSA-PSS restrictions on the same modulus and exponent.
 Its validation covers certificate signatures, validity, issuer chaining, CA path lengths, key usage, Netscape certificate types and unsupported critical extensions.
+Simple validation and client authority hints compare distinguished names using Java X500Principal canonicalization, including Unicode case conversion and NFKD normalization.
 Intermediate extended key usage does not constrain the simple validator.
 A directly trusted leaf bypasses certificate validity and usage checks while retaining explicit certificate distrust checks.
 `PKIX` follows Java's ordered-chain validation shortcut and otherwise builds a path from the supplied certificates.
@@ -107,7 +108,7 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 `NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
 OpenSSL's PKIX path-building choices, name constraints, and algorithm availability still require qualification against Java's validator.
-Distinguished-name matching still uses OpenSSL canonicalization; Java's Unicode case folding and NFKD normalization need a shared native adapter.
+PKIX issuer chaining and self-issued classification still use OpenSSL canonicalization; their Java name integration remains pending.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 These are open standard-configuration gaps.
 Additional Java providers and credential extensions require native implementations.
