@@ -31,7 +31,9 @@ The reference accepts a day component followed by bare lowercase `t`, while bare
 Both parsers borrow their input and use fixed-width component storage without decimal-power allocation.
 Transit period-duration values parse their two components independently, retain wrapping month/day admission, and normalize oversized durations into days after the reference vector-type selection.
 The Transit interval reader returns null when its outer lexical grammar does not match; component parsing failures still raise errors.
-JSON preserves integer and decimal digits, while JSON-LD and Transit use the pinned scalar and container representations.
+JSON output preserves integer and decimal digits.
+Untagged fractional JSON input opens as double precision, while JSON-LD decimal tags retain exact decimal input.
+JSON-LD and Transit use the pinned scalar and container representations.
 
 Several pinned encoders differ from PostgreSQL's usual binary representations.
 Interval and timestamp-range output remain textual in both formats, and OID/regclass/regproc output remains unsigned decimal ASCII in both formats.
