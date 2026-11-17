@@ -25,16 +25,19 @@ async fn exported_snapshot_and_copyboth_preserve_concurrent_updates_and_full_toa
     assert_eq!(batch.operations.len(), 1); assert_eq!(batch.operations[0].row["value"], Value::Utf8("before".into()));
     let toast = batch.operations[0].row["toast"].clone();
     assert!(snapshot.next_batch().await.unwrap().is_none()); snapshot.finish().await.unwrap();
+    wait_for_slot_release(&mut control, &slot).await;
     let mut stream = ChangeStream::open(&remote, &config, start, Arc::clone(&memory)).await.unwrap();
     let changed = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = stream.read().await.unwrap().transaction { break transaction; } } }).await.unwrap();
     assert!(changed.lsn > start); assert_eq!(changed.operations[0].row["value"], Value::Utf8("after".into())); assert_eq!(changed.operations[0].row["toast"], toast);
     stream.acknowledge(changed.lsn).await.unwrap();
     drop(stream);
+    wait_for_slot_release(&mut control, &slot).await;
     let mut resumed = ChangeStream::open(&remote, &config, changed.lsn, Arc::clone(&memory)).await.unwrap();
     control.query(&format!("DELETE FROM {table} WHERE _id = 1")).await.unwrap();
     let deleted = tokio::time::timeout(Duration::from_secs(20), async { loop { if let Some(transaction) = resumed.read().await.unwrap().transaction { if transaction.lsn > changed.lsn { break transaction; } } } }).await.unwrap();
     assert_eq!(deleted.operations[0].kind, crate::RowKind::Delete); assert_eq!(deleted.operations[0].row["_id"], Value::I32(1));
     drop(resumed);
+    wait_for_slot_release(&mut control, &slot).await;
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap();
     control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap();
     control.query(&format!("DROP TABLE {table}")).await.unwrap();
@@ -49,6 +52,16 @@ impl rtdb_replication::DatabaseEffects for Effects {
 }
 struct Authority;
 impl rtdb_tx::TransactionAuthorization for Authority { fn check_role_membership(&self, _: &str, _: Option<&str>) -> rtdb_types::Result<()> { Ok(()) } }
+async fn wait_for_slot_release(control: &mut Connection, slot: &str) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let result = control.query(&format!("SELECT active::text FROM pg_replication_slots WHERE slot_name = '{slot}'")).await.unwrap();
+            assert_eq!(result.rows.len(), 1);
+            if result.rows[0].cell(0).unwrap() == Some("false") { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+}
 async fn wait_for(mut predicate: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(20), async { while !predicate() { tokio::time::sleep(Duration::from_millis(10)).await; } }).await.unwrap();
 }
@@ -91,5 +104,6 @@ async fn native_source_applies_snapshot_streams_and_confirms_only_the_adopted_ex
     cancellation.cancel(); source_job.await.unwrap().unwrap(); handle.shutdown(); replica_job.await.unwrap().unwrap();
     let recovered = blocks.recover(rtdb_trie::TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
     assert_eq!(crate::ResumeToken::decode(recovered.progress.external_token.as_deref().unwrap()).unwrap().lsn, durable);
+    wait_for_slot_release(&mut control, &slot).await;
     control.query(&format!("SELECT pg_drop_replication_slot('{slot}')")).await.unwrap(); control.query(&format!("DROP PUBLICATION {publication}")).await.unwrap(); control.query(&format!("DROP TABLE {table}")).await.unwrap();
 }
