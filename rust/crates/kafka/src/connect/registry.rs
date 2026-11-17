@@ -18,6 +18,8 @@ use references::{ResolvedReferences, ResolvedSchema};
 mod http_tests;
 #[cfg(test)]
 mod input_window;
+#[cfg(test)]
+mod response;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RegistryFormat { Avro, Json }

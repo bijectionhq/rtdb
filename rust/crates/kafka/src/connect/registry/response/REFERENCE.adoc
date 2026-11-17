@@ -1,0 +1,123 @@
+= Registry REST response beans
+
+The ordered-byte decoder constructs nullable REST bean owners.
+The production Registry HTTP routes continue to use their published response path.
+The Registry test build includes 30 decoder regression source fixtures, with execution pending Phase 2.
+HTTP stream segmentation, persistent Jackson symbol-table state and effective shipped Jackson selection remain required before typed HTTP activation.
+The Phase 2, whole-native memory and source-completeness gates remain open.
+
+== Source profiles
+
+Confluent7.8.0 JacksonMapper constructs a fresh JsonMapper with ALLOW_NON_NUMERIC_NUMBERS enabled.
+The declared Confluent profile uses Jackson databind/core/annotations2.16.0.
+Connect JSON4.4.0 declares databind2.21.7, whose matching BOM selects core2.21.7 and annotations2.21.
+These declarations do not establish the effective runtime classloader or shaded distribution.
+Profile is explicit at each decoder entry point.
+
+Both inspected profiles preserve duplicate field order, nullable primitive wrappers, Java String UTF16 units, scalar coercions and ordinal enums.
+The newer profile rejects zero-prefixed quoted enum ordinals such as "01" and applies the number-length limit to coerced Integer strings.
+Core2.21.7 rejects raw three-byte UTF8 surrogate encodings when decoding text; its lazy string skip still checks only continuation bytes.
+Escaped isolated surrogate value strings are retained in both profiles.
+Core2.21.7 requires escaped field-name surrogate pairs, while2.16.0 permits isolated escaped units.
+The exact UTF8 value-string decoder uses bitwise OR to emit the high UTF16 unit of a four-byte encoding, while field-name decoding uses addition.
+These differ for accepted overlong four-byte encodings below0x10000: raw F0 80 80 80 produces FFC0 DC00 in a value and D7C0 DC00 in a name.
+Lazy skip validates continuation bytes without publishing either decoded value.
+Core2.16.0's literal-suffix error decoder rereads the non-ASCII lead byte;2.21.7 advances and rewinds that byte and checks the decoded code point truncated to a Java char.
+The bounded-byte fixtures retain these different observations.
+
+== Bean construction
+
+SchemaString has a default constructor and encounter-ordered setters; its public String constructor is also an implicitly discovered scalar creator.
+Its initial schemaType is AVRO and references is empty, while explicit setter nulls remain null.
+Schema has nine creator properties, including lowercase ruleset, and separately exposes the ordinary ruleSet setter.
+Creator duplicates replace the pending argument, and each argument contributes to the completion count once.
+When all arguments have appeared, Jackson advances to the following field or object end before constructing the bean.
+Ordinary pre-creator setters are buffered by prepending and replay in reverse encounter order.
+After construction, lowercase ruleset has no fallback setter; that failure precedes decoding a lazy string value.
+
+SchemaReference, Metadata, RuleSet, Rule, SchemaTags and SchemaEntity are fully decoded even when the immediate native caller would ignore their fields.
+Metadata normalizes tags, properties and sensitive in that constructor order.
+Rule supplies null kind/mode defaults and normalizes tags/params without invoking Rule.validate.
+Sorted constructors reject null set members and null tag-map values at construction.
+Creator Map/Set values assigned through Metadata/Rule's final SortedMap/SortedSet fallback fields fail reflective class assignment after their complete value has decoded.
+Explicit post-creator nulls can remain in those fields.
+RuleSet creator null lists become empty; later null assignments remain null and null list members remain present.
+SchemaEntity computes normalizedPath at construction; later reflected entityPath changes retain that earlier normalized value.
+
+== Owners and admission
+
+RawResponse and RawBody are passive byte envelopes for the later transport seam.
+Cursor and Input are passive call-local borrowed lexical state; Name retains an Input snapshot rather than a decoded-name allocation.
+Token, Frame, Profile, Utf8Demand and the failure variants are passive value tags.
+TextBufferObservation is a passive caller-owned observation of the actual source text-segment capacity in UTF16 units at a demanded value's opening-quote byte offset.
+Cursor borrows those observations with the response bytes; it retains no observation allocation or authority callback.
+TextBufferDemand is a passive scan-local output-segment counter and allocates no source segment storage.
+Creator is a single-writer transient seen-mask with an explicit constructed state.
+The separate Schema setter buffer is an admitted Values owner and is consumed in reverse order.
+SchemaString, Schema, Reference, Metadata, RuleSet, Rule, SchemaTags and SchemaEntity are passive typed result values.
+StringSet, Properties and Tags retain collection class/ordering state used by constructor and fallback-field behavior.
+No owner starts a task or retains the admission callback.
+
+Values checks array layout, multiplication and allocator margin before context.reserve and try_reserve_exact.
+Growing a vector reserves the replacement while the old vector and its charge remain live, then moves values and releases the old buffer.
+Payload fields precede their reservation fields, so retained payloads are destroyed before their own leases.
+JavaString::copy_utf16_with_admission reserves its checked shared backing before copying units, and retains the returned lease.
+Decoded-string scratch and output overlap is separately admitted.
+The existing ConversionContext retains every accepted charge until context drop; this conservative lifetime also covers buffers released earlier.
+Returned strings and collections retain their own reservations and can safely outlive the context.
+Native admission/allocation/overflow anomalies remain outer Failure::Native values.
+The cursor allocates no generic serde_json::Value tree and gives the private RawValue field name ordinary unknown-property treatment.
+
+== Parser boundary still requiring integration
+
+The plain schema/schema_string entry points have no source text-buffer capacity observation.
+For demanded strings of at most20million UTF16 units, that capacity does not affect the length guard.
+Crossing that bound without a qualified observation returns an outer unsupported-source-profile anomaly, not a claimed Jackson length failure.
+The qualified schema_with_text_buffers/schema_string_with_text_buffers entry points borrow TextBufferObservation values for demanded UTF8 strings.
+Each supplied capacity must be the actual positive current Java TextBuffer segment capacity at that byte offset, bounded by the Java array range.
+The caller must account for earlier numeric tokens, name decoding, demanded strings and recycler reuse when deriving that observation.
+A fresh default recycler starts at200 units, but reusing200 for every string is not a valid general observation.
+Each offset must have at most one observation; unneeded observations do not cause a parser demand.
+Matching observations are ignored for reader encodings because their shared text and reader-window branches remain outside this capability.
+Over-limit reader strings therefore remain unsupported.
+The observations are borrowed and any retained caller-owned storage remains the caller's admission responsibility.
+
+For a qualified UTF8 demand, string length is checked at completed output segments and at final contents demand, as in TextBuffer and UTF8StreamJsonParser.
+Replacement segments grow by50percent with a500-unit minimum and65,536-unit maximum.
+Malformed escape and UTF8 decoding can fail after20million units but before the next completed-segment check.
+At the next raw-character demand with a full output segment, source input exhaustion is demanded before segment validation.
+A supplementary decoded pair can also validate the segment between its two emitted units before another raw-character demand.
+The qualified source fixtures preserve those demand points and distinguish an unavailable observation from a Java failure.
+The current production transport's256KiB response cap is below the over-limit string witnesses; the direct decoder's borrowed byte input has no such cap.
+
+RestService320–323 passes HttpURLConnection.getInputStream directly to ObjectMapper.readValue.
+UTF32Reader and ReaderBasedJsonParser decode ahead in source-dependent input windows.
+An invalid UTF32 suffix can fail before a completed root bean is returned, and a supplementary character at an output-buffer boundary uses UTF32Reader's retained pending-char branch.
+Core2.21.7 also reports a non-identifier UTF8 literal suffix when decoding that suffix reloads its input buffer.
+The current byte-only cursor has no HTTP read-segmentation observation and does not reproduce those reader-window effects.
+A transport/reader observation boundary is required before claiming those cases.
+
+JsonFactory also shares seeded ByteQuadsCanonicalizer/CharsToNameCanonicalizer state across parser calls and enables FAIL_ON_SYMBOL_HASH_OVERFLOW by default.
+The borrowed cursor preserves decoded names and member order but carries no persistent mapper symbol state.
+Adversarial symbol-hash overflow, mapper reuse and their failure order therefore remain required.
+The local cursor's name-length/decode-buffer checks do not discharge that obligation.
+
+Typed HTTP projection must preserve a nullable Java UTF16 schema text, subject and reference name until their actual consumer demands them.
+Current RegistrySchema.schema:String and reference text maps require a coordinated carrier change before activation.
+No null-to-empty or isolated-surrogate-to-replacement projection is authorized here.
+Version lookup scheduling and caching remain owned by the separate Registry timing plan.
+
+== Provenance and derivation
+
+link:artifacts.json[artifacts.json] pins source archives, declared BOM/POM inputs, complete prefix lengths/digests and legal members.
+link:sources.sha256[sources.sha256] pins125 selected Java source files and21 legal members.
+link:COPYRIGHT[COPYRIGHT] retains every selected Java file's exact complete pre-package prefix, including empty prefixes.
+link:LICENSES[LICENSES] retains every selected upstream license and notice verbatim beneath its source label.
+The JDK source archive and legal files are the same Temurin25.0.1+8 inputs pinned by the Avro names prerequisite.
+
+link:cursor/identifier-parts.bin[identifier-parts.bin] is the8192-byte BMP Character.isJavaIdentifierPart bitmap derived from CharacterData00's static X/Y/A tables.
+The derivation independently compares all370 BMP decimal digit values against the shared decimal_digit helper's table.
+link:cursor/identifier-derivation.json[identifier-derivation.json] records the source/output hashes and counts.
+link:cursor/derive-identifiers.py[derive-identifiers.py] is a Python standard-library source-data transformation accepting src.zip, decimal_text.rs and an output directory.
+It invokes no Java, Rust, build or project runtime.
+The retained bitmap was produced by the equivalent isolated /tmp source-data transformation.
