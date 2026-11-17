@@ -20,5 +20,39 @@ A recognition failure retains its source span; rendering it requires allocation 
 The rendered diagnostic owns its message and borrows that allocation scope through destruction.
 Callers can borrow its anomaly; the diagnostic provides no owned extraction or cloning operation.
 
+== Buffered token demand
+
+The token stream owns the scanner and a buffered prefix of raw lexemes.
+Construction admits capacity for 100 lexemes under the caller's allocation scope and leaves the cursor uninitialized.
+Lookahead, consume and seek initialize the cursor by requesting the first token; zero and negative lookahead also perform this initialization.
+Negative lookahead before the first token returns no token.
+Positive lookahead requests one additional token at a time and leaves the initialized cursor unchanged.
+Each successful scan precedes any buffer-growth admission needed to retain its token.
+EOF occupies one buffered position; lookahead and seek beyond it return that position.
+Consuming EOF is a distinct contract error.
+Markers are zero and release has no effect; a saved token index identifies a rewind position within the retained prefix.
+These operations adapt ANTLR 4.13.2's https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/BufferedTokenStream.java[`BufferedTokenStream`] and https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/CommonTokenStream.java[`CommonTokenStream`].
+The upstream BSD 3-clause notice is retained in link:../../LICENSE-ANTLR[`LICENSE-ANTLR`].
+
+Consume and seek commit their target cursor after the requested fetch succeeds.
+A first call can commit cursor zero during initialization before a later fetch fails.
+Fetched tokens remain buffered on failure.
+A raw recognition failure is retained at the prefix boundary; later demands beyond that prefix return it without rescanning.
+Buffered reads and seek remain available for cleanup.
+
+Text extraction synchronizes its inclusive stop index without initializing the cursor, then joins the raw token spellings through that position.
+Skipped whitespace and comments are absent from the result.
+Negative bounds return empty text without fetching; reversed nonnegative bounds still synchronize the stop index.
+The stop index clamps at EOF, whose display text is omitted.
+Output bytes are counted and admitted before constructing the string.
+The returned text owns its string and borrows the allocation scope through destruction; callers receive only a borrowed string view.
+The stream retains the same scope borrow through destruction of its token buffer.
+
+Admission failure in scanning, buffer growth or text construction aborts the stream.
+A scanned token whose insertion fails remains a borrowed pending lexeme in that terminal state.
+The original allocation anomaly is returned once; renewed demand returns an allocation-free `Aborted` value.
+Cached inspection and buffered seek remain available, while consume, text construction and uncached demand cannot resume after other budget owners release memory.
+Reservations remain with the allocation scope until it is dropped.
+
 The scanner is isolated from production parse, control and statement-splitting entry points pending their integration review.
 Query C-escape decoding, opaque control strings, UTF16 literal values, parser prediction/error order, validated batch dispatch and AST/binder admission are separate required consumers.
