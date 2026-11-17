@@ -344,6 +344,7 @@ impl<'a> Expression<'a> {
             }
             Self::Call { function,arguments } => {
                 let function = function.evaluate(locals,context)?;
+                function.admit_ifn_cast()?;
                 let arguments = evaluate_arguments(arguments,locals,context)?;
                 let HostValue::Function(function) = function else { return Err(error("Host value is not callable")); };
                 function.apply(arguments,context)?
@@ -356,6 +357,15 @@ fn evaluate_arguments<'a>(expressions: &[Expression<'a>],locals: &mut [HostValue
     expressions.iter().map(|expression|expression.evaluate(locals,context)).collect()
 }
 impl HostValue<'_> {
+    fn admit_ifn_cast(&self) -> Result<()> {
+        match self {
+            Self::Function(_) | Self::Nil | Self::Vector(_) => Ok(()),
+            Self::Constant(Form::Literal(Value::Null | Value::Keyword(_)) | Form::Symbol(_) | Form::Vector(_) | Form::Map(_) | Form::Set(_)) => Ok(()),
+            Self::Number(_) | Self::Bool(_) | Self::Text(_) => Err(error("Host value is not callable")),
+            Self::Constant(Form::Literal(Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Utf8(_)) | Form::Character(_) | Form::List(_) | Form::AnonymousFunction(_)) => Err(error("Host value is not callable")),
+            Self::Constant(Form::Literal(_) | Form::BigInteger(_) | Form::Decimal(_) | Form::Tagged { .. }) => Err(unsupported("Host call admission requires an established host literal carrier")),
+        }
+    }
     fn truthy(&self) -> bool { !matches!(self,Self::Nil | Self::Bool(false) | Self::Constant(Form::Literal(Value::Null | Value::Bool(false)))) }
     fn string(&self) -> Result<&str> {
         match self { Self::Text(value) => Ok(value),Self::Constant(Form::Literal(Value::Utf8(value))) => Ok(value),_ => Err(error("Host value is not a String")) }
@@ -737,5 +747,46 @@ mod tests {
             }
         }
         assert_eq!(memory.used_bytes(),0);
+    }
+    #[test]
+    fn non_ifn_calls_fail_before_argument_budget_admission() {
+        let raw = [Form::Literal(Value::Bool(false)),Form::Literal(Value::I64(1)),Form::Literal(Value::Utf8("x".into())),Form::Character('x'),Form::List(vec![]),Form::AnonymousFunction(Box::new(Form::List(vec![])))];
+        let mut functions = raw.iter().map(HostValue::Constant).collect::<Vec<_>>();
+        functions.extend([HostValue::Bool(true),HostValue::Text(Arc::from("x")),HostValue::Number(Arc::new(Number::Long(1)))]);
+        let argument = Form::Literal(Value::I64(1));
+        for function in functions {
+            let memory = MemoryBudget::new(4096);
+            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(&argument)] };
+            let mut locals = [function];
+            {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext { allocation: Some(&scope),..Default::default() };
+                let error = expression.evaluate(&mut locals,&context).err().unwrap();
+                assert_eq!(error.message.as_deref(),Some("Host value is not callable"));
+                assert_eq!(memory.used_bytes(),4096);
+                assert_eq!(memory.peak_bytes(),4096);
+            }
+            assert_eq!(memory.used_bytes(),0);
+        }
+    }
+    #[test]
+    fn null_and_ifn_values_reach_argument_budget_admission() {
+        let raw = [Form::Literal(Value::Null),Form::Literal(Value::Keyword(rtdb_types::Keyword::from_name("k"))),Form::Symbol("k".into()),Form::Vector(vec![]),Form::Map(vec![]),Form::Set(vec![])];
+        let mut functions = raw.iter().map(HostValue::Constant).collect::<Vec<_>>();
+        functions.extend([HostValue::Nil,HostValue::Function(Function::Identity),HostValue::Vector(Vec::new().into())]);
+        let argument = Form::Literal(Value::I64(1));
+        for function in functions {
+            let memory = MemoryBudget::new(4096);
+            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(&argument)] };
+            let mut locals = [function];
+            {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext { allocation: Some(&scope),..Default::default() };
+                assert_eq!(expression.evaluate(&mut locals,&context).err().unwrap().code,"rtdb/memory-budget-exceeded");
+                assert_eq!(memory.used_bytes(),4096);
+                assert_eq!(memory.peak_bytes(),4096);
+            }
+            assert_eq!(memory.used_bytes(),0);
+        }
     }
 }

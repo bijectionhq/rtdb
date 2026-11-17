@@ -405,6 +405,10 @@ The raw carrier preserves host pattern lists, symbols and other forms independen
 Native host compilation admits all emitted pattern programs before any pattern binding executes.
 Its initial lexical and string forms include simple-symbol `let`/`let*`, `if`, `do`, `quote`, `when`, `when-not`, `and`, `or`, vector evaluation, and `str`, `identity`, `name`, `namespace`, `subs`, `not` and `boolean` calls.
 Lexical function values preserve strict argument evaluation, and substring indexes count UTF16 units.
+Ordinary host calls admit the evaluated function value to the JVM IFn boundary before reserving or evaluating arguments.
+Numbers, Booleans, strings, characters and raw lists fail that admission; nil, vectors, maps, sets, keywords and symbols retain argument evaluation before invocation.
+Quoted anonymous-function syntax retains its reader-expanded list shape at this boundary.
+Successful collection, keyword and symbol invocation, null invocation diagnostics and exact JVM throwable payloads remain required work; undefined programmatic literal and tagged carriers report their unsupported host interpretation explicitly.
 Host numeric values share exact BigInt, BigDecimal and JVM primitive categories with stored Transit objects, retaining decimal scale and Java numeric text.
 Checked `byte`, `short`, `int`, `long`, `float` and `double` calls preserve primitive inline overloads and boxed function invocation.
 Host `+`, `-`, `*`, `/`, `inc` and `dec`, including their promoting apostrophe variants, retain checked long operations, BigInt and ratio categories, and exact BigDecimal scale arithmetic.

@@ -545,3 +545,29 @@ async fn host_classifications_keep_ordinary_call_arity_and_boxed_result_metadata
     }
     assert_eq!(project(r#"(regexp-replace "NaN" (str (/ (zero? 1) ##NaN)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
 }
+
+#[tokio::test]
+async fn host_non_ifn_values_fail_before_argument_evaluation() {
+    for function in ["true","false","(number? 1)","(zero? 1)","1","1.0","1N","1M","(/ 1 2)","(byte 1)","(float 1)",r#""x""#,r#"(str "x")"#,r"\x","()","'(1)","'#(identity %)"] {
+        for body in [format!(r#"({function} (subs "x" -1))"#),format!(r#"(let [f {function}] (f (subs "x" -1)))"#)] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" {body} "x")"#)).await.unwrap_err().message.as_deref(),Some("Host value is not callable"),"{body}");
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({function} (subs "x" -1))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+}
+
+#[tokio::test]
+async fn host_null_and_ifn_values_evaluate_arguments_before_invocation() {
+    for function in ["nil","(if false 1)","str","[]","'[1]","{}","'{:a 1}","#{}","'#{1}",":a","'a",r#"'[(subs "x" -1)]"#] {
+        for body in [format!(r#"({function} (subs "x" -1))"#),format!(r#"(let [f {function}] (f (subs "x" -1)))"#)] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" {body} "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"),"{body}");
+        }
+    }
+    for body in [r#"(identity (subs "x" -1) 0)"#,r#"(number? 0 (subs "x" -1))"#,r#"((subs "x" -1) (/ 1 0))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {body} "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+    }
+    assert_eq!(project(r#"(regexp-replace "a" ([(/ 1 0)] (subs "x" -1)) "x")"#).await.unwrap_err().message.as_deref(),Some("Divide by zero"));
+    for body in [r#"(str "a")"#,r#"(identity "a")"#,r#"(let [f str] (f "a"))"#,r#"(if (number? 1) "a" "b")"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {body} "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+}
