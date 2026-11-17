@@ -1,4 +1,5 @@
 use super::Mapping;
+use super::probe::{DecodedUnit, DecodeError, ProbeStop, StrictProbe};
 mod aliases;
 mod tables;
 
@@ -11,35 +12,65 @@ pub(in super::super) fn lookup(name: &str) -> Option<EucJp> {
 }
 
 impl EucJp {
-    pub(in super::super) fn decode(self, mut bytes: &[u8]) -> String {
+    fn decode_unit(self, bytes: &[u8]) -> std::result::Result<Option<DecodedUnit>, DecodeError> {
+        let Some(&first) = bytes.first() else { return Ok(None); };
+        if first < 0x80 { return Ok(Some(DecodedUnit { unit: u16::from(first), bytes: 1 })); }
+        let count = if first == 0x8f { 3 } else { 2 };
+        if bytes.len() < count { return Ok(None); }
+        let unit = if first == 0x8f {
+            match self {
+                Self::Standard => jis_pair(&tables::JIS0212, bytes[1], bytes[2]),
+                Self::Linux => 0xfffd,
+                Self::Solaris => jis_pair(&tables::SOLARIS0212, bytes[1], bytes[2]),
+            }
+        } else {
+            let value = if first == 0x8e {
+                let second = usize::from(bytes[1]);
+                if second < 0x80 { 0xfffd }
+                else { u16::from_be_bytes([tables::JIS0201[second * 2], tables::JIS0201[second * 2 + 1]]) }
+            } else { jis_pair(&tables::JIS0208, first, bytes[1]) };
+            if value == 0xfffd && self == Self::Solaris {
+                jis_pair(&tables::SOLARIS0208, first, bytes[1])
+            } else { value }
+        };
+        if unit == 0xfffd { Err(DecodeError::Unmappable { bytes: count }) }
+        else { Ok(Some(DecodedUnit { unit, bytes: count })) }
+    }
+
+    pub(in super::super) fn decode(self, bytes: &[u8]) -> String {
         let mut output = String::with_capacity(bytes.len() * 3);
+        self.decode_into(bytes, &mut output);
+        output
+    }
+
+    pub(super) fn decode_into(self, mut bytes: &[u8], output: &mut String) {
         let units = std::iter::from_fn(|| {
-            let (&first, tail) = bytes.split_first()?;
-            bytes = tail;
-            if first < 0x80 { return Some(u16::from(first)); }
-            let count = if first == 0x8f { 2 } else { 1 };
-            if bytes.len() < count { bytes = &[]; return Some(0xfffd); }
-            let (trails, tail) = bytes.split_at(count);
-            bytes = tail;
-            Some(if first == 0x8f {
-                match self {
-                    Self::Standard => jis_pair(&tables::JIS0212, trails[0], trails[1]),
-                    Self::Linux => 0xfffd,
-                    Self::Solaris => jis_pair(&tables::SOLARIS0212, trails[0], trails[1]),
-                }
-            } else {
-                let value = if first == 0x8e {
-                    let second = usize::from(trails[0]);
-                    if second < 0x80 { 0xfffd }
-                    else { u16::from_be_bytes([tables::JIS0201[second * 2], tables::JIS0201[second * 2 + 1]]) }
-                } else { jis_pair(&tables::JIS0208, first, trails[0]) };
-                if value == 0xfffd && self == Self::Solaris {
-                    jis_pair(&tables::SOLARIS0208, first, trails[0])
-                } else { value }
-            })
+            if bytes.is_empty() { return None; }
+            let (unit, count) = match self.decode_unit(bytes) {
+                Ok(Some(decoded)) => (decoded.unit, decoded.bytes),
+                Ok(None) => (0xfffd, bytes.len()),
+                Err(error) => (0xfffd, error.bytes()),
+            };
+            bytes = &bytes[count..];
+            Some(unit)
         });
         output.extend(char::decode_utf16(units).map(|unit| unit.unwrap_or('\u{fffd}')));
-        output
+    }
+
+    pub(super) fn probe(self, bytes: &[u8], mut emit: impl FnMut(u16)) -> StrictProbe {
+        let (mut consumed, mut utf16_units) = (0, 0);
+        while consumed < bytes.len() {
+            match self.decode_unit(&bytes[consumed..]) {
+                Ok(Some(decoded)) => {
+                    emit(decoded.unit);
+                    consumed += decoded.bytes;
+                    utf16_units += 1;
+                },
+                Ok(None) => break,
+                Err(error) => return StrictProbe { consumed, utf16_units, stop: ProbeStop::Error(error) },
+            }
+        }
+        StrictProbe { consumed, utf16_units, stop: ProbeStop::Underflow }
     }
 }
 

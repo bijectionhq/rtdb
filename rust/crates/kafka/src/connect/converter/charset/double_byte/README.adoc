@@ -5,6 +5,8 @@ The families are Big5, Big5-Solaris, GB2312, GBK, EUC-KR, Shift_JIS, Windows-31J
 The manifest gives every canonical name and alias, including the `x-` prefix used by several Java canonical names.
 The Shift_JIS aliases are `sjis`, `shift_jis`, `shift-jis`, `ms_kanji`, `x-sjis`, and `csShiftJIS`.
 The Windows-31J aliases are `MS932`, `windows-932`, and `csWindows31J`.
+Internal strict probes retain successful input positions and source error widths, while append operations write into a caller-owned String.
+Their decoder-state ownership, fixed scratch bound, and source-derived regression manifests are described in link:probe/README.adoc[the Japanese probe reference].
 Name matching preserves punctuation and follows the standard provider's alias ownership.
 IBM942C owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`.
 `cp936` resolves to GBK, while `ms936` resolves to `x-mswin-936`.

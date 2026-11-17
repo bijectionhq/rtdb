@@ -1,0 +1,91 @@
+= Strict Japanese decoder probes and caller-owned output
+
+The double-byte, EUC-JP, and ISO-2022-JP decoder owners provide strict probes and append operations within the charset family.
+Existing String converter decoding continues to replace malformed, unmappable, and terminal incomplete groups with U+FFFD.
+This internal surface does not register another charset or select a detected encoding.
+
+`Mapping`, `EucJp`, and `Iso2022Jp` remain passive immutable configurations backed by process-lifetime mapping resources.
+`DecodedUnit`, `DecodeError`, `ProbeStop`, and `StrictProbe` are passive values describing one completed parsing step or strict pass.
+The ISO decoder's private `Decoder` is a passive transient whose current mode, previous mode, and selected tables belong to one call.
+It is discarded when that call returns.
+The input cursor, emitted-unit count, EUC observer, and output remain call-local values owned by the caller.
+
+== Strict results
+
+A strict probe stops before the first malformed, unmappable, or incomplete group.
+`consumed` counts input bytes before that group, and `utf16_units` counts successfully emitted UTF16 units.
+ISO designations and shifts consume input without incrementing the output count.
+Underflow represents either complete input consumption or a terminal incomplete group; the consumed position distinguishes them.
+Malformed and unmappable results retain the source error category and byte width without consuming the bad group.
+The EUC observer receives only successful units, in source order, and is never invoked for an incomplete or erroneous group.
+
+The pinned Java buffer loops restore their input position to the last successful group before returning an error or underflow.
+The native probes retain that position explicitly and allocate no output buffer.
+Each successful text group emits one UTF16 unit and consumes at least one byte.
+For an input of `n` bytes, all counters are bounded by `n`, and a Java sandbox with `n` character slots cannot overflow for these candidates.
+
+Double-byte probes consult the single-byte mapping first.
+A lone unmapped byte underflows even when it has no lead row.
+An unmapped pair is malformed with width one when its first byte has no lead row, its second byte has a lead row, or its second byte has a single-byte mapping.
+Otherwise it is unmappable with width two.
+This classification uses lead-row identity rather than an inferred numeric lead range.
+
+EUC-JP checks complete input availability before validating any trail.
+SS3 requires three bytes; all other high-byte groups require two.
+Completed unmapped EUC groups are unmappable with their full width.
+The standard, Linux, and Solaris variants retain their existing JIS0212 and fallback-table differences.
+
+ISO-2022-JP keeps its current and previous modes across replacement errors within one call.
+An ESC requires three available bytes before its second byte is checked.
+Unknown second bytes produce malformed width two, while invalid third bytes after `ESC (` or `ESC $` produce width three.
+Only variants supporting JIS0212 wait for the fourth byte of `ESC $ (` and diagnose its invalid fourth byte with width four.
+High first bytes are malformed with width one, and unmapped double-byte groups are unmappable with width two.
+Trail bytes remain mapping data even when they are control bytes.
+
+== Append ownership and allocation
+
+Append operations preserve the caller's existing String prefix and write into that same String.
+Existing decode operations reserve one output String and delegate to the corresponding append path.
+Each append call starts a fresh decoder state; multiple appends do not make one streaming decoder.
+The double-byte and EUC paths preserve UTF16 surrogate pairing through the existing UTF16 iterator.
+All admitted mapping resources contain nonsurrogate BMP units, and each replacement is U+FFFD.
+Output therefore needs at most three UTF8 bytes per input byte, in addition to the caller's existing prefix.
+The production String converter's checked `4 * n + 16,384` admission precedes output allocation.
+Probes add fixed-size parsing state and counters, with no retained buffer, growing collection, or reservation.
+
+Big5's pair callback remains live during append decoding.
+It is called once for each eligible complete pair, after the single-byte lookup and before error-width selection.
+An unmapped byte reprocessed after a width-one error performs its own lookup against the callback's current state.
+ASCII and incomplete terminal lead bytes do not invoke the callback.
+
+== Source provenance and reproduction
+
+The pinned source is Eclipse Temurin OpenJDK `25.0.1+8` from the Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins 21 files covering decoder loops, variant selection, mapping initialization, String replacement, and CharsetDecoder consumption.
+link:COPYRIGHT[Copyright notices] retain each upstream header verbatim, alongside link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-japanese-probes
+----
+
+It reconstructs all ten reused mapping resources, checks source initialization and nonsurrogate units, and writes their sizes and hashes to link:mappings.tsv[the mapping manifest].
+The existing resources contain 134,766 bytes in total and are not replaced by this refactor.
+The derivation also transcribes the pinned Java buffer loops into a source-derived strict and replacement model.
+It does not execute a JVM, native decoder, or test target.
+
+link:modes.tsv[The mode manifest] contains 53 rows covering SJIS and MS932 with two prefixes, the three EUC variants with seven prefixes, and the four ISO variants with seven prefixes.
+Each row gives strict single-byte and pair digests and an append-output digest.
+Strict single-byte digests cover all 256 independent prefixed records; strict pair and append digests cover all 65,536 pairs in unsigned order.
+Each strict result contributes consumed bytes and successful UTF16 unit count as unsigned big-endian 32-bit values, followed by one error-category byte and one error-width byte.
+Categories are zero for underflow, one for malformed, and two for unmappable; underflow has width zero.
+EUC results additionally contribute the successful UTF16 units as big-endian 16-bit values.
+Append digests concatenate the UTF8 `caller:` prefix, replacement-decoded text, and a U+0000 separator after each independent record.
+The separator is added after decoding and is never available as an input trail.
+
+Regression sources cover the complete manifest, bad-group positions, source error widths, EUC observer output, ISO control progress, incomplete groups, caller prefix and capacity preservation, record reset, live pair-callback publication, and UTF16 pairing.
+All existing affected unit-test bodies and mapping bytes are retained.
+Compilation, native execution, and differential runtime acceptance remain pending under the Phase 1 work order.

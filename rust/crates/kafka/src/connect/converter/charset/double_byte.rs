@@ -1,4 +1,5 @@
 mod aliases;
+use probe::{DecodedUnit, DecodeError, ProbeStop, StrictProbe};
 pub(super) mod big5;
 pub(super) mod ebcdic;
 pub(super) mod euc_jp;
@@ -9,6 +10,7 @@ pub(super) mod ibm_euc;
 pub(super) mod iso2022cnkr;
 pub(super) mod iso2022jp;
 pub(super) mod jis0213;
+mod probe;
 pub(super) mod subclasses;
 mod tables;
 
@@ -43,23 +45,52 @@ impl Mapping {
         self.decode_with_pairs(bytes, |first, second| self.pair(first, second))
     }
 
-    fn decode_with_pairs(&self, mut bytes: &[u8], pair: impl Fn(u8, u8) -> u16) -> String {
+    fn decode_into(&self, bytes: &[u8], output: &mut String) {
+        self.decode_with_pairs_into(bytes, |first, second| self.pair(first, second), output);
+    }
+
+    fn decode_with_pairs(&self, bytes: &[u8], pair: impl Fn(u8, u8) -> u16) -> String {
         let mut output = String::with_capacity(bytes.len() * 3);
+        self.decode_with_pairs_into(bytes, pair, &mut output);
+        output
+    }
+
+    fn decode_unit(&self, bytes: &[u8], pair: &impl Fn(u8, u8) -> u16) -> std::result::Result<Option<DecodedUnit>, DecodeError> {
+        let Some(&first) = bytes.first() else { return Ok(None); };
+        let single = self.single(first);
+        if single != 0xfffd { return Ok(Some(DecodedUnit { unit: single, bytes: 1 })); }
+        let Some(&second) = bytes.get(1) else { return Ok(None); };
+        let unit = pair(first, second);
+        if unit != 0xfffd { return Ok(Some(DecodedUnit { unit, bytes: 2 })); }
+        if self.row(first).is_none() || self.row(second).is_some() || self.single(second) != 0xfffd {
+            Err(DecodeError::Malformed { bytes: 1 })
+        } else { Err(DecodeError::Unmappable { bytes: 2 }) }
+    }
+
+    fn decode_with_pairs_into(&self, mut bytes: &[u8], pair: impl Fn(u8, u8) -> u16, output: &mut String) {
         let units = std::iter::from_fn(|| {
-            let (&first, tail) = bytes.split_first()?;
-            bytes = tail;
-            let single = self.single(first);
-            if single != 0xfffd { return Some(single); }
-            let Some(&second) = bytes.first() else { return Some(0xfffd); };
-            let pair = pair(first, second);
-            // OpenJDK25 DoubleByte.Decoder.crMalformedOrUnmappable uses lead-row identity.
-            if pair != 0xfffd || (self.row(first).is_some() && self.row(second).is_none() && self.single(second) == 0xfffd) {
-                bytes = &bytes[1..];
-            }
-            Some(pair)
+            if bytes.is_empty() { return None; }
+            let (unit, count) = match self.decode_unit(bytes, &pair) {
+                Ok(Some(decoded)) => (decoded.unit, decoded.bytes),
+                Ok(None) => (0xfffd, bytes.len()),
+                Err(error) => (0xfffd, error.bytes()),
+            };
+            bytes = &bytes[count..];
+            Some(unit)
         });
         output.extend(char::decode_utf16(units).map(|unit| unit.unwrap_or('\u{fffd}')));
-        output
+    }
+
+    fn probe(&self, bytes: &[u8]) -> StrictProbe {
+        let (mut consumed, mut utf16_units) = (0, 0);
+        while consumed < bytes.len() {
+            match self.decode_unit(&bytes[consumed..], &|first, second| self.pair(first, second)) {
+                Ok(Some(decoded)) => { consumed += decoded.bytes; utf16_units += 1; },
+                Ok(None) => break,
+                Err(error) => return StrictProbe { consumed, utf16_units, stop: ProbeStop::Error(error) },
+            }
+        }
+        StrictProbe { consumed, utf16_units, stop: ProbeStop::Underflow }
     }
 }
 
