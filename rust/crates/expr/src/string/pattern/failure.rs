@@ -10,6 +10,11 @@ pub(crate) struct PatternFailure {
     pub(super) pattern: JavaString,
     pub(super) syntax: Option<JavaSyntaxFailure>,
     pub(super) adapter_point: Option<usize>,
+    error: RetainedAnomaly,
+}
+
+#[derive(Debug)]
+pub(super) struct RetainedAnomaly {
     error: Anomaly,
     // The diagnostic allocation must be destroyed before its retained lease.
     _reservation: Option<Arc<MemoryReservation>>,
@@ -31,18 +36,15 @@ impl CompileFailure {
     }
 
     pub(super) fn legacy(self) -> Anomaly {
-        match self { Self::Pattern(failure) => failure.error, Self::Resource(error) => error }
+        match self { Self::Pattern(failure) => failure.error.legacy(), Self::Resource(error) => error }
     }
 }
 
 impl PatternFailure {
-    pub(super) fn error(&self) -> &Anomaly { &self.error }
+    pub(super) fn error(&self) -> &Anomaly { self.error.error() }
 
     fn retain(error: Anomaly, pattern: JavaText<'_>, adapter_point: Option<usize>, syntax: Option<Syntax<'_>>, context: &EvalContext<'_>) -> Result<Self> {
-        let bytes = std::mem::size_of::<Anomaly>().checked_add(error.code.capacity())
-            .and_then(|bytes| bytes.checked_add(error.message.as_ref().map_or(0, String::capacity)))
-            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
-        let reservation = context.allocation.map(|scope| scope.memory_budget().reserve(bytes)).transpose()?;
+        let error = RetainedAnomaly::retain(error, context)?;
         let pattern = retain_text(pattern, context)?;
         let syntax = syntax.map(|syntax| {
             let description = match syntax.description {
@@ -62,11 +64,24 @@ impl PatternFailure {
             };
             Ok::<_, Anomaly>(JavaSyntaxFailure { description, index: syntax.index })
         }).transpose()?;
-        Ok(Self { pattern, syntax, adapter_point, error, _reservation: reservation })
+        Ok(Self { pattern, syntax, adapter_point, error })
     }
 }
 
-fn retain_text(source: JavaText<'_>, context: &EvalContext<'_>) -> Result<JavaString> {
+impl RetainedAnomaly {
+    pub(super) fn retain(error: Anomaly, context: &EvalContext<'_>) -> Result<Self> {
+        let bytes = std::mem::size_of::<Anomaly>().checked_add(error.code.capacity())
+            .and_then(|bytes| bytes.checked_add(error.message.as_ref().map_or(0, String::capacity)))
+            .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+        let reservation = context.allocation.map(|scope| scope.memory_budget().reserve(bytes)).transpose()?;
+        Ok(Self { error, _reservation: reservation })
+    }
+
+    pub(super) fn error(&self) -> &Anomaly { &self.error }
+    pub(super) fn legacy(self) -> Anomaly { self.error }
+}
+
+pub(super) fn retain_text(source: JavaText<'_>, context: &EvalContext<'_>) -> Result<JavaString> {
     if let Some(source) = source.utf8_source() {
         return match context.allocation {
             Some(scope) => JavaString::copy_utf8(source, scope.memory_budget()),
@@ -79,7 +94,7 @@ fn retain_text(source: JavaText<'_>, context: &EvalContext<'_>) -> Result<JavaSt
     retain_units(&units, context)
 }
 
-fn retain_units(units: &[u16], context: &EvalContext<'_>) -> Result<JavaString> {
+pub(super) fn retain_units(units: &[u16], context: &EvalContext<'_>) -> Result<JavaString> {
     match context.allocation {
         Some(scope) => JavaString::copy_utf16(units, scope.memory_budget()),
         None => JavaString::copy_utf16_untracked(units),
