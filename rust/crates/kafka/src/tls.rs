@@ -16,6 +16,7 @@ pub(crate) mod security;
 pub(crate) mod request;
 mod public_key;
 pub(crate) mod random;
+mod registry;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
