@@ -1141,3 +1141,24 @@ Its production HTTP input capture and typed cursor integration remain open.
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Kafka Avro schemas and native Metadata ownership checkpoint
+
+The Avro source fixture target now registers canonical schema identities, source JSON node classes, memoized relations and the admitted record cycle collections.
+The constructors accept a qualified parsed schema.
+Schema relations and JSON walks enforce the declared native traversal limit.
+Production parsing, the native schema pairing and identity witnesses, graph and default conversion, cache and SMT integration, and writer ownership remain open.
+The original explicit null-default assertion and its source conflict are preserved.
+
+The producer source fixture target now has the bounded Java Random sequence and serialized default shuffle acquisition.
+The caller supplies the seed history and clock.
+An ordered Metadata exchange passes its admitted topic descriptors to the selected native endpoint or broker and keeps the original request scope with the response.
+Actual DNS and connection observation providers, complete refresh and failure scheduling, and DLQ partition dispatch remain open.
+
+Ordinary Metadata parsing on an accounted producer now admits the complete contiguous arena allocation and transfers its charge with the root.
+The Rust result retains the native byte account long enough to outlive its producer and frees the arena before releasing that guard.
+The native admin paths dispose a failed projection after formatting its live diagnostic data and propagate the actual parser error.
+Cache entries, independent clones, rack scratch, admin output copies and the other native construction and request allocations still require admission.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.
