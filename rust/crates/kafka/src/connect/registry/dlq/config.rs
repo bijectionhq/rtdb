@@ -34,8 +34,11 @@ impl Settings {
             if value > maximum { return Err(error("dlq", format!("Producer {name} exceeds its range"))); }
             Ok(value)
         };
-        for name in ["interceptor.classes", "partitioner.class", "sasl.login.class", "sasl.login.callback.handler.class", "sasl.client.callback.handler.class", "ssl.engine.factory.class"] {
+        for name in ["interceptor.classes", "partitioner.class", "sasl.login.class", "sasl.login.callback.handler.class", "sasl.client.callback.handler.class"] {
             if options.get(name).is_some_and(|value| !value.trim().is_empty()) { return Err(error("dlq", format!("Producer {name} requires a native adapter"))); }
+        }
+        if options.get("ssl.engine.factory.class").is_some_and(|value| value.trim_matches(|ch| ch <= '\u{20}') != "org.apache.kafka.common.security.ssl.DefaultSslEngineFactory") {
+            return Err(error("dlq", "Producer ssl.engine.factory.class requires a native adapter"));
         }
         let key_serializer = Serializer::parse(options.get("key.serializer"))?;
         let value_serializer = Serializer::parse(options.get("value.serializer"))?;
@@ -142,6 +145,20 @@ mod tests {
             options.insert(java.into(), "-2".into()); assert!(Settings::parse(&options).is_err());
             options.insert(java.into(), "2147483648".into()); assert!(Settings::parse(&options).is_err());
             options.remove(java);
+        }
+    }
+
+    #[test]
+    fn explicit_default_tls_factory_uses_the_native_java_configuration_adapter() {
+        let mut options = BTreeMap::from([
+            ("bootstrap.servers".into(), "localhost:9092".into()),
+            ("ssl.engine.factory.class".into(), " org.apache.kafka.common.security.ssl.DefaultSslEngineFactory ".into()),
+        ]);
+        let settings = Settings::parse(&options).unwrap();
+        assert!(!settings.properties.contains_key("ssl.engine.factory.class"));
+        for factory in ["", "custom.Factory", "org.apache.kafka.common.security.ssl.CommonNameLoggingSslEngineFactory", "\u{a0}org.apache.kafka.common.security.ssl.DefaultSslEngineFactory"] {
+            options.insert("ssl.engine.factory.class".into(), factory.into());
+            assert!(Settings::parse(&options).is_err());
         }
     }
 }

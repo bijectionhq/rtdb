@@ -13,11 +13,25 @@ fn contains_set(value: &Value) -> bool {
         _ => false,
     }
 }
-/// Bounds temporary type metadata for SQL equality admission; reserve it while calling an equality API.
-/// This charge is separate from numeric comparison scratch and excludes strict `===`.
+/// Bounds temporary type metadata and decoded Transit objects while calling an equality API, including strict `===`.
+/// This charge is separate from numeric comparison scratch.
 pub fn equality_allocation_bound(left: &Value, right: &Value) -> Result<usize> {
-    if !contains_set(left) || !contains_set(right) { return Ok(0); }
-    left.retained_bytes()?.checked_add(right.retained_bytes()?).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(crate::numeric::overflow)
+    let metadata = if contains_set(left) && contains_set(right) {
+        left.retained_bytes()?.checked_add(right.retained_bytes()?).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(crate::numeric::overflow)?
+    } else { 0 };
+    let left = transit_allocation_bound(left)?;
+    let right = transit_allocation_bound(right)?;
+    metadata.checked_add(left).and_then(|bytes| bytes.checked_add(right)).ok_or_else(crate::numeric::overflow)
+}
+fn transit_allocation_bound(value: &Value) -> Result<usize> {
+    let add = |total: usize, value: &Value| total.checked_add(transit_allocation_bound(value)?).ok_or_else(crate::numeric::overflow);
+    match value {
+        Value::Transit(_) => crate::text_allocation_bound(value),
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_fold(0, add),
+        Value::Struct(fields) => fields.values().try_fold(0, add),
+        Value::Map { entries, .. } => entries.iter().try_fold(0, |bytes, (key, value)| add(add(bytes, key)?, value)),
+        _ => Ok(0),
+    }
 }
 fn validate_equality_values(left: &Value, right: &Value) -> Result<()> {
     fn shape(value: &Value) -> rtdb_types::LogicalType {
@@ -109,6 +123,11 @@ fn emitted_integer(value: &Value) -> Option<i128> {
 }
 
 fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
+    if let (Value::Transit(left),Value::Transit(right)) = (left,right) {
+        let left = crate::transit_object::Object::decode(left)?;
+        let right = crate::transit_object::Object::decode(right)?;
+        return left.equivalent(&right);
+    }
     if let (Some(left), Some(right)) = (emitted_integer(left), emitted_integer(right)) { return Ok(left == right); }
     if let (Some(left), Some(right)) = (IntervalParts::of(left), IntervalParts::of(right)) {
         return Ok(left.months == right.months && left.days == right.days && left.nanos == right.nanos);
@@ -121,6 +140,7 @@ fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
 
 /// Preserves numeric categories, the distinction between dates and timestamps, timestamp zone labels and interval units.
 /// Nested NULLs compare equal; same-category temporal units still undergo checked conversion.
+/// Callers own the scratch charge returned by `equality_allocation_bound`.
 pub fn strict_eq(left: &Value, right: &Value) -> Result<bool> {
     if nullish(left) || nullish(right) { return Ok(nullish(left) && nullish(right)); }
     if date_time(left) && date_time(right) {

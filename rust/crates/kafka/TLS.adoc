@@ -1,6 +1,8 @@
 = Native Kafka producer TLS
 
 Registry dead-letter action options use Kafka's Java configuration names.
+An explicit `ssl.engine.factory.class=org.apache.kafka.common.security.ssl.DefaultSslEngineFactory` selects the same native Java-configuration adapter as the omitted default.
+Other factory classes require a native adapter.
 `ssl.keystore.location` accepts JKS or PKCS12 private-key stores and PEM files; PEM material also accepts `ssl.keystore.key` and `ssl.keystore.certificate.chain`.
 Store and private-key passwords are independent.
 `ssl.truststore.location` accepts the same store formats, and PEM roots also accept `ssl.truststore.certificates`.

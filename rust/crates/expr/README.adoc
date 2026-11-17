@@ -344,6 +344,10 @@ Merged fields retain their existing nested list readers until a field consumer r
 Stored Transit field access constructs semantic objects through the wire decoder's read cache.
 Repeated cached byte-array and NaN keys retain object identity during record construction, including NaN returned unchanged by ratio division.
 The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.
+Equality between two stored Transit values constructs each registered object graph before comparing it.
+Collection equality follows decoded values and identity-bearing objects retain their separate read identities, including when the serialized bytes match.
+The evaluator and direct scalar calls reserve decoded-graph scratch before parsing; direct equality API callers own the charge reported by `equality_allocation_bound`.
+`tests/transit_equality.rs` records MessagePack/JSON equality, nested native list and struct values, identity, malformed objects, and admission failures as unexecuted regression source.
 
 Scalar emission derives every declared type alternative from the complete runtime input and outer schemas and bound parameter types before selecting a payload.
 `EvalContext::parameter_types` optionally supplies the complete execution vector type for each parameter and must match the value slice's width.

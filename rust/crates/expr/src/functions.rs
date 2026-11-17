@@ -68,6 +68,9 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         };
         return Ok(component.map(|text| Value::Utf8(text.into_owned())).unwrap_or(Value::Null));
     }
+    if matches!(name.as_str(), "nullif" | "distinct_from" | "null_eq" | "===") && args.iter().all(|value| !nullish(value)) {
+        context.reserve(crate::equality_allocation_bound(&args[0], &args[1])?)?;
+    }
     match name.as_str() {
         "col_description" | "pg_indexam_has_property" => return Ok(Value::Null),
         "random" => return crate::volatile::random(),
@@ -125,7 +128,10 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             for value in args {
                 let mut found = false;
                 for old in &items {
-                    let equal = if nullish(old) || nullish(value) { nullish(old) && nullish(value) } else { crate::compare::sql_eq_value(old,value,context.timezone)? == Some(true) };
+                    let equal = if nullish(old) || nullish(value) { nullish(old) && nullish(value) } else {
+                        context.reserve(crate::equality_allocation_bound(old,value)?)?;
+                        crate::compare::sql_eq_value(old,value,context.timezone)? == Some(true)
+                    };
                     if equal { found = true; break; }
                 }
                 if !found { items.push(value.clone()); }
