@@ -19,7 +19,8 @@ The passive builder follows the pinned Temurin 25.0.1+8 `PKIXValidator`, `PKIXPa
   `SunCertPathBuilder.addVertices` removes candidates already represented by the same DER or by subject/public-key equality and the same parsed SAN extension bytes.
 ** SAN absence includes malformed noncritical values; accepted BER encodings, name order and case remain significant in the original parsed extension bytes.
 ** Public-key comparisons normalize encoded `X509Key` framing, including BER parameters, OIDs and unaligned bit strings.
-   AlgorithmParameters/KeyFactory acceptance and provider-specific equality, including SunJCE DH numeric `y`/`p`/`g` comparison, remain open compatibility work.
+   Both known DH OIDs use SunJCE signed numeric `y`/`p`/`g` equality after validating the DH fields; optional private-value length does not affect equality.
+   Other AlgorithmParameters/KeyFactory acceptance and custom provider equality remain open compatibility work.
 
 * *Forward selectors and branch rules bound the search.*
   Candidate validity, legacy-anchor validity coverage, CA path length and the default maximum of five non-self-issued intermediates follow the forward selectors.
