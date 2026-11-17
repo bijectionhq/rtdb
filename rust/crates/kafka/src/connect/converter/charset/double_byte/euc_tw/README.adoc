@@ -1,0 +1,88 @@
+= Java 25 EUC-TW and IBM964 character mappings
+
+The String converter supports `x-EUC-TW` and `x-IBM964`, with 11 distinct case-insensitive registered names.
+The standard variant includes `EUC-TW` and `cns11643`; IBM964 includes `ibm-euctw`.
+link:charsets.tsv[The charset manifest] records provider ownership, class/source hashes, aliases, and decoded probe digests.
+link:mappings.tsv[The mapping manifest] pins every resource and link:planes.tsv[the plane manifest] records supported selectors, mapping counts, supplementary counts, and quartet digests.
+
+`Charset::EucTw` contains a passive immutable `EucTw` variant.
+`StandardPlanes` holds one immutable collection of eight low-word mapping planes and the supplementary flags that interpret them.
+`IbmTables` holds one immutable collection of IBM964 single-byte and four-plane mappings.
+All 230,056 resource bytes have process lifetime; the input cursor and UTF8 output belong to one decode call.
+No mutable selector state persists across records or converters.
+The existing String scalar memory admission precedes decoding, and the output reserves at most three UTF8 bytes per input byte.
+Four-byte input producing a supplementary Unicode scalar needs four UTF8 output bytes, within that bound.
+
+== Supported planes and character values
+
+The standard decoder passes ASCII bytes through unchanged and uses its first plane for ordinary pairs from 0xA1 through 0xFE.
+SS2 (0x8E) starts a four-byte sequence whose selector is 0xA2 through 0xA7 or 0xAF, selecting CNS planes 2 through 7 or 15.
+Selector 0xA1 is unsupported even though ordinary pairs select plane 1.
+The low word of each mapping is combined with 0x20000 when its supplementary flag is set.
+The standard tables contain 30,712 supplementary mappings; plane 1 and plane 2 mappings are all BMP values.
+Examples include 0x8EA3A1C4 to U+2000B, 0x8EA6A1A1 to U+2F802, and 0x8EAFA1A1 to U+20002.
+
+IBM964 preserves C1 single-byte controls except the SS2 and SS3 prefixes.
+Its SS2 selectors are 0xA2, 0xAC, and 0xAD, and every mapping is a BMP value.
+The 0xA2 table is byte-identical to the standard CNS plane 2 table.
+The 0xAC plane maps its first 6,204 positions to the contiguous private-use range U+E000 through U+F83B.
+The 0xAD plane retains five additional private-use mappings to U+F83E through U+F842.
+Base-plane mappings differ, including 0xA1A6 mapping to U+30FB in EUC-TW and U+2027 in IBM964.
+
+== Replacement boundaries
+
+OpenJDK25 `String(byte[], Charset)` uses `CharsetDecoder` with replacement enabled and `endOfInput` true for both charsets.
+Neither decoder implements `ArrayDecoder`.
+Both require a complete four-byte SS2 group before validating its selector.
+An incomplete terminal SS2 prefix therefore produces one replacement for all remaining bytes, including an already invalid selector.
+Every record starts independently.
+
+An unsupported selector consumes the SS2 byte and selector, then processes the remaining two bytes again.
+For example, `[0x8E, 0xA1, 0x41, 0x42]` produces a replacement followed by `AB`, while the three-byte prefix `[0x8E, 0xA1, 0x41]` produces one replacement.
+
+For a supported selector, the standard decoder consumes all four bytes when either trail is invalid or the selected position is unmapped.
+IBM964 consumes three bytes when the first selected trail is invalid and processes the fourth byte again.
+An invalid final trail or unmapped selected position consumes all four bytes in IBM964.
+
+For ordinary pairs, the standard decoder replaces only the first byte when either byte lies outside 0xA1 through 0xFE, then processes the second again.
+A legal but unmapped pair consumes both bytes.
+IBM964 consumes both bytes when a legal pair lead has an invalid trail.
+IBM964 replaces 0x8F, 0xA0, and 0xFF individually.
+These rules remain separate even where the two variants share mapping values.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins the mapping classes, provider ownership, and String/CharsetDecoder replacement path.
+link:COPYRIGHT[Copyright notices] retain upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+The standard plane resource contains eight consecutive planes of 8,836 big-endian low-word units, in source plane-index order.
+Each plane uses unsigned lead order followed by unsigned trail order in the 0xA1 through 0xFE square.
+The supplementary resource retains all 17,672 bytes obtained by expanding the source flag string in big-endian order.
+For pair position `i` and source plane index `p`, bit `p` of byte `i` selects the supplementary scalar interpretation.
+Only the first 8,836 flag positions are addressed by mappings; the remaining source bytes are zero and remain in the resource.
+The unmapped low-word marker U+FFFD is checked before interpreting its supplementary flag.
+Every unflagged mapped unit is a nonsurrogate BMP value.
+
+The IBM964 resource contains 160 single-byte units followed by four 8,836-unit planes, all big-endian UTF16.
+The plane order is ordinary pairs, selector 0xA2, selector 0xAC, then selector 0xAD.
+All mapped units are BMP values without surrogates, and U+FFFD denotes an unmapped entry.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-euc-tw
+----
+
+It verifies archive hashes, source dimensions, selector ownership, supplementary flag interpretation, source surrogate constraints, and decoder error lengths.
+The single-byte digest concatenates all 256 bytes decoded as independent records.
+The pair digest concatenates all 65,536 two-byte records in unsigned order, appending U+0000 to each decoded result.
+Each supported-selector digest covers all 65,536 lead/trail combinations as independent SS2 quartets.
+The selector digest covers all 256 selectors with five fixed lead/trail cases, including ASCII, NUL, prefixes, and invalid bytes.
+Regression sources append separators to decoded results because an input zero may be consumed inside a pair or quartet.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes and pairs, every supported plane's complete quartet space, every selector, supplementary scalars, distinct base mappings, IBM964's private-use range, malformed lengths, terminal truncation, record independence, null values, configuration, and memory admission.
