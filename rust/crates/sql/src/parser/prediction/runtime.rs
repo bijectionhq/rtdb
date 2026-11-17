@@ -23,6 +23,9 @@ pub(super) use no_viable_report::NoViableDiagnostic;
 mod required_block_sync;
 pub(super) use required_block_sync::TokenDiagnostic;
 
+#[path = "generated_data_type.rs"]
+mod generated_data_type;
+
 #[path = "generated_isolation.rs"]
 mod generated_isolation;
 
@@ -84,6 +87,9 @@ enum ReplacementUse { Fresh, Installing, Installed }
 #[derive(Clone, Copy)]
 enum InvocationRole<'parse> {
     Ordinary,
+    OrdinaryTreeAttachmentFailed,
+    FieldDefinition { field_name: Option<InvocationKey<'parse>> },
+    RecursiveLabel,
     RecursiveEntry { saved: SavedOuterLink<'parse>, phase: RecursionPhase<'parse> },
     RecursionReplacement { entry: InvocationKey<'parse>, previous: InvocationKey<'parse>, state: ReplacementUse },
 }
@@ -106,10 +112,13 @@ enum InvocationException<'parse, 'sql> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextClass {
     ReadUncommittedIsolation, ReadCommittedIsolation, RepeatableReadIsolation, SerializableIsolation, IsolationLevelTxMode,
+    DateType, ArrayType, RegularIdentifier,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
+            Self::DateType | Self::ArrayType => 26,
+            Self::RegularIdentifier => 22,
             Self::IsolationLevelTxMode => 164,
             Self::ReadUncommittedIsolation | Self::ReadCommittedIsolation | Self::RepeatableReadIsolation | Self::SerializableIsolation => 175,
         }
@@ -127,6 +136,7 @@ struct InvocationRecord<'parse, 'sql> {
 }
 pub(super) struct PendingRecursionEntry<'parse> { key: InvocationKey<'parse> }
 pub(super) struct RecursionEntry<'parse> { key: InvocationKey<'parse> }
+struct TreeDataTypeEntry<'parse>(RecursionEntry<'parse>);
 pub(super) struct RecursionReplacement<'parse> { key: InvocationKey<'parse> }
 #[derive(Clone, Copy)]
 enum PrecedenceFrame<'parse> { Base0, Recursion { value: i32, entry: InvocationKey<'parse> } }
@@ -222,7 +232,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
         let result = (|| {
             self.ready()?;
             let record = self.record(frame)?;
-            if !matches!(record.role, InvocationRole::Ordinary) || record.start.is_some() || record.stop.is_some() || Some(frame) == self.current || record.parent != self.current || record.invoking != self.state { return Err(RuntimeError::Control(RuntimeProblem::Invocation)); }
+            if !matches!(record.role, InvocationRole::Ordinary | InvocationRole::FieldDefinition { field_name: None }) || record.start.is_some() || record.stop.is_some() || Some(frame) == self.current || record.parent != self.current || record.invoking != self.state { return Err(RuntimeError::Control(RuntimeProblem::Invocation)); }
             let start = self.call_binding(record.rule, false)?;
             self.state = ParserState::State(start); self.current = Some(frame);
             let token = self.input.lt(1)?; self.records[frame.index].start = token; Ok(())
@@ -230,29 +240,33 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     }
     fn enter_tree_rule(&mut self, frame: InvocationKey<'parse>) -> RuntimeResult<'sql, ()> {
         self.enter_rule(frame)?;
-        match self.records[frame.index].parent {
-            Some(parent) => self.append_child(parent, ContextChild::Context(frame)),
-            None => Ok(()),
+        let Some(parent) = self.records[frame.index].parent else { return Ok(()); };
+        let result = self.append_child(parent, ContextChild::Context(frame));
+        if result.is_err() {
+            self.records[frame.index].role = InvocationRole::OrdinaryTreeAttachmentFailed;
         }
+        result
     }
     fn append_child(&mut self, parent: InvocationKey<'parse>, child: ContextChild<'parse, 'sql>) -> RuntimeResult<'sql, ()> {
-        let result = (|| {
-            self.ready()?;
-            self.record(parent)?;
-            let children = self.records[parent.index].children.get_or_insert_with(Vec::new);
-            if children.len() == children.capacity() {
-                let capacity = children.capacity().checked_mul(2).ok_or_else(super::capacity_error)?.max(1);
-                let layout = Layout::array::<ContextChild<'parse, 'sql>>(capacity).map_err(|_| super::capacity_error())?;
-                self.work.reserve(layout.size()).map_err(PredictionError::Admission)?;
-                let mut replacement = Vec::new();
-                replacement.try_reserve_exact(capacity).map_err(|_| PredictionError::Admission(
-                    Anomaly::incorrect("rtdb/allocation-failed", "Unable to allocate parser context children")))?;
-                replacement.append(children);
-                *children = replacement;
-            }
-            children.push(child);
-            Ok(())
-        })(); self.finish(result)
+        let result = self.ready().and_then(|()| self.append_child_storage(parent, child));
+        self.finish(result)
+    }
+
+    fn append_child_storage(&mut self, parent: InvocationKey<'parse>, child: ContextChild<'parse, 'sql>) -> RuntimeResult<'sql, ()> {
+        self.record(parent)?;
+        let children = self.records[parent.index].children.get_or_insert_with(Vec::new);
+        if children.len() == children.capacity() {
+            let capacity = children.capacity().checked_mul(2).ok_or_else(super::capacity_error)?.max(1);
+            let layout = Layout::array::<ContextChild<'parse, 'sql>>(capacity).map_err(|_| super::capacity_error())?;
+            self.work.reserve(layout.size()).map_err(PredictionError::Admission)?;
+            let mut replacement = Vec::new();
+            replacement.try_reserve_exact(capacity).map_err(|_| PredictionError::Admission(
+                Anomaly::incorrect("rtdb/allocation-failed", "Unable to allocate parser context children")))?;
+            replacement.append(children);
+            *children = replacement;
+        }
+        children.push(child);
+        Ok(())
     }
     fn labelled_context(&mut self, generic: InvocationKey<'parse>, class: ContextClass) -> RuntimeResult<'sql, InvocationKey<'parse>> {
         let result = (|| {
@@ -299,7 +313,8 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
         let result = (|| {
             let key = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
             let record = self.record(key)?;
-            if !matches!(record.role, InvocationRole::Ordinary) || record.start.is_none() { return Err(RuntimeError::Control(RuntimeProblem::Invocation)); }
+            if !matches!(record.role, InvocationRole::Ordinary | InvocationRole::OrdinaryTreeAttachmentFailed | InvocationRole::FieldDefinition { .. })
+                || record.start.is_none() { return Err(RuntimeError::Control(RuntimeProblem::Invocation)); }
             let token = self.input.lt(if self.matched_eof { 1 } else { -1 })?;
             self.records[key.index].stop = token;
             self.state = self.records[key.index].invoking; self.current = self.records[key.index].parent; Ok(())
@@ -362,15 +377,113 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     pub(super) fn unroll_recursion(&mut self, entry: &mut RecursionEntry<'parse>) -> RuntimeResult<'sql, InvocationKey<'parse>> {
         let result = (|| {
             let (saved, _, _) = self.active_entry(entry)?;
-            let retctx = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Recursion))?;
-            self.precedence.pop();
-            self.records[entry.key.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Closing { head: retctx } };
-            let token = self.input.lt(-1)?; self.records[retctx.index].stop = token;
-            self.current = saved.parent; self.records[retctx.index].parent = saved.parent;
-            self.records[entry.key.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Closed };
-            Ok(retctx)
+            self.unroll_entered_recursion(entry.key, saved)
         })(); self.finish(result)
     }
+
+    fn unroll_entered_recursion(
+        &mut self,
+        entry: InvocationKey<'parse>,
+        saved: SavedOuterLink<'parse>,
+    ) -> RuntimeResult<'sql, InvocationKey<'parse>> {
+        let retctx = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Recursion))?;
+        self.precedence.pop();
+        self.records[entry.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Closing { head: retctx } };
+        let token = self.input.lt(-1)?;
+        self.records[retctx.index].stop = token;
+        self.current = saved.parent;
+        self.records[retctx.index].parent = saved.parent;
+        self.records[entry.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Closed };
+        Ok(retctx)
+    }
+
+    fn enter_data_type_tree(&mut self) -> RuntimeResult<'sql, TreeDataTypeEntry<'parse>> {
+        let site = (|| {
+            self.ready()?;
+            if self.profile != ParserProfile::SllBail {
+                return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
+            }
+            if let Some(parent) = self.current {
+                if self.state != ParserState::State(983)
+                    || !matches!(self.record(parent)?.role, InvocationRole::FieldDefinition { field_name: Some(_) })
+                {
+                    return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
+                }
+            }
+            Ok(())
+        })();
+        self.finish(site)?;
+        let pending = self.new_recursion_entry(26)?;
+        Ok(TreeDataTypeEntry(self.enter_recursion(pending, 0)?))
+    }
+
+    fn label_date_type(&mut self, entry: &TreeDataTypeEntry<'parse>) -> RuntimeResult<'sql, InvocationKey<'parse>> {
+        let result = (|| {
+            self.ready()?;
+            let (saved, generic, rule) = self.active_entry(&entry.0)?;
+            let old = self.record(generic)?;
+            if generic != entry.0.key || rule != 26 || old.class.is_some()
+                || old.children.is_some() || old.exception.is_some() || old.start.is_none()
+            {
+                return Err(RuntimeError::Control(RuntimeProblem::Recursion));
+            }
+
+            let copy = InvocationRecord {
+                parent: old.parent, invoking: old.invoking, rule, start: old.start, stop: old.stop,
+                role: InvocationRole::RecursiveLabel, exception: None, class: Some(ContextClass::DateType), children: None,
+            };
+            let key = InvocationKey::at(self.records.len());
+            push(&mut self.records, copy, self.work)?;
+            self.current = Some(key);
+            self.records[entry.0.key.index].role = InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Active { head: key } };
+            Ok(key)
+        })(); self.finish(result)
+    }
+
+    fn new_data_type_array(&mut self, entry: &TreeDataTypeEntry<'parse>) -> RuntimeResult<'sql, RecursionReplacement<'parse>> {
+        let replacement = self.new_recursion_replacement(&entry.0)?;
+        self.records[replacement.key.index].class = Some(ContextClass::ArrayType);
+        Ok(replacement)
+    }
+
+    fn push_data_type_array(&mut self, entry: &TreeDataTypeEntry<'parse>, replacement: RecursionReplacement<'parse>) -> RuntimeResult<'sql, ()> {
+        let next = replacement.key;
+        let previous = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Recursion));
+        let previous = self.finish(previous)?;
+        self.push_recursion(&entry.0, replacement)?;
+        self.append_child(next, ContextChild::Context(previous))
+    }
+
+    fn unroll_data_type_tree(&mut self, entry: &mut TreeDataTypeEntry<'parse>) -> RuntimeResult<'sql, ()> {
+        let result = (|| {
+            let key = entry.0.key;
+            let record = self.record(key)?;
+            let InvocationRole::RecursiveEntry { saved, phase: RecursionPhase::Active { head } } = record.role
+                else { return Err(RuntimeError::Control(RuntimeProblem::Recursion)); };
+            if record.rule != 26 || !matches!(self.precedence.last(), Some(PrecedenceFrame::Recursion { entry: top, .. }) if *top == key) {
+                return Err(RuntimeError::Control(RuntimeProblem::Recursion));
+            }
+            let current = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Recursion))?;
+            if current != head {
+                let child = self.record(current)?;
+                if !matches!(self.control, ParserControl::Failed)
+                    || !matches!(child.role, InvocationRole::OrdinaryTreeAttachmentFailed)
+                    || self.record(head)?.class != Some(ContextClass::ArrayType)
+                    || child.rule != 31 || self.state != ParserState::State(62)
+                    || child.invoking != ParserState::State(951) || child.parent != Some(head)
+                    || child.start.is_none() || child.stop.is_some()
+                {
+                    return Err(RuntimeError::Control(RuntimeProblem::Recursion));
+                }
+            }
+            let retctx = self.unroll_entered_recursion(key, saved)?;
+            if let Some(parent) = saved.parent {
+                self.append_child_storage(parent, ContextChild::Context(retctx))?;
+            }
+            Ok(())
+        })(); self.finish(result)
+    }
+
     pub(super) fn note_eof_match(&mut self) -> RuntimeResult<'sql, ()> { let result = self.ready().map(|()| self.matched_eof = true); self.finish(result) }
     pub(super) fn lookahead(&mut self, offset: isize) -> RuntimeResult<'sql, Option<IndexedLexeme<'sql>>> { let result = self.ready().and_then(|()| self.input.lt(offset).map_err(RuntimeError::Input)); self.finish(result) }
     fn lookahead_token(&mut self, offset: isize) -> RuntimeResult<'sql, (IndexedLexeme<'sql>, TokenType)> {
@@ -510,6 +623,12 @@ impl<'a, 'parse, 'sql> RuleContextView<'a, 'parse, 'sql> {
     pub(super) fn invoking_state(self) -> ParserState { self.record.invoking }
     pub(super) fn rule(self) -> u16 { self.record.rule }
     pub(super) fn class(self) -> Option<ContextClass> { self.record.class }
+    pub(super) fn field_name(self) -> Option<InvocationKey<'parse>> {
+        match self.record.role {
+            InvocationRole::FieldDefinition { field_name } => field_name,
+            _ => None,
+        }
+    }
     pub(super) fn start(self) -> Option<IndexedLexeme<'sql>> { self.record.start }
     pub(super) fn stop(self) -> Option<IndexedLexeme<'sql>> { self.record.stop }
     pub(super) fn children(self) -> &'a [ContextChild<'parse, 'sql>] { self.record.children.as_deref().unwrap_or(&[]) }

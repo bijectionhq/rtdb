@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation paths.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation and recursive DATE paths.
 
 == Owner and keys
 
@@ -386,8 +386,10 @@ Policy capture consumes explicit pruning/assertion facts without reading host en
 Its append-only parse-branded records are the actual context control identities and own the bounded generated tree.
 They remain through bounded control clearing and are destroyed before the work scope can drop.
 There is no parallel invocation graph, semantic stack, token provider, buffer replacement or per-transition collector.
-Ordinary construction rejects left-recursive rules; entry checks the Ordinary role, unentered start/stop and captured actual parent/state/call binding before effects.
-Ordinary exit requires an entered Ordinary current record and restores invoking state after its real stop demand.
+Ordinary construction rejects left-recursive rules.
+Entry checks an unentered ordinary context or a field definition awaiting its name, and validates its captured parent, invoking state and call binding.
+Ordinary exit accepts the entered ordinary or field-definition context, including a current child whose tree attachment failed after its start.
+It restores invoking state and parent after the real stop demand.
 Source-null start/stop facts retain their partial failure prefixes.
 
 Recursive entry saves the original generated outer parent/invoking state immutably on its initial primary record.
@@ -405,7 +407,8 @@ A pending Bail cancellation reserves rewind for the wrapper.
 The bounded cleanup theorem uses the existing stream's immutable buffered prefix: a successfully entered parent makes nested `LT(1)` and `LT(-1)` cached reads.
 Root initialization and constructor/precedence admission retain their real failure stages, including rule-start state before failed precedence growth.
 Entered ordinary children execute their source finally before recursive parents.
-Actual generated tree/listener/other post-current entry effects MUST reopen failed-child cleanup before generated or production adoption.
+The generated tree sections below cover the reached ordinary isolation and recursive DATE post-current entry effects.
+Additional tree and listener effects require their own failed-child cleanup review.
 This precursor does not replace that review with fabricated failed-child fixtures or an extra ordinary-scope stack.
 
 Prediction captures an actually initialized index, immutable current invocation view, source recognizer state and real stack top.
@@ -586,7 +589,7 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment beyond the bounded isolation path, further expected-token capabilities and production adoption remain open.
+Generated context and terminal attachment beyond the bounded isolation and recursive DATE paths, further expected-token capabilities and production adoption remain open.
 
 == Required isolation block synchronization
 
@@ -687,7 +690,42 @@ If the child enter's parent append fails after current and start are set, that c
 The already-entered common caller's finally therefore exits the actual child once.
 For ISOLATION LEVEL SERIALIZABLE it records the child's stop at LEVEL, restores state 2884 and current to the labelled common caller, and leaves that parent's stop unset.
 No extra pop, repair or invented child finally follows the original native error.
-Recursive generated tree attachment and failed-child unroll remain separate required work; the old context-only C4 recursion facade is unchanged.
+
+== Generated recursive DATE trees
+
+The private SLL action covers the DATE base of `dataType(0)` and its bracket continuations with optional maximum cardinality.
+A direct `fieldDefinition` action first calls the regular identifier branch and stores its labelled context as the field-name reference.
+It then calls the same data-type action with the actual field invocation and state 983.
+The captured field reference and the tree both borrow the primary records.
+Other type alternatives, ARRAY keyword syntax, other identifier alternatives, LL schedules and production adoption remain required.
+
+Recursive entry sets state, installs its existing witnessed precedence operand, reads the actual start token and leaves the outer child vector alone.
+The DATE label is a fresh primary record that copies its generic predecessor's outer links, start and stop.
+The source assigns the DATE label as current directly, so no first child attachment or parent-tail replacement occurs there.
+After the DATE terminal, the base assigns its actual `LT(-1)` stop before the array loop.
+
+A bracket continuation selects the source adaptive alternatives and constructs a fresh ArrayType with the entry's immutable saved outer pair.
+The push reparents the previous record, changes its invoking state, reads its stop, then installs the new current record and inherited start.
+It attaches the previous record only after that prefix.
+A denied attachment leaves the new current record for the entered recursive finally.
+The bracket arm checks its signed precedence and matches the actual bracket tokens, with a real cardinality call when the lookahead is an unsigned integer.
+
+If cardinality entry sets current and start but its parent append fails, its try and finally have yet to start.
+The primary record preserves that specific failed attachment fact.
+The recursive cleanup checks the actual top entry and accepts that direct failed cardinality child at call state 951 in addition to its current head.
+A child which entered its body still needs its own ordinary finally.
+The context-only C4 recursion facade keeps its existing current-head checks and other generated sites remain outside this tree adopter.
+
+Recursive finally pops one precedence operand and reads `LT(-1)` for the actual current record.
+It restores the saved outer current and reparents that actual record before admitting any final child attachment.
+Recognizer state stays where the reached body left it.
+Cleanup closes the entry before that attachment, so a later error cannot repeat the pop.
+An outer attachment requires a saved parent.
+
+After a denied four-slot append to the ArrayType, the actual cardinality is the record being unrolled.
+The surrounding field can still admit a two-slot vector and attach that record while ordinary execution remains sealed.
+If that append is denied too, the later finally failure escapes and the field's own already-entered finally still executes.
+Parse-tree listeners remain absent in this wrapper profile.
 
 == Finishing-alternative selection
 

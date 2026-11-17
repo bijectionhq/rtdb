@@ -225,7 +225,7 @@
     "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
     "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. Remaining generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. Remaining generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -333,7 +333,7 @@
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
     "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",
-    "cleanup_limit": "Mandatory reopen before generated/tree/listener post-current entry effects; legal cached-token precursor theorem does not settle arbitrary JVM Parser cleanup.",
+    "cleanup_limit": "Ordinary isolation and bounded DATE/bracket dataType have independently traced post-current entry and actual-current cleanup. Additional generated/tree/listener effects require their own proof.",
     "full": "Complete private Full start/closure/reach over the same terminal Local-to-Full ClosureRound/MergeRound. Full context domain includes generic Array classes and terminal EmptyReturn. No Full set is interned in ordinary C3 maps.",
     "memo": "Absent or Present retained exactly at handoff; first FullReach activates before intermediate admission; no nested/reset merge round after handoff.",
     "busy": "Separate Full theorem: only immutable EOF successors357/370 enter Boolean-only Busy under allocation-free incoming-first shared LinkedFrames equality; no JVM identity hash/layout/resource parity.",
@@ -343,7 +343,7 @@
       "Actual host snapshot/assertion producer",
       "Production classloader/cache realm, budget and concurrent writer policy",
       "embedded-parser-error-capability",
-      "Generated rule and tree coverage beyond the bounded two-profile isolation paths and the remaining strategy and diagnostic branches",
+      "Generated rule and tree coverage beyond the bounded two-profile isolation and SLL recursive DATE paths, plus remaining strategy and diagnostic branches",
       "Phase2 and executed compiler/discovery/tests"
     ]
   }
