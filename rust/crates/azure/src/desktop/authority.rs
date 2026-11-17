@@ -22,7 +22,7 @@ pub(super) struct Authority { mode: Mode }
 enum Mode {
     Configured { endpoint: Url, discovery: Option<Url>, client: reqwest::Client, metadata: Arc<Mutex<MetadataCache>> },
     #[cfg(test)]
-    Direct(Url),
+    Direct { token: Url, realm: Option<Url> },
 }
 
 #[derive(Default)]
@@ -106,9 +106,17 @@ impl Authority {
     }
 
     #[cfg(test)]
-    pub fn static_endpoint(endpoint: Url) -> Self { Self { mode: Mode::Direct(endpoint) } }
+    pub fn static_endpoint(endpoint: Url) -> Self { Self::static_endpoints(endpoint, None) }
+
+    #[cfg(test)]
+    pub fn static_endpoints(token: Url, realm: Option<Url>) -> Self { Self { mode: Mode::Direct { token, realm } } }
+
+    #[cfg(test)]
+    pub fn configured_token_endpoint(&self) -> &Url { match &self.mode { Mode::Configured { endpoint, .. } => endpoint, Mode::Direct { token, .. } => token } }
 
     pub fn user_realm_endpoint(&self, username: &str) -> azure_core::Result<Option<Url>> {
+        #[cfg(test)]
+        if let Mode::Direct { realm, .. } = &self.mode { return Ok(realm.clone()); }
         let Mode::Configured { endpoint, discovery: Some(_), .. } = &self.mode else { return Ok(None); };
         let origin = &endpoint[..url::Position::BeforePath];
         Url::parse(&format!("{origin}/common/userrealm/{username}?api-version=1.0"))
@@ -119,7 +127,7 @@ impl Authority {
         let (endpoint, discovery, client, metadata) = match &self.mode {
             Mode::Configured { endpoint, discovery, client, metadata } => (endpoint, discovery, client, metadata),
             #[cfg(test)]
-            Mode::Direct(endpoint) => return Ok(endpoint.clone()),
+            Mode::Direct { token, .. } => return Ok(token.clone()),
         };
         let host = endpoint.host_str().expect("validated authority host");
         let mut metadata = metadata.lock().await;

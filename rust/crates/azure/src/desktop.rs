@@ -11,6 +11,9 @@ use url::Url;
 mod cache;
 mod json;
 mod authority;
+mod federation;
+mod password;
+pub(crate) use password::PasswordCredential;
 
 const CLIENT_ID: &str = "04b07795-8ddb-461a-bbee-02f9e1bf7b46";
 const STORAGE_SCOPE: &str = "https://storage.azure.com/.default";
@@ -36,18 +39,23 @@ impl AccountId { fn bytes(&self) -> usize { match self { Self::Value(value) => v
 
 fn account_key(account: Option<&AccountId>) -> &str { match account { Some(AccountId::Value(value)) => value, _ => "null" } }
 fn same_account_key(left: Option<&AccountId>, right: Option<&AccountId>) -> bool { account_key(left).to_lowercase() == account_key(right).to_lowercase() }
-fn same_refresh_key(left: &(Option<AccountId>, Option<String>), right: &(Option<AccountId>, Option<String>)) -> bool {
-    same_account_key(left.0.as_ref(), right.0.as_ref()) && left.1.as_deref().unwrap_or(CLIENT_ID).to_lowercase() == right.1.as_deref().unwrap_or(CLIENT_ID).to_lowercase()
+fn same_refresh_key(client_id: &str, left: &(Option<AccountId>, Option<String>), right: &(Option<AccountId>, Option<String>)) -> bool {
+    same_account_key(left.0.as_ref(), right.0.as_ref()) && left.1.as_deref().unwrap_or(client_id).to_lowercase() == right.1.as_deref().unwrap_or(client_id).to_lowercase()
 }
 
-#[derive(Default)]
-struct Sessions { last_account: Option<Option<AccountId>>, tokens: Vec<Session>, refresh_tokens: Vec<((Option<AccountId>, Option<String>), Secret)>, accounts: Vec<AccountId>, family: bool }
+struct Sessions { client_id: String, last_account: Option<Option<AccountId>>, tokens: Vec<Session>, refresh_tokens: Vec<((Option<AccountId>, Option<String>), Secret)>, accounts: Vec<AccountId>, family: bool }
+
+impl Default for Sessions { fn default() -> Self { Self::for_client_id(CLIENT_ID.into()) } }
 
 impl Sessions {
+    fn for_client_id(client_id: String) -> Self {
+        Self { client_id, last_account: None, tokens: Vec::new(), refresh_tokens: Vec::new(), accounts: Vec::new(), family: false }
+    }
+
     fn store(&mut self, session: &Session) -> azure_core::Result<()> {
         let replacing = self.tokens.iter().position(|token| same_account_key(token.account.as_ref(), session.account.as_ref()) && token.scopes.to_lowercase() == session.scopes.to_lowercase());
         let refresh_key = (session.account.clone(), session.family.clone());
-        let replacing_refresh = self.refresh_tokens.iter().position(|(key, _)| same_refresh_key(key, &refresh_key));
+        let replacing_refresh = self.refresh_tokens.iter().position(|(key, _)| same_refresh_key(&self.client_id, key, &refresh_key));
         let replacing_account = session.account.as_ref().and_then(|account| self.accounts.iter().position(|cached| same_account_key(Some(cached), Some(account))));
         let token_bytes: usize = self.tokens.iter().enumerate().filter(|(index, _)| Some(*index) != replacing).map(|(_, token)| token.token.token.secret().len() + token.scopes.len() + token.account.as_ref().map_or(0, AccountId::bytes)).sum();
         let refresh_bytes: usize = self.refresh_tokens.iter().enumerate().filter(|(index, _)| session.refresh_token.is_none() || Some(*index) != replacing_refresh).map(|(_, ((account, family), token))| account.as_ref().map_or(0, AccountId::bytes) + family.as_ref().map_or(0, String::len) + token.secret().len()).sum();
@@ -55,7 +63,7 @@ impl Sessions {
         let last_account_bytes = self.last_account.as_ref().and_then(Option::as_ref).map_or(0, AccountId::bytes)
             .max(session.account.as_ref().map_or(0, AccountId::bytes));
         let new_bytes = session.token.token.secret().len() + session.scopes.len() + session.refresh_token.as_ref().map_or(0, |token| token.secret().len()) + 3 * session.account.as_ref().map_or(0, AccountId::bytes) + 2 * session.family.as_ref().map_or(0, String::len);
-        if token_bytes + refresh_bytes + account_bytes + last_account_bytes + new_bytes > 8 * MAX_RESPONSE_BYTES
+        if self.client_id.len() + token_bytes + refresh_bytes + account_bytes + last_account_bytes + new_bytes > 8 * MAX_RESPONSE_BYTES
             || (replacing.is_none() && self.tokens.len() >= 64)
             || (session.refresh_token.is_some() && replacing_refresh.is_none() && self.refresh_tokens.len() >= 64)
             || (session.account.is_some() && replacing_account.is_none() && self.accounts.len() >= 64) {
@@ -363,6 +371,32 @@ mod tests {
         response["id_token"] = "header.eyJzdWIiOiJ1c2VyIn0.signature".into();
         response["client_info"] = "eyJ1aWQiOiJ1c2VyIiwidXRpZCI6InRlbmFudCJ9".into();
         response.to_string()
+    }
+
+    #[tokio::test]
+    async fn intellij_default_tenant_is_common() {
+        let io = IoRegion::new();
+        let credential = IntelliJCredential::new(&BTreeMap::new(), Arc::clone(&io)).unwrap();
+        assert_eq!(credential.authority.configured_token_endpoint().path(), "/common/oauth2/v2.0/token");
+        io.close_and_wait().await;
+    }
+
+    #[test]
+    fn public_client_refresh_keys_use_the_cache_application_id() {
+        let now = OffsetDateTime::from_unix_timestamp(1000).unwrap();
+        let mut cache = Sessions::for_client_id("application-id".into());
+        let mut token = parse_token(authenticated(r#"{"access_token":"first","refresh_token":"family"}"#).as_bytes(), false, now).unwrap();
+        token.family = Some(CLIENT_ID.into());
+        cache.store(&token).unwrap();
+        token.family = None;
+        token.refresh_token = Some(Secret::new("application"));
+        cache.store(&token).unwrap();
+        assert_eq!(cache.refresh_tokens.len(), 2);
+        token.family = Some("APPLICATION-ID".into());
+        token.refresh_token = Some(Secret::new("same-key"));
+        cache.store(&token).unwrap();
+        assert_eq!(cache.refresh_tokens.len(), 2);
+        assert_eq!(cache.refresh_tokens[1].1.secret(), "same-key");
     }
 
     #[tokio::test]

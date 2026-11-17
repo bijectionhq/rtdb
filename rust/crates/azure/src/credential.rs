@@ -23,8 +23,8 @@ impl std::fmt::Debug for CredentialBridge {
 
 impl CredentialBridge {
     pub fn new(managed_identity_client_id: Option<&str>, io: Arc<rtdb_storage::IoRegion>) -> Result<Self> {
-        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_AUTHORITY_HOST", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "IDENTITY_HEADER", "IDENTITY_SERVER_THUMBPRINT", "IMDS_ENDPOINT", "MSI_ENDPOINT", "AZURE_POD_IDENTITY_AUTHORITY_HOST", "ProgramData"]
-            .into_iter().filter_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()).map(|value| (name, value))).collect();
+        let environment: BTreeMap<_, _> = ["AZURE_TOKEN_CREDENTIALS", "AZURE_TENANT_ID", "AZURE_AUTHORITY_HOST", "AZURE_CLIENT_ID", "AZURE_CLIENT_SECRET", "AZURE_CLIENT_CERTIFICATE_PATH", "AZURE_CLIENT_CERTIFICATE_PASSWORD", "AZURE_USERNAME", "AZURE_PASSWORD", "AZURE_FEDERATED_TOKEN_FILE", "IDENTITY_ENDPOINT", "IDENTITY_HEADER", "IDENTITY_SERVER_THUMBPRINT", "IMDS_ENDPOINT", "MSI_ENDPOINT", "AZURE_POD_IDENTITY_AUTHORITY_HOST", "ProgramData"]
+            .into_iter().filter_map(|name| std::env::var(name).ok().map(|value| (name, value))).collect();
         Self::from_environment(&environment, managed_identity_client_id, io)
     }
 
@@ -43,10 +43,16 @@ impl CredentialBridge {
                 sources.push(Candidate { credential: ClientCertificateCredential::new(tenant.clone(), client.clone(), certificate, Some(options)).map_err(invalid)?, failure: FailurePolicy::Stop });
             }
             if !sources.is_empty() { return Ok(Self { sources, selected: Mutex::new(None) }); }
-            if environment.contains_key("AZURE_FEDERATED_TOKEN_FILE") && matches!(selection.as_str(), "" | "prod" | "workloadidentitycredential") {
-                sources.push(Candidate { credential: WorkloadIdentityCredential::new(None).map_err(invalid)?, failure: FailurePolicy::Stop });
-                return Ok(Self { sources, selected: Mutex::new(None) });
-            }
+        }
+        if ["AZURE_CLIENT_ID", "AZURE_USERNAME", "AZURE_PASSWORD"].iter().all(|name| environment.contains_key(name))
+            && matches!(selection.as_str(), "" | "prod" | "environmentcredential") {
+            sources.push(Candidate { credential: crate::desktop::PasswordCredential::new(environment).map_err(invalid)?, failure: FailurePolicy::Stop });
+            return Ok(Self { sources, selected: Mutex::new(None) });
+        }
+        if ["AZURE_TENANT_ID", "AZURE_CLIENT_ID", "AZURE_FEDERATED_TOKEN_FILE"].iter().all(|name| environment.contains_key(name))
+            && matches!(selection.as_str(), "" | "prod" | "workloadidentitycredential") {
+            sources.push(Candidate { credential: WorkloadIdentityCredential::new(None).map_err(invalid)?, failure: FailurePolicy::Stop });
+            return Ok(Self { sources, selected: Mutex::new(None) });
         }
         if matches!(selection.as_str(), "environmentcredential" | "workloadidentitycredential") { return Err(invalid("Selected Azure credential requires complete environment configuration")); }
         let managed_id = managed_identity_client_id.map(str::to_owned).or_else(|| environment.get("AZURE_CLIENT_ID").cloned());
@@ -188,6 +194,52 @@ mod tests {
         ], selected: Mutex::new(None) };
         assert!(matches!(bridge.get_credential().await.unwrap().as_ref(), AzureCredential::BearerToken(token) if token == "token-0"));
         assert_eq!(available.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn environment_password_precedes_workload_and_does_not_require_a_tenant() {
+        let io = rtdb_storage::IoRegion::new();
+        for selection in ["", "prod", "EnvironmentCredential"] {
+            let mut environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", selection.into()), ("AZURE_CLIENT_ID", "application".into()), ("AZURE_USERNAME", "user".into()), ("AZURE_PASSWORD", "password".into())]);
+            for tenant in [None, Some("tenant")] {
+                if let Some(tenant) = tenant { environment.insert("AZURE_TENANT_ID", tenant.into()); environment.insert("AZURE_FEDERATED_TOKEN_FILE", "unused-file".into()); }
+                let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+                assert_eq!(bridge.sources.len(), 1);
+                assert_eq!(format!("{:?}", bridge.sources[0].credential), "PasswordCredential([redacted])");
+                assert!(matches!(bridge.sources[0].failure, FailurePolicy::Stop));
+            }
+        }
+        io.close_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn environment_application_secret_and_certificate_precede_password() {
+        let io = rtdb_storage::IoRegion::new();
+        let mut environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", "EnvironmentCredential".into()), ("AZURE_CLIENT_ID", "application".into()), ("AZURE_TENANT_ID", "tenant".into()), ("AZURE_CLIENT_SECRET", "application-secret".into()), ("AZURE_USERNAME", "user".into()), ("AZURE_PASSWORD", "password".into())]);
+        let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+        assert_eq!(bridge.sources.len(), 1);
+        assert!(!format!("{:?}", bridge.sources[0].credential).starts_with("PasswordCredential"));
+        environment.remove("AZURE_CLIENT_SECRET");
+        environment.insert("AZURE_CLIENT_CERTIFICATE_PATH", tempfile::tempdir().unwrap().path().join("absent.pem").to_string_lossy().into_owned());
+        assert!(CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).is_err());
+        environment.remove("AZURE_TENANT_ID");
+        let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+        assert_eq!(format!("{:?}", bridge.sources[0].credential), "PasswordCredential([redacted])");
+        io.close_and_wait().await;
+    }
+
+    #[tokio::test]
+    async fn present_empty_password_stops_the_configured_environment_provider() {
+        let io = rtdb_storage::IoRegion::new();
+        let mut environment = BTreeMap::from([("AZURE_TOKEN_CREDENTIALS", "EnvironmentCredential".into()), ("AZURE_CLIENT_ID", "application".into()), ("AZURE_USERNAME", "user".into()), ("AZURE_PASSWORD", String::new())]);
+        let bridge = CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).unwrap();
+        assert_eq!(bridge.sources.len(), 1);
+        assert!(bridge.get_credential().await.is_err());
+        environment.remove("AZURE_PASSWORD");
+        assert!(CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).is_err());
+        environment.insert("AZURE_TOKEN_CREDENTIALS", "UsernamePasswordCredential".into());
+        assert!(CredentialBridge::from_environment(&environment, None, Arc::clone(&io)).is_err());
+        io.close_and_wait().await;
     }
 
     #[tokio::test]
