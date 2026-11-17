@@ -63,7 +63,8 @@ An earlier database-operation timestamp can therefore fail index predecessor val
 `prepare_submission_with_sql_options` uses the submitting node's captured SQL preparation settings during static SQL expansion.
 The node also supplies its endpoint policy to transaction-time SQL resolution.
 The endpoint setting remains process configuration and adds no field to the source log.
-Submission and resolution regressions cover both GENERATE_SERIES endpoint modes as unexecuted source.
+Computed GENERATE_SERIES calls remain SQL source operations and use the resolving node's endpoint policy.
+Submission and resolution regressions cover both endpoint modes.
 
 Static PATCH expansion distinguishes literal NULL or FALSE clause endpoints from parameter values.
 Either literal becomes the corresponding time sentinel; a null parameter leaves the optional document-operation bound absent and a FALSE parameter fails datetime conversion.

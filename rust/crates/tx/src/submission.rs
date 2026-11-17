@@ -208,13 +208,14 @@ mod series_tests {
     use super::*;
 
     #[test]
-    fn static_series_expansion_captures_the_submitting_nodes_endpoint_policy() {
+    fn computed_series_sql_remains_on_the_resolution_path_for_each_endpoint_policy() {
         for end_exclusive in [false,true] {
             let memory = MemoryBudget::new(1 << 26);
             let options = rtdb_sql::PrepareOptions { generate_series_end_exclusive: end_exclusive, ..Default::default() };
             let request = prepare_submission_with_sql_options(vec![TxOp::Sql { sql: "INSERT INTO docs (_id,v) VALUES (1,GENERATE_SERIES(1,3))".into(),args: None }],SubmitOptions::default(),"xtdb",&memory,&options).unwrap();
-            let [crate::source::Operation::Public(TxOp::PutDocs { documents,.. })] = request.operations.as_slice() else { panic!("static documents") };
-            assert_eq!(documents.rows()[0]["v"],Value::List((1..if end_exclusive {3} else {4}).map(Value::I64).collect()));
+            let [crate::source::Operation::Public(TxOp::Sql { sql, args })] = request.operations.as_slice() else { panic!("SQL source") };
+            assert_eq!(sql,"INSERT INTO docs (_id,v) VALUES (1,GENERATE_SERIES(1,3))");
+            assert!(args.is_none());
         }
     }
 }
