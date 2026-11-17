@@ -90,7 +90,7 @@ fn edn_projection_never_silently_qualifies_nested_jvm_options() {
 
 #[test]
 fn database_partition_epoch_and_remote_reference_gaps_remain_visible() {
-    let report = assess("databases:\n  broken:\n    partitions: 2\n    log: !Kafka {cluster: missing, topic: same, replicaTopic: same, epoch: -2}\n    storage: !Remote {epoch: -1, objectStore: !S3 {bucket: b, prefix: ../escape, remote: missing}}\n", InputFormat::IngestYaml, b"{}");
+    let report = assess("databases:\n  broken:\n    partitions: 2\n    log: !Kafka {cluster: missing, topic: same, replicaTopic: same, epoch: 65536}\n    storage: !Remote {epoch: -1, objectStore: !S3 {bucket: b, prefix: ../escape, remote: missing}}\n", InputFormat::IngestYaml, b"{}");
     for code in ["unsupported-partition-count", "missing-or-wrong-remote", "aliased-log-identities", "invalid-log-epoch", "invalid-storage-epoch", "missing-disk-cache"] {
         assert!(report.configuration_gaps.iter().any(|finding| finding.code == code), "{code}");
     }
