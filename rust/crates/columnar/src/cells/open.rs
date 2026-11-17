@@ -1,4 +1,4 @@
-use arrow_array::{StructArray, make_array};
+use arrow_array::{FixedSizeListArray, ListArray, MapArray, StructArray, UnionArray, make_array};
 use arrow_data::ArrayData;
 use arrow_schema::UnionMode;
 
@@ -21,12 +21,12 @@ pub(super) fn open_from_parts(field: Arc<Field>, array: ArrayRef, reservation: A
     crate::from_field(&field)?;
     let data = normalize(&field, array.to_data(), reservation.budget())?;
     let normalized = make_array(data);
-    let owner = Arc::new(OpenedOwner { _array: array, reservation, _metadata: metadata });
+    let owner = Arc::new(NodeOwner { backing: BackingOwner::Arrow { _array: array, reservation }, metadata });
     let node = node(field, normalized, &owner)?;
     Ok(ExecutionVector::direct(node))
 }
 
-fn schema_bound(field: &Field, depth: usize) -> Result<(usize, usize)> {
+pub(super) fn schema_bound(field: &Field, depth: usize) -> Result<(usize, usize)> {
     if depth > 128 { return Err(Anomaly::unsupported("rtdb/vector-schema-depth", "Execution vector schema exceeds 128 levels")); }
     let mut bytes = 4096usize.checked_add(field.name().capacity()).ok_or_else(allocation)?;
     bytes = bytes.checked_add(field.metadata().capacity().checked_mul(128).ok_or_else(allocation)?).ok_or_else(allocation)?;
@@ -96,34 +96,82 @@ fn normalize(field: &Field, data: ArrayData, budget: &Arc<crate::MemoryBudget>) 
     ArrayData::builder(data_type).len(len).offset(offset).nulls(nulls).buffers(buffers).child_data(normalized).build().map_err(crate::arrow_error)
 }
 
-fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<OpenedOwner>) -> Result<Arc<OpenedNode>> {
+fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
     vector_length(array.len())?;
-    let logical = crate::execution_field_type(&field)?;
-    let mut children = Vec::new();
-    match field.data_type() {
+    let BackingOwner::Arrow { reservation, .. } = &owner.backing else { return Err(layout()); };
+    let length = array.len();
+    let storage = match field.data_type() {
         DataType::Struct(fields) => {
             let values = downcast::<StructArray>(array.as_ref())?;
-            children.reserve_exact(fields.len());
+            let mut children = Vec::with_capacity(fields.len());
             for (field, value) in fields.iter().zip(values.columns()) { children.push(node(Arc::clone(field), Arc::clone(value), owner)?); }
+            NodeLayout::Struct { validity: values.nulls().cloned(), children }
         }
-        DataType::List(field) => children.push(node(Arc::clone(field), Arc::clone(downcast::<ListArray>(array.as_ref())?.values()), owner)?),
-        DataType::FixedSizeList(field, _) => children.push(node(Arc::clone(field), Arc::clone(downcast::<FixedSizeListArray>(array.as_ref())?.values()), owner)?),
-        DataType::Map(field, _) => children.push(node(Arc::clone(field), Arc::new(downcast::<MapArray>(array.as_ref())?.entries().clone()), owner)?),
+        DataType::List(field) => {
+            let list = downcast::<ListArray>(array.as_ref())?;
+            NodeLayout::List {
+                validity: list.nulls().cloned(), offsets: RetainedBuffer::arrow(list.offsets().inner().inner().clone(), reservation),
+                elements: node(Arc::clone(field), Arc::clone(list.values()), owner)?,
+            }
+        }
+        DataType::FixedSizeList(field, size) => {
+            let list = downcast::<FixedSizeListArray>(array.as_ref())?;
+            NodeLayout::FixedList { validity: list.nulls().cloned(), size: usize::try_from(*size).map_err(|_| layout())?, elements: node(Arc::clone(field), Arc::clone(list.values()), owner)? }
+        }
+        DataType::Map(field, _) => {
+            let map = downcast::<MapArray>(array.as_ref())?;
+            NodeLayout::List {
+                validity: map.nulls().cloned(), offsets: RetainedBuffer::arrow(map.offsets().inner().inner().clone(), reservation),
+                elements: node(Arc::clone(field), Arc::new(map.entries().clone()), owner)?,
+            }
+        }
         DataType::Union(fields, _) => {
             let values = downcast::<UnionArray>(array.as_ref())?;
-            children.reserve_exact(fields.len());
+            let mut children = Vec::with_capacity(fields.len());
             for (id, field) in fields.iter() { children.push(node(Arc::clone(field), Arc::clone(values.child(id)), owner)?); }
+            NodeLayout::Union {
+                type_ids: RetainedBuffer::arrow(values.type_ids().inner().clone(), reservation),
+                offsets: RetainedBuffer::arrow(values.offsets().ok_or_else(layout)?.inner().clone(), reservation), children,
+            }
         }
         DataType::RunEndEncoded(ends, field) => {
-            let values = match ends.data_type() {
-                DataType::Int16 => downcast::<RunArray<Int16Type>>(array.as_ref())?.values(),
-                DataType::Int32 => downcast::<RunArray<Int32Type>>(array.as_ref())?.values(),
-                DataType::Int64 => downcast::<RunArray<Int64Type>>(array.as_ref())?.values(),
-                _ => return Err(layout()),
-            };
-            children.push(node(Arc::clone(field), Arc::clone(values), owner)?);
+            let data = array.to_data();
+            NodeLayout::RunEnd {
+                logical_offset: data.offset(),
+                ends: node(Arc::clone(ends), make_array(data.child_data()[0].clone()), owner)?,
+                values: node(Arc::clone(field), make_array(data.child_data()[1].clone()), owner)?,
+            }
         }
-        _ => {},
-    }
-    Ok(Arc::new(OpenedNode { field, logical, array, children, owner: Arc::clone(owner) }))
+        _ => {
+            let data = array.to_data();
+            NodeLayout::Leaf { payload: data.buffers().first().cloned(), payload_offset: data.offset(), array }
+        },
+    };
+    finish_node(field, length, storage, Arc::clone(owner))
+}
+
+pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
+    let data_type = match (&storage, ingress.data_type()) {
+        (NodeLayout::Struct { children, .. }, DataType::Struct(_)) => DataType::Struct(children.iter().map(|child| Arc::clone(&child.field)).collect()),
+        (NodeLayout::List { elements, .. }, DataType::List(_)) => DataType::List(Arc::clone(&elements.field)),
+        (NodeLayout::List { elements, .. }, DataType::Map(_, sorted)) => DataType::Map(Arc::clone(&elements.field), *sorted),
+        (NodeLayout::FixedList { elements, .. }, DataType::FixedSizeList(_, size)) => DataType::FixedSizeList(Arc::clone(&elements.field), *size),
+        (NodeLayout::Union { children, .. }, DataType::Union(fields, mode)) => DataType::Union(
+            arrow_schema::UnionFields::try_new(fields.iter().map(|(id, _)| id), children.iter().map(|child| Arc::clone(&child.field))).map_err(crate::arrow_error)?, *mode),
+        (NodeLayout::RunEnd { ends, values, .. }, DataType::RunEndEncoded(_, _)) => {
+            storage::check_runs(ends, values, length)?;
+            DataType::RunEndEncoded(Arc::clone(&ends.field), Arc::clone(&values.field))
+        }
+        (NodeLayout::Leaf { .. }, data_type) => match data_type {
+            DataType::UInt8 => DataType::Int8, DataType::UInt16 => DataType::Int16,
+            DataType::UInt32 => DataType::Int32, DataType::UInt64 => DataType::Int64,
+            DataType::Timestamp(unit, Some(zone)) => DataType::Timestamp(*unit, Some(rtdb_types::ZoneId::parse(zone)?.to_string().into())),
+            other => other.clone(),
+        },
+        _ => return Err(layout()),
+    };
+    let nullable = if matches!(&storage, NodeLayout::Union { .. } | NodeLayout::RunEnd { .. }) { false } else { ingress.is_nullable() };
+    let field = Arc::new(ingress.as_ref().clone().with_data_type(data_type).with_nullable(nullable));
+    let logical = crate::execution_field_type(&field)?;
+    Ok(Arc::new(PhysicalNode { ingress, field, logical, length, storage, owner }))
 }

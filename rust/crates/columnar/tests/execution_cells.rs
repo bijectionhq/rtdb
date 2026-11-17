@@ -4,8 +4,12 @@ use std::sync::Arc;
 use arrow_array::{*, types::{Int16Type, Int32Type, Int64Type}};
 use arrow_buffer::{BooleanBuffer, NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit as ArrowTimeUnit, UnionFields};
-use rtdb_columnar::{ExecutionVector, MemoryBudget, NullChecks, OwnedBatch, Selection, to_field};
+use rtdb_columnar::{ExecutionVector, MemoryBudget, NullChecks, OwnedBatch, Selection, VectorReadError, to_field};
 use rtdb_types::{IntervalUnit, LogicalType, ScalarType, TimeUnit, Value};
+
+fn anomaly(error: VectorReadError) -> rtdb_types::Anomaly {
+    match error { VectorReadError::Anomaly(error) => error, other => panic!("expected an existing anomaly, got {other:?}") }
+}
 
 fn batch(field: &Field, array: ArrayRef, budget: &Arc<MemoryBudget>) -> OwnedBatch {
     let storage = field.clone().with_nullable(true);
@@ -30,7 +34,7 @@ fn nullable_primitives_preserve_nonzero_payload_and_signed_execution_width() {
             let cell = vector.cell(1).unwrap();
             assert!(cell.is_null().unwrap());
             assert_eq!(cell.$get(NullChecks::Disabled).unwrap(), $expected);
-            let error = cell.$get(NullChecks::Enabled).unwrap_err();
+            let error = anomaly(cell.$get(NullChecks::Enabled).unwrap_err());
             assert_eq!(error.code, "xtdb.error/unknown");
             assert_eq!(error.message, "null at index 1");
             assert_eq!(cell.object().unwrap().value(), &Value::Null);
@@ -54,7 +58,7 @@ fn nullable_primitives_preserve_nonzero_payload_and_signed_execution_width() {
 fn getter_admission_precedes_validity_and_matches_concrete_vector_methods() {
     let budget = MemoryBudget::new(16 * 1024 * 1024);
     let byte = open(Field::new("v", DataType::Int8, true), Arc::new(Int8Array::new(vec![0, 9].into(), invalid())), &budget);
-    assert_eq!(byte.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err().code, "rtdb/unsupported-vector-reader");
+    assert_eq!(anomaly(byte.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
     let short = open(Field::new("v", DataType::Int16, true), Arc::new(Int16Array::from(vec![17])), &budget);
     assert_eq!(short.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 17);
     assert_eq!(short.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 17);
@@ -65,11 +69,11 @@ fn getter_admission_precedes_validity_and_matches_concrete_vector_methods() {
         let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(2).add_buffer(arrow_buffer::Buffer::from_slice_ref([3i32, 19])).nulls(invalid()).build().unwrap();
         let vector = open(field, make_array(data), &budget);
         assert_eq!(vector.cell(1).unwrap().get_int(NullChecks::Disabled).unwrap(), 19);
-        assert_eq!(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err().code, "rtdb/unsupported-vector-reader");
+        assert_eq!(anomaly(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
     }
     let null = open(Field::new("null", DataType::Null, true), Arc::new(NullArray::new(1)), &budget);
     assert!(null.cell(0).unwrap().is_null().unwrap());
-    assert_eq!(null.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err().code, "rtdb/unsupported-vector-reader");
+    assert_eq!(anomaly(null.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
     assert_eq!(null.cell(0).unwrap().object().unwrap().value(), &Value::Null);
     let bottom = open(Field::new("bottom", DataType::Null, false), Arc::new(NullArray::new(1)), &budget);
     assert!(bottom.cell(0).unwrap().is_null().unwrap());
@@ -105,7 +109,7 @@ fn struct_child_nullability_and_composed_selection_remain_independent_of_parent(
         assert_eq!(required.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 22);
         let optional = selected.struct_child("optional").unwrap().unwrap();
         assert_eq!(optional.cell(0).unwrap().get_long(NullChecks::Disabled).unwrap(), 42);
-        assert_eq!(optional.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+        assert_eq!(anomaly(optional.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
         let raw = selected.cell(0).unwrap().raw_struct_field("required").unwrap().unwrap();
         assert_eq!(raw.as_ref().getter_index().unwrap(), 1);
         assert_eq!(raw.as_ref().get_long(NullChecks::Enabled).unwrap(), 22);
@@ -130,12 +134,12 @@ fn dense_union_retains_nullable_duration_leaf_and_explicit_null_distinction() {
     assert_eq!(duration.leaf_field().unwrap().name(), "duration-micro");
     assert_eq!(duration.getter_index().unwrap(), 1);
     assert_eq!(duration.get_long(NullChecks::Disabled).unwrap(), 71);
-    assert_eq!(duration.get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+    assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
     assert_eq!(duration.object().unwrap().value(), &Value::Null);
     let null = vector.cell(0).unwrap();
     assert_eq!(null.leaf_field().unwrap().name(), "null");
     assert!(null.is_null().unwrap());
-    assert_eq!(null.get_long(NullChecks::Disabled).unwrap_err().code, "rtdb/unsupported-vector-reader");
+    assert_eq!(anomaly(null.get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
 }
 
 #[test]
@@ -149,7 +153,7 @@ fn run_end_slices_and_selections_preserve_physical_getter_index() {
             let selected = vector.select(&Selection::Indices(vec![2, 0, 1])).unwrap();
             assert_eq!(selected.cell(1).unwrap().getter_index().unwrap(), 0);
             assert_eq!(selected.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 101);
-            assert_eq!(selected.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 0");
+            assert_eq!(anomaly(selected.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 0");
             assert_eq!(selected.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 202);
             assert_eq!(selected.cell(0).unwrap().getter_index().unwrap(), 1);
         }};
@@ -157,6 +161,63 @@ fn run_end_slices_and_selections_preserve_physical_getter_index() {
     check!(Int16Type, Int16Array::from(vec![2, 5]));
     check!(Int32Type, Int32Array::from(vec![2, 5]));
     check!(Int64Type, Int64Array::from(vec![2, 5]));
+}
+
+#[test]
+fn sdk_run_end_domain_checks_unused_suffixes_inside_empty_and_nested_arrays() {
+    let budget = MemoryBudget::new(16 * 1024 * 1024);
+    for (offset, length) in [(0, 1), (0, 0), (1, 0)] {
+        for nesting in 0..3 {
+            let runs = RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1, i64::from(i32::MAX) + 1]), &Int64Array::from(vec![42, 73])).unwrap().slice(offset, length);
+            let runs: ArrayRef = Arc::new(runs);
+            let child = Arc::new(Field::new("runs", runs.data_type().clone(), true));
+            let array: ArrayRef = match nesting {
+                0 => runs,
+                1 => Arc::new(StructArray::new(Fields::from(vec![child]), vec![runs], None)),
+                _ => Arc::new(ListArray::new(child, OffsetBuffer::new(vec![0].into()), runs, None)),
+            };
+            let field = Arc::new(Field::new("root", array.data_type().clone(), false));
+            let reservation = budget.reserve(array.get_array_memory_size()).unwrap();
+            assert_eq!(ExecutionVector::with_reservation(field, array, reservation).unwrap_err().code, "rtdb/vector-length");
+            assert_eq!(budget.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn sdk_run_end_rejection_releases_metadata_without_releasing_caller_column() {
+    let budget = MemoryBudget::new(16 * 1024 * 1024);
+    let runs = RunArray::<Int64Type>::try_new(&Int64Array::from(vec![i64::from(i32::MAX) + 1]), &Int64Array::from(vec![42])).unwrap().slice(0, 1);
+    let field = Field::new("runs", runs.data_type().clone(), false);
+    let source = batch(&field, Arc::new(runs), &budget);
+    let before = budget.used_bytes();
+    assert!(before > 0);
+    assert_eq!(ExecutionVector::open(Arc::new(field), source.column(0).unwrap()).unwrap_err().code, "rtdb/vector-length");
+    assert_eq!(budget.used_bytes(), before);
+    assert_eq!(source.column(0).unwrap().array().len(), 1);
+    drop(source);
+    assert_eq!(budget.used_bytes(), 0);
+}
+
+#[test]
+fn sdk_i32_max_run_coverage_survives_slicing_selection_and_owner_drop() {
+    let budget = MemoryBudget::new(16 * 1024 * 1024);
+    for (offset, length) in [(0, 1), (i32::MAX as usize - 1, 1), (i32::MAX as usize, 0)] {
+        let runs = RunArray::<Int64Type>::try_new(&Int64Array::from(vec![i64::from(i32::MAX)]), &Int64Array::from(vec![42])).unwrap().slice(offset, length);
+        let vector = open(Field::new("runs", runs.data_type().clone(), false), Arc::new(runs), &budget);
+        let selected = vector.select(&Selection::All).unwrap();
+        drop(vector);
+        assert!(budget.used_bytes() > 0);
+        assert_eq!(selected.len(), length);
+        if length == 0 {
+            assert!(selected.cell(0).is_err());
+        } else {
+            assert_eq!(selected.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 42);
+            assert_eq!(selected.cell(0).unwrap().getter_index().unwrap(), 0);
+        }
+        drop(selected);
+        assert_eq!(budget.used_bytes(), 0);
+    }
 }
 
 #[test]
@@ -170,7 +231,7 @@ fn raw_run_end_list_access_does_not_grant_reference_nested_methods() {
     let elements = vector.cell(1).unwrap().raw_list_elements().unwrap();
     assert_eq!(elements.len(), 2);
     assert_eq!(elements.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 29);
-    assert_eq!(elements.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+    assert_eq!(anomaly(elements.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
     drop(vector);
     assert_eq!(elements.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 11);
 }
@@ -279,7 +340,7 @@ fn temporal_long_getters_read_declared_units_and_retain_nonzero_null_bits() {
         let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(2).add_buffer(arrow_buffer::Buffer::from_slice_ref([0i64, 259_200_017])).nulls(invalid()).build().unwrap();
         let vector = open(field, make_array(data), &budget);
         assert_eq!(vector.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), expected);
-        assert_eq!(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+        assert_eq!(anomaly(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
         assert_eq!(vector.cell(1).unwrap().object().unwrap().value(), &Value::Null);
     }
 }
@@ -297,8 +358,8 @@ fn structured_interval_vectors_do_not_expose_primitive_numeric_getters() {
         let array = rtdb_columnar::copy_array(&logical, &[value, Value::Null]).unwrap();
         let vector = open(field, array, &budget);
         for checks in [NullChecks::Enabled, NullChecks::Disabled] {
-            assert_eq!(vector.cell(1).unwrap().get_int(checks).unwrap_err().code, "rtdb/unsupported-vector-reader");
-            assert_eq!(vector.cell(1).unwrap().get_long(checks).unwrap_err().code, "rtdb/unsupported-vector-reader");
+            assert_eq!(anomaly(vector.cell(1).unwrap().get_int(checks).unwrap_err()).code, "rtdb/unsupported-vector-reader");
+            assert_eq!(anomaly(vector.cell(1).unwrap().get_long(checks).unwrap_err()).code, "rtdb/unsupported-vector-reader");
         }
     }
 }
@@ -314,7 +375,7 @@ fn raw_nested_cells_preserve_dense_union_and_run_end_struct_ownership() {
     assert!(vector.struct_child("value").is_err());
     drop(vector);
     assert_eq!(child.as_ref().get_long(NullChecks::Disabled).unwrap(), 73);
-    assert_eq!(child.as_ref().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+    assert_eq!(anomaly(child.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
     drop(child);
     assert_eq!(budget.used_bytes(), 0);
 
@@ -362,7 +423,7 @@ fn map_entries_retain_raw_child_payloads_and_reference_container_access() {
     assert_eq!(vector.list_elements().unwrap().len(), 2);
     drop(entries);
     drop(vector);
-    assert_eq!(value.as_ref().get_long(NullChecks::Enabled).unwrap_err().message, "null at index 1");
+    assert_eq!(anomaly(value.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
     drop(value);
     assert_eq!(budget.used_bytes(), 0);
 }

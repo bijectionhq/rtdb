@@ -1,272 +1,237 @@
 mod getters;
+mod materialize;
 mod open;
+mod scalar;
+mod storage;
+mod view;
 
 use std::sync::Arc;
-
-use arrow_array::{Array, ArrayRef, FixedSizeListArray, ListArray, MapArray, RunArray, UnionArray, types::{Int16Type, Int32Type, Int64Type}};
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::{DataType, Field};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
-
 use crate::{MemoryReservation, OwnedColumn, Selection};
+use storage::NodeLayout;
+pub use storage::{PhysicalLayout, RetainedBuffer};
 
 /// Controls primitive validity checks for an individual physical read.
 /// Logical object reads always retain their own null guard.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NullChecks { Enabled, Disabled }
 
+/// Primitive reader failure before a caller chooses its host-exception conversion boundary.
+/// AbsentPrimitiveReceiver is a message-less NullPointerException producer, not an already-converted anomaly.
+/// Kotlin and Clojure boundaries apply different null-message policies; no implicit reverse conversion is provided.
+#[derive(Debug)]
+pub enum VectorReadError { Anomaly(Anomaly), AbsentPrimitiveReceiver }
+
+/// Result of a forwarding primitive/getBytes read or a concrete numeric wrapper.
+pub type VectorReadResult<T> = std::result::Result<T, VectorReadError>;
+
+impl From<Anomaly> for VectorReadError { fn from(error: Anomaly) -> Self { Self::Anomaly(error) } }
+impl std::fmt::Display for VectorReadError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self { Self::Anomaly(error) => std::fmt::Display::fmt(error, formatter), Self::AbsentPrimitiveReceiver => formatter.write_str("java.lang.NullPointerException") }
+    }
+}
+impl std::error::Error for VectorReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { match self { Self::Anomaly(error) => Some(error), Self::AbsentPrimitiveReceiver => None } }
+}
+
 /// Immutable physical vector with shared buffer, schema and selection reservations.
-/// Clones and child views retain their owners; no payload buffers are copied by selection.
+/// Clones and child views retain their owners; selection does not copy payload buffers.
 #[derive(Clone, Debug)]
-pub struct ExecutionVector {
-    node: Arc<OpenedNode>,
-    address: Address,
+pub struct ExecutionVector { view: ReaderView, address: Address }
+
+#[derive(Clone, Debug)]
+enum ReaderView {
+    Direct(Arc<PhysicalNode>),
+    UnionLeg { union: Arc<PhysicalNode>, type_id: i8, inner: Arc<ExecutionVector>, _reservation: Arc<MemoryReservation> },
 }
 
 #[derive(Debug)]
-struct OpenedNode {
-    field: Arc<Field>,
-    logical: LogicalType,
-    array: ArrayRef,
-    children: Vec<Arc<OpenedNode>>,
-    owner: Arc<OpenedOwner>,
+struct PhysicalNode {
+    ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType, length: usize,
+    storage: NodeLayout, owner: Arc<NodeOwner>,
 }
-
 #[derive(Debug)]
-struct OpenedOwner {
-    _array: ArrayRef,
-    reservation: Arc<MemoryReservation>,
-    _metadata: Arc<MemoryReservation>,
-}
+struct NodeOwner { backing: BackingOwner, metadata: Arc<MemoryReservation> }
+#[derive(Debug)]
+enum BackingOwner { Arrow { _array: ArrayRef, reservation: Arc<MemoryReservation> }, Native }
 
 #[derive(Clone, Debug)]
 enum Address {
+    Identity { len: usize },
     Range { offset: usize, len: usize },
     Indices { selection: Arc<Indices>, offset: usize, len: usize },
 }
-
 #[derive(Debug)]
-struct Indices { rows: Vec<usize>, _reservation: Arc<MemoryReservation> }
-
+struct Indices { rows: Vec<PhysicalIndex>, _reservation: Arc<MemoryReservation> }
+#[derive(Clone, Copy, Debug)]
+struct PhysicalIndex(i32);
+impl PhysicalIndex {
+    fn from_position(index: usize) -> Result<Self> { i32::try_from(index).map(Self).map_err(|_| index_error()) }
+    fn position(self) -> Result<usize> { usize::try_from(self.0).map_err(|_| index_error()) }
+}
 impl Address {
-    fn len(&self) -> usize {
-        match self { Self::Range { len, .. } | Self::Indices { len, .. } => *len }
-    }
-
-    fn row(&self, index: usize) -> usize {
+    fn len(&self) -> usize { match self { Self::Identity { len } | Self::Range { len, .. } | Self::Indices { len, .. } => *len } }
+    fn row(&self, index: usize) -> Result<PhysicalIndex> { self.translate(PhysicalIndex::from_position(index)?) }
+    fn translate(&self, index: PhysicalIndex) -> Result<PhysicalIndex> {
         match self {
-            Self::Range { offset, .. } => offset + index,
-            Self::Indices { selection, offset, .. } => selection.rows[offset + index],
-        }
-    }
-
-    fn slice(&self, start: usize, length: usize) -> Self {
-        match self {
-            Self::Range { offset, .. } => Self::Range { offset: offset + start, len: length },
-            Self::Indices { selection, offset, .. } => Self::Indices { selection: Arc::clone(selection), offset: offset + start, len: length },
+            Self::Identity { .. } => Ok(index),
+            Self::Range { offset, .. } => Ok(PhysicalIndex((*offset as i32).wrapping_add(index.0))),
+            Self::Indices { selection, offset, len } => {
+                let index = index.position()?;
+                if index >= *len { return Err(index_error()); }
+                selection.rows.get(offset + index).copied().ok_or_else(index_error)
+            }
         }
     }
 }
 
 impl ExecutionVector {
-    /// Opens an admitted Arrow layout using the column's budget.
-    /// Declared nonnullable nodes ignore incoming validity, sharing all original payload buffers.
-    /// Schemas are limited to 128 levels and vectors to the signed 32-bit index domain.
-    /// Mismatched or unsupported layouts, HALF and insufficient budget return errors.
-    /// The caller's field and Arrow arrays remain unchanged.
+    /// Opens admitted Arrow under its retained budget, ignoring nonnullable validity without changing caller arrays.
+    /// Layout, timezone, 128-level schema depth, i32 vector length and budget validation precede publication; HALF is unsupported.
     pub fn open(field: Arc<Field>, column: OwnedColumn) -> Result<Self> { open::open(field, column) }
-
-    /// Adopts a pre-reserved Arrow allocation before execution nullability normalization.
-    /// The reservation must cover `array.get_array_memory_size()`.
-    /// Callers retaining independent input-array clones must retain their reservation separately.
-    /// Raw arrays are retained privately; only normalized, validated views are published.
-    /// Layout, schema-depth, signed-vector length and budget errors match `open`.
-    pub fn with_reservation(field: Arc<Field>, array: ArrayRef, reservation: Arc<MemoryReservation>) -> Result<Self> {
-        open::open_from_parts(field, array, reservation)
-    }
-
-    /// Borrows the opened physical declaration; selections leave it unchanged.
-    pub fn field(&self) -> &Field { &self.node.field }
-    /// Borrows the execution type, with unsigned widths interpreted as signed and logical union legs normalized.
-    pub fn logical_type(&self) -> &LogicalType { &self.node.logical }
+    /// Adopts raw Arrow before execution nullability normalization; the reservation must cover its full array memory size.
+    /// Caller-retained array clones require their reservation retained separately; validation matches `open`.
+    pub fn with_reservation(field: Arc<Field>, array: ArrayRef, reservation: Arc<MemoryReservation>) -> Result<Self> { open::open_from_parts(field, array, reservation) }
+    /// Adopts a native container with retained buffers and complete direct child vectors.
+    /// Length and schema-depth checks precede metadata reservation; layout validation follows it, and failure drops the adopted inputs.
+    /// Absent union discriminators are retained without constructing invalid Arrow arrays.
+    pub fn from_physical(field: Arc<Field>, layout: PhysicalLayout, memory: &Arc<crate::MemoryBudget>) -> Result<Self> { storage::native(field, layout, memory) }
+    /// Borrows canonical opened metadata, including signed integer widths and ZoneId spelling.
+    pub fn field(&self) -> &Field { &self.node().field }
+    /// Borrows the original declaration separately from canonical opened metadata.
+    pub fn ingress_field(&self) -> &Field { &self.node().ingress }
+    /// Borrows the normalized execution type; physical selected-leg identity is retained independently.
+    pub fn logical_type(&self) -> &LogicalType { &self.node().logical }
     pub fn len(&self) -> usize { self.address.len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
-
-    /// Normalizes indices to this opened vector's source rows before publishing a retained view.
-    /// Ranges share any existing index owner; index selections reserve their storage before allocation.
-    /// Invalid rows, signed-vector length overflow and budget exhaustion return errors.
-    pub fn select(&self, selection: &Selection) -> Result<Self> {
-        selection.validate(self.len())?;
-        let address = match selection {
-            Selection::All => self.address.clone(),
-            Selection::Range { offset, length } => self.address.slice(*offset, *length),
-            Selection::Indices(indices) => {
-                vector_length(indices.len())?;
-                let bytes = indices.len().checked_mul(std::mem::size_of::<usize>()).and_then(|n| n.checked_add(128)).ok_or_else(allocation)?;
-                let reservation = self.node.owner.reservation.budget().reserve(bytes)?;
-                let rows = indices.iter().map(|index| self.address.row(*index as usize)).collect();
-                Address::Indices { selection: Arc::new(Indices { rows, _reservation: reservation }), offset: 0, len: indices.len() }
-            }
-        };
-        Ok(Self { node: Arc::clone(&self.node), address })
-    }
-
-    /// Borrows a selected position without allocating; an out-of-range position returns an error.
+    /// Borrows a checked selected position without allocating.
     pub fn cell(&self, index: usize) -> Result<CellRef<'_>> {
         if index >= self.len() { return Err(index_error()); }
         Ok(CellRef { vector: self, index })
     }
-
-    /// Retains the vector and selection at a checked position without materializing its value.
+    /// Retains a checked cell's buffers, metadata and reader view without materialization.
     pub fn owned_cell(&self, index: usize) -> Result<OwnedCell> {
         self.cell(index)?;
         Ok(OwnedCell { vector: self.clone(), index })
     }
-
-    /// Implements the plain Struct vector's child lookup, retaining the parent's selection.
-    /// Missing fields return `None`; other vector classes, including run-end encoding, reject this method.
-    /// A null parent does not mask its child vector.
-    pub fn struct_child(&self, name: &str) -> Result<Option<Self>> {
-        let DataType::Struct(fields) = self.field().data_type() else { return Err(unsupported("vectorFor")); };
-        Ok(fields.iter().position(|field| field.name() == name).map(|index| Self {
-            node: Arc::clone(&self.node.children[index]), address: self.address.clone(),
-        }))
-    }
-
-    /// Returns the complete element vector for plain list/map containers and their extensions.
-    /// Parent selections do not select elements; use each cell's offsets or `raw_list_elements` for that.
-    /// Run-end and union vectors reject this reference reader method.
-    pub fn list_elements(&self) -> Result<Self> {
-        match self.field().data_type() {
-            DataType::List(_) | DataType::FixedSizeList(_, _) | DataType::Map(_, _) => Ok(Self::direct(Arc::clone(&self.node.children[0]))),
-            _ => Err(unsupported("listElements")),
+    fn node(&self) -> &PhysicalNode { match &self.view { ReaderView::Direct(node) => node, ReaderView::UnionLeg { inner, .. } => inner.node() } }
+    fn budget(&self) -> &Arc<crate::MemoryBudget> { self.node().owner.metadata.budget() }
+    fn direct(node: Arc<PhysicalNode>) -> Self { let len = node.length; Self { view: ReaderView::Direct(node), address: Address::Identity { len } } }
+    fn into_direct(self) -> Result<Arc<PhysicalNode>> {
+        match (self.view, self.address) {
+            (ReaderView::Direct(node), Address::Identity { len }) if len == node.length => Ok(node),
+            _ => Err(Anomaly::incorrect("rtdb/physical-child-view", "Physical container children must be complete direct vectors")),
         }
     }
-
-    fn direct(node: Arc<OpenedNode>) -> Self {
-        let len = node.array.len();
-        Self { node, address: Address::Range { offset: 0, len } }
+    fn resolve(&self, index: PhysicalIndex) -> Result<ResolvedAccess<'_>> {
+        let row = self.address.translate(index)?;
+        match &self.view {
+            ReaderView::Direct(node) => resolve_node(node, row),
+            ReaderView::UnionLeg { union, inner, .. } => inner.resolve(union.union_offset_index(row)?),
+        }
+    }
+    fn null(&self, index: PhysicalIndex) -> Result<bool> {
+        let row = self.address.translate(index)?;
+        match &self.view {
+            ReaderView::Direct(node) => node.null(row),
+            ReaderView::UnionLeg { union, type_id, inner, .. } => Ok(union.union_id(row)? != *type_id || inner.null(union.union_offset_index(row)?)?),
+        }
+    }
+    fn leg_name(&self, index: PhysicalIndex) -> Result<Option<&str>> {
+        fn name(node: &PhysicalNode, row: PhysicalIndex) -> Result<Option<&str>> {
+            match &node.storage {
+                NodeLayout::Union { .. } => Ok(node.union_leg(row)?.map(|child| child.field.name().as_str())),
+                NodeLayout::RunEnd { values, .. } => name(values, node.run_index(row)?),
+                _ => Err(unsupported("getLeg")),
+            }
+        }
+        let row = self.address.translate(index)?;
+        match &self.view {
+            ReaderView::Direct(node) => name(node, row),
+            ReaderView::UnionLeg { union, inner, .. } => inner.leg_name(union.union_offset_index(row)?),
+        }
     }
 }
 
-/// Borrowed selected cell; primitive methods resolve the actual union leg and physical run first.
-/// Getter failures report the resolved leaf index, not the outer selection position.
+/// Borrowed selected cell; primitive errors identify the resolved physical getter index.
 #[derive(Clone, Copy, Debug)]
 pub struct CellRef<'a> { vector: &'a ExecutionVector, index: usize }
-
-/// Retained selected cell sharing its complete buffer, metadata and index owners.
+/// Retained selected cell sharing its complete buffer, metadata and reader-view owners.
 #[derive(Clone, Debug)]
 pub struct OwnedCell { vector: ExecutionVector, index: usize }
-
-impl OwnedCell {
-    /// Borrows the retained selected position without materializing or reserving a value.
-    pub fn as_ref(&self) -> CellRef<'_> { CellRef { vector: &self.vector, index: self.index } }
-}
-
-/// Materialized logical value and its allocation reservation.
-/// Borrowing cannot detach its allocation charge; dropping the final owner releases the charge.
+impl OwnedCell { pub fn as_ref(&self) -> CellRef<'_> { CellRef { vector: &self.vector, index: self.index } } }
+/// Materialized logical value whose reservation remains attached through borrowed access.
 #[derive(Debug)]
 pub struct OwnedValue { value: Value, _reservation: Arc<MemoryReservation> }
+impl OwnedValue { pub fn value(&self) -> &Value { &self.value } }
 
-impl OwnedValue {
-    /// Borrows the logical value while this owner retains its decoding reservation.
-    pub fn value(&self) -> &Value { &self.value }
+struct ResolvedCell<'a> { node: &'a PhysicalNode, row: PhysicalIndex }
+struct PayloadCell<'a> { node: &'a PhysicalNode, row: usize }
+impl<'a> ResolvedCell<'a> {
+    fn payload(&self) -> Result<PayloadCell<'a>> { Ok(PayloadCell { node: self.node, row: self.node.checked_position(self.row)? }) }
 }
-
-struct ResolvedCell<'a> { node: &'a OpenedNode, row: usize }
-
+enum ResolvedAccess<'a> { Leaf(ResolvedCell<'a>), AbsentUnion { type_id: i8, row: PhysicalIndex } }
+fn resolve_node(mut node: &PhysicalNode, mut row: PhysicalIndex) -> Result<ResolvedAccess<'_>> {
+    loop {
+        match &node.storage {
+            NodeLayout::Union { .. } => match node.union_child(row)? {
+                Some((child, offset)) => { node = child; row = offset; }
+                None => return Ok(ResolvedAccess::AbsentUnion { type_id: node.union_id(row)?, row }),
+            },
+            NodeLayout::RunEnd { values, .. } => { row = node.run_index(row)?; node = values; }
+            _ => return Ok(ResolvedAccess::Leaf(ResolvedCell { node, row })),
+        }
+    }
+}
 impl<'a> CellRef<'a> {
-    /// Returns the selected physical leaf metadata, including nullable leaf identity.
+    /// Returns actual selected leaf metadata, including nullable leaf identity; an absent union leg is an error.
     pub fn leaf_field(&self) -> Result<&'a Field> { Ok(&self.resolve()?.node.field) }
-
-    /// Returns the physical leaf row after selection, union offsets and run-end resolution.
-    pub fn getter_index(&self) -> Result<usize> { Ok(self.resolve()?.row) }
-
-    /// Applies opened-vector nullability at the selected leaf; bottom and Null vectors report null.
-    pub fn is_null(&self) -> Result<bool> {
-        let cell = self.resolve()?;
-        Ok(cell.node.field.data_type() == &DataType::Null || cell.node.array.is_null(cell.row))
-    }
-
-    /// Materializes a logical execution value after reserving its result and decoding scratch.
-    /// Null payload bits are never exposed by this operation, regardless of primitive check policy.
-    /// Bottom, malformed logical objects and budget exhaustion return errors.
-    pub fn object(&self) -> Result<OwnedValue> {
-        let cell = self.resolve()?;
-        let bytes = crate::estimate_read_value_bytes(&cell.node.field, cell.node.array.as_ref(), cell.row)?;
-        let reservation = cell.node.owner.reservation.budget().reserve(bytes)?;
-        let value = crate::read_execution_value(&cell.node.field, cell.node.array.as_ref(), cell.row)?;
-        Ok(OwnedValue { value, _reservation: reservation })
-    }
-
-    /// Resolves physical indirection and returns a retained Struct child at the same leaf row.
-    /// This raw layout operation also works through run-end/union indirection; it does not grant their `vectorFor` method.
-    /// Missing names return `None`; a non-Struct leaf returns an error, and parent nullness does not mask child storage.
+    /// Returns a checked source leaf row after all indirection; absent legs and addresses outside that leaf return errors.
+    pub fn getter_index(&self) -> Result<usize> { Ok(self.resolve()?.payload()?.row) }
+    /// Applies reader nullness, including named-leg discriminator masks and absent union rows.
+    pub fn is_null(&self) -> Result<bool> { self.vector.null(PhysicalIndex::from_position(self.index)?) }
+    /// Reads the direct union's signed discriminator; named-leg/run-end readers reject getTypeId.
+    pub fn type_id(&self) -> Result<i8> { match &self.vector.view { ReaderView::Direct(node) => node.union_id(self.vector.address.row(self.index)?), _ => Err(unsupported("getTypeId")) } }
+    /// Resolves a selected union name, or None for an absent leg; non-union leaves reject getLeg.
+    /// Run-end and named-leg readers delegate to their inner reader.
+    pub fn leg_name(&self) -> Result<Option<&'a str>> { self.vector.leg_name(PhysicalIndex::from_position(self.index)?) }
+    /// Materializes logical Value with reserved result/scratch, applying logical null guards.
+    /// This adapter does not construct TaggedValue or the full JVM object surface; bottom and absent union reads fail.
+    pub fn object(&self) -> Result<OwnedValue> { materialize::object(self) }
+    /// Resolves physical indirection to a retained Struct child without masking it by parent nullness.
+    /// Raw access does not grant the wrapper's reference vectorFor method.
     pub fn raw_struct_field(&self, name: &str) -> Result<Option<OwnedCell>> {
         let cell = self.resolve()?;
-        let DataType::Struct(fields) = cell.node.field.data_type() else { return Err(unsupported("raw_struct_field")); };
-        fields.iter().position(|field| field.name() == name).map(|index| {
-            ExecutionVector::direct(Arc::clone(&cell.node.children[index])).owned_cell(cell.row)
-        }).transpose()
+        let NodeLayout::Struct { children, .. } = &cell.node.storage else { return Err(unsupported("raw_struct_field")); };
+        children.iter().find(|child| child.field.name() == name).map(|child| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
     }
-
-    /// Returns the retained physical element range even when the parent validity bit is null.
-    /// This raw layout operation resolves run-end/union indirection and is distinct from their reader-method admission.
-    /// Non-list leaves and invalid offset ranges return errors.
+    /// Returns retained raw elements, including null-parent payload, after physical indirection.
+    /// This is distinct from listElements admission on union/run-end readers.
     pub fn raw_list_elements(&self) -> Result<ExecutionVector> {
         let cell = self.resolve()?;
-        let (start, end) = match cell.node.field.data_type() {
-            DataType::List(_) => {
-                let array = downcast::<ListArray>(cell.node.array.as_ref())?;
-                (array.value_offsets()[cell.row] as usize, array.value_offsets()[cell.row + 1] as usize)
-            }
-            DataType::FixedSizeList(_, length) => {
-                let length = *length as usize;
-                let start = cell.row.checked_mul(length).ok_or_else(allocation)?;
-                (start, start.checked_add(length).ok_or_else(allocation)?)
-            }
-            DataType::Map(_, _) => {
-                let array = downcast::<MapArray>(cell.node.array.as_ref())?;
-                (array.value_offsets()[cell.row] as usize, array.value_offsets()[cell.row + 1] as usize)
-            }
-            _ => return Err(unsupported("raw_list_elements")),
-        };
-        let length = end.checked_sub(start).ok_or_else(layout)?;
-        ExecutionVector::direct(Arc::clone(&cell.node.children[0])).select(&Selection::Range { offset: start, length })
+        if !matches!(&cell.node.storage, NodeLayout::List { .. } | NodeLayout::FixedList { .. }) { return Err(unsupported("raw_list_elements")); }
+        let (child, start, end) = cell.node.elements(cell.node.checked_position(cell.row)?)?;
+        ExecutionVector::direct(Arc::clone(child)).select(&Selection::Range { offset: start, length: end - start })
     }
-
     fn resolve(&self) -> Result<ResolvedCell<'a>> {
-        let mut node = self.vector.node.as_ref();
-        let mut row = self.vector.address.row(self.index);
-        loop {
-            match node.field.data_type() {
-                DataType::Union(fields, _) => {
-                    let array = downcast::<UnionArray>(node.array.as_ref())?;
-                    let id = array.type_id(row);
-                    let index = fields.iter().position(|(candidate, _)| candidate == id).ok_or_else(layout)?;
-                    row = array.value_offset(row);
-                    node = &node.children[index];
-                }
-                DataType::RunEndEncoded(ends, _) => {
-                    row = match ends.data_type() {
-                        DataType::Int16 => downcast::<RunArray<Int16Type>>(node.array.as_ref())?.get_physical_index(row),
-                        DataType::Int32 => downcast::<RunArray<Int32Type>>(node.array.as_ref())?.get_physical_index(row),
-                        DataType::Int64 => downcast::<RunArray<Int64Type>>(node.array.as_ref())?.get_physical_index(row),
-                        _ => return Err(layout()),
-                    };
-                    node = &node.children[0];
-                }
-                _ => return Ok(ResolvedCell { node, row }),
-            }
-            if row >= node.array.len() { return Err(index_error()); }
+        match self.vector.resolve(PhysicalIndex::from_position(self.index)?)? { ResolvedAccess::Leaf(cell) => Ok(cell), ResolvedAccess::AbsentUnion { type_id, row } => Err(absent(type_id, row)) }
+    }
+    fn resolve_primitive(&self) -> VectorReadResult<ResolvedCell<'a>> {
+        match self.vector.resolve(PhysicalIndex::from_position(self.index)?)? {
+            ResolvedAccess::Leaf(cell) => Ok(cell),
+            ResolvedAccess::AbsentUnion { .. } => Err(VectorReadError::AbsentPrimitiveReceiver),
         }
     }
 }
 
 fn downcast<T: Array + 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downcast_ref().ok_or_else(layout) }
-fn vector_length(length: usize) -> Result<()> {
-    if length > i32::MAX as usize { Err(Anomaly::unsupported("rtdb/vector-length", "Execution vector length exceeds the signed 32-bit index domain")) } else { Ok(()) }
-}
+fn vector_length(length: usize) -> Result<()> { if length > i32::MAX as usize { Err(Anomaly::unsupported("rtdb/vector-length", "Execution vector length exceeds the signed 32-bit index domain")) } else { Ok(()) } }
+fn index_bytes(length: usize) -> Result<usize> { length.checked_mul(std::mem::size_of::<usize>() * 2).and_then(|n| n.checked_add(256)).ok_or_else(allocation) }
 fn index_error() -> Anomaly { Anomaly::incorrect("rtdb/row-index", "Cell index exceeds vector length") }
-fn layout() -> Anomaly { Anomaly::incorrect("rtdb/invalid-arrow", "Execution field and physical array layout disagree") }
+fn layout() -> Anomaly { Anomaly::incorrect("rtdb/invalid-arrow", "Execution field and physical layout disagree") }
 fn allocation() -> Anomaly { Anomaly::incorrect("rtdb/allocation-overflow", "Execution vector allocation bound exceeds usize") }
 fn unsupported(method: &str) -> Anomaly { Anomaly::unsupported("rtdb/unsupported-vector-reader", format!("Vector does not expose {method}")) }
+fn absent(_type_id: i8, row: PhysicalIndex) -> Anomaly { Anomaly::fault("xtdb.error/unknown", format!("no leg for index {}", row.0)) }

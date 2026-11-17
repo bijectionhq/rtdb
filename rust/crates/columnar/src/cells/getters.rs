@@ -32,52 +32,67 @@ impl Getter {
 }
 
 impl<'a> CellRef<'a> {
-    fn primitive(&self, getter: Getter, checks: NullChecks) -> Result<ResolvedCell<'a>> {
-        let cell = self.resolve()?;
-        if !getter.admits(&cell.node.logical) { return Err(unsupported(getter.name())); }
-        if checks == NullChecks::Enabled && cell.node.array.is_null(cell.row) {
-            return Err(Anomaly::fault("xtdb.error/unknown", format!("null at index {}", cell.row)));
+    /// Borrows raw Utf8/Binary/FixedSizeBinary payload bytes, including extension storage and null-row payloads.
+    /// Union, run-end and named-leg readers delegate; other leaf classes reject getBytes without a null check.
+    pub fn get_bytes(&self) -> VectorReadResult<&'a [u8]> {
+        let cell = self.resolve_primitive()?;
+        let array = cell.node.array().map_err(|_| unsupported("getBytes"))?;
+        if !matches!(array.data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
+        let cell = cell.payload()?;
+        match array.data_type() {
+            DataType::Utf8 => Ok(downcast::<StringArray>(array)?.value(cell.row).as_bytes()),
+            DataType::Binary => Ok(downcast::<BinaryArray>(array)?.value(cell.row)),
+            DataType::FixedSizeBinary(_) => Ok(downcast::<FixedSizeBinaryArray>(array)?.value(cell.row)),
+            _ => Err(unsupported("getBytes").into()),
         }
-        Ok(cell)
+    }
+
+    fn primitive(&self, getter: Getter, checks: NullChecks) -> VectorReadResult<PayloadCell<'a>> {
+        let cell = self.resolve_primitive()?;
+        if !getter.admits(&cell.node.logical) { return Err(unsupported(getter.name()).into()); }
+        if checks == NullChecks::Enabled && cell.node.null(cell.row)? {
+            return Err(Anomaly::fault("xtdb.error/unknown", format!("null at index {}", cell.row.0)).into());
+        }
+        Ok(cell.payload()?)
     }
 
     /// Reads Boolean payload bits after method admission and the requested validity check.
-    pub fn get_boolean(&self, checks: NullChecks) -> Result<bool> {
+    pub fn get_boolean(&self, checks: NullChecks) -> VectorReadResult<bool> {
         let cell = self.primitive(Getter::Boolean, checks)?;
-        Ok(downcast::<BooleanArray>(cell.node.array.as_ref())?.value(cell.row))
+        Ok(downcast::<BooleanArray>(cell.node.array()?)?.value(cell.row))
     }
 
     /// Reads signed byte bits from I8/U8 storage; other vector classes reject the method before checking nullness.
-    pub fn get_byte(&self, checks: NullChecks) -> Result<i8> {
+    pub fn get_byte(&self, checks: NullChecks) -> VectorReadResult<i8> {
         let cell = self.primitive(Getter::Byte, checks)?;
-        Ok(match cell.node.field.data_type() {
-            DataType::Int8 => downcast::<Int8Array>(cell.node.array.as_ref())?.value(cell.row),
-            DataType::UInt8 => downcast::<UInt8Array>(cell.node.array.as_ref())?.value(cell.row) as i8,
-            _ => return Err(layout()),
+        Ok(match cell.node.array()?.data_type() {
+            DataType::Int8 => downcast::<Int8Array>(cell.node.array()?)?.value(cell.row),
+            DataType::UInt8 => downcast::<UInt8Array>(cell.node.array()?)?.value(cell.row) as i8,
+            _ => return Err(layout().into()),
         })
     }
 
     /// Reads signed short bits from I16/U16 storage with the requested validity check.
-    pub fn get_short(&self, checks: NullChecks) -> Result<i16> {
+    pub fn get_short(&self, checks: NullChecks) -> VectorReadResult<i16> {
         let cell = self.primitive(Getter::Short, checks)?;
-        short(&cell)
+        Ok(short(&cell)?)
     }
 
     /// Reads the concrete vector's Int getter, widening Short and preserving signed storage bits.
     /// DateDay uses epoch days, Time32 its declared unit, and YearMonth intervals total months.
-    pub fn get_int(&self, checks: NullChecks) -> Result<i32> {
+    pub fn get_int(&self, checks: NullChecks) -> VectorReadResult<i32> {
         let cell = self.primitive(Getter::Int, checks)?;
-        int(&cell)
+        Ok(int(&cell)?)
     }
 
     /// Reads the concrete vector's Long getter, widening Short/Int and preserving signed storage bits.
     /// DateMilli returns epoch days by truncating raw milliseconds toward zero; other temporal getters retain their declared unit.
     /// DateDay, Time32, OID extensions, intervals and Byte do not expose this getter.
-    pub fn get_long(&self, checks: NullChecks) -> Result<i64> {
+    pub fn get_long(&self, checks: NullChecks) -> VectorReadResult<i64> {
         let cell = self.primitive(Getter::Long, checks)?;
-        let array = cell.node.array.as_ref();
+        let array = cell.node.array()?;
         let row = cell.row;
-        Ok(match cell.node.field.data_type() {
+        Ok(match cell.node.array()?.data_type() {
             DataType::Int16 | DataType::UInt16 | DataType::Int32 | DataType::UInt32 => i64::from(int(&cell)?),
             DataType::Int64 => downcast::<Int64Array>(array)?.value(row),
             DataType::UInt64 => downcast::<UInt64Array>(array)?.value(row) as i64,
@@ -96,39 +111,39 @@ impl<'a> CellRef<'a> {
                 ArrowTimeUnit::Microsecond => downcast::<DurationMicrosecondArray>(array)?.value(row),
                 ArrowTimeUnit::Nanosecond => downcast::<DurationNanosecondArray>(array)?.value(row),
             },
-            _ => return Err(layout()),
+            _ => return Err(layout().into()),
         })
     }
 
     /// Reads F32 payload bits with the requested validity check; HALF and Double are not Float getters.
-    pub fn get_float(&self, checks: NullChecks) -> Result<f32> {
+    pub fn get_float(&self, checks: NullChecks) -> VectorReadResult<f32> {
         let cell = self.primitive(Getter::Float, checks)?;
-        Ok(downcast::<Float32Array>(cell.node.array.as_ref())?.value(cell.row))
+        Ok(downcast::<Float32Array>(cell.node.array()?)?.value(cell.row))
     }
 
     /// Reads F64 or widens F32 after the requested validity check.
-    pub fn get_double(&self, checks: NullChecks) -> Result<f64> {
+    pub fn get_double(&self, checks: NullChecks) -> VectorReadResult<f64> {
         let cell = self.primitive(Getter::Double, checks)?;
-        Ok(match cell.node.field.data_type() {
-            DataType::Float32 => f64::from(downcast::<Float32Array>(cell.node.array.as_ref())?.value(cell.row)),
-            DataType::Float64 => downcast::<Float64Array>(cell.node.array.as_ref())?.value(cell.row),
-            _ => return Err(layout()),
+        Ok(match cell.node.array()?.data_type() {
+            DataType::Float32 => f64::from(downcast::<Float32Array>(cell.node.array()?)?.value(cell.row)),
+            DataType::Float64 => downcast::<Float64Array>(cell.node.array()?)?.value(cell.row),
+            _ => return Err(layout().into()),
         })
     }
 }
 
-fn short(cell: &ResolvedCell<'_>) -> Result<i16> {
-    Ok(match cell.node.field.data_type() {
-        DataType::Int16 => downcast::<Int16Array>(cell.node.array.as_ref())?.value(cell.row),
-        DataType::UInt16 => downcast::<UInt16Array>(cell.node.array.as_ref())?.value(cell.row) as i16,
+fn short(cell: &PayloadCell<'_>) -> Result<i16> {
+    Ok(match cell.node.array()?.data_type() {
+        DataType::Int16 => downcast::<Int16Array>(cell.node.array()?)?.value(cell.row),
+        DataType::UInt16 => downcast::<UInt16Array>(cell.node.array()?)?.value(cell.row) as i16,
         _ => return Err(layout()),
     })
 }
 
-fn int(cell: &ResolvedCell<'_>) -> Result<i32> {
-    let array = cell.node.array.as_ref();
+fn int(cell: &PayloadCell<'_>) -> Result<i32> {
+    let array = cell.node.array()?;
     let row = cell.row;
-    Ok(match cell.node.field.data_type() {
+    Ok(match cell.node.array()?.data_type() {
         DataType::Int16 | DataType::UInt16 => i32::from(short(cell)?),
         DataType::Int32 => downcast::<Int32Array>(array)?.value(row),
         DataType::UInt32 => downcast::<UInt32Array>(array)?.value(row) as i32,

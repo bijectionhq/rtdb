@@ -42,7 +42,37 @@ The original Arrow arrays remain unchanged and every payload buffer stays shared
 The opened schema is bounded to 128 levels and each vector length to the signed 32-bit index domain.
 HALF vectors are rejected by this execution opener.
 Timestamp timezone names are validated when opening, including empty and nested vectors.
+`field()` is the canonical opened descriptor: unsigned integer widths become signed, timestamp zones use `ZoneId` spelling, and union/run-end parents have no validity field.
+`ingress_field()` retains the original declaration.
+Both preserve custom child/leg names and declaration order.
 `logical_type()` retains existing execution type normalization; `CellRef::leaf_field()` separately preserves the actual selected union leaf even when that leaf is null.
+
+`from_physical` admits immutable Struct, List/Map, FixedSizeList, DenseUnion and RunEndEncoded containers without requiring a parent Arrow array.
+Their scalar children use the existing validated Arrow opener.
+Each `RetainedBuffer` owns its buffer allocation reservation; child vectors retain their own owners, and native metadata is reserved before cloning or publishing it.
+Container admission checks declarations, complete direct children, row counts, validity spans and child offsets.
+Native and Arrow run-end admission checks every retained end, including unused runs behind sliced, empty and nested readers.
+Run ends must be positive, strictly increasing and within `i32::MAX`, with one value per run and final coverage at least the logical length.
+A shorter logical length, including zero, retains the complete covering run table and its value owners.
+Arrow admission also preserves the SDK's offset-plus-length coverage validation.
+Dense unions retain every negative discriminator byte as an absent leg.
+Named-leg selections retain raw signed offsets without checking the final child's bounds; nested selection checks only intermediate offset/index entries it actually reads.
+Consuming getters check retained payload bounds before access.
+Internal receiver positions stay signed through forwarding and method dispatch.
+Unsupported methods reject their receiver class before checking a final leaf position.
+Null-vector nullness is constant true, and nonnullable scalar/container nullness is constant false; neither operation reads row storage.
+Nullable validity, union discriminators/offsets, indirect indices, run ends and actual payload reads retain their own checked accesses.
+An absent leg is null for `is_null`, has no `leg_name`, and fails primitive/object reads; it remains distinct from an explicit Null leg and from a null nullable Duration leaf.
+No invalid Arrow union is constructed.
+
+Forwarding primitive getters, `get_bytes` and concrete numeric wrappers return `VectorReadResult`.
+`VectorReadError::AbsentPrimitiveReceiver` retains the raw message-less NullPointerException producer separately from `VectorReadError::Anomaly`.
+Absent primitive receivers propagate through union, run-end, named-leg and indirect readers.
+At each absent DenseUnion receiver, failure precedes reading that union's offset or admitting a leaf getter.
+Object reads retain their distinct `no leg for index` diagnostic.
+No implicit conversion chooses an anomaly message for a raw absent receiver.
+Production adapters must still select the actual host conversion route: Kotlin's `toAnomaly` supplies its Fault default, while Clojure's primary constructor preserves a nil message.
+Those adapters and the shared nullable-message carrier are outside this reader increment.
 
 Direct ranges and composed selections preserve source row indices without taking Arrow payload copies.
 `CellRef` borrows a selected position; `OwnedCell` retains its buffer, metadata and normalized index owners.
@@ -55,14 +85,31 @@ An unsupported getter fails before the validity check; a supported null getter w
 With checks disabled it reads the stored payload, including nonzero null payloads.
 `object()` always applies logical nullness and retains its result and decoding reservation in `OwnedValue`.
 The caller borrows that value through `value()`.
+`get_bytes` and `byte_span` borrow payload storage without checking validity; pointer spans are supported by fixed/variable-width and run-end readers, but not union/named-leg readers.
+The fixed binary LongLong getter uses its source 16-byte row stride, including on null rows, and returns a bounds error outside retained bytes.
+Numeric `get_as_*` and `get_decimal` require the concrete direct Numeric/Decimal class; an indirect reader retains forwarding primitive methods but does not become a NumericVector.
+Decimal getters read null coefficients and reserve materialized/conversion scratch before allocating.
 
-`ExecutionVector::struct_child` and `list_elements` admit only the corresponding plain container vector methods and their list extensions.
-Run-end and direct union vectors reject those methods.
+`vector_for` resolves Struct children and named DenseUnion legs; missing names return no reader.
+A named leg masks `is_null` by its discriminator while its primitive/object getters use the stored inner offset.
+Its index selection, or a range on a direct leg, translates offsets into an inner selection and drops that mask.
+Those offsets may be negative or outside an empty/inactive child; selecting them succeeds until a later operation consumes the corresponding storage.
+A range on an already indirect leg reader preserves the mask, matching `IndirectVector.select(start, len)`.
+A first direct range retains Slice topology; another range over an indirect reader reserves and materializes translated selection indices even when its rows are contiguous.
+`Selection::All` invokes the same range behavior over the complete reader.
+`struct_child` also admits a named Struct leg, while `list_elements` and list offsets admit the corresponding plain or named-leg list reader.
+`list_start_index` and `list_count` return signed i32 values.
+Fixed lists compute start with wrapping multiplication and return the declared count without accessing row storage.
+Variable lists read their stored start directly; count reads end before start and uses wrapping subtraction.
+Raw list extraction separately checks the complete child range before publishing retained element views.
+Run-end wrappers reject reference nested access even when their resolved physical leaf is a container.
+`map_keys`/`map_values` return complete first/last Struct children or Map entry children; parent selections do not select those elements.
 `CellRef::raw_struct_field` and `raw_list_elements` are separate physical layout operations that resolve indirection and retain child owners.
 Raw access does not mask a child's payload with its parent's null bit and does not grant reference expression-reader method admission.
 
-`tests/execution_cells.rs` covers primitive null payloads, unsigned interpretation, getter admission, nonnullable validity, union leaf identity, composed selections, run-end slices, nested retention, DateMilli units and allocation failure release.
+`tests/execution_cells.rs` covers primitive null payloads, unsigned interpretation, getter admission, nonnullable validity, union leaf identity, composed selections, run-end slices and end-domain admission, nested retention, DateMilli units and allocation failure release.
+`tests/physical_layout.rs` adds native absent-leg containers, raw primitive failure routing, delayed inactive-offset admission, named-reader selection exceptions, canonical declarations, direct numeric/byte methods, shorter logical run lengths, malformed layout rejection and retained-owner failure cases.
 These are unexecuted source regressions.
 Query frames, parameters, spill transport, expression consumers and writeNull/setNull/raw-copy builders still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
-That rollout must preserve dense-union undefined cells with no selected leg, which validated Arrow union arrays cannot represent.
-Full object readers also require canonical timezone spelling and tagged objects for custom union-leg names; this foundation retains the existing logical `Value` materializer.
+Raw copy/write builders, physical page transport, hash/metadata factories and production consumers remain separate work.
+Full object readers require tagged custom union legs, null-field omission, collection equality and registered extension decoding; `object()` remains the logical `Value` materializer and canonicalizes its timestamp zone only.
