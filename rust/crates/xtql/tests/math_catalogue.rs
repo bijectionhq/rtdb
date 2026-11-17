@@ -32,8 +32,8 @@ async fn xtql_mod_discards_payloads_at_either_null_argument_and_preserves_select
     let start = tokio::time::Instant::now();
     for source in [
         "(mod nil (/ 1 0))", "(mod (/ 1 0) nil)",
-        "(mod (sleep (cast 60.0 #xt/type [:duration :milli])) (/ 1 0))",
-        "(mod (/ 1 0) (sleep (cast 60.0 #xt/type [:duration :milli])))",
+        "(mod (sleep (cast \"PT0.06S\" #xt/type [:duration :milli])) (/ 1 0))",
+        "(mod (/ 1 0) (sleep (cast \"PT0.06S\" #xt/type [:duration :milli])))",
     ] {
         assert_eq!(project(source).await.unwrap(), (LogicalType::Null,Value::Null), "{source}");
     }
@@ -41,4 +41,9 @@ async fn xtql_mod_discards_payloads_at_either_null_argument_and_preserves_select
     for source in ["(mod (if (= (/ 1 0) 0) 1 2) nil)", "(mod (if true (/ 1 0) nil) nil)"] {
         assert_eq!(project(source).await.unwrap_err().code, "xtdb.expression/division-by-zero", "{source}");
     }
+}
+
+#[tokio::test]
+async fn xtql_mod_requires_exactly_two_arguments() {
+    for source in ["(mod)","(mod 1)","(mod 1 2 3)"] { assert!(project(source).await.is_err(),"{source}"); }
 }

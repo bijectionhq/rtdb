@@ -574,7 +574,7 @@ fn and(mut predicates: Vec<PExpr>) -> Option<PExpr> {
 }
 fn scalar_call(name: &str, args: Vec<PExpr>) -> Result<PExpr> {
     let binary = match name { "+" => Some(BinaryOp::Add), "-" => Some(BinaryOp::Subtract), "*" => Some(BinaryOp::Multiply), "/" => Some(BinaryOp::Divide),
-        "mod" => Some(BinaryOp::Modulo), "=" | "==" => Some(BinaryOp::Eq), "<>" | "not=" => Some(BinaryOp::NotEq), "<" => Some(BinaryOp::Lt), "<=" => Some(BinaryOp::LtEq), ">" => Some(BinaryOp::Gt), ">=" => Some(BinaryOp::GtEq), "and" => Some(BinaryOp::And), "or" => Some(BinaryOp::Or), _ => None };
+        "=" | "==" => Some(BinaryOp::Eq), "<>" | "not=" => Some(BinaryOp::NotEq), "<" => Some(BinaryOp::Lt), "<=" => Some(BinaryOp::LtEq), ">" => Some(BinaryOp::Gt), ">=" => Some(BinaryOp::GtEq), "and" => Some(BinaryOp::And), "or" => Some(BinaryOp::Or), _ => None };
     if let Some(op) = binary {
         if args.is_empty() {
             return match name { "+" => Ok(PExpr::Literal(Value::I64(0))), "*" => Ok(PExpr::Literal(Value::I64(1))), "and" | "=" | "==" => Ok(PExpr::Literal(Value::Bool(true))), "or" => Ok(PExpr::Literal(Value::Bool(false))), _ => Err(error("xtql/malformed-call", "Function requires arguments")) };
