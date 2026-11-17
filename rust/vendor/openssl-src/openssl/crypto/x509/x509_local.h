@@ -162,3 +162,11 @@ int ossl_x509_signing_allowed(const X509 *issuer, const X509 *subject);
 int ossl_x509_store_ctx_get_by_subject(const X509_STORE_CTX *ctx, X509_LOOKUP_TYPE type,
     const X509_NAME *name, X509_OBJECT *ret);
 int ossl_x509_store_read_lock(X509_STORE *xs);
+
+int ossl_x509_load_cert_bio_ex(X509_LOOKUP *ctx, BIO *in, int type,
+    OSSL_LIB_CTX *libctx, const char *propq,
+    const X509_HASH_DIR_SOURCE *source, void *read, int *denied);
+int ossl_x509_load_crl_bio(X509_LOOKUP *ctx, BIO *in, int type,
+    const X509_HASH_DIR_SOURCE *source, void *read, int *denied);
+int ossl_x509_store_add_admitted(X509_STORE *store, void *certificate, int crl,
+    const X509_HASH_DIR_SOURCE *source, int *denied);

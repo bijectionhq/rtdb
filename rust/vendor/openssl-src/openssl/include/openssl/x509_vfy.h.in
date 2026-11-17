@@ -509,6 +509,40 @@ void *X509_STORE_get_ex_data(const X509_STORE *xs, int idx);
 int X509_STORE_set0_retained_owner(X509_STORE *store, void *owner,
     void (*free_owner)(void *));
 
+/*
+ * - Callbacks may run concurrently and must not unwind through C.
+ * - open returns 1 with immutable bytes/read ownership, 0 with an OS error number for an ordinary file failure, or -1 for admission denial.
+ *   Successful bytes must be non-NULL even for an empty input, with length at most INT_MAX.
+ *   They remain valid until close, which runs after the borrowed BIO is freed.
+ * - retain attaches a separate owner to the supplied certificate or CRL before cache insertion; exactly one object is non-NULL.
+ *   Return 1 on success or 0 to deny the lookup; duplicate objects still release their attached owners normally.
+ * - reserve admits metadata bytes before allocation and returns a unique non-NULL grant, or NULL to deny the lookup.
+ *   settle consumes each grant once: retained=1 keeps its admission through store destruction, retained=0 rolls it back.
+ * - Admission denial returns zero from this lookup without claiming a cached result; other lookup methods retain their normal fallback behavior.
+ * - free_source runs after the store's final lookup, cached-reference and heap-storage cleanup; independent object owners may outlive it.
+ */
+typedef struct x509_hash_dir_source_st {
+    void *arg;
+    int (*open)(void *arg, const char *path, const unsigned char **bytes,
+        size_t *length, void **read, int *os_error);
+    void (*close)(void *read);
+    int (*retain)(void *read, X509 *certificate, X509_CRL *crl);
+    void *(*reserve)(void *arg, size_t bytes);
+    void (*settle)(void *arg, void *grant, int retained);
+    void (*free_source)(void *arg);
+} X509_HASH_DIR_SOURCE;
+
+/*
+ * - Requires exclusive store access before publication and a complete callback table.
+ * - Installs only on an existing hash-directory lookup; it never creates a lookup or opens a path.
+ * - Directory registration must be complete; further X509_LOOKUP_add_dir calls fail after installation.
+ * - Returns 1 after copying the table and transferring arg ownership, 0 if no hash lookup exists, or -1 for invalid input or an existing owner/source.
+ * - The caller retains arg ownership unless the result is 1; the callback table itself is always borrowed for this call only.
+ * - The store's retained-owner slot must be empty and is occupied by the installed source.
+ */
+int X509_STORE_set0_hash_dir_source(X509_STORE *store,
+    const X509_HASH_DIR_SOURCE *source);
+
 X509_STORE_CTX *X509_STORE_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq);
 X509_STORE_CTX *X509_STORE_CTX_new(void);
 

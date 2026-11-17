@@ -92,7 +92,6 @@ int X509_load_cert_file_ex(X509_LOOKUP *ctx, const char *file, int type,
 {
     BIO *in = NULL;
     int count = 0;
-    X509 *x = NULL;
 
     if (file == NULL) {
         ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
@@ -105,6 +104,20 @@ int X509_load_cert_file_ex(X509_LOOKUP *ctx, const char *file, int type,
         ERR_raise(ERR_LIB_X509, ERR_R_BIO_LIB);
         goto err;
     }
+
+    count = ossl_x509_load_cert_bio_ex(ctx, in, type, libctx, propq,
+        NULL, NULL, NULL);
+err:
+    BIO_free(in);
+    return count;
+}
+
+int ossl_x509_load_cert_bio_ex(X509_LOOKUP *ctx, BIO *in, int type,
+    OSSL_LIB_CTX *libctx, const char *propq,
+    const X509_HASH_DIR_SOURCE *source, void *read, int *denied)
+{
+    int count = 0;
+    X509 *x = NULL;
 
     x = X509_new_ex(libctx, propq);
     if (x == NULL) {
@@ -131,7 +144,13 @@ int X509_load_cert_file_ex(X509_LOOKUP *ctx, const char *file, int type,
                 }
             }
             ERR_clear_last_mark();
-            if (!X509_STORE_add_cert(ctx->store_ctx, x)) {
+            if (source != NULL && !source->retain(read, x, NULL)) {
+                *denied = 1;
+                count = 0;
+                goto err;
+            }
+            if (!(source == NULL ? X509_STORE_add_cert(ctx->store_ctx, x)
+                      : ossl_x509_store_add_admitted(ctx->store_ctx, x, 0, source, denied))) {
                 count = 0;
                 goto err;
             }
@@ -153,14 +172,18 @@ int X509_load_cert_file_ex(X509_LOOKUP *ctx, const char *file, int type,
             ERR_raise(ERR_LIB_X509, X509_R_NO_CERTIFICATE_FOUND);
             goto err;
         }
-        count = X509_STORE_add_cert(ctx->store_ctx, x);
+        if (source != NULL && !source->retain(read, x, NULL)) {
+            *denied = 1;
+            goto err;
+        }
+        count = source == NULL ? X509_STORE_add_cert(ctx->store_ctx, x)
+                               : ossl_x509_store_add_admitted(ctx->store_ctx, x, 0, source, denied);
     } else {
         ERR_raise(ERR_LIB_X509, X509_R_BAD_X509_FILETYPE);
         goto err;
     }
 err:
     X509_free(x);
-    BIO_free(in);
     return count;
 }
 
@@ -173,7 +196,6 @@ int X509_load_crl_file(X509_LOOKUP *ctx, const char *file, int type)
 {
     BIO *in = NULL;
     int count = 0;
-    X509_CRL *x = NULL;
 
     if (file == NULL) {
         ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
@@ -186,6 +208,18 @@ int X509_load_crl_file(X509_LOOKUP *ctx, const char *file, int type)
         ERR_raise(ERR_LIB_X509, ERR_R_BIO_LIB);
         goto err;
     }
+
+    count = ossl_x509_load_crl_bio(ctx, in, type, NULL, NULL, NULL);
+err:
+    BIO_free(in);
+    return count;
+}
+
+int ossl_x509_load_crl_bio(X509_LOOKUP *ctx, BIO *in, int type,
+    const X509_HASH_DIR_SOURCE *source, void *read, int *denied)
+{
+    int count = 0;
+    X509_CRL *x = NULL;
 
     if (type == X509_FILETYPE_PEM) {
         for (;;) {
@@ -204,7 +238,13 @@ int X509_load_crl_file(X509_LOOKUP *ctx, const char *file, int type)
                     goto err;
                 }
             }
-            if (!X509_STORE_add_crl(ctx->store_ctx, x)) {
+            if (source != NULL && !source->retain(read, NULL, x)) {
+                *denied = 1;
+                count = 0;
+                goto err;
+            }
+            if (!(source == NULL ? X509_STORE_add_crl(ctx->store_ctx, x)
+                      : ossl_x509_store_add_admitted(ctx->store_ctx, x, 1, source, denied))) {
                 count = 0;
                 goto err;
             }
@@ -218,14 +258,18 @@ int X509_load_crl_file(X509_LOOKUP *ctx, const char *file, int type)
             ERR_raise(ERR_LIB_X509, X509_R_NO_CRL_FOUND);
             goto err;
         }
-        count = X509_STORE_add_crl(ctx->store_ctx, x);
+        if (source != NULL && !source->retain(read, NULL, x)) {
+            *denied = 1;
+            goto err;
+        }
+        count = source == NULL ? X509_STORE_add_crl(ctx->store_ctx, x)
+                               : ossl_x509_store_add_admitted(ctx->store_ctx, x, 1, source, denied);
     } else {
         ERR_raise(ERR_LIB_X509, X509_R_BAD_X509_FILETYPE);
         goto err;
     }
 err:
     X509_CRL_free(x);
-    BIO_free(in);
     return count;
 }
 

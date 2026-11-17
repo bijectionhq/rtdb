@@ -5,6 +5,8 @@ use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
 use crate::tls::NativeTls;
 
+mod directory;
+
 const MATERIALS: [(SslMaterialKind, &str); 5] = [
     (SslMaterialKind::CertificateAuthorities, "ssl.ca.location"),
     (SslMaterialKind::Revocations, "ssl.crl.location"),
@@ -36,6 +38,17 @@ impl SslMaterialLease for DecodeAdmission {
     }
 }
 
+struct DirectoryConstruction {
+    decoded: Option<Box<dyn SslMaterialLease>>,
+    constructor: Option<Arc<MemoryReservation>>,
+}
+impl SslMaterialLease for DirectoryConstruction {
+    fn loaded(&mut self) {
+        if let Some(decoded) = &mut self.decoded { decoded.loaded(); }
+        self.constructor = None;
+    }
+}
+
 impl Configuration {
     pub(crate) fn capture(owner: Arc<NativeTls>, properties: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<Self>> {
         let size = MATERIALS.iter().try_fold(1024usize, |size, (_, name)| size.checked_add(properties.get(*name).map_or(0, String::len)).ok_or_else(overflow))?;
@@ -55,6 +68,20 @@ impl Configuration {
         self.owner.reservations().iter().chain(std::iter::once(&self.charge)).chain(self.files.iter().flatten().filter_map(|file| match &file.contents {
             Contents::Bytes(bytes) => Some(&bytes.charge), _ => None,
         }))
+    }
+
+    fn directory_candidate(&self) -> Option<&str> {
+        match &self.files[0] {
+            Some(FileSnapshot { path, contents: Contents::Unmanaged }) if path.as_ref() != "probe" => Some(path),
+            _ => None,
+        }
+    }
+
+    fn admit_native(&self) -> Result<Option<Box<dyn SslMaterialLease>>> {
+        let decoded = self.admit_decoded()?;
+        let Some(path) = self.directory_candidate() else { return Ok(decoded); };
+        let constructor = self.charge.budget().reserve(directory::metadata_bound(path.len())?)?;
+        Ok(Some(Box::new(DirectoryConstruction { decoded, constructor: Some(constructor) })))
     }
 
     fn admit_decoded(&self) -> Result<Option<Box<dyn SslMaterialLease>>> {
@@ -79,7 +106,7 @@ impl Configuration {
 }
 
 impl SslMaterialSource for Configuration {
-    fn admit_context(&self) -> std::result::Result<Option<Box<dyn SslMaterialLease>>, String> { self.admit_decoded().map_err(|error| error.to_string()) }
+    fn admit_context(&self) -> std::result::Result<Option<Box<dyn SslMaterialLease>>, String> { self.admit_native().map_err(|error| error.to_string()) }
 
     fn material(&self, kind: SslMaterialKind, path: &CStr) -> SslMaterial<'_> {
         let index = MATERIALS.iter().position(|(candidate, _)| *candidate == kind).expect("complete native material kinds");
@@ -98,7 +125,13 @@ impl SslContextConfigurer for Configuration {
     fn material_source(&self) -> Option<&dyn SslMaterialSource> { Some(self) }
     fn replaces_default_trust(&self) -> bool { self.owner.replaces_default_trust() }
     unsafe fn library_context(&self) -> *mut c_void { unsafe { self.owner.library_context() } }
-    unsafe fn configure(&self, context: *mut c_void) -> std::result::Result<(), String> { unsafe { self.owner.configure(context) } }
+    unsafe fn configure(&self, context: *mut c_void) -> std::result::Result<(), String> {
+        unsafe { self.owner.configure(context)?; }
+        if let Some(path) = self.directory_candidate() {
+            unsafe { directory::install(context.cast(), Arc::clone(&self.owner), self.charge.budget(), path.len()) }.map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
 }
 
 fn snapshot(path: &str, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Contents> {

@@ -6,9 +6,9 @@ use openssl::{asn1::{Asn1Object, Asn1OctetString, Asn1Time}, hash::MessageDigest
 use rdkafka::{ClientConfig, client::{Client, DefaultClientContext}, producer::BaseProducer, types::RDKafkaType};
 use rtdb_columnar::MemoryBudget;
 #[path = "../../../tests/support/kafka_tls.rs"]
-mod support;
+pub(super) mod support;
 
-fn owner(memory: &Arc<MemoryBudget>) -> Arc<NativeTls> {
+pub(super) fn owner(memory: &Arc<MemoryBudget>) -> Arc<NativeTls> {
     let options = BTreeMap::from([("security.protocol".into(), "SSL".into()), ("ssl.ca.pem".into(), "native trust".into())]);
     NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap()
 }
