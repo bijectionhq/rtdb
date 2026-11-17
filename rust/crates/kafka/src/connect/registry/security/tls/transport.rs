@@ -2,8 +2,13 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::{IssuerNames, KeyStore};
 use rtdb_types::Result;
+use openssl::{asn1::Asn1Time, x509::X509};
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme, client::{ResolvesClientCert, danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}}, crypto::{CryptoProvider, WebPkiSupportedAlgorithms}, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime}, server::ParsedCertificate, sign::CertifiedKey};
+use crate::tls::keys::{self, Algorithm, KeyManager, KeyType};
 use super::error;
+#[cfg(test)]
+#[path = "../../../../../tests/support/kafka_tls.rs"]
+mod tls_test_support;
 
 pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeyStore>, identities: Option<&KeyStore>, registry_hostname_policy: bool, charge: Arc<MemoryReservation>) -> Result<ClientConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -20,7 +25,8 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
     let roots = roots(trust, Arc::clone(&charge))?;
     let verify_names = !options.get("endpoint.identification.algorithm").map_or(registry_hostname_policy, |algorithm| matches!(*algorithm, "" | "none"));
     let verifier = ChainVerifier { roots, algorithms: provider.signature_verification_algorithms, verify_names, _charge: Arc::clone(&charge) };
-    let resolver = ClientKeys::new(identities, &provider, charge)?;
+    let algorithm = Algorithm::parse(options.get("keymanager.algorithm").copied().filter(|name| !name.is_empty()))?;
+    let resolver = ClientKeys::new(identities, &provider, algorithm, charge)?;
     Ok(ClientConfig::builder_with_provider(provider).with_protocol_versions(&versions).map_err(|cause| error("invalid-plugin-config", cause))?
         .dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_client_cert_resolver(Arc::new(resolver)))
 }
@@ -31,16 +37,21 @@ fn roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<Roo
     for certificate in trust.trusted_certificates() { roots.add(CertificateDer::from(certificate.as_slice())).map_err(|cause| error("invalid-plugin-config", cause))?; }
     Ok(roots)
 }
-struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames }
-struct ClientKeys { identities: Vec<ClientIdentity>, _charge: Arc<MemoryReservation> }
+struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames, certificate: X509, kind: KeyType, _certificate_charge: Arc<MemoryReservation> }
+struct ClientKeys { identities: Vec<ClientIdentity>, manager: KeyManager, _charge: Arc<MemoryReservation> }
 impl ClientKeys {
-    fn new(store: Option<&KeyStore>, provider: &CryptoProvider, charge: Arc<MemoryReservation>) -> Result<Self> {
+    fn new(store: Option<&KeyStore>, provider: &CryptoProvider, algorithm: Algorithm, charge: Arc<MemoryReservation>) -> Result<Self> {
+        let manager = KeyManager::new(algorithm, store.map(KeyStore::identities).unwrap_or(&[]));
         let identities = store.into_iter().flat_map(KeyStore::identities).map(|identity| {
             let certificates = identity.certificates().iter().cloned().map(CertificateDer::from).collect();
             let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity.private_key_pkcs8().to_vec()));
-            Ok(ClientIdentity { key: Arc::new(CertifiedKey::from_der(certificates, key, provider).map_err(|cause| error("invalid-plugin-config", cause))?), issuers: identity.issuer_names(charge.budget())? })
+            let certificate_bound = KeyStore::allocation_bound(identity.certificates()[0].len())?;
+            let certificate_charge = charge.budget().reserve(certificate_bound)?;
+            let certificate = X509::from_der(&identity.certificates()[0]).map_err(|cause| error("invalid-plugin-config", cause))?;
+            let kind = KeyType::of(&certificate)?;
+            Ok(ClientIdentity { key: Arc::new(CertifiedKey::from_der(certificates, key, provider).map_err(|cause| error("invalid-plugin-config", cause))?), issuers: identity.issuer_names(charge.budget())?, certificate, kind, _certificate_charge: certificate_charge })
         }).collect::<Result<Vec<_>>>()?;
-        Ok(Self { identities, _charge: charge })
+        Ok(Self { identities, manager, _charge: charge })
     }
 }
 impl std::fmt::Debug for ClientKeys {
@@ -48,8 +59,13 @@ impl std::fmt::Debug for ClientKeys {
 }
 impl ResolvesClientCert for ClientKeys {
     fn resolve(&self, authorities: &[&[u8]], schemes: &[SignatureScheme]) -> Option<Arc<CertifiedKey>> {
-        self.identities.iter().find(|identity| identity.key.key.choose_scheme(schemes).is_some()
-            && (authorities.is_empty() || identity.issuers.as_slice().iter().any(|issuer| authorities.contains(&issuer.as_slice())))).map(|identity| Arc::clone(&identity.key))
+        let types = keys::requested_types(schemes.iter().map(|scheme| u16::from(*scheme)));
+        let now = Asn1Time::days_from_now(0).ok()?;
+        self.manager.choose(&types, |index, kind| {
+            let identity = &self.identities[index];
+            identity.kind == kind && identity.key.key.choose_scheme(schemes).is_some()
+                && (authorities.is_empty() || identity.issuers.as_slice().iter().any(|issuer| authorities.contains(&issuer.as_slice())))
+        }, |index| keys::client_status(&self.identities[index].certificate, &now)).map(|index| Arc::clone(&self.identities[index].key))
     }
     fn has_certs(&self) -> bool { !self.identities.is_empty() }
 }
@@ -91,12 +107,23 @@ mod tests {
         assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
+    fn registry_empty_key_algorithm_selects_default_but_preserves_whitespace() {
+        for (algorithm, valid) in [("", true), ("SunX509", true), ("newSunX509", true), ("PKIX", true), (" SunX509 ", false), ("\u{a0}SunX509", false)] {
+            let memory = MemoryBudget::new(1 << 25);
+            let charge = memory.reserve(crate::tls::trust::allocation_bound().unwrap()).unwrap();
+            let result = configuration(&BTreeMap::from([("keymanager.algorithm", algorithm)]), None, None, true, charge);
+            assert_eq!(result.is_ok(), valid, "{algorithm:?}");
+            drop(result);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+    #[test]
     fn client_identity_selection_checks_issuer_hints_and_signature_schemes() {
         let bytes = include_bytes!("../../../../../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.p12");
         let memory = MemoryBudget::new(1 << 24); let charge = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes.len(),Some("password123"),None).unwrap()).unwrap();
         let store = KeyStore::decode(bytes,StoreFormat::Java,StoreUse::Identity,Some("password123"),None,Arc::clone(&charge)).unwrap();
         let provider = rustls::crypto::aws_lc_rs::default_provider();
-        let first = ClientKeys::new(Some(&store),&provider,charge).unwrap();
+        let first = ClientKeys::new(Some(&store),&provider,Algorithm::SunX509,charge).unwrap();
         let issuer = &first.identities[0].issuers.as_slice()[0];
         let first_key = Arc::clone(&first.identities[0].key);
         assert!(Arc::ptr_eq(&first.resolve(&[issuer.as_slice()],&[SignatureScheme::RSA_PSS_SHA256]).unwrap(),&first_key));
@@ -104,6 +131,24 @@ mod tests {
         assert!(first.resolve(&[],&[SignatureScheme::ECDSA_NISTP256_SHA256]).is_none());
         assert!(first.resolve(&[],&[SignatureScheme::RSA_PSS_SHA256]).is_some());
         drop(first); drop(first_key); drop(store); assert_eq!(memory.used_bytes(),0);
+    }
+    #[test]
+    fn registry_builtin_key_managers_resolve_in_their_java_alias_order() {
+        let root = tls_test_support::Credential::new("issuer", false, None);
+        let first = tls_test_support::Credential::new("first", false, Some(&root));
+        let second = tls_test_support::Credential::new("second", false, Some(&root));
+        let bytes = tls_test_support::jks(&[("a", &first), ("b", &second)], "store", "key");
+        let memory = MemoryBudget::new(1 << 25);
+        let charge = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes.len(), Some("store"), Some("key")).unwrap()).unwrap();
+        let store = KeyStore::decode(&bytes, StoreFormat::Java, StoreUse::Identity, Some("store"), Some("key"), Arc::clone(&charge)).unwrap();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        for (algorithm, expected) in [(Algorithm::SunX509, &first), (Algorithm::NewSunX509, &second)] {
+            let resolver = ClientKeys::new(Some(&store), &provider, algorithm, Arc::clone(&charge)).unwrap();
+            let selected = resolver.resolve(&[], &[SignatureScheme::RSA_PSS_SHA256]).unwrap();
+            assert_eq!(selected.cert[0].as_ref(), expected.certificate.to_der().unwrap());
+            drop(selected); drop(resolver);
+        }
+        drop(store); drop(charge); assert_eq!(memory.used_bytes(), 0);
     }
     fn certificates() -> (Vec<u8>, Vec<u8>) {
         use openssl::{asn1::Asn1Time, bn::BigNum, ec::{EcGroup, EcKey}, hash::MessageDigest, nid::Nid, pkey::PKey, x509::{X509, X509NameBuilder, extension::{BasicConstraints, KeyUsage, SubjectAlternativeName}}};

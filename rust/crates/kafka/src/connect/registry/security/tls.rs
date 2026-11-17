@@ -10,7 +10,7 @@ const MAXIMUM_STORE_FILE: usize = 4 * 1024 * 1024;
 pub(super) fn client(options: &BTreeMap<String, String>, context: &mut ConversionContext, registry_hostname_policy: bool) -> Result<(Client, Arc<MemoryReservation>)> {
     let normalized = super::normalized(options);
     let tls = options.iter().filter_map(|(name, value)| name.strip_prefix("schema.registry.ssl.").map(|name| (name, value.as_str()))).collect::<BTreeMap<_, _>>();
-    for name in ["provider", "keymanager.algorithm", "trustmanager.algorithm", "secure.random.implementation", "cipher.suites"] {
+    for name in ["provider", "trustmanager.algorithm", "secure.random.implementation", "cipher.suites"] {
         if tls.get(name).is_some_and(|value| !value.is_empty()) { return Err(error("invalid-plugin-config", format!("Registry TLS option '{name}' requires a native provider adapter"))); }
     }
     let mut files = BTreeMap::new();

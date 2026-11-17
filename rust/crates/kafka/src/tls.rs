@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, ffi::c_void, io::Read, sync::Arc};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{pkey::{PKey, Private}, ssl::{SslContextBuilder, SslOptions, SslRef, SslVersion}, stack::Stack, x509::{X509, store::X509StoreBuilder}};
+use openssl::{asn1::Asn1Time, pkey::{PKey, Private}, ssl::{SslContextBuilder, SslOptions, SslRef, SslVersion}, stack::Stack, x509::{X509, store::X509StoreBuilder}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::{KeyStore, StoreFormat, StoreUse};
 use rtdb_types::{Anomaly, Result};
@@ -8,15 +8,18 @@ use zeroize::Zeroizing;
 
 mod policy;
 use policy::Policy;
+pub(crate) mod keys;
+use keys::{Algorithm, KeyManager, KeyType};
 pub(crate) mod trust;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
+    key_manager: KeyManager,
     trust: Option<Vec<X509>>,
     policy: Policy,
     reservations: Vec<Arc<MemoryReservation>>,
 }
-struct ClientIdentity { certificate: X509, key: PKey<Private>, chain: Stack<X509> }
+struct ClientIdentity { certificate: X509, key: PKey<Private>, chain: Stack<X509>, kind: KeyType }
 
 impl NativeTls {
     pub(crate) fn from_java(options: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Option<Arc<Self>>> {
@@ -24,6 +27,8 @@ impl NativeTls {
         let bytes = options.iter().try_fold(65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len())).ok_or_else(overflow))?;
         let mut reservations = vec![reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?];
         let policy = Policy::from_java(options)?;
+        let algorithm = Algorithm::parse(options.get("ssl.keymanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
+        let mut key_manager = KeyManager::new(algorithm, &[]);
         let mut identities = Vec::new();
         let mut trust = None;
         for (store, usage) in [("truststore", StoreUse::Trust), ("keystore", StoreUse::OptionalIdentity)] {
@@ -39,18 +44,20 @@ impl NativeTls {
                         trust = Some(certificates);
                     }
                     StoreUse::Identity | StoreUse::OptionalIdentity => {
+                        key_manager = KeyManager::new(algorithm, material.identities());
                         for identity in material.identities() {
                             let certificate = X509::from_der(&identity.certificates()[0]).map_err(invalid)?;
+                            let kind = KeyType::of(&certificate)?;
                             let key = PKey::private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(invalid)?;
                             let mut chain = Stack::new().map_err(invalid)?;
                             for certificate in &identity.certificates()[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-                            identities.push(ClientIdentity { certificate, key, chain });
+                            identities.push(ClientIdentity { certificate, key, chain, kind });
                         }
                     }
                 }
             }
         }
-        Ok(Some(Arc::new(Self { identities, trust, policy, reservations })))
+        Ok(Some(Arc::new(Self { identities, key_manager, trust, policy, reservations })))
     }
 
     pub(crate) fn reservations(&self) -> &[Arc<MemoryReservation>] { &self.reservations }
@@ -74,14 +81,18 @@ impl NativeTls {
 
     fn select(&self, ssl: &mut SslRef) -> Result<()> {
         unsafe { SSL_certs_clear(ssl.as_ptr()); }
-        for identity in &self.identities {
-            // SSL_check_chain checks peer signature, curve, certificate-type and issuer constraints.
-            // https://docs.openssl.org/3.0/man3/SSL_check_chain/
-            if unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & CERT_PKEY_VALID == 0 { continue; }
+        let types = requested_types(ssl);
+        let now = Asn1Time::days_from_now(0).map_err(invalid)?;
+        let required = CERT_PKEY_VALID | CERT_PKEY_ISSUER_NAME | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
+        let selected = self.key_manager.choose(&types, |index, kind| {
+            let identity = &self.identities[index];
+            identity.kind == kind && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
+        }, |index| keys::client_status(&self.identities[index].certificate, &now));
+        if let Some(index) = selected {
+            let identity = &self.identities[index];
             ssl.set_certificate(&identity.certificate).map_err(invalid)?;
             ssl.set_private_key(&identity.key).map_err(invalid)?;
             for certificate in &identity.chain { ssl.add_chain_cert(certificate.to_owned()).map_err(invalid)?; }
-            break;
         }
         Ok(())
     }
@@ -148,10 +159,29 @@ fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, re
 }
 
 const CERT_PKEY_VALID: i32 = 0x1;
+const CERT_PKEY_ISSUER_NAME: i32 = 0x200;
+const CERT_PKEY_CERT_TYPE: i32 = 0x400;
+
+fn requested_types(ssl: &SslRef) -> Vec<KeyType> {
+    let count = unsafe { SSL_get_sigalgs(ssl.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
+    let mut types = keys::requested_types((0..count).map(|index| {
+        let (mut signature, mut hash) = (0, 0);
+        unsafe { SSL_get_sigalgs(ssl.as_ptr(), index, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut signature, &mut hash); }
+        u16::from_be_bytes([hash, signature])
+    }));
+    if ssl.version2() == Some(SslVersion::TLS1_2) {
+        let mut types_pointer: *const u8 = std::ptr::null();
+        let length = unsafe { openssl_sys::SSL_ctrl(ssl.as_ptr(), 103, 0, (&mut types_pointer as *mut *const u8).cast()) };
+        let offered = if length > 0 && !types_pointer.is_null() { unsafe { std::slice::from_raw_parts(types_pointer, length as usize) } } else { &[] };
+        types.retain(|kind| offered.contains(&match kind { KeyType::Rsa | KeyType::RsaPss => 1, KeyType::Dsa => 2, KeyType::Ec | KeyType::EdDsa => 64, KeyType::Other => 0 }));
+    }
+    types
+}
 unsafe extern "C" {
     fn SSL_CTX_set_cert_cb(context: *mut openssl_sys::SSL_CTX, callback: Option<unsafe extern "C" fn(*mut openssl_sys::SSL, *mut c_void) -> i32>, opaque: *mut c_void);
     fn SSL_check_chain(ssl: *mut openssl_sys::SSL, certificate: *mut openssl_sys::X509, key: *mut openssl_sys::EVP_PKEY, chain: *mut openssl_sys::stack_st_X509) -> i32;
     fn SSL_certs_clear(ssl: *mut openssl_sys::SSL);
+    fn SSL_get_sigalgs(ssl: *mut openssl_sys::SSL, index: i32, signature: *mut i32, hash: *mut i32, signature_hash: *mut i32, raw_signature: *mut u8, raw_hash: *mut u8) -> i32;
 }
 fn invalid(cause: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-tls-config", cause.to_string()) }
 fn overflow() -> Anomaly { invalid("Kafka TLS material exceeds allocation range") }
