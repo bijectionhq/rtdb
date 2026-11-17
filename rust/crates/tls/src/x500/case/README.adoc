@@ -1,0 +1,53 @@
+= Java 25 distinguished-name case conversion
+
+`case::fold` implements `String.toUpperCase(Locale.US).toLowerCase(Locale.US)` for the Unicode scalar strings decoded by the X.500 name owner.
+The caller applies NFKD after this conversion.
+The helper and its `WordRules` table view are passive and stateless.
+The uppercase scalar buffer and lowercase result belong to one call, and their allocation grows linearly with the input.
+
+== Unicode mappings
+
+The case mappings are pinned to Unicode 16.0.0, the character-data version used by the reference JDK.
+They come from https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt[UnicodeData.txt] and https://www.unicode.org/Public/16.0.0/ucd/SpecialCasing.txt[SpecialCasing.txt].
+The source SHA-256 values are `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f` and `8d5de354eef79f2395a54c9c7dcebbaf3d30fc962d0f85611ea97aa973a0c451` respectively.
+`LICENSE-UNICODE` contains the Unicode License V3 copyright and permission notice for the derived data.
+
+The upper and lower tables start with fields 12 and 13 of `UnicodeData.txt`, then replace each mapping with the corresponding unconditional field 3 or field 1 from `SpecialCasing.txt`.
+Conditional and locale-specific entries are excluded from these tables.
+Identity mappings are omitted, and the records are sorted by source code point.
+Each 16-byte record contains four big-endian `u32` values: the source code point and up to three mapped code points, with zero padding after the last mapped value.
+The source data contains no case mapping to U+0000.
+An absent record leaves its input scalar unchanged, including code points assigned after Unicode 16.
+
+`unicode16-upper.bin` contains 1552 records and has SHA-256 `843b309e95006a6ede0e086a28b290f2518b163f6162c1cc0e9161b39ad5c065`.
+`unicode16-lower.bin` contains 1460 records and has SHA-256 `753c397062138931d7c3fdf0bcce2c6beaf55b2e97f4817620d9c40dfca2050a`.
+Uppercase conversion can expand one scalar into several scalars, and lowercase conversion sees that expanded sequence.
+The unconditional dotted-I lowercase expansion is included in the lower table.
+
+== Final sigma
+
+Locale.US has one contextual lowercase mapping: capital sigma becomes final sigma when it has a preceding cased character and no following cased character within the same Java word boundaries.
+This follows `java.base/java/lang/ConditionalSpecialCasing.java` in Eclipse Temurin 25.0.1+8.
+The helper evaluates the first and last cased scalar in each word of the uppercase sequence.
+
+`java25-cased.bin` follows that source's exact `isCased` definition: Unicode 16 categories `Lu`, `Ll`, and `Lt`, together with the explicit ranges U+02B0–U+02B8, U+02C0–U+02C1, U+02E0–U+02E4, U+0345, U+037A, U+1D2C–U+1D61, U+2160–U+217F, and U+24B6–U+24E9.
+It stores 150 sorted, disjoint, inclusive ranges of 4303 code points as pairs of big-endian `u32` values.
+Its SHA-256 is `b8b01339018a2ea6faae19601f861f50c92c1cb85dd7d86caa1c81bcbacbd875`.
+This set includes the historical additional ranges present in the Java implementation; the Unicode `Cased` derived property is a different set.
+
+`WordBreakIteratorData` is the unchanged `classes/sun/text/resources/WordBreakIteratorData` member of the pinned `java.base.jmod`.
+The Linux x64 JMOD archive is https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jmods_x64_linux_hotspot_25.0.1_8.tar.gz[OpenJDK25U-jmods_x64_linux_hotspot_25.0.1_8.tar.gz], SHA-256 `99deb26c3ab1546e1735ccd13ff3aaf48b34b2658fa9427f4a3cbe80ce88b436`.
+The resource occupies 19156 bytes and has SHA-256 `76c4756446bce5cf2fe7d644be3dafe27fcd3dec4499a4ffba60ffef31c55c75`.
+Its big-endian header and transition tables follow `java.base/sun/text/RuleBasedBreakIterator.java`, with BMP category lookup from `CompactByteArray.java` and supplementary lookup from `SupplementaryCharacterData.java`.
+The forward scanner uses Unicode scalar indices in place of UTF-16 offsets and preserves the iterator's U+FFFF sentinel behavior.
+ASCII punctuation that Java includes inside a word therefore participates in the final-sigma condition.
+
+The matching source archive is https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz[OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz], SHA-256 `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
+The JDK source files were compared byte-for-byte with this archive's `lib/src.zip`.
+`LICENSE`, `ASSEMBLY_EXCEPTION`, and `ADDITIONAL_LICENSE_INFO` preserve the pinned runtime's copyright and Classpath-exception material.
+
+== Validation
+
+Regression sources cover ordered uppercase/lowercase expansion, punctuation around sigma, Java's exact cased set, supplementary characters, Unicode 16 additions, later code points left unchanged, resource hashes, and table bounds.
+Resource derivation and archive comparison were performed as data inspection during Phase 1.
+Compilation and execution remain pending until the execution phase.
