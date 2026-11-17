@@ -188,3 +188,16 @@ fn lz4_payload_cannot_exceed_a_forged_small_arrow_length() {
     let mut reader = rtdb_format::ipc::ArrowFile::open(bytes.into(), None).unwrap();
     assert!(reader.read_page(0).unwrap_err().message.as_deref().is_some_and(|message| message.contains("LZ4 data exceeds its declared Arrow buffer length")));
 }
+
+#[test]
+fn empty_dense_union_stream_keeps_offset_buffers_aligned() {
+    let fields = arrow_schema::UnionFields::try_new([0], [Field::new("n", DataType::Int64, true)]).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("op", DataType::Union(fields, arrow_schema::UnionMode::Dense), false)]));
+    let batch = RecordBatch::new_empty(Arc::clone(&schema));
+    let bytes = write_stream(&schema, &[batch]).unwrap();
+    let mut reader = rtdb_format::ipc::ArrowStream::open(Arc::from(bytes), None).unwrap();
+    let batch = reader.next().unwrap().unwrap();
+    assert_eq!(batch.num_rows(), 0);
+    assert_eq!(batch.schema(), schema);
+    assert!(reader.next().is_none());
+}

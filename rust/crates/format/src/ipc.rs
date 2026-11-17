@@ -228,7 +228,7 @@ impl<R: Read> ArrowStream<R> {
             validate_lz4_lengths(&message, &body)?;
             nulls::normalize(&mut metadata, &body, &self.schema)?;
             let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
-            let body = Buffer::from(body);
+            let body = if body.is_empty() { Buffer::default() } else { Buffer::from(body) };
             if let Some(batch) = message.header_as_record_batch() {
                 return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(&self.schema), &self.dictionaries, self.projection.as_deref(), &message.version()).map(Some).map_err(invalid);
             }
