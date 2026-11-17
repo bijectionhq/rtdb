@@ -9,6 +9,8 @@ mod basic_constraints;
 pub use basic_constraints::CertificateBasicConstraints;
 mod key_usage;
 pub use key_usage::CertificateKeyUsage;
+mod public_key;
+pub use public_key::CertificatePublicKeyEncoding;
 
 /// Immutable Java certificate identifiers, independently charged through their last borrowed use.
 /// Serial numbers use minimal signed two's-complement bytes, including a sign byte when required.

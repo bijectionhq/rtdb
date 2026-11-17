@@ -60,7 +60,7 @@ impl Search<'_> {
             if !self.same_name(self.peer[index].subject_name(), self.peer[index - 1].issuer_name())? { return self.build(); }
             let mut trusted = false;
             for anchor in &self.anchors {
-                if self.same_name(anchor.subject_name(), self.peer[index].subject_name())? && super::super::super::public_key::same(anchor, self.peer[index])? {
+                if self.same_name(anchor.subject_name(), self.peer[index].subject_name())? && super::super::super::public_key::same(anchor, self.peer[index], self.charge.budget())? {
                     trusted = true; break;
                 }
             }

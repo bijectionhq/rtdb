@@ -1,58 +1,26 @@
+use std::sync::Arc;
+use foreign_types::ForeignTypeRef;
 use openssl::x509::X509Ref;
+use rtdb_columnar::MemoryBudget;
+use rtdb_tls::CertificatePublicKeyEncoding;
 use rtdb_types::Result;
 use super::invalid;
 
-pub(super) fn same(left: &X509Ref, right: &X509Ref) -> Result<bool> {
-    let left = left.to_der().map_err(invalid)?;
-    let right = right.to_der().map_err(invalid)?;
-    Ok(Key::from_certificate(&left)? == Key::from_certificate(&right)?)
+pub(super) fn same(left: &X509Ref, right: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<bool> {
+    let left = decode(left, memory)?;
+    let right = decode(right, memory)?;
+    Ok(left == right)
 }
 
-// OpenJDK 25.0.1 X509Key.equals and AlgorithmId.parse/encode compare encoded keys after NULL parameter normalization.
-#[derive(PartialEq, Eq)]
-struct Key<'a> { algorithm: &'a [u8], parameters: &'a [u8], bits: &'a [u8] }
-impl<'a> Key<'a> {
-    fn from_certificate(certificate: &'a [u8]) -> Result<Self> {
-        let mut certificate = Der(certificate);
-        let mut certificate = Der(certificate.value(0x30)?);
-        let mut signed = Der(certificate.value(0x30)?);
-        if signed.0.first() == Some(&0xa0) { signed.value(0xa0)?; }
-        signed.value(2)?;
-        for _ in 0..4 { signed.value(0x30)?; }
-        Self::read(signed.value(0x30)?)
-    }
-
-    fn read(contents: &'a [u8]) -> Result<Self> {
-        let mut input = Der(contents);
-        let mut algorithm = Der(input.value(0x30)?);
-        let identifier = algorithm.value(6)?;
-        let parameters = if algorithm.0.first() == Some(&5) {
-            if !algorithm.value(5)?.is_empty() || !algorithm.0.is_empty() { return Err(invalid("TLS public key has invalid NULL parameters")); }
-            &[][..]
-        } else { algorithm.0 };
-        let bits = input.value(3)?;
-        if !input.0.is_empty() || bits.first() != Some(&0) { return Err(invalid("TLS public key has an invalid bit-string encoding")); }
-        Ok(Self { algorithm: identifier, parameters, bits })
-    }
-}
-
-struct Der<'a>(&'a [u8]);
-impl<'a> Der<'a> {
-    fn take(&mut self, length: usize) -> Result<&'a [u8]> {
-        let (head, tail) = self.0.split_at_checked(length).ok_or_else(|| invalid("TLS public-key encoding is truncated"))?;
-        self.0 = tail;
-        Ok(head)
-    }
-    fn value(&mut self, tag: u8) -> Result<&'a [u8]> {
-        if self.take(1)?[0] != tag { return Err(invalid("TLS public-key encoding has an unexpected tag")); }
-        let length = self.take(1)?[0];
-        let length = if length < 128 { usize::from(length) } else {
-            let count = usize::from(length & 127);
-            if count == 0 || count > 4 { return Err(invalid("TLS public-key encoding has an invalid length")); }
-            self.take(count)?.iter().try_fold(0usize, |value, byte| value.checked_mul(256).and_then(|value| value.checked_add(usize::from(*byte))).ok_or_else(|| invalid("TLS public-key length exceeds allocation range")))?
-        };
-        self.take(length)
-    }
+fn decode(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<CertificatePublicKeyEncoding> {
+    let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), std::ptr::null_mut()) };
+    let bound = usize::try_from(length).ok().and_then(|length| length.checked_add(128))
+        .ok_or_else(|| invalid("TLS public-key certificate encoding exceeds allocation range"))?;
+    let _encoding = memory.reserve(bound)?;
+    let encoded = certificate.to_der().map_err(invalid)?;
+    CertificatePublicKeyEncoding::decode(&encoded, memory).map_err(|error| {
+        if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
+    })
 }
 
 #[cfg(test)]
@@ -76,7 +44,14 @@ mod tests {
         content.extend_from_slice(&der(3, &bits));
         der(0x30, &content)
     }
-    fn parsed(key: &[u8]) -> Key<'_> { Key::read(Der(key).value(0x30).unwrap()).unwrap() }
+    fn parse(key: &[u8]) -> Result<CertificatePublicKeyEncoding> {
+        let mut signed = der(2, &[1]);
+        for _ in 0..4 { signed.extend(der(0x30, &[])); }
+        signed.extend_from_slice(key);
+        let certificate = der(0x30, &[der(0x30, &signed), der(0x30, &[]), der(3, &[0])].concat());
+        CertificatePublicKeyEncoding::decode(&certificate, &MemoryBudget::new(16 << 20))
+    }
+    fn parsed(key: &[u8]) -> CertificatePublicKeyEncoding { parse(key).unwrap() }
 
     #[test]
     fn pss_key_equality_preserves_restrictions_ignored_by_native_public_equality() {
@@ -102,8 +77,20 @@ mod tests {
             certificate.build()
         };
         let first = certificate(&first_key); let second = certificate(&second_key);
-        assert!(!same(&first, &second).unwrap());
-        assert!(same(&first, &first).unwrap());
+        let memory = MemoryBudget::new(16 << 20);
+        assert!(!same(&first, &second, &memory).unwrap());
+        assert!(same(&first, &first, &memory).unwrap());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn public_key_comparison_releases_encoding_admission_when_parser_admission_fails() {
+        let credential = Credential::new("issuer", false, None);
+        for limit in [0, credential.certificate.to_der().unwrap().len() + 128] {
+            let memory = MemoryBudget::new(limit);
+            assert_eq!(same(&credential.certificate, &credential.certificate, &memory).unwrap_err().code, "rtdb/memory-budget-exceeded");
+            assert_eq!(memory.used_bytes(), 0);
+        }
     }
 
     #[test]
@@ -125,7 +112,7 @@ mod tests {
         for parameters in [vec![5, 1, 0], vec![5, 0, 5, 0], vec![5, 0x81, 0, 5, 0],
             vec![5, 0x80, 0, 0], vec![5, 0x82, 0], vec![5, 0x85, 0, 0, 0, 0, 0]] {
             let key = pss(&[0x30, 0], &parameters);
-            assert!(Key::read(Der(&key).value(0x30).unwrap()).is_err(), "{parameters:?}");
+            assert!(parse(&key).is_err(), "{parameters:?}");
         }
     }
 }

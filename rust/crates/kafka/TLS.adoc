@@ -135,7 +135,8 @@ A list containing only disabled suites or protocols produces no usable handshake
 The eager `SunX509` store decoder still differs from Java provider alias lookup for raw mixed-case JKS aliases and some PKCS12 alias and issuer-chain cases.
 Its JKS path recovers a private key before discarding an empty chain, while PKCS12 currently skips keys without a matched certificate before recovery; Java `SunX509KeyManagerImpl` recovers those keys first.
 PKIX trust-anchor identity hashes and non-Comparable collision ties use native process identity; they do not reproduce a particular JVM run's `System.identityHashCode` inputs.
-Public-key equality normalizes absent and BER-encoded empty NULL parameters; non-NULL BER parameter canonicalization, OID validation, unaligned BIT STRING handling and additional provider acceptance remain open.
+Public-key comparisons normalize encoded `X509Key` framing, including BER parameters, OIDs and unaligned bit strings.
+AlgorithmParameters/KeyFactory acceptance and provider-specific equality, including SunJCE DH numeric `y`/`p`/`g` comparison, remain open.
 Native name-constraint matching beyond Java self-issued exceptions and native algorithm availability still require qualification against Java's validator.
 The builder's Java BasicConstraints/KeyUsage selectors accept parsed extensions alongside malformed noncritical copies, but native path metadata still needs the same parsing boundary to admit those complete paths.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
