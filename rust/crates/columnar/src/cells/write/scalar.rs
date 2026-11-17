@@ -9,16 +9,15 @@ pub(super) enum MutableScalarData {
     Variable { offsets: MutableBytes, data: MutableBytes, last_offset: i32 },
 }
 struct ScalarDescriptor { ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType }
-pub(crate) struct ScalarWriter {
+pub(super) struct ScalarState {
     descriptor: ScalarDescriptor,
     pub(super) count: usize,
     pub(super) validity: Option<MutableBits>,
     pub(super) data: MutableScalarData,
     metadata: Arc<MemoryReservation>,
-    state: PublicationState,
 }
-impl ScalarWriter {
-    pub(crate) fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
+impl ScalarState {
+    fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
         let (bound, depth) = super::super::open::schema_bound(&ingress, 1)?;
         let metadata = memory.reserve(bound.checked_mul(depth).and_then(|n| n.checked_mul(16)).ok_or_else(allocation)?)?;
         crate::from_field(&ingress)?;
@@ -31,25 +30,15 @@ impl ScalarWriter {
             data_type => MutableScalarData::Fixed { width: super::super::scalar::fixed_width(data_type).ok_or_else(|| unsupported("ScalarWriter"))?, data: MutableBytes::new(&memory) },
         };
         let validity = (field.is_nullable() && field.data_type() != &DataType::Null).then(|| MutableBits::new(&memory));
-        Ok(Self { descriptor: ScalarDescriptor { ingress, field, logical }, count: 0, validity, data, metadata, state: PublicationState::Ready })
+        Ok(Self { descriptor: ScalarDescriptor { ingress, field, logical }, count: 0, validity, data, metadata })
     }
-    pub(crate) fn len(&self) -> usize { self.count }
-    pub(crate) fn field(&self) -> &Field { &self.descriptor.field }
+    pub(super) fn len(&self) -> usize { self.count }
+    pub(super) fn field(&self) -> &Field { &self.descriptor.field }
     pub(super) fn logical(&self) -> &LogicalType { &self.descriptor.logical }
     fn scalar_type(&self) -> Option<&ScalarType> {
         match self.logical() { LogicalType::Scalar(s) => Some(s), LogicalType::Maybe(inner) => match inner.as_ref() { LogicalType::Scalar(s) => Some(s), _ => None }, _ => None }
     }
     pub(super) fn extension(&self) -> bool { self.field().metadata().contains_key(crate::EXTENSION_NAME_KEY) }
-    pub(super) fn ready(&self) -> WriteResult<()> {
-        if self.state == PublicationState::NativeAborted { Err(WriteError::Native(aborted())) } else { Ok(()) }
-    }
-    pub(super) fn operation<T>(&mut self, action: impl FnOnce(&mut Self, &mut Mutation) -> WriteResult<T>) -> WriteResult<T> {
-        self.ready()?;
-        let mut mutation = Mutation::default();
-        let result = action(self, &mut mutation);
-        if matches!(&result, Err(WriteError::Native(_))) && mutation.changed { self.state = PublicationState::NativeAborted; }
-        result
-    }
     pub(super) fn promote(&mut self, mutation: &mut Mutation) -> WriteResult<()> {
         if self.field().is_nullable() { return Ok(()); }
         let ingress = Arc::new(self.descriptor.ingress.as_ref().clone().with_nullable(true));
@@ -99,8 +88,6 @@ impl ScalarWriter {
             },
         }
     }
-    pub(crate) fn write_undefined(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| writer.undefined(mutation)) }
-    pub(crate) fn write_null(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| { writer.promote(mutation)?; writer.undefined(mutation) }) }
     fn capacity(&mut self, count: usize, mutation: &mut Mutation) -> WriteResult<()> {
         checked_count(count)?;
         match &mut self.data {
@@ -132,16 +119,15 @@ impl ScalarWriter {
         }
         Ok(())
     }
-    pub(crate) fn ensure_capacity(&mut self, count: usize) -> WriteResult<()> {
-        self.operation(|writer, mutation| { if writer.extension() { return Err(unsupported_write("ensureCapacity")); } writer.capacity(count, mutation) })
+    pub(super) fn ensure_capacity(&mut self, count: usize, mutation: &mut Mutation) -> WriteResult<()> {
+        if self.extension() { return Err(unsupported_write("ensureCapacity")); }
+        self.capacity(count, mutation)
     }
-    pub(crate) fn set_null(&mut self, index: i32) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            if writer.extension() || matches!(&writer.data, MutableScalarData::Variable { .. }) { return Err(unsupported_write("setNull")); }
-            writer.capacity_after_index(index, mutation)?;
-            if let Some(validity) = &mut writer.validity { validity.set(usize::try_from(index).map_err(|_| bounds())?, false, mutation)?; }
-            Ok(())
-        })
+    pub(super) fn set_null(&mut self, index: i32, mutation: &mut Mutation) -> WriteResult<()> {
+        if self.extension() || matches!(&self.data, MutableScalarData::Variable { .. }) { return Err(unsupported_write("setNull")); }
+        self.capacity_after_index(index, mutation)?;
+        if let Some(validity) = &mut self.validity { validity.set(usize::try_from(index).map_err(|_| bounds())?, false, mutation)?; }
+        Ok(())
     }
     pub(super) fn boolean(&mut self, value: bool, mutation: &mut Mutation) -> WriteResult<()> {
         if !matches!(self.scalar_type(), Some(ScalarType::Bool)) { return Err(unsupported_write("writeBoolean")); }
@@ -153,105 +139,81 @@ impl ScalarWriter {
         let MutableScalarData::Bits(bits) = &mut self.data else { return Err(native_size()); };
         bits.write_at(row, value, mutation)
     }
-    pub(crate) fn write_boolean(&mut self, value: bool) -> WriteResult<()> { self.operation(|writer, mutation| writer.boolean(value, mutation)) }
-    fn primitive(&mut self, method: &'static str, bytes: &[u8]) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            use ScalarType::*;
-            let admitted = match (method, writer.scalar_type()) {
-                ("writeByte", Some(I8)) | ("writeShort", Some(I16)) | ("writeInt", Some(I32 | DateDay | Time { bit_width: 32, .. } | Interval(IntervalUnit::YearMonth) | Oid | RegClass | RegProc))
-                | ("writeLong", Some(I64 | DateMilli | Time { .. } | Timestamp { .. } | Duration(_))) | ("writeFloat", Some(F32)) | ("writeDouble", Some(F64)) => true,
-                _ => false,
-            };
-            if !admitted { return Err(unsupported_write(method)); }
-            writer.next_count()?;
-            let mut converted = [0; 8];
-            let bytes = if method == "writeLong" {
-                let value = i64::from_le_bytes(bytes.try_into().map_err(|_| native_size())?);
-                match writer.scalar_type() {
-                    Some(DateMilli) => { converted.copy_from_slice(&value.wrapping_mul(86_400_000).to_le_bytes()); &converted[..] },
-                    Some(Time { bit_width: 32, .. }) => { converted[..4].copy_from_slice(&(value as i32).to_le_bytes()); &converted[..4] },
-                    _ => bytes,
-                }
-            } else { bytes };
-            if method == "writeFloat" { writer.not_null(mutation)?; }
-            let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
+    pub(super) fn primitive(&mut self, method: &'static str, bytes: &[u8], mutation: &mut Mutation) -> WriteResult<()> {
+        use ScalarType::*;
+        let admitted = match (method, self.scalar_type()) {
+            ("writeByte", Some(I8)) | ("writeShort", Some(I16)) | ("writeInt", Some(I32 | DateDay | Time { bit_width: 32, .. } | Interval(IntervalUnit::YearMonth) | Oid | RegClass | RegProc))
+            | ("writeLong", Some(I64 | DateMilli | Time { .. } | Timestamp { .. } | Duration(_))) | ("writeFloat", Some(F32)) | ("writeDouble", Some(F64)) => true,
+            _ => false,
+        };
+        if !admitted { return Err(unsupported_write(method)); }
+        self.next_count()?;
+        let mut converted = [0; 8];
+        let bytes = if method == "writeLong" {
+            let value = i64::from_le_bytes(bytes.try_into().map_err(|_| native_size())?);
+            match self.scalar_type() {
+                Some(DateMilli) => { converted.copy_from_slice(&value.wrapping_mul(86_400_000).to_le_bytes()); &converted[..] },
+                Some(Time { bit_width: 32, .. }) => { converted[..4].copy_from_slice(&(value as i32).to_le_bytes()); &converted[..4] },
+                _ => bytes,
+            }
+        } else { bytes };
+        if method == "writeFloat" { self.not_null(mutation)?; }
+        let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
+        data.append(bytes, mutation)?;
+        if method != "writeFloat" { self.not_null(mutation)?; }
+        Ok(())
+    }
+    pub(super) fn bytes(&mut self, bytes: &[u8], mutation: &mut Mutation) -> WriteResult<()> {
+        match &self.data {
+            MutableScalarData::Fixed { .. } | MutableScalarData::Variable { .. } => (),
+            _ => return Err(unsupported_write("writeBytes")),
+        }
+        self.next_count()?;
+        if let MutableScalarData::Variable { last_offset, .. } = &self.data {
+            let length = i32::try_from(bytes.len()).map_err(|_| native_size())?;
+            self.offset(last_offset.wrapping_add(length), mutation)?;
+            self.not_null(mutation)?;
+            let MutableScalarData::Variable { data, .. } = &mut self.data else { return Err(native_size()); };
+            data.append(bytes, mutation)
+        } else {
+            let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
             data.append(bytes, mutation)?;
-            if method != "writeFloat" { writer.not_null(mutation)?; }
-            Ok(())
-        })
+            self.not_null(mutation)
+        }
     }
-    pub(crate) fn write_byte(&mut self, value: i8) -> WriteResult<()> { self.primitive("writeByte", &value.to_le_bytes()) }
-    pub(crate) fn write_short(&mut self, value: i16) -> WriteResult<()> { self.primitive("writeShort", &value.to_le_bytes()) }
-    pub(crate) fn write_int(&mut self, value: i32) -> WriteResult<()> { self.primitive("writeInt", &value.to_le_bytes()) }
-    pub(crate) fn write_long(&mut self, value: i64) -> WriteResult<()> { self.primitive("writeLong", &value.to_le_bytes()) }
-    pub(crate) fn write_float(&mut self, value: f32) -> WriteResult<()> { self.primitive("writeFloat", &value.to_le_bytes()) }
-    pub(crate) fn write_double(&mut self, value: f64) -> WriteResult<()> { self.primitive("writeDouble", &value.to_le_bytes()) }
-    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            match &writer.data {
-                MutableScalarData::Fixed { .. } | MutableScalarData::Variable { .. } => (),
-                _ => return Err(unsupported_write("writeBytes")),
-            }
-            writer.next_count()?;
-            if let MutableScalarData::Variable { last_offset, .. } = &writer.data {
-                let length = i32::try_from(bytes.len()).map_err(|_| native_size())?;
-                writer.offset(last_offset.wrapping_add(length), mutation)?;
-                writer.not_null(mutation)?;
-                let MutableScalarData::Variable { data, .. } = &mut writer.data else { return Err(native_size()); };
-                data.append(bytes, mutation)
-            } else {
-                let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
-                data.append(bytes, mutation)?;
-                writer.not_null(mutation)
-            }
-        })
+    pub(super) fn long_long(&mut self, high: i64, low: i64, mutation: &mut Mutation) -> WriteResult<()> {
+        if self.extension() || !matches!(self.field().data_type(), DataType::FixedSizeBinary(_)) { return Err(unsupported_write("writeLongLong")); }
+        self.next_count()?;
+        let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
+        data.append(&high.to_be_bytes(), mutation)?;
+        data.append(&low.to_be_bytes(), mutation)?;
+        self.not_null(mutation)
     }
-    pub(crate) fn write_long_long(&mut self, high: i64, low: i64) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            if writer.extension() || !matches!(writer.field().data_type(), DataType::FixedSizeBinary(_)) { return Err(unsupported_write("writeLongLong")); }
-            writer.next_count()?;
-            let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
-            data.append(&high.to_be_bytes(), mutation)?;
-            data.append(&low.to_be_bytes(), mutation)?;
-            writer.not_null(mutation)
-        })
+    pub(super) fn setter(&mut self, method: &'static str, index: i32, bytes: &[u8], mutation: &mut Mutation) -> WriteResult<()> {
+        if self.extension() || !matches!(&self.data, MutableScalarData::Fixed { .. }) { return Err(unsupported_write(method)); }
+        self.capacity_after_index(index, mutation)?;
+        let row = usize::try_from(index).map_err(|_| bounds())?;
+        if let Some(validity) = &mut self.validity { validity.set(row, true, mutation)?; }
+        let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
+        data.set(row.checked_mul(bytes.len()).ok_or_else(native_size)?, bytes, mutation)
     }
-    fn setter(&mut self, method: &'static str, index: i32, bytes: &[u8]) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            if writer.extension() || !matches!(&writer.data, MutableScalarData::Fixed { .. }) { return Err(unsupported_write(method)); }
-            writer.capacity_after_index(index, mutation)?;
-            let row = usize::try_from(index).map_err(|_| bounds())?;
-            if let Some(validity) = &mut writer.validity { validity.set(row, true, mutation)?; }
-            let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
-            data.set(row.checked_mul(bytes.len()).ok_or_else(native_size)?, bytes, mutation)
-        })
+    pub(super) fn set_boolean(&mut self, index: i32, value: bool, mutation: &mut Mutation) -> WriteResult<()> {
+        if !matches!(&self.data, MutableScalarData::Bits(_)) { return Err(unsupported_write("setBoolean")); }
+        self.capacity_after_index(index, mutation)?;
+        let row = usize::try_from(index).map_err(|_| bounds())?;
+        if let Some(validity) = &mut self.validity { validity.set(row, true, mutation)?; }
+        let MutableScalarData::Bits(bits) = &mut self.data else { return Err(native_size()); };
+        bits.set(row, value, mutation)
     }
-    pub(crate) fn set_int(&mut self, index: i32, value: i32) -> WriteResult<()> { self.setter("setInt", index, &value.to_le_bytes()) }
-    pub(crate) fn set_long(&mut self, index: i32, value: i64) -> WriteResult<()> { self.setter("setLong", index, &value.to_le_bytes()) }
-    pub(crate) fn set_float(&mut self, index: i32, value: f32) -> WriteResult<()> { self.setter("setFloat", index, &value.to_le_bytes()) }
-    pub(crate) fn set_double(&mut self, index: i32, value: f64) -> WriteResult<()> { self.setter("setDouble", index, &value.to_le_bytes()) }
-    pub(crate) fn set_boolean(&mut self, index: i32, value: bool) -> WriteResult<()> {
-        self.operation(|writer, mutation| {
-            if !matches!(&writer.data, MutableScalarData::Bits(_)) { return Err(unsupported_write("setBoolean")); }
-            writer.capacity_after_index(index, mutation)?;
-            let row = usize::try_from(index).map_err(|_| bounds())?;
-            if let Some(validity) = &mut writer.validity { validity.set(row, true, mutation)?; }
-            let MutableScalarData::Bits(bits) = &mut writer.data else { return Err(native_size()); };
-            bits.set(row, value, mutation)
-        })
-    }
-    pub(crate) fn clear(&mut self) {
+    fn clear(&mut self) {
         if let Some(validity) = &mut self.validity { validity.clear(); }
         match &mut self.data {
             MutableScalarData::Null => (), MutableScalarData::Bits(bits) => bits.clear(), MutableScalarData::Fixed { data, .. } => data.clear(),
             MutableScalarData::Variable { offsets, data, last_offset } => { offsets.clear(); data.clear(); *last_offset = 0; },
         }
         self.count = 0;
-        self.state = PublicationState::Ready;
     }
-    pub(crate) fn reader(&self) -> ScalarReader<'_> { ScalarReader { writer: self } }
-    pub(crate) fn finish(self) -> Result<ExecutionVector> {
-        if self.state == PublicationState::NativeAborted { return Err(aborted()); }
+    fn finish(self) -> Result<ExecutionVector> {
         let validity = self.validity.map(MutableBits::finish).transpose()?;
         let data = match self.data {
             MutableScalarData::Null => NativeScalarData::Null,
@@ -265,35 +227,89 @@ impl ScalarWriter {
     }
 }
 
-pub(crate) struct ScalarReader<'a> { writer: &'a ScalarWriter }
+pub(crate) struct ScalarWriter {
+    scalar: ScalarState,
+    state: PublicationState,
+}
+impl ScalarWriter {
+    pub(crate) fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { scalar: ScalarState::new(ingress, memory)?, state: PublicationState::Ready })
+    }
+    pub(crate) fn len(&self) -> usize { self.scalar.len() }
+    pub(crate) fn field(&self) -> &Field { self.scalar.field() }
+    pub(super) fn logical(&self) -> &LogicalType { self.scalar.logical() }
+    #[cfg(test)]
+    pub(super) fn fixture_state(&mut self) -> &mut ScalarState { &mut self.scalar }
+    pub(super) fn ready(&self) -> WriteResult<()> {
+        if self.state == PublicationState::NativeAborted { Err(WriteError::Native(aborted())) } else { Ok(()) }
+    }
+    pub(super) fn operation<T>(&mut self, action: impl FnOnce(&mut ScalarState, &mut Mutation) -> WriteResult<T>) -> WriteResult<T> {
+        self.ready()?;
+        let mut mutation = Mutation::default();
+        let result = action(&mut self.scalar, &mut mutation);
+        if matches!(&result, Err(WriteError::Native(_))) && mutation.changed { self.state = PublicationState::NativeAborted; }
+        result
+    }
+    pub(crate) fn write_undefined(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| writer.undefined(mutation)) }
+    pub(crate) fn write_null(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| { writer.promote(mutation)?; writer.undefined(mutation) }) }
+    pub(crate) fn ensure_capacity(&mut self, count: usize) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.ensure_capacity(count, mutation)) }
+    pub(crate) fn set_null(&mut self, index: i32) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.set_null(index, mutation)) }
+    pub(crate) fn write_boolean(&mut self, value: bool) -> WriteResult<()> { self.operation(|writer, mutation| writer.boolean(value, mutation)) }
+    fn primitive(&mut self, method: &'static str, bytes: &[u8]) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.primitive(method, bytes, mutation)) }
+    pub(crate) fn write_byte(&mut self, value: i8) -> WriteResult<()> { self.primitive("writeByte", &value.to_le_bytes()) }
+    pub(crate) fn write_short(&mut self, value: i16) -> WriteResult<()> { self.primitive("writeShort", &value.to_le_bytes()) }
+    pub(crate) fn write_int(&mut self, value: i32) -> WriteResult<()> { self.primitive("writeInt", &value.to_le_bytes()) }
+    pub(crate) fn write_long(&mut self, value: i64) -> WriteResult<()> { self.primitive("writeLong", &value.to_le_bytes()) }
+    pub(crate) fn write_float(&mut self, value: f32) -> WriteResult<()> { self.primitive("writeFloat", &value.to_le_bytes()) }
+    pub(crate) fn write_double(&mut self, value: f64) -> WriteResult<()> { self.primitive("writeDouble", &value.to_le_bytes()) }
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.bytes(bytes, mutation)) }
+    pub(crate) fn write_long_long(&mut self, high: i64, low: i64) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.long_long(high, low, mutation)) }
+    fn setter(&mut self, method: &'static str, index: i32, bytes: &[u8]) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.setter(method, index, bytes, mutation)) }
+    pub(crate) fn set_int(&mut self, index: i32, value: i32) -> WriteResult<()> { self.setter("setInt", index, &value.to_le_bytes()) }
+    pub(crate) fn set_long(&mut self, index: i32, value: i64) -> WriteResult<()> { self.setter("setLong", index, &value.to_le_bytes()) }
+    pub(crate) fn set_float(&mut self, index: i32, value: f32) -> WriteResult<()> { self.setter("setFloat", index, &value.to_le_bytes()) }
+    pub(crate) fn set_double(&mut self, index: i32, value: f64) -> WriteResult<()> { self.setter("setDouble", index, &value.to_le_bytes()) }
+    pub(crate) fn set_boolean(&mut self, index: i32, value: bool) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.set_boolean(index, value, mutation)) }
+    pub(crate) fn clear(&mut self) {
+        self.scalar.clear();
+        self.state = PublicationState::Ready;
+    }
+    pub(crate) fn reader(&self) -> ScalarReader<'_> { ScalarReader { scalar: &self.scalar } }
+    pub(crate) fn finish(self) -> Result<ExecutionVector> {
+        if self.state == PublicationState::NativeAborted { return Err(aborted()); }
+        self.scalar.finish()
+    }
+}
+
+pub(crate) struct ScalarReader<'a> { scalar: &'a ScalarState }
 impl ScalarReader<'_> {
     fn storage(&self) -> ScalarStorageRef<'_> {
-        match &self.writer.data {
+        match &self.scalar.data {
             MutableScalarData::Null => ScalarStorageRef::Null,
             MutableScalarData::Bits(bits) => ScalarStorageRef::Bits { data: bits.bytes(), offset: 0 },
             MutableScalarData::Fixed { data, .. } => ScalarStorageRef::Fixed { data: data.bytes(), offset: 0 },
             MutableScalarData::Variable { offsets, data, .. } => ScalarStorageRef::Variable { offsets: ScalarOffsets::Native(offsets.bytes()), data: data.bytes() },
         }
     }
-    fn row(&self, row: i32) -> Result<usize> { let row = usize::try_from(row).map_err(|_| index_error())?; if row >= self.writer.count { Err(index_error()) } else { Ok(row) } }
+    fn row(&self, row: i32) -> Result<usize> { let row = usize::try_from(row).map_err(|_| index_error())?; if row >= self.scalar.count { Err(index_error()) } else { Ok(row) } }
     pub(crate) fn is_null(&self, row: i32) -> Result<bool> {
-        if matches!(&self.writer.data, MutableScalarData::Null) { return Ok(true); }
-        match &self.writer.validity { None => Ok(false), Some(bits) => Ok(!native_scalar::bit(bits.bytes(), self.row(row)?)?) }
+        if matches!(&self.scalar.data, MutableScalarData::Null) { return Ok(true); }
+        match &self.scalar.validity { None => Ok(false), Some(bits) => Ok(!native_scalar::bit(bits.bytes(), self.row(row)?)?) }
     }
     fn primitive(&self, getter: Getter, row: i32, checks: NullChecks) -> VectorReadResult<usize> {
-        if !getter.admits(self.writer.logical()) { return Err(unsupported(getter.name()).into()); }
+        if !getter.admits(self.scalar.logical()) { return Err(unsupported(getter.name()).into()); }
         if checks == NullChecks::Enabled && self.is_null(row)? { return Err(Anomaly::fault("xtdb.error/unknown", format!("null at index {row}")).into()); }
         Ok(self.row(row)?)
     }
     pub(crate) fn get_boolean(&self, row: i32, checks: NullChecks) -> VectorReadResult<bool> { Ok(self.storage().bit(self.primitive(Getter::Boolean, row, checks)?)?) }
     pub(crate) fn get_byte(&self, row: i32, checks: NullChecks) -> VectorReadResult<i8> { Ok(self.storage().lane::<1>(self.primitive(Getter::Byte, row, checks)?)?[0] as i8) }
     pub(crate) fn get_short(&self, row: i32, checks: NullChecks) -> VectorReadResult<i16> { Ok(i16::from_le_bytes(self.storage().lane(self.primitive(Getter::Short, row, checks)?)?)) }
-    pub(crate) fn get_int(&self, row: i32, checks: NullChecks) -> VectorReadResult<i32> { Ok(super::super::getters::integer(self.storage(), self.writer.field().data_type(), self.primitive(Getter::Int, row, checks)?)?) }
-    pub(crate) fn get_long(&self, row: i32, checks: NullChecks) -> VectorReadResult<i64> { Ok(super::super::getters::long(self.storage(), self.writer.field().data_type(), self.primitive(Getter::Long, row, checks)?)?) }
+    pub(crate) fn get_int(&self, row: i32, checks: NullChecks) -> VectorReadResult<i32> { Ok(super::super::getters::integer(self.storage(), self.scalar.field().data_type(), self.primitive(Getter::Int, row, checks)?)?) }
+    pub(crate) fn get_long(&self, row: i32, checks: NullChecks) -> VectorReadResult<i64> { Ok(super::super::getters::long(self.storage(), self.scalar.field().data_type(), self.primitive(Getter::Long, row, checks)?)?) }
     pub(crate) fn get_float(&self, row: i32, checks: NullChecks) -> VectorReadResult<f32> { Ok(f32::from_le_bytes(self.storage().lane(self.primitive(Getter::Float, row, checks)?)?)) }
-    pub(crate) fn get_double(&self, row: i32, checks: NullChecks) -> VectorReadResult<f64> { Ok(super::super::getters::double(self.storage(), self.writer.field().data_type(), self.primitive(Getter::Double, row, checks)?)?) }
+    pub(crate) fn get_double(&self, row: i32, checks: NullChecks) -> VectorReadResult<f64> { Ok(super::super::getters::double(self.storage(), self.scalar.field().data_type(), self.primitive(Getter::Double, row, checks)?)?) }
     pub(crate) fn get_bytes(&self, row: i32) -> VectorReadResult<&[u8]> {
-        if !matches!(self.writer.field().data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
-        Ok(self.storage().bytes(self.row(row)?, self.writer.field().data_type())?)
+        if !matches!(self.scalar.field().data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
+        Ok(self.storage().bytes(self.row(row)?, self.scalar.field().data_type())?)
     }
 }
