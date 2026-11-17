@@ -40,11 +40,24 @@ fn verifies_names(tls: &BTreeMap<&str, &str>, registry_hostname_policy: bool) ->
 }
 
 fn tls_error(cause: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
-    if cause.code == "xtdb.kafka/invalid-tls-config" { error("invalid-plugin-config", cause.message) } else { cause }
+    if cause.code == "xtdb.kafka/invalid-tls-config" { rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka-connect-source/invalid-plugin-config", cause.message) } else { cause }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_tls_reclassification_preserves_optional_messages_and_other_errors() {
+        for message in [None, Some(String::new()), Some("invalid TLS configuration".into())] {
+            let cause = rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka/invalid-tls-config", message.clone()).with_context("source", "tls".into());
+            let error = tls_error(cause);
+            assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
+            assert_eq!(error.code, "xtdb.kafka-connect-source/invalid-plugin-config");
+            assert_eq!(error.message, message);
+            assert!(error.context.is_empty());
+            let cause = rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Busy, "rtdb/memory-budget-exceeded", message).with_context("source", "budget".into());
+            assert_eq!(tls_error(cause.clone()), cause);
+        }
+    }
     #[test]
     fn registry_trust_manager_names_preserve_jca_aliases_and_raw_strings() {
         let memory = rtdb_columnar::MemoryBudget::new(1 << 26);
