@@ -241,7 +241,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the recorded remaining sort algorithms, aggregate primitive factory schedules and expression invocation boundaries."
+      "requirement": "Complete alternate object-sort configuration, whole-group percentile sorting and remaining expression invocation boundaries; preserve physical vector null payloads, selected union legs and getter indexes through execution views, copies and native spilling."
     },
     {
       "id": "azure-desktop-credentials",
