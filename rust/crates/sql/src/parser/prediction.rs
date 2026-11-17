@@ -4,6 +4,7 @@ mod semantic;
 mod mode;
 mod storage;
 mod dfa;
+mod closure;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};
@@ -19,12 +20,16 @@ type Result<T> = std::result::Result<T, PredictionError>;
 pub(crate) enum PredictionError {
     Admission(Anomaly),
     Artifact(Problem),
+    SourceAssertion(SourceAssertionSite),
     ForeignOwner,
     Aborted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Problem { Capacity, Context, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, Grammar(ArtifactIssue) }
+pub(crate) enum Problem { Capacity, Context, LocalClosure, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, Grammar(ArtifactIssue) }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SourceAssertionSite { ReachStopEmpty, PopDepth, FalloffDepth }
 
 impl From<GrammarError> for PredictionError {
     fn from(error: GrammarError) -> Self {

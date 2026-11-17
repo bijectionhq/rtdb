@@ -397,6 +397,11 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         let result = self.equal_config(left, right, contexts);
         self.finish(result)
     }
+    pub(super) fn equivalent_config_for_probe(&mut self, incoming: ConfigKey<'cfg>, stored: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
+        self.check_context(contexts)?;
+        let result = self.equal_config_using(incoming, stored, contexts, EqualityPolicy::LinkedFrames);
+        self.finish(result)
+    }
     fn equal_config(&self, left: ConfigKey<'cfg>, right: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
         self.equal_config_using(left, right, contexts, EqualityPolicy::ScopedFrames)
     }

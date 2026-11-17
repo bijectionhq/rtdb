@@ -111,10 +111,65 @@
         "source": "dfa/DFA.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/dfa/DFA.java",
         "sha256": "6f119a06edf323f67fb0b4de10dd9b178ef38eb2bac2aea486447b97f1584621"
+      },
+      {
+        "source": "Parser.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/Parser.java",
+        "sha256": "ab6bc39813b663efe9744daf87f404764878cc7130f24113b170593f83e27d3e"
+      },
+      {
+        "source": "ParserRuleContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/ParserRuleContext.java",
+        "sha256": "9b8780f4d6cee7a8108bbd5d0b0ad99e2a69d417e05b11ac384c54ad898d2114"
+      },
+      {
+        "source": "RuleContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/RuleContext.java",
+        "sha256": "2168e3bec7f645132d6c0310b9f2c789f86cdc2440906e3df269a52e19e438f3"
+      },
+      {
+        "source": "atn/Transition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/Transition.java",
+        "sha256": "fed529b006069d6c56e4dca88dcd31b386de5619020b40aaaf1437b6e42e2e21"
+      },
+      {
+        "source": "atn/RuleTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/RuleTransition.java",
+        "sha256": "00bc5e209178fa3e6ef30497067eb2e510e6c4775f97c5ce4b2b1cfc99174dad"
+      },
+      {
+        "source": "atn/EpsilonTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/EpsilonTransition.java",
+        "sha256": "f3af8f03555bd09c5864f7f6323662a0d6e61379a4159cc4f82b2754c49710fb"
+      },
+      {
+        "source": "atn/ActionTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ActionTransition.java",
+        "sha256": "5465054eb4f0ff20dc9c9bb0f75573ee932929e925a1a2c8a6fb7a7cab4a35c0"
+      },
+      {
+        "source": "atn/PrecedencePredicateTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PrecedencePredicateTransition.java",
+        "sha256": "bf9b3ebae0c3024454a793d60f4791e361c940f7eb0d574be0851d4ab9a4d175"
+      },
+      {
+        "source": "atn/AtomTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/AtomTransition.java",
+        "sha256": "47bd3a0ab67dea59716351a3c3a0ea26322d76b4b442665816422f46bd15d1ac"
+      },
+      {
+        "source": "atn/SetTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SetTransition.java",
+        "sha256": "e221bf03db9ae5dae784de70e9c1d8e21c53f36beec8c2733cd803d9a844d55d"
+      },
+      {
+        "source": "atn/ATNDeserializer.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNDeserializer.java",
+        "sha256": "696e4b89613c6ad47ba5264c755ed77120897679bb1e4f961c3e3e799e38e7cf"
       }
     ]
   },
-  "scope": "Prediction-context/configuration/mode values and private retained 372-decision DFA storage, source publication phases and actual roots; no token prediction or production parser adapter.",
+  "scope": "Prediction-context/configuration/mode values, private retained 372-decision DFA storage and complete private local/SLL start/closure/reach/cold precedence-filter/loop-entry-pruning kernels for the pinned grammar; no full-context or adaptive predictor, generated parser or production adapter.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -184,5 +239,18 @@
     "finding": "embedded-parser-error-capability",
     "status": "open",
     "required": "Preserve supported embedded cause/recognizer/config/DFA behavior or deliver a specific reviewed-design-compatible migration with source/native assertions before production cache adoption or compatibility closure."
+  },
+  "local_producer_domain": {
+    "context": "Empty, Singleton with nonnull local parent, or sorted Array of at least two distinct non-EmptyReturn states with nonnull local parents; produced stop configurations have Empty contexts.",
+    "cached_input": "Checked C3 generation, phase, decision, binding and Local mode do not certify producer provenance; ordinary cache rows must arise only through the closed C4/C5 local producer path.",
+    "caller": "Preserve the active prediction memo through audited C3/mode work; no nested round/reset or arbitrary cached-config mutation.",
+    "merge_presence": "Absent during cold start/filter; Present before the first reach intermediate admission and until the same prediction round ends.",
+    "busy": "Incoming-first full-config equality with allocation-free LinkedFrames, stored native insertion hashes and boolean-only membership under the separate local producer stability proof.",
+    "source_assertions": "Explicit Enabled/Disabled runtime profile; reached no-message AssertionError site facts for RuleStop Empty context and MIN_VALUE-before-pop/falloff, with disabled Java wrapping arithmetic.",
+    "mandatory_successors": [
+      "Full-context producers over the real parser invocation/precedence/token owners on the same round",
+      "Adaptive prediction, metadata, diagnostics and generated 176-rule schedules",
+      "Production capability preservation or reviewed migration under the open embedded-parser-error-capability gate"
+    ]
   }
 }

@@ -1,6 +1,6 @@
 = Prediction values
 
-This private parser component implements prediction-context values, ordered configuration identities, prediction-mode facts and private retained DFA storage from ANTLR 4.13.2.
+This private parser component implements prediction-context values, ordered configuration identities, prediction-mode facts, private retained DFA storage and local/SLL configuration producers from ANTLR 4.13.2.
 `UPSTREAM.json` pins the primary sources; link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
 It does not perform token prediction, recognize SQL rules or change a production parser entry point.
 
@@ -141,7 +141,7 @@ Hashing folds the ordered list with Java's wrapping 31-fold.
 A read-only set retains a computed non-`-1` hash even if an alias subsequently changes a configuration.
 The value `-1` remains the source cache sentinel and is recomputed on the next request.
 Clearing a mutable set clears membership but retains semantic, outer-context, unique-alternative and conflict metadata.
-The private DFA map stores its native insertion-time hashes separately; a later closure container still requires its own reviewed implementation.
+The private DFA map and local closure Busy container store native insertion-time hashes separately under their distinct producer stability conditions.
 The DFA substitution proof requires its closed internal producer and nonescaping-capability premise, and does not deep-freeze arbitrary configuration aliases.
 
 == Semantic values and mode facts
@@ -269,7 +269,7 @@ Under the internal stable-producer and nonescaping-capability premise, complete 
 Actual internal ordinary successors are fresh except for unchanged skipped stop identities, and cold precedence filtering runs before ordinary publication.
 The actual SLL context producers exclude escaping one-entry Arrays and traversable null parents, so optimization preserves their class-sensitive equality and hash.
 The generic one-entry Array reconstruction, mutable alias, stale hash and conflict-identity regressions remain valid and unchanged.
-This premise does not authorize a generic mutable JVM cache surface or implement closure and adaptive prediction.
+This premise does not authorize a generic mutable JVM cache surface or implement adaptive prediction.
 
 == Embedded parser cause capability gate
 
@@ -287,7 +287,85 @@ No public cause behavior is removed or waived by this slice.
 
 == Remaining parser work
 
-Precedence filtering, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+Full-context production, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
+
+== Private local configuration producer
+
+`with_closure_round` opens one passive prediction transient borrowing the same `Configurations` and existing `MergeRound`.
+It implements the complete local/SLL start, iterative closure, epsilon successor, consuming reach, EOF stop filter, cold precedence filter and loop-entry pruning domain for the pinned grammar.
+Both source parser prediction modes initially use this local producer.
+There is no full-context flag, token callback, generated rule controller or production parser entry in this boundary.
+`ClosureOptions` carries captured loop-entry pruning and source assertion selections; the eventual parser environment owns their runtime provenance.
+Cold precedence filtering receives the current scalar from the real parser-owned precedence stack when reached.
+
+A local context is canonical Empty, a Singleton with a nonnull local parent, or a sorted Array of at least two distinct non-EmptyReturn states with nonnull local parents.
+Produced sets retain one distinct configuration identity per membership triple, while repeated occurrences of that same identity remain ordered occurrences.
+Every retained RuleStop configuration has Empty context.
+The pinned grammar has no consuming edge directly to RuleStop; trivial reach bypasses therefore preserve that stop invariant.
+Start creates fresh alternative configurations with Empty context; rule edges push actual follow states, stop edges pop live parents in order, and local merges use the existing context kernel.
+All six representable transition kinds are complete, including action collection latching, depth-gated precedence accumulation and EOF atom/set treatment.
+No application action or ordinary predicate is executed by this producer.
+
+`LocalSet` carries both configuration and fresh round brands.
+The factory result cannot return a round-branded set/start capability, a borrowed work view or the round itself.
+A key from one round cannot be supplied as a `LocalSet` in a later round.
+`with_closure_round(..., |round| round.local_start())` cannot make its branded result the independent callback result type.
+These lifetime contracts await compiler qualification.
+`StartSet::Precedence` carries a non-Copy `PrecedenceStart` which is consumed by cold filtering; cached inputs cannot substitute for it.
+Its prefilter key permits the actual C3 synthetic field to be written before filtering.
+`from_cached` checks occupied generation, Ordinary/Interned phase, decision, exact configuration binding and Local mode.
+Those checks and lifetime brands do not recursively prove the local context domain, stop invariant or source provenance.
+Its private precondition is that ordinary cache membership began empty and every real row arose through these producer outputs, later metadata preparation and the C3 interner.
+Arbitrary cache mutation, imported seeds and escaping error capabilities violate that premise.
+Existing generic one-entry Array, null-parent, mutable alias and stale-hash counterexamples remain valid tests outside that conditional producer domain.
+Every future production insertion and cached-input consumer requires that closed-caller audit before adoption.
+
+`parts` lends the existing configuration/context facades for audited C3 interning and mode facts while the same prediction memo remains alive.
+The caller must not open a nested/new merge round, clear the active memo or arbitrarily mutate cached configurations through those facades.
+This sequential caller condition is not enforced by the brands.
+Memo presence begins Absent, so cold start and filtering use the existing uncached addition path.
+The first reach changes it to Present before intermediate-set admission; all later additions share the same existing round memo.
+Clearing Busy membership, continuations, captured contexts or skipped stops does not clear that memo.
+A mandatory full-context successor must extend this same round and preserve the source terminal local-to-full handoff before adaptive prediction can be adopted.
+
+`ClosureWork` owns passive scope-local continuation, Busy, skipped-stop and captured-alt1 constituents.
+Continuations retain live configuration handles; resumed parent/context/packed reads observe alias updates at the source read points.
+Child context creation, configuration copying, suppression, outer increment, Busy insertion and dips flags finish before native parent-frame admission.
+A later admission error preserves those completed prefixes and seals the round and reached configuration/context collaborators without replacing the original error.
+DFA cached-input failures also seal the supplied DFA through its checked collaborator precheck.
+Completed views and actual retained roots remain available; a fresh access can resume from rooted completed cache history.
+
+Busy membership is logically new per start alternative and shared across all intermediate closures in a nontrivial reach.
+It observes incoming-versus-stored full configuration equality and only the insertion boolean.
+For local falloff inputs, Empty context is absorbing under later local merges; pinned EOF successors are immutable, and packed depth/suppression are omitted from the hash.
+Suppression may change equality, so stored objects remain live and complete lookup can encounter converged keys.
+Stored native insertion hashes survive rehash.
+The existing shared equality kernel selects `LinkedFrames` for these probes, with allocation-free cleanup before any result, error or unwind leaves its session.
+This separate local Busy proof does not certify full-context Busy inputs or arbitrary mutable keys.
+Java Empty semantic identity hash and JVM bucket/tree/heap/stack failure behavior are not native numeric or resource promises.
+
+Cold filtering processes alt1 first and captures each current context before adding or merging its configuration.
+The state map overwrites with the last captured context; it does not union contexts or later dereference a mutable configuration alias.
+Failed precedence evaluation precedes map/add demand; unchanged semantics share the original identity and changed semantics create a fresh copy.
+Unsuppressed later alternatives compare the captured context against their incoming context using the ordinary fallible scoped equality policy.
+Suppression bypasses that demand.
+EOF reach filters actual stop objects before appending unchanged skipped-stop identities, preserving repeated same-identity occurrences.
+Fresh output sets do not inherit conflict/unique/accept metadata; adaptive control owns that preparation.
+
+Busy and captured-alt1 tables begin with encountered 32-slot demand and stay half full.
+Duplicate/overwrite lookup precedes growth; complete checked replacement storage is admitted while the old table still exists.
+Frames and skipped lists use encountered 16-entry/doubling reservations.
+Scope charges survive logical clearing and round destruction until the caller's allocation scope drops.
+Retained configurations and contexts use the same sealed stores; work vectors do not become persistent storage or new roots.
+Collection follows round/facade destruction and traverses actual C3 maps, starts, synthetic prefilters and edges through existing ordered/building membership, conflicts, current contexts and canonical parent roots.
+
+Source assertions are selected explicitly rather than inferred from a Rust build profile.
+Reached checks retain the RuleStop-Empty and MIN_VALUE-before-pop/falloff sites as owned inline no-message `AssertionError` facts for the future diagnostic owner.
+Disabled checks retain Java wrapping arithmetic without an artificial depth cap.
+No-reach `None` is a producer fact; later adaptive control constructs the actual no-viable exception at its source location.
+Full-context producers, real parser/token ownership, adaptive control, generated schedules and diagnostic adapters remain mandatory successors.
+The OPEN `embedded-parser-error-capability` gate still blocks production adoption and compatibility closure; wire projection does not discharge the embedded cause/recognizer/config/DFA obligation.
+Compiler and runtime qualification remain unrun.
