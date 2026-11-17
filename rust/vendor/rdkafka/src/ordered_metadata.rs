@@ -5,7 +5,7 @@ use rdkafka_sys as sys;
 use crate::{client::{Client, ClientContext}, native_byte_account::NativeByteAccount, util::AsyncRuntime};
 
 mod wire;
-pub use wire::{Broker, Event, Int32Array, MetadataView, Partition, ProtocolError, Summary, Topic};
+pub use wire::{Broker, Event, Int32Array, MetadataView, Partition, ProtocolError, RawBroker, RawEvent, RawMetadataView, RawTopic, Summary, Topic};
 
 /// A topic name borrowed for submission only; no allocation or NUL terminator is required.
 /// Submission rejects empty names and names longer than the Kafka signed-short string range.
@@ -87,6 +87,17 @@ impl OrderedMetadataRequest {
     /// Unconsumed suffix bytes are retained; see MetadataView::trailing_bytes.
     /// Native failures precede wire validation and preserve their integer codes.
     pub fn poll(&self) -> Option<Result<MetadataView<'_>, OrderedMetadataError>> {
+        self.response().map(|result| result.and_then(|(version, bytes)| MetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
+    }
+
+    /// Polls without waiting or output allocation, preserving malformed UTF8 as raw string bytes.
+    /// Native failures precede structural validation; no caller visitor runs before the complete field prefix and tags validate.
+    /// The borrowed view and its strings cannot outlive this request; replacement decoding remains caller-owned.
+    pub fn poll_raw(&self) -> Option<Result<RawMetadataView<'_>, OrderedMetadataError>> {
+        self.response().map(|result| result.and_then(|(version, bytes)| RawMetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol)))
+    }
+
+    fn response(&self) -> Option<Result<(i16, &[u8]), OrderedMetadataError>> {
         let mut error = sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR_NO_ERROR;
         let mut version = 0;
         let mut body = std::ptr::null();
@@ -98,7 +109,7 @@ impl OrderedMetadataRequest {
         }
         if body.is_null() || length > isize::MAX as usize { return Some(Err(OrderedMetadataError::InvalidCompletion)); }
         let bytes = unsafe { std::slice::from_raw_parts(body.cast::<u8>(), length) };
-        Some(MetadataView::parse(version, bytes).map_err(OrderedMetadataError::Protocol))
+        Some(Ok((version, bytes)))
     }
 
     /// Waits on the caller's runtime with a 10ms polling interval, without spawning a task.
@@ -107,6 +118,16 @@ impl OrderedMetadataRequest {
     pub async fn wait<R: AsyncRuntime>(&self) -> Result<MetadataView<'_>, OrderedMetadataError> {
         loop {
             if let Some(result) = self.poll() { return result; }
+            R::delay_for(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Waits on the caller's runtime for a raw-string view, polling every 10ms without spawning a task.
+    /// Cancelling the wait leaves the request pollable; dropping it abandons delivery under the existing native drain contract.
+    /// Runtime allocation and replacement decoding remain caller-owned.
+    pub async fn wait_raw<R: AsyncRuntime>(&self) -> Result<RawMetadataView<'_>, OrderedMetadataError> {
+        loop {
+            if let Some(result) = self.poll_raw() { return result; }
             R::delay_for(Duration::from_millis(10)).await;
         }
     }

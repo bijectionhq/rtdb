@@ -55,7 +55,12 @@ The visitor's second pass borrows broker, cluster, topic, UUID, partition, repli
 Duplicate entries and signed error/ID/epoch values remain unmodified.
 Leader epochs are present from v7, while has_reliable_leader_epochs follows Java's v9 threshold.
 Unknown flexible body tags, including duplicate, decreasing and negative IDs, remain in received order in raw bytes.
-Malformed UTF8 is an explicit UnsupportedUtf8 result; Java replacement behavior remains a prerequisite for full compatibility.
+The MetadataView facade returns UnsupportedUtf8 for malformed strings, at the original field-read position before later fields can fail.
+RawMetadataView preserves those strings as borrowed byte slices through RawBroker, RawTopic and RawEvent.
+OrderedMetadataRequest::poll_raw and wait_raw expose this view from the same native completion and retain its existing account lifetime.
+Both views use one checked cursor with a compile-time UTF8-validation profile.
+Raw string lengths and Summary.string_bytes describe the original wire payload, before replacement expansion.
+The raw view accepts malformed UTF8 without normalizing or re-encoding the body; Java replacement decoding and output admission belong to the producer metadata owner.
 The cursor, event views, array iterator and summary are passive call-local borrowed values with no output heap owner.
 Caller-side collections require their own admission before construction.
 
@@ -87,5 +92,7 @@ Rust regression sources cover every supported version, unsorted entries, raw err
 Generated-reader boundaries include every fifth varint byte, all four string slots, all array and tag-list slots, signed nullable lengths, count-cap failure order, a million borrowed replica IDs, duplicate/decreasing/negative tag IDs and retained suffixes.
 The native header fixtures pass through actual correlation lookup and ordered request dispatch, including rejected headers, the 10,000-tag boundary and fifth-byte truncation.
 The Kafka integration sources use the safe API with the native mock producer, retain a response after producer destruction and exercise abandonment followed by teardown.
+The raw-string integration fixture configures malformed rack bytes through the existing native mock API, observes the original bytes through poll_raw, retains the UTF8 facade's error and keeps the raw result through producer destruction.
+Additional raw-view sources retain all supported versions, nullable names, original string-size ceilings, tag/suffix bytes, and validation before visitation.
 All previously published assertions remain unchanged.
 Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.

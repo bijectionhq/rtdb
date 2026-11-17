@@ -339,3 +339,79 @@ fn wrapper_suffix_acceptance_preserves_the_complete_body_and_visitor_boundary() 
     if let Ok(view) = MetadataView::parse(0, &body[..7]) { view.visit(|_| calls += 1).unwrap(); }
     assert_eq!(calls, 0);
 }
+
+
+#[test]
+fn raw_views_preserve_every_version_and_validate_before_visitation() {
+    for version in 0..=13 {
+        let body = response(version, version >= 12);
+        let text = MetadataView::parse(version, &body).unwrap();
+        let raw = RawMetadataView::parse(version, &body).unwrap();
+        assert_eq!(raw.raw(), text.raw()); assert_eq!(raw.summary(), text.summary());
+        assert_eq!(raw.version(), version); assert_eq!(raw.has_reliable_leader_epochs(), version >= 9);
+        let mut ids = Vec::new();
+        raw.visit(|event| if let RawEvent::Partition(p) = event { ids.push(p.id); }).unwrap();
+        assert_eq!(ids, [7,1,7,1]);
+        for end in 0..body.len() {
+            let mut calls = 0;
+            if let Ok(view) = RawMetadataView::parse(version, &body[..end]) { view.visit(|_| calls += 1).unwrap(); }
+            assert_eq!(calls, 0, "v{version} length {end}");
+            assert!(RawMetadataView::parse(version, &body[..end]).is_err());
+        }
+    }
+}
+
+#[test]
+fn raw_strings_preserve_malformed_bytes_in_all_four_fields() {
+    for version in [2, 8, 9, 12, 13] {
+        for slot in 0..4 {
+            let mut body = response_with_string(version, slot, "x");
+            let offset = body.iter().position(|byte| *byte == b'x').unwrap();
+            body[offset] = 0x80;
+            assert_eq!(MetadataView::parse(version, &body).unwrap_err(), ProtocolError::UnsupportedUtf8);
+            let view = RawMetadataView::parse(version, &body).unwrap();
+            assert_eq!(view.summary().string_bytes, 1);
+            let mut fields = Vec::new();
+            view.visit(|event| match event {
+                RawEvent::Broker(b) => { fields.push(b.host); fields.push(b.rack.unwrap()); }
+                RawEvent::Cluster {id, ..} => fields.push(id.unwrap()),
+                RawEvent::Topic(t) => fields.push(t.name.unwrap()),
+                _ => (),
+            }).unwrap();
+            assert_eq!(fields[slot], [0x80]);
+            assert_eq!(fields[slot].as_ptr(), body[offset..].as_ptr());
+        }
+    }
+}
+
+#[test]
+fn raw_string_limits_apply_before_replacement_expansion() {
+    for slot in 0..4 {
+        let mut body = response_with_string(13, slot, &"x".repeat(32767));
+        for byte in &mut body { if *byte == b'x' { *byte = 0x80; } }
+        let view = RawMetadataView::parse(13, &body).unwrap();
+        assert_eq!(view.summary().string_bytes, 32767);
+        assert_eq!(view.raw(), body);
+        assert_eq!(MetadataView::parse(13, &body).unwrap_err(), ProtocolError::UnsupportedUtf8);
+        let oversized = response_with_string(13, slot, &"x".repeat(32768));
+        assert_eq!(RawMetadataView::parse(13, &oversized).unwrap_err(), ProtocolError::StringTooLong);
+    }
+}
+
+#[test]
+fn utf8_facade_retains_string_error_priority_before_later_truncation() {
+    let body = [0,0,0,1, 0,0,0,1, 0,1, 0x80];
+    assert_eq!(MetadataView::parse(0, &body).unwrap_err(), ProtocolError::UnsupportedUtf8);
+    assert_eq!(RawMetadataView::parse(0, &body).unwrap_err(), ProtocolError::Truncated);
+}
+
+#[test]
+fn raw_suffix_tags_and_nullable_names_remain_uninterpreted() {
+    let mut body = response(13, true);
+    body.truncate(body.len()-5); body.extend([2,7,0,6,0,0xff,0x80]);
+    let view = RawMetadataView::parse(13, &body).unwrap();
+    assert_eq!(view.raw(), body); assert_eq!(view.trailing_bytes(), [0xff,0x80]);
+    let mut names = Vec::new();
+    view.visit(|event| if let RawEvent::Topic(topic) = event { names.push(topic.name); }).unwrap();
+    assert_eq!(names, [Some(b"z".as_slice()), None]);
+}

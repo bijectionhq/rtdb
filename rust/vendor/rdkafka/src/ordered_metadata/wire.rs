@@ -1,4 +1,4 @@
-/// A rejected wire representation; no partial visitor events have been delivered by parse.
+/// A rejected wire representation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolError {
     /// The response version is outside 0..13.
@@ -15,7 +15,7 @@ pub enum ProtocolError {
     ArrayTooLong,
     /// A tag count exceeds 10,000 after the remaining-byte check.
     TooManyTags,
-    /// Java's malformed UTF8 replacement behavior is outside this transport profile.
+    /// A string is malformed UTF8 in the MetadataView facade; RawMetadataView preserves its bytes.
     UnsupportedUtf8,
 }
 
@@ -28,7 +28,7 @@ pub struct Summary {
     pub topics: usize,
     /// Total partition entries across topics, in wire order.
     pub partitions: usize,
-    /// Total borrowed UTF8 payload bytes across all strings.
+    /// Total wire payload bytes across all strings, before any replacement decoding.
     pub string_bytes: usize,
     /// Top-level Kafka error code; zero before Metadata v13.
     pub error: i16,
@@ -68,7 +68,6 @@ pub struct Int32Array<'a>(&'a [u8]);
 impl<'a> Int32Array<'a> {
     /// Returns the element count, with no copy or sorting.
     pub fn len(self) -> usize { self.0.len() / 4 }
-    /// Returns whether the array has no elements.
     pub fn is_empty(self) -> bool { self.0.is_empty() }
     /// Iterates signed values in their original order.
     pub fn iter(self) -> impl ExactSizeIterator<Item = i32> + 'a {
@@ -101,7 +100,6 @@ pub struct Partition<'a> {
 pub enum Event<'a> {
     /// Throttle duration in milliseconds; zero before v3.
     Throttle(i32),
-    /// One broker entry.
     Broker(Broker<'a>),
     /// Cluster/controller values after all broker entries; -1 means no controller.
     Cluster {
@@ -110,7 +108,6 @@ pub enum Event<'a> {
         /// Controller node ID; -1 before v1 or when absent.
         controller: i32,
     },
-    /// One topic header.
     Topic(Topic<'a>),
     /// One partition of the current topic.
     Partition(Partition<'a>),
@@ -132,34 +129,134 @@ pub enum Event<'a> {
 /// Construction and visitation allocate no output storage and preserve the original order.
 /// Unknown flexible tags and unconsumed suffixes remain in raw bytes; malformed UTF8 is explicitly unsupported.
 #[derive(Clone, Copy, Debug)]
-pub struct MetadataView<'a> { version: i16, bytes: &'a [u8], summary: Summary, consumed: usize }
+pub struct MetadataView<'a>(RawMetadataView<'a>);
 impl<'a> MetadataView<'a> {
     /// Validates all versioned fields and nested tags before publishing a view.
     /// Accepts Metadata versions 0..13 and an unconsumed suffix, as the Java response wrapper does.
-    /// Errors never call a visitor.
     pub fn parse(version: i16, bytes: &'a [u8]) -> Result<Self, ProtocolError> {
-        let (summary, consumed) = walk(version, bytes, &mut |_| {})?;
-        Ok(Self { version, bytes, summary, consumed })
+        let (summary, consumed) = walk::<true>(version, bytes, &mut |_| Ok(()))?;
+        Ok(Self(RawMetadataView { version, bytes, summary, consumed }))
     }
     /// Returns the exact body, including unknown flexible tags and any unconsumed suffix.
-    pub fn raw(self) -> &'a [u8] { self.bytes }
+    pub fn raw(self) -> &'a [u8] { self.0.raw() }
     /// Returns bytes after the complete versioned fields and root tags, without interpreting them.
-    pub fn trailing_bytes(self) -> &'a [u8] { &self.bytes[self.consumed..] }
+    pub fn trailing_bytes(self) -> &'a [u8] { self.0.trailing_bytes() }
     /// Returns the negotiated protocol version.
-    pub fn version(self) -> i16 { self.version }
-    /// Matches Java MetadataResponse's reliability threshold, independently of epoch presence.
-    pub fn has_reliable_leader_epochs(self) -> bool { self.version >= 9 }
+    pub fn version(self) -> i16 { self.0.version() }
+    /// Reports Java's v9 reliability threshold independently of epoch-field presence.
+    pub fn has_reliable_leader_epochs(self) -> bool { self.0.has_reliable_leader_epochs() }
     /// Returns validated counts and the top-level error without constructing collections.
-    pub fn summary(self) -> Summary { self.summary }
+    pub fn summary(self) -> Summary { self.0.summary() }
     /// Calls the visitor synchronously on Rust with borrowed source-order fields.
     /// The immutable body has already passed the identical complete parser; visitor allocations remain caller-owned.
     pub fn visit(self, mut visitor: impl FnMut(Event<'a>)) -> Result<(), ProtocolError> {
-        walk(self.version, self.bytes, &mut visitor).map(|_| ())
+        walk::<true>(self.0.version, self.0.bytes, &mut |event| { visitor(event.utf8()?); Ok(()) }).map(|_| ())
     }
 }
 
-struct Cursor<'a> { bytes: &'a [u8], at: usize, flexible: bool, strings: usize }
-impl<'a> Cursor<'a> {
+/// Borrowed broker fields with the original string bytes, including malformed UTF8.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawBroker<'a> {
+    /// Signed broker node ID.
+    pub id: i32,
+    /// Original hostname bytes, bounded by the wire string limit.
+    pub host: &'a [u8],
+    /// Signed advertised port.
+    pub port: i32,
+    /// Absent before v1 or for a negative nullable length.
+    pub rack: Option<&'a [u8]>,
+}
+
+/// Borrowed topic fields with the original nullable name bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawTopic<'a> {
+    /// Signed Kafka topic error, including unknown codes.
+    pub error: i16,
+    /// Original topic-name bytes; absent names are accepted from v12.
+    pub name: Option<&'a [u8]>,
+    /// Network-order UUID bytes; absent before v10.
+    pub id: Option<&'a [u8; 16]>,
+    /// The wire flag, false before v1.
+    pub internal: bool,
+    /// Number of following partition events for this topic.
+    pub partitions: usize,
+}
+
+/// Events preserve order, duplicates and raw string bytes without replacement or normalization.
+/// Each Topic precedes its declared Partition events and one TopicEnd.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RawEvent<'a> {
+    /// Throttle milliseconds, zero before v3.
+    Throttle(i32),
+    Broker(RawBroker<'a>),
+    /// Cluster/controller fields after all brokers.
+    Cluster {
+        /// Original nullable cluster ID bytes; absent before v2.
+        id: Option<&'a [u8]>,
+        /// Signed controller ID; -1 before v1 or when absent.
+        controller: i32,
+    },
+    Topic(RawTopic<'a>),
+    /// One partition of the current topic.
+    Partition(Partition<'a>),
+    /// Fields following the current topic's partitions.
+    TopicEnd {
+        /// Raw authorization bits; absent before v8.
+        authorized_operations: Option<i32>,
+    },
+    /// Fields after all topics.
+    End {
+        /// Raw cluster authorization bits from v8..10.
+        authorized_operations: Option<i32>,
+        /// Raw signed top-level error; zero before v13.
+        error: i16,
+    },
+}
+impl<'a> RawEvent<'a> {
+    fn utf8(self) -> Result<Event<'a>, ProtocolError> {
+        fn text(bytes: &[u8]) -> Result<&str, ProtocolError> { std::str::from_utf8(bytes).map_err(|_| ProtocolError::UnsupportedUtf8) }
+        Ok(match self {
+            Self::Throttle(value) => Event::Throttle(value),
+            Self::Broker(b) => Event::Broker(Broker { id: b.id, host: text(b.host)?, port: b.port, rack: b.rack.map(text).transpose()? }),
+            Self::Cluster {id, controller} => Event::Cluster { id: id.map(text).transpose()?, controller },
+            Self::Topic(t) => Event::Topic(Topic { error: t.error, name: t.name.map(text).transpose()?, id: t.id, internal: t.internal, partitions: t.partitions }),
+            Self::Partition(value) => Event::Partition(value),
+            Self::TopicEnd {authorized_operations} => Event::TopicEnd {authorized_operations},
+            Self::End {authorized_operations, error} => Event::End {authorized_operations, error},
+        })
+    }
+}
+
+/// A structurally validated Metadata body whose strings remain borrowed byte slices.
+/// Construction and visitation allocate no output storage; the caller owns replacement decoding and its admission.
+#[derive(Clone, Copy, Debug)]
+pub struct RawMetadataView<'a> { version: i16, bytes: &'a [u8], summary: Summary, consumed: usize }
+impl<'a> RawMetadataView<'a> {
+    /// Validates v0..13 fields and nested tags before exposing a view.
+    /// String lengths are checked against the original wire bytes; malformed UTF8 and unconsumed suffixes are retained.
+    pub fn parse(version: i16, bytes: &'a [u8]) -> Result<Self, ProtocolError> {
+        let (summary, consumed) = walk::<false>(version, bytes, &mut |_| Ok(()))?;
+        Ok(Self {version, bytes, summary, consumed})
+    }
+    /// Returns the complete original body, including unknown tags and any unconsumed suffix.
+    pub fn raw(self) -> &'a [u8] { self.bytes }
+    /// Returns bytes after all versioned fields and root tags, without interpreting them.
+    pub fn trailing_bytes(self) -> &'a [u8] { &self.bytes[self.consumed..] }
+    /// Returns the negotiated Metadata version.
+    pub fn version(self) -> i16 { self.version }
+    /// Reports Java's v9 reliability threshold independently of epoch-field presence.
+    pub fn has_reliable_leader_epochs(self) -> bool { self.version >= 9 }
+    /// Returns validated counts and original string byte lengths for caller admission.
+    pub fn summary(self) -> Summary { self.summary }
+    /// Visits validated fields synchronously in original order, with no output allocation.
+    /// String replacement and visitor allocations remain caller-owned.
+    pub fn visit(self, mut visitor: impl FnMut(RawEvent<'a>)) -> Result<(), ProtocolError> {
+        walk::<false>(self.version, self.bytes, &mut |event| { visitor(event); Ok(()) }).map(|_| ())
+    }
+}
+
+struct Cursor<'a, const VALIDATE_UTF8: bool> { bytes: &'a [u8], at: usize, flexible: bool, strings: usize }
+impl<'a, const VALIDATE_UTF8: bool> Cursor<'a, VALIDATE_UTF8> {
     fn take(&mut self, len: usize) -> Result<&'a [u8], ProtocolError> {
         let end = self.at.checked_add(len).ok_or(ProtocolError::InvalidLength)?;
         let bytes = self.bytes.get(self.at..end).ok_or(ProtocolError::Truncated)?;
@@ -185,12 +282,13 @@ impl<'a> Cursor<'a> {
         if n > 1_000_000 { return Err(ProtocolError::ArrayTooLong); }
         Ok(n)
     }
-    fn string(&mut self, nullable: bool) -> Result<Option<&'a str>, ProtocolError> {
+    fn string(&mut self, nullable: bool) -> Result<Option<&'a [u8]>, ProtocolError> {
         let length = if self.flexible { self.varint()?.wrapping_sub(1) } else { i32::from(self.i16()?) };
         if length < 0 { return if nullable { Ok(None) } else { Err(ProtocolError::InvalidLength) }; }
         if length > 32767 { return Err(ProtocolError::StringTooLong); }
         let length = length as usize;
-        let value = std::str::from_utf8(self.take(length)?).map_err(|_| ProtocolError::UnsupportedUtf8)?;
+        let value = self.take(length)?;
+        if VALIDATE_UTF8 { std::str::from_utf8(value).map_err(|_| ProtocolError::UnsupportedUtf8)?; }
         self.strings = self.strings.checked_add(length).ok_or(ProtocolError::InvalidLength)?;
         Ok(Some(value))
     }
@@ -212,11 +310,11 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn walk<'a>(version: i16, bytes: &'a [u8], visitor: &mut impl FnMut(Event<'a>)) -> Result<(Summary, usize), ProtocolError> {
+fn walk<'a, const VALIDATE_UTF8: bool>(version: i16, bytes: &'a [u8], visitor: &mut impl FnMut(RawEvent<'a>) -> Result<(), ProtocolError>) -> Result<(Summary, usize), ProtocolError> {
     if !(0..=13).contains(&version) { return Err(ProtocolError::UnsupportedVersion); }
-    let mut c = Cursor { bytes, at: 0, flexible: version >= 9, strings: 0 };
+    let mut c = Cursor::<VALIDATE_UTF8> { bytes, at: 0, flexible: version >= 9, strings: 0 };
     let mut summary = Summary::default();
-    visitor(Event::Throttle(if version >= 3 { c.i32()? } else { 0 }));
+    visitor(RawEvent::Throttle(if version >= 3 { c.i32()? } else { 0 }))?;
     summary.brokers = c.array()?;
     for _ in 0..summary.brokers {
         let id = c.i32()?;
@@ -224,11 +322,11 @@ fn walk<'a>(version: i16, bytes: &'a [u8], visitor: &mut impl FnMut(Event<'a>)) 
         let port = c.i32()?;
         let rack = if version >= 1 { c.string(true)? } else { None };
         c.tags()?;
-        visitor(Event::Broker(Broker { id, host, port, rack }));
+        visitor(RawEvent::Broker(RawBroker { id, host, port, rack }))?;
     }
     let id = if version >= 2 { c.string(true)? } else { None };
     let controller = if version >= 1 { c.i32()? } else { -1 };
-    visitor(Event::Cluster { id, controller });
+    visitor(RawEvent::Cluster { id, controller })?;
     summary.topics = c.array()?;
     for _ in 0..summary.topics {
         let error = c.i16()?;
@@ -237,7 +335,7 @@ fn walk<'a>(version: i16, bytes: &'a [u8], visitor: &mut impl FnMut(Event<'a>)) 
         let internal = version >= 1 && c.byte()? != 0;
         let partitions = c.array()?;
         summary.partitions = summary.partitions.checked_add(partitions).ok_or(ProtocolError::InvalidLength)?;
-        visitor(Event::Topic(Topic { error, name, id, internal, partitions }));
+        visitor(RawEvent::Topic(RawTopic { error, name, id, internal, partitions }))?;
         for _ in 0..partitions {
             let error = c.i16()?;
             let id = c.i32()?;
@@ -247,16 +345,16 @@ fn walk<'a>(version: i16, bytes: &'a [u8], visitor: &mut impl FnMut(Event<'a>)) 
             let isr = c.ints()?;
             let offline = if version >= 5 { c.ints()? } else { Int32Array(&[]) };
             c.tags()?;
-            visitor(Event::Partition(Partition { error, id, leader, leader_epoch, replicas, isr, offline }));
+            visitor(RawEvent::Partition(Partition { error, id, leader, leader_epoch, replicas, isr, offline }))?;
         }
         let authorized_operations = if version >= 8 { Some(c.i32()?) } else { None };
         c.tags()?;
-        visitor(Event::TopicEnd { authorized_operations });
+        visitor(RawEvent::TopicEnd { authorized_operations })?;
     }
     let authorized_operations = if (8..=10).contains(&version) { Some(c.i32()?) } else { None };
     summary.error = if version >= 13 { c.i16()? } else { 0 };
     c.tags()?;
     summary.string_bytes = c.strings;
-    visitor(Event::End { authorized_operations, error: summary.error });
+    visitor(RawEvent::End { authorized_operations, error: summary.error })?;
     Ok((summary, c.at))
 }

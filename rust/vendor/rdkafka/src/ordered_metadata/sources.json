@@ -43,6 +43,9 @@
     "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_queue.c": "c04b8248715327afdd856b59cd2277201138a1e19e5a401ab04c1a6eff3e428e",
     "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.c": "b13ad292b72394993717f127f7e5da15e1b003921a5765e69a120ff65c21e226",
     "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.h": "315d1a9f8ff17708bb4d1db2980ab49b11d7b90aef14088af7a8a7b0b08a9d53",
-    "rust/vendor/rdkafka-sys/librdkafka/src/rdavg.h": "eca75b6b9ecee763c29571ed2e7d7932da150269f666dc1d99a0044fe9afe6e8"
-  }
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdavg.h": "eca75b6b9ecee763c29571ed2e7d7932da150269f666dc1d99a0044fe9afe6e8",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_mock.c": "8a853438de7537e263ae9a301353022ff210f754a4a19bd049a57eb02aa0be82",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_mock_handlers.c": "df6f665f30cbb08cacbed0c82f500d89c9c6ec28c5f4514d07f57b51712c5e1d"
+  },
+  "raw_string_api_baseline_commit": "65c7eaf41119d132d7182f0d086c68d5415f9dfb"
 }
