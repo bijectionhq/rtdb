@@ -327,5 +327,4 @@ impl<T> PreparedSend<T> {
 }
 
 #[cfg(test)]
-#[path = "state/tests.rs"]
 mod tests;

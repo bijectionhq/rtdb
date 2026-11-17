@@ -91,7 +91,7 @@ impl Holder {
         result?;
         let nodes = Shared::new(brokers.finish(budget)?, budget)?;
         let mut topics: Vector<Topic> = Vector::with_capacity(view.summary().topics, budget)?;
-        let mut result = Ok(());
+        let mut result: rtdb_types::Result<()> = Ok(());
         view.visit(|event| {
             if result.is_err() { return; }
             result = (|| {
