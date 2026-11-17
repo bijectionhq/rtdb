@@ -36,5 +36,13 @@ The passive builder follows the pinned Temurin 25.0.1+8 `PKIXValidator`, `PKIXPa
 ** Candidate DER and hashes are compact retained values; canonical trusted-subject copies have independent actual-size reservations.
 ** Distinguished names, identifiers, SAN and CA-extension parsers are call-local and release their larger scratch reservations after each comparison or check.
 ** DFS frames own their candidate reservations, and failed attempts release their scratch before another candidate is visited.
+** One passive `PathMetadata` value borrows the selected original chain and retains an admitted immutable non-anchor facts array through native validation.
+   Shared Java BC/KU/EKU decoding precedes native metadata filtering; each parser's scratch is released after its result is consumed.
+   The retained allowance includes the facts array and conservative per-certificate native-copy allowance of 64 KiB plus 64 times the DER length, rather than a complete native allocator bound.
+
+The selected path uses reverse Java `KeyChecker` and signed `ConstraintsChecker` rules, including immediate-anchor legacy rollover and non-self-issued path-length consumption.
+The same parsed KU facts supply the SSLAlgorithmConstraints primitive gate.
+Leaf KU/EKU decisions use shared Java parsing after selection; malformed-only intermediate EKU does not restrict the path.
+Netscape certificate types, name constraints and other native extension caches retain separate parsing qualifications.
 
 The regression sources cover asymmetric rotations, hash-to-tree insertion, comparator precedence, SAN and BER-NULL key repetition, depth, branch return, post-selection failures, and reservation release with a default-sized trust set.

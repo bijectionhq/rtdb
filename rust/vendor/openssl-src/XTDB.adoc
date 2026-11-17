@@ -48,6 +48,21 @@ Version-1/version-2 intermediates require Java self-issuance and immediate place
 Per-certificate metadata allocation is admitted before the native call and released after all copies are destroyed.
 The regression sources are `../../crates/kafka/src/tls/validation/pkix/tests/selected_chain.rs`; they have not been compiled or executed during Phase 1.
 
+`X509_STORE_CTX_verify_selected_java_chain` is an additive entry point for callers that have parsed Java BC/KU/EKU states before native verification.
+Its borrowed immutable facts array contains only non-anchor members, in leaf-first order, with signed BasicConstraints, Java self-issuance and high-bit-first KeyUsage permissions.
+A tagged policy in the passive native metadata owner chooses between the original selected-chain rules and the Java-facts rules.
+Java-mode metadata excludes every BC/KU/EKU copy; the original entry point continues to parse those extensions natively.
+Reverse intermediate checks follow Java's `KeyChecker` before `ConstraintsChecker`, preserving signed limits and decrementing only for non-self-issued intermediates.
+Exactly `-1` rejects CA status; another negative limit is retained until a later non-self-issued intermediate consumes it.
+Version-1/version-2 self-issued intermediates are allowed only immediately below the anchor.
+A callback that overrides a path-length failure observes the original certificate, and signed decrement uses Java wrapping at the minimum 32-bit value.
+Original encodings still supply signatures, dates, callback certificate values and returned chain references.
+Caller-owned post-selection checks supply anchor BC/KU and leaf server KU/EKU decisions.
+Netscape types, native name-constraint matching and other extension caches remain independent Java compatibility qualifications.
+The Rust call-local aggregate admits its fact array and a conservative 64 KiB plus 64 times DER length allowance for each native metadata copy; this is not a complete native allocation bound.
+The Java-facts regression sources are `../../crates/kafka/src/tls/validation/pkix/tests/selected_chain/java_constraints.rs`, with admission sources in `../../crates/kafka/src/tls/security/pkix.rs`.
+They have not been compiled or executed during Phase 1.
+
 `X509_set0_retained_owner`, `X509_CRL_set0_retained_owner` and `X509_STORE_set0_retained_owner` attach one passive resource owner to a native object's lifetime.
 The setter transfers the opaque owner only on success, requires exclusive access before publication and rejects a second owner or a null destruction callback.
 Native reference-counted aliases retain that same owner until the last reference is released.

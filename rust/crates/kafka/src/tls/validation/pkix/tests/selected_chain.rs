@@ -262,3 +262,5 @@ fn selected_native_anchor_key_usage_is_owned_by_the_java_policy_caller() {
     assert!(verify_store(&store(&[root]), &[leaf], &now(), &charge).is_err());
     drop(charge); assert_eq!(memory.used_bytes(), 0);
 }
+
+mod java_constraints;

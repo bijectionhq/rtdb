@@ -58,7 +58,20 @@ fn date_index() -> Result<i32> {
     }).as_ref().copied().map_err(invalid)
 }
 
+#[cfg(test)]
 fn verify_with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, originals: &StackRef<X509>, self_issued: &[u8]) -> Result<bool> {
+    with_dates(context, now, |context| unsafe {
+        X509_STORE_CTX_verify_selected_chain(context.as_ptr(), originals.as_ptr(), self_issued.as_ptr(), self_issued.len())
+    })
+}
+
+fn verify_java_with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, originals: &StackRef<X509>, metadata: &super::super::security::PathMetadata<'_>) -> Result<bool> {
+    with_dates(context, now, |context| unsafe {
+        X509_STORE_CTX_verify_selected_java_chain(context.as_ptr(), originals.as_ptr(), metadata.facts().as_ptr(), metadata.facts().len())
+    })
+}
+
+fn with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, verify: impl FnOnce(&mut X509StoreContextRef) -> i32) -> Result<bool> {
     let index = date_index()?;
     let previous = unsafe { X509_STORE_CTX_get_verify_cb(context.as_ptr()) };
     let data = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(context.as_ptr(), index) };
@@ -67,7 +80,7 @@ fn verify_with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, origi
     if result != 1 { return Err(invalid(openssl::error::ErrorStack::get())); }
     let _restore = RestoreCallback { context: context.as_ptr(), previous, data, index };
     unsafe { X509_STORE_CTX_set_verify_cb(context.as_ptr(), Some(check_date)); }
-    let verified = unsafe { X509_STORE_CTX_verify_selected_chain(context.as_ptr(), originals.as_ptr(), self_issued.as_ptr(), self_issued.len()) };
+    let verified = verify(context);
     if verified < 0 { Err(invalid(openssl::error::ErrorStack::get())) } else { Ok(verified == 1) }
 }
 
@@ -127,7 +140,9 @@ unsafe extern "C" fn verify_native(context: *mut openssl_sys::X509_STORE_CTX, op
 }
 
 unsafe extern "C" {
+    #[cfg(test)]
     fn X509_STORE_CTX_verify_selected_chain(context: *mut openssl_sys::X509_STORE_CTX, chain: *mut openssl_sys::stack_st_X509, self_issued: *const u8, count: usize) -> i32;
+    fn X509_STORE_CTX_verify_selected_java_chain(context: *mut openssl_sys::X509_STORE_CTX, chain: *mut openssl_sys::stack_st_X509, facts: *const super::super::security::JavaCertificateFacts, count: usize) -> i32;
     fn SSL_CTX_set_cert_verify_callback(context: *mut openssl_sys::SSL_CTX, callback: Option<unsafe extern "C" fn(*mut openssl_sys::X509_STORE_CTX, *mut c_void) -> i32>, opaque: *mut c_void);
     fn X509_STORE_CTX_get0_cert(context: *const openssl_sys::X509_STORE_CTX) -> *mut openssl_sys::X509;
     fn X509_STORE_CTX_get0_untrusted(context: *const openssl_sys::X509_STORE_CTX) -> *mut openssl_sys::stack_st_X509;

@@ -163,6 +163,31 @@ int X509_STORE_CTX_verify(X509_STORE_CTX *ctx);
  */
 int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
     STACK_OF(X509) *chain, const unsigned char *self_issued, size_t count);
+/* Java getBasicConstraints(), self-issued equality and first-byte KeyUsage permissions for one certificate. */
+typedef struct {
+    int32_t basic_constraints;
+    unsigned char self_issued;
+    unsigned char key_usage;
+} X509_JAVA_CERTIFICATE_FACTS;
+
+/*
+ * Verify a caller-selected chain using OpenJDK 25 ConstraintsChecker and KeyChecker facts.
+ * - The context and chain have the same preconditions, reference ownership and callback behavior as X509_STORE_CTX_verify_selected_chain().
+ *   Calls on one context require exclusive access; independent contexts share no mutable facts.
+ * - facts has count == chain length - 1 entries, in leaf-first order, with 1 <= count < INT_MAX.
+ *   The final chain certificate is the anchor and has no facts entry.
+ *   The immutable array is borrowed only until return and is neither retained nor freed.
+ * - The caller must first parse all non-anchor BasicConstraints, KeyUsage and ExtendedKeyUsage with Java's duplicate, criticality and malformed-value rules.
+ *   basic_constraints is the signed Java getBasicConstraints() result; exactly -1 means not a CA.
+ *   self_issued is 0 or 1 under Java name equality.
+ *   key_usage contains usage bits zero through seven, high bit first, with undeclared bits zero and absent usage 0xff.
+ * - Non-anchor metadata excludes all BC/KU/EKU copies and noncritical identifiers.
+ *   Signatures, dates and callbacks use original certificates; anchor checks and leaf server-usage checks remain the caller's responsibility.
+ * - Returns 1 on success, 0 on validation failure, -1 on error.
+ *   A failed call can retain the original chain in the context until normal cleanup.
+ */
+int X509_STORE_CTX_verify_selected_java_chain(X509_STORE_CTX *ctx,
+    STACK_OF(X509) *chain, const X509_JAVA_CERTIFICATE_FACTS *facts, size_t count);
 STACK_OF(X509) *X509_build_chain(X509 *target, STACK_OF(X509) *certs,
     X509_STORE *store, int with_self_signed,
     OSSL_LIB_CTX *libctx, const char *propq);

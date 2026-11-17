@@ -43,7 +43,7 @@ impl Search<'_> {
         let selected = self.select()?;
         if selected.len() > 1 {
             super::super::super::security::verify_pkix_anchor(selected.last().expect("selected anchor"), self.charge.budget())?;
-            super::super::server_usage(&selected[0])?;
+            super::super::pkix_server_usage(&selected[0], self.charge.budget())?;
             let references = selected.iter().map(X509::as_ref).collect::<Vec<_>>();
             super::super::super::security::verify_server_distrust(&references)?;
         }
@@ -87,7 +87,8 @@ impl Search<'_> {
             }
         }
         for certificate in chain { identifiers(certificate, self.charge)?; }
-        super::super::super::security::verify_server_path(chain)?;
+        let metadata = super::super::super::security::PathMetadata::decode(chain, self.charge.budget())?;
+        metadata.verify_ssl_algorithms()?;
         super::policy::verify(chain, self.charge)?;
         for certificate in &chain[..chain.len() - 1] {
             super::super::critical_extensions(certificate, &[Nid::BASIC_CONSTRAINTS, Nid::NAME_CONSTRAINTS, Nid::CERTIFICATE_POLICIES,
@@ -97,19 +98,11 @@ impl Search<'_> {
             }
         }
         let _scratch = reserve(chain.iter().copied(), self.charge)?;
-        let metadata_bound = chain[..chain.len() - 1].iter().try_fold(0usize, |bound, certificate| {
-            let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), ptr::null_mut()) };
-            usize::try_from(length).ok().and_then(|length| length.checked_mul(64)).and_then(|length| length.checked_add(65_536))
-                .and_then(|length| bound.checked_add(length)).ok_or_else(|| invalid("TLS selected-chain metadata exceeds allocation range"))
-        })?;
-        let _metadata = self.charge.budget().reserve(metadata_bound)?;
         let store = X509StoreBuilder::new().map_err(invalid)?.build();
         let untrusted = Stack::new().map_err(invalid)?;
         let mut originals = Stack::new().map_err(invalid)?;
-        let mut self_issued = Vec::with_capacity(chain.len());
         for certificate in chain {
             originals.push((*certificate).to_owned()).map_err(invalid)?;
-            self_issued.push(u8::from(self.same_name(certificate.subject_name(), certificate.issuer_name())?));
         }
         let mut context = X509StoreContext::new().map_err(invalid)?;
         context.init(&store, chain[0], &untrusted, |context| {
@@ -120,7 +113,7 @@ impl Search<'_> {
                 let ssl = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(self.source.as_ptr(), ssl_index) };
                 if !ssl.is_null() && unsafe { X509_STORE_CTX_set_ex_data(context.as_ptr(), ssl_index, ssl) } != 1 { return Err(invalid(openssl::error::ErrorStack::get())); }
                 unsafe { X509_STORE_CTX_set_verify_cb(context.as_ptr(), X509_STORE_CTX_get_verify_cb(self.source.as_ptr())); }
-                if !verify_with_dates(context, self.now, &originals, &self_issued)? { return Err(invalid(context.error())); }
+                if !verify_java_with_dates(context, self.now, &originals, &metadata)? { return Err(invalid(context.error())); }
                 let selected = context.chain().ok_or_else(|| invalid("TLS PKIX validation produced no chain"))?;
                 if selected.len() != chain.len() || selected.iter().zip(chain.iter()).any(|(selected, expected)| selected.as_ptr() != expected.as_ptr()) {
                     return Err(invalid("TLS PKIX validation changed the selected certificate path"));

@@ -52,6 +52,7 @@ Fields after a parsed path length are ignored.
 Absent usage permits certificate signing, digital signatures and cryptographic primitives.
 Parsed usage requires bit five for certificate signing, bit zero for digital signatures and any bit from zero through six for an algorithm primitive.
 Short arrays supply false for missing bits; isolated encipherOnly or decipherOnly bits grant no primitive.
+`permitted_bits` exposes the first eight decisions in high-bit-first order, with absence represented by `0xff` and undeclared parsed bits masked to zero.
 The parser accepts one primitive OCTET STRING wrapper and masks BER padding bits beyond the declared bit length.
 Signed length arithmetic and backing-capacity checks follow `DerValue.getUnalignedBitString` and `BitArray` on the standalone extension-value array.
 * Malformed noncritical extensions are absent.
