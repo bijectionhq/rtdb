@@ -187,19 +187,19 @@
   // No match found
   x2("(?:(?'name'a)|(?'name'b))(?('name')c|d)e", "ace", 0, 3);
 
-  // Compile failed: ParseError(0, InvalidEscape("\\R"))
+  // Compile failed: CompileError(FeatureNotYetSupported("Java node atoms require java_matching"))
   x2("\\R", "\r\n", 0, 2);
 
-  // Compile failed: ParseError(0, InvalidEscape("\\R"))
+  // Compile failed: CompileError(FeatureNotYetSupported("Java node atoms require java_matching"))
   x2("\\R", "\r", 0, 1);
 
-  // Compile failed: ParseError(0, InvalidEscape("\\R"))
+  // Compile failed: CompileError(FeatureNotYetSupported("Java node atoms require java_matching"))
   x2("\\R", "\n", 0, 1);
 
-  // Compile failed: ParseError(0, InvalidEscape("\\R"))
+  // Compile failed: CompileError(FeatureNotYetSupported("Java node atoms require java_matching"))
   x2("\\R", "\x0b", 0, 1);
 
-  // Compile failed: ParseError(0, InvalidEscape("\\R"))
+  // Compile failed: CompileError(FeatureNotYetSupported("Java node atoms require java_matching"))
   x2("\\R", "\xc2\x85", 0, 2);
 
   // Compile failed: ParseError(0, InvalidEscape("\\N"))
@@ -528,27 +528,6 @@
 
   // Compile failed: ParseError(3, InvalidEscape("\\Y"))
   x2("...\\Y.", "\xE3\x80\xB0\xCC\x82\xE2\x80\x8D\xE2\xAD\x95", 0, 11);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\x0d\x0a", 0, 2);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\x67\xCC\x88", 0, 3);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\xE1\x84\x80\xE1\x85\xA1\xE1\x86\xA8", 0, 9);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\xE0\xAE\xA8\xE0\xAE\xBF", 0, 6);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\xE0\xB8\x81\xE0\xB8\xB3", 0, 6);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("^\\X$", "\xE0\xA4\xB7\xE0\xA4\xBF", 0, 6);
-
-  // Compile failed: ParseError(1, InvalidEscape("\\X"))
-  x2("h\\Xllo", "ha\xCC\x80llo", 0, 7);
 
   // Compile failed: ParseError(2, UnknownFlag("(?y"))
   x2("(?y{g})\\yabc\\y", "abc", 0, 3);
