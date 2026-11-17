@@ -1,0 +1,93 @@
+= Java private-key factory admission
+
+`PrivateKey::decode` checks recovered PKCS8 through the pinned Java 25 default private-key factory rules before a SunX509 PKCS12 entry can be filtered for an empty certificate chain.
+The caller owns decryption, the recovered-key algorithm preparse, and empty-password retry.
+The preparse accepts one or two AlgorithmIdentifier fields, so this module retains that restriction when reading the identifier even though the DH factory alone ignores later identifier fields.
+Generic `KeyStore`, deferred NewSunX509 recovery, and SunX509 JKS recovery have separate entrypoints.
+This decoder never imports a key into OpenSSL and never compares it with a certificate.
+
+`PrivateKey` is an immutable passive owner of provider-returned PKCS8 bytes and its memory reservation.
+Parsing and encoding complete on the caller, with no tasks, global mutable state, retained password, or published construction state.
+The PKCS8 frame, algorithm identifier, parameters, integer slices, and optional fields are call-local views or zeroizing transients.
+The resulting key owns zeroizing encoded bytes and retains its lease until drop.
+Copies made by a transport require separate admission.
+
+== Default provider behavior
+
+The provider and helper sources are pinned in link:sources.sha256[the source manifest] from Eclipse Temurin OpenJDK `25.0.1+8` for Linux x64.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`, and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+The built-in SUN, SunRsaSign, SunEC, and SunJCE registrations determine algorithm dispatch and parameter services.
+Installed providers, configured PKCS11 providers, and Java system-property overrides remain outside this source-owned decoder.
+RSA admission uses the pinned default `sun.security.rsa.restrictRSAExponent=true`.
+
+Common PKCS8 factory implementations accept signed integer versions zero and one, primitive private-key OCTET STRINGs, optional opaque attributes, and the version-one implicit public BIT STRING.
+Attributes are omitted from version-zero output and emitted with constructed context tag zero for version one.
+Public bits normalize unused padding bits and use primitive context tag one.
+AlgorithmId NULL normalization follows the shared Java DER helper, while provider AlgorithmParameters validation belongs here.
+An unregistered key algorithm fails before empty-chain filtering.
+
+RSA and RSASSA-PSS require a PKCS1 sequence with version zero and eight nonempty integer components.
+The components use Java's unsigned interpretation even when their encoded sign bit is set.
+Modulus length rounds up to a byte and must be between 512 and 16,384 bits inclusive.
+Above 3,072 modulus bits, the default provider limits the public exponent to 64 bits.
+The factory checks these limits before deciding whether CRT components are present.
+A zero public exponent, prime, prime exponent, or CRT coefficient rebuilds a version-zero non-CRT key containing only the normalized modulus and private exponent.
+The private exponent may itself be zero.
+RSA, its historical PKCS1 alias, and its ITU X509 alias dispatch to the RSA factory.
+The ordinary RSA CRT path retains non-NULL parameters because the default providers register no `AlgorithmParameters.RSA` service.
+A non-CRT rebuild uses the canonical RSA identifier and drops those unparsed parameters.
+
+PSS parameters accept absent or NULL parameters and the provider's explicit context fields, including repeated fields whose last value wins.
+Salt length must be a nonnegative signed 32-bit integer, trailer field must be one, and the mask-generation algorithm must be MGF1.
+MGF1 digest names are SHA-1, SHA-224/256/384/512, SHA-512/224, SHA-512/256, and the four SHA3 digests.
+The main hash identifier is not restricted to that list at factory admission.
+The CRT path retains its parameter encoding; the non-CRT path regenerates the parameter sequence from its resulting hash, MGF digest, and salt values, omitting defaults.
+Context-field contents may retain unused trailing bytes as Java does.
+
+DSA accepts absent or NULL parameters, or a sequence of exactly three signed integers for p, q, and g.
+Its private x value is signed, and trailing bytes after that integer inside the private-key octets are retained without parsing.
+The historical OIW DSA identifier dispatches to the same factory.
+
+DH accepts only version zero, requires a sequence containing signed p and g plus an optional signed 32-bit private-value length, and rejects optional outer PKCS8 fields.
+Its signed x value may have trailing bytes inside the private-key octets.
+Both registered DH names select these rules, including the X9.42 OID that Java maps to DiffieHellman.
+The DH factory retains the original input encoding, including BER length forms and integer padding.
+
+EC requires one of the 53 named-curve OIDs initialized by `CurveDB`, and an inner ECPrivateKey sequence with version one and primitive scalar octets.
+The factory does not impose a scalar length or range check during this path.
+Inner context zero carries opaque domain parameters.
+Inner context one contains a nested BIT STRING that is validated and replaces any outer version-one public bits.
+Its backing-length checks retain local unparsed suffixes after BER conversion and retain enclosing suffixes only for borrowed views.
+Remaining fields after that public field, and bytes after the inner ECPrivateKey sequence, are ignored by the factory.
+link:curves.rs[The curve OIDs] are derived from active `CurveDB.add` calls and `KnownOIDs` values; commented-out curve registrations are excluded.
+Upstream headers are retained in link:COPYRIGHT[COPYRIGHT], with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+X25519, X448, Ed25519, and Ed448 require primitive inner scalar octets of 32, 56, 32, and 57 bytes respectively.
+Bytes following those octets are retained without parsing.
+Non-NULL AlgorithmIdentifier parameters remain opaque because the pinned providers register no AlgorithmParameters service for these names.
+
+ML-DSA-44/65/87 and ML-KEM-512/768/1024 use `NamedKeyFactory` and `NamedPKCS8Key`.
+They require absent or NULL AlgorithmIdentifier parameters and primitive inner key octets.
+This factory stage imposes no cryptographic key-length check, including on empty key octets.
+HSS/LMS private-key generation always fails in the pinned provider.
+
+== Admission and remaining source work
+
+Decode reserves `128 * input_bytes + 65,536` before parsing, with checked arithmetic.
+The source estimate covers one shared Java BER converter's growing section vector, normalized frame and algorithm owners, a fixed number of provider parameter/key views, and the temporary encoded fragments plus final output.
+On a 64-bit target, the converter's section payload is at most 40 bytes per section, with each section requiring at least two input bytes; old and replacement vector capacities can overlap during growth.
+The 128 multiplier leaves room for that overlap and the bounded simultaneously retained byte owners.
+RSA component collections have eight members, optional PKCS8 fields have at most two members, and PSS retains only its last digest, MGF digest, and salt values.
+Recursive nested PSS AlgorithmParameters are not traversed.
+The fixed allowance covers small owner/control allocations and bounded OID representations.
+The estimate is conservative source accounting rather than a measured allocator high-water bound.
+Temporary owners drop before the reservation shrinks to retained encoded capacity, owner size, and 128 bytes of reservation overhead.
+Malformed data, unsupported factories, unsupported nested parameters, and budget exhaustion release their reservations.
+
+Nested PSS hash identifiers can select arbitrary AlgorithmParameters services.
+This decoder validates nested DSA, DH, and EC parameters and preserves parameters for identifiers without a registered service.
+Nested PSS, OAEP, AES, legacy PBE, PBES2, DESede, Blowfish, and ChaCha20-Poly1305 parameter services currently return an explicit unsupported-parameters error.
+The parameter-dependent `SpecifiedSHA2withECDSA` name is also unsupported in that nested position.
+Successful factory admission does not establish native TLS import, signing, key/certificate consistency, or cryptographic validity.
+
+Regression sources cover PKCS8 fields and BER framing, provider aliases, RSA range and CRT fallback behavior, PSS defaults and errors, signed DSA/DH values and retained tails, all registered EC curves, nested EC public bits, XDH/EdDSA scalar lengths, named post-quantum acceptance, HSS rejection, and reservation lifetime.

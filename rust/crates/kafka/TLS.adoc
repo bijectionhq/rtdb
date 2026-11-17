@@ -55,7 +55,10 @@ Recovered native keys retain independent reservations and both random-provider c
 PEM keys and `SunX509` Java keys remain eager.
 SunX509 JKS credentials resolve raw aliases through Java lowercase lookup and recover every resolved key before discarding an empty chain.
 Aliases that resolve to the same entry share retained key and certificate material; native per-alias imports receive separate admission.
-JKS credential loading and native context construction accept native-supported mismatched private keys and certificates.
+SunX509 PKCS12 credentials use provider alias replacement and issuer-chain rules, then recover private and secret entries before filtering secrets or empty chains.
+Private recovery uses the pinned Java factory admission rules; secret recovery checks the registered protection and secret-key services before discarding the key.
+The link:../tls/src/sun_pkcs12/README.adoc[Sun PKCS12 reference] describes PBE/MAC parameters, empty-password retry and independently admitted construction and recovery owners.
+SunX509 credential loading and native context construction accept native-supported mismatched private keys and certificates.
 The leaf certificate supplies the selection key type, and public-value mismatch can fail later when installing the selected key for a handshake.
 Both transports keep the peer's certificate signature preferences separate from its CertificateVerify schemes.
 TLS 1.3 uses `signature_algorithms_cert` when present, with the unfiltered `signature_algorithms` list as its fallback.
@@ -146,8 +149,9 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 == Open parity gaps
 
-The eager `SunX509` PKCS12 decoder still differs in provider alias lookup, issuer-chain recovery and recovery before filtering keys without matched certificates.
-PKCS12 secret-key entries also require eager recovery before Java's private-key filter; their protected payload and recovery semantics remain unimplemented on this path.
+SunX509 PKCS12 private-factory admission retains explicit unsupported nested parameter services and pinned default-provider assumptions.
+Native certificate parsing, re-encoding and issuer self-signature verification do not yet establish the full Java CertificateFactory acceptance boundary.
+The unchanged deferred PKCS12 decoder recognizes CRLBag suffix four as secret metadata and misses actual SecretBag suffix five; NewSunX509 alias replacement remains open for those bags.
 The SunX509 JKS parser implements Java protection-envelope and PKCS8 framing, while AlgorithmParameters validation and provider-specific KeyFactory normalization remain open.
 Java can retain a generic PKCS8 key after provider rejection; native import can reject that key while constructing the transport.
 SunX509 selection still applies native `SSL_check_chain` qualification, and native installation checks public-key values earlier than Java's signature proof.

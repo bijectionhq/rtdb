@@ -1,0 +1,97 @@
+= SunX509 PKCS12 eager loading
+
+`SunX509Pkcs12Store` is a passive immutable owner for the pinned default-provider eager PKCS12 path.
+`SunX509Pkcs12Identity` owns one normalized UTF-16 alias, an admitted private key, a nonempty leaf-first certificate chain, and the chain reservation.
+The private key retains its own independent reservation and zeroizing encoding.
+The caller supplies store and effective key passwords explicitly; neither password survives loading.
+Generic `KeyStore`, deferred `ProtectedKeyStore`, and eager SunX509 JKS have separate entrypoints.
+
+`LoadedPkcs12` is a single-writer construction transient containing ordered alias bindings, all parsed private entries, shared source certificates and the provider counters.
+The alias vector owns each final private, secret or trusted binding; a private binding indexes its entry in the transient's private-entry collection.
+Replacement preserves the first alias position and the last entry value.
+All private entries participate in load-time certificate-chain construction, including overwritten entries.
+Only the final alias bindings perform eager recovery.
+The completed owner contains credentials only; construction metadata and protected entries are released before publication.
+
+== Provider behavior
+
+The source manifest pins Eclipse Temurin OpenJDK `25.0.1+8` for Linux x64 in link:sources.sha256[sources.sha256].
+The upstream headers are retained in link:COPYRIGHT[COPYRIGHT], with the shared link:../private_factory/LICENSE[GPLv2 with Classpath Exception], link:../private_factory/ASSEMBLY_EXCEPTION[assembly exception], and link:../private_factory/ADDITIONAL_LICENSE_INFO[additional license information].
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`, and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+`PKCS12KeyStore`, `SunX509KeyManagerImpl`, `ContentInfo`, `MacData`, `EncryptedPrivateKeyInfo`, and the registered SunJCE services determine loading and recovery order.
+
+The PFX stream consumes its first value, accepts SEQUENCE or SET through `toDerInputStream`, and ignores trailing stream bytes.
+ContentInfo requires one or two sequence members and ignores the explicit wrapper's tag while requiring exactly one contained value.
+Authenticated sections load before MAC verification.
+A missing store password skips encrypted sections and MAC verification without discarding protected private entries.
+SafeContents bag arrays and attribute sets validate their framing before their individual members are interpreted.
+SecretBag uses OID suffix five; CRLBag suffix four and other unsupported bag types are ignored after their envelope and attributes are parsed.
+The link:attributes.adoc[bag attribute reference] describes UTF-16 alias decoding, swallowed outer-set framing failures and typed unknown attributes.
+
+Aliases use the shared pinned locale-English lowercase rules.
+An absent private local-key ID becomes ASCII `01` only for the first encountered private bag; later private bags without an ID are skipped.
+The private counter advances before this filtering.
+Generated aliases increment only when a retained key or trusted certificate lacks a friendly name.
+Certificate matching prefers the first full ID-and-Java-case-insensitive-name match, then the last ID match, then the last name match.
+The missing certificate-ID workaround applies only to index zero in the current SafeContents when exactly one private bag has been encountered.
+
+Chains compare Java distinguished names and stop on repeated encoded certificates.
+Equal subject and issuer names stop a chain only when the certificate verifies with its own public key.
+Without an authority key identifier, the first issuer-name match wins.
+With one, the first exact encoded identifier match wins; otherwise the last issuer-name match without a subject-key identifier is the fallback.
+Different subject identifiers and different issuer names cannot provide that fallback.
+
+SunX509 recovers each final key entry before filtering secret keys and private entries without chains.
+Private recovery includes the Java signed-version and AlgorithmIdentifier preparse followed by link:../private_factory/README.adoc[private-factory admission].
+There is no generic-key fallback on this PKCS12 path.
+Secret recovery accepts any signed 32-bit version, one or two algorithm-identifier fields, and nonempty primitive key octets.
+It ignores the inner algorithm parameters and trailing inner fields as Java does.
+Unknown non-PBE OIDs can produce a valid discarded SecretKeySpec; known PBE names require a registered secret-key factory.
+Private-key and certificate algorithms or values are not matched by this owner.
+
+== Protection services
+
+The passive per-call `Protection` value owns validated cipher parameters and retains no password or mutable provider state.
+SunJCE PKCS12 legacy protection admits RC4-128, RC4-40, SHA1/DESede, RC2-128 and RC2-40.
+The unregistered two-key DESede OID is rejected.
+Legacy cipher passwords pass through UTF-8 PBEKey bytes masked to seven-bit characters before PKCS12 derivation.
+MAC passwords use the UTF-8 decode followed by UTF-16 PKCS12 representation.
+The single NUL password selects the legacy empty-password representation.
+Legacy ciphers and MAC require at least eight salt bytes and positive iterations.
+PBEWithMD5AndDES uses UTF-8 password bytes, exactly eight salt bytes and the repeated MD5 derivation.
+
+PBES2 admits AES-128-CBC or AES-256-CBC and the registered SHA1, SHA224, SHA256, SHA384, SHA512, SHA512/224 and SHA512/256 PRFs.
+Its optional PBKDF2 key length is parsed as a signed integer and overwritten by the cipher size.
+Its salt contains at least eight bytes, its IV contains sixteen bytes, negative iterations fail, and zero iterations select the provider default of 4096.
+The legacy nested PBES2 parameter wrapper and the provider's ignored parameter tails are retained.
+Encoded PBE and MAC iteration counts above 5,000,000 fail before derivation.
+
+An empty supplied password retries with a single NUL after a semantic cipher, parser or factory failure.
+The retry covers decryption and recovered-key parsing together.
+Encrypted SafeContents retry also covers bag loading and preserves any construction mutations from a partially successful first attempt.
+Memory-admission failure is fatal and never enters this retry.
+
+== Admission and remaining limits
+
+Initial admission is `64 * input_bytes + 16 * supplied_password_utf8_bytes + 65,536`, matching the eager JKS caller bound.
+Loading acquires an additional `192 * input_bytes` transient reservation before parsing and retains it until every construction owner is released.
+Each encrypted section and key recovery separately reserves `512 * protected_bytes + 16 * effective_password_utf8_bytes + 65,536` for its simultaneously live normalization, password, derivation and plaintext owners.
+Private-factory parsing retains its own scratch and resulting-key reservation.
+Each private chain reserves its maximum certificate-reference vector before expansion and shares source certificate bytes.
+Final credential chains reserve `16 * certificate_bytes + 64 * certificate_count + 65,536` before copying and shrink to their retained vector capacities and owner overhead.
+Native transports reserve their own per-alias key and certificate imports.
+These are conservative source bounds, not measured allocator high-water results.
+
+Secret DER normalization, decrypted sections, private encodings, secret-key octets and password representations use zeroizing owners.
+Secret byte buffers receive their complete capacity before contents are appended.
+Cipher and digest implementation state remains owned by the native crypto library; the Rust buffer guarantee does not characterize every native or scalar temporary.
+Metadata aliases, certificate bytes and local-key identifiers are retained as provider metadata.
+
+Native X509 certificate parsing, certificate re-encoding and signature verification remain dependencies whose full Java CertificateFactory acceptance is not established here.
+The private-factory reference records its explicit unsupported nested parameter services and pinned-provider assumptions.
+Factory acceptance does not establish native TLS import, signing support or cryptographic validity.
+Custom providers and provider configuration overrides remain outside this decoder.
+SunX509 native chain qualification and public-key installation checks still constrain handshake behavior separately.
+The unchanged deferred PKCS12 decoder recognizes the CRL suffix four as secret metadata and does not yet recognize the actual SecretBag suffix five; its alias-replacement parity remains open.
+
+Regression sources cover eager private and secret recovery, alias collisions, missing IDs, provider framing, issuer selection, signed-value and PBE rules, memory release, producer and registry construction, and native client authentication.
