@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_plan::{AggregateFunction, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp};
+use rtdb_plan::{AggregateFunction, BinaryOp, ColumnId, Expr, Field, JoinKind, Relation, RelationNode, Schema, UnaryOp,
+    RegexFormView, RegexFormKind as F, RegexForms, RegexLiteralView, RegexLiteralKind as LiteralKind};
 use rtdb_types::{Keyword, LogicalType, Result, ScalarType, Value};
 use crate::invalid;
 
@@ -145,13 +146,13 @@ fn form(expr: &Expr, columns: &BTreeMap<ColumnId, String>) -> Result<String> {
     let child = |expr: &Expr| form(expr, columns);
     let call = |name: &str, args: Vec<String>| if args.is_empty() { format!("({name})") } else { format!("({name} {})", args.join(" ")) };
     Ok(match expr {
-        Expr::Literal(value) => literal(value)?,
+        Expr::Literal(value) => literal(RegexLiteralView::new(value))?,
         Expr::Column { id, .. } | Expr::Correlated { id, .. } => columns.get(id).cloned().unwrap_or_else(|| format!("_column_{}", id.0)),
         Expr::Parameter { index, .. } => format!("?_{}", index),
         Expr::Unary { op, expr } => call(match op { UnaryOp::Negate => "-", UnaryOp::Not => "not", UnaryOp::BitNot => "bit-not", UnaryOp::IsNull | UnaryOp::IsUnknown => "nil?", UnaryOp::IsNotNull => "some?", UnaryOp::IsTrue => "true?", UnaryOp::IsFalse => "false?" }, vec![child(expr)?]),
         Expr::Binary { op, left, right } => call(match op { BinaryOp::Add => "+", BinaryOp::Subtract => "-", BinaryOp::Multiply => "*", BinaryOp::Divide => "/", BinaryOp::Modulo => "mod", BinaryOp::Eq => "==", BinaryOp::NotEq => "<>", BinaryOp::Lt => "<", BinaryOp::LtEq => "<=", BinaryOp::Gt => ">", BinaryOp::GtEq => ">=", BinaryOp::IsDistinctFrom => "distinct-from", BinaryOp::IsNotDistinctFrom => "not-distinct-from", BinaryOp::And => "and", BinaryOp::Or => "or", BinaryOp::Concat => "concat", BinaryOp::BitAnd => "bit-and", BinaryOp::BitOr => "bit-or", BinaryOp::BitXor => "bit-xor", BinaryOp::ShiftLeft => "bit-shift-left", BinaryOp::ShiftRight => "bit-shift-right" }, vec![child(left)?, child(right)?]),
         Expr::Call { name, args, .. } => call(name, args.iter().map(child).collect::<Result<_>>()?),
-        Expr::RegexReplace { source,recipe,.. } => call("regexp-replace",vec![child(source)?,regex_form(&recipe.pattern)?,regex_form(&recipe.replacement)?,regex_form(&recipe.start)?,regex_form(&recipe.occurrence)?,regex_form(&recipe.flags)?]),
+        Expr::RegexReplace { source,recipe,.. } => call("regexp-replace",vec![child(source)?,regex_form(recipe.pattern.view())?,regex_form(recipe.replacement.view())?,regex_form(recipe.start.view())?,regex_form(recipe.occurrence.view())?,regex_form(recipe.flags.view())?]),
         Expr::Cast { expr, target } => {
             let mut args = vec![child(expr)?, match target { rtdb_plan::CastTarget::Checked { requested, .. } => requested.to_edn()?, _ => target.result_type(&expr.data_type()).to_edn()? }];
             if let Some(options) = cast_options(target) { args.push(options); }
@@ -171,13 +172,12 @@ fn form(expr: &Expr, columns: &BTreeMap<ColumnId, String>) -> Result<String> {
     })
 }
 fn quote(text: &str) -> Result<String> { serde_json::to_string(text).map_err(|error| invalid("explain-string", error)) }
-fn regex_form(form: &rtdb_plan::RegexForm) -> Result<String> {
-    use rtdb_plan::RegexForm as F;
-    let sequence = |open: &str,values: &[F],close: &str| Ok::<_,rtdb_types::Anomaly>(format!("{open}{}{close}",values.iter().map(regex_form).collect::<Result<Vec<_>>>()?.join(" ")));
-    Ok(match form {
+fn regex_form(form: RegexFormView<'_>) -> Result<String> {
+    let sequence = |open: &str,values: RegexForms<'_>,close: &str| Ok::<_,rtdb_types::Anomaly>(format!("{open}{}{close}",values.iter().map(regex_form).collect::<Result<Vec<_>>>()?.join(" ")));
+    Ok(match form.kind() {
         F::Literal(value) => literal(value)?,
-        F::Character(ch) => if u32::from(*ch) <= 0xffff { format!("\\u{:04x}",u32::from(*ch)) } else { format!("\\{ch}") },
-        F::Symbol(value) => value.clone(),F::BigInteger(value) => format!("{value}N"),F::Decimal(value) => format!("{value}M"),
+        F::Character(ch) => if u32::from(ch) <= 0xffff { format!("\\u{:04x}",u32::from(ch)) } else { format!("\\{ch}") },
+        F::Symbol(value) => value.to_owned(),F::BigInteger(value) => format!("{value}N"),F::Decimal(value) => format!("{value}M"),
         F::List(values) => sequence("(",values,")")?,F::Vector(values) => sequence("[",values,"]")?,F::Set(values) => sequence("#{",values,"}")?,
         F::Map(values) => format!("{{{}}}",values.iter().map(|(key,value)|Ok(format!("{} {}",regex_form(key)?,regex_form(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         F::Tagged { tag,value } => format!("#{tag} {}",regex_form(value)?),F::AnonymousFunction(value) => format!("#{}",regex_form(value)?),
@@ -204,25 +204,28 @@ fn cast_options(target: &rtdb_plan::CastTarget) -> Option<String> {
         _ => None,
     }
 }
-fn literal(value: &Value) -> Result<String> {
-    Ok(match value {
-        Value::Null | Value::Undefined => "nil".into(), Value::Bool(value) => value.to_string(),
-        Value::I8(value) => value.to_string(), Value::I16(value) => value.to_string(), Value::I32(value) | Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => value.to_string(), Value::I64(value) => value.to_string(),
-        Value::U8(value) => value.to_string(), Value::U16(value) => value.to_string(), Value::U32(value) => value.to_string(), Value::U64(value) => value.to_string(),
-        Value::F32(value) => rtdb_types::java_f32_text(*value), Value::F64(value) => rtdb_types::java_f64_text(*value), Value::F16(value) => value.to_string(),
-        Value::Decimal(value) => format!("{}M", rtdb_expr::decimal_text(value)), Value::Utf8(value) => quote(value)?, Value::Keyword(value) => value.to_string(),
-        Value::Uri(value) => format!("#xt/uri {}", quote(&rtdb_types::UriParts::parse(value)?.to_ascii_string())?),
-        Value::Uuid(value) => format!("#uuid \"{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\"", value[0],value[1],value[2],value[3],value[4],value[5],value[6],value[7],value[8],value[9],value[10],value[11],value[12],value[13],value[14],value[15]),
-        Value::Binary(bytes) | Value::FixedSizeBinary(bytes) | Value::Transit(bytes) => format!("#bytes \"{}\"", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
-        Value::List(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(literal).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::Set(values) => format!("#{{{}}}", values.iter().map(literal).collect::<Result<Vec<_>>>()?.join(" ")),
-        Value::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!(":{name} {}", literal(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
-        Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", literal(key)?, literal(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
-        other => {
-            let Value::Utf8(text) = rtdb_expr::cast(other, &LogicalType::Scalar(ScalarType::Utf8), "UTC")? else { return Err(invalid("explain-literal", "Temporal literal did not render as text")); };
-            let tag = match other { Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => "time/date", Value::Time { .. } => "time/time", Value::Timestamp { timezone: None, .. } => "time/date-time", Value::Timestamp { .. } => "time/zoned-date-time", Value::Duration { .. } => "time/duration", Value::TimestampTzRange { .. } => "xt/tstz-range", _ => "xt/interval" };
-            format!("#{tag} {}", quote(&text)?)
-        }
+fn literal(value: RegexLiteralView<'_>) -> Result<String> {
+    Ok(match value.kind() {
+        LiteralKind::Text(value) => quote(value)?, LiteralKind::Keyword(value) => format!(":{value}"),
+        LiteralKind::List(values) | LiteralKind::FixedSizeList(values) => format!("[{}]", values.iter().map(literal).collect::<Result<Vec<_>>>()?.join(" ")),
+        LiteralKind::Set(values) => format!("#{{{}}}", values.iter().map(literal).collect::<Result<Vec<_>>>()?.join(" ")),
+        LiteralKind::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!(":{name} {}", literal(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
+        LiteralKind::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", literal(key)?, literal(value)?))).collect::<Result<Vec<_>>>()?.join(", ")),
+        LiteralKind::Leaf(leaf) => match leaf.value() {
+            Value::Null | Value::Undefined => "nil".into(), Value::Bool(value) => value.to_string(),
+            Value::I8(value) => value.to_string(), Value::I16(value) => value.to_string(), Value::I32(value) | Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) => value.to_string(), Value::I64(value) => value.to_string(),
+            Value::U8(value) => value.to_string(), Value::U16(value) => value.to_string(), Value::U32(value) => value.to_string(), Value::U64(value) => value.to_string(),
+            Value::F32(value) => rtdb_types::java_f32_text(*value), Value::F64(value) => rtdb_types::java_f64_text(*value), Value::F16(value) => value.to_string(),
+            Value::Decimal(value) => format!("{}M", rtdb_expr::decimal_text(value)),
+            Value::Uri(value) => format!("#xt/uri {}", quote(&rtdb_types::UriParts::parse(value)?.to_ascii_string())?),
+            Value::Uuid(value) => format!("#uuid \"{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}\"", value[0],value[1],value[2],value[3],value[4],value[5],value[6],value[7],value[8],value[9],value[10],value[11],value[12],value[13],value[14],value[15]),
+            Value::Binary(bytes) | Value::FixedSizeBinary(bytes) | Value::Transit(bytes) => format!("#bytes \"{}\"", bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+            other => {
+                let Value::Utf8(text) = rtdb_expr::cast(other, &LogicalType::Scalar(ScalarType::Utf8), "UTC")? else { return Err(invalid("explain-literal", "Temporal literal did not render as text")); };
+                let tag = match other { Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_) => "time/date", Value::Time { .. } => "time/time", Value::Timestamp { timezone: None, .. } => "time/date-time", Value::Timestamp { .. } => "time/zoned-date-time", Value::Duration { .. } => "time/duration", Value::TimestampTzRange { .. } => "xt/tstz-range", _ => "xt/interval" };
+                format!("#{tag} {}", quote(&text)?)
+            }
+        },
     })
 }
 

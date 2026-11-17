@@ -1,6 +1,7 @@
-use std::{alloc::Layout, collections::btree_map};
-use rtdb_types::{AllocationScope, Value, java_text::JavaText};
-use crate::{RegexForm, RegexReplacement};
+use std::alloc::Layout;
+use rtdb_types::{AllocationScope, java_text::JavaText};
+use crate::{RegexReplacement, RegexFormView, RegexFormKind as FormKind, RegexForms, RegexFormPairs,
+    RegexLiteralView, RegexLiteralKind as LiteralKind, RegexLiterals, RegexLiteralPairs, RegexFieldIter};
 use super::{BoundedSink, CountingSink, JsonDocument, JsonSink, JsonWriteFailure, WriteResult, leaf, text};
 
 #[cfg(test)]
@@ -9,13 +10,13 @@ mod tests;
 
 enum Frame<'source> {
     Recipe { recipe: &'source RegexReplacement, next: usize },
-    Form(&'source RegexForm),
-    Value(&'source Value),
-    Forms { values: &'source [RegexForm], next: usize },
-    FormPairs { entries: &'source [(RegexForm, RegexForm)], next: usize, phase: PairPhase },
-    Values { values: &'source [Value], next: usize },
-    ValuePairs { entries: &'source [(Value, Value)], next: usize, phase: PairPhase, sorted: bool },
-    Fields { entries: btree_map::Iter<'source, String, Value>, first: bool },
+    Form(RegexFormView<'source>),
+    Value(RegexLiteralView<'source>),
+    Forms { values: RegexForms<'source>, next: usize },
+    FormPairs { entries: RegexFormPairs<'source>, next: usize, phase: PairPhase },
+    Values { values: RegexLiterals<'source>, next: usize },
+    ValuePairs { entries: RegexLiteralPairs<'source>, next: usize, phase: PairPhase, sorted: bool },
+    Fields { entries: RegexFieldIter<'source>, first: bool },
     Close(&'static [u8]),
 }
 
@@ -52,11 +53,11 @@ impl<'source, 'scope> Traversal<'source, 'scope> {
             match frame {
                 Frame::Recipe { recipe, next } => {
                     let (name, value) = match next {
-                        0 => (b"\"pattern\":".as_slice(), &recipe.pattern),
-                        1 => (b"\"replacement\":".as_slice(), &recipe.replacement),
-                        2 => (b"\"start\":".as_slice(), &recipe.start),
-                        3 => (b"\"occurrence\":".as_slice(), &recipe.occurrence),
-                        4 => (b"\"flags\":".as_slice(), &recipe.flags),
+                        0 => (b"\"pattern\":".as_slice(), recipe.pattern.view()),
+                        1 => (b"\"replacement\":".as_slice(), recipe.replacement.view()),
+                        2 => (b"\"start\":".as_slice(), recipe.start.view()),
+                        3 => (b"\"occurrence\":".as_slice(), recipe.occurrence.view()),
+                        4 => (b"\"flags\":".as_slice(), recipe.flags.view()),
                         _ => { sink.append(b"}")?; continue; }
                     };
                     if next != 0 { sink.append(b",")?; }
@@ -64,68 +65,68 @@ impl<'source, 'scope> Traversal<'source, 'scope> {
                     self.push(Frame::Recipe { recipe, next: next + 1 }, growth)?;
                     self.push(Frame::Form(value), growth)?;
                 }
-                Frame::Form(form) => match form {
-                    RegexForm::Literal(value) => {
+                Frame::Form(form) => match form.kind() {
+                    FormKind::Literal(value) => {
                         sink.append(b"{\"Literal\":")?;
                         self.push(Frame::Close(b"}"), growth)?;
                         self.push(Frame::Value(value), growth)?;
                     }
-                    RegexForm::Character(character) => {
+                    FormKind::Character(character) => {
                         sink.append(b"{\"Character\":")?;
                         let mut units = [0; 2];
                         text::string(JavaText::from_utf16(character.encode_utf16(&mut units)), sink)?;
                         sink.append(b"}")?;
                     }
-                    RegexForm::Symbol(value) | RegexForm::BigInteger(value) | RegexForm::Decimal(value) => {
-                        sink.append(match form { RegexForm::Symbol(_) => b"{\"Symbol\":".as_slice(), RegexForm::BigInteger(_) => b"{\"BigInteger\":".as_slice(), _ => b"{\"Decimal\":".as_slice() })?;
+                    FormKind::Symbol(value) | FormKind::BigInteger(value) | FormKind::Decimal(value) => {
+                        sink.append(match form.kind() { FormKind::Symbol(_) => b"{\"Symbol\":".as_slice(), FormKind::BigInteger(_) => b"{\"BigInteger\":".as_slice(), _ => b"{\"Decimal\":".as_slice() })?;
                         text::string(JavaText::from_utf8(value), sink)?;
                         sink.append(b"}")?;
                     }
-                    RegexForm::List(values) | RegexForm::Vector(values) | RegexForm::Set(values) => {
-                        sink.append(match form { RegexForm::List(_) => b"{\"List\":[".as_slice(), RegexForm::Vector(_) => b"{\"Vector\":[".as_slice(), _ => b"{\"Set\":[".as_slice() })?;
+                    FormKind::List(values) | FormKind::Vector(values) | FormKind::Set(values) => {
+                        sink.append(match form.kind() { FormKind::List(_) => b"{\"List\":[".as_slice(), FormKind::Vector(_) => b"{\"Vector\":[".as_slice(), _ => b"{\"Set\":[".as_slice() })?;
                         self.push(Frame::Forms { values, next: 0 }, growth)?;
                     }
-                    RegexForm::Map(entries) => {
+                    FormKind::Map(entries) => {
                         sink.append(b"{\"Map\":[")?;
                         self.push(Frame::FormPairs { entries, next: 0, phase: PairPhase::Key }, growth)?;
                     }
-                    RegexForm::Tagged { tag, value } => {
+                    FormKind::Tagged { tag, value } => {
                         sink.append(b"{\"Tagged\":{\"tag\":")?;
                         text::string(JavaText::from_utf8(tag), sink)?;
                         sink.append(b",\"value\":")?;
                         self.push(Frame::Close(b"}}"), growth)?;
                         self.push(Frame::Form(value), growth)?;
                     }
-                    RegexForm::AnonymousFunction(value) => {
+                    FormKind::AnonymousFunction(value) => {
                         sink.append(b"{\"AnonymousFunction\":")?;
                         self.push(Frame::Close(b"}"), growth)?;
                         self.push(Frame::Form(value), growth)?;
                     }
                 },
-                Frame::Value(value) => match value {
-                    Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
-                        sink.append(match value { Value::List(_) => b"{\"List\":[".as_slice(), Value::Set(_) => b"{\"Set\":[".as_slice(), _ => b"{\"FixedSizeList\":[".as_slice() })?;
+                Frame::Value(value) => match value.kind() {
+                    LiteralKind::List(values) | LiteralKind::Set(values) | LiteralKind::FixedSizeList(values) => {
+                        sink.append(match value.kind() { LiteralKind::List(_) => b"{\"List\":[".as_slice(), LiteralKind::Set(_) => b"{\"Set\":[".as_slice(), _ => b"{\"FixedSizeList\":[".as_slice() })?;
                         self.push(Frame::Values { values, next: 0 }, growth)?;
                     }
-                    Value::Map { entries, sorted } => {
+                    LiteralKind::Map { entries, sorted } => {
                         sink.append(b"{\"Map\":{\"entries\":[")?;
-                        self.push(Frame::ValuePairs { entries, next: 0, phase: PairPhase::Key, sorted: *sorted }, growth)?;
+                        self.push(Frame::ValuePairs { entries, next: 0, phase: PairPhase::Key, sorted }, growth)?;
                     }
-                    Value::Struct(fields) => {
+                    LiteralKind::Struct(fields) => {
                         sink.append(b"{\"Struct\":{")?;
                         self.push(Frame::Fields { entries: fields.iter(), first: true }, growth)?;
                     }
-                    Value::Keyword(keyword) => {
-                        sink.append(b"{\"Keyword\":")?;
-                        text::string(JavaText::from_utf8(keyword.as_str()), sink)?;
+                    LiteralKind::Text(text_value) => {
+                        sink.append(b"{\"Utf8\":")?;
+                        text::string(JavaText::from_utf8(text_value), sink)?;
                         sink.append(b"}")?;
                     }
-                    scalar @ (Value::Undefined | Value::Null | Value::Bool(_) | Value::I8(_) | Value::I16(_) | Value::I32(_) | Value::I64(_)
-                    | Value::U8(_) | Value::U16(_) | Value::U32(_) | Value::U64(_) | Value::F16(_) | Value::F32(_) | Value::F64(_)
-                    | Value::Utf8(_) | Value::Binary(_) | Value::FixedSizeBinary(_) | Value::Decimal(_) | Value::Date(_) | Value::DateDay(_) | Value::DateMilli(_)
-                    | Value::Time { .. } | Value::Timestamp { .. } | Value::Duration { .. } | Value::IntervalYearMonth(_) | Value::IntervalDayTime { .. }
-                    | Value::IntervalMonthDayNano { .. } | Value::IntervalMonthDayMicro { .. } | Value::Uuid(_) | Value::Uri(_) | Value::Transit(_)
-                    | Value::Oid(_) | Value::RegClass(_) | Value::RegProc(_) | Value::TimestampTzRange { .. }) => leaf::serialize(leaf::LeafValue::new(scalar).ok_or(JsonWriteFailure::Internal)?, sink)?,
+                    LiteralKind::Keyword(keyword) => {
+                        sink.append(b"{\"Keyword\":")?;
+                        text::string(JavaText::from_utf8(keyword), sink)?;
+                        sink.append(b"}")?;
+                    }
+                    LiteralKind::Leaf(proved) => leaf::serialize(leaf::LeafValue::new(proved.value()).ok_or(JsonWriteFailure::Internal)?, sink)?,
                 },
                 Frame::Forms { values, next } => {
                     if let Some(value) = values.get(next) {

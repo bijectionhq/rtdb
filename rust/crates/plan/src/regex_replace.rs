@@ -1,6 +1,11 @@
 use rtdb_types::{Anomaly,LogicalType as L,Result,ScalarType as S,Value};
 use serde::{Deserialize,Serialize};
 
+mod view;
+pub use view::{RegexFormView, RegexFormKind, RegexForms, RegexFormIter, RegexFormPairs, RegexFormPairIter,
+    RegexLiteralView, RegexLiteralKind, RegexLiterals, RegexLiteralIter, RegexLiteralPairs, RegexLiteralPairIter,
+    RegexFields, RegexFieldIter, RegexLeaf};
+
 /// Owned raw REGEXP_REPLACE metadata, preserved independently of scalar expression binding.
 /// Lists retain host-form syntax; characters and numeric spellings do not pass through vector admission.
 #[derive(Clone,Debug,PartialEq,Serialize,Deserialize)]
@@ -13,7 +18,12 @@ pub enum RegexForm {
 impl Default for RegexForm { fn default() -> Self { Self::Literal(Value::Null) } }
 
 impl RegexForm {
-    fn truthy(&self) -> bool { !matches!(self,Self::Literal(Value::Null | Value::Bool(false))) }
+    /// Borrows raw syntax without evaluating metadata or copying its owned storage.
+    pub fn view(&self) -> RegexFormView<'_> { RegexFormView(self) }
+
+    fn truthy(&self) -> bool {
+        !matches!(self.view().kind(), RegexFormKind::Literal(value) if matches!(value.kind(), RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null | Value::Bool(false))))
+    }
     /// Bounds this owned metadata tree, including its retained raw forms.
     pub fn retained_bytes(&self) -> Result<usize> {
         let mut bytes = std::mem::size_of::<Self>();
@@ -81,8 +91,8 @@ impl RegexReplacement {
 
     /// Returns the literal replacement consumed during metadata admission.
     pub fn replacement_text(&self) -> Result<&str> {
-        match &self.replacement {
-            RegexForm::Literal(Value::Utf8(value)) => Ok(value),
+        match self.replacement.view().kind() {
+            RegexFormKind::Literal(value) => match value.kind() { RegexLiteralKind::Text(text) => Ok(text), _ => Err(metadata_error("REGEXP_REPLACE replacement is not a string")) },
             _ => Err(metadata_error("REGEXP_REPLACE replacement is not a string")),
         }
     }
@@ -92,11 +102,15 @@ impl RegexReplacement {
     pub fn flag_text(&self) -> Result<String> {
         let mut flags = [false;3];
         let mut flag = |ch| match ch { 'i' => flags[0] = true,'s' => flags[1] = true,'m' => flags[2] = true,_ => () };
-        match &self.flags {
-            RegexForm::Literal(Value::Null) | RegexForm::Map(_) => (),
-            RegexForm::Literal(Value::Utf8(value)) => { for ch in value.chars() { flag(ch); } }
-            RegexForm::List(values) | RegexForm::Vector(values) | RegexForm::Set(values) => {
-                for value in values { if let RegexForm::Character(ch) = value { flag(*ch); } }
+        match self.flags.view().kind() {
+            RegexFormKind::Map(_) => (),
+            RegexFormKind::Literal(value) => match value.kind() {
+                RegexLiteralKind::Leaf(leaf) if matches!(leaf.value(), Value::Null) => (),
+                RegexLiteralKind::Text(text) => { for ch in text.chars() { flag(ch); } }
+                _ => return Err(metadata_error("REGEXP_REPLACE flags are not seqable")),
+            },
+            RegexFormKind::List(values) | RegexFormKind::Vector(values) | RegexFormKind::Set(values) => {
+                for value in values.iter() { if let RegexFormKind::Character(ch) = value.kind() { flag(ch); } }
             }
             _ => return Err(metadata_error("REGEXP_REPLACE flags are not seqable")),
         }

@@ -28,6 +28,10 @@ mod json;
 pub use catalog::*;
 pub use expr::*;
 pub use regex_replace::{RegexForm,RegexReplacement};
+#[doc(hidden)]
+pub use regex_replace::{RegexFormView, RegexFormKind, RegexForms, RegexFormIter, RegexFormPairs, RegexFormPairIter,
+    RegexLiteralView, RegexLiteralKind, RegexLiterals, RegexLiteralIter, RegexLiteralPairs, RegexLiteralPairIter,
+    RegexFields, RegexFieldIter, RegexLeaf};
 pub use cast::*;
 pub use temporal_cast::*;
 pub use deferred_cast::*;

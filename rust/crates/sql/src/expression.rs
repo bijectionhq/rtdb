@@ -192,7 +192,7 @@ impl Context<'_> {
                     let mut recipe = rtdb_plan::RegexReplacement { pattern: metadata(1)?,replacement: metadata(2)?,..Default::default() };
                     for index in 3..arguments.len() {
                         let value = metadata(index)?;
-                        if matches!(&value,rtdb_plan::RegexForm::Literal(Value::Utf8(_))) { recipe.flags = value; }
+                        if matches!(value.view().kind(),rtdb_plan::RegexFormKind::Literal(literal) if matches!(literal.kind(),rtdb_plan::RegexLiteralKind::Text(_))) { recipe.flags = value; }
                         else if index == 3 { recipe.start = value; } else { recipe.occurrence = value; }
                     }
                     return Ok(Expr::regex_replace(self.expr_bound(argument(0)?,input,replacements)?,recipe));

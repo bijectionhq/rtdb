@@ -11,3 +11,16 @@ A shared iterative traversal handles recursive raw forms and physical values und
 Counting and filling share the encoder and retain the admitted traversal capacity; output scratch remains charged while the completed document acquires an independent lease.
 The private regression sources preserve existing JSON schemas, unit distinctions, failure prefixes and allocation lifetimes.
 Public tree serialization, canonical node ownership, semantic consumers and production literal binding require their dependent migrations before exact-unit tree input is exposed.
+
+== Borrowed raw-form views
+
+The internal cross-crate view API borrows the existing canonical raw forms and physical literal values without copying their text, children or map keys.
+Child views and iterator items retain the original source lifetime, including when their intermediate parent view or iterator has been dropped.
+Indexed raw sequences use child positions; `get` returns an optional child, while `at` and half-open `slice` use Rust's indexing panic contract.
+Iterators preserve source order, support both ends, report exact remaining lengths and remain exhausted after their final item.
+Metadata admission, SQL metadata classification, host compilation, explain rendering and private JSON encoding consume these views.
+Physical literal strings and keyword names have separate borrowed UTF8 cases, and five recursive literal container cases expose borrowed children.
+The sealed physical leaf view admits the other 34 variants; the private JSON adapter retains its existing 35-variant guard and serializer, including its independent UTF8 support.
+The recipe encoder writes borrowed UTF8 through the existing JSON string kernel and passes proved physical leaves through that unchanged guard.
+The owned enums, their generic serialization traits and their programmatic constructors retain their existing contracts.
+The views add no text or node owner, retained lease, exact-unit producer or alternate representation.

@@ -1,5 +1,5 @@
 use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
-use rtdb_plan::RegexForm as Form;
+use rtdb_plan::{RegexForm as Form, RegexFormKind as FormKind, RegexFormView as FormView, RegexForms as Forms, RegexLiteralKind as LiteralKind};
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
 use crate::jvm_number::{Binary,Bit,Cast,Classification,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
@@ -8,7 +8,7 @@ pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
 impl AsRef<str> for PatternText<'_> { fn as_ref(&self) -> &str { match self { Self::Borrowed(value) => value,Self::Computed(value) => value } } }
 enum Expression<'a> {
-    Constant(&'a Form),Number(Arc<Number>),Nil,Local { index: usize,emission: Emission },Function(Function),
+    Constant(FormView<'a>),Number(Arc<Number>),Nil,Local { index: usize,emission: Emission },Function(Function),
     Cast { kind: Cast,resolution: Resolution<CastInput>,value: Box<Expression<'a>> },
     Boolean { resolution: Resolution<()>,value: Box<Expression<'a>> },
     Unary { operation: Unary,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
@@ -30,7 +30,7 @@ enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmet
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
-enum HostValue<'a> { Constant(&'a Form),Number(Arc<Number>),Nil,Bool(bool),Text(Arc<str>),Function(Function),Vector(Arc<[HostValue<'a>]>) }
+enum HostValue<'a> { Constant(FormView<'a>),Number(Arc<Number>),Nil,Bool(bool),Text(Arc<str>),Function(Function),Vector(Arc<[HostValue<'a>]>) }
 struct Compiler<'a,'c,'context> { symbols: BTreeMap<&'a str,(usize,Emission)>,active: usize,slots: usize,nodes: usize,context: &'c EvalContext<'context> }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Emission { Number(Cast),Boolean,Reference,Unknown }
@@ -71,7 +71,7 @@ impl Resolution<ExtremumCall> {
 impl<'a> Program<'a> {
     pub(super) fn compile(form: &'a Form,context: &EvalContext<'_>) -> Result<Self> {
         let mut compiler = Compiler { symbols: BTreeMap::new(),active: 0,slots: 0,nodes: 0,context };
-        let expression = compiler.expression(form,0)?;
+        let expression = compiler.expression(form.view(),0)?;
         if expression.stack_depth() > 128 { return Err(limit()); }
         Ok(Self { expression,locals: compiler.slots })
     }
@@ -80,72 +80,74 @@ impl<'a> Program<'a> {
         let mut locals = vec![HostValue::Nil;self.locals];
         match self.expression.evaluate(&mut locals,context)? {
             HostValue::Text(value) => Ok(PatternText::Computed(value)),
-            HostValue::Constant(Form::Literal(Value::Utf8(value))) => Ok(PatternText::Borrowed(value)),
+            HostValue::Constant(form) => match form.kind() {
+                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(PatternText::Borrowed(value)), _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")) },
+                _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")),
+            },
             _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")),
         }
     }
 }
 
 impl<'a> Compiler<'a,'_,'_> {
-    fn expression(&mut self,form: &'a Form,depth: usize) -> Result<Expression<'a>> {
+    fn expression(&mut self,form: FormView<'a>,depth: usize) -> Result<Expression<'a>> {
         self.nodes += 1;
         if depth > 128 || self.nodes > 65_536 { return Err(limit()); }
         self.context.reserve(256)?;
-        Ok(match form {
-            Form::Symbol(name) => {
-                if let Some((index,emission)) = self.symbols.get(name.as_str()) { Expression::Local { index: *index,emission: *emission } }
+        Ok(match form.kind() {
+            FormKind::Symbol(name) => {
+                if let Some((index,emission)) = self.symbols.get(name) { Expression::Local { index: *index,emission: *emission } }
                 else if let Some(function) = function(name) { Expression::Function(function) }
                 else { return Err(unsupported("Host symbol or namespace is not implemented")); }
             }
-            Form::List(values) if !values.is_empty() => self.list(values,depth + 1)?,
-            Form::BigInteger(_) | Form::Decimal(_) => Expression::Number(Arc::new(literal_number(form,self.context)?)),
-            Form::Vector(values) => Expression::Vector(self.expressions(values,depth + 1)?),
-            Form::Map(values) if values.is_empty() => Expression::Constant(form),
-            Form::Set(values) if values.is_empty() => Expression::Constant(form),
-            Form::Map(_) | Form::Set(_) | Form::Tagged { .. } | Form::AnonymousFunction(_) => return Err(unsupported("Host collection, tagged object or function syntax is not implemented")),
+            FormKind::List(values) => match values.split_first() { Some((head,args)) => self.list(head,args,depth + 1)?, None => Expression::Constant(form) },
+            FormKind::BigInteger(_) | FormKind::Decimal(_) => Expression::Number(Arc::new(literal_number(form,self.context)?)),
+            FormKind::Vector(values) => Expression::Vector(self.expressions(values,depth + 1)?),
+            FormKind::Map(values) if values.is_empty() => Expression::Constant(form),
+            FormKind::Set(values) if values.is_empty() => Expression::Constant(form),
+            FormKind::Map(_) | FormKind::Set(_) | FormKind::Tagged { .. } | FormKind::AnonymousFunction(_) => return Err(unsupported("Host collection, tagged object or function syntax is not implemented")),
             _ => Expression::Constant(form),
         })
     }
-    fn expressions(&mut self,forms: &'a [Form],depth: usize) -> Result<Vec<Expression<'a>>> {
+    fn expressions(&mut self,forms: Forms<'a>,depth: usize) -> Result<Vec<Expression<'a>>> {
         self.context.reserve(forms.len().checked_mul(std::mem::size_of::<Expression<'_>>()).ok_or_else(limit)?)?;
         forms.iter().map(|form|self.expression(form,depth)).collect()
     }
-    fn body(&mut self,forms: &'a [Form],depth: usize) -> Result<Expression<'a>> { Ok(Expression::Body(self.expressions(forms,depth)?)) }
-    fn list(&mut self,forms: &'a [Form],depth: usize) -> Result<Expression<'a>> {
-        let operation = match &forms[0] { Form::Symbol(name) if matches!(name.as_str(),"quote" | "if" | "do" | "let*") || !self.symbols.contains_key(name.as_str()) => Some(name.as_str()),_ => None };
-        let args = &forms[1..];
+    fn body(&mut self,forms: Forms<'a>,depth: usize) -> Result<Expression<'a>> { Ok(Expression::Body(self.expressions(forms,depth)?)) }
+    fn list(&mut self,head: FormView<'a>,args: Forms<'a>,depth: usize) -> Result<Expression<'a>> {
+        let operation = match head.kind() { FormKind::Symbol(name) if matches!(name,"quote" | "if" | "do" | "let*") || !self.symbols.contains_key(name) => Some(name),_ => None };
         if matches!(operation,Some("boolean" | "clojure.core/boolean")) {
             arity(args.len(),1,1)?;
-            let value = self.expression(&args[0],depth)?;
+            let value = self.expression(args.at(0),depth)?;
             let resolution = if matches!(value.emission(),Emission::Number(_)) { Resolution::Reflective } else { Resolution::Resolved(()) };
             return Ok(Expression::Boolean { resolution,value: Box::new(value) });
         }
         if let Some(Function::Cast(kind)) = operation.and_then(function) {
             arity(args.len(),1,1)?;
-            let value = self.expression(&args[0],depth)?;
+            let value = self.expression(args.at(0),depth)?;
             let resolution = match value.emission() { Emission::Number(_) => Resolution::Resolved(CastInput::Primitive),Emission::Boolean => Resolution::Reflective,_ => Resolution::Resolved(CastInput::Boxed) };
             return Ok(Expression::Cast { kind,resolution,value: Box::new(value) });
         }
         if let Some(Function::Predicate(operation)) = operation.and_then(function) {
             arity(args.len(),1,1)?;
-            let value = self.expression(&args[0],depth)?;
+            let value = self.expression(args.at(0),depth)?;
             return Ok(Expression::Predicate { operation,resolution: Resolution::unary(value.emission()),value: Box::new(value) });
         }
         if let Some(Function::Comparison(operation)) = operation.and_then(function) {
             if args.len() == 2 {
-                let left = self.expression(&args[0],depth)?;let right = self.expression(&args[1],depth)?;
+                let left = self.expression(args.at(0),depth)?;let right = self.expression(args.at(1),depth)?;
                 let resolution = Resolution::binary(left.emission(),right.emission());
                 return Ok(Expression::Comparison { operation,resolution,values: Box::new([left,right]) });
             }
         }
         if let Some(Function::Integral(operation)) = operation.and_then(function) {
             arity(args.len(),2,2)?;
-            let left = self.expression(&args[0],depth)?;let right = self.expression(&args[1],depth)?;
+            let left = self.expression(args.at(0),depth)?;let right = self.expression(args.at(1),depth)?;
             let resolution = Resolution::integral(left.emission(),right.emission());
             return Ok(Expression::Integral { operation,resolution,values: Box::new([left,right]) });
         }
         if matches!(operation.and_then(function),Some(Function::Absolute)) && args.len() == 1 {
-            let value = self.expression(&args[0],depth)?;
+            let value = self.expression(args.at(0),depth)?;
             return Ok(Expression::Absolute { resolution: Resolution::unary(value.emission()),value: Box::new(value) });
         }
         if let Some(Function::Extremum(operation)) = operation.and_then(function) {
@@ -153,7 +155,7 @@ impl<'a> Compiler<'a,'_,'_> {
         }
         if matches!(operation.and_then(function),Some(Function::BitNot)) {
             arity(args.len(),1,1)?;
-            let value = self.expression(&args[0],depth)?;
+            let value = self.expression(args.at(0),depth)?;
             return Ok(Expression::BitNot { resolution: Resolution::bit(value.emission()),value: Box::new(value) });
         }
         if let Some(Function::Bit(operation)) = operation.and_then(function) {
@@ -163,30 +165,30 @@ impl<'a> Compiler<'a,'_,'_> {
             if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
         }
         Ok(match operation {
-            Some("quote") => { arity(args.len(),1,1)?;match &args[0] { Form::BigInteger(_) | Form::Decimal(_) => Expression::Number(Arc::new(literal_number(&args[0],self.context)?)),_ => Expression::Constant(&args[0]) } }
+            Some("quote") => { arity(args.len(),1,1)?;match args.at(0).kind() { FormKind::BigInteger(_) | FormKind::Decimal(_) => Expression::Number(Arc::new(literal_number(args.at(0),self.context)?)),_ => Expression::Constant(args.at(0)) } }
             Some("if") => {
                 arity(args.len(),2,3)?;
-                Expression::If(Box::new([self.expression(&args[0],depth)?,self.expression(&args[1],depth)?,match args.get(2) { Some(value) => self.expression(value,depth)?,None => Expression::Nil }]))
+                Expression::If(Box::new([self.expression(args.at(0),depth)?,self.expression(args.at(1),depth)?,match args.get(2) { Some(value) => self.expression(value,depth)?,None => Expression::Nil }]))
             }
             Some("do") => self.body(args,depth)?,
             Some("let" | "clojure.core/let" | "let*") => {
-                let Some(Form::Vector(bindings)) = args.first() else { return Err(error("Host let requires a binding vector")); };
+                let Some(FormKind::Vector(bindings)) = args.first().map(|form|form.kind()) else { return Err(error("Host let requires a binding vector")); };
                 if bindings.len() % 2 != 0 { return Err(error("Host let requires binding pairs")); }
                 let first = self.active;
                 self.context.reserve(bindings.len().checked_mul(std::mem::size_of::<Expression<'_>>() + 256).ok_or_else(limit)?)?;
                 let mut expressions = Vec::with_capacity(bindings.len() / 2);
                 let mut previous = Vec::with_capacity(bindings.len() / 2);
-                for pair in bindings.chunks_exact(2) {
-                    let Form::Symbol(name) = &pair[0] else { return Err(unsupported("Host binding destructuring is not implemented")); };
+                for offset in (0..bindings.len()).step_by(2) {
+                    let FormKind::Symbol(name) = bindings.at(offset).kind() else { return Err(unsupported("Host binding destructuring is not implemented")); };
                     if name != "/" && name.contains('/') { return Err(error("Host let cannot bind a qualified symbol")); }
-                    let expression = self.expression(&pair[1],depth)?;
+                    let expression = self.expression(bindings.at(offset + 1),depth)?;
                     let emission = expression.emission();
                     expressions.push(expression);
-                    previous.push((name.as_str(),self.symbols.insert(name,(self.active,emission))));
+                    previous.push((name,self.symbols.insert(name,(self.active,emission))));
                     self.active += 1;
                     self.slots = self.slots.max(self.active);
                 }
-                let body = Box::new(self.body(&args[1..],depth)?);
+                let body = Box::new(self.body(args.slice(1..args.len()),depth)?);
                 for (name,index) in previous.into_iter().rev() {
                     match index { Some(index) => { self.symbols.insert(name,index); },None => { self.symbols.remove(name); } }
                 }
@@ -196,15 +198,15 @@ impl<'a> Compiler<'a,'_,'_> {
             Some("when" | "clojure.core/when" | "when-not" | "clojure.core/when-not") => {
                 let Some(test) = args.first() else { return Err(error("Host when requires a test")); };
                 let test = self.expression(test,depth)?;
-                let body = self.body(&args[1..],depth)?;
+                let body = self.body(args.slice(1..args.len()),depth)?;
                 let branches = if operation.is_some_and(|name|name.ends_with("when-not")) { [test,Expression::Nil,body] } else { [test,body,Expression::Nil] };
                 Expression::If(Box::new(branches))
             }
             Some("and" | "clojure.core/and" | "or" | "clojure.core/or") => Expression::Logical { conjunction: operation.is_some_and(|name|name.ends_with("and")),values: self.expressions(args,depth)? },
-            _ => Expression::Call { function: Box::new(self.expression(&forms[0],depth)?),arguments: self.expressions(args,depth)? },
+            _ => Expression::Call { function: Box::new(self.expression(head,depth)?),arguments: self.expressions(args,depth)? },
         })
     }
-    fn arithmetic(&mut self,operation: Arithmetic,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+    fn arithmetic(&mut self,operation: Arithmetic,args: Forms<'a>,depth: usize) -> Result<Expression<'a>> {
         if matches!(operation,Arithmetic::Increment(_) | Arithmetic::Decrement(_)) { arity(args.len(),1,1)?; }
         if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
         let mut args = args.iter();
@@ -225,7 +227,7 @@ impl<'a> Compiler<'a,'_,'_> {
         if result.stack_depth() > 128 { return Err(limit()); }
         Ok(result)
     }
-    fn bit(&mut self,operation: Bit,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+    fn bit(&mut self,operation: Bit,args: Forms<'a>,depth: usize) -> Result<Expression<'a>> {
         if !operation.variadic() { arity(args.len(),2,2)?; }
         if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
         let mut args = args.iter();
@@ -241,7 +243,7 @@ impl<'a> Compiler<'a,'_,'_> {
         if result.stack_depth() > 128 { return Err(limit()); }
         Ok(result)
     }
-    fn extremum(&mut self,operation: Extremum,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+    fn extremum(&mut self,operation: Extremum,args: Forms<'a>,depth: usize) -> Result<Expression<'a>> {
         if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
         let mut args = args.iter();
         let mut result = self.expression(args.next().ok_or_else(||error("Missing host argument"))?,depth)?;
@@ -273,7 +275,7 @@ impl<'a> Expression<'a> {
     }
     fn emission(&self) -> Emission {
         match self {
-            Self::Constant(Form::Literal(Value::I64(_))) => Emission::Number(Cast::Long),Self::Constant(Form::Literal(Value::F64(_))) => Emission::Number(Cast::Double),
+            Self::Constant(form) => match literal_leaf(*form) { Some(Value::I64(_)) => Emission::Number(Cast::Long), Some(Value::F64(_)) => Emission::Number(Cast::Double), _ => Emission::Reference },
             Self::Local { emission,.. } => *emission,
             Self::Cast { kind,resolution,.. } => resolution.emission(|_|Emission::Number(*kind)),
             Self::Boolean { resolution,.. } => resolution.emission(|_|Emission::Boolean),
@@ -293,7 +295,7 @@ impl<'a> Expression<'a> {
     }
     fn evaluate(&self,locals: &mut [HostValue<'a>],context: &EvalContext<'_>) -> Result<HostValue<'a>> {
         Ok(match self {
-            Self::Constant(form) => HostValue::Constant(form),Self::Number(value) => HostValue::Number(Arc::clone(value)),Self::Nil => HostValue::Nil,
+            Self::Constant(form) => HostValue::Constant(*form),Self::Number(value) => HostValue::Number(Arc::clone(value)),Self::Nil => HostValue::Nil,
             Self::Local { index,.. } => locals[*index].clone(),Self::Function(function) => HostValue::Function(*function),
             Self::Cast { kind,resolution,value } => numeric_cast(*kind,value.evaluate(locals,context)?,matches!(resolution,Resolution::Resolved(CastInput::Primitive)),context)?,
             Self::Boolean { value,.. } => HostValue::Bool(value.evaluate(locals,context)?.truthy()),
@@ -360,32 +362,62 @@ impl HostValue<'_> {
     fn admit_ifn_cast(&self) -> Result<()> {
         match self {
             Self::Function(_) | Self::Nil | Self::Vector(_) => Ok(()),
-            Self::Constant(Form::Literal(Value::Null | Value::Keyword(_)) | Form::Symbol(_) | Form::Vector(_) | Form::Map(_) | Form::Set(_)) => Ok(()),
             Self::Number(_) | Self::Bool(_) | Self::Text(_) => Err(error("Host value is not callable")),
-            Self::Constant(Form::Literal(Value::Bool(_) | Value::I64(_) | Value::F64(_) | Value::Utf8(_)) | Form::Character(_) | Form::List(_) | Form::AnonymousFunction(_)) => Err(error("Host value is not callable")),
-            Self::Constant(Form::Literal(_) | Form::BigInteger(_) | Form::Decimal(_) | Form::Tagged { .. }) => Err(unsupported("Host call admission requires an established host literal carrier")),
+            Self::Constant(form) => match form.kind() {
+                FormKind::Symbol(_) | FormKind::Vector(_) | FormKind::Map(_) | FormKind::Set(_) => Ok(()),
+                FormKind::Character(_) | FormKind::List(_) | FormKind::AnonymousFunction(_) => Err(error("Host value is not callable")),
+                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Tagged { .. } => Err(unsupported("Host call admission requires an established host literal carrier")),
+                FormKind::Literal(value) => match value.kind() {
+                    LiteralKind::Keyword(_) => Ok(()),
+                    LiteralKind::Text(_) => Err(error("Host value is not callable")),
+                    LiteralKind::Leaf(leaf) => match leaf.value() {
+                        Value::Null => Ok(()),
+                        Value::Bool(_) | Value::I64(_) | Value::F64(_) => Err(error("Host value is not callable")),
+                        _ => Err(unsupported("Host call admission requires an established host literal carrier")),
+                    },
+                    _ => Err(unsupported("Host call admission requires an established host literal carrier")),
+                },
+            },
         }
     }
-    fn truthy(&self) -> bool { !matches!(self,Self::Nil | Self::Bool(false) | Self::Constant(Form::Literal(Value::Null | Value::Bool(false)))) }
+    fn truthy(&self) -> bool {
+        match self { Self::Nil | Self::Bool(false) => false, Self::Constant(form) => !matches!(literal_leaf(*form), Some(Value::Null | Value::Bool(false))), _ => true }
+    }
     fn string(&self) -> Result<&str> {
-        match self { Self::Text(value) => Ok(value),Self::Constant(Form::Literal(Value::Utf8(value))) => Ok(value),_ => Err(error("Host value is not a String")) }
+        match self {
+            Self::Text(value) => Ok(value),
+            Self::Constant(form) => match form.kind() {
+                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(value), _ => Err(error("Host value is not a String")) },
+                _ => Err(error("Host value is not a String")),
+            },
+            _ => Err(error("Host value is not a String")),
+        }
     }
     fn number(&self,context: &EvalContext<'_>) -> Result<Cow<'_,Number>> {
-        match self { Self::Number(value) => Ok(Cow::Borrowed(value)),Self::Constant(form) => literal_number(form,context).map(Cow::Owned),_ => Err(error("Host value is not a Number")) }
+        match self { Self::Number(value) => Ok(Cow::Borrowed(value)),Self::Constant(form) => literal_number(*form,context).map(Cow::Owned),_ => Err(error("Host value is not a Number")) }
     }
     fn classifies(&self,classification: Classification) -> Result<bool> {
         Ok(match self {
             Self::Number(value) => value.classifies(classification),
-            Self::Constant(Form::Literal(Value::I64(value))) => Number::Long(*value).classifies(classification),
-            Self::Constant(Form::Literal(Value::F64(value))) => Number::Double(*value).classifies(classification),
-            Self::Constant(Form::Literal(Value::Null | Value::Bool(_) | Value::Utf8(_) | Value::Keyword(_))) => false,
-            Self::Constant(Form::Character(_) | Form::Symbol(_) | Form::List(_) | Form::Vector(_) | Form::Set(_) | Form::Map(_) | Form::AnonymousFunction(_)) => false,
-            Self::Constant(Form::Literal(_) | Form::BigInteger(_) | Form::Decimal(_) | Form::Tagged { .. }) => return Err(unsupported("Host classification requires an established host literal carrier")),
+            Self::Constant(form) => match form.kind() {
+                FormKind::Literal(value) => match value.kind() {
+                    LiteralKind::Text(_) | LiteralKind::Keyword(_) => false,
+                    LiteralKind::Leaf(leaf) => match leaf.value() {
+                        Value::I64(value) => Number::Long(*value).classifies(classification),
+                        Value::F64(value) => Number::Double(*value).classifies(classification),
+                        Value::Null | Value::Bool(_) => false,
+                        _ => return Err(unsupported("Host classification requires an established host literal carrier")),
+                    },
+                    _ => return Err(unsupported("Host classification requires an established host literal carrier")),
+                },
+                FormKind::Character(_) | FormKind::Symbol(_) | FormKind::List(_) | FormKind::Vector(_) | FormKind::Set(_) | FormKind::Map(_) | FormKind::AnonymousFunction(_) => false,
+                FormKind::BigInteger(_) | FormKind::Decimal(_) | FormKind::Tagged { .. } => return Err(unsupported("Host classification requires an established host literal carrier")),
+            },
             Self::Nil | Self::Bool(_) | Self::Text(_) | Self::Function(_) | Self::Vector(_) => false,
         })
     }
-    fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(Form::Literal(Value::F64(value))) => value.is_nan(),_ => false } }
-    fn nil(&self) -> bool { matches!(self,Self::Nil | Self::Constant(Form::Literal(Value::Null))) }
+    fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(form) => matches!(literal_leaf(*form), Some(Value::F64(value)) if value.is_nan()),_ => false } }
+    fn nil(&self) -> bool { matches!(self,Self::Nil) || matches!(self,Self::Constant(form) if matches!(literal_leaf(*form),Some(Value::Null))) }
     fn index(&self,context: &EvalContext<'_>) -> Result<i32> {
         drop(self.number(context)?);
         let value = numeric_cast(Cast::Int,self.clone(),false,context)?;
@@ -443,10 +475,17 @@ impl Function {
                 arity(args.len(),1,1)?;
                 let namespace = matches!(self,Self::Namespace);
                 let name = match &args[0] {
-                    HostValue::Constant(Form::Symbol(name)) => name.as_str(),
-                    HostValue::Constant(Form::Literal(Value::Keyword(name))) => name.as_str(),
-                    value if !namespace => return Ok(HostValue::Text(text(value.string()?,context)?)),
-                    _ => return Err(error("Host namespace requires a symbol or keyword")),
+                    HostValue::Constant(form) => match form.kind() {
+                        FormKind::Symbol(name) => Some(name),
+                        FormKind::Literal(value) => match value.kind() { LiteralKind::Keyword(name) => Some(name), _ => None },
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                let name = match name {
+                    Some(name) => name,
+                    None if !namespace => return Ok(HostValue::Text(text(args[0].string()?,context)?)),
+                    None => return Err(error("Host namespace requires a symbol or keyword")),
                 };
                 let (prefix,name) = if name == "/" { (None,name) } else { name.split_once('/').map_or((None,name),|(prefix,name)|(Some(prefix),name)) };
                 match if namespace { prefix } else { Some(name) } { Some(value) => HostValue::Text(text(value,context)?),None => HostValue::Nil }
@@ -611,34 +650,53 @@ fn numeric_compare(operation: Comparison,dispatch: Dispatch,left: &HostValue<'_>
 fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<Arc<str>> {
     match value {
         HostValue::Text(value) => Ok(Arc::clone(value)),HostValue::Nil => text("",context),HostValue::Bool(value) => text(if *value { "true" } else { "false" },context),
-        HostValue::Constant(Form::Literal(Value::Null)) => text("",context),
-        HostValue::Constant(Form::Literal(Value::Utf8(value))) | HostValue::Constant(Form::Symbol(value)) => text(value,context),
-        HostValue::Constant(Form::Literal(Value::Bool(value))) => text(if *value { "true" } else { "false" },context),
-        HostValue::Constant(Form::Character(value)) => { context.reserve(32)?;text(&value.to_string(),context) }
-        HostValue::Constant(Form::Literal(Value::I64(value))) => { context.reserve(32)?;text(&value.to_string(),context) }
-        HostValue::Constant(Form::Literal(Value::F64(value))) => { context.reserve(64)?;text(&rtdb_types::java_f64_text(*value),context) }
+        HostValue::Constant(form) => match form.kind() {
+            FormKind::Symbol(value) => text(value,context),
+            FormKind::Character(value) => { context.reserve(32)?;text(&value.to_string(),context) }
+            FormKind::Literal(value) => match value.kind() {
+                LiteralKind::Text(value) => text(value,context),
+                LiteralKind::Keyword(value) => { reserve_text(value.len().checked_add(1).ok_or_else(limit)?,context)?;text(&format!(":{value}"),context) }
+                LiteralKind::Leaf(leaf) => match leaf.value() {
+                    Value::Null => text("",context),
+                    Value::Bool(value) => text(if *value { "true" } else { "false" },context),
+                    Value::I64(value) => { context.reserve(32)?;text(&value.to_string(),context) }
+                    Value::F64(value) => { context.reserve(64)?;text(&rtdb_types::java_f64_text(*value),context) }
+                    _ => Err(unsupported("Host object string rendering is not implemented for this value")),
+                },
+                _ => Err(unsupported("Host object string rendering is not implemented for this value")),
+            },
+            _ => Err(unsupported("Host object string rendering is not implemented for this value")),
+        },
         HostValue::Number(value) => { reserve_text(value.text_capacity().map_err(|_|limit())?,context)?;text(&value.text(),context) }
-        HostValue::Constant(Form::Literal(Value::Keyword(value))) => { reserve_text(value.as_str().len().checked_add(1).ok_or_else(limit)?,context)?;text(&value.to_string(),context) }
         _ => Err(unsupported("Host object string rendering is not implemented for this value")),
     }
 }
-fn literal_number(form: &Form,context: &EvalContext<'_>) -> Result<Number> {
-    Ok(match form {
-        Form::Literal(Value::I64(value)) => Number::Long(*value),Form::Literal(Value::F64(value)) => Number::Double(*value),
-        Form::BigInteger(value) | Form::Decimal(value) => {
+fn literal_leaf<'a>(form: FormView<'a>) -> Option<&'a Value> {
+    match form.kind() { FormKind::Literal(value) => match value.kind() { LiteralKind::Leaf(leaf) => Some(leaf.value()), _ => None }, _ => None }
+}
+fn literal_number(form: FormView<'_>,context: &EvalContext<'_>) -> Result<Number> {
+    Ok(match form.kind() {
+        FormKind::Literal(value) => match value.kind() {
+            LiteralKind::Leaf(leaf) => match leaf.value() { Value::I64(value) => Number::Long(*value), Value::F64(value) => Number::Double(*value), _ => return Err(error("Host value is not a Number")) },
+            _ => return Err(error("Host value is not a Number")),
+        },
+        FormKind::BigInteger(value) | FormKind::Decimal(value) => {
             if value.len() > 16 * 1024 * 1024 { return Err(limit()); }
             context.reserve(value.len().checked_mul(32).and_then(|bytes|bytes.checked_add(256)).ok_or_else(limit)?)?;
-            if matches!(form,Form::BigInteger(_)) { Number::integer(value) } else { Number::decimal(value) }.map_err(|_|error("Invalid host numeric literal"))?
+            if matches!(form.kind(),FormKind::BigInteger(_)) { Number::integer(value) } else { Number::decimal(value) }.map_err(|_|error("Invalid host numeric literal"))?
         }
         _ => return Err(error("Host value is not a Number")),
     })
 }
 fn numeric_cast<'a>(kind: Cast,value: HostValue<'a>,primitive: bool,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
     let source = match &value {
-        HostValue::Constant(Form::Character(value)) if matches!(kind,Cast::Byte | Cast::Short | Cast::Int | Cast::Long) => {
-            if u32::from(*value) > u32::from(u16::MAX) { return Err(unsupported("Host Character requires a single UTF16 code unit")); }
-            Cow::Owned(Number::Long(i64::from(u32::from(*value))))
-        }
+        HostValue::Constant(form) if matches!(kind,Cast::Byte | Cast::Short | Cast::Int | Cast::Long) => match form.kind() {
+            FormKind::Character(character) => {
+                if u32::from(character) > u32::from(u16::MAX) { return Err(unsupported("Host Character requires a single UTF16 code unit")); }
+                Cow::Owned(Number::Long(i64::from(u32::from(character))))
+            }
+            _ => value.number(context)?,
+        },
         _ => value.number(context)?,
     };
     let capacity = source.text_capacity().map_err(|_|limit())?;
@@ -756,12 +814,12 @@ mod tests {
     #[test]
     fn non_ifn_calls_fail_before_argument_budget_admission() {
         let raw = [Form::Literal(Value::Bool(false)),Form::Literal(Value::I64(1)),Form::Literal(Value::Utf8("x".into())),Form::Character('x'),Form::List(vec![]),Form::AnonymousFunction(Box::new(Form::List(vec![])))];
-        let mut functions = raw.iter().map(HostValue::Constant).collect::<Vec<_>>();
+        let mut functions = raw.iter().map(|form|HostValue::Constant(form.view())).collect::<Vec<_>>();
         functions.extend([HostValue::Bool(true),HostValue::Text(Arc::from("x")),HostValue::Number(Arc::new(Number::Long(1)))]);
         let argument = Form::Literal(Value::I64(1));
         for function in functions {
             let memory = MemoryBudget::new(4096);
-            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(&argument)] };
+            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(argument.view())] };
             let mut locals = [function];
             {
                 let scope = EvaluationScope::new(&memory).unwrap();
@@ -777,12 +835,12 @@ mod tests {
     #[test]
     fn null_and_ifn_values_reach_argument_budget_admission() {
         let raw = [Form::Literal(Value::Null),Form::Literal(Value::Keyword(rtdb_types::Keyword::from_name("k"))),Form::Symbol("k".into()),Form::Vector(vec![]),Form::Map(vec![]),Form::Set(vec![])];
-        let mut functions = raw.iter().map(HostValue::Constant).collect::<Vec<_>>();
+        let mut functions = raw.iter().map(|form|HostValue::Constant(form.view())).collect::<Vec<_>>();
         functions.extend([HostValue::Nil,HostValue::Function(Function::Identity),HostValue::Vector(Vec::new().into())]);
         let argument = Form::Literal(Value::I64(1));
         for function in functions {
             let memory = MemoryBudget::new(4096);
-            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(&argument)] };
+            let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(argument.view())] };
             let mut locals = [function];
             {
                 let scope = EvaluationScope::new(&memory).unwrap();

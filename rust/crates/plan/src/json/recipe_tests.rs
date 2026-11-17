@@ -1,6 +1,7 @@
 use super::*;
 use std::{collections::BTreeMap, mem::size_of};
-use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, MemoryBudget, TimeUnit};
+use crate::RegexForm;
+use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, MemoryBudget, TimeUnit, Value};
 
 fn recipe(pattern: RegexForm) -> RegexReplacement { RegexReplacement { pattern, ..Default::default() } }
 fn expected(pattern: &str) -> String {
@@ -366,4 +367,35 @@ fn reuse_mode_rejects_unadmitted_frames_instead_of_growing_silently() {
     assert!(matches!(traversal.write(&source, &mut CountingSink::default(), Growth::Reuse), Err(JsonWriteFailure::Internal)));
     assert_eq!(memory.used_bytes(), 4096);
     assert_eq!(traversal.limit, 0);
+}
+
+#[test]
+fn literal_view_leaf_bridge_preserves_the_existing_utf8_guard_membership() {
+    let source = Value::Utf8("borrowed".into());
+    assert!(matches!(RegexLiteralView::new(&source).kind(), LiteralKind::Text("borrowed")));
+    assert!(leaf::LeafValue::new(&source).is_some());
+    let source = Value::I64(7);
+    let LiteralKind::Leaf(proved) = RegexLiteralView::new(&source).kind() else { panic!("expected a physical leaf") };
+    assert!(std::ptr::eq(proved.value(), &source));
+    assert!(leaf::LeafValue::new(proved.value()).is_some());
+    for value in [Value::List(vec![]), Value::Set(vec![]), Value::Map { entries: vec![], sorted: false }, Value::FixedSizeList(vec![]), Value::Struct(BTreeMap::new()), Value::Keyword(Keyword::from_name("name"))] {
+        assert!(!matches!(RegexLiteralView::new(&value).kind(), LiteralKind::Leaf(_)));
+        assert!(leaf::LeafValue::new(&value).is_none());
+    }
+}
+
+#[test]
+fn proved_physical_leaf_serializer_failures_keep_the_original_prefix_error() {
+    let source = recipe(RegexForm::Literal(Value::I64(123456789)));
+    let expected = serde_json::to_string(&source).unwrap();
+    let memory = MemoryBudget::new(1 << 20);
+    let allocation = AllocationScope::new(&memory).unwrap();
+    for limit in 0..expected.len() {
+        let mut sink = FailingSink { bytes: Vec::new(), limit };
+        let mut traversal = Traversal::new(&allocation);
+        assert!(matches!(traversal.write(&source, &mut sink, Growth::Admit), Err(JsonWriteFailure::Capacity)));
+        assert!(expected.as_bytes().starts_with(&sink.bytes));
+        assert!(sink.bytes.len() <= limit);
+    }
+    assert_eq!(serde_json::to_string(&source).unwrap(), expected);
 }
