@@ -16,13 +16,69 @@ pub(crate) enum ExpressionInput<'a> {
     Scalar(&'a Schema),
     Relational(&'a mut Arc<Relation>),
 }
+
 impl ExpressionInput<'_> {
-    pub fn schema(&self) -> &Schema { match self { Self::Scalar(schema) => schema, Self::Relational(input) => input.schema() } }
-    fn relation(&self) -> Result<Arc<Relation>> {
-        match self { Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")), Self::Relational(input) => Ok(Arc::clone(input)) }
+    pub fn schema(&self) -> &Schema {
+        match self {
+            Self::Scalar(schema) => schema,
+            Self::Relational(input) => input.schema(),
+        }
     }
-    fn replace(&mut self, relation: Arc<Relation>) -> Result<()> {
-        match self { Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")), Self::Relational(input) => { **input = relation; Ok(()) } }
+
+    fn require_relation(&self) -> Result<()> {
+        match self {
+            Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")),
+            Self::Relational(_) => Ok(()),
+        }
+    }
+
+    fn attach(&mut self, attachment: ExpressionAttachment) -> Result<()> {
+        let Self::Relational(input) = self else {
+            return Err(error("Subqueries are not allowed in this context"));
+        };
+        **input = attachment.bind(Arc::clone(input))?;
+        Ok(())
+    }
+}
+
+enum ExpressionAttachment {
+    Apply {
+        dependent: Arc<Relation>,
+        arguments: Vec<(usize, Expr)>,
+        kind: ApplyKind,
+        output: Field,
+    },
+    Materialize(NamedExpr),
+    Mark {
+        dependent: Arc<Relation>,
+        arguments: Vec<(usize, Expr)>,
+        comparison: Expr,
+        output: Field,
+    },
+}
+
+impl ExpressionAttachment {
+    fn bind(self, input: Arc<Relation>) -> Result<Arc<Relation>> {
+        let relation = match self {
+            Self::Apply { dependent, arguments, kind, output } => {
+                let schema = input.schema().concat(&Schema::new(vec![output.clone()])?)?;
+                Relation::new(schema, RelationNode::Apply {
+                    input, dependent, arguments, kind, output: Some(output),
+                })?
+            }
+            Self::Materialize(expression) => {
+                let mut expressions = input.schema().fields().iter()
+                    .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+                    .collect::<Vec<_>>();
+                expressions.push(expression);
+                input.project(expressions)?
+            }
+            Self::Mark { dependent, arguments, comparison, output } => {
+                let schema = input.schema().concat(&Schema::new(vec![output.clone()])?)?;
+                Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison, output })?
+            }
+        };
+        Ok(Arc::new(relation))
     }
 }
 
@@ -125,7 +181,7 @@ impl Context<'_> {
     }
 
     fn dependent(&mut self, query: &ast::Query, input: &ExpressionInput<'_>) -> Result<(Arc<Relation>, Vec<(usize, Expr)>)> {
-        input.relation()?;
+        input.require_relation()?;
         self.outer_scopes.push(CorrelationScope::new(input.schema().clone()));
         let relation = self.query(query);
         let arguments = self.outer_scopes.pop().ok_or_else(|| error("Subquery correlation scope is unavailable"))?.arguments();
@@ -141,19 +197,15 @@ impl Context<'_> {
 
     fn apply_expression(&mut self, input: &mut ExpressionInput<'_>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind) -> Result<Expr> {
         let data_type = if kind == ApplyKind::Exists { LogicalType::Scalar(ScalarType::Bool) } else { dependent.schema().fields()[0].data_type.clone().maybe() };
-        let field = self.hidden_field(data_type)?;
-        let relation = input.relation()?;
-        let schema = relation.schema().concat(&Schema::new(vec![field.clone()])?)?;
-        input.replace(Arc::new(Relation::new(schema, RelationNode::Apply { input: relation, dependent, arguments, kind, output: Some(field.clone()) })?))?;
-        Ok(field.expression())
+        let output = self.hidden_field(data_type)?;
+        let expression = output.expression();
+        input.attach(ExpressionAttachment::Apply { dependent, arguments, kind, output })?;
+        Ok(expression)
     }
 
     fn materialize(&mut self, expression: Expr, input: &mut ExpressionInput<'_>) -> Result<Field> {
         let field = self.hidden_field(expression.data_type())?;
-        let relation = input.relation()?;
-        let mut expressions: Vec<_> = relation.schema().fields().iter().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
-        expressions.push(NamedExpr { field: field.clone(), expr: expression });
-        input.replace(Arc::new(relation.project(expressions)?))?;
+        input.attach(ExpressionAttachment::Materialize(NamedExpr { field: field.clone(), expr: expression }))?;
         Ok(field)
     }
 
@@ -179,10 +231,9 @@ impl Context<'_> {
         let comparison = Expr::binary(BinaryOp::Eq, needle.expression(), candidate.expression());
         let dependent = Arc::new(Relation::new(Schema::new(vec![candidate])?, RelationNode::Values { rows })?);
         let output = self.hidden_field(LogicalType::Scalar(ScalarType::Bool).maybe())?;
-        let relation = input.relation()?;
-        let schema = relation.schema().concat(&Schema::new(vec![output.clone()])?)?;
-        input.replace(Arc::new(Relation::new(schema, RelationNode::Mark { input: relation, dependent, arguments, comparison, output: output.clone() })?))?;
-        Ok(output.expression())
+        let expression = output.expression();
+        input.attach(ExpressionAttachment::Mark { dependent, arguments, comparison, output })?;
+        Ok(expression)
     }
 
     pub(crate) fn quantified_subquery(&mut self, needle: &ast::Expr, query: &ast::Query, op: BinaryOp, negate: bool, input: &mut ExpressionInput<'_>, replacements: &Replacements) -> Result<Expr> {
