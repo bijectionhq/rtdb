@@ -54,7 +54,7 @@ pub(super) enum NodeLayout {
     List { validity: Option<NullBuffer>, offsets: RetainedBuffer, elements: Arc<PhysicalNode> },
     FixedList { validity: Option<NullBuffer>, size: usize, elements: Arc<PhysicalNode> },
     Union { type_ids: RetainedBuffer, offsets: RetainedBuffer, children: Vec<Arc<PhysicalNode>> },
-    RunEnd { logical_offset: usize, ends: Arc<PhysicalNode>, values: Arc<PhysicalNode> },
+    RunEnd(RunEndReader),
 }
 
 impl PhysicalNode {
@@ -77,7 +77,7 @@ impl PhysicalNode {
                 }
             },
             NodeLayout::Union { .. } => match self.union_child(row)? { Some((child, offset)) => child.null(offset)?, None => true },
-            NodeLayout::RunEnd { values, .. } => values.null(self.run_index(row)?)?,
+            NodeLayout::RunEnd(reader) => reader.values().null(reader.index(row)?)?,
         })
     }
     pub(super) fn check(&self, row: usize) -> Result<()> { if row < self.length { Ok(()) } else { Err(index_error()) } }
@@ -99,17 +99,6 @@ impl PhysicalNode {
     }
     pub(super) fn union_child(&self, row: PhysicalIndex) -> Result<Option<(&Arc<Self>, PhysicalIndex)>> {
         self.union_leg(row)?.map(|child| Ok((child, self.union_offset_index(row)?))).transpose()
-    }
-    pub(super) fn run_index(&self, row: PhysicalIndex) -> Result<PhysicalIndex> {
-        let NodeLayout::RunEnd { logical_offset, ends, .. } = &self.storage else { return Err(layout()); };
-        let logical = row.0.wrapping_add(PhysicalIndex::from_position(*logical_offset)?.0);
-        let mut lower = 0;
-        let mut upper = ends.length;
-        while lower < upper {
-            let middle = lower + (upper - lower) / 2;
-            if i64::try_from(run_end(ends, middle)?).map_err(|_| layout())? <= i64::from(logical) { lower = middle + 1; } else { upper = middle; }
-        }
-        PhysicalIndex::from_position(lower)
     }
     pub(super) fn list_offset(&self, row: PhysicalIndex, count: bool) -> Result<i32> {
         match &self.storage {
@@ -235,7 +224,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
         (DataType::RunEndEncoded(ends_field, values_field), PhysicalLayout::RunEndEncoded { length, run_ends, values }) => {
             let ends = direct(run_ends, ends_field)?;
             let values = direct(values, values_field)?;
-            (length, NodeLayout::RunEnd { logical_offset: 0, ends, values })
+            (length, NodeLayout::RunEnd(RunEndReader::new(RunStorage { logical_offset: 0, ends, values })))
         }
         _ => return Err(layout()),
     };

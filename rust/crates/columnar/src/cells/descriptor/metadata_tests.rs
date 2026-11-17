@@ -232,7 +232,7 @@ fn concrete_reads_and_structural_materialization_do_not_demand_failed_logical_me
     let ends = scalar("ends", DataType::Int32, false, &memory).into_direct().unwrap();
     let values = scalar("values", DataType::Null, true, &memory).into_direct().unwrap();
     let runs_descriptor = run("runs", &ends.descriptor, &values.descriptor, &memory);
-    let runs = node(runs_descriptor, 1, NodeLayout::RunEnd { logical_offset: 0, ends, values });
+    let runs = node(runs_descriptor, 1, NodeLayout::RunEnd(RunEndReader::new(RunStorage { logical_offset: 0, ends, values })));
     assert_eq!(runs.logical_type(), Err(failure(UnencodedBottom::Null, RunEndWidth::I32)));
     assert!(runs.reader_nullable());
     assert!(runs.cell(0).unwrap().is_null().unwrap());
