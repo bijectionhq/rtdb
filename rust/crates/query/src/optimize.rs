@@ -87,7 +87,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let input = prepare(Arc::clone(input))?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Unnest { input, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer })?))
         }
-        RelationNode::PatchGaps { .. } | RelationNode::Reference { .. } | RelationNode::List { .. } => Ok(relation),
+        RelationNode::PatchGaps { .. } | RelationNode::Reference { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => Ok(relation),
     }
 }
 

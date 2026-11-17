@@ -224,6 +224,9 @@ pub struct WindowExpr { pub field: Field, pub function: WindowFunction }
 pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
     List { expr: Expr, element: Field },
+    /// Materializes the selected list during opening and publishes one page, including an empty page.
+    /// Statically non-list scalar payloads are not demanded; null and non-list results produce an empty page.
+    ColumnTable { expr: Expr, element: Field },
     PageOrdinality { input: Arc<Relation>, field: Field },
     Scan(Scan),
     Project { input: Arc<Relation>, expressions: Vec<NamedExpr> },
@@ -287,7 +290,7 @@ impl Relation {
 
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
-            RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
+            RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
             RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
@@ -314,7 +317,7 @@ impl Relation {
             RelationNode::SortLimit { order_by, offset, fetch, .. } => order_by.iter().map(|order| &order.expr).chain(offset.iter()).chain(fetch.iter()).collect(),
             RelationNode::Window { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
-            RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } => vec![expr],
+            RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => vec![expr],
             RelationNode::PatchGaps { from, to, .. } => vec![from, to],
             RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::PageOrdinality { .. } => vec![],
         }
@@ -476,7 +479,7 @@ impl Relation {
                     if output.data_type != left.data_type.join(&right.data_type) { return invalid("Set output type is not the join of its inputs"); }
                 }
             }
-            RelationNode::List { element, .. } => {
+            RelationNode::List { element, .. } | RelationNode::ColumnTable { element, .. } => {
                 if self.schema.fields() != [element.clone()] { return invalid("List schema differs from its element"); }
             }
             RelationNode::PageOrdinality { input, field } => {

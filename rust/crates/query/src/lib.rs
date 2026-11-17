@@ -5,6 +5,9 @@ mod cursor;
 mod runtime_schema;
 mod operators;
 mod list;
+mod column_table;
+#[cfg(test)]
+mod column_table_tests;
 #[cfg(test)]
 mod list_tests;
 mod join;

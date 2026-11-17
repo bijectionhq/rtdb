@@ -95,7 +95,7 @@ fn duration(value: i64) -> Value { Value::Duration { value, unit: TimeUnit::Micr
 
 pub(crate) fn operator(relation: &Relation) -> &'static str {
     match relation.node() {
-        RelationNode::Values { .. } => "table", RelationNode::Scan(_) => "scan", RelationNode::Project { .. } => "project",
+        RelationNode::Values { .. } | RelationNode::ColumnTable { .. } => "table", RelationNode::Scan(_) => "scan", RelationNode::Project { .. } => "project",
         RelationNode::Rename { .. } => "rename", RelationNode::Let { .. } => "let", RelationNode::Reference { .. } => "relation",
         RelationNode::Filter { .. } => "select", RelationNode::Limit { .. } => "top", RelationNode::Distinct { .. } => "distinct",
         RelationNode::Sort { .. } => "order-by", RelationNode::SortLimit { .. } => "sort", RelationNode::Join { kind, .. } => match kind { rtdb_plan::JoinKind::Inner => "inner-join", rtdb_plan::JoinKind::Cross => "cross-join", rtdb_plan::JoinKind::Left | rtdb_plan::JoinKind::Right => "left-join", rtdb_plan::JoinKind::Full => "full-join", rtdb_plan::JoinKind::Semi => "semi-join", rtdb_plan::JoinKind::Anti => "anti-join" }, RelationNode::Aggregate { .. } => "group-by", RelationNode::Window { .. } => "window",

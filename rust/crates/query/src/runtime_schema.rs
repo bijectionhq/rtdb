@@ -152,7 +152,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
                 for order in &aggregate.order_by { expression(&order.expr)?; }
             }
         }
-        RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } => expression(expr)?,
+        RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => expression(expr)?,
         RelationNode::Join { condition, .. } => if let Some(condition) = condition { expression(condition)?; },
         RelationNode::Apply { arguments, .. } => for (_, expr) in arguments { expression(expr)?; },
         RelationNode::Mark { arguments, comparison, .. } => { for (_, expr) in arguments { expression(expr)?; } expression(comparison)?; },
@@ -274,7 +274,7 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
             for expr in expressions { fields.push(field_type(&expr.field, expr.function.result_type(&input)?)); }
             Schema::new(fields)?
         }
-        RelationNode::List { expr, element } => {
+        RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => {
             let types = expression_type(expr, &Schema::default(), parameters, outer)?.legs().into_iter().map(|ty| match ty.unencoded() {
                 L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element,
                 _ => L::Null,
@@ -328,7 +328,7 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         }
     };
     let node = match (relation.node(), children.as_slice()) {
-        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
+        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
         (RelationNode::Aggregate { .. }, [input]) => EmittedNode::Aggregate { input: Arc::clone(input), types: aggregates },
         (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => EmittedNode::Binary(Arc::clone(left), Arc::clone(right)),
         (RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }

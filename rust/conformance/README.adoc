@@ -20,7 +20,9 @@ Compilation and execution are pending under the Phase 1 work order.
 link:source-completeness.adoc[The source completeness record] separates missing implementation and unfinished source review from Phase 2 qualification.
 Every execution runner validates that record and its reviewed implementation revision before starting project code.
 
-The initial `assertion-ledger.json` maps the two mandatory comparison controls.
+`assertion-ledger.json` maps the two mandatory comparison controls and the four compound assertions in `xtdb.operator.table-test/test-single-col`.
+`fixtures/table-column.json` retains that test's inputs and exact typed rows; its native counterpart exercises the column-table operator.
+The column-table mapping has no paired execution receipts yet.
 The ledger is incomplete: the source inventory remains the record of unmapped files and candidate cases.
 `configurations/control-selection.json` selects those controls by complete ledger identity.
 The runner retains exact ledger, selection and configuration input snapshots with their digests.

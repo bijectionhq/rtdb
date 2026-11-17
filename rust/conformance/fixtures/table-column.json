@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "kind": "table_column_assertions",
+  "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+  "source": "src/test/clojure/xtdb/operator/table_test.clj",
+  "qualified_name": "xtdb.operator.table-test/test-single-col",
+  "source_sha256": "7abb2ec8ae0dfb092e7763947a95556a6f5ebee55e79165d5fa1848e81cba62c",
+  "cases": [
+    {
+      "id": "integers",
+      "source_assertion_line": 157,
+      "column": "x5",
+      "parameter": false,
+      "input": {
+        "List": [
+          {
+            "I64": 1
+          },
+          {
+            "I64": 2
+          },
+          {
+            "I64": 3
+          }
+        ]
+      },
+      "expected": {
+        "data_type": {
+          "Scalar": "I64"
+        },
+        "rows": [
+          [
+            {
+              "I64": 1
+            }
+          ],
+          [
+            {
+              "I64": 2
+            }
+          ],
+          [
+            {
+              "I64": 3
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "mixed-numbers",
+      "source_assertion_line": 162,
+      "column": "x5",
+      "parameter": false,
+      "input": {
+        "List": [
+          {
+            "I64": 1
+          },
+          {
+            "F64": 4611686018427387904
+          },
+          {
+            "I64": 3
+          }
+        ]
+      },
+      "expected": {
+        "data_type": {
+          "Union": [
+            {
+              "Scalar": "I64"
+            },
+            {
+              "Scalar": "F64"
+            }
+          ]
+        },
+        "rows": [
+          [
+            {
+              "I64": 1
+            }
+          ],
+          [
+            {
+              "F64": 4611686018427387904
+            }
+          ],
+          [
+            {
+              "I64": 3
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "parameter-with-null",
+      "source_assertion_line": 167,
+      "column": "unnest-param",
+      "parameter": true,
+      "input": {
+        "List": [
+          {
+            "F64": 4623170197477182669
+          },
+          "Null",
+          {
+            "I64": 100
+          },
+          {
+            "F64": 4635541022703616000
+          }
+        ]
+      },
+      "expected": {
+        "data_type": {
+          "Union": [
+            "Null",
+            {
+              "Scalar": "I64"
+            },
+            {
+              "Scalar": "F64"
+            }
+          ]
+        },
+        "rows": [
+          [
+            {
+              "F64": 4623170197477182669
+            }
+          ],
+          [
+            "Null"
+          ],
+          [
+            {
+              "I64": 100
+            }
+          ],
+          [
+            {
+              "F64": 4635541022703616000
+            }
+          ]
+        ]
+      }
+    },
+    {
+      "id": "null-input",
+      "source_assertion_line": 174,
+      "column": "b",
+      "parameter": false,
+      "input": "Null",
+      "expected": {
+        "data_type": "Null",
+        "rows": []
+      }
+    }
+  ]
+}

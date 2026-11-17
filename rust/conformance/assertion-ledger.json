@@ -35,6 +35,57 @@
         {"id": "legacy/decoded", "comparison": "exact", "expected": {"kind": "returned"}},
         {"id": "claim/decoded", "comparison": "exact", "expected": {"kind": "returned"}}
       ]
+    },
+    {
+      "identity": {
+        "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+        "source": "src/test/clojure/xtdb/operator/table_test.clj",
+        "qualified_name": "xtdb.operator.table-test/test-single-col",
+        "parameter_fixture": "rust/conformance/fixtures/table-column.json",
+        "configuration": "unit/arrow/default"
+      },
+      "source_assertion_lines": [
+        157,
+        158,
+        162,
+        163,
+        167,
+        168,
+        174
+      ],
+      "counterparts": [
+        "rtdb-query::column_table_tests::column_tables_preserve_the_four_original_single_column_assertions"
+      ],
+      "observations": [
+        {
+          "id": "integers",
+          "comparison": "exact",
+          "expected": {
+            "kind": "returned"
+          }
+        },
+        {
+          "id": "mixed-numbers",
+          "comparison": "exact",
+          "expected": {
+            "kind": "returned"
+          }
+        },
+        {
+          "id": "parameter-with-null",
+          "comparison": "exact",
+          "expected": {
+            "kind": "returned"
+          }
+        },
+        {
+          "id": "null-input",
+          "comparison": "exact",
+          "expected": {
+            "kind": "returned"
+          }
+        }
+      ]
     }
   ]
 }
