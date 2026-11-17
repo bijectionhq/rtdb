@@ -6,13 +6,43 @@ struct Bucket { head: Option<usize>, tail: Option<usize>, len: usize, root: Opti
 struct Replay<'a, K, C> { entries: Vec<Entry<'a, K>>, compare_keys: C, buckets: BTreeMap<usize, Bucket>, capacity: usize, threshold: usize }
 
 /// Returns OpenJDK HashMap iteration indices after insertion, replacement and collision-tree ordering.
-/// Keys share one Java comparable class: `hash` returns its raw `hashCode`, and `compare_keys` uses its `Comparable` ordering.
+/// `hash` returns the raw Java `hashCode`; comparable keys share one class and use its `Comparable` ordering.
+/// Non-comparable keys must already be deduplicated and use a stable per-object identity tie order.
 /// Duplicate keys return the last input index at their retained Java iteration position.
 /// The caller owns keys and allocation admission; an overflowing initial capacity returns `None`.
 pub fn indices<'a, K: Eq + 'a>(initial: usize, keys: impl IntoIterator<Item = &'a K>, hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Option<Vec<usize>> {
     let capacity = initial.max(1).checked_next_power_of_two()?.min(1 << 30);
     let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity, threshold: capacity * 3 / 4 };
     for (source, key) in keys.into_iter().enumerate() { replay.insert(key, source, hash(key)); }
+    let mut order = Vec::with_capacity(replay.entries.len());
+    for bucket in replay.buckets.values() {
+        let mut next = bucket.head;
+        while let Some(index) = next { order.push(replay.entries[index].source); next = replay.entries[index].next; }
+    }
+    Some(order)
+}
+
+/// Returns iteration indices after individual insertions followed by OpenJDK `HashMap.putAll`.
+/// `initial = None` selects the default constructor; `Some` selects an explicit initial capacity.
+/// `additions` contains distinct keys in the source map's iteration order; its length is that map's size.
+/// Indices address the concatenation of `keys` and `additions`, retaining the latest replacement index.
+/// Key comparison and allocation obligations match `indices`; capacity overflow returns `None`.
+pub fn put_all_indices<'a, K: Eq + 'a>(initial: Option<usize>, keys: impl IntoIterator<Item = &'a K>, additions: &[&'a K], hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Option<Vec<usize>> {
+    let capacity = initial.unwrap_or(16).max(1).checked_next_power_of_two()?.min(1 << 30);
+    let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity, threshold: if capacity == 1 << 30 { i32::MAX as usize } else { capacity * 3 / 4 } };
+    let mut offset = 0;
+    for key in keys { replay.insert(key, offset, hash(key)); offset += 1; }
+    if !additions.is_empty() {
+        if offset == 0 {
+            let requested = if additions.len() >= (1 << 30) * 3 / 4 { 1 << 30 } else { (additions.len() * 4).div_ceil(3) };
+            let threshold = initial.map_or(0, |_| capacity).max(requested);
+            replay.capacity = threshold.max(1).next_power_of_two().min(1 << 30);
+            replay.threshold = if replay.capacity == 1 << 30 { i32::MAX as usize } else { replay.capacity * 3 / 4 };
+        } else {
+            while additions.len() > replay.threshold && replay.capacity < 1 << 30 { replay.resize(); }
+        }
+        for (index, key) in additions.iter().enumerate() { replay.insert(*key, offset + index, hash(*key)); }
+    }
     let mut order = Vec::with_capacity(replay.entries.len());
     for bucket in replay.buckets.values() {
         let mut next = bucket.head;
@@ -159,5 +189,51 @@ impl<'a, K: Eq, C: Fn(&K, &K) -> Ordering> Replay<'a, K, C> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bulk_default_constructor_presizes_before_first_insertion() {
+        let keys = [9i32, 2];
+        let additions = keys.iter().collect::<Vec<_>>();
+        assert_eq!(put_all_indices(None, std::iter::empty(), &additions, |key| *key, Ord::cmp), Some(vec![0, 1]));
+        assert_eq!(put_all_indices(Some(16), std::iter::empty(), &additions, |key| *key, Ord::cmp), Some(vec![1, 0]));
+        assert_eq!(put_all_indices(None, keys[..1].iter(), &additions[1..], |key| *key, Ord::cmp), Some(vec![1, 0]));
+    }
+
+    #[test]
+    fn bulk_capacity_uses_ceiling_without_extra_bucket_at_exact_load_factor() {
+        let keys = [4i32, 1, 2];
+        assert_eq!(put_all_indices(None, std::iter::empty(), &keys.iter().collect::<Vec<_>>(), |key| *key, Ord::cmp), Some(vec![0, 1, 2]));
+    }
+
+    #[test]
+    fn bulk_replacement_indices_include_replaced_first_batch_entries() {
+        let first = [1i32, 1, 2];
+        let additions = [1i32, 3];
+        assert_eq!(put_all_indices(None, first.iter(), &additions.iter().collect::<Vec<_>>(), |key| *key, Ord::cmp), Some(vec![3, 2, 4]));
+        assert_eq!(put_all_indices(Some(usize::MAX), first.iter(), &[], |key| *key, Ord::cmp), None);
+    }
+
+    #[test]
+    fn unique_identity_ranked_keys_retain_collision_tree_root_order() {
+        #[derive(PartialEq, Eq)]
+        struct Key { identity: u32 }
+        let keys = (0..9).map(|identity| Key { identity }).collect::<Vec<_>>();
+        let order = indices(64, keys.iter(), |_| 1, |left, right| left.identity.cmp(&right.identity)).unwrap();
+        assert_eq!(order[0], 3);
+        let mut sorted = order; sorted.sort_unstable(); assert_eq!(sorted, (0..9).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn bulk_large_collision_family_retains_every_key_and_replacement() {
+        let keys = (0..64).collect::<Vec<u32>>();
+        let additions = keys.iter().rev().collect::<Vec<_>>();
+        let mut order = put_all_indices(None, keys[..12].iter(), &additions, |_| 1, Ord::cmp).unwrap();
+        order.sort_unstable(); assert_eq!(order, (12..76).collect::<Vec<_>>());
     }
 }
