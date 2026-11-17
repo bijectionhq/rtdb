@@ -12,6 +12,9 @@ Reference requests use the supplied signed version and `deleted=true`.
 A requested version of `-1` is replaced in the containing reference by the fetched response's version before duplicate detection.
 A missing response version remains null and is omitted from subsequent lookup-body serialization.
 Zero and negative returned versions retain their values.
+Missing or null whole reference lists normalize to empty lists.
+Individual null entries remain in source order and fail only when their edge is demanded, after any earlier valid fetches.
+A duplicate fetched schema's null entries are not demanded when its descent is skipped.
 Missing reference names, subjects, or versions fail when their edge is reached.
 Empty names and subjects remain distinct from missing values.
 
@@ -22,6 +25,7 @@ For example, parent `:.ctx:parent` and child `child` request `:.ctx:child`.
 The explicit default-context child `:.:child` under that parent requests `:.ctx::.:child`; with no parent it requests `child`.
 Fetched subject/version metadata belongs to a separate response envelope and cannot enter the subject-version POST body.
 Reference resolution and version replacement precede that POST, which uses `normalize=false` and `deleted=true`.
+An empty root reference list is omitted from the POST body under the source NON_EMPTY policy.
 
 == Ownership and admission
 
@@ -35,19 +39,20 @@ Initial frame storage and each reference step are admitted before their native a
 The checked step bound includes text copies, map nodes, request overhead, and three slots per frame and ordered name.
 Three slots cover geometric vector reallocation with old and new buffers simultaneously live.
 The completed document separately charges retained map nodes, string capacities, and ordered-vector storage.
-Root reference-vector capacity and optional string capacities remain charged even when nullable version replacement makes their serialized entries empty.
+Root reference-vector capacity uses the full nullable slot size, including null entries and spare capacity, and optional string capacities remain charged even when nullable version replacement makes their serialized entries empty.
 Metadata and rule JSON containers retain explicit heap bounds, and serialized size is measured with a passive counting sink without creating an output buffer.
-Each typed reference-vector conversion admits three slots per element before deserialization, including its geometric growth overlap.
+Each typed reference-vector conversion admits three nullable slots per input array element before deserialization, including null members and geometric growth overlap.
+The shared nullable-list decoder creates no intermediate vector; missing and null lists require no vector allocation.
 The reference-count limit is the available budget; response byte limits remain in force.
 Cancellation and errors drop partial graph data, while the conversion context retains its reservation charges until that context drops.
 Published documents retain their own lease after the context is released.
 
 == Remaining qualification
 
-This source implementation covers reference-resolution order, nullable version replacement, subject contexts, and their ownership boundaries.
+This source implementation covers reference-resolution order, nullable list and entry demand, nullable version replacement, subject contexts, and their ownership boundaries.
 Persistent fetched-version cache semantics remain separate work.
 The native subject-version lookup still precedes semantic schema/reader/datum work that Java performs before that lookup.
-Parsed schema ownership, canonical and empty-field POST serialization, semantic record subject names, Jackson response coercions and nullable reference-list/entry shapes still require source integration.
+Parsed schema ownership, canonical and other empty-field POST serialization, semantic record subject names and Jackson response coercions still require source integration.
 The shared request path also retains UTF8 URL encoding and URL dot-segment handling that differ from Java's UTF16 URI encoder.
 Generic response JSON parse admission remains separate from the typed vector admission above.
 No runtime compatibility or Phase 1 completeness claim follows from this bounded change.

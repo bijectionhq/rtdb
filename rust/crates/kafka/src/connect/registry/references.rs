@@ -18,8 +18,8 @@ struct ReferenceResponse {
     schema: String,
     #[serde(rename = "schemaType")]
     schema_type: Option<String>,
-    #[serde(default)]
-    references: Vec<super::Reference>,
+    #[serde(default, deserialize_with = "deserialize_reference_list")]
+    references: Vec<Option<super::Reference>>,
     #[serde(rename = "ruleSet")]
     rule_set: Option<Json>,
     #[serde(default)]
@@ -63,7 +63,7 @@ impl RegistryConverter {
                 else { return Ok(ResolvedSchema { root: frame.schema.body, references }); }
                 continue;
             }
-            let reference = &frame.schema.body.references[frame.next];
+            let reference = frame.schema.body.references[frame.next].as_ref().ok_or_else(|| error("schema-registry", "Schema reference must not be null"))?;
             let (Some(name), Some(subject), Some(version)) = (&reference.name, &reference.subject, reference.version) else {
                 return Err(error("schema-registry", "Schema reference requires a name, subject and version"));
             };
@@ -80,7 +80,7 @@ impl RegistryConverter {
                 subject: response.subject, version: response.version,
             };
             if version == -1 {
-                stack.last_mut().expect("requesting reference frame").schema.body.references[index].version = fetched.version;
+                stack.last_mut().expect("requesting reference frame").schema.body.references[index].as_mut().expect("requesting reference was validated").version = fetched.version;
             }
             if !visited.insert(name.clone()) { continue; }
             stack.push(Frame { schema: fetched, next: 0, name: Some(name) });
@@ -111,19 +111,23 @@ fn qualify_subject(parent: Option<&str>, child: &str) -> String {
     if parent_context != "." { format!(":{parent_context}:{child}") } else { subject.into() }
 }
 
+pub(super) fn deserialize_reference_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<Option<super::Reference>>, D::Error> {
+    <Option<Vec<Option<super::Reference>>> as serde::Deserialize<'de>>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 pub(super) fn empty_text(value: &Option<String>) -> bool { value.as_ref().is_none_or(String::is_empty) }
 
 pub(super) fn admit_typed_references(value: &Json, context: &mut ConversionContext) -> Result<()> {
     if let Some(values) = value.get("references").and_then(Json::as_array) {
-        context.reserve(values.len().checked_mul(std::mem::size_of::<super::Reference>()).and_then(|bytes| bytes.checked_mul(3)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        context.reserve(values.len().checked_mul(std::mem::size_of::<Option<super::Reference>>()).and_then(|bytes| bytes.checked_mul(3)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
     }
     Ok(())
 }
 
 pub(super) fn root_retained_bound(root: &RegistrySchema) -> Result<usize> {
     let mut bytes = add(root.schema.capacity(), root.schema_type.as_ref().map_or(0, String::capacity))?;
-    bytes = add(bytes, root.references.capacity().checked_mul(std::mem::size_of::<super::Reference>()).ok_or_else(overflow)?)?;
-    for reference in &root.references {
+    bytes = add(bytes, root.references.capacity().checked_mul(std::mem::size_of::<Option<super::Reference>>()).ok_or_else(overflow)?)?;
+    for reference in root.references.iter().flatten() {
         bytes = add(add(bytes, reference.name.as_ref().map_or(0, String::capacity))?, reference.subject.as_ref().map_or(0, String::capacity))?;
     }
     for value in [&root.metadata, &root.rule_set].into_iter().flatten() { bytes = add(bytes, json_retained_bound(value)?)?; }

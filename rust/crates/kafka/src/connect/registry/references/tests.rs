@@ -94,7 +94,7 @@ async fn reference_graph_fetches_depth_first_and_inserts_dependencies_before_par
         "GET /subjects/zsub/versions/1?deleted=true HTTP/1.1", "GET /subjects/:.ctx:shared/versions/1?deleted=true HTTP/1.1",
         "GET /subjects/asub/versions/1?deleted=true HTTP/1.1", "GET /subjects/:.ctx:shared/versions/1?deleted=true HTTP/1.1",
     ]);
-    assert_eq!(resolved.root.references[0].subject.as_deref(), Some("zsub"));
+    assert_eq!(resolved.root.references[0].as_ref().unwrap().subject.as_deref(), Some("zsub"));
     drop(resolved); drop(converter); drop(context); assert_eq!(memory.used_bytes(), 0);
 }
 
@@ -118,9 +118,9 @@ async fn latest_reference_versions_mutate_before_duplicate_skipping_and_preserve
         let (url, handle) = server(vec![first, duplicate]).await;
         let mut converter = converter(url); let memory = MemoryBudget::new(1 << 27); let mut context = ConversionContext::new(Arc::clone(&memory));
         let resolved = converter.resolve_references(root(vec![reference("A", ":.:a", json!(-1)), reference("A", ":.:a", json!(-1))]), &mut context).await.unwrap();
-        assert_eq!(resolved.root.references[0].version, Some(7));
-        assert_eq!(resolved.root.references[1].version, returned.as_i64().map(|version| version as i32));
-        assert_eq!(resolved.root.references[1].subject.as_deref(), Some(":.:a"));
+        assert_eq!(resolved.root.references[0].as_ref().unwrap().version, Some(7));
+        assert_eq!(resolved.root.references[1].as_ref().unwrap().version, returned.as_i64().map(|version| version as i32));
+        assert_eq!(resolved.root.references[1].as_ref().unwrap().subject.as_deref(), Some(":.:a"));
         assert_eq!(resolved.references.texts().collect::<Vec<_>>(), ["\"first\""]);
         for (request, _) in requests(handle).await { assert_eq!(request, "GET /subjects/a/versions/-1?deleted=true HTTP/1.1"); }
         let encoded = serde_json::to_value(&resolved.root).unwrap();
@@ -209,7 +209,7 @@ async fn cancelled_reference_resolution_drops_partial_data_and_keeps_charges_unt
 fn retained_document_keeps_empty_reference_slots_and_metadata_capacity_after_context_drop() {
     let mut root = root((0..4096).map(|_| reference("", "", Json::Null)).collect());
     let mut metadata = Vec::with_capacity(1024); metadata.push(json!(true)); root.metadata = Some(Json::Array(metadata));
-    let reference_slots = root.references.capacity() * std::mem::size_of::<super::super::Reference>();
+    let reference_slots = root.references.capacity() * std::mem::size_of::<Option<super::super::Reference>>();
     let Json::Array(metadata) = root.metadata.as_ref().unwrap() else { unreachable!() };
     let metadata_slots = metadata.capacity() * std::mem::size_of::<Json>();
     assert!(root_retained_bound(&root).unwrap() >= reference_slots + metadata_slots);
@@ -228,7 +228,7 @@ fn retained_document_keeps_empty_reference_slots_and_metadata_capacity_after_con
 #[test]
 fn typed_reference_vector_admission_precedes_materialization_and_ignores_nonarray_shapes() {
     let value = schema("\"int\"", vec![json!({}); 1024]);
-    let bound = 1024 * std::mem::size_of::<super::super::Reference>() * 3 + 4096;
+    let bound = 1024 * std::mem::size_of::<Option<super::super::Reference>>() * 3 + 4096;
     let memory = MemoryBudget::new(bound); let mut context = ConversionContext::with_limit(Arc::clone(&memory), bound - 1);
     assert_eq!(admit_typed_references(&value, &mut context).err().unwrap().code, "xtdb.kafka-connect-source/batch-too-large");
     assert_eq!(memory.used_bytes(), 0);
@@ -240,3 +240,5 @@ fn typed_reference_vector_admission_precedes_materialization_and_ignores_nonarra
     assert_eq!(memory.used_bytes(), bound);
     drop(materialized); drop(context); assert_eq!(memory.used_bytes(), 0);
 }
+
+mod nullable;

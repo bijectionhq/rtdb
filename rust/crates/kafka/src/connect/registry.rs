@@ -118,8 +118,8 @@ struct RegistrySchema {
     schema: String,
     #[serde(rename = "schemaType", default, skip_serializing_if = "Option::is_none")]
     schema_type: Option<String>,
-    #[serde(default)]
-    references: Vec<Reference>,
+    #[serde(default, deserialize_with = "references::deserialize_reference_list", skip_serializing_if = "Vec::is_empty")]
+    references: Vec<Option<Reference>>,
     #[serde(rename = "ruleSet", default, skip_serializing_if = "Option::is_none")]
     rule_set: Option<Json>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

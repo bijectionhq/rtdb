@@ -7,10 +7,15 @@ link:../../../../../../../dev/doc/rust-kafka-reference-resolution.adoc[The devel
 `AvroSchema` parses resolved texts in insertion order before the root.
 `QualifiedSubject.qualifySubjectWithParent` supplies default-tenant parent-context qualification without a tenant prefix.
 `SchemaReference` retains nullable fields and omits empty values when serialized.
+The HTTP-backed `Schema` creator normalizes missing/null reference lists to empty lists; its SchemaString and SchemaMetadata wrapper constructors normalize again.
+Those wrappers retain null list members, which the traversal rejects only when their edge is demanded after prior valid fetches.
+A duplicate fetched schema can contain an undemanded null member because lookup and latest-version replacement precede descent skipping.
+An empty root reference list is omitted from subject-version POST bodies under the source NON_EMPTY policy.
 `RestService` supplies signed version URIs, deleted lookups, and subject-version request options.
 The client and deserializer sources establish the initial null-parent roots and the later schema-version lookup timing.
 
-link:sources.sha256[The source manifest] pins every inspected Java file.
+link:sources.sha256[The source manifest] pins every inspected Java file, including the SchemaString and SchemaMetadata constructor path.
+`Schema.setReferences` itself can assign null; the normalization above describes the HTTP creator/wrapper paths, not a universal setter invariant.
 The registry-client files come from `io.confluent:kafka-schema-registry-client:7.8.0`, whose source JAR has SHA256 `0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf`.
 The deserializer sources belong to `io.confluent:kafka-schema-serializer:7.8.0` and `io.confluent:kafka-avro-serializer:7.8.0`.
 link:COPYRIGHT[Original source headers] retain their notices.
@@ -18,4 +23,5 @@ link:LICENSE-APACHE[The Apache License 2.0] is retained byte-for-byte from the p
 The inspected Confluent source JAR contains no separate license or notice member.
 
 Regression sources cover ordered and indexed observations, contexts, null and empty values, duplicate and cyclic edges, version mutation, POST sequencing, failure cleanup, and initial admission.
+Nullable-list sources additionally cover ID and fetched response normalization, demanded and skipped null entries, latest-version mutation before skipping, empty-list serialization, typed nullable-slot admission and retained spare capacity.
 These are source expectations from the pinned code; they have not been executed during Phase 1.
