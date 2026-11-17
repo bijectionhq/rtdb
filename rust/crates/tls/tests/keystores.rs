@@ -175,3 +175,36 @@ fn jks_load_compares_stored_alias_case_exactly_and_validates_overwritten_certifi
         assert!(decode(&jks_store(&[certificate_entry(alias, &chain[0])]), Some("12345678"), None, StoreUse::Trust).is_err());
     }
 }
+
+#[test]
+fn jks_identity_aliases_retain_hashtable_enumeration_before_and_after_resize() {
+    let (key, chain) = fixture_key();
+    for (names, expected) in [
+        (vec!["a", "b", "c", "d", "e", "f", "g", "h"], vec!["b", "a", "h", "g", "f", "e", "d", "c"]),
+        (vec!["a", "b", "c", "d", "e", "f", "g", "h", "i"], vec!["i", "h", "g", "f", "e", "d", "c", "b", "a"]),
+        (vec!["a", "l", "a"], vec!["l", "a"]),
+        (vec!["a", "x", "b", "c", "d", "e", "f", "g", "h"], vec!["h", "g", "f", "e", "d", "c", "b", "a", "x"]),
+    ] {
+        let entries = names.iter().map(|name| key_entry(name.as_bytes(), &key, &chain)).collect::<Vec<_>>();
+        let store = decode(&jks_store(&entries), Some("12345678"), None, StoreUse::Identity).unwrap();
+        let aliases = store.identities().iter().map(|identity| String::from_utf16(identity.alias().unwrap()).unwrap()).collect::<Vec<_>>();
+        assert_eq!(aliases, expected);
+    }
+}
+
+#[test]
+fn jks_identity_aliases_keep_isolated_utf16_code_units() {
+    let (key, chain) = fixture_key();
+    let store = decode(&jks_store(&[key_entry(b"\xed\xa0\x80", &key, &chain)]), Some("12345678"), None, StoreUse::Identity).unwrap();
+    assert_eq!(store.identities()[0].alias(), Some([0xd800u16].as_slice()));
+}
+
+#[test]
+fn pem_identity_has_no_java_store_alias() {
+    let mut pem = include_bytes!("../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.key").to_vec();
+    pem.extend_from_slice(include_bytes!("../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.crt"));
+    let memory = MemoryBudget::new(1 << 20);
+    let charge = memory.reserve(KeyStore::allocation_bound(pem.len()).unwrap()).unwrap();
+    let store = KeyStore::decode(&pem, StoreFormat::Pem, StoreUse::Identity, None, None, charge).unwrap();
+    assert_eq!(store.identities()[0].alias(), None);
+}

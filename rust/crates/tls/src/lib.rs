@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use openssl::{pkey::PKey, x509::X509};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
@@ -7,6 +7,7 @@ use sha1::{Digest, Sha1};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 mod pkcs12;
+mod aliases;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }
@@ -20,7 +21,7 @@ pub enum StoreUse {
     Trust,
 }
 pub struct KeyStore { identities: Vec<Identity>, trusted: Vec<Vec<u8>>, reservation: Arc<MemoryReservation> }
-pub struct Identity { private_key: Zeroizing<Vec<u8>>, certificates: Vec<Vec<u8>> }
+pub struct Identity { alias: Option<Vec<u16>>, private_key: Zeroizing<Vec<u8>>, certificates: Vec<Vec<u8>> }
 pub struct IssuerNames { names: Vec<Vec<u8>>, _reservation: Arc<MemoryReservation> }
 impl IssuerNames {
     pub fn as_slice(&self) -> &[Vec<u8>] { &self.names }
@@ -59,18 +60,21 @@ impl KeyStore {
         if usage == StoreUse::Identity && parts.identities.is_empty() { return Err(invalid("Keystore contains no private key and certificate chain")); }
         Ok(Self { identities: parts.identities, trusted: parts.trusted, reservation })
     }
+    /// Private-key entries in the Java store's alias-enumeration order, or the single PEM identity.
     pub fn identities(&self) -> &[Identity] { &self.identities }
     pub fn trusted_certificates(&self) -> &[Vec<u8>] { &self.trusted }
     /// Retain this charge with TLS configuration objects that copy material from this store.
     pub fn reservation(&self) -> Arc<MemoryReservation> { Arc::clone(&self.reservation) }
 }
 impl Identity {
-    fn new(private_key: Zeroizing<Vec<u8>>, certificates: Vec<Vec<u8>>) -> Result<Self> {
+    fn new(alias: Option<Vec<u16>>, private_key: Zeroizing<Vec<u8>>, certificates: Vec<Vec<u8>>) -> Result<Self> {
         let key = PKey::private_key_from_pkcs8(&private_key).map_err(invalid)?;
         let certificate = X509::from_der(certificates.first().ok_or_else(|| invalid("Private key has no certificate"))?).map_err(invalid)?;
         if !certificate.public_key().map_err(invalid)?.public_eq(&key) { return Err(invalid("Private key does not match its leaf certificate")); }
-        Ok(Self { private_key, certificates })
+        Ok(Self { alias, private_key, certificates })
     }
+    /// Java store alias as UTF-16 code units; PEM identities have no stored alias.
+    pub fn alias(&self) -> Option<&[u16]> { self.alias.as_deref() }
     pub fn private_key_pkcs8(&self) -> &[u8] { &self.private_key }
     pub fn certificates(&self) -> &[Vec<u8>] { &self.certificates }
     /// DER issuer names in chain order, for matching a peer's acceptable certificate-authority hints.
@@ -107,7 +111,7 @@ fn pem(bytes: &[u8], key_password: Option<&str>, private_keys: bool) -> Result<P
         if plain + encrypted != 1 { return Err(invalid("PEM identity requires exactly one PKCS8 private key")); }
         if (encrypted == 1) != key_password.is_some() { return Err(invalid("Encrypted PEM keys require a key password; plain keys require no password")); }
         let key = match key_password { Some(password) => PKey::private_key_from_pem_passphrase(bytes, password.as_bytes()), None => PKey::private_key_from_pem(bytes) }.map_err(invalid)?;
-        vec![Identity::new(Zeroizing::new(key.private_key_to_pkcs8().map_err(invalid)?), certificates.clone())?]
+        vec![Identity::new(None, Zeroizing::new(key.private_key_to_pkcs8().map_err(invalid)?), certificates.clone())?]
     } else { Vec::new() };
     Ok(Parts { identities, trusted: certificates })
 }
@@ -129,7 +133,7 @@ fn jks(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private
     if !matches!(version, 1 | 2) { return Err(invalid("Unsupported JKS version")); }
     let count = cursor.u32()? as usize;
     if count > cursor.0.len() / 14 { return Err(invalid("JKS entry count exceeds input")); }
-    let mut entries = BTreeMap::new();
+    let mut entries = aliases::JksEntries::new();
     for _ in 0..count {
         let tag = cursor.u32()?;
         let alias = modified_utf8(cursor.short_bytes()?)?;
@@ -146,18 +150,18 @@ fn jks(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private
             2 => JksEntry::Certificate(certificate(&mut cursor, version)?),
             _ => return Err(invalid("Unknown JKS entry type")),
         };
-        entries.insert(alias, entry);
+        entries.insert(alias, entry)?;
     }
     if !cursor.0.is_empty() { return Err(invalid("Trailing JKS content")); }
     let mut identities = Vec::new(); let mut trusted = Vec::new();
-    for entry in entries.into_values() {
+    for (alias, entry) in entries.into_enumeration() {
         match entry {
             JksEntry::Key { protected, certificates } => {
                 if let Some(certificate) = certificates.first() { trusted.push(certificate.to_vec()); }
                 if private_keys {
                     let password = key_password.as_ref().ok_or_else(|| invalid("JKS private keys require a password"))?;
                     let key = decrypt_jks_key(protected, password)?;
-                    if !certificates.is_empty() { identities.push(Identity::new(key, certificates.into_iter().map(<[u8]>::to_vec).collect())?); }
+                    if !certificates.is_empty() { identities.push(Identity::new(Some(alias), key, certificates.into_iter().map(<[u8]>::to_vec).collect())?); }
                 }
             }
             JksEntry::Certificate(certificate) => trusted.push(certificate.to_vec()),
