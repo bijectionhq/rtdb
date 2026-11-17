@@ -101,13 +101,16 @@ impl Bags {
     fn finish(self, password: Option<&str>, private_keys: bool, mut remaining: usize) -> Result<Parts> {
         let mut entries = std::collections::BTreeMap::new();
         for (attributes, order) in self.keys.iter().map(|key| (&key.attributes,key.order)).chain(self.certificates.iter().filter(|certificate| certificate.attributes.trusted).map(|certificate| (&certificate.attributes,certificate.order))) {
-            if let Some(alias) = attributes.alias.as_deref() { entries.entry(alias).and_modify(|previous: &mut usize| *previous = (*previous).max(order)).or_insert(order); }
+            if let Some(alias) = attributes.alias.as_deref() {
+                entries.entry(alias).and_modify(|previous: &mut (usize, usize)| { previous.0 = previous.0.min(order); previous.1 = previous.1.max(order); }).or_insert((order, order));
+            }
         }
-        let current = |attributes: &Attributes, order: usize| attributes.alias.as_deref().is_some_and(|alias| entries.get(alias) == Some(&order));
+        let current = |attributes: &Attributes, order: usize| attributes.alias.as_deref().is_some_and(|alias| entries.get(alias).is_some_and(|(_, latest)| *latest == order));
         let mut identities = Vec::new();
         let mut trusted = self.certificates.iter().filter(|certificate| certificate.attributes.trusted && current(&certificate.attributes,certificate.order)).map(|certificate| certificate.der.clone()).collect::<Vec<_>>();
-        for key in &self.keys {
-            if !current(&key.attributes,key.order) { continue; }
+        let mut keys = self.keys.iter().filter(|key| current(&key.attributes, key.order)).collect::<Vec<_>>();
+        keys.sort_by_key(|key| entries[key.attributes.alias.as_deref().expect("named key entry")].0);
+        for key in keys {
             let same_alias = |certificate: &&CertificateBag| key.attributes.alias.as_ref().zip(certificate.attributes.alias.as_ref()).is_some_and(|(a,b)| a == b);
             let same_id = |certificate: &&CertificateBag| key.attributes.key_id.is_some() && key.attributes.key_id == certificate.attributes.key_id;
             let certificate = self.certificates.iter().filter(|certificate| !certificate.attributes.trusted).find(|certificate| same_id(certificate) && same_alias(certificate))
@@ -138,7 +141,7 @@ impl Bags {
                 }
                 if next.is_none() { next = fallback; }
             }
-            identities.push(Identity::new(private_key, chain)?);
+            identities.push(Identity::new(key.attributes.alias.as_deref().map(|alias| alias.encode_utf16().collect()), private_key, chain)?);
         }
         Ok(Parts { identities, trusted })
     }
@@ -334,7 +337,29 @@ mod tests {
     }
     #[test]
     fn duplicate_aliases_replace_earlier_keys_case_insensitively() {
-        assert_eq!(decode(&store(true),Some("store-password"),Some("key-password"),true).unwrap().identities.len(),1);
+        let decoded = decode(&store(true),Some("store-password"),Some("key-password"),true).unwrap();
+        assert_eq!(decoded.identities.len(),1);
+        assert_eq!(decoded.identities[0].alias(), Some("shared".encode_utf16().collect::<Vec<_>>().as_slice()));
+    }
+    #[test]
+    fn pkcs12_replacement_retains_the_original_alias_enumeration_position() {
+        let key = PKey::private_key_from_pem(include_bytes!("../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.key")).unwrap();
+        let certificate = X509::from_pem(include_bytes!("../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.crt")).unwrap().to_der().unwrap();
+        let certificate = sequence(&[der(6,b"\x2a\x86\x48\x86\xf7\x0d\x01\x09\x16\x01"),der(0xa0,&der(4,&certificate))]);
+        let encrypted = key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(),b"key-password").unwrap();
+        let bags = sequence(&[
+            safe_bag(2, encrypted.clone(), 1, Some("first")),
+            safe_bag(2, encrypted.clone(), 2, Some("second")),
+            safe_bag(2, encrypted, 3, Some("FIRST")),
+            safe_bag(3, certificate.clone(), 1, None),
+            safe_bag(3, certificate.clone(), 2, None),
+            safe_bag(3, certificate, 3, None),
+        ]);
+        let authenticated = sequence(&[sequence(&[der(6,DATA),der(0xa0,&der(4,&bags))])]);
+        let store = sequence(&[der(2,&[3]),sequence(&[der(6,DATA),der(0xa0,&der(4,&authenticated))])]);
+        let decoded = decode(&store, None, Some("key-password"), true).unwrap();
+        let aliases = decoded.identities.iter().map(|identity| String::from_utf16(identity.alias().unwrap()).unwrap()).collect::<Vec<_>>();
+        assert_eq!(aliases, ["first", "second"]);
     }
     #[test]
     fn iteration_limits_are_enforced_before_derivation() {
