@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls"]
+exclude = ["vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls", "vendor/openssl-src"]
 
 [patch.crates-io]
 rustls = { path = "vendor/rustls" }
+openssl-src = { path = "vendor/openssl-src" }
 
 [workspace.package]
 version = "0.1.0"

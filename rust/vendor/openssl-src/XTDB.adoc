@@ -1,0 +1,12 @@
+= Local OpenSSL source
+
+This directory contains the complete published `openssl-src` 300.6.1+3.6.3 package from the local Cargo registry source cache.
+The package builds OpenSSL 3.6.3 and retains its upstream sources, build machinery and license notices.
+The upstream package is https://crates.io/crates/openssl-src/300.6.1+3.6.3[openssl-src 300.6.1+3.6.3].
+The OpenSSL source repository is https://github.com/openssl/openssl/tree/openssl-3.6.3[OpenSSL 3.6.3].
+
+`UPSTREAM.sha256` records every original package file before local changes.
+The manifest SHA-256 is `f513696ac0a80fb28ce9ac16d4ecbcf76b441973be5afd9a38365838fa1b9a49`.
+The source cache contained no package archive checksum, so this manifest identifies the available source without asserting independent archive verification.
+The workspace patch gives all OpenSSL consumers one source identity.
+This source copy has not been compiled or executed during Phase 1.
