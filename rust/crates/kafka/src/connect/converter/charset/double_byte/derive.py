@@ -201,9 +201,65 @@ for path in provenance_paths:
     original = source[path].decode()
     header = original[:original.index('*/') + 2]
     headers.setdefault(header, []).append(path)
+solaris_path = 'jdk.charsets/sun/nio/cs/ext/Big5_Solaris.java'
+solaris_original = source[solaris_path].decode()
+solaris = uncomment(solaris_original)
+assert re.search(r'public CharsetDecoder newDecoder\(\)\s*\{\s*return new DoubleByte.Decoder\(this, Holder.b2c, Holder.b2cSB, 0x40, 0xfe, true\);\s*\}', solaris)
+assert re.search(r'public CharsetEncoder newEncoder\(\)\s*\{\s*return new DoubleByte.Encoder\(this, Holder.c2b, Holder.c2bIndex, true\);\s*\}', solaris)
+initialization = re.sub(r'\s+', ' ', solaris.split('static {', 1)[1].split('c2b =', 1)[0]).strip()
+expected = 'b2c = Big5.DecodeHolder.b2c.clone(); int[] sol = new int[] { 0xF9D6, 0x7881, 0xF9D7, 0x92B9, 0xF9D8, 0x88CF, 0xF9D9, 0x58BB, 0xF9DA, 0x6052, 0xF9DB, 0x7CA7, 0xF9DC, 0x5AFA }; if (b2c[0xf9] == DoubleByte.B2C_UNMAPPABLE) { b2c[0xf9] = new char[0xfe - 0x40 + 1]; Arrays.fill(b2c[0xf9], UNMAPPABLE_DECODING); } for (int i = 0; i < sol.length;) { b2c[0xf9][sol[i++] & 0xff - 0x40] = (char)sol[i++]; } b2cSB = Big5.DecodeHolder.b2cSB;'
+assert initialization == expected
+patch_array = re.search(r'int\[\] sol = new int\[\] \{(.*?)\};', solaris, re.S).group(1)
+patch_numbers = [int(value, 16) for value in re.findall(r'0x[0-9A-Fa-f]+', patch_array)]
+points, replacements = patch_numbers[::2], patch_numbers[1::2]
+assert points == list(range(0xf9d6, 0xf9dd))
+singles, pairs = mappings['Big5']
+assert pairs[0xf9] is not None
+base_units = [pairs[0xf9][point & (0xff - 0x40)] for point in points]
+assert base_units == [0xfffd] * 7
+assert all(pairs[point & 255] is not None for point in points)
+assert all(not 0xd800 <= unit <= 0xdfff for unit in replacements)
+solaris_canonical, solaris_aliases = extended_names['Big5_Solaris']
+solaris_names = sorted({name.lower() for name in [solaris_canonical, *solaris_aliases]})
+assert solaris_names == ['big5_solaris', 'x-big5-solaris']
+for name in solaris_names:
+    assert resolve(name) == ('jdk.charsets', 'Big5_Solaris')
+(output / 'big5').mkdir(exist_ok=True)
+patches = 'pub(super) const LEAD: u8 = 0xf9;\npub(super) const FIRST: u8 = 0xd6;\npub(super) const LAST: u8 = 0xdc;\n'
+patches += 'pub(super) const BASE_UNIT: u16 = 0xfffd;\n'
+patches += 'pub(super) const SOLARIS_UNITS: [u16; 7] = [' + ', '.join(f'0x{unit:04x}' for unit in replacements) + '];\n'
+(output / 'big5' / 'patches.rs').write_text(patches)
+patched_pairs = pairs.copy()
+patched_pairs[0xf9] = pairs[0xf9].copy()
+for index, point in enumerate(points):
+    patched_pairs[0xf9][(point & 255) - 0x40] = replacements[index]
+post_activation_probe = hashlib.sha256()
+for first in range(256):
+    for second in range(256):
+        if singles[first] != 0xfffd:
+            units = [singles[first], singles[second]]
+        else:
+            mapped = patched_pairs[first][second - 0x40] if patched_pairs[first] is not None and 0x40 <= second <= 0xfe else 0xfffd
+            if mapped != 0xfffd:
+                units = [mapped]
+            elif patched_pairs[first] is None or patched_pairs[second] is not None or singles[second] != 0xfffd:
+                units = [0xfffd, singles[second]]
+            else:
+                units = [0xfffd]
+        post_activation_probe.update(''.join(chr(unit) for unit in [*units, 0]).encode('utf-8'))
+solaris_manifest = 'canonical\tclass\tsource\tsource_sha256\tbase_source\tbase_source_sha256\tlead\tfirst\tlast\tbase_unit\tsolaris_units\taliases\tpost_activation_pair_probe_utf8_sha256\n'
+solaris_manifest += '\t'.join([solaris_canonical, 'Big5_Solaris', solaris_path, hashlib.sha256(source[solaris_path]).hexdigest(), class_paths['Big5'], hashlib.sha256(source[class_paths['Big5']]).hexdigest(), 'f9', 'd6', 'dc', 'fffd', '|'.join(f'{unit:04x}' for unit in replacements), '|'.join(solaris_aliases), post_activation_probe.hexdigest()]) + '\n'
+(output / 'big5-solaris.tsv').write_text(solaris_manifest)
+solaris_sources = [solaris_path, class_paths['Big5'], 'java.base/sun/nio/cs/DoubleByte.java', 'java.base/java/lang/String.java', extended_path, 'jdk.charsets/sun/nio/cs/ext/AbstractCharsetProvider.java', 'java.base/sun/nio/cs/Big5_HKSCS.java', 'jdk.charsets/sun/nio/cs/ext/Big5_HKSCS_2001.java', 'java.base/sun/nio/cs/HKSCS.java']
+(output / 'big5-solaris.sources.sha256').write_text(''.join(f'{hashlib.sha256(source[path]).hexdigest()}  {path}\n' for path in solaris_sources))
+headers.setdefault(solaris_original[:solaris_original.index('*/') + 2], []).append(solaris_path)
+
 (output / 'COPYRIGHT').write_text('\n\n'.join('\n'.join(paths) + '\n\n' + header for header, paths in headers.items()) + '\n')
 print('names', len(aliases), 'tables', len(rows), 'bytes', sum(int(row[8]) for row in rows))
 for row in rows:
     print(row[0], 'lead rows', row[7], 'bytes', row[8], 'sha256', row[9], 'pair probe', row[11])
 for filename in ['aliases.rs', 'tables.rs', 'charsets.tsv', 'sources.sha256']:
+    print(filename, hashlib.sha256((output / filename).read_bytes()).hexdigest())
+
+for filename in ['big5/patches.rs', 'big5-solaris.tsv', 'big5-solaris.sources.sha256']:
     print(filename, hashlib.sha256((output / filename).read_bytes()).hexdigest())
