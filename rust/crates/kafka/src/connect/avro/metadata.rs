@@ -194,7 +194,7 @@ pub(super) fn raw_default_value(value: &super::default_json::DefaultJson, schema
     Ok(match &schema.kind {
         SchemaKind::Bool => Value::Bool(value.as_bool().unwrap_or(false)),
         SchemaKind::I8 => Value::I8(value.int_value().unwrap_or(0) as i8), SchemaKind::I16 => Value::I16(value.int_value().unwrap_or(0) as i16), SchemaKind::I32 => Value::I32(value.int_value().unwrap_or(0)), SchemaKind::I64 => Value::I64(integer()),
-        SchemaKind::F32 => Value::F32(value.float_value().unwrap_or(0.0)), SchemaKind::F64 => Value::F64(value.double_value().unwrap_or(0.0)),
+        SchemaKind::F32 => Value::F32(value.double_value().unwrap_or(0.0) as f32), SchemaKind::F64 => Value::F64(value.double_value().unwrap_or(0.0)),
         SchemaKind::String => Value::Utf8(value.as_str().map(str::to_owned).ok_or_else(|| error("avro-schema", "String default is not textual"))?), SchemaKind::Bytes => Value::Binary(bytes()?),
         SchemaKind::Array(element) => Value::List(value.as_array().ok_or_else(|| error("avro-schema", "Array default is not an array"))?.iter().map(|value| raw_default_value(value, element, field_default)).collect::<Result<_>>()?),
         SchemaKind::Map(_, element) => Value::Map { entries: value.as_object().ok_or_else(|| error("avro-schema", "Map default is not an object"))?.iter().map(|(key, value)| Ok((Value::Utf8(key.clone()), raw_default_value(value, element, field_default)?))).collect::<Result<_>>()?, sorted: false },
@@ -245,5 +245,26 @@ mod tests {
         assert!(default_value(&Json::String("\u{1}".into()), &schema, false).is_err());
         schema.parameters.insert("scale".into(), "0".into());
         assert!(default_value(&Json::String(String::new()), &schema, false).is_err());
+    }
+    #[test]
+    fn field_float_defaults_round_through_the_jackson_double_accessor() {
+        for (literal,bits) in [("1152921573326323713",0x5d800000),("-1152921573326323713",0xdd800000)] {
+            let schema=format!(r#"{{"type":"record","name":"R","fields":[{{"name":"scalar","type":"float","default":{literal}}},{{"name":"array","type":{{"type":"array","items":"float"}},"default":[{literal}]}},{{"name":"map","type":{{"type":"map","values":"float"}},"default":{{"a":{literal}}}}},{{"name":"node","type":{{"type":"float","connect.default":{literal}}}}}]}}"#);
+            let plan=super::super::AvroPlan::parse(&schema,&[]).unwrap();
+            let scalar=plan.connect.field("scalar").unwrap().schema;
+            let Value::F32(value)=scalar.default.as_ref().unwrap() else { panic!("expected Float default") };
+            assert_eq!(value.to_bits(),bits);
+            let array=plan.connect.field("array").unwrap().schema;
+            let Value::List(values)=array.default.as_ref().unwrap() else { panic!("expected Array default") };
+            let Value::F32(value)=&values[0] else { panic!("expected Float element") };
+            assert_eq!(value.to_bits(),bits);
+            let map=plan.connect.field("map").unwrap().schema;
+            let Value::Map {entries,..}=map.default.as_ref().unwrap() else { panic!("expected Map default") };
+            let Value::F32(value)=&entries[0].1 else { panic!("expected Float map value") };
+            assert_eq!(value.to_bits(),bits);
+            let node=plan.connect.field("node").unwrap().schema;
+            let Value::F32(value)=node.default.as_ref().unwrap() else { panic!("expected JsonNode Float default") };
+            assert_eq!(value.to_bits(),bits);
+        }
     }
 }
