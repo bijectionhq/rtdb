@@ -1,10 +1,12 @@
 use super::Number;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Classification { Numeric,Integer,FixedInteger,Double,Floating,Ratio,Decimal,Rational,PositiveInteger,NegativeInteger,NaturalInteger }
+/// Clojure runtime numeric classification, including sign refinements restricted to fixed-width integers.
+pub enum Classification { Numeric,Integer,FixedInteger,Double,Floating,Ratio,Decimal,Rational,PositiveInteger,NegativeInteger,NaturalInteger }
 
 impl Number {
-    pub(crate) fn classifies(&self,classification: Classification) -> bool {
+    /// Inspects the stored category without conversion, coefficient copying or collection traversal.
+    pub fn classifies(&self,classification: Classification) -> bool {
         use Classification as C;
         match self {
             Self::Byte(value) => classification.fixed(i64::from(*value)),

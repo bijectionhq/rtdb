@@ -1,15 +1,18 @@
 use num_bigint::BigInt;
 use num_traits::{Signed,Zero};
-use rtdb_types::Anomaly;
+use crate::Anomaly;
 use super::{Binary,Cast,Dispatch,Error,Number,Result,arithmetic::{align_decimal,decimal_error},comparison::decimal_compare,invalid};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Integral { Quotient,Remainder }
+/// Truncating quotient or the corresponding remainder, retaining the selected numeric category's rules.
+pub enum Integral { Quotient,Remainder }
 impl Integral {
-    pub(crate) fn primitive(self,dispatch: Dispatch) -> Option<Cast> { dispatch.result(false) }
+    /// Returns the primitive result category for the selected overload, or None for boxed dispatch.
+    pub fn primitive(self,dispatch: Dispatch) -> Option<Cast> { dispatch.result(false) }
 }
 impl Number {
-    pub(crate) fn integral_bound(&self,other: &Self) -> Result<usize> {
+    /// Bounds scratch and output storage for quotient or remainder, including decimal preferred-scale work.
+    pub fn integral_bound(&self,other: &Self) -> Result<usize> {
         let base = self.binary_bound(Binary::Multiply(false),other)?;
         let mut bytes = base.checked_mul(4).ok_or_else(invalid)?;
         if !matches!(self,Self::Float(_) | Self::Double(_)) && !matches!(other,Self::Float(_) | Self::Double(_)) && (matches!(self,Self::Decimal { .. }) || matches!(other,Self::Decimal { .. })) {
@@ -29,7 +32,7 @@ impl Number {
         Ok(bytes)
     }
     /// Retain the integral_bound reservation through this call and the returned value's lifetime.
-    pub(crate) fn integral(&self,operation: Integral,other: &Self,dispatch: Dispatch) -> Result<Self> {
+    pub fn integral(&self,operation: Integral,other: &Self,dispatch: Dispatch) -> Result<Self> {
         if dispatch == Dispatch::Long {
             let (left,right) = (self.long()?,other.long()?);
             if right == 0 { return Err(failure("/ by zero")); }

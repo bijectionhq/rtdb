@@ -491,7 +491,12 @@ fn function(name: &str) -> Option<Function> {
         "bit-clear" => Function::Bit(Bit::Clear),"bit-set" => Function::Bit(Bit::Set),"bit-flip" => Function::Bit(Bit::Flip),"bit-test" => Function::BitTest,
         "bit-shift-left" => Function::Bit(Bit::ShiftLeft),"bit-shift-right" => Function::Bit(Bit::ShiftRight),"unsigned-bit-shift-right" => Function::Bit(Bit::UnsignedShiftRight),_ => return None })
 }
-impl Bit {
+trait BitHost: Sized {
+    fn variadic(self) -> bool;
+    fn inline(self,count: usize) -> bool;
+    fn apply_host<'a>(self,args: Vec<HostValue<'a>>,context: &EvalContext<'_>) -> Result<HostValue<'a>>;
+}
+impl BitHost for Bit {
     fn variadic(self) -> bool { matches!(self,Self::And | Self::Or | Self::Xor | Self::AndNot) }
     fn inline(self,count: usize) -> bool { if self.variadic() { count > 1 } else { matches!(self,Self::ShiftLeft | Self::ShiftRight | Self::UnsignedShiftRight) } }
     fn apply_host<'a>(self,args: Vec<HostValue<'a>>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {

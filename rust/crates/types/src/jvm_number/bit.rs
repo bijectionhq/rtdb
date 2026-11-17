@@ -1,10 +1,12 @@
-use rtdb_types::Anomaly;
+use crate::Anomaly;
 use super::{Error,Number,Result};
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Bit { And,Or,Xor,AndNot,Clear,Set,Flip,ShiftLeft,ShiftRight,UnsignedShiftRight }
+/// Fixed-long bit operation; shift and bit-index operands use their low six bits.
+pub enum Bit { And,Or,Xor,AndNot,Clear,Set,Flip,ShiftLeft,ShiftRight,UnsignedShiftRight }
 impl Bit {
-    pub(crate) fn apply(self,left: i64,right: i64) -> i64 {
+    /// Applies an admitted fixed-long operation without allocating; right shifts distinguish signed and unsigned bits.
+    pub fn apply(self,left: i64,right: i64) -> i64 {
         let count = (right as u64 & 63) as u32;
         match self {
             Self::And => left & right,Self::Or => left | right,Self::Xor => left ^ right,Self::AndNot => left & !right,
@@ -13,11 +15,14 @@ impl Bit {
         }
     }
 }
-pub(crate) fn bit_not(value: i64) -> i64 { !value }
-pub(crate) fn bit_test(value: i64,index: i64) -> bool { value & 1i64.wrapping_shl((index as u64 & 63) as u32) != 0 }
+/// Complements an admitted signed-long bit pattern without allocating.
+pub fn bit_not(value: i64) -> i64 { !value }
+/// Tests the bit selected by the low six bits of a signed-long index.
+pub fn bit_test(value: i64,index: i64) -> bool { value & 1i64.wrapping_shl((index as u64 & 63) as u32) != 0 }
 
 impl Number {
-    pub(crate) fn bit_operand(&self) -> Result<i64> {
+    /// Admits Byte, Short, Int or Long and rejects other numeric categories with their JVM class diagnostic.
+    pub fn bit_operand(&self) -> Result<i64> {
         let message = match self {
             Self::Byte(value) => return Ok(i64::from(*value)),Self::Short(value) => return Ok(i64::from(*value)),Self::Int(value) => return Ok(i64::from(*value)),Self::Long(value) => return Ok(*value),
             Self::BigInt(_) => "bit operation not supported for: class clojure.lang.BigInt",

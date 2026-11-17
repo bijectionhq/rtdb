@@ -1,46 +1,58 @@
 use super::{Cast,Error,Number,Result,invalid,reduce};
 use num_bigint::BigInt;
 use num_traits::Zero;
-use rtdb_types::Anomaly;
+use crate::Anomaly;
 
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Binary { Add(bool),Subtract(bool),Multiply(bool),Divide }
+/// Binary numeric operation; a true arithmetic flag permits fixed-long overflow to promote to BigInt.
+pub enum Binary { Add(bool),Subtract(bool),Multiply(bool),Divide }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Unary { Negate(bool),Increment(bool),Decrement(bool) }
+/// Unary numeric operation with the same checked-versus-promoting flag as `Binary`.
+pub enum Unary { Negate(bool),Increment(bool),Decrement(bool) }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Dispatch { Object,Long,Double }
+/// Overload selected by the caller's emitted argument metadata.
+/// `Object` preserves boxed dispatch; primitive Long and Double paths retain their distinct arithmetic contracts.
+pub enum Dispatch { Object,Long,Double }
 impl Dispatch {
-    pub(crate) fn unary(value: Option<Cast>) -> Self {
+    /// Selects unary dispatch from a known primitive category, or Object for absent primitive metadata.
+    pub fn unary(value: Option<Cast>) -> Self {
         match value { Some(Cast::Float | Cast::Double) => Self::Double,Some(_) => Self::Long,None => Self::Object }
     }
-    pub(crate) fn binary(left: Option<Cast>,right: Option<Cast>) -> Self {
+    /// Selects binary dispatch with Double precedence and Long only when both arguments are integral primitives.
+    pub fn binary(left: Option<Cast>,right: Option<Cast>) -> Self {
         match (Self::unary(left),Self::unary(right)) {
             (Self::Double,_) | (_,Self::Double) => Self::Double,
             (Self::Long,Self::Long) => Self::Long,
             _ => Self::Object,
         }
     }
-    pub(crate) fn result(self,promoting: bool) -> Option<Cast> {
+    /// Returns the emitted primitive result category; promoting integral operations return boxed objects.
+    pub fn result(self,promoting: bool) -> Option<Cast> {
         match self { Self::Double => Some(Cast::Double),Self::Long if !promoting => Some(Cast::Long),_ => None }
     }
 }
 impl Binary {
-    pub(crate) fn primitive(self,dispatch: Dispatch) -> Option<Cast> {
+    /// Returns this operation's result metadata for the selected overload.
+    pub fn primitive(self,dispatch: Dispatch) -> Option<Cast> {
         dispatch.result(matches!(self,Self::Add(true) | Self::Subtract(true) | Self::Multiply(true) | Self::Divide))
     }
 }
 impl Unary {
-    pub(crate) fn primitive(self,dispatch: Dispatch) -> Option<Cast> {
+    /// Returns this operation's result metadata for the selected overload.
+    pub fn primitive(self,dispatch: Dispatch) -> Option<Cast> {
         dispatch.result(matches!(self,Self::Negate(true) | Self::Increment(true) | Self::Decrement(true)))
     }
 }
 
 impl Number {
-    pub(crate) fn admit_divisor(&self) -> Result<()> { if self.zero() { Err(failure("Divide by zero")) } else { Ok(()) } }
-    pub(crate) fn unary_bound(&self,operation: Unary) -> Result<usize> {
+    /// Checks boxed divisor zero admission without evaluating or converting a numerator.
+    pub fn admit_divisor(&self) -> Result<()> { if self.zero() { Err(failure("Divide by zero")) } else { Ok(()) } }
+    /// Bounds scratch and returned numeric storage for the paired unary operation, with checked size arithmetic.
+    pub fn unary_bound(&self,operation: Unary) -> Result<usize> {
         match operation { Unary::Negate(_) => scratch(self.storage_bits()?.checked_add(64).ok_or_else(invalid)?),Unary::Increment(_) | Unary::Decrement(_) => self.binary_bound(Binary::Add(false),&Self::Long(1)) }
     }
-    pub(crate) fn binary_bound(&self,operation: Binary,other: &Self) -> Result<usize> {
+    /// Bounds scratch and returned numeric storage for the paired binary operation, including decimal alignment.
+    pub fn binary_bound(&self,operation: Binary,other: &Self) -> Result<usize> {
         let mut bits = self.storage_bits()?.checked_add(other.storage_bits()?).and_then(|bits|bits.checked_add(128)).ok_or_else(invalid)?;
         if !self.floating() && !other.floating() && (self.decimal_kind() || other.decimal_kind()) {
             for value in [self,other] {
@@ -57,7 +69,7 @@ impl Number {
         scratch(bits)
     }
     /// Retain the unary_bound reservation through this call and the returned value's lifetime.
-    pub(crate) fn unary(&self,operation: Unary,dispatch: Dispatch) -> Result<Self> {
+    pub fn unary(&self,operation: Unary,dispatch: Dispatch) -> Result<Self> {
         if dispatch == Dispatch::Double || self.floating() {
             let value = self.double()?;
             return Ok(Self::Double(match operation { Unary::Negate(_) => -value,Unary::Increment(_) => value + 1.0,Unary::Decrement(_) => value - 1.0 }));
@@ -74,7 +86,7 @@ impl Number {
         }
     }
     /// Retain the binary_bound reservation through this call and the returned value's lifetime.
-    pub(crate) fn binary(&self,operation: Binary,other: &Self,dispatch: Dispatch) -> Result<Self> {
+    pub fn binary(&self,operation: Binary,other: &Self,dispatch: Dispatch) -> Result<Self> {
         if dispatch == Dispatch::Double {
             let (left,right) = (self.double()?,other.double()?);
             return Ok(Self::Double(match operation { Binary::Add(_) => left + right,Binary::Subtract(_) => left - right,Binary::Multiply(_) => left * right,Binary::Divide => left / right }));

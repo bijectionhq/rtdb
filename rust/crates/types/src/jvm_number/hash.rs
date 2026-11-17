@@ -1,7 +1,7 @@
 use num_bigint::BigInt;
 use num_traits::{ToPrimitive,Zero};
 use super::{Number,Result,invalid};
-fn clojure_long(value: i64) -> i32 { if value == 0 { 0 } else { rtdb_columnar::murmur3_32(&value.to_le_bytes(),0) as i32 } }
+fn clojure_long(value: i64) -> i32 { if value == 0 { 0 } else { crate::murmur3_32(&value.to_le_bytes(),0) as i32 } }
 
 fn integer(value: &BigInt) -> i32 {
     let (sign,digits) = value.to_u32_digits();
@@ -11,7 +11,9 @@ fn integer(value: &BigInt) -> i32 {
 fn long(value: i64) -> i32 { (value ^ ((value as u64 >> 32) as i64)) as i32 }
 
 impl Number {
-    pub(crate) fn java_hash_code(&self) -> i32 {
+    /// Computes Java numeric-wrapper hashing, preserving Decimal scale and canonical floating NaN bits.
+    /// Arbitrary-precision digit buffers require caller-admitted scratch storage.
+    pub fn java_hash_code(&self) -> i32 {
         match self {
             Self::Byte(value) => i32::from(*value),Self::Short(value) => i32::from(*value),Self::Int(value) => *value,Self::Long(value) => long(*value),
             Self::BigInt(value) => value.to_i64().map_or_else(||integer(value),long),
@@ -21,7 +23,9 @@ impl Number {
             Self::Ratio { numerator,denominator } => integer(numerator) ^ integer(denominator),
         }
     }
-    pub(crate) fn hasheq(&self) -> Result<i32> {
+    /// Computes Clojure numeric hashing, including normalized Decimal scale and zero hashes for floating signed zero.
+    /// Decimal normalization may allocate coefficient scratch and may reject scale underflow; the caller admits that work.
+    pub fn hasheq(&self) -> Result<i32> {
         Ok(match self {
             Self::Byte(value) => clojure_long(i64::from(*value)),Self::Short(value) => clojure_long(i64::from(*value)),Self::Int(value) => clojure_long(i64::from(*value)),Self::Long(value) => clojure_long(*value),
             Self::BigInt(value) => value.to_i64().map_or_else(||integer(value),clojure_long),

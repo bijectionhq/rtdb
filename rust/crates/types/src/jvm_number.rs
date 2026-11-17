@@ -1,47 +1,68 @@
+//! JVM numeric categories and Clojure operations for caller-admitted values.
+//! Callers admit input, scratch and output allocations and retain their charges through the values' lifetimes.
+//! Operation-specific `*_bound` methods cover their paired operations; parsing, casts, hashing and text need caller admission too.
+//! This module owns no allocation scope, identity, namespace or dynamic arithmetic binding.
+//! Object identity checks, reader admission and adapter-specific diagnostics remain with the caller.
+
 use num_bigint::BigInt;
 use num_traits::{Signed,ToPrimitive,Zero};
-use rtdb_types::Anomaly;
-use crate::decimal::decimal_parts_text as decimal_text;
+use crate::Anomaly;
+use self::text::decimal_parts_text as decimal_text;
+mod text;
+pub use text::decimal_parts_text;
 mod parse;
 mod hash;
 mod arithmetic;
-pub(crate) use arithmetic::{Binary,Dispatch,Unary};
+pub use arithmetic::{Binary,Dispatch,Unary};
 mod comparison;
-pub(crate) use comparison::{Comparison,Predicate};
+pub use comparison::{Comparison,Predicate};
 mod classification;
-pub(crate) use classification::Classification;
+pub use classification::Classification;
 mod integral;
-pub(crate) use integral::Integral;
+pub use integral::Integral;
 mod bit;
-pub(crate) use bit::{Bit,bit_not,bit_test};
+pub use bit::{Bit,bit_not,bit_test};
 mod extrema;
-pub(crate) use extrema::{Extremum,ExtremumCall,Selected};
+pub use extrema::{Extremum,ExtremumCall,Selected};
 
 #[derive(Debug)]
-pub(crate) enum Error { Invalid,External(Anomaly) }
+/// `Invalid` requests an adapter-specific numeric diagnostic; `External` retains an operation's selected anomaly.
+pub enum Error { Invalid,External(Anomaly) }
 impl From<Anomaly> for Error { fn from(error: Anomaly) -> Self { Self::External(error) } }
-pub(crate) type Result<T> = std::result::Result<T,Error>;
+/// A numeric outcome whose invalid-input diagnostic is selected by its consuming adapter.
+pub type Result<T> = std::result::Result<T,Error>;
 fn invalid() -> Error { Error::Invalid }
 
 #[derive(Clone,Debug,PartialEq)]
-pub(crate) enum Number {
+/// Numeric payload with its JVM wrapper or Clojure exact-number category.
+/// Ratio denominators must be positive and nonzero; callers establish their source representation before construction.
+/// Cloning copies arbitrary-precision payloads and requires caller admission.
+/// Derived `PartialEq` compares the stored Rust representation; use the named equality methods for JVM semantics.
+pub enum Number {
     Byte(i8),Short(i16),Int(i32),Long(i64),BigInt(BigInt),Float(f32),Double(f64),
     Decimal { coefficient: BigInt,scale: i32 },Ratio { numerator: BigInt,denominator: BigInt },
 }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Cast { Byte,Short,Int,Long,Float,Double }
+/// Target primitive category for checked JVM numeric conversion.
+pub enum Cast { Byte,Short,Int,Long,Float,Double }
 
 impl Number {
-    pub(crate) fn parse_long(text: &str) -> Result<Self> { parse::long(text) }
-    pub(crate) fn parse_double(text: &str) -> Result<Self> { parse::double(text) }
-    pub(crate) fn is_nan(&self) -> bool { matches!(self,Self::Float(value) if value.is_nan()) || matches!(self,Self::Double(value) if value.is_nan()) }
-    pub(crate) fn integer(text: &str) -> Result<Self> { Ok(Self::BigInt(integer(text)?)) }
-    pub(crate) fn decimal(text: &str) -> Result<Self> {
-        let spelling = rtdb_types::decimal_spelling(text)?;
+    /// Parses a signed Java decimal long, rejecting whitespace and overflow.
+    pub fn parse_long(text: &str) -> Result<Self> { parse::long(text) }
+    /// Parses Java Double text, including hexadecimal literals, suffixes and ASCII control-space trimming.
+    pub fn parse_double(text: &str) -> Result<Self> { parse::double(text) }
+    /// Tests floating payloads without coercing or copying other numeric categories.
+    pub fn is_nan(&self) -> bool { matches!(self,Self::Float(value) if value.is_nan()) || matches!(self,Self::Double(value) if value.is_nan()) }
+    /// Parses a signed decimal integer into the Clojure BigInt category, including values that fit a long.
+    pub fn integer(text: &str) -> Result<Self> { Ok(Self::BigInt(integer(text)?)) }
+    /// Parses Java BigDecimal syntax and retains its signed 32-bit scale.
+    pub fn decimal(text: &str) -> Result<Self> {
+        let spelling = crate::decimal_spelling(text)?;
         let mantissa = spelling.ascii().split(['e','E']).next().ok_or_else(invalid)?;
         Ok(Self::Decimal { coefficient: integer(&mantissa.replace('.',""))?,scale: spelling.scale() })
     }
-    pub(crate) fn cast(kind: Cast,source: &Self) -> Result<Self> {
+    /// Applies the checked boxed RT conversion, retaining its NaN and truncation rules.
+    pub fn cast(kind: Cast,source: &Self) -> Result<Self> {
         Ok(match kind {
             Cast::Byte => Self::Byte(i8::try_from(source.long()?).map_err(|_|invalid())?),
             Cast::Short => Self::Short(i16::try_from(source.long()?).map_err(|_|invalid())?),
@@ -56,7 +77,9 @@ impl Number {
             Cast::Double => Self::Double(source.double()?),
         })
     }
-    pub(crate) fn cast_primitive(kind: Cast,source: &Self) -> Result<Self> {
+    /// Applies checked primitive RT overloads, including direct integer-to-float rounding.
+    /// The caller selects this path from emitted primitive metadata rather than a boxed runtime category.
+    pub fn cast_primitive(kind: Cast,source: &Self) -> Result<Self> {
         if kind == Cast::Float {
             let value = match source { Self::Byte(value) => Some(*value as f32),Self::Short(value) => Some(*value as f32),Self::Int(value) => Some(*value as f32),Self::Long(value) => Some(*value as f32),_ => None };
             if let Some(value) = value { return Ok(Self::Float(value)); }
@@ -76,7 +99,8 @@ impl Number {
         }
         Self::cast(kind,source)
     }
-    pub(crate) fn text_capacity(&self) -> Result<usize> {
+    /// Bounds bytes in `text` and `printed` outputs from the stored payload size; scratch admission remains with the caller.
+    pub fn text_capacity(&self) -> Result<usize> {
         let bits = match self {
             Self::BigInt(value) | Self::Decimal { coefficient: value,.. } => value.bits(),
             Self::Ratio { numerator,denominator } => numerator.bits().checked_add(denominator.bits()).ok_or_else(invalid)?,
@@ -84,14 +108,16 @@ impl Number {
         };
         usize::try_from(bits).ok().and_then(|bits|bits.checked_add(64)).ok_or_else(invalid)
     }
-    pub(crate) fn text(&self) -> String {
+    /// Returns Java numeric object text, preserving Decimal scale and Ratio numerator/denominator spelling.
+    pub fn text(&self) -> String {
         match self {
             Self::Byte(value) => value.to_string(),Self::Short(value) => value.to_string(),Self::Int(value) => value.to_string(),Self::Long(value) => value.to_string(),Self::BigInt(value) => value.to_string(),
-            Self::Float(value) => rtdb_types::java_f32_text(*value),Self::Double(value) => rtdb_types::java_f64_text(*value),
+            Self::Float(value) => crate::java_f32_text(*value),Self::Double(value) => crate::java_f64_text(*value),
             Self::Decimal { coefficient,scale } => decimal_text(coefficient,*scale),Self::Ratio { numerator,denominator } => format!("{numerator}/{denominator}"),
         }
     }
-    pub(crate) fn printed(&self) -> String {
+    /// Returns readable Clojure numeric text, including exact-number suffixes and symbolic nonfinite values.
+    pub fn printed(&self) -> String {
         match self {
             Self::BigInt(_) => format!("{}N",self.text()),Self::Decimal { .. } => format!("{}M",self.text()),
             Self::Float(value) if value.is_nan() => "##NaN".into(),Self::Double(value) if value.is_nan() => "##NaN".into(),
@@ -108,7 +134,8 @@ impl Number {
             _ => { let value = self.double()?;if value < i64::MIN as f64 || value > i64::MAX as f64 { return Err(invalid()); } value as i64 }
         })
     }
-    pub(crate) fn double(&self) -> Result<f64> {
+    /// Converts to JVM double semantics, including ratio rounding and decimal signed underflow.
+    pub fn double(&self) -> Result<f64> {
         Ok(match self {
             Self::Float(value) => f64::from(*value),Self::Double(value) => *value,
             Self::BigInt(value) => float_integer(value),
@@ -119,7 +146,9 @@ impl Number {
             _ => self.long()? as f64,
         })
     }
-    pub(crate) fn divide(left: &Self,right: &Self) -> Result<Self> {
+    /// Divides numeric objects while preserving exact-number categories and NaN selection.
+    /// After NaN selection, zero divisors and unrepresentable exact decimal results return `Error::Invalid` for the adapter to interpret.
+    pub fn divide(left: &Self,right: &Self) -> Result<Self> {
         for value in [left,right] { if matches!(value,Self::Float(value) if value.is_nan()) || matches!(value,Self::Double(value) if value.is_nan()) { return Ok(value.clone()); } }
         if right.zero() { return Err(invalid()); }
         if matches!(left,Self::Float(_) | Self::Double(_)) || matches!(right,Self::Float(_) | Self::Double(_)) { return Ok(Self::Double(left.double()? / right.double()?)); }
@@ -159,7 +188,9 @@ impl Number {
             Self::Float(value) => *value == 0.0,Self::Double(value) => *value == 0.0,
         }
     }
-    pub(crate) fn equivalent(&self,other: &Self) -> bool {
+    /// Compares numeric payloads using Clojure collection category rules, without an object-identity fast path.
+    /// Callers preserve identity-sensitive cases such as a reader's shared NaN object before calling this method.
+    pub fn equivalent(&self,other: &Self) -> bool {
         match (self,other) {
             (Self::Float(_) | Self::Double(_),Self::Float(_) | Self::Double(_)) => self.double().ok().zip(other.double().ok()).is_some_and(|(left,right)|left == right),
             (Self::Decimal { coefficient: left,scale: ls },Self::Decimal { coefficient: right,scale: rs }) => bigdecimal::BigDecimal::new(left.clone(),i64::from(*ls)) == bigdecimal::BigDecimal::new(right.clone(),i64::from(*rs)),
@@ -167,7 +198,8 @@ impl Number {
             _ => self.rational().ok().zip(other.rational().ok()).is_some_and(|((ln,ld),(rn,rd))|ld == BigInt::from(1) && rd == BigInt::from(1) && ln == rn),
         }
     }
-    pub(crate) fn java_equal(&self,other: &Self) -> bool {
+    /// Compares JVM numeric wrappers, preserving category, Decimal scale, signed zero and canonical NaN equality.
+    pub fn java_equal(&self,other: &Self) -> bool {
         match (self,other) {
             (Self::Float(left),Self::Float(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
             (Self::Double(left),Self::Double(right)) => left.to_bits() == right.to_bits() || left.is_nan() && right.is_nan(),
@@ -179,7 +211,7 @@ impl Number {
 fn integer(text: &str) -> Result<BigInt> {
     let (negative,digits) = match text.as_bytes().first() { Some(b'-') => (true,&text[1..]),Some(b'+') => (false,&text[1..]),_ => (false,text) };
     if digits.is_empty() { return Err(invalid()); }
-    let digits = digits.chars().map(|ch|rtdb_types::decimal_digit(ch).map(|digit|char::from(b'0' + digit)).ok_or_else(invalid)).collect::<Result<String>>()?;
+    let digits = digits.chars().map(|ch|crate::decimal_digit(ch).map(|digit|char::from(b'0' + digit)).ok_or_else(invalid)).collect::<Result<String>>()?;
     let value = BigInt::parse_bytes(digits.as_bytes(),10).ok_or_else(invalid)?;
     Ok(if negative { -value } else { value })
 }
