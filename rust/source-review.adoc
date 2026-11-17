@@ -949,3 +949,22 @@ The bounded write-trace conclusion is unchanged; its submission-source digest id
 
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+== Retained private DFA source checkpoint
+
+The private prediction region owns all 372 decision descriptors and five synthetic precedence starts under its existing retained budget and grammar.
+Ordinary states distinguish unnumbered drafts, numbered unpublished prefixes and interned backing, with distinct typed handles and checked generation, phase and decision.
+Cache hits return the stored value before incoming numbering or optimization; misses preserve completed numbering, optimization and read-only prefixes through later admission failure.
+Target publication precedes ordinary edge storage, and native map and precedence-buffer replacement retain their full old/new overlap.
+Actual map keys and values, starts, synthetic prefilters and edges root the current configuration graph before allocation-free collection.
+Private map probes use admitted linked continuations through the shared context equality kernel; generic comparisons retain their original fallible frame policy and residue.
+Independent source review covers all 38 added regression sources and preservation of the 98 existing parser prediction test bodies.
+The native map substitution remains conditional on stable internal producers and a nonescaping cache boundary.
+Supported embedded recognition-exception capabilities remain an open compatibility requirement before production adoption.
+Parser-produced closure/reach sets, adaptive prediction, shared parser ownership, generated rule control, diagnostics and production integration remain required.
+
+Incoming submission changes only adjust the computed-series regression source; production submission bodies and the bounded write-trace conclusion are unchanged.
+The submission evidence digest now identifies those current committed bytes.
+
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.

@@ -119,7 +119,7 @@
       "evidence": {
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
         "rust/crates/node/src/statement.rs": "c23c62efb2345f44f2644c6cd6cef4aa98b38a4f433cad4eadee500184efa42a",
-        "rust/crates/tx/src/submission.rs": "996164a8e08e825b89d9bd94970941c6defcd44633497f6c4cd1403b393f286e",
+        "rust/crates/tx/src/submission.rs": "4be2b77f816b203708d408c4132db776f227466dd57e10168b22304b2026b696",
         "rust/crates/tx/src/resolver.rs": "5de2a6f21839cbc23ab47688adc14e1b5ab3e9d904659e7683301102a2ecdc91",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context and configuration storage, ordered configuration/mode, exact-unit literal-decoder and private tree-JSON foundations with actual DFA roots, adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration and private actual-root DFA storage, ordered configuration/mode, exact-unit literal-decoder and private tree-JSON foundations with parser-produced closure/reach sets, adaptive prediction and cache insertion, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "source-signed-binary-width",
