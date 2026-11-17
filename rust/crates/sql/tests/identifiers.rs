@@ -20,8 +20,8 @@ fn identifiers_retain_pinned_quoted_and_regular_spellings() {
     for (source, name) in [
         ("SELECT 1 AS \"é@#\"", "é@#"),
         ("SELECT 1 AS `é@#`", "é@#"),
-        ("SELECT 1 AS \"a\"\"b\"", "a\"b"),
-        ("SELECT 1 AS `a``b`", "a`b"),
+        ("SELECT 1 AS \"a\"\"b\"", "a\"\"b"),
+        ("SELECT 1 AS `a``b`", "a``b"),
     ] {
         let rtdb_plan::Statement::Query(relation) = prepare(source, &EmptyCatalog, &PrepareOptions::default()).unwrap().statement else { panic!() };
         assert_eq!(relation.schema().fields()[0].name, name);
@@ -77,5 +77,26 @@ fn invalid_combined_operator_reports_its_first_invalid_character_before_a_later_
             assert_eq!(error.code, "xtdb/sql-error");
             assert_eq!(error.context["position"], serde_json::json!(source.find(first).unwrap() + 1));
         }
+    }
+}
+
+#[test]
+fn quoted_query_names_and_control_names_retain_doubled_delimiters() {
+    for (name, expected) in [(r#""a""b""#, "a\"\"b"), ("`a``b`", "a``b"), (r#""a""""b""#, "a\"\"\"\"b")] {
+        for source in [
+            format!("SELECT {name} FROM (SELECT 1 AS {name}) AS t"),
+            format!("WITH {name} AS (SELECT 1 AS {name}) SELECT {name} FROM {name}"),
+        ] {
+            let rtdb_plan::Statement::Query(relation) = prepare(&source, &EmptyCatalog, &PrepareOptions::default()).unwrap().statement else { panic!() };
+            assert_eq!(relation.schema().fields()[0].name, expected);
+            let spans = split_statements(&source).unwrap();
+            assert_eq!(spans.len(), 1);
+            assert_eq!(&source[spans[0].start..spans[0].end], source);
+        }
+        let rtdb_plan::ControlStatement::AttachDatabase { name: actual, .. } = parse_control(&format!("ATTACH DATABASE {name}"), &PrepareOptions::default()).unwrap().unwrap() else { panic!() };
+        assert_eq!(actual, expected);
+        let rtdb_plan::ControlStatement::CopyIn { table, .. } = parse_control(&format!("COPY {name} FROM STDIN WITH ()"), &PrepareOptions::default()).unwrap().unwrap() else { panic!() };
+        assert_eq!(table[0].text, expected);
+        assert!(table[0].quoted);
     }
 }
