@@ -681,7 +681,7 @@ Execution vectors retain native container descriptors independently of Arrow SDK
 Native union descriptors retain every child and its ordinal, including ordinals whose narrowed signed byte is negative.
 Checked SDK projection reports unrepresentable union declarations without discarding their native descriptors.
 Descriptor construction admits depth-weighted Struct-join allocations before cloning metadata, with retained-child and release regression sources.
-Partial native container storage, recursive writers/copies and production adoption remain required implementation work.
+Recursive writers/copies and production adoption remain required implementation work.
 
 The private SQL grammar graph retains the pinned serialized automaton, checked owner-bound links and its rule-return edges.
 Expected-token traversal implements local epsilon results, full-context EOF results and source-ordered invocation returns without recursive native traversal.
@@ -703,12 +703,12 @@ Their lookup checks the current run, its successor and then binary search, with 
 Private snapshots recursively create fresh reader identities, share retained buffers and descriptors, and retain their own admitted metadata lease.
 Nonempty variable and list snapshots preserve terminal-offset construction demand; a failed copy leaves the original readers and cursors unchanged.
 Independent source review covers these boundaries and all 13 new regression sources remain unexecuted.
-Native partial-container publication, writer trees, copying, full object reads, transport and production reader adoption remain incomplete.
+Writer trees, copying, full object reads, transport and production reader adoption remain incomplete.
 
 `types::java_text` provides retained Java strings and borrowed views of exact UTF16 units, including isolated surrogate units and slices through a pair.
 Copies made with a memory budget retain their own lease; code-point iteration and explicit Java UTF8 byte emission preserve their separate encoding boundaries.
 Independent source review covers the carrier and all 14 regression sources remain unexecuted.
-Regex input, semantic literals, host strings, serialized trees and raw diagnostic consumers remain required implementation work.
+Semantic literals, host strings, serialized trees and complete raw diagnostic consumers remain required implementation work.
 
 == Prediction-context source checkpoint
 
@@ -716,5 +716,36 @@ The private parser prediction-context owner retains flat completed graph values 
 It preserves Empty, null-parent and Array class distinctions, source merge identity, round-local memo membership and canonical-context identity.
 Context equality and canonicalization remain fallible allocation operations; failure seals the owner while completed nonallocating views remain available.
 Independent source review covers the pinned ANTLR algorithms and all 25 regression sources remain unexecuted.
-Ordered configurations, actual adaptive prediction, shared parser-cache ownership, generated rule schedules and production parsing remain required implementation work.
+Actual adaptive prediction, shared parser-cache ownership, generated rule schedules and production parsing remain required implementation work.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+
+== Native containers and pattern input source checkpoint
+
+Private native container publication retains parent and child counts, initialized spans, cursors and list last-offset independently.
+Descriptors derive from the actual retained children, while public ingestion continues enforcing complete external layouts.
+Direct Struct field lookup retains the child's count; indirect lookup retains the reader's selection.
+Snapshots preserve source capture order and terminal-offset demand, releasing partial copies without changing original readers.
+Independent source review covers all 14 private regression sources and the public rejection counterpart to the migrated Null-valued run fixture.
+The tests remain unexecuted; independent Struct lookup keys, signed source counts, mutable writer trees, promotion, copying and production adoption remain required.
+
+Pattern compilation and boolean matching accept exact borrowed Java text through a private adapter.
+Quotation preprocessing retains the original source separately from its grammar points; isolated units remain exact until a grammar operation consumes them.
+Raw failure source, descriptions and native diagnostic buffers retain independent allocation leases.
+Only source-proven first-error branches receive Java syntax descriptions and indices; other failures retain native facts and the original text.
+Independent source review covers all 18 added regression sources, which remain unexecuted.
+Full syntax-error mappings and message rendering, replacement text and SQL/XTQL/host consumers remain required.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+
+== Prediction-configuration source checkpoint
+
+Private prediction sets and their copies retain live configuration identities in ordered membership.
+Copying a configuration itself creates a fresh identity.
+Read-only membership leaves aliased configuration data live, preserving stale hash caches and conflict-object identity.
+Uncached context merging uses the same traversal without reading, clearing or publishing the active round memo.
+The pinned grammar bounds alternatives and precedence values; prediction-mode work preserves all-stop demand, fresh SLL stripping and complete grouping before reduction.
+Fallible operations check their collaborators before identity, empty and cached shortcuts, sealing further work after an abort.
+Independent source review covers all 38 added regression sources; the 25 prediction-context sources remain unchanged.
+All remain unexecuted; closure and DFA insertion hashes, adaptive prediction, persistent cache ownership, generated rules and production parsing remain required.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
