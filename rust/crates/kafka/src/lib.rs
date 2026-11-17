@@ -1,6 +1,5 @@
 mod config;
 mod driver;
-mod java_map;
 mod tail;
 mod tls;
 pub mod connect;

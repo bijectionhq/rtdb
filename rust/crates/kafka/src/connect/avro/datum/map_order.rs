@@ -3,7 +3,7 @@ use super::MapKey;
 
 pub(super) fn indices<'a>(initial: usize, keys: impl IntoIterator<Item = &'a MapKey>) -> Result<Vec<usize>> {
     if initial > i32::MAX as usize { return Err(super::super::super::error("avro-json", "Map initial block exceeds Java map capacity")); }
-    crate::java_map::indices(initial, keys, |key| match key {
+    rtdb_types::java_hash_map_order(initial, keys, |key| match key {
         MapKey::String(key) => key.encode_utf16().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(unit))),
         MapKey::Utf8(key) => key.iter().fold(0i32, |hash, byte| hash.wrapping_mul(31).wrapping_add(i32::from(*byte as i8))),
     }, |left, right| match (left, right) {
