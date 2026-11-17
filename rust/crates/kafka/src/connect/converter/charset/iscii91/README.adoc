@@ -1,0 +1,93 @@
+= Java 25 ISCII91 decoding
+
+The String converter supports `x-ISCII91` and its five aliases: `iscii`, `ST_SEV_358-88`, `iso-ir-153`, `csISO153GOST1976874`, and `ISCII91`.
+All six names resolve case-insensitively through the pinned Java extended provider.
+link:charsets.tsv[The charset manifest] records the provider class, source hash, and alias list.
+
+`Charset::Iscii91` is a passive immutable configuration value.
+The static direct mapping contains all 255 source UTF16 units in 510 bytes.
+One call-local `Context` value distinguishes empty context, an emitted unit, and a pending unit.
+The input traversal and UTF8 output belong to the same decode call.
+The existing scalar memory admission precedes decoding, and output reserves three UTF8 bytes per input byte.
+Each source unit is a nonsurrogate BMP value, and terminal flushing keeps total output at or below one unit per input byte.
+
+== Byte mapping and composition
+
+The decoder preserves OpenJDK25's signed-byte table indexing.
+Bytes below 0x80 index the table directly, and higher bytes use index `byte - 1`.
+Consequently, both 0x7F and 0x80 emit U+007F.
+Bytes 0x81 through 0xA0 map to the invalid-unit marker U+FFFF.
+
+Eight mapped base characters are delayed to inspect the following character.
+A following Nukta byte 0xE9 composes them according to this table:
+
+[cols="1,1,1",options="header"]
+|===
+|Base byte |Base unit |Composed unit
+|0xA1 |U+0901 |U+0950
+|0xA6 |U+0907 |U+090C
+|0xA7 |U+0908 |U+0961
+|0xAA |U+090B |U+0960
+|0xDB |U+093F |U+0962
+|0xDC |U+0940 |U+0963
+|0xDF |U+0943 |U+0944
+|0xEA |U+0964 |U+093D
+|===
+
+A pending base is emitted when the following character does not compose with it.
+That following character becomes pending, retaining the pending state across ordinary characters, Halant, Nukta, invalid units, and attribute markers.
+A pending unit at the end of the record is emitted by the decoder's flush step.
+
+An emitted Halant byte 0xE8 followed by another Halant emits U+200C for the second byte.
+An emitted Halant followed by Nukta emits U+200D for the Nukta byte.
+The context remembers the mapped Halant even after emitting U+200C, so a further Nukta also emits U+200D.
+Pending Halant follows the pending-unit behavior and does not produce those joiner substitutions.
+
+== Invalid units and attribute context
+
+OpenJDK25 `String(byte[], Charset)` uses this `CharsetDecoder` with replacement enabled, `endOfInput` true, and a final flush.
+The decoder does not implement `ArrayDecoder`.
+An invalid unit with no pending character produces one U+FFFD replacement without changing the context.
+For example, `[0xE8, 0x81, 0xE9]` emits U+094D, U+FFFD, and U+200D.
+
+An invalid unit encountered while a character is pending instead emits that preceding character and retains U+FFFF as the next pending unit.
+The pending U+FFFF is emitted literally if it is later displaced or flushed.
+Thus `[0xA1, 0x81]` emits U+0901 followed by U+FFFF.
+U+FFFF is a Unicode noncharacter and remains distinct from the replacement U+FFFD.
+
+Attribute and extension bytes 0xEF and 0xF0 map to U+FFFD and establish attribute context.
+The following byte is consumed as another U+FFFD and clears that context, regardless of its value.
+If the marker was pending, that next output accounts for the pending marker and following byte together.
+For example, `[0xEF, 0x41]` emits two replacements, while `[0xA1, 0xEF, 0x41]` emits U+0901 and one replacement.
+Every record starts with empty context, including after null or empty values.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins seven source files covering ISCII91, provider resolution, and the String/CharsetDecoder replacement and flush path.
+link:COPYRIGHT[Copyright notices] retain upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:mappings.tsv[The mapping manifest] records the source hash, resource size, resource hash, and unit count.
+`direct-map.bin` stores the 255 source units in their original order as big-endian UTF16.
+It preserves U+FFFF invalid markers and U+FFFD attribute markers separately.
+The signed-byte index adjustment belongs to decoding and is not folded into the resource.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-iscii91
+----
+
+It checks archive hashes, provider aliases, literal table dimensions, signed-byte indexing, composition cases, and the replacement and flush path.
+Its reference decoder preserves the Java context unit and pending flag separately.
+link:contexts.tsv[The context manifest] records 20 prefixes covering empty context, emitted Halant/Nukta/attribute markers, each pending composition base, ordinary pending units, pending special and invalid units, and retained Halant after an error.
+Each single-byte digest concatenates all 256 independently decoded prefixed records.
+Each pair digest covers all 65,536 unsigned pair suffixes and appends U+0000 after each decoded result.
+The separator is added after decoding because input NUL participates in pending-unit processing.
+
+Regression sources cover all six names in original and uppercase spelling, all single bytes and pairs, and every context prefix's complete byte and pair suffix spaces.
+Focused cases cover all eight compositions, pending chains, Halant joiners, retained error context, literal U+FFFF flushing, attribute consumption, record independence, configuration, and memory admission.

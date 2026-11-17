@@ -121,7 +121,9 @@ ISO-2022-JP, ISO-2022-JP-2, x-windows-50220, x-windows-50221, and x-windows-iso2
 Their JIS mapping differences, Roman/Kana modes, optional JIS0212 designation, and replacement boundaries are documented in the link:src/connect/converter/charset/double_byte/iso2022jp/README.adoc[ISO-2022-JP reference].
 ISO-2022-CN, its CNS/GB variants, and ISO-2022-KR support all 12 registered names with record-local shift and designation state.
 Their GB2312/KSC5601 and CNS mappings, high-byte interpretation, BMP-only CNS single shifts, and distinct escape-error lengths are documented in the link:src/connect/converter/charset/double_byte/iso2022cnkr/README.adoc[ISO-2022-CN/KR reference].
-Other built-in multibyte and stateful charset families, including GB18030, JIS0213, JISAutoDetect, and ISCII, and additional installed charset providers remain source-completeness work.
+ISCII91 supports all six registered names with delayed Nukta compositions, Halant joiners, and record-local pending-character state.
+Its signed-byte indexing, attribute handling, retained error context, and terminal flush behavior are documented in the link:src/connect/converter/charset/iscii91/README.adoc[ISCII91 reference].
+Other built-in multibyte and stateful charset families, including GB18030, JIS0213, and JISAutoDetect, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.

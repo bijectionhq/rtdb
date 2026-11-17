@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use rtdb_types::Result;
 use super::error;
 mod double_byte;
+mod iscii91;
 mod single_byte;
 
 #[derive(Clone, Copy)]
@@ -10,6 +11,7 @@ pub(super) enum Charset {
     Cesu8,
     Latin1,
     Ascii,
+    Iscii91,
     Big5(&'static double_byte::big5::Big5Family),
     Big5Solaris(&'static double_byte::big5::Big5Family),
     Hkscs(&'static double_byte::hkscs::Hkscs),
@@ -64,7 +66,8 @@ impl Charset {
             "big5" | "csbig5" => Self::Big5(&double_byte::big5::FAMILY),
             "x-big5-solaris" | "big5_solaris" => Self::Big5Solaris(&double_byte::big5::FAMILY),
             normalized => {
-                if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
+                if iscii91::supports(normalized) { Self::Iscii91 }
+                else if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
                 else if let Some(table) = double_byte::hkscs::lookup(normalized) { Self::Hkscs(table) }
                 else if let Some(decoder) = double_byte::subclasses::lookup(normalized) { Self::DoubleByteSubclass(decoder) }
                 else if let Some(table) = double_byte::ebcdic::lookup(normalized) { Self::Ebcdic(table) }
@@ -85,6 +88,7 @@ impl Charset {
             Self::Cesu8 => decode_cesu8(bytes),
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
+            Self::Iscii91 => iscii91::decode(bytes),
             Self::Big5(family) => family.decode_big5(bytes),
             Self::Big5Solaris(family) => family.decode_solaris(bytes),
             Self::Hkscs(table) => table.decode(bytes),
