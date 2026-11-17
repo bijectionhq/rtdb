@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Generated SQL rule recognition and production parser integration remain required.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded SLL isolation path.
 
 == Owner and keys
 
@@ -288,7 +288,7 @@ No public cause behavior is removed or waived by this slice.
 == Remaining parser work
 
 The private runtime, Full producer and adaptive prediction paths are described below.
-All 176 generated rule schedules and the remaining SLL/Bail-to-LL error branches stay open.
+Complete 176-rule generated coverage and the remaining SLL/Bail-to-LL error branches stay open.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
@@ -383,7 +383,7 @@ The host snapshot/assertion producer and production cache realm, shared budget, 
 Policy capture consumes explicit pruning/assertion facts without reading host environment, inferring build assertions or selecting defaults.
 
 `ParserSession` is a passive parse transient owning the real admitted `TokenStream`, primary invocation records, current recognizer state/context, witnessed signed precedence stack, matched-EOF fact and failure state.
-Its append-only parse-branded records are the actual context control identities for later generated/tree work.
+Its append-only parse-branded records are the actual context control identities and own the bounded generated tree.
 They remain through bounded control clearing and are destroyed before the work scope can drop.
 There is no parallel invocation graph, semantic stack, token provider, buffer replacement or per-transition collector.
 Ordinary construction rejects left-recursive rules; entry checks the Ordinary role, unentered start/stop and captured actual parent/state/call binding before effects.
@@ -442,7 +442,7 @@ This does not claim JVM Empty identity hashes, collision/tree layout or Java hea
 Existing collector traversal reaches actual C3 roots and their current configuration contexts; unrooted Full work is swept by the same guard.
 
 The embedded cause/recognizer/config/DFA capability gate remains OPEN and distinct from wire results.
-All 176 generated schedules, trees, labels, listeners, the remaining error-strategy and diagnostic branches, and production adapters stay open.
+Complete 176-rule schedules and tree coverage, listeners, the remaining error-strategy and diagnostic branches, and production adapters stay open.
 
 == Private adaptive DFA paths
 
@@ -586,7 +586,7 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment, expected-token capabilities and production adoption remain open.
+Generated context and terminal attachment beyond the bounded SLL isolation path, expected-token capabilities and production adoption remain open.
 
 == Required isolation block synchronization
 
@@ -635,7 +635,50 @@ The required sync sites have no epsilon and an accepted sync clears the source's
 These inline paths therefore use the ordinary constructor.
 The existing generated catch assigns the cause to the local record and reports it through the admitted listener path.
 The source error and finally ordering remains the same for native input and allocation failures.
-Terminal attachment, nullable sync context capture, additional match sites and full generated rule adoption require their own source increments.
+LL terminal attachment, nullable sync context capture, additional match sites and full generated rule adoption remain required.
+
+== Generated SLL isolation contexts
+
+The private generated path implements all four SLL alternatives of `levelOfIsolation`, decision 371, and only the ISOLATION branch of its `commonTxMode` caller.
+It uses the actual SLL strategy, real required-block sync, real token matches, adaptive catch and Bail cancellation.
+Build-tree behavior is fixed on, parse-tree listeners are absent, and syntax listener dispatch is empty.
+The caller checks its real first token at state 2886; TIME, TIMEZONE and the direct generated no-viable branch are outside this entry's domain and return a private site error.
+LL rule bodies and production parser entry adoption remain required.
+
+Each primary invocation record owns its optional exact labelled class and optional ordered child vector.
+Children are closed context keys or indexed terminal lexemes in that same branded parse region.
+A borrowed context view reads those primary fields and children directly.
+Terminals belong to their containing context and ordinal; normal terminals never move in this profile.
+There is no second topology, cloned token text, owned subtree or separate finally stack.
+Unreachable generic records remain in the admitted arena until session destruction.
+
+Ordinary tree entry sets the real state and current record, demands `LT(1)`, then attaches that context to its actual parent.
+The label constructor admits a fresh same-rule primary record and copies parent, invoking state, start and stop before any current or parent-tail mutation.
+Its predecessor has no children or exception in this reached SLL profile.
+General error-leaf copying and reparenting stay outside the closed label constructor.
+Outer-alt entry replaces the actual parent's last generic child with the fresh labelled key, then changes current.
+The validated pop/push reuses existing capacity and has no fallible operation between those effects.
+Alternative numbers are not stored because the pinned context's setter is empty.
+
+The normal terminal is attached only after the actual match and consume finish.
+A following lexer failure leaves that attempted terminal absent.
+After successful consumption, child growth admission can fail while retaining the advanced real cursor.
+Child lists start at one slot and double by checked capacity; checked layouts and scope admission precede fallible replacement allocation.
+Old and replacement buffers and all earlier scope charges overlap until replacement completes.
+The primary record arena continues to use its existing admission policy.
+
+The generated constructor and tree enter remain outside each rule's try.
+An entered body runs its actual catch and always calls the real `exit_rule` afterward, including native errors and catch/report failures.
+Finally reads actual current and its real `LT(-1)` stop; its failure supersedes the body result.
+An adaptive no-viable catch stores the one cause in the generated local, reports through the empty SLL syntax listener, then links the live parent chain and cancels through Bail.
+Inline mismatch cancellation skips that catch and creates no normal terminal for the mismatched attempt.
+Lexer and native allocation errors bypass recognition assignment and cannot authorize LL retry.
+
+If the child enter's parent append fails after current and start are set, that child body and child finally were never entered.
+The already-entered common caller's finally therefore exits the actual child once.
+For ISOLATION LEVEL SERIALIZABLE it records the child's stop at LEVEL, restores state 2884 and current to the labelled common caller, and leaves that parent's stop unset.
+No extra pop, repair or invented child finally follows the original native error.
+Recursive generated tree attachment and failed-child unroll remain separate required work; the old context-only C4 recursion facade is unchanged.
 
 == Finishing-alternative selection
 

@@ -1,5 +1,5 @@
-use std::marker::PhantomData;
-use rtdb_types::AllocationScope;
+use std::{alloc::Layout, marker::PhantomData};
+use rtdb_types::{AllocationScope, Anomaly};
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
 use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TokenType, TransitionView};
 use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
@@ -22,6 +22,9 @@ pub(super) use no_viable_report::NoViableDiagnostic;
 #[path = "required_block_sync.rs"]
 mod required_block_sync;
 pub(super) use required_block_sync::TokenDiagnostic;
+
+#[path = "generated_isolation.rs"]
+mod generated_isolation;
 
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
@@ -100,10 +103,27 @@ enum InvocationException<'parse, 'sql> {
     Shared(InvocationKey<'parse>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ContextClass {
+    ReadUncommittedIsolation, ReadCommittedIsolation, RepeatableReadIsolation, SerializableIsolation, IsolationLevelTxMode,
+}
+impl ContextClass {
+    fn rule(self) -> u16 {
+        match self {
+            Self::IsolationLevelTxMode => 164,
+            Self::ReadUncommittedIsolation | Self::ReadCommittedIsolation | Self::RepeatableReadIsolation | Self::SerializableIsolation => 175,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum ContextChild<'parse, 'sql> { Context(InvocationKey<'parse>), Terminal(IndexedLexeme<'sql>) }
+
 struct InvocationRecord<'parse, 'sql> {
     parent: Option<InvocationKey<'parse>>, invoking: ParserState, rule: u16,
     start: Option<IndexedLexeme<'sql>>, stop: Option<IndexedLexeme<'sql>>, role: InvocationRole<'parse>,
     exception: Option<InvocationException<'parse, 'sql>>,
+    class: Option<ContextClass>, children: Option<Vec<ContextChild<'parse, 'sql>>>,
 }
 pub(super) struct PendingRecursionEntry<'parse> { key: InvocationKey<'parse> }
 pub(super) struct RecursionEntry<'parse> { key: InvocationKey<'parse> }
@@ -179,7 +199,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     fn record(&self, key: InvocationKey<'parse>) -> RuntimeResult<'sql, &InvocationRecord<'parse, 'sql>> { self.records.get(key.index).ok_or(RuntimeError::Control(RuntimeProblem::Invocation)) }
     fn append(&mut self, rule: u16, saved: SavedOuterLink<'parse>, role: InvocationRole<'parse>) -> RuntimeResult<'sql, InvocationKey<'parse>> {
         let key = InvocationKey::at(self.records.len());
-        push(&mut self.records, InvocationRecord { parent: saved.parent, invoking: saved.invoking, rule, start: None, stop: None, role, exception: None }, self.work)?;
+        push(&mut self.records, InvocationRecord { parent: saved.parent, invoking: saved.invoking, rule, start: None, stop: None, role, exception: None, class: None, children: None }, self.work)?;
         Ok(key)
     }
     fn call_binding(&self, rule: u16, recursive: bool) -> RuntimeResult<'sql, u32> {
@@ -206,6 +226,73 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             let start = self.call_binding(record.rule, false)?;
             self.state = ParserState::State(start); self.current = Some(frame);
             let token = self.input.lt(1)?; self.records[frame.index].start = token; Ok(())
+        })(); self.finish(result)
+    }
+    fn enter_tree_rule(&mut self, frame: InvocationKey<'parse>) -> RuntimeResult<'sql, ()> {
+        self.enter_rule(frame)?;
+        match self.records[frame.index].parent {
+            Some(parent) => self.append_child(parent, ContextChild::Context(frame)),
+            None => Ok(()),
+        }
+    }
+    fn append_child(&mut self, parent: InvocationKey<'parse>, child: ContextChild<'parse, 'sql>) -> RuntimeResult<'sql, ()> {
+        let result = (|| {
+            self.ready()?;
+            self.record(parent)?;
+            let children = self.records[parent.index].children.get_or_insert_with(Vec::new);
+            if children.len() == children.capacity() {
+                let capacity = children.capacity().checked_mul(2).ok_or_else(super::capacity_error)?.max(1);
+                let layout = Layout::array::<ContextChild<'parse, 'sql>>(capacity).map_err(|_| super::capacity_error())?;
+                self.work.reserve(layout.size()).map_err(PredictionError::Admission)?;
+                let mut replacement = Vec::new();
+                replacement.try_reserve_exact(capacity).map_err(|_| PredictionError::Admission(
+                    Anomaly::incorrect("rtdb/allocation-failed", "Unable to allocate parser context children")))?;
+                replacement.append(children);
+                *children = replacement;
+            }
+            children.push(child);
+            Ok(())
+        })(); self.finish(result)
+    }
+    fn labelled_context(&mut self, generic: InvocationKey<'parse>, class: ContextClass) -> RuntimeResult<'sql, InvocationKey<'parse>> {
+        let result = (|| {
+            self.ready()?;
+            let old = self.record(generic)?;
+            if self.current != Some(generic) || !matches!(old.role, InvocationRole::Ordinary) || old.rule != class.rule()
+                || old.class.is_some() || old.children.is_some() || old.exception.is_some() || old.start.is_none() {
+                return Err(RuntimeError::Control(RuntimeProblem::Invocation));
+            }
+            let copy = InvocationRecord { parent: old.parent, invoking: old.invoking, rule: old.rule,
+                start: old.start, stop: old.stop, role: InvocationRole::Ordinary, exception: None, class: Some(class), children: None };
+            let key = InvocationKey::at(self.records.len());
+            push(&mut self.records, copy, self.work)?;
+            Ok(key)
+        })(); self.finish(result)
+    }
+    fn enter_outer_alt(&mut self, labelled: InvocationKey<'parse>) -> RuntimeResult<'sql, ()> {
+        let result = (|| {
+            self.ready()?;
+            let generic = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
+            let old = self.record(generic)?;
+            let new = self.record(labelled)?;
+            if labelled.index <= generic.index || old.class.is_some() || new.class.map(ContextClass::rule) != Some(old.rule)
+                || !matches!(old.role, InvocationRole::Ordinary) || !matches!(new.role, InvocationRole::Ordinary)
+                || old.children.is_some() || new.children.is_some() || old.exception.is_some() || new.exception.is_some()
+                || old.rule != new.rule || old.parent != new.parent || old.invoking != new.invoking
+                || old.start.map(IndexedLexeme::index) != new.start.map(IndexedLexeme::index)
+                || old.stop.map(IndexedLexeme::index) != new.stop.map(IndexedLexeme::index) {
+                return Err(RuntimeError::Control(RuntimeProblem::Invocation));
+            }
+            if let Some(parent) = old.parent {
+                let children = self.records[parent.index].children.as_mut().ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
+                if !matches!(children.last(), Some(ContextChild::Context(key)) if *key == generic) {
+                    return Err(RuntimeError::Control(RuntimeProblem::Invocation));
+                }
+                children.pop();
+                children.push(ContextChild::Context(labelled));
+            }
+            self.current = Some(labelled);
+            Ok(())
         })(); self.finish(result)
     }
     pub(super) fn exit_rule(&mut self) -> RuntimeResult<'sql, ()> {
@@ -387,6 +474,9 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
 #[derive(Clone, Copy)]
 pub(super) struct InvocationView<'a, 'parse, 'sql> { records: &'a [InvocationRecord<'parse, 'sql>], current: Option<InvocationKey<'parse>> }
 impl<'a, 'parse, 'sql> InvocationView<'a, 'parse, 'sql> {
+    pub(super) fn context(&self, invocation: InvocationKey<'parse>) -> Option<RuleContextView<'a, 'parse, 'sql>> {
+        self.records.get(invocation.index).map(|record| RuleContextView { key: invocation, record })
+    }
     pub(super) fn exception(&self, invocation: InvocationKey<'parse>) -> Option<&InvocationCause<'sql>> {
         let exception = self.records.get(invocation.index)?.exception.as_ref()?;
         let owner = match exception {
@@ -410,6 +500,19 @@ impl<'a, 'parse, 'sql> InvocationView<'a, 'parse, 'sql> {
             Some(grammar.state(number).expect("immutable owner-bound invocation state"))
         })
     }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct RuleContextView<'a, 'parse, 'sql> { key: InvocationKey<'parse>, record: &'a InvocationRecord<'parse, 'sql> }
+impl<'a, 'parse, 'sql> RuleContextView<'a, 'parse, 'sql> {
+    pub(super) fn key(self) -> InvocationKey<'parse> { self.key }
+    pub(super) fn parent(self) -> Option<InvocationKey<'parse>> { self.record.parent }
+    pub(super) fn invoking_state(self) -> ParserState { self.record.invoking }
+    pub(super) fn rule(self) -> u16 { self.record.rule }
+    pub(super) fn class(self) -> Option<ContextClass> { self.record.class }
+    pub(super) fn start(self) -> Option<IndexedLexeme<'sql>> { self.record.start }
+    pub(super) fn stop(self) -> Option<IndexedLexeme<'sql>> { self.record.stop }
+    pub(super) fn children(self) -> &'a [ContextChild<'parse, 'sql>] { self.record.children.as_deref().unwrap_or(&[]) }
 }
 
 enum RestorationState { Armed { origin: usize, marker: usize }, Finished }
