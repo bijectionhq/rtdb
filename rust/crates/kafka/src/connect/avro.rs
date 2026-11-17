@@ -392,6 +392,21 @@ fn decimal_value_at_scale(bytes: Vec<u8>, scale: i32) -> Result<Value> {
 mod tests {
     use super::*;
     #[test]
+    fn scrub_invalid_names_preserves_ingested_connect_names_and_ascii_fields() {
+        let schema = r#"{"type":"record","name":"wire.Event","connect.name":"connect.name-with spaces","fields":[{"name":"field_1","type":"long"},{"name":"nested","type":{"type":"record","name":"Child","connect.name":"1 child","fields":[{"name":"_value","type":"string"}]}}]}"#;
+        for scrub in ["false", "true"] {
+            let options = BTreeMap::from([("scrub.invalid.names".into(), scrub.into())]);
+            let plan = AvroPlan::parse_version(schema, &[], &options, None).unwrap();
+            assert_eq!(plan.connect.name.as_deref(), Some("connect.name-with spaces"));
+            assert_eq!(plan.connect.field("nested").unwrap().schema.resolved().name.as_deref(), Some("1 child"));
+            let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+            assert_eq!(plan.decode(&[14, 2, b'x'], &mut context).unwrap().value, Value::Struct(BTreeMap::from([
+                ("field_1".into(), Value::I64(7)),
+                ("nested".into(), Value::Struct(BTreeMap::from([("_value".into(), Value::Utf8("x".into()))]))),
+            ])));
+        }
+    }
+    #[test]
     fn recursive_avro_values_and_detached_field_views_keep_schema_definitions() {
         let plan = AvroPlan::parse(r#"{"type":"record","name":"Node","fields":[{"name":"value","type":"long"},{"name":"next","type":["null","Node"],"default":null}]}"#, &[]).unwrap();
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));

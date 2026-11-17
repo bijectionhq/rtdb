@@ -61,3 +61,28 @@ fn documented_plain_jaas_credentials_translate_without_revealing_secrets_in_erro
     let invalid = BTreeMap::from([("sasl.jaas.config".into(), "bad module secret-value".into())]);
     assert!(!format!("{:?}", native_properties(&invalid).unwrap_err()).contains("secret-value"));
 }
+
+#[test]
+fn plain_and_scram_accept_all_jaas_flags_with_java_uppercase_matching() {
+    for module in ["plain.PlainLoginModule", "scram.ScramLoginModule"] {
+        for flag in ["required", "ReQuIsItE", "SUFFICIENT", "optional", "REQUıRED", "ſufficient", "SUﬃCIENT"] {
+            let config = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.{module} {flag} username=\"u\" password=\"p\";"))]);
+            let native = native_properties(&config).unwrap();
+            assert_eq!(native["sasl.username"], "u");
+            assert_eq!(native["sasl.password"], "p");
+        }
+    }
+    for flag in ["mandatory", "require", "requİred", "OPTIONALLY"] {
+        let config = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.plain.PlainLoginModule {flag} username=\"u\" password=\"secret-value\";"))]);
+        let error = native_properties(&config).unwrap_err();
+        assert!(!format!("{error:?}").contains("secret-value"));
+    }
+}
+
+#[test]
+fn later_jaas_options_replace_earlier_credentials() {
+    let config = BTreeMap::from([("sasl.jaas.config".into(), r#"org.apache.kafka.common.security.plain.PlainLoginModule optional username="old" password="old" username="u" password="p";"#.into())]);
+    let native = native_properties(&config).unwrap();
+    assert_eq!(native["sasl.username"], "u");
+    assert_eq!(native["sasl.password"], "p");
+}

@@ -135,9 +135,7 @@ impl RegistryConverter {
         let latest = reader::LatestCache::open(options)?;
         let capacity = options.get("max.schemas.per.subject").map(|value| value.parse::<usize>().map_err(|cause| error("invalid-plugin-config", cause))).transpose()?.unwrap_or(1000);
         if capacity == 0 { return Err(error("invalid-plugin-config", "Schema cache capacity must be positive")); }
-        for key in ["scrub.invalid.names"] {
-            if super::converter::option_bool(options, key, false)? { return Err(error("invalid-plugin-config", format!("Native converter option '{key}' requires its schema mapping extension"))); }
-        }
+        if format == RegistryFormat::Avro { super::converter::option_bool(options, "scrub.invalid.names", false)?; }
         for key in ["specific.avro.reader", "schema.reflection"] {
             if super::converter::option_bool(options, key, false)? { return Err(rtdb_types::Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-registry-option", format!("Registry option '{key}' requires a native reader-schema adapter"))); }
         }
@@ -373,5 +371,25 @@ impl RegistryConverter {
             self.dlq.insert(rule.action.name.clone(), producer);
         }
         self.dlq.get_mut(&rule.action.name).expect("DLQ producer retained").send(record, context).await
+    }
+}
+
+#[cfg(test)]
+mod configuration_tests {
+    use super::*;
+
+    #[test]
+    fn avro_accepts_name_scrubbing_and_validates_its_boolean() {
+        for value in ["true", "false"] {
+            let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([
+                ("schema.registry.url".into(), "http://registry.invalid".into()), ("scrub.invalid.names".into(), value.into()),
+            ]) };
+            assert!(RegistryConverter::open(&spec, RegistryFormat::Avro, false).is_ok());
+        }
+        let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([
+            ("schema.registry.url".into(), "http://registry.invalid".into()), ("scrub.invalid.names".into(), "invalid".into()),
+        ]) };
+        assert!(RegistryConverter::open(&spec, RegistryFormat::Avro, false).is_err());
+        assert!(RegistryConverter::open(&spec, RegistryFormat::Json, false).is_ok());
     }
 }
