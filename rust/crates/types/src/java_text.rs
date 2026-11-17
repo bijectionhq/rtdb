@@ -85,15 +85,19 @@ impl JavaString {
     fn copy(source: Source<'_>, memory: Option<&Arc<MemoryBudget>>) -> Result<Self> {
         let (units, retained_bytes) = source.allocation()?;
         let reservation = memory.map(|memory| memory.reserve(retained_bytes)).transpose()?;
+        Ok(Self::copy_storage(source, units, retained_bytes, reservation))
+    }
+
+    fn copy_storage(source: Source<'_>, units: usize, retained_bytes: usize, reservation: Option<Arc<MemoryReservation>>) -> Self {
         let text = match source {
             Source::Utf8(value) => Text::Utf8 { value: Box::from(value), units },
             Source::Utf16(value) => Text::Utf16(Box::from(value)),
         };
         let storage = Arc::new(TextStorage { text, retained_bytes });
-        Ok(Self(match reservation {
+        Self(match reservation {
             Some(reservation) => Backing::Tracked { storage, reservation },
             None => Backing::Untracked(storage),
-        }))
+        })
     }
 }
 
@@ -127,7 +131,6 @@ impl<'a> JavaText<'a> {
     /// Returns this range's UTF16 unit count in constant time.
     pub fn len_units(self) -> usize { self.end - self.start }
 
-    /// Returns whether the range contains no units.
     pub fn is_empty(self) -> bool { self.start == self.end }
 
     /// Selects a half-open unit range relative to this view in constant time.
@@ -146,7 +149,7 @@ impl<'a> JavaText<'a> {
     pub fn code_points(self) -> JavaCodePoints<'a> { JavaCodePoints::new(self.units()) }
 
     /// Explicitly applies Java String's UTF8 encoding: valid pairs combine; each unmatched unit emits `?`.
-    /// Uses constant state and no owned output; callers admit any buffer they collect into.
+    /// Uses constant state and no owned output.
     pub fn java_utf8_bytes(self) -> JavaUtf8Bytes<'a> { JavaUtf8Bytes::new(self.code_points()) }
 
     /// Counts the explicit Java UTF8 encoding without allocation; an unrepresentable byte count is an error.
