@@ -2,28 +2,49 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Binary,Cast,Dispatch,Error as NumberError,Number,Unary};
+use crate::jvm_number::{Binary,Cast,Comparison,Dispatch,Error as NumberError,Number,Predicate,Unary};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
 impl AsRef<str> for PatternText<'_> { fn as_ref(&self) -> &str { match self { Self::Borrowed(value) => value,Self::Computed(value) => value } } }
 enum Expression<'a> {
-    Constant(&'a Form),Number(Arc<Number>),Nil,Local { index: usize,primitive: Option<Cast> },Function(Function),
-    Cast { kind: Cast,primitive: bool,value: Box<Expression<'a>> },
-    Unary { operation: Unary,dispatch: Dispatch,value: Box<Expression<'a>> },
-    Binary { operation: Binary,dispatch: Dispatch,values: Box<[Expression<'a>;2]> },
+    Constant(&'a Form),Number(Arc<Number>),Nil,Local { index: usize,emission: Emission },Function(Function),
+    Cast { kind: Cast,resolution: Resolution<CastInput>,value: Box<Expression<'a>> },
+    Boolean { resolution: Resolution<()>,value: Box<Expression<'a>> },
+    Unary { operation: Unary,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
+    Binary { operation: Binary,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
+    Predicate { operation: Predicate,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
+    Comparison { operation: Comparison,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
     If(Box<[Expression<'a>;3]>),Body(Vec<Expression<'a>>),
     Let { first: usize,bindings: Vec<Expression<'a>>,body: Box<Expression<'a>> },
     Logical { conjunction: bool,values: Vec<Expression<'a>> },
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic) }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate) }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
 enum HostValue<'a> { Constant(&'a Form),Number(Arc<Number>),Nil,Bool(bool),Text(Arc<str>),Function(Function),Vector(Arc<[HostValue<'a>]>) }
-struct Compiler<'a,'c,'context> { symbols: BTreeMap<&'a str,(usize,Option<Cast>)>,active: usize,slots: usize,nodes: usize,context: &'c EvalContext<'context> }
+struct Compiler<'a,'c,'context> { symbols: BTreeMap<&'a str,(usize,Emission)>,active: usize,slots: usize,nodes: usize,context: &'c EvalContext<'context> }
+#[derive(Clone,Copy,PartialEq,Eq)]
+enum Emission { Number(Cast),Boolean,Reference,Unknown }
+#[derive(Clone,Copy)]
+enum Resolution<T> { Resolved(T),Reflective }
+#[derive(Clone,Copy)]
+enum CastInput { Primitive,Boxed }
+impl Emission {
+    fn number(self) -> Option<Cast> { match self { Self::Number(kind) => Some(kind),_ => None } }
+    fn branch(self,other: Self) -> Self { if self == other && matches!(self,Self::Number(_) | Self::Boolean) { self } else { Self::Unknown } }
+}
+impl<T: Copy> Resolution<T> {
+    fn emission(self,resolved: impl FnOnce(T)->Emission) -> Emission { match self { Self::Resolved(value) => resolved(value),Self::Reflective => Emission::Unknown } }
+}
+impl Resolution<Dispatch> {
+    fn unary(value: Emission) -> Self { if value == Emission::Boolean { Self::Reflective } else { Self::Resolved(Dispatch::unary(value.number())) } }
+    fn binary(left: Emission,right: Emission) -> Self { if left == Emission::Boolean || right == Emission::Boolean { Self::Reflective } else { Self::Resolved(Dispatch::binary(left.number(),right.number())) } }
+    fn dispatch(self) -> Dispatch { match self { Self::Resolved(value) => value,Self::Reflective => Dispatch::Object } }
+}
 
 impl<'a> Program<'a> {
     pub(super) fn compile(form: &'a Form,context: &EvalContext<'_>) -> Result<Self> {
@@ -50,7 +71,7 @@ impl<'a> Compiler<'a,'_,'_> {
         self.context.reserve(256)?;
         Ok(match form {
             Form::Symbol(name) => {
-                if let Some((index,primitive)) = self.symbols.get(name.as_str()) { Expression::Local { index: *index,primitive: *primitive } }
+                if let Some((index,emission)) = self.symbols.get(name.as_str()) { Expression::Local { index: *index,emission: *emission } }
                 else if let Some(function) = function(name) { Expression::Function(function) }
                 else { return Err(unsupported("Host symbol or namespace is not implemented")); }
             }
@@ -71,11 +92,29 @@ impl<'a> Compiler<'a,'_,'_> {
     fn list(&mut self,forms: &'a [Form],depth: usize) -> Result<Expression<'a>> {
         let operation = match &forms[0] { Form::Symbol(name) if matches!(name.as_str(),"quote" | "if" | "do" | "let*") || !self.symbols.contains_key(name.as_str()) => Some(name.as_str()),_ => None };
         let args = &forms[1..];
-        if matches!(operation,Some("boolean" | "clojure.core/boolean")) { arity(args.len(),1,1)?; }
+        if matches!(operation,Some("boolean" | "clojure.core/boolean")) {
+            arity(args.len(),1,1)?;
+            let value = self.expression(&args[0],depth)?;
+            let resolution = if matches!(value.emission(),Emission::Number(_)) { Resolution::Reflective } else { Resolution::Resolved(()) };
+            return Ok(Expression::Boolean { resolution,value: Box::new(value) });
+        }
         if let Some(Function::Cast(kind)) = operation.and_then(function) {
             arity(args.len(),1,1)?;
             let value = self.expression(&args[0],depth)?;
-            return Ok(Expression::Cast { kind,primitive: value.primitive().is_some(),value: Box::new(value) });
+            let resolution = match value.emission() { Emission::Number(_) => Resolution::Resolved(CastInput::Primitive),Emission::Boolean => Resolution::Reflective,_ => Resolution::Resolved(CastInput::Boxed) };
+            return Ok(Expression::Cast { kind,resolution,value: Box::new(value) });
+        }
+        if let Some(Function::Predicate(operation)) = operation.and_then(function) {
+            arity(args.len(),1,1)?;
+            let value = self.expression(&args[0],depth)?;
+            return Ok(Expression::Predicate { operation,resolution: Resolution::unary(value.emission()),value: Box::new(value) });
+        }
+        if let Some(Function::Comparison(operation)) = operation.and_then(function) {
+            if args.len() == 2 {
+                let left = self.expression(&args[0],depth)?;let right = self.expression(&args[1],depth)?;
+                let resolution = Resolution::binary(left.emission(),right.emission());
+                return Ok(Expression::Comparison { operation,resolution,values: Box::new([left,right]) });
+            }
         }
         if let Some(Function::Arithmetic(operation)) = operation.and_then(function) {
             if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
@@ -98,9 +137,9 @@ impl<'a> Compiler<'a,'_,'_> {
                     let Form::Symbol(name) = &pair[0] else { return Err(unsupported("Host binding destructuring is not implemented")); };
                     if name != "/" && name.contains('/') { return Err(error("Host let cannot bind a qualified symbol")); }
                     let expression = self.expression(&pair[1],depth)?;
-                    let primitive = expression.primitive();
+                    let emission = expression.emission();
                     expressions.push(expression);
-                    previous.push((name.as_str(),self.symbols.insert(name,(self.active,primitive))));
+                    previous.push((name.as_str(),self.symbols.insert(name,(self.active,emission))));
                     self.active += 1;
                     self.slots = self.slots.max(self.active);
                 }
@@ -128,7 +167,7 @@ impl<'a> Compiler<'a,'_,'_> {
         let mut args = args.iter();
         let first = self.expression(args.next().ok_or_else(||error("Missing host argument"))?,depth)?;
         if let Some(unary) = operation.unary() {
-            if args.len() == 0 { return Ok(Expression::Unary { operation: unary,dispatch: Dispatch::unary(first.primitive()),value: Box::new(first) }); }
+            if args.len() == 0 { return Ok(Expression::Unary { operation: unary,resolution: Resolution::unary(first.emission()),value: Box::new(first) }); }
         }
         let binary = operation.binary().ok_or_else(||error("Invalid host arithmetic arity"))?;
         let mut result = first;
@@ -137,8 +176,8 @@ impl<'a> Compiler<'a,'_,'_> {
             if self.nodes > 65_536 { return Err(limit()); }
             self.context.reserve(256)?;
             let right = self.expression(value,depth)?;
-            let dispatch = Dispatch::binary(result.primitive(),right.primitive());
-            result = Expression::Binary { operation: binary,dispatch,values: Box::new([result,right]) };
+            let resolution = Resolution::binary(result.emission(),right.emission());
+            result = Expression::Binary { operation: binary,resolution,values: Box::new([result,right]) };
         }
         if result.stack_depth() > 128 { return Err(limit()); }
         Ok(result)
@@ -148,8 +187,8 @@ impl<'a> Compiler<'a,'_,'_> {
 impl<'a> Expression<'a> {
     fn stack_depth(&self) -> usize {
         let children = match self {
-            Self::Cast { value,.. } | Self::Unary { value,.. } => value.stack_depth(),
-            Self::Binary { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } => value.stack_depth(),
+            Self::Binary { values,.. } | Self::Comparison { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::If(values) => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Body(values) | Self::Vector(values) | Self::Logical { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Let { bindings,body,.. } => bindings.iter().map(Self::stack_depth).max().unwrap_or(0).max(body.stack_depth()),
@@ -158,27 +197,38 @@ impl<'a> Expression<'a> {
         };
         children + 1
     }
-    fn primitive(&self) -> Option<Cast> {
+    fn emission(&self) -> Emission {
         match self {
-            Self::Constant(Form::Literal(Value::I64(_))) => Some(Cast::Long),Self::Constant(Form::Literal(Value::F64(_))) => Some(Cast::Double),
-            Self::Local { primitive,.. } => *primitive,Self::Cast { kind,.. } => Some(*kind),
-            Self::Unary { operation,dispatch,.. } => operation.primitive(*dispatch),Self::Binary { operation,dispatch,.. } => operation.primitive(*dispatch),
-            Self::If(branches) => branches[1].primitive().filter(|kind|branches[2].primitive() == Some(*kind)),
-            Self::Body(values) => values.last().and_then(Self::primitive),Self::Let { body,.. } => body.primitive(),
-            Self::Logical { values,.. } => values.first().and_then(Self::primitive).filter(|kind|values.iter().all(|value|value.primitive() == Some(*kind))),
-            _ => None,
+            Self::Constant(Form::Literal(Value::I64(_))) => Emission::Number(Cast::Long),Self::Constant(Form::Literal(Value::F64(_))) => Emission::Number(Cast::Double),
+            Self::Local { emission,.. } => *emission,
+            Self::Cast { kind,resolution,.. } => resolution.emission(|_|Emission::Number(*kind)),
+            Self::Boolean { resolution,.. } => resolution.emission(|_|Emission::Boolean),
+            Self::Predicate { resolution,.. } | Self::Comparison { resolution,.. } => resolution.emission(|_|Emission::Boolean),
+            Self::Unary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
+            Self::Binary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
+            Self::If(branches) => branches[1].emission().branch(branches[2].emission()),
+            Self::Body(values) => values.last().map_or(Emission::Reference,Self::emission),Self::Let { body,.. } => body.emission(),
+            Self::Logical { values,.. } => values.iter().map(Self::emission).reduce(Emission::branch).unwrap_or(Emission::Reference),
+            Self::Call { .. } => Emission::Unknown,
+            _ => Emission::Reference,
         }
     }
     fn evaluate(&self,locals: &mut [HostValue<'a>],context: &EvalContext<'_>) -> Result<HostValue<'a>> {
         Ok(match self {
             Self::Constant(form) => HostValue::Constant(form),Self::Number(value) => HostValue::Number(Arc::clone(value)),Self::Nil => HostValue::Nil,
             Self::Local { index,.. } => locals[*index].clone(),Self::Function(function) => HostValue::Function(*function),
-            Self::Cast { kind,primitive,value } => numeric_cast(*kind,value.evaluate(locals,context)?,*primitive,context)?,
-            Self::Unary { operation,dispatch,value } => numeric_unary(*operation,*dispatch,value.evaluate(locals,context)?,context)?,
-            Self::Binary { operation,dispatch,values } => {
+            Self::Cast { kind,resolution,value } => numeric_cast(*kind,value.evaluate(locals,context)?,matches!(resolution,Resolution::Resolved(CastInput::Primitive)),context)?,
+            Self::Boolean { value,.. } => HostValue::Bool(value.evaluate(locals,context)?.truthy()),
+            Self::Unary { operation,resolution,value } => numeric_unary(*operation,resolution.dispatch(),value.evaluate(locals,context)?,context)?,
+            Self::Binary { operation,resolution,values } => {
                 let left = values[0].evaluate(locals,context)?;
                 let right = values[1].evaluate(locals,context)?;
-                numeric_binary(*operation,*dispatch,left,right,context)?
+                numeric_binary(*operation,resolution.dispatch(),left,right,context)?
+            }
+            Self::Predicate { operation,value,.. } => numeric_predicate(*operation,&value.evaluate(locals,context)?,context)?,
+            Self::Comparison { operation,resolution,values } => {
+                let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
+                HostValue::Bool(numeric_compare(*operation,resolution.dispatch(),&left,&right,context)?)
             }
             Self::If(branches) => if branches[0].evaluate(locals,context)?.truthy() { branches[1].evaluate(locals,context)? } else { branches[2].evaluate(locals,context)? },
             Self::Body(expressions) => {
@@ -245,6 +295,13 @@ impl Function {
             Self::Identity => { arity(args.len(),1,1)?;args.into_iter().next().ok_or_else(||error("Missing host argument"))? }
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
             Self::Arithmetic(operation) => operation.apply(args,context)?,
+            Self::Predicate(operation) => { arity(args.len(),1,1)?;numeric_predicate(operation,&args[0],context)? }
+            Self::Comparison(operation) => {
+                arity(args.len(),1,usize::MAX)?;
+                let mut result = true;
+                for pair in args.windows(2) { if !numeric_compare(operation,Dispatch::Object,&pair[0],&pair[1],context)? { result = false;break; } }
+                HostValue::Bool(result)
+            }
             Self::Boolean | Self::Not => { arity(args.len(),1,1)?;HostValue::Bool(args[0].truthy() == matches!(self,Self::Boolean)) }
             Self::Name | Self::Namespace => {
                 arity(args.len(),1,1)?;
@@ -285,7 +342,9 @@ fn function(name: &str) -> Option<Function> {
         "byte" => Function::Cast(Cast::Byte),"short" => Function::Cast(Cast::Short),"int" => Function::Cast(Cast::Int),"long" => Function::Cast(Cast::Long),"float" => Function::Cast(Cast::Float),"double" => Function::Cast(Cast::Double),
         "+" => Function::Arithmetic(Arithmetic::Add(false)),"+'" => Function::Arithmetic(Arithmetic::Add(true)),"-" => Function::Arithmetic(Arithmetic::Subtract(false)),"-'" => Function::Arithmetic(Arithmetic::Subtract(true)),
         "*" => Function::Arithmetic(Arithmetic::Multiply(false)),"*'" => Function::Arithmetic(Arithmetic::Multiply(true)),"/" => Function::Arithmetic(Arithmetic::Divide),
-        "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),_ => return None })
+        "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),
+        "<" => Function::Comparison(Comparison::Less),"<=" => Function::Comparison(Comparison::LessEqual),">" => Function::Comparison(Comparison::Greater),">=" => Function::Comparison(Comparison::GreaterEqual),"==" => Function::Comparison(Comparison::Equivalent),
+        "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),_ => return None })
 }
 impl Arithmetic {
     fn inline(self,count: usize) -> bool {
@@ -340,6 +399,14 @@ fn reserve_numeric(bytes: usize,context: &EvalContext<'_>) -> Result<()> {
     context.reserve(bytes)
 }
 fn numeric_error(error: NumberError) -> Anomaly { match error { NumberError::External(error) => error,NumberError::Invalid => self::error("Invalid host arithmetic operation") } }
+fn numeric_predicate<'a>(operation: Predicate,value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    Ok(HostValue::Bool(value.number(context)?.predicate(operation)))
+}
+fn numeric_compare(operation: Comparison,dispatch: Dispatch,left: &HostValue<'_>,right: &HostValue<'_>,context: &EvalContext<'_>) -> Result<bool> {
+    let left = left.number(context)?;let right = right.number(context)?;
+    reserve_numeric(left.comparison_bound(&right).map_err(|_|limit())?,context)?;
+    left.compare_numeric(operation,&right,dispatch).map_err(numeric_error)
+}
 fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<Arc<str>> {
     match value {
         HostValue::Text(value) => Ok(Arc::clone(value)),HostValue::Nil => text("",context),HostValue::Bool(value) => text(if *value { "true" } else { "false" },context),

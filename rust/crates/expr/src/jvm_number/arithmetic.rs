@@ -145,11 +145,11 @@ fn scratch(bits: u64) -> Result<usize> { usize::try_from(bits).ok().and_then(|bi
 fn integral_result(value: Option<i64>,promote: bool,large: impl FnOnce()->BigInt) -> Result<Number> {
     match value { Some(value) => Ok(Number::Long(value)),None if promote => Ok(Number::BigInt(large())),None => Err(failure("long overflow")) }
 }
-fn align_decimal(value: BigInt,places: i64) -> Result<BigInt> {
+pub(super) fn align_decimal(value: BigInt,places: i64) -> Result<BigInt> {
     if value.is_zero() || places == 0 { Ok(value) } else { Ok(value * BigInt::from(10).pow(u32::try_from(places).map_err(|_|failure("BigDecimal scale overflow"))?)) }
 }
 fn failure(message: &str) -> Error { Error::External(Anomaly::fault("xtdb.error/unknown",message)) }
-fn decimal_error(error: Error) -> Error {
+pub(super) fn decimal_error(error: Error) -> Error {
     match error { Error::Invalid => failure("Non-terminating decimal expansion; no exact representable decimal result."),other => other }
 }
 
