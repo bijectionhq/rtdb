@@ -70,6 +70,9 @@ fn digest(input: &mut Der<'_>) -> Result<Algorithm> {
             DSA | [0x2b, 0x0e, 3, 2, 12] => integers(parameter, 3, false)?,
             DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => integers(parameter, 2, true)?,
             EC => curve(parameter)?,
+            [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1] => primitive_iv(parameter, 16)?,
+            [0x2b, 0x0e, 3, 2, 17] | [0x2b, 6, 1, 4, 1, 0x97, 0x55, 1, 1, 2] => primitive_iv(parameter, 8)?,
+            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
             PSS | [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(unsupported()),
             oid if registered_parameter_service(oid) => return Err(unsupported()),
             _ => {},
@@ -78,17 +81,27 @@ fn digest(input: &mut Der<'_>) -> Result<Algorithm> {
     Ok(algorithm)
 }
 
+fn primitive_iv(bytes: &[u8], length: usize) -> Result<()> {
+    let mut input = Der(bytes);
+    if expect(&mut input, 4)?.len() != length { return Err(malformed()); }
+    input.end()
+}
+
+fn chacha_nonce(bytes: &[u8]) -> Result<()> {
+    let mut input = Der(bytes);
+    let nonce = next(&mut input)?;
+    input.end()?;
+    if secret_der::octets(nonce, malformed)?.len() != 12 { return Err(malformed()); }
+    Ok(())
+}
+
 fn is_mgf_digest(oid: &[u8]) -> bool { matches!(oid, SHA1 | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1..=10]) }
 
 fn registered_parameter_service(oid: &[u8]) -> bool {
     matches!(oid,
-        [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7]
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7]
         | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3 | 13]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18]
-        | [0x2b, 0x0e, 3, 2, 17]
-        | [0x2b, 6, 1, 4, 1, 0x97, 0x55, 1, 1, 2])
+        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6])
 }
 
 impl Pss {
