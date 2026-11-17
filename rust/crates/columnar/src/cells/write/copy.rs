@@ -1,5 +1,5 @@
 use super::*;
-use super::scalar::MutableScalarData;
+use super::scalar::{MutableScalarData, ScalarState};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScalarSource<'a> { vector: &'a ExecutionVector, node: &'a PhysicalNode }
@@ -180,7 +180,7 @@ fn copy_validity(destination: &mut MutableBits, source: ScalarSource<'_>, rows: 
         _ => destination.selected(rows.len(), |index| source.valid(rows.at(index)), mutation),
     }
 }
-fn copy_variable_range(writer: &mut ScalarWriter, source: ScalarSource<'_>, start: i32, length: usize, mutation: &mut Mutation) -> WriteResult<()> {
+fn copy_variable_range(writer: &mut ScalarState, source: ScalarSource<'_>, start: i32, length: usize, mutation: &mut Mutation) -> WriteResult<()> {
     let MutableScalarData::Variable { offsets, data, last_offset } = &mut writer.data else { return Err(native_size()); };
     if writer.count == 0 { offsets.append_reserved(&0i32.to_le_bytes(), mutation)?; }
     let (src_start, src_end) = source.variable_range(start, length)?;
