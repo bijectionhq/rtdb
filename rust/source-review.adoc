@@ -831,3 +831,34 @@ Actual append errors and successful pump exit during an active, uncancelled term
 The evidence hashes identify those reviewed committed bytes.
 This workflow has executed none of the added regression sources or the Phase 2 qualification matrix.
 The source-completeness gate remains false.
+
+
+== Signed scalar arithmetic, retained configurations and private tree JSON source checkpoint
+
+Scalar writers retain wrapping signed counts independently of initialized byte extents and signed append cursors.
+Method-specific capacity, validity, data and count schedules preserve completed prefixes and later failure demand.
+Native scalar copies consume retained buffers without adding a logical-row preflight; admitted SDK arrays retain their checked row boundary and sliced payload bases.
+Nullable all-valid SDK sources preserve selected-validity cursor scheduling.
+Unchecked Arrow primitive appends check writable count before native unsafe-address admission; checked setters, arrays, raw copies and zero fills preserve their distinct span checks.
+Native admission after mutation retains the existing abort-until-clear publication gate.
+Independent source review covers 27 added regression sources and preservation of the existing writer, container, run-reader and signed-count assertions, including the incoming fixture changes.
+Container count arithmetic, signed reader slices, recursive writer/copy trees, relations, full objects, transport and production adoption remain required.
+
+Retained configuration pools preserve live object, ordered-set and conflict identities when reached from persistent set roots.
+Scoped and retained accesses share the existing membership, merge, equality, hashing, optimization and prediction-mode kernels under fresh configuration and context brands.
+Cleanup traces ordered and building membership independently, retaining an index publication that precedes a failed ordered append.
+Current configuration contexts are marked before canonical-context and parent collection, preserving completed alias and optimization updates without retaining obsolete context payloads.
+Read-only cached hashes and independent conflict identities survive reopening unchanged.
+Independent source review covers 17 added regression sources and preservation of all existing context, configuration, mode and retained-context assertions.
+The root fixture is test-only; actual DFA roots, mutable-key container semantics, shared adaptive histories, generated rules, diagnostics and production parsing remain required.
+
+The private plan JSON prerequisite validates borrowed string tokens while retaining escaped Java text units independently.
+Its string writer preserves existing valid-UTF8 spelling and represents isolated units with JSON escapes.
+Raw recipe forms and recursive physical values share one admitted iterative continuation stack and one encoder for counting and filling.
+The closed delegated-leaf boundary excludes recursive values and Keyword cloning; all 41 physical value shapes and five recipe fields retain their existing JSON schema and order.
+Completed UTF8 documents acquire independent retained storage while scratch and traversal reservations remain live.
+Independent source review covers 27 added regression sources, including exact-unit strings, every raw form/value variant, deep trees, allocation boundaries and retained-owner release.
+Public serialization, canonical exact-text tree ownership, semantic producers, host and external codecs, raw diagnostics and production literal binding remain required.
+
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.

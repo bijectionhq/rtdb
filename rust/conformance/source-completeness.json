@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and the mutable count arithmetic, source signed slices, writer/copy, relation, full-object and transport successors to the reviewed scalar, descriptor, metadata-demand, reader-identity, immutable native-container, keyed Struct and signed reader-count foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and the container count arithmetic, source signed slices, recursive writer/copy, relation, full-object and transport successors to the reviewed scalar writer/count/cursor, descriptor, metadata-demand, reader-identity, immutable native-container and keyed Struct foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context storage, ordered configuration/mode and exact-unit literal-decoder foundations with retained configurations, adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context and configuration storage, ordered configuration/mode, exact-unit literal-decoder and private tree-JSON foundations with actual DFA roots, adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "planning-allocation",
