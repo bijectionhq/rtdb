@@ -1014,3 +1014,43 @@ Custom rounding and default page/order properties, unsafe-memory-access settings
 Existing-inner aliases, full Field factories, raw getter/object/hash behavior, custom ZoneRulesProvider rules, signed Slice, routed writers and recursive copies, relations, physical transport and production adoption remain required.
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+
+== Kafka retained response and producer-state source checkpoint
+
+The ordered Metadata transport retains its native account through request completion, response borrowing and final native release.
+Its raw facade preserves wire text while the strict facade retains field-specific UTF8 error priority.
+Java replacement decoding and decoded UTF16 hashing/comparison are separate borrowed primitives.
+Incoming fixes retain the distinct ordered-request C descriptor type and raw queue-operation fixture ownership.
+
+Actual DLQ construction attaches the native byte account using the existing retained capacity reservation.
+DeliveryContext owns every admitted receipt before enqueue; native opaque identities own no Rust Box.
+An unaccepted registration rolls back on error or cancellation.
+Reported record reservations survive until SDK poll/flush returns after native event/message/key/header destruction.
+Unreported receipts remain owned until joined native client destruction and iterative context cleanup.
+Receipt reporting allocates no collection storage; SDK diagnostic error formatting retains its existing String allocation.
+These selected ceilings and receipt boundaries do not establish a whole-producer allocation bound.
+
+The registered shared HashMap capability retains actual lookup and encounter geometry with fallible key operations and collection admission.
+Hash guards preserve distinct mappings for source-equal keys with different ordinary hash results.
+Iterator removal uses the stored node hash and movable=false, retaining saved-next traversal, head/root divergence and singleton-tree resize behavior.
+Payload ownership and qualified Java identity observations remain concrete-adapter obligations.
+MemoryBudget exposes an allocation-free ancestor-control count for caller-owned reservation allowances.
+
+ProducerMetadata owns refresh state, active topics, last-seen epochs and producer-lifetime RoundRobin counters under one serialized caller.
+Immutable snapshots retain their admitted payloads and shared collection geometry independently of later mutable-capability failure.
+Response application preserves holder and error-map stages, full/partial snapshot construction, both partial map replays, epoch/UUID updates and recoverable-error publication.
+PreparedSend retains one partition selection with its record and snapshot across retries.
+The current standalone fixture imports the state implementation directly; production registration and actual DLQ enqueue are pending.
+CHM tree profiles, bootstrap/rebootstrap generations, Cluster node shuffling, network scheduling, throttles, fatal errors, waiter notification and qualified Java math/random/identity providers remain required.
+Native construction, broker/thread growth, automatic metadata caches, ApiVersions, security, ordinary outbound owners and compression overlap still require a finite admitted domain.
+
+Registry HTTP JSON materialization now follows borrowed source-tree measurement and authoritative admission, including duplicate entries and the materializer's raw-value branch.
+Ordered typed REST bean coercion and branch-specific version lookup, cache and failure timing remain separate implementation work.
+Avro default-property, scalar, materializer, ToConnectContext and typed-object arena prerequisites have source regression coverage.
+Actual canonical naming, arbitrary-key collection/hash/equality/property-cache behavior and complete graph/writer/SMT/cache admission still require coordinated integration.
+The preserved explicit-null Connect-default assertion conflicts with the pinned source prediction; neither expectation has been silently rewritten or counted as reconciled parity.
+
+Independent source reviews cover the bounded published changes and their regression sources.
+This workflow has executed no compiler, formatter, runtime discovery, regression suite or Phase 2 qualification.
+The implementation revision remains unset, every area conclusion remains pending and the source-completeness gate remains false.

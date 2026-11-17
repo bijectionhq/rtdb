@@ -311,6 +311,16 @@
       "requirement": "Complete required built-in TLS algorithm/provider choices and nondefault Connect settings; reconcile native extension registrations with the shipped classpath."
     },
     {
+      "id": "kafka-avro-registry-and-producer",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "compaction_gc_adapters",
+        "client_operational_surfaces"
+      ],
+      "requirement": "Complete actual Avro canonical naming, typed graph/default materialization, arbitrary-key collection/hash/equality/property-cache and writer/SMT/cache ownership integration; retain and reconcile the explicit null-default source/assertion conflict. Complete ordered typed Registry REST bean coercion and branch-specific version lookup/cache/error timing. Complete stock Java producer metadata CHM tree profiles, qualified Java identity/math/random providers, bootstrap/rebootstrap and network/throttle/fatal/waiter ownership, actual DLQ selected-partition enqueue, and finite native construction/broker/thread/cache/security/outbound/compression admission beyond reviewed receive/ordered-request and receipt lifetime boundaries."
+    },
+    {
       "id": "final-design-closure",
       "kind": "review",
       "status": "open",
