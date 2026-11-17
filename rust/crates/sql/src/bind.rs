@@ -8,6 +8,7 @@ use sqlparser::ast as ast;
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
 use crate::PrepareOptions;
 use crate::expression::{ReplacementKey, Replacements};
+use crate::subquery::{DeferredExpressionInput, ExpressionAttachment, ExpressionInput};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HiddenColumn { ExplicitOnly, Internal }
@@ -49,6 +50,7 @@ pub(crate) struct Context<'a> {
     next_symbol: u64,
     pub(crate) hidden_columns: BTreeMap<ColumnId, HiddenColumn>,
     pub(crate) outer_scopes: Vec<crate::subquery::CorrelationScope>,
+    inferred_group_scopes: Vec<InferredGroupScope>,
     pub(crate) next_parameter: usize,
     period_columns: BTreeSet<String>,
     notices: Vec<SqlNotice>,
@@ -66,6 +68,11 @@ struct SelectProjection<'a> {
     distinct: bool,
 }
 
+struct InferredGroupScope {
+    source: BTreeSet<ColumnId>,
+    required: BTreeSet<ColumnId>,
+}
+
 pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions, forms: FormAllocation<'_>) -> Result<Expr> {
     struct ScalarCatalog;
     impl Catalog for ScalarCatalog {
@@ -74,7 +81,7 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
@@ -85,7 +92,7 @@ pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog,
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();
-    let mut context = Context { forms, literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = parsed.settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
@@ -112,6 +119,26 @@ impl Catalog for TransactionCatalog<'_> {
 }
 
 impl Context<'_> {
+    pub(crate) fn record_column_demand(&mut self, id: ColumnId) {
+        for scope in &mut self.inferred_group_scopes {
+            if scope.source.contains(&id) {
+                scope.required.insert(id);
+            }
+        }
+    }
+
+    fn with_inferred_group_scope<T>(
+        &mut self, source: &Schema, bind: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<(T, BTreeSet<ColumnId>)> {
+        self.inferred_group_scopes.push(InferredGroupScope {
+            source: source.ids(),
+            required: BTreeSet::new(),
+        });
+        let result = bind(self);
+        let scope = self.inferred_group_scopes.pop().expect("Inference scope installed by caller");
+        Ok((result?, scope.required))
+    }
+
     fn row_count(&mut self,expression: &ast::Expr) -> Result<Expr> {
         let valid = matches!(expression,ast::Expr::Value(value) if matches!(&value.value,ast::Value::Placeholder(_)) || matches!(&value.value,ast::Value::Number(text,_) if !text.is_empty() && text.bytes().all(|byte|byte.is_ascii_digit())));
         if !valid { return Err(error("LIMIT and OFFSET require an unsigned integer or parameter")); }
@@ -424,66 +451,51 @@ impl Context<'_> {
             if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; crate::expression::aggregate_notices(expr, &mut self.notices); }
         }
         if let Some(having) = select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
+        let inferred_scope = (groups.is_empty() && !aggregate_calls.is_empty())
+            .then(|| input.schema().clone());
         let mut replacements = BTreeMap::new();
-        if !groups.is_empty() || !aggregate_calls.is_empty() {
-            let mut named_groups = Vec::new();
-            for (index, group) in groups.iter().enumerate() {
-                let group = ordinal_projection(group, projection)?.unwrap_or(group);
-                let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
-                let qualifier = match &expr { Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()), _ => None };
-                let mut field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
-                field.qualifier = qualifier;
-                replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
-                named_groups.push(NamedExpr { field, expr });
+        let mut named_groups = Vec::new();
+        for (index, group) in groups.iter().enumerate() {
+            let group = ordinal_projection(group, projection)?.unwrap_or(group);
+            let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
+            let qualifier = match &expr {
+                Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()),
+                _ => None,
+            };
+            let mut field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
+            field.qualifier = qualifier;
+            replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
+            named_groups.push(NamedExpr { field, expr });
+        }
+        let mut aggregates = Vec::new();
+        for (key, function) in aggregate_calls {
+            let aggregate = self.aggregate(&function, &mut input, aggregates.len())?;
+            replacements.insert(ReplacementKey::Aggregate(key), aggregate.field.clone());
+            aggregates.push(aggregate);
+        }
+
+        let (mut input, projected, names) = if let Some(source) = inferred_scope {
+            let aggregate_fields = aggregates.iter().map(|aggregate| aggregate.field.clone()).collect();
+            for aggregate in &aggregates {
+                self.hidden_columns.insert(aggregate.field.id, HiddenColumn::Internal);
             }
-            let mut aggregates = Vec::new();
-            for (key, function) in aggregate_calls {
-                let aggregate = self.aggregate(&function, &mut input, aggregates.len())?;
-                replacements.insert(ReplacementKey::Aggregate(key), aggregate.field.clone());
-                aggregates.push(aggregate);
+            let mut deferred = DeferredExpressionInput::new(source.concat(&Schema::new(aggregate_fields)?)?);
+            let ((projected, names), demand) = self.with_inferred_group_scope(&source, |context| {
+                context.select_outputs(&select, &mut ExpressionInput::Deferred(&mut deferred), &mut replacements)
+            })?;
+            let keys = source.fields().iter().filter(|field| demand.contains(&field.id))
+                .map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect();
+            let grouped = aggregate_relation(input, keys, aggregates)?;
+            (deferred.bind(grouped)?, projected, names)
+        } else {
+            if !named_groups.is_empty() || !aggregates.is_empty() {
+                input = aggregate_relation(input, named_groups, aggregates)?;
             }
-            let schema = Schema::new(named_groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|agg| agg.field.clone())).collect())?;
-            input = Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups: named_groups, aggregates })?);
-        }
-        if let Some(having) = select.having { let predicate = self.relational_expr(having, &mut input, &replacements)?; input = Arc::new(input.filter(predicate)?); }
-        let mut windows = Vec::new();
-        for item in projection {
-            if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
-        }
-        if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
-        if let Some((key, function)) = windows.pop() {
-            let (window, field) = self.window(input, &function, &replacements)?;
-            input = window;
-            replacements.insert(ReplacementKey::Expression(key), field);
-        }
-        let mut projected = Vec::new();
-        for (index, item) in projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
-            match item {
-                ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
-                    let expression = self.relational_expr(expr, &mut input, &replacements)?;
-                    let unnamed = matches!(&expression, Expr::Column { id, .. } if input.schema().get(*id).is_some_and(|field| field.unnamed));
-                    let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else if unnamed { format!("_column_{}", index + 1) } else { expression_name(expr, index) };
-                    let field = self.binder.field(name, None, expression.data_type())?;
-                    projected.push(NamedExpr { field, expr: expression });
-                }
-                ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
-                    projected.extend(self.wildcard(input.schema(), Some(name), options, &BTreeSet::new())?);
-                }
-                _ => return Err(unsupported("Projection shape")),
-            }
-        }
-        let wildcards = projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
-        if let Some((index, options)) = wildcards.first() {
-            if wildcards.len() != 1 || (*index != 0 && *index + 1 != projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
-            let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
-            let mut expanded = self.wildcard(input.schema(), None, options, &explicit_names)?;
-            expanded.extend(projected);
-            projected = expanded;
-        }
-        let mut names = BTreeSet::new();
-        for projection in &projected {
-            if !names.insert(projection.field.name.clone()) { return Err(error(format!("Duplicate column projection: {}", projection.field.name))); }
-        }
+            let (projected, names) = self.select_outputs(
+                &select, &mut ExpressionInput::Relational(&mut input), &mut replacements,
+            )?;
+            (input, projected, names)
+        };
         if let Some(order_by) = order_by {
             let ast::OrderByKind::Expressions(expressions) = &order_by.kind else { return Err(unsupported("ORDER BY ALL")); };
             let fields = projected.iter().map(|projection| projection.field.clone()).collect::<Vec<_>>();
@@ -517,6 +529,57 @@ impl Context<'_> {
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
         }
         Ok(input)
+    }
+
+    fn select_outputs(
+        &mut self, select: &SelectProjection<'_>, input: &mut ExpressionInput<'_>,
+        replacements: &mut Replacements,
+    ) -> Result<(Vec<NamedExpr>, BTreeSet<String>)> {
+        let projection = select.items;
+        if let Some(having) = select.having {
+            let predicate = self.expr_bound(having, input, replacements)?;
+            input.attach(ExpressionAttachment::Filter(predicate))?;
+        }
+        let mut windows = Vec::new();
+        for item in projection {
+            if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
+        }
+        if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
+        if let Some((key, function)) = windows.pop() {
+            let window = self.bind_window(input.schema(), &function, replacements)?;
+            let field = window.output().clone();
+            input.attach(ExpressionAttachment::Window(window))?;
+            replacements.insert(ReplacementKey::Expression(key), field);
+        }
+        let mut projected = Vec::new();
+        for (index, item) in projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
+            match item {
+                ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
+                    let expression = self.expr_bound(expr, input, replacements)?;
+                    let unnamed = matches!(&expression, Expr::Column { id, .. } if input.schema().get(*id).is_some_and(|field| field.unnamed));
+                    let name = if let ast::SelectItem::ExprWithAlias { alias, .. } = item { identifier(alias).normalized() } else if unnamed { format!("_column_{}", index + 1) } else { expression_name(expr, index) };
+                    let field = self.binder.field(name, None, expression.data_type())?;
+                    projected.push(NamedExpr { field, expr: expression });
+                }
+                ast::SelectItem::QualifiedWildcard(ast::SelectItemQualifiedWildcardKind::ObjectName(name), options) => {
+                    projected.extend(self.wildcard(input.schema(), Some(name), options, &BTreeSet::new())?);
+                }
+                _ => return Err(unsupported("Projection shape")),
+            }
+        }
+        let wildcards = projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
+        if let Some((index, options)) = wildcards.first() {
+            if wildcards.len() != 1 || (*index != 0 && *index + 1 != projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
+            let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
+            let mut expanded = self.wildcard(input.schema(), None, options, &explicit_names)?;
+            expanded.extend(projected);
+            projected = expanded;
+        }
+        let mut names = BTreeSet::new();
+        for projection in &projected {
+            if !names.insert(projection.field.name.clone()) { return Err(error(format!("Duplicate column projection: {}", projection.field.name))); }
+        }
+        Ok((projected, names))
     }
 
     fn joined_table(&mut self, table: &ast::TableWithJoins, lateral_start: usize) -> Result<Arc<Relation>> {
@@ -931,7 +994,13 @@ fn join(left: Arc<Relation>, right: Arc<Relation>, kind: JoinKind, condition: Op
 }
 
 
-pub(crate) fn expression_name(expr: &ast::Expr, index: usize) -> String {
+pub(crate) fn aggregate_relation(input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>) -> Result<Arc<Relation>> {
+    let schema = Schema::new(groups.iter().map(|group| group.field.clone())
+        .chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect())?;
+    Ok(Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups, aggregates })?))
+}
+
+fn expression_name(expr: &ast::Expr, index: usize) -> String {
     match expr { ast::Expr::Identifier(name) => identifier(name).normalized(), ast::Expr::CompoundIdentifier(names) => names.last().map(|name| identifier(name).normalized()).unwrap_or_default(), ast::Expr::Function(function) if function.over.is_none() && !function.name.0.last().and_then(ast::ObjectNamePart::as_ident).is_some_and(|name| name.quote_style.is_none() && matches!(name.value.to_ascii_lowercase().as_str(), "generate_series" | "range")) => function.name.to_string().to_lowercase(), _ => format!("_column_{}", index + 1) }
 }
 

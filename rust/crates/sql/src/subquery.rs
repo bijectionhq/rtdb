@@ -15,33 +15,55 @@ impl CorrelationScope {
 pub(crate) enum ExpressionInput<'a> {
     Scalar(&'a Schema),
     Relational(&'a mut Arc<Relation>),
+    Deferred(&'a mut DeferredExpressionInput),
 }
-
 impl ExpressionInput<'_> {
     pub fn schema(&self) -> &Schema {
         match self {
             Self::Scalar(schema) => schema,
             Self::Relational(input) => input.schema(),
+            Self::Deferred(input) => &input.schema,
         }
     }
-
     fn require_relation(&self) -> Result<()> {
         match self {
             Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")),
-            Self::Relational(_) => Ok(()),
+            Self::Relational(_) | Self::Deferred(_) => Ok(()),
         }
     }
 
-    fn attach(&mut self, attachment: ExpressionAttachment) -> Result<()> {
-        let Self::Relational(input) = self else {
-            return Err(error("Subqueries are not allowed in this context"));
-        };
-        **input = attachment.bind(Arc::clone(input))?;
-        Ok(())
+    pub(crate) fn attach(&mut self, attachment: ExpressionAttachment) -> Result<()> {
+        match self {
+            Self::Scalar(_) => Err(error("Subqueries are not allowed in this context")),
+            Self::Relational(input) => {
+                **input = attachment.bind(Arc::clone(input))?;
+                Ok(())
+            }
+            Self::Deferred(input) => {
+                input.schema = input.schema.concat(&attachment.output_schema()?)?;
+                input.attachments.push(attachment);
+                Ok(())
+            }
+        }
     }
 }
 
-enum ExpressionAttachment {
+pub(crate) struct DeferredExpressionInput {
+    schema: Schema,
+    attachments: Vec<ExpressionAttachment>,
+}
+
+impl DeferredExpressionInput {
+    pub(crate) fn new(schema: Schema) -> Self {
+        Self { schema, attachments: Vec::new() }
+    }
+
+    pub(crate) fn bind(self, input: Arc<Relation>) -> Result<Arc<Relation>> {
+        self.attachments.into_iter().try_fold(input, |input, attachment| attachment.bind(input))
+    }
+}
+
+pub(crate) enum ExpressionAttachment {
     Apply {
         dependent: Arc<Relation>,
         arguments: Vec<(usize, Expr)>,
@@ -55,9 +77,20 @@ enum ExpressionAttachment {
         comparison: Expr,
         output: Field,
     },
+    Filter(Expr),
+    Window(crate::window::BoundWindow),
 }
 
 impl ExpressionAttachment {
+    fn output_schema(&self) -> Result<Schema> {
+        match self {
+            Self::Apply { output, .. } | Self::Mark { output, .. }
+            | Self::Materialize(NamedExpr { field: output, .. }) => Schema::new(vec![output.clone()]),
+            Self::Filter(_) => Ok(Schema::default()),
+            Self::Window(window) => window.output_schema(),
+        }
+    }
+
     fn bind(self, input: Arc<Relation>) -> Result<Arc<Relation>> {
         let relation = match self {
             Self::Apply { dependent, arguments, kind, output } => {
@@ -77,6 +110,8 @@ impl ExpressionAttachment {
                 let schema = input.schema().concat(&Schema::new(vec![output.clone()])?)?;
                 Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison, output })?
             }
+            Self::Filter(predicate) => input.filter(predicate)?,
+            Self::Window(window) => return window.bind(input),
         };
         Ok(Arc::new(relation))
     }
@@ -86,7 +121,10 @@ impl Context<'_> {
     pub(crate) fn resolve_column(&mut self, names: &[Identifier], schema: &Schema) -> Result<Expr> {
         let schema = Schema::new(schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
         let missing = match schema.resolve(names) {
-            Ok(field) => return Ok(field.expression()),
+            Ok(field) => {
+                self.record_column_demand(field.id);
+                return Ok(field.expression());
+            }
             Err(error) if error.code != "xtdb/column-not-found" => return Err(error),
             Err(error) => error,
         };
@@ -105,6 +143,7 @@ impl Context<'_> {
     }
 
     fn capture_outer(&mut self, scope: usize, field: &Field) -> Result<Expr> {
+        self.record_column_demand(field.id);
         let index = match self.outer_scopes[scope].captures.get(&field.id) {
             Some((index, _)) => *index,
             None => {
@@ -118,7 +157,13 @@ impl Context<'_> {
 
     pub(crate) fn wildcard_columns(&mut self, schema: &Schema, qualifier: Option<&str>, excludes: &BTreeSet<String>) -> Result<Vec<(Field, Expr)>> {
         let selected = wildcard_fields(schema, qualifier, excludes, &self.hidden_columns);
-        if !selected.is_empty() { return Ok(selected.into_iter().map(|field| { let expr = field.expression(); (field, expr) }).collect()); }
+        if !selected.is_empty() {
+            return Ok(selected.into_iter().map(|field| {
+                self.record_column_demand(field.id);
+                let expr = field.expression();
+                (field, expr)
+            }).collect());
+        }
         for scope in (0..self.outer_scopes.len()).rev() {
             if !self.outer_scopes[scope].visible { continue; }
             let selected = wildcard_fields(&self.outer_scopes[scope].schema, qualifier, excludes, &self.hidden_columns);
@@ -127,14 +172,22 @@ impl Context<'_> {
         Ok(Vec::new())
     }
 
-    pub(crate) fn wildcard_source_id(&self, names: &[Identifier], schema: &Schema) -> Result<Option<ColumnId>> {
+    pub(crate) fn wildcard_source_id(&mut self, names: &[Identifier], schema: &Schema) -> Result<Option<ColumnId>> {
         let find = |schema: &Schema| -> Result<Option<ColumnId>> {
             let schema = Schema::new(schema.fields().iter().filter(|field| self.hidden_columns.get(&field.id) != Some(&HiddenColumn::Internal)).cloned().collect())?;
             match schema.resolve(names) { Ok(field) => Ok(Some(field.id)), Err(error) if error.code == "xtdb/column-not-found" => Ok(None), Err(error) => Err(error) }
         };
-        if let Some(id) = find(schema)? { return Ok(Some(id)); }
-        for scope in self.outer_scopes.iter().rev().filter(|scope| scope.visible) { if let Some(id) = find(&scope.schema)? { return Ok(Some(id)); } }
-        Ok(None)
+        let mut id = find(schema)?;
+        if id.is_none() {
+            for scope in self.outer_scopes.iter().rev().filter(|scope| scope.visible) {
+                id = find(&scope.schema)?;
+                if id.is_some() { break; }
+            }
+        }
+        if let Some(id) = id {
+            self.record_column_demand(id);
+        }
+        Ok(id)
     }
 
     fn internal_parameter(&mut self) -> Result<usize> {

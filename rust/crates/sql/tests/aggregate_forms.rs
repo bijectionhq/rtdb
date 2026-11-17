@@ -1,16 +1,44 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
+use rtdb_index::{PartitionState, TransactionBuffer};
 use rtdb_plan::{ExplainMode, Statement};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
 use rtdb_sql::{PrepareOptions, prepare};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
-use rtdb_types::{Result, Timestamp, Value};
+use rtdb_types::{Interval, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
 fn context() -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap()
+}
+
+fn multiple_query_tails_context() -> Arc<QueryContext> {
+    let partition = PartitionState::empty(Default::default()).unwrap();
+    let time = Timestamp(100);
+    let mut transaction = TransactionBuffer::new(
+        partition.value().snapshot(),
+        TransactionKey { tx_id: TxId(0), system_time: time },
+        MemoryBudget::new(1 << 27),
+    ).unwrap();
+    for (id, v) in [(1, 1), (2, 1), (3, 2), (4, 3), (5, 4)] {
+        transaction.put(
+            TableRef::new("public", "foo"),
+            BTreeMap::from([("_id".into(), Value::I64(id)), ("v".into(), Value::I64(v))]),
+            Interval::ALL,
+        ).unwrap();
+    }
+    partition.apply(&transaction.stage().unwrap()).unwrap();
+    let database = DatabaseSnapshot {
+        partitions: vec![partition.value().snapshot()],
+        storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)),
+    };
+    let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+    QueryContext::new(
+        catalog, MemoryBudget::new(1 << 27), time, "UTC", QueryOptions::default(),
+        &CancellationToken::new(),
+    ).unwrap()
 }
 async fn collect(context: &Arc<QueryContext>, prepared: rtdb_plan::PreparedStatement) -> Result<Vec<Vec<Value>>> {
     let query = PreparedQuery::from_prepared(prepared, &context.memory)?;
@@ -25,6 +53,67 @@ async fn collect(context: &Arc<QueryContext>, prepared: rtdb_plan::PreparedState
 }
 async fn sql(context: &Arc<QueryContext>, query: &str) -> Result<Vec<Vec<Value>>> {
     collect(context, prepare(query, &context.catalog, &PrepareOptions::default()).unwrap()).await
+}
+
+#[tokio::test]
+async fn multiple_query_tails() {
+    let context = multiple_query_tails_context();
+    let cases = [
+        ("FROM foo
+          SELECT v, COUNT(*) AS v_count
+          ORDER BY v",
+         vec!["v", "v_count"], vec![vec![1, 2], vec![2, 1], vec![3, 1], vec![4, 1]]),
+        ("FROM foo
+          SELECT v, COUNT(*) AS v_count
+          SELECT v_count, COUNT(*) AS freq
+          ORDER BY v_count",
+         vec!["v_count", "freq"], vec![vec![1, 3], vec![2, 1]]),
+        ("FROM foo
+          SELECT v, COUNT(*) AS v_count
+          SELECT v
+          ORDER BY v_count, v",
+         vec!["v"], vec![vec![2], vec![3], vec![4], vec![1]]),
+        ("FROM foo
+          SELECT _id, ROW_NUMBER () OVER (PARTITION BY v ORDER BY _id) row_num
+          WHERE row_num = 1
+          SELECT _id
+          ORDER BY _id",
+         vec!["_id"], vec![vec![1], vec![3], vec![4], vec![5]]),
+    ];
+    for (source, names, rows) in cases {
+        let prepared = prepare(source, &context.catalog, &PrepareOptions::default()).unwrap();
+        let Statement::Query(relation) = &prepared.statement else { panic!("Expected a query") };
+        assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), names, "{source}");
+        let rows = rows.into_iter().map(|row| row.into_iter().map(Value::I64).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(collect(&context, prepared).await.unwrap(), rows, "{source}");
+    }
+}
+
+#[tokio::test]
+async fn inferred_group_keys_include_outer_columns_demanded_by_projection_subqueries() {
+    let context = multiple_query_tails_context();
+    let rows = sql(&context, "SELECT (SELECT f.v) AS v, SUM(f._id) AS n FROM foo AS f ORDER BY v").await.unwrap();
+    let expected = [(1, 3), (2, 3), (3, 4), (4, 5)].into_iter()
+        .map(|(value, total)| vec![Value::I64(value), Value::I64(total)]).collect::<Vec<_>>();
+    assert_eq!(rows, expected);
+}
+
+#[tokio::test]
+async fn inferred_group_keys_include_having_windows_and_wildcards() {
+    let context = context();
+    for (source, expected) in [
+        ("SELECT COUNT(*) AS n FROM (VALUES(1),(1),(2)) t(v) HAVING v > 0 ORDER BY n",
+         vec![vec![1], vec![2]]),
+        ("SELECT COUNT(*) AS n, ROW_NUMBER() OVER (ORDER BY v) AS r FROM (VALUES(1),(1),(2)) t(v) ORDER BY r",
+         vec![vec![2, 1], vec![1, 2]]),
+        ("SELECT *, COUNT(*) AS n FROM (VALUES(1),(1),(2)) t(v) ORDER BY v",
+         vec![vec![1, 2], vec![2, 1]]),
+        ("SELECT * EXCLUDE (v) RENAME (v AS w), COUNT(*) AS n FROM (VALUES (1),(1),(2)) AS t(v) ORDER BY n",
+         vec![vec![1], vec![2]]),
+    ] {
+        let expected = expected.into_iter().map(|row| row.into_iter().map(Value::I64).collect::<Vec<_>>()).collect::<Vec<_>>();
+        assert_eq!(sql(&context, source).await.unwrap(), expected, "{source}");
+    }
 }
 fn aggregate_forms(rows: &[Vec<Value>]) -> Vec<String> {
     rows.iter().filter_map(|row| row[2].field("aggregates").filter(|value| !matches!(value, Value::Null))).flat_map(|value| {

@@ -5,8 +5,40 @@ use sqlparser::ast;
 use crate::bind::{Context, HiddenColumn, error, identifiers, unsupported};
 use crate::expression::Replacements;
 
+pub(crate) struct BoundWindow {
+    keys: Vec<NamedExpr>,
+    partition_by: Vec<ColumnId>,
+    order_by: Vec<SortExpr>,
+    expression: WindowExpr,
+}
+
+impl BoundWindow {
+    pub(crate) fn output(&self) -> &Field { &self.expression.field }
+
+    pub(crate) fn output_schema(&self) -> Result<Schema> {
+        Schema::new(self.keys.iter().map(|key| key.field.clone())
+            .chain([self.expression.field.clone()]).collect())
+    }
+
+    pub(crate) fn bind(self, input: Arc<Relation>) -> Result<Arc<Relation>> {
+        let input = if self.keys.is_empty() {
+            input
+        } else {
+            let projections = input.schema().fields().iter()
+                .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+                .chain(self.keys).collect();
+            Arc::new(input.project(projections)?)
+        };
+        let schema = input.schema().concat(&Schema::new(vec![self.expression.field.clone()])?)?;
+        Ok(Arc::new(Relation::new(schema, RelationNode::Window {
+            input, partition_by: self.partition_by, order_by: self.order_by,
+            expressions: vec![self.expression],
+        })?))
+    }
+}
+
 impl Context<'_> {
-    pub(crate) fn window(&mut self, input: Arc<Relation>, function: &ast::Function, replacements: &Replacements) -> Result<(Arc<Relation>, Field)> {
+    pub(crate) fn bind_window(&mut self, schema: &Schema, function: &ast::Function, replacements: &Replacements) -> Result<BoundWindow> {
         let Some(ast::WindowType::WindowSpec(specification)) = &function.over else { return Err(unsupported("Named windows")); };
         if specification.window_frame.is_some() { return Err(unsupported("Window frames")); }
         if function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) || function.uses_odbc_syntax { return Err(unsupported("Window function modifiers")); }
@@ -25,7 +57,7 @@ impl Context<'_> {
                 if arguments.len() > 2 { return Err(Anomaly::unsupported("xtdb.sql/lead-lag-default-expr", "LEAD/LAG default expressions are not currently supported")); }
                 if function.null_treatment.is_some() { return Err(Anomaly::unsupported("xtdb.sql/lead-lag-ignore-nulls", "LEAD/LAG IGNORE NULLS is not currently supported")); }
                 let argument = arguments.first().ok_or_else(|| error("LEAD/LAG requires a column"))?;
-                let Expr::Column { id: column, .. } = self.expr(argument, input.schema(), replacements)? else { return Err(Anomaly::unsupported("xtdb.sql/lead-lag-expr", "LEAD/LAG currently only supports column references, not arbitrary expressions")); };
+                let Expr::Column { id: column, .. } = self.expr(argument, schema, replacements)? else { return Err(Anomaly::unsupported("xtdb.sql/lead-lag-expr", "LEAD/LAG currently only supports column references, not arbitrary expressions")); };
                 let offset = arguments.get(1).map(|argument| offset(argument)).transpose()?.unwrap_or(1);
                 if name == "lead" { WindowFunction::Lead { column, offset } } else { WindowFunction::Lag { column, offset } }
             }
@@ -33,30 +65,27 @@ impl Context<'_> {
         };
         let partition_by = specification.partition_by.iter().map(|column| {
             if !matches!(column, ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)) { return Err(error("Window partitions require column references")); }
-            match self.expr(column, input.schema(), replacements)? {
+            match self.expr(column, schema, replacements)? {
                 Expr::Column { id, .. } => Ok(id),
                 _ => Err(error("Window partitions require column references")),
             }
         }).collect::<Result<Vec<ColumnId>>>()?;
-        let mut projections: Vec<_> = input.schema().fields().iter().map(|field| NamedExpr { field: field.clone(),expr: field.expression() }).collect();
+        let mut keys = Vec::new();
         let order_by = specification.order_by.iter().map(|order| {
             if matches!(&order.expr, ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if !value.contains(['.', 'e', 'E']))) { return Err(error("Window ORDER BY has no output ordinal positions")); }
-            let expr = self.expr(&order.expr, input.schema(), &BTreeMap::new())?;
+            let expr = self.expr(&order.expr, schema, &BTreeMap::new())?;
             let descending = crate::bind::sort_descending(&order.options)?;
             let mut field = self.binder.field("",None,expr.data_type())?;
             field.name = format!("_window_order_{}",field.id.0);
             self.hidden_columns.insert(field.id,HiddenColumn::Internal);
             let key = field.expression();
-            projections.push(NamedExpr { field,expr });
+            keys.push(NamedExpr { field,expr });
             Ok(SortExpr { expr: key, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
         }).collect::<Result<Vec<_>>>()?;
-        let input = if order_by.is_empty() { input } else { Arc::new(input.project(projections)?) };
-        let mut field = self.binder.field("", None, function.result_type(input.schema())?)?;
+        let mut field = self.binder.field("", None, function.result_type(schema)?)?;
         field.name = format!("_window_{}", field.id.0);
         self.hidden_columns.insert(field.id,HiddenColumn::Internal);
-        let schema = input.schema().concat(&Schema::new(vec![field.clone()])?)?;
-        let relation = Arc::new(Relation::new(schema, RelationNode::Window { input, partition_by, order_by, expressions: vec![WindowExpr { field: field.clone(), function }] })?);
-        Ok((relation, field))
+        Ok(BoundWindow { keys, partition_by, order_by, expression: WindowExpr { field, function } })
     }
 }
 

@@ -136,7 +136,7 @@ impl Context<'_> {
         }).collect()
     }
 
-    fn wildcard_rename_map(&self, schema: &Schema, qualifier: Option<&Identifier>, options: &ast::WildcardAdditionalOptions) -> Result<BTreeMap<ColumnId, String>> {
+    fn wildcard_rename_map(&mut self, schema: &Schema, qualifier: Option<&Identifier>, options: &ast::WildcardAdditionalOptions) -> Result<BTreeMap<ColumnId, String>> {
         let pairs: &[ast::IdentWithAlias] = match &options.opt_rename { None => &[], Some(ast::RenameSelectItem::Single(pair)) => std::slice::from_ref(pair), Some(ast::RenameSelectItem::Multiple(pairs)) => pairs };
         let mut renames = BTreeMap::new();
         for pair in pairs {

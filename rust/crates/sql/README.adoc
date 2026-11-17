@@ -374,6 +374,9 @@ Each FROM-first WHERE or SELECT tail uses the columns produced by the preceding 
 After a SELECT tail, later tails resolve only the projected names and columns local to their own subqueries.
 GROUP BY and HAVING belong to the SELECT tail that follows them.
 ORDER BY can reference the final SELECT's input as well as its output names.
+When an aggregate SELECT omits GROUP BY, its grouping keys are the input columns that SELECT and HAVING resolve outside aggregate calls.
+This includes keys used by a projected window or captured by a subquery.
+A wildcard rename resolves its source column even when the wildcard excludes that column.
 Series table forms use a List cursor with semantic pages of 1,024 rows and retain a constant-size integer-series descriptor.
 LIMIT and OFFSET consume those pages without materializing the complete series.
 Series WITH ORDINALITY uses signed 64-bit local row numbers, restarting at each semantic page.
