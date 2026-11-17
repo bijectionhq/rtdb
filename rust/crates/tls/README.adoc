@@ -40,6 +40,11 @@ RDN boundaries, assertion counts and geographical attributes come from the origi
 Canonical-string punctuation does not define structural RDN boundaries.
 The structural view shares the name's existing reservation and is released with it.
 
+`java_der` supplies crate-internal Java ASN.1 framing, OID validation, OCTET STRING flattening, encoding, and unaligned BIT STRING layout.
+`Der` is a passive borrowed cursor; indefinite-length conversion and constructed-octet flattening own call-local scratch.
+Callers reserve that scratch before parsing and retain ownership of returned byte buffers.
+Certificate identifier and public-key views share these helpers through their existing memory reservations.
+
 The codec reads JKS and PKCS12 stores, PEM trust certificates, and plain or encrypted PKCS8 PEM identities.
 JKS store integrity and private-key protection use independent passwords.
 A missing JKS store password skips the integrity check while retaining bounded framing checks.
