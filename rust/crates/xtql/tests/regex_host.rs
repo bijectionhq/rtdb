@@ -310,3 +310,83 @@ async fn host_integral_inline_arity_and_mixed_result_metadata_remain_distinct() 
     assert_eq!(project(r#"(regexp-replace "Infinity" (str (/ (quot 2.0 1) 0)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
     assert_eq!(project(r#"(regexp-replace "a" (str (/ (quot 2.0 (identity 1)) 0)) "x")"#).await.unwrap_err().message,"Divide by zero");
 }
+
+#[tokio::test]
+async fn host_bit_operations_keep_long_results_and_mask_signed_long_counts() {
+    for (form,expected) in [
+        ("(bit-not (int 0))","-1"),("(bit-and (byte -1) 255)","255"),
+        ("(bit-and 15 7 3)","3"),("(bit-or 1 2 4)","7"),("(bit-xor 15 7 3)","11"),("(bit-and-not 15 3 4)","8"),
+        ("(bit-shift-left 1 4294967296)","1"),("(bit-shift-left 1 -1)","-9223372036854775808"),
+        ("(bit-shift-left 9223372036854775807 1)","-2"),("(bit-shift-right -2 1)","-1"),
+        ("(unsigned-bit-shift-right -1 1)","9223372036854775807"),("(unsigned-bit-shift-right -1 0)","-1"),
+        ("(unsigned-bit-shift-right -1 -1)","1"),("(unsigned-bit-shift-right -1 4294967296)","-1"),
+        ("(bit-clear -1 -1)","9223372036854775807"),("(bit-set 0 -1)","-9223372036854775808"),
+        ("(bit-flip -9223372036854775808 63)","0"),("(bit-test -9223372036854775808 -1)","true"),
+        ("(bit-test 1 64)","true"),("(bit-test 1 -1)","false"),("(bit-set 0 4294967296)","1"),
+        ("(bit-clear -1 -9223372036854775808)","-2"),("(bit-flip 1 4294967296)","0"),
+        ("(clojure.core/bit-and 12 10)","8"),("(let [f bit-xor] (f 15 7 3))","11"),
+        ("(let [f bit-not] (f 0))","-1"),("(let [f bit-test] (f 1 64))","true"),
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str "\\Q" {form} "\\E") "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
+    }
+}
+
+#[tokio::test]
+async fn host_bit_admission_rejects_other_numeric_categories_before_the_next_operand() {
+    for (value,class) in [("1N","clojure.lang.BigInt"),("1M","java.math.BigDecimal"),("(/ 1 2)","clojure.lang.Ratio"),("(float 1)","java.lang.Float"),("1.0","java.lang.Double")] {
+        let message = format!("bit operation not supported for: class {class}");
+        for form in [format!("(bit-not {value})"),format!(r#"(bit-and {value} "not numeric")"#),format!("(bit-shift-left 1 {value})"),format!("(bit-test 1 {value})")] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,message,"{form}");
+        }
+    }
+    for value in [r#"\a"#,"true","nil",r#""not numeric""#,"[]",":a"] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not {value})) "x")"#)).await.unwrap_err().code,"xtdb.error/unknown");
+    }
+    for operation in ["bit-and","bit-or","bit-xor","bit-and-not"] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N 1 (subs "x" -1))) "x")"#)).await.unwrap_err().message,"bit operation not supported for: class clojure.lang.BigInt");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f 1N 1 (subs "x" -1)))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (str (bit-and "not numeric" 1N)) "x")"#).await.unwrap_err().code,"xtdb.error/unknown");
+    assert_eq!(project(r#"(regexp-replace "a" (str (bit-set 1N (subs "x" -1))) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+}
+
+#[tokio::test]
+async fn host_bit_inline_arity_distinguishes_fixed_variadic_and_ordinary_calls() {
+    for (operation,arguments) in [("bit-not",""),("bit-not","1 2"),("bit-shift-left","1"),("bit-shift-right",""),("unsigned-bit-shift-right","1 2 3")] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+    }
+    for operation in ["bit-and","bit-or","bit-xor","bit-and-not","bit-clear","bit-set","bit-flip","bit-test"] {
+        for arguments in ["","1N"] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+        }
+    }
+    for operation in ["bit-not","bit-shift-left","bit-test"] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (if true "a" (f))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{operation} str] ({operation} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (let [f bit-not] (f 1 (subs "x" -1))) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (if true "a" (bit-set 1 2 3)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
+}
+
+#[tokio::test]
+async fn host_bit_metadata_preserves_unresolved_calls_and_resolved_outer_calls() {
+    for form in [
+        "(bit-and 1.0 1)","(bit-not 1.0)","(bit-and (float 1) 1)","(bit-shift-left 1 1.0)",
+        "(bit-and 1 (boolean nil))","(bit-not (pos? 1))","(let [b (boolean nil)] (bit-not b))",
+        "(bit-not (if true (boolean nil) (pos? 1)))","(bit-not (do 0 (boolean nil)))",
+        "(bit-not (and (boolean nil) (pos? 1)))","(bit-not (or (boolean nil) (pos? 1)))",
+        "(bit-clear 1 0)","(bit-set 0 1)","(bit-flip 1 0)","(bit-test 1 0)","(let [f bit-not] (f 1))",
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 {form}) -9223372036854775808)) "x")"#)).await.unwrap_err().message,"long overflow","{form}");
+    }
+    for form in [
+        "(bit-and 1 1)","(bit-not (byte 0))","(bit-and (identity 1.0) 1)","(bit-and true 1)",
+        "(bit-and 1.0 1 1)","(bit-not (bit-not 1.0))","(bit-not (boolean 1))","(bit-not (pos? (boolean nil)))",
+        "(bit-not (identity true))","(bit-shift-left 1 (identity 1.0))",
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "0" (str (- (if true -9223372036854775808 {form}) -9223372036854775808)) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (str (byte (if true 127.9 (+ 1.0 (bit-test 1 0))))) "x")"#).await.unwrap_err().message,"Host numeric cast is out of range");
+}

@@ -2,7 +2,7 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Binary,Cast,Comparison,Dispatch,Error as NumberError,Integral,Number,Predicate,Unary};
+use crate::jvm_number::{Binary,Bit,Cast,Comparison,Dispatch,Error as NumberError,Integral,Number,Predicate,Unary,bit_not,bit_test};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
@@ -16,13 +16,15 @@ enum Expression<'a> {
     Predicate { operation: Predicate,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
     Comparison { operation: Comparison,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
     Integral { operation: Integral,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
+    BitNot { resolution: Resolution<()>,value: Box<Expression<'a>> },
+    Bit { operation: Bit,resolution: Resolution<()>,values: Box<[Expression<'a>;2]> },
     If(Box<[Expression<'a>;3]>),Body(Vec<Expression<'a>>),
     Let { first: usize,bindings: Vec<Expression<'a>>,body: Box<Expression<'a>> },
     Logical { conjunction: bool,values: Vec<Expression<'a>> },
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
@@ -49,6 +51,12 @@ impl Resolution<Dispatch> {
         else { Self::Resolved(match (left.number(),right.number()) { (Some(left),Some(right)) => Dispatch::binary(Some(left),Some(right)),_ => Dispatch::Object }) }
     }
     fn dispatch(self) -> Dispatch { match self { Self::Resolved(value) => value,Self::Reflective => Dispatch::Object } }
+}
+impl Resolution<()> {
+    fn bit(value: Emission) -> Self { if matches!(value,Emission::Boolean | Emission::Number(Cast::Float | Cast::Double)) { Self::Reflective } else { Self::Resolved(()) } }
+    fn bits(left: Emission,right: Emission) -> Self {
+        match (Self::bit(left),Self::bit(right)) { (Self::Resolved(()),Self::Resolved(())) => Self::Resolved(()),_ => Self::Reflective }
+    }
 }
 
 impl<'a> Program<'a> {
@@ -127,6 +135,14 @@ impl<'a> Compiler<'a,'_,'_> {
             let resolution = Resolution::integral(left.emission(),right.emission());
             return Ok(Expression::Integral { operation,resolution,values: Box::new([left,right]) });
         }
+        if matches!(operation.and_then(function),Some(Function::BitNot)) {
+            arity(args.len(),1,1)?;
+            let value = self.expression(&args[0],depth)?;
+            return Ok(Expression::BitNot { resolution: Resolution::bit(value.emission()),value: Box::new(value) });
+        }
+        if let Some(Function::Bit(operation)) = operation.and_then(function) {
+            if operation.inline(args.len()) { return self.bit(operation,args,depth); }
+        }
         if let Some(Function::Arithmetic(operation)) = operation.and_then(function) {
             if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
         }
@@ -193,13 +209,29 @@ impl<'a> Compiler<'a,'_,'_> {
         if result.stack_depth() > 128 { return Err(limit()); }
         Ok(result)
     }
+    fn bit(&mut self,operation: Bit,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+        if !operation.variadic() { arity(args.len(),2,2)?; }
+        if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
+        let mut args = args.iter();
+        let mut result = self.expression(args.next().ok_or_else(||error("Missing host argument"))?,depth)?;
+        for value in args {
+            self.nodes += 1;
+            if self.nodes > 65_536 { return Err(limit()); }
+            self.context.reserve(256)?;
+            let right = self.expression(value,depth)?;
+            let resolution = Resolution::bits(result.emission(),right.emission());
+            result = Expression::Bit { operation,resolution,values: Box::new([result,right]) };
+        }
+        if result.stack_depth() > 128 { return Err(limit()); }
+        Ok(result)
+    }
 }
 
 impl<'a> Expression<'a> {
     fn stack_depth(&self) -> usize {
         let children = match self {
-            Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } => value.stack_depth(),
-            Self::Binary { values,.. } | Self::Comparison { values,.. } | Self::Integral { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } | Self::BitNot { value,.. } => value.stack_depth(),
+            Self::Binary { values,.. } | Self::Comparison { values,.. } | Self::Integral { values,.. } | Self::Bit { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::If(values) => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Body(values) | Self::Vector(values) | Self::Logical { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Let { bindings,body,.. } => bindings.iter().map(Self::stack_depth).max().unwrap_or(0).max(body.stack_depth()),
@@ -218,6 +250,7 @@ impl<'a> Expression<'a> {
             Self::Unary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::Binary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::Integral { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
+            Self::BitNot { resolution,.. } | Self::Bit { resolution,.. } => resolution.emission(|_|Emission::Number(Cast::Long)),
             Self::If(branches) => branches[1].emission().branch(branches[2].emission()),
             Self::Body(values) => values.last().map_or(Emission::Reference,Self::emission),Self::Let { body,.. } => body.emission(),
             Self::Logical { values,.. } => values.iter().map(Self::emission).reduce(Emission::branch).unwrap_or(Emission::Reference),
@@ -245,6 +278,11 @@ impl<'a> Expression<'a> {
             Self::Integral { operation,resolution,values } => {
                 let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
                 numeric_integral(*operation,resolution.dispatch(),&left,&right,context)?
+            }
+            Self::BitNot { value,.. } => numeric_bit_not(&value.evaluate(locals,context)?,context)?,
+            Self::Bit { operation,values,.. } => {
+                let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
+                numeric_bit(*operation,&left,&right,context)?
             }
             Self::If(branches) => if branches[0].evaluate(locals,context)?.truthy() { branches[1].evaluate(locals,context)? } else { branches[2].evaluate(locals,context)? },
             Self::Body(expressions) => {
@@ -318,6 +356,13 @@ impl Function {
                 if numeric_predicate(Predicate::Zero,&remainder,context)?.truthy() || numeric_predicate(Predicate::Positive,&args[0],context)?.truthy() == numeric_predicate(Predicate::Positive,&args[1],context)?.truthy() { remainder }
                 else { numeric_binary(Binary::Add(false),Dispatch::Object,remainder,args[1].clone(),context)? }
             }
+            Self::BitNot => { arity(args.len(),1,1)?;numeric_bit_not(&args[0],context)? }
+            Self::Bit(operation) => operation.apply_host(args,context)?,
+            Self::BitTest => {
+                arity(args.len(),2,2)?;
+                let left = bit_operand(&args[0],context)?;let right = bit_operand(&args[1],context)?;
+                HostValue::Bool(bit_test(left,right))
+            }
             Self::Predicate(operation) => { arity(args.len(),1,1)?;numeric_predicate(operation,&args[0],context)? }
             Self::Comparison(operation) => {
                 arity(args.len(),1,usize::MAX)?;
@@ -368,7 +413,21 @@ fn function(name: &str) -> Option<Function> {
         "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),
         "<" => Function::Comparison(Comparison::Less),"<=" => Function::Comparison(Comparison::LessEqual),">" => Function::Comparison(Comparison::Greater),">=" => Function::Comparison(Comparison::GreaterEqual),"==" => Function::Comparison(Comparison::Equivalent),
         "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),
-        "quot" => Function::Integral(Integral::Quotient),"rem" => Function::Integral(Integral::Remainder),"mod" => Function::Modulo,_ => return None })
+        "quot" => Function::Integral(Integral::Quotient),"rem" => Function::Integral(Integral::Remainder),"mod" => Function::Modulo,
+        "bit-not" => Function::BitNot,"bit-and" => Function::Bit(Bit::And),"bit-or" => Function::Bit(Bit::Or),"bit-xor" => Function::Bit(Bit::Xor),"bit-and-not" => Function::Bit(Bit::AndNot),
+        "bit-clear" => Function::Bit(Bit::Clear),"bit-set" => Function::Bit(Bit::Set),"bit-flip" => Function::Bit(Bit::Flip),"bit-test" => Function::BitTest,
+        "bit-shift-left" => Function::Bit(Bit::ShiftLeft),"bit-shift-right" => Function::Bit(Bit::ShiftRight),"unsigned-bit-shift-right" => Function::Bit(Bit::UnsignedShiftRight),_ => return None })
+}
+impl Bit {
+    fn variadic(self) -> bool { matches!(self,Self::And | Self::Or | Self::Xor | Self::AndNot) }
+    fn inline(self,count: usize) -> bool { if self.variadic() { count > 1 } else { matches!(self,Self::ShiftLeft | Self::ShiftRight | Self::UnsignedShiftRight) } }
+    fn apply_host<'a>(self,args: Vec<HostValue<'a>>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+        arity(args.len(),2,if self.variadic() { usize::MAX } else { 2 })?;
+        let mut args = args.into_iter();
+        let mut result = args.next().ok_or_else(||error("Missing host argument"))?;
+        for value in args { result = numeric_bit(self,&result,&value,context)?; }
+        Ok(result)
+    }
 }
 impl Arithmetic {
     fn inline(self,count: usize) -> bool {
@@ -430,6 +489,16 @@ fn numeric_integral<'a>(operation: Integral,dispatch: Dispatch,left: &HostValue<
     } else { (left.number(context)?,right.number(context)?) };
     reserve_numeric(left.integral_bound(&right).map_err(|_|limit())?,context)?;
     Ok(HostValue::Number(Arc::new(left.integral(operation,&right,dispatch).map_err(numeric_error)?)))
+}
+fn bit_operand(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<i64> { value.number(context)?.bit_operand().map_err(numeric_error) }
+fn bit_result<'a>(value: i64,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    context.reserve(std::mem::size_of::<Number>() + 2 * std::mem::size_of::<usize>())?;
+    Ok(HostValue::Number(Arc::new(Number::Long(value))))
+}
+fn numeric_bit_not<'a>(value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> { bit_result(bit_not(bit_operand(value,context)?),context) }
+fn numeric_bit<'a>(operation: Bit,left: &HostValue<'a>,right: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    let left = bit_operand(left,context)?;let right = bit_operand(right,context)?;
+    bit_result(operation.apply(left,right),context)
 }
 fn numeric_error(error: NumberError) -> Anomaly { match error { NumberError::External(error) => error,NumberError::Invalid => self::error("Invalid host arithmetic operation") } }
 fn numeric_predicate<'a>(operation: Predicate,value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {

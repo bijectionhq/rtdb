@@ -164,3 +164,45 @@ fn host_decimal_zero_quotient_keeps_extreme_scales_without_expanding_coefficient
         assert_eq!(memory.used_bytes(),0);
     }
 }
+
+#[test]
+fn host_bit_nary_expansion_retains_the_instruction_depth_limit() {
+    for operation in ["bit-and","bit-or","bit-xor","bit-and-not"] {
+        let expression = replace(call("str",vec![call(operation,vec![F::Literal(V::I64(1));129])]));
+        assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
+    }
+}
+
+#[test]
+fn host_bit_rejection_borrows_big_integer_payloads_and_releases_preparation_charges() {
+    let expression = replace(call("str",vec![call("bit-and",vec![F::BigInteger("9".repeat(1024)),string("not numeric")])]));
+    let memory = MemoryBudget::new(64 << 10);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        let error = ExpressionInvocation::prepare(&expression,&Schema::default(),&context).err().unwrap();
+        assert_eq!(error.message,"bit operation not supported for: class clojure.lang.BigInt");
+        assert!(memory.peak_bytes() < memory.limit_bytes());
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn host_bit_count_magnitude_does_not_expand_preparation_storage() {
+    let mut retained = None;
+    for count in [0,-1,64,4294967296,i64::MIN,i64::MAX] {
+        let pattern = call("str",vec![call("bit-shift-right",vec![F::Literal(V::I64(-1)),F::Literal(V::I64(count))])]);
+        let expression = Expr::regex_replace(Expr::Literal(V::Utf8("-1".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
+        let memory = MemoryBudget::new(128 << 20);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let schema = Schema::default();
+            let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+            let prepared = memory.used_bytes();
+            if let Some(expected) = retained { assert_eq!(prepared,expected); } else { retained = Some(prepared); }
+            assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+}
