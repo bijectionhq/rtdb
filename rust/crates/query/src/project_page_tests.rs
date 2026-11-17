@@ -111,7 +111,7 @@ async fn projection_publishes_complete_rows_with_retained_cell_charges() {
 #[tokio::test]
 async fn cancellation_in_a_later_column_releases_the_unpublished_page() {
     let execution = execution();
-    let sleep = Expr::Call { name: "sleep".into(),args: vec![int(1000)],return_type: LogicalType::Null };
+    let sleep = Expr::Call { name: "sleep".into(),args: vec![Expr::Literal(Value::Duration { value: 1000, unit: rtdb_types::TimeUnit::Millisecond })],return_type: LogicalType::Null };
     let baseline = execution.context.memory.used_bytes();
     let mut cursor = cursor(vec![1,2],vec![Expr::Literal(Value::Utf8("retained".repeat(1024))),sleep],&execution);
     let mut pending = Box::pin(cursor.next_page());

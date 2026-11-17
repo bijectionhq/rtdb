@@ -134,8 +134,9 @@ async fn composite_hashes_follow_equality_pair_order_in_both_input_schemas() {
 async fn cancelling_a_suspended_build_key_releases_the_input_and_spool() {
     let left = numbers(0, "l", &[1]); let right = numbers(1, "r", &[]);
     let sleep = Expr::Call { name: "sleep".into(), args: vec![Expr::Literal(Value::Duration { value: 60_000, unit: TimeUnit::Millisecond })], return_type: LogicalType::Null };
-    let key = Expr::Coalesce(vec![sleep, left.schema().fields()[0].expression()]);
-    let condition = Expr::binary(BinaryOp::Eq, key, right.schema().fields()[0].expression());
+    let key = Expr::Call { name: "format".into(), args: vec![Expr::Literal(Value::Utf8("%s%s".into())), sleep, left.schema().fields()[0].expression()], return_type: LogicalType::Scalar(ScalarType::Utf8) };
+    let right_key = Expr::Call { name: "str".into(), args: vec![right.schema().fields()[0].expression()], return_type: LogicalType::Scalar(ScalarType::Utf8) };
+    let condition = Expr::binary(BinaryOp::Eq, key, right_key);
     let cancel = CancellationToken::new(); let context = context(&cancel);
     let query = join(left, right, JoinKind::Inner, condition);
     let mut cursor = query.execute(Arc::clone(&context), vec![]).await.unwrap();
