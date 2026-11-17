@@ -13,7 +13,7 @@ Only the factory can construct an owner.
 A `ContextView` borrows that exact owner, and input `State` views are checked against the retained grammar before transition access.
 Invocation input excludes the root sentinel and runs innermost to outermost; conversion resolves follow states from outermost to innermost.
 
-The owner retains flat immutable node and edge arrays, mutable round-local memo membership, canonical-context membership and traversal scratch.
+The owner retains flat immutable node slots with owned array payloads, mutable round-local memo membership, canonical-context membership and traversal scratch.
 A candidate array remains private and mutable until operand reuse and common-parent normalization finish.
 Published nodes and their edges do not change.
 The derived local-domain bit records whether a node can be traversed by the SLL cached-context operation without following a null parent.
@@ -25,8 +25,13 @@ The lifetime constraints can be read directly at the private boundary:
 A key from an enclosing factory cannot be passed to a separately opened nested factory.
 A borrowed view cannot survive the owner borrow, and a scope cannot be dropped before an owner which still holds it.
 These are source contracts; compiler qualification remains unrun.
-A later persistent parser cache would require a separately reviewed retained-storage/per-borrow-brand boundary.
-The closure-bound owner itself cannot be stored in that environment.
+`PredictionStorage` owns an `OwnedGrammar` and retained context storage across accesses.
+Its constructor transfers the completed grammar; it cannot replace that graph or reopen the context store against a different graph.
+`with_contexts` creates fresh invariant keys, an allocation-free grammar facade and call-owned scratch under the supplied `AllocationScope`.
+The facade borrows the retained store exclusively and cannot escape the callback.
+The scoped and retained facades use the same equality, merge and canonicalization algorithms with sealed allocation policies.
+Returning a retained facade's key or view as the independent callback result is likewise excluded by its invariant brand and access lifetime.
+Each access keeps both the work scope and retained owner borrowed through facade destruction and the ensuing collection.
 
 == Context values and identity
 
@@ -63,13 +68,17 @@ Canonicalizing such a graph is an internal caller error, not an accepted SQL nor
 == Admission and failures
 
 The empty owner allocates no dynamic graph storage.
-Node, edge, invocation and work vectors admit requested capacities before allocation, beginning at 16 slots and growing by checked doubling or the larger concrete requirement.
+Node slots, invocation and work vectors admit requested capacities before allocation, beginning at 16 slots and growing by checked doubling or the larger concrete requirement.
 An array candidate admits the exact requested edge count before construction.
+Its completed node admits a separate payload of that length before admitting its node slot.
 Lookup tables begin at 32 slots, stay at most half full, and admit complete replacement storage before rehashing.
 Every byte product and capacity operation is checked before reservation.
 Old storage and its charge remain live while replacement storage is constructed.
 Candidate buffers and final storage are both covered while they overlap.
-All earlier reservations, including cleared memo capacity and discarded candidates, stay with the caller's scope until it drops.
+Scoped storage reservations, cleared memo capacity and discarded candidate charges stay with the caller's scope until it drops.
+Retained blocks instead own their individual leases, charging each concrete capacity plus 256 bytes of native bookkeeping before allocation.
+Replacing a retained block releases its old capacity charge only after that vector is destroyed.
+No scope-only vector is transferred into retained storage.
 These are native admission points, not a claim of identical JVM heap exhaustion.
 
 The first allocation failure returns its original admission anomaly and seals further mutation or allocating inspection.
@@ -77,6 +86,24 @@ A later request returns the inline Aborted failure without attempting another al
 Completed views remain available for nonallocating inspection.
 No partially constructed key is returned on failure; private storage completed before a later cache-publication failure remains inaccessible through the failed operation.
 Failures do not create source-derived diagnostic strings in this component.
+
+== Retained context lifetime
+
+Canonical membership contains the actual persistent context roots, including both stored keys and values.
+Ending an access destroys its facades and traversal work before a private guard traces these roots and their parents.
+The trace uses pre-admitted slot links and marks; collection, failure cleanup and deep graph destruction allocate no traversal stack and perform no input-depth recursion.
+Unreachable node payloads release their leases, while free slot capacity stays charged for reuse.
+Slot generations advance before reuse and retire permanently on exhaustion, so a stale private ID cannot refer to a replacement node.
+Binding a persistent ID to a fresh key checks its live generation; stored parent links remain within the completed graph.
+Collection cannot run while a branded key or view is live.
+
+Completed canonical publications survive later failures, including failure to record identity-visited work.
+An unpublished array payload is dropped if admitting its node slot fails.
+The failed access remains sealed, but a subsequent access has fresh work and abort state under the same retained budget.
+Canonical entries are strong roots and are not evicted or reset to recover memory.
+Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its context blocks and then its owned grammar.
+The region exposes neither raw stores nor graph replacement, and takes no ambient budget or cache.
+Configuration storage, DFA root integration and parser-environment sharing remain separate required work.
 
 == Configuration objects and ordered sets
 

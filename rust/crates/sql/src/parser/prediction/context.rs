@@ -1,17 +1,24 @@
 use std::marker::PhantomData;
 use rtdb_types::AllocationScope;
 use crate::parser::grammar::{Grammar, State, TransitionView};
-use super::{PredictionError, Problem, Result, capacity_error, push, reserve, vector};
+use super::{PredictionError, Problem, Result, capacity_error, push, vector};
+use super::storage::{Block, Pool, Retained, Scoped, SlotId, StoreMemory, StoreRef};
 #[cfg(test)]
 #[path = "context_tests.rs"]
 mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ContextKey<'id> { index: usize, brand: PhantomData<fn(&'id mut ()) -> &'id mut ()> }
+pub(crate) struct ContextKey<'id> { id: ContextId, brand: PhantomData<fn(&'id mut ()) -> &'id mut ()> }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ContextId { Empty, Node(SlotId) }
 
 impl ContextKey<'_> {
-    fn at(index: usize) -> Self { Self { index, brand: PhantomData } }
-    fn empty() -> Self { Self::at(usize::MAX) }
+    fn at(id: ContextId) -> Self { Self { id, brand: PhantomData } }
+    fn empty() -> Self { Self::at(ContextId::Empty) }
+    fn index(self) -> usize { match self.id { ContextId::Empty => usize::MAX, ContextId::Node(id) => id.index } }
+    #[cfg(test)]
+    pub(super) fn identity(self) -> ContextId { self.id }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,21 +37,31 @@ impl ReturnAddress {
 #[derive(Clone, Copy)]
 struct Edge<'id> { parent: Option<ContextKey<'id>>, address: ReturnAddress }
 #[derive(Clone, Copy)]
-enum Shape<'id> { Singleton(Edge<'id>), Array { start: usize, len: usize } }
-#[derive(Clone, Copy)]
-struct Node<'id> { shape: Shape<'id>, hash: i32, local: bool }
+struct StoredEdge { parent: Option<ContextId>, address: ReturnAddress }
+impl Edge<'_> {
+    fn stored(self) -> StoredEdge { StoredEdge { parent: self.parent.map(|key| key.id), address: self.address } }
+}
+impl StoredEdge {
+    fn branded<'id>(self) -> Edge<'id> { Edge { parent: self.parent.map(ContextKey::at), address: self.address } }
+}
+enum Shape<M: StoreMemory> { Singleton(StoredEdge), Array(Block<StoredEdge, M>) }
+struct Node<M: StoreMemory> { shape: Shape<M>, hash: i32, local: bool }
+impl<M: StoreMemory> Node<M> {
+    fn len(&self) -> usize { match &self.shape { Shape::Singleton(_) => 1, Shape::Array(edges) => edges.len() } }
+    fn edge(&self, index: usize) -> StoredEdge { match &self.shape { Shape::Singleton(edge) => *edge, Shape::Array(edges) => edges[index] } }
+}
 
 #[derive(Clone, Copy)]
 struct Record<K, V> { hash: u64, key: K, value: V }
-struct Table<K, V> { slots: Vec<Option<Record<K, V>>>, len: usize }
-impl<K: Copy, V: Copy> Table<K, V> {
-    fn new() -> Self { Self { slots: Vec::new(), len: 0 } }
+struct Table<K, V, M: StoreMemory> { slots: Block<Option<Record<K, V>>, M>, len: usize }
+impl<K: Copy, V: Copy, M: StoreMemory> Table<K, V, M> {
+    fn new() -> Self { Self { slots: Block::new(), len: 0 } }
     fn clear(&mut self) { self.slots.fill(None); self.len = 0; }
-    fn prepare(&mut self, allocation: &AllocationScope) -> Result<()> {
+    fn prepare(&mut self, memory: &M) -> Result<()> {
         if self.len < self.slots.len() / 2 { return Ok(()); }
         let capacity = self.slots.len().checked_mul(2).ok_or_else(capacity_error)?.max(32);
-        let mut slots = vector(allocation, capacity)?;
-        slots.resize(capacity, None);
+        let mut slots = Block::with_capacity(memory, capacity)?;
+        for _ in 0..capacity { slots.push(None); }
         for record in self.slots.iter().flatten().copied() {
             let mut index = record.hash as usize & (capacity - 1);
             while slots[index].is_some() { index = (index + 1) & (capacity - 1); }
@@ -58,6 +75,50 @@ impl<K: Copy, V: Copy> Table<K, V> {
         while self.slots[index].is_some() { index = (index + 1) & (self.slots.len() - 1); }
         self.slots[index] = Some(record);
         self.len += 1;
+    }
+}
+
+pub(super) struct ContextStore<M: StoreMemory> {
+    nodes: Pool<Node<M>, M>,
+    canonical: Table<ContextId, ContextId, M>,
+    memory: M,
+}
+impl<M: StoreMemory> ContextStore<M> {
+    pub(super) fn new(memory: M) -> Self { Self { nodes: Pool::new(), canonical: Table::new(), memory } }
+    fn node(&self, id: ContextId) -> &Node<M> {
+        let ContextId::Node(id) = id else { unreachable!() };
+        self.nodes.get(id).expect("branded context retains its occupied slot")
+    }
+    fn contains(&self, id: ContextId) -> bool {
+        match id { ContextId::Empty => true, ContextId::Node(id) => self.nodes.get(id).is_some() }
+    }
+    pub(super) fn collect(&mut self) {
+        for record in self.canonical.slots.iter().flatten() {
+            if let ContextId::Node(id) = record.key { self.nodes.mark(id); }
+            if let ContextId::Node(id) = record.value { self.nodes.mark(id); }
+        }
+        while let Some(id) = self.nodes.next_marked() {
+            let len = self.nodes.get(id).unwrap().len();
+            for index in 0..len {
+                let parent = self.nodes.get(id).unwrap().edge(index).parent;
+                if let Some(ContextId::Node(parent)) = parent { self.nodes.mark(parent); }
+            }
+        }
+        self.nodes.sweep();
+    }
+    #[cfg(test)]
+    pub(super) fn live(&self) -> usize { self.nodes.len() }
+    #[cfg(test)]
+    pub(super) fn canonical_len(&self) -> usize { self.canonical.len }
+    #[cfg(test)]
+    pub(super) fn array_edges(&self) -> usize {
+        self.nodes.values().map(|node| match &node.shape { Shape::Array(edges) => edges.len(), _ => 0 }).sum()
+    }
+    #[cfg(test)]
+    pub(super) fn array_bytes(length: usize) -> usize { 256 + length * std::mem::size_of::<StoredEdge>() }
+    #[cfg(test)]
+    pub(super) fn first_canonical_work_bytes() -> usize {
+        256 + std::mem::size_of::<Edge<'_>>() + 256 + 16 * std::mem::size_of::<CanonicalFrame<'_>>()
     }
 }
 
@@ -79,26 +140,24 @@ enum MergeFrame<'id> {
 struct CanonicalParents<'id> { original: ContextKey<'id>, next: usize, changed: bool, candidate: CandidateArray<'id> }
 enum CanonicalFrame<'id> { Visit(ContextKey<'id>), Parent(CanonicalParents<'id>) }
 
-pub(crate) struct PredictionContexts<'id, 'g, 'scope> {
+pub(crate) struct PredictionContexts<'id, 'g, 'scope, M: StoreMemory = Scoped<'scope>> {
     grammar: &'g Grammar<'scope>,
     allocation: &'scope AllocationScope,
-    nodes: Vec<Node<'id>>,
-    edges: Vec<Edge<'id>>,
+    store: StoreRef<'g, ContextStore<M>>,
     equality: Vec<EqualityFrame<'id>>,
     merges: Vec<MergeFrame<'id>>,
     canonicalizing: Vec<CanonicalFrame<'id>>,
     invocations: Vec<State<'g, 'scope>>,
-    memo: Table<(ContextKey<'id>, ContextKey<'id>), ContextKey<'id>>,
-    canonical: Table<ContextKey<'id>, ContextKey<'id>>,
-    visited: Table<ContextKey<'id>, ContextKey<'id>>,
-    common_parents: Table<Option<ContextKey<'id>>, Option<ContextKey<'id>>>,
+    memo: Table<(ContextKey<'id>, ContextKey<'id>), ContextKey<'id>, Scoped<'scope>>,
+    visited: Table<ContextKey<'id>, ContextKey<'id>, Scoped<'scope>>,
+    common_parents: Table<Option<ContextKey<'id>>, Option<ContextKey<'id>>, Scoped<'scope>>,
     aborted: bool,
 }
 
-impl Drop for PredictionContexts<'_, '_, '_> { fn drop(&mut self) { let _ = self.allocation; } }
+impl<M: StoreMemory> Drop for PredictionContexts<'_, '_, '_, M> { fn drop(&mut self) { let _ = self.allocation; } }
 
-pub(crate) struct ContextView<'a, 'id, 'g, 'scope> { owner: &'a PredictionContexts<'id, 'g, 'scope>, key: ContextKey<'id> }
-impl<'id, 'g, 'scope> ContextView<'_, 'id, 'g, 'scope> {
+pub(crate) struct ContextView<'a, 'id, 'g, 'scope, M: StoreMemory = Scoped<'scope>> { owner: &'a PredictionContexts<'id, 'g, 'scope, M>, key: ContextKey<'id> }
+impl<'id, 'g, 'scope, M: StoreMemory> ContextView<'_, 'id, 'g, 'scope, M> {
     pub(crate) fn shape(&self) -> ContextShape { self.owner.shape(self.key) }
     pub(crate) fn is_empty(&self) -> bool { self.owner.is_empty(self.key) }
     pub(crate) fn len(&self) -> usize { self.owner.len(self.key) }
@@ -115,24 +174,44 @@ impl<'id, 'g, 'scope> ContextView<'_, 'id, 'g, 'scope> {
     }
 }
 
-pub(crate) struct MergeRound<'round, 'id, 'g, 'scope> { owner: &'round mut PredictionContexts<'id, 'g, 'scope> }
-impl Drop for MergeRound<'_, '_, '_, '_> { fn drop(&mut self) { self.owner.memo.clear(); } }
-impl<'id, 'g, 'scope> MergeRound<'_, 'id, 'g, 'scope> {
+pub(crate) struct MergeRound<'round, 'id, 'g, 'scope, M: StoreMemory = Scoped<'scope>> { owner: &'round mut PredictionContexts<'id, 'g, 'scope, M> }
+impl<M: StoreMemory> Drop for MergeRound<'_, '_, '_, '_, M> { fn drop(&mut self) { self.owner.memo.clear(); } }
+impl<'id, 'g, 'scope, M: StoreMemory> MergeRound<'_, 'id, 'g, 'scope, M> {
     pub(crate) fn merge(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, mode: MergeMode) -> Result<ContextKey<'id>> {
         self.owner.ready()?;
         let result = self.owner.merge(left, right, mode, MemoUse::Round);
         self.owner.finish(result)
     }
-    pub(super) fn contexts(&mut self) -> &mut PredictionContexts<'id, 'g, 'scope> { self.owner }
+    pub(super) fn contexts(&mut self) -> &mut PredictionContexts<'id, 'g, 'scope, M> { self.owner }
 }
 
 impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
     pub(super) fn new(grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope) -> Self {
+        Self::open(grammar, allocation, StoreRef::Local(ContextStore::new(Scoped(allocation))))
+    }
+}
+impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope, Retained> {
+    pub(super) fn borrowed(grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope, store: &'g mut ContextStore<Retained>) -> Self {
+        Self::open(grammar, allocation, StoreRef::Borrowed(store))
+    }
+}
+impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
+    fn open(grammar: &'g Grammar<'scope>, allocation: &'scope AllocationScope, store: StoreRef<'g, ContextStore<M>>) -> Self {
         Self {
-            grammar, allocation, nodes: Vec::new(), edges: Vec::new(), equality: Vec::new(), merges: Vec::new(),
-            canonicalizing: Vec::new(), invocations: Vec::new(), memo: Table::new(), canonical: Table::new(),
+            grammar, allocation, store, equality: Vec::new(), merges: Vec::new(),
+            canonicalizing: Vec::new(), invocations: Vec::new(), memo: Table::new(),
             visited: Table::new(), common_parents: Table::new(), aborted: false,
         }
+    }
+    #[cfg(test)]
+    pub(super) fn restore(&mut self, id: ContextId) -> Result<ContextKey<'id>> {
+        self.ready()?;
+        let result = self.bind(id);
+        self.finish(result)
+    }
+    fn bind(&self, id: ContextId) -> Result<ContextKey<'id>> {
+        if self.store.contains(id) { Ok(ContextKey::at(id)) }
+        else { Err(PredictionError::Artifact(Problem::Context)) }
     }
 
     pub(super) fn ready(&self) -> Result<()> { if self.aborted { Err(PredictionError::Aborted) } else { Ok(()) } }
@@ -151,34 +230,33 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         self.finish(result)
     }
     pub(crate) fn empty(&self) -> ContextKey<'id> { ContextKey::empty() }
-    pub(crate) fn view(&self, key: ContextKey<'id>) -> ContextView<'_, 'id, 'g, 'scope> { ContextView { owner: self, key } }
+    pub(crate) fn view(&self, key: ContextKey<'id>) -> ContextView<'_, 'id, 'g, 'scope, M> { ContextView { owner: self, key } }
 
     fn shape(&self, key: ContextKey<'id>) -> ContextShape {
         if key == self.empty() { return ContextShape::Empty; }
-        match self.nodes[key.index].shape { Shape::Singleton(_) => ContextShape::Singleton, Shape::Array { .. } => ContextShape::Array }
+        match &self.store.node(key.id).shape { Shape::Singleton(_) => ContextShape::Singleton, Shape::Array(_) => ContextShape::Array }
     }
     fn len(&self, key: ContextKey<'id>) -> usize {
-        if key == self.empty() { return 1; }
-        match self.nodes[key.index].shape { Shape::Singleton(_) => 1, Shape::Array { len, .. } => len }
+        if key == self.empty() { 1 } else { self.store.node(key.id).len() }
     }
     fn edge(&self, key: ContextKey<'id>, index: usize) -> Edge<'id> {
         if key == self.empty() { return Edge { parent: None, address: ReturnAddress::Empty }; }
-        match self.nodes[key.index].shape { Shape::Singleton(edge) => edge, Shape::Array { start, .. } => self.edges[start + index] }
+        self.store.node(key.id).edge(index).branded()
     }
     fn is_empty(&self, key: ContextKey<'id>) -> bool {
         key == self.empty() || self.shape(key) == ContextShape::Array && self.edge(key, 0).address == ReturnAddress::Empty
     }
-    fn hash(&self, key: ContextKey<'id>) -> i32 { if key == self.empty() { finish_hash(1, 0) } else { self.nodes[key.index].hash } }
-    fn local(&self, key: ContextKey<'id>) -> bool { key == self.empty() || self.nodes[key.index].local }
+    fn hash(&self, key: ContextKey<'id>) -> i32 { if key == self.empty() { finish_hash(1, 0) } else { self.store.node(key.id).hash } }
+    fn local(&self, key: ContextKey<'id>) -> bool { key == self.empty() || self.store.node(key.id).local }
     fn parent_hash(&self, parent: Option<ContextKey<'id>>) -> i32 { parent.map_or(0, |key| self.hash(key)) }
     fn edge_local(&self, edge: Edge<'id>) -> bool {
         matches!(edge.address, ReturnAddress::Follow(_)) && edge.parent.is_some_and(|parent| self.local(parent))
     }
 
-    fn append(&mut self, node: Node<'id>) -> Result<ContextKey<'id>> {
-        let key = ContextKey::at(self.nodes.len());
-        push(&mut self.nodes, node, self.allocation)?;
-        Ok(key)
+    fn append(&mut self, node: Node<M>) -> Result<ContextKey<'id>> {
+        let store = &mut *self.store;
+        let id = store.nodes.insert(node, &store.memory)?;
+        Ok(ContextKey::at(ContextId::Node(id)))
     }
     fn singleton_edge(&mut self, edge: Edge<'id>) -> Result<ContextKey<'id>> {
         if edge.address == ReturnAddress::Empty && edge.parent.is_none() { return Ok(self.empty()); }
@@ -186,7 +264,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
             None => finish_hash(1, 0),
             Some(parent) => finish_hash(update_hash(update_hash(1, self.hash(parent)), edge.address.number()), 2),
         };
-        self.append(Node { shape: Shape::Singleton(edge), hash, local: self.edge_local(edge) })
+        self.append(Node { shape: Shape::Singleton(edge.stored()), hash, local: self.edge_local(edge) })
     }
     fn array_hash(&self, edges: &[Edge<'id>]) -> i32 {
         let mut hash = 1;
@@ -198,17 +276,13 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         if candidate.edges.is_empty() || candidate.edges.windows(2).any(|pair| pair[0].address.number() >= pair[1].address.number()) {
             return Err(PredictionError::Artifact(Problem::Context));
         }
-        reserve(&mut self.edges, candidate.edges.len(), self.allocation)?;
-        reserve(&mut self.nodes, 1, self.allocation)?;
-        let start = self.edges.len();
+        let mut edges = Block::with_capacity(&self.store.memory, candidate.edges.len())?;
+        for edge in &candidate.edges { edges.push(edge.stored()); }
         let node = Node {
-            shape: Shape::Array { start, len: candidate.edges.len() }, hash: self.array_hash(&candidate.edges),
+            shape: Shape::Array(edges), hash: self.array_hash(&candidate.edges),
             local: candidate.edges.iter().all(|edge| self.edge_local(*edge)),
         };
-        self.edges.extend_from_slice(&candidate.edges);
-        let key = ContextKey::at(self.nodes.len());
-        self.nodes.push(node);
-        Ok(key)
+        self.append(node)
     }
 
     pub(crate) fn singleton(&mut self, parent: ContextKey<'id>, follow: State<'g, 'scope>) -> Result<ContextKey<'id>> {
@@ -307,7 +381,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
     }
     fn memo_put(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, value: ContextKey<'id>) -> Result<()> {
         if let Some(index) = self.memo_slot(left, right)? { self.memo.slots[index].as_mut().unwrap().value = value; return Ok(()); }
-        self.memo.prepare(self.allocation)?;
+        self.memo.prepare(&Scoped(self.allocation))?;
         self.memo.insert(Record { hash: pair_hash(self.hash(left), self.hash(right)), key: (left, right), value });
         Ok(())
     }
@@ -324,7 +398,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         self.finish(result)
     }
 
-    pub(crate) fn with_merge_round<R>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope>) -> Result<R>) -> Result<R> {
+    pub(crate) fn with_merge_round<R>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope, M>) -> Result<R>) -> Result<R> {
         self.ready()?;
         self.memo.clear();
         let result = use_round(&mut MergeRound { owner: self });
@@ -460,7 +534,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         self.common_parents.clear();
         for edge in &candidate.edges {
             if self.common_slot(edge.parent)?.is_none() {
-                self.common_parents.prepare(self.allocation)?;
+                self.common_parents.prepare(&Scoped(self.allocation))?;
                 self.common_parents.insert(Record { hash: self.parent_hash(edge.parent) as u32 as u64, key: edge.parent, value: edge.parent });
             }
         }
@@ -484,25 +558,27 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
     }
 
     fn canonical_slot(&mut self, context: ContextKey<'id>) -> Result<Option<usize>> {
-        if self.canonical.slots.is_empty() { return Ok(None); }
+        if self.store.canonical.slots.is_empty() { return Ok(None); }
         let hash = self.hash(context) as u32 as u64;
-        let mut index = hash as usize & (self.canonical.slots.len() - 1);
+        let mut index = hash as usize & (self.store.canonical.slots.len() - 1);
         loop {
-            let Some(record) = self.canonical.slots[index] else { return Ok(None); };
-            if record.hash == hash && self.equal(context, record.key)? { return Ok(Some(index)); }
-            index = (index + 1) & (self.canonical.slots.len() - 1);
+            let Some(record) = self.store.canonical.slots[index] else { return Ok(None); };
+            if record.hash == hash && self.equal(context, self.bind(record.key)?)? { return Ok(Some(index)); }
+            index = (index + 1) & (self.store.canonical.slots.len() - 1);
         }
     }
     fn cache_add(&mut self, context: ContextKey<'id>) -> Result<ContextKey<'id>> {
         if context == self.empty() { return Ok(context); }
-        if let Some(index) = self.canonical_slot(context)? { return Ok(self.canonical.slots[index].unwrap().value); }
-        self.canonical.prepare(self.allocation)?;
-        self.canonical.insert(Record { hash: self.hash(context) as u32 as u64, key: context, value: context });
+        if let Some(index) = self.canonical_slot(context)? { return self.bind(self.store.canonical.slots[index].unwrap().value); }
+        let hash = self.hash(context) as u32 as u64;
+        let store = &mut *self.store;
+        store.canonical.prepare(&store.memory)?;
+        store.canonical.insert(Record { hash, key: context.id, value: context.id });
         Ok(context)
     }
     fn visited_get(&self, context: ContextKey<'id>) -> Option<ContextKey<'id>> {
         if self.visited.slots.is_empty() { return None; }
-        let mut index = context.index & (self.visited.slots.len() - 1);
+        let mut index = context.index() & (self.visited.slots.len() - 1);
         loop {
             let record = self.visited.slots[index]?;
             if record.key == context { return Some(record.value); }
@@ -511,14 +587,14 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
     }
     fn visited_put(&mut self, context: ContextKey<'id>, value: ContextKey<'id>) -> Result<()> {
         if !self.visited.slots.is_empty() {
-            let mut index = context.index & (self.visited.slots.len() - 1);
+            let mut index = context.index() & (self.visited.slots.len() - 1);
             while let Some(record) = self.visited.slots[index] {
                 if record.key == context { self.visited.slots[index].as_mut().unwrap().value = value; return Ok(()); }
                 index = (index + 1) & (self.visited.slots.len() - 1);
             }
         }
-        self.visited.prepare(self.allocation)?;
-        self.visited.insert(Record { hash: context.index as u64, key: context, value });
+        self.visited.prepare(&Scoped(self.allocation))?;
+        self.visited.insert(Record { hash: context.index() as u64, key: context, value });
         Ok(())
     }
     pub(crate) fn canonicalize(&mut self, context: ContextKey<'id>) -> Result<ContextKey<'id>> {
@@ -537,7 +613,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
                     if self.is_empty(context) { result = context; }
                     else if let Some(cached) = self.visited_get(context) { result = cached; }
                     else if let Some(index) = self.canonical_slot(context)? {
-                        result = self.canonical.slots[index].unwrap().value;
+                        result = self.bind(self.store.canonical.slots[index].unwrap().value)?;
                         self.visited_put(context, result)?;
                     } else {
                         let mut candidate = self.candidate(self.len(context))?;

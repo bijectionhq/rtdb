@@ -4,6 +4,7 @@ use std::sync::Arc;
 use rtdb_types::{MemoryBudget, murmur3_32};
 use super::*;
 use super::super::with_prediction_contexts;
+use super::super::storage::Slot;
 
 fn fixture<R>(limit: usize, use_contexts: impl for<'id, 'g, 'scope> FnOnce(&mut PredictionContexts<'id, 'g, 'scope>, &Arc<MemoryBudget>) -> Result<R>) -> R {
     let grammar_memory = MemoryBudget::new(8 << 20);
@@ -138,7 +139,7 @@ fn memo_checks_both_orientations_and_equal_keys_without_interning_inputs() {
             assert_eq!(round.owner.memo.len, 1);
             Ok(())
         })?;
-        assert!(contexts.canonical.slots.is_empty());
+        assert!(contexts.store.canonical.slots.is_empty());
         Ok(())
     });
 }
@@ -309,7 +310,7 @@ fn state_owner_checks_precede_transition_access_and_parent_lookup_is_outer_first
     with_prediction_contexts(&grammar, &allocation, |contexts| {
         let empty = contexts.empty();
         assert!(matches!(contexts.singleton(empty, foreign), Err(PredictionError::ForeignOwner)));
-        assert!(contexts.nodes.is_empty());
+        assert!(contexts.store.nodes.is_empty());
         Ok(())
     }).unwrap();
     with_prediction_contexts(&grammar, &allocation, |contexts| {
@@ -360,10 +361,10 @@ fn deep_conversion_equality_merge_canonicalization_and_destruction_use_flat_stor
 
 #[test]
 fn first_node_admission_seals_the_owner_and_releases_no_unpublished_key() {
-    fixture(4096 + 256 + 16 * size_of::<Node<'_>>() - 1, |contexts, memory| {
+    fixture(4096 + 256 + 16 * size_of::<Slot<Node<Scoped<'_>>>>() - 1, |contexts, memory| {
         let empty = contexts.empty();
         admission(single(contexts, empty, 1));
-        assert!(contexts.nodes.is_empty());
+        assert!(contexts.store.nodes.is_empty());
         assert_eq!(memory.used_bytes(), 4096);
         assert!(matches!(single(contexts, empty, 1), Err(PredictionError::Aborted)));
         assert_eq!(memory.used_bytes(), 4096);
@@ -373,15 +374,15 @@ fn first_node_admission_seals_the_owner_and_releases_no_unpublished_key() {
 
 #[test]
 fn node_growth_admits_the_entire_replacement_while_the_old_capacity_remains_charged() {
-    let first = 256 + 16 * size_of::<Node<'_>>();
-    let replacement = 256 + 32 * size_of::<Node<'_>>();
+    let first = 256 + 16 * size_of::<Slot<Node<Scoped<'_>>>>();
+    let replacement = 256 + 32 * size_of::<Slot<Node<Scoped<'_>>>>();
     fixture(4096 + first + replacement - 1, |contexts, memory| {
         let empty = contexts.empty();
         let mut last = empty;
         for _ in 0..16 { last = single(contexts, empty, 1)?; }
         assert_eq!(memory.used_bytes(), 4096 + first);
         admission(single(contexts, empty, 1));
-        assert_eq!(contexts.nodes.len(), 16);
+        assert_eq!(contexts.store.nodes.len(), 16);
         assert_eq!(contexts.view(last).follow(0)?.unwrap().number(), 1);
         assert_eq!(memory.used_bytes(), 4096 + first);
         Ok(())
@@ -390,17 +391,17 @@ fn node_growth_admits_the_entire_replacement_while_the_old_capacity_remains_char
 
 #[test]
 fn failed_array_edge_admission_does_not_publish_the_candidate() {
-    let nodes = 256 + 16 * size_of::<Node<'_>>();
+    let nodes = 256 + 16 * size_of::<Slot<Node<Scoped<'_>>>>();
     let frames = 256 + 16 * size_of::<MergeFrame<'_>>();
     let candidate = 256 + 2 * size_of::<Edge<'_>>();
-    let edges = 256 + 16 * size_of::<Edge<'_>>();
+    let edges = 256 + 2 * size_of::<StoredEdge>();
     fixture(4096 + nodes + frames + candidate + edges - 1, |contexts, memory| {
         let empty = contexts.empty();
         let a = single(contexts, empty, 1)?;
         let b = single(contexts, empty, 2)?;
         admission(contexts.with_merge_round(|round| round.merge(a, b, MergeMode::FullExact)));
-        assert_eq!(contexts.nodes.len(), 2);
-        assert!(contexts.edges.is_empty());
+        assert_eq!(contexts.store.nodes.len(), 2);
+        assert_eq!(contexts.store.array_edges(), 0);
         assert_eq!(memory.used_bytes(), 4096 + nodes + frames + candidate);
         assert!(matches!(contexts.equivalent(a, b), Err(PredictionError::Aborted)));
         Ok(())
@@ -409,18 +410,18 @@ fn failed_array_edge_admission_does_not_publish_the_candidate() {
 
 #[test]
 fn failed_memo_admission_retains_only_private_completed_storage_under_an_aborted_owner() {
-    let nodes = 256 + 16 * size_of::<Node<'_>>();
+    let nodes = 256 + 16 * size_of::<Slot<Node<Scoped<'_>>>>();
     let frames = 256 + 16 * size_of::<MergeFrame<'_>>();
     let candidate = 256 + 2 * size_of::<Edge<'_>>();
-    let edges = 256 + 16 * size_of::<Edge<'_>>();
+    let edges = 256 + 2 * size_of::<StoredEdge>();
     let memo = 256 + 32 * size_of::<Option<Record<(ContextKey<'_>, ContextKey<'_>), ContextKey<'_>>>>();
     fixture(4096 + nodes + frames + candidate + edges + memo - 1, |contexts, memory| {
         let empty = contexts.empty();
         let a = single(contexts, empty, 1)?;
         let b = single(contexts, empty, 2)?;
         admission(contexts.with_merge_round(|round| round.merge(a, b, MergeMode::FullExact)));
-        assert_eq!(contexts.nodes.len(), 3);
-        assert_eq!(contexts.edges.len(), 2);
+        assert_eq!(contexts.store.nodes.len(), 3);
+        assert_eq!(contexts.store.array_edges(), 2);
         assert_eq!(contexts.memo.len, 0);
         let before = memory.used_bytes();
         assert!(matches!(contexts.with_merge_round(|round| round.merge(a, b, MergeMode::FullExact)), Err(PredictionError::Aborted)));
@@ -468,12 +469,12 @@ fn canonical_membership_and_identity_visits_grow_without_changing_representative
         let mut root = contexts.empty();
         for _ in 0..64 { root = single(contexts, root, 1)?; }
         assert_eq!(contexts.canonicalize(root)?, root);
-        assert_eq!(contexts.canonical.len, 64);
-        assert_eq!(contexts.canonical.slots.len(), 128);
+        assert_eq!(contexts.store.canonical.len, 64);
+        assert_eq!(contexts.store.canonical.slots.len(), 128);
         assert_eq!(contexts.visited.len, 64);
         assert_eq!(contexts.visited.slots.len(), 128);
         assert_eq!(contexts.canonicalize(root)?, root);
-        assert_eq!(contexts.canonical.len, 64);
+        assert_eq!(contexts.store.canonical.len, 64);
         assert_eq!(contexts.visited.len, 1);
         Ok(())
     });

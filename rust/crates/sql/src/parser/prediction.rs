@@ -2,6 +2,7 @@ mod context;
 mod config;
 mod semantic;
 mod mode;
+mod storage;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};
@@ -9,6 +10,7 @@ pub(crate) use context::{ContextKey, ContextShape, ContextView, MergeMode, Merge
 pub(crate) use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, ConfigView, ConfigSetView, Configurations, ConflictKey, SetMode};
 pub(crate) use semantic::Semantic;
 pub(crate) use mode::{AlternativeChoice, ModeWorkspace, PredictionMode, SubsetsView};
+pub(crate) use storage::PredictionStorage;
 
 type Result<T> = std::result::Result<T, PredictionError>;
 
