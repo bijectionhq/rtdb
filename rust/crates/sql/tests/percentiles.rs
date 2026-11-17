@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 fn context() -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    QueryContext::new(catalog, MemoryBudget::new(1 << 25), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes: 128, merge_fan_in: 2, ..Default::default() }, &CancellationToken::new()).unwrap()
+    QueryContext::new(catalog, MemoryBudget::new(1 << 25), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes: 128, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
 
 async fn query(sql: &str, parameters: Vec<Value>) -> Result<(Schema, Vec<Vec<Value>>)> {

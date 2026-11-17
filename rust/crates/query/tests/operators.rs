@@ -42,7 +42,7 @@ async fn admitted_unsigned_values_sort_exactly_through_spills_and_release_on_can
     let rows = (0..4).map(|index| vec![Expr::Parameter { index, data_type: ty.clone() }]).collect();
     let input = Arc::new(Relation::new(Schema::new(vec![field.clone()]).unwrap(), RelationNode::Values { rows }).unwrap());
     let sorted = Arc::new(input.sort(vec![SortExpr { expr: field.expression(), descending: false, nulls_first: false }]).unwrap());
-    let context = query_context(QueryOptions { sort_memory_bytes: 1, batch_rows: 1, merge_fan_in: 2, ..Default::default() });
+    let context = query_context(QueryOptions { sort_memory_bytes: 1, batch_rows: 1, ..Default::default() });
     let prepared = PreparedQuery::new(sorted).unwrap();
     let values = vec![Value::U64((1 << 53) + 1), Value::U64(u64::MAX), Value::U64(1 << 63), Value::U64(1 << 53)];
     let mut cursor = prepared.execute(Arc::clone(&context), values.clone()).await.unwrap();
@@ -220,7 +220,7 @@ async fn external_sort_preserves_ties_and_explicit_null_order_and_releases_spill
     let input = values(0, "n", scalar(ScalarType::I64).maybe(), vec![Value::I64(1), Value::Null, Value::I64(3), Value::I64(2), Value::I64(3)]);
     let expression = input.schema().fields()[0].expression();
     let sorted = Arc::new(input.sort(vec![SortExpr { expr: expression, descending: true, nulls_first: true }]).unwrap());
-    let options = QueryOptions { sort_memory_bytes: 1, merge_fan_in: 2, batch_rows: 2, ..QueryOptions::default() };
+    let options = QueryOptions { sort_memory_bytes: 1, batch_rows: 2, ..QueryOptions::default() };
     let context = query_context(options);
     assert_eq!(collect(sorted, Arc::clone(&context)).await.unwrap(), vec![vec![Value::Null], vec![Value::I64(3)], vec![Value::I64(3)], vec![Value::I64(2)], vec![Value::I64(1)]]);
     assert!(context.spill_peak_bytes() > 0);
@@ -347,7 +347,7 @@ async fn array_aggregate_orders_selected_rows_and_distinct_retains_null_argument
     let mut array = agg(1, AggregateFunction::ArrayAgg, Some(argument.clone()), LogicalType::list(scalar(ScalarType::I64).maybe()).maybe());
     array.distinct = true;
     array.order_by.push(SortExpr { expr: argument, descending: false, nulls_first: true });
-    assert_eq!(collect(aggregate(input, vec![], vec![array]), query_context(QueryOptions { sort_memory_bytes: 1, merge_fan_in: 2, ..QueryOptions::default() })).await.unwrap(), vec![vec![Value::List(vec![Value::Null, Value::Null, Value::I64(1), Value::I64(2)])]]);
+    assert_eq!(collect(aggregate(input, vec![], vec![array]), query_context(QueryOptions { sort_memory_bytes: 1, ..QueryOptions::default() })).await.unwrap(), vec![vec![Value::List(vec![Value::Null, Value::Null, Value::I64(1), Value::I64(2)])]]);
 }
 
 #[tokio::test]

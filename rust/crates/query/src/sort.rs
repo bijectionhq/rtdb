@@ -1,195 +1,327 @@
-use std::cmp::Ordering;
-use std::sync::Arc;
-
+use std::{cmp::Ordering, sync::Arc};
 use async_trait::async_trait;
+use rtdb_columnar::MemoryReservation;
 use rtdb_expr::{ordered_compare_in_timezone, validate_order_type};
 use rtdb_plan::{Schema, SortExpr};
 use rtdb_types::{LogicalType, Result, Value};
+use crate::{context::Execution, cursor::{BoxCursor, OwnedRow, RowCursor}, invalid, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, spill::{SpillFile, SpillReader}};
 
-use crate::context::Execution;
-use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
-use crate::spill::{SpillFile, SpillReader};
-use crate::invalid;
-use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
+mod records;
+mod timsort;
+use records::{RecordBuffer, RecordCursor, RecordStore};
 
-struct SortPageLayout { first: usize, remaining: usize, multiple: bool, limit: u64 }
-impl Default for SortPageLayout {
-    fn default() -> Self { Self { first: 0,remaining: 0,multiple: false,limit: i64::MAX as u64 } }
-}
-impl SortPageLayout {
-    fn observe(&mut self,rows: usize) -> Result<()> {
-        self.remaining = self.remaining.checked_add(rows).ok_or_else(||invalid("row-count","Sort input row count overflow"))?;
-        if self.first <= 102_400 {
-            self.first = self.first.checked_add(rows).ok_or_else(||invalid("row-count","Sort initial page count overflow"))?;
-            if self.first > 102_400 && self.limit <= 51_200 { self.first = self.limit as usize; }
-        }
-        else if rows > 0 { self.multiple = true; }
-        Ok(())
-    }
-    fn finish(&mut self) { self.remaining = self.remaining.min(usize::try_from(self.limit).unwrap_or(usize::MAX)); }
-    fn next_size(&self) -> usize { self.remaining.min(if self.multiple { 102_401 } else { self.first }) }
-}
+const BLOCK_ROWS: usize = 102_400;
+const MERGE_FAN_IN: usize = 4;
 
-pub(crate) struct SortCursor { input: Option<BoxPageCursor>, schema: Schema, order: Vec<SortExpr>, execution: Execution, reader: Option<SpillReader>, layout: SortPageLayout }
-impl SortCursor {
-    pub fn new(input: BoxCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self {
-        Self::from_pages(crate::pages::from_rows(input,Arc::clone(&execution.context)),schema,order,execution)
-    }
-    pub fn from_pages(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self { Self::with_row_limit(input,schema,order,i64::MAX as u64,execution) }
-    pub fn with_row_limit(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution) -> Self { Self { input: Some(input), schema, order, execution, reader: None, layout: SortPageLayout { limit,..Default::default() } } }
-    async fn initialize(&mut self, mut input: BoxPageCursor) -> Result<()> {
-        let mut levels: Vec<Vec<Arc<SpillFile>>> = Vec::new();
-        let mut rows = Vec::new();
-        let mut bytes = 0usize;
-        let mut sequence = 0u64;
-        let mut order_types: Option<(Vec<LogicalType>, Arc<rtdb_columnar::MemoryReservation>)> = None;
-        while let Some(mut page) = input.next_page().await? {
-          self.layout.observe(page.len())?;
-          let mut keys = crate::pages::project(&page,&self.schema,self.order.iter().map(|order|&order.expr),&self.execution).await?;
-          while let Some(row) = page.next() {
-            self.execution.context.check_cancelled()?;
-            let scope = self.execution.scope()?;
-            let key = keys.next().ok_or_else(||invalid("sort-state","Projected sort keys ended before their input page"))?;
-            let record = OwnedRow::copy_parts(&[&[Value::U64(sequence)],&key.values,&row.values],0,0,&self.execution.context.memory)?;
-            sequence = sequence.checked_add(1).ok_or_else(|| invalid("row-count", "Sort row count overflow"))?;
-            let old_bytes = order_types.as_ref().map_or(Ok(0), |(types, _)| type_bytes(types))?;
-            let declared_bytes = self.order.iter().try_fold(0usize, |bytes, order| bytes.checked_add(crate::runtime_schema::expression_bound(&order.expr)?).ok_or_else(|| invalid("sort-size", "Order type size overflow")))?;
-            let key_bytes = record.values[1..1 + self.order.len()].iter().try_fold(0usize, |bytes, value| {
-                let zone = match value { Value::Timestamp { timezone: Some(zone), .. } => zone.len(), _ => 0 };
-                bytes.checked_add(zone).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| invalid("sort-size", "Order key type size overflow"))
-            })?;
-            let bound = old_bytes.checked_add(key_bytes).and_then(|bytes| bytes.checked_add(declared_bytes)).and_then(|bytes| bytes.checked_add(4096)).and_then(|bytes| bytes.checked_mul(16)).ok_or_else(|| invalid("sort-size", "Order type allocation bound overflow"))?;
-            let temporary = self.execution.context.memory.reserve(bound)?;
-            let types: Vec<_> = self.order.iter().enumerate().map(|(index, order)| {
-                let declared = self.execution.expression_type(&scope,&order.expr,&self.schema)?;
-                scope.reserve(declared.retained_bytes()?.checked_mul(16).ok_or_else(||invalid("sort-size","Order type allocation bound overflow"))?)?;
-                let previous = order_types.as_ref().map_or(&declared, |(types, _)| &types[index]);
-                Ok(previous.join(&key_type(&record.values[index + 1])?))
-            }).collect::<Result<_>>()?;
-            for ty in &types { validate_order_type(ty)?; }
-            let retained = type_bytes(&types)?;
-            order_types = Some((types, self.execution.context.memory.reserve(retained)?));
-            drop(temporary);
-            bytes = bytes.checked_add(record.bytes()).ok_or_else(|| invalid("sort-size", "Sort buffer size overflow"))?;
-            rows.push(record);
-            if bytes >= self.execution.context.options.sort_memory_bytes {
-                self.add_run(&mut levels, self.write_run(&mut rows)?)?;
-                bytes = 0;
-            }
-          }
-        }
-        drop(input);
-        if !rows.is_empty() { self.add_run(&mut levels, self.write_run(&mut rows)?)?; }
-        let mut pending: Vec<_> = levels.into_iter().flatten().collect();
-        while pending.len() > 1 {
-            let mut next = Vec::new();
-            for chunk in pending.chunks(self.execution.context.options.merge_fan_in) { next.push(self.merge_runs(chunk)?); }
-            pending = next;
-        }
-        self.reader = pending.pop().map(|file| file.reader(Arc::clone(&self.execution.context.memory))).transpose()?;
-        self.layout.finish();
-        Ok(())
-    }
-    fn read_row(&mut self) -> Result<Option<OwnedRow>> {
-        self.execution.context.check_cancelled()?;
-        if self.layout.remaining == 0 { self.reader = None;return Ok(None); }
-        let Some(reader) = &mut self.reader else { return Ok(None); };
-        let Some(mut row) = reader.next()? else { self.reader = None;return Ok(None); };
-        let prefix = self.order.len() + 1;
-        if row.values.len() != prefix + self.schema.len() { return Err(invalid("invalid-spill","Sorted record has an invalid width")); }
-        row.values.drain(..prefix);
-        self.layout.remaining = self.layout.remaining.checked_sub(1).ok_or_else(||invalid("sort-state","Sort emitted more rows than its input"))?;
+struct SortPlan { schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution }
+pub(crate) struct SortCursor { plan: SortPlan, phase: SortPhase }
+enum SortPhase { Input(BoxPageCursor), Output(SortOutput), Done }
+enum OutputRows { Records(RecordCursor), Spill(SpillReader) }
+struct SortOutput { rows: OutputRows, remaining: u64, page_rows: usize, empty_callback: bool }
+impl SortOutput {
+    fn row(&mut self, plan: &SortPlan) -> Result<Option<OwnedRow>> {
+        if self.remaining == 0 { return Ok(None); }
+        plan.execution.context.check_cancelled()?;
+        let row = match &mut self.rows { OutputRows::Records(rows) => rows.next()?, OutputRows::Spill(rows) => rows.next()? };
+        let mut row = row.ok_or_else(|| invalid("sort-state", "Sorted records ended before their row count"))?;
+        if row.values.len() != plan.order.len() + plan.schema.len() { return Err(invalid("invalid-spill", "Sorted record has an invalid width")); }
+        row.values.drain(..plan.order.len());
+        self.remaining -= 1;
         Ok(Some(row))
     }
-    fn write_run(&self, rows: &mut Vec<OwnedRow>) -> Result<Arc<SpillFile>> {
-        let scratch = rows.len().checked_mul(std::mem::size_of::<OwnedRow>() * 2).ok_or_else(|| invalid("sort-size", "Sort scratch size overflow"))?;
-        let _reservation = self.execution.context.memory.reserve(scratch)?;
-        let mut error = None;
-        rows.sort_by(|left, right| {
-            if error.is_some() { return Ordering::Equal; }
-            match self.compare_records(&left.values, &right.values) { Ok(order) => order, Err(failure) => { error = Some(failure); Ordering::Equal } }
-        });
-        if let Some(error) = error { return Err(error); }
-        let mut writer = self.execution.context.spill.create()?;
-        for row in rows.drain(..) { self.execution.context.check_cancelled()?; writer.write(&row.values, &self.execution.context.memory)?; }
-        writer.finish()
-    }
-    fn add_run(&self, levels: &mut Vec<Vec<Arc<SpillFile>>>, mut run: Arc<SpillFile>) -> Result<()> {
-        let mut level = 0;
-        loop {
-            if levels.len() == level { levels.push(Vec::new()); }
-            levels[level].push(run);
-            if levels[level].len() < self.execution.context.options.merge_fan_in { return Ok(()); }
-            let inputs = std::mem::take(&mut levels[level]);
-            run = self.merge_runs(&inputs)?;
-            level += 1;
-        }
-    }
-    fn compare_records(&self, left: &[Value], right: &[Value]) -> Result<Ordering> {
-        for (index, order) in self.order.iter().enumerate() {
-            let (left, right) = (&left[index + 1], &right[index + 1]);
-            let mut comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
-            if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) { comparison = comparison.reverse(); }
-            if comparison != Ordering::Equal { return Ok(comparison); }
-        }
-        let (Some(Value::U64(left)), Some(Value::U64(right))) = (left.first(), right.first()) else { return Err(invalid("invalid-spill", "Sort record lacks an input sequence")); };
-        Ok(left.cmp(right))
-    }
-    fn merge_runs(&self, runs: &[Arc<SpillFile>]) -> Result<Arc<SpillFile>> {
-        if runs.len() == 1 { return Ok(Arc::clone(&runs[0])); }
-        let mut readers = runs.iter().map(|file| file.reader(Arc::clone(&self.execution.context.memory))).collect::<Result<Vec<_>>>()?;
-        let mut heads = readers.iter_mut().map(SpillReader::next).collect::<Result<Vec<_>>>()?;
-        let mut writer = self.execution.context.spill.create()?;
-        loop {
-            self.execution.context.check_cancelled()?;
-            let mut winner: Option<usize> = None;
-            for (index, row) in heads.iter().enumerate() {
-                let Some(row) = row else { continue; };
-                if let Some(previous) = winner {
-                    if self.compare_records(&row.values, &heads[previous].as_ref().ok_or_else(|| invalid("sort-state", "Merge head is absent"))?.values)? == Ordering::Less { winner = Some(index); }
-                } else { winner = Some(index); }
-            }
-            let Some(index) = winner else { break; };
-            let row = heads[index].take().ok_or_else(|| invalid("sort-state", "Merge head is absent"))?;
-            writer.write(&row.values, &self.execution.context.memory)?;
-            drop(row);
-            heads[index] = readers[index].next()?;
-        }
-        writer.finish()
+    fn page(&mut self, plan: &SortPlan) -> Result<Option<OwnedPage>> {
+        if self.remaining == 0 && !self.empty_callback { return Ok(None); }
+        self.empty_callback = false;
+        let count = self.remaining.min(self.page_rows as u64) as usize;
+        let mut page = PageBuilder::new(count, &plan.execution.context.memory)?;
+        for _ in 0..count { page.push(self.row(plan)?.ok_or_else(|| invalid("sort-state", "Sorted page ended early"))?)?; }
+        Ok(Some(page.finish()))
     }
 }
-
-fn type_bytes(types: &[LogicalType]) -> Result<usize> {
-    types.iter().try_fold(256usize, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(|| invalid("sort-size", "Order type size overflow")))
-}
-fn key_type(value: &Value) -> Result<LogicalType> {
-    if matches!(value, Value::List(_) | Value::Set(_) | Value::FixedSizeList(_) | Value::Map { .. } | Value::Struct(_) | Value::TimestampTzRange { .. }) {
-        return Err(rtdb_types::Anomaly::incorrect("xtdb.expression/function-type-mismatch", "compare is not applicable to these vector types"));
+impl SortCursor {
+    pub fn new(input: BoxCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self {
+        Self::from_pages(crate::pages::from_rows(input, Arc::clone(&execution.context)), schema, order, execution)
     }
-    Ok(value.logical_type())
+    pub fn from_pages(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, execution: Execution) -> Self {
+        Self::with_row_limit(input, schema, order, i64::MAX as u64, execution)
+    }
+    pub fn with_row_limit(input: BoxPageCursor, schema: Schema, order: Vec<SortExpr>, limit: u64, execution: Execution) -> Self {
+        Self { plan: SortPlan { schema, order, limit, execution }, phase: SortPhase::Input(input) }
+    }
+    async fn initialize(&mut self) -> Result<()> {
+        if !matches!(self.phase, SortPhase::Input(_)) { return Ok(()); }
+        let SortPhase::Input(input) = std::mem::replace(&mut self.phase, SortPhase::Done) else { unreachable!() };
+        if let Some(output) = self.plan.initialize(input).await? { self.phase = SortPhase::Output(output); }
+        Ok(())
+    }
 }
 #[async_trait]
 impl RowCursor for SortCursor {
     async fn next(&mut self) -> Result<Option<OwnedRow>> {
-        self.execution.context.check_cancelled()?;
-        if let Some(input) = self.input.take() { self.initialize(input).await?; }
-        self.read_row()
+        if let Err(error) = self.plan.execution.context.check_cancelled() { self.phase = SortPhase::Done; return Err(error); }
+        self.initialize().await?;
+        let SortPhase::Output(mut output) = std::mem::replace(&mut self.phase, SortPhase::Done) else { return Ok(None); };
+        let row = output.row(&self.plan)?;
+        if row.is_some() { self.phase = SortPhase::Output(output); }
+        Ok(row)
     }
 }
-
 #[async_trait]
 impl PageCursor for SortCursor {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.execution.context.check_cancelled()?;
-        if let Some(input) = self.input.take() { self.initialize(input).await?; }
-        let count = self.layout.next_size();
-        if count == 0 { self.reader = None;return Ok(None); }
-        let mut page = PageBuilder::new(count,&self.execution.context.memory)?;
-        for _ in 0..count {
-            let row = self.read_row()?.ok_or_else(||invalid("sort-state","Sort spill ended before its input row count"))?;
-            page.push(row)?;
+        if let Err(error) = self.plan.execution.context.check_cancelled() { self.phase = SortPhase::Done; return Err(error); }
+        self.initialize().await?;
+        let SortPhase::Output(mut output) = std::mem::replace(&mut self.phase, SortPhase::Done) else { return Ok(None); };
+        let page = output.page(&self.plan)?;
+        if page.is_some() { self.phase = SortPhase::Output(output); }
+        Ok(page)
+    }
+}
+
+struct Accumulator { records: RecordBuffer, keys: KeyTypes }
+impl SortPlan {
+    fn accumulator(&self) -> Result<Accumulator> {
+        Ok(Accumulator { records: RecordBuffer::new(Arc::clone(&self.execution.context))?, keys: KeyTypes::declared(self)? })
+    }
+    async fn append(&self, accumulator: &mut Accumulator, mut page: OwnedPage) -> Result<()> {
+        let mut keys = crate::pages::project(&page, &self.schema, self.order.iter().map(|order| &order.expr), &self.execution).await?;
+        while let Some(row) = page.next() {
+            self.execution.context.check_cancelled()?;
+            let key = keys.next().ok_or_else(|| invalid("sort-state", "Projected sort keys ended before their input page"))?;
+            accumulator.keys.observe(&key.values, self)?;
+            accumulator.records.push(OwnedRow::copy_parts(&[&key.values, &row.values], 0, 0, &self.execution.context.memory)?)?;
         }
-        Ok(Some(page.finish()))
+        Ok(())
+    }
+    fn indices(&self, store: &RecordStore, keys: &KeyTypes) -> Result<Indices> {
+        keys.validate()?;
+        let scratch = timsort::scratch_bytes(store.len())?;
+        let bytes = store.len().checked_mul(std::mem::size_of::<usize>()).and_then(|size| size.checked_add(scratch)).and_then(|size| size.checked_add(256)).ok_or_else(size_error)?;
+        let reservation = self.execution.context.memory.reserve(bytes)?;
+        let mut indices: Vec<_> = (0..store.len()).collect();
+        let mut access = store.access()?;
+        timsort::sort(&mut indices, |left, right| {
+            self.execution.context.check_cancelled()?;
+            let left = access.get(left)?;
+            let right = access.get(right)?;
+            self.compare(left.values(), right.values())
+        })?;
+        indices.truncate(usize::try_from(self.limit).unwrap_or(usize::MAX));
+        Ok(Indices { values: indices, _reservation: reservation })
+    }
+    fn compare(&self, left: &[Value], right: &[Value]) -> Result<Ordering> {
+        for (index, order) in self.order.iter().enumerate() {
+            let left = left.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
+            let right = right.get(index).ok_or_else(|| invalid("invalid-spill", "Sort key is absent"))?;
+            let mut comparison = ordered_compare_in_timezone(left, right, order.nulls_first, &self.execution.context.timezone)?;
+            if order.descending && !matches!(left, Value::Null | Value::Undefined) && !matches!(right, Value::Null | Value::Undefined) { comparison = comparison.reverse(); }
+            if comparison != Ordering::Equal { return Ok(comparison); }
+        }
+        Ok(Ordering::Equal)
+    }
+    fn reduce(&self, accumulator: Accumulator) -> Result<Accumulator> {
+        let Accumulator { records, keys } = accumulator;
+        let store = records.finish()?;
+        let indices = self.indices(&store, &keys)?;
+        let selected = store.select(&indices.values, Arc::clone(&self.execution.context))?;
+        let mut rows = selected.into_cursor()?;
+        drop(indices);
+        drop(store);
+        let mut records = RecordBuffer::new(Arc::clone(&self.execution.context))?;
+        while let Some(row) = rows.next()? { self.execution.context.check_cancelled()?; records.push(row)?; }
+        Ok(Accumulator { records, keys })
+    }
+    fn write_run(&self, accumulator: Accumulator) -> Result<SortedRun> {
+        let Accumulator { records, keys } = accumulator;
+        let store = records.finish()?;
+        let indices = self.indices(&store, &keys)?;
+        let mut access = store.access()?;
+        let mut writer = self.execution.context.spill.create()?;
+        for index in &indices.values {
+            self.execution.context.check_cancelled()?;
+            writer.write(access.get(*index)?.values(), &self.execution.context.memory)?;
+        }
+        Ok(SortedRun { file: writer.finish()?, rows: indices.values.len() as u64, page_rows: indices.values.len(), keys })
+    }
+    async fn initialize(&self, mut input: BoxPageCursor) -> Result<Option<SortOutput>> {
+        let mut accumulator = self.accumulator()?;
+        while accumulator.records.len() <= BLOCK_ROWS {
+            let Some(page) = input.next_page().await? else { break; };
+            self.append(&mut accumulator, page).await?;
+            if self.limit <= (BLOCK_ROWS / 2) as u64 && accumulator.records.len() > BLOCK_ROWS { accumulator = self.reduce(accumulator)?; }
+        }
+        if accumulator.records.len() <= BLOCK_ROWS {
+            if accumulator.records.len() == 0 { return Ok(None); }
+            let Accumulator { records, keys } = accumulator;
+            let store = records.finish()?;
+            let indices = self.indices(&store, &keys)?;
+            let selected = store.select(&indices.values, Arc::clone(&self.execution.context))?;
+            let rows = selected.len();
+            return Ok(Some(SortOutput { rows: OutputRows::Records(selected.into_cursor()?), remaining: rows as u64, page_rows: rows, empty_callback: rows == 0 }));
+        }
+        let mut runs = RunList::new(self)?;
+        runs.push(self.write_run(accumulator)?, self)?;
+        loop {
+            let mut accumulator = self.accumulator()?;
+            while accumulator.records.len() <= BLOCK_ROWS {
+                let Some(page) = input.next_page().await? else { break; };
+                self.append(&mut accumulator, page).await?;
+            }
+            if accumulator.records.len() == 0 { break; }
+            runs.push(self.write_run(accumulator)?, self)?;
+        }
+        drop(input);
+        while runs.values.len() > 1 { runs = self.merge_pass(runs)?; }
+        let run = runs.values.pop().ok_or_else(|| invalid("sort-state", "External sort produced no run"))?;
+        Ok(Some(SortOutput { rows: OutputRows::Spill(run.file.reader(Arc::clone(&self.execution.context.memory))?), remaining: run.rows, page_rows: run.page_rows, empty_callback: false }))
+    }
+}
+struct Indices { values: Vec<usize>, _reservation: Arc<MemoryReservation> }
+fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory") }
+
+struct KeyTypes { values: Vec<LogicalType>, _reservation: Arc<MemoryReservation> }
+impl KeyTypes {
+    fn declared(plan: &SortPlan) -> Result<Self> {
+        let mut bound = crate::runtime_schema::schema_bound(&plan.schema)?;
+        for order in &plan.order { bound = bound.checked_add(crate::runtime_schema::expression_bound(&order.expr)?).ok_or_else(size_error)?; }
+        for ty in plan.execution.parameters.types() { bound = bound.checked_add(ty.retained_bytes()?).ok_or_else(size_error)?; }
+        for (schema, _) in &plan.execution.outer.rows { bound = bound.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(size_error)?; }
+        let scope = plan.execution.scope()?;
+        scope.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
+        let values = plan.order.iter().map(|order| plan.execution.expression_type(&scope, &order.expr, &plan.schema)).collect::<Result<Vec<_>>>()?;
+        Self::new(values, plan)
+    }
+    fn new(values: Vec<LogicalType>, plan: &SortPlan) -> Result<Self> {
+        let reservation = plan.execution.context.memory.reserve(type_bytes(&values)?)?;
+        Ok(Self { values, _reservation: reservation })
+    }
+    fn observe(&mut self, values: &[Value], plan: &SortPlan) -> Result<()> {
+        if values.len() != self.values.len() { return Err(invalid("sort-state", "Sort key metadata width changed")); }
+        let bound = values.iter().try_fold(type_bytes(&self.values)?, |sum, value| sum.checked_add(value.retained_bytes()?).ok_or_else(size_error))?;
+        let _temporary = plan.execution.context.memory.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
+        let values = self.values.iter().zip(values).map(|(ty, value)| ty.join(&value.logical_type())).collect();
+        *self = Self::new(values, plan)?;
+        Ok(())
+    }
+    fn join(&self, other: &Self, plan: &SortPlan) -> Result<Self> {
+        if self.values.len() != other.values.len() { return Err(invalid("sort-state", "Sort run key metadata widths differ")); }
+        let bound = type_bytes(&self.values)?.checked_add(type_bytes(&other.values)?).and_then(|n| n.checked_mul(16)).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?;
+        let _temporary = plan.execution.context.memory.reserve(bound)?;
+        Self::new(self.values.iter().zip(&other.values).map(|(left, right)| left.join(right)).collect(), plan)
+    }
+    fn validate(&self) -> Result<()> { for ty in &self.values { validate_order_type(ty)?; } Ok(()) }
+}
+fn type_bytes(types: &Vec<LogicalType>) -> Result<usize> {
+    let base = types.capacity().checked_mul(std::mem::size_of::<LogicalType>()).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?;
+    types.iter().try_fold(base, |sum, ty| sum.checked_add(ty.retained_bytes()?).ok_or_else(size_error))
+}
+struct SortedRun { file: Arc<SpillFile>, rows: u64, page_rows: usize, keys: KeyTypes }
+struct RunList { values: Vec<SortedRun>, _reservation: Arc<MemoryReservation> }
+impl RunList {
+    fn new(plan: &SortPlan) -> Result<Self> { Ok(Self { values: Vec::new(), _reservation: plan.execution.context.memory.reserve(0)? }) }
+    fn push(&mut self, run: SortedRun, plan: &SortPlan) -> Result<()> {
+        if self.values.len() == self.values.capacity() {
+            let capacity = self.values.len().checked_mul(2).map(|n| n.max(1)).ok_or_else(size_error)?;
+            let bytes = capacity.checked_mul(std::mem::size_of::<SortedRun>()).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?;
+            let reservation = plan.execution.context.memory.reserve(bytes)?;
+            self.values.reserve_exact(capacity - self.values.len());
+            self._reservation = reservation;
+        }
+        self.values.push(run);
+        Ok(())
+    }
+}
+struct MergeReader { reader: SpillReader, head: Option<OwnedRow>, remaining: u64 }
+impl MergeReader {
+    fn new(run: &SortedRun, plan: &SortPlan) -> Result<Self> {
+        let mut reader = Self { reader: run.file.reader(Arc::clone(&plan.execution.context.memory))?, head: None, remaining: run.rows };
+        reader.advance()?;
+        Ok(reader)
+    }
+    fn advance(&mut self) -> Result<()> {
+        self.head = if self.remaining == 0 { None } else {
+            let row = self.reader.next()?.ok_or_else(|| invalid("sort-state", "Merge input ended before its row count"))?;
+            self.remaining -= 1;
+            Some(row)
+        };
+        Ok(())
+    }
+}
+struct MergeHeap { runs: [usize; MERGE_FAN_IN], len: usize }
+impl MergeHeap {
+    fn new() -> Self { Self { runs: [0; MERGE_FAN_IN], len: 0 } }
+    fn push(&mut self, run: usize, mut compare: impl FnMut(usize, usize) -> Result<Ordering>) -> Result<()> {
+        if self.len == self.runs.len() { return Err(invalid("sort-state", "Merge heap exceeded its fan-in")); }
+        let mut slot = self.len;
+        self.len += 1;
+        while slot > 0 {
+            let parent = (slot - 1) / 2;
+            if compare(run, self.runs[parent])? != Ordering::Less { break; }
+            self.runs[slot] = self.runs[parent];
+            slot = parent;
+        }
+        self.runs[slot] = run;
+        Ok(())
+    }
+    fn pop(&mut self, mut compare: impl FnMut(usize, usize) -> Result<Ordering>) -> Result<Option<usize>> {
+        if self.len == 0 { return Ok(None); }
+        let result = self.runs[0];
+        self.len -= 1;
+        if self.len > 0 {
+            let replacement = self.runs[self.len];
+            let mut slot = 0;
+            while slot < self.len / 2 {
+                let mut child = slot * 2 + 1;
+                if child + 1 < self.len && compare(self.runs[child], self.runs[child + 1])? == Ordering::Greater { child += 1; }
+                if compare(replacement, self.runs[child])? != Ordering::Greater { break; }
+                self.runs[slot] = self.runs[child];
+                slot = child;
+            }
+            self.runs[slot] = replacement;
+        }
+        Ok(Some(result))
+    }
+}
+impl SortPlan {
+    fn compare_heads(&self, readers: &[MergeReader], left: usize, right: usize) -> Result<Ordering> {
+        self.execution.context.check_cancelled()?;
+        let at = |index: usize| readers.get(index).and_then(|reader| reader.head.as_ref()).ok_or_else(|| invalid("sort-state", "Merge heap selected an absent head"));
+        if left < right { self.compare(&at(left)?.values, &at(right)?.values) }
+        else { self.compare(&at(right)?.values, &at(left)?.values).map(Ordering::reverse) }
+    }
+    fn merge_pass(&self, runs: RunList) -> Result<RunList> {
+        let RunList { values, _reservation } = runs;
+        let mut source = values.into_iter();
+        let mut next = RunList::new(self)?;
+        while source.len() > 0 {
+            let count = source.len().min(MERGE_FAN_IN);
+            let merged = self.merge(&source.as_slice()[..count])?;
+            for _ in 0..count { drop(source.next()); }
+            next.push(merged, self)?;
+        }
+        Ok(next)
+    }
+    fn merge(&self, runs: &[SortedRun]) -> Result<SortedRun> {
+        let _reservation = self.execution.context.memory.reserve(runs.len().checked_mul(std::mem::size_of::<MergeReader>()).and_then(|n| n.checked_add(256)).ok_or_else(size_error)?)?;
+        let mut readers = runs.iter().map(|run| MergeReader::new(run, self)).collect::<Result<Vec<_>>>()?;
+        let mut output_types = KeyTypes::declared(self)?;
+        for run in runs { output_types = output_types.join(&run.keys, self)?; }
+        for i in 0..runs.len() { for j in 0..i { runs[j].keys.join(&runs[i].keys, self)?.validate()?; } }
+        let mut queue = MergeHeap::new();
+        for i in 0..readers.len() { if readers[i].head.is_some() { queue.push(i, |left, right| self.compare_heads(&readers, left, right))?; } }
+        let mut writer = self.execution.context.spill.create()?;
+        let mut copied = 0;
+        while copied < self.limit {
+            let Some(run) = queue.pop(|left, right| self.compare_heads(&readers, left, right))? else { break; };
+            self.execution.context.check_cancelled()?;
+            let row = readers[run].head.take().ok_or_else(|| invalid("sort-state", "Merge winner is absent"))?;
+            writer.write(&row.values, &self.execution.context.memory)?;
+            drop(row);
+            readers[run].advance()?;
+            if readers[run].head.is_some() { queue.push(run, |left, right| self.compare_heads(&readers, left, right))?; }
+            copied = copied.checked_add(1).ok_or_else(size_error)?;
+        }
+        Ok(SortedRun { file: writer.finish()?, rows: copied, page_rows: BLOCK_ROWS + 1, keys: output_types })
     }
 }
 
@@ -203,47 +335,6 @@ mod page_layout_tests {
     use rtdb_types::{ScalarType,Timestamp};
     use tokio_util::sync::CancellationToken;
     use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows};
-    fn layout(pages: &[usize]) -> SortPageLayout { let mut layout = SortPageLayout::default();for rows in pages { layout.observe(*rows).unwrap(); }layout }
-    #[test]
-    fn a_single_source_accumulation_is_one_page_even_above_the_spill_threshold() {
-        for pages in [&[100,200][..],&[102_400,1][..],&[100_000,50_000,0][..]] {
-            let layout = layout(pages);assert_eq!(layout.next_size(),pages.iter().sum::<usize>());assert!(!layout.multiple);
-        }
-    }
-    #[test]
-    fn multiple_source_accumulations_use_reference_merged_page_size() {
-        let mut first = layout(&[100_000,50_000,1]);
-        assert_eq!(first.next_size(),102_401);first.remaining -= 102_401;assert_eq!(first.next_size(),47_600);
-        let layout = layout(&[102_400,1,1]);assert_eq!(layout.next_size(),102_401);assert!(layout.multiple);
-    }
-    #[test]
-    fn empty_pages_and_input_count_overflow_have_explicit_results() {
-        assert_eq!(layout(&[0,0]).next_size(),0);
-        let mut layout = layout(&[usize::MAX]);assert!(layout.observe(1).is_err());
-    }
-    #[test]
-    fn small_top_bounds_reduce_each_initial_accumulation_to_one_final_page() {
-        for limit in [0,1,51_200] {
-            let mut layout = SortPageLayout { limit,..Default::default() };
-            for rows in [100_000,50_000,100_000,50_000] { layout.observe(rows).unwrap(); }
-            layout.finish();
-            assert!(!layout.multiple);
-            assert_eq!(layout.next_size(),limit as usize);
-        }
-    }
-    #[test]
-    fn large_top_bounds_preserve_external_merge_pages_and_cap_the_total() {
-        let mut layout = SortPageLayout { limit: 150_000,..Default::default() };
-        for rows in [100_000,50_000,100_000] { layout.observe(rows).unwrap(); }
-        layout.finish();
-        assert!(layout.multiple);
-        assert_eq!(layout.next_size(),102_401);
-        layout.remaining -= 102_401;
-        assert_eq!(layout.next_size(),47_599);
-        let mut single = SortPageLayout { limit: 51_201,..Default::default() };
-        single.observe(150_000).unwrap();single.finish();
-        assert!(!single.multiple);assert_eq!(single.next_size(),51_201);
-    }
     struct Input { pages: VecDeque<Vec<i64>>,memory: Arc<MemoryBudget> }
     #[async_trait]
     impl PageCursor for Input {
@@ -322,3 +413,6 @@ mod page_layout_tests {
         drop(page);drop(cursor);assert_eq!(context.memory.used_bytes(),0);assert_eq!(context.spill_bytes(),0);
     }
 }
+
+#[cfg(test)]
+mod schedule_tests;

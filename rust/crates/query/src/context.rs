@@ -100,13 +100,12 @@ pub struct QueryOptions {
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
     pub spill_limit_bytes: u64,
-    pub merge_fan_in: usize,
     pub bypass_temporal_pruning: bool,
     /// SQL GENERATE_SERIES excludes its endpoint when the process compatibility setting is enabled.
     pub generate_series_end_exclusive: bool,
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, merge_fan_in: 16, bypass_temporal_pruning: false, generate_series_end_exclusive: false } }
+    fn default() -> Self { Self { batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false } }
 }
 
 pub struct QueryContext {
@@ -130,8 +129,8 @@ impl QueryContext {
     }
     /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
     pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
-        if options.batch_rows == 0 || options.sort_memory_bytes == 0 || options.merge_fan_in < 2 {
-            return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive; merge fan-in must be at least two"));
+        if options.batch_rows == 0 || options.sort_memory_bytes == 0 {
+            return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
         Ok(Arc::new(Self { catalog, memory, current_time: current_time.into(), timezone: timezone.into(), options, cancellation: parent_cancellation.child_token(), owner_cancellation: owner_cancellation.clone(), spill, execution_observer: None, tracer: None, trace_parent: None, read_basis: None }))

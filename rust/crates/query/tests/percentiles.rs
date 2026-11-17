@@ -10,7 +10,7 @@ fn field(id: u32, name: &str, ty: LogicalType) -> Field { Field { id: ColumnId(i
 fn context(spill_limit_bytes: u64) -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
-    QueryContext::new(catalog, MemoryBudget::new(1 << 25), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes: 128, merge_fan_in: 2, spill_limit_bytes, ..Default::default() }, &CancellationToken::new()).unwrap()
+    QueryContext::new(catalog, MemoryBudget::new(1 << 25), Timestamp(0), "UTC", QueryOptions { batch_rows: 1, sort_memory_bytes: 128, spill_limit_bytes, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
 fn percentile(input: Arc<Relation>, kind: PercentileKind, fraction: PercentileFraction, descending: bool, grouped: bool) -> Arc<Relation> {
     let argument = input.schema().fields().last().unwrap().expression();
