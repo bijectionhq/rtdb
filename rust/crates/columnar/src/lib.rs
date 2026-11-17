@@ -1,4 +1,5 @@
 mod allocation;
+mod cells;
 mod conform;
 mod decimal;
 mod execution;
@@ -10,6 +11,7 @@ mod schema;
 mod values;
 
 pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs};
+pub use cells::{CellRef, ExecutionVector, NullChecks, OwnedCell, OwnedValue};
 pub use conform::{DeclaredBatch, conform_batch};
 pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DECIMAL_SCALE_KEY, decimal_field_parameters, decimal_parameters, decimal_scale, decimal_storage_precision, decimal_storage_scale, map_schema_fields, with_decimal_parameters, with_decimal_scale};
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value};

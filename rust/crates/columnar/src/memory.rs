@@ -144,6 +144,7 @@ pub struct OwnedColumn {
 impl OwnedColumn {
     /// Clones obtained through Arrow's array data retain the memory reservation.
     pub fn array(&self) -> &dyn Array { self.array.as_ref() }
+    pub(crate) fn into_parts(self) -> (ArrayRef, Arc<MemoryReservation>) { (self.array, self.reservation) }
     pub fn slice(&self, offset: usize, length: usize) -> Result<Self> {
         check_slice(offset, length, self.array.len())?;
         Ok(Self { array: self.array.slice(offset, length), reservation: Arc::clone(&self.reservation) })
