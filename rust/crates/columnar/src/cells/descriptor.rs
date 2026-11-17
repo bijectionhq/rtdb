@@ -588,7 +588,8 @@ mod tests {
         assert!(matches!(children[5].descriptor().container(), Some(ContainerKind::RunEnd { .. })));
         let projected = vector.arrow_field().unwrap();
         assert_eq!(projected.field(), &expected);
-        assert_eq!(vector.logical_type().unwrap(), &crate::execution_field_type(projected.field()).unwrap());
+        let logical = Field::new("root", DataType::Struct(fields(DataType::Int32, "UTC").into()), true);
+        assert_eq!(vector.logical_type().unwrap(), &crate::execution_field_type(&logical).unwrap());
         drop(vector);
         assert_eq!(memory.used_bytes(), projected._reservation.bytes());
         drop(projected);

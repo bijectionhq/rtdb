@@ -449,11 +449,11 @@ fn clear_zeros_capacity_and_keeps_nullability_and_owner_lifetime() {
 #[test]
 fn native_run_ends_validate_every_retained_end_with_the_shared_getter() {
     let memory = memory();
-    let mut ends = writer(DataType::Int32, false, &memory);
+    let mut ends = ScalarWriter::new(Arc::new(Field::new("run_ends", DataType::Int32, false)), Arc::clone(&memory)).unwrap();
     ends.write_int(2).unwrap();
     ends.write_int(5).unwrap();
     let ends = frozen(ends);
-    let mut values = writer(DataType::Int64, false, &memory);
+    let mut values = ScalarWriter::new(Arc::new(Field::new("values", DataType::Int64, false)), Arc::clone(&memory)).unwrap();
     values.write_long(3).unwrap();
     values.write_long(7).unwrap();
     let values = frozen(values);

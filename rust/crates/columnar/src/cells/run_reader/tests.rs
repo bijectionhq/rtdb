@@ -1,3 +1,4 @@
+use super::super::native_container::{CapturedChildren, NativeContainerParts, publish_native};
 use arrow_array::{Int32Array, Int64Array, NullArray};
 use arrow_buffer::Buffer;
 use crate::MemoryBudget;
@@ -325,4 +326,81 @@ fn list_snapshot_captures_child_before_terminal_offset_and_skips_terminal_at_zer
     drop((runs, broken, empty, copied));
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(target.used_bytes(), 0);
+}
+
+
+fn anomaly(error: VectorReadError) -> rtdb_types::Anomaly {
+    match error { VectorReadError::Anomaly(error) => error, other => panic!("expected an existing anomaly, got {other:?}") }
+}
+fn open(field: Field, array: ArrayRef, memory: &Arc<MemoryBudget>) -> ExecutionVector {
+    let charge = memory.reserve(array.get_array_memory_size()).unwrap();
+    ExecutionVector::with_reservation(Arc::new(field), array, charge).unwrap()
+}
+fn absent_parent(child: ExecutionVector, positions: &[i32], memory: &Arc<MemoryBudget>) -> ExecutionVector {
+    let mut children = CapturedChildren::new(1, memory).unwrap();
+    children.push(child).unwrap();
+    let ids = vec![255; positions.len()];
+    let offsets = positions.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+    let type_ids = StoredBytes { bytes: bytes(&ids, memory), append: ids.len() };
+    let offsets = StoredBytes { bytes: bytes(&offsets, memory), append: offsets.len() };
+    publish_native("parent", SourceCount::from_len(positions.len()).unwrap(), NativeContainerParts::Union { type_ids, offsets, children }, memory).unwrap()
+}
+
+#[test]
+fn run_end_forwarding_keeps_storage_free_leaf_methods_and_signed_search_positions() {
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    for populated in [false, true] {
+        let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(if populated { vec![2] } else { vec![] })), &memory);
+        let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(if populated { vec![73] } else { vec![] })), &memory);
+        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
+        let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: if populated { 2 } else { 0 }, run_ends: ends, values }, &memory).unwrap();
+        let parent = absent_parent(runs, &[0, -1, i32::MAX], &memory);
+        let named = parent.vector_for("runs").unwrap().unwrap();
+        let selected = named.select(&Selection::All).unwrap().select(&Selection::All).unwrap();
+        for row in 0..3 {
+            let cell = selected.cell(row).unwrap();
+            assert!(!cell.is_null().unwrap());
+            assert_eq!(anomaly(cell.get_boolean(NullChecks::Enabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
+            assert_eq!(anomaly(cell.get_bytes().unwrap_err()).code, "rtdb/unsupported-vector-reader");
+            assert_eq!(cell.get_long_long_high().unwrap_err().code, "rtdb/unsupported-vector-reader");
+            assert_eq!(cell.type_id().unwrap_err().code, "rtdb/unsupported-vector-reader");
+            assert_eq!(cell.leg_name().unwrap_err().code, "rtdb/unsupported-vector-reader");
+            assert_eq!(cell.list_count().unwrap_err().code, "rtdb/unsupported-vector-reader");
+            if populated && row < 2 { assert_eq!(cell.get_long(NullChecks::Enabled).unwrap(), 73); }
+            else { assert_eq!(anomaly(cell.get_long(NullChecks::Enabled).unwrap_err()).code, "rtdb/row-index"); }
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn native_short_run_lengths_keep_all_covering_values_owned() {
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    for length in [0, 1] {
+        let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(vec![2, 5])), &memory);
+        let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(vec![42, 73])), &memory);
+        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
+        let vector = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length, run_ends: ends, values }, &memory).unwrap();
+        assert_eq!(vector.checked_len().unwrap(), length);
+        let selected = vector.select(&Selection::All).unwrap();
+        assert_eq!(selected.checked_len().unwrap(), length);
+        if length == 0 {
+            assert!(selected.cell(0).is_err());
+        } else {
+            let selected = selected.select(&Selection::Indices(vec![0])).unwrap();
+            assert_eq!(selected.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 42);
+            assert_eq!(selected.cell(0).unwrap().getter_index().unwrap(), 0);
+        }
+        drop(selected);
+        let parent = absent_parent(vector, &[3], &memory);
+        let named = parent.vector_for("runs").unwrap().unwrap();
+        let retained = named.select(&Selection::All).unwrap().owned_cell(0).unwrap();
+        drop(parent);
+        drop(named);
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(retained.as_ref().get_long(NullChecks::Enabled).unwrap(), 73);
+        assert_eq!(retained.as_ref().getter_index().unwrap(), 1);
+        drop(retained);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }

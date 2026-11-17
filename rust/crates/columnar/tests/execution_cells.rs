@@ -170,7 +170,7 @@ fn sdk_run_end_domain_checks_unused_suffixes_inside_empty_and_nested_arrays() {
         for nesting in 0..3 {
             let runs = RunArray::<Int64Type>::try_new(&Int64Array::from(vec![1, i64::from(i32::MAX) + 1]), &Int64Array::from(vec![42, 73])).unwrap().slice(offset, length);
             let runs: ArrayRef = Arc::new(runs);
-            let child = Arc::new(Field::new("runs", runs.data_type().clone(), true));
+            let child = Arc::new(Field::new("runs", runs.data_type().clone(), false));
             let array: ArrayRef = match nesting {
                 0 => runs,
                 1 => Arc::new(StructArray::new(Fields::from(vec![child]), vec![runs], None)),
@@ -498,8 +498,11 @@ fn execution_length_rejects_more_than_the_signed_vector_domain_without_allocatin
 fn opened_schema_depth_admission_precedes_recursive_logical_construction() {
     let budget = MemoryBudget::new(16 * 1024 * 1024);
     let mut field = Field::new("leaf", DataType::Int64, false);
-    for _ in 0..128 { field = Field::new("list", DataType::List(Arc::new(field)), false); }
-    let array = new_empty_array(field.data_type());
+    let mut array: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
+    for _ in 0..128 {
+        array = Arc::new(ListArray::new(Arc::new(field), OffsetBuffer::new_empty(), array, None));
+        field = Field::new("list", array.data_type().clone(), false);
+    }
     let reservation = budget.reserve(array.get_array_memory_size()).unwrap();
     assert_eq!(ExecutionVector::with_reservation(Arc::new(field), array, reservation).unwrap_err().code, "rtdb/vector-schema-depth");
     assert_eq!(budget.used_bytes(), 0);
