@@ -98,12 +98,32 @@ mod owner_tests {
         assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
-    fn original_literal_checks_precede_copy_admission_and_failed_native_copies_release() {
+    fn original_literal_checks_precede_copy_admission() {
         let memory = MemoryBudget::new(0);
+        for tail in ["9223372036854775808", "1, -9223372036854775809"] {
+            let sql = format!("SELECT regexp_replace('x', 'x', 'y', {tail})");
+            let error = prepare_in(&sql, &ScalarCatalog, &PrepareOptions::default(), &memory).unwrap_err();
+            assert_eq!(error.message.as_deref(), Some("REGEXP_REPLACE integer literal exceeds signed 64-bit range"));
+        }
         let error = prepare_in("SELECT regexp_replace('x', 9223372036854775808, 'y')", &ScalarCatalog, &PrepareOptions::default(), &memory).unwrap_err();
-        assert_eq!(error.message.as_deref(), Some("REGEXP_REPLACE integer literal exceeds signed 64-bit range"));
+        assert_eq!(error.message.as_deref(), Some("REGEXP_REPLACE requires literal pattern, replacement, start, count and flags"));
+        assert_eq!(memory.peak_bytes(), 0);
+    }
+    #[test]
+    fn failed_native_regex_copies_release_admitted_parts() {
+        let memory = MemoryBudget::new(0);
         let error = prepare_in("SELECT regexp_replace('x', 'x', 'y')", &ScalarCatalog, &PrepareOptions::default(), &memory).unwrap_err();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), 0);
+        let baseline = MemoryBudget::new(1 << 20);
+        let prepared = prepare_in("SELECT regexp_replace('x', 'x', 'y')", &ScalarCatalog, &PrepareOptions::default(), &baseline).unwrap();
+        let limit = baseline.peak_bytes();
+        drop(prepared);
+        let memory = MemoryBudget::new(limit);
+        let sql = format!("SELECT regexp_replace('x', 'x', '{}')", "y".repeat(limit + 1));
+        let error = prepare_in(&sql, &ScalarCatalog, &PrepareOptions::default(), &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert!(memory.peak_bytes() > 0);
         assert_eq!(memory.used_bytes(), 0);
     }
     #[test]

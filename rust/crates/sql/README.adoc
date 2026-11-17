@@ -16,6 +16,7 @@ Unsupported aggregate factories and modifiers fail during preparation.
 Text expressions bind POSITION with CHARACTERS or OCTETS units, OVERLAY with an explicit or inferred replacement length, and binary substring/trim/concatenation.
 The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
 REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.
+The SQL binder validates the literal arguments before retaining their metadata in the recipe.
 Applicable UTF8 source types reject unsupported start/occurrence arguments during emitted-type admission; null-only sources leave metadata uninterpreted.
 Integer metadata uses the SQL signed 64-bit literal boundary, including when the source is null.
 Session-information expressions expose CURRENT_USER, CURRENT_CATALOG, CURRENT_DATABASE, CURRENT_SCHEMA, CURRENT_SCHEMAS, and CURRENT_SETTING.

@@ -180,10 +180,11 @@ impl Context<'_> {
                     let arguments = function_arguments(function)?;
                     crate::settings::regexp_arguments(&arguments)?;
                     let argument = |index| match &arguments[index] { ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr)) => Ok(expr), _ => Err(error("REGEXP_REPLACE requires expressions")) };
-                    let metadata = |index| -> Result<rtdb_plan::RegexForm> {
+                    let source = self.expr_bound(argument(0)?, input, replacements)?;
+                    let metadata = |index| -> Result<Value> {
                         let expr = argument(index)?;
                         if let ast::Expr::Value(value) = expr {
-                            if let Ok(Value::Utf8(value)) = crate::types::literal(&value.value) { return self.forms.literal(&Value::Utf8(value)); }
+                            if let Ok(value @ Value::Utf8(_)) = crate::types::literal(&value.value) { return Ok(value); }
                         }
                         let (sign,value) = match expr {
                             ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus,expr } => ("-",expr.as_ref()),
@@ -193,15 +194,26 @@ impl Context<'_> {
                         let ast::Expr::Value(value) = value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
                         let ast::Value::Number(value,_) = &value.value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
                         let value = format!("{sign}{value}").parse::<i64>().map_err(|_|error("REGEXP_REPLACE integer literal exceeds signed 64-bit range"))?;
-                        self.forms.literal(&Value::I64(value))
+                        Ok(Value::I64(value))
                     };
-                    let mut recipe = rtdb_plan::RegexReplacement { pattern: metadata(1)?,replacement: metadata(2)?,..Default::default() };
+                    let (pattern, replacement) = (metadata(1)?, metadata(2)?);
+                    let (mut start, mut occurrence, mut flags) = (None, None, None);
                     for index in 3..arguments.len() {
                         let value = metadata(index)?;
-                        if matches!(value.view().kind(),rtdb_plan::RegexFormKind::Literal(literal) if matches!(literal.kind(),rtdb_plan::RegexLiteralKind::Text(_))) { recipe.flags = value; }
-                        else if index == 3 { recipe.start = value; } else { recipe.occurrence = value; }
+                        if matches!(value, Value::Utf8(_)) { flags = Some(value); }
+                        else if index == 3 { start = Some(value); } else { occurrence = Some(value); }
                     }
-                    return Ok(Expr::regex_replace(self.expr_bound(argument(0)?,input,replacements)?,recipe));
+                    let optional_form = |value: Option<Value>| -> Result<rtdb_plan::RegexForm> {
+                        Ok(value.as_ref().map(|value| self.forms.literal(value)).transpose()?.unwrap_or_default())
+                    };
+                    let recipe = rtdb_plan::RegexReplacement {
+                        pattern: self.forms.literal(&pattern)?,
+                        replacement: self.forms.literal(&replacement)?,
+                        start: optional_form(start)?,
+                        occurrence: optional_form(occurrence)?,
+                        flags: optional_form(flags)?,
+                    };
+                    return Ok(Expr::regex_replace(source, recipe));
                 }
                 if matches!(name.as_str(),"date_bin" | "range_bins") && !matches!(function_arguments(function)?.first(),Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Interval(_))))) {
                     return Err(error("Temporal bin functions require an interval literal stride"));
