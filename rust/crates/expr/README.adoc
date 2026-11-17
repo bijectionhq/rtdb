@@ -444,3 +444,13 @@ Unknown Transit tagged objects preserve their decoded identity through native ob
 An alias compares equal before its representation is inspected; separately decoded wrappers compare their representations with Java object equality.
 A null representation therefore fails equality between distinct wrappers with equal tags and always fails hashing.
 The tagged object's content hash and wire representation remain independent of its native address.
+
+Stored Transit TableRef values construct unrestricted schema and table strings through the registered Clojure map-destructuring and object-string rules.
+Null schema defaults to `public`, null table becomes empty text, and flat list destructuring preserves array-map duplicate handling without hash promotion.
+The complete schema/table pair owns equality, Java hashing and canonical Transit output.
+Scalar names use Java object text; collection names use readable Clojure forms, including numeric suffixes and registered print methods.
+ByteBuffer aliases retain the identity used by default readable printing while content equality and wire output remain byte-based.
+The pure text adapter assumes the default Clojure print bindings and enabled Java time literals.
+Legacy Date text still requires a caller-owned process default-zone/calendar provider, and readable ExceptionInfo output still requires construction-stack semantics; those valid name inputs currently report explicit unsupported errors.
+Cross-process identity text, nondefault print bindings and time-literal initialization remain required parity work.
+`tests/transit_tables.rs` records the TableRef conversion, canonical key identity, malformed nested input and allocation-lifetime assertions; execution remains pending.

@@ -14,6 +14,7 @@ impl Object {
             (Self::Character(left),Self::Character(right)) => left == right,(Self::Uuid(left),Self::Uuid(right)) => left == right,
             (Self::Time(left),Self::Time(right)) => left == right,
             (Self::Path(left),Self::Path(right)) => left == right,
+            (Self::TableRef(left),Self::TableRef(right)) => left == right,
             (Self::ByteBuffer(left),Self::ByteBuffer(right)) => left == right,
             (Self::Bytes(left),Self::Bytes(right)) => Arc::ptr_eq(left,right),(Self::Throwable(left),Self::Throwable(right)) => super::Throwable::equal(left,right)?,(Self::Link(left),Self::Link(right)) => Arc::ptr_eq(left,right),
             (Self::Vector(left) | Self::List(left),Self::Vector(right) | Self::List(right)) => {

@@ -111,6 +111,17 @@ impl Time {
         };
         Ok(tagged(tag,T::String(text)))
     }
+    pub(super) fn text(&self) -> Result<String> {
+        if let Self::Range { from,to } = self {
+            let text = |value: &Option<Zoned>|value.map(Zoned::text).transpose().map(|value|value.unwrap_or_else(||"null".into()));
+            return Ok(format!("ZonedDateTimeRange(from={}, to={})",text(from)?,text(to)?));
+        }
+        if matches!(self,Self::LegacyDate(_)) {
+            return Err(rtdb_types::Anomaly::unsupported("xtdb.expression/transit-date-text", "Date object text requires the process default time-zone provider"));
+        }
+        let T::Tagged { representation,.. } = self.wire()? else { return Err(invalid()); };
+        let T::String(text) = *representation else { return Err(invalid()); };Ok(text)
+    }
     pub(super) fn java_hash(&self) -> Result<i32> {
         Ok(match self {
             Self::Period(value) => value.years.wrapping_add(value.months.rotate_left(8)).wrapping_add(value.days.rotate_left(16)),
