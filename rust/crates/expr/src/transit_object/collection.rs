@@ -58,6 +58,39 @@ impl Map {
     pub(super) fn from_entries(entries: impl IntoIterator<Item=Entry>) -> Result<Self> {
         let mut map = Self::new();for (key,value) in entries { map.assoc(key,value)?; }Ok(map)
     }
+    pub(super) fn from_flat_sequence(mut values: Vec<Object>) -> Result<Self> {
+        let trailing = if values.len() % 2 == 1 { values.pop() } else { None };
+        let mut values = values.into_iter();
+        let mut entries = Vec::with_capacity(values.len() / 2);
+        while let Some(key) = values.next() { entries.push((key,values.next().ok_or_else(invalid)?)); }
+        let mut complex = trailing.is_some();
+        if let Some(trailing) = trailing {
+            let mut map = Self::new();map.conj(trailing)?;entries.extend(map.into_entries());
+        } else {
+            'duplicates: for (index,(key,_)) in entries.iter().enumerate() {
+                for (previous,_) in &entries[..index] { if key.equivalent(previous)? { complex = true;break 'duplicates; } }
+            }
+        }
+        if !complex { return Ok(Self::Array(entries)); }
+        let mut count = 0;
+        for (index,(key,_)) in entries.iter().enumerate() {
+            let mut duplicate = false;
+            for (previous,_) in &entries[..index] { if key.equivalent(previous)? { duplicate = true;break; } }
+            if !duplicate { count += 1; }
+        }
+        if count == entries.len() { return Ok(Self::Array(entries)); }
+        let mut unique: Vec<Entry> = Vec::with_capacity(count);
+        for (index,(key,_)) in entries.iter().enumerate() {
+            let mut duplicate = false;
+            for (previous,_) in &unique { if key.equivalent(previous)? { duplicate = true;break; } }
+            if duplicate { continue; }
+            for (candidate,value) in entries[index..].iter().rev() {
+                if key.equivalent(candidate)? { unique.push((key.clone(),value.clone()));break; }
+            }
+        }
+        if unique.len() != count { return Err(invalid()); }
+        Ok(Self::Array(unique))
+    }
     pub(super) fn len(&self) -> usize { match self { Self::Array(entries) => entries.len(),Self::Hash(hash) => usize::from(hash.null.is_some()) + hash.buckets.values().map(Vec::len).sum::<usize>() } }
     pub(super) fn is_empty(&self) -> bool { self.len() == 0 }
     pub(super) fn entries(&self) -> Entries<'_> {

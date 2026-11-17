@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use rtdb_format::transit::{TransitReadBuilder,TransitValue as T,decode_with};
-use rtdb_types::{Anomaly,Result};
+use rtdb_types::{Anomaly,Result,TableRef};
 mod number;
 mod default_handlers;
 mod collection;
@@ -10,6 +10,8 @@ mod time;
 mod path;
 mod throwable;
 mod tagged_value;
+mod render;
+mod table;
 use collection::{Array,Map,Record,Entries};
 use number::Number;
 use time::Time;
@@ -21,7 +23,7 @@ use tagged_value::Tagged;
 pub(crate) enum Object {
     Null,Bool(bool),Number(Arc<Number>),String(String),Keyword(String),Symbol(String),Character(u16),
     Bytes(Arc<Vec<u8>>),Vector(Vec<Self>),List(Vec<Self>),Set(Map),Map(Map),
-    Uri(String),Uuid([i64;2]),ByteBuffer(Vec<u8>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),
+    Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(TableRef),
     TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),
 }
 
@@ -80,7 +82,7 @@ impl Object {
             "c" => Self::Character(representation.text()?.encode_utf16().next().ok_or_else(invalid)?),
             "r" => { let value = representation.text()?;rtdb_types::UriParts::parse(value)?;Self::Uri(value.into()) }
             "u" => Self::Uuid(uuid(&representation)?),
-            "xtdb/byte-array" => Self::ByteBuffer(byte_buffer(representation.text()?)?),
+            "xtdb/byte-array" => Self::ByteBuffer(Arc::new(byte_buffer(representation.text()?)?)),
             "xtdb/key-fn" => match representation {
                 Self::KeyFn(value) => Self::KeyFn(value),
                 Self::Keyword(value) if ["kebab-case-string","kebab-case-keyword","snake-case-string","snake-case-keyword"].contains(&value.as_str()) => Self::KeyFn(value),
@@ -93,6 +95,7 @@ impl Object {
             "link" => match representation { Self::Map(map) => Self::Link(Arc::new(map.into_entries())),Self::TxKey(record) => Self::Link(Arc::new(record.into_entries())),_ => return Err(invalid()) },
             "xtdb/tx-key" => Self::TxKey(Record::read(representation)?),
             "xtdb/path" => Self::Path(Path::read(representation.text()?)?),
+            "xt/table" => Self::TableRef(table::read(representation)?),
             "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Self::Throwable(Arc::new(Throwable::read(&tag,&representation)?)),
             tag if Time::recognizes(tag) => Time::read(tag,&representation)?.map_or(Self::Null,Self::Time),
             _ => Self::Tagged(Arc::new(Tagged::new(tag,representation))),
@@ -140,10 +143,11 @@ impl Object {
             Self::Map(map) => map_wire(map)?,
             Self::TxKey(record) => tagged("xtdb/tx-key",map_wire(&Map::from_entries(record.entries().map(|(key,value)|(key.clone(),value.clone())))?)?),
             Self::Uri(value) => tagged("r",T::String(value.clone())),Self::Uuid(values) => tagged("u",T::Array(values.iter().map(|value|T::Integer(*value)).collect())),
-            Self::ByteBuffer(value) => { let mut text = String::from("0x");const HEX: &[u8] = b"0123456789abcdef";for byte in value { text.push(HEX[(byte >> 4) as usize] as char);text.push(HEX[(byte & 15) as usize] as char); }tagged("xtdb/byte-array",T::String(text)) }
+            Self::ByteBuffer(value) => { let mut text = String::from("0x");const HEX: &[u8] = b"0123456789abcdef";for byte in value.iter() { text.push(HEX[(byte >> 4) as usize] as char);text.push(HEX[(byte & 15) as usize] as char); }tagged("xtdb/byte-array",T::String(text)) }
             Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire()?),
             Self::Time(value) => value.wire()?,
             Self::Path(value) => value.wire(),
+            Self::TableRef(value) => table::wire(value),
             Self::Link(entries) => tagged("link",T::Map(entries.iter().map(|(key,value)|Ok((key.wire()?,value.wire()?))).collect::<Result<_>>()?)),
             Self::Throwable(value) => value.wire()?,
             Self::Tagged(value) => value.wire()?,
