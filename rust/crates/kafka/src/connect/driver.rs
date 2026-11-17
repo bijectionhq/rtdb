@@ -6,7 +6,7 @@ use rtdb_types::{Anomaly, Result};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use super::{ConnectConfig, ConversionContext, Converter, DateEnvironment, PluginRegistry, RecordIndexer, ResumeToken, SinkRecord, SourceConfig, SourceTransactions, error};
-use crate::{KafkaClusterConfig, client_config, native_properties};
+use crate::KafkaClusterConfig;
 
 #[derive(Clone, Debug)]
 pub struct SourceOptions {
@@ -105,9 +105,8 @@ impl SourceDriver {
         };
         after_close(result, converters.close().await)
     }
-    async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {
-        let registration = self.metrics.as_ref().map(|(identity, observer)| observer.register(identity, self.subscribe())).transpose()?;
-        let mut properties = native_properties(&self.cluster.properties()?)?;
+    fn consumer_configuration(&mut self) -> Result<rdkafka::ClientConfig> {
+        let mut properties = self.cluster.properties()?;
         if let Some(maximum) = properties.remove("max.poll.records") {
             let maximum = maximum.parse::<usize>().map_err(|cause| error("invalid-config", cause))?;
             if maximum == 0 { return Err(error("invalid-config", "max.poll.records must be positive")); }
@@ -123,7 +122,12 @@ impl SourceDriver {
         properties.entry("group.id".into()).or_insert_with(|| "rtdb-kafka-connect-explicit-assignment".into());
         properties.insert("queued.max.messages.kbytes".into(), self.options.maximum_batch_bytes.div_ceil(1024).to_string());
         properties.insert("fetch.message.max.bytes".into(), self.options.maximum_record_bytes.to_string());
-        let consumer: BaseConsumer<SourceContext> = client_config(&properties).create_with_context(SourceContext { progress: Arc::clone(&self.progress), topic: self.source.topic.clone(), partition: self.options.partition }).map_err(transport)?;
+        crate::client::prepare(&properties, &self.memory)
+    }
+    async fn ingest(&mut self, term: &TermHandle, after: Option<ResumeToken>, converters: &mut Converters, plugin_charge: &Arc<MemoryReservation>) -> Result<()> {
+        let registration = self.metrics.as_ref().map(|(identity, observer)| observer.register(identity, self.subscribe())).transpose()?;
+        let configuration = self.consumer_configuration()?;
+        let consumer: BaseConsumer<SourceContext> = configuration.create_with_context(SourceContext { progress: Arc::clone(&self.progress), topic: self.source.topic.clone(), partition: self.options.partition }).map_err(transport)?;
         let (low, high) = consumer.fetch_watermarks(&self.source.topic, self.options.partition, self.options.request_timeout).map_err(transport)?;
         let next = after.map(|token| token.0.checked_add(1).ok_or_else(|| error("invalid-token", "Kafka offset exhausted"))).transpose()?.unwrap_or(low);
         if next < low || next > high { return Err(error("offset-out-of-range", format!("Resume offset {next} is outside retained range [{low}, {high}]"))); }
@@ -221,6 +225,9 @@ fn kafka_timestamp(timestamp: KafkaTimestamp) -> i64 {
 }
 fn transport(cause: impl std::fmt::Display) -> Anomaly { Anomaly::new(rtdb_types::AnomalyCategory::Unavailable, "xtdb.kafka-connect-source/kafka", cause.to_string()) }
 fn overflow() -> Anomaly { error("allocation-overflow", "Kafka Connect allocation size overflow") }
+
+#[cfg(test)]
+mod client_tests;
 
 #[cfg(test)]
 mod tests {

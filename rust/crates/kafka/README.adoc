@@ -27,7 +27,14 @@ Configuration properties merge bootstrap servers, the property map, then the ISO
 The documented PLAIN JAAS configuration and SCRAM username/password configuration translate to native SASL properties.
 Both modules accept `required`, `requisite`, `sufficient`, and `optional` with Java's locale-independent uppercase matching; later duplicate options replace earlier values.
 Other login modules and Java client extensions require an explicit native adapter and return an error.
-Native TLS and SASL properties pass through to librdkafka.
+Kafka log clients and Connect source consumers accept Java TLS properties through the shared native TLS adapter.
+Each log prepares one retained client configuration for its topic administrator, producer, watermark readers, ranges, and tails.
+Each source assignment prepares one configuration for its consumer.
+Derived native clients retain the admitted TLS material even after the originating configuration or log is released.
+`KafkaLog::open` and the node's Kafka resource registration receive the existing node memory budget; TLS material remains charged until the last native client releases it.
+The adapter consumes its supported Java TLS properties and preserves other native TLS and SASL properties for librdkafka validation.
+Java and native identity settings, or Java and native trust settings, cannot both supply the same client.
+Producer acknowledgement, idempotence, compression, queue and message-size overrides apply after preparation without replacing its TLS owner.
 The schema registry URL is retained for source configuration; the log transports envelope bytes without a registry lookup.
 
 Fresh broker watermarks determine the durable tip.
@@ -35,10 +42,11 @@ Retention, withdrawn observed offsets, unexpected gaps, tombstones, and fetch ti
 Empty polling means the cursor reached the observed tip.
 The transport does not open Kafka transactions; externally written transaction/control records that introduce offset gaps are rejected.
 Poll batches and range reads have explicit limits; a range exceeding its limits fails instead of truncating silently.
-Native prefetch and decompression allocations still require qualification against the process-wide memory contract.
+Native client contexts, prefetch and decompression allocations still require qualification against the process-wide memory contract.
 
 Source references are `modules/kafka/src/main/kotlin/xtdb/api/log/KafkaCluster.kt`, `KafkaClusterTest.kt`, `KafkaLogFactoryTest.kt`, `KafkaDurabilityTest.kt`, and `allium/log-processor-lifecycle.allium`.
 The Rust test sources cover configuration precedence, JAAS credentials, acknowledgements, topic partition validation, read-back, read-only handles, and cancellation while admission is backpressured.
+TLS assembly regressions cover admission before connection setup, failed-setup release, retained configuration and native-client clones, source-consumer options, and producer defaults.
 They have not been compiled or executed during Phase 1.
 Real broker failover, retained-range truncation, authentication, and native shutdown qualification remain required before backend compatibility can be claimed.
 
