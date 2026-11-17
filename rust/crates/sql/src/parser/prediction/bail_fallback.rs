@@ -5,6 +5,7 @@ use super::{
     BailRecovery, InvocationCause, InvocationException, InvocationKey, ParserControl, ParserEnvironment, ParserProfile, ParserSession,
     PrecedenceFrame, RuntimeError, RuntimeProblem, RuntimeResult, with_parser_session,
 };
+use super::required_block_sync::TokenReport;
 use super::super::PredictionMode;
 
 #[cfg(test)]
@@ -58,7 +59,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         &mut self,
         expected: TokenType,
     ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
-        let current = self.ready().and_then(|()| {
+        let entered = self.ready().and_then(|()| {
             if self.profile != ParserProfile::SllBail {
                 return Err(RuntimeError::Control(RuntimeProblem::Aborted));
             }
@@ -66,17 +67,15 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             if self.record(current)?.start.is_none() {
                 return Err(RuntimeError::Control(RuntimeProblem::Invocation));
             }
-            Ok(current)
+            Ok(())
         });
-        let current = self.finish(current)?;
+        self.finish(entered)?;
         let matched = self.lookahead(1)?.expect("positive lookahead");
         let actual = self.environment.storage.grammar_view().token_type(matched.lexeme().kind())
             .map_err(RuntimeError::from);
         if self.finish(actual)? != expected {
-            let state = self.state;
-            let offending = self.lookahead(1)?.expect("positive lookahead");
-            let cause = InvocationCause::InputMismatch { offending, state };
-            self.records[current.index].exception = Some(InvocationException::Owned(cause));
+            let (current, cause) = self.capture_input_mismatch()?;
+            self.records[current.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
             return self.cancel_bail(current, BailRecovery::Clear);
         }
 
@@ -90,20 +89,34 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         Ok(matched)
     }
 
-    pub(in crate::parser::prediction) fn catch_no_viable_alternative<T>(
+    pub(in crate::parser::prediction) fn catch_recognition<T>(
         &mut self,
         local: InvocationKey<'parse>,
     ) -> PassResult<'parse, 'sql, T> {
         let report = self.pending_no_viable_report()
             .filter(|report| self.profile != ParserProfile::Kernel && report.invocation == local);
-        let Some(report) = report else {
-            self.control.abort();
-            return Err(RuntimeError::Control(RuntimeProblem::Aborted).into());
-        };
-        let cause = InvocationCause::NoViableAlternative(report.cause);
-        self.records[local.index].exception = Some(InvocationException::Owned(cause));
-        self.report_no_viable_alternative()?;
-        self.cancel_bail(local, BailRecovery::Entered)
+        if let Some(report) = report {
+            let cause = InvocationCause::NoViableAlternative(report.cause);
+            self.records[local.index].exception = Some(InvocationException::Owned(cause));
+            self.report_no_viable_alternative()?;
+            return self.cancel_bail(local, BailRecovery::Entered);
+        }
+
+        if let ParserControl::PendingInputMismatch(report) = &self.control
+            && self.profile == ParserProfile::LlDefault
+            && local == report.invocation
+            && self.current == Some(local)
+            && self.state == report.cause.state
+            && self.input.index() == Some(report.cause.offending.index())
+        {
+            let (cause, expected) = (report.cause, report.expected);
+            self.records[local.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
+            self.control = ParserControl::InErrorRecovery;
+            return self.report_token_syntax(TokenReport::Mismatch(cause), expected).map_err(PassError::from);
+        }
+
+        self.control.abort();
+        Err(RuntimeError::Control(RuntimeProblem::Aborted).into())
     }
 
     fn cancel_bail<T>(&mut self, local: InvocationKey<'parse>, recovery: BailRecovery) -> PassResult<'parse, 'sql, T> {

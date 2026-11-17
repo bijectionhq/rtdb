@@ -588,6 +588,32 @@ A real decision 371 can select the REPEATABLE alternative before demanding its f
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
 Generated context and terminal attachment, LL inline recovery, expected-token capabilities and production adoption remain open.
 
+== Required isolation block synchronization
+
+The generated `commonTxMode` block at 2886 and `levelOfIsolation` block at 3014 use one sync operation.
+SLL Bail sync returns without reading input.
+LL first observes the current token type and derives the within-rule lookahead set from the actual ATN.
+Both block sets lack epsilon, so the source's later expected-token queries return the same set.
+An accepted first type returns without another lookahead.
+
+A rejected first type demands `LA(2)` before checking whether deletion could help.
+A lexer or native input failure at that demand precedes recovery or exception assignment.
+If the second type is expected, recovery begins and the current token is read again for the unwanted-token report.
+The LL listener receives a null cause and throws before the parser consumes either token.
+No catch assigns an exception to the current invocation for that report.
+
+If the second type is unexpected, the ordinary mismatch constructor captures the current invocation and recognizer state before reading its offending token.
+The generated catch assigns that mismatch to the actual local record and then enters recovery.
+Its report uses the captured token and the same nonnullable expected set.
+Only the pending report carries that set.
+The LL listener receives the original mismatch facts and throws before recovery can consume input or assign an ancestor exception.
+
+Both report messages quote the raw token spelling or `<EOF>` and use the pinned vocabulary in token order.
+Recovery starts before parser message admission.
+Notification increments the syntax error count after the parser message is complete and before the listener admits its retained diagnostic.
+The report leaves the cursor at the offending token and can be followed by the caller's existing finally operations.
+Nullable decisions, loop synchronization, LL inline recovery and full generated rule adoption remain required.
+
 == Finishing-alternative selection
 
 The adaptive caller constructs the candidate no-viable error and seeks the prediction origin before asking the current Local or Full facade for a finishing alternative.

@@ -15,13 +15,18 @@ const ALTERNATIVE_PREFIX: &str = "no viable alternative at input ";
 #[derive(Debug)]
 pub(in crate::parser::prediction) struct NoViableDiagnostic<'sql> {
     cause: NoViableAlternative<'sql>,
-    anomaly: Anomaly,
+    listener: ListenerDiagnostic,
+}
+
+#[derive(Debug)]
+pub(super) struct ListenerDiagnostic {
+    pub(super) anomaly: Anomaly,
     _lease: Arc<MemoryReservation>,
 }
 
 impl<'sql> NoViableDiagnostic<'sql> {
     pub(in crate::parser::prediction) fn cause(&self) -> NoViableAlternative<'sql> { self.cause }
-    pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.anomaly }
+    pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
 }
 
 impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
@@ -47,25 +52,11 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
                 Some(text) => text.as_str(),
                 None => "<EOF>",
             };
-            let capacity = message_size([
-                ALTERNATIVE_PREFIX.len(),
-                2,
-                input.len(),
-                input.bytes().filter(|&value| matches!(value, b'\r' | b'\n' | b'\t')).count(),
-            ])?;
+            let capacity = message_size([ALTERNATIVE_PREFIX.len(), quoted_len(input)?])?;
             self.work.reserve(capacity).map_err(PredictionError::Admission)?;
             let mut message = message_buffer(capacity)?;
             message.push_str(ALTERNATIVE_PREFIX);
-            message.push('\'');
-            for character in input.chars() {
-                match character {
-                    '\r' => message.push_str("\\r"),
-                    '\n' => message.push_str("\\n"),
-                    '\t' => message.push_str("\\t"),
-                    character => message.push(character),
-                }
-            }
-            message.push('\'');
+            write_quoted(&mut message, input);
             message
         };
         self.syntax_errors = self.syntax_errors.wrapping_add(1);
@@ -74,18 +65,17 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
         match mode {
             PredictionMode::Sll => Ok(()),
             PredictionMode::Ll => Err(RuntimeError::ReportedNoViableAlternative(
-                listener_diagnostic(cause, position, &message, self.work)?,
+                NoViableDiagnostic { cause, listener: listener_diagnostic(position, &message, self.work)? },
             )),
         }
     }
 }
 
-fn listener_diagnostic<'sql>(
-    cause: NoViableAlternative<'sql>,
+pub(super) fn listener_diagnostic(
     position: Position,
     parser_message: &str,
     allocation: &AllocationScope,
-) -> Result<NoViableDiagnostic<'sql>, PredictionError> {
+) -> Result<ListenerDiagnostic, PredictionError> {
     let digits = |value: usize| value.checked_ilog10().unwrap_or(0) as usize + 1;
     let capacity = message_size([
         LISTENER_PREFIX.len(),
@@ -102,19 +92,40 @@ fn listener_diagnostic<'sql>(
     message.push_str(parser_message);
     let mut code = message_buffer(CODE.len())?;
     code.push_str(CODE);
-    Ok(NoViableDiagnostic { cause, anomaly: Anomaly::incorrect(code, message), _lease: lease })
+    Ok(ListenerDiagnostic { anomaly: Anomaly::incorrect(code, message), _lease: lease })
 }
 
-fn message_size(sizes: impl IntoIterator<Item = usize>) -> Result<usize, PredictionError> {
+pub(super) fn message_size(sizes: impl IntoIterator<Item = usize>) -> Result<usize, PredictionError> {
     sizes.into_iter().try_fold(0usize, |sum, size| {
         sum.checked_add(size).filter(|total| *total <= isize::MAX as usize).ok_or_else(capacity_error)
     })
 }
 
-fn message_buffer(capacity: usize) -> Result<String, PredictionError> {
+pub(super) fn message_buffer(capacity: usize) -> Result<String, PredictionError> {
     let mut buffer = String::new();
     buffer.try_reserve_exact(capacity).map_err(|error| {
         PredictionError::Admission(Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))
     })?;
     Ok(buffer)
+}
+
+pub(super) fn quoted_len(input: &str) -> Result<usize, PredictionError> {
+    message_size([
+        2,
+        input.len(),
+        input.bytes().filter(|&value| matches!(value, b'\r' | b'\n' | b'\t')).count(),
+    ])
+}
+
+pub(super) fn write_quoted(output: &mut String, input: &str) {
+    output.push('\'');
+    for character in input.chars() {
+        match character {
+            '\r' => output.push_str("\\r"),
+            '\n' => output.push_str("\\n"),
+            '\t' => output.push_str("\\t"),
+            character => output.push(character),
+        }
+    }
+    output.push('\'');
 }

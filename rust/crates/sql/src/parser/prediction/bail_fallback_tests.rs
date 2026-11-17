@@ -67,7 +67,7 @@ fn catch_failed_prediction<'parse, 'sql>(
     mode: PredictionMode,
 ) -> PassResult<'parse, 'sql, ()> {
     match session.adaptive_predict(DECISION, mode) {
-        Err(RuntimeError::NoViableAlternative(_)) => session.catch_no_viable_alternative(local),
+        Err(RuntimeError::NoViableAlternative(_)) => session.catch_recognition(local),
         Err(error) => Err(error.into()),
         Ok(_) => panic!("expected the level-of-isolation decision to fail"),
     }
@@ -176,7 +176,7 @@ fn report_admission_failure_preserves_the_catch_assignment_and_prevents_bail() {
         let [root, parent, local] = enter_isolation(session)?;
         assert!(matches!(session.adaptive_predict(DECISION, mode), Err(RuntimeError::NoViableAlternative(_))));
         let _blocker = exhaust(memory);
-        let pass: PassResult<'_, '_, ()> = session.catch_no_viable_alternative(local);
+        let pass: PassResult<'_, '_, ()> = session.catch_recognition(local);
         assert!(matches!(&pass, Err(PassError::Runtime(RuntimeError::Input(
             StreamError::Scan(ScanError::Admission(error)),
         ))) if error.code == "rtdb/memory-budget-exceeded"));
@@ -223,7 +223,7 @@ fn the_catch_rejects_a_different_local_invocation_before_writing_or_reporting() 
         let frames = enter_isolation(session)?;
         assert!(matches!(session.adaptive_predict(DECISION, mode), Err(RuntimeError::NoViableAlternative(_))));
         let used = memory.used_bytes();
-        let pass: PassResult<'_, '_, ()> = session.catch_no_viable_alternative(frames[1]);
+        let pass: PassResult<'_, '_, ()> = session.catch_recognition(frames[1]);
         assert!(matches!(&pass, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::Aborted)))));
         assert!(frames.into_iter().all(|frame| session.invocation_view().exception(frame).is_none()));
         assert_eq!(session.syntax_errors, 0);
@@ -277,7 +277,7 @@ fn isolated_prediction_kernel_cannot_mint_a_bail_cancellation() {
         let frames = enter_isolation(session)?;
         assert!(matches!(session.adaptive_predict(DECISION, PredictionMode::Sll), Err(RuntimeError::NoViableAlternative(_))));
         let used = memory.used_bytes();
-        let pass: PassResult<'_, '_, ()> = session.catch_no_viable_alternative(frames[2]);
+        let pass: PassResult<'_, '_, ()> = session.catch_recognition(frames[2]);
         assert!(matches!(pass, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::Aborted)))));
         assert!(session.invocation_view().exception(frames[2]).is_none());
         assert_eq!(session.syntax_errors, 0);
@@ -383,10 +383,10 @@ fn repeatable_predicts_before_demanding_the_token_that_bails_inline() {
             assert_eq!(session.current(), Some(local));
             assert!(session.buffered_token(4).is_none());
 
-            assert!(matches!(&session.records[local.index].exception, Some(InvocationException::Owned(InvocationCause::InputMismatch { .. }))));
+            assert!(matches!(&session.records[local.index].exception, Some(InvocationException::Owned(InvocationCause::InputMismatch(_)))));
             let view = session.invocation_view();
             let cause = view.exception(local).unwrap();
-            let InvocationCause::InputMismatch { state, offending } = cause else { panic!("expected inline mismatch cause"); };
+            let InvocationCause::InputMismatch(super::super::InputMismatch { state, offending }) = cause else { panic!("expected inline mismatch cause"); };
             assert_eq!(*state, ParserState::State(3012));
             assert_eq!(offending.index(), 3);
             match spelling {
@@ -545,3 +545,6 @@ fn denied_normal_use_preserves_the_recovery_state_of_each_cancelled_path() {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[path = "required_block_sync_tests.rs"]
+mod required_block_sync_tests;

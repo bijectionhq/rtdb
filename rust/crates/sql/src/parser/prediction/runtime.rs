@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use rtdb_types::AllocationScope;
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
-use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TransitionView};
+use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TransitionView};
 use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
 use super::adaptive;
 use super::closure::{ClosureOptions, ClosureRound, with_closure_round_result};
@@ -16,6 +16,10 @@ pub(super) use bail_fallback::{PassError, PassResult, with_bail_fallback};
 mod no_viable_report;
 pub(super) use no_viable_report::NoViableDiagnostic;
 
+#[path = "required_block_sync.rs"]
+mod required_block_sync;
+pub(super) use required_block_sync::TokenDiagnostic;
+
 #[cfg(test)]
 #[path = "runtime_tests.rs"]
 mod tests;
@@ -28,6 +32,8 @@ pub(super) enum RuntimeError<'sql> {
     Control(RuntimeProblem),
     NoViableAlternative(NoViableAlternative<'sql>),
     ReportedNoViableAlternative(NoViableDiagnostic<'sql>),
+    InputMismatch(InputMismatch<'sql>),
+    ReportedTokenSyntax(TokenDiagnostic<'sql>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,9 +81,15 @@ enum InvocationRole<'parse> {
     RecursiveEntry { saved: SavedOuterLink<'parse>, phase: RecursionPhase<'parse> },
     RecursionReplacement { entry: InvocationKey<'parse>, previous: InvocationKey<'parse>, state: ReplacementUse },
 }
+#[derive(Clone, Copy, Debug)]
+pub(super) struct InputMismatch<'sql> {
+    pub(super) offending: IndexedLexeme<'sql>,
+    pub(super) state: ParserState,
+}
+
 pub(super) enum InvocationCause<'sql> {
     NoViableAlternative(NoViableAlternative<'sql>),
-    InputMismatch { offending: IndexedLexeme<'sql>, state: ParserState },
+    InputMismatch(InputMismatch<'sql>),
 }
 
 enum InvocationException<'parse, 'sql> {
@@ -103,12 +115,19 @@ struct PendingNoViableReport<'parse, 'sql> {
     mode: PredictionMode,
 }
 
+struct PendingInputMismatch<'parse, 'sql> {
+    invocation: InvocationKey<'parse>,
+    cause: InputMismatch<'sql>,
+    expected: TokenSet,
+}
+
 enum BailRecovery { Clear, Entered }
 
 enum ParserControl<'parse, 'sql> {
     Ready,
     Failed,
     PendingNoViable(PendingNoViableReport<'parse, 'sql>),
+    PendingInputMismatch(PendingInputMismatch<'parse, 'sql>),
     InErrorRecovery,
     BailCancelled { exception: InvocationKey<'parse>, recovery: BailRecovery },
 }
@@ -296,6 +315,14 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             self.control = ParserControl::PendingNoViable(PendingNoViableReport { invocation, cause: *cause, mode });
         }
         result
+    }
+
+    fn capture_input_mismatch(&mut self) -> RuntimeResult<'sql, (InvocationKey<'parse>, InputMismatch<'sql>)> {
+        let current = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation));
+        let invocation = self.finish(current)?;
+        let state = self.state;
+        let offending = self.lookahead(1)?.expect("positive lookahead");
+        Ok((invocation, InputMismatch { offending, state }))
     }
 
     fn pending_no_viable_report(&self) -> Option<&PendingNoViableReport<'parse, 'sql>> {

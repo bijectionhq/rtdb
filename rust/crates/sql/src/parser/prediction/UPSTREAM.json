@@ -211,6 +211,11 @@
         "source": "InputMismatchException.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/InputMismatchException.java",
         "sha256": "b3e982ce671dacc901ecb30063460b8fed70a6eff6c3304ee10f62caf669e0a4"
+      },
+      {
+        "source": "CommonToken.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/CommonToken.java",
+        "sha256": "2f9f1c430969fa9a96bc69582280e19a70e8ff892087ca88f59beb7b39f494c8"
       }
     ]
   },
@@ -220,7 +225,7 @@
     "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
     "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, and same-session Bail-to-LL retry. Generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, same-session Bail-to-LL retry, and LL synchronization at the two required isolation blocks. Generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
