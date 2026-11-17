@@ -98,6 +98,31 @@
         "path": "atn/SetTransition.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SetTransition.java",
         "sha256": "e221bf03db9ae5dae784de70e9c1d8e21c53f36beec8c2733cd803d9a844d55d"
+      },
+      {
+        "path": "atn/LL1Analyzer.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/LL1Analyzer.java",
+        "sha256": "71d849df3d2071217e50574d002f43ed9e1b8252c9df94607a1fa33220b9a6c2"
+      },
+      {
+        "path": "atn/ATNConfig.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNConfig.java",
+        "sha256": "077e41382b431c4e30d90e617a54e888c0af0beb5f4c376292c8cf5610b9e2be"
+      },
+      {
+        "path": "atn/PredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PredictionContext.java",
+        "sha256": "af228bbc8c2373c086bf15b64d89c0f2ccb141405bf3b804269e36651b71ad91"
+      },
+      {
+        "path": "atn/SingletonPredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SingletonPredictionContext.java",
+        "sha256": "6473a3fdb2e32680644fea0df5efa9b437fd0224e13040f906afecff32d3ada3"
+      },
+      {
+        "path": "atn/EmptyPredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/EmptyPredictionContext.java",
+        "sha256": "950278da93427419b0a1425d4a4a3fdd2e7a177e9ef2078557b2b674e303bd1e"
       }
     ]
   },
