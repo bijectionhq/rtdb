@@ -1,0 +1,68 @@
+= Pinned Java certificate security policy
+
+This module implements the certificate constraints used by Eclipse Temurin 25.0.1+8's SunJSSE provider.
+Its passive entry points finish on the caller's thread and retain no mutable state.
+`verify_server_chain` consumes a leaf-first chain ending in the selected trust anchor.
+It supplies the security-policy checks to the native SimpleTrust validator, which owns chain construction, signature verification, validity, certificate extensions, and server-name verification.
+`verify_client_chain` applies the NewSunX509 identity-selection algorithm constraints to every chain member, including the final certificate.
+`verify_public_key` exposes the certificate public-key size restrictions to the native transport's security callback.
+
+== Provenance
+
+The resources come from https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.1%2B8[Temurin 25.0.1+8].
+The Linux x64 JRE archive is `OpenJDK25U-jre_x64_linux_hotspot_25.0.1_8.tar.gz`, SHA-256 `126c7f59b91df97b2e930b0a456422ce29af7f2385117e1c04297eba962b0b1c`.
+The corresponding JDK archive is `OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz`, SHA-256 `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
+Both release files identify source commit `61d6a2c1b35e`.
+The upstream license and Classpath exception are retained with link:../cacerts/README.adoc[the bundled trust store].
+
+`temurin-25.0.1.blocked.certs` is the unchanged JRE `lib/security/blocked.certs` file.
+It contains 38 SHA-256 fingerprints, occupies 2488 bytes, and has SHA-256 `96572f243f31c2ef81a6e627542e596f6a9295cff3c7ae095c1b595cb1457ded`.
+
+`temurin-25.0.1.jdk-anchors.sha256` contains the uppercase SHA-256 certificate fingerprints for the 146 aliases containing ` [jdk` in the bundled JRE `lib/security/cacerts`, in store order.
+The derivation follows `java.base/sun/security/util/AnchorCertificates.java`.
+The file occupies 9490 bytes and has SHA-256 `cc9fd59d407106b5c5f00a19069276a673aab4b526ca0e2a0535d9314dd16226`.
+An explicitly configured store containing one of these same certificates still identifies it as a JDK anchor.
+
+The remaining fingerprint lists come from `java.base/sun/security/validator/{Symantec,Entrust,Camerfirma}TLSPolicy.java` in the pinned JDK's `lib/src.zip`.
+`symantec.sha256` contains the 16 root fingerprints and `symantec-exempt.sha256` the two subordinate-CA exceptions.
+`entrust.sha256` contains five roots and `camerfirma.sha256` one root.
+These lists also cover roots removed from the bundled trust store but present in an explicit store.
+
+== Constraints
+
+The pinned JRE `conf/security/java.security` has SHA-256 `6a6435789711cf0809558d85c2e61dc477d106eb9657237f92c303c463bf3e1a`.
+Its certificate-path property is:
+
+[source,properties]
+----
+jdk.certpath.disabledAlgorithms=MD2, MD5, SHA1 jdkCA & usage TLSServer, RSA keySize < 1024, DSA keySize < 1024, EC keySize < 224, SHA1 usage SignedJAR & denyAfter 2019-01-01
+----
+
+Its TLS property adds `DH keySize < 1024` and `EC keySize < 224`, disables `MD5withRSA`, and restricts SHA-1 handshake signature schemes to exclude `HandshakeSignature` usage.
+The native transport owns protocol, cipher, group, and handshake signature-scheme restrictions.
+Certificate signature algorithms and public-key sizes are checked here using the pinned `AlgorithmChecker`, `DisabledAlgorithmConstraints`, and `SSLAlgorithmConstraints` semantics.
+RSA-PSS signature parameters include their digest and MGF1 digest in the server certificate-path check.
+The `RSA keySize` constraint matches RSA keys; Java's distinct `RSASSA-PSS` public-key algorithm does not inherit that size constraint.
+DSA keys with omitted parameters inherit the preceding issuer's DSA parameters for subsequent algorithm checks.
+
+SHA-1 certificate signatures are disabled for TLS server chains anchored in the pinned JDK root set.
+Private-CA SHA-1 certificate signatures remain permitted by this policy.
+The `denyAfter` constraint applies to SignedJAR usage, so TLS policy evaluation does not require a validation time.
+The surrounding validator owns certificate validity at its explicit validation time.
+
+The enabled distrust policies are `SYMANTEC_TLS`, `ENTRUST_TLS`, and `CAMERFIRMA_TLS`.
+They reject a server leaf whose UTC issuance date is later than 2019-04-16, 2024-11-11, or 2025-04-15 respectively, when its selected root is listed by the corresponding policy.
+The two Symantec subordinate-CA exceptions instead permit issuance through 2019-12-31.
+The subordinate exception checks the chain member immediately below the selected trust anchor.
+
+SimpleValidator checks the blocklist even for a directly trusted leaf.
+A one-member trusted chain skips algorithm and CA distrust checks, matching the pinned validator's direct-trust branch.
+For longer chains, the trust anchor's public key is constrained and its self-signature is outside the certificate-path checks.
+NewSunX509 identity selection checks the final member's signature algorithm and public key as well as earlier members, without applying the server trust blocklist or CA distrust policy.
+Its basic `SSLAlgorithmConstraints` calls do not have the anchor context used by the server's conditional SHA-1 constraint.
+
+== Validation
+
+Regression sources pin the runtime resources and cover direct trust, issuer key restrictions, private-CA and JDK-CA SHA-1, client identity selection, key usage, RSA-PSS digest parameters, and every distrust cutoff.
+The bundled-store tests verify that every derived JDK fingerprint belongs to the retained trust-store resource.
+Source and resource inspection were performed during Phase 1; compilation, tests, and transport handshakes remain pending until the execution phase.

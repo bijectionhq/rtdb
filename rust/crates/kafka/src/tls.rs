@@ -11,15 +11,18 @@ use policy::Policy;
 pub(crate) mod keys;
 use keys::{Algorithm, KeyManager, KeyType};
 pub(crate) mod trust;
+pub(crate) mod validation;
+pub(crate) mod security;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
     key_manager: KeyManager,
     trust: Option<Vec<X509>>,
+    simple_trust: Option<validation::SimpleTrust>,
     policy: Policy,
     reservations: Vec<Arc<MemoryReservation>>,
 }
-struct ClientIdentity { certificate: X509, key: PKey<Private>, chain: Stack<X509>, kind: KeyType }
+struct ClientIdentity { certificate: X509, key: PKey<Private>, chain: Stack<X509>, kind: KeyType, eligible: bool }
 
 impl NativeTls {
     pub(crate) fn from_java(options: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Option<Arc<Self>>> {
@@ -29,6 +32,7 @@ impl NativeTls {
         validate_provider(options.get("ssl.provider").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let policy = Policy::from_java(options)?;
         let algorithm = Algorithm::parse(options.get("ssl.keymanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
+        let trust_algorithm = validation::Algorithm::parse(options.get("ssl.trustmanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let mut key_manager = KeyManager::new(algorithm, &[]);
         let mut identities = Vec::new();
         let mut trust = None;
@@ -52,13 +56,21 @@ impl NativeTls {
                             let key = PKey::private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(invalid)?;
                             let mut chain = Stack::new().map_err(invalid)?;
                             for certificate in &identity.certificates()[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-                            identities.push(ClientIdentity { certificate, key, chain, kind });
+                            let eligible = algorithm == Algorithm::SunX509 || {
+                                let certificates = std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>();
+                                security::verify_client_chain(&certificates).is_ok()
+                            };
+                            identities.push(ClientIdentity { certificate, key, chain, kind, eligible });
                         }
                     }
                 }
             }
         }
-        Ok(Some(Arc::new(Self { identities, key_manager, trust, policy, reservations })))
+        let simple_trust = if trust_algorithm == validation::Algorithm::SunX509 {
+            let anchors = trust.as_ref().ok_or_else(|| invalid("SunX509 trust management requires Java-style trust material"))?.clone();
+            Some(validation::SimpleTrust::new(anchors, Arc::clone(&reservations[0]))?)
+        } else { None };
+        Ok(Some(Arc::new(Self { identities, key_manager, trust, simple_trust, policy, reservations })))
     }
 
     pub(crate) fn reservations(&self) -> &[Arc<MemoryReservation>] { &self.reservations }
@@ -77,6 +89,7 @@ impl NativeTls {
         if !self.identities.is_empty() {
             unsafe { SSL_CTX_set_cert_cb(context.as_ptr(), Some(select_identity), (self as *const Self).cast_mut().cast()); }
         }
+        if let Some(trust) = &self.simple_trust { unsafe { trust.configure_native(context)?; } }
         Ok(())
     }
 
@@ -87,7 +100,7 @@ impl NativeTls {
         let required = CERT_PKEY_VALID | CERT_PKEY_ISSUER_NAME | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
         let selected = self.key_manager.choose(&types, |index, kind| {
             let identity = &self.identities[index];
-            identity.kind == kind && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
+            identity.eligible && identity.kind == kind && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
         }, |index| keys::client_status(&self.identities[index].certificate, &now));
         if let Some(index) = selected {
             let identity = &self.identities[index];
