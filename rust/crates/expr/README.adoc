@@ -484,3 +484,17 @@ The pure text adapter assumes the default Clojure print bindings and enabled Jav
 Legacy Date text still requires a caller-owned process default-zone/calendar provider, and readable ExceptionInfo output still requires construction-stack semantics; those valid name inputs currently report explicit unsupported errors.
 Cross-process identity text, nondefault print bindings and time-literal initialization remain required parity work.
 `tests/transit_tables.rs` records the TableRef conversion, canonical key identity, malformed nested input and allocation-lifetime assertions; execution remains pending.
+
+Registered Transit `xtdb/type` values retain their VectorType kind, raw Arrow constructor fields and encoding independently of query-schema types.
+Bare container keywords construct Scalar descriptors; vector forms construct Listy or Struct descriptors, and set inputs convert every member before the Mono-leg factory runs.
+Nullable wire rendering removes the outer Mono encoding and retains child encodings, while Kotlin object text recursively removes the Mono's encodings.
+Flat nullable prefixes are consumed iteratively and apply their conversions after the underlying descriptor succeeds.
+Struct field names use the existing object text rules, retain first-key/last-value association, and reserve derived text and container storage through the caller's evaluation scope before allocation.
+Type equality retains constructor kind and compares Struct fields and Poly legs independently of their iteration order.
+Raw Arrow widths and timezone strings remain constructor values, including values that query-schema admission would reject.
+The adapter currently substitutes deterministic class-and-name hashes for JVM enum identity hashes.
+Exact enum-key collection ordering remains required parity work and prevents closing the source gate; the surrogate is not an environment waiver.
+Nondefault JVM assertions and Clojure numeric/print bindings, process identity and the existing Date/Throwable text capabilities remain required completion work.
+The explicit `invalid-type` anomaly retains its category, code, message and canonical `type-spec` object through the existing internal Transit JSON wrappers, with admission before conversion.
+Plain JSON and JSON-LD error transports still require a separate review of their rendering of those internal wrappers.
+`tests/transit_vector_types.rs` records JSON/MessagePack constructor, rendering, equality, failure-order and derived-allocation regressions as unexecuted source.
