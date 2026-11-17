@@ -86,3 +86,61 @@ fn later_jaas_options_replace_earlier_credentials() {
     assert_eq!(native["sasl.username"], "u");
     assert_eq!(native["sasl.password"], "p");
 }
+
+#[test]
+fn jaas_comments_and_control_whitespace_follow_stream_tokenizer() {
+    for options in [
+        "/* header */ required // line\nusername=user / single slash\npassword=secret; /* unterminated trailing comment",
+        "required username=user /\nignored=discard\npassword=secret;",
+        "\u{0}required\u{1f}username\u{0}=user\u{b}password=secret;",
+        "required username=user /* middle\r\n comment */ password=secret; // trailing",
+    ] {
+        let properties = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.plain.PlainLoginModule {options}"))]);
+        let native = native_properties(&properties).unwrap();
+        assert_eq!(native["sasl.username"], "user");
+        assert_eq!(native["sasl.password"], "secret");
+    }
+    let properties = BTreeMap::from([("sasl.jaas.config".into(), "org.apache.kafka.common.security.plain.PlainLoginModule required username=user password=secret /* missing terminator".into())]);
+    assert!(native_properties(&properties).is_err());
+}
+
+#[test]
+fn jaas_quotes_decode_java_octal_escapes_and_end_at_unescaped_line_breaks() {
+    for (value, expected) in [
+        (r#""\141\377\477\08\7\a\v\u0041""#, "a\u{ff}'7\u{0}8\u{7}\u{7}\u{b}u0041"),
+        ("\"line\n", "line"),
+        ("'line\r", "line"),
+        ("\"first\\\nsecond\"", "first\nsecond"),
+        ("''", ""),
+    ] {
+        let properties = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.plain.PlainLoginModule required username=user password={value};"))]);
+        let native = native_properties(&properties).unwrap();
+        assert_eq!(native["sasl.password"], expected);
+    }
+}
+
+#[test]
+fn jaas_word_boundaries_require_quotes_for_numbers_and_punctuation() {
+    for value in ["service-user.v1", "_user", "$user", "é", "😀", "\u{a0}"] {
+        let properties = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.plain.PlainLoginModule required username={value} password=secret;"))]);
+        assert_eq!(native_properties(&properties).unwrap()["sasl.username"], value);
+    }
+    for value in ["123", "123abc", "-user", ".user", "user@host", "user:host", "user+suffix", "user\\name", "\u{85}", "user\u{85}name"] {
+        let jaas = format!("org.apache.kafka.common.security.plain.PlainLoginModule required username={value} password=secret-value;");
+        let properties = BTreeMap::from([("sasl.jaas.config".into(), jaas)]);
+        let error = native_properties(&properties).unwrap_err();
+        assert!(!format!("{error:?}").contains("secret-value"));
+        let properties = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.plain.PlainLoginModule required username='{value}' password=secret;"))]);
+        assert!(native_properties(&properties).is_ok());
+    }
+}
+
+#[test]
+fn jaas_null_option_keys_do_not_replace_named_credentials() {
+    let properties = BTreeMap::from([("sasl.jaas.config".into(), "org.apache.kafka.common.security.plain.PlainLoginModule required username=user password=secret ?=ignored 123=ignored . =ignored - =ignored;".into())]);
+    let native = native_properties(&properties).unwrap();
+    assert_eq!(native["sasl.username"], "user");
+    assert_eq!(native["sasl.password"], "secret");
+    let properties = BTreeMap::from([("sasl.jaas.config".into(), "org.apache.kafka.common.security.plain.PlainLoginModule required username=user password=secret 123abc=ignored;".into())]);
+    assert!(native_properties(&properties).is_err());
+}
