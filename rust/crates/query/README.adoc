@@ -39,8 +39,10 @@ Candidate files and temporary rows are released with the cursor or the current c
 Returned `OwnedBatch` values and cloned Arrow arrays retain their own allocation reservations after the cursor has gone away.
 
 `QueryCursor::schema` retains the advertised result fields.
-Its passive `RuntimeSchema` value owns a tree of immutable `RuntimeRelation` values containing execution-derived batch fields.
-The tree and any aggregate or correlated-apply cursor retaining a subtree share the schema allocation reservation.
+Each passive immutable `EmittedRelation` owns its exact logical relation, resolved batch fields, typed children and aggregate factories.
+Operator opening consumes this artifact; deferred inputs and correlated cursors retain the emitted subtree they will open.
+The tree and any cursor retaining a subtree share the schema allocation reservation.
+`QueryCursor::from_rows` retains a charged `RuntimeSchema` for its fixed output fields.
 The recursive derivation reserves its transient schema work before construction and uses the execution's pinned `CatalogSnapshot`, after dependency validation.
 Exact virtual-table definitions supply NULL types for absent scan columns; ordinary tables retain their validated scan types, including `xt.txs` and persisted tables in the `xt` schema.
 Projection, correlation, joins, grouping keys, sets, and windows propagate these runtime fields without inspecting observed row values.

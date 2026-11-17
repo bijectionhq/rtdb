@@ -4,7 +4,7 @@ use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Relation, RelationNode, Schema}
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, operators::build_pages, pages::BoxPageCursor, parameters::BoundParameters, runtime_schema::RuntimeSchema};
+use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::{Execution, OuterRows}, operators::build_pages, pages::BoxPageCursor, parameters::BoundParameters, runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
@@ -22,8 +22,8 @@ fn series(start: i64, end: i64, step: i64, inclusive: bool) -> Expr {
     Expr::Call { name: "generate_series".into(), return_type: rtdb_plan::function_type_with_args("generate_series", &args).unwrap(), args }
 }
 async fn open(relation: Arc<Relation>, execution: &Execution) -> Result<BoxPageCursor> {
-    let runtime = RuntimeSchema::derive(&relation, &execution.context.catalog, execution.parameters.types(), &execution.context.memory)?;
-    build_pages(relation, runtime.root(), execution.clone()).await
+    let runtime = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, execution.parameters.types(), &execution.context.memory)?;
+    build_pages(Arc::clone(&runtime), execution.clone()).await
 }
 fn numbers(values: &[i64]) -> Vec<Vec<Value>> { values.iter().map(|value| vec![Value::I64(*value)]).collect() }
 
@@ -93,4 +93,44 @@ async fn list_descriptor_errors_happen_while_the_cursor_opens() {
     let args = vec![division_by_zero(), Expr::Literal(Value::I64(5)), Expr::Literal(Value::I64(1)), Expr::Literal(Value::Bool(false))];
     let expression = Expr::Call { name: "generate_series".into(), return_type: rtdb_plan::function_type_with_args("generate_series", &args).unwrap(), args };
     assert_eq!(open(list(expression), &execution).await.err().unwrap().code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
+async fn emitted_definition_survives_its_caller_and_output_survives_the_cursor() {
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    let relation = list(series(1, 4, 1, false));
+    let definition = Arc::downgrade(&relation);
+    let emitted = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, execution.parameters.types(), &execution.context.memory).unwrap();
+    drop(relation);
+    assert!(definition.upgrade().is_some());
+    let mut cursor = build_pages(emitted, execution.clone()).await.unwrap();
+    let page = cursor.next_page().await.unwrap().unwrap();
+    drop(cursor);
+    assert!(definition.upgrade().is_none());
+    assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), numbers(&[1,2,3]));
+    drop(page);
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
+}
+
+#[test]
+fn emissions_of_one_definition_retain_their_own_complete_parameter_fields() {
+    let execution = execution(1);
+    let baseline = execution.context.memory.used_bytes();
+    let declared = LogicalType::Scalar(ScalarType::I64);
+    let field = Field { id: ColumnId(0), name: "a".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: declared.clone() };
+    let relation = Arc::new(Arc::new(Relation::unit()).project(vec![rtdb_plan::NamedExpr { field, expr: Expr::Parameter { index: 0, data_type: declared.clone() } }]).unwrap());
+    {
+        let narrow = LogicalType::Scalar(ScalarType::I32).maybe();
+        let first = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, std::slice::from_ref(&narrow), &execution.context.memory).unwrap();
+        let second = EmittedRelation::derive(Arc::clone(&relation), &execution.context.catalog, std::slice::from_ref(&declared), &execution.context.memory).unwrap();
+        assert!(Arc::ptr_eq(first.relation(), second.relation()));
+        assert_eq!(first.schema().fields()[0].data_type, narrow);
+        assert_eq!(second.schema().fields()[0].data_type, declared);
+        assert_eq!(relation.schema().fields()[0].data_type, declared);
+        let output = first.output();
+        drop(first);
+        assert_eq!(output.schema().fields()[0].data_type, narrow);
+    }
+    assert_eq!(execution.context.memory.used_bytes(), baseline);
 }

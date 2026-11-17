@@ -11,7 +11,7 @@ use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
 use crate::operators::rows_equal;
 use crate::pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor};
 use crate::spill::{SpillReader, SpillWriter};
-use crate::runtime_schema::RuntimeRelation;
+use crate::runtime_schema::EmittedRelation;
 use crate::{invalid, sort::SortCursor};
 
 pub(crate) struct AggregateTypes { input: LogicalType, declared_output: LogicalType, output: LogicalType }
@@ -59,10 +59,10 @@ impl AggregateTypes {
 
 pub(crate) struct AggregateCursor {
     input: Option<BoxPageCursor>, schema: Schema, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr>,
-    runtime: Arc<RuntimeRelation>, execution: Execution,
+    runtime: Arc<EmittedRelation>, execution: Execution,
 }
 impl AggregateCursor {
-    pub fn new(input: BoxPageCursor, schema: Schema, groups: Vec<NamedExpr>, mut aggregates: Vec<AggregateExpr>, runtime: Arc<RuntimeRelation>, execution: Execution) -> Result<Self> {
+    pub fn new(input: BoxPageCursor, schema: Schema, groups: Vec<NamedExpr>, mut aggregates: Vec<AggregateExpr>, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
         if runtime.aggregates()?.len() != aggregates.len() { return Err(invalid("runtime-plan", "Aggregate factories disagree with their expressions")); }
         for aggregate in &mut aggregates {
             aggregate.function = aggregate.function.canonical();

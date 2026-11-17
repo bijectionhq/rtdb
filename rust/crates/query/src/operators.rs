@@ -7,21 +7,21 @@ use rtdb_plan::{ApplyKind, Expr, NamedExpr, Relation, RelationNode, Schema, SetO
 use rtdb_types::{Result, Value};
 
 use crate::context::Execution;
-use crate::cursor::{BoxCursor, OwnedRow, RowCursor};
+use crate::cursor::{BoxCursor, OwnedRow};
 use crate::spill::{SpillReader, SpillWriter};
-use crate::runtime_schema::RuntimeRelation;
+use crate::runtime_schema::{EmittedRelation, RuntimeSchema};
 use crate::{invalid, QueryContext};
 use crate::pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor};
 
-pub(crate) fn build(relation: Arc<Relation>, runtime: Arc<RuntimeRelation>, execution: Execution) -> futures::future::BoxFuture<'static, Result<BoxCursor>> {
-    build_constrained(relation, runtime, execution, crate::inspection::Constraints::default(), None)
+pub(crate) fn build(runtime: Arc<EmittedRelation>, execution: Execution) -> futures::future::BoxFuture<'static, Result<BoxCursor>> {
+    build_constrained(runtime, execution, crate::inspection::Constraints::default(), None)
 }
-pub(crate) fn build_pages(relation: Arc<Relation>, runtime: Arc<RuntimeRelation>, execution: Execution) -> futures::future::BoxFuture<'static, Result<BoxPageCursor>> {
-    build_pages_constrained(relation,runtime,execution,crate::inspection::Constraints::default(),None)
+pub(crate) fn build_pages(runtime: Arc<EmittedRelation>, execution: Execution) -> futures::future::BoxFuture<'static, Result<BoxPageCursor>> {
+    build_pages_constrained(runtime,execution,crate::inspection::Constraints::default(),None)
 }
 
 pub(crate) struct DeferredInput {
-    relation: Arc<Relation>, runtime: Arc<RuntimeRelation>, execution: Execution,
+    runtime: Arc<EmittedRelation>, execution: Execution,
     constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>,
 }
 impl DeferredInput {
@@ -31,18 +31,19 @@ impl DeferredInput {
     }
     pub async fn open_pages(self, own: Option<Arc<crate::pushdown::Pushdowns>>) -> Result<BoxPageCursor> {
         let pushdowns = crate::pushdown::Pushdowns::merge(self.pushdowns.as_ref(), own, &self.execution.context.memory)?;
-        build_pages_constrained(self.relation, self.runtime, self.execution, self.constraints, pushdowns).await
+        build_pages_constrained(self.runtime, self.execution, self.constraints, pushdowns).await
     }
 }
 
-fn build_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<BoxCursor>> { Box::pin(async move {
+fn build_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<BoxCursor>> { Box::pin(async move {
     let context = Arc::clone(&execution.context);
-    let pages = build_pages_constrained(relation, runtime, execution, constraints, pushdowns).await?;
+    let pages = build_pages_constrained(runtime, execution, constraints, pushdowns).await?;
     Ok(crate::pages::rows(pages, context))
 }) }
 
-fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
+fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, constraints: crate::inspection::Constraints, pushdowns: Option<Arc<crate::pushdown::Pushdowns>>) -> futures::future::BoxFuture<'static, Result<crate::pages::BoxPageCursor>> { Box::pin(async move {
     execution.context.check_cancelled()?;
+    let relation = Arc::clone(runtime.relation());
     let mut state_bound = crate::runtime_schema::local_allocation_bound(&relation)?;
     state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.schema())?).ok_or_else(||invalid("operator-size","Operator schema copies exceed addressable memory"))?;
     for (index,_) in relation.children().iter().enumerate() { state_bound = state_bound.checked_add(crate::runtime_schema::schema_bound(runtime.child(index)?.schema())?).ok_or_else(|| invalid("operator-size", "Operator schema copies exceed addressable memory"))?; }
@@ -51,15 +52,15 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
     let traced_context = Arc::clone(&execution.context);
     let analysis = execution.analysis.clone();
     if let RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to } = relation.node() {
-        let input_pages = build_pages_constrained(Arc::clone(input), runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
+        let input_pages = build_pages_constrained(runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
         let pages = Box::new(crate::patch::PatchGaps::new(input_pages, input.schema(), [*iid, *valid_from, *valid_to, *document], from, to, execution).await?);
         let pages = crate::pages::retain_page_state(pages, state_reservation);
         return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
     }
     match relation.node() {
-        RelationNode::Join { left,right,kind: rtdb_plan::JoinKind::Cross,.. } => {
-            let left = build_pages_constrained(Arc::clone(left),runtime.child(0)?,execution.child(0),constraints.clone(),pushdowns.clone()).await?;
-            let right = build_pages_constrained(Arc::clone(right),runtime.child(1)?,execution.child(1),constraints,pushdowns).await?;
+        RelationNode::Join { kind: rtdb_plan::JoinKind::Cross,.. } => {
+            let left = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints.clone(),pushdowns.clone()).await?;
+            let right = build_pages_constrained(runtime.child(1)?,execution.child(1),constraints,pushdowns).await?;
             let pages = Box::new(crate::cross::CrossJoin::new(left,right,Arc::clone(&traced_context)));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -67,9 +68,9 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
         RelationNode::Join { left,right,kind,condition } => {
             let mut constraints = constraints;if let Some(condition) = condition { constraints.require(condition); }
             let build_left = crate::join::build_left(left,right,*kind,&execution)?;
-            let (build_relation,probe_relation,build_index,probe_index) = if build_left { (left,right,0,1) } else { (right,left,1,0) };
-            let build = build_pages_constrained(Arc::clone(build_relation),runtime.child(build_index)?,execution.child(build_index),constraints.clone(),pushdowns.clone()).await?;
-            let probe = DeferredInput { relation: Arc::clone(probe_relation),runtime: runtime.child(probe_index)?,execution: execution.child(probe_index),constraints,pushdowns };
+            let (build_index,probe_index) = if build_left { (0,1) } else { (1,0) };
+            let build = build_pages_constrained(runtime.child(build_index)?,execution.child(build_index),constraints.clone(),pushdowns.clone()).await?;
+            let probe = DeferredInput { runtime: runtime.child(probe_index)?,execution: execution.child(probe_index),constraints,pushdowns };
             let mut layout = crate::join_key::JoinLayout::new(left,right,condition.as_ref(),&execution.context.memory)?;
             layout.resolve_types(runtime.child(0)?.schema(),runtime.child(1)?.schema(),&execution)?;
             let pages = Box::new(crate::join::JoinCursor::new(build,probe,layout,build_left,*kind,execution)?);
@@ -95,42 +96,42 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Project { input,expressions } | RelationNode::Rename { input,expressions,.. } => {
+        RelationNode::Project { expressions,.. } | RelationNode::Rename { expressions,.. } => {
             let pushdowns = pushdowns.map(|filters|filters.project(expressions,&execution.context.memory)).transpose()?;
-            let pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),constraints.through_project(expressions),pushdowns).await?;
+            let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints.through_project(expressions),pushdowns).await?;
             let pages = Box::new(PageProject { input: pages,schema: runtime.child(0)?.schema().clone(),expressions: expressions.clone(),execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Filter { input,predicate } => {
+        RelationNode::Filter { predicate,.. } => {
             let mut constraints = constraints;constraints.add(predicate);
-            let pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
+            let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
             let pages = Box::new(PageFilter { input: pages,schema: runtime.child(0)?.schema().clone(),predicate: predicate.clone(),execution });
             let pages = crate::pages::coalesce(pages,Arc::clone(&traced_context));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Sort { input,order_by } => {
+        RelationNode::Sort { order_by,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
-            let pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
+            let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
             let pages = Box::new(crate::sort::SortCursor::from_pages(pages,runtime.child(0)?.schema().clone(),order_by.clone(),execution));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Limit { input,offset,fetch } => {
+        RelationNode::Limit { offset,fetch,.. } => {
             let offset = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let input = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
+            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
             let pages = Box::new(Limit { input: Some(input),offset,remaining,execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::SortLimit { input,order_by,offset,fetch } => {
+        RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
             let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let mut pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
+            let mut pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
             if !order_by.is_empty() {
                 let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
                 pages = Box::new(crate::sort::SortCursor::with_row_limit(pages,runtime.child(0)?.schema().clone(),order_by.clone(),row_limit,execution.clone()));
@@ -139,18 +140,18 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Distinct { input } => {
-            let input = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
-            let pages = Box::new(Distinct { input,seen: SeenRows::new(&execution.context,runtime.child(0)?)?,execution });
+        RelationNode::Distinct { .. } => {
+            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
+            let pages = Box::new(Distinct { input,seen: SeenRows::new(&execution.context,runtime.child(0)?.output())?,execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Set { left,right,operator,all } => {
-            let left = build_pages_constrained(Arc::clone(left),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns.clone()).await?;
-            let right = build_pages_constrained(Arc::clone(right),runtime.child(1)?,execution.child(1),crate::inspection::Constraints::default(),pushdowns).await?;
+        RelationNode::Set { operator,all,.. } => {
+            let left = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns.clone()).await?;
+            let right = build_pages_constrained(runtime.child(1)?,execution.child(1),crate::inspection::Constraints::default(),pushdowns).await?;
             let pages: BoxPageCursor = if *operator == SetOperator::Union {
                 let input: BoxPageCursor = Box::new(Union { left: Some(left),right });
-                if *all { input } else { Box::new(Distinct { input,seen: SeenRows::new(&execution.context,Arc::clone(&runtime))?,execution }) }
+                if *all { input } else { Box::new(Distinct { input,seen: SeenRows::new(&execution.context,runtime.output())?,execution }) }
             } else { Box::new(SetCursor::new(left,right,*operator,*all,Arc::clone(&runtime),execution)?) };
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -160,29 +161,29 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
             let pages = crate::pages::retain_page_state(pages, state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
         }
-        RelationNode::PageOrdinality { input, .. } => {
-            let input = build_pages_constrained(Arc::clone(input), runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
+        RelationNode::PageOrdinality { .. } => {
+            let input = build_pages_constrained(runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
             let pages = Box::new(crate::list::PageOrdinality::new(input, Arc::clone(&execution.context)));
             let pages = crate::pages::retain_page_state(pages, state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
         }
-        RelationNode::Unnest { input,expr,ordinality,outer,.. } => {
-            let input_pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
+        RelationNode::Unnest { expr,ordinality,outer,.. } => {
+            let input_pages = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
             let pages = Box::new(Unnest { input: input_pages,schema: runtime.child(0)?.schema().clone(),expr: expr.clone(),ordinality: ordinality.is_some(),outer: *outer,execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Apply { input,dependent,arguments,kind,.. } => {
-            let input_pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
-            let pages = Box::new(Apply { input: input_pages,schema: runtime.child(0)?.schema().clone(),dependent: Arc::clone(dependent),dependent_runtime: runtime.child(1)?,arguments: arguments.clone(),kind: *kind,execution });
+        RelationNode::Apply { arguments,kind,.. } => {
+            let input_pages = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
+            let pages = Box::new(Apply { input: input_pages,schema: runtime.child(0)?.schema().clone(),dependent: runtime.child(1)?,arguments: arguments.clone(),kind: *kind,execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Let { binding,body } => {
-            let bound = build_pages_constrained(Arc::clone(&binding.relation),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
+        RelationNode::Let { binding,.. } => {
+            let bound = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
             let scope = crate::materialized::BindingScope::new(Arc::clone(binding),bound,execution.bindings.clone(),Arc::clone(&execution.context))?;
             let mut body_execution = execution.child(1);body_execution.bindings = Some(Arc::clone(&scope));
-            let body = build_pages_constrained(Arc::clone(body),runtime.child(1)?,body_execution,constraints,pushdowns).await?;
+            let body = build_pages_constrained(runtime.child(1)?,body_execution,constraints,pushdowns).await?;
             let pages = Box::new(crate::materialized::LetCursor { body,_binding: scope });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -192,22 +193,22 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Mark { input,dependent,arguments,comparison,.. } => {
+        RelationNode::Mark { arguments,comparison,.. } => {
             let pages = Box::new(crate::mark::Mark::new(
-                DeferredInput { relation: Arc::clone(input),runtime: runtime.child(0)?,execution: execution.child(0),constraints,pushdowns },
-                runtime.child(0)?.schema().clone(),Arc::clone(dependent),runtime.child(1)?,arguments.clone(),comparison.clone(),execution,
+                DeferredInput { runtime: runtime.child(0)?,execution: execution.child(0),constraints,pushdowns },
+                runtime.child(0)?.schema().clone(),runtime.child(1)?,arguments.clone(),comparison.clone(),execution,
             )?);
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Aggregate { input,groups,aggregates } => {
-            let input = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
+        RelationNode::Aggregate { groups,aggregates,.. } => {
+            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
             let pages = Box::new(crate::aggregate::AggregateCursor::new(input,runtime.child(0)?.schema().clone(),groups.clone(),aggregates.clone(),Arc::clone(&runtime),execution)?);
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Window { input,partition_by,order_by,expressions } => {
-            let input = build_pages(Arc::clone(input),runtime.child(0)?,execution.child(0)).await?;
+        RelationNode::Window { partition_by,order_by,expressions,.. } => {
+            let input = build_pages(runtime.child(0)?,execution.child(0)).await?;
             let pages = Box::new(crate::window::WindowCursor::new(input,runtime.child(0)?,partition_by.clone(),order_by.clone(),expressions.clone(),execution));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -340,9 +341,9 @@ pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory
     }
     Ok(true)
 }
-pub(crate) struct SeenRows { writer: SpillWriter, runtime: Arc<RuntimeRelation>, context: Arc<QueryContext> }
+pub(crate) struct SeenRows { writer: SpillWriter, runtime: Arc<RuntimeSchema>, context: Arc<QueryContext> }
 impl SeenRows {
-    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeRelation>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, runtime, context: Arc::clone(context) }) }
+    pub fn new(context: &Arc<QueryContext>, runtime: Arc<RuntimeSchema>) -> Result<Self> { Ok(Self { writer: context.spill.create()?, runtime, context: Arc::clone(context) }) }
     pub fn insert(&mut self, values: &[Value]) -> Result<bool> {
         for field in self.runtime.schema().fields() { rtdb_plan::validate_equality_types(&field.data_type, &field.data_type)?; }
         let mut reader = self.writer.reader(Arc::clone(&self.context.memory))?;
@@ -384,10 +385,10 @@ impl PageCursor for Distinct {
     }
 }
 
-struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, reader: Option<SpillReader>, operator: SetOperator, all: bool, consumed: OrdinalSet, seen: SeenRows, runtime: Arc<RuntimeRelation>, execution: Execution }
+struct SetCursor { left: BoxPageCursor, right: Option<BoxPageCursor>, reader: Option<SpillReader>, operator: SetOperator, all: bool, consumed: OrdinalSet, seen: SeenRows, runtime: Arc<EmittedRelation>, execution: Execution }
 impl SetCursor {
-    fn new(left: BoxPageCursor, right: BoxPageCursor, operator: SetOperator, all: bool, runtime: Arc<RuntimeRelation>, execution: Execution) -> Result<Self> {
-        Ok(Self { left, right: Some(right), reader: None, operator, all, consumed: OrdinalSet::new(&execution.context)?, seen: SeenRows::new(&execution.context, runtime.child(0)?)?, runtime, execution })
+    fn new(left: BoxPageCursor, right: BoxPageCursor, operator: SetOperator, all: bool, runtime: Arc<EmittedRelation>, execution: Execution) -> Result<Self> {
+        Ok(Self { left, right: Some(right), reader: None, operator, all, consumed: OrdinalSet::new(&execution.context)?, seen: SeenRows::new(&execution.context, runtime.child(0)?.output())?, runtime, execution })
     }
 }
 #[async_trait]
@@ -467,13 +468,13 @@ impl PageCursor for Unnest {
     }
 }
 
-struct Apply { input: BoxPageCursor, schema: Schema, dependent: Arc<Relation>, dependent_runtime: Arc<RuntimeRelation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, execution: Execution }
+struct Apply { input: BoxPageCursor, schema: Schema, dependent: Arc<EmittedRelation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind, execution: Execution }
 impl Apply {
     fn document(&self, row: &OwnedRow) -> Value {
-        Value::Struct(self.dependent.schema().fields().iter().zip(&row.values).map(|(field, value)| (field.name.clone(), value.clone())).collect::<BTreeMap<_, _>>())
+        Value::Struct(self.dependent.relation().schema().fields().iter().zip(&row.values).map(|(field, value)| (field.name.clone(), value.clone())).collect::<BTreeMap<_, _>>())
     }
     fn document_bound(&self, row: &OwnedRow) -> Result<usize> {
-        self.dependent.schema().fields().iter().try_fold(row.bytes(), |bytes, field| bytes.checked_add(field.name.len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("row-size", "Apply document allocation overflow")))
+        self.dependent.relation().schema().fields().iter().try_fold(row.bytes(), |bytes, field| bytes.checked_add(field.name.len()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("row-size", "Apply document allocation overflow")))
     }
 }
 #[async_trait]
@@ -486,7 +487,7 @@ impl PageCursor for Apply {
             self.execution.context.check_cancelled()?;
             let row = Arc::new(row);
             let execution = self.execution.bind_arguments(&self.arguments,&self.schema,Arc::clone(&row)).await?;
-            let mut cursor = build(Arc::clone(&self.dependent),Arc::clone(&self.dependent_runtime),execution).await?;
+            let mut cursor = build(Arc::clone(&self.dependent),execution).await?;
             if matches!(self.kind, ApplyKind::Inner | ApplyKind::Left) {
                 let mut matched = false;
                 while let Some(dependent) = cursor.next().await? {
@@ -495,7 +496,7 @@ impl PageCursor for Apply {
                     output.push_growing(OwnedRow::copy_parts(&[&row.values,&dependent.values],0,0,&self.execution.context.memory)?,&self.execution.context.memory)?;
                 }
                 if self.kind == ApplyKind::Left && !matched {
-                    output.push_growing(OwnedRow::copy_parts(&[&row.values],0,self.dependent.schema().len(),&self.execution.context.memory)?,&self.execution.context.memory)?;
+                    output.push_growing(OwnedRow::copy_parts(&[&row.values],0,self.dependent.relation().schema().len(),&self.execution.context.memory)?,&self.execution.context.memory)?;
                 }
                 continue;
             }

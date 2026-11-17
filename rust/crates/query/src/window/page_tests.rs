@@ -5,7 +5,7 @@ use rtdb_plan::{Expr,Field,Relation,RelationNode};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{ScalarType,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
 struct Input { pages: VecDeque<Vec<Vec<Value>>>,memory: Arc<MemoryBudget> }
 #[async_trait]
@@ -26,9 +26,9 @@ fn execution(batch_rows: usize) -> Execution {
 fn schema() -> Schema {
     Schema::new((0..2).map(|id|Field { id: ColumnId(id),name: format!("c{id}"),qualifier: None,qualified_only: false,unnamed: false,data_type: LogicalType::Scalar(ScalarType::I64) }).collect()).unwrap()
 }
-fn runtime(execution: &Execution) -> Arc<crate::runtime_schema::RuntimeRelation> {
+fn runtime(execution: &Execution) -> Arc<crate::runtime_schema::EmittedRelation> {
     let relation = Relation::new(schema(),RelationNode::Values { rows: vec![] }).unwrap();
-    RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap().root()
+    EmittedRelation::derive(Arc::new(relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap()
 }
 fn input(pages: Vec<Vec<Vec<Value>>>,execution: &Execution) -> BoxPageCursor { Box::new(Input { pages: pages.into(),memory: Arc::clone(&execution.context.memory) }) }
 fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
@@ -102,7 +102,7 @@ async fn partition_hash_precedes_cross_unit_timestamp_equality() {
     let ty = first.logical_type().join(&second.logical_type());
     let schema = Schema::new(vec![Field { id: ColumnId(0),name: "x".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: ty }]).unwrap();
     let relation = Relation::new(schema,RelationNode::Values { rows: vec![] }).unwrap();
-    let runtime = RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap().root();
+    let runtime = EmittedRelation::derive(Arc::new(relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
     let mut cursor = PartitionPages { input: input(vec![vec![vec![first],vec![second]]],&execution),positions: vec![0],runtime,keys: execution.context.spill.create().unwrap(),count: 0,execution: execution.clone() };
     let mut page = cursor.next_page().await.unwrap().unwrap();
     assert_eq!(partition_id(&page.next().unwrap().values).unwrap(),0);

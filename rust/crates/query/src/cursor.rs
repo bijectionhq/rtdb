@@ -120,12 +120,12 @@ impl PreparedQuery {
         let types = crate::runtime_schema::parameter_types(&self.relation, &parameters);
         let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
         drop(temporary);
-        let runtime_schema = crate::runtime_schema::RuntimeSchema::derive(&self.relation, &context.catalog, parameters.types(), &context.memory)?;
+        let runtime_schema = crate::runtime_schema::EmittedRelation::derive(Arc::clone(&self.relation), &context.catalog, parameters.types(), &context.memory)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
         let cancellation = context.cancellation.clone();
         let owner = context.owner_cancellation.clone();
-        let mut input = owner.run_until_cancelled(cancellation.run_until_cancelled(crate::operators::build(Arc::clone(&self.relation), runtime_schema.root(), execution))).await.flatten().ok_or_else(cancelled)??;
+        let mut input = owner.run_until_cancelled(cancellation.run_until_cancelled(crate::operators::build(Arc::clone(&runtime_schema), execution))).await.flatten().ok_or_else(cancelled)??;
         let sample = Some(ExecutionSample::new(context.execution_observer.clone(), ExecutionTimer::Query));
         if let (QueryOutput::Analyze(schema), Some(analysis)) = (&self.output, analysis) {
             while let Some(row) = owner.run_until_cancelled(cancellation.run_until_cancelled(input.next())).await.flatten().ok_or_else(cancelled)?? { context.check_cancelled()?; drop(row); }
@@ -139,11 +139,11 @@ impl PreparedQuery {
             return Ok(cursor);
         }
         let trace = crate::trace::CursorTrace::new(&context, "output", "query.cursor.output", true);
-        Ok(QueryCursor { schema: self.relation.schema().clone(), runtime_schema, input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
+        Ok(QueryCursor { schema: self.relation.schema().clone(), runtime_schema: runtime_schema.output(), input: Some(input), context, sample, trace, query_span, plan_reservation: self._plan_reservation.clone() })
     }
 }
 
-pub struct QueryCursor { schema: Schema, runtime_schema: crate::runtime_schema::RuntimeSchema, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
+pub struct QueryCursor { schema: Schema, runtime_schema: Arc<crate::runtime_schema::RuntimeSchema>, input: Option<BoxCursor>, context: Arc<QueryContext>, sample: Option<ExecutionSample>, trace: Option<crate::trace::CursorTrace>, query_span: Option<crate::trace::QueryTrace>, plan_reservation: Option<Arc<MemoryReservation>> }
 impl QueryCursor {
     /// The caller reserves before allocating rows; the reservation must cover their complete retained capacities.
     /// The returned cursor owns the rows and a child cancellation scope; its parent context stays usable after cancellation.

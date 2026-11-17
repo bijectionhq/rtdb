@@ -4,7 +4,7 @@ use rtdb_plan::{BinaryOp,ColumnId,Field};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{LogicalType,ScalarType,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize) -> Execution {
     execution_threshold(batch_rows,100_000)
@@ -30,8 +30,8 @@ fn mark(input: Arc<Relation>,dependent: Arc<Relation>,comparison: Expr,correlate
     Arc::new(Relation::new(schema,RelationNode::Mark { input,dependent,arguments: if correlated { vec![(0,column(0))] } else { vec![] },comparison,output }).unwrap())
 }
 async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
-    let runtime = RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    build_pages(relation,runtime.root(),execution.clone()).await.unwrap()
+    let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
+    build_pages(Arc::clone(&runtime),execution.clone()).await.unwrap()
 }
 fn inverse_equals_one(column: Expr) -> Expr { Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,literal(1),column),literal(1)) }
 

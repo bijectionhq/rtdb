@@ -5,7 +5,7 @@ use rtdb_plan::{BinaryOp,ColumnId,Expr,Field,Relation,RelationNode};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{Anomaly,TimeUnit,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
 struct Input { pages: VecDeque<Vec<Vec<Value>>>,fail_after: Option<usize>,polls: Arc<AtomicUsize>,memory: Arc<MemoryBudget> }
 #[async_trait]
@@ -43,7 +43,7 @@ fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,group
     let input = Arc::new(Relation::new(schema.clone(),RelationNode::Values { rows: vec![] }).unwrap());
     let output = Schema::new(groups.iter().map(|group|group.field.clone()).chain(aggregates.iter().map(|aggregate|aggregate.field.clone())).collect()).unwrap();
     let relation = Relation::new(output,RelationNode::Aggregate { input,groups: groups.clone(),aggregates: aggregates.clone() }).unwrap();
-    let runtime = RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap().root();
+    let runtime = EmittedRelation::derive(Arc::new(relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
     let polls = Arc::new(AtomicUsize::new(0));
     let input = Box::new(Input { pages: pages.into(),fail_after,polls: Arc::clone(&polls),memory: Arc::clone(&execution.context.memory) });
     (AggregateCursor::new(input,schema,groups,aggregates,runtime,execution.clone()).unwrap(),polls)

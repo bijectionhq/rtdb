@@ -34,49 +34,52 @@ pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value])
     declarations.into_iter().zip(values).map(|(declared, value)| declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())).collect()
 }
 
-pub(crate) struct RuntimeSchema { root: Arc<RuntimeRelation> }
+pub(crate) struct RuntimeSchema { schema: Schema, _reservation: Arc<MemoryReservation> }
 
-pub(crate) struct RuntimeRelation {
-    schema: Schema,
-    node: RuntimeNode,
-    _reservation: Arc<MemoryReservation>,
+pub(crate) struct EmittedRelation {
+    relation: Arc<Relation>,
+    output: Arc<RuntimeSchema>,
+    node: EmittedNode,
 }
 
-enum RuntimeNode {
+enum EmittedNode {
     Leaf,
-    Unary(Arc<RuntimeRelation>),
-    Binary(Arc<RuntimeRelation>, Arc<RuntimeRelation>),
-    Aggregate { input: Arc<RuntimeRelation>, types: Vec<crate::aggregate::AggregateTypes> },
+    Unary(Arc<EmittedRelation>),
+    Binary(Arc<EmittedRelation>, Arc<EmittedRelation>),
+    Aggregate { input: Arc<EmittedRelation>, types: Vec<crate::aggregate::AggregateTypes> },
 }
 
-impl RuntimeRelation {
-    pub fn schema(&self) -> &Schema { &self.schema }
+impl EmittedRelation {
+    pub fn schema(&self) -> &Schema { self.output.schema() }
+    pub fn output(&self) -> Arc<RuntimeSchema> { Arc::clone(&self.output) }
+    pub fn relation(&self) -> &Arc<Relation> { &self.relation }
     pub fn child(&self, index: usize) -> Result<Arc<Self>> {
         match (&self.node, index) {
-            (RuntimeNode::Unary(input) | RuntimeNode::Aggregate { input, .. } | RuntimeNode::Binary(input, _), 0) => Ok(Arc::clone(input)),
-            (RuntimeNode::Binary(_, right), 1) => Ok(Arc::clone(right)),
+            (EmittedNode::Unary(input) | EmittedNode::Aggregate { input, .. } | EmittedNode::Binary(input, _), 0) => Ok(Arc::clone(input)),
+            (EmittedNode::Binary(_, right), 1) => Ok(Arc::clone(right)),
             _ => Err(invalid("runtime-plan", "Runtime relation child is absent")),
         }
     }
     pub fn aggregates(&self) -> Result<&[crate::aggregate::AggregateTypes]> {
-        match &self.node { RuntimeNode::Aggregate { types, .. } => Ok(types), _ => Err(invalid("runtime-plan", "Runtime relation is not an aggregate")) }
+        match &self.node { EmittedNode::Aggregate { types, .. } => Ok(types), _ => Err(invalid("runtime-plan", "Runtime relation is not an aggregate")) }
+    }
+}
+
+impl EmittedRelation {
+    pub fn derive(relation: Arc<Relation>, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let bound = parameters.iter().try_fold(allocation_bound(&relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 32)?, 512)?))?;
+        let reservation = memory.reserve(bound)?;
+        let parameters = parameters.iter().enumerate().map(|(index, ty)| (index, ty.clone())).collect();
+        relation_types(&relation, catalog, &parameters, &[], &reservation)
     }
 }
 
 impl RuntimeSchema {
-    pub fn derive(relation: &Relation, catalog: &CatalogSnapshot, parameters: &[L], memory: &Arc<MemoryBudget>) -> Result<Self> {
-        let bound = parameters.iter().try_fold(allocation_bound(relation)?, |bytes, ty| add(bytes, add(multiply(ty.retained_bytes()?, 32)?, 512)?))?;
-        let reservation = memory.reserve(bound)?;
-        let parameters = parameters.iter().enumerate().map(|(index, ty)| (index, ty.clone())).collect();
-        let root = relation_types(relation, catalog, &parameters, &[], &reservation)?;
-        Ok(Self { root })
-    }
-    pub fn fixed(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub fn fixed(schema: &Schema, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(schema_bound(schema)?)?;
-        Ok(Self { root: Arc::new(RuntimeRelation { schema: schema.clone(), node: RuntimeNode::Leaf, _reservation: reservation }) })
+        Ok(Arc::new(Self { schema: schema.clone(), _reservation: reservation }))
     }
-    pub fn schema(&self) -> &Schema { self.root.schema() }
-    pub fn root(&self) -> Arc<RuntimeRelation> { Arc::clone(&self.root) }
+    pub fn schema(&self) -> &Schema { &self.schema }
 }
 
 fn add(left: usize, right: usize) -> Result<usize> { left.checked_add(right).ok_or_else(|| invalid("runtime-schema-size", "Runtime schema allocation exceeds addressable memory")) }
@@ -179,10 +182,10 @@ pub(crate) fn allocation_bound(relation: &Relation) -> Result<usize> {
 }
 
 fn field_type(field: &Field, data_type: L) -> Field { let mut field = field.clone(); field.data_type = data_type; field }
-fn relation_types(relation: &Relation, catalog: &CatalogSnapshot, parameters: &BTreeMap<usize, L>, outer: &[Schema], reservation: &Arc<MemoryReservation>) -> Result<Arc<RuntimeRelation>> {
+fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameters: &BTreeMap<usize, L>, outer: &[Schema], reservation: &Arc<MemoryReservation>) -> Result<Arc<EmittedRelation>> {
     let mut children = Vec::new();
     let mut aggregates = Vec::new();
-    let mut child = |input: &Relation| {
+    let mut child = |input: &Arc<Relation>| {
         let runtime = relation_types(input, catalog, parameters, outer, reservation)?;
         let schema = runtime.schema().clone();
         children.push(runtime);
@@ -325,14 +328,14 @@ fn relation_types(relation: &Relation, catalog: &CatalogSnapshot, parameters: &B
         }
     };
     let node = match (relation.node(), children.as_slice()) {
-        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => RuntimeNode::Leaf,
-        (RelationNode::Aggregate { .. }, [input]) => RuntimeNode::Aggregate { input: Arc::clone(input), types: aggregates },
-        (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => RuntimeNode::Binary(Arc::clone(left), Arc::clone(right)),
+        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
+        (RelationNode::Aggregate { .. }, [input]) => EmittedNode::Aggregate { input: Arc::clone(input), types: aggregates },
+        (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => EmittedNode::Binary(Arc::clone(left), Arc::clone(right)),
         (RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
-            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => RuntimeNode::Unary(Arc::clone(input)),
+            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => EmittedNode::Unary(Arc::clone(input)),
         _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
     };
-    Ok(Arc::new(RuntimeRelation { schema, node, _reservation: Arc::clone(reservation) }))
+    Ok(Arc::new(EmittedRelation { relation: Arc::clone(relation), output: Arc::new(RuntimeSchema { schema, _reservation: Arc::clone(reservation) }), node }))
 }
 
 fn coalesce_type(args: &[Expr],input: &Schema,parameters: &BTreeMap<usize,L>,outer: &[Schema]) -> Result<L> {

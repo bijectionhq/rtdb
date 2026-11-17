@@ -1,16 +1,18 @@
 use std::sync::Arc;
 use async_trait::async_trait;
-use rtdb_plan::{BinaryOp,Expr,Relation,Schema};
+use rtdb_plan::{BinaryOp,Expr,Schema};
+#[cfg(test)]
+use rtdb_plan::Relation;
 use rtdb_types::{LogicalType,Result,Value};
-use crate::{context::Execution,cursor::OwnedRow,invalid,operators::{DeferredInput,build_pages},pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor},runtime_schema::RuntimeRelation,join_storage::{BuildAccumulator,BuildInput,BuildTable,HashedPage,PartitionSpool,hash_values}};
+use crate::{context::Execution,cursor::OwnedRow,invalid,operators::{DeferredInput,build_pages},pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor},runtime_schema::EmittedRelation,join_storage::{BuildAccumulator,BuildInput,BuildTable,HashedPage,PartitionSpool,hash_values}};
 
 enum State {
-    Build { probe: DeferredInput,relation: Arc<Relation>,runtime: Arc<RuntimeRelation> },
+    Build { probe: DeferredInput,runtime: Arc<EmittedRelation> },
     Memory { probe: BoxPageCursor,table: BuildTable,facts: CandidateFacts,_build: BoxPageCursor },
     EveryRowDisk { probe: BoxPageCursor,build: PartitionSpool,_build: BoxPageCursor },
     KeyedDisk { probe: PartitionSpool,build: PartitionSpool,facts: CandidateFacts,table: Option<BuildTable>,build_part: usize,probe_part: usize,_build_cursor: BoxPageCursor,_probe_cursor: BoxPageCursor },
-    CorrelatedUnopened { input: DeferredInput,relation: Arc<Relation>,runtime: Arc<RuntimeRelation>,arguments: Vec<(usize,Expr)> },
-    Correlated { input: BoxPageCursor,relation: Arc<Relation>,runtime: Arc<RuntimeRelation>,arguments: Vec<(usize,Expr)> },
+    CorrelatedUnopened { input: DeferredInput,runtime: Arc<EmittedRelation>,arguments: Vec<(usize,Expr)> },
+    Correlated { input: BoxPageCursor,runtime: Arc<EmittedRelation>,arguments: Vec<(usize,Expr)> },
     Done,
 }
 #[derive(Clone,Copy)]
@@ -29,11 +31,11 @@ impl CandidateFacts {
 struct MarkPlan { input_schema: Schema,comparison_schema: Schema,comparison: Expr,probe_key: Option<usize>,execution: Execution }
 pub(crate) struct Mark { state: State,plan: MarkPlan }
 impl Mark {
-    pub fn new(input: DeferredInput,input_schema: Schema,dependent: Arc<Relation>,runtime: Arc<RuntimeRelation>,arguments: Vec<(usize,Expr)>,comparison: Expr,execution: Execution) -> Result<Self> {
+    pub fn new(input: DeferredInput,input_schema: Schema,runtime: Arc<EmittedRelation>,arguments: Vec<(usize,Expr)>,comparison: Expr,execution: Execution) -> Result<Self> {
         let comparison_schema = input_schema.concat(runtime.schema())?;
         let probe_key = probe_key(&input_schema,runtime.schema(),&comparison);
-        let state = if arguments.is_empty() { State::Build { probe: input,relation: dependent,runtime } }
-            else { State::CorrelatedUnopened { input,relation: dependent,runtime,arguments } };
+        let state = if arguments.is_empty() { State::Build { probe: input,runtime } }
+            else { State::CorrelatedUnopened { input,runtime,arguments } };
         Ok(Self { state,plan: MarkPlan { input_schema,comparison_schema,comparison,probe_key,execution } })
     }
 }
@@ -117,8 +119,8 @@ impl PageCursor for Mark {
         loop {
             plan.execution.context.check_cancelled()?;
             match std::mem::replace(&mut self.state,State::Done) {
-                State::Build { probe,relation,runtime } => {
-                    let mut input = build_pages(relation,Arc::clone(&runtime),plan.execution.child(1)).await?;
+                State::Build { probe,runtime } => {
+                    let mut input = build_pages(Arc::clone(&runtime),plan.execution.child(1)).await?;
                     let mut accumulator = BuildAccumulator::new(plan.execution.context.options.join_build_rows,Arc::clone(&plan.execution.context))?;
                     let mut facts = CandidateFacts { empty: true,null: false,nested: false };
                     while let Some(page) = input.next_page().await? { facts.add(&page,runtime.schema());accumulator.append(page)?; }
@@ -171,20 +173,20 @@ impl PageCursor for Mark {
                     self.state = State::KeyedDisk { probe,build,facts,table,build_part,probe_part,_build_cursor,_probe_cursor };
                     if output.len() > 0 { return Ok(Some(output)); }
                 }
-                State::CorrelatedUnopened { input,relation,runtime,arguments } => {
-                    self.state = State::Correlated { input: input.open_pages(None).await?,relation,runtime,arguments };
+                State::CorrelatedUnopened { input,runtime,arguments } => {
+                    self.state = State::Correlated { input: input.open_pages(None).await?,runtime,arguments };
                 }
-                State::Correlated { mut input,relation,runtime,arguments } => {
+                State::Correlated { mut input,runtime,arguments } => {
                     let Some(mut page) = input.next_page().await? else { return Ok(None); };
                     let mut output = PageBuilder::new(page.len(),&plan.execution.context.memory)?;
                     while let Some(row) = page.next() {
                         let row = Arc::new(row);
                         let execution = plan.execution.bind_arguments(&arguments,&plan.input_schema,Arc::clone(&row)).await?;
-                        let dependent = build_pages(Arc::clone(&relation),Arc::clone(&runtime),execution.clone()).await?;
+                        let dependent = build_pages(Arc::clone(&runtime),execution.clone()).await?;
                         let result = correlated_mark(&row,dependent,&plan.comparison,&plan.comparison_schema,&execution).await?;
                         output.push(OwnedRow::copy_parts(&[&row.values,&[result]],0,0,&plan.execution.context.memory)?)?;
                     }
-                    self.state = State::Correlated { input,relation,runtime,arguments };
+                    self.state = State::Correlated { input,runtime,arguments };
                     return Ok(Some(output.finish()));
                 }
                 State::Done => return Ok(None),
@@ -251,17 +253,17 @@ mod facts_tests {
         use rtdb_storage::{MemoryStore,cache::BufferPool};
         use rtdb_types::{ScalarType,Timestamp};
         use tokio_util::sync::CancellationToken;
-        use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+        use crate::{CatalogSnapshot,DatabaseSnapshot,QueryContext,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
         let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
         let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
         let context = QueryContext::new(catalog,MemoryBudget::new(1 << 25),Timestamp(0),"UTC",QueryOptions::default(),&CancellationToken::new()).unwrap();
         let execution = Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context: Arc::clone(&context),bindings: None,analysis: None };
         let field = Field { id: ColumnId(1),name: "v".into(),qualifier: None,qualified_only: false,unnamed: false,data_type: LogicalType::Scalar(ScalarType::I64) };
         let relation = Arc::new(Relation::new(Schema::new(vec![field]).unwrap(),rtdb_plan::RelationNode::Values { rows: vec![vec![Expr::binary(BinaryOp::Divide,Expr::Literal(Value::I64(1)),Expr::Literal(Value::I64(0)))]] }).unwrap());
-        let runtime = RuntimeSchema::derive(&relation,&context.catalog,execution.parameters.types(),&context.memory).unwrap();
+        let runtime = EmittedRelation::derive(Arc::clone(&relation),&context.catalog,execution.parameters.types(),&context.memory).unwrap();
         let mut cursor = Mark {
-            state: State::Correlated { input: Box::new(EmptyCallback { remaining: true,memory: Arc::clone(&context.memory) }),relation,runtime: runtime.root(),arguments: vec![] },
-            plan: MarkPlan { input_schema: Schema::default(),comparison_schema: runtime.root().schema().clone(),comparison: Expr::Literal(Value::Bool(true)),probe_key: None,execution },
+            state: State::Correlated { input: Box::new(EmptyCallback { remaining: true,memory: Arc::clone(&context.memory) }),runtime: Arc::clone(&runtime),arguments: vec![] },
+            plan: MarkPlan { input_schema: Schema::default(),comparison_schema: runtime.schema().clone(),comparison: Expr::Literal(Value::Bool(true)),probe_key: None,execution },
         };
         assert_eq!(cursor.next_page().await.unwrap().unwrap().len(),0);
         assert!(cursor.next_page().await.unwrap().is_none());

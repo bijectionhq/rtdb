@@ -5,11 +5,11 @@ use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use crate::{context::Execution, cursor::OwnedRow, invalid, operators::rows_equal, pages::{BoxPageCursor,OwnedPage,PageBuilder,PageCursor}, sort::SortCursor, spill::SpillWriter};
 
 pub(crate) struct WindowCursor {
-    input: Option<BoxPageCursor>, runtime: Arc<crate::runtime_schema::RuntimeRelation>, schema: Schema, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution,
+    input: Option<BoxPageCursor>, runtime: Arc<crate::runtime_schema::EmittedRelation>, schema: Schema, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution,
 }
 
 impl WindowCursor {
-    pub fn new(input: BoxPageCursor, runtime: Arc<crate::runtime_schema::RuntimeRelation>, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution) -> Self {
+    pub fn new(input: BoxPageCursor, runtime: Arc<crate::runtime_schema::EmittedRelation>, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr>, execution: Execution) -> Self {
         Self { input: Some(input), schema: runtime.schema().clone(), runtime, partition_by, order_by, expressions, execution }
     }
 
@@ -75,7 +75,7 @@ impl PageCursor for WindowCursor {
     }
 }
 
-struct PartitionPages { input: BoxPageCursor, positions: Vec<usize>, runtime: Arc<crate::runtime_schema::RuntimeRelation>, keys: SpillWriter, count: u64, execution: Execution }
+struct PartitionPages { input: BoxPageCursor, positions: Vec<usize>, runtime: Arc<crate::runtime_schema::EmittedRelation>, keys: SpillWriter, count: u64, execution: Execution }
 #[async_trait]
 impl PageCursor for PartitionPages {
     async fn next_page(&mut self) -> Result<Option<OwnedPage>> {

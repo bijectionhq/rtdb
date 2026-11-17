@@ -4,7 +4,7 @@ use rtdb_plan::{BinaryOp,ColumnId,Field,JoinKind,RegexForm,RegexReplacement};
 use rtdb_storage::{MemoryStore,cache::BufferPool};
 use rtdb_types::{LogicalType,ScalarType,Timestamp};
 use tokio_util::sync::CancellationToken;
-use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::RuntimeSchema};
+use crate::{CatalogSnapshot,DatabaseSnapshot,QueryOptions,context::OuterRows,parameters::BoundParameters,runtime_schema::EmittedRelation};
 
 fn execution(batch_rows: usize,threshold: i64) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
@@ -33,8 +33,8 @@ fn join(left: Arc<Relation>,right: Arc<Relation>,kind: JoinKind,condition: Optio
 }
 fn equal(left: &Relation,right: &Relation) -> Expr { Expr::binary(BinaryOp::Eq,left.schema().fields()[0].expression(),right.schema().fields()[0].expression()) }
 async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
-    let runtime = RuntimeSchema::derive(&relation,&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
-    build_pages(relation,runtime.root(),execution.clone()).await.unwrap()
+    let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
+    build_pages(Arc::clone(&runtime),execution.clone()).await.unwrap()
 }
 fn rows(page: OwnedPage) -> Vec<Vec<Value>> { page.rows().iter().map(|row|row.values.clone()).collect() }
 async fn collect(mut cursor: BoxPageCursor) -> Vec<Vec<Vec<Value>>> {
