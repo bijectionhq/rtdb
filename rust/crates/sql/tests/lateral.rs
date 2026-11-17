@@ -18,6 +18,14 @@ fn context() -> Arc<QueryContext> {
         ("y", vec![vec![("_id", Value::I64(1)), ("b", Value::Utf8("one".into()))]]),
         ("nested_table", vec![vec![("_id", Value::I64(1)), ("nest", Value::List(vec![Value::I64(1), Value::I64(2), Value::I64(3)]))]]),
         ("other_table", (1..=3).map(|id| vec![("_id", Value::I64(id))]).collect()),
+        ("actors", [
+            ("bob", "Bob", vec!["The Great Escape", "Bob the Builder", "Bob the Builder Electric Boogaloo"]),
+            ("steve", "Steve", vec!["Hot Fuzz", "Shaun of the Dead"]),
+        ].into_iter().map(|(id, name, films)| vec![
+            ("_id", Value::Utf8(id.into())), ("name", Value::Utf8(name.into())),
+            ("films", Value::List(films.into_iter().map(|film| Value::Utf8(film.into())).collect())),
+        ]).collect()),
+        ("docs", vec![vec![("_id", Value::I64(1)), ("xs", Value::List(vec![Value::I64(2)])), ("ys", Value::List(vec![Value::I64(3)]))]]),
     ] {
         for row in rows { transaction.put(TableRef::new("public", table), row.into_iter().map(|(name, value)| (name.into(), value)).collect(), Interval::ALL).unwrap(); }
     }
@@ -162,4 +170,123 @@ fn recursive_ctes_retain_the_reference_unsupported_anomaly() {
         assert_eq!(error.code, "xtdb.sql/recursive-ctes");
         assert_eq!(error.message.as_deref(), Some("Recursive CTEs are not supported yet"));
     }
+}
+
+#[tokio::test]
+async fn unnest_ordinal_width_follows_the_bound_table_and_cross_apply_shapes() {
+    let cases = [
+        (
+            "SELECT v,n FROM UNNEST(ARRAY[1,2]) WITH ORDINALITY AS u(v,n)",
+            vec![vec![Value::I64(1),Value::I64(1)],vec![Value::I64(2),Value::I64(2)]],
+            rtdb_types::ScalarType::I64,
+        ),
+        (
+            "SELECT k,v,n FROM (VALUES (1),(2)) AS t(k) CROSS JOIN UNNEST(ARRAY[1,2]) WITH ORDINALITY AS u(v,n)",
+            vec![vec![Value::I64(1),Value::I64(1),Value::I64(1)],vec![Value::I64(1),Value::I64(2),Value::I64(2)],
+                 vec![Value::I64(2),Value::I64(1),Value::I64(1)],vec![Value::I64(2),Value::I64(2),Value::I64(2)]],
+            rtdb_types::ScalarType::I64,
+        ),
+        (
+            "SELECT k,v,n FROM (VALUES (1),(2)) AS t(k) CROSS JOIN UNNEST(ARRAY[k,k+1]) WITH ORDINALITY AS u(v,n)",
+            vec![vec![Value::I64(1),Value::I64(1),Value::I32(1)],vec![Value::I64(1),Value::I64(2),Value::I32(2)],
+                 vec![Value::I64(2),Value::I64(2),Value::I32(1)],vec![Value::I64(2),Value::I64(3),Value::I32(2)]],
+            rtdb_types::ScalarType::I32,
+        ),
+        (
+            "SELECT k,v,n FROM (VALUES (1),(2)) AS t(k), LATERAL (SELECT v,n FROM UNNEST(ARRAY[t.k]) WITH ORDINALITY AS u(v,n)) AS u",
+            vec![vec![Value::I64(1),Value::I64(1),Value::I64(1)],vec![Value::I64(2),Value::I64(2),Value::I64(1)]],
+            rtdb_types::ScalarType::I64,
+        ),
+    ];
+    let context = context();
+    for (sql, expected, ordinal) in cases {
+        let prepared = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap();
+        let query_plan = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+        let expected_type = rtdb_types::LogicalType::Scalar(ordinal);
+        assert_eq!(query_plan.schema().fields().last().unwrap().data_type, expected_type, "{sql}");
+        let mut cursor = query_plan.execute(Arc::clone(&context), vec![]).await.unwrap();
+        assert_eq!(cursor.runtime_schema().fields().last().unwrap().data_type, expected_type, "{sql}");
+        let mut actual = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            for row in 0..batch.batch().num_rows() {
+                actual.push(batch.batch().schema().fields().iter().zip(batch.batch().columns())
+                    .map(|(field, column)| read_value(field, column.as_ref(), row).unwrap()).collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(actual, expected, "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn captured_unnest_reads_a_staged_column_and_preserves_external_parameter_ids() {
+    let sql = "SELECT v, n FROM (VALUES (?)) AS t(k), UNNEST(ARRAY[k, k+?]) WITH ORDINALITY AS u(v,n)";
+    let context = context();
+    let value_type = Value::I64(0).logical_type();
+    let options = PrepareOptions { parameter_types: BTreeMap::from([(0, value_type.clone()), (1, value_type)]), ..Default::default() };
+    let prepared = prepare(sql, &context.catalog, &options).unwrap();
+    assert_eq!(prepared.parameter_types.len(), 2);
+    let Statement::Query(relation) = prepared.statement else { panic!("Expected query") };
+    assert_eq!(relation.parameter_count(), 2);
+    fn unnest(relation: &Relation) -> Option<&RelationNode> {
+        if matches!(relation.node(), RelationNode::Unnest { .. }) { return Some(relation.node()); }
+        relation.children().into_iter().find_map(|child| unnest(child))
+    }
+    let Some(RelationNode::Unnest { input, expr, .. }) = unnest(&relation) else { panic!("Expected staged UNNEST") };
+    let RelationNode::Extend { expressions, .. } = input.node() else { panic!("Expected column extension") };
+    assert_eq!(expressions.len(), 1);
+    assert_eq!(expr, &expressions[0].field.expression());
+    assert_eq!(expressions[0].expr.parameter_count(), 2);
+    assert_eq!(expressions[0].expr.referenced_columns().len(), 1);
+    assert_eq!(query(sql, vec![Value::I64(2), Value::I64(10)]).await.unwrap(), [vec![Value::I64(2),Value::I32(1)],vec![Value::I64(12),Value::I32(2)]]);
+}
+
+#[tokio::test]
+async fn unnest_completes_its_reference_materialization_boundary_before_limit() {
+    let context = context();
+    let baseline = context.memory.used_bytes();
+    let standalone = "SELECT v FROM UNNEST(ARRAY[1,1/0]) AS u(v) LIMIT 1";
+    let captured = "SELECT v FROM (VALUES (1),(0)) AS t(k),UNNEST(ARRAY[1/k]) AS u(v) LIMIT 1";
+    let prepare_query = |sql| PreparedQuery::from_prepared(prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap(), &context.memory).unwrap();
+    let query_plan = prepare_query(standalone);
+    assert!(query_plan.execute(Arc::clone(&context), vec![]).await.is_err());
+    drop(query_plan);
+    assert_eq!(context.memory.used_bytes(), baseline);
+    let query_plan = prepare_query(captured);
+    let mut cursor = query_plan.execute(Arc::clone(&context), vec![]).await.unwrap();
+    assert_eq!(cursor.next_batch().await.unwrap_err().code, "xtdb.expression/division-by-zero");
+    drop(cursor);
+    drop(query_plan);
+    assert_eq!(context.memory.used_bytes(), baseline);
+    assert!(query("SELECT v FROM (SELECT 1 AS k WHERE FALSE) AS t, UNNEST(ARRAY[k/0]) AS u(v)", vec![]).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn actor_unnest_preserves_both_original_runtime_assertions() {
+    let expected = [
+        ("Bob", "The Great Escape", 1),
+        ("Bob", "Bob the Builder", 2),
+        ("Bob", "Bob the Builder Electric Boogaloo", 3),
+        ("Steve", "Hot Fuzz", 1),
+        ("Steve", "Shaun of the Dead", 2),
+    ];
+    assert_eq!(query("SELECT name, film FROM actors, UNNEST(films) AS films(film)", vec![]).await.unwrap(),
+        expected.map(|(name, film, _)| vec![Value::Utf8(name.into()), Value::Utf8(film.into())]));
+    assert_eq!(query("SELECT name, film, ord FROM actors, UNNEST(films) WITH ORDINALITY AS films(film, ord)", vec![]).await.unwrap(),
+        expected.map(|(name, film, ord)| vec![Value::Utf8(name.into()), Value::Utf8(film.into()), Value::I32(ord)]));
+}
+
+#[test]
+fn multiple_unnests_unnest_distinct_columns() {
+    let context = context();
+    let sql = "SELECT a.x, b.y FROM docs d, UNNEST(d.xs) AS a(x), UNNEST(d.ys) AS b(y)";
+    let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("Expected query") };
+    fn staged_ids(relation: &Relation, ids: &mut std::collections::BTreeSet<rtdb_plan::ColumnId>) {
+        if let RelationNode::Unnest { expr: rtdb_plan::Expr::Column { id, .. }, .. } = relation.node() {
+            ids.insert(*id);
+        }
+        for child in relation.children() { staged_ids(child, ids); }
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    staged_ids(&relation, &mut ids);
+    assert_eq!(ids.len(), 2);
 }

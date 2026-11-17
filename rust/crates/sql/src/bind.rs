@@ -322,9 +322,11 @@ impl Context<'_> {
         for (index, table) in select.from.iter().enumerate() {
             let (right, arguments) = if index == 0 { (self.joined_table(table, self.outer_scopes.len())?, Vec::new()) }
                 else { self.from_scope(input.schema().clone(), |context, start| context.joined_table(table, start))? };
-            input = if !arguments.is_empty() { apply_join(input, right, ApplyKind::Inner, arguments)? }
-                else if input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) { right }
-                else { join(input, right, JoinKind::Cross, None)? };
+            input = if arguments.is_empty() && input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) {
+                right
+            } else {
+                self.cross_join_from(input, right, arguments)?
+            };
         }
         if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
@@ -511,10 +513,69 @@ impl Context<'_> {
                 Some(ast::JoinConstraint::None) | None => None,
                 _ => return Err(error("Named join constraint was not lowered")),
             };
-            left = if arguments.is_empty() { join(left, right, kind, condition)? }
-                else { apply_join(left, right, if kind == JoinKind::Left { ApplyKind::Left } else { ApplyKind::Inner }, arguments)? };
+            left = if kind == JoinKind::Cross {
+                self.cross_join_from(left, right, arguments)?
+            } else if arguments.is_empty() {
+                join(left, right, kind, condition)?
+            } else {
+                apply_join(left, right, if kind == JoinKind::Left { ApplyKind::Left } else { ApplyKind::Inner }, arguments)?
+            };
         }
         Ok(left)
+    }
+
+    fn cross_join_from(&mut self, input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>) -> Result<Arc<Relation>> {
+        if arguments.is_empty() {
+            return join(input, dependent, JoinKind::Cross, None);
+        }
+        if let Some(lowered) = self.lower_column_table_apply(&input, &dependent, &arguments)? {
+            return Ok(lowered);
+        }
+        apply_join(input, dependent, ApplyKind::Inner, arguments)
+    }
+
+    fn lower_column_table_apply(&mut self, input: &Arc<Relation>, dependent: &Arc<Relation>, arguments: &[(usize, Expr)]) -> Result<Option<Arc<Relation>>> {
+        let table = match dependent.node() {
+            RelationNode::Rename { input, expressions, .. }
+                if expressions.len() == input.schema().len()
+                    && expressions.iter().zip(input.schema().fields()).all(|(named, field)| named.expr == field.expression()) => input.as_ref(),
+            _ => dependent.as_ref(),
+        };
+        let table = match table.node() {
+            RelationNode::PageOrdinality { input, .. } => input.as_ref(),
+            _ => table,
+        };
+        let RelationNode::ColumnTable { expr, .. } = table.node() else { return Ok(None); };
+        let mut collection = expr.clone();
+        let bindings = arguments.iter().map(|(index, expr)| (*index, expr)).collect::<BTreeMap<_, _>>();
+        let mut captured = false;
+        collection.rewrite(&mut |expr| {
+            if let Expr::Parameter { index, .. } = expr {
+                if let Some(&replacement) = bindings.get(index) {
+                    *expr = replacement.clone();
+                    captured = true;
+                }
+            }
+        });
+        if !captured {
+            return Ok(Some(join(Arc::clone(input), Arc::clone(dependent), JoinKind::Cross, None)?));
+        }
+
+        let name = self.symbol("_unnest_input")?;
+        let staged_field = self.binder.field(name, None, collection.data_type())?;
+        let staged = Arc::new(Arc::clone(input).extend(vec![NamedExpr { field: staged_field.clone(), expr: collection }])?);
+        let element = dependent.schema().fields()[0].clone();
+        let ordinal = dependent.schema().fields().get(1).cloned().map(|mut field| {
+            field.data_type = LogicalType::Scalar(ScalarType::I32);
+            field
+        });
+        let projection = input.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinal.iter().cloned())
+            .map(|field| NamedExpr { expr: field.expression(), field }).collect();
+        let schema = Schema::new(staged.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinal.iter().cloned()).collect())?;
+        let expanded = Arc::new(Relation::new(schema, RelationNode::Unnest {
+            input: staged, expr: staged_field.expression(), element, ordinality: ordinal, outer: false,
+        })?);
+        Ok(Some(Arc::new(expanded.project(projection)?)))
     }
 
     fn table_for(&mut self, table: &ast::TableFactor, purpose: TablePurpose, lateral_start: usize) -> Result<Arc<Relation>> {
@@ -642,16 +703,20 @@ impl Context<'_> {
         element.unnamed = true;
         let ordinality = if with_ordinality {
             let name = self.symbol("_ordinal")?;
-            let mut field = self.binder.field(name, None, LogicalType::Scalar(if kind == ListTableKind::Series { ScalarType::I64 } else { ScalarType::I32 }))?;
+            let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I64))?;
             field.unnamed = true;
             Some(field)
         } else { None };
         let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
-        let relation = if kind == ListTableKind::Series {
-            let input = Arc::new(Relation::new(Schema::new(vec![element.clone()])?, RelationNode::List { expr, element })?);
-            if let Some(field) = ordinality { Arc::new(Relation::new(schema, RelationNode::PageOrdinality { input, field })?) } else { input }
-        } else {
-            Arc::new(Relation::new(schema, RelationNode::Unnest { input: Arc::new(Relation::unit()), expr, element, ordinality, outer: false })?)
+        let element_schema = Schema::new(vec![element.clone()])?;
+        let node = match kind {
+            ListTableKind::Series => RelationNode::List { expr, element },
+            ListTableKind::Unnest => RelationNode::ColumnTable { expr, element },
+        };
+        let input = Arc::new(Relation::new(element_schema, node)?);
+        let relation = match ordinality {
+            Some(field) => Arc::new(Relation::new(schema, RelationNode::PageOrdinality { input, field })?),
+            None => input,
         };
         self.alias(relation, alias)
     }
