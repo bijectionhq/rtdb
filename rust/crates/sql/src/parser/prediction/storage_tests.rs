@@ -233,16 +233,18 @@ fn retained_access_rejects_foreign_graph_states_before_storage_admission() {
     let foreign = other.view();
     let work_memory = MemoryBudget::new(1 << 20);
     let work = AllocationScope::new(&work_memory).unwrap();
-    storage.with_contexts(&work, |contexts| {
+    {
+        let grammar = storage.grammar.view();
+        let mut contexts = PredictionContexts::borrowed(&grammar, &work, &mut storage.contexts);
         let empty = contexts.empty();
-        let same = contexts.grammar().state(1)?;
+        let same = contexts.grammar().state(1).unwrap();
         assert!(same.belongs_to(contexts.grammar()));
         assert_eq!(contexts.view(empty).shape(), ContextShape::Empty);
-        assert!(matches!(contexts.singleton(empty, foreign.state(3000)?), Err(PredictionError::ForeignOwner)));
+        assert!(matches!(contexts.singleton(empty, foreign.state(3000).unwrap()), Err(PredictionError::ForeignOwner)));
         assert_eq!(memory.used_bytes(), 0);
         assert!(matches!(contexts.singleton(empty, same), Err(PredictionError::Aborted)));
-        Ok(())
-    }).unwrap();
+    }
+    storage.contexts.collect();
     assert_eq!(storage.contexts.live(), 0);
 }
 
