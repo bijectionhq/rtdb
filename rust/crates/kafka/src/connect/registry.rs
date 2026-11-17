@@ -11,6 +11,8 @@ mod rules;
 mod reader;
 mod dlq;
 mod http;
+mod references;
+use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
 
@@ -34,7 +36,7 @@ pub(super) struct RegistryConverter {
     binding_order: VecDeque<(String, u32)>,
     dlq: BTreeMap<String, dlq::DlqProducer>,
 }
-struct SchemaDocument { root: RegistrySchema, references: BTreeMap<String, String>, subject: String, version: i32, bytes: usize, charge: Arc<MemoryReservation> }
+struct SchemaDocument { root: RegistrySchema, references: ResolvedReferences, subject: String, version: i32, bytes: usize, charge: Arc<MemoryReservation> }
 struct WriterEntry { document: Arc<SchemaDocument>, key_charge: Arc<MemoryReservation> }
 struct ReaderBinding { writer: Arc<SchemaDocument>, selected: Option<Arc<SchemaDocument>>, plan: ReaderPlan, migrations: Vec<rules::ReadRules>, read_rules: rules::ReadRules, _charges: Vec<Arc<MemoryReservation>> }
 enum ReaderPlan {
@@ -70,7 +72,7 @@ impl ReaderBinding {
                 if let Some(rule) = self.read_rules.check(false)? { return Ok(Decoded::Dlq { rule, original: Original::Framed }); }
                 if matches!(output, JsonOutput::Unprepared) {
                     let document = self.selected.as_ref().unwrap_or(&self.writer);
-                    *output = JsonOutput::Prepared(super::json_schema::JsonPlan::parse_version(&document.root.schema, &document.references, options, Some(document.version))?);
+                    *output = JsonOutput::Prepared(super::json_schema::JsonPlan::parse_version(&document.root.schema, document.references.by_name(), options, Some(document.version))?);
                 }
                 let JsonOutput::Prepared(plan) = output else { unreachable!() };
                 plan.convert(datum, context).map(Decoded::Data)
@@ -124,7 +126,14 @@ struct RegistrySchema {
     metadata: Option<Json>,
 }
 #[derive(Clone, PartialEq, Deserialize, Serialize)]
-struct Reference { name: String, subject: String, version: i32 }
+struct Reference {
+    #[serde(default, skip_serializing_if = "references::empty_text")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "references::empty_text")]
+    subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    version: Option<i32>,
+}
 impl RegistryConverter {
     pub fn open(spec: &PluginSpec, format: RegistryFormat, is_key: bool) -> Result<Self> {
         let options = &spec.options;
@@ -148,7 +157,9 @@ impl RegistryConverter {
         Ok(Self { client: None, urls, security, format, is_key, options: options.clone(), schemas: BTreeMap::new(), order: VecDeque::new(), capacity, maximum_schema_bytes: 256 * 1024, next_avro_union: 0, reader_selection, latest, bindings: BTreeMap::new(), binding_order: VecDeque::new(), dlq: BTreeMap::new() })
     }
     async fn fetch(&mut self, path: &[String], context: &mut ConversionContext) -> Result<RegistrySchema> {
-        serde_json::from_value(self.request(path, None, context).await?).map_err(|cause| error("schema-registry", cause))
+        let value = self.request(path, None, context).await?;
+        references::admit_typed_references(&value, context)?;
+        serde_json::from_value(value).map_err(|cause| error("schema-registry", cause))
     }
     async fn request(&mut self, path: &[String], body: Option<&Json>, context: &mut ConversionContext) -> Result<Json> {
         self.request_query(path, &[], body, context).await
@@ -204,12 +215,13 @@ impl RegistryConverter {
         while self.schemas.len() >= self.capacity { if let Some(id) = self.order.pop_front() { self.schemas.remove(&id); } }
         let root = self.fetch(&["schemas".into(), "ids".into(), id.to_string()], context).await?;
         self.validate_format(&root)?;
-        let subject = self.subject(topic, &root.schema)?;
-        let lookup = serde_json::to_value(&root).map_err(|cause| error("schema-registry", cause))?;
-        let lookup = self.request(&["subjects".into(), subject.clone()], Some(&lookup), context).await?;
+        let resolved = self.resolve_references(root, context).await?;
+        let subject = self.subject(topic, &resolved.root.schema)?;
+        let lookup = serde_json::to_value(&resolved.root).map_err(|cause| error("schema-registry", cause))?;
+        let lookup = self.request_query(&["subjects".into(), subject.clone()], &[("normalize".into(), "false".into()), ("deleted".into(), "true".into())], Some(&lookup), context).await?;
         let version = lookup.get("version").and_then(Json::as_i64).and_then(|version| i32::try_from(version).ok()).ok_or_else(|| error("schema-registry", "Subject lookup has no valid schema version"))?;
         if lookup.get("id").and_then(Json::as_u64) != Some(u64::from(id)) { return Err(error("schema-registry", "Subject lookup returned a different schema ID")); }
-        let schema = self.document(root, subject, version, context).await?;
+        let schema = self.finish_document(resolved, subject, version, context)?;
         self.schemas.insert(cache_key.clone(), WriterEntry { document: Arc::clone(&schema), key_charge }); self.order.push_back(cache_key); Ok(schema)
     }
     fn validate_format(&self, root: &RegistrySchema) -> Result<()> {
@@ -219,22 +231,22 @@ impl RegistryConverter {
     }
     async fn document(&mut self, root: RegistrySchema, subject: String, version: i32, context: &mut ConversionContext) -> Result<Arc<SchemaDocument>> {
         self.validate_format(&root)?;
-        let mut pending = VecDeque::from(root.references.clone()); let mut references = BTreeMap::new();
-        while let Some(reference) = pending.pop_front() {
-            if references.contains_key(&reference.name) { continue; }
-            if references.len() >= 128 { return Err(error("schema-registry", "Schema reference graph exceeds its limit")); }
-            let fetched = self.fetch(&["subjects".into(), reference.subject, "versions".into(), reference.version.to_string()], context).await?;
-            pending.extend(fetched.references); references.insert(reference.name, fetched.schema);
-        }
-        let root_bytes = serde_json::to_vec(&root).map_err(|cause| error("schema-registry", cause))?.len();
-        let bytes = references.iter().try_fold(root_bytes.checked_add(subject.len()).ok_or_else(|| error("allocation-overflow", "Schema subject size overflow"))?, |bytes, (name, text)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(text.len())).ok_or_else(|| error("allocation-overflow", "Schema graph size overflow")))?;
-        let charge = context.reserve(bytes.checked_mul(8).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Schema document allocation overflow"))?)?;
+        let resolved = self.resolve_references(root, context).await?;
+        self.finish_document(resolved, subject, version, context)
+    }
+    fn finish_document(&self, resolved: ResolvedSchema, subject: String, version: i32, context: &mut ConversionContext) -> Result<Arc<SchemaDocument>> {
+        let ResolvedSchema { root, references } = resolved;
+        let root_bytes = references::serialized_size(&root)?;
+        let bytes = references.by_name().iter().try_fold(root_bytes.checked_add(subject.len()).ok_or_else(|| error("allocation-overflow", "Schema subject size overflow"))?, |bytes, (name, text)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(text.len())).ok_or_else(|| error("allocation-overflow", "Schema graph size overflow")))?;
+        let reference_bytes = references.retained_bound()?;
+        let root_heap = references::root_retained_bound(&root)?;
+        let charge = context.reserve(root_heap.checked_add(reference_bytes).and_then(|bytes| bytes.checked_add(subject.capacity())).and_then(|bytes| bytes.checked_add(std::mem::size_of::<SchemaDocument>())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Schema document allocation overflow"))?)?;
         if self.format == RegistryFormat::Json {
             context.reserve(root.schema.len().checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "JSON schema syntax allocation overflow"))?)?;
             serde_json::from_str::<Json>(&root.schema).map_err(|cause| error("json-schema", cause))?;
         }
         if let Some(rule_set) = &root.rule_set {
-            let rule_bytes = serde_json::to_vec(rule_set).map_err(|cause| error("schema-registry", cause))?.len();
+            let rule_bytes = references::serialized_size(rule_set)?;
             context.reserve(rule_bytes.checked_mul(64).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Schema rules allocation overflow"))?)?;
             rules::validate(rule_set)?;
         }
@@ -245,7 +257,7 @@ impl RegistryConverter {
         context.reserve(document.bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)
     }
     fn avro_plan(&self, document: &SchemaDocument) -> Result<Arc<super::avro::AvroDatumPlan>> {
-        super::avro::AvroDatumPlan::parse(&document.root.schema, &document.references.values().cloned().collect::<Vec<_>>(), &self.options).map(Arc::new)
+        super::avro::AvroDatumPlan::parse(&document.root.schema, &document.references.texts().map(str::to_owned).collect::<Vec<_>>(), &self.options).map(Arc::new)
     }
     async fn reader_document(&mut self, writer: &SchemaDocument, id: u32, context: &mut ConversionContext) -> Result<Option<Arc<SchemaDocument>>> {
         context.reserve(self.reader_selection.request_bound(&writer.subject)?)?;
@@ -257,6 +269,7 @@ impl RegistryConverter {
         let (path, query) = self.reader_selection.request(&writer.subject).ok_or_else(|| error("schema-registry", "Reader schema selection lost its request"))?;
         let value = self.request_query(&path, &query, None, context).await?;
         let version = value.get("version").and_then(Json::as_i64).and_then(|version| i32::try_from(version).ok()).ok_or_else(|| error("schema-registry", "Selected reader schema has no valid version"))?;
+        references::admit_typed_references(&value, context)?;
         let root = serde_json::from_value(value).map_err(|cause| error("schema-registry", cause))?;
         let document = self.document(root, writer.subject.clone(), version, context).await?;
         self.latest.insert(key, Arc::clone(&document), Instant::now());
@@ -271,6 +284,7 @@ impl RegistryConverter {
         for version in i64::from(first.version) + 1..i64::from(last.version) {
             let value = self.request_query(&["subjects".into(), writer.subject.clone(), "versions".into(), version.to_string()], &[("deleted".into(), "true".into())], None, context).await?;
             let returned = value.get("version").and_then(Json::as_i64).and_then(|version| i32::try_from(version).ok()).ok_or_else(|| error("schema-registry", "Migration schema has no valid version"))?;
+            references::admit_typed_references(&value, context)?;
             let root = serde_json::from_value(value).map_err(|cause| error("schema-registry", cause))?;
             let document = self.document(root, writer.subject.clone(), returned, context).await?;
             self.plan_charge(&document, context)?;
@@ -402,7 +416,7 @@ mod configuration_tests {
     fn document(schema: &str, context: &mut ConversionContext) -> Arc<SchemaDocument> {
         Arc::new(SchemaDocument {
             root: RegistrySchema { schema: schema.into(), schema_type: Some("AVRO".into()), references: Vec::new(), rule_set: None, metadata: None },
-            references: BTreeMap::new(), subject: "events-value".into(), version: 1, bytes: schema.len(),
+            references: ResolvedReferences::default(), subject: "events-value".into(), version: 1, bytes: schema.len(),
             charge: context.reserve(schema.len() * 4 + 1024).unwrap(),
         })
     }

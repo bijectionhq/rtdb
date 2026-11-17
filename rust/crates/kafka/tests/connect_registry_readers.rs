@@ -7,7 +7,7 @@ use tokio::{io::{AsyncReadExt, AsyncWriteExt}, task::JoinHandle};
 
 struct Reply { method: &'static str, path: String, body: Json }
 fn get(path: &str, body: Json) -> Reply { Reply { method: "GET", path: path.into(), body } }
-fn lookup(version: i32) -> Reply { Reply { method: "POST", path: "/subjects/events-value".into(), body: json!({"id":7,"version":version}) } }
+fn lookup(version: i32) -> Reply { Reply { method: "POST", path: "/subjects/events-value?normalize=false&deleted=true".into(), body: json!({"id":7,"version":version}) } }
 fn schema(format: &str, text: &str, version: i32, rules: Json) -> Json { json!({"id":7,"version":version,"schemaType":format,"schema":text,"ruleSet":rules}) }
 fn framed(datum: &[u8]) -> Vec<u8> { let mut bytes = vec![0,0,0,0,7]; bytes.extend_from_slice(datum); bytes }
 fn context(memory: &Arc<MemoryBudget>) -> ConversionContext { ConversionContext::new(Arc::clone(memory)) }

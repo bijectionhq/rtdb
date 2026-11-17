@@ -1,0 +1,54 @@
+= Rust Schema Registry reference resolution
+
+The native Connect registry converter resolves reference lists depth-first in source order.
+Each reference version lookup completes before its name is checked against the visited set.
+The resolver marks a new name before descending and appends that schema's text after its dependencies.
+The first visit determines the schema retained for a name.
+Cycles and duplicate names still demand their version lookup but do not descend again.
+Avro receives reference texts in this dependency insertion order before the root text.
+JSON Schema continues to receive a name-indexed map.
+
+Reference requests use the supplied signed version and `deleted=true`.
+A requested version of `-1` is replaced in the containing reference by the fetched response's version before duplicate detection.
+A missing response version remains null and is omitted from subsequent lookup-body serialization.
+Zero and negative returned versions retain their values.
+Missing reference names, subjects, or versions fail when their edge is reached.
+Empty names and subjects remain distinct from missing values.
+
+The initial provider root has no parent subject, independently of the application subject-name strategy.
+A fetched schema's response subject supplies the parent context for its children.
+Default-tenant qualification affects only the version-request URI; the original reference subject remains in the document.
+For example, parent `:.ctx:parent` and child `child` request `:.ctx:child`.
+The explicit default-context child `:.:child` under that parent requests `:.ctx::.:child`; with no parent it requests `child`.
+Fetched subject/version metadata belongs to a separate response envelope and cannot enter the subject-version POST body.
+Reference resolution and version replacement precede that POST, which uses `normalize=false` and `deleted=true`.
+
+== Ownership and admission
+
+The converter remains passive and completes resolution on its caller without creating a task.
+One call-local frame vector owns the active depth-first path and one visited set records completed or active names.
+The immutable `ResolvedReferences` value publishes its indexed texts and ordered names together.
+Document equivalence includes their order.
+A completed intermediate value carries the updated root and references until subject-version lookup supplies the document's application version.
+
+Initial frame storage and each reference step are admitted before their native allocations.
+The checked step bound includes text copies, map nodes, request overhead, and three slots per frame and ordered name.
+Three slots cover geometric vector reallocation with old and new buffers simultaneously live.
+The completed document separately charges retained map nodes, string capacities, and ordered-vector storage.
+Root reference-vector capacity and optional string capacities remain charged even when nullable version replacement makes their serialized entries empty.
+Metadata and rule JSON containers retain explicit heap bounds, and serialized size is measured with a passive counting sink without creating an output buffer.
+Each typed reference-vector conversion admits three slots per element before deserialization, including its geometric growth overlap.
+The reference-count limit is the available budget; response byte limits remain in force.
+Cancellation and errors drop partial graph data, while the conversion context retains its reservation charges until that context drops.
+Published documents retain their own lease after the context is released.
+
+== Remaining qualification
+
+This source implementation covers reference-resolution order, nullable version replacement, subject contexts, and their ownership boundaries.
+Persistent fetched-version cache semantics remain separate work.
+The native subject-version lookup still precedes semantic schema/reader/datum work that Java performs before that lookup.
+Parsed schema ownership, canonical and empty-field POST serialization, semantic record subject names, Jackson response coercions and nullable reference-list/entry shapes still require source integration.
+The shared request path also retains UTF8 URL encoding and URL dot-segment handling that differ from Java's UTF16 URI encoder.
+Generic response JSON parse admission remains separate from the typed vector admission above.
+No runtime compatibility or Phase 1 completeness claim follows from this bounded change.
+Its HTTP, error-order, identity, context, and memory regression sources first execute in Phase 2 under the implementation handoff.

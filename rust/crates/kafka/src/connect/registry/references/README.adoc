@@ -1,0 +1,21 @@
+= Registry reference source mapping
+
+The implementation follows Confluent Schema Registry 7.8.0.
+link:../../../../../../../dev/doc/rust-kafka-reference-resolution.adoc[The developer reference] records traversal, request order, owners, admission, and remaining integration work.
+
+`AbstractSchemaProvider.resolveReferences` supplies ordered depth-first insertion, fetch-before-visit behavior, and nullable latest-version replacement.
+`AvroSchema` parses resolved texts in insertion order before the root.
+`QualifiedSubject.qualifySubjectWithParent` supplies default-tenant parent-context qualification without a tenant prefix.
+`SchemaReference` retains nullable fields and omits empty values when serialized.
+`RestService` supplies signed version URIs, deleted lookups, and subject-version request options.
+The client and deserializer sources establish the initial null-parent roots and the later schema-version lookup timing.
+
+link:sources.sha256[The source manifest] pins every inspected Java file.
+The registry-client files come from `io.confluent:kafka-schema-registry-client:7.8.0`, whose source JAR has SHA256 `0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf`.
+The deserializer sources belong to `io.confluent:kafka-schema-serializer:7.8.0` and `io.confluent:kafka-avro-serializer:7.8.0`.
+link:COPYRIGHT[Original source headers] retain their notices.
+link:LICENSE-APACHE[The Apache License 2.0] is retained byte-for-byte from the pinned Apache Avro source distribution.
+The inspected Confluent source JAR contains no separate license or notice member.
+
+Regression sources cover ordered and indexed observations, contexts, null and empty values, duplicate and cyclic edges, version mutation, POST sequencing, failure cleanup, and initial admission.
+These are source expectations from the pinned code; they have not been executed during Phase 1.

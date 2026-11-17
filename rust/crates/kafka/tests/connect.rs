@@ -229,6 +229,6 @@ async fn confluent_avro_registry_lookup_is_cached_and_null_tombstones_do_not_fet
     let first = converter.decode("events", Some(&payload), &mut context).await.unwrap();
     assert_eq!(first.value, Value::Struct(BTreeMap::from([("id".into(), Value::I64(7))])));
     assert_eq!(first.schema.as_ref().unwrap().version, Some(3));
-    let requests = server.await.unwrap(); assert!(requests[0].starts_with("GET /schemas/ids/7 ")); assert!(requests[1].starts_with("POST /subjects/events-value "));
+    let requests = server.await.unwrap(); assert!(requests[0].starts_with("GET /schemas/ids/7 ")); assert!(requests[1].starts_with("POST /subjects/events-value?normalize=false&deleted=true "));
     assert_eq!(converter.decode("events", Some(&payload), &mut context).await.unwrap(), first);
 }
