@@ -1,7 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/*"]
-exclude = ["vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys"]
+exclude = ["vendor/fancy-regex", "vendor/validation-json", "vendor/validation-referencing", "vendor/validation-jsonschema", "vendor/rdkafka", "vendor/rdkafka-sys", "vendor/rustls"]
+
+[patch.crates-io]
+rustls = { path = "vendor/rustls" }
 
 [workspace.package]
 version = "0.1.0"
