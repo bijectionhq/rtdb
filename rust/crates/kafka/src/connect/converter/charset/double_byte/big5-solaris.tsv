@@ -1,0 +1,2 @@
+canonical	class	source	source_sha256	base_source	base_source_sha256	lead	first	last	base_unit	solaris_units	aliases	post_activation_pair_probe_utf8_sha256
+x-Big5-Solaris	Big5_Solaris	jdk.charsets/sun/nio/cs/ext/Big5_Solaris.java	de5c72c11d2def4512f5bf599ee102a96f114bd291a7f1ac00780a1b6955f055	java.base/sun/nio/cs/Big5.java	656e24e5fe5976072921e2587645c813e75f171778fbbc93c4313e5589d5ab8b	f9	d6	dc	fffd	7881|92b9|88cf|58bb|6052|7ca7|5afa	Big5_Solaris	f037789a1e4d8844b02130a7bfe3e32e719a3c17691bee7b0ebb0cc23c8ffccd

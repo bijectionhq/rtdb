@@ -10,6 +10,8 @@ pub(super) enum Charset {
     Cesu8,
     Latin1,
     Ascii,
+    Big5(&'static double_byte::big5::Big5Family),
+    Big5Solaris(&'static double_byte::big5::Big5Family),
     DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
     Utf16(Utf16Order),
@@ -51,6 +53,8 @@ impl Charset {
             "utf-32" | "utf_32" | "utf32" => Self::Utf32(Utf32Order::Detect),
             "utf-32be" | "utf_32be" | "x-utf-32be" | "x-utf-32be-bom" | "utf_32be_bom" | "utf-32be-bom" => Self::Utf32(Utf32Order::Big),
             "utf-32le" | "utf_32le" | "x-utf-32le" | "x-utf-32le-bom" | "utf_32le_bom" | "utf-32le-bom" => Self::Utf32(Utf32Order::Little),
+            "big5" | "csbig5" => Self::Big5(&double_byte::big5::FAMILY),
+            "x-big5-solaris" | "big5_solaris" => Self::Big5Solaris(&double_byte::big5::FAMILY),
             normalized => {
                 if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
                 else if let Some(table) = double_byte::lookup(normalized) { Self::DoubleByte(table) }
@@ -65,6 +69,8 @@ impl Charset {
             Self::Cesu8 => decode_cesu8(bytes),
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
+            Self::Big5(family) => family.decode_big5(bytes),
+            Self::Big5Solaris(family) => family.decode_solaris(bytes),
             Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
             Self::Utf16(order) => decode_utf16(bytes, order),

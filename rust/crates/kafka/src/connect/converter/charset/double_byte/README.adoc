@@ -1,7 +1,7 @@
 = Java 25 double-byte character mappings
 
-The String converter supports 20 Java25 charsets that use `DoubleByte.Decoder`, with 100 distinct case-insensitive registered names.
-The families are Big5, GB2312, GBK, EUC-KR, Shift_JIS, Windows-31J, IBM1381/942/943/948/949/950, IBM942C/943C/949C, Johab, PCK, and Windows936/949/950.
+The String converter supports 21 Java25 charsets that use `DoubleByte.Decoder`, with 102 distinct case-insensitive registered names.
+The families are Big5, Big5-Solaris, GB2312, GBK, EUC-KR, Shift_JIS, Windows-31J, IBM1381/942/943/948/949/950, IBM942C/943C/949C, Johab, PCK, and Windows936/949/950.
 The manifest gives every canonical name and alias, including the `x-` prefix used by several Java canonical names.
 The Shift_JIS aliases are `sjis`, `shift_jis`, `shift-jis`, `ms_kanji`, `x-sjis`, and `csShiftJIS`.
 The Windows-31J aliases are `MS932`, `windows-932`, and `csWindows31J`.
@@ -10,19 +10,23 @@ IBM942C owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`.
 `cp936` resolves to GBK, while `ms936` resolves to `x-mswin-936`.
 `cp949` and `cp950` resolve to IBM charsets, while `windows-949` and `windows-950` resolve to their Microsoft variants.
 link:charsets.tsv[The charset manifest] records canonical names, classes, source hashes, ASCII flags, trail ranges, present lead rows, resource sizes, mapping digests, decoded probe digests, and provider aliases.
+link:big5-solaris.tsv[The Big5-Solaris manifest] records its canonical name, `Big5_Solaris` alias, seven shared-row updates, source hashes, and pair-probe digest after initialization.
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.
+The passive Big5 configuration variants borrow one process-lifetime `Big5Family` initialization Monitor Object.
+It owns seven independent atomic mapping entries and a `Once` completion barrier; Solaris callers can wait for that barrier, while ordinary Big5 callers read the entries directly.
 The decoder's byte cursor and output buffer belong to one call, so partial input never survives a record boundary.
 Its result buffer reserves three bytes per input byte, within the scalar converter's four-bytes-per-input-byte plus 16384-byte admission.
 No runtime mapping cache or decoder allocation is required.
 
 == Decoding and replacement
 
-All 20 Java classes construct the same `DoubleByte.Decoder` with their class's selected tables and trail range.
+All 21 Java classes construct the same `DoubleByte.Decoder` with their class's selected tables and trail range.
 Seventeen classes use their own `DecodeHolder` tables, and the three IBM C variants share their base class's double-byte rows with a separate patched single-byte table.
+Big5-Solaris shares Big5's rows and updates seven entries during its holder initialization.
 `String` selects its `ArrayDecoder.decode` entry point and uses U+FFFD replacements.
-The ASCII fastpath has the same result as the tables for the fourteen constructors that enable it.
+The ASCII fastpath has the same result as the tables for the fifteen constructors that enable it.
 IBM942 and IBM943 map ASCII-range control bytes 0x1A, 0x1C, and 0x7F to U+001C, U+007F, and U+001A, and bytes 0x5C and 0x7E to yen and overline.
 IBM949 maps byte 0x5C to the won sign.
 The three IBM C variants restore ASCII identity mappings and retain the constructor's false ASCII-fastpath flag.
@@ -47,9 +51,30 @@ GB2312 maps 0xA1A4 and 0xA1AA to U+30FB and U+2015, while GBK maps them to U+00B
 Windows936 maps byte 0x80 to the euro sign, and Windows949 includes Hangul extensions such as 0x8141 for U+AC02.
 IBM948 and IBM950 retain their own Chinese and private-use mappings, including distinct interpretations of 0xA440 and 0xF9D6.
 
-Big5 uses the mapping present before Java initializes `Big5_Solaris.Holder`.
-Big5-Solaris initialization shallow-copies Big5's row array and then mutates seven entries in the shared 0xF9 row, changing existing Big5 decoders too.
-Big5-Solaris and this process-wide initialization behavior remain unsupported.
+== Big5-Solaris initialization
+
+Big5-Solaris initializes when its first admitted nonempty record is decoded, including an ASCII-only record.
+Looking up or configuring the charset, validating a serializer encoding, and decoding null or empty records leave initialization pending.
+Initialization updates pairs 0xF9D6 through 0xF9DC, in that order, to U+7881, U+92B9, U+88CF, U+58BB, U+6052, U+7CA7, and U+5AFA.
+Before initialization, all seven entries are unmapped; their lead rows remain present throughout.
+The shared entries apply to existing and future Big5 converters across registry instances and last until process exit.
+
+In Java, `Big5_Solaris.newDecoder()` and `newEncoder()` both initialize `Big5_Solaris.Holder` when they first read its fields.
+The holder shallow-copies Big5's row array, then writes into the already-present shared 0xF9 row.
+`Charset.forName` only initializes the outer charset class.
+The `String` constructor returns early for empty bytes, and otherwise creates the decoder before checking its ASCII fastpath.
+The Java `String.getBytes` encoder path initializes even for an empty nonnull string; the native ingestion converter validates serializer encodings without invoking serialization.
+
+Solaris callers wait for `Once` initialization to complete before decoding.
+The initializer stores each mapping with `Ordering::Relaxed`, and ordinary Big5 pair lookups load the corresponding entry with the same ordering.
+The completion barrier makes every patch visible to callers that return from `Once::call_once`, as specified by https://doc.rust-lang.org/std/sync/struct.Once.html#method.call_once[Rust's Once contract].
+Ordinary Big5 reads can observe partially published mappings, including changes between pairs in one record.
+The native implementation uses atomic entries to avoid Rust data races.
+Java's existing Big5 decoders read ordinary array elements without acquiring the Solaris initialization lock, so exhaustive equivalence with every Java memory-model outcome is not claimed.
+Java's initialization ordering and conflicting-access rules are specified in https://docs.oracle.com/javase/specs/jls/se25/html/jls-12.html#jls-12.4.2[JLS 12.4.2] and https://docs.oracle.com/javase/specs/jls/se25/html/jls-17.html#jls-17.4.5[JLS 17.4.5].
+
+Big5-HKSCS and Big5-HKSCS-2001 retain a Big5 decoder for fallback in Java.
+Their future native fallback must read this same `Big5Family` owner so that any affected fallback entries share the initialization state.
 
 == Sources and representation
 
@@ -57,6 +82,7 @@ The data comes from Eclipse Temurin 25.0.1+8's https://github.com/adoptium/temur
 The archive SHA-256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
 Its `jdk-25.0.1+8/lib/src.zip` member has SHA-256 `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
 link:sources.sha256[Supporting source hashes] pin the provider registrations, `DoubleByte`, `ArrayDecoder`, `CharsetMapping`, `String`, `Charset`, and `AbstractCharsetProvider`.
+link:big5-solaris.sources.sha256[Big5-Solaris source hashes] also pin its holder, Big5's base table, and the HKSCS fallback consumers.
 The manifest pins each charset class's original source bytes.
 `COPYRIGHT` retains source copyright and license headers; `LICENSE`, `ASSEMBLY_EXCEPTION`, and `ADDITIONAL_LICENSE_INFO` retain the archive's license bytes, including the Classpath exception.
 
@@ -81,6 +107,7 @@ python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp
 ----
 
 It verifies the archive and source-member hashes, the decoder constructors, the direct and patched table initialization, row dimensions, enabled ASCII-fastpath identity, surrogate exclusions, and exact provider alias ownership before emitting the resources.
+It also verifies the Solaris holder's exact patch order, the shared row's presence, the seven original unmapped units, and the provider aliases before emitting `big5/patches.rs` and the Solaris manifest.
 It reads Java source text and archive contents only and requires no JDK execution.
 The decoded single-byte digest concatenates the result of every byte decoded as a separate record.
 The pair-probe digest concatenates the result of every two-byte record in unsigned order, with a U+0000 separator after each record.
@@ -91,3 +118,6 @@ These probes cover every input pair, including malformed recovery and table hole
 Independent regression anchors cover Japanese, Chinese and Korean text, controls, halfwidth katakana, differing symbols, Windows extensions, private-use values, replacement grouping, truncated records, key/value precedence, null values, alias punctuation, and memory admission.
 The IBM ASCII-range remappings are asserted with ASCII-only records and multibyte suffixes.
 The original Shift_JIS and Windows-31J mapping bytes, source hashes, probe digests, and alias lists remain separately pinned.
+Local-owner regression sources cover partial publication, changing mappings between pairs, concurrent first Solaris callers, and unchanged row identity and surrounding mappings.
+The Solaris integration source has its own test process so that it can assert initial and initialized Big5 behavior without changing other tests' process-wide state.
+It covers existing and future converters, configuration and serializer validation, null and empty records, admission failures, the first ASCII record, and every input pair after activation for all Big5 and Solaris names.

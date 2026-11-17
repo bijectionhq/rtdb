@@ -97,8 +97,10 @@ Shift_JIS and Windows-31J support all ten distinct registered names, including `
 Their mappings retain Japanese symbols, halfwidth katakana, Windows extensions and private-use characters, with Java's one- or two-byte replacement boundaries for malformed and unmappable input.
 The same decoder also supports Big5, GB2312, GBK, EUC-KR, Johab, PCK, IBM1381/942/943/948/949/950, the IBM942C/943C/949C variants, and Windows936/949/950, for 20 double-byte charsets and 100 registered names in total.
 IBM control remappings, yen/overline/won signs, Windows extensions, and private-use mappings follow their individual Java tables.
+Big5-Solaris adds the `x-Big5-Solaris` and `Big5_Solaris` names, bringing this family to 21 charsets and 102 registered names.
+Its first admitted nonempty record updates seven Big5 mappings process-wide, including converters opened earlier; configuration, null records, and empty records leave those mappings unchanged.
 The link:src/connect/converter/charset/double_byte/README.adoc[double-byte mapping reference] records the source-derived tables, aliases, and replacement rules.
-Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, ISCII, and Big5-Solaris's process-wide mutation of Big5 mappings, and additional installed charset providers remain source-completeness work.
+Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.

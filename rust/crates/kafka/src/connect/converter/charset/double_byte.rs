@@ -1,4 +1,5 @@
 mod aliases;
+pub(super) mod big5;
 mod tables;
 
 pub(in super::super) struct Mapping(&'static [u8]);
@@ -28,7 +29,11 @@ impl Mapping {
         self.unit(1026 + index * 2)
     }
 
-    pub(super) fn decode(&self, mut bytes: &[u8]) -> String {
+    pub(super) fn decode(&self, bytes: &[u8]) -> String {
+        self.decode_with_pairs(bytes, |first, second| self.pair(first, second))
+    }
+
+    fn decode_with_pairs(&self, mut bytes: &[u8], pair: impl Fn(u8, u8) -> u16) -> String {
         let mut output = String::with_capacity(bytes.len() * 3);
         let units = std::iter::from_fn(|| {
             let (&first, tail) = bytes.split_first()?;
@@ -36,7 +41,7 @@ impl Mapping {
             let single = self.single(first);
             if single != 0xfffd { return Some(single); }
             let Some(&second) = bytes.first() else { return Some(0xfffd); };
-            let pair = self.pair(first, second);
+            let pair = pair(first, second);
             // OpenJDK25 DoubleByte.Decoder.crMalformedOrUnmappable uses lead-row identity.
             if pair != 0xfffd || (self.row(first).is_some() && self.row(second).is_none() && self.single(second) == 0xfffd) {
                 bytes = &bytes[1..];
