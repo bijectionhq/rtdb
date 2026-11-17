@@ -36,6 +36,9 @@ The parser tokenizes before binding so anonymous parameters follow lexical order
 Query parsing, session-control parsing and statement splitting skip nested block comments and line comments, including `/*! ... */` and `/*+ ... */` contents.
 Parameters and semicolons inside comments do not enter statement syntax; comment delimiters inside quoted text remain text.
 `tests/comments.rs` retains lexical metadata, prepared-plan, control, source-span and nested-comment regression sources; execution remains pending.
+Unquoted identifiers start with an ASCII letter or underscore and continue with ASCII letters, digits, underscores or dollar signs.
+Quoted identifiers retain Unicode and escaped quotes and reject slashes, following the pinned lexer.
+All three lexical entries reject invalid character tokens before returning statement metadata; `tests/identifiers.rs` retains admission and error-order regression sources.
 Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
 Temporal clauses retain the source location of their table and become scan dimensions before execution.
 Error contexts retain byte spans and one-based positions in the original SQL text.

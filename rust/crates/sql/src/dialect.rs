@@ -44,8 +44,8 @@ macro_rules! generic_flags {
 
 impl Dialect for SqlDialect {
     fn dialect(&self) -> std::any::TypeId { GenericDialect {}.dialect() }
-    fn is_identifier_start(&self, ch: char) -> bool { GenericDialect {}.is_identifier_start(ch) }
-    fn is_identifier_part(&self, ch: char) -> bool { GenericDialect {}.is_identifier_part(ch) }
+    fn is_identifier_start(&self, ch: char) -> bool { ch.is_ascii_alphabetic() || ch == '_' }
+    fn is_identifier_part(&self, ch: char) -> bool { ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') }
     fn is_delimited_identifier_start(&self, ch: char) -> bool { GenericDialect {}.is_delimited_identifier_start(ch) }
 
     generic_flags!(

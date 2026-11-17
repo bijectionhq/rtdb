@@ -2,14 +2,12 @@ use std::collections::BTreeMap;
 
 use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Expr, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
 use rtdb_types::{Result, Value};
-use sqlparser::{parser::Parser, tokenizer::{Span, Token, TokenWithSpan, Tokenizer}};
+use sqlparser::{parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
 use crate::{PrepareOptions, parse::{source_span, sql_error}};
 
 pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<ControlStatement>> {
-    let dialect = crate::dialect::SqlDialect::default();
-    let mut tokens: Vec<_> = Tokenizer::new(&dialect, source).tokenize_with_location()
-        .map_err(|error| sql_error(error.to_string(), source, Span::new(error.location, error.location)))?
+    let mut tokens: Vec<_> = crate::parse::tokenize(source)?
         .into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     if tokens.last().is_some_and(|token| token.token == Token::SemiColon) { tokens.pop(); }
     let Some(first) = tokens.first() else { return Ok(None); };

@@ -76,9 +76,30 @@ pub(crate) enum TemporalExtent {
     Between(ast::Expr, ast::Expr),
 }
 
+pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
+    let dialect = SqlDialect::default();
+    let mut tokens = Vec::new();
+    let mut invalid_token = None;
+    let result = Tokenizer::new(&dialect, source).tokenize_with_location_into_buf_with_mapper(&mut tokens, |token| {
+        if invalid_token.is_none() {
+            let invalid = match &token.token {
+                Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),
+                Token::ArrowAt => Some(("Invalid character in SQL source", Span::new(Location::new(token.span.start.line, token.span.start.column + 1), token.span.end))),
+                Token::Char(_) | Token::AtSign | Token::AtAt | Token::AtArrow | Token::AtQuestion | Token::CaretAt => Some(("Invalid character in SQL source", token.span)),
+                _ => None,
+            };
+            if let Some((message, span)) = invalid { invalid_token = Some(sql_error(message, source, span)); }
+        }
+        token
+    });
+    if let Some(error) = invalid_token { return Err(error); }
+    result.map_err(|error| sql_error(error.to_string(), source, Span::new(error.location, error.location)))?;
+    Ok(tokens)
+}
+
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
     let dialect = SqlDialect::default();
-    let tokens = Tokenizer::new(&dialect, sql).tokenize_with_location().map_err(|error| sql_error(error.to_string(), sql, Span::new(error.location, error.location)))?;
+    let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     for pair in tokens.windows(2) {
         if word(pair.first(),"LIMIT") && word(pair.get(1),"ALL") { return Err(sql_error("LIMIT requires an unsigned integer or parameter",sql,pair[1].span)); }

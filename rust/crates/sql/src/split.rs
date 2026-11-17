@@ -1,10 +1,9 @@
 use rtdb_plan::SourceSpan;
 use rtdb_types::Result;
-use sqlparser::tokenizer::{Span, Token, Tokenizer};
+use sqlparser::tokenizer::{Span, Token};
 
 pub fn split_statements(source: &str) -> Result<Vec<SourceSpan>> {
-    let tokens = Tokenizer::new(&crate::dialect::SqlDialect::default(), source).tokenize_with_location()
-        .map_err(|error| crate::parse::sql_error(error.to_string(), source, Span::new(error.location, error.location)))?;
+    let tokens = crate::parse::tokenize(source)?;
     let mut start = None;
     let mut end = None;
     let mut result = Vec::new();
