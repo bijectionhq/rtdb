@@ -56,7 +56,7 @@ fn failed_actual_native_client_configuration_releases_the_account_after_its_cont
 
 #[test]
 fn native_capacity_admission_fails_before_client_construction() {
-    let options = BTreeMap::from([
+    let options: BTreeMap<String, String> = BTreeMap::from([
         ("bootstrap.servers".into(), "localhost:1".into()),
         ("buffer.memory".into(), (1 << 20).to_string()),
     ]);
