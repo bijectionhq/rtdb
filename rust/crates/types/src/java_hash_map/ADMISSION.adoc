@@ -1,0 +1,94 @@
+= Admitted source HashMap operations
+
+This registered internal capability has no production callers.
+It supplies fallible source-order collection operations shared by producer metadata and Avro semantic objects.
+The existing java_map API and its consumers remain unchanged.
+
+== Owners and operations
+
+Map<K,V,L> is a passive single-writer transient owning private slots, free-slot reuse, sparse buckets, source table geometry and its collection-allocation leases.
+NormalizedMap<K,V,L> is the passive immutable owner produced by finish and preserves the original encounter and lookup geometry.
+Iter borrows its owner's entries; no entry index escapes the collection.
+Neither map retains a callback, admission borrow, task or monitor.
+Keys and values arrive with their payload and semantic-provenance owners already retained by the caller.
+Collection reservations do not admit those payloads.
+
+Admission has an associated owned Lease and a synchronous reserve(bytes) operation.
+KeyOps<K,A> supplies fallible hashCode, ordinary equals, Comparable class screening/comparison and explicit Java identity-hash witnesses through that same authority.
+Actual key operations and identity witnesses must remain stable while retained, including when native slots move.
+Source null keys hash to zero without user hashing; null and identical candidates use their source equality short circuits.
+Class-name ordering compares unsigned UTF16 units, and spread hashes and identity hashes compare as signed Java int values where the source does.
+Native allocation addresses and schema-region nonces do not establish Java System.identityHashCode equivalence.
+An adapter must supply a qualified witness or reject an unsupported demanded identity operation.
+
+Map::new(None) preserves default lazy construction; Some(capacity) preserves an explicit nonnegative signed32-bit capacity.
+Uninitialized get/contains_key skip hashing entirely; put and public remove hash before checking table existence.
+An allocated empty map retains its source capacity and still hashes lookups.
+Put replacement retains the first stored equal key and returns the previous owned value.
+Put_if_absent uses an explicit pure value predicate to identify Java null, returning Inserted, Replaced(previous) or a borrowed Present(value).
+The borrowed result cannot outlive the mutable-map borrow that produced it.
+
+Tree lookup preserves hash guards, candidate equality, exact Comparable screening and ambiguous subtree searches.
+Insertion preserves the source first-node check, treeification threshold, root-to-front order, low/high resize split and red-black balancing.
+Iterator removal may leave the encounter head different from the actual balanced root.
+A singleton TreeNode is preserved directly by resize, whereas a multi-node tree split uses the source six-node untreeify boundary.
+NormalizedMap retains this geometry because later lookups can demand different equality/comparison callbacks from a flattened entry scan.
+
+The capability represents actual Java hash-filtered mappings.
+It does not globally collapse all structurally equal keys: equal source objects with different hashCode results can remain distinct, as in Java HashMap.
+Adapters must preserve their source classes' actual hash/equality operations even when those classes violate the usual equals/hashCode consistency law.
+
+== Removal and failure boundaries
+
+Public remove returns the original stored key/value pair and uses movable=true.
+Its tree removal uses the source structural small-tree test, link/color substitution and root-to-front movement.
+The six-node resize split rule is a different boundary.
+Remove_if accepts a fallible predicate borrowing each key/value and the same operator/admission authority.
+It saves the original next encounter cursor before the predicate, then selected removal uses the stored node hash and movable=false.
+This iterator route does not call user hashCode, flatten small trees or move the balanced root to the encounter front.
+It returns whether a predicate selected removal, matching Collection.removeIf after its iterator.remove call.
+Removed slots enter the private free list; later insertions reuse their existing collection admission.
+
+A mutation error poisons this unpublished transient.
+Completed removal prefixes remain private, and later lookup, iteration, mutation or finish rejects the failed transient.
+A caller must discard that transient rather than expose it as a successful snapshot.
+Read-only lookup errors do not modify either a successful transient or an immutable map.
+All key callbacks run before the corresponding removal-link mutation.
+Admission errors, checked arithmetic overflow and allocation failures remain outer Result errors.
+This native construction failure policy does not claim JVM allocation/OOME equivalence.
+
+== Collection storage admission
+
+The constructor creates no heap storage.
+The first put obtains a 4096-byte storage reservation after hashing and before initializing the sparse table.
+Every newly allocated entry obtains an 8192-byte envelope for sparse bucket/tree storage and resize overlap, plus its checked slot-vector growth bound.
+A reused vacant slot requires no new collection reservation.
+For slot and lease vectors, a requested first capacity of four or doubled current capacity admits sixteen times the requested slot bytes plus 256 bytes before try_reserve_exact.
+The lease-vector growth bound is included in the same reservation that precedes that growth.
+Checked arithmetic rejects capacity and byte-bound overflow.
+Old leases remain retained while old/new vector buffers and old/new sparse bucket nodes can coexist.
+Tree rotations, removal, encounter iteration and move-only finish allocate no collection scratch.
+KeyOps implementations separately admit any evaluation scratch before allocating it.
+
+NormalizedMap retains every collection lease after the creating admission authority drops.
+Its leases() borrow lets a cached-owner adapter count existing reservations against a fresh conversion scope without reserving the same heap twice.
+Dropping removed entries does not release their collection envelope, because vacant slots and source table capacity remain reusable.
+Payload and imported semantic-owner reservation retention remains the responsibility of the concrete key/value owner.
+
+== Pinned source and regression sources
+
+The source profile is Temurin25.0.1+8, reused from the existing source-only provider archive.
+link:source-profile.json[] records the archive digest, release tag and six consulted members.
+link:sources.sha256[] pins their exact bytes, link:COPYRIGHT[] retains every full pre-package prefix and link:LICENSE[] carries GPLv2 with its Classpath exception.
+The HashMap algorithms use the default load factor only; arbitrary custom load factors, subclass hooks and externally mutating/concurrent Java keys are outside this API.
+HashSet and IdentityHashMap were read for later adapters; this slice does not implement those concrete semantic adapters.
+
+HashMap.java intervals include hash/comparableClassFor333–375, getNode574–595, putVal632–675, resize684–758, treeifyBin762–783, remove804–859, HashIterator1582–1624, moveRootToFront1991–2010, find2018–2048, tieBreak2059–2068, treeify2072–2111, untreeify2118–2129, putTreeVal2134–2176, removeTreeNode2190–2286, split2298–2343, rotations2348–2382 and balancing2384–2530.
+Collection.removeIf576–586 supplies predicate/iterator ordering.
+The pinned iterator uses removeNode(p.hash,p.key,null,false,false); public remove separately computes hash(key).
+
+Nineteen core and fourteen removal regression functions are present as source.
+They cover lazy capacities and callbacks, null/identity/hash guards, first-key replacement, comparable/noncomparable collision trees, signed spread ordering, identity ties, resize geometry, immutable lease ownership, failure boundaries, public removal geometry and iterator cursor behavior.
+The regression expectations were source-read or manually traced; none have run.
+No compiler, formatter, runtime discovery, dependency discovery or Java/native test execution was used.
+Concrete producer adapters, Avro arbitrary-key/equality/cache integration and production activation require separate reviewed caller changes.

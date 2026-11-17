@@ -5,6 +5,7 @@ mod legacy_zone;
 mod float_text;
 mod id;
 mod java_map;
+pub mod java_hash_map;
 mod logical;
 mod position;
 mod pg;
