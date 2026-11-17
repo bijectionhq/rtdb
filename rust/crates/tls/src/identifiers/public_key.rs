@@ -1,7 +1,8 @@
 use super::*;
+mod comparison;
 
 /// Immutable `X509Key` encoded-key normalization with independent allocation ownership.
-/// Equality compares normalized encodings; it does not apply provider-specific public-key equality.
+/// `PartialEq` compares normalized encodings; `same_public_key` additionally applies the supported provider rules.
 #[derive(Debug)]
 pub struct CertificatePublicKeyEncoding { encoded: Vec<u8>, _reservation: Arc<MemoryReservation> }
 
@@ -9,7 +10,7 @@ impl CertificatePublicKeyEncoding {
     /// Reads SubjectPublicKeyInfo from an already decoded X.509 certificate's encoding.
     ///
     /// - Follows OpenJDK 25.0.1 `AlgorithmId`, `ObjectIdentifier`, `DerValue` and `BitArray` framing and encoding rules.
-    /// - Provider parameter validation, key acceptance, provider-specific equality and certificate verification are outside this view.
+    /// - Provider parameter validation, key acceptance and certificate verification are outside decoding.
     /// - Invalid framing, OIDs and bit lengths return a TLS-material error.
     /// - Reserves before parsing and releases scratch admission before returning independently owned encoding bytes.
     /// - The borrowed input has its own owner, and budget errors propagate unchanged.
@@ -26,6 +27,19 @@ impl CertificatePublicKeyEncoding {
 
     /// Borrows the normalized SubjectPublicKeyInfo encoding through this value's reservation.
     pub fn encoded(&self) -> &[u8] { &self.encoded }
+
+    /// Compares the pinned built-in key equality rules implemented for these encodings.
+    ///
+    /// - The PKCS#3 and X9.42 DH OIDs use SunJCE numeric `y`, `p` and `g` equality after validating both keys' DH fields.
+    /// - Other OIDs use normalized `X509Key` encoding equality.
+    /// - Invalid DH fields return a TLS-material error, including when an encoding is compared with itself.
+    /// - Comparison borrows both values' admitted bytes without retaining additional state.
+    /// - Other provider acceptance checks, custom provider equality and certificate admission remain outside this method.
+    pub fn same_public_key(&self, other: &Self) -> Result<bool> {
+        let left = comparison::Key::read(self)?;
+        let right = comparison::Key::read(other)?;
+        Ok(left == right)
+    }
 }
 
 impl PartialEq for CertificatePublicKeyEncoding { fn eq(&self, other: &Self) -> bool { self.encoded == other.encoded } }

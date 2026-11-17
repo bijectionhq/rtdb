@@ -86,8 +86,17 @@ It is a passive immutable view with independent memory admission.
   Signed integer wrapping and the backing-buffer capacity check follow the pinned implementations.
 * Parsing scratch is reserved before decoding and released before the view returns.
   The surviving reservation covers the retained encoding capacity and its owner until drop.
-* The view does not instantiate `AlgorithmParameters` or `KeyFactory` providers and does not validate their accepted parameter or key values.
-  Equality is encoded `X509Key` equality; SunJCE `DHPublicKey.equals` compares numeric `y`, `p` and `g` independently of optional private-value length and requires a separate provider-aware comparison.
-  Certificate signatures, validity and trust are outside this view.
+* `PartialEq` compares normalized `X509Key` encodings.
+  `same_public_key` applies the pinned SunJCE DH numeric comparison and uses encoding equality for other OIDs.
+* Both `1.2.840.113549.1.3.1` and `1.2.840.10046.2.1` resolve through `AlgorithmId.getName` to the registered SunJCE `DiffieHellman` parameters and key factory.
+* DH comparison validates signed `p` and `g`, optional signed 32-bit private-value length, and signed `y` before comparing numeric `y`, `p` and `g`.
+** Signed integer magnitudes follow the pinned `BigInteger` range limit.
+** Private-value length does not participate in equality.
+** Bytes after the first inner `y` INTEGER are ignored.
+** Invalid DH fields fail even when the encoding is compared with itself or with a non-DH key.
+* Call-local comparison values borrow the existing encoding owner without additional allocation.
+* Other `AlgorithmParameters` and `KeyFactory` acceptance checks, custom provider equality, global certificate admission, signatures, validity and trust remain outside these operations.
 
 Public-key regression sources cover parameter framing, converter padding and opaque nested values, the NULL-emitting OID set, OID validity and size boundaries, unaligned bits, integer wrapping, nested conversion and reservation cleanup.
+
+DH regression sources cover both OIDs, signed numeric padding and magnitudes, virtual `BigInteger` range boundaries, private-value length boundaries, ignored key tails, malformed fields, encoding equality and allocation ownership.

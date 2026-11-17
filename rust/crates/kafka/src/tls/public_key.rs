@@ -9,7 +9,7 @@ use super::invalid;
 pub(super) fn same(left: &X509Ref, right: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<bool> {
     let left = decode(left, memory)?;
     let right = decode(right, memory)?;
-    Ok(left == right)
+    left.same_public_key(&right).map_err(material_error)
 }
 
 fn decode(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<CertificatePublicKeyEncoding> {
@@ -18,9 +18,11 @@ fn decode(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<Certifica
         .ok_or_else(|| invalid("TLS public-key certificate encoding exceeds allocation range"))?;
     let _encoding = memory.reserve(bound)?;
     let encoded = certificate.to_der().map_err(invalid)?;
-    CertificatePublicKeyEncoding::decode(&encoded, memory).map_err(|error| {
-        if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
-    })
+    CertificatePublicKeyEncoding::decode(&encoded, memory).map_err(material_error)
+}
+
+fn material_error(error: rtdb_types::Anomaly) -> rtdb_types::Anomaly {
+    if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error }
 }
 
 #[cfg(test)]
@@ -28,6 +30,7 @@ mod tests {
     use super::*;
     use openssl::{hash::MessageDigest, pkey::PKey, rsa::Rsa};
     use crate::tls::tests::support::Credential;
+    mod dh;
 
     fn der(tag: u8, content: &[u8]) -> Vec<u8> {
         let mut bytes = vec![tag];
