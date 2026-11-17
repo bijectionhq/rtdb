@@ -28,6 +28,11 @@ impl MemoryBudget {
     /// Exceeding this budget or an ancestor limit, including size overflow, returns an error.
     pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
         let parent = self.parent.as_ref().map(|parent| parent.reserve(bytes)).transpose()?;
+        self.acquire(bytes)?;
+        Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }))
+    }
+
+    fn acquire(&self, bytes: usize) -> Result<()> {
         let mut current = self.used_bytes.load(Ordering::Relaxed);
         loop {
             let next = current.checked_add(bytes).filter(|next| *next <= self.limit_bytes)
@@ -35,7 +40,7 @@ impl MemoryBudget {
             match self.used_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
                 Ok(_) => {
                     self.peak_bytes.fetch_max(next, Ordering::Relaxed);
-                    return Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }));
+                    return Ok(());
                 }
                 Err(actual) => current = actual,
             }
@@ -48,7 +53,7 @@ impl MemoryBudget {
 }
 
 /// Retained byte charge keeping its budget and ancestor leases alive.
-/// Arc clones share one charge; only exclusive access permits shrinking.
+/// Arc clones share one charge; only exclusive access permits resizing.
 #[derive(Debug)]
 pub struct MemoryReservation {
     budget: Arc<MemoryBudget>,
@@ -59,6 +64,25 @@ pub struct MemoryReservation {
 impl MemoryReservation {
     pub fn bytes(&self) -> usize { self.bytes }
     pub fn budget(&self) -> &Arc<MemoryBudget> { &self.budget }
+
+    /// - Admits additional bytes through this lease and every ancestor before the caller allocates them.
+    /// - Requires exclusive access and a total at least as large as the held bytes; allocations are not resized.
+    /// - An admission failure preserves retained bytes and lease sizes; ancestor peaks may record temporary admission.
+    pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
+        let additional = bytes.checked_sub(self.bytes)
+            .ok_or_else(|| Anomaly::incorrect("rtdb/reservation-shrink", "Reservation growth requires at least the held bytes"))?;
+        if let Some(parent) = &mut self.parent {
+            Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").grow_to(bytes)?;
+        }
+        if let Err(error) = self.budget.acquire(additional) {
+            if let Some(parent) = &mut self.parent {
+                Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").release_to(self.bytes);
+            }
+            return Err(error);
+        }
+        self.bytes = bytes;
+        Ok(())
+    }
 
     /// Releases excess capacity from this lease and its parent leases without lowering recorded peaks.
     /// The requested bytes must cover every allocation retained under this lease; this method does not resize allocations.
