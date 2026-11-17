@@ -1,73 +1,11 @@
-use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, UInt32Array, make_array};
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer};
 use arrow_data::ArrayData;
 use rtdb_types::{Anomaly, Result};
 
-#[derive(Debug)]
-pub struct MemoryBudget {
-    limit_bytes: usize,
-    used_bytes: AtomicUsize,
-    peak_bytes: AtomicUsize,
-    parent: Option<Arc<MemoryBudget>>,
-}
-
-impl MemoryBudget {
-    pub fn new(limit_bytes: usize) -> Arc<Self> {
-        Arc::new(Self { limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: None })
-    }
-
-    /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
-    /// Retained reservations keep both budgets alive after the region closes.
-    pub fn scope(self: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)) })
-    }
-
-    /// Reserves bytes without waiting; release occurs when the last reservation handle drops.
-    pub fn reserve(self: &Arc<Self>, bytes: usize) -> Result<Arc<MemoryReservation>> {
-        let parent = self.parent.as_ref().map(|parent| parent.reserve(bytes)).transpose()?;
-        let mut current = self.used_bytes.load(Ordering::Relaxed);
-        loop {
-            let next = current.checked_add(bytes).filter(|next| *next <= self.limit_bytes)
-                .ok_or_else(|| Anomaly::incorrect("rtdb/memory-budget-exceeded", format!("Cannot reserve {bytes} bytes from budget {} with {current} retained", self.limit_bytes)))?;
-            match self.used_bytes.compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed) {
-                Ok(_) => {
-                    self.peak_bytes.fetch_max(next, Ordering::Relaxed);
-                    return Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }));
-                }
-                Err(actual) => current = actual,
-            }
-        }
-    }
-
-    pub fn used_bytes(&self) -> usize { self.used_bytes.load(Ordering::Acquire) }
-    pub fn peak_bytes(&self) -> usize { self.peak_bytes.load(Ordering::Relaxed) }
-    pub fn limit_bytes(&self) -> usize { self.limit_bytes }
-}
-
-#[derive(Debug)]
-pub struct MemoryReservation {
-    budget: Arc<MemoryBudget>,
-    bytes: usize,
-    parent: Option<Arc<MemoryReservation>>,
-}
-
-impl MemoryReservation {
-    pub fn bytes(&self) -> usize { self.bytes }
-    pub fn budget(&self) -> &Arc<MemoryBudget> { &self.budget }
-
-    fn shrink_to(&mut self, bytes: usize) {
-        if let Some(parent) = &mut self.parent { Arc::get_mut(parent).expect("reservation exclusively owns its parent lease").shrink_to(bytes); }
-        let released = self.bytes - bytes;
-        self.bytes = bytes;
-        self.budget.used_bytes.fetch_sub(released, Ordering::AcqRel);
-    }
-}
-
-impl Drop for MemoryReservation {
-    fn drop(&mut self) { self.budget.used_bytes.fetch_sub(self.bytes, Ordering::AcqRel); }
-}
+pub use rtdb_types::{MemoryBudget, MemoryReservation};
 
 #[derive(Clone, Debug)]
 pub struct OwnedBatch {
@@ -128,7 +66,7 @@ impl OwnedBatch {
                 if bytes > reservation.bytes() {
                     return Err(Anomaly::fault("rtdb/selection-allocation-bound", "Arrow selection exceeded its reserved allocation bound"));
                 }
-                Arc::get_mut(&mut reservation).ok_or_else(|| Anomaly::fault("rtdb/shared-allocation-reservation", "Selection reservation escaped before allocation completed"))?.shrink_to(bytes);
+                Arc::get_mut(&mut reservation).ok_or_else(|| Anomaly::fault("rtdb/shared-allocation-reservation", "Selection reservation escaped before allocation completed"))?.shrink_to(bytes)?;
                 Self::with_reservation(batch, reservation)
             }
         }
