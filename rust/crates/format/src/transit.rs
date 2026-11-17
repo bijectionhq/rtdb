@@ -225,6 +225,32 @@ impl<'de> serde::Deserialize<'de> for JsonPacked {
     }
 }
 
+/// Bounds MessagePack output capacity, temporary text and the encoder's string cache for this value.
+/// Reserve before encoding and retain the charge while the returned bytes live.
+/// Size overflow and nesting beyond the encoder's depth limit return errors.
+pub fn msgpack_allocation_bound(value: &TransitValue) -> Result<usize> {
+    fn bound(value: &TransitValue,depth: usize) -> Result<usize> {
+        if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+        let add = |left: usize,right: usize|left.checked_add(right).ok_or_else(||invalid("Transit encoding allocation exceeds addressable memory"));
+        let text = |size: usize|size.checked_mul(16).ok_or_else(||invalid("Transit encoding allocation exceeds addressable memory"));
+        let payload = match value {
+            TransitValue::String(value) | TransitValue::Keyword(value) | TransitValue::Symbol(value) => text(value.len())?,
+            TransitValue::Bytes(value) => text(value.len())?,
+            TransitValue::Array(values) => values.iter().try_fold(0,|bytes,value|add(bytes,bound(value,depth + 1)?))?,
+            TransitValue::Map(values) => values.iter().try_fold(0,|bytes,(key,value)|add(add(bytes,bound(key,depth + 1)?)?,bound(value,depth + 1)?))?,
+            TransitValue::Tagged { tag,representation } => {
+                let representation = if tag.chars().count() == 1 {
+                    match representation.as_ref() { TransitValue::String(value) => add(512,text(value.len())?)?,value => bound(value,depth + 1)? }
+                } else { bound(representation,depth + 1)? };
+                add(text(tag.len())?,representation)?
+            },
+            _ => 0,
+        };
+        add(512,payload)
+    }
+    bound(value,0)?.checked_add(4096).ok_or_else(||invalid("Transit encoding allocation exceeds addressable memory"))
+}
+
 pub fn encode_msgpack(value: &TransitValue) -> Result<Vec<u8>> {
     let mut encoder = Encoder { bytes: Vec::new(), cache: BTreeMap::new() };
     match value {

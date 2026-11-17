@@ -2,7 +2,7 @@ use rtdb_format::transit::TransitValue as T;
 use rtdb_types::{Result,TableRef};
 use super::{Map,Object,render,tagged};
 
-pub(super) fn read(representation: Object) -> Result<TableRef> {
+pub(super) fn read(representation: Object,allocation: &crate::EvaluationScope) -> Result<TableRef> {
     let representation = match representation {
         Object::List(mut values) => match values.len() {
             0 => Object::Map(Map::new()),1 => values.pop().unwrap(),_ => Object::Map(Map::from_flat_sequence(values)?),
@@ -11,7 +11,7 @@ pub(super) fn read(representation: Object) -> Result<TableRef> {
     };
     let schema = lookup(&representation,"schema-name")?;
     let table = lookup(&representation,"table-name")?;
-    Ok(TableRef::new(if matches!(schema,Object::Null) { "public".into() } else { render::string(&schema)? },render::string(&table)?))
+    Ok(TableRef::new(if matches!(schema,Object::Null) { allocation.reserve(6)?; "public".into() } else { render::string(&schema,allocation)? },render::string(&table,allocation)?))
 }
 
 fn lookup(value: &Object,name: &str) -> Result<Object> {

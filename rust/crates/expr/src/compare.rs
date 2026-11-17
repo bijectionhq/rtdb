@@ -2,6 +2,7 @@ use crate::numeric::{exact_decimal, inapplicable, integer, number};
 use crate::temporal::{date_days, timestamp_units, IntervalParts};
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
 use std::cmp::Ordering;
+use crate::EvaluationScope;
 
 pub(crate) fn nullish(value: &Value) -> bool { matches!(value, Value::Null | Value::Undefined) }
 
@@ -13,25 +14,19 @@ fn contains_set(value: &Value) -> bool {
         _ => false,
     }
 }
-/// Bounds temporary type metadata and decoded Transit objects while calling an equality API, including strict `===`.
-/// This charge is separate from numeric comparison scratch.
+/// Bounds temporary equality type metadata.
+/// Equality APIs acquire this charge from their scope; numeric comparison scratch remains caller-owned.
 pub fn equality_allocation_bound(left: &Value, right: &Value) -> Result<usize> {
-    let metadata = if contains_set(left) && contains_set(right) {
-        left.retained_bytes()?.checked_add(right.retained_bytes()?).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(crate::numeric::overflow)?
-    } else { 0 };
-    let left = transit_allocation_bound(left)?;
-    let right = transit_allocation_bound(right)?;
-    metadata.checked_add(left).and_then(|bytes| bytes.checked_add(right)).ok_or_else(crate::numeric::overflow)
+    if contains_set(left) && contains_set(right) {
+        left.retained_bytes()?.checked_add(right.retained_bytes()?).and_then(|bytes| bytes.checked_mul(8)).ok_or_else(crate::numeric::overflow)
+    } else { Ok(0) }
 }
-fn transit_allocation_bound(value: &Value) -> Result<usize> {
-    let add = |total: usize, value: &Value| total.checked_add(transit_allocation_bound(value)?).ok_or_else(crate::numeric::overflow);
-    match value {
-        Value::Transit(_) => crate::text_allocation_bound(value),
-        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().try_fold(0, add),
-        Value::Struct(fields) => fields.values().try_fold(0, add),
-        Value::Map { entries, .. } => entries.iter().try_fold(0, |bytes, (key, value)| add(add(bytes, key)?, value)),
-        _ => Ok(0),
+fn admit_equality(left: &Value, right: &Value, allocation: Option<&EvaluationScope>) -> Result<()> {
+    if let Some(scope) = allocation {
+        let bytes = equality_allocation_bound(left, right)?;
+        if bytes != 0 { scope.reserve(bytes)?; }
     }
+    validate_equality_values(left, right)
 }
 fn validate_equality_values(left: &Value, right: &Value) -> Result<()> {
     fn shape(value: &Value) -> rtdb_types::LogicalType {
@@ -47,21 +42,28 @@ fn validate_equality_values(left: &Value, right: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn sql_eq(left: &Value, right: &Value) -> Result<Option<bool>> {
-    sql_eq_in_timezone(left, right, "UTC")
+/// SQL equality in UTC; the scope retains admitted metadata and reached Transit allocations.
+/// NULL yields unknown; callers separately own numeric comparison scratch.
+pub fn sql_eq(left: &Value, right: &Value, allocation: &EvaluationScope) -> Result<Option<bool>> {
+    sql_eq_in_timezone(left, right, "UTC", allocation)
 }
 
 /// Uses the session timezone when comparing a date or local timestamp with a zoned timestamp.
 /// Temporal units are converted to the finer unit with checked signed 64-bit arithmetic.
 /// Declared collection shapes reject nested Set/Set equality before length or value comparisons.
-/// Callers own the scratch charge returned by `equality_allocation_bound`.
-pub fn sql_eq_in_timezone(left: &Value, right: &Value, timezone: &str) -> Result<Option<bool>> {
-    validate_equality_values(left, right)?;
-    sql_eq_value(left, right, timezone)
+/// The scope retains type metadata and reached Transit intermediates; callers separately own numeric scratch.
+pub fn sql_eq_in_timezone(left: &Value, right: &Value, timezone: &str, allocation: &EvaluationScope) -> Result<Option<bool>> {
+    sql_eq_scoped(left, right, timezone, Some(allocation))
 }
 
-pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str) -> Result<Option<bool>> {
+pub(crate) fn sql_eq_scoped(left: &Value, right: &Value, timezone: &str, allocation: Option<&EvaluationScope>) -> Result<Option<bool>> {
+    admit_equality(left, right, allocation)?;
+    sql_eq_value(left, right, timezone, allocation)
+}
+
+pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str, allocation: Option<&EvaluationScope>) -> Result<Option<bool>> {
     if nullish(left) || nullish(right) { return Ok(None); }
+    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right, allocation).map(Some); }
     if let (Some(left), Some(right)) = (integer(left), integer(right)) { return Ok(Some(left == right)); }
     if let (Some(left), Some(right)) = (exact_decimal(left), exact_decimal(right)) {
         let (left, ls) = left.into_bigint_and_scale(); let (right, rs) = right.into_bigint_and_scale();
@@ -72,14 +74,14 @@ pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str) -> Resul
         (Value::List(left), Value::List(right)) | (Value::FixedSizeList(left), Value::FixedSizeList(right)) => {
             if left.len() != right.len() { return Ok(Some(false)); }
             let mut unknown = false;
-            for (a, b) in left.iter().zip(right) { match sql_eq_value(a, b, timezone)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
+            for (a, b) in left.iter().zip(right) { match sql_eq_value(a, b, timezone, allocation)? { Some(false) => return Ok(Some(false)), None => unknown = true, _ => () } }
             Ok(if unknown { None } else { Some(true) })
         }
         (Value::Struct(left), Value::Struct(right)) => {
             if !left.keys().eq(right.keys()) { return Ok(Some(false)); }
             let mut unknown = false;
             for name in left.keys() {
-                match sql_eq_value(left.get(name).unwrap_or(&Value::Null), right.get(name).unwrap_or(&Value::Null), timezone)? {
+                match sql_eq_value(left.get(name).unwrap_or(&Value::Null), right.get(name).unwrap_or(&Value::Null), timezone, allocation)? {
                     Some(false) => return Ok(Some(false)), None => unknown = true, _ => (),
                 }
             }
@@ -87,32 +89,42 @@ pub(crate) fn sql_eq_value(left: &Value, right: &Value, timezone: &str) -> Resul
         }
         _ if date_time(left) && date_time(right) => Ok(Some(compare_in_timezone(left, right, false, timezone)? == Ordering::Equal)),
         (Value::Time { .. }, Value::Time { .. }) | (Value::Duration { .. }, Value::Duration { .. }) => Ok(Some(compare_in_timezone(left, right, false, timezone)? == Ordering::Equal)),
-        _ => Ok(Some(emitted_eq(left, right)?)),
+        _ => Ok(Some(emitted_eq(left, right, allocation)?)),
     }
 }
 
-pub fn null_eq(left: &Value, right: &Value) -> Result<bool> {
-    null_eq_in_timezone(left, right, "UTC")
+/// NULL-aware equality in UTC with caller-owned allocation admission and numeric scratch.
+pub fn null_eq(left: &Value, right: &Value, allocation: &EvaluationScope) -> Result<bool> {
+    null_eq_in_timezone(left, right, "UTC", allocation)
 }
 
 /// Treats two outer NULLs as equal; nested unknown equality counts as unequal.
-/// Callers own the scratch charge returned by `equality_allocation_bound`.
-pub fn null_eq_in_timezone(left: &Value, right: &Value, timezone: &str) -> Result<bool> {
+/// The scope retains type metadata and reached Transit intermediates; callers separately own numeric scratch.
+pub fn null_eq_in_timezone(left: &Value, right: &Value, timezone: &str, allocation: &EvaluationScope) -> Result<bool> {
+    null_eq_scoped(left, right, timezone, Some(allocation))
+}
+
+pub(crate) fn null_eq_scoped(left: &Value, right: &Value, timezone: &str, allocation: Option<&EvaluationScope>) -> Result<bool> {
     if nullish(left) || nullish(right) { return Ok(nullish(left) && nullish(right)); }
-    Ok(sql_eq_in_timezone(left, right, timezone)? == Some(true))
+    Ok(sql_eq_scoped(left, right, timezone, allocation)? == Some(true))
 }
 
 /// Numeric and composite inequality negate SQL equality; temporal scalars compare their read values without unit coercion.
 /// NULL produces unknown, including nested NULLs in equal-shaped lists or structs.
-/// Callers own the scratch charge returned by `equality_allocation_bound`.
-pub fn sql_not_eq_in_timezone(left: &Value, right: &Value, timezone: &str) -> Result<Option<bool>> {
-    validate_equality_values(left, right)?;
+/// The scope retains type metadata and reached Transit intermediates; callers separately own numeric scratch.
+pub fn sql_not_eq_in_timezone(left: &Value, right: &Value, timezone: &str, allocation: &EvaluationScope) -> Result<Option<bool>> {
+    sql_not_eq_scoped(left, right, timezone, Some(allocation))
+}
+
+pub(crate) fn sql_not_eq_scoped(left: &Value, right: &Value, timezone: &str, allocation: Option<&EvaluationScope>) -> Result<Option<bool>> {
+    admit_equality(left, right, allocation)?;
     if nullish(left) || nullish(right) { return Ok(None); }
+    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right, allocation).map(|equal|Some(!equal)); }
     if (number(left).is_some() && number(right).is_some()) || matches!((left, right),
         (Value::List(_), Value::List(_)) | (Value::FixedSizeList(_), Value::FixedSizeList(_)) | (Value::Struct(_), Value::Struct(_))) {
-        return Ok(sql_eq_value(left, right, timezone)?.map(|equal| !equal));
+        return Ok(sql_eq_value(left, right, timezone, allocation)?.map(|equal| !equal));
     }
-    Ok(Some(!emitted_eq(left, right)?))
+    Ok(Some(!emitted_eq(left, right, allocation)?))
 }
 
 fn emitted_integer(value: &Value) -> Option<i128> {
@@ -122,13 +134,13 @@ fn emitted_integer(value: &Value) -> Option<i128> {
     })
 }
 
-fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
+fn emitted_eq(left: &Value, right: &Value, allocation: Option<&EvaluationScope>) -> Result<bool> {
     if let Value::Transit(left) = left {
-        let left = crate::transit_object::Object::decode(left)?;
-        return if let Value::Transit(right) = right { left.equivalent(&crate::transit_object::Object::decode(right)?) }
+        let left = crate::transit_object::Decoded::read(left, crate::transit_object::scope(allocation)?)?;
+        return if let Value::Transit(right) = right { left.equivalent(&crate::transit_object::Decoded::read(right, crate::transit_object::scope(allocation)?)?) }
             else { left.equivalent_emitted(right) };
     }
-    if let Value::Transit(right) = right { return crate::transit_object::Object::decode(right)?.equivalent_emitted(left); }
+    if let Value::Transit(right) = right { return crate::transit_object::Decoded::read(right, crate::transit_object::scope(allocation)?)?.equivalent_emitted(left); }
     if let (Some(left), Some(right)) = (emitted_integer(left), emitted_integer(right)) { return Ok(left == right); }
     if let (Some(left), Some(right)) = (IntervalParts::of(left), IntervalParts::of(right)) {
         return Ok(left.months == right.months && left.days == right.days && left.nanos == right.nanos);
@@ -141,9 +153,13 @@ fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
 
 /// Preserves numeric categories, the distinction between dates and timestamps, timestamp zone labels and interval units.
 /// Nested NULLs compare equal; same-category temporal units still undergo checked conversion.
-/// Callers own the scratch charge returned by `equality_allocation_bound`.
-pub fn strict_eq(left: &Value, right: &Value) -> Result<bool> {
-    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right); }
+/// The scope retains type metadata and reached Transit intermediates; callers separately own numeric scratch.
+pub fn strict_eq(left: &Value, right: &Value, allocation: &EvaluationScope) -> Result<bool> {
+    strict_eq_scoped(left, right, Some(allocation))
+}
+
+pub(crate) fn strict_eq_scoped(left: &Value, right: &Value, allocation: Option<&EvaluationScope>) -> Result<bool> {
+    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right, allocation); }
     if nullish(left) || nullish(right) { return Ok(nullish(left) && nullish(right)); }
     if date_time(left) && date_time(right) {
         return match (left, right) {
@@ -153,25 +169,25 @@ pub fn strict_eq(left: &Value, right: &Value) -> Result<bool> {
         };
     }
     if IntervalParts::of(left).is_some() && IntervalParts::of(right).is_some() {
-        return Ok(std::mem::discriminant(left) == std::mem::discriminant(right) && emitted_eq(left, right)?);
+        return Ok(std::mem::discriminant(left) == std::mem::discriminant(right) && emitted_eq(left, right, allocation)?);
     }
     let category = |value: &Value| match value { Value::Decimal(_) => 2, Value::F16(_) | Value::F32(_) | Value::F64(_) => 1, _ => 0 };
     if number(left).is_some() && number(right).is_some() {
-        return Ok(category(left) == category(right) && sql_eq(left, right)? == Some(true));
+        return Ok(category(left) == category(right) && sql_eq_scoped(left, right, "UTC", allocation)? == Some(true));
     }
     match (left, right) {
         (Value::List(a), Value::List(b)) | (Value::FixedSizeList(a), Value::FixedSizeList(b)) => {
             if a.len() != b.len() { return Ok(false); }
-            for (a, b) in a.iter().zip(b) { if !strict_eq(a, b)? { return Ok(false); } }
+            for (a, b) in a.iter().zip(b) { if !strict_eq_scoped(a, b, allocation)? { return Ok(false); } }
             Ok(true)
         }
         (Value::Struct(a), Value::Struct(b)) => {
             if !a.keys().eq(b.keys()) { return Ok(false); }
-            for (a, b) in a.values().zip(b.values()) { if !strict_eq(a, b)? { return Ok(false); } }
+            for (a, b) in a.values().zip(b.values()) { if !strict_eq_scoped(a, b, allocation)? { return Ok(false); } }
             Ok(true)
         }
         (Value::Time { .. }, Value::Time { .. }) | (Value::Duration { .. }, Value::Duration { .. }) => Ok(compare(left, right, false)? == Ordering::Equal),
-        _ => emitted_eq(left, right),
+        _ => emitted_eq(left, right, allocation),
     }
 }
 

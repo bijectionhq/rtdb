@@ -82,11 +82,11 @@ fn half_even_rescaling_bounds_coefficients_and_preserves_zero_scale() {
 #[test]
 fn wide_scale_comparisons_keep_exact_order_and_cohort_equality() {
     for scale in [i32::MIN, -1000, 1000, i32::MAX - 1] {
-        assert_eq!(sql_eq(&value(1, scale), &value(10, scale + 1)).unwrap(), Some(true));
+        assert_eq!(sql_eq(&value(1, scale), &value(10, scale + 1), &equality_scope()).unwrap(), Some(true));
         assert_eq!(compare(&value(-1, scale), &value(-9, scale + 1), false).unwrap(), Ordering::Less);
     }
     assert_eq!(compare(&value(1, i32::MIN), &value(1, i32::MAX), false).unwrap(), Ordering::Greater);
-    assert_eq!(sql_eq(&value(0, i32::MIN), &value(0, i32::MAX)).unwrap(), Some(true));
+    assert_eq!(sql_eq(&value(0, i32::MIN), &value(0, i32::MAX), &equality_scope()).unwrap(), Some(true));
 }
 
 #[test]
@@ -143,4 +143,8 @@ fn round_changes_decimal_metadata_and_rejects_dynamic_integer_scales() {
     assert_eq!(scalar_call("ceil", &[value(125, 2)], &context).unwrap(), V::F64(2.0));
     let args = [Expr::Literal(value(125, 2)), Expr::Parameter { index: 0, data_type: T::Scalar(S::I64) }];
     assert_eq!(function_type_with_args("round", &args).unwrap_err().code, "xtdb.expression/non-literal-scale");
+}
+
+fn equality_scope() -> rtdb_expr::EvaluationScope {
+    rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

@@ -1,4 +1,5 @@
-use crate::{EvalContext, cast, compare_in_timezone, null_eq_in_timezone, sql_eq_in_timezone};
+use crate::compare::{null_eq_scoped,sql_eq_scoped};
+use crate::{EvalContext, cast, compare_in_timezone};
 use crate::compare::nullish;
 use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Value};
@@ -68,9 +69,6 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         };
         return Ok(component.map(|text| Value::Utf8(text.into_owned())).unwrap_or(Value::Null));
     }
-    if matches!(name.as_str(), "nullif" | "distinct_from" | "null_eq" | "===") && (name == "===" || args.iter().all(|value| !nullish(value))) {
-        context.reserve(crate::equality_allocation_bound(&args[0], &args[1])?)?;
-    }
     match name.as_str() {
         "col_description" | "pg_indexam_has_property" => return Ok(Value::Null),
         "random" => return crate::volatile::random(),
@@ -95,19 +93,19 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
             return Ok(Value::Struct(fields));
         }
         "coalesce" => return Ok(args.iter().find(|value| !nullish(value)).cloned().unwrap_or(Value::Null)),
-        "nullif" => return Ok(if sql_eq_in_timezone(&args[0], &args[1], context.timezone)? == Some(true) { Value::Null } else { args[0].clone() }),
+        "nullif" => return Ok(if sql_eq_scoped(&args[0], &args[1], context.timezone, context.allocation)? == Some(true) { Value::Null } else { args[0].clone() }),
         "nil?" | "is_null" => return Ok(Value::Bool(nullish(&args[0]))),
         "true?" | "is_true" => return Ok(Value::Bool(args[0] == Value::Bool(true))),
         "false?" | "is_false" => return Ok(Value::Bool(args[0] == Value::Bool(false))),
         "distinct_from" => return if args.iter().any(nullish) { Ok(Value::Bool(!args.iter().all(nullish))) }
-            else { Ok(crate::sql_not_eq_in_timezone(&args[0], &args[1], context.timezone)?.map(Value::Bool).unwrap_or(Value::Null)) },
+            else { Ok(crate::compare::sql_not_eq_scoped(&args[0], &args[1], context.timezone, context.allocation)?.map(Value::Bool).unwrap_or(Value::Null)) },
         "_meta_double" => return Ok(if let Some(value) = number(&args[0]) { Value::F64(value) }
             else if let Some(days) = crate::temporal::date_days(&args[0]) { Value::F64(days as f64 * 86_400.0) }
             else if let Value::Timestamp { value, unit, .. } | Value::Time { value, unit, .. } | Value::Duration { value, unit } = &args[0] { Value::F64(*value as f64 / unit.units_per_second() as f64) }
             else { Value::Null }),
         "boolean" => return Ok(Value::Bool(!nullish(&args[0]) && args[0] != Value::Bool(false))),
-        "null_eq" => return Ok(Value::Bool(null_eq_in_timezone(&args[0], &args[1], context.timezone)?)),
-        "===" => return Ok(Value::Bool(crate::strict_eq(&args[0], &args[1])?)),
+        "null_eq" => return Ok(Value::Bool(null_eq_scoped(&args[0], &args[1], context.timezone, context.allocation)?)),
+        "===" => return Ok(Value::Bool(crate::compare::strict_eq_scoped(&args[0], &args[1], context.allocation)?)),
         "period" => {
             let timestamp = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
             let endpoint = |value: &Value, unbounded| -> Result<i64> {
@@ -129,8 +127,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
                 let mut found = false;
                 for old in &items {
                     let equal = if nullish(old) || nullish(value) { nullish(old) && nullish(value) } else {
-                        context.reserve(crate::equality_allocation_bound(old,value)?)?;
-                        crate::compare::sql_eq_value(old,value,context.timezone)? == Some(true)
+                        crate::compare::sql_eq_value(old,value,context.timezone, context.allocation)? == Some(true)
                     };
                     if equal { found = true; break; }
                 }

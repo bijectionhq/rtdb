@@ -136,3 +136,20 @@ fn transit_sequences_reset_cache_per_top_level_and_reject_partial_tail() {
     assert!(decode_json_sequence(br#"["~:alpha"] ["unfinished"#).is_err());
     assert!(decode_json_sequence(b"").unwrap().is_empty());
 }
+
+#[test]
+fn msgpack_allocation_admission_preserves_the_encoders_depth_boundary() {
+    use rtdb_format::transit::msgpack_allocation_bound;
+    for leaf in [V::Null, V::Tagged { tag: "i".into(), representation: Box::new(V::String("7".into())) }] {
+        let mut value = leaf;
+        for _ in 0..128 { value = V::Array(vec![value]); }
+        assert!(msgpack_allocation_bound(&value).unwrap() >= encode_msgpack(&value).unwrap().len());
+        value = V::Array(vec![value]);
+        assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message, "Transit nesting limit exceeded");
+        assert_eq!(encode_msgpack(&value).unwrap_err().message, "Transit nesting limit exceeded");
+    }
+    let mut value = V::Tagged { tag: "xt/custom".into(), representation: Box::new(V::String("payload".into())) };
+    for _ in 0..128 { value = V::Array(vec![value]); }
+    assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message, "Transit nesting limit exceeded");
+    assert_eq!(encode_msgpack(&value).unwrap_err().message, "Transit nesting limit exceeded");
+}
