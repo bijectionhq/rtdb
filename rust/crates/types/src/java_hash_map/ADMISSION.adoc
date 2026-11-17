@@ -75,6 +75,8 @@ KeyOps implementations separately admit any evaluation scratch before allocating
 
 NormalizedMap retains every collection lease after the creating admission authority drops.
 Its leases() borrow lets a cached-owner adapter count existing reservations against a fresh conversion scope without reserving the same heap twice.
+The transient `Map::leases()` borrow provides the same accounting view for reusable scratch tables.
+Warm capacity, including storage held after clear or a failed mutation, remains visible through this borrow until final release.
 Dropping removed entries does not release their collection envelope, because vacant slots and source table capacity remain reusable.
 Payload and imported semantic-owner reservation retention remains the responsibility of the concrete key/value owner.
 

@@ -226,6 +226,10 @@ impl<K, V, L> Map<K, V, L> {
     fn iter_unchecked(&self) -> Iter<'_, K, V> { Iter { slots: &self.slots, buckets: self.buckets.values(), next: None, remaining: self.len } }
     /// Returns the constructed entry count; after mutation failure this is diagnostic prefix state only.
     pub fn len(&self) -> usize { self.len }
+    /// Borrows every reservation still owned by the collection, including retained capacity after `clear`.
+    /// Failed transients still expose their storage reservations for accounting.
+    /// Payload and provenance reservations owned by entries remain separate.
+    pub fn leases(&self) -> &[L] { &self.charges }
     /// Consumes a successful construction prefix into an immutable table without allocating or invoking the admission authority.
     /// The admission argument is a type witness only; a failed transient is dropped and returns an error.
     pub fn finish<A: Admission<Lease = L>>(self, _admission: &mut A) -> Result<NormalizedMap<K, V, L>> { self.usable()?; Ok(NormalizedMap { map: self }) }
@@ -239,7 +243,7 @@ impl<K, V, L> NormalizedMap<K, V, L> {
     pub fn iter(&self) -> Iter<'_, K, V> { self.map.iter_unchecked() }
     /// Borrows collection reservations for a caller retaining cached storage against another admission scope.
     /// Payload/provenance reservations owned by keys or values remain separate.
-    pub fn leases(&self) -> &[L] { &self.map.charges }
+    pub fn leases(&self) -> &[L] { self.map.leases() }
     /// Borrows a matching value with the original source lookup geometry and callback order; errors leave this map unchanged.
     pub fn get<A: Admission<Lease = L>, O: KeyOps<K, A>>(&self, key: &K, ops: &mut O, admission: &mut A) -> Result<Option<&V>> { self.map.get(key, ops, admission) }
     /// Tests membership using the same lookup callback/error order as get.

@@ -407,3 +407,24 @@ fn unwinding_during_clear_cannot_publish_partial_removal() {
     assert!(map.finish(&mut budget).is_err());
     assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
 }
+
+#[test]
+fn transient_leases_remain_visible_after_clear_and_failed_mutation() {
+    let mut budget = Budget::new();
+    let mut ops = Ops::new();
+    let mut map = populated(&[1, 2], &mut budget, &mut ops);
+    let retained = map.leases().iter().map(|lease| lease.bytes).sum::<usize>();
+    assert!(retained > 0);
+    assert_eq!(retained, budget.live.load(AtomicOrdering::SeqCst));
+    let requests = budget.requests;
+
+    map.clear().unwrap();
+    assert_eq!(map.leases().iter().map(|lease| lease.bytes).sum::<usize>(), retained);
+    ops.fail_hash = true;
+    assert!(map.put(key(3, 3), 30, &mut ops, &mut budget).is_err());
+    assert!(map.try_iter().is_err());
+    assert_eq!(map.leases().iter().map(|lease| lease.bytes).sum::<usize>(), retained);
+    assert_eq!(budget.requests, requests);
+    drop(map);
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
+}
