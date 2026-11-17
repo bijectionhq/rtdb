@@ -44,7 +44,7 @@ impl Number {
         match operation { Predicate::Zero => ordering == Some(Ordering::Equal),Predicate::Positive => ordering == Some(Ordering::Greater),Predicate::Negative => ordering == Some(Ordering::Less) }
     }
 }
-fn decimal_compare(left: BigInt,ls: i32,right: BigInt,rs: i32) -> Result<Ordering> {
+pub(super) fn decimal_compare(left: BigInt,ls: i32,right: BigInt,rs: i32) -> Result<Ordering> {
     let signs = left.sign().cmp(&right.sign());
     if signs != Ordering::Equal { return Ok(signs); }
     if left.is_zero() { return Ok(Ordering::Equal); }

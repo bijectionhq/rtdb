@@ -246,3 +246,67 @@ async fn host_primitive_boolean_metadata_preserves_unresolved_static_calls() {
     assert_eq!(project(r#"(regexp-replace "NaN" (str (/ (boolean nil) ##NaN)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
     assert_eq!(project(r#"(regexp-replace "a" (str (/ false ##NaN)) "x")"#).await.unwrap_err().message,"Host value is not a Number");
 }
+
+#[tokio::test]
+async fn host_integral_division_preserves_categories_scales_and_floating_roundoff() {
+    for (form,expected) in [
+        ("(quot -7 3)","-2"),("(rem -7 3)","-1"),("(mod -7 3)","2"),("(mod 7 -3)","-2"),
+        ("(quot -9223372036854775808 -1)","-9223372036854775808"),("(rem -9223372036854775808 -1)","0"),
+        ("(quot -9223372036854775808N -1)","9223372036854775808"),("(mod -9223372036854775808 -1)","0"),
+        ("(quot (/ 7 2) 1)","3"),("(rem (/ 7 2) 1)","1/2"),("(mod (/ -7 2) 1)","1/2"),
+        ("(quot 2.00M 0.5M)","4.0"),("(quot 1.00M 3M)","0.00"),("(rem 5.00M 2M)","1.00"),
+        ("(quot 1E+3M 4M)","2.5E+2"),("(rem 1E+3M 4M)","0E+1"),("(mod -7.00M 3M)","2.00"),
+        ("(quot -0.0 1.0)","0.0"),("(rem -0.0 1.0)","-0.0"),("(mod -0.0 1.0)","-0.0"),
+        ("(rem -0.0 -1.0)","0.0"),("(mod -0.0 -1.0)","0.0"),
+        ("(rem 1.0 0.1)","0.0"),("(rem 1.0 ##Inf)","NaN"),("(quot 1.0 ##Inf)","0.0"),
+        ("(mod 1.0 ##Inf)","NaN"),("(quot 1E100 1.0)","1.0E100"),("(rem 1E100 1.0)","0.0"),
+        ("(quot (float 7.5) (short 2))","3.0"),("(clojure.core/rem 7 3)","1"),
+        ("(let [f quot] (f -7 3))","-2"),("(let [f rem] (f -7 3))","-1"),("(let [f mod] (f -7 3))","2"),
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str "\\Q" {form} "\\E") "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
+    }
+}
+
+#[tokio::test]
+async fn host_integral_division_admits_boxed_rhs_before_lhs_without_nan_shortcuts() {
+    for operation in ["quot","rem"] {
+        for (arguments,message) in [
+            ("1 0","/ by zero"),("1.0 0","Divide by zero"),("##NaN 0.0","Divide by zero"),
+            (r#"(identity "not numeric") 0"#,"Divide by zero"),(r#""not numeric" 0.0"#,"Divide by zero"),
+            ("(boolean nil) 0","Divide by zero"),("(zero? 1) 0.0","Divide by zero"),
+            ("##NaN 1","Infinite or NaN"),("1 ##NaN","Infinite or NaN"),("##Inf 1.0","Infinite or NaN"),
+            (r#""not numeric" ##NaN"#,"Host value is not a Number"),(r#"##NaN "not numeric""#,"Host value is not a Number"),
+            (r#"(subs "x" -1) 0"#,"Host substring indexes are out of range"),
+        ] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message,message,"{operation} {arguments}");
+        }
+        for arguments in ["1 0",r#""not numeric" 0"#,"##NaN 0"] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f {arguments}))) "x")"#)).await.unwrap_err().message,"Divide by zero");
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1M (/ 1 3))) "x")"#)).await.unwrap_err().message,"Non-terminating decimal expansion; no exact representable decimal result.");
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (str (mod 1 0)) "x")"#).await.unwrap_err().message,"Divide by zero");
+}
+
+#[tokio::test]
+async fn host_integral_inline_arity_and_mixed_result_metadata_remain_distinct() {
+    for operation in ["quot","rem"] {
+        for arguments in ["","1","1 2 3"] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (if true "a" (f))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (f (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{operation} str] ({operation} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        for arguments in ["2.0 (identity 1)","(identity 2) 1.0","2.0 (boolean nil)","2.0 (pos? 1)"] {
+            assert_eq!(project(&format!(r#"(regexp-replace "127" (str (byte (if true 127.9 ({operation} {arguments})))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 ({operation} 2.0 1)))) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "0" (str (- (if true -9223372036854775808 ({operation} 2 1)) -9223372036854775808)) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 ({operation} 2 (identity 1))) -9223372036854775808)) "x")"#)).await.unwrap_err().message,"long overflow");
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (if true "a" (mod)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
+    assert_eq!(project(r#"(regexp-replace "a" (mod (subs "x" -1)) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 (mod 2 1)) -9223372036854775808)) "x")"#).await.unwrap_err().message,"long overflow");
+    assert_eq!(project(r#"(regexp-replace "Infinity" (str (/ (quot 2.0 1) 0)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
+    assert_eq!(project(r#"(regexp-replace "a" (str (/ (quot 2.0 (identity 1)) 0)) "x")"#).await.unwrap_err().message,"Divide by zero");
+}

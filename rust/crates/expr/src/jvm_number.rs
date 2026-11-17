@@ -8,6 +8,8 @@ mod arithmetic;
 pub(crate) use arithmetic::{Binary,Dispatch,Unary};
 mod comparison;
 pub(crate) use comparison::{Comparison,Predicate};
+mod integral;
+pub(crate) use integral::Integral;
 
 #[derive(Debug)]
 pub(crate) enum Error { Invalid,External(Anomaly) }

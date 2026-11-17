@@ -123,3 +123,44 @@ fn host_decimal_comparison_admits_extreme_scale_without_expanding_coefficients()
     }
     assert_eq!(memory.used_bytes(),0);
 }
+
+#[test]
+fn host_integral_division_admits_products_and_scale_expansion_before_allocation() {
+    for (left,right,budget,code) in [
+        (F::BigInteger("9".repeat(512)),F::BigInteger("7".repeat(512)),64 << 10,"rtdb/memory-budget-exceeded"),
+        (call("/",vec![F::BigInteger("9".repeat(128)),F::Literal(V::I64(7))]),call("/",vec![F::Literal(V::I64(1)),F::Literal(V::I64(3))]),64 << 10,"rtdb/memory-budget-exceeded"),
+        (F::Decimal("1E+2147483647".into()),F::Literal(V::I64(3)),128 << 20,"rtdb.expr/regex-host-limit"),
+    ] {
+        for operation in ["quot","rem","mod"] {
+            let expression = replace(call("str",vec![call(operation,vec![left.clone(),right.clone()])]));
+            let memory = MemoryBudget::new(budget);
+            {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext { allocation: Some(&scope),..Default::default() };
+                assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&context).err().unwrap().code,code);
+                assert!(memory.peak_bytes() <= memory.limit_bytes());
+            }
+            assert_eq!(memory.used_bytes(),0);
+        }
+    }
+}
+
+#[test]
+fn host_decimal_zero_quotient_keeps_extreme_scales_without_expanding_coefficients() {
+    for operation in ["quot","rem","mod"] {
+        let result = call(operation,vec![F::Decimal("1E-2147483647".into()),F::Decimal("1E+2147483647".into())]);
+        let expected = operation == "quot";
+        let pattern = call("if",vec![call("zero?",vec![result]),string(if expected { "a" } else { "b" }),string(if expected { "b" } else { "a" })]);
+        let expression = replace(pattern);
+        let memory = MemoryBudget::new(128 << 20);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let schema = Schema::default();
+            let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+            assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+            assert!(memory.peak_bytes() < memory.limit_bytes());
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+}

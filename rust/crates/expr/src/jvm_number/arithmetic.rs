@@ -137,7 +137,7 @@ impl Number {
     fn storage_bits(&self) -> Result<u64> {
         match self { Self::BigInt(value) | Self::Decimal { coefficient: value,.. } => Ok(value.bits()),Self::Ratio { numerator,denominator } => numerator.bits().checked_add(denominator.bits()).ok_or_else(invalid),_ => Ok(64) }
     }
-    fn decimal_scale_range(&self) -> Result<(i64,i64)> {
+    pub(super) fn decimal_scale_range(&self) -> Result<(i64,i64)> {
         Ok(match self { Self::Decimal { scale,.. } => (i64::from(*scale),i64::from(*scale)),Self::Ratio { denominator,.. } => (0,i64::try_from(denominator.bits()).map_err(|_|invalid())?),_ => (0,0) })
     }
 }
