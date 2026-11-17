@@ -13,7 +13,9 @@ The decoder checks store integrity and decrypts encrypted certificate sections a
 PEM material remains on the eager `KeyStore` path because Kafka's `DefaultSslEngineFactory.PemStore` decrypts PEM keys before initializing either key manager.
 `ProtectedIdentity` is an immutable enumerated-alias binding, and multiple bindings may share one protected entry.
 JKS bindings follow raw `Hashtable` enumeration followed by locale-English lowercase lookup, including aliases that resolve to a different stored entry or no private-key entry.
-PKCS12 bindings follow normalized `LinkedHashMap` keys and replacement order, including secret-key entries that replace private-key aliases.
+PKCS12 bindings follow normalized `LinkedHashMap` keys and replacement order, including SecretBag entries with OID suffix five that replace private-key aliases.
+Deferred loading validates each SecretBag envelope and includes unnamed secret entries in the generated-alias counter, without recovering their protected payload.
+CRLBag suffix four does not replace aliases or require a secret-key payload; its outer bag envelope and attributes are still parsed.
 Their alias lookup uses pinned Unicode 16 full lowercase and Java's word-boundary final-sigma handling, preserving isolated JKS UTF-16 surrogate units.
 PKCS12 friendly-name matching uses Java's simple character case comparison, which differs from full lowercase expansion.
 Protected PKCS12 certificate chains compare Java canonical distinguished names and use the first matching issuer when no authority key identifier is present.
@@ -55,7 +57,7 @@ Secret-key recovery preserves registered PBE factory rules and permits Java's no
 The Sun-only protection services implement the pinned PBE/MAC password, parameter and retry rules without changing generic or deferred recovery.
 Loading uses the JKS-compatible initial bound plus a separately admitted construction transient, section/recovery scratch, chain expansion and retained key owners.
 Both producer and registry adapters import these credentials independently of private-key/certificate consistency.
-The link:src/sun_pkcs12/README.adoc[Sun PKCS12 reference] records source provenance, provider services, admission bounds, native certificate/import limits and remaining deferred SecretBag handling work.
+The link:src/sun_pkcs12/README.adoc[Sun PKCS12 reference] records source provenance, provider services, admission bounds, native certificate/import limits and the separate deferred parsing boundary.
 
 `DistinguishedName` is a passive immutable Java principal value with an independent reservation covering decoding and its retained canonical spelling.
 It follows OpenJDK 25.0.1 `X500Name`, `RDN`, and `AVA` canonicalization: RDN order remains significant, assertions within an RDN are sorted, and repeated assertions are retained.

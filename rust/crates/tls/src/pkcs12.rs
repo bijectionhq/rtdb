@@ -172,7 +172,7 @@ impl Bags {
                     if attributes.trusted { self.name_entry(&mut attributes); }
                     self.certificates.push(CertificateBag { der, certificate, attributes, order });
                 }
-                Some(4) if self.java => {
+                Some(5) if self.java => {
                     let mut value = value.sequence()?;
                     value.expect(6)?;
                     explicit_octets(value.expect(0xa0)?)?;

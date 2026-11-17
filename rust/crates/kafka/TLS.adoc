@@ -48,6 +48,8 @@ Client EKU permits only absence, `clientAuth` or `anyExtendedKeyUsage`, with mal
 Extension parsing reserves memory before allocation; admission failure aborts construction or selection without returning an ineligible identity or previous fallback.
 The link:src/tls/keys/README.adoc[client identity ranking reference] describes usage decisions, ownership and remaining native key-import boundaries.
 Java JKS and PKCS12 stores under `NewSunX509` retain encrypted private keys and select using certificate metadata before recovering the chosen entry.
+Deferred PKCS12 loading includes SecretBag suffix five in generated aliases and replacement order while checking its envelope without recovering the secret key.
+CRLBag suffix four cannot replace private-key aliases and does not require a secret-key payload.
 An unavailable key password or malformed protected key on an unselected entry does not fail configuration.
 Ordinary recovery failure on the selected entry supplies no client certificate and does not select another alias; memory-admission failures fail the callback.
 The retained effective key password has its own admitted, zeroized buffer, with the store password used when no key password was supplied.
@@ -151,7 +153,7 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 SunX509 PKCS12 private-factory admission retains explicit unsupported nested parameter services and pinned default-provider assumptions.
 Native certificate parsing, re-encoding and issuer self-signature verification do not yet establish the full Java CertificateFactory acceptance boundary.
-The unchanged deferred PKCS12 decoder recognizes CRLBag suffix four as secret metadata and misses actual SecretBag suffix five; NewSunX509 alias replacement remains open for those bags.
+NewSunX509 PKCS12 loading and recovery retain their separate BER and PBE implementations; exact provider acceptance remains open.
 The SunX509 JKS parser implements Java protection-envelope and PKCS8 framing, while AlgorithmParameters validation and provider-specific KeyFactory normalization remain open.
 Java can retain a generic PKCS8 key after provider rejection; native import can reject that key while constructing the transport.
 SunX509 selection still applies native `SSL_check_chain` qualification, and native installation checks public-key values earlier than Java's signature proof.

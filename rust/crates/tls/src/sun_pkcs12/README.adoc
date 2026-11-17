@@ -92,6 +92,8 @@ The private-factory reference records its explicit unsupported nested parameter 
 Factory acceptance does not establish native TLS import, signing support or cryptographic validity.
 Custom providers and provider configuration overrides remain outside this decoder.
 SunX509 native chain qualification and public-key installation checks still constrain handshake behavior separately.
-The unchanged deferred PKCS12 decoder recognizes the CRL suffix four as secret metadata and does not yet recognize the actual SecretBag suffix five; its alias-replacement parity remains open.
+Deferred PKCS12 loading recognizes SecretBag suffix five for generated aliases and replacement order, validates its envelope and leaves its protected payload unrecovered.
+CRLBag suffix four remains ignored after its outer envelope and attributes are parsed.
+Deferred loading and recovery retain their separate BER and PBE implementations; exact provider acceptance remains open.
 
 Regression sources cover eager private and secret recovery, alias collisions, missing IDs, provider framing, issuer selection, signed-value and PBE rules, memory release, producer and registry construction, and native client authentication.
