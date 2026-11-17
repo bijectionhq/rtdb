@@ -137,7 +137,8 @@ fn check_oniguruma_mode_changes_wordbounds() {
 
 #[test]
 fn delegated_nfa_limit_applies_inside_a_hard_pattern() {
-    assert!(RegexBuilder::new(r"(?=a)a").delegate_size_limit(1).build().is_err());
+    assert!(RegexBuilder::new(r"(?=a)a").delegate_size_limit(1).build().unwrap().is_match("a").unwrap());
+    assert!(RegexBuilder::new(r"(?=a)[a-z]").delegate_size_limit(1).build().is_err());
 }
 
 #[test]
