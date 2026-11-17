@@ -345,6 +345,9 @@ Stored Transit field access constructs semantic objects through the wire decoder
 Repeated cached byte-array and NaN keys retain object identity during record construction, including NaN returned unchanged by ratio division.
 The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.
 Equality between two stored Transit values constructs each registered object graph before comparing it.
+Comparisons with native scalar operands retain their emitted JVM representation: numeric categories stay distinct, and UTF8, keyword, UUID and binary scalars supply byte buffers.
+Interval scalars compare their months, days and nanoseconds.
+Strict equality reads a Transit object even against native NULL; a decoded Transit null equals native NULL, while ordinary SQL equality keeps outer NULL propagation.
 Collection equality follows decoded values and identity-bearing objects retain their separate read identities, including when the serialized bytes match.
 The evaluator and direct scalar calls reserve decoded-graph scratch before parsing; direct equality API callers own the charge reported by `equality_allocation_bound`.
 `tests/transit_equality.rs` records MessagePack/JSON equality, nested native list and struct values, identity, malformed objects, and admission failures as unexecuted regression source.

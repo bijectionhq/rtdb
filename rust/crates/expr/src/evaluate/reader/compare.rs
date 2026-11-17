@@ -8,13 +8,19 @@ pub(super) fn equal<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,fr
 
 fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: &'a EvaluationFrame<'a>) -> Result<Pending<'a,Option<bool>>> {
     boxed(async move {
+        if strict {
+            if let (EvalValue::Scalar(a),EvalValue::Scalar(b)) = (&left,&right) {
+                frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;
+                return crate::strict_eq(a,b).map(Some);
+            }
+        }
         if is_null(&left) || is_null(&right) {
             return Ok(if strict { Some(is_null(&left) && is_null(&right)) } else { None });
         }
         match (&left,&right) {
             (EvalValue::Scalar(a),EvalValue::Scalar(b)) => {
                 frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;
-                if strict { crate::strict_eq(a,b).map(Some) } else { crate::sql_eq_in_timezone(a,b,frame.context.timezone) }
+                crate::sql_eq_in_timezone(a,b,frame.context.timezone)
             },
             (EvalValue::List(a,_),EvalValue::List(b,_)) if a == b && *a != Kind::Set => {
                 let size = len(&left)?;
