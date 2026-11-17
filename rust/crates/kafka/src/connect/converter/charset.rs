@@ -13,6 +13,7 @@ pub(super) enum Charset {
     Big5(&'static double_byte::big5::Big5Family),
     Big5Solaris(&'static double_byte::big5::Big5Family),
     Hkscs(&'static double_byte::hkscs::Hkscs),
+    DoubleByteSubclass(double_byte::subclasses::Decoder),
     DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
     Utf16(Utf16Order),
@@ -59,6 +60,7 @@ impl Charset {
             normalized => {
                 if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
                 else if let Some(table) = double_byte::hkscs::lookup(normalized) { Self::Hkscs(table) }
+                else if let Some(decoder) = double_byte::subclasses::lookup(normalized) { Self::DoubleByteSubclass(decoder) }
                 else if let Some(table) = double_byte::lookup(normalized) { Self::DoubleByte(table) }
                 else { return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{name}'"))); }
             },
@@ -74,6 +76,7 @@ impl Charset {
             Self::Big5(family) => family.decode_big5(bytes),
             Self::Big5Solaris(family) => family.decode_solaris(bytes),
             Self::Hkscs(table) => table.decode(bytes),
+            Self::DoubleByteSubclass(decoder) => decoder.decode(bytes),
             Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
             Self::Utf16(order) => decode_utf16(bytes, order),

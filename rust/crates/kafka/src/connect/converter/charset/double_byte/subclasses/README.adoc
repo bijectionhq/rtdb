@@ -1,0 +1,64 @@
+= Java 25 DBCS-only and simple EUC mappings
+
+The String converter supports six Java25 charsets implemented by `DoubleByte.Decoder_DBCSONLY` and `DoubleByte.Decoder_EUC_SIM`, with 36 distinct case-insensitive registered names.
+The DBCS-only charsets are `x-JIS0208`, `JIS_X0212-1990`, `x-IBM300`, and `x-IBM834`.
+The simple EUC charsets are `x-IBM1383` and `x-IBM970`.
+link:charsets.tsv[The manifest] records every canonical name and alias, decoder kind, charset and mapping source hashes, ASCII flag, trail range, present row count, resource size, mapping digest, and decoded probe digests.
+The DBCS-only charsets have 22 registered names and the simple EUC charsets have 14.
+
+`Decoder` is a passive immutable enum that selects DBCS-only or simple EUC behavior and borrows a static `Mapping`.
+The input cursor and UTF8 output belong to the decode call.
+Six static resources occupy 142,686 bytes and add no retained allocation per converter or record.
+The existing String scalar memory admission precedes decoding, and the output reserves at most three UTF8 bytes per input byte.
+Java's decoder holders initialize immutable tables and have no process-wide mapping updates.
+
+== DBCS-only decoding
+
+OpenJDK25 `String(byte[], Charset)` uses the inherited `DoubleByte.Decoder` ArrayDecoder loop with the DBCS-only subclass's replacement rules.
+That subclass substitutes an all-unmappable single-byte table, disables the ASCII fastpath, and consumes two bytes for every complete candidate, including malformed or unmappable pairs.
+An unmatched final byte produces one replacement.
+ASCII, zero, and SO/SI bytes participate in pairs; they have no separate single-byte or shift-mode interpretation.
+For example, the ASCII-range bytes 0x24 0x22 produce U+3042 in JIS0208, while either byte decoded alone produces a replacement.
+
+JIS0208 and JIS0212 use trails 0x21 through 0x7E; IBM300 and IBM834 use trails 0x40 through 0xFE.
+IBM834 borrows `IBM933.DecodeHolder` pair mappings without using IBM933's EBCDIC decoder state machine.
+Its mappings preserve the decoder's values for non-round-trip encoder alternatives, including 0x4143 to U+30FB.
+The resource retains IBM933's source single-byte table for provenance, and the DBCS-only loop ignores it, matching the Java constructor.
+
+== Simple EUC decoding
+
+OpenJDK25 `String(byte[], Charset)` calls `Decoder_EUC_SIM.decode(byte[], int, int, char[])` through ArrayDecoder after the ASCII fastpath.
+IBM1383 and IBM970 map bytes 0x00 through 0x9F to matching Unicode code points except SS2 (0x8E) and SS3 (0x8F).
+Other bytes start two-byte candidates with trails 0xA1 through 0xFE.
+An unmappable candidate consumes both bytes unless its first byte is SS2 or SS3; those prefixes produce a replacement and leave the next byte for decoding.
+Both pinned mappings have absent SS2/SS3 lead rows, so those prefixes always follow that retry rule.
+An unmatched final lead produces one replacement, and the next record starts with a fresh cursor.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The supporting source manifest] pins the providers, decoder subclasses, charset lookup, and String construction path.
+link:COPYRIGHT[Copyright notices] retain the upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+The resources use the existing immutable `Mapping` format described in link:../README.adoc[the double-byte reference]: two trail-bound bytes, 256 single-byte units, 256 row indices, then compact pair rows.
+Source single-byte and pair units remain unchanged, including the single-byte units ignored by DBCS-only decoding.
+The row-index marker 0xFFFF occupies a separate field from the unmapped character marker U+FFFD.
+All source units are BMP values without surrogate units.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-double-byte-subclasses
+----
+
+It verifies archive hashes, decoder constructors and overrides, holder initialization, IBM834's table source, row dimensions, surrogate exclusions, simple EUC single-byte entries and SS2/SS3 row absence, and exact provider alias ownership.
+The single-byte digest concatenates all 256 bytes decoded as independent records using the selected decoder kind.
+The pair digest concatenates all 65,536 two-byte records in unsigned order, appending U+0000 to each decoded result.
+Regression sources decode probes independently before appending the separator because zero bytes can be consumed by both decoder kinds.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes and pairs, raw JIS text, IBM Japanese and Korean mappings, private-use values, non-round-trip decoder values, C1 controls, SS2/SS3 retries, ASCII and zero trail consumption, odd lengths, record boundaries, null values, key/value configuration, punctuation, trimming, and memory admission.
+The existing immutable double-byte resources and Big5-Solaris process-isolated regressions remain separately pinned.
