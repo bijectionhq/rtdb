@@ -8,6 +8,7 @@
  */
 
 #include "internal/refcount.h"
+#include "crypto/x509.h"
 
 #define X509V3_conf_add_error_name_value(val) \
     ERR_add_error_data(4, "name=", (val)->name, ", value=", (val)->value)
@@ -146,6 +147,7 @@ struct x509_store_st {
     CRYPTO_EX_DATA ex_data;
     CRYPTO_REF_COUNT references;
     CRYPTO_RWLOCK *lock;
+    OSSL_X509_RETAINED_OWNER retained_owner;
 };
 
 typedef struct lookup_dir_hashes_st BY_DIR_HASH;

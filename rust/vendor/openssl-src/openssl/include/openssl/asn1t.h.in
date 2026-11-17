@@ -716,6 +716,16 @@ typedef struct ASN1_STREAM_ARG_st {
     unsigned char **boundary;
 } ASN1_STREAM_ARG;
 
+/*
+ * - ASN1_AFLG_FREE_FINAL supplies this zeroed structure to ASN1_OP_FREE_POST in exarg.
+ * - A populated free_func runs after field and object storage cleanup, with only the captured arg.
+ * - For embedded values, the containing allocation remains owned by the enclosing value.
+ */
+typedef struct ASN1_FREE_ARG_st {
+    void (*free_func)(void *);
+    void *arg;
+} ASN1_FREE_ARG;
+
 /* Flags in ASN1_AUX */
 
 /* Use a reference count */
@@ -726,6 +736,8 @@ typedef struct ASN1_STREAM_ARG_st {
 #define ASN1_AFLG_BROKEN 4
 /* Use the new asn1_const_cb */
 #define ASN1_AFLG_CONST_CB 8
+/* Capture a final cleanup callback during ASN1_OP_FREE_POST. */
+#define ASN1_AFLG_FREE_FINAL 16
 
 /* operation values for asn1_cb */
 

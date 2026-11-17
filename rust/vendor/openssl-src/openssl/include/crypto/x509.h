@@ -19,6 +19,11 @@
 
 /* Internal X509 structures and functions: not for application use */
 
+typedef struct ossl_x509_retained_owner_st {
+    void *arg;
+    void (*free_func)(void *);
+} OSSL_X509_RETAINED_OWNER;
+
 /* Note: unless otherwise stated a field pointer is mandatory and should
  * never be set to NULL: the ASN.1 code and accessors rely on mandatory
  * fields never being NULL.
@@ -125,6 +130,7 @@ struct X509_crl_st {
 
     OSSL_LIB_CTX *libctx;
     char *propq;
+    OSSL_X509_RETAINED_OWNER retained_owner;
 };
 
 struct x509_revoked_st {
@@ -205,6 +211,7 @@ struct x509_st {
 
     OSSL_LIB_CTX *libctx;
     char *propq;
+    OSSL_X509_RETAINED_OWNER retained_owner;
 } /* X509 */;
 
 /*

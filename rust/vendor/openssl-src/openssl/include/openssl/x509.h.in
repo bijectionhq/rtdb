@@ -570,6 +570,20 @@ DECLARE_ASN1_FUNCTIONS(X509)
 X509 *X509_new_ex(OSSL_LIB_CTX *libctx, const char *propq);
 DECLARE_ASN1_FUNCTIONS(X509_CERT_AUX)
 
+/*
+ * - Transfers owner on success (1); failure (0) leaves ownership with the caller.
+ * - Set once with exclusive access before publication; free_owner must be non-NULL.
+ * - The certificate or CRL must be heap-allocated, not embedded in another ASN.1 value.
+ * - free_owner runs after the final native reference, successful payload cleanup and object storage destruction.
+ * - A custom CRL method that aborts payload cleanup also leaves the owner unreleased.
+ * - The callback must not access the destroyed object or unwind through C.
+ * - Duplication does not copy this owner; decoding into the same object preserves it.
+ * - The owner must cover any later mutation for which the caller uses it as an allocation lease.
+ */
+int X509_set0_retained_owner(X509 *x, void *owner, void (*free_owner)(void *));
+int X509_CRL_set0_retained_owner(X509_CRL *crl, void *owner,
+    void (*free_owner)(void *));
+
 #define X509_get_ex_new_index(l, p, newf, dupf, freef) \
     CRYPTO_get_ex_new_index(CRYPTO_EX_INDEX_X509, l, p, newf, dupf, freef)
 int X509_set_ex_data(X509 *r, int idx, void *arg);

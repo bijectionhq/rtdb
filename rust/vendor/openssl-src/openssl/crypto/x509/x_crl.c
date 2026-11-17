@@ -267,6 +267,12 @@ static int crl_cb(int operation, ASN1_VALUE **pval, const ASN1_ITEM *it,
         ASN1_INTEGER_free(crl->base_crl_number);
         sk_GENERAL_NAMES_pop_free(crl->issuers, GENERAL_NAMES_free);
         OPENSSL_free(crl->propq);
+        if (exarg != NULL) {
+            ASN1_FREE_ARG *final = exarg;
+
+            final->free_func = crl->retained_owner.free_func;
+            final->arg = crl->retained_owner.arg;
+        }
         break;
     case ASN1_OP_DUP_POST: {
         X509_CRL *old = exarg;
@@ -328,7 +334,12 @@ static int setup_idp(X509_CRL *crl, ISSUING_DIST_POINT *idp)
     return ret;
 }
 
-ASN1_SEQUENCE_ref(X509_CRL, crl_cb) = {
+static const ASN1_AUX X509_CRL_aux = {
+    NULL, ASN1_AFLG_REFCOUNT | ASN1_AFLG_FREE_FINAL,
+    offsetof(X509_CRL, references), offsetof(X509_CRL, lock), crl_cb, 0, NULL
+};
+
+ASN1_SEQUENCE(X509_CRL) = {
     ASN1_EMBED(X509_CRL, crl, X509_CRL_INFO),
     ASN1_EMBED(X509_CRL, sig_alg, X509_ALGOR),
     ASN1_EMBED(X509_CRL, signature, ASN1_BIT_STRING)
@@ -343,6 +354,17 @@ IMPLEMENT_ASN1_FUNCTIONS(X509_CRL_INFO)
 IMPLEMENT_ASN1_FUNCTIONS(X509_CRL)
 
 IMPLEMENT_ASN1_DUP_FUNCTION(X509_CRL)
+
+int X509_CRL_set0_retained_owner(X509_CRL *crl, void *owner,
+    void (*free_owner)(void *))
+{
+    OSSL_X509_RETAINED_OWNER retained = { owner, free_owner };
+
+    if (crl == NULL || free_owner == NULL || crl->retained_owner.free_func != NULL)
+        return 0;
+    crl->retained_owner = retained;
+    return 1;
+}
 
 static int X509_REVOKED_cmp(const X509_REVOKED *const *a,
     const X509_REVOKED *const *b)
