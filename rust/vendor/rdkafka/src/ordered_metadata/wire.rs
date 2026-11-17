@@ -68,6 +68,7 @@ pub struct Int32Array<'a>(&'a [u8]);
 impl<'a> Int32Array<'a> {
     /// Returns the element count, with no copy or sorting.
     pub fn len(self) -> usize { self.0.len() / 4 }
+    /// Returns whether the array contains zero integers.
     pub fn is_empty(self) -> bool { self.0.is_empty() }
     /// Iterates signed values in their original order.
     pub fn iter(self) -> impl ExactSizeIterator<Item = i32> + 'a {
@@ -100,6 +101,7 @@ pub struct Partition<'a> {
 pub enum Event<'a> {
     /// Throttle duration in milliseconds; zero before v3.
     Throttle(i32),
+    /// One advertised broker, including entries with duplicate node IDs.
     Broker(Broker<'a>),
     /// Cluster/controller values after all broker entries; -1 means no controller.
     Cluster {
@@ -108,6 +110,7 @@ pub enum Event<'a> {
         /// Controller node ID; -1 before v1 or when absent.
         controller: i32,
     },
+    /// Begins a topic group, including topics with no partitions.
     Topic(Topic<'a>),
     /// One partition of the current topic.
     Partition(Partition<'a>),
@@ -188,6 +191,7 @@ pub struct RawTopic<'a> {
 pub enum RawEvent<'a> {
     /// Throttle milliseconds, zero before v3.
     Throttle(i32),
+    /// One advertised broker with its original host and rack bytes.
     Broker(RawBroker<'a>),
     /// Cluster/controller fields after all brokers.
     Cluster {
@@ -196,6 +200,7 @@ pub enum RawEvent<'a> {
         /// Signed controller ID; -1 before v1 or when absent.
         controller: i32,
     },
+    /// Begins a topic group without decoding its nullable name bytes.
     Topic(RawTopic<'a>),
     /// One partition of the current topic.
     Partition(Partition<'a>),
