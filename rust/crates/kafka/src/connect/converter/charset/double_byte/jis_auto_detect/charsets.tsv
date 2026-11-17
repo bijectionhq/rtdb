@@ -1,0 +1,2 @@
+canonical	class	source	source_sha256	profile	aliases
+x-JISAutoDetect	JISAutoDetect	jdk.charsets/sun/nio/cs/ext/JISAutoDetect.java	6503aaff73893b23acd89666665e8835fcef77d33e0d9d1dc1f17bf27df82dc0	linux-Shift_JIS	JISAutoDetect

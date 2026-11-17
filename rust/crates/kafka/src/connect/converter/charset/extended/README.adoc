@@ -22,7 +22,8 @@ Lookup compares the caller's borrowed name against that inventory using call-loc
 It allocates no buffer and retains no per-call state.
 The existing decoder lookup then consumes that canonical name.
 Decoder state, mapping resources, output ownership, and memory admission retain their existing contracts.
-The two JISAutoDetect keys are included in the provider inventory; decoder implementation remains a separate source-completeness obligation.
+The two JISAutoDetect keys route to the pinned Linux detector, including their Unicode case equivalents.
+Its selection and decoding rules are described in link:../double_byte/jis_auto_detect/README.adoc[the JIS auto-detection reference].
 
 == Source provenance and reproduction
 

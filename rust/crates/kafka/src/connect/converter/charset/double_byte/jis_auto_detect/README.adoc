@@ -1,0 +1,87 @@
+= Java 25 JIS auto-detection
+
+The String converter supports `x-JISAutoDetect` and its `JISAutoDetect` alias under the pinned Linux provider profile.
+Both names support ordinary case-insensitive lookup and the extended provider's Unicode case equivalents.
+link:charsets.tsv[The charset manifest] records provider ownership, source hash, aliases, and platform profile.
+The pinned `OperatingSystem.isWindows()` result is false because its generated `PlatformProps` targets Linux.
+The SJIS candidate is therefore standard Shift_JIS regardless of the Rust process's host operating system.
+The Windows provider's windows-31J branch requires a separate source profile.
+The other candidates are standard EUC-JP, including JIS0212, and standard ISO-2022-JP, without JIS0212 designation.
+
+`Charset::JisAutoDetect` is a passive immutable configuration with no retained selection or decoder state.
+The private `Selection` value describes the result of one call's strict probes.
+`JapaneseCounts` is a passive call-local transient whose sole writer saturates two counters at two.
+The input slices, prefix length, strict results, and output String also belong to that call.
+The selected decoder borrows existing process-lifetime mapping resources and appends into the one output String.
+No candidate buffer, reconstructed mapping owner, background task, or mutable state survives between records.
+
+== Probe selection and replay
+
+The detector first copies the maximal leading ASCII prefix, stopping before ESC or a high byte.
+SO, SI, NUL, DEL, and other ASCII controls in that prefix remain literal characters.
+An all-ASCII record without ESC needs no selected decoder.
+The copied prefix is excluded from every candidate probe and from selected-decoder replay.
+
+ISO-2022-JP is probed first from its reset ASCII state.
+Any non-error result selects it, including incomplete underflow with no progress.
+If ISO fails, EUC-JP is probed from the original suffix start.
+An EUC error selects Shift_JIS immediately, without consulting the Shift_JIS probe result.
+Otherwise Shift_JIS is probed from the same start, and a Shift_JIS error selects EUC-JP.
+
+When both EUC and Shift_JIS return non-error results, the detector compares consumed input positions.
+The candidate consuming more bytes wins, independently of its output count.
+An equal position at the suffix start leaves the charset unselected; terminal handling emits one U+FFFD for the whole remaining suffix.
+An equal positive position invokes the Japanese-text heuristic on successful EUC UTF16 units.
+EUC wins if at least two units are in U+3040 through U+309F, or at least two units are in U+FF65 through U+FF9F.
+One unit from each range is insufficient.
+Halfwidth punctuation U+FF61 through U+FF64 and fullwidth Katakana U+30A0 through U+30FF do not count.
+Shift_JIS wins every other positive tie.
+
+The selected candidate is reset and replacement-decodes the entire original suffix.
+Probe output and probe state are discarded.
+For example, an ISO probe may consume a Roman designation before failing on a later high byte; an eventual Shift_JIS selection decodes that designation again as ordinary input bytes.
+A leading literal SO does not change the selected ISO decoder's initial mode.
+Replacement boundaries and ISO state within the winning decode follow link:../probe/README.adoc[the shared decoder rules].
+Every record starts unselected, and candidate flushes produce no additional characters.
+
+== Capacity and admission
+
+The Java detector uses read-only input views, which select the candidates' buffer decode loops.
+Each candidate emits at most one UTF16 unit per consumed input byte.
+The Java sandbox has `n` character slots for the complete original input of `n` bytes, so no probe can overflow it.
+The native probe results retain only consumed position, output count, error status, and two capped EUC category counts.
+All of that scratch is fixed-size and call-local.
+
+The converter admits checked `4 * n + 16,384` bytes before probing or allocating the output.
+After selection, one String reserves at most `3 * n` bytes for the literal prefix and selected suffix output together.
+All candidate mappings are nonsurrogate BMP values and replacement is U+FFFD, so three UTF8 bytes per input byte bound the result.
+The probe does not allocate a String or retain decoded EUC text.
+The existing scalar reservation also covers empty records and records containing only output-free ISO designations.
+
+== Source provenance and reproduction
+
+The source is Eclipse Temurin OpenJDK `25.0.1+8` from the Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`; its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins 28 files for the detector, shared Japanese decoding model, provider registration, source platform, and replacement behavior.
+link:COPYRIGHT[Copyright notices] retain complete upstream headers verbatim, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:derive.py[The Python standard-library derivation] reads archive bytes and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-jis-auto-detect
+----
+
+It checks the pinned hashes, source scheduling, heuristic bounds, reset behavior, provider alias, and Linux platform constants.
+Its shared reference model reconstructs the ten mapping resources listed in link:mappings.tsv[the mapping manifest], totaling 134,766 bytes.
+Those resources retain the same bytes as the link:../probe/mappings.tsv[shared probe resources]; the detector adds no mapping resource.
+The derivation transcribes the Java decoder loops and detector scheduling without running Java, a native decoder, or project code.
+
+link:probes.tsv[The probe manifest] contains 17 prefix/suffix modes.
+Each mode covers all 256 single bytes and all 65,536 pairs in unsigned order, with fixed input prefixes or suffixes.
+Contexts include literal ASCII and shifts, incomplete ESC, Roman, Kana, JIS0208/JIS0212 designations, prior EUC text, an ISO error, and trailing ASCII, designation, high byte, or EUC text.
+Output digests append U+0000 after each independently decoded result; the separator is never part of input.
+Pair-selection digests append one byte per record: zero for all-literal ASCII, one for ISO-2022-JP, two for EUC-JP, three for Shift_JIS, and four for an unselected incomplete suffix.
+
+Regression sources cover every probe mode, both provider names, Unicode case equivalents, Linux mapping choice, ISO underflow priority, error-driven choices, consumed-input comparisons, separate heuristic thresholds, replay, literal controls, record reset, null and empty records, configuration precedence, source hashes, and memory admission.
+Compilation and execution remain pending under the Phase 1 work order.

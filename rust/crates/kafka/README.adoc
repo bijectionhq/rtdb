@@ -129,7 +129,9 @@ x-SJIS_0213 and x-MS932_0213 support all 13 registered names, including the `sji
 Their MS932 BMP precedence, supplementary scalars, combining sequences, and replacement boundaries are documented in the link:src/connect/converter/charset/double_byte/jis0213/README.adoc[JIS0213 reference].
 Extended-provider names accept Java's four Unicode case equivalents through their own canonical-name and alias inventory, as described in the link:src/connect/converter/charset/extended/README.adoc[extended name lookup reference].
 Standard-provider names retain ASCII-only case handling.
-The built-in JISAutoDetect family and additional installed charset providers remain source-completeness work.
+x-JISAutoDetect and JISAutoDetect select ISO-2022-JP, EUC-JP, or Shift_JIS under the pinned Linux provider profile.
+Their probe priority, consumed-input comparison, Japanese-text heuristic, suffix replay, and record reset are documented in the link:src/connect/converter/charset/double_byte/jis_auto_detect/README.adoc[JIS auto-detection reference].
+Additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.

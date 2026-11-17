@@ -25,6 +25,7 @@ pub(super) enum Charset {
     Iso2022CnKr(double_byte::iso2022cnkr::Iso2022CnKr),
     Iso2022Jp(double_byte::iso2022jp::Iso2022Jp),
     Jis0213(double_byte::jis0213::Jis0213),
+    JisAutoDetect,
     DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
     Utf16(Utf16Order),
@@ -70,6 +71,7 @@ impl Charset {
             "big5" | "csbig5" => Self::Big5(&double_byte::big5::FAMILY),
             "x-big5-solaris" | "big5_solaris" => Self::Big5Solaris(&double_byte::big5::FAMILY),
             "gb18030" | "gb18030-2022" => Self::Gb18030,
+            "x-jisautodetect" | "jisautodetect" => Self::JisAutoDetect,
             normalized => {
                 if iscii91::supports(normalized) { Self::Iscii91 }
                 else if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
@@ -107,6 +109,7 @@ impl Charset {
             Self::Iso2022CnKr(decoder) => decoder.decode(bytes),
             Self::Iso2022Jp(decoder) => decoder.decode(bytes),
             Self::Jis0213(decoder) => decoder.decode(bytes),
+            Self::JisAutoDetect => double_byte::jis_auto_detect::decode(bytes),
             Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
             Self::Utf16(order) => decode_utf16(bytes, order),
