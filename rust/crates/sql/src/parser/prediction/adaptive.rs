@@ -1,13 +1,123 @@
-use crate::parser::grammar::{Decision, TokenType};
-use super::{AlternativeSet, ConfigSetKey, Configurations, PredictionContexts, PredictionError, PredictionMode, Problem, Result, Semantic, vector};
+use crate::parser::grammar::{Decision, Grammar, TokenType};
+use super::{Alternative, AlternativeChoice, AlternativeSet, ConfigSetKey, Configurations, PredictionContexts, PredictionError, PredictionMode, Problem, Result, Semantic, vector};
 use super::closure::{ClosureRound, StartSet};
 use super::dfa::{AcceptReason, Acceptance, Candidate, DfaTarget, DraftKey, InternedStateKey, PredPrediction, PredictionDfas};
-use super::runtime::{PredictionInput, RuntimeResult};
+use super::runtime::{PredictionInput, RuntimeError, RuntimeResult};
 use super::storage::Retained;
 
 #[cfg(test)]
 #[path = "adaptive_tests.rs"]
 mod tests;
+
+pub(super) fn adaptive_predict<'cfg, 'id, 'g, 'scope, 'round, 'sql>(
+    round: &mut ClosureRound<'_, 'round, 'cfg, 'id, 'g, 'scope, Retained>,
+    dfas: &mut PredictionDfas<'cfg, 'g, 'scope>,
+    input: &mut PredictionInput<'_, '_, 'round, '_, 'sql, '_>,
+    mode: PredictionMode,
+) -> RuntimeResult<'sql, Alternative> {
+    let decision = input.decision();
+    let origin = input.origin();
+    let mut previous = local_dfa_start(round, dfas, input)?;
+    let grammar = round.parts().1.grammar();
+    let mut token = lookahead_type(input, grammar)?;
+    loop {
+        let DfaTarget::Interned(target) = local_dfa_target(round, dfas, input, previous, token, mode)? else {
+            let candidate = input.no_viable_alternative()?;
+            input.seek(origin)?;
+            let previous_configs = round.from_cached(dfas, previous)?;
+            return round.local_finishing_alternative(previous_configs, input)?
+                .ok_or(RuntimeError::NoViableAlternative(candidate));
+        };
+        match (mode, dfas.view(decision, target)?.acceptance()) {
+            (PredictionMode::Ll, Acceptance::Plain { reason: AcceptReason::Conflict, .. }) => {
+                return full_prediction(round, input);
+            }
+            (PredictionMode::Ll, Acceptance::Predicated { reason: AcceptReason::Conflict, pairs }) => {
+                let conflict_index = input.index().expect("prediction cursor");
+                if conflict_index != origin {
+                    input.seek(origin)?;
+                }
+                let alternatives = evaluate_predicate_pairs(pairs, input.precedence());
+                if alternatives.count() == 1 {
+                    return Ok(alternatives.first().expect("single evaluated alternative"));
+                }
+                if conflict_index != origin {
+                    input.seek(conflict_index)?;
+                }
+                return full_prediction(round, input);
+            }
+            (_, Acceptance::Plain { prediction, .. }) => return Ok(prediction),
+            (_, Acceptance::Predicated { pairs, .. }) => {
+                input.seek(origin)?;
+                return match evaluate_predicate_pairs(pairs, input.precedence()).first() {
+                    Some(alternative) => Ok(alternative),
+                    None => Err(RuntimeError::NoViableAlternative(input.no_viable_alternative()?)),
+                };
+            }
+            (_, Acceptance::NonAccept) => {}
+        }
+        previous = target;
+        if token != TokenType::EOF {
+            input.advance()?;
+            token = lookahead_type(input, grammar)?;
+        }
+    }
+}
+
+fn full_prediction<'cfg, 'id, 'g, 'scope, 'round, 'sql>(
+    round: &mut ClosureRound<'_, 'round, 'cfg, 'id, 'g, 'scope, Retained>,
+    input: &mut PredictionInput<'_, '_, 'round, '_, 'sql, '_>,
+) -> RuntimeResult<'sql, Alternative> {
+    let origin = input.origin();
+    let mut full = round.enter_full(input)?;
+    let mut previous = full.full_start()?;
+    full.input().seek(origin)?;
+    let grammar = full.parts().1.grammar();
+    let mut token = lookahead_type(full.input(), grammar)?;
+    loop {
+        let Some(reach) = full.full_reach(previous, token)? else {
+            let candidate = full.input().no_viable_alternative()?;
+            full.input().seek(origin)?;
+            return full.full_finishing_alternative(previous)?
+                .ok_or(RuntimeError::NoViableAlternative(candidate));
+        };
+        let (configs, contexts) = full.parts();
+        let mut workspace = configs.mode_workspace();
+        let subsets = workspace.conflicting_subsets(configs, reach.key(), contexts)?;
+        let unique = configs.view_set(reach.key()).unique_alternative();
+        configs.set_unique(reach.key(), unique)?;
+        if let Some(alternative) = unique {
+            return Ok(alternative);
+        }
+        if let AlternativeChoice::One(alternative) = subsets.single_viable() {
+            return Ok(alternative);
+        }
+
+        previous = reach;
+        if token != TokenType::EOF {
+            full.input().advance()?;
+            token = lookahead_type(full.input(), grammar)?;
+        }
+    }
+}
+
+fn lookahead_type<'sql>(
+    input: &mut PredictionInput<'_, '_, '_, '_, 'sql, '_>,
+    grammar: &Grammar<'_>,
+) -> RuntimeResult<'sql, TokenType> {
+    let token = input.lookahead(1)?.expect("positive lookahead");
+    Ok(grammar.token_type(token.lexeme().kind())?)
+}
+
+fn evaluate_predicate_pairs(pairs: &[PredPrediction], precedence: i32) -> AlternativeSet {
+    let mut alternatives = AlternativeSet::default();
+    for pair in pairs {
+        if pair.semantic == Semantic::Unpredicated || pair.semantic.evaluate(precedence) {
+            alternatives.insert(pair.alternative);
+        }
+    }
+    alternatives
+}
 
 pub(super) fn local_dfa_start<'cfg, 'id, 'g, 'scope, 'round, 'sql>(
     round: &mut ClosureRound<'_, 'round, 'cfg, 'id, 'g, 'scope, Retained>,

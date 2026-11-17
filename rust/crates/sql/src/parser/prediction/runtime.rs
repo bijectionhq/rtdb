@@ -2,7 +2,8 @@ use std::marker::PhantomData;
 use rtdb_types::AllocationScope;
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
 use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TransitionView};
-use super::{FactoryError, PredictionError, PredictionStorage, Result, Semantic, push};
+use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
+use super::adaptive;
 use super::closure::{ClosureOptions, ClosureRound, with_closure_round_result};
 use super::dfa::PredictionDfas;
 use super::storage::{Retained, with_prediction_storage, with_prediction_storage_result};
@@ -13,7 +14,19 @@ mod tests;
 
 pub(super) type RuntimeResult<'sql, T> = std::result::Result<T, RuntimeError<'sql>>;
 #[derive(Debug)]
-pub(super) enum RuntimeError<'sql> { Prediction(PredictionError), Input(StreamError<'sql>), Control(RuntimeProblem) }
+pub(super) enum RuntimeError<'sql> {
+    Prediction(PredictionError),
+    Input(StreamError<'sql>),
+    Control(RuntimeProblem),
+    NoViableAlternative(NoViableAlternative<'sql>),
+}
+
+#[derive(Debug)]
+pub(super) struct NoViableAlternative<'sql> {
+    pub(super) start: IndexedLexeme<'sql>,
+    pub(super) offending: IndexedLexeme<'sql>,
+    pub(super) state: ParserState,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RuntimeProblem { Aborted, Invocation, Recursion, UninitializedOrigin, PredictionSite }
 impl From<PredictionError> for RuntimeError<'_> { fn from(error: PredictionError) -> Self { Self::Prediction(error) } }
@@ -206,6 +219,10 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     pub(super) fn clear_rule_control(&mut self) -> RuntimeResult<'sql, ()> {
         let result = if self.precedence.len() != 1 { Err(RuntimeError::Control(RuntimeProblem::Recursion)) } else { self.current = None; self.matched_eof = false; self.precedence.clear(); self.precedence.push(PrecedenceFrame::Base0); Ok(()) }; self.finish(result)
     }
+    pub(super) fn adaptive_predict(&mut self, decision: u16, mode: PredictionMode) -> RuntimeResult<'sql, Alternative> {
+        self.with_prediction(decision, |round, dfas, input| adaptive::adaptive_predict(round, dfas, input, mode))
+    }
+
     pub(super) fn with_prediction<R>(&mut self, decision: u16,
         use_prediction: impl for<'cfg, 'ctx, 'access, 'call, 'round, 'input, 'origin> FnOnce(
             &mut ClosureRound<'call, 'round, 'cfg, 'ctx, 'access, 'access, Retained>,
@@ -222,7 +239,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             Ok(origin)
         })();
         let origin = match self.finish(entered) { Ok(origin) => origin, Err(error) => return Err(error) };
-        let precedence = self.precedence(); let options = self.environment.policy.options;
+        let state = self.state; let precedence = self.precedence(); let options = self.environment.policy.options;
         let view = InvocationView { records: &self.records, current: self.current };
         let mut restoration = PredictionRestoration::new(&mut self.input, &mut self.failed, origin);
         let result: RuntimeResult<'sql, R> = with_prediction_storage_result(&mut self.environment.storage, self.work, |access| {
@@ -232,7 +249,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
                 Err(error) => { dfas.abort(configs, contexts); return Err(RuntimeError::Prediction(error.into())); }
             };
             let result = with_closure_round_result(configs, contexts, selected, options, |round| {
-                let mut input = PredictionInput { restoration: &mut restoration, invocations: view, decision, precedence, brand: PhantomData };
+                let mut input = PredictionInput { restoration: &mut restoration, invocations: view, decision, state, precedence, brand: PhantomData };
                 let result = use_prediction(round, dfas, &mut input);
                 if result.is_err() { input.abort(); round.abort(); let (configs, contexts) = round.parts(); dfas.abort(configs, contexts); }
                 result
@@ -276,7 +293,7 @@ impl Drop for PredictionRestoration<'_, '_, '_> {
 }
 pub(super) struct PredictionInput<'input, 'origin, 'round, 'parse, 'sql, 'work> {
     restoration: &'input mut PredictionRestoration<'origin, 'sql, 'work>, invocations: InvocationView<'input, 'parse, 'sql>,
-    decision: u16, precedence: i32, brand: PhantomData<fn(&'round mut ()) -> &'round mut ()>,
+    decision: u16, state: ParserState, precedence: i32, brand: PhantomData<fn(&'round mut ()) -> &'round mut ()>,
 }
 impl<'sql> PredictionInput<'_, '_, '_, '_, 'sql, '_> {
     pub(super) fn ready(&self) -> RuntimeResult<'sql, ()> { if *self.restoration.failed { Err(RuntimeError::Control(RuntimeProblem::Aborted)) } else { Ok(()) } }
@@ -290,6 +307,12 @@ impl<'sql> PredictionInput<'_, '_, '_, '_, 'sql, '_> {
     pub(super) fn seek(&mut self, index: usize) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.restoration.input.seek(index).map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn lookahead(&mut self, offset: isize) -> RuntimeResult<'sql, Option<IndexedLexeme<'sql>>> { let result = self.ready().and_then(|()| self.restoration.input.lt(offset).map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn advance(&mut self) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.restoration.input.consume().map_err(RuntimeError::Input)); self.finish(result) }
+    pub(super) fn no_viable_alternative(&mut self) -> RuntimeResult<'sql, NoViableAlternative<'sql>> {
+        self.ready()?;
+        let start = self.restoration.input.buffered(self.origin()).expect("buffered prediction origin");
+        let offending = self.lookahead(1)?.expect("positive lookahead");
+        Ok(NoViableAlternative { start, offending, state: self.state })
+    }
     pub(super) fn evaluate_precedence(&mut self, predicate: Semantic) -> RuntimeResult<'sql, bool> {
         let result = (|| {
             self.ready()?;

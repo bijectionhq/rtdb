@@ -1,8 +1,8 @@
 = Prediction values
 
-This private parser component implements prediction-context values, ordered configuration identities, prediction-mode facts, private retained DFA storage and local/SLL configuration producers from ANTLR 4.13.2.
-`UPSTREAM.json` pins the primary sources; link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-It does not perform token prediction, recognize SQL rules or change a production parser entry point.
+This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
+`UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
+Generated SQL rule recognition and production parser integration remain required.
 
 == Owner and keys
 
@@ -287,8 +287,8 @@ No public cause behavior is removed or waived by this slice.
 
 == Remaining parser work
 
-The private runtime, Full producer and adaptive DFA paths are described below.
-The adaptive execution loops, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+The private runtime, Full producer and adaptive prediction paths are described below.
+All 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
@@ -369,7 +369,7 @@ Source assertions are selected explicitly rather than inferred from a Rust build
 Reached checks retain the RuleStop-Empty and MIN_VALUE-before-pop/falloff sites as owned inline no-message `AssertionError` facts for the future diagnostic owner.
 Disabled checks retain Java wrapping arithmetic without an artificial depth cap.
 No-reach `None` lets the adaptive target path publish an ERROR edge.
-The future adaptive execution loop constructs the actual no-viable exception at its source location.
+The adaptive execution loop captures the private no-viable token and recognizer-state facts at their source location.
 The OPEN `embedded-parser-error-capability` gate still blocks production adoption and compatibility closure; wire projection does not discharge the embedded cause/recognizer/config/DFA obligation.
 Compiler and runtime qualification remain unrun.
 
@@ -407,7 +407,7 @@ Entered ordinary children execute their source finally before recursive parents.
 Actual generated tree/listener/other post-current entry effects MUST reopen failed-child cleanup before generated or production adoption.
 This precursor does not replace that review with fabricated failed-child fixtures or an extra ordinary-scope stack.
 
-Prediction captures an actually initialized index, immutable current invocation view and real stack top.
+Prediction captures an actually initialized index, immutable current invocation view, source recognizer state and real stack top.
 An uninitialized index remains absent and fails before mark, work or memo entry.
 `PredictionInput` exclusively borrows the stack-owned restoration guard outside the access and closure factories.
 That guard alone borrows the actual stream and failure state.
@@ -430,7 +430,8 @@ The explicit source profile selects the completed `FullNoOuter` assertion.
 Full precedence uses actual origin/current seeks around the pinned stack predicate, then copies or eliminates the successor without accumulating semantic context.
 Full reach withholds all prior stops for every token, runs the source shortcut only without withheld stops and non-EOF input, and filters EOF results before longest-match stop reinsertion.
 Prior stops are reinserted only when no new stop was reached.
-Full sets retain fresh metadata and never enter ordinary C3 maps or acquire fabricated roots.
+The Full producer returns fresh metadata for the execution loop to complete.
+Full sets never enter ordinary C3 maps or acquire fabricated roots.
 
 Full Busy has its own source proof.
 Full stop handling makes the local falloff insertion unreachable; only EOF successors357/370 are inserted.
@@ -478,8 +479,41 @@ Subsequent cold starts use newly produced objects, and the classifier's semantic
 The private production path therefore preserves each previously interned configuration's values and set hash across later start, reach and classification work.
 This proof depends on ordinary rows originating at the bounded Local producer and on use through the existing exclusive access.
 
-The adaptive execution loops, accept-predicate evaluation, Full dispatch and report, and no-viable construction remain open.
-The production host and cache mapping and the embedded cause capability gate remain open.
+== Private adaptive execution
+
+`ParserSession::adaptive_predict` selects the supplied SLL or LL profile inside the existing prediction scope.
+The Local loop selects the real DFA start before demanding the first token type through the pinned grammar's lexer mapping.
+Each iteration checks the cached or newly computed target for ERROR first, followed by LL conflict, accepting result and continuation.
+Only continuation consumes the current token and demands another, and only when the current token is different from EOF.
+
+For an LL conflict with predicates, the loop saves the conflict cursor, seeks the origin when necessary, and evaluates every pair in alternative order.
+An unpredicated pair succeeds, and the real predicates use the captured signed precedence.
+One surviving alternative resolves the decision before Full.
+Otherwise the loop restores the conflict cursor before computing Full start.
+A plain LL conflict goes directly to Full.
+An ordinary predicated accept seeks the prediction origin and returns the smallest surviving alternative, or constructs a no-viable fact at that post-seek occurrence when none survives.
+
+Full start runs in the same round at the conflict cursor before the Full execution seek back to the origin.
+Full reach uses the actual token type, builds the conflicting subsets, then writes the actual unique-alternative fact to the reach set.
+A unique alternative returns immediately.
+When every subset has the same minimum, LL returns that common viable alternative.
+Full predicates are evaluated by the closure producer.
+A continuing Full iteration advances only for a current token different from EOF.
+
+The pinned SQL wrapper removes parser listeners for SLL.
+Its LL listener overrides syntax errors and inherits the empty ambiguity, attempting-Full-context and context-sensitivity methods of `BaseErrorListener`.
+These report sites therefore have no listener effects in the private wrapper profiles.
+The attempting-Full-context site is after Full start and before seeking the origin, the Local ambiguity site follows predicate evaluation, and the Full reports follow unique or common-viable resolution.
+Exact-ambiguity mode, production listeners, diagnostics and error-strategy effects remain open.
+
+On a Local ERROR edge or absent Full reach, candidate construction first observes the already buffered indexed start token and then demands the current real `LT(1)`.
+The candidate carries both original lexemes and the captured recognizer state.
+The loop then seeks the origin and tries the finishing query on the same previous set.
+A selected finishing alternative discards the candidate.
+An unselected candidate crosses the existing factories as the original `Err` after cleanup and restoration, subject to the existing precedence of actual failures.
+The candidate is a private diagnostic projection.
+The JVM dead-end configuration set, recognizer and observable shared-cache capabilities remain open under the embedded cause capability gate.
+The production host and cache mapping remain open.
 Compiler and runtime qualification remain part of Phase 2.
 
 == Finishing-alternative selection
@@ -493,7 +527,7 @@ An unpredicated configuration succeeds, and a precedence predicate uses the capt
 A configuration finishes when its outer depth is positive or its RuleStop context has an empty return path.
 The latter tests the last return address, including a terminal EmptyReturn in a nonempty Full Array.
 Selection takes the smallest finishing alternative from the succeeded set first, then from the failed set.
-An absent choice leaves reporting to the adaptive caller.
+An absent choice returns the original candidate through prediction restoration.
 
 Within the closed Local and Full producer domain, each membership triple has one representative identity, with possible repeated occurrences of that identity.
 Splitting into subgroups keeps that identity and does not merge distinct representatives into previously cached configurations.

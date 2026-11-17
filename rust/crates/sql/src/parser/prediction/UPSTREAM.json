@@ -174,7 +174,7 @@
       }
     ]
   },
-  "scope": "Prediction-context/configuration/mode values, retained private372-decision DFA, complete Local/SLL and Full start/closure/reach kernels over one merge round, and bounded explicit-policy real-token/primary-invocation runtime control; adaptive prediction, generated schedules, host-policy capture, production cache mapping and capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round. Generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -254,7 +254,7 @@
     "source_assertions": "Explicit Enabled/Disabled runtime profile; reached no-message AssertionError site facts for RuleStop Empty context and MIN_VALUE-before-pop/falloff, with disabled Java wrapping arithmetic.",
     "mandatory_successors": [
       "Actual host snapshot/assertion producer and production parser/cache ownership mapping; private Full producer is implemented separately on the same round.",
-      "Adaptive prediction, metadata, diagnostics and generated 176-rule schedules",
+      "Metadata, diagnostics and generated 176-rule schedules",
       "Production capability preservation or reviewed migration under the open embedded-parser-error-capability gate"
     ]
   },
@@ -292,7 +292,7 @@
       "Actual host snapshot/assertion producer",
       "Production classloader/cache realm, budget and concurrent writer policy",
       "embedded-parser-error-capability",
-      "Adaptive prediction and all176 generated/tree/listener/diagnostic/reset schedules",
+      "All 176 generated rule schedules, trees, listeners, diagnostics and reset",
       "Phase2 and executed compiler/discovery/tests"
     ]
   }

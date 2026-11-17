@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use rtdb_types::{AllocationScope, MemoryBudget, MemoryReservation};
-use crate::lexer::{ScanError, StreamError};
+use crate::lexer::{Kind, ScanError, StreamError};
 use crate::parser::grammar::{Grammar, OwnedGrammar, TransitionView};
 use super::*;
 use super::super::{ContextKey, MergeMode, PredictionStorage, SetMode};
 use super::super::closure::{ClosureOptions, LoopEntryOption, SourceAssertions};
-use super::super::runtime::{CapturedClassPolicy, ParserEnvironment, ParserSession, RuntimeError, with_parser_session};
+use super::super::runtime::{CapturedClassPolicy, ParserEnvironment, ParserSession, ParserState, RuntimeError, RuntimeProblem, with_parser_session};
 
 const ISOLATION_RULE: u16 = 175;
 const ISOLATION_DECISION: u16 = 371;
@@ -37,11 +37,6 @@ fn isolation<'sql>(session: &mut ParserSession<'_, 'sql, '_, '_>) -> RuntimeResu
     session.set_state(3014)
 }
 
-fn current_token<'sql>(input: &mut PredictionInput<'_, '_, '_, '_, 'sql, '_>, grammar: &Grammar<'_>) -> RuntimeResult<'sql, TokenType> {
-    let token = input.lookahead(1)?.expect("positive lookahead");
-    Ok(grammar.token_type(token.lexeme().kind())?)
-}
-
 fn interned<'cfg>(target: DfaTarget<'cfg>) -> InternedStateKey<'cfg> {
     let DfaTarget::Interned(state) = target else { panic!("ordinary DFA target") };
     state
@@ -49,6 +44,169 @@ fn interned<'cfg>(target: DfaTarget<'cfg>) -> InternedStateKey<'cfg> {
 
 fn exhaust(memory: &Arc<MemoryBudget>) -> Arc<MemoryReservation> {
     memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap()
+}
+
+#[test]
+fn adaptive_isolation_uses_two_real_tokens_and_leaves_the_following_token_unreached() {
+    for (cold, warm) in [(PredictionMode::Sll, PredictionMode::Ll), (PredictionMode::Ll, PredictionMode::Sll)] {
+        environment(|env, work, retained, memory| {
+            with_parser_session(env, "READ COMMITTED @", work, |session| {
+                isolation(session)?;
+                for (mode, cached) in [(cold, false), (warm, true)] {
+                    let blockers = cached.then(|| (exhaust(retained), exhaust(memory)));
+                    assert_eq!(session.adaptive_predict(ISOLATION_DECISION, mode)?.number(), 2);
+                    assert_eq!(session.input_index(), Some(0));
+                    assert_eq!(session.buffered_token(1).unwrap().lexeme().raw(), "COMMITTED");
+                    assert!(session.buffered_token(2).is_none());
+                    drop(blockers);
+                }
+                session.exit_rule()
+            }).unwrap();
+        });
+    }
+}
+
+#[test]
+fn adaptive_isolation_reports_the_original_offending_occurrence_after_rewind() {
+    for (sql, eof, expected_raw) in [
+        ("before READ /* ignored */ read", false, "read"),
+        ("before READ", true, ""),
+    ] {
+        environment(|env, work, _, _| {
+            for mode in [PredictionMode::Sll, PredictionMode::Ll] {
+                let result = with_parser_session(env, sql, work, |session| {
+                    isolation(session)?;
+                    session.advance_input()?;
+                    let invocation = session.current();
+                    let result = session.adaptive_predict(ISOLATION_DECISION, mode);
+                    assert_eq!(session.input_index(), Some(1));
+                    assert_eq!(session.state(), ParserState::State(3014));
+                    assert_eq!(session.current(), invocation);
+                    assert!(matches!(session.lookahead(1), Err(RuntimeError::Control(RuntimeProblem::Aborted))));
+                    session.exit_rule()?;
+                    result
+                });
+                let Err(RuntimeError::NoViableAlternative(error)) = result else {
+                    panic!("adaptive no viable alternative: {result:?}");
+                };
+                assert_eq!((error.start.index(), error.start.lexeme().raw()), (1, "READ"));
+                let expected_kind = if eof { Kind::Eof } else { error.start.lexeme().kind() };
+                assert_eq!((error.offending.index(), error.offending.lexeme().kind(), error.offending.lexeme().raw()),
+                    (2, expected_kind, expected_raw));
+                assert_eq!(error.offending.lexeme().span().start.byte, sql.len() - expected_raw.len());
+                assert_eq!(error.state, ParserState::State(3014));
+            }
+        });
+    }
+}
+
+#[test]
+fn adaptive_isolation_propagates_the_following_lexer_fault_before_localization() {
+    environment(|env, work, _, _| {
+        for mode in [PredictionMode::Sll, PredictionMode::Ll] {
+            let result = with_parser_session(env, "READ @", work, |session| {
+                isolation(session)?;
+                let result = session.adaptive_predict(ISOLATION_DECISION, mode);
+                assert_eq!(session.input_index(), Some(0));
+                assert!(session.buffered_token(1).is_none());
+                session.exit_rule()?;
+                result
+            });
+            assert!(matches!(result, Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));
+        }
+    });
+}
+
+#[test]
+fn adaptive_isolation_retains_the_actual_token_buffer_admission_failure() {
+    environment(|env, work, _, memory| {
+        with_parser_session(env, "READ COMMITTED", work, |session| {
+            isolation(session)?;
+            assert_eq!(session.adaptive_predict(ISOLATION_DECISION, PredictionMode::Sll)?.number(), 2);
+            session.exit_rule()
+        }).unwrap();
+
+        let sql = format!("{}READ COMMITTED", "before ".repeat(99));
+        let result = with_parser_session(env, &sql, work, |session| {
+            isolation(session)?;
+            for _ in 0..99 {
+                session.advance_input()?;
+            }
+            let blocker = exhaust(memory);
+            let result = session.adaptive_predict(ISOLATION_DECISION, PredictionMode::Ll);
+            assert_eq!(session.input_index(), Some(99));
+            assert!(session.buffered_token(100).is_none());
+            drop(blocker);
+            session.exit_rule()?;
+            result
+        });
+        assert!(matches!(result, Err(RuntimeError::Input(StreamError::Scan(ScanError::Admission(error))))
+            if error.code == "rtdb/memory-budget-exceeded"));
+    });
+}
+
+#[test]
+fn overlapping_insert_values_and_query_alternatives_reach_full_prediction_only_in_ll() {
+    const RULE: u16 = 157;
+    const DECISION: u16 = 335;
+    environment(|env, work, retained, _| {
+        for (mode, block_full) in [
+            (PredictionMode::Sll, false),
+            (PredictionMode::Sll, true),
+            (PredictionMode::Ll, true),
+            (PredictionMode::Ll, false),
+        ] {
+            let result = with_parser_session(env, "VALUES (1)", work, |session| {
+                let invocation = session.new_invocation(RULE)?;
+                session.enter_rule(invocation)?;
+                session.set_state(2804)?;
+                let blocker = block_full.then(|| exhaust(retained));
+                let result = session.adaptive_predict(DECISION, mode);
+                assert_eq!(session.input_index(), Some(0));
+                drop(blocker);
+                session.exit_rule()?;
+                result
+            });
+            if block_full && mode == PredictionMode::Ll {
+                assert!(matches!(result, Err(RuntimeError::Prediction(PredictionError::Admission(error)))
+                    if error.code == "rtdb/memory-budget-exceeded"));
+            } else {
+                assert_eq!(result.unwrap().number(), 1);
+            }
+        }
+    });
+}
+
+#[test]
+fn data_type_branch_evaluates_the_stored_array_predicate_at_the_prediction_origin() {
+    const DECISION: u16 = 82;
+    environment(|env, work, _, _| {
+        for mode in [PredictionMode::Sll, PredictionMode::Ll] {
+            for precedence in [2, 3] {
+                let result = with_parser_session(env, "INT ARRAY @", work, |session| {
+                    let pending = session.new_recursion_entry(DATA_TYPE_RULE)?;
+                    let mut entry = session.enter_recursion(pending, precedence)?;
+                    session.advance_input()?;
+                    session.set_state(955)?;
+                    let result = session.adaptive_predict(DECISION, mode);
+                    assert_eq!(session.input_index(), Some(1));
+                    assert!(session.buffered_token(2).is_none());
+                    session.unroll_recursion(&mut entry)?;
+                    result
+                });
+                if precedence == 2 {
+                    assert_eq!(result.unwrap().number(), 1);
+                } else {
+                    let Err(RuntimeError::NoViableAlternative(error)) = result else {
+                        panic!("array precedence rejection: {result:?}");
+                    };
+                    assert_eq!((error.start.index(), error.offending.index()), (1, 1));
+                    assert_eq!(error.offending.lexeme().raw(), "ARRAY");
+                    assert_eq!(error.state, ParserState::State(955));
+                }
+            }
+        }
+    });
 }
 
 #[test]
@@ -67,13 +225,13 @@ fn real_regular_start_and_successive_edges_warm_across_modes_without_admission()
                         assert!(matches!(dfas.view(decision, start)?.acceptance(), Acceptance::NonAccept));
 
                         let grammar = round.parts().1.grammar();
-                        let read = current_token(input, grammar)?;
+                        let read = lookahead_type(input, grammar)?;
                         let previous = interned(local_dfa_target(round, dfas, input, start, read, mode)?);
                         assert_eq!(dfas.state_at(decision, 1)?, Some(previous));
                         assert_eq!(dfas.existing_edge(decision, start, read.number())?, Some(DfaTarget::Interned(previous)));
                         assert!(matches!(dfas.view(decision, previous)?.acceptance(), Acceptance::NonAccept));
                         input.advance()?;
-                        let token = current_token(input, grammar)?;
+                        let token = lookahead_type(input, grammar)?;
                         let target = local_dfa_target(round, dfas, input, previous, token, mode)?;
                         assert_eq!(dfas.existing_edge(decision, previous, token.number())?, Some(target));
                         if accepts {
@@ -183,7 +341,7 @@ fn warm_local_start_and_target_reject_terminal_full_phase() {
                 isolation(session)?;
                 let result = session.with_prediction(ISOLATION_DECISION, |round, dfas, input| {
                     let start = local_dfa_start(round, dfas, input)?;
-                    let token = current_token(input, round.parts().1.grammar())?;
+                    let token = lookahead_type(input, round.parts().1.grammar())?;
                     local_dfa_target(round, dfas, input, start, token, PredictionMode::Sll)?;
                     drop(round.enter_full(input)?);
                     let _blockers = (exhaust(retained), exhaust(memory));
@@ -211,7 +369,7 @@ fn real_miss_admission_failure_leaves_the_prior_start_and_allows_a_fresh_retry()
                 let result = session.with_prediction(ISOLATION_DECISION, |round, dfas, input| {
                     let start = local_dfa_start(round, dfas, input)?;
                     assert_eq!(dfas.state_count(ISOLATION_DECISION)?, 1);
-                    let token = current_token(input, round.parts().1.grammar())?;
+                    let token = lookahead_type(input, round.parts().1.grammar())?;
                     assert_eq!(dfas.existing_edge(ISOLATION_DECISION, start, token.number())?, None);
                     let _blocker = fail.then(|| exhaust(retained));
                     let target = interned(local_dfa_target(round, dfas, input, start, token, PredictionMode::Sll)?);
@@ -238,7 +396,7 @@ fn completed_local_edge_survives_the_real_following_token_error() {
             isolation(session)?;
             let result = session.with_prediction(ISOLATION_DECISION, |round, dfas, input| {
                 let start = local_dfa_start(round, dfas, input)?;
-                let token = current_token(input, round.parts().1.grammar())?;
+                let token = lookahead_type(input, round.parts().1.grammar())?;
                 let target = interned(local_dfa_target(round, dfas, input, start, token, PredictionMode::Sll)?);
                 assert!(matches!(dfas.view(ISOLATION_DECISION, target)?.acceptance(), Acceptance::NonAccept));
                 input.advance()
@@ -254,7 +412,7 @@ fn completed_local_edge_survives_the_real_following_token_error() {
             session.with_prediction(ISOLATION_DECISION, |round, dfas, input| {
                 let _blockers = (exhaust(retained), exhaust(memory));
                 let start = local_dfa_start(round, dfas, input)?;
-                let token = current_token(input, round.parts().1.grammar())?;
+                let token = lookahead_type(input, round.parts().1.grammar())?;
                 let target = interned(local_dfa_target(round, dfas, input, start, token, PredictionMode::Ll)?);
                 assert_eq!(dfas.state_at(ISOLATION_DECISION, 1)?, Some(target));
                 Ok(())
@@ -292,6 +450,97 @@ fn add<'cfg, 'id, 'g, 'scope>(
 }
 
 #[test]
+fn late_predicated_conflict_restarts_real_ll_and_uses_its_unique_choice_or_offending_token() {
+    for (sql, viable) in [("READ COMMITTED", true), ("READ read", false)] {
+        environment(|env, work, _, _| {
+            let result = with_parser_session(env, sql, work, |session| {
+                isolation(session)?;
+                session.with_prediction(ISOLATION_DECISION, |round, dfas, input| {
+                    let start = local_dfa_start(round, dfas, input)?;
+                    let grammar = round.parts().1.grammar();
+                    let first = lookahead_type(input, grammar)?;
+                    let previous = interned(local_dfa_target(round, dfas, input, start, first, PredictionMode::Sll)?);
+                    assert!(matches!(dfas.view(ISOLATION_DECISION, previous)?.acceptance(), Acceptance::NonAccept));
+                    input.advance()?;
+                    let second = lookahead_type(input, grammar)?;
+
+                    let (configs, contexts) = round.parts();
+                    let decision = grammar.decision(ISOLATION_DECISION)?;
+                    let stop = decision.state().rule().stop().number();
+                    let predicate = precedence(configs, grammar, 1)?;
+                    let set = configs.new_set(SetMode::Local)?;
+                    let empty = contexts.empty();
+                    add(configs, contexts, set, stop, 1, empty, predicate)?;
+                    add(configs, contexts, set, stop, 2, empty, Semantic::Unpredicated)?;
+                    let draft = prepare_target(dfas, configs, contexts, decision, set, PredictionMode::Sll)?;
+                    assert!(matches!(dfas.view_draft(ISOLATION_DECISION, draft)?.acceptance(),
+                        Acceptance::Predicated { reason: AcceptReason::Conflict, .. }));
+                    dfas.add_edge(ISOLATION_DECISION, Some(previous), second.number(), Some(Candidate::Draft(draft)), configs, contexts)?;
+                    Ok(())
+                })?;
+
+                assert_eq!(session.adaptive_predict(ISOLATION_DECISION, PredictionMode::Sll)?.number(), 1);
+                let result = session.adaptive_predict(ISOLATION_DECISION, PredictionMode::Ll);
+                assert_eq!(session.input_index(), Some(0));
+                session.exit_rule()?;
+                result
+            });
+            if viable {
+                assert_eq!(result.unwrap().number(), 2);
+            } else {
+                let Err(RuntimeError::NoViableAlternative(error)) = result else {
+                    panic!("full no viable alternative: {result:?}");
+                };
+                assert_eq!((error.start.index(), error.start.lexeme().raw()), (0, "READ"));
+                assert_eq!((error.offending.index(), error.offending.lexeme().raw()), (1, "read"));
+                assert_eq!(error.state, ParserState::State(3014));
+            }
+        });
+    }
+}
+
+#[test]
+fn ll_conflict_with_one_passing_predicate_resolves_from_the_warm_local_state() {
+    const DECISION: u16 = 82;
+    environment(|env, work, retained, memory| {
+        with_parser_session(env, "INT ARRAY @", work, |session| {
+            let pending = session.new_recursion_entry(DATA_TYPE_RULE)?;
+            let mut entry = session.enter_recursion(pending, 2)?;
+            session.advance_input()?;
+            session.set_state(955)?;
+            session.with_prediction(DECISION, |round, dfas, input| {
+                let start = local_dfa_start(round, dfas, input)?;
+                let (configs, contexts) = round.parts();
+                let grammar = contexts.grammar();
+                let token = lookahead_type(input, grammar)?;
+                let decision = grammar.decision(DECISION)?;
+                let stop = decision.state().rule().stop();
+                let set = configs.new_set(SetMode::Local)?;
+                for (ordinal, threshold) in [(1, 1), (2, 2)] {
+                    let alternative = configs.alternative(decision, ordinal)?;
+                    let semantic = precedence(configs, grammar, threshold)?;
+                    let config = configs.create(stop, alternative, contexts.empty(), semantic)?;
+                    configs.add_uncached(set, config, contexts)?;
+                }
+                let draft = prepare_target(dfas, configs, contexts, decision, set, PredictionMode::Sll)?;
+                assert!(matches!(dfas.view_draft(DECISION, draft)?.acceptance(),
+                    Acceptance::Predicated { reason: AcceptReason::Conflict, .. }));
+                dfas.add_edge(DECISION, Some(start), token.number(), Some(Candidate::Draft(draft)), configs, contexts)?;
+                Ok(())
+            })?;
+
+            let blockers = (exhaust(retained), exhaust(memory));
+            assert_eq!(session.adaptive_predict(DECISION, PredictionMode::Ll)?.number(), 2);
+            assert_eq!(session.input_index(), Some(1));
+            assert!(session.buffered_token(2).is_none());
+            drop(blockers);
+            session.unroll_recursion(&mut entry)?;
+            Ok(())
+        }).unwrap();
+    });
+}
+
+#[test]
 fn all_stop_conflict_prepares_predicates_in_alternative_order_and_accepts_the_unpredicated_default() {
     environment(|env, work, _, _| {
         with_parser_session(env, "READ COMMITTED", work, |session| {
@@ -322,6 +571,11 @@ fn all_stop_conflict_prepares_predicates_in_alternative_order_and_accepts_the_un
                         Acceptance::Plain { reason: AcceptReason::Conflict, prediction } if dominates => assert_eq!(prediction.number(), 1),
                         Acceptance::Predicated { reason: AcceptReason::Conflict, pairs } if !dominates => {
                             assert!(pairs.iter().map(|pair| (pair.alternative.number(), pair.semantic)).eq([(1, unpredicated), (2, high), (3, unpredicated)]));
+                            assert_eq!(evaluate_predicate_pairs(pairs, 2), conflicting);
+                            let passing = evaluate_predicate_pairs(pairs, 3);
+                            assert_eq!(passing.count(), 2);
+                            assert_eq!(passing.first().unwrap().number(), 1);
+                            assert!(!passing.contains(pairs[1].alternative));
                         }
                         _ => panic!("prepared conflict"),
                     }
