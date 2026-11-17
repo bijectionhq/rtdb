@@ -989,6 +989,11 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
     {_RK_GLOBAL | _RK_HIGH | _RK_SENSITIVE, "sasl.password", _RK_C_STR,
      _RK(sasl.password),
      "SASL password for use with the PLAIN and SASL-SCRAM-.. mechanism"},
+    {_RK_GLOBAL, "sasl.scram.tokenauth", _RK_C_BOOL,
+     _RK(sasl.scram_tokenauth),
+     "Send tokenauth=true in the SASL SCRAM client-first message when "
+     "authenticating with a delegation token.",
+     0, 1, 0, _UNSUPPORTED_SSL},
     {_RK_GLOBAL | _RK_SENSITIVE, "sasl.oauthbearer.config", _RK_C_STR,
      _RK(sasl.oauthbearer_config),
      "SASL/OAUTHBEARER configuration. The format is "

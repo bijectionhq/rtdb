@@ -144,3 +144,32 @@ fn jaas_null_option_keys_do_not_replace_named_credentials() {
     let properties = BTreeMap::from([("sasl.jaas.config".into(), "org.apache.kafka.common.security.plain.PlainLoginModule required username=user password=secret 123abc=ignored;".into())]);
     assert!(native_properties(&properties).is_err());
 }
+
+#[test]
+fn login_modules_ignore_unconsumed_options_and_scram_preserves_token_authentication() {
+    for module in ["plain.PlainLoginModule", "scram.ScramLoginModule"] {
+        for (token, enabled) in [("true", true), ("TrUe", true), ("false", false), ("yes", false), (" true ", false)] {
+            let properties = BTreeMap::from([("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.{module} required username=user password=secret debug=true user_other=ignored tokenauth='{token}';"))]);
+            let native = native_properties(&properties).unwrap();
+            assert_eq!(native["sasl.username"], "user");
+            assert_eq!(native["sasl.password"], "secret");
+            assert!(!native.contains_key("debug"));
+            assert!(!native.contains_key("user_other"));
+            assert!(!native.contains_key("tokenauth"));
+            assert_eq!(native.get("sasl.scram.tokenauth").map(String::as_str), if module.starts_with("scram.") { Some(if enabled { "true" } else { "false" }) } else { None });
+        }
+    }
+}
+
+#[test]
+fn scram_native_token_configuration_must_agree_with_jaas() {
+    for (jaas, native, accepted) in [("true", "TRUE", true), ("true", "1", true), ("true", "t", true), ("false", "0", true), ("false", "F", true), ("true", "false", false), ("false", "true", false), ("true", "invalid", false)] {
+        let properties = BTreeMap::from([
+            ("sasl.jaas.config".into(), format!("org.apache.kafka.common.security.scram.ScramLoginModule required username=user password=secret-value tokenauth={jaas};")),
+            ("sasl.scram.tokenauth".into(), native.into()),
+        ]);
+        let result = native_properties(&properties);
+        assert_eq!(result.is_ok(), accepted);
+        if let Err(error) = result { assert_eq!(error.code, "xtdb.kafka/conflicting-config"); assert!(!format!("{error:?}").contains("secret-value")); }
+    }
+}

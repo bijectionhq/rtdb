@@ -602,6 +602,7 @@ rd_kafka_sasl_scram_build_client_first_message(rd_kafka_transport_t *rktrans,
         char *sasl_username;
         struct rd_kafka_sasl_scram_state *state = rktrans->rktrans_sasl.state;
         rd_kafka_conf_t *conf = &rktrans->rktrans_rkb->rkb_rk->rk_conf;
+        const char *extension = conf->sasl.scram_tokenauth ? ",tokenauth=true" : "";
 
         rd_kafka_sasl_scram_generate_nonce(&state->cnonce);
 
@@ -610,11 +611,12 @@ rd_kafka_sasl_scram_build_client_first_message(rd_kafka_transport_t *rktrans,
         mtx_unlock(&conf->sasl.lock);
 
         out->size =
-            strlen("n,,n=,r=") + strlen(sasl_username) + state->cnonce.size;
+            strlen("n,,n=,r=") + strlen(sasl_username) + state->cnonce.size +
+            strlen(extension);
         out->ptr = rd_malloc(out->size + 1);
 
-        rd_snprintf(out->ptr, out->size + 1, "n,,n=%s,r=%.*s", sasl_username,
-                    (int)state->cnonce.size, state->cnonce.ptr);
+        rd_snprintf(out->ptr, out->size + 1, "n,,n=%s,r=%.*s%s", sasl_username,
+                    (int)state->cnonce.size, state->cnonce.ptr, extension);
         rd_free(sasl_username);
 
         /* Save client-first-message-bare (skip gs2-header) */
@@ -847,11 +849,55 @@ static int unittest_scram_safe(void) {
 }
 
 
+static int unittest_scram_tokenauth(void) {
+        rd_kafka_t rk = RD_ZERO_INIT;
+        rd_kafka_broker_t broker = RD_ZERO_INIT;
+        rd_kafka_transport_t transport = RD_ZERO_INIT;
+        int enabled;
+
+        broker.rkb_rk = &rk;
+        transport.rktrans_rkb = &broker;
+        rk.rk_conf.sasl.username = "user,name=token";
+        RD_UT_ASSERT(mtx_init(&rk.rk_conf.sasl.lock, mtx_plain) == thrd_success,
+                     "Credential mutex initialization failed");
+
+        for (enabled = 0; enabled <= 1; enabled++) {
+                struct rd_kafka_sasl_scram_state state = RD_ZERO_INIT;
+                rd_chariov_t message = RD_ZERO_INIT;
+                char expected[128];
+
+                transport.rktrans_sasl.state = &state;
+                rk.rk_conf.sasl.scram_tokenauth = enabled;
+                rd_kafka_sasl_scram_build_client_first_message(&transport,
+                                                              &message);
+                rd_snprintf(expected, sizeof(expected),
+                            "n,,n=user=2Cname=3Dtoken,r=%.*s%s",
+                            (int)state.cnonce.size, state.cnonce.ptr,
+                            enabled ? ",tokenauth=true" : "");
+                RD_UT_ASSERT(message.size == strlen(expected) &&
+                                 !strcmp(message.ptr, expected),
+                             "Unexpected SCRAM client-first message");
+                RD_UT_ASSERT(state.first_msg_bare.size == message.size - 3 &&
+                                 !memcmp(state.first_msg_bare.ptr,
+                                         expected + 3,
+                                         state.first_msg_bare.size),
+                             "Authentication transcript excludes message bytes");
+                rd_free(message.ptr);
+                rd_free(state.cnonce.ptr);
+                rd_free(state.first_msg_bare.ptr);
+        }
+
+        mtx_destroy(&rk.rk_conf.sasl.lock);
+        RD_UT_PASS();
+}
+
+
 int unittest_scram(void) {
         int fails = 0;
 
         fails += unittest_scram_nonce();
         fails += unittest_scram_safe();
+        fails += unittest_scram_tokenauth();
 
         return fails;
 }

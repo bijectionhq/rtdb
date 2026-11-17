@@ -70,7 +70,7 @@ impl Settings {
                 "max.in.flight.requests.per.connection" | "retries" | "compression.type" | "metadata.max.age.ms" |
                 "reconnect.backoff.ms" | "reconnect.backoff.max.ms" | "retry.backoff.ms" | "retry.backoff.max.ms" |
                 "connections.max.idle.ms" | "security.protocol" | "sasl.mechanism" | "sasl.jaas.config" |
-                "sasl.username" | "sasl.password" | "sasl.kerberos.service.name" | "sasl.kerberos.principal" |
+                "sasl.username" | "sasl.password" | "sasl.scram.tokenauth" | "sasl.kerberos.service.name" | "sasl.kerberos.principal" |
                 "transactional.id" | "transaction.timeout.ms" | "ssl.cipher.suites" | "ssl.key.password" |
                 "ssl.ca.location" | "ssl.ca.pem" | "ssl.key.location" | "ssl.key.pem" |
                 "ssl.certificate.location" | "ssl.certificate.pem" => name.as_str(),
@@ -107,6 +107,20 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delegation_token_options_reach_the_native_dead_letter_producer() {
+        let mut options = BTreeMap::from([
+            ("bootstrap.servers".into(), "localhost:9092".into()),
+            ("sasl.mechanism".into(), "SCRAM-SHA-256".into()),
+            ("sasl.jaas.config".into(), "org.apache.kafka.common.security.scram.ScramLoginModule required username=token password=secret tokenauth=true debug=true;".into()),
+        ]);
+        assert_eq!(Settings::parse(&options).unwrap().properties["sasl.scram.tokenauth"], "true");
+        options.insert("sasl.scram.tokenauth".into(), "false".into());
+        assert!(Settings::parse(&options).is_err());
+        options.remove("sasl.jaas.config");
+        assert_eq!(Settings::parse(&options).unwrap().properties["sasl.scram.tokenauth"], "false");
+    }
+
     #[test]
     fn dlq_defaults_and_java_producer_aliases_are_applied_without_registry_properties() {
         let settings = Settings::parse(&BTreeMap::from([
