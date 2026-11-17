@@ -1,0 +1,7 @@
+f63f9f773c68956503b3892749d7e56a71e82ab59138526dce27cd4f4ce20eac  jackson-databind-2.16.0/com/fasterxml/jackson/databind/DeserializationFeature.java
+4275b8edcb0e03d0a1a85cd7dbe8f5a385efc6904c69760bbfb123a56266fca2  jackson-databind-2.16.0/com/fasterxml/jackson/databind/cfg/JsonNodeFeature.java
+04798ee6901669f43077c36bab288f81f1e0d81404c4966724212d9954103e61  jackson-databind-2.16.0/com/fasterxml/jackson/databind/deser/std/JsonNodeDeserializer.java
+6bcfee8fd8f82c162e305b95e10a034665ee975cae7cdaa7a2c77906b9f27035  jackson-databind-2.21.7/com/fasterxml/jackson/databind/DeserializationFeature.java
+c78bd26653733f2e76b8622164369fa019aed7757668de947782c48693c83094  jackson-databind-2.21.7/com/fasterxml/jackson/databind/cfg/JsonNodeFeature.java
+9de3d15eb8049f640b5e3e21867ee506ec2ce67db95c38b8668e463807fb0561  jackson-databind-2.21.7/com/fasterxml/jackson/databind/deser/std/JsonNodeDeserializer.java
+32bfe421ef8c304207797c21ad9564a472e725708d4da42f0c4f4503ec065528  apache-avro-1.11.4/org/apache/avro/JsonProperties.java

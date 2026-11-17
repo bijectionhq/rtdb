@@ -15,6 +15,7 @@ mod names;
 mod conversion;
 mod default_input;
 mod default_scalar;
+mod default_property;
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;

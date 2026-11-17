@@ -1,0 +1,42 @@
+= Borrowed schema-property roundtrip
+
+PropertyNode is a passive borrowed proof value over an already admitted DefaultJson owner.
+Its private field can be obtained only after the untyped Jackson object and JSON encoding scans succeed.
+The helper creates no intermediate object tree, JSON tree, Value tree, namespace copy or retained index.
+A caller can turn the surviving property view into the actual JsonNode input for default conversion.
+Raw schema/property storage remains unchanged for its own serialization and cache identity.
+
+JsonProperties.getObjectProp delegates to untyped JacksonUtils.toObject.
+AvroData obtains connect.default through that getter and then invokes JacksonUtils.toJsonNode before the default DataException catch.
+A missing property and a top-level integer beyond signed 64 bits both produce no resulting node.
+Explicit JSON null becomes JsonProperties.NULL_VALUE and survives to an actual NullNode.
+Nested integer fallthroughs become Java null and fail unchecked when JacksonUtils.toJson reaches its unrecognized datum.getClass branch.
+PropertyObject is a passive borrowed proof that the complete getObjectProp/object stage succeeded.
+Its constructor completes the full untyped object scan independently of the later encoding demand, preserving that stage order relative to its own depth/resource guard.
+PropertyObject::node performs the separate encoding scan, while node(raw) composes both stages as a convenience.
+The actual caller always evaluates the object stage but demands encoding only when fieldDefaultVal is Java null.
+A supplied non-null FieldObject default skips encoding, including an encoding failure in an otherwise valid property object.
+An explicit JSON null property remains a non-null NULL_VALUE sentinel through the object stage and becomes an actual NullNode when encoding is demanded.
+
+For the consumed accessor profile, surviving raw nodes can remain borrowed.
+Floating lexemes retain the same parsed Double value and class, including overflow to Infinity and signed zero; integral -0 accessors already normalize to integer zero.
+String, Boolean and explicit-null values survive, and object insertion/replacement order remains with the existing raw owner.
+The helper establishes default-input accessor semantics rather than a new canonical schema serializer.
+The constructor enforces the Double-mode schema parser profile and rejects a registry JsonDecimal carrier as an outer unsupported-profile error.
+Registry envelope Decimal parsing must not silently replace parsing the quoted Avro schema text.
+The separate actual-node scalar adapter can model DecimalNode accessors without making that class a reachable raw property in this schema-parser profile.
+General JSON lexical/node-factory configuration and isolated UTF16 representation retain their owning parser qualifications.
+
+The pinned source chain is JsonProperties.java240–242, JacksonUtils.java47–96 and104–174, and AvroData.java2045–2062.
+Avro Schema.java115–123 creates a fresh ObjectMapper and enables comments without changing numeric coercion options.
+The two databind profiles disable BigDecimal/BigInteger/Long overrides and retain null properties by default; their JsonNodeDeserializer chooses the corresponding primitive nodes.
+The link:profile-sources.sha256[profile source manifest], link:COPYRIGHT[complete source prefixes] and link:schema-profile.json[static profile proof] cover those additional source branches.
+The schema text is parsed through DefaultJson::parse in Double mode; RegistrySchema.schema remains a quoted text payload even when its surrounding HTTP envelope uses Decimal mode.
+The link:../default_scalar/sources.sha256[default scalar source manifest] and its retained source headers/licenses cover the consulted implementation bytes.
+The separate link:../default_input/ADMISSION.adoc[default input reference] distinguishes FieldObject source preprocessing from this schema-property roundtrip.
+
+Eight regression sources cover absent/top-level fallthrough versus explicit null, nested unchecked encoding failures, complete object-scan timing, raw payload identity/member order, floating/integer accessor classes, explicit NullNode input and conditional encoding after a competing FieldObject default.
+The old A09 production assertion for an Array[String] connect.default:[null] remains unchanged for explicit Phase2 reference reconciliation.
+This new property/input path follows the pinned source chain and does not treat that old native assertion as a reference execution result.
+No Java name policy, production default path or completeness gate is activated by this helper.
+Rust/Java compilation and regression execution remain pending under the Phase1 work order.
