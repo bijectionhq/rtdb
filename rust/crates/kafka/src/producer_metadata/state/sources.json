@@ -53,6 +53,11 @@
         "prefix_bytes": 800,
         "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
       },
+      "org/apache/kafka/common/utils/Timer.java": {
+        "sha256": "b5549a9778ccdea940cd7ddfd7dec6b71f398f8be40e3e1b63ba9ce85afbf79f",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
       "org/apache/kafka/common/Node.java": {
         "sha256": "f82353cccc5435fc4ca958dbaaf73741750f629b466fedfec4e145c13a7f953f",
         "prefix_bytes": 800,

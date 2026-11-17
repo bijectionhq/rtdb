@@ -136,6 +136,14 @@ A synchronous unsupported-version send reports the fatal cause and failed refres
 Disconnect bookkeeping records any due failure before a fatal authentication cause and the request for a full refresh.
 The caller owns actual native completion, connection and clock observations, diagnostics, response application and waiter delivery.
 
+== Awaiting a Metadata version
+
+`MetadataWait` retains the requested signed update version and the source Timer for one waiting call.
+The initial clock read precedes timeout validation, and the deadline saturates at the signed long maximum.
+Each evaluation checks the source fatal error, closed state and update version before demanding a new clock sample.
+Clock samples can advance cached time, and a timeout retains the original requested duration.
+The enclosing monitor supplies fatal ownership, lock synchronization and notification or timeout delivery.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
