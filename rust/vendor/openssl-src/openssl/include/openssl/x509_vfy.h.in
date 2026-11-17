@@ -499,6 +499,16 @@ X509_STORE_CTX_cleanup_fn X509_STORE_get_cleanup(const X509_STORE *xs);
 int X509_STORE_set_ex_data(X509_STORE *xs, int idx, void *data);
 void *X509_STORE_get_ex_data(const X509_STORE *xs, int idx);
 
+/*
+ * - Transfers owner on success (1); failure (0) leaves ownership with the caller.
+ * - Set once with exclusive access before publication; free_owner must be non-NULL.
+ * - free_owner runs after the final store reference, lookups, cached references and store storage are destroyed.
+ * - Independently retained certificates and CRLs may outlive the store.
+ * - The callback must not access the destroyed store or unwind through C.
+ */
+int X509_STORE_set0_retained_owner(X509_STORE *store, void *owner,
+    void (*free_owner)(void *));
+
 X509_STORE_CTX *X509_STORE_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq);
 X509_STORE_CTX *X509_STORE_CTX_new(void);
 

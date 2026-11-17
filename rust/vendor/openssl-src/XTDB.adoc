@@ -47,3 +47,59 @@ The final anchor is excluded from path-extension, name-constraint, date and sign
 Version-1/version-2 intermediates require Java self-issuance and immediate placement below the anchor.
 Per-certificate metadata allocation is admitted before the native call and released after all copies are destroyed.
 The regression sources are `../../crates/kafka/src/tls/validation/pkix/tests/selected_chain.rs`; they have not been compiled or executed during Phase 1.
+
+`X509_set0_retained_owner`, `X509_CRL_set0_retained_owner` and `X509_STORE_set0_retained_owner` attach one passive resource owner to a native object's lifetime.
+The setter transfers the opaque owner only on success, requires exclusive access before publication and rejects a second owner or a null destruction callback.
+Native reference-counted aliases retain that same owner until the last reference is released.
+Certificate and CRL owners run after their decoded fields, cached payload and heap object storage have been destroyed, including destruction through generic ASN.1 entry points.
+Their inputs must be heap-allocated objects rather than embedded ASN.1 values.
+Store owners run after lookup methods, cached references, pointer stacks and the store's own storage have been destroyed.
+An independently retained certificate or CRL can outlive its store and carries its own owner until its final destruction.
+
+The opt-in `ASN1_AFLG_FREE_FINAL` flag passes a zeroed `ASN1_FREE_ARG` to `ASN1_OP_FREE_POST`.
+That callback may capture a destruction function and opaque argument; generic ASN.1 cleanup calls it after freeing the native object's storage.
+The captured callback receives no pointer to the destroyed object and must not unwind through C.
+Only X509 and X509_CRL opt into the flag in this source tree, and objects without retained owners use their existing cleanup path.
+ASN.1 duplicates start without a retained owner; decoding into an existing object preserves its owner until that object's destruction.
+These hooks provide lifetime ownership and do not admit new allocations made by duplication or subsequent mutation.
+Custom CRL methods retain their existing cleanup behavior.
+If a custom destruction callback aborts before cached payload cleanup, the retained owner is also left unreleased, keeping its admission while the skipped native allocations remain live.
+The pinned built-in CRL method has no destruction callback and follows the complete payload cleanup path.
+Native default/probe stores, inline inputs, nonregular files, arbitrary providers, and later handshake/session allocations remain independent admission qualifications.
+The lazy native hashed-directory loader has not yet been connected to these hooks.
+
+`openssl/test/retained_owner_test.c` is a standalone native regression program.
+Its process-local allocator hooks check that object, property, cached-extension, lookup and pointer-stack storage is freed before owner callbacks.
+The cases cover generic ASN.1 cleanup, reference-counted aliases, failed ownership transfer, cached objects retained after store destruction and conservative owner retention after a custom CRL cleanup failure.
+Deterministic Ed25519 fixtures also cover X509/CRL duplication with independent owners and successful decode into an existing object.
+Malformed outer tags and empty sequences cover failed decode before and after `D2I_PRE`, including an alias that keeps the old object alive after the input pointer is cleared.
+Malformed auxiliary certificate data covers `d2i_X509_AUX` returning failure while preserving an existing certificate and its owner.
+The pinned paths are `crypto/asn1/a_dup.c:ASN1_item_dup`, `crypto/asn1/tasn_dec.c:asn1_item_ex_d2i_intern` and `crypto/x509/x_x509.c:d2i_X509_AUX`.
+
+This package omits the upstream test harness sources.
+The Cargo builder passes `no-tests` and invokes `make depend` followed by `make build_libs`; the root OpenSSL `build.info` excludes the entire test directory under `no-tests`.
+Enabling the ordinary OpenSSL test targets would require omitted sources, so the standalone program is compiled directly against the configured library and generated headers.
+The following Phase 2 workflow is scoped to a native Apple Silicon macOS host with Perl, Make and the Xcode command-line C toolchain, starting at the repository root.
+It uses a separate build directory and the pinned `darwin64-arm64` target from `Configurations/10-main.conf`.
+The program has its own `main`, requires the default Ed25519 implementation and does not link the missing test harness.
+
+[source,shell]
+----
+rtdb_openssl_source="$PWD/rust/vendor/openssl-src/openssl"
+rtdb_owner_build="$(mktemp -d "${TMPDIR:-/tmp}/rtdb-retained-owner.XXXXXX")"
+(
+  set -e
+  cd "$rtdb_owner_build"
+  perl "$rtdb_openssl_source/Configure" darwin64-arm64 no-shared no-module no-tests no-comp no-zlib no-zlib-dynamic
+  make depend
+  make build_libs
+  cc -arch arm64 -I"$rtdb_owner_build/include" -I"$rtdb_openssl_source/include" -I"$rtdb_openssl_source" \
+    "$rtdb_openssl_source/test/retained_owner_test.c" "$rtdb_owner_build/libcrypto.a" \
+    -o "$rtdb_owner_build/retained_owner_test"
+  OPENSSL_CONF=/dev/null "$rtdb_owner_build/retained_owner_test"
+)
+----
+
+Other platforms need their matching Configure target, compiler architecture and platform link dependencies.
+This is a source-traced workflow rather than a successful build claim.
+The hooks and regression source have been reviewed as source only, without compilation or execution during Phase 1.

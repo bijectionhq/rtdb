@@ -31,6 +31,8 @@ void ossl_asn1_item_embed_free(ASN1_VALUE **pval, const ASN1_ITEM *it, int embed
     const ASN1_EXTERN_FUNCS *ef;
     const ASN1_AUX *aux = it->funcs;
     ASN1_aux_cb *asn1_cb;
+    ASN1_FREE_ARG final = { NULL, NULL };
+    void *free_arg;
     int i;
 
     if (pval == NULL)
@@ -41,6 +43,11 @@ void ossl_asn1_item_embed_free(ASN1_VALUE **pval, const ASN1_ITEM *it, int embed
         asn1_cb = aux->asn1_cb;
     else
         asn1_cb = 0;
+    free_arg = (it->itype == ASN1_ITYPE_CHOICE
+                   || it->itype == ASN1_ITYPE_SEQUENCE
+                   || it->itype == ASN1_ITYPE_NDEF_SEQUENCE)
+            && aux != NULL && (aux->flags & ASN1_AFLG_FREE_FINAL) != 0
+        ? &final : NULL;
 
     switch (it->itype) {
 
@@ -70,11 +77,13 @@ void ossl_asn1_item_embed_free(ASN1_VALUE **pval, const ASN1_ITEM *it, int embed
             ossl_asn1_template_free(pchval, tt);
         }
         if (asn1_cb)
-            asn1_cb(ASN1_OP_FREE_POST, pval, it, NULL);
+            asn1_cb(ASN1_OP_FREE_POST, pval, it, free_arg);
         if (embed == 0) {
             OPENSSL_free(*pval);
             *pval = NULL;
         }
+        if (final.free_func != NULL)
+            final.free_func(final.arg);
         break;
 
     case ASN1_ITYPE_EXTERN:
@@ -114,11 +123,13 @@ void ossl_asn1_item_embed_free(ASN1_VALUE **pval, const ASN1_ITEM *it, int embed
             ossl_asn1_template_free(pseqval, seqtt);
         }
         if (asn1_cb)
-            asn1_cb(ASN1_OP_FREE_POST, pval, it, NULL);
+            asn1_cb(ASN1_OP_FREE_POST, pval, it, free_arg);
         if (embed == 0) {
             OPENSSL_free(*pval);
             *pval = NULL;
         }
+        if (final.free_func != NULL)
+            final.free_func(final.arg);
         break;
     }
 }

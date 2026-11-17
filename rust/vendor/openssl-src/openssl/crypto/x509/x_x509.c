@@ -96,6 +96,12 @@ static int x509_cb(int operation, ASN1_VALUE **pval, const ASN1_ITEM *it,
 #endif
         ASN1_OCTET_STRING_free(ret->distinguishing_id);
         OPENSSL_free(ret->propq);
+        if (exarg != NULL) {
+            ASN1_FREE_ARG *final = exarg;
+
+            final->free_func = ret->retained_owner.free_func;
+            final->arg = ret->retained_owner.arg;
+        }
         break;
 
     case ASN1_OP_DUP_POST: {
@@ -123,7 +129,12 @@ static int x509_cb(int operation, ASN1_VALUE **pval, const ASN1_ITEM *it,
     return 1;
 }
 
-ASN1_SEQUENCE_ref(X509, x509_cb) = {
+static const ASN1_AUX X509_aux = {
+    NULL, ASN1_AFLG_REFCOUNT | ASN1_AFLG_FREE_FINAL,
+    offsetof(X509, references), offsetof(X509, lock), x509_cb, 0, NULL
+};
+
+ASN1_SEQUENCE(X509) = {
     ASN1_EMBED(X509, cert_info, X509_CINF),
     ASN1_EMBED(X509, sig_alg, X509_ALGOR),
     ASN1_EMBED(X509, signature, ASN1_BIT_STRING)
@@ -131,6 +142,16 @@ ASN1_SEQUENCE_ref(X509, x509_cb) = {
 
 IMPLEMENT_ASN1_FUNCTIONS(X509)
 IMPLEMENT_ASN1_DUP_FUNCTION(X509)
+
+int X509_set0_retained_owner(X509 *x, void *owner, void (*free_owner)(void *))
+{
+    OSSL_X509_RETAINED_OWNER retained = { owner, free_owner };
+
+    if (x == NULL || free_owner == NULL || x->retained_owner.free_func != NULL)
+        return 0;
+    x->retained_owner = retained;
+    return 1;
+}
 
 /*
  * This should only be used if the X509 object was embedded inside another

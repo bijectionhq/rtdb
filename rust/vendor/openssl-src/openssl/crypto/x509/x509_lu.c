@@ -228,6 +228,7 @@ void X509_STORE_free(X509_STORE *xs)
     int i;
     STACK_OF(X509_LOOKUP) *sk;
     X509_LOOKUP *lu;
+    OSSL_X509_RETAINED_OWNER retained_owner;
 
     if (xs == NULL)
         return;
@@ -236,6 +237,8 @@ void X509_STORE_free(X509_STORE *xs)
     if (i > 0)
         return;
     REF_ASSERT_ISNT(i < 0);
+
+    retained_owner = xs->retained_owner;
 
     sk = xs->get_cert_methods;
     for (i = 0; i < sk_X509_LOOKUP_num(sk); i++) {
@@ -251,6 +254,19 @@ void X509_STORE_free(X509_STORE *xs)
     CRYPTO_THREAD_lock_free(xs->lock);
     CRYPTO_FREE_REF(&xs->references);
     OPENSSL_free(xs);
+    if (retained_owner.free_func != NULL)
+        retained_owner.free_func(retained_owner.arg);
+}
+
+int X509_STORE_set0_retained_owner(X509_STORE *store, void *owner,
+    void (*free_owner)(void *))
+{
+    OSSL_X509_RETAINED_OWNER retained = { owner, free_owner };
+
+    if (store == NULL || free_owner == NULL || store->retained_owner.free_func != NULL)
+        return 0;
+    store->retained_owner = retained;
+    return 1;
 }
 
 int X509_STORE_up_ref(X509_STORE *xs)
