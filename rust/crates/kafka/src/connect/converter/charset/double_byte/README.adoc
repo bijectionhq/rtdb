@@ -17,6 +17,8 @@ JIS0208, JIS0212, IBM300, IBM834, IBM1383, and IBM970 use DBCS-only or simple EU
 Their static mappings and subclass replacement rules are described in link:subclasses/README.adoc[the subclass reference].
 The six mixed EBCDIC charsets IBM1364/930/933/935/937/939 have 30 further registered names and shift state scoped to each record.
 Their mappings, SO/SI transitions, and replacement boundaries are described in link:ebcdic/README.adoc[the mixed EBCDIC reference].
+EUC-JP, x-euc-jp-linux, and x-eucJP-Open support 14 registered names through ASCII, JIS0201, JIS0208, and optional JIS0212 decoding.
+Their Linux/Solaris differences and replacement boundaries are described in link:euc_jp/README.adoc[the EUC-JP reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.
