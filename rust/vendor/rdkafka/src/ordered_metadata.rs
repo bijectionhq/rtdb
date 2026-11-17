@@ -57,6 +57,12 @@ pub struct OrderedMetadataRequest {
 unsafe impl Send for OrderedMetadataRequest {}
 unsafe impl Sync for OrderedMetadataRequest {}
 
+enum MetadataTarget<'a> {
+    AnyNamed(&'a [MetadataTopic<'a>]),
+    AnyBrokers,
+    Broker { id: i32, topics: &'a [MetadataTopic<'a>] },
+}
+
 impl<C: ClientContext> Client<C> {
     /// Starts an ordered named-topic request without blocking for broker readiness.
     /// The producer must carry a NativeByteAccount; completion storage and native encoding/network overlap acquire that account before allocation.
@@ -66,25 +72,38 @@ impl<C: ClientContext> Client<C> {
     /// Topic inputs are consumed synchronously and need not remain alive afterward.
     /// No cache mutation, result decoding or Rust callback runs on native completion.
     pub fn start_ordered_metadata(&self, topics: &[MetadataTopic<'_>], body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
-        self.start_ordered_metadata_request(Some(topics), body_capacity, timeout)
+        self.start_ordered_metadata_request(MetadataTarget::AnyNamed(topics), body_capacity, timeout)
     }
 
     /// Starts a broker-only Metadata request using an explicit empty topic list.
     /// Negotiates Metadata versions 1 through 13, or 4 through 13 with auto creation disabled.
     /// Uses the admission, timeout and completion ownership of [`Self::start_ordered_metadata`].
     pub fn start_ordered_metadata_brokers(&self, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
-        self.start_ordered_metadata_request(None, body_capacity, timeout)
+        self.start_ordered_metadata_request(MetadataTarget::AnyBrokers, body_capacity, timeout)
     }
 
-    fn start_ordered_metadata_request(&self, topics: Option<&[MetadataTopic<'_>]>, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
+    /// Starts ordered Metadata on the existing native broker with this nonnegative node ID.
+    /// Missing or unavailable brokers return `BrokerNotReady`; a sparse connection may start for the requested broker.
+    /// An empty topic slice uses the version floor and wire semantics of [`Self::start_ordered_metadata_brokers`].
+    /// Named topics, resource admission, timeout and completion follow [`Self::start_ordered_metadata`].
+    /// The accepted request follows the selected broker owner across its native reconnects.
+    pub fn start_ordered_metadata_at(&self, broker_id: i32, topics: &[MetadataTopic<'_>], body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
+        self.start_ordered_metadata_request(MetadataTarget::Broker { id: broker_id, topics }, body_capacity, timeout)
+    }
+
+    fn start_ordered_metadata_request(&self, target: MetadataTarget<'_>, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
         let account = self.native_client().byte_account().ok_or(OrderedMetadataError::AccountRequired)?;
         let millis = timeout.as_millis().checked_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0)).ok_or(OrderedMetadataError::InvalidTimeout)?;
         let millis = i32::try_from(millis).ok().filter(|value| *value > 0).ok_or(OrderedMetadataError::InvalidTimeout)?;
         let mut result = std::ptr::null_mut();
         let error = unsafe {
-            match topics {
-                Some(topics) => sys::rd_kafka_ordered_metadata_start(self.native_ptr(), topics.as_ptr().cast(), topics.len(), body_capacity, millis, &mut result),
-                None => sys::rd_kafka_ordered_metadata_start_brokers(self.native_ptr(), body_capacity, millis, &mut result),
+            match target {
+                MetadataTarget::AnyNamed(topics) => sys::rd_kafka_ordered_metadata_start(self.native_ptr(), topics.as_ptr().cast(), topics.len(), body_capacity, millis, &mut result),
+                MetadataTarget::AnyBrokers => sys::rd_kafka_ordered_metadata_start_brokers(self.native_ptr(), body_capacity, millis, &mut result),
+                MetadataTarget::Broker { id, topics } => {
+                    let pointer = if topics.is_empty() { std::ptr::null() } else { topics.as_ptr().cast() };
+                    sys::rd_kafka_ordered_metadata_start_at(self.native_ptr(), id, pointer, topics.len(), body_capacity, millis, &mut result)
+                }
             }
         };
         if error == sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__TRANSPORT {

@@ -14,6 +14,13 @@ The broker's existing flexible request finalizer appends the empty body tag coun
 Both entry points reject unsupported profiles and invalid lengths.
 Ordinary fetch_metadata, MetadataRequest wrappers, native cache parsing and their version ceilings are unchanged.
 
+`Client::start_ordered_metadata_at` submits the named or broker-only form to one learned native broker selected by its nonnegative node ID.
+The inventory lookup retains that broker while the client lock is held and returns `BrokerNotReady` for an absent, non-Up or terminating target.
+Sparse connection scheduling can start the existing target's initial connection.
+The request uses the selected native broker owner through completion and retries.
+The same owner can change its advertised endpoint and reconnect.
+The negative Java bootstrap IDs and exact endpoint or connection-incarnation qualification require their own transport capability.
+
 == Ownership and release
 
 OrderedMetadataRequest is a passive owner of a C completion reference and an Arc of the producer's actual native byte account.
@@ -100,6 +107,8 @@ The Kafka integration sources use the safe API with the native mock producer, re
 The raw-string integration fixture configures malformed rack bytes through the existing native mock API, observes the original bytes through poll_raw, retains the UTF8 facade's error and keeps the raw result through producer destruction.
 The broker-only sources check the v0 exclusion, v1 and v4 negotiation floors and explicit empty wire counts.
 The native mock integration fixture creates an existing topic and verifies that broker-only Metadata returns the broker and zero topics, including when read after producer destruction.
+The targeted lookup cases distinguish two broker owners, unavailable or terminating targets and balanced references.
+The targeted mock integration submits named and broker-only requests to learned IDs and checks missing-target readiness with other brokers already usable.
 Additional raw-view sources retain all supported versions, nullable names, original string-size ceilings, tag/suffix bytes, and validation before visitation.
 All previously published assertions remain unchanged.
 Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.

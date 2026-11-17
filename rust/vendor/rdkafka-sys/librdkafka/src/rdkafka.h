@@ -3187,6 +3187,19 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_brokers(
     rd_kafka_ordered_metadata_t **result);
 
 /**
+ * Submits to the native broker with nonnegative node_id, without waiting for readiness.
+ * Holds that broker's identity for the request lifetime across its native reconnects.
+ * A missing or non-Up broker returns TRANSPORT and may initiate a sparse connection to that node.
+ * A NULL topics pointer with count zero uses the broker-only body and its negotiated version floor.
+ * Other inputs and all admission, timeout, result and lifetime contracts follow rd_kafka_ordered_metadata_start.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
+    rd_kafka_t *rk, int32_t node_id, const rd_kafka_ordered_metadata_topic_t *topics,
+    size_t count, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **result);
+
+/**
  * Returns 0 while pending or 1 after terminal publication, with error, version and body set.
  * All arguments must be non-NULL and result must have a live caller reference.
  * Pending polls leave the output arguments unchanged.

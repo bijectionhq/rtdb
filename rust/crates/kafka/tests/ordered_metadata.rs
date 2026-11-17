@@ -120,3 +120,47 @@ fn broker_only_metadata_omits_existing_topics_and_retains_the_response() {
     drop(request);
     assert_eq!(account.used(), 0);
 }
+
+#[test]
+fn targeted_metadata_uses_learned_broker_ids_without_readiness_fallback() {
+    let account = NativeByteAccount::new(4 * 1024 * 1024, ()).unwrap();
+    let producer: BaseProducer = ClientConfig::new()
+        .set("test.mock.num.brokers", "2")
+        .set_native_byte_account(Arc::clone(&account))
+        .create()
+        .unwrap();
+    let client = producer.client();
+    client.mock_cluster().unwrap().create_topic("targeted", 2, 1).unwrap();
+    let metadata = client.fetch_metadata(None, Duration::from_secs(10)).unwrap();
+    assert_eq!(metadata.brokers().len(), 2);
+    let first = metadata.brokers()[0].id();
+    let second = metadata.brokers()[1].id();
+    assert_ne!(first, second);
+
+    let send = |id, topics: &[MetadataTopic<'_>]| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match client.start_ordered_metadata_at(id, topics, 65536, Duration::from_secs(5)) {
+                Ok(request) => break request,
+                Err(OrderedMetadataError::BrokerNotReady) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => panic!("targeted submission: {result:?}"),
+            }
+        }
+    };
+    let named = send(first, &[MetadataTopic::new("targeted")]);
+    assert_eq!(wait(&named).summary().partitions, 2);
+    let brokers_only = send(second, &[]);
+    assert_eq!(wait(&brokers_only).summary().brokers, 2);
+    assert_eq!(wait(&brokers_only).summary().topics, 0);
+
+    assert!(matches!(client.start_ordered_metadata_at(i32::MAX, &[], 65536, Duration::from_secs(5)),
+        Err(OrderedMetadataError::BrokerNotReady)));
+    assert!(matches!(client.start_ordered_metadata_at(-1, &[], 65536, Duration::from_secs(5)),
+        Err(OrderedMetadataError::Native(_))));
+    drop(named);
+    drop(brokers_only);
+    drop(producer);
+    assert_eq!(account.used(), 0);
+}

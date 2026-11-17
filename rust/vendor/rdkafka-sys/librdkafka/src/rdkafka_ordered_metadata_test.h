@@ -48,6 +48,65 @@ static int ut_ordered_brokers_only(rd_kafka_broker_t *rkb) {
         RD_UT_PASS();
 }
 
+static int ut_ordered_target_selection(void) {
+        rd_kafka_t rk = RD_ZERO_INIT;
+        rd_kafka_broker_t brokers[2] = {RD_ZERO_INIT, RD_ZERO_INIT};
+        rd_kafka_broker_t *first, *second, *absent, *down, *terminating;
+        int first_ref, second_ref;
+        size_t i;
+
+        rwlock_init(&rk.rk_lock);
+        rd_atomic32_init(&rk.rk_terminate, 0);
+        rd_list_init(&rk.rk_broker_by_id, 2, NULL);
+        for (i = 0; i < RD_ARRAYSIZE(brokers); i++) {
+                rd_kafka_broker_t *broker = &brokers[i];
+                broker->rkb_rk = &rk;
+                broker->rkb_nodeid = (int32_t)i + 1;
+                broker->rkb_state = RD_KAFKA_BROKER_STATE_UP;
+                mtx_init(&broker->rkb_lock, mtx_plain);
+                rd_refcnt_init(&broker->rkb_refcnt, 1);
+                rd_atomic32_init(&broker->termination_in_progress, 0);
+                rd_list_add(&rk.rk_broker_by_id, broker);
+        }
+        rd_list_sort(&rk.rk_broker_by_id, rd_kafka_broker_cmp_by_id);
+
+        first = rd_kafka_ordered_metadata_find_broker(&rk, 1);
+        second = rd_kafka_ordered_metadata_find_broker(&rk, 2);
+        absent = rd_kafka_ordered_metadata_find_broker(&rk, 3);
+        brokers[1].rkb_state = RD_KAFKA_BROKER_STATE_DOWN;
+        down = rd_kafka_ordered_metadata_find_broker(&rk, 2);
+        brokers[1].rkb_state = RD_KAFKA_BROKER_STATE_UP;
+        rd_atomic32_set(&brokers[1].termination_in_progress, 1);
+        terminating = rd_kafka_ordered_metadata_find_broker(&rk, 2);
+
+        if (first)
+                rd_kafka_broker_destroy(first);
+        if (second)
+                rd_kafka_broker_destroy(second);
+        if (absent)
+                rd_kafka_broker_destroy(absent);
+        if (down)
+                rd_kafka_broker_destroy(down);
+        if (terminating)
+                rd_kafka_broker_destroy(terminating);
+        first_ref = rd_refcnt_sub(&brokers[0].rkb_refcnt);
+        second_ref = rd_refcnt_sub(&brokers[1].rkb_refcnt);
+        rd_list_destroy(&rk.rk_broker_by_id);
+        for (i = 0; i < RD_ARRAYSIZE(brokers); i++) {
+                rd_refcnt_destroy(&brokers[i].rkb_refcnt);
+                mtx_destroy(&brokers[i].rkb_lock);
+        }
+        rwlock_destroy(&rk.rk_lock);
+
+        RD_UT_ASSERT(first == &brokers[0] && second == &brokers[1],
+                     "targeted lookup retains the exact broker owner");
+        RD_UT_ASSERT(!absent && !down && !terminating,
+                     "missing, non-Up and terminating targets are unavailable");
+        RD_UT_ASSERT(first_ref == 0 && second_ref == 0,
+                     "targeted lookup balances temporary broker references");
+        RD_UT_PASS();
+}
+
 static int ut_ordered_encode(void) {
         unsigned char bytes[64];
         size_t size;
@@ -362,6 +421,7 @@ int unittest_ordered_metadata(void) {
         fails+=ut_ordered_version_intersection(&rkb);
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"version selection releases broker references");
         fails += ut_ordered_brokers_only(&rkb);
+        fails += ut_ordered_target_selection();
         fails+=ut_ordered_header_boundary(&rkb);
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"header cases release broker references: %d",rd_refcnt_get(&rkb.rkb_refcnt));
         fails+=ut_ordered_invalid_header_before_admission(&rkb);

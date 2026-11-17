@@ -247,9 +247,23 @@ static int16_t rd_kafka_ordered_metadata_version(rd_kafka_broker_t *rkb,
             rkb, RD_KAFKAP_Metadata, minimum, 13, NULL);
 }
 
+static rd_kafka_broker_t *rd_kafka_ordered_metadata_find_broker(
+    rd_kafka_t *rk, int32_t node_id) {
+        rd_kafka_broker_t *rkb;
+        rd_kafka_rdlock(rk);
+        rkb = rd_kafka_broker_find_by_nodeid0(rk, node_id,
+                                             RD_KAFKA_BROKER_STATE_UP, rd_true);
+        rd_kafka_rdunlock(rk);
+        if (rkb && rd_kafka_broker_or_instance_terminating(rkb)) {
+                rd_kafka_broker_destroy(rkb);
+                return NULL;
+        }
+        return rkb;
+}
+
 static rd_kafka_resp_err_t rd_kafka_ordered_metadata_start0(
     rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
-    rd_bool_t brokers_only, size_t body_capacity, int timeout_ms,
+    rd_bool_t brokers_only, const int32_t *node_id, size_t body_capacity, int timeout_ms,
     rd_kafka_ordered_metadata_t **result) {
         rd_kafka_broker_t *rkb;
         rd_kafka_resp_err_t error;
@@ -262,13 +276,16 @@ static rd_kafka_resp_err_t rd_kafka_ordered_metadata_start0(
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         if (rk->rk_type != RD_KAFKA_PRODUCER || !rk->rk_byte_account)
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
-        if (!brokers_only && count == 0)
+        if ((!brokers_only && count == 0) || (node_id && *node_id < 0))
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         error = rd_kafka_ordered_body_size(topics, count, 13, &ignored);
         if (error)
                 return error;
-        rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, rd_true, 0,
-                                        "ordered Metadata request");
+        if (node_id)
+                rkb = rd_kafka_ordered_metadata_find_broker(rk, *node_id);
+        else
+                rkb = rd_kafka_broker_any_usable(rk, RD_POLL_NOWAIT, rd_true, 0,
+                                                "ordered Metadata request");
         if (!rkb)
                 return RD_KAFKA_RESP_ERR__TRANSPORT;
         version = rd_kafka_ordered_metadata_version(rkb, brokers_only);
@@ -285,12 +302,20 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
     rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
     size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result) {
         return rd_kafka_ordered_metadata_start0(
-            rk, topics, count, rd_false, body_capacity, timeout_ms, result);
+            rk, topics, count, rd_false, NULL, body_capacity, timeout_ms, result);
 }
 
 rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_brokers(
     rd_kafka_t *rk, size_t body_capacity, int timeout_ms,
     rd_kafka_ordered_metadata_t **result) {
         return rd_kafka_ordered_metadata_start0(
-            rk, NULL, 0, rd_true, body_capacity, timeout_ms, result);
+            rk, NULL, 0, rd_true, NULL, body_capacity, timeout_ms, result);
+}
+
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
+    rd_kafka_t *rk, int32_t node_id, const rd_kafka_ordered_metadata_topic_t *topics,
+    size_t count, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **result) {
+        return rd_kafka_ordered_metadata_start0(
+            rk, topics, count, count == 0, &node_id, body_capacity, timeout_ms, result);
 }
