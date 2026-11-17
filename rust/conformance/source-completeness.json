@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the private native scanner, token stream, owned grammar, expected-token traversal, retained adaptive SLL/LL prediction and no-viable reporting with generated rule control, the remaining diagnostic and reset schedules, exact-unit literal and private tree JSON producers, canonical text and codec consumers, and whole-batch syntax validation before simple-query effects. Complete host policy capture, production parser and cache ownership, and admitted parsed ownership across every frontend."
+      "requirement": "Complete generated rule and tree schedules beyond the private SLL isolation rules, using the native scanner, token stream, owned grammar, retained adaptive SLL/LL prediction, same-session Bail retry, and the reached isolation sync and inline recovery. Complete remaining diagnostic schedules, exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before simple-query effects, host policy and production cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
@@ -277,7 +277,7 @@
         "client_operational_surfaces",
         "client_read"
       ],
-      "requirement": "Reconcile supported embedded SQL errors whose RecognitionException cause exposes the recognizer and shared mutable DFA/configuration objects with the native exception projection: preserve required observable behavior/capability or a concrete migration consistent with the reviewed binding design, retain source assertion cases, and enforce any private native-cache no-escape premise separately before production parsing or compatibility closure. Trace in-process causes separately from serialized pgwire/Flight diagnostics."
+      "requirement": "Qualify the documented embedded live-recognizer migration using the original JVM and native Java and Clojure source observations, with explicit migration comparisons for the shared RecognitionException recognizer and DFA capability. Enforce private native-cache nonescape separately before production parsing and qualify serialized pgwire and Flight diagnostics separately from the in-process cases."
     },
     {
       "id": "planning-allocation",
@@ -318,7 +318,7 @@
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Complete Avro canonical schemas, admitted graph/default and union materialization, concrete arbitrary-key MapEntry, qualified Java text and identity ownership, and writer/SMT/cache production wiring. Preserve and reconcile the explicit null-default assertion conflict. Integrate ordered typed Registry REST parsing through qualified stream and symbol state with nullable UTF16 schema, reference and rule consumers and branch-specific version, cache and failure timing. Activate stock producer metadata and node selection through actual DNS, bootstrap endpoint and connection qualification, Java observation providers, network scheduling, throttling, fatal errors, waiters and selected-partition DLQ enqueue. Complete native admission for remaining construction, broker threads, caches, security and outbound/compression owners."
+      "requirement": "Complete Avro canonical schemas, admitted graph/default and union materialization, concrete arbitrary-key MapEntry, qualified Java text and identity ownership, and writer/SMT/cache production wiring. Preserve and reconcile the explicit null-default assertion conflict. Integrate ordered typed Registry REST parsing through actual observed stream routing and symbol state with nullable UTF16 schema, reference and rule consumers and branch-specific version, cache and failure timing. Connect retained Cluster node selection and socket-generation-qualified Metadata to actual DNS, Java observation providers, network scheduling, throttling, fatal errors, waiters and selected-partition DLQ enqueue. Complete native admission for remaining construction, broker threads, caches, security and outbound/compression owners."
     },
     {
       "id": "final-design-closure",

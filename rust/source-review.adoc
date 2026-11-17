@@ -1114,3 +1114,30 @@ Nineteen source fixtures cover observed input windows through byte bootstrap, UT
 Thirty source fixtures cover ordered typed REST beans.
 Live typed parsing, actual HTTP stream observations, symbol tables, nullable UTF16 carrier consumers, version lookup and cache timing remain open.
 New source fixtures are unexecuted, and the source-completeness gate remains false.
+
+== Isolation parsing and embedded diagnostic source checkpoint
+
+The private SLL pass carries a branded Bail cancellation through the entered rule cleanup to the same parser's LL retry.
+Both seeks return to token zero using the retained buffer, and the retry keeps retained DFA history.
+The two required isolation blocks and nine match sites use the actual token demands and ATN lookahead.
+The LL listener distinguishes reports with a null cause from a mismatch assigned to the active local invocation.
+
+The SLL `levelOfIsolation` rule builds each of its four labelled contexts with the actual indexed terminals.
+The common caller's ISOLATION branch keeps its ordered terminals and real child context.
+If child attachment fails after that context becomes current, the entered caller's finally records the actual child's stop.
+The shared generated LL schedule, recursive failed-child unroll, remaining rules and production parsing still require source work.
+
+The embedded migration cases preserve the JVM `SELEC 1` mismatch's shared recognizer capability as an explicit difference from the native ADBC and Clojure diagnostic projection.
+`extra SELECT 1` pins the separate source null-cause report.
+Source-to-native diagnostic parity, private cache nonescape at production entry points and serialized wire checks remain required.
+The shared regex host pipeline now retains exact UTF16 units through computed string values and replacement compilation.
+Other raw syntax, host and external codec consumers remain open.
+
+Ordered Metadata can bind a configured bootstrap endpoint to one authenticated connection generation and check it again before transmission.
+The retained snapshot's selector borrows an original node from the ordered Cluster list and observes its connection state without copying it.
+The producer's DNS, connection and DLQ orchestration still requires production wiring.
+The Registry's observed input window now includes the fixed-endian JDK UTF16 decoder with separate refill, availability and close demands.
+Its production HTTP input capture and typed cursor integration remain open.
+
+The implementation revision remains unset and the source-completeness gate remains false.
+Compilation, runtime discovery and regression execution remain pending.
