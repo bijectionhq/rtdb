@@ -1,0 +1,70 @@
+use super::*;
+
+/// Immutable Java extended-key-usage state with independent allocation ownership.
+#[derive(Debug)]
+pub struct CertificateExtendedKeyUsage { usage: Usage, _reservation: Arc<MemoryReservation> }
+#[derive(Clone, Copy, Debug)]
+enum Usage { Absent, Parsed { server_authentication: bool }, Unparseable }
+
+impl CertificateExtendedKeyUsage {
+    /// Reads ExtendedKeyUsage from an already decoded X.509 certificate's encoding.
+    ///
+    /// - Malformed noncritical values remain unparseable unless another copy parses.
+    /// - Malformed critical values and duplicate parsed copies fail.
+    /// - Every parsed usage OID is validated, including unrecognized purposes.
+    /// - Signatures, validity, other extension contents and trust are not verified.
+    /// - Parsing scratch owns a reservation until this value drops, and budget errors propagate unchanged.
+    pub fn decode(certificate_der: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
+            .ok_or_else(|| invalid("Certificate extended key usage exceeds allocation range"))?;
+        let reservation = memory.reserve(bound)?;
+        let mut usage = Usage::Absent;
+        scan_certificate(certificate_der, |oid, critical, encoded| {
+            if oid != [0x55, 0x1d, 0x25] { return Ok(()); }
+            match decode_server_authentication(&encoded) {
+                Ok(server_authentication) => {
+                    if matches!(usage, Usage::Parsed { .. }) { return Err(invalid("Certificate contains duplicate parsed extended-key-usage extensions")); }
+                    usage = Usage::Parsed { server_authentication };
+                }
+                Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {
+                    if !matches!(usage, Usage::Parsed { .. }) { usage = Usage::Unparseable; }
+                }
+                Err(error) => return Err(error),
+            }
+            Ok(())
+        })?;
+        Ok(Self { usage, _reservation: reservation })
+    }
+
+    /// Applies Java EndEntityChecker's TLS server extended-usage decision.
+    ///
+    /// - Absence, anyExtendedKeyUsage, serverAuth and the Microsoft/Netscape SGC purposes permit server authentication.
+    /// - Other parsed lists, including an empty list, deny permission.
+    /// - Unparseable-only noncritical copies return a TLS-material error, following X509CertImpl.getExtendedKeyUsage.
+    pub fn permits_server_authentication(&self) -> Result<bool> {
+        match self.usage {
+            Usage::Absent => Ok(true),
+            Usage::Parsed { server_authentication } => Ok(server_authentication),
+            Usage::Unparseable => Err(invalid("Certificate extended key usage is unparseable")),
+        }
+    }
+}
+
+fn decode_server_authentication(encoded: &[u8]) -> Result<bool> {
+    let sequence = single(encoded, 0x30)?;
+    let mut usages = Der(&sequence);
+    let mut permits = false;
+    while !usages.0.is_empty() {
+        let oid = usages.expect(6)?;
+        valid_oid(&oid)?;
+        permits |= matches!(oid.as_ref(),
+            [0x55, 0x1d, 0x25, 0]
+            | [0x2b, 6, 1, 5, 5, 7, 3, 1]
+            | [0x2b, 6, 1, 4, 1, 0x82, 0x37, 0x0a, 3, 3]
+            | [0x60, 0x86, 0x48, 1, 0x86, 0xf8, 0x42, 4, 1]);
+    }
+    Ok(permits)
+}
+
+#[cfg(test)]
+mod tests;

@@ -40,7 +40,7 @@ Case, name order and accepted BER encodings remain significant even when the par
 
 SAN regression sources cover original-byte equality, empty and malformed names, duplicate handling, BER retention, environmental URI errors and reservation lifetime.
 
-`CertificateBasicConstraints` and `CertificateKeyUsage` expose passive immutable Java CA-selection results.
+`CertificateBasicConstraints` and `CertificateKeyUsage` expose passive immutable Java certificate-constraint results.
 Each view owns its parsing reservation independently until it drops.
 
 * BasicConstraints follows `BasicConstraintsExtension` and `X509CertImpl.getBasicConstraints`.
@@ -48,15 +48,32 @@ Absent extensions, empty sequences and non-BOOLEAN first fields yield `-1`.
 A nonzero CA flag without a path length yields `i32::MAX`.
 Explicit signed path lengths retain negative values and accept redundant BER sign bytes within Java's integer range.
 Fields after a parsed path length are ignored.
-* KeyUsage follows `KeyUsageExtension` and `KeyChecker.verifyCAKeyUsage`.
-Absent usage permits certificate signing.
-Parsed usage requires bit five; short arrays supply false for missing bits.
-The parser accepts one primitive OCTET STRING wrapper and ignores nonzero BER padding bits beyond the declared bit length.
+* KeyUsage follows `KeyUsageExtension`, `KeyChecker.verifyCAKeyUsage`, `AlgorithmChecker` and `EndEntityChecker`.
+Absent usage permits certificate signing, digital signatures and cryptographic primitives.
+Parsed usage requires bit five for certificate signing, bit zero for digital signatures and any bit from zero through six for an algorithm primitive.
+Short arrays supply false for missing bits; isolated encipherOnly or decipherOnly bits grant no primitive.
+The parser accepts one primitive OCTET STRING wrapper and masks BER padding bits beyond the declared bit length.
+Signed length arithmetic and backing-capacity checks follow `DerValue.getUnalignedBitString` and `BitArray` on the standalone extension-value array.
 * Malformed noncritical extensions are absent.
 * A parsed copy survives unparseable copies.
 * Malformed critical extensions and duplicate parsed copies fail.
 
-Thirteen CA-extension regression sources cover Java defaults, signed integer limits, ignored fields, bit boundaries, framing, duplicate handling and reservation lifetime.
+Constraint regression sources cover Java defaults, signed integer limits, ignored fields, all first-byte permission masks, wrapping capacity boundaries, framing, duplicate handling and reservation lifetime.
+
+`CertificateExtendedKeyUsage` is a separate passive immutable view with independent parsing admission.
+
+* The view follows `ExtendedKeyUsageExtension`, `CertificateExtensions`, `X509CertImpl.getExtendedKeyUsage` and `EndEntityChecker`.
+  Every usage OID is validated, including unrecognized purposes after an accepted server purpose.
+* Absence permits TLS server authentication.
+  Parsed lists permit `serverAuth`, `anyExtendedKeyUsage`, Microsoft SGC or Netscape SGC; an empty parsed list denies permission.
+* An unparseable-only noncritical extension remains a decoded state.
+  Requesting its server-authentication decision returns a TLS-material error.
+* A parsed copy wins over malformed noncritical copies in either order.
+  Malformed critical copies and two parsed copies fail during decoding.
+* The view validates extension contents independently of certificate signature, validity and trust.
+  Its admission remains owned through the last use of its decision state.
+
+Extended-usage regression sources cover every accepted server purpose, empty and unrelated purpose lists, malformed and duplicate copies, OID framing and size limits, BER conversion and reservation cleanup.
 
 `CertificatePublicKeyEncoding` owns the normalized SubjectPublicKeyInfo encoding used by OpenJDK 25.0.1 `X509Key`.
 It is a passive immutable view with independent memory admission.
