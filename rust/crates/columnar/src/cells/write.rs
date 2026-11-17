@@ -1,5 +1,5 @@
 mod buffer;
-mod scalar;
+mod owner;
 mod copy;
 #[cfg(test)]
 mod tests;
@@ -10,7 +10,7 @@ use super::*;
 use crate::MemoryBudget;
 use buffer::{MutableBits, MutableBytes};
 use native_scalar::{NativeScalarData, NativeScalarStorage, ScalarOffsets, ScalarStorageRef, StoredBits, StoredBytes};
-pub(crate) use scalar::{ScalarReader, ScalarWriter};
+pub(crate) use owner::{ScalarReader, ScalarWriter};
 pub(crate) use copy::{ScalarCopier, ScalarSource};
 
 #[derive(Debug, PartialEq, Eq)]

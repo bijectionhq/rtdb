@@ -786,7 +786,7 @@ fn variable_preflight_offset_failure_leaves_destination_buffers_unchanged() {
         let validity = output.fixture_state().validity.as_ref().unwrap();
         assert_eq!(validity.append, 1);
         assert_eq!(validity.bytes()[0], 1);
-        let scalar::MutableScalarData::Variable { offsets, data, last_offset } = &output.fixture_state().data else { panic!(); };
+        let owner::MutableScalarData::Variable { offsets, data, last_offset } = &output.fixture_state().data else { panic!(); };
         assert_eq!(offsets.append, 8);
         assert_eq!(data.append, 3);
         assert_eq!(*last_offset, 3);
@@ -828,7 +828,7 @@ fn native_negative_variable_spans_keep_reference_failure_after_offset_prefixes()
     for (start, end) in [(-1i32, 0i32), (1, 0)] {
         let mut source = writer(DataType::Binary, false, &memory);
         source.write_bytes(b"a").unwrap();
-        let scalar::MutableScalarData::Variable { offsets, .. } = &mut source.fixture_state().data else { panic!(); };
+        let owner::MutableScalarData::Variable { offsets, .. } = &mut source.fixture_state().data else { panic!(); };
         let mut mutation = Mutation::default();
         offsets.set(0, &start.to_le_bytes(), &mut mutation).unwrap();
         offsets.set(4, &end.to_le_bytes(), &mut mutation).unwrap();
@@ -836,7 +836,7 @@ fn native_negative_variable_spans_keep_reference_failure_after_offset_prefixes()
         let mut output = writer(DataType::Binary, false, &memory);
         assert!(matches!(ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_row(0), Err(WriteError::Reference(ReferenceFailure::Bounds))));
         assert_eq!(output.value_count(), 0);
-        let scalar::MutableScalarData::Variable { offsets, .. } = &output.fixture_state().data else { panic!(); };
+        let owner::MutableScalarData::Variable { offsets, .. } = &output.fixture_state().data else { panic!(); };
         assert_eq!(offsets.append, 8);
         output.write_bytes(b"z").unwrap();
         output.clear();

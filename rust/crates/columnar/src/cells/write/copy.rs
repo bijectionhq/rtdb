@@ -1,5 +1,5 @@
 use super::*;
-use super::scalar::{MutableScalarData, ScalarState};
+use super::owner::{MutableScalarData, ScalarState};
 
 #[derive(Clone, Copy)]
 pub(crate) struct ScalarSource<'a> { vector: &'a ExecutionVector, node: &'a PhysicalNode, descriptor: super::super::descriptor::ScalarDescriptorRef<'a> }

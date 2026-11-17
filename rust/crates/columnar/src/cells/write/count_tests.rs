@@ -455,7 +455,7 @@ fn sdk_nullable_all_valid_source_failure_precedes_validity_flush_and_payload_cop
     assert_eq!(validity.byte_append(), 0);
     assert_eq!(validity.bytes()[0], 0);
     assert_eq!(output.value_count(), 0);
-    let scalar::MutableScalarData::Fixed { data, .. } = &output.fixture_state().data else { panic!() };
+    let owner::MutableScalarData::Fixed { data, .. } = &output.fixture_state().data else { panic!() };
     assert_eq!(data.append, 0);
     assert!(output.ready().is_err());
 }
@@ -489,7 +489,7 @@ fn sliced_sdk_fixed_storage_rejects_a_wrapped_copy_address_outside_logical_rows(
     let mut output = writer(DataType::Int32, false, &memory);
     assert!(matches!(ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_row(1_073_741_824), Err(WriteError::Native(_))));
     assert_eq!(output.value_count(), 0);
-    let scalar::MutableScalarData::Fixed { data, .. } = &output.fixture_state().data else { panic!() };
+    let owner::MutableScalarData::Fixed { data, .. } = &output.fixture_state().data else { panic!() };
     assert_eq!(data.append, 0);
     assert!(output.ready().is_err());
     output.clear();
