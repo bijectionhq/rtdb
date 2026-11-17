@@ -23,7 +23,7 @@ use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
 use crate::admin::NativeEvent;
-use crate::config::{ClientConfig, NativeClientConfig, RDKafkaLogLevel, SslContextConfig};
+use crate::config::{ClientConfig, NativeClientConfig, RDKafkaLogLevel, SslContextConfig, SslMaterialLease};
 use crate::consumer::RebalanceProtocol;
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::groups::GroupList;
@@ -158,6 +158,7 @@ impl ClientContext for DefaultClientContext {}
 pub struct NativeClient {
     ptr: NativePtr<RDKafka>,
     _ssl_context: Option<Arc<SslContextConfig>>,
+    material_lease: Option<Box<dyn SslMaterialLease>>,
 }
 
 unsafe impl KafkaDrop for RDKafka {
@@ -170,11 +171,13 @@ unsafe impl Sync for NativeClient {}
 unsafe impl Send for NativeClient {}
 
 impl NativeClient {
-    /// Wraps a pointer to an RDKafka object and returns a new NativeClient.
-    pub(crate) unsafe fn from_ptr(ptr: *mut RDKafka, ssl_context: Option<Arc<SslContextConfig>>) -> NativeClient {
+    /// # Safety
+    /// `ptr` must be a live, exclusively owned native client whose callbacks remain valid through destruction.
+    pub(crate) unsafe fn from_ptr(ptr: *mut RDKafka, ssl_context: Option<Arc<SslContextConfig>>, material_lease: Option<Box<dyn SslMaterialLease>>) -> NativeClient {
         NativeClient {
             ptr: NativePtr::from_ptr(ptr).unwrap(),
             _ssl_context: ssl_context,
+            material_lease,
         }
     }
 
@@ -257,6 +260,10 @@ impl<C: ClientContext> Client<C> {
         };
         native_config.set("log.queue", "true")?;
 
+        let material_lease = match &native_config.ssl_context {
+            Some(configuration) => configuration.admit_material().map_err(KafkaError::ClientCreation)?,
+            None => None,
+        };
         let ssl_context = native_config.ssl_context.take();
         let client_ptr = unsafe {
             rdsys::rd_kafka_new(
@@ -271,7 +278,8 @@ impl<C: ClientContext> Client<C> {
             return Err(KafkaError::ClientCreation(err_buf.to_string()));
         }
         std::mem::forget(native_config);
-        let native = unsafe { NativeClient::from_ptr(client_ptr, ssl_context) };
+        let mut native = unsafe { NativeClient::from_ptr(client_ptr, ssl_context, material_lease) };
+        if let Some(lease) = &mut native.material_lease { lease.loaded(); }
         trace!("Create new librdkafka client {:p}", client_ptr);
 
         let log_queue = unsafe { NativeQueue::from_ptr(rdsys::rd_kafka_queue_get_main(client_ptr)).unwrap() };

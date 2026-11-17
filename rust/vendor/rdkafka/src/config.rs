@@ -113,9 +113,21 @@ pub enum SslMaterial<'a> {
     Unavailable(i32),
 }
 
+/// Owns one native client's material admission until native destruction completes.
+pub trait SslMaterialLease: Send + Sync {
+    /// Releases construction-only resources after successful native client creation.
+    /// Called once after `rd_kafka_new` succeeds, before publication, even if later Rust client setup fails.
+    /// When `rd_kafka_new` fails, the lease is dropped without this call.
+    fn loaded(&mut self) {}
+}
+
 /// Supplies immutable native TLS material at its original loading site.
 /// Calls can be concurrent across client copies; returned bytes must remain immutable while this source is retained.
 pub trait SslMaterialSource: Send + Sync {
+    /// Acquires a separate lease before each native client creation, including clients from cloned configurations.
+    /// An error prevents native construction; `None` preserves construction without an admission lease.
+    fn admit_context(&self) -> Result<Option<Box<dyn SslMaterialLease>>, String> { Ok(None) }
+
     /// `path` is the configured native filename, without normalization.
     /// `Unmanaged` preserves filesystem loading, including hashed CA directory lookup.
     fn material(&self, kind: SslMaterialKind, path: &CStr) -> SslMaterial<'_>;
@@ -147,6 +159,11 @@ pub trait SslContextConfigurer: Send + Sync {
 }
 
 pub(crate) struct SslContextConfig(Arc<dyn SslContextConfigurer>);
+impl SslContextConfig {
+    pub(crate) fn admit_material(&self) -> Result<Option<Box<dyn SslMaterialLease>>, String> {
+        match self.0.material_source() { Some(source) => source.admit_context(), None => Ok(None) }
+    }
+}
 impl std::fmt::Debug for SslContextConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("SslContextConfig") }
 }

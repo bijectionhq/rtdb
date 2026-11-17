@@ -31,12 +31,35 @@ Nonregular paths and the special CA value `probe` also keep native filesystem ha
 Those paths are not covered by this regular-file raw snapshot admission increment.
 Java JKS, PKCS12 and PEM store snapshots have their own retained material owner; native hashed directories are a distinct configuration surface.
 
-This increment admits retained raw bytes and wrapper/path storage.
-OpenSSL certificate/key decoding runs for each native TLS context, so one shared raw-byte lease does not admit all per-client decoded allocations.
-That remaining qualification needs a per-context lease acquired before native material loading and retained until the context and its keys are destroyed.
-A future bounded directory loader also needs leases attached to retained X509/CRL objects, with duplicate temporary reads releasing their own charge.
-Charging only a temporary directory BIO would leave OpenSSL's growing certificate/CRL cache unaccounted for.
+Each native client also acquires its own decode admission before `rd_kafka_new`, including clients made from duplicated native configurations.
+`DecodeAdmission` is a passive lease owned by that client's `NativeClient`, with a construction state holding retained and scratch reservations and a retained state after native loading succeeds.
+A client with regular-file snapshots reserves 64 KiB plus 512 bytes per raw input byte for decoded material and loader overhead.
+This is a conservative allowance whose native allocation qualification remains pending; it is not a measured bound for every OpenSSL allocation path.
+An admitted key or native PKCS12 snapshot also reserves 33 MiB of temporary built-in PBE workspace, released after native construction succeeds.
+Failed admission returns before native material parsing, and a failed native construction releases both reservations after native cleanup.
+The lease is `Send + Sync`, like the retained native client that owns it.
+
+The scratch allowance includes the pinned PKCS#5 scrypt path's 32 MiB working-buffer limit plus 1 MiB of ancillary workspace.
+OpenSSL 3.6.3 `crypto/asn1/p5_scrypt.c:PKCS5_v2_scrypt_keyivgen_ex` calls `EVP_PBE_scrypt_ex` with `maxmem=0`.
+`crypto/evp/pbe_scrypt.c` substitutes `SCRYPT_MAX_MEM`, whose pinned default is 32 MiB, and passes that limit explicitly to the provider.
+`providers/implementations/kdfs/scrypt.c.in:scrypt_alg` checks the combined B, V, X and T allocation against this limit before allocation.
+The provider's direct-KDF default is larger and is not the default used by this PKCS#5 path.
+Native password/configuration copies, arbitrary provider implementations and modified OpenSSL compile-time limits remain outside this allowance's qualification.
+
+Rust destroys `NativeClient`'s native pointer before its material lease.
+The pinned `rd_kafka_destroy` joins the internal thread and calls `rd_kafka_destroy_final`, which frees the TLS context and loaded providers before returning.
+A native pointer is placed under Rust ownership before the lease's successful-load callback runs, so callback unwinding also destroys TLS before releasing admission.
+The sole `NativeClient::from_ptr` construction path carries the acquired lease.
+Clients without a material source, and sources using the default admission method, receive no decode lease.
+These lifetimes assume the callback contract: applications do not retain native TLS objects beyond their owning Kafka client.
+
+This admission covers explicit regular-file snapshots and their per-client decoding allowance.
+Native default/probe stores, hashed directories, nonregular paths, inline PEM, memory-installed certificates, engines, arbitrary providers and later handshake/session allocations remain separate qualification gaps.
+The retained reservation uses the snapshot owner's memory budget; it is a client-lifetime charge rather than a new per-record converter reservation.
+A future bounded directory loader needs leases attached to retained X509/CRL objects, with duplicate temporary reads releasing their own charge.
+The native `BY_DIR_HASH` suffix cache requires its own retained metadata admission even when a decoded CRL duplicates an existing object.
+Charging only a temporary directory BIO or only retained certificates would leave part of that growing cache unaccounted for.
 
 The source trace is librdkafka 2.10.0 `rd_kafka_ssl_set_certs`, OpenSSL 3.6.3 `crypto/x509/by_file.c`, `crypto/x509/by_dir.c` and `ssl/ssl_rsa.c`.
-Regression sources cover immutable bytes after unlinking, native configuration copies, deferred file failures, admission rollback, native load order, mixed certificate/CRL inputs and PKCS12 password failures.
+Regression sources cover immutable bytes after unlinking, independently admitted native client copies, deferred file failures, admission rollback, native load order, mixed certificate/CRL inputs, PKCS12 password failures, scratch release and native destruction before lease release.
 The patch and test sources remain uncompiled and unexecuted in the source-only phase.
