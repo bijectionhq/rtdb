@@ -5,6 +5,10 @@ use crate::{DistinguishedName, invalid};
 
 mod alternative_names;
 pub use alternative_names::CertificateAlternativeNames;
+mod basic_constraints;
+pub use basic_constraints::CertificateBasicConstraints;
+mod key_usage;
+pub use key_usage::CertificateKeyUsage;
 
 /// Immutable Java certificate identifiers, independently charged through their last borrowed use.
 /// Serial numbers use minimal signed two's-complement bytes, including a sign byte when required.
