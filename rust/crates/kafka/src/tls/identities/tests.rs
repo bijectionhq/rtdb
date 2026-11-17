@@ -18,7 +18,10 @@ fn deferred_keys_preserve_selected_alias_failure_without_trying_another_entry() 
     let charge = memory.reserve(65_536).unwrap();
     let random = random::Context::new(None, &memory).unwrap();
     let signatures = random::Context::new(None, &memory).unwrap();
-    let (manager, identities, native_charge) = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native_charge = native.reservation();
+    let manager = native.manager();
+    let identities = native.entries();
     let selected = manager.choose(&[KeyType::Rsa], |_, _| true, |_| Status::Valid).unwrap();
     assert_eq!(identities[selected].certificate.to_der().unwrap(), second.certificate.to_der().unwrap());
     let context = SslContextBuilder::new(SslMethod::tls_client()).unwrap().build();
@@ -32,7 +35,7 @@ fn deferred_keys_preserve_selected_alias_failure_without_trying_another_entry() 
     assert!(identities[selected].install(&mut ssl, &random, &signatures).unwrap());
     assert_eq!(ssl.certificate().unwrap().to_der().unwrap(), first.certificate.to_der().unwrap());
     assert_eq!(ssl.ex_data(selected_index().unwrap()).unwrap().len(), 1);
-    drop(ssl); drop(context); drop(identities); drop(material); drop(native_charge); drop(charge); drop(random); drop(signatures);
+    drop(ssl); drop(context); drop(native); drop(material); drop(native_charge); drop(charge); drop(random); drop(signatures);
     assert_eq!(memory.used_bytes(), 0);
 }
 
@@ -46,13 +49,15 @@ fn recovered_ssl_key_lease_retains_contexts_and_charge_through_native_ssl_cleanu
     let random = random::Context::new(None, &memory).unwrap();
     let signatures = random::Context::new(None, &memory).unwrap();
     let weak_random = Arc::downgrade(&random); let weak_signatures = Arc::downgrade(&signatures);
-    let (_, identities, native_charge) = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native_charge = native.reservation();
+    let identities = native.entries();
     let context = SslContextBuilder::new(SslMethod::tls_client()).unwrap().build();
     let mut ssl = Ssl::new(&context).unwrap();
     assert!(identities[0].install(&mut ssl, &random, &signatures).unwrap());
     assert!(identities[0].install(&mut ssl, &random, &signatures).unwrap());
     assert_eq!(ssl.ex_data(selected_index().unwrap()).unwrap().len(), 2);
-    drop(identities); drop(material); drop(charge); drop(random); drop(signatures);
+    drop(native); drop(material); drop(charge); drop(random); drop(signatures);
     assert!(weak_random.upgrade().is_some()); assert!(weak_signatures.upgrade().is_some());
     assert!(ssl.private_key().unwrap().public_eq(&identity.key));
     assert!(memory.used_bytes() > 0);
@@ -70,7 +75,9 @@ fn selected_key_memory_failure_is_not_an_absent_java_key_entry() {
     let charge = memory.reserve(65_536).unwrap();
     let random = random::Context::new(None, &memory).unwrap();
     let signatures = random::Context::new(None, &memory).unwrap();
-    let (_, identities, native_charge) = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+    let native_charge = native.reservation();
+    let identities = native.entries();
     let context = SslContextBuilder::new(SslMethod::tls_client()).unwrap().build();
     let mut ssl = Ssl::new(&context).unwrap();
     let remaining = memory.reserve((32 << 20) - memory.used_bytes()).unwrap();
@@ -78,7 +85,7 @@ fn selected_key_memory_failure_is_not_an_absent_java_key_entry() {
     assert!(ssl.certificate().is_none());
     drop(remaining);
     assert!(identities[0].install(&mut ssl, &random, &signatures).unwrap());
-    drop(ssl); drop(context); drop(identities); drop(material); drop(native_charge); drop(charge); drop(random); drop(signatures);
+    drop(ssl); drop(context); drop(native); drop(material); drop(native_charge); drop(charge); drop(random); drop(signatures);
     assert_eq!(memory.used_bytes(), 0);
 }
 
@@ -101,4 +108,27 @@ fn java_new_sunx509_defers_password_errors_but_pem_and_sunx509_remain_eager() {
         assert!(Material::decode(&pem, StoreFormat::Pem, StoreUse::OptionalIdentity, algorithm, None, Some("wrong"), charge).is_err());
     }
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn native_identity_owner_retains_entries_alias_order_and_charge_after_material_drops() {
+    let identity = Credential::new("client", false, None);
+    let bytes = support::jks(&[("client", &identity)], "store", "key");
+    for algorithm in [Algorithm::SunX509, Algorithm::NewSunX509] {
+        let memory = MemoryBudget::new(32 << 20);
+        let material = material(&bytes, Some("key"), algorithm, &memory);
+        let charge = memory.reserve(65_536).unwrap();
+        let random = random::Context::new(None, &memory).unwrap();
+        let native = Arc::new(material.native(algorithm, &random, &charge).unwrap());
+        let weak_charge = Arc::downgrade(&native.charge);
+        let retained = Arc::clone(&native);
+        drop(native); drop(material); drop(charge); drop(random);
+        assert!(weak_charge.upgrade().is_some());
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(retained.manager().choose(&[KeyType::Rsa], |_, _| true, |_| Status::Valid), Some(0));
+        assert_eq!(retained.entries()[0].certificate.to_der().unwrap(), identity.certificate.to_der().unwrap());
+        drop(retained);
+        assert!(weak_charge.upgrade().is_none());
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }

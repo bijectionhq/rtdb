@@ -4,7 +4,7 @@ use openssl::{ssl::{SslContext, SslContextBuilder, SslMode, SslVerifyMode}, x509
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::KeyStore;
 use rtdb_types::Result;
-use super::{Algorithm, KeyManager, Material, NativeTls, Policy, invalid, random, trust, validation};
+use super::{Algorithm, Material, NativeTls, Policy, invalid, random, trust, validation};
 
 impl NativeTls {
     pub(crate) fn from_registry(options: &BTreeMap<&str, &str>, trust: Option<&KeyStore>, identities: Option<&Material>, charge: Arc<MemoryReservation>) -> Result<Arc<Self>> {
@@ -22,13 +22,13 @@ impl NativeTls {
         let default_trust = if trust.is_none() { Some(trust::decode(Arc::clone(&charge))?) } else { None };
         let trust = trust.or(default_trust.as_ref()).expect("explicit or default Registry trust");
         let trust = trust.trusted_certificates().iter().map(|certificate| X509::from_der(certificate).map_err(invalid)).collect::<Result<Vec<_>>>()?;
-        let (key_manager, identities) = if let Some(material) = identities {
-            let (manager, identities, native_charge) = material.native(algorithm, &random, &charge)?;
-            reservations.push(native_charge);
-            (manager, identities)
-        } else { (KeyManager::new(algorithm, &[]), Vec::new()) };
+        let identities = if let Some(material) = identities {
+            let identities = material.native(algorithm, &random, &charge)?;
+            reservations.push(identities.reservation());
+            Some(identities)
+        } else { None };
         let simple_trust = if trust_algorithm == validation::Algorithm::SunX509 { Some(validation::SimpleTrust::new(trust.clone(), Arc::clone(&charge))?) } else { None };
-        Ok(Arc::new(Self { identities, key_manager, trust: Some(trust), simple_trust, policy, reservations, random, signature_random }))
+        Ok(Arc::new(Self { identities, trust: Some(trust), simple_trust, policy, reservations, random, signature_random }))
     }
 
     // This owner must outlive the returned context and every SSL connection and native key created from it.
