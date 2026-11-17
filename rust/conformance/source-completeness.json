@@ -224,7 +224,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including isolated UTF16 source carriers; reconcile dev/doc/rust-regex.adoc against the final implementation."
+      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including checked-index reader/compiler/host consumers, shared object identity and isolated UTF16 source carriers; reconcile dev/doc/rust-regex.adoc against the final implementation."
     },
     {
       "id": "transit-registered-objects",
@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and the reviewed scalar foundation's container/relation/full-object/transport successors; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and the reviewed scalar/descriptor foundations' fallible metadata, run-reader identity, native container, relation, full-object and transport successors; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner and token stream with complete lazy grammar prediction and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, grammar graph and expected-token traversal with complete adaptive prediction, generated rule control and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "planning-allocation",
