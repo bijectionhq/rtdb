@@ -15,6 +15,7 @@ chrono.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 rtdb-format.workspace = true
 rtdb-index.workspace = true
 rtdb-trie.workspace = true

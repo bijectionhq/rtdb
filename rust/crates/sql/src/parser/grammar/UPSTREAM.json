@@ -1,0 +1,121 @@
+{
+  "archive": {
+    "coordinates": "com.xtdb:xtdb-core:2.x-20261106.153107-1:sources",
+    "url": "https://central.sonatype.com/repository/maven-snapshots/com/xtdb/xtdb-core/2.x-SNAPSHOT/xtdb-core-2.x-20261106.153107-1-sources.jar",
+    "sha256": "00d5777611aaa0af9eb98058d2bac8b9373bba7a6baa064d8f467f989cade472"
+  },
+  "artifacts": {
+    "Sql.g4": {
+      "path": "xtdb/antlr/Sql.g4",
+      "sha256": "46ac30b2a5b2cd94b60d4dba7f3e0e89e0bacdc05ab86f7d6367aed2d891840e"
+    },
+    "SqlLexer.g4": {
+      "path": "xtdb/antlr/SqlLexer.g4",
+      "sha256": "3d7f01c3d638fea7765279da259112a805ca8061e374ec952ab253a8b1fd9c0a"
+    },
+    "Sql.java": {
+      "path": "xtdb/antlr/Sql.java",
+      "sha256": "74eb25b3c9039d91cd6f575e98a8d09e3909db8740a6123d4c9a37753b0fb438"
+    },
+    "Sql.interp": {
+      "path": "xtdb/antlr/Sql.interp",
+      "sha256": "7ddd4e07bfee31ae4fb58775221992a4ec5310e0e5f1fc24d9b61af9ff9253c5"
+    },
+    "Sql.tokens": {
+      "path": "xtdb/antlr/Sql.tokens",
+      "sha256": "c9e575fdbeefc06924fc18f9bd438ffaa4dc329df57a1997bd94224074f73dde"
+    },
+    "SqlParser.kt": {
+      "path": "xtdb/query/SqlParser.kt",
+      "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
+    }
+  },
+  "antlr": {
+    "version": "4.13.2",
+    "license": "../../../LICENSE-ANTLR",
+    "runtime_sources": [
+      {
+        "path": "atn/ATNDeserializer.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNDeserializer.java",
+        "sha256": "696e4b89613c6ad47ba5264c755ed77120897679bb1e4f961c3e3e799e38e7cf"
+      },
+      {
+        "path": "atn/ATNState.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNState.java",
+        "sha256": "825c020effdac6ecb0ab5f64fef810478b60020ebd215482863b59276b2f0600"
+      },
+      {
+        "path": "atn/ATNDeserializationOptions.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNDeserializationOptions.java",
+        "sha256": "12308f7f14ca64c0f83d0d5137534b5efafe4029f7b4715fa16677da9d951153"
+      },
+      {
+        "path": "atn/ATN.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATN.java",
+        "sha256": "c1a59f44da2ff7843cce4532e999b4e5bb0c7aa829587763bf07556488426343"
+      },
+      {
+        "path": "VocabularyImpl.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/VocabularyImpl.java",
+        "sha256": "ac8addb69eaf2efacabf362b230868db30ddb4dbfc39c815ecb31748be8908a6"
+      },
+      {
+        "path": "misc/IntervalSet.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/IntervalSet.java",
+        "sha256": "8c8a88f5fa5ebf5fb7c765913f210067768aee5bd686b8123a9aae08c099f439"
+      },
+      {
+        "path": "atn/Transition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/Transition.java",
+        "sha256": "fed529b006069d6c56e4dca88dcd31b386de5619020b40aaaf1437b6e42e2e21"
+      },
+      {
+        "path": "atn/RuleTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/RuleTransition.java",
+        "sha256": "00bc5e209178fa3e6ef30497067eb2e510e6c4775f97c5ce4b2b1cfc99174dad"
+      },
+      {
+        "path": "atn/ActionTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ActionTransition.java",
+        "sha256": "5465054eb4f0ff20dc9c9bb0f75573ee932929e925a1a2c8a6fb7a7cab4a35c0"
+      },
+      {
+        "path": "atn/EpsilonTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/EpsilonTransition.java",
+        "sha256": "f3af8f03555bd09c5864f7f6323662a0d6e61379a4159cc4f82b2754c49710fb"
+      },
+      {
+        "path": "atn/PrecedencePredicateTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PrecedencePredicateTransition.java",
+        "sha256": "bf9b3ebae0c3024454a793d60f4791e361c940f7eb0d574be0851d4ab9a4d175"
+      },
+      {
+        "path": "atn/AtomTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/AtomTransition.java",
+        "sha256": "47bd3a0ab67dea59716351a3c3a0ea26322d76b4b442665816422f46bd15d1ac"
+      },
+      {
+        "path": "atn/SetTransition.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SetTransition.java",
+        "sha256": "e221bf03db9ae5dae784de70e9c1d8e21c53f36beec8c2733cd803d9a844d55d"
+      }
+    ]
+  },
+  "parser": {
+    "serialization_version": 4,
+    "max_token": 368,
+    "serialized_words": 28406,
+    "states": 3017,
+    "rules": 176,
+    "sets": 43,
+    "intervals": 107,
+    "serialized_edges": 3515,
+    "return_edge_candidates": 602,
+    "transition_capacity": 4117,
+    "derived_return_edges": 556,
+    "final_edges": 4071,
+    "decisions": 372,
+    "precedence_decisions": 5,
+    "action_edges": 5
+  }
+}
