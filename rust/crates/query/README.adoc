@@ -48,6 +48,7 @@ Each aggregate node owns passive `AggregateTypes` descriptors shared by its outp
 The descriptor keeps the actual input type for vector dispatch and the emitted factory type for numeric output; array elements retain their emitted types with runtime nullability promotion.
 Physical data pages can have narrower fields than the snapshot schema; this derivation retains the snapshot's declared union legs for those scans.
 `BoundParameters` retains parameter cells and their complete declared vector types as one immutable charged value.
+An untyped manual query infers Null when its raw null argument cannot inhabit the annotated nonnullable field.
 Apply and Mark derive capture types from the runtime independent schema before evaluating the selected row, preserving unselected union legs through nested dependent queries.
 The dependent runtime schema and scalar evaluator consume that same type vector; a stale preparation annotation does not narrow a capture.
 

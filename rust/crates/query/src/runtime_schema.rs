@@ -31,7 +31,7 @@ pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value])
     }
     let mut declarations = vec![None; values.len()];
     collect(relation, &mut declarations, &mut Vec::new());
-    declarations.into_iter().zip(values).map(|(declared, value)| declared.unwrap_or_else(|| value.logical_type())).collect()
+    declarations.into_iter().zip(values).map(|(declared, value)| declared.filter(|ty| !matches!(value, rtdb_types::Value::Null) || ty.nullable()).unwrap_or_else(|| value.logical_type())).collect()
 }
 
 pub(crate) struct RuntimeSchema { root: Arc<RuntimeRelation> }
@@ -437,6 +437,15 @@ mod parameter_tests {
     fn unknown_parameter_annotations_infer_the_admitted_cell_type() {
         let input = parameter(0, L::Null);
         assert_eq!(parameter_types(&input, &[Value::I64(7)]), [L::Scalar(ScalarType::I64)]);
+    }
+
+    #[test]
+    fn raw_null_parameters_infer_null_when_the_annotation_excludes_it() {
+        for ty in [L::Scalar(ScalarType::I64), L::Scalar(ScalarType::I64).maybe()] {
+            let input = parameter(0, ty.clone());
+            let expected = if ty.nullable() { ty } else { L::Null };
+            assert_eq!(parameter_types(&input, &[Value::Null]), [expected]);
+        }
     }
 
     #[test]
