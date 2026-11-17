@@ -139,3 +139,92 @@ async fn standard_java_charset_aliases_select_the_same_decoders() {
     for alias in ["646", "ANSI_X3.4-1968", "iso_646.irv:1983", "ascii7"] { assert_eq!(decode(alias, &[0xe9, b'a']).await, "\u{fffd}a"); }
     for alias in ["utf16", "UTF_16", "UnicodeBig"] { assert_eq!(decode(alias, &[0, b'a']).await, "a"); }
 }
+
+fn utf32_words(little: bool, words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| if little { word.to_le_bytes() } else { word.to_be_bytes() }).collect()
+}
+
+#[tokio::test]
+async fn utf32_variants_and_all_java_aliases_decode_bmp_and_supplementary_values() {
+    for (little, aliases) in [
+        (false, &["UTF-32", "UTF_32", "UTF32", "UTF-32BE", "UTF_32BE", "X-UTF-32BE", "X-UTF-32BE-BOM", "UTF_32BE_BOM", "UTF-32BE-BOM"][..]),
+        (true, &["UTF-32LE", "UTF_32LE", "X-UTF-32LE", "X-UTF-32LE-BOM", "UTF_32LE_BOM", "UTF-32LE-BOM"][..]),
+    ] {
+        let bytes = utf32_words(little, &[0, 0x61, 0xe9, 0x1f600, 0x10ffff, 0xffff]);
+        for alias in aliases {
+            assert_eq!(decode(alias, &bytes).await, "\0aé😀\u{10ffff}\u{ffff}", "{alias}");
+            assert_eq!(decode(alias, &[]).await, "");
+        }
+    }
+    assert_eq!(decode("uTf_32lE_bOm", &[0xe9, 0, 0, 0]).await, "é");
+    for alias in ["UTF32BE", "UTF32LE", "UTF_32LE-BOM", "UTF-32-BOM"] {
+        assert!(PluginRegistry::default().converter(&spec(&[("converter.encoding", alias)]), false).is_err());
+    }
+}
+
+#[tokio::test]
+async fn utf32_consumes_only_matching_initial_marks_and_auto_defaults_to_big_endian() {
+    for (little, aliases) in [
+        (false, &["UTF-32BE", "X-UTF-32BE-BOM"][..]),
+        (true, &["UTF-32LE", "X-UTF-32LE-BOM"][..]),
+    ] {
+        let marked = utf32_words(little, &[0xfeff, 0x61, 0xfeff, 0xfffe]);
+        assert_eq!(decode("UTF-32", &marked).await, "a\u{feff}\u{fffe}");
+        for alias in aliases {
+            assert_eq!(decode(alias, &marked).await, "a\u{feff}\u{fffe}");
+            assert_eq!(decode(alias, &utf32_words(little, &[0xfeff])).await, "");
+            assert_eq!(decode(alias, &utf32_words(little, &[0xfffe0000, 0x61])).await, "\u{fffd}a");
+            assert_eq!(decode(alias, &utf32_words(little, &[0xfeff, 0xfffe0000, 0x61])).await, "\u{fffd}a");
+        }
+    }
+    assert_eq!(decode("UTF-32", &[0, 0, 0, b'a']).await, "a");
+    assert_eq!(decode("UTF-32", &[b'a', 0, 0, 0]).await, "\u{fffd}");
+}
+
+#[tokio::test]
+async fn utf32_invalid_words_and_truncated_tails_have_separate_replacements() {
+    for (little, aliases) in [
+        (false, &["UTF-32", "UTF-32BE", "X-UTF-32BE-BOM"][..]),
+        (true, &["UTF-32LE", "X-UTF-32LE-BOM"][..]),
+    ] {
+        for alias in aliases {
+            let invalid = utf32_words(little, &[0x110000, 0x7fffffff, 0x80000000, 0xffffffff, 0x61]);
+            assert_eq!(decode(alias, &invalid).await, "\u{fffd}\u{fffd}\u{fffd}\u{fffd}a");
+            for tail in [&[0][..], &[0, 0][..], &[0, 0, 0][..]] {
+                assert_eq!(decode(alias, tail).await, "\u{fffd}");
+                let mut bytes = utf32_words(little, &[0xfeff, 0x61, 0xffffffff]);
+                bytes.extend_from_slice(tail);
+                assert_eq!(decode(alias, &bytes).await, "a\u{fffd}\u{fffd}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn utf32_java_surrogate_units_pair_across_words_at_the_native_string_boundary() {
+    for little in [false, true] {
+        let encoding = if little { "UTF-32LE" } else { "UTF-32BE" };
+        for (words, expected) in [
+            (&[0xd83d, 0xde00][..], "😀"),
+            (&[0xd800, 0xd801, 0xdc00][..], "\u{fffd}\u{10400}"),
+            (&[0xd800, 0x61, 0xdc00][..], "\u{fffd}a\u{fffd}"),
+            (&[0xd800, 0x1f600, 0xdc00][..], "\u{fffd}😀\u{fffd}"),
+            (&[0xd800, 0xffffffff, 0xdc00][..], "\u{fffd}\u{fffd}\u{fffd}"),
+        ] {
+            assert_eq!(decode(encoding, &utf32_words(little, words)).await, expected);
+        }
+        let mut bytes = utf32_words(little, &[0xd800]);
+        bytes.push(0);
+        assert_eq!(decode(encoding, &bytes).await, "\u{fffd}\u{fffd}");
+    }
+}
+
+#[tokio::test]
+async fn utf32_decoder_byte_order_resets_for_each_record() {
+    let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", "UTF-32")]), false).unwrap();
+    let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+    for bytes in [utf32_words(true, &[0xfeff, 0x61]), utf32_words(false, &[0x61])] {
+        assert_eq!(converter.decode("events", Some(&bytes), &mut context).await.unwrap().value, Value::Utf8("a".into()));
+    }
+    assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null);
+}
