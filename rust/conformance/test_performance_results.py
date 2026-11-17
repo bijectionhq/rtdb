@@ -11,13 +11,13 @@ def measured_case():
             "setup": [], "checkpoint": [{**operation, "id": "prefix"}], "workers": [[operation]], "checks": [operation]}
     client = {"execution_complete": True, "client_closed": True, "elapsed_ns": 1000,
               "samples": [{"worker": 0, "round": 0, "operation": "lookup", "elapsed_ns": 100,
-                           "value": {"schema": [{"name": "one", "oid": 20}], "rows": operation["expected_rows"]}}]}
+                           "value": {"schema": [{"name": "one", "oid": 20}], "rows": copy.deepcopy(operation["expected_rows"])}}]}
     provider = {"boundary": "successful_object_http_payload_and_requests", "observer_artifact_sha256": "a" * 64,
                 "storage_placement": "same-zone", "successful_read_bytes": 0, "successful_read_requests": 0,
                 "successful_write_bytes": 0, "successful_write_requests": 0}
     process = {"peak_rss_bytes": 10000, "peak_boundary": "engine_process_lifetime_through_sample"}
     receipt = {"case": "lookup", "trace_sha256": operation_trace_digest(case), "resources": {}, "execution_complete": True,
-               "drained": True, "checkpoint": {**client, "samples": [{**client["samples"][0], "operation": "prefix"}]},
+               "drained": True, "checkpoint": copy.deepcopy({**client, "samples": [{**client["samples"][0], "operation": "prefix"}]}),
                "rounds": [{"client": client, "processes": [process], "provider": provider}]}
     return case, receipt
 
@@ -70,7 +70,9 @@ class PerformanceEvidence(unittest.TestCase):
 
     def test_equal_wrong_results_fail_against_immutable_expectations(self):
         case, receipt = measured_case()
-        receipt["rounds"][0]["client"]["samples"][0]["value"]["rows"] = [[{"kind": "integer", "value": "2"}]]
+        receipt["rounds"][0]["client"]["samples"][0]["value"]["rows"][0][0]["value"] = "2"
+        self.assertEqual(receipt["checkpoint"]["samples"][0]["value"]["rows"], [[{"kind": "integer", "value": "1"}]])
+        self.assertEqual(case["workers"][0][0]["expected_rows"], [[{"kind": "integer", "value": "1"}]])
         self.assertIn("query differs from immutable expected rows", inspect_case(case, receipt, {})[0])
 
     def test_duplicate_samples_and_missing_cold_restarts_preserve_denominator(self):

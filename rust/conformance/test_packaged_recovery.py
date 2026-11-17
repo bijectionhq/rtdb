@@ -122,7 +122,7 @@ class RecoveryEvidenceTest(unittest.TestCase):
 
     def test_server_evidence_rejects_idle_compactor_and_readonly_external_recovery(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            root = Path(temporary).resolve()
             selected = plan("pg-source")
             run = {"selection":{"kind":"external", "mode":"storage-only"}, "namespace":selected["namespace"] + "-jvm-to-rust-storage-only"}
             configuration = root / "target.yaml"
