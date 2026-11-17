@@ -50,7 +50,7 @@ async fn strict_set_expressions_compare_reader_identity_without_demanding_elemen
         (constructed_set(), constructed_set()),
         (Expr::Literal(set()), Expr::Literal(set())),
         (Expr::List(vec![constructed_set()]), Expr::List(vec![constructed_set()])),
-        (Expr::Struct(BTreeMap::from([("field".into(), constructed_set())])), Expr::Struct(BTreeMap::from([("field".into(), constructed_set())]))),
+        (Expr::Struct(vec![("field".into(), constructed_set())]), Expr::Struct(vec![("field".into(), constructed_set())])),
     ] {
         let expression = Expr::Call { name: "===".into(), args: vec![left, right], return_type: L::Scalar(S::Bool) };
         assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext::default()).unwrap(), V::Bool(false));

@@ -75,7 +75,7 @@ impl SimpleTrust {
                 return Err(invalid("TLS certificate is outside its validity interval"));
             }
             if !super::names::same(certificate.issuer_name(), issuer.subject_name(), self._charge.budget())? { return Err(invalid("TLS certificate issuer does not match the supplied chain")); }
-            if !certificate.verify(&issuer.public_key().map_err(invalid)?).map_err(invalid)? { return Err(invalid("TLS certificate signature is invalid")); }
+            if !certificate.verify(issuer.public_key().map_err(invalid)?.as_ref()).map_err(invalid)? { return Err(invalid("TLS certificate signature is invalid")); }
             if index != 0 { maximum_path = ca_extensions(certificate, maximum_path, super::names::same(certificate.subject_name(), certificate.issuer_name(), self._charge.budget())?)?; }
         }
         if chain.len() > 1 { server_extensions(chain[0])?; }

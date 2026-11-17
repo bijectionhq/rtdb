@@ -1,6 +1,6 @@
 use std::{ffi::c_void, sync::OnceLock};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{error::ErrorStack, ex_data::Index, nid::Nid, ssl::{SslContext, SslContextBuilder, SslOptions}, x509::X509Ref};
+use openssl::{error::ErrorStack, ex_data::Index, nid::Nid, ssl::{SslContext, SslContextBuilder, SslContextRef, SslOptions}, x509::X509Ref};
 use rtdb_types::Result;
 use super::super::invalid;
 
@@ -16,11 +16,11 @@ const CURVE_CHECK: i32 = 0x20006;
 
 pub(crate) fn configure(context: &mut SslContextBuilder) -> Result<()> {
     let index = index()?;
-    if context.ex_data(index).is_some() { return Err(invalid("TLS context security callback is already configured")); }
+    if unsafe { SslContextRef::from_ptr(context.as_ptr()) }.ex_data(index).is_some() { return Err(invalid("TLS context security callback is already configured")); }
     let previous = unsafe { SSL_CTX_get_security_callback(context.as_ptr()) }.ok_or_else(|| invalid("TLS context has no security callback"))?;
     let extra = unsafe { SSL_CTX_get0_security_ex_data(context.as_ptr()) } as usize;
     context.set_ex_data(index, Previous { callback: previous, extra });
-    let previous = context.ex_data(index).expect("installed TLS security callback") as *const Previous;
+    let previous = unsafe { SslContextRef::from_ptr(context.as_ptr()) }.ex_data(index).expect("installed TLS security callback") as *const Previous;
     context.set_security_level(1);
     context.set_options(SslOptions::NO_COMPRESSION);
     unsafe {
@@ -67,7 +67,7 @@ mod tests {
     fn native_security_keeps_handshake_sha1_disabled_and_java_certificate_key_limits() {
         let mut context = SslContextBuilder::new(SslMethod::tls_client()).unwrap();
         configure(&mut context).unwrap();
-        assert_eq!(context.security_level(), 1);
+        assert_eq!(unsafe { SslContextRef::from_ptr(context.as_ptr()) }.security_level(), 1);
         assert!(context.options().contains(SslOptions::NO_COMPRESSION));
         let opaque = unsafe { SSL_CTX_get0_security_ex_data(context.as_ptr()) };
         let call = |operation, bits, nid, other| unsafe { check(ptr::null(), context.as_ptr(), operation, bits, nid, other, opaque) };

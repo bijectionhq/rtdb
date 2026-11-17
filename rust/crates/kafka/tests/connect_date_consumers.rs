@@ -66,14 +66,18 @@ fn timestamp_converter_converts_schema_defaults_for_null_rows_and_reuses_them() 
     schema.default = Some(Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("1970".into()))])));
     let schema = Arc::new(schema);
     let first = chain.apply(record(&schema, Value::Null)).unwrap().unwrap();
+    let retained = memory.used_bytes();
     let next = chain.apply(record(&schema, Value::Null)).unwrap().unwrap();
+    assert_eq!(memory.used_bytes(), retained);
     assert_eq!(first.value.value, Value::Null);
     assert_eq!(first.value.schema.as_ref().unwrap().default, Some(Value::Struct(BTreeMap::from([("when".into(), date(0))]))));
     assert!(Arc::ptr_eq(first.value.schema.as_ref().unwrap(), next.value.schema.as_ref().unwrap()));
-    assert!(Arc::ptr_eq(&first.reservations[0], &next.reservations[0]));
     drop(chain);
     assert!(memory.used_bytes() > 0);
-    drop((first, next));
+    let retained = memory.used_bytes();
+    drop(first);
+    assert_eq!(memory.used_bytes(), retained);
+    drop(next);
     assert_eq!(memory.used_bytes(), 0);
 }
 
@@ -113,12 +117,14 @@ fn cast_schema_cache_reuses_evicts_and_keeps_record_allocations_alive() {
     let mut chain = chain("Cast", &[("spec", "when:string")], &memory);
     let schema = date_field();
     let first = chain.apply(record(&schema, date_row(0))).unwrap().unwrap();
+    let retained = memory.used_bytes();
     let next = chain.apply(record(&schema, date_row(0))).unwrap().unwrap();
+    assert_eq!(memory.used_bytes(), retained);
     assert_eq!(first.value.value, Value::Struct(BTreeMap::from([("when".into(), Value::Utf8("00:00:00.000Z".into()))])));
     assert_eq!(first.value.schema.as_ref().unwrap().field("when").unwrap().schema.default, Some(Value::Utf8("00:00:00.000Z".into())));
     assert!(Arc::ptr_eq(first.value.schema.as_ref().unwrap(), next.value.schema.as_ref().unwrap()));
-    assert!(Arc::ptr_eq(&first.reservations[0], &next.reservations[0]));
     drop(next);
+    assert_eq!(memory.used_bytes(), retained);
     for index in 0..16 {
         let mut other = schema.as_ref().clone();
         other.doc = Some(index.to_string());
@@ -239,7 +245,6 @@ fn schema_caches_treat_absent_and_explicit_null_defaults_as_equal_recursively() 
             let next = chain.apply(record(next_schema, value())).unwrap().unwrap();
             assert_eq!(memory.used_bytes(), retained);
             assert!(Arc::ptr_eq(first.value.schema.as_ref().unwrap(), next.value.schema.as_ref().unwrap()));
-            assert!(Arc::ptr_eq(&first.reservations[0], &next.reservations[0]));
             assert!(first.value.schema.as_ref().unwrap().default.is_none());
             assert!(first.value.schema.as_ref().unwrap().field("when").unwrap().schema.default.is_none());
             let mut changed = first_schema.as_ref().clone();
@@ -249,7 +254,9 @@ fn schema_caches_treat_absent_and_explicit_null_defaults_as_equal_recursively() 
             assert_ne!(&changed, first_schema);
             let other = chain.apply(record(&changed, value())).unwrap().unwrap();
             assert!(!Arc::ptr_eq(first.value.schema.as_ref().unwrap(), other.value.schema.as_ref().unwrap()));
-            drop((other, next, first, chain));
+            drop((other, next, chain));
+            assert!(memory.used_bytes() > 0);
+            drop(first);
             assert_eq!(memory.used_bytes(), 0);
         }
     }
@@ -364,12 +371,18 @@ async fn custom_converter_nan_defaults_reuse_both_transform_caches_recursively()
         for selector in [0, 1] {
             let mut context = ConversionContext::new(Arc::clone(&memory));
             let data = converter.decode("events", Some(&[selector]), &mut context).await.unwrap();
+            let retained = memory.used_bytes();
             outputs.push(chain.apply(SinkRecord::new("events".into(), 0, 0, ConnectData::null(), data)).unwrap().unwrap());
+            if selector == 1 { assert_eq!(memory.used_bytes(), retained); }
             contexts.push(context);
         }
         assert!(Arc::ptr_eq(outputs[0].value.schema.as_ref().unwrap(), outputs[1].value.schema.as_ref().unwrap()));
-        assert!(Arc::ptr_eq(&outputs[0].reservations[0], &outputs[1].reservations[0]));
-        drop((outputs, chain, contexts));
+        drop((chain, contexts));
+        let retained = memory.used_bytes();
+        assert!(retained > 0);
+        drop(outputs.pop());
+        assert_eq!(memory.used_bytes(), retained);
+        drop(outputs);
         assert_eq!(memory.used_bytes(), 0);
     }
     converter.close().await.unwrap();

@@ -90,15 +90,15 @@ async fn compressed_data_and_metadata_compact_with_identical_retry_bytes() {
 
 #[test]
 fn recency_partition_boundaries_are_inclusive() {
-    let monday = rtdb_types::calendar::CivilDate::from_ymd(2020, 1, 6).unwrap();
+    let monday = rtdb_types::CivilDate::from_ymd(2020, 1, 6).unwrap();
     let micros = monday.epoch_day() * 86_400_000_000;
     assert_eq!(recency_partition(Timestamp(micros), RecencyPartition::Week).unwrap(), monday);
-    assert_eq!(recency_partition(Timestamp(micros + 1), RecencyPartition::Week).unwrap(), rtdb_types::calendar::CivilDate::from_ymd(2020, 1, 13).unwrap());
+    assert_eq!(recency_partition(Timestamp(micros + 1), RecencyPartition::Week).unwrap(), rtdb_types::CivilDate::from_ymd(2020, 1, 13).unwrap());
 }
 
 #[test]
 fn recency_partitions_cover_wide_calendar_years_and_all_timestamp_values() {
-    use rtdb_types::calendar::CivilDate;
+    use rtdb_types::CivilDate;
     for year in [-280_000, 0, 280_000] {
         for (partition, month, day, next_year, next_month, next_day) in [
             (RecencyPartition::Week, 1, 3, year, 1, 10),

@@ -142,7 +142,7 @@ fn patch_endpoint(expr: &Expr, rendered: String) -> Result<String> {
     })
 }
 fn form(expr: &Expr, columns: &BTreeMap<ColumnId, String>) -> Result<String> {
-    let child = |expr| form(expr, columns);
+    let child = |expr: &Expr| form(expr, columns);
     let call = |name: &str, args: Vec<String>| if args.is_empty() { format!("({name})") } else { format!("({name} {})", args.join(" ")) };
     Ok(match expr {
         Expr::Literal(value) => literal(value)?,

@@ -1,5 +1,5 @@
 use std::{collections::BTreeSet, sync::Arc};
-use arrow_flight::{FlightData, sql::{Command, SqlInfo, metadata::sql_info::{SqlInfoData, SqlInfoDataBuilder}}};
+use arrow_flight::{FlightData, sql::{Command, SqlInfo, metadata::{SqlInfoData, SqlInfoDataBuilder}}};
 use arrow_schema::Schema;
 use rtdb_columnar::OwnedBatch;
 use tonic::{Response, Status};

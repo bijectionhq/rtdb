@@ -1,5 +1,5 @@
 use crate::{ObservationReceipt, Outcome};
-use rtdb_format::ReplicaEnvelope;
+use rtdb_format::envelope::ReplicaEnvelope;
 use rtdb_temporal::PolygonCalculator;
 use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp};
 use serde::{Deserialize, Serialize};

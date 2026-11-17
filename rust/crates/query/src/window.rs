@@ -13,7 +13,7 @@ impl WindowCursor {
         Self { input: Some(input), schema: runtime.schema().clone(), runtime, partition_by, order_by, expressions, execution }
     }
 
-    async fn sorted_input(&self, input: BoxPageCursor) -> Result<OwnedPage> {
+    async fn sorted_input(&mut self, input: BoxPageCursor) -> Result<OwnedPage> {
         let mut binder = Binder::after(&self.schema)?;
         let partition = binder.field("", None, LogicalType::Scalar(ScalarType::U64))?;
         let schema = self.schema.concat(&Schema::new(vec![partition.clone()])?)?;

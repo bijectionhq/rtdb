@@ -175,6 +175,7 @@ pub(crate) struct Execution {
 
 pub(crate) struct OuterRows { rows: Vec<(rtdb_plan::Schema, Arc<crate::cursor::OwnedRow>)>, _reservation: Arc<rtdb_columnar::MemoryReservation> }
 impl OuterRows {
+    pub fn schemas(&self) -> impl Iterator<Item = &rtdb_plan::Schema> { self.rows.iter().map(|(schema, _)| schema) }
     pub fn empty(memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         let reservation = memory.reserve(256)?;
         Ok(Arc::new(Self { rows: Vec::new(), _reservation: reservation }))

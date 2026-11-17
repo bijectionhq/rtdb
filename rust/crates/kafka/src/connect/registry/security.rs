@@ -87,9 +87,11 @@ impl OAuth {
         let (client, client_charge) = self.client.as_ref().expect("OAuth client initialized");
         context.retain(Arc::clone(client_charge))?;
         let charge = context.reserve(MAXIMUM_TOKEN_RESPONSE * 8)?;
-        let mut form = url::form_urlencoded::Serializer::new(String::new()); form.append_pair("grant_type", "client_credentials");
-        if let Some(scope) = &self.scope { form.append_pair("scope", scope); }
-        let form = form.finish();
+        let form = {
+            let mut form = url::form_urlencoded::Serializer::new(String::new()); form.append_pair("grant_type", "client_credentials");
+            if let Some(scope) = &self.scope { form.append_pair("scope", scope); }
+            form.finish()
+        };
         let started = tokio::time::Instant::now(); let mut backoff = Duration::from_millis(100);
         let response = loop {
             let mut headers = HeaderMap::new();

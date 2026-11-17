@@ -196,10 +196,10 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(128);
         let mut connection = Connection { socket: Box::new(client), reading: Reading::new(), memory: Arc::clone(&memory), max_message: 1024 };
         server.write_all(&[b'd', 0]).await.unwrap();
-        assert!(futures::poll!(connection.read()).is_pending());
+        assert!(futures::poll!(std::pin::pin!(connection.read())).is_pending());
         assert_eq!(connection.reading.header_read, 2);
         server.write_all(&[0, 0, 7, 1]).await.unwrap();
-        assert!(futures::poll!(connection.read()).is_pending());
+        assert!(futures::poll!(std::pin::pin!(connection.read())).is_pending());
         assert_eq!(connection.reading.bytes_read, 1);
         server.write_all(&[2, 3]).await.unwrap();
         let frame = connection.read().await.unwrap(); assert_eq!(frame.bytes, [1, 2, 3]);

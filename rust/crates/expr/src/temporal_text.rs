@@ -11,7 +11,7 @@ fn regex(pattern: &str) -> Result<Regex> { Regex::new(pattern).map_err(|error| A
 pub(crate) fn iso_duration(text: &str) -> Result<i128> {
     let pattern = regex(r"(?i-u)^([+-]?)P(?:([+-]?[0-9]+)D)?(?:T(?:([+-]?[0-9]+)H)?(?:([+-]?[0-9]+)M)?(?:([+-]?[0-9]+)(?:[.,]([0-9]{0,9}))?S)?)?$")?;
     let captures = pattern.captures(text).ok_or_else(|| invalid_duration(text))?;
-    if (2..=5).all(|index| captures.get(index).is_none()) || (text.contains('T') && (3..=5).all(|index| captures.get(index).is_none()) { return Err(invalid_duration(text)); }
+    if (2..=5).all(|index| captures.get(index).is_none()) || (text.contains('T') && (3..=5).all(|index| captures.get(index).is_none())) { return Err(invalid_duration(text)); }
     let mut components = [0i64; 4];
     for (index, factor) in [(2, 86_400i64), (3, 3600), (4, 60), (5, 1)] {
         if let Some(value) = captures.get(index) {

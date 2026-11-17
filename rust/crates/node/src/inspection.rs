@@ -142,7 +142,7 @@ impl CatalogInspection for Inspection {
 }
 
 impl Inspection {
-    async fn read(&self, key: &str) -> Result<Option<CacheLease>> {
+    async fn read(&mut self, key: &str) -> Result<Option<CacheLease>> {
         match self.database.storage.get(&ObjectKey::new(key)?).await {
             Ok(bytes) => Ok(Some(bytes)),
             Err(error @ rtdb_storage::Error::MemoryLimit { .. }) => Err(error.into()),
@@ -269,7 +269,7 @@ mod tests {
 
     #[test]
     fn table_block_file_tries_groups_legacy_tries_and_retains_recency_as_micros() {
-        let date = rtdb_types::calendar::CivilDate::from_ymd(2024, 1, 1).unwrap();
+        let date = rtdb_types::CivilDate::from_ymd(2024, 1, 1).unwrap();
         let key = TrieKey::new(2, Some(date), vec![1, 3], BlockIndex(10)).unwrap();
         let wire = TableBlockProto { row_count: Some(1), tries: vec![proto::TrieDetails { trie_key: Some(key.to_string()), ..Default::default() }], ..Default::default() };
         let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();
@@ -282,7 +282,7 @@ mod tests {
 
     #[test]
     fn legacy_partition_inspection_supports_wide_recency_and_checks_midnight_overflow() {
-        let date = rtdb_types::calendar::CivilDate::from_ymd(280_000, 1, 3).unwrap();
+        let date = rtdb_types::CivilDate::from_ymd(280_000, 1, 3).unwrap();
         let key = TrieKey::new(2, Some(date), vec![], BlockIndex(0)).unwrap();
         let wire = TableBlockProto { tries: vec![proto::TrieDetails { trie_key: Some(key.to_string()), ..Default::default() }], ..Default::default() };
         let metadata = TableBlock::decode(&wire.encode_to_vec()).unwrap();

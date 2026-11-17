@@ -24,7 +24,7 @@ impl CharacterClass {
         match self {
             Self::Set(set) => set.contains(value),
             Self::Regex(regex) => char::from_u32(value).is_some_and(|character| {
-                let mut bytes = [0; 4]; regex.is_match(character.encode_utf8(&mut bytes))
+                let mut bytes = [0; 4]; regex.is_match(&*character.encode_utf8(&mut bytes))
             }),
         }
     }

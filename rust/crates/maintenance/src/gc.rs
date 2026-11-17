@@ -85,7 +85,8 @@ impl TrieCollector {
         for chunk in keys.chunks(self.config.chunk_size) {
             if cancellation.is_cancelled() { return Err(crate::closed()); }
             if chunk.iter().any(|key| key.level() == 0) { return Err(crate::invalid("L0 recovery files cannot be garbage collected")); }
-            let results = stream::iter(chunk).map(|key| async move {
+            let results = stream::iter(0..chunk.len()).map(|index| async move {
+                let key = &chunk[index];
                 let _permit = deletes.acquire().await.map_err(crate::invalid)?;
                 if cancellation.is_cancelled() { return Err(crate::closed()); }
                 self.store.delete(&ObjectKey::new(entry.slug.data_key(key)).map_err(crate::invalid)?).await.map_err(crate::invalid)?;

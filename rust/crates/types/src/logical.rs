@@ -140,6 +140,10 @@ impl LogicalType {
     pub fn join(&self, other: &Self) -> Self { Self::join_all([self, other]) }
 
     pub fn join_all<'a>(types: impl IntoIterator<Item = &'a Self>) -> Self {
+        Self::join_iter(&mut types.into_iter())
+    }
+
+    fn join_iter<'a>(types: &mut dyn Iterator<Item = &'a Self>) -> Self {
         let mut scalar_legs = BTreeSet::new();
         let mut list_legs: BTreeMap<ListKind, Self> = BTreeMap::new();
         let mut structs: Vec<BTreeMap<String, Self>> = Vec::new();
@@ -161,7 +165,7 @@ impl LogicalType {
             let names: BTreeSet<_> = structs.iter().flat_map(|fields| fields.keys().cloned()).collect();
             let mut merged = BTreeMap::new();
             for name in names {
-                let ty = Self::join_all(structs.iter().map(|fields| fields.get(&name).unwrap_or(&Self::Null)));
+                let ty = Self::join_iter(&mut structs.iter().map(|fields| fields.get(&name).unwrap_or(&Self::Null)));
                 merged.insert(name, ty);
             }
             scalar_legs.insert(Self::Struct(merged));

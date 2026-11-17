@@ -568,7 +568,7 @@ fn numeric_extremum<'a>(operation: Extremum,call: ExtremumCall,left: HostValue<'
     let (value,parameter) = selected.choose((left,call.left),(right,call.right));
     let kind = match parameter { Dispatch::Object => return Ok(value),Dispatch::Long => Cast::Long,Dispatch::Double => Cast::Double };
     context.reserve(std::mem::size_of::<Number>() + 2 * std::mem::size_of::<usize>())?;
-    Ok(HostValue::Number(Arc::new(Number::cast(kind,&value.number(context)?).map_err(numeric_error)?)))
+    Ok(HostValue::Number(Arc::new(Number::cast(kind,value.number(context)?.as_ref()).map_err(numeric_error)?)))
 }
 fn numeric_absolute<'a>(dispatch: Dispatch,value: HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
     let result = {

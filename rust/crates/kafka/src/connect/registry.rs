@@ -242,7 +242,7 @@ impl RegistryConverter {
     }
     fn plan_charge(&self, document: &SchemaDocument, context: &mut ConversionContext) -> Result<Arc<MemoryReservation>> {
         let rule_bound = rules::ReadRules::allocation_bound(document.root.rule_set.as_ref(), &self.options)?;
-        context.reserve(document.bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow")))
+        context.reserve(document.bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)
     }
     fn avro_plan(&self, document: &SchemaDocument) -> Result<Arc<super::avro::AvroDatumPlan>> {
         super::avro::AvroDatumPlan::parse(&document.root.schema, &document.references.values().cloned().collect::<Vec<_>>(), &self.options).map(Arc::new)

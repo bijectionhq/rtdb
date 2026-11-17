@@ -159,7 +159,7 @@ fn adbc_session_show_survives_failed_transaction_while_queries_and_pgwire_show_r
     let token = handles::cancellation(operation, &session).unwrap();
     {
         let mut connection = session.state.lock();
-        connection.state_mut().set_parameter("application_name".into(), Some("inspectable".into())).unwrap();
+        connection.state_mut().set_parameter("application_name", Some("inspectable".into())).unwrap();
         connection.state_mut().begin().unwrap();
         connection.state_mut().fail_transaction(invalid("failed"));
     }

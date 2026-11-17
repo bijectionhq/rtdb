@@ -1,4 +1,5 @@
 use alloc::{collections::BTreeSet, string::String, vec, vec::Vec};
+use core::convert::TryFrom;
 use crate::{analyze::Info, Assertion, CompileError, Error, Expr, LookAround, RegexOptions, Result, RuntimeError};
 
 #[path = "java_class.rs"]
@@ -368,7 +369,7 @@ impl Matcher<'_> {
                         position += 1; node = *next; continue;
                     }
                     if let Atom::Canonical(class) = atom {
-                        for end in crate::canonical::candidates_utf16(self.text, position, |value| class.contains(value)).into_iter().flatten() {
+                        for end in IntoIterator::into_iter(crate::canonical::candidates_utf16(self.text, position, |value| class.contains(value))).flatten() {
                             if self.matches(*next, end)? { return Ok(true); }
                         }
                         return Ok(false);

@@ -150,7 +150,7 @@ fn millisecond_date_text_uses_truncated_epoch_days_in_each_output_family() {
 #[test]
 fn binary_millisecond_date_has_no_integer_reader_and_releases_its_reservation() {
     let memory = MemoryBudget::new(1 << 20);
-    let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(0), &SessionEnvironment::default(), &memory).unwrap_err();
+    let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(0), &SessionEnvironment::default(), &memory).err().unwrap();
     assert_eq!(error.category, rtdb_types::AnomalyCategory::Fault);
     assert_eq!(error.message.as_deref(), Some("getInt unsupported on DateMilliVector"));
     assert_eq!(memory.used_bytes(), 0);

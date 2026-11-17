@@ -62,7 +62,7 @@ impl Key {
 }
 
 pub(crate) fn verify_public_key(certificate: &X509Ref) -> Result<()> {
-    Key::of(&certificate.public_key().map_err(invalid)?).check()
+    Key::of(certificate.public_key().map_err(invalid)?.as_ref()).check()
 }
 
 pub(crate) fn verify_untrusted_certificate(certificate: &X509Ref) -> Result<()> {
@@ -85,12 +85,12 @@ fn verify_server_path_with_usage(chain: &[&X509Ref], usage: impl Fn(usize, &X509
     blocked(anchor_fingerprint)?;
     if chain.len() == 1 { return Ok(()); }
     let jdk_ca = anchor_fingerprint.listed(JDK_ANCHORS);
-    let mut issuer = Key::of(&anchor.public_key().map_err(invalid)?);
+    let mut issuer = Key::of(anchor.public_key().map_err(invalid)?.as_ref());
     for (index, certificate) in chain[..chain.len() - 1].iter().enumerate().rev() {
         blocked(Fingerprint::of(certificate)?)?;
         usage(index, certificate)?;
         issuer.check()?;
-        let key = Key::of(&certificate.public_key().map_err(invalid)?);
+        let key = Key::of(certificate.public_key().map_err(invalid)?.as_ref());
         signature(certificate, jdk_ca, true)?;
         key.check()?;
         issuer = key.inherit(Some(issuer))?;
@@ -116,7 +116,7 @@ fn verify_client_chain_with_usage(chain: &[&X509Ref], usage: impl Fn(&X509Ref) -
     for certificate in chain.iter().rev() {
         usage(certificate)?;
         signature(certificate, false, false)?;
-        let key = Key::of(&certificate.public_key().map_err(invalid)?);
+        let key = Key::of(certificate.public_key().map_err(invalid)?.as_ref());
         key.check()?;
         if let Some(issuer) = issuer { issuer.check()?; }
         issuer = Some(key.inherit(issuer)?);

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use async_trait::async_trait;
 use arrow_schema::{DataType, SchemaRef};
-use rtdb_types::calendar::CivilDate;
+use rtdb_types::CivilDate;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, from_field};
 use rtdb_format::{data::{EventBatch, StoredEvent, copy_event_batch_with_recency}, ipc::{ArrowFile, ArrowFileWriter, inspect_file_reserved}, keys::TrieKey,
     log::proto::{TriesAdded, TrieDetails}, metadata::MetadataFile};
@@ -318,7 +318,7 @@ impl MergeFile {
     fn new(path: PathBuf, recency: Option<CivilDate>, carries_recency: bool, part: &[u8], put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let schema = OutputSchema { put: put.clone(), iid_encoding: (config.run_end_encoded_iids && recency.is_some()).then_some(RunEndWidth::I32), recency: carries_recency };
         let directory = path.parent().ok_or_else(|| crate::invalid("Merge path has no parent"))?;
-        let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, &schema.schema()?, disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
+        let writer = ArrowFileWriter::new_bounded_reserved(create_file(&path)?, schema.schema()?.as_ref(), disk_remaining(directory, config.temporary_byte_limit)?, memory)?;
         Ok(Self { path, part: part.to_vec(), recency, carries_recency, writer: Some(writer), leaves: Vec::new() })
     }
     fn write(&mut self, events: &[StoredEvent], path: Vec<u8>, put: &Option<BTreeMap<String, LogicalType>>, config: &MergeConfig) -> Result<()> {
