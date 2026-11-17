@@ -23,6 +23,14 @@ The Java foreign-memory adapter implements ADBC and the existing Clojure connect
 Applications depending on concrete JVM `Xtdb.Connection` or `RelationReader` classes need the migration described in link:../../rust/crates/ffi/README.adoc[the embedded binding reference].
 Native buffer owners survive statement closure until the foreign consumer releases them.
 
+== Expression equality
+
+Strict expression equality (`===`) compares native set-reader identities without reading their elements.
+Separate set constructions remain distinct, while an alias of one reader retains its identity.
+Ordinary SQL equality continues to reject set/set comparisons at type admission.
+Stored Transit values use their registered object semantics, including distinct identity-bearing objects and the emitted representations of supported native scalars.
+The link:../../rust/crates/expr/README.adoc[expression reference] records the implemented comparison paths and their regression sources.
+
 == Operations
 
 Health HTTP exposes the index, metrics, started, alive and ready routes, plus POST `/system/finish-block`.
