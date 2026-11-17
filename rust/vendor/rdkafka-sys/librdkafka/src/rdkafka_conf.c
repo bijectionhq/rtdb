@@ -922,6 +922,10 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
     {_RK_GLOBAL, "ssl.ctx.configure_opaque", _RK_C_PTR,
      _RK(ssl.ctx_configure_opaque),
      "Borrowed TLS context callback state.", _UNSUPPORTED_SSL},
+    {_RK_GLOBAL, "ssl.material.cb", _RK_C_PTR, _RK(ssl.material_cb),
+     "Callback supplying immutable native TLS file contents.", _UNSUPPORTED_SSL},
+    {_RK_GLOBAL, "ssl.material.opaque", _RK_C_PTR, _RK(ssl.material_opaque),
+     "Borrowed native TLS material owner.", _UNSUPPORTED_SSL},
     {_RK_GLOBAL, "ssl.ctx.libctx", _RK_C_PTR, _RK(ssl.libctx),
      "Borrowed OpenSSL library context.", _UNSUPPORTED_SSL},
     {_RK_GLOBAL | _RK_HIDDEN, "ssl.ctx.replaces.default.trust", _RK_C_BOOL,
@@ -2942,6 +2946,20 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb(
 #endif
 }
 
+
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_material_cb(
+    rd_kafka_conf_t *conf,
+    int (*callback)(int kind, const char *path, const void **data,
+                    size_t *size, int *os_error, void *opaque),
+    void *opaque) {
+#if WITH_SSL && defined(OPENSSL_RTDB_MATERIAL_BIO)
+        rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf, "ssl.material.cb", callback);
+        rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf, "ssl.material.opaque", opaque);
+        return RD_KAFKA_CONF_OK;
+#else
+        return callback ? RD_KAFKA_CONF_INVALID : RD_KAFKA_CONF_OK;
+#endif
+}
 
 rd_kafka_conf_res_t rd_kafka_conf_set_ssl_ctx_replaces_default_trust(
     rd_kafka_conf_t *conf, int replace) {

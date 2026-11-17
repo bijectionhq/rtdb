@@ -232,10 +232,8 @@ err:
 int X509_load_cert_crl_file_ex(X509_LOOKUP *ctx, const char *file, int type,
     OSSL_LIB_CTX *libctx, const char *propq)
 {
-    STACK_OF(X509_INFO) *inf = NULL;
-    X509_INFO *itmp = NULL;
     BIO *in = NULL;
-    int i, count = 0;
+    int count;
 
     if (type != X509_FILETYPE_PEM)
         return X509_load_cert_file_ex(ctx, file, type, libctx, propq);
@@ -248,8 +246,23 @@ int X509_load_cert_crl_file_ex(X509_LOOKUP *ctx, const char *file, int type,
         ERR_raise(ERR_LIB_X509, ERR_R_BIO_LIB);
         return 0;
     }
-    inf = PEM_X509_INFO_read_bio_ex(in, NULL, NULL, "", libctx, propq);
+    count = X509_load_cert_crl_bio_ex(ctx, in, libctx, propq);
     BIO_free(in);
+    return count;
+}
+
+int X509_load_cert_crl_bio_ex(X509_LOOKUP *ctx, BIO *in,
+    OSSL_LIB_CTX *libctx, const char *propq)
+{
+    STACK_OF(X509_INFO) *inf;
+    X509_INFO *itmp;
+    int i, count = 0;
+
+    if (in == NULL) {
+        ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
+        return 0;
+    }
+    inf = PEM_X509_INFO_read_bio_ex(in, NULL, NULL, "", libctx, propq);
     if (inf == NULL) {
         ERR_raise(ERR_LIB_X509, ERR_R_PEM_LIB);
         return 0;

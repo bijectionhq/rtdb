@@ -37,6 +37,8 @@ Kafka log clients and Connect source consumers accept Java TLS properties throug
 Each log prepares one retained client configuration for its topic administrator, producer, watermark readers, ranges, and tails.
 Each source assignment prepares one configuration for its consumer.
 Derived native clients retain the admitted TLS material even after the originating configuration or log is released.
+Regular native CA, CRL, certificate, key and native PKCS12 files use admitted immutable raw snapshots at their original native loading sites.
+link:src/client/material/README.adoc[Native material ownership] records snapshot lifetimes, deferred I/O failures and the separate hashed-directory/native-allocation qualification gaps.
 `KafkaLog::open` and the node's Kafka resource registration receive the existing node memory budget; TLS material remains charged until the last native client releases it.
 The adapter consumes its supported Java TLS properties and preserves other native TLS and SASL properties for librdkafka validation.
 Java and native identity settings, or Java and native trust settings, cannot both supply the same client.

@@ -52,6 +52,8 @@
 #endif
 
 #include <ctype.h>
+#include <limits.h>
+#include <errno.h>
 
 #if !_WIN32
 #include <sys/types.h>
@@ -1143,6 +1145,117 @@ static int rd_kafka_ssl_cert_callback(SSL *ssl, void *arg) {
         return 1;
 }
 
+#ifdef OPENSSL_RTDB_MATERIAL_BIO
+static int rd_kafka_ssl_material_bio(rd_kafka_t *rk, int kind,
+                                     const char *path, BIO **bio) {
+        const void *data = NULL;
+        size_t size = 0;
+        int os_error = EIO;
+        int result;
+
+        *bio = NULL;
+        if (!rk->rk_conf.ssl.material_cb)
+                return 0;
+        result = rk->rk_conf.ssl.material_cb(
+            kind, path, &data, &size, &os_error,
+            rk->rk_conf.ssl.material_opaque);
+        if (result == 0)
+                return 0;
+        if (result != 1 || size > INT_MAX || (size && !data)) {
+                ERR_raise(ERR_LIB_SYS, result == -1 ? os_error : EINVAL);
+                ERR_raise(ERR_LIB_BIO, ERR_R_SYS_LIB);
+                return -1;
+        }
+        *bio = BIO_new_mem_buf(data ? data : "", (int)size);
+        return *bio ? 1 : -1;
+}
+
+static int rd_kafka_ssl_material_ca(rd_kafka_t *rk, SSL_CTX *ctx,
+                                    int kind, const char *path, int *managed) {
+        BIO *bio;
+        int result = rd_kafka_ssl_material_bio(rk, kind, path, &bio);
+        *managed = result != 0;
+        if (result != 1)
+                return 0;
+        {
+                X509_LOOKUP *lookup = X509_STORE_add_lookup(
+                    SSL_CTX_get_cert_store(ctx), X509_LOOKUP_file());
+                result = lookup && X509_load_cert_crl_bio_ex(
+                    lookup, bio, rk->rk_conf.ssl.libctx, NULL) > 0;
+        }
+        BIO_free(bio);
+        return result;
+}
+
+static int rd_kafka_ssl_material_certificate(rd_kafka_t *rk, SSL_CTX *ctx,
+                                             const char *path) {
+        BIO *bio;
+        int result = rd_kafka_ssl_material_bio(
+            rk, RD_KAFKA_SSL_MATERIAL_CERTIFICATE, path, &bio);
+        if (result == 0)
+                return SSL_CTX_use_certificate_chain_file(ctx, path);
+        if (result < 0)
+                return 0;
+        result = SSL_CTX_use_certificate_chain_bio(ctx, bio);
+        BIO_free(bio);
+        return result;
+}
+
+static int rd_kafka_ssl_material_key(rd_kafka_t *rk, SSL_CTX *ctx,
+                                     const char *path) {
+        BIO *bio;
+        EVP_PKEY *key;
+        int result = rd_kafka_ssl_material_bio(
+            rk, RD_KAFKA_SSL_MATERIAL_PRIVATE_KEY, path, &bio);
+        if (result == 0)
+                return SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM);
+        if (result < 0)
+                return 0;
+#if OPENSSL_VERSION_NUMBER >= 0x30000000
+        key = PEM_read_bio_PrivateKey_ex(
+            bio, NULL, SSL_CTX_get_default_passwd_cb(ctx),
+            SSL_CTX_get_default_passwd_cb_userdata(ctx),
+            rk->rk_conf.ssl.libctx, NULL);
+#else
+        key = PEM_read_bio_PrivateKey(
+            bio, NULL, SSL_CTX_get_default_passwd_cb(ctx),
+            SSL_CTX_get_default_passwd_cb_userdata(ctx));
+#endif
+        if (!key) {
+                ERR_raise(ERR_LIB_SSL, ERR_R_PEM_LIB);
+                result = 0;
+        } else {
+                result = SSL_CTX_use_PrivateKey(ctx, key);
+        }
+        EVP_PKEY_free(key);
+        BIO_free(bio);
+        return result;
+}
+
+#else
+static int rd_kafka_ssl_material_bio(rd_kafka_t *rk, int kind,
+                                     const char *path, BIO **bio) {
+        *bio = NULL;
+        return 0;
+}
+
+static int rd_kafka_ssl_material_ca(rd_kafka_t *rk, SSL_CTX *ctx,
+                                    int kind, const char *path, int *managed) {
+        *managed = 0;
+        return 0;
+}
+
+static int rd_kafka_ssl_material_certificate(rd_kafka_t *rk, SSL_CTX *ctx,
+                                             const char *path) {
+        return SSL_CTX_use_certificate_chain_file(ctx, path);
+}
+
+static int rd_kafka_ssl_material_key(rd_kafka_t *rk, SSL_CTX *ctx,
+                                     const char *path) {
+        return SSL_CTX_use_PrivateKey_file(ctx, path, SSL_FILETYPE_PEM);
+}
+#endif
+
 /**
  * @brief Registers certificates, keys, etc, on the SSL_CTX
  *
@@ -1177,17 +1290,24 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                 if (rk->rk_conf.ssl.ca_location &&
                     strcmp(rk->rk_conf.ssl.ca_location, "probe")) {
                         /* CA certificate location, either file or directory. */
-                        int is_dir =
-                            rd_kafka_path_is_dir(rk->rk_conf.ssl.ca_location);
+                        int managed;
+                        int is_dir = 0;
+                        r = rd_kafka_ssl_material_ca(
+                            rk, ctx, RD_KAFKA_SSL_MATERIAL_CA,
+                            rk->rk_conf.ssl.ca_location, &managed);
+                        if (!managed)
+                                is_dir = rd_kafka_path_is_dir(
+                                    rk->rk_conf.ssl.ca_location);
 
                         rd_kafka_dbg(rk, SECURITY, "SSL",
                                      "Loading CA certificate(s) from %s %s",
                                      is_dir ? "directory" : "file",
                                      rk->rk_conf.ssl.ca_location);
 
-                        r = SSL_CTX_load_verify_locations(
-                            ctx, !is_dir ? rk->rk_conf.ssl.ca_location : NULL,
-                            is_dir ? rk->rk_conf.ssl.ca_location : NULL);
+                        if (!managed)
+                                r = SSL_CTX_load_verify_locations(
+                                    ctx, !is_dir ? rk->rk_conf.ssl.ca_location : NULL,
+                                    is_dir ? rk->rk_conf.ssl.ca_location : NULL);
 
                         if (r != 1) {
                                 rd_snprintf(errstr, errstr_size,
@@ -1320,8 +1440,15 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                 rd_kafka_dbg(rk, SECURITY, "SSL", "Loading CRL from file %s",
                              rk->rk_conf.ssl.crl_location);
 
-                r = SSL_CTX_load_verify_locations(
-                    ctx, rk->rk_conf.ssl.crl_location, NULL);
+                {
+                        int managed;
+                        r = rd_kafka_ssl_material_ca(
+                            rk, ctx, RD_KAFKA_SSL_MATERIAL_CRL,
+                            rk->rk_conf.ssl.crl_location, &managed);
+                        if (!managed)
+                                r = SSL_CTX_load_verify_locations(
+                                    ctx, rk->rk_conf.ssl.crl_location, NULL);
+                }
 
                 if (r != 1) {
                         rd_snprintf(errstr, errstr_size,
@@ -1371,8 +1498,8 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                              "Loading public key from file %s",
                              rk->rk_conf.ssl.cert_location);
 
-                r = SSL_CTX_use_certificate_chain_file(
-                    ctx, rk->rk_conf.ssl.cert_location);
+                r = rd_kafka_ssl_material_certificate(
+                    rk, ctx, rk->rk_conf.ssl.cert_location);
 
                 if (r != 1) {
                         rd_snprintf(errstr, errstr_size,
@@ -1450,8 +1577,8 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                              "Loading private key file from %s",
                              rk->rk_conf.ssl.key_location);
 
-                r = SSL_CTX_use_PrivateKey_file(
-                    ctx, rk->rk_conf.ssl.key_location, SSL_FILETYPE_PEM);
+                r = rd_kafka_ssl_material_key(
+                    rk, ctx, rk->rk_conf.ssl.key_location);
                 if (r != 1) {
                         rd_snprintf(errstr, errstr_size,
                                     "ssl.key.location failed: ");
@@ -1508,7 +1635,11 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                              "Loading client's keystore file from %s",
                              rk->rk_conf.ssl.keystore_location);
 
-                bio = BIO_new_file(rk->rk_conf.ssl.keystore_location, "rb");
+                r = rd_kafka_ssl_material_bio(
+                    rk, RD_KAFKA_SSL_MATERIAL_KEYSTORE,
+                    rk->rk_conf.ssl.keystore_location, &bio);
+                if (r == 0)
+                        bio = BIO_new_file(rk->rk_conf.ssl.keystore_location, "rb");
                 if (!bio) {
                         rd_snprintf(errstr, errstr_size,
                                     "Failed to open ssl.keystore.location: "

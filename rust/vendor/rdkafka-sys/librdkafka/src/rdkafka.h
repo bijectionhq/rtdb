@@ -2480,6 +2480,30 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb(
                               void *opaque));
 
 
+/** Native TLS file-loading site passed to the material callback. */
+typedef enum rd_kafka_ssl_material_type_t {
+        RD_KAFKA_SSL_MATERIAL_CA = 0,
+        RD_KAFKA_SSL_MATERIAL_CRL = 1,
+        RD_KAFKA_SSL_MATERIAL_CERTIFICATE = 2,
+        RD_KAFKA_SSL_MATERIAL_PRIVATE_KEY = 3,
+        RD_KAFKA_SSL_MATERIAL_KEYSTORE = 4
+} rd_kafka_ssl_material_type_t;
+
+/**
+ * @brief Supply immutable bytes at native TLS file-loading sites.
+ * The callback returns 0 for filesystem loading, 1 for borrowed data/size, or -1 for an unavailable file with its OS error number in os_error.
+ * Neither the path nor returned data is transferred; data and opaque must remain valid through destruction of every client made from this configuration or a copy.
+ * Calls may be concurrent across clients.
+ * A NULL callback preserves file loading.
+ * @returns RD_KAFKA_CONF_INVALID when a callback requires an unavailable bundled OpenSSL material API.
+ */
+RD_EXPORT
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_material_cb(
+    rd_kafka_conf_t *conf,
+    int (*callback)(int kind, const char *path, const void **data,
+                    size_t *size, int *os_error, void *opaque),
+    void *opaque);
+
 /**
  * @brief Skip automatic CA discovery when a TLS context callback supplies trust.
  * A nonzero replace value skips platform certificate stores, CA path probing and OpenSSL default verify paths; explicit CA, CRL and identity loading remains enabled.

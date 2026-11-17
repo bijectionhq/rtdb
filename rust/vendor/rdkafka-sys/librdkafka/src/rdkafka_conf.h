@@ -280,6 +280,9 @@ struct rd_kafka_conf_s {
                 void *ctx_configure_opaque;
                 void *libctx;
                 int ctx_replaces_default_trust;
+                int (*material_cb)(int kind, const char *path, const void **data,
+                                   size_t *size, int *os_error, void *opaque);
+                void *material_opaque;
                 int (*cert_verify_cb)(rd_kafka_t *rk,
                                       const char *broker_name,
                                       int32_t broker_id,
