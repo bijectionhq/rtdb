@@ -7,6 +7,10 @@ use super::invalid;
 mod parameters;
 mod peer;
 pub(crate) use peer::permits_client_certificate;
+mod pkix;
+pub(crate) use pkix::verify_pkix_server_chain;
+mod native;
+pub(crate) use native::configure as configure_native;
 
 const BLOCKED: &str = include_str!("security/temurin-25.0.1.blocked.certs");
 const JDK_ANCHORS: &str = include_str!("security/temurin-25.0.1.jdk-anchors.sha256");

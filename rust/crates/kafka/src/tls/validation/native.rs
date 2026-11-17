@@ -29,21 +29,25 @@ impl SimpleTrust {
         let now = Asn1Time::days_from_now(0).map_err(invalid)?;
         let verified = self.verify(&peer, &now, crate::tls::security::verify_server_chain)?;
         unsafe { verify_names(context, verified[0])?; }
-        let mut chain = Stack::new().map_err(invalid)?;
-        for certificate in verified { chain.push(certificate.to_owned()).map_err(invalid)?; }
-        let ssl = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(context, openssl_sys::SSL_get_ex_data_X509_STORE_CTX_idx()) }.cast::<openssl_sys::SSL>();
-        if ssl.is_null() { return Err(invalid("TLS verifier has no owning connection")); }
-        let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-        let index = charges_index()?;
-        if let Some(charges) = ssl.ex_data_mut(index) { charges.push(charge); } else { ssl.set_ex_data(index, vec![charge]); }
-        unsafe { X509_STORE_CTX_set0_verified_chain(context, chain.as_ptr()); }
-        std::mem::forget(chain);
-        unsafe { openssl_sys::X509_STORE_CTX_set_error(context, openssl_sys::X509_V_OK); }
-        Ok(())
+        unsafe { retain_chain(context, verified, charge) }
     }
 }
 
-fn charges_index() -> Result<Index<Ssl, Vec<Arc<MemoryReservation>>>> {
+pub(super) unsafe fn retain_chain<'a>(context: *mut openssl_sys::X509_STORE_CTX, verified: impl IntoIterator<Item = &'a X509Ref>, charge: Arc<MemoryReservation>) -> Result<()> {
+    let mut chain = Stack::new().map_err(invalid)?;
+    for certificate in verified { chain.push(certificate.to_owned()).map_err(invalid)?; }
+    let ssl = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(context, openssl_sys::SSL_get_ex_data_X509_STORE_CTX_idx()) }.cast::<openssl_sys::SSL>();
+    if ssl.is_null() { return Err(invalid("TLS verifier has no owning connection")); }
+    let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
+    let index = charges_index()?;
+    if let Some(charges) = ssl.ex_data_mut(index) { charges.push(charge); } else { ssl.set_ex_data(index, vec![charge]); }
+    unsafe { X509_STORE_CTX_set0_verified_chain(context, chain.as_ptr()); }
+    std::mem::forget(chain);
+    unsafe { openssl_sys::X509_STORE_CTX_set_error(context, openssl_sys::X509_V_OK); }
+    Ok(())
+}
+
+pub(super) fn charges_index() -> Result<Index<Ssl, Vec<Arc<MemoryReservation>>>> {
     static INDEX: OnceLock<std::result::Result<Index<Ssl, Vec<Arc<MemoryReservation>>>, ErrorStack>> = OnceLock::new();
     INDEX.get_or_init(Ssl::new_ex_index).as_ref().copied().map_err(invalid)
 }
@@ -59,7 +63,7 @@ unsafe extern "C" fn verify(context: *mut openssl_sys::X509_STORE_CTX, opaque: *
     }
 }
 
-unsafe fn verify_names(context: *mut openssl_sys::X509_STORE_CTX, certificate: &X509Ref) -> Result<()> {
+pub(super) unsafe fn verify_names(context: *mut openssl_sys::X509_STORE_CTX, certificate: &X509Ref) -> Result<()> {
     let parameters = unsafe { X509_STORE_CTX_get0_param(context) };
     if parameters.is_null() { return Err(invalid("TLS verification parameters are absent")); }
     let flags = unsafe { X509_VERIFY_PARAM_get_hostflags(parameters) };

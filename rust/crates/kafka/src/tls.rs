@@ -85,6 +85,7 @@ impl NativeTls {
     // The installed certificate callback borrows self until this context and its SSL objects are destroyed.
     unsafe fn configure_context(&self, context: &mut SslContextBuilder) -> Result<()> {
         unsafe { self.signature_random.configure_signatures(context); }
+        security::configure_native(context)?;
         context.set_min_proto_version(Some(SslVersion::TLS1_2)).map_err(invalid)?;
         context.set_max_proto_version(Some(SslVersion::TLS1_3)).map_err(invalid)?;
         context.clear_options(SslOptions::NO_TLSV1_2 | SslOptions::NO_TLSV1_3);
@@ -99,6 +100,7 @@ impl NativeTls {
             unsafe { SSL_CTX_set_cert_cb(context.as_ptr(), Some(select_identity), (self as *const Self).cast_mut().cast()); }
         }
         if let Some(trust) = &self.simple_trust { unsafe { trust.configure_native(context)?; } }
+        else { unsafe { validation::pkix::configure_native(context, &self.reservations[0])?; } }
         Ok(())
     }
 
