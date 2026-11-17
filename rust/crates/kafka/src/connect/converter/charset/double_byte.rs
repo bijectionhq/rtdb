@@ -5,6 +5,7 @@ pub(super) mod euc_jp;
 pub(super) mod euc_tw;
 pub(super) mod hkscs;
 pub(super) mod ibm_euc;
+pub(super) mod iso2022cnkr;
 pub(super) mod iso2022jp;
 pub(super) mod subclasses;
 mod tables;

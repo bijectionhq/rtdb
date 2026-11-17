@@ -25,6 +25,8 @@ EUC-TW and IBM964 add 11 registered names with distinct plane selectors, supplem
 Their source tables and replacement rules are described in link:euc_tw/README.adoc[the EUC-TW and IBM964 reference].
 The five ISO-2022-JP variants add 17 registered names with record-local designation and shift state.
 Their JIS mapping differences, Roman/Kana modes, and replacement boundaries are described in link:iso2022jp/README.adoc[the ISO-2022-JP reference].
+ISO-2022-CN, its CNS/GB variants, and ISO-2022-KR add 12 registered names with separate Chinese and Korean decoding loops.
+Their designation rules, BMP-only CNS planes, and escape-error boundaries are described in link:iso2022cnkr/README.adoc[the ISO-2022-CN/KR reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.

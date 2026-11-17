@@ -1,0 +1,114 @@
+= Java 25 ISO-2022-CN and ISO-2022-KR character mappings
+
+The String converter supports `ISO-2022-CN`, `x-ISO-2022-CN-CNS`, `x-ISO-2022-CN-GB`, and `ISO-2022-KR`, with 12 distinct case-insensitive registered names.
+Aliases include `ISO2022CN`, `csISO2022CN`, `ISO2022CN_CNS`, `ISO-2022-CN-CNS`, `ISO2022CN_GB`, `ISO-2022-CN-GB`, `ISO2022KR`, and `csISO2022KR`.
+link:charsets.tsv[The charset manifest] records provider ownership, source hashes, configurations, and complete alias lists.
+All four classes resolve through the pinned Java extended provider.
+All three CN classes instantiate the same decoder and accept GB2312 and CNS mappings.
+Their distinct encoding capabilities do not restrict String decoding.
+
+`Charset::Iso2022CnKr` holds a passive immutable `Iso2022CnKr` configuration selecting one of two decoding loops.
+Two immutable `Mapping` resources contain GB2312 and KSC5601 data.
+Three immutable `CnsPlane` values hold the BMP decoding results for CNS planes 1 through 3.
+The five resources total 87,028 bytes with process lifetime.
+CN's shift flag and `CnDesignation`, KR's shift flag, input cursors, and output buffers are transients owned by each decode call.
+Both loops begin unshifted, and CN begins with GB2312 selected.
+The existing String scalar memory admission precedes decoding, including records containing only designations.
+Every emitted character is a nonsurrogate BMP value, within the three-UTF8-bytes-per-input-byte reserve.
+
+== Shared character interpretation
+
+SO (0x0E) selects shifted decoding, and SI (0x0F) selects unshifted decoding.
+A designation is not required before SO.
+Unshifted bytes other than ESC, SO, and SI emit their unsigned byte value, including 0x80 through 0xFF.
+Shifted decoding combines two bytes after setting the high bit of each byte.
+Low, high, and mixed byte pairs therefore address the same table positions where valid.
+An unmapped pair consumes both bytes and produces U+FFFD.
+The second byte is mapping data even when it equals ESC, SO, or SI.
+Repeated SO and SI preserve their selected shift state.
+Newline has no special reset behavior in either decoder.
+
+== Chinese designations and single shifts
+
+Every ESC resets the SO designation to GB2312 before validating any following byte.
+This happens for malformed escapes and CNS single shifts as well as accepted designations.
+ESC does not change the shift flag.
+`ESC $ A` and `ESC $ ) A` select GB2312, while `ESC $ ) G` selects CNS plane 1.
+`ESC $ * H` and `ESC $ + I` are accepted designations and leave GB2312 selected.
+The three-byte `ESC $ A` sequence retains the pinned Java decoder's compatibility behavior.
+
+`ESC N` consumes a two-byte payload using CNS plane 2, and `ESC O` consumes a two-byte payload using CNS plane 3.
+Neither requires a preceding designation.
+These single shifts leave the shift flag unchanged while resetting its designation to GB2312.
+For example, after selecting CNS plane 1 and SO, pair 0x2122 emits U+FF0C.
+After an intervening `ESC N` sequence, the same pair emits GB2312 U+3001.
+An invalid escape has the same designation-reset effect.
+
+CNS decoding uses `EUC_TW.Decoder.decodeSingleOrReplace`, which returns a replacement for supplementary mappings.
+The first two CNS planes contain no supplementary mappings.
+Plane 3 retains 6,323 BMP mappings and replaces 71 supplementary positions.
+For example, `ESC O 0x21 0x44` emits U+FFFD, while the corresponding EUC-TW plane-3 position maps to U+2000B.
+The three planes retain 5,867, 7,650, and 6,323 mapped BMP positions respectively.
+
+An ESC requires its second byte before validation.
+An unknown or high second byte consumes two malformed bytes.
+After `ESC $`, an unknown or high third byte consumes three malformed bytes.
+The third bytes `)`, `*`, and `+` require a fourth byte, and an invalid final designation byte consumes four malformed bytes.
+The complete `ESC N` or `ESC O` sequence consumes four bytes even for invalid or unmapped payloads.
+
+== Korean designation and escape handling
+
+`ESC $ ) C` is the accepted designation and changes no shift state.
+Shifted pairs use the KSC5601 mapping through the EUC-KR table.
+For example, SO followed by 0x3021 emits U+AC00 without a preceding designation.
+
+Every ESC requires four available bytes before validating its second byte.
+With four available, an exact `ESC $ ) C` consumes all four and emits nothing.
+`ESC N` and `ESC O` consume four bytes and always emit U+FFFD, including payloads that contain control bytes.
+Every other escape consumes two malformed bytes and processes the remaining bytes again in the current shift state.
+Consequently, `ESC X A` produces one replacement, while `ESC X A B` produces a replacement followed by `AB` when unshifted.
+CN produces a replacement followed by `A` for the first example because its second-byte validation needs only two available bytes.
+
+== Terminal input and record boundaries
+
+OpenJDK25 `String(byte[], Charset)` uses `CharsetDecoder` with replacement enabled and `endOfInput` true for these charsets.
+Neither decoder implements `ArrayDecoder`.
+An incomplete terminal escape or shifted pair produces one replacement for the remaining bytes.
+A completed designation, SO, or SI produces no text, including at the end of a record.
+Replacement retains the shift flag and CN's current designation, including any reset performed before an escape error.
+Every record starts independently, including after null or empty input.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins 17 files covering the providers, decoder classes, mapping classes, superclass, and String/CharsetDecoder replacement path.
+link:COPYRIGHT[Copyright notices] retain upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:mappings.tsv[The mapping manifest] records source hashes, resource sizes and hashes, table shape, mapped-position counts, and supplementary replacement counts.
+The GB2312 and EUC-KR resources contain trail bounds 0xA1 and 0xFE, 256 single-byte units, 256 row indices, and their present 94-unit rows.
+The two resources have 81 and 89 present rows and retain the same bytes as the existing standalone tables.
+An absent row uses index 0xFFFF, and an unmapped pair uses U+FFFD.
+Each CNS resource contains 8,836 units in unsigned lead/trail order over the 0xA1 through 0xFE square.
+The source supplementary flag is applied when deriving each CNS resource, replacing flagged positions with U+FFFD.
+Every stored unit and row index uses big-endian order.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-iso2022cnkr
+----
+
+It checks archive hashes, effective provider ownership, decoder selection, table initialization and dimensions, supplementary filtering, and replacement-path source constraints.
+Separate reference loops preserve the CN and KR state and consumption rules.
+link:modes.tsv[The mode manifest] records four CN prefixes covering both designations in both shift states, plus two KR shift-state prefixes.
+The single-byte digest concatenates all 256 independently decoded prefixed records.
+Five pair-space digests each cover all 65,536 unsigned byte pairs following the prefix and an optional ESC, `ESC $`, `ESC N`, or `ESC O`.
+An additional digest covers all 256 escape selectors with five fixed two-byte payloads, including controls, high bytes, and the valid Korean designation suffix.
+Each nonsingle probe appends U+0000 to the decoded result so input consumption cannot absorb the separator.
+
+Regression sources cover all 12 names in original and uppercase spelling, all single bytes in their source states, and each canonical decoder's complete pair, designation, and single-shift probe spaces.
+Focused cases cover designation retention and reset, malformed lengths, terminal prechecks, high-byte interpretation, controls as trails, CNS supplementary replacement, null and empty records, configuration, and memory admission.
