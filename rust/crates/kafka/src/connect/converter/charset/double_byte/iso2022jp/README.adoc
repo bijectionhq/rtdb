@@ -1,0 +1,97 @@
+= Java 25 ISO-2022-JP character mappings
+
+The String converter supports `ISO-2022-JP`, `ISO-2022-JP-2`, `x-windows-50220`, `x-windows-50221`, and `x-windows-iso2022jp`, with 17 distinct case-insensitive registered names.
+Aliases include `jis`, `jis_encoding`, `csISO2022JP`, `csISO2022JP2`, `ms50220`, `cp50220`, `ms50221`, `cp50221`, and `windows-iso2022jp`.
+link:charsets.tsv[The charset manifest] records each provider-owned class, source hash, decoder configuration, and complete alias list.
+All five classes resolve through the pinned Java extended provider.
+
+`Charset::Iso2022Jp` holds a passive immutable `Iso2022Jp` configuration.
+Five immutable `Mapping` resources contain 79,390 bytes with process lifetime.
+The four decoder configurations select their JIS0208 table and optional JIS0212 table.
+MS50220 and MS50221 share their decoder implementation; their difference belongs to encoding.
+Passive `Mode` values represent ASCII, Roman, Kana, or a selected double-byte mapping.
+Current mode, previous mode, input cursor, and output are transients owned by one decode call.
+Each record starts with both modes set to ASCII.
+The existing String scalar memory admission precedes decoding, including records containing only designations that produce no text.
+The output reserves at most three UTF8 bytes per input byte because every mapped character is a nonsurrogate BMP value.
+
+== Designations, shifts, and mappings
+
+`ESC ( B` selects ASCII, `ESC ( J` selects Roman, and `ESC ( I` selects Kana.
+Roman mode replaces byte 0x5C with U+00A5 and byte 0x7E with U+203E.
+`ESC $ @` and `ESC $ B` select the same JIS0208 mapping in each variant.
+`ESC $ ( D` selects JIS0212 in ISO-2022-JP-2 and both MS5022x variants.
+ISO-2022-JP and x-windows-iso2022jp do not accept that designation.
+
+SO saves the current mode as the previous mode and selects Kana.
+SI restores the previous mode without changing it.
+Every SO overwrites the previous mode, including a repeated SO while Kana is selected.
+An escape designation changes the current mode while preserving the previous mode.
+The explicit Kana designation and SO use the same character conversion.
+They accept bytes at or below 0x5F and add 0xFF40, including control values such as 0x00 mapping to U+FF40.
+ESC, SO, and SI remain controls when they start a decoding step.
+
+Standard JIS0208 maps 0x213D to U+2014, while both Microsoft tables map it to U+2015.
+At 0x2141, the standard and MS5022x tables map to U+301C, while the MSISO table maps to U+FF5E.
+At 0x2D60, MS5022x maps to U+301E and MSISO maps to U+301D.
+The MS5022x JIS0208 table maps 0x7521 to U+E000 and 0x7921 to U+E178; its JIS0212 table maps 0x7521 to U+E3AC.
+The MSISO JIS0208 table maps 0x7921 to U+7E8A.
+The independent standard JIS tables retain the same bytes as the existing standalone JIS resources.
+
+== Replacement boundaries
+
+OpenJDK25 `String(byte[], Charset)` uses `CharsetDecoder` with replacement enabled and `endOfInput` true for these charsets.
+The shared ISO2022_JP decoder does not implement `ArrayDecoder`.
+Malformed and unmappable results retain the current and previous modes.
+An incomplete terminal input group produces one replacement for all remaining bytes.
+A completed designation produces no output, including at the end of a record.
+
+A leading byte with its high bit set is malformed and consumes one byte in every mode.
+An ESC requires three available bytes before validating its second byte.
+An unknown second byte consumes ESC and that byte, leaving the third byte to be decoded again.
+An invalid third byte after `ESC (` or `ESC $` consumes three bytes.
+For a decoder supporting JIS0212, `ESC $ (` requires four available bytes; an invalid fourth byte consumes all four.
+For a decoder without JIS0212, `ESC $ (` consumes three malformed bytes and the following byte is decoded again.
+Consequently, `ESC $ ( D` produces a replacement followed by `D` in the two configurations without JIS0212.
+
+Double-byte modes require two bytes and consume both for an unmapped position or invalid trail.
+The second byte is mapping data even when it equals ESC, SO, SI, or has its high bit set.
+Kana bytes above 0x5F consume one malformed byte.
+Every replacement is U+FFFD.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins 18 source files covering the mapping classes, decoder inheritance, provider ownership, and String/CharsetDecoder replacement path.
+link:COPYRIGHT[Copyright notices] retain the upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:mappings.tsv[The mapping manifest] records each source hash, resource size, resource hash, and present lead-row count.
+Each resource begins with trail bounds 0x21 and 0x7E, followed by 256 single-byte UTF16 units, 256 row indices, and the present 94-unit rows.
+All units and indices use big-endian order.
+Single-byte entries are U+FFFD because these mapping classes are DBCS-only.
+An absent lead row has index 0xFFFF; an unmapped pair has unit U+FFFD.
+The source tables contain no surrogate units.
+The five resources have 77, 68, 88, 80, and 82 present rows respectively.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-iso2022jp
+----
+
+It checks archive hashes, provider ownership, table dimensions, source initialization, decoder selection, nonsurrogate mappings, and the replacement path.
+Its reference decoder keeps the seven integer states from the Java source.
+link:modes.tsv[The mode manifest] records four probe digests for each configuration and seven prefixes: ASCII, Roman, Kana, JIS1978, JIS1983, JIS0212, and SO.
+The JIS0212 prefix also probes its rejection by configurations without that table.
+The single-byte digest concatenates all 256 independent prefixed records.
+The pair digest covers all 65,536 pairs in unsigned order after the prefix.
+The escape digest covers all 65,536 two-byte suffixes after the prefix and ESC.
+The JIS0212 escape digest covers all 256 final bytes after the prefix and `ESC $ (`.
+Each nonsingle probe appends U+0000 to the decoded result, so input consumption cannot absorb the separator.
+
+Regression sources cover all 17 names in original and uppercase spelling, all single bytes in seven modes, and every canonical decoder's complete pair and escape probe spaces.
+Focused cases cover mapping differences, private-use values, repeated SO, SI after a designation, control bytes used as trails, high bytes, malformed lengths, truncation, record reset, null and empty values, configuration, and memory admission.

@@ -117,7 +117,9 @@ The IBM29626C and IBM33722 Japanese EUC charsets support all 13 registered names
 Their symbol differences, IBM943-filtered JIS0212 mappings, and variant-specific malformed-input lengths are documented in the link:src/connect/converter/charset/double_byte/ibm_euc/README.adoc[IBM Japanese EUC reference].
 EUC-TW and IBM964 support all 11 registered names through separate plane-selection and replacement rules.
 The standard decoder includes supplementary CNS planes, while IBM964 preserves C1 controls and its private-use planes, as described in the link:src/connect/converter/charset/double_byte/euc_tw/README.adoc[EUC-TW and IBM964 reference].
-Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
+ISO-2022-JP, ISO-2022-JP-2, x-windows-50220, x-windows-50221, and x-windows-iso2022jp support all 17 registered names with record-local designation and shift state.
+Their JIS mapping differences, Roman/Kana modes, optional JIS0212 designation, and replacement boundaries are documented in the link:src/connect/converter/charset/double_byte/iso2022jp/README.adoc[ISO-2022-JP reference].
+Other built-in multibyte and stateful charset families, including GB18030, ISO-2022-CN/KR, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.
