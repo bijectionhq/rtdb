@@ -49,6 +49,44 @@ fn reissued_anchor_uses_the_trusted_key_and_anchor_validity_is_not_checked() {
 }
 
 #[test]
+fn simple_trust_chains_and_replaces_anchors_using_java_unicode_names() {
+    let root_key = key(); let root = certificate("ÉCOLE", &root_key, None, ca(), VALID);
+    let reissued = certificate("e\u{301}cole", &root_key, None, ca(), VALID);
+    let leaf = certificate("server", &key(), Some((&reissued, &root_key)), server(), VALID);
+    let trust = trust(vec![root.clone()]);
+    for chain in [vec![leaf.clone()], vec![leaf, reissued]] {
+        let verified = trust.verify(&chain, &now(), |_| Ok(())).unwrap();
+        assert_eq!(verified.last().unwrap().to_der().unwrap(), root.to_der().unwrap());
+    }
+    let different = certificate("ecole", &root_key, None, ca(), VALID);
+    let leaf = certificate("server", &key(), Some((&different, &root_key)), server(), VALID);
+    assert!(trust.verify(&[leaf], &now(), |_| Ok(())).is_err());
+}
+
+#[test]
+fn simple_trust_java_self_issued_names_preserve_ca_path_length() {
+    let root_key = key(); let root = certificate("root", &root_key, None, ca(), VALID);
+    let top_key = key(); let top = certificate("ÉCOLE", &top_key, Some((&root, &root_key)), vec![BasicConstraints::new().ca().pathlen(0).build().unwrap()], VALID);
+    let lower_key = key(); let trust = trust(vec![root]);
+    for (subject, accepted) in [("e\u{301}cole", true), ("other", false)] {
+        let lower = certificate(subject, &lower_key, Some((&top, &top_key)), ca(), VALID);
+        let leaf = certificate("server", &key(), Some((&lower, &lower_key)), server(), VALID);
+        assert_eq!(trust.verify(&[leaf, lower, top.clone()], &now(), |_| Ok(())).is_ok(), accepted);
+    }
+}
+
+#[test]
+fn simple_trust_name_admission_failure_retains_the_memory_error() {
+    let root_key = key(); let root = certificate("root", &root_key, None, ca(), VALID);
+    let leaf = certificate("server", &key(), Some((&root, &root_key)), server(), VALID);
+    let memory = MemoryBudget::new(1024);
+    let trust = SimpleTrust::new(vec![root], memory.reserve(1024).unwrap()).unwrap();
+    assert_eq!(trust.verify(&[leaf], &now(), |_| Ok(())).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), 1024);
+    drop(trust); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn authority_key_identifier_selects_a_matching_anchor_before_subject_fallback() {
     use openssl::asn1::{Asn1Object, Asn1OctetString};
     let identifier = |authority: bool, value: u8| {

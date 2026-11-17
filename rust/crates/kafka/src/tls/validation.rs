@@ -45,20 +45,22 @@ impl SimpleTrust {
             chain.push(certificate.as_ref());
         }
         let last = *chain.last().expect("nonempty peer chain");
-        let mut candidates = self.anchors.iter().filter(|anchor| same_name(anchor.subject_name(), last.issuer_name()));
-        let mut anchor = candidates.next().ok_or_else(|| invalid("TLS certificate chain has no trust anchor"))?;
-        if let Some(identifier) = last.authority_key_id() {
-            if !anchor.subject_key_id().is_some_and(|subject| subject.as_slice() == identifier.as_slice()) {
-                if let Some(matched) = candidates.find(|candidate| candidate.subject_key_id().is_some_and(|subject| subject.as_slice() == identifier.as_slice())) { anchor = matched; }
+        let mut anchor = None;
+        let identifier = last.authority_key_id();
+        for candidate in &self.anchors {
+            if !super::names::same(candidate.subject_name(), last.issuer_name(), self._charge.budget())? { continue; }
+            if anchor.is_none() { anchor = Some(candidate); }
+            if identifier.is_none() || candidate.subject_key_id().is_some_and(|subject| identifier.is_some_and(|identifier| subject.as_slice() == identifier.as_slice())) {
+                anchor = Some(candidate); break;
             }
         }
-        chain.push(anchor.as_ref());
+        chain.push(anchor.ok_or_else(|| invalid("TLS certificate chain has no trust anchor"))?.as_ref());
         self.check(chain, now, constraints)
     }
 
     fn trusted(&self, certificate: &X509Ref) -> Result<Option<&X509Ref>> {
         for anchor in &self.anchors {
-            if same_name(anchor.subject_name(), certificate.subject_name()) && same_name(anchor.issuer_name(), certificate.issuer_name())
+            if super::names::same(anchor.subject_name(), certificate.subject_name(), self._charge.budget())? && super::names::same(anchor.issuer_name(), certificate.issuer_name(), self._charge.budget())?
                 && super::public_key::same(anchor, certificate)? { return Ok(Some(anchor)); }
         }
         Ok(None)
@@ -72,9 +74,9 @@ impl SimpleTrust {
             if certificate.not_before().compare(now).map_err(invalid)? == Ordering::Greater || certificate.not_after().compare(now).map_err(invalid)? == Ordering::Less {
                 return Err(invalid("TLS certificate is outside its validity interval"));
             }
-            if !same_name(certificate.issuer_name(), issuer.subject_name()) { return Err(invalid("TLS certificate issuer does not match the supplied chain")); }
+            if !super::names::same(certificate.issuer_name(), issuer.subject_name(), self._charge.budget())? { return Err(invalid("TLS certificate issuer does not match the supplied chain")); }
             if !certificate.verify(&issuer.public_key().map_err(invalid)?).map_err(invalid)? { return Err(invalid("TLS certificate signature is invalid")); }
-            if index != 0 { maximum_path = ca_extensions(certificate, maximum_path)?; }
+            if index != 0 { maximum_path = ca_extensions(certificate, maximum_path, super::names::same(certificate.subject_name(), certificate.issuer_name(), self._charge.budget())?)?; }
         }
         if chain.len() > 1 { server_extensions(chain[0])?; }
         Ok(chain)
@@ -83,12 +85,12 @@ impl SimpleTrust {
 
 fn same_name(left: &X509NameRef, right: &X509NameRef) -> bool { left.try_cmp(right).is_ok_and(|order| order == Ordering::Equal) }
 
-fn ca_extensions(certificate: &X509Ref, mut maximum_path: usize) -> Result<usize> {
+fn ca_extensions(certificate: &X509Ref, mut maximum_path: usize, self_issued: bool) -> Result<usize> {
     let flags = unsafe { openssl_sys::X509_get_extension_flags(certificate.as_ptr()) };
     if flags & (openssl_sys::EXFLAG_BCONS | openssl_sys::EXFLAG_CA) != (openssl_sys::EXFLAG_BCONS | openssl_sys::EXFLAG_CA) {
         return Err(invalid("TLS intermediate certificate is not a certificate authority"));
     }
-    if !same_name(certificate.subject_name(), certificate.issuer_name()) { maximum_path = maximum_path.checked_sub(1).ok_or_else(|| invalid("TLS certificate path exceeds its length constraint"))?; }
+    if !self_issued { maximum_path = maximum_path.checked_sub(1).ok_or_else(|| invalid("TLS certificate path exceeds its length constraint"))?; }
     let path = unsafe { openssl_sys::X509_get_pathlen(certificate.as_ptr()) };
     if path >= 0 { maximum_path = maximum_path.min(path as usize); }
     if !bit_extension(certificate, Nid::KEY_USAGE, 0x04)? { return Err(invalid("TLS intermediate key usage excludes certificate signing")); }
