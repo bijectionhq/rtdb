@@ -915,14 +915,16 @@ fn deep_parent_pops_are_iterative_and_preserve_the_negative_depth_latch() {
 }
 
 #[test]
-fn factory_rejects_a_foreign_decision_before_work_or_set_admission() {
+fn factory_rejects_a_short_lived_foreign_decision_before_work_or_set_admission() {
     fixture(65,options(),|round,retained,work| {
-        let other_memory=MemoryBudget::new(8<<20);
-        let other_scope=AllocationScope::new(&other_memory).unwrap();
-        let foreign=Grammar::load(&other_scope).unwrap();
         let before=(retained.used_bytes(),work.used_bytes());
-        let(configs,contexts)=round.parts();
-        assert!(matches!(with_closure_round(configs,contexts,foreign.decision(65)?,options(),|_|Ok(())),Err(PredictionError::ForeignOwner)));
+        {
+            let other_memory=MemoryBudget::new(8<<20);
+            let other_scope=AllocationScope::new(&other_memory).unwrap();
+            let foreign=Grammar::load(&other_scope).unwrap();
+            let(configs,contexts)=round.parts();
+            assert!(matches!(with_closure_round(configs,contexts,foreign.decision(65)?,options(),|_|Ok(())),Err(PredictionError::ForeignOwner)));
+        }
         assert_eq!((retained.used_bytes(),work.used_bytes()),before);
         assert!(matches!(round.local_start(),Err(PredictionError::Aborted)));
         Ok(())

@@ -299,6 +299,8 @@ It implements the complete local/SLL start, iterative closure, epsilon successor
 Both source parser prediction modes initially use this local producer.
 There is no full-context flag, token callback, generated rule controller or production parser entry in this boundary.
 `ClosureOptions` carries captured loop-entry pruning and source assertion selections; the eventual parser environment owns their runtime provenance.
+Closure admission checks a candidate decision's grammar ownership before retaining a decision borrowed from the current grammar.
+The candidate borrow lives only through admission; successful rounds retain the current access's handle.
 Cold precedence filtering receives the current scalar from the real parser-owned precedence stack when reached.
 
 A local context is canonical Empty, a Singleton with a nonnull local parent, or a sorted Array of at least two distinct non-EmptyReturn states with nonnull local parents.

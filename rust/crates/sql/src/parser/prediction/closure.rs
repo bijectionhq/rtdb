@@ -137,7 +137,7 @@ pub(super) struct ClosureRound<'call, 'round, 'cfg, 'id, 'g, 'scope, M: StoreMem
 
 pub(super) fn with_closure_round<'cfg, 'id, 'g, 'scope, M: StoreMemory, R>(
     configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>,
-    decision: Decision<'g, 'scope>, options: ClosureOptions,
+    decision: Decision<'_, '_>, options: ClosureOptions,
     use_round: impl for<'call, 'round> FnOnce(&mut ClosureRound<'call, 'round, 'cfg, 'id, 'g, 'scope, M>) -> Result<R>,
 ) -> Result<R> {
     let entered = configs.ready().and_then(|()| contexts.ready()).and_then(|()| {
@@ -145,6 +145,7 @@ pub(super) fn with_closure_round<'cfg, 'id, 'g, 'scope, M: StoreMemory, R>(
     });
     let entered = configs.finish(entered);
     contexts.finish(entered)?;
+    let decision = contexts.grammar().decision(decision.number())?;
     let allocation = contexts.allocation();
     let result = contexts.with_merge_round(|merge| {
         let mut round = ClosureRound { configs: &mut *configs, contexts: merge, decision, options, memo: MergePresence::Absent, work: ClosureWork::new(allocation), aborted: false };
