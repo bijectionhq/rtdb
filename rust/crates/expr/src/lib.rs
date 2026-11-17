@@ -36,5 +36,5 @@ pub use decimal::{decimal_text, decimal_long_value, decimal_rescale, decimal_to_
 
 mod field;
 mod transit_object;
-mod jvm_number;
+pub(crate) use rtdb_types::jvm_number;
 mod semantic_text;

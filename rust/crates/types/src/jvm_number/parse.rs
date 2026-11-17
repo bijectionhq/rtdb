@@ -8,7 +8,7 @@ pub(super) fn long(text: &str) -> Result<Number> {
     let limit = if negative { i64::MIN } else { -i64::MAX };
     let mut value = 0i64;
     for ch in digits.chars() {
-        let digit = i64::from(rtdb_types::decimal_digit(ch).ok_or_else(invalid)?);
+        let digit = i64::from(crate::decimal_digit(ch).ok_or_else(invalid)?);
         value = value.checked_mul(10).and_then(|value|value.checked_sub(digit)).filter(|value|*value >= limit).ok_or_else(invalid)?;
     }
     Ok(Number::Long(if negative { value } else { -value }))

@@ -107,4 +107,16 @@ Native geometric growth and retained old charges are covered by `allocation_boun
 `clojure_index/tests.rs` and the scope-lifetime documentation examples remain unexecuted regression sources.
 
 This constructor has no production host or reader adapter yet.
-Shared UTF16 and numeric carriers, reader admission and singleton identity, quoted constant reconstruction, function-root identity and semantic host text remain required work.
+Shared UTF16, frontend numeric admission and reader singleton identity, quoted constant reconstruction, function-root identity and semantic host text remain required work.
+
+== Shared JVM numeric values
+
+`jvm_number` owns the numeric payload and operation descriptors shared by host expressions and stored Transit objects.
+It retains fixed-width JVM categories, Clojure BigInt, Decimal coefficient and scale, and Ratio numerator and denominator.
+Callers admit numeric inputs, scratch and outputs and retain their charges through the values' lifetimes; the numeric value owns no scope or object identity.
+Operation-specific bounds support the existing arithmetic, comparison and extrema admission points.
+Collection equivalence, Java wrapper equality and cross-category numeric comparison remain distinct operations, and an enclosing object owner supplies identity-sensitive equality such as shared NaN objects.
+`jvm_number::decimal_parts_text` formats the same coefficient and scale used by numeric objects and physical decimal adapters.
+`murmur3_32` supplies the shared borrowed-byte hash; columnar vector hashing and XXHash32 retain their columnar owner.
+The numeric unit tests and `tests/jvm_number.rs` preserve regression sources for category behavior, primitive and boxed casts, decimal scale edges and hash vectors; they remain unexecuted.
+Frontend semantic admission, shared UTF16, reader singleton identity and host collection/text adapters remain required work.

@@ -4,9 +4,11 @@ use num_traits::{Signed,Zero};
 use super::{Binary,Dispatch,Number,Result,arithmetic::{align_decimal,decimal_error},invalid};
 
 #[derive(Clone,Copy,Debug)]
-pub(crate) enum Comparison { Less,LessEqual,Greater,GreaterEqual,Equivalent }
+/// Numeric comparison across categories, distinct from collection equivalence and Java wrapper equality.
+pub enum Comparison { Less,LessEqual,Greater,GreaterEqual,Equivalent }
 #[derive(Clone,Copy,Debug)]
-pub(crate) enum Predicate { Zero,Positive,Negative }
+/// Numeric sign or zero predicate; floating NaN satisfies none of these predicates.
+pub enum Predicate { Zero,Positive,Negative }
 impl Comparison {
     fn accepts(self,ordering: Option<Ordering>) -> bool {
         match (self,ordering) {
@@ -20,9 +22,10 @@ impl Comparison {
     }
 }
 impl Number {
-    pub(crate) fn comparison_bound(&self,other: &Self) -> Result<usize> { self.binary_bound(Binary::Multiply(false),other) }
+    /// Bounds temporary numeric storage for `compare_numeric` and `select_extremum`.
+    pub fn comparison_bound(&self,other: &Self) -> Result<usize> { self.binary_bound(Binary::Multiply(false),other) }
     /// Retain the comparison_bound reservation through this call.
-    pub(crate) fn compare_numeric(&self,operation: Comparison,other: &Self,dispatch: Dispatch) -> Result<bool> {
+    pub fn compare_numeric(&self,operation: Comparison,other: &Self,dispatch: Dispatch) -> Result<bool> {
         let ordering = if dispatch == Dispatch::Double || matches!(self,Self::Float(_) | Self::Double(_)) || matches!(other,Self::Float(_) | Self::Double(_)) {
             self.double()?.partial_cmp(&other.double()?)
         } else if matches!(self,Self::Decimal { .. }) || matches!(other,Self::Decimal { .. }) {
@@ -35,7 +38,8 @@ impl Number {
         };
         Ok(operation.accepts(ordering))
     }
-    pub(crate) fn predicate(&self,operation: Predicate) -> bool {
+    /// Tests sign or zero from the stored category without allocating or coercing a payload.
+    pub fn predicate(&self,operation: Predicate) -> bool {
         let ordering = match self {
             Self::Byte(value) => Some(value.cmp(&0)),Self::Short(value) => Some(value.cmp(&0)),Self::Int(value) => Some(value.cmp(&0)),Self::Long(value) => Some(value.cmp(&0)),
             Self::Float(value) => value.partial_cmp(&0.0),Self::Double(value) => value.partial_cmp(&0.0),

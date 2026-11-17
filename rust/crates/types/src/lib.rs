@@ -19,6 +19,8 @@ mod object_sort;
 mod memory;
 mod allocation;
 mod clojure_index;
+pub mod jvm_number;
+mod murmur3;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
@@ -39,6 +41,7 @@ pub use object_sort::ObjectSort;
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use allocation::AllocationScope;
 pub use clojure_index::{CheckedIndex,ClojureKeyIndex,DuplicateKey,KeySemantics};
+pub use murmur3::murmur3_32;
 
 mod decimal_text;
 pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};

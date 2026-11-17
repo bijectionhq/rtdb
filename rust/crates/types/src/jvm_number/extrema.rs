@@ -3,23 +3,29 @@ use num_traits::Signed;
 use super::{Cast,Comparison,Dispatch,Number,Result,Unary};
 
 #[derive(Clone,Copy,Debug)]
-pub(crate) enum Extremum { Min,Max }
+/// Minimum or maximum selection under the caller's chosen overload metadata.
+pub enum Extremum { Min,Max }
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
-pub(crate) enum Selected { Left,Right }
+/// The selected input side, allowing the caller to retain the original object's identity.
+pub enum Selected { Left,Right }
 #[derive(Clone,Copy,Debug)]
-pub(crate) struct ExtremumCall { pub(crate) left: Dispatch,pub(crate) right: Dispatch }
+/// The emitted parameter kind of each extremum operand, retained independently for mixed overloads.
+pub struct ExtremumCall { pub left: Dispatch,pub right: Dispatch }
 impl ExtremumCall {
-    pub(crate) const BOXED: Self = Self { left: Dispatch::Object,right: Dispatch::Object };
-    pub(crate) fn primitive(self) -> Option<Cast> {
+    /// Boxed Object/Object invocation, including its right-biased equal-value selection.
+    pub const BOXED: Self = Self { left: Dispatch::Object,right: Dispatch::Object };
+    /// Returns a primitive result only for homogeneous Long or Double parameter kinds.
+    pub fn primitive(self) -> Option<Cast> {
         match (self.left,self.right) { (Dispatch::Long,Dispatch::Long) => Some(Cast::Long),(Dispatch::Double,Dispatch::Double) => Some(Cast::Double),_ => None }
     }
 }
 impl Selected {
-    pub(crate) fn choose<T>(self,left: T,right: T) -> T { match self { Self::Left => left,Self::Right => right } }
+    /// Moves the selected input out and drops the unselected input without cloning either.
+    pub fn choose<T>(self,left: T,right: T) -> T { match self { Self::Left => left,Self::Right => right } }
 }
 impl Number {
     /// Retain the comparison_bound reservation through this call.
-    pub(crate) fn select_extremum(&self,operation: Extremum,other: &Self,call: ExtremumCall) -> Result<Selected> {
+    pub fn select_extremum(&self,operation: Extremum,other: &Self,call: ExtremumCall) -> Result<Selected> {
         if self.is_nan() { return Ok(Selected::Left); }
         if other.is_nan() { return Ok(Selected::Right); }
         let left = match call.primitive() {
@@ -40,12 +46,14 @@ impl Number {
         };
         Ok(if left { Selected::Left } else { Selected::Right })
     }
-    pub(crate) fn absolute_bound(&self,dispatch: Dispatch) -> Result<usize> {
+    /// Bounds absolute-value scratch and owned output, returning zero for a borrowed nonnegative boxed Decimal.
+    pub fn absolute_bound(&self,dispatch: Dispatch) -> Result<usize> {
         if dispatch == Dispatch::Object && matches!(self,Self::Decimal { coefficient,.. } if !coefficient.is_negative()) { return Ok(0); }
         self.unary_bound(Unary::Negate(false))
     }
     /// Retain the absolute_bound reservation through the returned owned value's lifetime.
-    pub(crate) fn absolute(&self,dispatch: Dispatch) -> Result<Cow<'_,Self>> {
+    /// A nonnegative boxed Decimal borrows this payload; callers retain their existing object identity in that case.
+    pub fn absolute(&self,dispatch: Dispatch) -> Result<Cow<'_,Self>> {
         if dispatch == Dispatch::Double || matches!(self,Self::Float(_) | Self::Double(_)) { return Ok(Cow::Owned(Self::Double(self.double()?.abs()))); }
         if dispatch == Dispatch::Long { return Ok(Cow::Owned(Self::Long(self.long()?.wrapping_abs()))); }
         Ok(match self {
