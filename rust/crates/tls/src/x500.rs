@@ -5,6 +5,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::invalid;
 
 mod case;
+pub(crate) use case::{equals_ignore_case_utf16, lowercase_utf16};
 
 /// Immutable Java X500Principal canonical name decoded from an ASN.1 name.
 /// Its allocation reservation covers parsing scratch and remains owned until this value drops.

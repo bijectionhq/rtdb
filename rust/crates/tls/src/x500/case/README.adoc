@@ -1,4 +1,4 @@
-= Java 25 distinguished-name case conversion
+= Java 25 case conversion
 
 `case::fold` implements `String.toUpperCase(Locale.US).toLowerCase(Locale.US)` for the Unicode scalar strings decoded by the X.500 name owner.
 The caller applies NFKD after this conversion.
@@ -24,6 +24,14 @@ An absent record leaves its input scalar unchanged, including code points assign
 Uppercase conversion can expand one scalar into several scalars, and lowercase conversion sees that expanded sequence.
 The unconditional dotted-I lowercase expansion is included in the lower table.
 
+`lowercase_utf16` implements locale-English lowercase for Java keystore alias lookup without the preceding uppercase pass.
+It retains isolated UTF-16 surrogate units and applies the same final-sigma word boundaries to the original input.
+`equals_ignore_case_utf16` follows Java string length and simple character case comparisons used for PKCS12 friendly names.
+`unicode16-simple-fold.bin` maps each code point through the simple uppercase mapping in `UnicodeData.txt` field 12 and then the simple lowercase mapping in field 13.
+It contains 1483 nonidentity records, each two big-endian `u32` values, sorted by source code point, totaling 11864 bytes.
+Its SHA-256 is `76b08a5b0961021d3a57d1bc49b42e23dad71d440b8d16ab1de0097eb54cabf2`.
+This comparison preserves the distinction between a simple one-character case mapping and a full string expansion.
+
 == Final sigma
 
 Locale.US has one contextual lowercase mapping: capital sigma becomes final sigma when it has a preceding cased character and no following cased character within the same Java word boundaries.
@@ -39,7 +47,7 @@ This set includes the historical additional ranges present in the Java implement
 The Linux x64 JMOD archive is https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jmods_x64_linux_hotspot_25.0.1_8.tar.gz[OpenJDK25U-jmods_x64_linux_hotspot_25.0.1_8.tar.gz], SHA-256 `99deb26c3ab1546e1735ccd13ff3aaf48b34b2658fa9427f4a3cbe80ce88b436`.
 The resource occupies 19156 bytes and has SHA-256 `76c4756446bce5cf2fe7d644be3dafe27fcd3dec4499a4ffba60ffef31c55c75`.
 Its big-endian header and transition tables follow `java.base/sun/text/RuleBasedBreakIterator.java`, with BMP category lookup from `CompactByteArray.java` and supplementary lookup from `SupplementaryCharacterData.java`.
-The forward scanner uses Unicode scalar indices in place of UTF-16 offsets and preserves the iterator's U+FFFF sentinel behavior.
+The forward scanner uses Unicode code point indices in place of UTF-16 offsets and preserves the iterator's U+FFFF sentinel behavior.
 ASCII punctuation that Java includes inside a word therefore participates in the final-sigma condition.
 
 The matching source archive is https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz[OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz], SHA-256 `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.

@@ -7,6 +7,24 @@ Transport-specific certificate selection, TLS policy, and connection lifetime be
 A transport that copies key material retains the store's reservation until those copies are released.
 `IssuerNames` and `PemIdentity` are passive result owners with separate reservations for each conversion call.
 Their borrowed slices remain valid until the result drops; copying those slices requires another reservation.
+`ProtectedKeyStore` is an additive passive owner for Java keystore metadata and encrypted private-key entries.
+It follows the deferred recovery boundary of OpenJDK 25.0.1 `KeyManagerFactoryImpl.X509` and `X509KeyManagerImpl`: loading exposes certificate metadata, and `ProtectedIdentity::recover` decrypts only the selected entry.
+The decoder checks store integrity and decrypts encrypted certificate sections at load time, without retaining or checking a private-key password.
+PEM material remains on the eager `KeyStore` path because Kafka's `DefaultSslEngineFactory.PemStore` decrypts PEM keys before initializing either key manager.
+`ProtectedIdentity` is an immutable enumerated-alias binding, and multiple bindings may share one protected entry.
+JKS bindings follow raw `Hashtable` enumeration followed by locale-English lowercase lookup, including aliases that resolve to a different stored entry or no private-key entry.
+PKCS12 bindings follow normalized `LinkedHashMap` keys and replacement order, including secret-key entries that replace private-key aliases.
+Their alias lookup uses pinned Unicode 16 full lowercase and Java's word-boundary final-sigma handling, preserving isolated JKS UTF-16 surrogate units.
+PKCS12 friendly-name matching uses Java's simple character case comparison, which differs from full lowercase expansion.
+Protected PKCS12 certificate chains compare Java canonical distinguished names and use the first matching issuer when no authority key identifier is present.
+With an authority key identifier, an exact match uses its canonical encoded octets and the candidate's original subject-key-identifier extension bytes; otherwise the last matching issuer without a subject-key identifier is the fallback.
+Expanded chains have separate retained reservations, and distinguished-name and identifier decoding reserve temporary scratch independently.
+Adapters retain the protected store owner while using its metadata and reserve any additional copies separately.
+`RecoveredKey` owns a separate reservation and zeroized PKCS8 buffer, so it can outlive the protected store.
+Recovery checks Java `PrivateKeyEntry` algorithm equality, leaving proof of possession to the transport; it does not cache results or select another alias after failure.
+The existing eager `KeyStore` API retains its public-key equality assertion and existing alias and chain behavior.
+In particular, eager JKS identities use stored entries directly, and eager PKCS12 retains its previous Rust lowercase, encoded-name comparisons, issuer fallback order, and retained-chain expansion bound.
+The protected API supplies the Java metadata and recovery semantics without changing those existing callers.
 `DistinguishedName` is a passive immutable Java principal value with an independent reservation covering decoding and its retained canonical spelling.
 It follows OpenJDK 25.0.1 `X500Name`, `RDN`, and `AVA` canonicalization: RDN order remains significant, assertions within an RDN are sorted, and repeated assertions are retained.
 Standard RFC2253 keywords decode UTF8String and PrintableString values, including Java's Latin-1 decoding of PrintableString bytes.
@@ -36,6 +54,7 @@ A missing PKCS12 store password skips encrypted certificate sections and the int
 Raw private-key and non-TLS bags are skipped; public-key-protected stores and unrecognized cryptographic algorithms fail explicitly.
 
 The JKS source mapping is OpenJDK `JavaKeyStore` and `KeyProtector` at `jdk-21+35`.
+The protected API was additionally traced against the pinned Temurin 25.0.1+8 `JavaKeyStore`, `PKCS12KeyStore`, `KeyStoreSpi`, `KeyStore.PrivateKeyEntry`, and `X509KeyManagerImpl` sources.
 Registry configuration semantics are mapped to Confluent 7.8.0 `SslFactory`.
 The server retains the existing `ServerConfig` keystore surface and pinned PostgreSQL TLS fixtures.
 Independent pyjks vectors cover protected keys, Unicode and separate passwords, and tampering.

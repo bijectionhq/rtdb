@@ -10,6 +10,8 @@ mod pkcs12;
 mod aliases;
 mod x500;
 pub use x500::DistinguishedName;
+mod protected;
+pub use protected::{ProtectedIdentity, ProtectedKeyStore, RecoveredKey};
 mod identifiers;
 pub use identifiers::CertificateIdentifiers;
 
@@ -122,6 +124,26 @@ fn pem(bytes: &[u8], key_password: Option<&str>, private_keys: bool) -> Result<P
 // JKS framing and key protection: OpenJDK JavaKeyStore and KeyProtector, jdk-21+35.
 // https://github.com/openjdk/jdk/tree/jdk-21%2B35/src/java.base/share/classes/sun/security/provider
 fn jks(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private_keys: bool) -> Result<Parts> {
+    let entries = jks_entries(bytes, password, |_| Ok(()))?;
+    let key_password = key_password.or(password).map(|password| Zeroizing::new(password.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<_>>()));
+    let mut identities = Vec::new(); let mut trusted = Vec::new();
+    for (alias, entry) in entries.into_enumeration() {
+        match entry {
+            JksEntry::Key { protected, certificates } => {
+                if let Some(certificate) = certificates.first() { trusted.push(certificate.to_vec()); }
+                if private_keys {
+                    let password = key_password.as_ref().ok_or_else(|| invalid("JKS private keys require a password"))?;
+                    let key = decrypt_jks_key(protected, password)?;
+                    if !certificates.is_empty() { identities.push(Identity::new(Some(alias), key, certificates.into_iter().map(<[u8]>::to_vec).collect())?); }
+                }
+            }
+            JksEntry::Certificate(certificate) => trusted.push(certificate.to_vec()),
+        }
+    }
+    Ok(Parts { identities, trusted })
+}
+
+fn jks_entries<'a>(bytes: &'a [u8], password: Option<&str>, validate_certificate: impl Fn(&[u8]) -> Result<()>) -> Result<aliases::JksEntries<JksEntry<'a>>> {
     let split = bytes.len().checked_sub(20).ok_or_else(|| invalid("Truncated JKS digest"))?;
     let (body, digest) = bytes.split_at(split);
     if let Some(password) = password {
@@ -130,7 +152,6 @@ fn jks(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private
         verifier.update(b"Mighty Aphrodite"); verifier.update(body);
         if !bool::from(verifier.finalize().as_slice().ct_eq(digest)) { return Err(invalid("JKS integrity check failed")); }
     }
-    let key_password = key_password.or(password).map(|password| Zeroizing::new(password.encode_utf16().flat_map(u16::to_be_bytes).collect::<Vec<_>>()));
     let mut cursor = Input(body);
     if cursor.u32()? != 0xfeedfeed { return Err(invalid("Invalid JKS magic")); }
     let version = cursor.u32()?;
@@ -148,30 +169,24 @@ fn jks(bytes: &[u8], password: Option<&str>, key_password: Option<&str>, private
                 let chain_count = cursor.u32()? as usize;
                 if chain_count > cursor.0.len() / 4 { return Err(invalid("JKS certificate count exceeds input")); }
                 let mut certificates = Vec::with_capacity(chain_count);
-                for _ in 0..chain_count { certificates.push(certificate(&mut cursor, version)?); }
+                for _ in 0..chain_count {
+                    let certificate = certificate(&mut cursor, version)?;
+                    validate_certificate(certificate)?;
+                    certificates.push(certificate);
+                }
                 JksEntry::Key { protected, certificates }
             }
-            2 => JksEntry::Certificate(certificate(&mut cursor, version)?),
+            2 => {
+                let certificate = certificate(&mut cursor, version)?;
+                validate_certificate(certificate)?;
+                JksEntry::Certificate(certificate)
+            }
             _ => return Err(invalid("Unknown JKS entry type")),
         };
         entries.insert(alias, entry)?;
     }
     if !cursor.0.is_empty() { return Err(invalid("Trailing JKS content")); }
-    let mut identities = Vec::new(); let mut trusted = Vec::new();
-    for (alias, entry) in entries.into_enumeration() {
-        match entry {
-            JksEntry::Key { protected, certificates } => {
-                if let Some(certificate) = certificates.first() { trusted.push(certificate.to_vec()); }
-                if private_keys {
-                    let password = key_password.as_ref().ok_or_else(|| invalid("JKS private keys require a password"))?;
-                    let key = decrypt_jks_key(protected, password)?;
-                    if !certificates.is_empty() { identities.push(Identity::new(Some(alias), key, certificates.into_iter().map(<[u8]>::to_vec).collect())?); }
-                }
-            }
-            JksEntry::Certificate(certificate) => trusted.push(certificate.to_vec()),
-        }
-    }
-    Ok(Parts { identities, trusted })
+    Ok(entries)
 }
 
 enum JksEntry<'a> { Key { protected: &'a [u8], certificates: Vec<&'a [u8]> }, Certificate(&'a [u8]) }

@@ -100,3 +100,33 @@ fn word_table_indices_cover_unicode_scalars_and_always_advance() {
         }
     }
 }
+
+#[test]
+fn java_english_lowercase_preserves_expansions_sigma_and_raw_utf16_aliases() {
+    for (input, expected) in [
+        ("Straße", "straße"), ("ſﬃ", "ſﬃ"), ("İıI", "i\u{307}ıi"),
+        ("A.Σ", "a.ς"), ("A:Σ", "a:σ"), ("οσ", "οσ"),
+        ("AΣ.B", "aσ.b"), ("AΣ..B", "aς..b"),
+        ("𐐀", "𐐨"), ("\u{a7ce}", "\u{a7ce}"),
+    ] {
+        assert_eq!(lowercase_utf16(&input.encode_utf16().collect::<Vec<_>>()), expected.encode_utf16().collect::<Vec<_>>());
+    }
+    assert_eq!(lowercase_utf16(&[0xd800, b'A' as u16, 0xdc00]), [0xd800, b'a' as u16, 0xdc00]);
+    assert_eq!(lowercase_utf16(&[b'A' as u16, 0xd800, 'Σ' as u16]), [b'a' as u16, 0xd800, 'σ' as u16]);
+}
+
+#[test]
+fn java_ignore_case_uses_simple_character_case_without_full_string_expansion() {
+    for (left, right, matches) in [
+        ("İ", "i", true), ("ı", "I", true), ("ſ", "S", true),
+        ("ß", "ẞ", true), ("ß", "SS", false), ("İ", "i\u{307}", false),
+        ("Σ", "ς", true), ("𐐀", "𐐨", true),
+        ("\u{1c89}", "\u{1c8a}", true), ("\u{a7ce}", "\u{a7cf}", false),
+    ] {
+        assert_eq!(equals_ignore_case_utf16(&left.encode_utf16().collect::<Vec<_>>(), &right.encode_utf16().collect::<Vec<_>>()), matches);
+    }
+    assert!(equals_ignore_case_utf16(&[0xd800, b'A' as u16], &[0xd800, b'a' as u16]));
+    assert!(!equals_ignore_case_utf16(&[0xd800], &[0xdc00]));
+    assert_eq!(SIMPLE_FOLD.len(), 1483 * 8);
+    assert_eq!(openssl::sha::sha256(SIMPLE_FOLD).iter().map(|byte| format!("{byte:02x}")).collect::<String>(), "76b08a5b0961021d3a57d1bc49b42e23dad71d440b8d16ab1de0097eb54cabf2");
+}
