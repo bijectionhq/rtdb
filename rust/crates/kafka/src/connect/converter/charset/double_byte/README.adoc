@@ -21,6 +21,8 @@ EUC-JP, x-euc-jp-linux, and x-eucJP-Open support 14 registered names through ASC
 Their Linux/Solaris differences and replacement boundaries are described in link:euc_jp/README.adoc[the EUC-JP reference].
 The IBM29626C and IBM33722 Japanese EUC charsets add 13 registered names with C1 controls, extra SS2 symbols, private-use mappings, and distinct malformed-input consumption.
 Their mapping composition and IBM943 encoder filtering are described in link:ibm_euc/README.adoc[the IBM Japanese EUC reference].
+EUC-TW and IBM964 add 11 registered names with distinct plane selectors, supplementary or private-use mappings, and malformed-input lengths.
+Their source tables and replacement rules are described in link:euc_tw/README.adoc[the EUC-TW and IBM964 reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.

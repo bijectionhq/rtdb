@@ -115,6 +115,8 @@ The Linux variant rejects JIS0212 triples; the Solaris variant adds its JIS0208 
 Their complete-group replacements and terminal truncation behavior are documented in the link:src/connect/converter/charset/double_byte/euc_jp/README.adoc[EUC-JP reference].
 The IBM29626C and IBM33722 Japanese EUC charsets support all 13 registered names with C1 controls, extra SS2 symbols, and separate G1/G3 private-use ranges.
 Their symbol differences, IBM943-filtered JIS0212 mappings, and variant-specific malformed-input lengths are documented in the link:src/connect/converter/charset/double_byte/ibm_euc/README.adoc[IBM Japanese EUC reference].
+EUC-TW and IBM964 support all 11 registered names through separate plane-selection and replacement rules.
+The standard decoder includes supplementary CNS planes, while IBM964 preserves C1 controls and its private-use planes, as described in the link:src/connect/converter/charset/double_byte/euc_tw/README.adoc[EUC-TW and IBM964 reference].
 Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
