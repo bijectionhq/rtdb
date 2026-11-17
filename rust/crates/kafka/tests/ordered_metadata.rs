@@ -136,6 +136,7 @@ fn targeted_metadata_uses_learned_broker_ids_without_readiness_fallback() {
     let first = metadata.brokers()[0].id();
     let second = metadata.brokers()[1].id();
     assert_ne!(first, second);
+    drop(metadata);
 
     let send = |id, topics: &[MetadataTopic<'_>]| {
         let deadline = Instant::now() + Duration::from_secs(10);
