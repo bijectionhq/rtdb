@@ -19,7 +19,7 @@ fn tx(state: &PartitionState, budget: &Arc<MemoryBudget>, id: i64, system: i64) 
 fn timestamp(value: i64) -> Value { Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 
 #[tokio::test]
-async fn stored_unsigned_cells_open_signed_without_mutating_snapshot_types() {
+async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_storage() {
     let budget = MemoryBudget::new(1 << 27);
     let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
     let mut transaction = tx(&state, &budget, 0, 0);
@@ -28,9 +28,9 @@ async fn stored_unsigned_cells_open_signed_without_mutating_snapshot_types() {
     let physical = state.value().snapshot().column_types(&table())["v"].clone();
     let store = Arc::new(MemoryStore::default());
     let live = state.value().snapshot();
-    persist(&state, &store).await;
-    for snapshot in [live, state.value().snapshot()] {
-        let context = query_context(snapshot, Arc::clone(&store), false);
+    assert_eq!(rtdb_format::columns::type_to_proto(&physical).unwrap_err().code, "xtdb/col-meta-arrow-type");
+    {
+        let context = query_context(live, Arc::clone(&store), false);
         let relation = scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None);
         let mut cursor = PreparedQuery::new(relation).unwrap().execute(context, vec![]).await.unwrap();
         assert_eq!(cursor.schema().fields()[0].data_type, physical);
@@ -67,13 +67,13 @@ async fn compressed_trie_metadata_and_pages_preserve_history_and_release_decode_
             store.put(&object.key, bytes).await.unwrap();
         }
         for (time, expected) in [(15, "old"), (25, "new")] {
-            let context = query_context(state.value().snapshot(), Arc::clone(&store), false);
+            let context = query_context(state.value().snapshot().with_system_time_cap(None).unwrap(), Arc::clone(&store), false);
             let relation = scan(&context, &["v"], TemporalFilter::All, at(time), None);
             assert_eq!(collect(relation, Arc::clone(&context)).await.unwrap(), vec![vec![Value::Utf8(expected.into())]]);
             assert_eq!(context.memory.used_bytes(), 0);
         }
         if codec == arrow_ipc::CompressionType::LZ4_FRAME {
-            let database = DatabaseSnapshot { partitions: vec![state.value().snapshot()], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
+            let database = DatabaseSnapshot { partitions: vec![state.value().snapshot().with_system_time_cap(None).unwrap()], storage: Arc::new(BufferPool::new(store, 1 << 26)) };
             let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
             let budget = MemoryBudget::new(64 << 20);
             let context = QueryContext::new(catalog, Arc::clone(&budget), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
