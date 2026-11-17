@@ -32,6 +32,7 @@ async fn query(sql: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
 async fn sql_catalog_keeps_character_length_alias_and_rejects_unregistered_functions() {
     assert_eq!(query("SELECT CHAR_LENGTH('abc'),CHARACTER_LENGTH('abc')",vec![]).await.unwrap(),[vec![V::I32(3),V::I32(3)]]);
     let context = context();
+    assert!(prepare("SETTING CLOCK_TIME=SUBSTR(NULL) SELECT 1", &context.catalog, &PrepareOptions::default()).is_err());
     for name in ["TRUNC","ATAN2","DEGREES","RADIANS","UUID","URI","SUBSTR","BIT_LENGTH","UNREGISTERED_FN"] {
         assert!(prepare(&format!("SELECT {name}(NULL)"),&context.catalog,&PrepareOptions::default()).is_err(),"{name}");
     }

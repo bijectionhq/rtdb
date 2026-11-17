@@ -129,6 +129,11 @@ impl Dialect for SqlDialect {
             }));
         }
         let Token::Word(word) = &token.token else { return None; };
+        if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("SUBSTR") && parser.peek_nth_token(1).token == Token::LParen {
+            let name = ast::ObjectName::from(vec![word.to_ident(token.span)]);
+            parser.next_token();
+            return Some(parser.parse_function(name));
+        }
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("URI")
             && matches!(parser.peek_nth_token(1).token, Token::SingleQuotedString(_) | Token::EscapedStringLiteral(_) | Token::DollarQuotedString(_)) {
             let name = ast::ObjectName::from(vec![word.to_ident(token.span)]);
