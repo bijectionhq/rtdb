@@ -56,7 +56,7 @@ impl ExecutionVector {
     pub fn vector_for(&self, name: &str) -> Result<Option<Self>> {
         match &self.view {
             ReaderView::Direct(node) => match node.container() {
-                Some(ContainerStorageRef::Struct { children, .. }) => Ok(children.iter().find(|child| child.descriptor.name() == name).map(|child| match &self.address {
+                Some(ContainerStorageRef::Struct { children, .. }) => Ok(children.iter().find(|(key, _)| *key == name).map(|(_, child)| match &self.address {
                     Address::Identity { .. } => Self::direct(Arc::clone(child)),
                     address => Self { view: ReaderView::Direct(Arc::clone(child)), address: address.clone() },
                 })),
@@ -106,7 +106,7 @@ impl ExecutionVector {
     /// Borrows Struct keys in declaration order; named-leg readers delegate and other classes return None.
     pub fn key_names(&self) -> Option<impl Iterator<Item = &str>> {
         let Some(ContainerKind::Struct(children)) = self.node().descriptor.container() else { return None; };
-        Some(children.iter().map(|child| child.name()))
+        Some(children.iter().map(StructFieldDescriptor::key))
     }
 
     /// Returns the complete first Struct child, or the Map entry reader's first child.
@@ -121,7 +121,7 @@ impl ExecutionVector {
             ReaderView::UnionLeg { inner, .. } => inner.map_column(last),
             ReaderView::Direct(node) => match node.container() {
                 Some(ContainerStorageRef::Struct { children, .. }) => {
-                    let child = if last { children.last() } else { children.first() }.ok_or_else(|| unsupported("empty Struct map reader"))?;
+                    let (_, child) = if last { children.iter().next_back() } else { children.iter().next() }.ok_or_else(|| unsupported("empty Struct map reader"))?;
                     Ok(Self::direct(Arc::clone(child)))
                 }
                 Some(ContainerStorageRef::List { elements, .. }) if matches!(node.descriptor.container(), Some(ContainerKind::Map { .. })) => Self::direct(Arc::clone(elements)).map_column(last),

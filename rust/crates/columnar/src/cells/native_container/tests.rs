@@ -19,9 +19,21 @@ fn offsets(value: &[i32], append: usize, memory: &Arc<MemoryBudget>) -> StoredBy
 fn bits(value: &[u8], append: i32, byte_append: usize, memory: &Arc<MemoryBudget>) -> StoredBits {
     StoredBits { bytes: bytes(value, byte_append, memory).bytes, append, byte_append }
 }
+fn captured(children: impl ExactSizeIterator<Item = ExecutionVector>, memory: &Arc<MemoryBudget>) -> CapturedChildren<ExecutionVector> {
+    let mut output = CapturedChildren::new(children.len(), memory).unwrap();
+    for child in children { output.push(child).unwrap(); }
+    output
+}
+fn fields<const N: usize>(children: [ExecutionVector; N], memory: &Arc<MemoryBudget>) -> CapturedChildren<NativeStructInput> {
+    let mut output = CapturedChildren::new(N, memory).unwrap();
+    for child in children {
+        output.push(NativeStructInput::new(child.descriptor().name(), child.clone(), memory).unwrap()).unwrap();
+    }
+    output
+}
 fn union(child: ExecutionVector, positions: &[i32], ids: &[u8], memory: &Arc<MemoryBudget>) -> ExecutionVector {
     publish_native("parent", positions.len(), NativeContainerParts::Union {
-        type_ids: bytes(ids, 0, memory), offsets: offsets(positions, 0, memory), children: vec![child],
+        type_ids: bytes(ids, 0, memory), offsets: offsets(positions, 0, memory), children: captured([child].into_iter(), memory),
     }, memory).unwrap()
 }
 fn list(child: ExecutionVector, length: usize, positions: &[i32], last_offset: i32, memory: &Arc<MemoryBudget>) -> ExecutionVector {
@@ -58,7 +70,7 @@ fn empty_run_end_null_values_keep_constant_nullness_after_named_selection() {
 fn native_struct_retains_independent_parent_and_child_counts() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let child = ints("child", &[7], &memory);
-    let parent = publish_native("parent", 2, NativeContainerParts::Struct { validity: None, children: vec![child.clone()] }, &memory).unwrap();
+    let parent = publish_native("parent", 2, NativeContainerParts::Struct { validity: None, children: fields([child.clone()], &memory) }, &memory).unwrap();
     assert!(parent.ingress_field().arrow().is_none());
     assert!(!parent.cell(1).unwrap().is_null().unwrap());
     let field = parent.vector_for("child").unwrap().unwrap();
@@ -76,16 +88,16 @@ fn native_struct_retains_independent_parent_and_child_counts() {
     assert!(matches!(&selected.address, Address::Indices { len: 2, .. }));
     assert_eq!(anomaly(selected.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap_err()).code, "rtdb/row-index");
     assert_eq!(selected.cell(1).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
-    let behind = publish_native("behind", 0, NativeContainerParts::Struct { validity: None, children: vec![child.clone()] }, &memory).unwrap();
+    let behind = publish_native("behind", 0, NativeContainerParts::Struct { validity: None, children: fields([child.clone()], &memory) }, &memory).unwrap();
     let behind_child = behind.vector_for("child").unwrap().unwrap();
     assert_eq!(behind_child.len(), 1);
     assert_eq!(behind_child.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
     assert_eq!(behind.select(&Selection::All).unwrap().vector_for("child").unwrap().unwrap().len(), 0);
     assert_eq!(behind.map_keys().unwrap().len(), 1);
     let Some(ContainerKind::Struct(fields)) = parent.descriptor().container() else { panic!() };
-    assert!(Arc::ptr_eq(&fields[0], &child.node().descriptor));
+    assert!(Arc::ptr_eq(fields[0].descriptor(), &child.node().descriptor));
     let Some(ContainerStorageRef::Struct { children, .. }) = parent.node().container() else { panic!() };
-    assert!(Arc::ptr_eq(&children[0].descriptor, &fields[0]));
+    assert!(Arc::ptr_eq(&children.iter().next().unwrap().1.descriptor, fields[0].descriptor()));
     drop((child, parent, field, sliced, selected, behind, behind_child));
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -94,7 +106,7 @@ fn native_struct_retains_independent_parent_and_child_counts() {
 fn native_nullable_bits_use_initialized_span_independently_of_cursors_and_parent_length() {
     let memory = MemoryBudget::new(8 * 1024 * 1024);
     let parent = publish_native("parent", 9, NativeContainerParts::Struct {
-        validity: Some(bits(&[0b10000001], -17, 0, &memory)), children: vec![],
+        validity: Some(bits(&[0b10000001], -17, 0, &memory)), children: fields([], &memory),
     }, &memory).unwrap();
     assert!(!parent.cell(0).unwrap().is_null().unwrap());
     assert!(parent.cell(1).unwrap().is_null().unwrap());
@@ -102,7 +114,7 @@ fn native_nullable_bits_use_initialized_span_independently_of_cursors_and_parent
     assert_eq!(parent.cell(8).unwrap().is_null().unwrap_err().code, "rtdb/row-index");
     let NodeLayout::NativeContainer(NativeContainerStorage::Struct { validity: Some(validity), .. }) = &parent.node().storage else { panic!() };
     assert_eq!((validity.append, validity.byte_append), (-17, 0));
-    let empty = publish_native("empty", 0, NativeContainerParts::Struct { validity: Some(bits(&[1], 0, 0, &memory)), children: vec![] }, &memory).unwrap();
+    let empty = publish_native("empty", 0, NativeContainerParts::Struct { validity: Some(bits(&[1], 0, 0, &memory)), children: fields([], &memory) }, &memory).unwrap();
     let masked = union(empty, &[0], &[255], &memory);
     let named = masked.vector_for("empty").unwrap().unwrap();
     assert!(named.cell(0).unwrap().is_null().unwrap());
@@ -115,9 +127,9 @@ fn nested_struct_selection_retains_child_validity_without_parent_mask() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     for nullable_parent in [false, true] {
         let leaf = open("leaf", Arc::new(Int32Array::from(vec![Some(11), None])), true, &memory);
-        let child = publish_native("child", 2, NativeContainerParts::Struct { validity: Some(bits(&[0], 2, 1, &memory)), children: vec![leaf] }, &memory).unwrap();
+        let child = publish_native("child", 2, NativeContainerParts::Struct { validity: Some(bits(&[0], 2, 1, &memory)), children: fields([leaf], &memory) }, &memory).unwrap();
         let parent = publish_native("parent", 2, NativeContainerParts::Struct {
-            validity: nullable_parent.then(|| bits(&[0], 2, 1, &memory)), children: vec![child],
+            validity: nullable_parent.then(|| bits(&[0], 2, 1, &memory)), children: fields([child], &memory),
         }, &memory).unwrap();
         let wrapper = union(parent, &[1, 0], &[255, 255], &memory);
         let named = wrapper.vector_for("parent").unwrap().unwrap().vector_for("child").unwrap().unwrap().vector_for("leaf").unwrap().unwrap();
@@ -202,7 +214,7 @@ fn union_retains_type_offset_cursors_and_defers_consuming_failures() {
     let memory = MemoryBudget::new(8 * 1024 * 1024);
     let child = ints("number", &[7], &memory);
     let parent = publish_native("parent", 3, NativeContainerParts::Union {
-        type_ids: bytes(&[255, 0], 0, &memory), offsets: offsets(&[i32::MIN], 0, &memory), children: vec![child],
+        type_ids: bytes(&[255, 0], 0, &memory), offsets: offsets(&[i32::MIN], 0, &memory), children: captured([child].into_iter(), &memory),
     }, &memory).unwrap();
     assert!(parent.cell(0).unwrap().is_null().unwrap());
     assert!(matches!(parent.cell(0).unwrap().get_int(NullChecks::Enabled), Err(VectorReadError::AbsentPrimitiveReceiver)));
@@ -218,7 +230,7 @@ fn union_retains_type_offset_cursors_and_defers_consuming_failures() {
 #[test]
 fn union_retains_all_ordinal_children_and_named_negative_discriminator() {
     let memory = MemoryBudget::new(64 * 1024 * 1024);
-    let children = (0..130).map(|n| ints(&format!("leg{n}"), &[n], &memory)).collect::<Vec<_>>();
+    let children = captured((0..130).map(|n| ints(&format!("leg{n}"), &[n], &memory)), &memory);
     let parent = publish_native("parent", 1, NativeContainerParts::Union {
         type_ids: bytes(&[128], 1, &memory), offsets: offsets(&[0], 4, &memory), children,
     }, &memory).unwrap();
@@ -285,10 +297,10 @@ fn native_publication_rejects_uncovered_cursors_and_selected_children_without_le
     let bad_offsets = StoredBytes { bytes: bytes(&[], 0, &memory).bytes, append: 1 };
     assert!(publish_native("list", 1, NativeContainerParts::List { kind: NativeListKind::List, validity: None, offsets: bad_offsets, last_offset: 0, elements: child.clone() }, &memory).is_err());
     assert_eq!(memory.used_bytes(), before);
-    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: Some(bits(&[], 0, 1, &memory)), children: vec![child.clone()] }, &memory).is_err());
+    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: Some(bits(&[], 0, 1, &memory)), children: fields([child.clone()], &memory) }, &memory).is_err());
     assert_eq!(memory.used_bytes(), before);
     let selected = child.select(&Selection::All).unwrap();
-    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: vec![selected] }, &memory).is_err());
+    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: fields([selected], &memory) }, &memory).is_err());
     assert_eq!(memory.used_bytes(), before);
     assert_eq!(child.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 9);
     drop(child);
@@ -303,13 +315,13 @@ fn native_publication_admission_failure_preserves_children_and_retry_retains_all
     let before = source.used_bytes();
     let owners = match &child.view { ReaderView::Direct(node) => Arc::strong_count(node), _ => panic!() };
     let blocker = target.reserve(target.limit_bytes()).unwrap();
-    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: vec![child.clone()] }, &target).is_err());
+    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: fields([child.clone()], &source) }, &target).is_err());
     assert_eq!(source.used_bytes(), before);
     let ReaderView::Direct(node) = &child.view else { panic!() };
     assert_eq!(Arc::strong_count(node), owners);
     drop(blocker);
     assert_eq!(target.used_bytes(), 0);
-    let parent = publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: vec![child.clone()] }, &target).unwrap();
+    let parent = publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: fields([child.clone()], &source) }, &target).unwrap();
     let cell = parent.cell(0).unwrap().raw_struct_field("child").unwrap().unwrap();
     let retained_parent = parent.owned_cell(0).unwrap();
     drop((child, parent));
@@ -332,7 +344,7 @@ fn native_snapshot_failure_drops_captured_children_and_preserves_initial_cursor_
     assert_eq!(advance.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 44);
     let broken = list(ints("item", &[], &memory), 1, &[], 97, &memory);
     let parent = publish_native("parent", 1, NativeContainerParts::Struct {
-        validity: Some(bits(&[1], -9, 0, &memory)), children: vec![runs.clone(), broken.clone()],
+        validity: Some(bits(&[1], -9, 0, &memory)), children: fields([runs.clone(), broken.clone()], &memory),
     }, &memory).unwrap();
     let before = memory.used_bytes();
     assert_eq!(parent.snapshot_reader(&target).unwrap_err().code, "rtdb/row-index");
@@ -345,4 +357,132 @@ fn native_snapshot_failure_drops_captured_children_and_preserves_initial_cursor_
     assert_eq!((bits.append, bits.byte_append), (-9, 0));
     drop((runs, advance, broken, parent));
     assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn struct_keys_remain_distinct_from_equal_child_field_names() {
+    let memory = MemoryBudget::new(16 * 1024 * 1024);
+    let first = ints("i32", &[7, 8], &memory);
+    let second = ints("i32", &[11, 12], &memory);
+    let mut children = CapturedChildren::new(2, &memory).unwrap();
+    children.push(NativeStructInput::new("user", first.clone(), &memory).unwrap()).unwrap();
+    children.push(NativeStructInput::new("other", second.clone(), &memory).unwrap()).unwrap();
+    let parent = publish_native("parent", 2, NativeContainerParts::Struct { validity: None, children }, &memory).unwrap();
+    assert_eq!(parent.key_names().unwrap().collect::<Vec<_>>(), vec!["user", "other"]);
+    assert!(parent.vector_for("i32").unwrap().is_none());
+    assert!(parent.cell(0).unwrap().raw_struct_field("i32").unwrap().is_none());
+    let selected = parent.select(&Selection::Indices(vec![1, 0])).unwrap();
+    assert_eq!(selected.vector_for("user").unwrap().unwrap().cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 8);
+    assert_eq!(selected.cell(0).unwrap().raw_struct_field("other").unwrap().unwrap().as_ref().get_int(NullChecks::Enabled).unwrap(), 12);
+    assert_eq!(parent.map_keys().unwrap().cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
+    assert_eq!(parent.map_values().unwrap().cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 11);
+    let LogicalType::Struct(types) = parent.logical_type().unwrap() else { panic!() };
+    assert_eq!(types.keys().map(String::as_str).collect::<Vec<_>>(), vec!["other", "user"]);
+    let object = parent.cell(0).unwrap().object().unwrap();
+    let Value::Struct(values) = object.value() else { panic!() };
+    assert_eq!(values.get("user"), Some(&Value::I32(7)));
+    assert_eq!(values.get("other"), Some(&Value::I32(11)));
+    assert!(!values.contains_key("i32"));
+    let projected = parent.arrow_field().unwrap();
+    let DataType::Struct(projected_fields) = projected.field().data_type() else { panic!() };
+    assert_eq!(projected_fields.iter().map(|field| field.name().as_str()).collect::<Vec<_>>(), vec!["i32", "i32"]);
+    assert!(crate::from_field(projected.field()).is_err());
+    let snapshot = parent.snapshot_reader(&memory).unwrap();
+    assert_eq!(snapshot.key_names().unwrap().collect::<Vec<_>>(), vec!["user", "other"]);
+    let parent_union = union(parent.clone(), &[1], &[0], &memory);
+    let named = parent_union.vector_for("parent").unwrap().unwrap().vector_for("other").unwrap().unwrap();
+    assert_eq!(named.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 12);
+    drop((parent, first, second, selected, object, projected, snapshot, parent_union, named));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn native_struct_rejects_duplicate_lookup_keys_without_relabeling_children() {
+    let memory = MemoryBudget::new(8 * 1024 * 1024);
+    let first = ints("first", &[1], &memory);
+    let second = ints("second", &[2], &memory);
+    let before = memory.used_bytes();
+    let mut children = CapturedChildren::new(2, &memory).unwrap();
+    children.push(NativeStructInput::new("same", first.clone(), &memory).unwrap()).unwrap();
+    children.push(NativeStructInput::new("same", second.clone(), &memory).unwrap()).unwrap();
+    assert!(publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children }, &memory).is_err());
+    assert_eq!(memory.used_bytes(), before);
+    assert_eq!(first.descriptor().name(), "first");
+    assert_eq!(second.descriptor().name(), "second");
+    assert_eq!(first.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 1);
+    drop((first, second));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn capture_input_capacity_is_admitted_before_allocation_and_cannot_grow() {
+    let source = MemoryBudget::new(8 * 1024 * 1024);
+    let target = MemoryBudget::new(1024);
+    let child = ints("child", &[5], &source);
+    let before = source.used_bytes();
+    let blocker = target.reserve(target.limit_bytes()).unwrap();
+    assert!(CapturedChildren::<ExecutionVector>::new(1, &target).is_err());
+    assert_eq!(source.used_bytes(), before);
+    drop(blocker);
+    let mut children = CapturedChildren::new(1, &target).unwrap();
+    let admitted = target.used_bytes();
+    children.push(child.clone()).unwrap();
+    assert!(children.push(child.clone()).is_err());
+    assert_eq!(children.as_slice().len(), 1);
+    assert_eq!(target.used_bytes(), admitted);
+    drop(children);
+    assert_eq!(target.used_bytes(), 0);
+    assert_eq!(source.used_bytes(), before);
+    drop(child);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn capture_input_key_copy_is_admitted_without_borrowing_child_budget() {
+    let source = MemoryBudget::new(8 * 1024 * 1024);
+    let target = MemoryBudget::new(1024);
+    let child = ints("short", &[3], &source);
+    let key = "k".repeat(2048);
+    let before = source.used_bytes();
+    let ReaderView::Direct(node) = &child.view else { panic!() };
+    let owners = Arc::strong_count(node);
+    assert!(NativeStructInput::new(&key, child.clone(), &target).is_err());
+    assert_eq!(Arc::strong_count(node), owners);
+    assert_eq!(source.used_bytes(), before);
+    assert_eq!(target.used_bytes(), 0);
+    let input = NativeStructInput::new("key", child.clone(), &target).unwrap();
+    assert_eq!(input.key(), "key");
+    assert!(target.used_bytes() > 0);
+    drop(input);
+    assert_eq!(target.used_bytes(), 0);
+    drop(child);
+    assert_eq!(source.used_bytes(), 0);
+}
+
+#[test]
+fn native_struct_metadata_reserves_independent_lookup_key_bytes_before_retention() {
+    let source = MemoryBudget::new(8 * 1024 * 1024);
+    let small = MemoryBudget::new(64 * 1024);
+    let enough = MemoryBudget::new(4 * 1024 * 1024);
+    let child = ints("i32", &[9], &source);
+    let key = "k".repeat(128 * 1024);
+    let before = source.used_bytes();
+    for (target, succeeds) in [(&small, false), (&enough, true)] {
+        let mut inputs = CapturedChildren::new(1, &source).unwrap();
+        inputs.push(NativeStructInput::new(&key, child.clone(), &source).unwrap()).unwrap();
+        let result = publish_native("parent", 1, NativeContainerParts::Struct { validity: None, children: inputs }, target);
+        assert_eq!(result.is_ok(), succeeds);
+        assert_eq!(source.used_bytes(), before);
+        if let Ok(parent) = result {
+            assert_eq!(parent.key_names().unwrap().next(), Some(key.as_str()));
+            assert_eq!(parent.vector_for(&key).unwrap().unwrap().descriptor().name(), "i32");
+            let snapshot = parent.snapshot_reader(target).unwrap();
+            drop(parent);
+            assert_eq!(snapshot.key_names().unwrap().next(), Some(key.as_str()));
+            drop(snapshot);
+        }
+        assert_eq!(target.used_bytes(), 0);
+    }
+    drop(child);
+    assert_eq!(source.used_bytes(), 0);
 }

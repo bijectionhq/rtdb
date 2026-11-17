@@ -46,11 +46,22 @@ impl From<VectorTypeResult<LogicalType>> for LogicalMetadata {
 #[derive(Debug)]
 pub enum UnionEncoding { DeclaredIds(Vec<i8>), Ordinal }
 
+/// An ordered Struct entry whose lookup key is independent of its child's field name.
+/// Both values are retained by the containing VectorDescriptor; borrowing an entry does not allocate.
+#[derive(Debug)]
+pub struct StructFieldDescriptor { key: String, descriptor: Arc<VectorDescriptor> }
+impl StructFieldDescriptor {
+    /// Borrows the key used by Struct lookup and logical type construction.
+    pub fn key(&self) -> &str { &self.key }
+    /// Borrows the actual child descriptor; shallow Arc clones retain its metadata lease.
+    pub fn descriptor(&self) -> &Arc<VectorDescriptor> { &self.descriptor }
+}
+
 /// Concrete container shape with retained children in source order.
 /// The descriptor exposes this shape by borrow; child Arc clones retain their metadata leases.
 #[derive(Debug)]
 pub enum ContainerKind {
-    Struct(Vec<Arc<VectorDescriptor>>),
+    Struct(Vec<StructFieldDescriptor>),
     List(Arc<VectorDescriptor>),
     Set(Arc<VectorDescriptor>),
     FixedList { size: i32, elements: Arc<VectorDescriptor> },
@@ -75,8 +86,11 @@ impl<'a> ScalarDescriptorRef<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct StructFieldRef<'a> { pub key: &'a str, pub descriptor: &'a Arc<VectorDescriptor> }
+
+#[derive(Clone, Copy)]
 pub(super) enum ContainerShapeRef<'a> {
-    Struct(&'a [Arc<VectorDescriptor>]),
+    Struct(&'a [StructFieldRef<'a>]),
     List(&'a Arc<VectorDescriptor>),
     Set(&'a Arc<VectorDescriptor>),
     FixedList { size: i32, elements: &'a Arc<VectorDescriptor> },
@@ -87,11 +101,12 @@ pub(super) enum ContainerShapeRef<'a> {
 }
 impl<'a> ContainerShapeRef<'a> {
     fn child_count(self) -> usize {
-        match self { Self::Struct(children) | Self::OrdinalUnion(children) => children.len(), Self::RunEnd { .. } => 2, _ => 1 }
+        match self { Self::Struct(children) => children.len(), Self::OrdinalUnion(children) => children.len(), Self::RunEnd { .. } => 2, _ => 1 }
     }
     fn child(self, index: usize) -> Option<&'a Arc<VectorDescriptor>> {
         match self {
-            Self::Struct(children) | Self::OrdinalUnion(children) => children.get(index),
+            Self::Struct(children) => children.get(index).map(|field| field.descriptor),
+            Self::OrdinalUnion(children) => children.get(index),
             Self::RunEnd { ends, values } => match index { 0 => Some(ends), 1 => Some(values), _ => None },
             Self::List(child) | Self::Set(child) | Self::TimestampRange(child)
             | Self::FixedList { elements: child, .. } | Self::Map { entries: child, .. } => (index == 0).then_some(child),
@@ -99,7 +114,7 @@ impl<'a> ContainerShapeRef<'a> {
     }
     fn retain(self) -> ContainerKind {
         match self {
-            Self::Struct(children) => ContainerKind::Struct(children.to_vec()),
+            Self::Struct(children) => ContainerKind::Struct(children.iter().map(|field| StructFieldDescriptor { key: field.key.to_owned(), descriptor: Arc::clone(field.descriptor) }).collect()),
             Self::List(child) => ContainerKind::List(Arc::clone(child)),
             Self::Set(child) => ContainerKind::Set(Arc::clone(child)),
             Self::FixedList { size, elements } => ContainerKind::FixedList { size, elements: Arc::clone(elements) },
@@ -140,14 +155,16 @@ pub(super) enum Declaration { Arrow(Arc<Field>), Native }
 impl ContainerKind {
     fn child_count(&self) -> usize {
         match self {
-            Self::Struct(children) | Self::DenseUnion { children, .. } => children.len(),
+            Self::Struct(children) => children.len(),
+            Self::DenseUnion { children, .. } => children.len(),
             Self::RunEnd { .. } => 2,
             _ => 1,
         }
     }
     fn child(&self, index: usize) -> Option<&Arc<VectorDescriptor>> {
         match self {
-            Self::Struct(children) | Self::DenseUnion { children, .. } => children.get(index),
+            Self::Struct(children) => children.get(index).map(|field| &field.descriptor),
+            Self::DenseUnion { children, .. } => children.get(index),
             Self::RunEnd { ends, values } => match index { 0 => Some(ends), 1 => Some(values), _ => None },
             Self::List(child) | Self::Set(child) | Self::TimestampRange(child)
             | Self::FixedList { elements: child, .. } | Self::Map { entries: child, .. } => (index == 0).then_some(child),
@@ -156,12 +173,12 @@ impl ContainerKind {
     fn logical(&self) -> Result<LogicalMetadata> {
         if let Self::Struct(children) = self {
             for (index, child) in children.iter().enumerate() {
-                if children[..index].iter().any(|earlier| earlier.name() == child.name()) { return Err(layout()); }
+                if children[..index].iter().any(|earlier| earlier.key == child.key) { return Err(layout()); }
             }
         }
         let logical = match self {
             Self::Struct(children) => {
-                let fields = children.iter().map(|child| child.logical_type().map(|logical| (child.name().to_owned(), logical.clone())))
+                let fields = children.iter().map(|field| field.descriptor.logical_type().map(|logical| (field.key.clone(), logical.clone())))
                     .collect::<VectorTypeResult<BTreeMap<_, _>>>();
                 fields.map(LogicalType::Struct)
             },
@@ -241,6 +258,9 @@ impl VectorDescriptor {
         for (key, value) in self.metadata() { bytes = bytes.checked_add(key.len()).and_then(|n| n.checked_add(value.len())).ok_or_else(allocation)?; }
         let mut maximum = depth;
         if let Some(kind) = self.container() {
+            if let ContainerKind::Struct(fields) = kind {
+                for field in fields { bytes = bytes.checked_add(field.key.len()).ok_or_else(allocation)?; }
+            }
             for index in 0..kind.child_count() {
                 let (child_bytes, child_depth) = kind.child(index).ok_or_else(layout)?.bound(depth + 1)?;
                 bytes = bytes.checked_add(child_bytes).ok_or_else(allocation)?;
@@ -253,7 +273,7 @@ impl VectorDescriptor {
     fn project(&self) -> Result<Field> {
         let DescriptorShape::Container { name, nullable, metadata, kind, .. } = &self.shape else { return Ok(self.scalar_field().ok_or_else(layout)?.clone()); };
         let data_type = match kind {
-            ContainerKind::Struct(children) => DataType::Struct(children.iter().map(|child| child.project().map(Arc::new)).collect::<Result<Vec<_>>>()?.into()),
+            ContainerKind::Struct(children) => DataType::Struct(children.iter().map(|field| field.descriptor.project().map(Arc::new)).collect::<Result<Vec<_>>>()?.into()),
             ContainerKind::List(child) | ContainerKind::Set(child) => DataType::List(Arc::new(child.project()?)),
             ContainerKind::FixedList { size, elements } => DataType::FixedSizeList(Arc::new(elements.project()?), *size),
             ContainerKind::TimestampRange(child) => DataType::FixedSizeList(Arc::new(child.project()?), 2),
@@ -276,7 +296,10 @@ impl VectorDescriptor {
                 let logical = crate::execution_field_type(&field)?;
                 return Ok(Arc::new(Self { shape: DescriptorShape::Scalar { field, logical }, reservation }));
             },
-            (NodeLayout::Struct { children, .. }, DataType::Struct(_)) => ContainerKind::Struct(children.iter().map(|child| Arc::clone(&child.descriptor)).collect()),
+            (NodeLayout::Struct { children, .. }, DataType::Struct(fields)) => {
+                if fields.len() != children.len() { return Err(layout()); }
+                ContainerKind::Struct(fields.iter().zip(children).map(|(field, child)| StructFieldDescriptor { key: field.name().clone(), descriptor: Arc::clone(&child.descriptor) }).collect())
+            },
             (NodeLayout::List { elements, .. }, DataType::List(_)) => {
                 let child = Arc::clone(&elements.descriptor);
                 if ingress.metadata().get(crate::EXTENSION_NAME_KEY).is_some_and(|name| name == "set") { ContainerKind::Set(child) } else { ContainerKind::List(child) }
@@ -309,11 +332,12 @@ impl VectorDescriptor {
         if let ContainerShapeRef::RunEnd { ends, .. } = shape {
             if ends.reader_nullable() || ends.run_end_width().is_none() { return Err(layout()); }
         }
-        let mut bytes = 4096usize.checked_add(name.len()).and_then(|n| n.checked_add(shape.child_count().checked_mul(std::mem::size_of::<Arc<Self>>())?)).ok_or_else(allocation)?;
+        let slot_bytes = if matches!(shape, ContainerShapeRef::Struct(_)) { std::mem::size_of::<StructFieldDescriptor>() } else { std::mem::size_of::<Arc<Self>>() };
+        let mut bytes = 4096usize.checked_add(name.len()).and_then(|n| n.checked_add(shape.child_count().checked_mul(slot_bytes)?)).ok_or_else(allocation)?;
         for index in 0..shape.child_count() {
             let child = shape.child(index).ok_or_else(layout)?;
             let (_, join_depth) = child.bound(2)?;
-            if matches!(shape, ContainerShapeRef::Struct(_)) { bytes = bytes.checked_add(child.name().len()).ok_or_else(allocation)?; }
+            if let ContainerShapeRef::Struct(fields) = shape { bytes = bytes.checked_add(fields[index].key.len()).ok_or_else(allocation)?; }
             let demands_type = match shape { ContainerShapeRef::TimestampRange(_) => false, ContainerShapeRef::RunEnd { .. } => index == 1, _ => true };
             if demands_type {
                 let mut logical_bytes = match child.logical_type() { Ok(logical) => logical.retained_bytes()?, Err(_) => std::mem::size_of::<VectorTypeFailure>() };
@@ -556,12 +580,12 @@ mod tests {
         let vector = ExecutionVector::with_reservation(Arc::new(ingress.clone()), array, reservation).unwrap();
         assert_eq!(vector.ingress_field().arrow(), Some(&ingress));
         let Some(ContainerKind::Struct(children)) = vector.descriptor().container() else { panic!(); };
-        assert!(matches!(children[0].container(), Some(ContainerKind::List(_))));
-        assert!(matches!(children[1].container(), Some(ContainerKind::Set(_))));
-        assert!(matches!(children[2].container(), Some(ContainerKind::FixedList { size: 3, .. })));
-        assert!(matches!(children[3].container(), Some(ContainerKind::TimestampRange(_))));
-        assert!(matches!(children[4].container(), Some(ContainerKind::Map { sorted: true, .. })));
-        assert!(matches!(children[5].container(), Some(ContainerKind::RunEnd { .. })));
+        assert!(matches!(children[0].descriptor().container(), Some(ContainerKind::List(_))));
+        assert!(matches!(children[1].descriptor().container(), Some(ContainerKind::Set(_))));
+        assert!(matches!(children[2].descriptor().container(), Some(ContainerKind::FixedList { size: 3, .. })));
+        assert!(matches!(children[3].descriptor().container(), Some(ContainerKind::TimestampRange(_))));
+        assert!(matches!(children[4].descriptor().container(), Some(ContainerKind::Map { sorted: true, .. })));
+        assert!(matches!(children[5].descriptor().container(), Some(ContainerKind::RunEnd { .. })));
         let projected = vector.arrow_field().unwrap();
         assert_eq!(projected.field(), &expected);
         assert_eq!(vector.logical_type().unwrap(), &crate::execution_field_type(projected.field()).unwrap());

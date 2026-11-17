@@ -1,4 +1,7 @@
-use super::descriptor::ContainerShapeRef;
+mod inputs;
+
+pub(super) use inputs::{CapturedChildren, NativeStructInput};
+use super::descriptor::{ContainerShapeRef, StructFieldRef};
 use super::native_scalar::{StoredBits, StoredBytes};
 use super::*;
 
@@ -8,10 +11,10 @@ pub(super) enum NativeListKind { List, Set, Map { sorted: bool } }
 pub(super) enum NativeFixedKind { List(i32), TimestampRange }
 
 pub(super) enum NativeContainerParts {
-    Struct { validity: Option<StoredBits>, children: Vec<ExecutionVector> },
+    Struct { validity: Option<StoredBits>, children: CapturedChildren<NativeStructInput> },
     List { kind: NativeListKind, validity: Option<StoredBits>, offsets: StoredBytes, last_offset: i32, elements: ExecutionVector },
     FixedList { kind: NativeFixedKind, validity: Option<StoredBits>, elements: ExecutionVector },
-    Union { type_ids: StoredBytes, offsets: StoredBytes, children: Vec<ExecutionVector> },
+    Union { type_ids: StoredBytes, offsets: StoredBytes, children: CapturedChildren<ExecutionVector> },
     RunEnd { ends: ExecutionVector, values: ExecutionVector },
 }
 
@@ -59,8 +62,21 @@ impl ContainerOffsets<'_> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct StructChildren<'a> { fields: &'a [StructFieldDescriptor], nodes: &'a [Arc<PhysicalNode>] }
+impl<'a> StructChildren<'a> {
+    fn new(node: &'a PhysicalNode, nodes: &'a [Arc<PhysicalNode>]) -> Option<Self> {
+        let ContainerKind::Struct(fields) = node.descriptor.container()? else { return None; };
+        (fields.len() == nodes.len() && fields.iter().zip(nodes).all(|(field, node)| Arc::ptr_eq(field.descriptor(), &node.descriptor))).then_some(Self { fields, nodes })
+    }
+    pub(super) fn iter(self) -> impl ExactSizeIterator<Item = (&'a str, &'a Arc<PhysicalNode>)> + DoubleEndedIterator {
+        self.fields.iter().zip(self.nodes).map(|(field, node)| (field.key(), node))
+    }
+    pub(super) fn len(self) -> usize { self.nodes.len() }
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum ContainerStorageRef<'a> {
-    Struct { validity: ContainerValidity<'a>, children: &'a [Arc<PhysicalNode>] },
+    Struct { validity: ContainerValidity<'a>, children: StructChildren<'a> },
     List { validity: ContainerValidity<'a>, offsets: ContainerOffsets<'a>, elements: &'a Arc<PhysicalNode> },
     FixedList { validity: ContainerValidity<'a>, size: i32, elements: &'a Arc<PhysicalNode> },
     Union { type_ids: &'a [u8], offsets: ContainerOffsets<'a>, children: &'a [Arc<PhysicalNode>] },
@@ -72,13 +88,13 @@ impl PhysicalNode {
     }
     pub(super) fn container(&self) -> Option<ContainerStorageRef<'_>> {
         Some(match &self.storage {
-            NodeLayout::Struct { validity, children } => ContainerStorageRef::Struct { validity: self.sdk_validity(validity.as_ref()), children },
+            NodeLayout::Struct { validity, children } => ContainerStorageRef::Struct { validity: self.sdk_validity(validity.as_ref()), children: StructChildren::new(self, children)? },
             NodeLayout::List { validity, offsets, elements } => ContainerStorageRef::List { validity: self.sdk_validity(validity.as_ref()), offsets: ContainerOffsets::Sdk(offsets), elements },
             NodeLayout::FixedList { validity, size, elements } => ContainerStorageRef::FixedList { validity: self.sdk_validity(validity.as_ref()), size: *size as i32, elements },
             NodeLayout::Union { type_ids, offsets, children } => ContainerStorageRef::Union { type_ids: type_ids.as_slice(), offsets: ContainerOffsets::Sdk(offsets), children },
             NodeLayout::NativeContainer(storage) => {
                 match storage {
-                    NativeContainerStorage::Struct { validity: bits, children } => ContainerStorageRef::Struct { validity: native_validity(bits.as_ref()), children },
+                    NativeContainerStorage::Struct { validity: bits, children } => ContainerStorageRef::Struct { validity: native_validity(bits.as_ref()), children: StructChildren::new(self, children)? },
                     NativeContainerStorage::List { validity: bits, offsets, elements, .. } => ContainerStorageRef::List { validity: native_validity(bits.as_ref()), offsets: ContainerOffsets::Native(offsets), elements },
                     NativeContainerStorage::FixedList { validity: bits, elements } => {
                         let size = match self.descriptor.container()? { ContainerKind::FixedList { size, .. } => *size, ContainerKind::TimestampRange(_) => 2, _ => return None };
@@ -97,28 +113,29 @@ fn check_bits(bits: Option<&StoredBits>) -> Result<()> {
     if bits.is_some_and(|bits| bits.byte_append > bits.bytes.len()) { Err(layout()) } else { Ok(()) }
 }
 
-/// The caller must admit the input child-vector capacity before constructing `parts` and retain that lease through this call.
-/// Publication reserves the overlapping input, new node and descriptor-reference slots; it does not admit an earlier allocation retroactively.
 pub(super) fn publish_native(name: &str, length: usize, parts: NativeContainerParts, memory: &Arc<crate::MemoryBudget>) -> Result<ExecutionVector> {
     vector_length(length)?;
     let slots = match &parts {
-        NativeContainerParts::Struct { children, .. } | NativeContainerParts::Union { children, .. } => { vector_length(children.len())?; children.capacity() },
+        NativeContainerParts::Struct { children, .. } => children.capacity(),
+        NativeContainerParts::Union { children, .. } => children.capacity(),
         NativeContainerParts::RunEnd { .. } => 2,
         _ => 1,
     };
-    let bytes = slots.checked_mul(std::mem::size_of::<ExecutionVector>() + 3 * std::mem::size_of::<Arc<PhysicalNode>>()).and_then(|n| n.checked_add(2048)).ok_or_else(allocation)?;
+    let bytes = slots.checked_mul(std::mem::size_of::<ExecutionVector>() + 3 * std::mem::size_of::<Arc<PhysicalNode>>() + std::mem::size_of::<StructFieldRef<'_>>()).and_then(|n| n.checked_add(2048)).ok_or_else(allocation)?;
     let metadata = memory.reserve(bytes)?;
-    let children = |children: Vec<ExecutionVector>| -> Result<Vec<Arc<PhysicalNode>>> {
+    let children = |children: &[ExecutionVector]| -> Result<Vec<Arc<PhysicalNode>>> {
         let mut nodes = Vec::with_capacity(children.len());
-        for child in children { nodes.push(child.into_direct()?); }
+        for child in children { nodes.push(child.clone().into_direct()?); }
         Ok(nodes)
     };
     let (descriptor, storage) = match parts {
         NativeContainerParts::Struct { validity, children: inputs } => {
             check_bits(validity.as_ref())?;
-            let children = children(inputs)?;
-            let descriptors = children.iter().map(|child| Arc::clone(&child.descriptor)).collect::<Vec<_>>();
+            let mut children = Vec::with_capacity(inputs.as_slice().len());
+            for input in inputs.as_slice() { children.push(input.vector.clone().into_direct()?); }
+            let descriptors = inputs.as_slice().iter().zip(&children).map(|(input, child)| StructFieldRef { key: input.key(), descriptor: &child.descriptor }).collect::<Vec<_>>();
             let descriptor = VectorDescriptor::native_container(name, validity.is_some(), ContainerShapeRef::Struct(&descriptors), memory)?;
+            drop(descriptors);
             (descriptor, NodeLayout::NativeContainer(NativeContainerStorage::Struct { validity, children }))
         },
         NativeContainerParts::List { kind, validity, offsets, last_offset, elements } => {
@@ -141,7 +158,7 @@ pub(super) fn publish_native(name: &str, length: usize, parts: NativeContainerPa
         },
         NativeContainerParts::Union { type_ids, offsets, children: inputs } => {
             check_bytes(&type_ids)?; check_bytes(&offsets)?;
-            let children = children(inputs)?;
+            let children = children(inputs.as_slice())?;
             let descriptors = children.iter().map(|child| Arc::clone(&child.descriptor)).collect::<Vec<_>>();
             let descriptor = VectorDescriptor::native_container(name, false, ContainerShapeRef::OrdinalUnion(&descriptors), memory)?;
             (descriptor, NodeLayout::NativeContainer(NativeContainerStorage::Union { type_ids, offsets, children }))
