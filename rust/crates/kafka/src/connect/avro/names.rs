@@ -2,6 +2,9 @@ use apache_avro::{AvroResult, error::Details, schema::{Name, Namespace, RecordFi
 use rtdb_types::Result;
 use super::{Avro, error};
 
+mod grammar;
+pub(super) use grammar::validate_ordered;
+
 static BMP_FLAGS: &[u8; 16384] = include_bytes!("names/bmp-flags.bin");
 
 pub(super) struct JavaNames;
