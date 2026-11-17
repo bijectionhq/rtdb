@@ -151,24 +151,9 @@ fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Ar
 }
 
 pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
-    let data_type = match (&storage, ingress.data_type()) {
-        (NodeLayout::Struct { children, .. }, DataType::Struct(_)) => DataType::Struct(children.iter().map(|child| Arc::clone(&child.field)).collect()),
-        (NodeLayout::List { elements, .. }, DataType::List(_)) => DataType::List(Arc::clone(&elements.field)),
-        (NodeLayout::List { elements, .. }, DataType::Map(_, sorted)) => DataType::Map(Arc::clone(&elements.field), *sorted),
-        (NodeLayout::FixedList { elements, .. }, DataType::FixedSizeList(_, size)) => DataType::FixedSizeList(Arc::clone(&elements.field), *size),
-        (NodeLayout::Union { children, .. }, DataType::Union(fields, mode)) => DataType::Union(
-            arrow_schema::UnionFields::try_new(fields.iter().map(|(id, _)| id), children.iter().map(|child| Arc::clone(&child.field))).map_err(crate::arrow_error)?, *mode),
-        (NodeLayout::RunEnd { ends, values, .. }, DataType::RunEndEncoded(_, _)) => {
-            storage::check_runs(ends, values, length)?;
-            DataType::RunEndEncoded(Arc::clone(&ends.field), Arc::clone(&values.field))
-        }
-        (NodeLayout::Leaf { .. } | NodeLayout::Scalar(_), data_type) => scalar_data_type(data_type)?,
-        _ => return Err(layout()),
-    };
-    let nullable = if matches!(&storage, NodeLayout::Union { .. } | NodeLayout::RunEnd { .. }) { false } else { ingress.is_nullable() };
-    let field = Arc::new(ingress.as_ref().clone().with_data_type(data_type).with_nullable(nullable));
-    let logical = crate::execution_field_type(&field)?;
-    Ok(Arc::new(PhysicalNode { ingress, field, logical, length, storage, owner }))
+    if let (NodeLayout::RunEnd { ends, values, .. }, DataType::RunEndEncoded(_, _)) = (&storage, ingress.data_type()) { storage::check_runs(ends, values, length)?; }
+    let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
+    Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, length, storage, owner }))
 }
 
 pub(super) fn scalar_data_type(data_type: &DataType) -> Result<DataType> {

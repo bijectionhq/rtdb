@@ -25,7 +25,7 @@ fn offsets(values: &[i32], memory: &Arc<MemoryBudget>) -> RetainedBuffer {
 }
 
 fn absent_parent(child: ExecutionVector, positions: &[i32], memory: &Arc<MemoryBudget>) -> ExecutionVector {
-    let fields = UnionFields::try_new([0], vec![child.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([0], vec![child.ingress_field().arrow().unwrap().clone()]).unwrap();
     ExecutionVector::from_physical(Arc::new(Field::new("parent", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&vec![255; positions.len()], memory), offsets: offsets(positions, memory), children: vec![child],
     }, memory).unwrap()
@@ -43,7 +43,7 @@ fn empty_required_leg_admits_methods_before_signed_payload_bounds() {
     for reader in [&named, &selected, &composed] {
         for row in 0..reader.len() {
             let cell = reader.cell(row).unwrap();
-            assert_eq!(cell.leaf_field().unwrap().name(), "numbers");
+            assert_eq!(cell.leaf_descriptor().unwrap().name(), "numbers");
             for checks in [NullChecks::Enabled, NullChecks::Disabled] {
                 assert_eq!(anomaly(cell.get_boolean(checks).unwrap_err()).code, "rtdb/unsupported-vector-reader");
                 assert_eq!(anomaly(cell.get_long(checks).unwrap_err()).code, "rtdb/row-index");
@@ -150,7 +150,7 @@ fn run_end_forwarding_keeps_storage_free_leaf_methods_and_signed_search_position
     for populated in [false, true] {
         let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(if populated { vec![2] } else { vec![] })), &memory);
         let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(if populated { vec![73] } else { vec![] })), &memory);
-        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
         let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: if populated { 2 } else { 0 }, run_ends: ends, values }, &memory).unwrap();
         let parent = absent_parent(runs, &[0, -1, i32::MAX], &memory);
         let named = parent.vector_for("runs").unwrap().unwrap();
@@ -176,7 +176,7 @@ fn empty_run_end_null_values_keep_constant_nullness_after_named_selection() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(Vec::<i32>::new())), &memory);
     let values = open(Field::new("values", DataType::Null, true), Arc::new(NullArray::new(0)), &memory);
-    let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
     let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 0, run_ends: ends, values }, &memory).unwrap();
     let parent = absent_parent(runs, &[0, -1, i32::MAX], &memory);
     let selected = parent.vector_for("runs").unwrap().unwrap().select(&Selection::All).unwrap();
@@ -193,7 +193,7 @@ fn empty_run_end_null_values_keep_constant_nullness_after_named_selection() {
 fn fixed_list_offset_getters_keep_signed_arithmetic_without_row_access() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let elements = open(Field::new("item", DataType::Int64, false), Arc::new(Int64Array::from(Vec::<i64>::new())), &memory);
-    let field = Arc::new(Field::new("items", DataType::FixedSizeList(Arc::new(elements.ingress_field().clone()), 3), false));
+    let field = Arc::new(Field::new("items", DataType::FixedSizeList(Arc::new(elements.ingress_field().arrow().unwrap().clone()), 3), false));
     let list = ExecutionVector::from_physical(field, PhysicalLayout::FixedSizeList { length: 0, validity: None, elements }, &memory).unwrap();
     let parent = absent_parent(list, &[0, -1, i32::MAX], &memory);
     let named = parent.vector_for("items").unwrap().unwrap();
@@ -212,7 +212,7 @@ fn fixed_list_offset_getters_keep_signed_arithmetic_without_row_access() {
 fn variable_list_start_getter_reads_terminal_offset_without_consuming_end() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let elements = open(Field::new("item", DataType::Int64, false), Arc::new(Int64Array::from(Vec::<i64>::new())), &memory);
-    let field = Arc::new(Field::new("items", DataType::List(Arc::new(elements.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("items", DataType::List(Arc::new(elements.ingress_field().arrow().unwrap().clone())), false));
     let list = ExecutionVector::from_physical(field, PhysicalLayout::List { length: 0, validity: None, offsets: offsets(&[0], &memory), elements }, &memory).unwrap();
     let parent = absent_parent(list, &[0, -1, i32::MAX], &memory);
     let named = parent.vector_for("items").unwrap().unwrap();
@@ -253,7 +253,7 @@ fn absent_primitive_receivers_remain_raw_through_indirect_and_run_end_readers() 
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let values = union("values", &[255, 128], &[-1, i32::MAX], &memory);
     let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(vec![2, 5])), &memory);
-    let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
     let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 5, run_ends: ends, values: values.clone() }, &memory).unwrap();
     for vector in [&values, &runs] {
         for row in 0..vector.len() { assert_absent_primitives(vector.cell(row).unwrap()); }
@@ -278,7 +278,7 @@ fn absent_primitive_receivers_remain_raw_through_indirect_and_run_end_readers() 
 fn named_reader_primitive_absence_comes_from_inner_receiver_not_outer_mask() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let inner = union("inner", &[255, 7], &[0, 1], &memory);
-    let fields = UnionFields::try_new([3], vec![inner.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([3], vec![inner.ingress_field().arrow().unwrap().clone()]).unwrap();
     let outer = ExecutionVector::from_physical(Arc::new(Field::new("outer", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[3, 255], &memory), offsets: offsets(&[0, 1], &memory), children: vec![inner],
     }, &memory).unwrap();
@@ -345,7 +345,7 @@ fn absent_union_bytes_are_not_explicit_null_or_nullable_duration() {
     }
     let duration = vector.cell(2).unwrap();
     assert!(duration.is_null().unwrap());
-    assert_eq!(duration.leaf_field().unwrap().name(), "custom-duration");
+    assert_eq!(duration.leaf_descriptor().unwrap().name(), "custom-duration");
     assert_eq!(duration.get_long(NullChecks::Disabled).unwrap(), 71);
     assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 0"));
     assert_eq!(duration.object().unwrap().value(), &Value::Null);
@@ -398,7 +398,7 @@ fn inactive_leg_offset_is_checked_only_when_the_reader_consumes_it() {
 fn absent_union_empty_leg_selects_before_final_child_bounds_are_consumed() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let child = open(Field::new("numbers", DataType::Int64, false), Arc::new(Int64Array::from(Vec::<i64>::new())), &memory);
-    let fields = UnionFields::try_new([0], vec![child.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([0], vec![child.ingress_field().arrow().unwrap().clone()]).unwrap();
     let vector = ExecutionVector::from_physical(Arc::new(Field::new("u", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[255, 255, 255], &memory), offsets: offsets(&[0, -1, i32::MAX], &memory), children: vec![child],
     }, &memory).unwrap();
@@ -406,7 +406,7 @@ fn absent_union_empty_leg_selects_before_final_child_bounds_are_consumed() {
     for selection in [Selection::All, Selection::Range { offset: 0, length: 3 }, Selection::Indices(vec![2, 1, 0])] {
         let selected = leg.select(&selection).unwrap();
         assert_eq!(selected.len(), 3);
-        assert_eq!(selected.field().name(), "numbers");
+        assert_eq!(selected.descriptor().name(), "numbers");
         for row in 0..3 {
             assert_eq!(anomaly(selected.cell(row).unwrap().get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/row-index");
         }
@@ -426,11 +426,11 @@ fn absent_union_empty_leg_selects_before_final_child_bounds_are_consumed() {
 fn nested_leg_selection_reads_intermediate_offsets_but_defers_final_leaf_bounds() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let leaf = open(Field::new("numbers", DataType::Int64, false), Arc::new(Int64Array::from(Vec::<i64>::new())), &memory);
-    let fields = UnionFields::try_new([3], vec![leaf.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([3], vec![leaf.ingress_field().arrow().unwrap().clone()]).unwrap();
     let inner = ExecutionVector::from_physical(Arc::new(Field::new("inner", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[255], &memory), offsets: offsets(&[-7], &memory), children: vec![leaf],
     }, &memory).unwrap();
-    let fields = UnionFields::try_new([4], vec![inner.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([4], vec![inner.ingress_field().arrow().unwrap().clone()]).unwrap();
     let outer = ExecutionVector::from_physical(Arc::new(Field::new("outer", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[255, 255, 255], &memory), offsets: offsets(&[0, -1, i32::MAX], &memory), children: vec![inner],
     }, &memory).unwrap();
@@ -464,7 +464,7 @@ fn absent_union_under_nullable_struct_is_hidden_only_by_logical_object_guard() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     for nullable in [true, false] {
         let child = union("u", &[255], &[0], &memory);
-        let field = Arc::new(Field::new("s", DataType::Struct(Fields::from(vec![child.ingress_field().clone()])), nullable));
+        let field = Arc::new(Field::new("s", DataType::Struct(Fields::from(vec![child.ingress_field().arrow().unwrap().clone()])), nullable));
         let vector = ExecutionVector::from_physical(field, PhysicalLayout::Struct { length: 1, validity: Some(buffer(&[0], &memory)), children: vec![child] }, &memory).unwrap();
         assert_eq!(vector.cell(0).unwrap().is_null().unwrap(), nullable);
         assert!(vector.cell(0).unwrap().raw_struct_field("u").unwrap().unwrap().as_ref().object().is_err());
@@ -479,7 +479,7 @@ fn native_list_fixed_list_and_run_end_retain_absent_children() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     for fixed in [false, true] {
         let child = union("item", &[7, 255], &[1, 0], &memory);
-        let ty = if fixed { DataType::FixedSizeList(Arc::new(child.ingress_field().clone()), 2) } else { DataType::List(Arc::new(child.ingress_field().clone())) };
+        let ty = if fixed { DataType::FixedSizeList(Arc::new(child.ingress_field().arrow().unwrap().clone()), 2) } else { DataType::List(Arc::new(child.ingress_field().arrow().unwrap().clone())) };
         let layout = if fixed { PhysicalLayout::FixedSizeList { length: 1, validity: None, elements: child } }
             else { PhysicalLayout::List { length: 1, validity: None, offsets: offsets(&[0, 2], &memory), elements: child } };
         let vector = ExecutionVector::from_physical(Arc::new(Field::new("l", ty, false)), layout, &memory).unwrap();
@@ -491,7 +491,7 @@ fn native_list_fixed_list_and_run_end_retain_absent_children() {
     }
     let values = union("values", &[255, 7], &[0, 1], &memory);
     let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(vec![2, 4])), &memory);
-    let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
     let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 4, run_ends: ends, values }, &memory).unwrap();
     assert_eq!(runs.cell(0).unwrap().leg_name().unwrap(), None);
     assert_eq!(runs.cell(3).unwrap().leg_name().unwrap(), Some("custom-duration"));
@@ -509,17 +509,18 @@ fn native_list_fixed_list_and_run_end_retain_absent_children() {
 fn opened_metadata_canonicalizes_signed_width_and_zone_without_changing_ingress() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let integers = open(Field::new("unsigned-name", DataType::UInt32, false), Arc::new(UInt32Array::from(vec![u32::MAX])), &memory);
-    assert_eq!(integers.ingress_field().data_type(), &DataType::UInt32);
-    assert_eq!(integers.field().data_type(), &DataType::Int32);
+    assert_eq!(integers.ingress_field().arrow().unwrap().data_type(), &DataType::UInt32);
+    assert_eq!(integers.descriptor().scalar_field().unwrap().data_type(), &DataType::Int32);
     assert_eq!(integers.logical_type(), &LogicalType::Scalar(ScalarType::I32));
     assert_eq!(integers.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), -1);
     assert_eq!(integers.cell(0).unwrap().object().unwrap().value(), &Value::I32(-1));
     let array = TimestampMicrosecondArray::from(vec![123]).with_timezone("+01");
     let timestamps = open(Field::new("zone-name", array.data_type().clone(), false), Arc::new(array), &memory);
-    assert_eq!(timestamps.ingress_field().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("+01".into())));
-    assert_eq!(timestamps.field().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into())));
-    let parent = ExecutionVector::from_physical(Arc::new(Field::new("s", DataType::Struct(Fields::from(vec![integers.ingress_field().clone(), timestamps.ingress_field().clone()])), false)), PhysicalLayout::Struct { length: 1, validity: None, children: vec![integers, timestamps] }, &memory).unwrap();
-    let DataType::Struct(fields) = parent.field().data_type() else { panic!() };
+    assert_eq!(timestamps.ingress_field().arrow().unwrap().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("+01".into())));
+    assert_eq!(timestamps.descriptor().scalar_field().unwrap().data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into())));
+    let parent = ExecutionVector::from_physical(Arc::new(Field::new("s", DataType::Struct(Fields::from(vec![integers.ingress_field().arrow().unwrap().clone(), timestamps.ingress_field().arrow().unwrap().clone()])), false)), PhysicalLayout::Struct { length: 1, validity: None, children: vec![integers, timestamps] }, &memory).unwrap();
+    let projected = parent.arrow_field().unwrap();
+    let DataType::Struct(fields) = projected.field().data_type() else { panic!() };
     assert_eq!(fields[0].data_type(), &DataType::Int32);
     assert_eq!(fields[1].data_type(), &DataType::Timestamp(TimeUnit::Microsecond, Some("+01:00".into())));
     let value = parent.cell(0).unwrap().object().unwrap();
@@ -640,10 +641,10 @@ fn named_struct_child_retains_outer_offset_and_discriminator() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let required = open(Field::new("required", DataType::Int64, false), Arc::new(Int64Array::from(vec![11, 29])), &memory);
     let optional = open(Field::new("optional", DataType::Int64, true), Arc::new(Int64Array::new(vec![41, 43].into(), Some(NullBuffer::from(vec![true, false])))), &memory);
-    let structure = ExecutionVector::from_physical(Arc::new(Field::new("named-struct", DataType::Struct(Fields::from(vec![required.ingress_field().clone(), optional.ingress_field().clone()])), true)), PhysicalLayout::Struct {
+    let structure = ExecutionVector::from_physical(Arc::new(Field::new("named-struct", DataType::Struct(Fields::from(vec![required.ingress_field().arrow().unwrap().clone(), optional.ingress_field().arrow().unwrap().clone()])), true)), PhysicalLayout::Struct {
         length: 2, validity: Some(buffer(&[0], &memory)), children: vec![required, optional],
     }, &memory).unwrap();
-    let fields = UnionFields::try_new([4], vec![structure.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([4], vec![structure.ingress_field().arrow().unwrap().clone()]).unwrap();
     let vector = ExecutionVector::from_physical(Arc::new(Field::new("u", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[4, 255], &memory), offsets: offsets(&[1, 0], &memory), children: vec![structure],
     }, &memory).unwrap();
@@ -668,12 +669,12 @@ fn native_container_validation_rejects_bad_offsets_and_selected_children() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     for positions in [vec![0, 3], vec![1, 0], vec![-1, 1], vec![0]] {
         let child = open(Field::new("item", DataType::Int32, false), Arc::new(Int32Array::from(vec![1, 2])), &memory);
-        let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().clone())), false));
+        let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().arrow().unwrap().clone())), false));
         assert!(ExecutionVector::from_physical(field, PhysicalLayout::List { length: 1, validity: None, offsets: offsets(&positions, &memory), elements: child }, &memory).is_err());
         assert_eq!(memory.used_bytes(), 0);
     }
     let child = open(Field::new("item", DataType::Int32, false), Arc::new(Int32Array::from(vec![1, 2])), &memory).select(&Selection::Range { offset: 0, length: 2 }).unwrap();
-    let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().arrow().unwrap().clone())), false));
     assert_eq!(ExecutionVector::from_physical(field, PhysicalLayout::List { length: 1, validity: None, offsets: offsets(&[0, 2], &memory), elements: child }, &memory).unwrap_err().code, "rtdb/physical-child-view");
     assert_eq!(memory.used_bytes(), 0);
     let field = Arc::new(Field::new("s", DataType::Struct(Fields::empty()), false));
@@ -686,7 +687,7 @@ fn native_union_rejects_unknown_positive_ids_and_live_child_bounds() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     for (id, position) in [(8, 0), (7, 2), (7, -1)] {
         let child = open(Field::new("i", DataType::Int64, false), Arc::new(Int64Array::from(vec![1, 2])), &memory);
-        let fields = UnionFields::try_new([7], vec![child.ingress_field().clone()]).unwrap();
+        let fields = UnionFields::try_new([7], vec![child.ingress_field().arrow().unwrap().clone()]).unwrap();
         let field = Arc::new(Field::new("u", DataType::Union(fields, UnionMode::Dense), false));
         assert!(ExecutionVector::from_physical(field, PhysicalLayout::DenseUnion { type_ids: buffer(&[id], &memory), offsets: offsets(&[position], &memory), children: vec![child] }, &memory).is_err());
         assert_eq!(memory.used_bytes(), 0);
@@ -697,12 +698,12 @@ fn native_union_rejects_unknown_positive_ids_and_live_child_bounds() {
 fn union_opened_parent_has_no_validity_even_when_ingress_declares_nullable() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let child = open(Field::new("i", DataType::Int64, false), Arc::new(Int64Array::from(vec![1])), &memory);
-    let fields = UnionFields::try_new([0], vec![child.ingress_field().clone()]).unwrap();
+    let fields = UnionFields::try_new([0], vec![child.ingress_field().arrow().unwrap().clone()]).unwrap();
     let vector = ExecutionVector::from_physical(Arc::new(Field::new("u", DataType::Union(fields, UnionMode::Dense), true)), PhysicalLayout::DenseUnion {
         type_ids: buffer(&[0], &memory), offsets: offsets(&[0], &memory), children: vec![child],
     }, &memory).unwrap();
-    assert!(vector.ingress_field().is_nullable());
-    assert!(!vector.field().is_nullable());
+    assert!(vector.ingress_field().arrow().unwrap().is_nullable());
+    assert!(!vector.descriptor().is_nullable());
     assert_eq!(vector.logical_type(), &LogicalType::Scalar(ScalarType::I64));
 }
 
@@ -712,7 +713,7 @@ fn native_short_run_lengths_keep_all_covering_values_owned() {
     for length in [0, 1] {
         let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(vec![2, 5])), &memory);
         let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(vec![42, 73])), &memory);
-        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
         let vector = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length, run_ends: ends, values }, &memory).unwrap();
         assert_eq!(vector.len(), length);
         let selected = vector.select(&Selection::All).unwrap();
@@ -744,7 +745,7 @@ fn native_run_admission_rejects_unused_large_ends_and_releases_children() {
     for length in [0, 1] {
         let ends = open(Field::new("run_ends", DataType::Int64, false), Arc::new(Int64Array::from(vec![1, i64::from(i32::MAX) + 1])), &memory);
         let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(vec![42, 73])), &memory);
-        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+        let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
         assert_eq!(ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length, run_ends: ends, values }, &memory).unwrap_err().code, "rtdb/vector-length");
         assert_eq!(memory.used_bytes(), 0);
     }
@@ -756,7 +757,7 @@ fn native_run_end_validation_and_declared_child_identity_release_owners() {
     for end_values in [vec![0, 2], vec![2, 2], vec![2, 3]] {
         let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(end_values)), &memory);
         let values = open(Field::new("values", DataType::Utf8, false), Arc::new(StringArray::from(vec!["a", "b"])), &memory);
-        let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+        let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
         assert!(ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 4, run_ends: ends, values }, &memory).is_err());
         assert_eq!(memory.used_bytes(), 0);
     }
@@ -771,7 +772,7 @@ fn native_admission_and_leg_selection_failures_release_only_new_allocations() {
     let memory = MemoryBudget::new(1024 * 1024);
     let child = open(Field::new("item", DataType::Int32, false), Arc::new(Int32Array::from(vec![1, 2])), &memory);
     let positions = offsets(&[0, 2], &memory);
-    let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("l", DataType::List(Arc::new(child.ingress_field().arrow().unwrap().clone())), false));
     let before = memory.used_bytes();
     let held = memory.reserve(memory.limit_bytes() - before).unwrap();
     assert_eq!(ExecutionVector::from_physical(field, PhysicalLayout::List { length: 1, validity: None, offsets: positions.clone(), elements: child.clone() }, &memory).unwrap_err().code, "rtdb/memory-budget-exceeded");

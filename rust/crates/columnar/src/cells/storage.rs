@@ -64,14 +64,14 @@ impl PhysicalNode {
     pub(super) fn null(&self, row: PhysicalIndex) -> Result<bool> {
         Ok(match &self.storage {
             NodeLayout::Scalar(storage) => {
-                if self.field.data_type() == &DataType::Null { true }
+                if self.scalar_field()?.data_type() == &DataType::Null { true }
                 else if let Some(bits) = &storage.validity { !super::native_scalar::bit(bits.bytes.as_slice(), self.checked_position(row)?)? }
                 else { false }
             },
-            NodeLayout::Leaf { array, .. } if array.data_type() == &DataType::Null => true,
-            NodeLayout::Leaf { array, .. } => self.field.is_nullable() && array.is_null(self.checked_position(row)?),
+            NodeLayout::Leaf { .. } if self.descriptor.scalar_field().is_some_and(|field| field.data_type() == &DataType::Null) => true,
+            NodeLayout::Leaf { array, .. } => self.descriptor.is_nullable() && array.is_null(self.checked_position(row)?),
             NodeLayout::Struct { validity, .. } | NodeLayout::List { validity, .. } | NodeLayout::FixedList { validity, .. } => {
-                if !self.field.is_nullable() { false } else {
+                if !self.descriptor.is_nullable() { false } else {
                     let row = self.checked_position(row)?;
                     validity.as_ref().is_some_and(|bits| bits.is_null(row))
                 }
@@ -93,8 +93,8 @@ impl PhysicalNode {
     pub(super) fn union_leg(&self, row: PhysicalIndex) -> Result<Option<&Arc<Self>>> {
         let id = self.union_id(row)?;
         if id < 0 { return Ok(None); }
-        let (DataType::Union(fields, _), NodeLayout::Union { children, .. }) = (self.field.data_type(), &self.storage) else { return Err(layout()); };
-        let index = fields.iter().position(|(candidate, _)| candidate == id).ok_or_else(layout)?;
+        let NodeLayout::Union { children, .. } = &self.storage else { return Err(layout()); };
+        let index = self.descriptor.union_index(id)?;
         Ok(Some(&children[index]))
     }
     pub(super) fn union_child(&self, row: PhysicalIndex) -> Result<Option<(&Arc<Self>, PhysicalIndex)>> {
@@ -142,7 +142,7 @@ pub(super) fn run_end(ends: &PhysicalNode, row: usize) -> Result<usize> {
     ends.check(row)?;
     if let NodeLayout::Scalar(storage) = &ends.storage {
         let data = storage.borrow();
-        let value = match ends.field.data_type() {
+        let value = match ends.scalar_field()?.data_type() {
             DataType::Int16 => i64::from(i16::from_le_bytes(data.lane(row)?)),
             DataType::Int32 => i64::from(i32::from_le_bytes(data.lane(row)?)),
             DataType::Int64 => i64::from_le_bytes(data.lane(row)?),
@@ -161,7 +161,7 @@ pub(super) fn run_end(ends: &PhysicalNode, row: usize) -> Result<usize> {
 }
 
 pub(super) fn check_runs(ends: &PhysicalNode, values: &PhysicalNode, length: usize) -> Result<()> {
-    if ends.field.is_nullable() || !matches!(ends.field.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) || ends.length != values.length { return Err(layout()); }
+    if ends.descriptor.is_nullable() || !matches!(ends.scalar_field()?.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) || ends.length != values.length { return Err(layout()); }
     let mut previous = 0;
     for row in 0..ends.length {
         let next = run_end(ends, row)?;
@@ -186,7 +186,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
     let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata });
     let direct = |vector: ExecutionVector, declaration: &Field| -> Result<Arc<PhysicalNode>> {
         let node = vector.into_direct()?;
-        if node.ingress.as_ref() != declaration { return Err(layout()); }
+        if node.ingress_arrow()? != declaration { return Err(layout()); }
         Ok(node)
     };
     let validity = |length: usize, bits: Option<RetainedBuffer>| -> Result<Option<NullBuffer>> {

@@ -55,10 +55,10 @@ impl ExecutionVector {
     pub fn vector_for(&self, name: &str) -> Result<Option<Self>> {
         match &self.view {
             ReaderView::Direct(node) => match &node.storage {
-                NodeLayout::Struct { children, .. } => Ok(children.iter().find(|child| child.field.name() == name).map(|child| Self { view: ReaderView::Direct(Arc::clone(child)), address: self.address.clone() })),
+                NodeLayout::Struct { children, .. } => Ok(children.iter().find(|child| child.descriptor.name() == name).map(|child| Self { view: ReaderView::Direct(Arc::clone(child)), address: self.address.clone() })),
                 NodeLayout::Union { children, .. } => {
-                    let DataType::Union(fields, _) = node.field.data_type() else { return Err(layout()); };
-                    let Some((index, (id, _))) = fields.iter().enumerate().find(|(_, (_, field))| field.name() == name) else { return Ok(None); };
+                    let Some(index) = children.iter().position(|child| child.descriptor.name() == name) else { return Ok(None); };
+                    let id = node.descriptor.union_type_id(index)?;
                     self.leg(node, id, Self::direct(Arc::clone(&children[index]))).map(Some)
                 }
                 _ => Err(unsupported("vectorFor")),
@@ -75,7 +75,7 @@ impl ExecutionVector {
     /// Looks up a Struct child, including a Struct reached through a named union leg.
     /// Other classes reject the method; parent nullness does not mask child storage.
     pub fn struct_child(&self, name: &str) -> Result<Option<Self>> {
-        if !matches!(self.field().data_type(), DataType::Struct(_)) { return Err(unsupported("vectorFor")); }
+        if !matches!(self.descriptor().container(), Some(ContainerKind::Struct(_))) { return Err(unsupported("vectorFor")); }
         self.vector_for(name)
     }
 
@@ -95,14 +95,14 @@ impl ExecutionVector {
     /// Non-union readers, including run-end wrappers, return None.
     pub fn leg_names(&self) -> Option<impl Iterator<Item = &str>> {
         let node = self.node();
-        let DataType::Union(fields, _) = node.field.data_type() else { return None; };
-        Some(fields.iter().map(|(_, field)| field.name().as_str()))
+        let Some(ContainerKind::DenseUnion { children, .. }) = node.descriptor.container() else { return None; };
+        Some(children.iter().map(|child| child.name()))
     }
 
     /// Borrows Struct keys in declaration order; named-leg readers delegate and other classes return None.
     pub fn key_names(&self) -> Option<impl Iterator<Item = &str>> {
-        let DataType::Struct(fields) = self.node().field.data_type() else { return None; };
-        Some(fields.iter().map(|field| field.name().as_str()))
+        let Some(ContainerKind::Struct(children)) = self.node().descriptor.container() else { return None; };
+        Some(children.iter().map(|child| child.name()))
     }
 
     /// Returns the complete first Struct child, or the Map entry reader's first child.
@@ -120,7 +120,7 @@ impl ExecutionVector {
                     let child = if last { children.last() } else { children.first() }.ok_or_else(|| unsupported("empty Struct map reader"))?;
                     Ok(Self::direct(Arc::clone(child)))
                 }
-                NodeLayout::List { elements, .. } if matches!(node.field.data_type(), DataType::Map(_, _)) => Self::direct(Arc::clone(elements)).map_column(last),
+                NodeLayout::List { elements, .. } if matches!(node.descriptor.container(), Some(ContainerKind::Map { .. })) => Self::direct(Arc::clone(elements)).map_column(last),
                 _ => Err(unsupported(if last { "mapValues" } else { "mapKeys" })),
             },
         }

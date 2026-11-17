@@ -42,10 +42,15 @@ The original Arrow arrays remain unchanged and every payload buffer stays shared
 The opened schema is bounded to 128 levels and each vector length to the signed 32-bit index domain.
 HALF vectors are rejected by this execution opener.
 Timestamp timezone names are validated when opening, including empty and nested vectors.
-`field()` is the canonical opened descriptor: unsigned integer widths become signed, timestamp zones use `ZoneId` spelling, and union/run-end parents have no validity field.
-`ingress_field()` retains the original declaration.
-Both preserve custom child/leg names and declaration order.
-`logical_type()` retains existing execution type normalization; `CellRef::leaf_field()` separately preserves the actual selected union leaf even when that leaf is null.
+`descriptor()` borrows the canonical `VectorDescriptor`: unsigned integer widths become signed, timestamp zones use `ZoneId` spelling, and union/run-end parents have no validity field.
+Scalar descriptors retain one validated scalar `Field`; container descriptors retain their native kind and ordered children.
+`ingress_field()` returns `DeclarationRef::Arrow` for an original admitted declaration and `DeclarationRef::Native` when only a native descriptor exists.
+`arrow_field()` allocates checked SDK metadata in a `RetainedArrowField`; every clone retains the projection's reservation.
+Native union descriptors retain all ordered children and wrapping ordinal discriminators independently of SDK schema limits.
+Native union construction reserves logical-join scratch for cloned ancestor maps across the bounded descriptor depth before retaining children; their existing metadata leases remain independent.
+SDK projection rejects a native union with more than 128 children without removing its children or changing its native descriptor.
+The native descriptor and its SDK projection preserve custom child/leg names and declaration order.
+`logical_type()` retains existing execution type normalization; `CellRef::leaf_descriptor()` separately preserves the actual selected union leaf even when that leaf is null.
 
 `from_physical` admits immutable Struct, List/Map, FixedSizeList, DenseUnion and RunEndEncoded containers without requiring a parent Arrow array.
 Scalar children retain either admitted Arrow or immutable native scalar storage.
@@ -110,6 +115,8 @@ Raw access does not mask a child's payload with its parent's null bit and does n
 
 `tests/execution_cells.rs` covers primitive null payloads, unsigned interpretation, getter admission, nonnullable validity, union leaf identity, composed selections, run-end slices and end-domain admission, nested retention, DateMilli units and allocation failure release.
 `tests/physical_layout.rs` adds native absent-leg containers, raw primitive failure routing, delayed inactive-offset admission, named-reader selection exceptions, canonical declarations, direct numeric/byte methods, shorter logical run lengths, malformed layout rejection and retained-owner failure cases.
+`cells/descriptor.rs` covers nested checked metadata projection, retained projection charges, allocation failure release, declared and ordinal discriminator identity, wrapped named-leg reads, custom child order, empty union types, descriptor depth admission and deep Struct joins under independent finite budgets.
+Native partial container storage and writer construction remain separate from this descriptor prerequisite; public `from_physical` retains its strict SDK-declared input validation.
 These are unexecuted source regressions.
 Query frames, parameters, spill transport and expression consumers still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
 Container writers, physical page transport, hash/metadata factories and production consumers remain separate work.

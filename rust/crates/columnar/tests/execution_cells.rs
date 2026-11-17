@@ -131,13 +131,13 @@ fn dense_union_retains_nullable_duration_leaf_and_explicit_null_distinction() {
     let vector = open(field, Arc::new(union), &budget).select(&Selection::Indices(vec![1, 0, 2])).unwrap();
     assert_eq!(vector.logical_type(), &LogicalType::Scalar(ScalarType::Duration(TimeUnit::Microsecond)).maybe());
     let duration = vector.cell(1).unwrap();
-    assert_eq!(duration.leaf_field().unwrap().name(), "duration-micro");
+    assert_eq!(duration.leaf_descriptor().unwrap().name(), "duration-micro");
     assert_eq!(duration.getter_index().unwrap(), 1);
     assert_eq!(duration.get_long(NullChecks::Disabled).unwrap(), 71);
     assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     assert_eq!(duration.object().unwrap().value(), &Value::Null);
     let null = vector.cell(0).unwrap();
-    assert_eq!(null.leaf_field().unwrap().name(), "null");
+    assert_eq!(null.leaf_descriptor().unwrap().name(), "null");
     assert!(null.is_null().unwrap());
     assert_eq!(anomaly(null.get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
 }
