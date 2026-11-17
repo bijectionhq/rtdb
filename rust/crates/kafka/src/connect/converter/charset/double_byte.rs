@@ -110,7 +110,7 @@ mod tests {
         for name in ["shift_jis", "windows-31j"] {
             for byte in 0u8..128 { assert_eq!(lookup(name).unwrap().single(byte), u16::from(byte)); }
         }
-        for table in tables::TABLES {
+        for table in &tables::TABLES {
             let width = usize::from(table.0[1] - table.0[0]) + 1;
             assert_eq!((table.0.len() - 1026) % (width * 2), 0);
             let row_count = (table.0.len() - 1026) / (width * 2);

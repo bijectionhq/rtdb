@@ -208,7 +208,7 @@ fn append_preserves_pair_callback_count_order_and_mutations_between_pairs() {
 
 #[test]
 fn double_byte_append_retains_utf16_pairing_and_every_existing_static_configuration() {
-    for mapping in super::super::tables::TABLES {
+    for mapping in &super::super::tables::TABLES {
         for bytes in [&b""[..], &b"A\0\xff\x81\x82\xa0"[..], &b"\xf9\xd6\0\xf9\xd7"[..]] {
             let mut output = String::from("caller:");
             mapping.decode_into(bytes, &mut output);

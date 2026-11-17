@@ -194,7 +194,7 @@ aliases = sorted((name, index) for index, row in enumerate(rows) for name in row
 assert len(aliases) == len({name for name, _ in aliases}) == 100
 assert len(rows) == 20
 (output / 'aliases.rs').write_text('pub(super) const ALIASES: &[(&str, usize)] = &[\n' + ''.join(f'    ("{name}", {index}),\n' for name, index in aliases) + '];\n')
-(output / 'tables.rs').write_text('use super::Mapping;\n\npub(super) static TABLES: &[Mapping] = &[\n' + ''.join(f'    Mapping(include_bytes!("{row[-2]}")),\n' for row in rows) + '];\n')
+(output / 'tables.rs').write_text('use super::Mapping;\n\npub(super) static TABLES: [Mapping; 20] = [\n' + ''.join(f'    Mapping(include_bytes!("{row[-2]}")),\n' for row in rows) + '];\n')
 provenance_paths = [standard_path, extended_path, 'java.base/sun/nio/cs/DoubleByte.java', 'java.base/sun/nio/cs/ArrayDecoder.java', 'java.base/sun/nio/cs/CharsetMapping.java', 'java.base/java/lang/String.java', 'java.base/java/nio/charset/Charset.java', 'jdk.charsets/sun/nio/cs/ext/AbstractCharsetProvider.java']
 (output / 'sources.sha256').write_text(''.join(f'{hashlib.sha256(source[path]).hexdigest()}  {path}\n' for path in provenance_paths))
 for path in provenance_paths:

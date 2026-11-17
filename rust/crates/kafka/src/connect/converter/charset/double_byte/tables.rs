@@ -1,6 +1,6 @@
 use super::Mapping;
 
-pub(super) static TABLES: &[Mapping] = &[
+pub(super) static TABLES: [Mapping; 20] = [
     Mapping(include_bytes!("big5.bin")),
     Mapping(include_bytes!("euc-kr.bin")),
     Mapping(include_bytes!("gb2312.bin")),
