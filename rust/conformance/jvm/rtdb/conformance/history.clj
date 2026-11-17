@@ -102,8 +102,9 @@
     (.getClassLoader ^Class BufferPool)
     (into-array Class [BufferPool])
     (reify InvocationHandler
-      (invoke [_ proxy ^Method method args]
-        (let [args (or args (object-array 0))]
+      (invoke [_ proxy method args]
+        (let [^Method method method
+              args (or args (object-array 0))]
           (case (.getName method)
             "close" nil
             "toString" "HistoryCountingBufferPool"

@@ -14,9 +14,9 @@
   (Proxy/newProxyInstance
     (.getClassLoader ^Class BufferPool) (into-array Class [BufferPool])
     (reify InvocationHandler
-      (invoke [_ _ ^Method method _]
-        (swap! calls conj (.getName method))
-        (case (.getName method)
+      (invoke [_ _ method _]
+        (swap! calls conj (.getName ^Method method))
+        (case (.getName ^Method method)
           "getByteArray" (byte-array [1 2 3])
           "close" nil
           (throw (ex-info "Read failed" {})))))))
@@ -42,9 +42,9 @@
         delegate (Proxy/newProxyInstance
                    (.getClassLoader ^Class BufferPool) (into-array Class [BufferPool])
                    (reify InvocationHandler
-                     (invoke [_ _ ^Method method _]
-                       (swap! calls conj (.getName method))
-                       (case (.getName method)
+                     (invoke [_ _ method _]
+                       (swap! calls conj (.getName ^Method method))
+                       (case (.getName ^Method method)
                          "getFooter" (ArrowFooter. (Schema. []) [] [(ArrowBlock. 0 8 24)])
                          "getRecordBatchSync" (ArrowRecordBatch. 0 [] [])
                          (throw (ex-info "Unexpected delegate method" {}))))))
