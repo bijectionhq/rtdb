@@ -6,6 +6,34 @@ use rtdb_types::{LogicalType as L, Result, ScalarType};
 
 use crate::{CatalogSnapshot, invalid};
 
+pub(crate) fn parameter_types(relation: &Relation, values: &[rtdb_types::Value]) -> Vec<L> {
+    fn collect(relation: &Relation, declarations: &mut [Option<L>], local: &mut Vec<usize>) {
+        for expression in relation.expressions() {
+            expression.visit(&mut |expression| {
+                if let Expr::Parameter { index, data_type } = expression {
+                    if local.contains(index) || matches!(data_type, L::Nothing | L::Null) { return; }
+                    if let Some(declared) = declarations.get_mut(*index) {
+                        let ty = rtdb_columnar::execution_type(data_type);
+                        *declared = Some(match declared.take() { Some(previous) => L::join_all(&[previous, ty]), None => ty });
+                    }
+                }
+            });
+        }
+        if let RelationNode::Apply { input, dependent, arguments, .. } | RelationNode::Mark { input, dependent, arguments, .. } = relation.node() {
+            collect(input, declarations, local);
+            let outer = local.len();
+            local.extend(arguments.iter().map(|(index, _)| *index));
+            collect(dependent, declarations, local);
+            local.truncate(outer);
+        } else {
+            for child in relation.children() { collect(child, declarations, local); }
+        }
+    }
+    let mut declarations = vec![None; values.len()];
+    collect(relation, &mut declarations, &mut Vec::new());
+    declarations.into_iter().zip(values).map(|(declared, value)| declared.unwrap_or_else(|| value.logical_type())).collect()
+}
+
 pub(crate) struct RuntimeSchema { root: Arc<RuntimeRelation> }
 
 pub(crate) struct RuntimeRelation {
@@ -393,4 +421,37 @@ fn expression_type(expr: &Expr, input: &Schema, parameters: &BTreeMap<usize, L>,
             rtdb_plan::function_type(if *case_insensitive { "ilike" } else { "like" }, &[value_type, pattern_type])?
         }
     })
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::*;
+    use rtdb_types::Value;
+
+    fn field(id: u32, ty: L) -> Field { Field { id: ColumnId(id), name: format!("c{id}"), qualifier: None, qualified_only: false, unnamed: false, data_type: ty } }
+    fn parameter(id: u32, ty: L) -> Arc<Relation> {
+        Arc::new(Relation::new(Schema::new(vec![field(id, ty.clone())]).unwrap(), RelationNode::Values { rows: vec![vec![Expr::Parameter { index: 0, data_type: ty }]] }).unwrap())
+    }
+
+    #[test]
+    fn unknown_parameter_annotations_infer_the_admitted_cell_type() {
+        let input = parameter(0, L::Null);
+        assert_eq!(parameter_types(&input, &[Value::I64(7)]), [L::Scalar(ScalarType::I64)]);
+    }
+
+    #[test]
+    fn apply_and_mark_local_parameters_do_not_replace_external_declarations() {
+        let input = parameter(0, L::Scalar(ScalarType::U64).maybe());
+        let dependent = parameter(1, L::Scalar(ScalarType::Utf8));
+        let arguments = vec![(0, input.schema().fields()[0].expression())];
+        let output = field(2, L::Scalar(ScalarType::Utf8).maybe());
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let apply = Relation::new(schema, RelationNode::Apply { input: Arc::clone(&input), dependent: Arc::clone(&dependent), arguments: arguments.clone(), kind: ApplyKind::Scalar, output: Some(output) }).unwrap();
+        let output = field(2, L::Scalar(ScalarType::Bool).maybe());
+        let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+        let mark = Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison: Expr::Literal(Value::Bool(true)), output }).unwrap();
+        for relation in [&apply, &mark] {
+            assert_eq!(parameter_types(relation, &[Value::I64(-1)]), [L::Scalar(ScalarType::I64).maybe()]);
+        }
+    }
 }

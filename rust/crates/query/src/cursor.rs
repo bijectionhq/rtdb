@@ -113,7 +113,13 @@ impl PreparedQuery {
             cursor.plan_reservation = self._plan_reservation.clone();
             return Ok(cursor);
         }
-        let parameters = Arc::new(crate::parameters::BoundParameters::infer(parameters, &context.memory)?);
+        let bound = parameters.iter().try_fold(crate::runtime_schema::allocation_bound(&self.relation)?, |bytes, value| {
+            bytes.checked_add(value.retained_bytes()?.checked_mul(16).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))?).ok_or_else(|| invalid("parameter-size", "Parameter type allocation overflow"))
+        })?;
+        let temporary = context.memory.reserve(bound)?;
+        let types = crate::runtime_schema::parameter_types(&self.relation, &parameters);
+        let parameters = Arc::new(crate::parameters::BoundParameters::new(parameters, types, &context.memory)?);
+        drop(temporary);
         let runtime_schema = crate::runtime_schema::RuntimeSchema::derive(&self.relation, &context.catalog, parameters.types(), &context.memory)?;
         let analysis = if matches!(&self.output, QueryOutput::Analyze(_)) { Some(crate::analysis::AnalysisNode::new(&self.relation, &context)?) } else { None };
         let execution = Execution { context: Arc::clone(&context), parameters, outer: crate::context::OuterRows::empty(&context.memory)?, bindings: None, analysis: analysis.clone() };
