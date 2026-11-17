@@ -1,0 +1,27 @@
+= Explicit RoundRobin selection
+
+`RoundRobinCounter` implements the partition-selection step of Kafka's `RoundRobinPartitioner` for a caller-owned producer/topic entry.
+
+* Each partitioning attempt consumes one signed counter value.
+** The first value is zero and increment wraps as a Java `int`.
+** Selection masks the sign bit with `0x7fffffff` before taking a remainder.
+** An empty topic list reports `EmptyTopic` after consuming its value, matching the source's remainder-by-zero stage.
+
+* `PartitionChoices` borrows the snapshot's per-topic encounter order.
+** A non-null resolved leader makes a partition available, including an empty `Node`.
+** Available partitions return their original signed IDs.
+** If all leaders are absent, selection returns an index into the full list's size.
+** Construction rejects lengths above Java's signed `List.size()` domain before selection.
+
+* `SelectedPartition` belongs to one send.
+** The caller must retain that value across enqueue retries.
+** The caller must retain the producer/topic counter across metadata snapshot changes and topic-cache eviction.
+** Record keys and values do not enter the selection calculation.
+
+Four source regressions cover sparse and negative IDs, availability filtering, empty-topic consumption, both signed wrap boundaries, independent topic counters and retained selections across snapshot changes.
+The integration fixture imports the production source directly.
+No producer module declaration or partitioner configuration is enabled by this prerequisite.
+Actual snapshot construction, topic ownership, enqueue integration and the native producer allocation bound remain unfinished.
+
+`sources.json` records the consulted Kafka and OpenJDK archive members.
+`COPYRIGHT` retains complete leading notices; accompanying license files are verbatim copies.
