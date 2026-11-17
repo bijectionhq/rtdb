@@ -613,6 +613,10 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
 rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque);
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque,
+    int timeout_ms);
 void rd_kafka_broker_buf_retry(rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf);
 
 
@@ -719,5 +723,6 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 
 int unittest_broker(void);
 int unittest_byte_account(void);
+int unittest_ordered_metadata(void);
 
 #endif /* _RDKAFKA_BROKER_H_ */

@@ -197,19 +197,15 @@ rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
                                          rd_false);
 }
 
-rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
-    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
-    rd_kafka_buf_t **result) {
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata_size(
+    rd_kafka_broker_t *rkb, int16_t version, size_t length, size_t *charge) {
         rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
         const rd_kafkap_str_t *client_id = rkb->rkb_rk->rk_client_id;
         rd_bool_t flexible = version >= 9;
         size_t header;
         size_t fixed = sizeof(rd_kafka_buf_t) +
                        2 * RD_ROUNDUP(sizeof(rd_segment_t), 8);
-        size_t charge;
-        rd_kafka_buf_t *request;
-        *result = NULL;
-        if (!account || version < 0 || version > 13 || (!body && length))
+        if (!account || version < 0 || version > 13)
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         if (client_id->len < RD_KAFKAP_STR_LEN_NULL)
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
@@ -220,7 +216,24 @@ rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
         if (length > (size_t)INT32_MAX - header ||
             length + header > SIZE_MAX - fixed)
                 return RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
-        charge = fixed + header + length;
+        *charge = fixed + header + length;
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_buf_t **result) {
+        rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
+        rd_bool_t flexible = version >= 9;
+        rd_kafka_resp_err_t error;
+        size_t charge;
+        rd_kafka_buf_t *request;
+        *result = NULL;
+        if (!body && length)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        error = rd_kafka_buf_accounted_metadata_size(rkb, version, length, &charge);
+        if (error)
+                return error;
         if (!rd_kafka_byte_account_acquire(account, charge))
                 return RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
         request = rd_kafka_buf_new_request1(rkb, RD_KAFKAP_Metadata, 1, length,

@@ -194,6 +194,10 @@ impl NativeClient {
         self.ptr.ptr()
     }
 
+    pub(crate) fn byte_account(&self) -> Option<&Arc<NativeByteAccount>> {
+        self._byte_account.as_ref()
+    }
+
     pub(crate) fn rebalance_protocol(&self) -> RebalanceProtocol {
         let protocol = unsafe { rdsys::rd_kafka_rebalance_protocol(self.ptr()) };
         if protocol.is_null() {

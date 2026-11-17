@@ -1,0 +1,48 @@
+{
+  "kafka_archive": {
+    "file": "/tmp/rtdb-kafka-connect-sources/kafka-clients-sources.jar",
+    "sha256": "5782400b3bf0ee4b92d45478b075194e9539bad9cbec9ed2caba992b4deee0c4",
+    "members": {
+      "common/message/MetadataRequest.json": "4dd85dfe9585b9f59210ba78bc60b5c86d7684614c3a8829b8dea343f22a1d36",
+      "common/message/MetadataResponse.json": "482b7171b2c41172213b9d8c7842998938c386872a0c89f209cc0e0427d4b4d8",
+      "org/apache/kafka/clients/Metadata.java": "14c3e3e12dc652edf82da8e2dc46c5c0bb7990e1bba4554e0747292fe6e3ae75",
+      "org/apache/kafka/clients/MetadataSnapshot.java": "d5c4ebc3fe2da75631e234a6ad0d2e529886d0be1037ba58c1a08472b85cdeed",
+      "org/apache/kafka/clients/NetworkClient.java": "6db4453663f0412cdc608b397af2eee246343ce511442193411eb316ba6b1a28",
+      "org/apache/kafka/clients/NodeApiVersions.java": "95cd0a79598b6cc0fe8edd6a0e287f3ec003539f6423bb2b7bcaf432b6447538",
+      "org/apache/kafka/clients/producer/internals/ProducerMetadata.java": "71a470a6abffb5ee66d0d9336441e247f0168b3d3f4ac3af8a5a975bbff4a63f",
+      "org/apache/kafka/common/Cluster.java": "ce43a2870701690ba5351de05df1c46cd8702b3855507d43cfc0d59ec13bc510",
+      "org/apache/kafka/common/requests/MetadataRequest.java": "5f4b41fc6112e97c450e8728e33f447a28954701091871d2dee533372add72b8",
+      "org/apache/kafka/common/requests/MetadataResponse.java": "4bc7c408c4f884734dd793c9ad3fb0f04de640f0287b47342becd776a23d94b5",
+      "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "NOTICE": "e10a1d2b5812b6eeac08ec087512bbf649739ca23cb7ee610702acb976f42936",
+      "org/apache/kafka/common/message/MetadataRequestData.java": "7e10763e5f040743945789775fc08921d9fbbb3e3a272ae95357a9ac2e4a661b",
+      "org/apache/kafka/common/message/MetadataResponseData.java": "ea7ffde34a441d726ca9e4d6cb015a1e525a07be6698705154f9fbbd5bab69a0",
+      "org/apache/kafka/common/protocol/Readable.java": "c343566c71570920737b9e9cbf6c97f3d3cf3398ecc6a6fbc0a9bce795563050",
+      "org/apache/kafka/common/protocol/ByteBufferAccessor.java": "1b987edf39d9e90131f43fd65c559cb27c42fa088231fc1548af93924de6668f",
+      "org/apache/kafka/common/utils/internals/ByteUtils.java": "63bfb865943ebd6cc4a2e47ef810a91b26aae2b3789477d40ad2da53e20453f8",
+      "org/apache/kafka/common/protocol/MessageUtil.java": "df6e2e21ff3a7383c304e700da10b7dd7bfd21eb92599e85290ddb68ffb23aa4",
+      "org/apache/kafka/common/protocol/types/RawTaggedField.java": "01bd6135373f8b7ff42e04ff94decf96322f83c7d9d27ff03d57db6cbd1b1b62",
+      "org/apache/kafka/common/requests/AbstractResponse.java": "a6749f2df1fb6be881a3a08933df57cd5935af949dd611953f222789961daa88",
+      "org/apache/kafka/common/message/ResponseHeaderData.java": "b60e81a96c9ed656d0c0029e1d5908427b2c77af3a749462882a0712d8077461",
+      "org/apache/kafka/common/requests/ResponseHeader.java": "320123cc6fd6d8817d5efe701ca2d353daf4d57e8a3252b85e1883ed941f1a59"
+    }
+  },
+  "native_baseline_commit": "e747c55a8f7705a1716cccaec4d2c3a97f7c4263",
+  "native_baseline_sources": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.h": "79f0daaf245958bbcdc1bc57c38d9b349c264b2b5ac8bba7b832a325c96f3823",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.c": "bdf87da6d05e91d61cc4740840589f465f7660e46b4823ccce74a3825b8f5d5b",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.c": "ad1463e856717d67cb57a9f43fc0798bfa4b58baa12e0fe38abe0c412c5ccf9a",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_broker.h": "fd1fea8b7afdb28d26fde498f458b543a20bdd6fe276fe48bd5921ab1fafddee",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_request.c": "4b1492b2d0bd4e208cb297b52758b6e3da3aa612ee223847a71ad95a4ebe806a",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_request.h": "4b9bdf6325c13b428bd610100152229071bb455aea15bcc85110aeaa24d20186",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata.c": "dbb8d96c10920bda83a24170b6684c0230b51965abd54a0e76697b7c4a5e374a",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_metadata_cache.c": "1a5793b8836936eb2cbd61f3bd964c1b604d7561f0cff1630048d1d051467102",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_buf.c": "c951fa95ab47958a8b3f98fc421308fccb50798b0206dfc56f109a74e02d1dec",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_buf.h": "d65cfb10262ee781999e7a4150dc3b06bbe6f9473fd499704f48b11b188b5046",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_op.c": "92bd07cb6b7e9ac5ea205cd32f7384e238e6dbade46c5360d367d7c6ad20033e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_queue.c": "c04b8248715327afdd856b59cd2277201138a1e19e5a401ab04c1a6eff3e428e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.c": "b13ad292b72394993717f127f7e5da15e1b003921a5765e69a120ff65c21e226",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.h": "315d1a9f8ff17708bb4d1db2980ab49b11d7b90aef14088af7a8a7b0b08a9d53",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdavg.h": "eca75b6b9ecee763c29571ed2e7d7932da150269f666dc1d99a0044fe9afe6e8"
+  }
+}

@@ -3152,6 +3152,50 @@ rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
                                             rd_kafka_byte_account_t *account,
                                             char *errstr, size_t errstr_size);
 
+typedef struct rd_kafka_ordered_metadata_s rd_kafka_ordered_metadata_t;
+typedef struct rd_kafka_metadata_topic_s {
+        const void *name;
+        size_t length;
+} rd_kafka_metadata_topic_t;
+
+/**
+ * Starts a named-topic Metadata request on an accounted producer without waiting for a broker.
+ * topics must contain count readable nonempty names, each at most INT16_MAX bytes, for this call only.
+ * count must be in 1..INT32_MAX, timeout_ms must be positive, and body_capacity must fit INT32_MAX bytes.
+ * result must be a writable non-NULL pointer; body_capacity bounds the retained raw response body.
+ * The producer account admits completion storage, encoding scratch, request buffers and queue nodes independently.
+ * Negotiates Metadata 0..13 with an Up broker; disabling auto creation requires version 4 or newer.
+ * Returns TRANSPORT when no broker is ready, UNSUPPORTED_FEATURE for an incompatible profile, or an admission/argument error.
+ * On error *result is NULL and no operation is accepted; success returns one caller reference even if completion ran inline.
+ * The caller keeps the account alive until this reference is destroyed, and must not destroy rk concurrently with submission.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
+    rd_kafka_t *rk, const rd_kafka_metadata_topic_t *topics, size_t count,
+    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
+
+/**
+ * Returns 0 while pending or 1 after terminal publication, with error, version and body set.
+ * All arguments must be non-NULL and result must have a live caller reference.
+ * Pending polls leave the output arguments unchanged.
+ * On success the body is immutable and borrowed until the caller destroys its reference.
+ * Native errors are preserved; an oversized body reports MSG_SIZE_TOO_LARGE and a missing/truncated body reports BAD_MSG.
+ * Polling and completion may run concurrently; destruction requires exclusive ownership of the caller reference.
+ */
+RD_EXPORT
+int rd_kafka_ordered_metadata_poll(
+    rd_kafka_ordered_metadata_t *result, rd_kafka_resp_err_t *error,
+    int16_t *version, const void **body, size_t *length);
+
+/**
+ * Releases the caller reference without waiting for the request or invoking user callbacks.
+ * A pending request retains its completion storage until its deadline or native teardown.
+ * Publication is logical completion; request, frame and queue charges end at their own final frees.
+ * NULL is accepted; the account must remain alive through this call.
+ */
+RD_EXPORT
+void rd_kafka_ordered_metadata_destroy(rd_kafka_ordered_metadata_t *result);
+
 
 
 /**

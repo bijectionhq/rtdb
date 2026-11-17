@@ -1004,6 +1004,8 @@ rd_kafka_buf_t *rd_kafka_buf_new0(int segcnt, size_t size, int flags);
 rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_buf_t **result);
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata_size(
+    rd_kafka_broker_t *rkb, int16_t version, size_t length, size_t *charge);
 rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
                                           int16_t ApiKey,
                                           int segcnt,

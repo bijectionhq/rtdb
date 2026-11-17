@@ -456,6 +456,7 @@ int rd_unittest(void) {
                 {"conf", unittest_conf},
                 {"broker", unittest_broker},
                 {"byte_account", unittest_byte_account},
+                {"ordered_metadata", unittest_ordered_metadata},
                 {"request", unittest_request},
 #if WITH_SASL_OAUTHBEARER
                 {"sasl_oauthbearer", unittest_sasl_oauthbearer},

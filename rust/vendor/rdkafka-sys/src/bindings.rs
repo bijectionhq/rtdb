@@ -84,6 +84,28 @@ pub struct rd_kafka_byte_account_s {
     _unused: [u8; 0],
 }
 pub type rd_kafka_byte_account_t = rd_kafka_byte_account_s;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rd_kafka_ordered_metadata_s {
+    _unused: [u8; 0],
+}
+pub type rd_kafka_ordered_metadata_t = rd_kafka_ordered_metadata_s;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct rd_kafka_metadata_topic_t {
+    pub name: *const c_void,
+    pub length: usize,
+}
+extern "C" {
+    pub fn rd_kafka_ordered_metadata_start(rk: *mut rd_kafka_t,
+        topics: *const rd_kafka_metadata_topic_t, count: usize,
+        body_capacity: usize, timeout_ms: c_int,
+        result: *mut *mut rd_kafka_ordered_metadata_t) -> rd_kafka_resp_err_t;
+    pub fn rd_kafka_ordered_metadata_poll(result: *mut rd_kafka_ordered_metadata_t,
+        error: *mut rd_kafka_resp_err_t, version: *mut i16,
+        body: *mut *const c_void, length: *mut usize) -> c_int;
+    pub fn rd_kafka_ordered_metadata_destroy(result: *mut rd_kafka_ordered_metadata_t);
+}
 extern "C" {
     pub fn rd_kafka_byte_account_new(capacity: usize) -> *mut rd_kafka_byte_account_t;
     pub fn rd_kafka_byte_account_used(account: *mut rd_kafka_byte_account_t) -> usize;

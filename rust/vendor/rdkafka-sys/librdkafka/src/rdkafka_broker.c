@@ -1269,6 +1269,14 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
 rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque) {
+        return rd_kafka_broker_accounted_metadata_timeout(
+            rkb, version, body, length, queue, completion, opaque, 0);
+}
+
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque,
+    int timeout_ms) {
         rd_kafka_replyq_t replyq = RD_ZERO_INIT;
         rd_kafka_buf_t *request;
         rd_kafka_resp_err_t err;
@@ -1277,6 +1285,8 @@ rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
         err = rd_kafka_buf_accounted_metadata(rkb, version, body, length, &request);
         if (err)
                 return err;
+        if (timeout_ms > 0)
+                rd_kafka_buf_set_abs_timeout(request, timeout_ms, 0);
         if (queue)
                 replyq.q = rd_kafka_q_keep(queue);
         rd_kafka_broker_buf_enq_replyq(rkb, request, replyq, completion, opaque);
@@ -1949,6 +1959,8 @@ static rd_kafka_buf_t *rd_kafka_waitresp_find(rd_kafka_broker_t *rkb,
 
 
 
+#include "rdkafka_ordered_metadata_header.h"
+
 /**
  * Map a response message to a request.
  */
@@ -2000,7 +2012,12 @@ static int rd_kafka_req_response(rd_kafka_broker_t *rkb,
         /* In case of flexibleVersion, skip the response header tags.
          * The ApiVersion request/response is different since it needs
          * be backwards compatible and thus has no header tags. */
-        if (req->rkbuf_reqhdr.ApiKey != RD_KAFKAP_ApiVersion)
+        if (req->rkbuf_cb == rd_kafka_ordered_metadata_complete) {
+                if (!rd_kafka_ordered_metadata_header(rkbuf)) {
+                        rkbuf->rkbuf_err = RD_KAFKA_RESP_ERR__BAD_MSG;
+                        goto err_parse;
+                }
+        } else if (req->rkbuf_reqhdr.ApiKey != RD_KAFKAP_ApiVersion)
                 rd_kafka_buf_skip_tags(rkbuf);
 
         if (!rkbuf->rkbuf_rkb) {
@@ -6261,6 +6278,8 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 }
 
 #include "rdkafka_byte_account_test.h"
+#include "rdkafka_ordered_metadata.h"
+#include "rdkafka_ordered_metadata_test.h"
 
 /**
  * @name Unit tests

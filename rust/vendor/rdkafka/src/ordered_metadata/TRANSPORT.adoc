@@ -1,0 +1,91 @@
+= Ordered Metadata transport
+
+Client::start_ordered_metadata submits named-topic Metadata requests on the producer's existing authenticated librdkafka connection.
+The producer must have a NativeByteAccount installed before creation.
+The operation uses the first selected Up broker's negotiated Metadata API range, capped at version 13.
+A disabled auto-creation setting requires version 4 or later.
+An absent ready broker returns BrokerNotReady without accepting work; the native sparse-connection machinery schedules connection attempts.
+The caller bounds readiness retries separately from the accepted request's deadline.
+Empty topic sets, unsupported profiles and invalid lengths are rejected explicitly.
+Ordinary fetch_metadata, MetadataRequest wrappers, native cache parsing and their version ceilings are unchanged.
+
+== Ownership and release
+
+OrderedMetadataRequest is a passive owner of a C completion reference and an Arc of the producer's actual native byte account.
+The C completion is a passive handoff with a mutex protecting reference count and one terminal publication.
+It owns one allocation containing its record and a fixed body-capacity region.
+The account acquires that allocation's complete size before calloc.
+An encoded request scratch buffer acquires a separate exact charge before malloc and releases it after the accounted sender has copied the request.
+The sender's request buffer and every XMIT_BUF, XMIT_RETRY and RECV_BUF node retain the existing independent final-free charges.
+Client-ID/header and complete request size validation run before completion admission.
+
+The accepted operation and Rust caller hold separate completion references.
+Retries retain the operation reference through the absolute deadline, including a nested inline retry-node denial.
+A transport, timeout or broker request-timeout error retries through the native retry path when permitted by that deadline and the existing request retry limit.
+Terminal publication records the original native error before considering body-copy errors.
+A successful body must fit the pre-admitted completion capacity and be fully readable; excess size reports MSG_SIZE_TOO_LARGE and a missing or truncated body reports BAD_MSG.
+The callback allocates no output and invokes no Rust closure, destructor or waker.
+The last native completion reference destroys the mutex and allocation before returning its account charge.
+
+The Rust destructor releases its C reference before its account Arc.
+Dropping an async wait leaves the request pollable; dropping the request abandons delivery while the native operation remains bounded by its deadline or producer teardown.
+A completed raw response remains readable after producer destruction because its request handle retains the account.
+Native request, response and queue owners may remain live after terminal publication or after the caller drops the result.
+Their charges remain until their own final frees, independently of the completion record.
+NativeByteAccount remains a Monitor Object whose clients == 0 && used == 0 condition controls last-guard release on the Rust caller.
+The existing blocking last-account-drop contract still applies.
+
+== Borrowed response access
+
+rd_kafka_req_response initializes its reader after the eight-byte response size/correlation header, copies the request's flexible flag, and consumes flexible response-header tags before invoking the custom completion.
+Ordered request callback identity selects a borrowed header reader matching ResponseHeaderData and ByteUtils; ordinary requests retain their existing header path.
+The ordered header reader consumes at most five bytes per varint, truncates the fifth terminal byte into Java int bits, and checks nonnegative counts/sizes and the 10,000-tag limit.
+Unknown tag IDs may repeat, decrease or decode to negative Java ints.
+A native header parse failure reaches the existing error callback path as BAD_MSG before body publication.
+The custom completion copies the remaining body before rd_kafka_parse_Metadata or the metadata cache can sort any partition array.
+
+MetadataView validates every known field and nested tag before exposing a visitor.
+It covers versions 0 through 13 with the generated MetadataResponseData reader's signed length arithmetic and failure order.
+Strings are limited to 32767 bytes; any negative nullable string length represents null.
+Compact length subtraction wraps as a Java int, including a fifth terminal varint byte whose high bits are discarded.
+Array and tag counts must be nonnegative and no greater than the remaining byte count before their respective 1,000,000-element and 10,000-tag ceilings are checked.
+Tag payload sizes must be nonnegative and fit the remaining source.
+An unconsumed suffix is accepted by the Java response wrapper and retained by raw(); trailing_bytes() exposes it separately.
+The visitor's second pass borrows broker, cluster, topic, UUID, partition, replica, ISR, offline-replica, authorization, throttle and raw error fields in wire order.
+Duplicate entries and signed error/ID/epoch values remain unmodified.
+Leader epochs are present from v7, while has_reliable_leader_epochs follows Java's v9 threshold.
+Unknown flexible body tags, including duplicate, decreasing and negative IDs, remain in received order in raw bytes.
+Malformed UTF8 is an explicit UnsupportedUtf8 result; Java replacement behavior remains a prerequisite for full compatibility.
+The cursor, event views, array iterator and summary are passive call-local borrowed values with no output heap owner.
+Caller-side collections require their own admission before construction.
+
+== Allocation domain
+
+The completion record, fixed copied-body capacity and temporary request encoding join the account's existing request/frame/queue domain.
+At every instant their combined native allocation charges share the fixed pre-admitted account ceiling.
+Receive frames still acquire admission before correlation, including late and partial responses.
+Copying a response retains both the source frame and completion capacity until their separate owners release them.
+Validation does not allocate an output collection or grow a buffer.
+The caller owns the topic-input array, any application result, and runtime timer/task allocation used by wait.
+
+This account does not bound native client construction, bootstrap/discovered broker growth, broker threads or stacks, automatic Metadata decode/caches, ApiVersions state, TLS/SASL, ordinary outbound requests, allocator overhead or the account monitor itself.
+A whole-producer bound still requires a separately pre-admitted construction/background domain or admission interception for every reachable owner in that domain.
+Neither the completion cap nor borrowed validation establishes that bound.
+Java snapshot retention and partial/full merge, UUID/leader-epoch state, HashMap encounter order, metadata refresh/throttle scheduling, per-topic signed RoundRobin counters and once-per-send explicit partition binding remain separate integration work.
+The Java RoundRobinPartitioner class is not activated by this transport.
+
+== Source and regression record
+
+link:sources.json[The source record] pins the inspected Kafka 4.4 source archive and members, the published native-account baseline, and native Metadata/cache/version/queue sources.
+link:COPYRIGHT[The retained source notices] contains their complete leading notices.
+The upstream licenses remain in link:../../LICENSE[rdkafka's license] and link:../../../rdkafka-sys/librdkafka/LICENSE[librdkafka's license].
+Kafka source licensing is retained in link:LICENSE-KAFKA[the Kafka source archive license] and link:NOTICE-KAFKA[its notice].
+Existing vendor UPSTREAM.json files retain their original archive and member identities.
+
+The native regression sources exercise the actual accounted sender and completion paths, protocol version intersection, response-header tag consumption, four admission thresholds, native-error priority, disabled reply queues, abandoned callers, retained overlapping owners, retry expiry and inline retry denial.
+Rust regression sources cover every supported version, unsorted entries, raw errors, UUIDs, replica order, every known-field prefix truncation, nullable-name gates, explicit UTF8 rejection and transparent topic-input layout.
+Generated-reader boundaries include every fifth varint byte, all four string slots, all array and tag-list slots, signed nullable lengths, count-cap failure order, a million borrowed replica IDs, duplicate/decreasing/negative tag IDs and retained suffixes.
+The native header fixtures pass through actual correlation lookup and ordered request dispatch, including rejected headers, the 10,000-tag boundary and fifth-byte truncation.
+The Kafka integration sources use the safe API with the native mock producer, retain a response after producer destruction and exercise abandonment followed by teardown.
+All previously published assertions remain unchanged.
+Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.
