@@ -1,0 +1,84 @@
+= Prediction contexts
+
+This private parser component implements the prediction-context value, merge and cached-context schedules from ANTLR 4.13.2.
+`UPSTREAM.json` pins the primary sources; link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
+It does not perform token prediction, recognize SQL rules or change a production parser entry point.
+
+== Owner and keys
+
+`with_prediction_contexts` opens one passive, single-writer owner under an explicit `AllocationScope` and borrowed `Grammar`.
+Its callback is universally quantified over a fresh invariant context-key lifetime.
+The callback result cannot contain that lifetime; keys cannot escape into a later owner or be supplied to a different invocation of the factory.
+Only the factory can construct an owner.
+A `ContextView` borrows that exact owner, and input `State` views are checked against the retained grammar before transition access.
+Invocation input excludes the root sentinel and runs innermost to outermost; conversion resolves follow states from outermost to innermost.
+
+The owner retains flat immutable node and edge arrays, mutable round-local memo membership, canonical-context membership and traversal scratch.
+A candidate array remains private and mutable until operand reuse and common-parent normalization finish.
+Published nodes and their edges do not change.
+The derived local-domain bit records whether a node can be traversed by the SLL cached-context operation without following a null parent.
+The owner has an explicit `Drop` lifetime witness, so its allocation scope must outlive storage destruction.
+It exposes no storage extraction, cloning or mutable graph view.
+
+The lifetime constraints can be read directly at the private boundary:
+`with_prediction_contexts(..., |owner| Ok(owner.empty()))` cannot return its branded key as the factory's independent result type.
+A key from an enclosing factory cannot be passed to a separately opened nested factory.
+A borrowed view cannot survive the owner borrow, and a scope cannot be dropped before an owner which still holds it.
+These are source contracts; compiler qualification remains unrun.
+A later persistent parser cache would require a separately reviewed retained-storage/per-borrow-brand boundary.
+The closure-bound owner itself cannot be stored in that environment.
+
+== Context values and identity
+
+Canonical Empty, Singleton and Array remain distinct shapes.
+A full-context EmptyReturn edge has a null parent; that null is not the canonical Empty context.
+Array edges are sorted by return state and have no repeated return state.
+An Array with one edge retains its Array class except at the source's explicit singleton reconstruction points.
+A one-entry EmptyReturn Array reports empty and is returned unchanged by cached-context traversal.
+
+Identity succeeds before value equality.
+Two distinct nonempty null-parent Singletons are unequal even when their return states and hashes match.
+Arrays compare ordered return states followed by nullable parents; null parent slots compare equal.
+Hashes use the source Murmur3 word order and cached parent hashes.
+Equality, merging, invocation conversion and canonicalization use explicit work states instead of input-depth native recursion.
+Flat node/edge storage also makes destruction independent of context depth.
+
+A merge round retains one memo across both local-wildcard and full-exact calls.
+Keys follow source context equality, with forward lookup before reversed lookup and branch-specific insertion.
+Merge mode is not an additional memo-key field.
+Ending a round clears membership while retaining its already admitted capacity.
+The graph and canonical cache survive the round.
+Local-wildcard Empty absorbs a root; full-exact merging retains an explicit EmptyReturn edge.
+Operand and parent identity reuse follows the source branches, and common-parent normalization retains the first equal parent only after operand-reuse checks.
+
+Cached-context traversal first preserves any entire empty context, then checks identity-visited and canonical membership before visiting parents in index order.
+Unchanged parents retain the original node.
+Changed one-parent reconstruction uses Singleton, including when its input was an Array.
+The result of adding that reconstructed node to the canonical cache does not replace its returned identity.
+Full-context graphs with traversable null parents fail the local-domain check; no null-to-Empty substitution is performed.
+Canonicalizing such a graph is an internal caller error, not an accepted SQL normalization.
+
+== Admission and failures
+
+The empty owner allocates no dynamic graph storage.
+Node, edge, invocation and work vectors admit requested capacities before allocation, beginning at 16 slots and growing by checked doubling or the larger concrete requirement.
+An array candidate admits the exact requested edge count before construction.
+Lookup tables begin at 32 slots, stay at most half full, and admit complete replacement storage before rehashing.
+Every byte product and capacity operation is checked before reservation.
+Old storage and its charge remain live while replacement storage is constructed.
+Candidate buffers and final storage are both covered while they overlap.
+All earlier reservations, including cleared memo capacity and discarded candidates, stay with the caller's scope until it drops.
+These are native admission points, not a claim of identical JVM heap exhaustion.
+
+The first allocation failure returns its original admission anomaly and seals further mutation or allocating inspection.
+A later request returns the inline Aborted failure without attempting another allocation, even if other callers have released memory.
+Completed views remain available for nonallocating inspection.
+No partially constructed key is returned on failure; private storage completed before a later cache-publication failure remains inaccessible through the failed operation.
+Failures do not create source-derived diagnostic strings in this component.
+
+== Remaining parser work
+
+Ordered configuration sets, precedence filtering, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
+Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
+All regression sources and lifetime contracts remain unexecuted.
