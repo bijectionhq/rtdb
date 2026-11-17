@@ -27,7 +27,7 @@
     },
     "sql_xtql_execution": {
       "status": "pending",
-      "conclusion": "Physical operator schedules, regex host forms and remaining registered Transit semantics still require source completion.",
+      "conclusion": "Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and frontend allocation still require source completion.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/xtql/src/lib.rs",
@@ -117,9 +117,9 @@
       "evidence": {
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
         "rust/crates/node/src/statement.rs": "c23c62efb2345f44f2644c6cd6cef4aa98b38a4f433cad4eadee500184efa42a",
-        "rust/crates/tx/src/submission.rs": "dd666de0fbcc94b00e3fcf56178d4af913d0a07dfecd1c32f687bbcc8e765ed0",
+        "rust/crates/tx/src/submission.rs": "68da80f245ea6b555d6f8a820fd719fb29cb6b78236000e8b4f50f288cc1f450",
         "rust/crates/tx/src/resolver.rs": "5de2a6f21839cbc23ab47688adc14e1b5ab3e9d904659e7683301102a2ecdc91",
-        "rust/crates/replication/src/appender.rs": "cb1fb1e6740df647d8eb4f5ac884c42914a74746cd10987998714acefa537974",
+        "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
         "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30"
       }
@@ -181,7 +181,7 @@
       "evidence": {
         "rust/crates/node/src/postgres.rs": "1b17a33ecf1f59af84aa1dfef572b09e5c4b9333f31d2c30b7c2a1bbee2447d2",
         "rust/crates/pg-source/src/driver.rs": "c46fd1c124c0aa46e9e82ca83d2545fd5295b9ecb750a8fa6455f140bc4782e4",
-        "rust/crates/pg-source/src/snapshot.rs": "9ee624e1690e231814b41933f318b27f3b68b67136969b076dd7e8eed879388b",
+        "rust/crates/pg-source/src/snapshot.rs": "177de67373d3316dff7b008b2a506bd486db479798c214adb73b05961fdbc3b2",
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
@@ -204,7 +204,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
-        "rust/crates/ffi/src/lib.rs": "55f47e1553f75719b7850f73c07c19e232c76beedcc9c5fd2395e4c03bde3715",
+        "rust/crates/ffi/src/lib.rs": "724ed33aadefe5696ea930ee2bbe9a111920fb13855be6b03846f52519f06826",
         "rust/crates/node/src/node.rs": "26eb2e6929a8b7eb6c1788d8a9c6eb57c1c35f78f7e02db5afa4c53ab95064c0",
         "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
@@ -244,6 +244,16 @@
         "client_read"
       ],
       "requirement": "Complete remaining expression invocation boundaries; preserve physical vector null payloads, selected union legs and getter indexes through execution views, copies and native spilling."
+    },
+    {
+      "id": "sql-grammar-and-literals",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Complete the pinned lexical vocabulary and fallback, lazy grammar prediction and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; integrate every frontend through admitted parsed ownership."
     },
     {
       "id": "planning-allocation",
