@@ -16,12 +16,16 @@ use crate::NativeResources;
 
 impl NativeResources {
     #[cfg(feature = "kafka")]
-    pub fn with_kafka(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>) -> Result<Self> {
-        self.with_kafka_topic_creation(clusters, observer, true)
+    /// Registers Kafka log resources with automatic topic creation and the node's TLS allocation budget.
+    /// Opens no clients and returns an error if the Kafka log configuration type is already registered.
+    pub fn with_kafka(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, memory: Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
+        self.with_kafka_topic_creation(clusters, observer, true, memory)
     }
     #[cfg(feature = "kafka")]
-    pub fn with_kafka_topic_creation(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool) -> Result<Self> {
-        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer, auto_create_topic }))
+    /// Registers Kafka resources with the supplied topic-creation policy and node allocation budget.
+    /// Opens no clients and returns an error if the Kafka log configuration type is already registered.
+    pub fn with_kafka_topic_creation(self, clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool, memory: Arc<rtdb_columnar::MemoryBudget>) -> Result<Self> {
+        self.register_log("xtdb.kafka.proto.KafkaLogConfig", Arc::new(KafkaFactory { clusters, observer, auto_create_topic, memory }))
     }
     #[cfg(feature = "s3")]
     pub fn with_s3(self, remotes: Arc<dyn rtdb_s3::S3CredentialResolver>) -> Result<Self> {
@@ -69,7 +73,7 @@ impl RemoteStorageFactory for GcsFactory {
 }
 
 #[cfg(feature = "kafka")]
-struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool }
+struct KafkaFactory { clusters: std::collections::BTreeMap<String, rtdb_kafka::KafkaClusterConfig>, observer: Arc<dyn rtdb_kafka::KafkaObserver>, auto_create_topic: bool, memory: Arc<rtdb_columnar::MemoryBudget> }
 #[cfg(feature = "kafka")]
 #[async_trait]
 impl crate::LogFactory for KafkaFactory {
@@ -90,8 +94,8 @@ impl crate::LogFactory for KafkaFactory {
         replica_options.read_only = access.replica_read_only();
         replica_options.auto_create_topic = self.auto_create_topic;
         replica_options.pipelined = true;
-        let source = KafkaLog::open(source_cluster, source_options, Arc::clone(&self.observer)).await?;
-        let replica = KafkaLog::open(replica_cluster, replica_options, Arc::clone(&self.observer)).await?;
+        let source = KafkaLog::open(source_cluster, source_options, Arc::clone(&self.observer), Arc::clone(&self.memory)).await?;
+        let replica = KafkaLog::open(replica_cluster, replica_options, Arc::clone(&self.observer), Arc::clone(&self.memory)).await?;
         let mut drivers = Vec::new();
         for driver in source.driver.into_iter().chain(replica.driver) {
             let token = cancellation.clone();
@@ -104,3 +108,23 @@ impl crate::LogFactory for KafkaFactory {
 
 #[cfg(any(feature = "kafka", feature = "s3", feature = "azure", feature = "gcs"))]
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.db-catalog/invalid-db-config", message.to_string()) }
+
+#[cfg(all(test, feature = "kafka"))]
+mod kafka_tests {
+    use super::*;
+    use crate::LogFactory;
+    struct Observer;
+    impl rtdb_kafka::KafkaObserver for Observer { fn warning(&self, _: rtdb_kafka::KafkaWarning) {} }
+
+    #[tokio::test]
+    async fn kafka_log_factory_admits_tls_against_the_supplied_node_budget() {
+        let memory = rtdb_columnar::MemoryBudget::new(0);
+        let mut cluster = rtdb_kafka::KafkaClusterConfig::new("unused.invalid:9092");
+        cluster.properties_map.insert("security.protocol".into(), "SSL".into());
+        let factory = KafkaFactory { clusters: std::collections::BTreeMap::from([("remote".into(), cluster)]), observer: Arc::new(Observer), auto_create_topic: false, memory: Arc::clone(&memory) };
+        let configuration = Any { type_url: "xtdb.kafka.proto.KafkaLogConfig".into(), value: rtdb_kafka::KafkaLogConfig::new("remote", "source").to_proto().encode_to_vec() };
+        let result = factory.open(&configuration, crate::LogAccess::ReadWrite, tokio_util::sync::CancellationToken::new()).await;
+        assert_eq!(result.err().unwrap().code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

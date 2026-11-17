@@ -28,7 +28,10 @@ Provider cache limits, ownership details, and regression-source coverage are rec
 
 == Kafka and Schema Registry TLS
 
-Kafka dead-letter producers accept the Java SSL configuration names through the native TLS adapter.
+Kafka logs, Connect source consumers, and dead-letter producers accept the Java SSL configuration names through the native TLS adapter.
+Log administrators, producers, watermark readers, ranges, and tails share the log's prepared TLS configuration.
+Source consumers retain the configuration for their assignment.
+The server supplies its existing memory budget; admitted TLS material remains owned through the last derived native client's destruction.
 Schema Registry HTTPS uses the corresponding `schema.registry.ssl.*` options.
 JKS, PKCS12, and PEM stores retain independent store and private-key passwords.
 The default trust anchors come from the pinned Temurin resource; explicit trust material overrides them, including an explicitly empty store.

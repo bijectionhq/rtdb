@@ -1,4 +1,5 @@
 mod config;
+mod client;
 mod driver;
 mod tail;
 mod tls;
@@ -11,6 +12,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}};
 use async_trait::async_trait;
 use bytes::Bytes;
+use rtdb_columnar::MemoryBudget;
 use rdkafka::{ClientConfig, Message, admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication}, client::DefaultClientContext,
     consumer::{BaseConsumer, Consumer}, error::{KafkaError, RDKafkaErrorCode}, message::BorrowedMessage, producer::BaseProducer};
 use rtdb_storage::{Error, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
@@ -40,29 +42,22 @@ enum Access {
     Writable { queue: mpsc::Sender<driver::Queued>, bytes: Arc<Semaphore>, records: Arc<Semaphore> },
 }
 
-pub struct KafkaLog { properties: BTreeMap<String, String>, options: KafkaLogOptions, progress: Arc<Progress>, access: Access }
+pub struct KafkaLog { configuration: ClientConfig, options: KafkaLogOptions, progress: Arc<Progress>, access: Access }
 pub struct OpenedKafkaLog { pub log: Arc<KafkaLog>, pub driver: Option<KafkaLogDriver> }
 
 impl KafkaLog {
     /// The owner must run the returned driver, then cancel and join it before releasing a writable log.
-    pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>) -> Result<OpenedKafkaLog> {
+    /// TLS material is admitted against `memory` and remains charged until the last derived native client is destroyed.
+    pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>) -> Result<OpenedKafkaLog> {
         options.validate()?;
-        let properties = native_properties(&cluster.properties()?)?;
-        if properties.contains_key("transactional.id") { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
-        ensure_topic(&properties, &options, observer.as_ref()).await?;
-        let consumer = consumer(&properties, &options).map_err(Anomaly::from)?;
+        let configuration = client::prepare(&cluster.properties()?, &memory)?;
+        if configuration.get("transactional.id").is_some() { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
+        ensure_topic(&configuration, &options, observer.as_ref()).await?;
+        let consumer = consumer(&configuration, &options).map_err(Anomaly::from)?;
         let (_, end) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
         let progress = Arc::new(Progress::new(end - 1));
         let (access, driver) = if options.read_only { (Access::ReadOnly, None) } else {
-            if let Some(value) = properties.get("acks").filter(|value| value.as_str() != "all" && value.as_str() != "-1") {
-                observer.warning(KafkaWarning::AcknowledgementsOverridden { configured: value.clone() });
-            }
-            let mut producer_properties = producer_properties(&properties, options.pipelined);
-            if producer_properties.get("enable.idempotence").is_some_and(|value| value == "false") { observer.warning(KafkaWarning::IdempotenceDisabled); }
-            producer_properties.insert("queue.buffering.max.messages".into(), options.queue_capacity.to_string());
-            producer_properties.insert("queue.buffering.max.kbytes".into(), options.queued_bytes.div_ceil(1024).to_string());
-            producer_properties.entry("message.max.bytes".into()).or_insert_with(|| options.maximum_message_bytes.saturating_add(1024).to_string());
-            let producer: BaseProducer<driver::DeliveryContext> = client_config(&producer_properties).create_with_context(driver::DeliveryContext { progress: Arc::clone(&progress), topic: options.topic.clone() })
+            let producer: BaseProducer<driver::DeliveryContext> = producer_config(&configuration, &options, observer.as_ref()).create_with_context(driver::DeliveryContext { progress: Arc::clone(&progress), topic: options.topic.clone() })
                 .map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
             let (queue, receiver) = mpsc::channel(options.queue_capacity);
             let bytes = Arc::new(Semaphore::new(options.queued_bytes));
@@ -70,7 +65,7 @@ impl KafkaLog {
             let access = Access::Writable { queue, bytes: Arc::clone(&bytes), records: Arc::clone(&records) };
             (access, Some(KafkaLogDriver::new(producer, receiver, Arc::clone(&progress), options.clone(), bytes, records)))
         };
-        Ok(OpenedKafkaLog { log: Arc::new(Self { properties, options, progress, access }), driver })
+        Ok(OpenedKafkaLog { log: Arc::new(Self { configuration, options, progress, access }), driver })
     }
 }
 
@@ -80,8 +75,23 @@ fn client_config(properties: &BTreeMap<String, String>) -> ClientConfig {
     config
 }
 
-fn consumer(properties: &BTreeMap<String, String>, options: &KafkaLogOptions) -> StorageResult<BaseConsumer> {
-    let mut config = client_config(properties);
+fn producer_config(configuration: &ClientConfig, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> ClientConfig {
+    if let Some(value) = configuration.get("acks").filter(|value| *value != "all" && *value != "-1") {
+        observer.warning(KafkaWarning::AcknowledgementsOverridden { configured: value.into() });
+    }
+    let properties = configuration.config_map().iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+    let mut properties = producer_properties(&properties, options.pipelined);
+    if properties.get("enable.idempotence").is_some_and(|value| value == "false") { observer.warning(KafkaWarning::IdempotenceDisabled); }
+    properties.insert("queue.buffering.max.messages".into(), options.queue_capacity.to_string());
+    properties.insert("queue.buffering.max.kbytes".into(), options.queued_bytes.div_ceil(1024).to_string());
+    properties.entry("message.max.bytes".into()).or_insert_with(|| options.maximum_message_bytes.saturating_add(1024).to_string());
+    let mut result = configuration.clone();
+    result.extend(properties);
+    result
+}
+
+fn consumer(configuration: &ClientConfig, options: &KafkaLogOptions) -> StorageResult<BaseConsumer> {
+    let mut config = configuration.clone();
     config.set("group.id", "rtdb-explicit-assignment").set("enable.auto.commit", "false").set("enable.auto.offset.store", "false")
         .set("allow.auto.create.topics", "false")
         .set("isolation.level", "read_committed").set("auto.offset.reset", "error").set("enable.partition.eof", "true")
@@ -105,8 +115,8 @@ fn metadata(message: &BorrowedMessage<'_>, topic: &str) -> StorageResult<LogMeta
     Ok(LogMetadata { offset: LogOffset(message.offset()), timestamp: Timestamp(millis.checked_mul(1000).ok_or_else(|| Error::Remote { key: topic.into(), message: "Kafka timestamp exceeds microsecond range".into() })?) })
 }
 
-async fn ensure_topic(properties: &BTreeMap<String, String>, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> Result<()> {
-    let mut admin_config = client_config(properties);
+async fn ensure_topic(configuration: &ClientConfig, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> Result<()> {
+    let mut admin_config = configuration.clone();
     admin_config.set("allow.auto.create.topics", "false");
     let admin: AdminClient<DefaultClientContext> = admin_config.create().map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
     let mut metadata = admin.inner().fetch_metadata(Some(&options.topic), options.request_timeout).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
@@ -149,7 +159,7 @@ impl Log for KafkaLog {
         if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         let mut options = self.options.clone();
         options.maximum_poll_records = 1;
-        let consumer = consumer(&self.properties, &options)?;
+        let consumer = consumer(&self.configuration, &options)?;
         let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
         if from.0 < low { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: low }); }
         let tail = tail::KafkaTail::new(consumer, options, Arc::clone(&self.progress), LogOffset(from.0.min(high) - 1))?;
@@ -173,7 +183,7 @@ impl Log for KafkaLog {
 
     fn latest(&self) -> StorageResult<LogOffset> {
         self.progress.check()?;
-        let consumer = consumer(&self.properties, &self.options)?;
+        let consumer = consumer(&self.configuration, &self.options)?;
         let (_, end) = consumer.fetch_watermarks(&self.options.topic, 0, self.options.request_timeout).map_err(|error| transport_error(&self.options.topic, error))?;
         if end - 1 < self.progress.observed_tip.load(Ordering::Acquire) { return Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka withdrew an observed log position".into() }); }
         self.progress.advance(end - 1);
@@ -181,13 +191,13 @@ impl Log for KafkaLog {
     }
 
     async fn tail(&self, after: LogOffset) -> StorageResult<Box<dyn LogTail>> {
-        Ok(Box::new(tail::KafkaTail::new(consumer(&self.properties, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?))
+        Ok(Box::new(tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?))
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> StorageResult<Vec<LogRecord>> {
         if from.0 < 0 || to < from { return Err(Error::UnavailableLogRange { requested: from.0, first_retained: 0 }); }
         let after = LogOffset(from.0 - 1);
-        let mut tail = tail::KafkaTail::new(consumer(&self.properties, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?;
+        let mut tail = tail::KafkaTail::new(consumer(&self.configuration, &self.options)?, self.options.clone(), Arc::clone(&self.progress), after)?;
         let end = tail.end()?.min(to.0);
         let mut result = Vec::new();
         let mut bytes = 0usize;
