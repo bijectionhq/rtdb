@@ -206,6 +206,6 @@ pub(crate) fn validate_provider(name: Option<&str>) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 #[cfg(test)]
 mod random_integration;

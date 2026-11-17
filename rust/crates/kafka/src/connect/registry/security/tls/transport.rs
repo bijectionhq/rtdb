@@ -103,10 +103,13 @@ mod client_usage_tests {
 
     #[test]
     fn rustls_reference_adapter_surfaces_new_sun_usage_admission_from_construction() {
-        let bytes = include_bytes!("../../../../../../tls/tests/fixtures/rsa1024.jks");
+        use crate::tls::tests::support::{Credential, jks};
+        let issuer = Credential::new("issuer", true, None);
+        let identity = Credential::new("client", true, Some(&issuer));
+        let bytes = jks(&[("client", &identity)], "12345678", "12345678");
         let memory = MemoryBudget::new(32 << 20);
         let charge = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes.len(), Some("12345678"), None).unwrap()).unwrap();
-        let store = KeyStore::decode(bytes, StoreFormat::Java, StoreUse::Identity, Some("12345678"), None, Arc::clone(&charge)).unwrap();
+        let store = KeyStore::decode(&bytes, StoreFormat::Java, StoreUse::Identity, Some("12345678"), None, Arc::clone(&charge)).unwrap();
         assert_eq!(store.identities().len(), 1);
         let certificates = store.identities()[0].certificates();
         let native_bound = certificates.iter().fold(65_536usize, |bytes, certificate| bytes + certificate.len() * 32);

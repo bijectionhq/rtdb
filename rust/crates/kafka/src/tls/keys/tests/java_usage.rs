@@ -101,7 +101,14 @@ fn client_native_key_algorithms_preserve_pss_and_dh_usage_rules() {
         der(3, &[vec![0], signer.rsa().unwrap().public_key_to_der_pkcs1().unwrap()].concat())].concat());
     let dsa = PKey::from_dsa(Dsa::generate(2048).unwrap()).unwrap().public_key_to_der().unwrap();
     let ec = PKey::from_ec_key(EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap()).unwrap().public_key_to_der().unwrap();
-    let dh = PKey::from_dh(Dh::get_2048_256().unwrap().generate_key().unwrap()).unwrap().public_key_to_der().unwrap();
+    let dh = Dh::get_2048_256().unwrap().generate_key().unwrap();
+    let integer = |value: &openssl::bn::BigNumRef| {
+        let mut bytes = value.to_vec();
+        if bytes.first().is_some_and(|byte| byte & 0x80 != 0) { bytes.insert(0, 0); }
+        der(2, &bytes)
+    };
+    let algorithm = der(0x30, &[der(6, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 3, 1]), der(0x30, &[integer(dh.prime_p()), integer(dh.generator())].concat())].concat());
+    let dh = der(0x30, &[algorithm, der(3, &[vec![0], integer(dh.public_key())].concat())].concat());
     let dhx = PKey::from_dhx(Dh::get_2048_256().unwrap().generate_key().unwrap()).unwrap().public_key_to_der().unwrap();
     let ed = PKey::generate_ed25519().unwrap().public_key_to_der().unwrap();
     for (public_key, kind, required) in [(rsa, Id::RSA, 0x80), (pss, Id::RSA_PSS, 0), (dsa, Id::DSA, 0x80), (ec, Id::EC, 0x80),

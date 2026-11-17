@@ -2,7 +2,7 @@ use super::*;
 use openssl::pkey::PKey;
 use rtdb_columnar::MemoryBudget;
 #[path = "../../tests/support/kafka_tls.rs"]
-pub(super) mod support;
+pub(crate) mod support;
 mod deferred;
 mod sun_jks;
 mod sun_pkcs12;
