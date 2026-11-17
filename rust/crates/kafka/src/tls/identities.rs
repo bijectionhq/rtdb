@@ -1,7 +1,7 @@
 use std::sync::{Arc, OnceLock};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{error::ErrorStack, ex_data::Index, pkey::{PKey, Private}, ssl::{Ssl, SslRef}, stack::Stack, x509::X509};
-use rtdb_columnar::MemoryReservation;
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_tls::{KeyStore, ProtectedKeyStore, StoreFormat, StoreUse, SunX509JksStore};
 use rtdb_types::Result;
 use zeroize::Zeroizing;
@@ -68,7 +68,7 @@ impl Material {
                 let manager = KeyManager::new(algorithm, store.identities());
                 let identities = store.identities().iter().map(|identity| {
                     let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
-                    ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm)
+                    ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm, charge.budget())
                 }).collect::<Result<Vec<_>>>()?;
                 (manager, identities)
             }
@@ -77,7 +77,7 @@ impl Material {
                 let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = store.identities().iter().map(|identity| {
                     let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
-                    ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm)
+                    ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm, charge.budget())
                 }).collect::<Result<Vec<_>>>()?;
                 (manager, identities)
             }
@@ -85,7 +85,7 @@ impl Material {
                 let aliases = owner.store.identities().iter().map(|identity| identity.alias()).collect::<Vec<_>>();
                 let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = owner.store.identities().iter().enumerate().map(|(index, identity)| {
-                    ClientIdentity::new(identity.certificates(), Key::Deferred { owner: Arc::clone(owner), index }, algorithm)
+                    ClientIdentity::new(identity.certificates(), Key::Deferred { owner: Arc::clone(owner), index }, algorithm, charge.budget())
                 }).collect::<Result<Vec<_>>>()?;
                 (manager, identities)
             }
@@ -101,12 +101,12 @@ impl NativeIdentities {
 }
 
 impl ClientIdentity {
-    fn new(certificates: &[Vec<u8>], key: Key, algorithm: Algorithm) -> Result<Self> {
+    fn new(certificates: &[Vec<u8>], key: Key, algorithm: Algorithm, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let certificate = X509::from_der(&certificates[0]).map_err(invalid)?;
         let kind = KeyType::of(&certificate)?;
         let mut chain = Stack::new().map_err(invalid)?;
         for certificate in &certificates[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-        let eligible = algorithm == Algorithm::SunX509 || security::verify_client_chain(&std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>()).is_ok();
+        let eligible = algorithm == Algorithm::SunX509 || security::java_client_chain_eligible(&std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>(), memory)?;
         Ok(Self { certificate, chain, kind, eligible, key })
     }
 

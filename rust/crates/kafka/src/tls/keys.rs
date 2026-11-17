@@ -1,7 +1,8 @@
-use std::{cmp::Ordering, ptr};
-use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{asn1::{Asn1BitString, Asn1Object, Asn1TimeRef}, nid::Nid, pkey::Id, stack::Stack, x509::X509Ref};
-use rtdb_tls::Identity;
+use std::{cmp::Ordering, ptr, sync::Arc};
+use foreign_types::ForeignTypeRef;
+use openssl::{asn1::Asn1TimeRef, pkey::Id, x509::X509Ref};
+use rtdb_columnar::MemoryBudget;
+use rtdb_tls::{CertificateExtendedKeyUsage, CertificateKeyUsage, Identity};
 use rtdb_types::Result;
 use super::invalid;
 
@@ -38,24 +39,29 @@ impl KeyManager {
         Self { algorithm, order }
     }
 
-    // OpenJDK 25.0.1 SunX509KeyManagerImpl.chooseClientAlias and X509KeyManagerImpl.chooseAlias/getAliases.
+    #[cfg(test)]
     pub(crate) fn choose(&self, types: &[KeyType], compatible: impl Fn(usize, KeyType) -> bool, status: impl Fn(usize) -> Status) -> Option<usize> {
+        self.try_choose(types, compatible, |index| Ok(status(index))).expect("infallible client status")
+    }
+
+    // OpenJDK 25.0.1 SunX509KeyManagerImpl.chooseClientAlias and X509KeyManagerImpl.chooseAlias/getAliases.
+    pub(crate) fn try_choose(&self, types: &[KeyType], compatible: impl Fn(usize, KeyType) -> bool, status: impl Fn(usize) -> Result<Status>) -> Result<Option<usize>> {
         if self.algorithm == Algorithm::SunX509 {
-            return types.iter().find_map(|kind| self.order.iter().copied().find(|index| compatible(*index, *kind)));
+            return Ok(types.iter().find_map(|kind| self.order.iter().copied().find(|index| compatible(*index, *kind))));
         }
         let mut valid = None;
         let mut fallback = None;
         for index in self.order.iter().copied() {
             let Some(key_index) = types.iter().position(|kind| compatible(index, *kind)) else { continue; };
-            let status = status(index);
+            let status = status(index)?;
             if status == Status::Valid {
-                if key_index == 0 { return Some(index); }
+                if key_index == 0 { return Ok(Some(index)); }
                 valid.get_or_insert(index);
             } else if fallback.is_none_or(|(previous, previous_key, _)| (status, key_index) < (previous, previous_key)) {
                 fallback = Some((status, key_index, index));
             }
         }
-        valid.or_else(|| fallback.map(|(_, _, index)| index))
+        Ok(valid.or_else(|| fallback.map(|(_, _, index)| index)))
     }
 }
 
@@ -84,32 +90,41 @@ pub(crate) fn requested_types(schemes: impl IntoIterator<Item = u16>) -> Vec<Key
     types
 }
 
-pub(crate) fn client_status(certificate: &X509Ref, now: &Asn1TimeRef) -> Status {
-    if !client_extensions(certificate) { return Status::ExtensionMismatch; }
+pub(crate) fn client_status(certificate: &X509Ref, now: &Asn1TimeRef, memory: &Arc<MemoryBudget>) -> Result<Status> {
+    Ok(status_with_usage(certificate, now, client_extensions(certificate, memory)?))
+}
+
+pub(crate) fn status_with_usage(certificate: &X509Ref, now: &Asn1TimeRef, usage_eligible: bool) -> Status {
+    if !usage_eligible { return Status::ExtensionMismatch; }
     if !certificate.not_before().compare(now).is_ok_and(|order| order != Ordering::Greater)
         || !certificate.not_after().compare(now).is_ok_and(|order| order != Ordering::Less) { return Status::Expired; }
     Status::Valid
 }
 
-fn client_extensions(certificate: &X509Ref) -> bool {
-    let mut critical = -1;
-    let usage = unsafe { openssl_sys::X509_get_ext_d2i(certificate.as_ptr(), Nid::EXT_KEY_USAGE.as_raw(), &mut critical, ptr::null_mut()) };
-    if usage.is_null() {
-        if critical != -1 { return false; }
-    } else {
-        let usage = unsafe { Stack::<Asn1Object>::from_ptr(usage.cast()) };
-        if !usage.iter().any(|oid| matches!(oid.nid(), Nid::CLIENT_AUTH | Nid::ANYEXTENDEDKEYUSAGE)) { return false; }
+pub(crate) fn client_extensions(certificate: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<bool> {
+    let length = unsafe { openssl_sys::i2d_X509(certificate.as_ptr(), ptr::null_mut()) };
+    let bound = usize::try_from(length).ok().filter(|length| *length > 0).and_then(|length| length.checked_add(64))
+        .ok_or_else(|| invalid("TLS client certificate encoding exceeds allocation range"))?;
+    let _encoding = memory.reserve(bound)?;
+    let encoded = certificate.to_der().map_err(invalid)?;
+    match CertificateExtendedKeyUsage::decode(&encoded, memory).and_then(|usage| usage.permits_client_authentication()) {
+        Ok(true) => {},
+        Ok(false) => return Ok(false),
+        Err(error) if error.code == "rtdb.tls/invalid-keystore" => return Ok(false),
+        Err(error) => return Err(error),
     }
-    let usage = unsafe { openssl_sys::X509_get_ext_d2i(certificate.as_ptr(), Nid::KEY_USAGE.as_raw(), &mut critical, ptr::null_mut()) };
-    if usage.is_null() { return critical == -1; }
-    let usage = unsafe { Asn1BitString::from_ptr(usage.cast()) };
-    let bits = usage.as_slice().first().copied().unwrap_or(0);
-    match certificate.public_key().map(|key| key.id()) {
+    let bits = match CertificateKeyUsage::decode(&encoded, memory) {
+        Ok(usage) => usage.permitted_bits(),
+        Err(error) if error.code == "rtdb.tls/invalid-keystore" => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if bits & 0x88 == 0x88 { return Ok(true); }
+    Ok(match certificate.public_key().map(|key| key.id()) {
         Ok(Id::RSA | Id::DSA | Id::EC) => bits & 0x80 != 0,
-        Ok(Id::DH) => bits & 0x08 != 0,
+        Ok(Id::DH | Id::DHX) => bits & 0x08 != 0,
         Ok(_) => true,
         Err(_) => false,
-    }
+    })
 }
 
 #[cfg(test)]

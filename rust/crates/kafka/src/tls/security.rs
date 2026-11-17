@@ -5,6 +5,8 @@ use rtdb_types::Result;
 use super::invalid;
 
 mod parameters;
+mod client;
+pub(crate) use client::java_client_chain_eligible;
 mod peer;
 pub(crate) use peer::permits_client_certificate;
 mod pkix;
@@ -104,10 +106,15 @@ pub(crate) fn verify_server_distrust(chain: &[&X509Ref]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn verify_client_chain(chain: &[&X509Ref]) -> Result<()> {
+    verify_client_chain_with_usage(chain, key_usage)
+}
+
+fn verify_client_chain_with_usage(chain: &[&X509Ref], usage: impl Fn(&X509Ref) -> Result<()>) -> Result<()> {
     let mut issuer: Option<Key> = None;
     for certificate in chain.iter().rev() {
-        key_usage(certificate)?;
+        usage(certificate)?;
         signature(certificate, false, false)?;
         let key = Key::of(&certificate.public_key().map_err(invalid)?);
         key.check()?;

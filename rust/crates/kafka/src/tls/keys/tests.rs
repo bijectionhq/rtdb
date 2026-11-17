@@ -1,5 +1,5 @@
 use super::*;
-use openssl::{asn1::Asn1Time, bn::BigNum, ec::{EcGroup, EcKey}, hash::MessageDigest, pkey::PKey, x509::{X509, X509Extension, X509NameBuilder, extension::{ExtendedKeyUsage, KeyUsage}}};
+use openssl::{asn1::Asn1Time, bn::BigNum, ec::{EcGroup, EcKey}, hash::MessageDigest, nid::Nid, pkey::PKey, x509::{X509, X509Extension, X509NameBuilder, extension::{ExtendedKeyUsage, KeyUsage}}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tls::{KeyStore, StoreFormat, StoreUse};
 
@@ -95,3 +95,9 @@ fn builtin_key_manager_aliases_and_signature_key_order_follow_sunjsse() {
     for name in ["", "custom.Manager", "SunPKIX"] { assert!(Algorithm::parse(Some(name)).is_err()); }
     assert_eq!(requested_types([0x080a, 0x0804, 0x0403, 0x0401, 0x0807, 0x0808, 0x0402, 0xffff]), vec![KeyType::RsaPss, KeyType::Rsa, KeyType::Ec, KeyType::EdDsa, KeyType::Dsa]);
 }
+
+fn client_status(certificate: &X509Ref, now: &Asn1TimeRef) -> Status {
+    super::client_status(certificate, now, &MemoryBudget::new(1 << 20)).unwrap()
+}
+
+mod java_usage;
