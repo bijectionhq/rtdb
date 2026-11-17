@@ -167,6 +167,9 @@ pub(crate) struct ContextView<'a, 'id, 'g, 'scope, M: StoreMemory = Scoped<'scop
 impl<'id, 'g, 'scope, M: StoreMemory> ContextView<'_, 'id, 'g, 'scope, M> {
     pub(crate) fn shape(&self) -> ContextShape { self.owner.shape(self.key) }
     pub(crate) fn is_empty(&self) -> bool { self.owner.is_empty(self.key) }
+    pub(super) fn has_empty_path(&self) -> bool {
+        self.len().checked_sub(1).is_some_and(|last| self.owner.edge(self.key, last).address == ReturnAddress::Empty)
+    }
     pub(crate) fn len(&self) -> usize { self.owner.len(self.key) }
     pub(crate) fn hash(&self) -> i32 { self.owner.hash(self.key) }
     pub(crate) fn parent(&self, index: usize) -> Option<Option<ContextKey<'id>>> {

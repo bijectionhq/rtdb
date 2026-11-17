@@ -6,6 +6,8 @@ use super::dfa::{InternedStateKey, PredictionDfas};
 use super::storage::{Retained, StoreMemory};
 use super::runtime::{PredictionInput, RuntimeError, RuntimeProblem, RuntimeResult};
 use super::FactoryError;
+#[path = "localization.rs"]
+mod localization;
 #[cfg(test)]
 #[path = "full_tests.rs"]
 mod full_tests;

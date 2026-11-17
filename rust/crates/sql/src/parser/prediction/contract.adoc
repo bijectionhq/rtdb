@@ -478,6 +478,23 @@ Subsequent cold starts use newly produced objects, and the classifier's semantic
 The private production path therefore preserves each previously interned configuration's values and set hash across later start, reach and classification work.
 This proof depends on ordinary rows originating at the bounded Local producer and on use through the existing exclusive access.
 
-The adaptive execution loops, predicate evaluation, Full dispatch and report, no-viable construction and error localization remain open.
+The adaptive execution loops, accept-predicate evaluation, Full dispatch and report, and no-viable construction remain open.
 The production host and cache mapping and the embedded cause capability gate remain open.
 Compiler and runtime qualification remain part of Phase 2.
+
+== Finishing-alternative selection
+
+The adaptive caller constructs the candidate no-viable error and seeks the prediction origin before asking the current Local or Full facade for a finishing alternative.
+The query checks its phase and the restored origin before preparing any split sets.
+It adds the original configurations to succeeded and failed sets in occurrence order using the original set mode.
+Those sets use uncached addition and leave the prediction memo intact.
+An unpredicated configuration succeeds, and a precedence predicate uses the captured signed stack top.
+
+A configuration finishes when its outer depth is positive or its RuleStop context has an empty return path.
+The latter tests the last return address, including a terminal EmptyReturn in a nonempty Full Array.
+Selection takes the smallest finishing alternative from the succeeded set first, then from the failed set.
+An absent choice leaves reporting to the adaptive caller.
+
+Within the closed Local and Full producer domain, each membership triple has one representative identity, with possible repeated occurrences of that identity.
+Splitting into subgroups keeps that identity and does not merge distinct representatives into previously cached configurations.
+Unrooted split sets are reclaimed by the existing prediction collector.
