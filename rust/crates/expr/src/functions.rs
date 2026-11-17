@@ -68,7 +68,7 @@ pub fn scalar_call(name: &str, args: &[Value], context: &EvalContext<'_>) -> Res
         };
         return Ok(component.map(|text| Value::Utf8(text.into_owned())).unwrap_or(Value::Null));
     }
-    if matches!(name.as_str(), "nullif" | "distinct_from" | "null_eq" | "===") && args.iter().all(|value| !nullish(value)) {
+    if matches!(name.as_str(), "nullif" | "distinct_from" | "null_eq" | "===") && (name == "===" || args.iter().all(|value| !nullish(value))) {
         context.reserve(crate::equality_allocation_bound(&args[0], &args[1])?)?;
     }
     match name.as_str() {

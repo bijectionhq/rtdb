@@ -123,11 +123,12 @@ fn emitted_integer(value: &Value) -> Option<i128> {
 }
 
 fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
-    if let (Value::Transit(left),Value::Transit(right)) = (left,right) {
+    if let Value::Transit(left) = left {
         let left = crate::transit_object::Object::decode(left)?;
-        let right = crate::transit_object::Object::decode(right)?;
-        return left.equivalent(&right);
+        return if let Value::Transit(right) = right { left.equivalent(&crate::transit_object::Object::decode(right)?) }
+            else { left.equivalent_emitted(right) };
     }
+    if let Value::Transit(right) = right { return crate::transit_object::Object::decode(right)?.equivalent_emitted(left); }
     if let (Some(left), Some(right)) = (emitted_integer(left), emitted_integer(right)) { return Ok(left == right); }
     if let (Some(left), Some(right)) = (IntervalParts::of(left), IntervalParts::of(right)) {
         return Ok(left.months == right.months && left.days == right.days && left.nanos == right.nanos);
@@ -142,6 +143,7 @@ fn emitted_eq(left: &Value, right: &Value) -> Result<bool> {
 /// Nested NULLs compare equal; same-category temporal units still undergo checked conversion.
 /// Callers own the scratch charge returned by `equality_allocation_bound`.
 pub fn strict_eq(left: &Value, right: &Value) -> Result<bool> {
+    if matches!(left, Value::Transit(_)) || matches!(right, Value::Transit(_)) { return emitted_eq(left, right); }
     if nullish(left) || nullish(right) { return Ok(nullish(left) && nullish(right)); }
     if date_time(left) && date_time(right) {
         return match (left, right) {
