@@ -123,7 +123,7 @@ fn inline_xtql_arity_and_reader_errors_retain_original_sql_spans() {
     let sql = "SELECT 1 FROM (XTQL ($$#(rel [{:a %}] [a])$$,?,?)) AS t";
     let error = parse(sql).unwrap_err();
     assert_eq!(error.code,"xtql/fn-arity-error");
-    assert_eq!(error.message,"XTQL fn expects 1 argument(s), got 2");
+    assert_eq!(error.message.as_deref(),Some("XTQL fn expects 1 argument(s), got 2"));
     assert_eq!(error.context["position"],serde_json::json!(sql.find("XTQL").unwrap()+1));
     let malformed = "SELECT 1 FROM (XTQL $$(rel [$$) AS t";
     let error = parse(malformed).unwrap_err();

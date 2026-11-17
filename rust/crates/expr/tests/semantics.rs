@@ -111,9 +111,9 @@ fn integer_comparison_does_not_round_through_f64() {
 #[test]
 fn numeric_errors_preserve_division_and_overflow_diagnostics() {
     for left in [V::I64(5), V::F64(5.0)] {
-        for right in [V::I64(0), V::F64(0.0)] { assert!(arithmetic(B::Divide, &left, &right).unwrap_err().message.contains("division by zero")); }
+        for right in [V::I64(0), V::F64(0.0)] { assert!(arithmetic(B::Divide, &left, &right).unwrap_err().message.as_deref().is_some_and(|message| message.contains("division by zero"))); }
     }
-    assert!(arithmetic(B::Add, &V::I64(i64::MAX), &V::I64(i64::MAX)).unwrap_err().message.contains("overflow"));
+    assert!(arithmetic(B::Add, &V::I64(i64::MAX), &V::I64(i64::MAX)).unwrap_err().message.as_deref().is_some_and(|message| message.contains("overflow")));
     assert!(arithmetic(B::Multiply, &V::I32(i32::MIN), &V::I32(2)).is_err());
     assert_eq!(arithmetic(B::Divide, &V::I64(7), &V::I64(2)).unwrap(), V::I64(3));
 }
@@ -155,7 +155,7 @@ fn substring_keeps_unicode_and_outside_range_cases() {
     ] {
         assert_eq!(scalar_call("substring", &[V::Utf8(text.into()), V::I64(pos), V::I64(length)], &EvalContext::default()).unwrap(), V::Utf8(expected.into()));
     }
-    assert!(scalar_call("substring", &[V::Utf8("".into()), V::I64(0), V::I64(-1)], &EvalContext::default()).unwrap_err().message.contains("Negative substring length"));
+    assert!(scalar_call("substring", &[V::Utf8("".into()), V::I64(0), V::I64(-1)], &EvalContext::default()).unwrap_err().message.as_deref().is_some_and(|message| message.contains("Negative substring length")));
 }
 
 #[test]
@@ -209,7 +209,7 @@ fn period_constructor_accepts_date_time_pairs_and_preserves_asymmetric_null_disp
     for to in [V::DateDay(1), V::Timestamp { value: 1, unit: TimeUnit::Microsecond, timezone: None }] {
         assert_eq!(scalar_call("period", &[V::Null, to], &context).unwrap_err().code, "xtdb.expression/function-type-mismatch");
     }
-    assert_eq!(scalar_call("period", &[V::Null, V::DateDay(1)], &context).unwrap_err().message, "period not applicable to types null and date");
+    assert_eq!(scalar_call("period", &[V::Null, V::DateDay(1)], &context).unwrap_err().message.as_deref(), Some("period not applicable to types null and date"));
     assert_eq!(scalar_call("period", &[V::Utf8("2020-01-01".into()), V::Null], &context).unwrap_err().code, "xtdb.expression/function-type-mismatch");
 }
 

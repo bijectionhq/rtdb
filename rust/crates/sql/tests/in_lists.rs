@@ -116,7 +116,7 @@ fn list_candidates_share_scalar_admission_and_row_arity_at_every_length() {
         for candidate in ["(SELECT 1)","MAX(x)","ROW_NUMBER() OVER ()"] {
             let sql = format!("SELECT x IN ({candidate}{suffix}) FROM (VALUES (1)) t(x) GROUP BY x");
             let error = prepare(&sql, &context.catalog, &PrepareOptions::default()).unwrap_err();
-            assert!(error.message.contains("not allowed in this context"), "{sql}: {error}");
+            assert!(error.message.as_deref().is_some_and(|message| message.contains("not allowed in this context")), "{sql}: {error}");
         }
     }
     for candidates in ["(1,2)","ROW(1,2)","ROW()","1,(2,3)"] {

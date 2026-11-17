@@ -215,9 +215,9 @@ async fn avro_decimal_conversion_failures_release_public_decoder_allocations() {
     let writer = schema("AVRO", text, 1, Json::Null);
     let (mut converter, server) = registry("AVRO", vec![get("/schemas/ids/7", writer), lookup(1)], BTreeMap::new()).await;
     let memory = MemoryBudget::new(1 << 27);
-    assert!(converter.decode("events", Some(&framed(&[])), &mut context(&memory)).await.unwrap_err().message.contains("Decimal coefficient bytes are empty"));
+    assert!(converter.decode("events", Some(&framed(&[])), &mut context(&memory)).await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Decimal coefficient bytes are empty")));
     server.await.unwrap();
-    assert!(converter.decode("events", Some(&framed(&[1])), &mut context(&memory)).await.unwrap_err().message.contains("Decimal schema has no scale"));
+    assert!(converter.decode("events", Some(&framed(&[1])), &mut context(&memory)).await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Decimal schema has no scale")));
     converter.close().await.unwrap();
     drop(converter);
     assert_eq!(memory.used_bytes(), 0);

@@ -23,7 +23,7 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
         if protocols.iter().any(|protocol| !matches!(*protocol, "TLSv1.2" | "TLSv1.3")) { return Err(error("invalid-plugin-config", "Unsupported registry TLS enabled protocol")); }
         versions.retain(|version| match version.version { rustls::ProtocolVersion::TLSv1_2 => protocols.contains(&"TLSv1.2"), rustls::ProtocolVersion::TLSv1_3 => protocols.contains(&"TLSv1.3"), _ => false });
     }
-    let trust_algorithm = validation::Algorithm::parse(options.get("trustmanager.algorithm").copied().filter(|name| !name.is_empty())).map_err(|cause| error("invalid-plugin-config", cause.message))?;
+    let trust_algorithm = validation::Algorithm::parse(options.get("trustmanager.algorithm").copied().filter(|name| !name.is_empty())).map_err(|cause| rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka-connect-source/invalid-plugin-config", cause.message))?;
     let roots = match trust_algorithm {
         validation::Algorithm::Pkix => Trust::Pkix(roots(trust, Arc::clone(&charge))?),
         validation::Algorithm::SunX509 => Trust::SunX509(simple_roots(trust, Arc::clone(&charge))?),
@@ -44,7 +44,7 @@ fn roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<Pki
 }
 fn simple_roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<SimpleTrust> {
     let (anchors, charge) = decoded_roots(trust, charge)?;
-    SimpleTrust::new(anchors, charge).map_err(|cause| error("invalid-plugin-config", cause.message))
+    SimpleTrust::new(anchors, charge).map_err(|cause| rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka-connect-source/invalid-plugin-config", cause.message))
 }
 fn decoded_roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<(Vec<X509>, Arc<MemoryReservation>)> {
     let explicit = trust.is_some();

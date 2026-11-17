@@ -40,7 +40,7 @@ pub(crate) fn clock_timestamp_literal(expression: &ast::Expr) -> Result<Option<S
     let ast::Expr::TypedString(value) = expression else { return Ok(None); };
     if !matches!(value.data_type,ast::DataType::Timestamp(..)) { return Ok(None); }
     let Value::Utf8(text) = crate::types::literal(&value.value.value)? else { return Ok(None); };
-    rtdb_types::parse_sql_timestamp_instant(&text,"UTC").map_err(|failure| crate::bind::error(format!("Cannot parse timestamp: {text} - failed with message {}",failure.message)))?;
+    rtdb_types::parse_sql_timestamp_instant(&text,"UTC").map_err(|failure| crate::bind::error(format!("Cannot parse timestamp: {text} - failed with message {}",failure.message.as_deref().unwrap_or("null"))))?;
     Ok(Some(text))
 }
 

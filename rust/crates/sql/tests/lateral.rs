@@ -158,6 +158,6 @@ fn recursive_ctes_retain_the_reference_unsupported_anomaly() {
         let error = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap_err();
         assert_eq!(error.category, AnomalyCategory::Unsupported);
         assert_eq!(error.code, "xtdb.sql/recursive-ctes");
-        assert_eq!(error.message, "Recursive CTEs are not supported yet");
+        assert_eq!(error.message.as_deref(), Some("Recursive CTEs are not supported yet"));
     }
 }

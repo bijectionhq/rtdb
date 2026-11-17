@@ -44,7 +44,9 @@ Observers return promptly and do not panic; an unavailable stderr does not alter
 The JSON event is `compaction_failed`, with `table`, `output_trie_key`, `anomaly_code`, `anomaly_category`, `operation`, `object_key`, `permission_denied`, and `message_sha256` fields.
 Missing operation or object-key context is serialized as null.
 `permission_denied` comes only from the typed `rtdb.storage/permission-denied` code.
-`message_sha256` is lowercase SHA-256 of the original message's UTF-8 bytes; the event omits the raw message, provider URL, local root path, and arbitrary anomaly context.
+`message_sha256` is lowercase SHA-256 of a present message's UTF-8 bytes, including the digest of empty bytes for an empty message.
+An absent message has a null digest.
+The event omits the raw message, provider URL, local root path, and arbitrary anomaly context.
 Operation context accepts lowercase ASCII identifiers and object-key context passes `ObjectKey` validation.
 
 `TrieCollector` and `BlockCollector` are passive cycle capabilities.

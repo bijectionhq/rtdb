@@ -139,16 +139,16 @@ async fn host_arithmetic_keeps_numeric_categories_scale_and_primitive_overloads(
 #[tokio::test]
 async fn host_direct_arithmetic_runs_each_nested_operation_before_later_arguments() {
     let direct = project(r#"(regexp-replace "a" (str (+ 9223372036854775807 1 (subs "x" -1))) "x")"#).await.unwrap_err();
-    assert_eq!(direct.message,"long overflow");
+    assert_eq!(direct.message.as_deref(),Some("long overflow"));
     let indirect = project(r#"(regexp-replace "a" (let [f +] (str (f 9223372036854775807 1 (subs "x" -1)))) "x")"#).await.unwrap_err();
-    assert_eq!(indirect.message,"Host substring indexes are out of range");
+    assert_eq!(indirect.message.as_deref(),Some("Host substring indexes are out of range"));
     let boxed = project(r#"(regexp-replace "a" (let [f -] (str (f -9223372036854775808 -9223372036854775808))) "x")"#).await.unwrap_err();
-    assert_eq!(boxed.message,"long overflow");
+    assert_eq!(boxed.message.as_deref(),Some("long overflow"));
     let promoted = project(r#"(regexp-replace "a" (str (- (+' -9223372036854775808 0) -9223372036854775808)) "x")"#).await.unwrap_err();
-    assert_eq!(promoted.message,"long overflow");
+    assert_eq!(promoted.message.as_deref(),Some("long overflow"));
     for pattern in [r#"(let [f /] (str (f 1.0 0.0)))"#,r#"(str (/ (identity 1.0) 0))"#,r#"(str (/ 1 0))"#,
         r#"(str (/ (identity "not numeric") 0))"#,r#"(let [f /] (str (f "not numeric" 0)))"#] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().message,"Divide by zero","{pattern}");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().message.as_deref(),Some("Divide by zero"),"{pattern}");
     }
 }
 
@@ -173,7 +173,7 @@ async fn host_exact_decimal_failures_preserve_jvm_arithmetic_messages() {
     ] {
         let error = project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err();
         assert_eq!(error.code,"xtdb.error/unknown");
-        assert_eq!(error.message,message,"{form}");
+        assert_eq!(error.message.as_deref(),Some(message),"{form}");
     }
 }
 
@@ -195,7 +195,7 @@ async fn host_numeric_comparisons_cross_categories_and_keep_nan_unordered() {
         let expected = if expected { "true" } else { "false" };
         assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str {form}) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
     }
-    assert_eq!(project(r#"(regexp-replace "a" (str (== (/ 1 3) 0.3M)) "x")"#).await.unwrap_err().message,"Non-terminating decimal expansion; no exact representable decimal result.");
+    assert_eq!(project(r#"(regexp-replace "a" (str (== (/ 1 3) 0.3M)) "x")"#).await.unwrap_err().message.as_deref(),Some("Non-terminating decimal expansion; no exact representable decimal result."));
 }
 
 #[tokio::test]
@@ -205,7 +205,7 @@ async fn host_comparison_chains_evaluate_arguments_before_short_circuiting_numer
         assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str {form}) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
     for form in [r#"(< 3 2 (subs "x" -1))"#,r#"(let [f <] (f 3 2 (subs "x" -1)))"#,r#"(== 1 2 (subs "x" -1))"#] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
     }
     for pattern in [r#"(if true "a" (<))"#,r#"(if true "a" (==))"#,r#"(let [f zero?] (if true "a" (f)))"#,r#"(let [< str] (< "a"))"#] {
         assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()));
@@ -241,10 +241,10 @@ async fn host_primitive_boolean_metadata_preserves_unresolved_static_calls() {
         "(byte (if true 127.9 (+ 1.0 (not nil))))",
         "(byte (if true 127.9 (double true)))",
     ] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range","{form}");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host numeric cast is out of range"),"{form}");
     }
     assert_eq!(project(r#"(regexp-replace "NaN" (str (/ (boolean nil) ##NaN)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
-    assert_eq!(project(r#"(regexp-replace "a" (str (/ false ##NaN)) "x")"#).await.unwrap_err().message,"Host value is not a Number");
+    assert_eq!(project(r#"(regexp-replace "a" (str (/ false ##NaN)) "x")"#).await.unwrap_err().message.as_deref(),Some("Host value is not a Number"));
 }
 
 #[tokio::test]
@@ -278,37 +278,37 @@ async fn host_integral_division_admits_boxed_rhs_before_lhs_without_nan_shortcut
             (r#""not numeric" ##NaN"#,"Host value is not a Number"),(r#"##NaN "not numeric""#,"Host value is not a Number"),
             (r#"(subs "x" -1) 0"#,"Host substring indexes are out of range"),
         ] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message,message,"{operation} {arguments}");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some(message),"{operation} {arguments}");
         }
         for arguments in ["1 0",r#""not numeric" 0"#,"##NaN 0"] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f {arguments}))) "x")"#)).await.unwrap_err().message,"Divide by zero");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f {arguments}))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Divide by zero"));
         }
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1M (/ 1 3))) "x")"#)).await.unwrap_err().message,"Non-terminating decimal expansion; no exact representable decimal result.");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1M (/ 1 3))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Non-terminating decimal expansion; no exact representable decimal result."));
     }
-    assert_eq!(project(r#"(regexp-replace "a" (str (mod 1 0)) "x")"#).await.unwrap_err().message,"Divide by zero");
+    assert_eq!(project(r#"(regexp-replace "a" (str (mod 1 0)) "x")"#).await.unwrap_err().message.as_deref(),Some("Divide by zero"));
 }
 
 #[tokio::test]
 async fn host_integral_inline_arity_and_mixed_result_metadata_remain_distinct() {
     for operation in ["quot","rem"] {
         for arguments in ["","1","1 2 3"] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
         }
         assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (if true "a" (f))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (f (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (f (subs "x" -1))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
         assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{operation} str] ({operation} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
         for arguments in ["2.0 (identity 1)","(identity 2) 1.0","2.0 (boolean nil)","2.0 (pos? 1)"] {
             assert_eq!(project(&format!(r#"(regexp-replace "127" (str (byte (if true 127.9 ({operation} {arguments})))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
         }
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 ({operation} 2.0 1)))) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 ({operation} 2.0 1)))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host numeric cast is out of range"));
         assert_eq!(project(&format!(r#"(regexp-replace "0" (str (- (if true -9223372036854775808 ({operation} 2 1)) -9223372036854775808)) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 ({operation} 2 (identity 1))) -9223372036854775808)) "x")"#)).await.unwrap_err().message,"long overflow");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 ({operation} 2 (identity 1))) -9223372036854775808)) "x")"#)).await.unwrap_err().message.as_deref(),Some("long overflow"));
     }
     assert_eq!(project(r#"(regexp-replace "a" (if true "a" (mod)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
-    assert_eq!(project(r#"(regexp-replace "a" (mod (subs "x" -1)) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
-    assert_eq!(project(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 (mod 2 1)) -9223372036854775808)) "x")"#).await.unwrap_err().message,"long overflow");
+    assert_eq!(project(r#"(regexp-replace "a" (mod (subs "x" -1)) "x")"#).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+    assert_eq!(project(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 (mod 2 1)) -9223372036854775808)) "x")"#).await.unwrap_err().message.as_deref(),Some("long overflow"));
     assert_eq!(project(r#"(regexp-replace "Infinity" (str (/ (quot 2.0 1) 0)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
-    assert_eq!(project(r#"(regexp-replace "a" (str (/ (quot 2.0 (identity 1)) 0)) "x")"#).await.unwrap_err().message,"Divide by zero");
+    assert_eq!(project(r#"(regexp-replace "a" (str (/ (quot 2.0 (identity 1)) 0)) "x")"#).await.unwrap_err().message.as_deref(),Some("Divide by zero"));
 }
 
 #[tokio::test]
@@ -336,37 +336,37 @@ async fn host_bit_admission_rejects_other_numeric_categories_before_the_next_ope
     for (value,class) in [("1N","clojure.lang.BigInt"),("1M","java.math.BigDecimal"),("(/ 1 2)","clojure.lang.Ratio"),("(float 1)","java.lang.Float"),("1.0","java.lang.Double")] {
         let message = format!("bit operation not supported for: class {class}");
         for form in [format!("(bit-not {value})"),format!(r#"(bit-and {value} "not numeric")"#),format!("(bit-shift-left 1 {value})"),format!("(bit-test 1 {value})")] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,message,"{form}");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message.as_deref(),Some(message.as_str()),"{form}");
         }
     }
     for value in [r#"\a"#,"true","nil",r#""not numeric""#,"[]",":a"] {
         assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not {value})) "x")"#)).await.unwrap_err().code,"xtdb.error/unknown");
     }
     for operation in ["bit-and","bit-or","bit-xor","bit-and-not"] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N 1 (subs "x" -1))) "x")"#)).await.unwrap_err().message,"bit operation not supported for: class clojure.lang.BigInt");
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f 1N 1 (subs "x" -1)))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N 1 (subs "x" -1))) "x")"#)).await.unwrap_err().message.as_deref(),Some("bit operation not supported for: class clojure.lang.BigInt"));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f 1N 1 (subs "x" -1)))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1N (subs "x" -1))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
     }
     assert_eq!(project(r#"(regexp-replace "a" (str (bit-and "not numeric" 1N)) "x")"#).await.unwrap_err().code,"xtdb.error/unknown");
-    assert_eq!(project(r#"(regexp-replace "a" (str (bit-set 1N (subs "x" -1))) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (str (bit-set 1N (subs "x" -1))) "x")"#).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
 }
 
 #[tokio::test]
 async fn host_bit_inline_arity_distinguishes_fixed_variadic_and_ordinary_calls() {
     for (operation,arguments) in [("bit-not",""),("bit-not","1 2"),("bit-shift-left","1"),("bit-shift-right",""),("unsigned-bit-shift-right","1 2 3")] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
     }
     for operation in ["bit-and","bit-or","bit-xor","bit-and-not","bit-clear","bit-set","bit-flip","bit-test"] {
         for arguments in ["","1N"] {
             assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation} {arguments})) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
         }
     }
     for operation in ["bit-not","bit-shift-left","bit-test"] {
         assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (if true "a" (f))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
         assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{operation} str] ({operation} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
-    assert_eq!(project(r#"(regexp-replace "a" (let [f bit-not] (f 1 (subs "x" -1))) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (let [f bit-not] (f 1 (subs "x" -1))) "x")"#).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
     assert_eq!(project(r#"(regexp-replace "a" (if true "a" (bit-set 1 2 3)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
 }
 
@@ -379,7 +379,7 @@ async fn host_bit_metadata_preserves_unresolved_calls_and_resolved_outer_calls()
         "(bit-not (and (boolean nil) (pos? 1)))","(bit-not (or (boolean nil) (pos? 1)))",
         "(bit-clear 1 0)","(bit-set 0 1)","(bit-flip 1 0)","(bit-test 1 0)","(let [f bit-not] (f 1))",
     ] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 {form}) -9223372036854775808)) "x")"#)).await.unwrap_err().message,"long overflow","{form}");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 {form}) -9223372036854775808)) "x")"#)).await.unwrap_err().message.as_deref(),Some("long overflow"),"{form}");
     }
     for form in [
         "(bit-and 1 1)","(bit-not (byte 0))","(bit-and (identity 1.0) 1)","(bit-and true 1)",
@@ -388,7 +388,7 @@ async fn host_bit_metadata_preserves_unresolved_calls_and_resolved_outer_calls()
     ] {
         assert_eq!(project(&format!(r#"(regexp-replace "0" (str (- (if true -9223372036854775808 {form}) -9223372036854775808)) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
     }
-    assert_eq!(project(r#"(regexp-replace "a" (str (byte (if true 127.9 (+ 1.0 (bit-test 1 0))))) "x")"#).await.unwrap_err().message,"Host numeric cast is out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (str (byte (if true 127.9 (+ 1.0 (bit-test 1 0))))) "x")"#).await.unwrap_err().message.as_deref(),Some("Host numeric cast is out of range"));
 }
 
 #[tokio::test]
@@ -407,8 +407,8 @@ async fn host_extrema_preserve_selected_categories_scales_and_primitive_zero_rul
         assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str "\\Q" {form} "\\E") "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
     }
     for operation in ["min","max"] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not ({operation} 1 1N))) "x")"#)).await.unwrap_err().message,"bit operation not supported for: class clojure.lang.BigInt");
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1M (/ 1 3))) "x")"#)).await.unwrap_err().message,"Non-terminating decimal expansion; no exact representable decimal result.");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not ({operation} 1 1N))) "x")"#)).await.unwrap_err().message.as_deref(),Some("bit operation not supported for: class clojure.lang.BigInt"));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} 1M (/ 1 3))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Non-terminating decimal expansion; no exact representable decimal result."));
     }
 }
 
@@ -422,11 +422,11 @@ async fn host_extrema_check_nan_before_numeric_admission_but_after_argument_payl
             (format!("({operation} (float ##NaN) 1)"),"java.lang.Double"),
             (format!("(let [f {operation}] (f (float ##NaN) 1))"),"java.lang.Float"),
         ] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not {form})) "x")"#)).await.unwrap_err().message,format!("bit operation not supported for: class {class}"));
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (bit-not {form})) "x")"#)).await.unwrap_err().message.as_deref().expect("present diagnostic message"),format!("bit operation not supported for: class {class}"));
         }
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} ##NaN (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} "not numeric" 1 (subs "x" -1))) "x")"#)).await.unwrap_err().message,"Host value is not a Number");
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f "not numeric" 1 (subs "x" -1)))) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} ##NaN (subs "x" -1))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({operation} "not numeric" 1 (subs "x" -1))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host value is not a Number"));
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {operation}] (str (f "not numeric" 1 (subs "x" -1)))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
     }
 }
 
@@ -437,16 +437,16 @@ async fn host_extrema_recompute_each_nested_result_metadata_and_keep_ordinary_ar
             assert_eq!(project(&format!(r#"(regexp-replace "0" (str (- (if true -9223372036854775808 ({operation} {arguments})) -9223372036854775808)) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
         }
         for arguments in ["1 2.0","1 2.0 3","1 true","1 (boolean nil)","1 (identity 2)"] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 ({operation} {arguments})) -9223372036854775808)) "x")"#)).await.unwrap_err().message,"long overflow");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (- (if true -9223372036854775808 ({operation} {arguments})) -9223372036854775808)) "x")"#)).await.unwrap_err().message.as_deref(),Some("long overflow"));
         }
         for arguments in ["1.0 2.0","1.0 (float 2)"] {
-            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 ({operation} {arguments})))) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range");
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 ({operation} {arguments})))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host numeric cast is out of range"));
         }
         for arguments in ["1.0 2.0 3","1.0 true","1.0 (boolean nil)"] {
             assert_eq!(project(&format!(r#"(regexp-replace "127" (str (byte (if true 127.9 ({operation} {arguments})))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
         }
         assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({operation})) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
-        assert_eq!(project(&format!(r#"(regexp-replace "a" ({operation}) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" ({operation}) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
         assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{operation} str] ({operation} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
 }
@@ -465,11 +465,11 @@ async fn host_absolute_value_preserves_category_scale_and_inline_metadata() {
     }
     for arguments in ["","1 2"] {
         assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" (abs {arguments})) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (abs {arguments})) "x")"#)).await.unwrap_err().message,"Host form has the wrong number of arguments");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (abs {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
     }
-    assert_eq!(project(r#"(regexp-replace "a" (abs 1 (subs "x" -1)) "x")"#).await.unwrap_err().message,"Host substring indexes are out of range");
+    assert_eq!(project(r#"(regexp-replace "a" (abs 1 (subs "x" -1)) "x")"#).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
     for form in ["(abs 1.0)","(abs (float 1))"] {
-        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 {form}))) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range");
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str (byte (if true 127.9 {form}))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host numeric cast is out of range"));
     }
     for form in ["(abs (identity 1.0))","(abs (boolean nil))","(abs true)","(let [f abs] (f 1.0))"] {
         assert_eq!(project(&format!(r#"(regexp-replace "127" (str (byte (if true 127.9 {form}))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));

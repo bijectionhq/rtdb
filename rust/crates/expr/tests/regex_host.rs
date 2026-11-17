@@ -181,7 +181,7 @@ fn host_bit_rejection_borrows_big_integer_payloads_and_releases_preparation_char
         let scope = EvaluationScope::new(&memory).unwrap();
         let context = EvalContext { allocation: Some(&scope),..Default::default() };
         let error = ExpressionInvocation::prepare(&expression,&Schema::default(),&context).err().unwrap();
-        assert_eq!(error.message,"bit operation not supported for: class clojure.lang.BigInt");
+        assert_eq!(error.message.as_deref(),Some("bit operation not supported for: class clojure.lang.BigInt"));
         assert!(memory.peak_bytes() < memory.limit_bytes());
     }
     assert_eq!(memory.used_bytes(),0);

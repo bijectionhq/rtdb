@@ -67,7 +67,7 @@ impl From<Error> for rtdb_types::Anomaly {
             Error::PermissionDenied { key, .. } => (Category::Forbidden, "rtdb.storage/permission-denied", serde_json::json!({"key": key})),
             Error::MultipartAbort { upload, abort } => {
                 let mut anomaly = Anomaly::from(*upload);
-                anomaly.message = message;
+                anomaly.message = Some(message);
                 anomaly.context.insert("multipart-abort".into(), serde_json::json!(Anomaly::from(*abort)));
                 return anomaly;
             }
@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(anomaly.code, "rtdb.storage/permission-denied");
         assert_eq!(anomaly.context["key"], "meta/trie.arrow");
         assert_eq!(anomaly.context["multipart-abort"]["code"], "rtdb.storage/remote");
-        assert!(anomaly.message.contains("upload denied"));
-        assert!(anomaly.message.contains("abort unavailable"));
+        assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("upload denied")));
+        assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("abort unavailable")));
     }
 }

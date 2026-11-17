@@ -36,7 +36,7 @@ fn nullable_primitives_preserve_nonzero_payload_and_signed_execution_width() {
             assert_eq!(cell.$get(NullChecks::Disabled).unwrap(), $expected);
             let error = anomaly(cell.$get(NullChecks::Enabled).unwrap_err());
             assert_eq!(error.code, "xtdb.error/unknown");
-            assert_eq!(error.message, "null at index 1");
+            assert_eq!(error.message.as_deref(), Some("null at index 1"));
             assert_eq!(cell.object().unwrap().value(), &Value::Null);
         }};
     }
@@ -109,7 +109,7 @@ fn struct_child_nullability_and_composed_selection_remain_independent_of_parent(
         assert_eq!(required.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 22);
         let optional = selected.struct_child("optional").unwrap().unwrap();
         assert_eq!(optional.cell(0).unwrap().get_long(NullChecks::Disabled).unwrap(), 42);
-        assert_eq!(anomaly(optional.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+        assert_eq!(anomaly(optional.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
         let raw = selected.cell(0).unwrap().raw_struct_field("required").unwrap().unwrap();
         assert_eq!(raw.as_ref().getter_index().unwrap(), 1);
         assert_eq!(raw.as_ref().get_long(NullChecks::Enabled).unwrap(), 22);
@@ -134,7 +134,7 @@ fn dense_union_retains_nullable_duration_leaf_and_explicit_null_distinction() {
     assert_eq!(duration.leaf_field().unwrap().name(), "duration-micro");
     assert_eq!(duration.getter_index().unwrap(), 1);
     assert_eq!(duration.get_long(NullChecks::Disabled).unwrap(), 71);
-    assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+    assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     assert_eq!(duration.object().unwrap().value(), &Value::Null);
     let null = vector.cell(0).unwrap();
     assert_eq!(null.leaf_field().unwrap().name(), "null");
@@ -153,7 +153,7 @@ fn run_end_slices_and_selections_preserve_physical_getter_index() {
             let selected = vector.select(&Selection::Indices(vec![2, 0, 1])).unwrap();
             assert_eq!(selected.cell(1).unwrap().getter_index().unwrap(), 0);
             assert_eq!(selected.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 101);
-            assert_eq!(anomaly(selected.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 0");
+            assert_eq!(anomaly(selected.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 0"));
             assert_eq!(selected.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 202);
             assert_eq!(selected.cell(0).unwrap().getter_index().unwrap(), 1);
         }};
@@ -231,7 +231,7 @@ fn raw_run_end_list_access_does_not_grant_reference_nested_methods() {
     let elements = vector.cell(1).unwrap().raw_list_elements().unwrap();
     assert_eq!(elements.len(), 2);
     assert_eq!(elements.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 29);
-    assert_eq!(anomaly(elements.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+    assert_eq!(anomaly(elements.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     drop(vector);
     assert_eq!(elements.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 11);
 }
@@ -340,7 +340,7 @@ fn temporal_long_getters_read_declared_units_and_retain_nonzero_null_bits() {
         let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(2).add_buffer(arrow_buffer::Buffer::from_slice_ref([0i64, 259_200_017])).nulls(invalid()).build().unwrap();
         let vector = open(field, make_array(data), &budget);
         assert_eq!(vector.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), expected);
-        assert_eq!(anomaly(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+        assert_eq!(anomaly(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
         assert_eq!(vector.cell(1).unwrap().object().unwrap().value(), &Value::Null);
     }
 }
@@ -375,7 +375,7 @@ fn raw_nested_cells_preserve_dense_union_and_run_end_struct_ownership() {
     assert!(vector.struct_child("value").is_err());
     drop(vector);
     assert_eq!(child.as_ref().get_long(NullChecks::Disabled).unwrap(), 73);
-    assert_eq!(anomaly(child.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+    assert_eq!(anomaly(child.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     drop(child);
     assert_eq!(budget.used_bytes(), 0);
 
@@ -423,7 +423,7 @@ fn map_entries_retain_raw_child_payloads_and_reference_container_access() {
     assert_eq!(vector.list_elements().unwrap().len(), 2);
     drop(entries);
     drop(vector);
-    assert_eq!(anomaly(value.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+    assert_eq!(anomaly(value.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     drop(value);
     assert_eq!(budget.used_bytes(), 0);
 }

@@ -88,6 +88,6 @@ fn position_retry_exhaustion_is_a_public_sql_error() {
         }
         let error = rtdb_sql::parse(&format!("SELECT {source}")).unwrap_err();
         assert_eq!(error.code,"xtdb/sql-error");
-        assert!(error.message.contains("POSITION cumulative parsing work limit exceeded"),"{error:?}");
+        assert!(error.message.as_deref().is_some_and(|message| message.contains("POSITION cumulative parsing work limit exceeded")),"{error:?}");
     }
 }

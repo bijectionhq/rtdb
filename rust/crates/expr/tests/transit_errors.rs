@@ -23,6 +23,32 @@ fn set_values(values: Vec<T>,json: bool) -> Vec<T> {
 }
 
 #[test]
+fn shared_nullable_anomalies_round_trip_through_object_throwables() {
+    use rtdb_format::transit::{decode_anomaly,encode_anomaly};
+    use rtdb_types::{Anomaly,AnomalyCategory};
+    let memory = MemoryBudget::new(1 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        for json in [false,true] {
+            let mut values = Vec::new();
+            for message in [None,Some(String::new()),Some("detail".into())] {
+                let error = Anomaly::new_nullable(AnomalyCategory::Incorrect,"test/error",message.clone());
+                let wire = decode_msgpack(&encode_anomaly(&error).unwrap()).unwrap();
+                let object_wire = selected(wire.clone(),json,&context).unwrap();
+                assert_eq!(decode_anomaly(&encode_msgpack(&object_wire).unwrap()).unwrap(),error);
+                assert_eq!(object_wire,wire);
+                values.push(wire);
+            }
+            let members = set_values(vec![values[0].clone(),values[1].clone(),values[0].clone(),values[1].clone()],json);
+            assert_eq!(members.len(),2);
+            assert!(members.contains(&values[0]));assert!(members.contains(&values[1]));
+        }
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
 fn anomaly_keys_compare_normalized_message_data_and_structural_causes() {
     for json in [false,true] {
         let direct = anomaly("message",vec![(keyword("x"),T::Integer(1))]);

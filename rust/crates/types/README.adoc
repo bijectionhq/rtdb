@@ -76,3 +76,11 @@ The scope must outlive every allocation it admits, unless another charged owner 
 Calls may share one scope across threads; each reservation includes bookkeeping and charges the same finite budget chain.
 Expression callers use the same concrete type through the `EvaluationScope` reexport.
 Frontend planning admission still requires reservations before parsing and catalog-dependent binding; shared budget availability alone does not provide those reservations.
+
+== Anomaly messages
+
+`Anomaly` owns its category, code, optional message and context as one passive diagnostic value.
+`new`, `incorrect`, `unsupported` and `fault` create a present message, including a present empty string.
+`new_nullable` preserves an absent message separately from an empty message.
+Native serde retains absence as JSON null; native display prints the code alone when the message is absent and `code: message` when present.
+Wire adapters apply their own message rendering rules.

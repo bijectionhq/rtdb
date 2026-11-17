@@ -47,11 +47,11 @@ fn timestamp_converter_rejects_non_struct_rows_before_parsing_schema_defaults() 
     let baseline = memory.used_bytes();
     for value in [Value::I64(7), Value::Map { entries: vec![(Value::Utf8("when".into()), Value::Utf8("1970".into()))], sorted: false }] {
         let error = chain.apply(record(&schema, value)).err().unwrap();
-        assert_eq!(error.message, "Field TimestampConverter requires a Struct or null");
+        assert_eq!(error.message.as_deref(), Some("Field TimestampConverter requires a Struct or null"));
         assert_eq!(memory.used_bytes(), baseline);
     }
     let error = chain.apply(record(&schema, Value::Null)).err().unwrap();
-    assert_ne!(error.message, "Field TimestampConverter requires a Struct or null");
+    assert_ne!(error.message.as_deref(), Some("Field TimestampConverter requires a Struct or null"));
     assert_eq!(memory.used_bytes(), baseline);
     drop(chain);
     assert_eq!(memory.used_bytes(), 0);
@@ -87,7 +87,7 @@ fn cast_converts_all_schema_defaults_before_any_row_fields() {
     ])));
     let baseline = memory.used_bytes();
     let value = Value::Struct(BTreeMap::from([("number".into(), Value::Utf8("invalid".into())), ("when".into(), date(0))]));
-    assert_eq!(chain.apply(record(&schema, value)).err().unwrap().message, "Connect Date contains nonzero time fields");
+    assert_eq!(chain.apply(record(&schema, value)).err().unwrap().message.as_deref(), Some("Connect Date contains nonzero time fields"));
     assert_eq!(memory.used_bytes(), baseline);
     drop(chain);
     assert_eq!(memory.used_bytes(), 0);
@@ -99,7 +99,7 @@ fn cast_builds_whole_schema_defaults_before_values_and_keeps_null_records_unchan
     let mut chain = chain("Cast", &[("spec", "int64")], &memory);
     let schema = logical_date(1);
     let baseline = memory.used_bytes();
-    assert_eq!(chain.apply(record(&schema, Value::Utf8("invalid".into()))).err().unwrap().message, "Connect Date contains nonzero time fields");
+    assert_eq!(chain.apply(record(&schema, Value::Utf8("invalid".into()))).err().unwrap().message.as_deref(), Some("Connect Date contains nonzero time fields"));
     let null = chain.apply(record(&schema, Value::Null)).unwrap().unwrap();
     assert!(Arc::ptr_eq(null.value.schema.as_ref().unwrap(), &schema));
     assert_eq!(memory.used_bytes(), baseline);
@@ -156,7 +156,7 @@ fn whole_cast_validates_converted_defaults_against_the_retained_logical_name() {
         let mut chain = chain("Cast", &[("spec", target)], &memory);
         let baseline = memory.used_bytes();
         let error = chain.apply(record(&logical_date(0), date(0))).err().unwrap();
-        assert_eq!(error.message, "Value does not match its Connect schema");
+        assert_eq!(error.message.as_deref(), Some("Value does not match its Connect schema"));
         assert_eq!(memory.used_bytes(), baseline);
         drop(chain);
         assert_eq!(memory.used_bytes(), 0);
@@ -178,7 +178,7 @@ fn date_field_transforms_validate_required_nulls_after_default_replacement_selec
             let mut chain = chain(class, &options, &memory);
             let result = chain.apply(record(&schema, Value::Struct(BTreeMap::new())));
             if replace == "true" { assert!(result.is_ok()); }
-            else { assert_eq!(result.err().unwrap().message, "Value does not match its Connect schema"); }
+            else { assert_eq!(result.err().unwrap().message.as_deref(), Some("Value does not match its Connect schema")); }
         }
         assert_eq!(memory.used_bytes(), 0);
     }

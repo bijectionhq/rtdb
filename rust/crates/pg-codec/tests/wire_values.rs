@@ -6,6 +6,29 @@ use rtdb_types::{PgType, TimeUnit, Value};
 fn output(ty: PgType, format: Format, value: &Value) -> Vec<u8> { encode_value(ty, format, value, &SessionEnvironment::default()).unwrap() }
 
 #[test]
+fn nullable_error_messages_keep_each_wire_formats_presence_contract() {
+    use rtdb_types::{Anomaly, AnomalyCategory};
+    use rtdb_format::transit::{decode_anomaly, decode_json, encode_msgpack};
+    for message in [None, Some(String::new()), Some("detail".into())] {
+        let error = Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone());
+        let json: serde_json::Value = serde_json::from_slice(&rtdb_pg_codec::encode_error(&error, PgType::Json).unwrap()).unwrap();
+        assert_eq!(json.get("message"), message.as_ref().map(|message| serde_json::Value::String(message.clone())).as_ref());
+        let ld = rtdb_pg_codec::encode_error(&error, PgType::JsonLd).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&ld).unwrap();
+        assert_eq!(value["@value"].get("xtdb.error/message"), Some(&serde_json::to_value(&message).unwrap()));
+        let Value::Transit(bytes) = read_text(114, std::str::from_utf8(&ld).unwrap()).unwrap() else { panic!("error value") };
+        assert_eq!(decode_anomaly(&bytes).unwrap().message, message);
+        let transit = decode_json(&rtdb_pg_codec::encode_error(&error, PgType::Transit).unwrap()).unwrap();
+        assert_eq!(decode_anomaly(&encode_msgpack(&transit).unwrap()).unwrap(), error);
+    }
+    for message in ["", ",\"xtdb.error/message\":null", ",\"xtdb.error/message\":42"] {
+        let text = format!(r#"{{"@type":"xt:fault","@value":{{"xtdb.error/data":{{}}{message}}}}}"#);
+        let Value::Transit(bytes) = read_text(114, &text).unwrap() else { panic!("error value") };
+        assert!(decode_anomaly(&bytes).unwrap().message.is_none());
+    }
+}
+
+#[test]
 fn numeric_base_10000_matches_pinned_numeric_bin_including_negative_zero_sign() {
     for (text, words) in [
         ("12345.6789", vec![3i16, 1, 0, 4, 1, 2345, 6789]),
@@ -129,7 +152,7 @@ fn binary_millisecond_date_has_no_integer_reader_and_releases_its_reservation() 
     let memory = MemoryBudget::new(1 << 20);
     let error = encode(PgType::Date, Format::Binary, &Value::DateMilli(0), &SessionEnvironment::default(), &memory).unwrap_err();
     assert_eq!(error.category, rtdb_types::AnomalyCategory::Fault);
-    assert_eq!(error.message, "getInt unsupported on DateMilliVector");
+    assert_eq!(error.message.as_deref(), Some("getInt unsupported on DateMilliVector"));
     assert_eq!(memory.used_bytes(), 0);
     assert_eq!(output(PgType::Date, Format::Binary, &Value::DateDay(0)), (-10_957i32).to_be_bytes());
     assert!(encode(PgType::Date, Format::Binary, &Value::Null, &SessionEnvironment::default(), &memory).unwrap().is_none());

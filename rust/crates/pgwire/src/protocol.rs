@@ -84,7 +84,7 @@ impl ProtocolSession {
                     if oid == 0 && matches!(prepared.kind, PreparedKind::Dml(_)) { self.record_transaction_error(); return Err(Anomaly::incorrect("xtdb.pgwire/missing-arg-types", "Missing types for args - client must specify types for all non-null params in DML statements")); }
                     let ty = PgType::from_oid(oid).ok_or_else(|| Anomaly::unsupported("xtdb.pgwire/unsupported-param-type", format!("Unsupported param type OID {oid}")))?;
                     let format = item_format(&formats, count, index)?;
-                    let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| Anomaly::incorrect("xtdb.pgwire/invalid-arg-representation", error.message).with_context("arg-idx", index.into()).with_context("arg-format", if format == Format::Binary { "binary" } else { "text" }.into()))?;
+                    let decoded = rtdb_pg_codec::decode(ty, format, bytes, self.node.memory()).map_err(|error| invalid_argument(error, index, format))?;
                     let (value, charge) = decoded.into_parts(); arguments.push(value); charges.push(charge);
                 }
                 if matches!(prepared.kind, PreparedKind::Query(_) | PreparedKind::Control(ControlStatement::Execute { .. })) && count != prepared.oids.len() { return Err(protocol("Argument count differs from prepared statement")); }
@@ -282,8 +282,31 @@ impl ProtocolSession {
     }
 }
 
+fn invalid_argument(error: Anomaly, index: usize, format: Format) -> Anomaly {
+    Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.pgwire/invalid-arg-representation", error.message)
+        .with_context("arg-idx", index.into()).with_context("arg-format", if format == Format::Binary { "binary" } else { "text" }.into())
+}
 fn item_format(formats: &[Format], count: usize, index: usize) -> Result<Format> { match formats.len() { 0 => Ok(Format::Text), 1 => Ok(formats[0]), length if length == count => Ok(formats[index]), _ => Err(protocol("Invalid format code count")) } }
 fn head(source: &str) -> String { source.split_whitespace().next().unwrap_or_default().to_ascii_uppercase() }
 fn dml_tag(source: &str) -> String { match head(source).as_str() { "INSERT" => "INSERT 0 0".into(), "UPDATE" => "UPDATE 0".into(), "DELETE" => "DELETE 0".into(), "PATCH" => "PATCH 0".into(), "ERASE" => "ERASE 0".into(), "CREATE" => "CREATE TABLE".into(), value => value.into() } }
 fn is_type_probe(source: &str) -> bool { let mut prior_space = false; source.chars().filter(|character| { let repeated = *character == ' ' && prior_space; prior_space = *character == ' '; !repeated }).collect::<String>() == "SELECT pg_type.oid, typname FROM pg_catalog.pg_type LEFT JOIN (select ns.oid as nspoid, ns.nspname, r.r from pg_namespace as ns join ( select s.r, (current_schemas(false))[s.r] as nspname from generate_series(1, array_upper(current_schemas(false), 1)) as s(r) ) as r using ( nspname ) ) as sp ON sp.nspoid = typnamespace WHERE typname = $1 ORDER BY sp.r, pg_type.oid DESC LIMIT 1" }
 fn replace_query(source: &str) -> &str { if source == "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname" { "SELECT n.oid,n.nspname,n.nspowner,n.nspacl,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname" } else { source } }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argument_reclassification_preserves_nullable_messages_and_parameter_location() {
+        for message in [None, Some(String::new()), Some("invalid input".into())] {
+            for format in [Format::Text, Format::Binary] {
+                let error = invalid_argument(Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "test/decode", message.clone()), 2, format);
+                assert_eq!(error.message, message);
+                assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
+                assert_eq!(error.code, "xtdb.pgwire/invalid-arg-representation");
+                assert_eq!(error.context["arg-idx"], 2);
+                assert_eq!(error.context["arg-format"], if format == Format::Binary { "binary" } else { "text" });
+            }
+        }
+    }
+}

@@ -88,3 +88,8 @@ Protocol references are https://www.postgresql.org/docs/17/protocol-message-form
 TLS uses https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/[tokio-rustls 0.26.6].
 Interop with PostgreSQL clients, successful TLS handshakes, external authentication, connection-saturation fault injection, client-disconnect write races, and full resource accounting remain unexecuted qualification work.
 Planning warnings are not yet exposed as protocol notices by the shared preparation API.
+
+An absent anomaly message becomes an empty primary `M` field; structured detail retains its JSON, JSON-LD or Transit presence rules.
+Bind argument reclassification preserves the native decoder message, including absence.
+The pinned raw-Throwable fallback for a message-less decoding failure requires the original throwable class and display; the passive anomaly does not retain that origin.
+Production routing of raw host failures through this boundary still requires that conversion.

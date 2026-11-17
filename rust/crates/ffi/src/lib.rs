@@ -87,7 +87,12 @@ pub unsafe extern "C" fn rtdb_v1_error_field(handle: u64, field: u32, out: *mut 
             let Handle::Error(diagnostic) = handles::get(handle)? else { return Err(invalid("Expected an error handle")); };
             let value = match field {
                 0 => match diagnostic.error.category { AnomalyCategory::Incorrect => "incorrect", AnomalyCategory::Unsupported => "unsupported", AnomalyCategory::NotFound => "not-found", AnomalyCategory::Forbidden => "forbidden", AnomalyCategory::Conflict => "conflict", AnomalyCategory::Busy => "busy", AnomalyCategory::Unavailable => "unavailable", AnomalyCategory::Interrupted => "interrupted", AnomalyCategory::Fault => "fault" }.as_bytes(),
-                1 => diagnostic.error.code.as_bytes(), 2 => diagnostic.error.message.as_bytes(), 3 => diagnostic.wire.as_ref(),
+                1 => diagnostic.error.code.as_bytes(),
+                2 => match &diagnostic.error.message {
+                    Some(message) => message.as_bytes(),
+                    None => { *out = RtdbSlice { data: std::ptr::null(), length: 0 }; return Ok(()); }
+                },
+                3 => diagnostic.wire.as_ref(),
                 _ => return Err(invalid("Unknown diagnostic field")),
             };
             *out = RtdbSlice { data: value.as_ptr(), length: value.len() }; return Ok(());

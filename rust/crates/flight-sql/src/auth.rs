@@ -59,12 +59,22 @@ impl Authentication {
         Ok(Arc::new(Caller { owner, principal, mac: credentials.raw().map(|raw| self.mac(raw)) }))
     }
 }
-pub(crate) fn auth_error(error: Anomaly) -> Status { match error.category { AnomalyCategory::Fault => Status::internal("authentication failed"), AnomalyCategory::Unsupported => Status::unimplemented(error.message), _ => unauthenticated(error.message) } }
+pub(crate) fn auth_error(error: Anomaly) -> Status { match error.category { AnomalyCategory::Fault => Status::internal("authentication failed"), AnomalyCategory::Unsupported => Status::unimplemented(error.message.unwrap_or_default()), _ => unauthenticated(error.message.unwrap_or_else(|| "authentication failed".into())) } }
 pub(crate) fn unauthenticated(message: impl Into<String>) -> Status { Status::unauthenticated(message) }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn absent_authentication_messages_follow_category_specific_policy() {
+        for (category, code, absent, present) in [(AnomalyCategory::Fault, tonic::Code::Internal, "authentication failed", "authentication failed"), (AnomalyCategory::Unsupported, tonic::Code::Unimplemented, "", ""), (AnomalyCategory::Forbidden, tonic::Code::Unauthenticated, "authentication failed", "")] {
+            let status = auth_error(Anomaly::new_nullable(category, "test/auth", None));
+            assert_eq!(status.code(), code); assert_eq!(status.message(), absent);
+            assert_eq!(auth_error(Anomaly::new(category, "test/auth", "")).message(), present);
+        }
+        let response = auth_error(Anomaly::new_nullable(AnomalyCategory::Unsupported, "test/auth", None)).into_http::<()>();
+        assert!(!response.headers().contains_key("grpc-message"));
+    }
     #[test]
     fn verifiable_credentials_preserve_raw_header_and_empty_secret() {
         let mut request = Request::new(()); request.metadata_mut().insert("authorization", "  bAsIc dXNlcjo=  ".parse().unwrap());

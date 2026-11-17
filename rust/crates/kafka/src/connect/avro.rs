@@ -583,7 +583,7 @@ mod tests {
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         for (time, expected) in [(-1, "Time is outside one day"), (0, "Logical date value has an incompatible primitive representation")] {
             let bytes = apache_avro::to_avro_datum(&parsed, apache_avro::types::Value::Record(vec![("time".into(), apache_avro::types::Value::Int(time))])).unwrap();
-            assert!(plan.decode(&bytes, &mut context).unwrap_err().message.contains(expected));
+            assert!(plan.decode(&bytes, &mut context).unwrap_err().message.as_deref().is_some_and(|message| message.contains(expected)));
         }
     }
     #[test]
@@ -607,16 +607,16 @@ mod tests {
     fn decimal_coefficients_and_children_fail_before_parent_scale_or_representation() {
         let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
         let missing_scale = AvroPlan::parse(r#"{"type":"bytes","connect.name":"org.apache.kafka.connect.data.Decimal"}"#, &[]).unwrap();
-        assert_eq!(missing_scale.decode(&[], &mut context).unwrap_err().message, "Decimal coefficient bytes are empty");
-        assert_eq!(missing_scale.decode(&[1], &mut context).unwrap_err().message, "Decimal schema has no scale");
+        assert_eq!(missing_scale.decode(&[], &mut context).unwrap_err().message.as_deref(), Some("Decimal coefficient bytes are empty"));
+        assert_eq!(missing_scale.decode(&[1], &mut context).unwrap_err().message.as_deref(), Some("Decimal schema has no scale"));
         for scale in ["2147483648", "-2147483649", " 2", "2 ", "", "𝟚"] {
             let text = format!(r#"{{"type":"bytes","connect.name":"org.apache.kafka.connect.data.Decimal","connect.parameters":{{"scale":"{scale}"}}}}"#);
-            assert_eq!(AvroPlan::parse(&text, &[]).unwrap().decode(&[1], &mut context).unwrap_err().message, "Decimal scale is not a signed 32-bit integer");
+            assert_eq!(AvroPlan::parse(&text, &[]).unwrap().decode(&[1], &mut context).unwrap_err().message.as_deref(), Some("Decimal scale is not a signed 32-bit integer"));
         }
         let text = r#"{"type":"record","name":"Container","connect.name":"org.apache.kafka.connect.data.Decimal","fields":[{"name":"time","type":{"type":"int","connect.name":"org.apache.kafka.connect.data.Time"}}]}"#;
         let plan = AvroPlan::parse(text, &[]).unwrap();
-        assert_eq!(plan.decode(&[1], &mut context).unwrap_err().message, "Time is outside one day");
-        assert_eq!(plan.decode(&[0], &mut context).unwrap_err().message, "Logical Decimal value has an incompatible primitive representation");
+        assert_eq!(plan.decode(&[1], &mut context).unwrap_err().message.as_deref(), Some("Time is outside one day"));
+        assert_eq!(plan.decode(&[0], &mut context).unwrap_err().message.as_deref(), Some("Logical Decimal value has an incompatible primitive representation"));
     }
     #[test]
     fn confluent_root_bytes_have_no_avro_length_prefix() {

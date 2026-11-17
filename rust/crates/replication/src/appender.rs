@@ -184,14 +184,14 @@ mod tests {
         let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) })), BlockIndex(0), Some(sender), &memory).unwrap();
         handle.enqueue(write).unwrap();
         let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
-        assert!(error.message.contains("provider rejected durability"));
-        assert!(receiver.await.unwrap().unwrap_err().message.contains("provider rejected durability"));
+        assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
+        assert!(receiver.await.unwrap().unwrap_err().message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
     }
     #[tokio::test]
     async fn heartbeat_receipt_failure_stops_pump_without_waiting_for_readback() {
         let (_handle, appender, _) = pump(Duration::from_millis(1));
         let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
-        assert!(error.message.contains("provider rejected durability"));
+        assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
     }
 
     #[tokio::test]

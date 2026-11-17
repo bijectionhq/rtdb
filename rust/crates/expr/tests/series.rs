@@ -86,7 +86,7 @@ fn series_type_admission_matches_integer_date_and_timestamp_families() {
     assert!(function_type("generate_series",&vec![L::Scalar(S::I64);2]).is_err());
     assert!(function_type("generate_series",&[L::Scalar(S::DateMilli),L::Scalar(S::DateDay),L::Scalar(S::Interval(IntervalUnit::YearMonth))]).is_err());
     for (start,end,message) in [(S::DateMilli,S::DateMilli,"generate_series with date-from of type date-milli"),(S::DateDay,S::DateMilli,"generate_series with date-to of type date-milli")] {
-        assert_eq!(function_type("generate_series",&[L::Scalar(start),L::Scalar(end),L::Scalar(S::Interval(IntervalUnit::YearMonth))]).unwrap_err().message,message);
+        assert_eq!(function_type("generate_series",&[L::Scalar(start),L::Scalar(end),L::Scalar(S::Interval(IntervalUnit::YearMonth))]).unwrap_err().message.as_deref(),Some(message));
     }
     let division = Expr::binary(rtdb_plan::BinaryOp::Divide,int(1),int(0));
     assert_eq!(run(&call("generate_series",vec![lit(V::Null),division,int(1)])).unwrap(),V::Null);

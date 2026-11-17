@@ -261,7 +261,7 @@ fn absent_primitive_receivers_remain_raw_through_indirect_and_run_end_readers() 
         let selected = selected.select(&Selection::All).unwrap();
         assert_absent_primitives(selected.cell(0).unwrap());
         assert_absent_primitives(selected.cell(1).unwrap());
-        assert_eq!(selected.cell(0).unwrap().object().unwrap_err().message, "no leg for index 1");
+        assert_eq!(selected.cell(0).unwrap().object().unwrap_err().message.as_deref(), Some("no leg for index 1"));
     }
     for checks in [NullChecks::Enabled, NullChecks::Disabled] {
         let cell = values.cell(0).unwrap();
@@ -284,7 +284,7 @@ fn named_reader_primitive_absence_comes_from_inner_receiver_not_outer_mask() {
     }, &memory).unwrap();
     let leg = outer.vector_for("inner").unwrap().unwrap();
     assert_absent_primitives(leg.cell(0).unwrap());
-    assert_eq!(leg.cell(0).unwrap().object().unwrap_err().message, "no leg for index 0");
+    assert_eq!(leg.cell(0).unwrap().object().unwrap_err().message.as_deref(), Some("no leg for index 0"));
     assert!(leg.cell(1).unwrap().is_null().unwrap());
     assert_eq!(leg.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap(), 83);
     let indirect_leg = outer.select(&Selection::Range { offset: 0, length: 2 }).unwrap().vector_for("inner").unwrap().unwrap();
@@ -339,7 +339,7 @@ fn absent_union_bytes_are_not_explicit_null_or_nullable_duration() {
         assert!(cell.is_null().unwrap());
         assert_eq!(cell.type_id().unwrap(), id);
         assert_eq!(cell.leg_name().unwrap(), None);
-        assert_eq!(cell.object().unwrap_err().message, format!("no leg for index {row}"));
+        assert_eq!(cell.object().unwrap_err().message, Some(format!("no leg for index {row}")));
         assert!(matches!(cell.get_long(NullChecks::Disabled), Err(VectorReadError::AbsentPrimitiveReceiver)));
         assert!(cell.getter_index().is_err());
     }
@@ -347,7 +347,7 @@ fn absent_union_bytes_are_not_explicit_null_or_nullable_duration() {
     assert!(duration.is_null().unwrap());
     assert_eq!(duration.leaf_field().unwrap().name(), "custom-duration");
     assert_eq!(duration.get_long(NullChecks::Disabled).unwrap(), 71);
-    assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 0");
+    assert_eq!(anomaly(duration.get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 0"));
     assert_eq!(duration.object().unwrap().value(), &Value::Null);
     let explicit = vector.cell(3).unwrap();
     assert_eq!(explicit.leg_name().unwrap(), Some("explicit-null"));
@@ -656,7 +656,7 @@ fn named_struct_child_retains_outer_offset_and_discriminator() {
     assert_eq!(required.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap(), 29);
     let optional = leg.struct_child("optional").unwrap().unwrap();
     assert_eq!(optional.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 43);
-    assert_eq!(anomaly(optional.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message, "null at index 1");
+    assert_eq!(anomaly(optional.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     assert_eq!(leg.map_keys().unwrap().cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 11);
     drop(vector);
     drop(leg);

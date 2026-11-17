@@ -219,10 +219,10 @@ mod tests {
         let environment = super::super::super::date_environment::test_environment("en","US","UTC");
         let mut router = router(&BTreeMap::from([("timestamp.format".into(),"invalid".into())]),environment).unwrap();
         let record = || SinkRecord::new("topic".into(),0,0,ConnectData::null(),ConnectData::null());
-        assert!(router.apply(record()).err().unwrap().message.contains("TimestampRouter requires a record timestamp"));
+        assert!(router.apply(record()).err().unwrap().message.as_deref().is_some_and(|message| message.contains("TimestampRouter requires a record timestamp")));
         let mut record = record();
         record.timestamp_millis = Some(0);
-        assert!(router.apply(record).err().unwrap().message.contains("Invalid date pattern field"));
+        assert!(router.apply(record).err().unwrap().message.as_deref().is_some_and(|message| message.contains("Invalid date pattern field")));
     }
     #[test]
     fn converter_pattern_blank_check_uses_java_trim_without_unicode_space_folding() {

@@ -72,17 +72,17 @@ impl Context<'_> {
             ast::Expr::TypedString(value) => {
                 let literal = crate::types::literal(&value.value.value)?;
                 match (&value.data_type, &literal) {
-                    (ast::DataType::Date, Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_date_literal(text).map_err(|failure| error(format!("Cannot parse date: {text} - failed with message {}", failure.message)))?),
-                    (ast::DataType::Timestamp(..), Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_timestamp_literal(text).map_err(|failure| error(format!("Cannot parse timestamp: {text} - failed with message {}", failure.message)))?),
+                    (ast::DataType::Date, Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_date_literal(text).map_err(|failure| error(format!("Cannot parse date: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?),
+                    (ast::DataType::Timestamp(..), Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_timestamp_literal(text).map_err(|failure| error(format!("Cannot parse timestamp: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?),
                     (ast::DataType::Time(..), Value::Utf8(text)) => {
-                        rtdb_types::validate_sql_time_literal(text).map_err(|failure| error(format!("Cannot parse time: {text} - failed with message {}", failure.message)))?;
+                        rtdb_types::validate_sql_time_literal(text).map_err(|failure| error(format!("Cannot parse time: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?;
                         Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? }
                     }
                     _ => {
                         let target = self.cast_target(&value.data_type)?;
                         if target.result_type(&literal.logical_type()) == LogicalType::Scalar(ScalarType::Uri) {
                             let Value::Utf8(text) = literal else { return Err(error("URI literal requires a string")); };
-                            rtdb_types::UriParts::parse(&text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message)))?;
+                            rtdb_types::UriParts::parse(&text).map_err(|failure| error(format!("Cannot parse uri: {}", failure.message.as_deref().unwrap_or("null"))))?;
                             Expr::Literal(Value::Uri(text))
                         } else { Expr::Cast { expr: Box::new(Expr::Literal(literal)), target } }
                     },

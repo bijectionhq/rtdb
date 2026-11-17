@@ -67,7 +67,7 @@ fn vector_type_nullable_tail_and_set_factories_keep_their_distinct_admission() {
             for (encoding,width) in [("ree-i16","I16"),("ree","I32"),("ree-i64","I64")] {
                 let error = selected(ty(vector(encoding,vec![keyword(name)])),json).unwrap_err();
                 assert_eq!(error.category,AnomalyCategory::Unsupported);assert_eq!(error.code,"");
-                assert_eq!(error.message,format!("{} can't be laid out as RunEnd(width={width})",if name == "null" { "Null" } else { "Nothing" }));
+                assert_eq!(error.message,Some(format!("{} can't be laid out as RunEnd(width={width})",if name == "null" { "Null" } else { "Nothing" })));
             }
         }
         assert_eq!(selected(ty(set(vec![keyword("nothing"),T::Bool(false)])),json).unwrap_err().code,"invalid-type");
@@ -127,7 +127,7 @@ fn vector_type_invalid_spec_context_preserves_canonical_objects_without_semantic
         ]));
         let scope = EvaluationScope::new(&MemoryBudget::new(64 << 20)).unwrap();
         let error = field(T::Map(vec![(keyword("chosen"),ty(spec))]),json,&scope).unwrap_err();
-        assert_eq!(error.category,AnomalyCategory::Incorrect);assert_eq!(error.code,"invalid-type");assert_eq!(error.message,"Invalid type");
+        assert_eq!(error.category,AnomalyCategory::Incorrect);assert_eq!(error.code,"invalid-type");assert_eq!(error.message.as_deref(),Some("Invalid type"));
         assert_eq!(rtdb_format::transit::from_json_value(&error.context["type-spec"]).unwrap(),expected);
         let wire = tag("xt/error",T::Array(vec![keyword("incorrect"),keyword("invalid-type"),text("Invalid type"),T::Map(vec![(keyword("type-spec"),expected)])]));
         assert_eq!(rtdb_format::transit::encode_anomaly(&error).unwrap(),encode_msgpack(&wire).unwrap());

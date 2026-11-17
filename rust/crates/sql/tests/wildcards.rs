@@ -58,7 +58,7 @@ async fn explicit_names_suppress_original_wildcard_fields_before_rename_and_foll
         let (schema, rows) = query(&format!("SELECT {projection} FROM (VALUES (1,2)) t(x,y)")).await.unwrap();
         assert_eq!(names(&schema), ["y", "x"]); assert_eq!(rows, [vec![Value::I64(2), Value::I64(99)]]);
     }
-    assert!(query("SELECT * RENAME x AS z,99 AS z FROM (VALUES (1,2)) t(x,y)").await.unwrap_err().message.contains("Duplicate column projection"));
+    assert!(query("SELECT * RENAME x AS z,99 AS z FROM (VALUES (1,2)) t(x,y)").await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Duplicate column projection")));
     let (schema, rows) = query("SELECT * EXCLUDE (x,y) FROM (VALUES (1,2)) t(x,y)").await.unwrap();
     assert!(schema.is_empty()); assert_eq!(rows, [Vec::<Value>::new()]);
 }
@@ -98,8 +98,8 @@ async fn nested_queries_and_correlated_wildcards_use_original_identifier_spans()
 #[tokio::test]
 async fn rename_resolution_precedes_unqualified_exclusion_but_qualified_selection_must_survive() {
     assert_eq!(query("SELECT * EXCLUDE x RENAME x AS z FROM (VALUES (1)) l(x) CROSS JOIN (VALUES (2)) r(x)").await.unwrap_err().code, "xtdb/ambiguous-column");
-    assert!(query("SELECT t.* EXCLUDE x RENAME missing AS z FROM (VALUES (1)) t(x)").await.unwrap_err().message.contains("Table not found"));
-    assert!(query("SELECT t.* FROM (VALUES (1)) other(x)").await.unwrap_err().message.contains("Table not found"));
+    assert!(query("SELECT t.* EXCLUDE x RENAME missing AS z FROM (VALUES (1)) t(x)").await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Table not found")));
+    assert!(query("SELECT t.* FROM (VALUES (1)) other(x)").await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Table not found")));
 }
 
 #[test]

@@ -16,7 +16,7 @@ impl SnapshotReader {
         let mut slot = Connection::open(remote, true, Arc::clone(&memory)).await?;
         let result = slot.query(&format!("CREATE_REPLICATION_SLOT {} LOGICAL pgoutput (SNAPSHOT 'export', FAILOVER)", identifier(&config.slot_name)?)).await.map_err(|error| {
             let duplicate = error.context.get("sql-state").and_then(serde_json::Value::as_str) == Some("42710");
-            Anomaly::new(if duplicate { AnomalyCategory::Conflict } else { AnomalyCategory::Incorrect }, if duplicate { "xtdb.postgres/slot-exists" } else { "xtdb.postgres/slot-creation-failed" }, error.message).with_context("slot-name", config.slot_name.clone().into())
+            Anomaly::new_nullable(if duplicate { AnomalyCategory::Conflict } else { AnomalyCategory::Incorrect }, if duplicate { "xtdb.postgres/slot-exists" } else { "xtdb.postgres/slot-creation-failed" }, error.message).with_context("slot-name", config.slot_name.clone().into())
         })?;
         let row = result.rows.first().ok_or_else(|| Anomaly::fault("xtdb.postgres/slot-creation-no-result", "CREATE_REPLICATION_SLOT returned no slot"))?;
         let lsn = row.cell(1)?.ok_or_else(|| protocol("Slot has no consistent point"))?.parse()?;

@@ -358,7 +358,7 @@ mod tests {
                 if trace.len() == fail_at { Err(Anomaly::incorrect("test/comparator","sentinel")) }
                 else { Ok(keys[left].cmp(&keys[right])) }
             }).unwrap_err();
-            assert_eq!(error.code,"test/comparator");assert_eq!(error.message,"sentinel");
+            assert_eq!(error.code,"test/comparator");assert_eq!(error.message.as_deref(),Some("sentinel"));
             assert_eq!(trace.as_slice(),&full[..fail_at]);
         }
     }
@@ -376,7 +376,7 @@ mod tests {
             let (left,right) = (Run { base: 0,len: 16 },Run { base: 16,len: 16 });
             let error = if high { state.merge_high(left,right) } else { state.merge_low(left,right) }.unwrap_err();
             assert_eq!(error.code,"xtdb.error/unknown");
-            assert_eq!(error.message,"Comparison method violates its general contract!");
+            assert_eq!(error.message.as_deref(),Some("Comparison method violates its general contract!"));
             assert_eq!(calls,12);
         }
     }

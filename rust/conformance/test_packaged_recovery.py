@@ -331,7 +331,7 @@ class RecoveryEvidenceTest(unittest.TestCase):
         event = {"event": "compaction_failed", "table": "public/prices", "output_trie_key": job["output"], "object_key": job["metadata_key"],
             "operation": "put_file", "permission_denied": True, "anomaly_code": "rtdb.storage/permission-denied", "anomaly_category": "forbidden", "message_sha256": "a" * 64}
         self.assertEqual(event, worker_failure("rust", json.dumps(event), job))
-        for changed in ({"event": "denial_probe"}, {"object_key": "tables/prices/data/l01-rc-b00.arrow"}, {"permission_denied": False}, {"output_trie_key": "l01-rc-b01"}):
+        for changed in ({"event": "denial_probe"}, {"object_key": "tables/prices/data/l01-rc-b00.arrow"}, {"permission_denied": False}, {"output_trie_key": "l01-rc-b01"}, {"message_sha256": None}, {"message_sha256": ""}, {"message_sha256": 12}):
             with self.assertRaises(ValueError):
                 worker_failure("rust", json.dumps({**event, **changed}), job)
         with self.assertRaises(ValueError):
