@@ -33,6 +33,9 @@ Base-table alias column lists declare the available document names, preserving d
 Derived-table alias column lists rename output fields positionally.
 
 The parser tokenizes before binding so anonymous parameters follow lexical order across projection, predicate, nested query, and temporal clauses.
+Query parsing, session-control parsing and statement splitting skip nested block comments and line comments, including `/*! ... */` and `/*+ ... */` contents.
+Parameters and semicolons inside comments do not enter statement syntax; comment delimiters inside quoted text remain text.
+`tests/comments.rs` retains lexical metadata, prepared-plan, control, source-span and nested-comment regression sources; execution remains pending.
 Dollar parameters retain their explicit one-based spelling and use zero-based plan indices.
 Temporal clauses retain the source location of their table and become scan dimensions before execution.
 Error contexts retain byte spans and one-based positions in the original SQL text.
