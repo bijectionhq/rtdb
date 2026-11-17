@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use super::{ConnectConfig, PluginRegistry, Predicate, PredicateFactory, SinkRecord, Transform, TransformChain, TransformFactory};
-use crate::connect::date_environment::test_environment;
+use crate::connect::{ConnectData, date_environment::test_environment};
 use rtdb_types::Result;
 
 const RECORDING_PREDICATE: &str = "xtdb.kafka.connectsrc.RecordingPredicate";
@@ -38,11 +38,17 @@ impl TransformFactory for RecordingFactory {
 }
 
 impl Predicate for RecordingPlugin {
-    fn test(&mut self, _: &SinkRecord) -> Result<bool> { Ok(true) }
+    fn test(&mut self, _: &SinkRecord) -> Result<bool> {
+        self.events.lock().unwrap().push(format!("test {}", self.name));
+        Ok(true)
+    }
 }
 
 impl Transform for RecordingPlugin {
-    fn apply(&mut self, record: SinkRecord) -> Result<Option<SinkRecord>> { Ok(Some(record)) }
+    fn apply(&mut self, record: SinkRecord) -> Result<Option<SinkRecord>> {
+        self.events.lock().unwrap().push(format!("apply {}", self.name));
+        Ok(Some(record))
+    }
 }
 
 impl Drop for RecordingPlugin {
@@ -134,4 +140,60 @@ fn opens_a_shared_predicate_once_and_closes_it_once() {
     assert_eq!(observed(&events), ["open predicate", "open transform", "open transform"]);
     drop(chain);
     assert_eq!(observed(&events).iter().filter(|event| event.as_str() == "drop predicate").count(), 1);
+}
+
+fn open_four_steps(registry: &PluginRegistry, fourth_transform: &str, last_predicate: &str) -> Result<TransformChain> {
+    open(registry, &[
+        ("transforms", "first,second,third,fourth"),
+        ("transforms.first.type", RECORDING_TRANSFORM), ("transforms.first.name", "first"),
+        ("transforms.first.predicate", "a"),
+        ("transforms.second.type", RECORDING_TRANSFORM), ("transforms.second.name", "second"),
+        ("transforms.second.predicate", "z"), ("transforms.second.negate", "true"),
+        ("transforms.third.type", RECORDING_TRANSFORM), ("transforms.third.name", "third"),
+        ("transforms.third.predicate", "a"),
+        ("transforms.fourth.type", fourth_transform), ("transforms.fourth.name", "fourth"),
+        ("transforms.fourth.predicate", "m"),
+        ("predicates", "unused,m,z,a"),
+        ("predicates.unused.type", "com.example.DoesNotExist"),
+        ("predicates.m.type", last_predicate), ("predicates.m.name", "m"),
+        ("predicates.z.type", RECORDING_PREDICATE), ("predicates.z.name", "z"),
+        ("predicates.a.type", RECORDING_PREDICATE), ("predicates.a.name", "a"),
+    ])
+}
+
+#[test]
+fn a_completed_chain_uses_shared_predicate_slots_and_drops_transforms_before_predicates() {
+    let (registry, events) = recording_registry();
+    let mut chain = open_four_steps(&registry, RECORDING_TRANSFORM, RECORDING_PREDICATE).unwrap();
+    let record = SinkRecord::new("events".into(), 0, 0, ConnectData::null(), ConnectData::null());
+    assert!(chain.apply(record).unwrap().is_some());
+    drop(chain);
+    assert_eq!(observed(&events), [
+        "open a", "open z", "open m", "open first", "open second", "open third", "open fourth",
+        "test a", "apply first", "test z", "test a", "apply third", "test m", "apply fourth",
+        "drop first", "drop second", "drop third", "drop fourth", "drop a", "drop z", "drop m",
+    ]);
+}
+
+#[test]
+fn transform_open_failure_drops_successful_transforms_then_predicates_in_reverse_opening_order() {
+    let (registry, events) = recording_registry();
+    let error = open_four_steps(&registry, "com.example.MissingTransform", RECORDING_PREDICATE)
+        .err().expect("missing transform class");
+    assert_eq!(error.code, "xtdb.kafka-connect-source/plugin-class-not-found");
+    assert!(error.message.as_deref().is_some_and(|message| message.contains("com.example.MissingTransform")));
+    assert_eq!(observed(&events), [
+        "open a", "open z", "open m", "open first", "open second", "open third",
+        "drop third", "drop second", "drop first", "drop m", "drop z", "drop a",
+    ]);
+}
+
+#[test]
+fn predicate_open_failure_drops_preceding_predicates_in_reverse_opening_order() {
+    let (registry, events) = recording_registry();
+    let error = open_four_steps(&registry, RECORDING_TRANSFORM, "com.example.MissingPredicate")
+        .err().expect("missing predicate class");
+    assert_eq!(error.code, "xtdb.kafka-connect-source/plugin-class-not-found");
+    assert!(error.message.as_deref().is_some_and(|message| message.contains("com.example.MissingPredicate")));
+    assert_eq!(observed(&events), ["open a", "open z", "drop z", "drop a"]);
 }

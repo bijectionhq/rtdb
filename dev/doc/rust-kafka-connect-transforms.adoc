@@ -25,9 +25,10 @@ It visits predicate aliases in the order transforms first refer to them, shares 
 It then opens the transforms in declaration order.
 A predicate class or configuration error therefore reaches the caller before any transform factory runs.
 
-The reference closes already-opened plugins in reverse opening order after a startup failure.
-On normal completion it closes transforms in step order, followed by predicates in first-use order.
-Native plugins release their resources through Rust destructors, and their relative destruction order remains a compatibility gap for custom factories.
+After a startup failure, the assignment releases already-opened transforms in reverse step order, then predicates in reverse first-use order.
+Dropping a completed chain releases transforms in step order, followed by predicates in first-use order.
+Steps that share a predicate alias use the same instance and release it once.
+Native plugins run their Rust destructors on the caller, and these cleanup orders apply when the destructors return normally.
 
 == Reference
 

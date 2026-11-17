@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 use std::sync::Arc;
 use async_trait::async_trait;
 use rtdb_types::Result;
@@ -75,33 +75,65 @@ impl PluginRegistry {
     }
     /// Opens an assignment-owned, single-writer transform chain with explicit process date defaults.
     /// It opens each referenced predicate once in first-use order, then opens the transforms in declaration order.
+    /// On failure it drops opened plugins in reverse opening order.
+    /// A completed chain drops transforms in step order, then predicates in first-use order.
+    /// Both orders assume normally returning plugin destructors.
     /// Built-in date transforms retain the shared environment; custom factories retain their own configuration.
     /// Eager configuration and allocation failures return before publishing the chain.
     /// TimestampRouter constructs its formatter on the first timestamped record, so its pattern errors are returned by `apply`.
     pub fn chain_with_environment(&self, config: &ConnectConfig, environment: Arc<super::DateEnvironment>) -> Result<TransformChain> {
-        let mut predicates = BTreeMap::new();
-        for alias in config.transforms.iter().filter_map(|spec| spec.predicate.as_ref()) {
-            if !predicates.contains_key(alias) {
+        let mut opening = OpeningChain { chain: TransformChain { steps: Vec::new(), predicates: Vec::new() } };
+        let mut predicate_slots = BTreeMap::new();
+        for alias in config.transforms.iter().filter_map(|spec| spec.predicate.as_deref()) {
+            if let Entry::Vacant(slot) = predicate_slots.entry(alias) {
                 let predicate = config.predicates.get(alias).ok_or_else(|| error("undeclared-predicate", alias))?;
                 let opened = match self.predicates.get(&predicate.class_name) { Some(factory) => factory.open(&predicate.options)?, None => super::transforms::predicate(predicate)? };
-                predicates.insert(alias.clone(), opened);
+                slot.insert(opening.chain.predicates.len());
+                opening.chain.predicates.push(opened);
             }
         }
-        let mut steps = Vec::new();
         for spec in &config.transforms {
             let transform = match self.transforms.get(&spec.plugin.class_name) { Some(factory) => factory.open(&spec.plugin.options)?, None => super::transforms::open(&spec.plugin, Arc::clone(&environment))? };
             let configuration_bytes = spec.plugin.options.iter().try_fold(4096usize, |size, (key, value)| size.checked_add(key.len()).and_then(|size| size.checked_add(value.len())).ok_or_else(|| error("allocation-overflow", "Transform configuration size overflow")))?;
-            steps.push(Step { transform, predicate: spec.predicate.clone(), negate: spec.negate, configuration_bytes });
+            let predicate = spec.predicate.as_deref().map(|alias| predicate_slots[alias]);
+            opening.chain.steps.push(Step { transform, predicate, negate: spec.negate, configuration_bytes });
         }
-        Ok(TransformChain { steps, predicates })
+        Ok(opening.finish())
     }
 }
-struct Step { transform: Box<dyn Transform>, predicate: Option<String>, negate: bool, configuration_bytes: usize }
-pub struct TransformChain { steps: Vec<Step>, predicates: BTreeMap<String, Box<dyn Predicate>> }
+
+struct OpeningChain { chain: TransformChain }
+
+impl OpeningChain {
+    fn finish(mut self) -> TransformChain {
+        TransformChain {
+            steps: std::mem::take(&mut self.chain.steps),
+            predicates: std::mem::take(&mut self.chain.predicates),
+        }
+    }
+}
+
+impl Drop for OpeningChain {
+    fn drop(&mut self) {
+        while let Some(step) = self.chain.steps.pop() { drop(step); }
+        while let Some(predicate) = self.chain.predicates.pop() { drop(predicate); }
+    }
+}
+
+struct Step { transform: Box<dyn Transform>, predicate: Option<usize>, negate: bool, configuration_bytes: usize }
+pub struct TransformChain { steps: Vec<Step>, predicates: Vec<Box<dyn Predicate>> }
+
+impl Drop for TransformChain {
+    fn drop(&mut self) {
+        for step in self.steps.drain(..) { drop(step); }
+        for predicate in self.predicates.drain(..) { drop(predicate); }
+    }
+}
+
 impl TransformChain {
     pub fn apply(&mut self, mut record: SinkRecord) -> Result<Option<SinkRecord>> {
         for step in &mut self.steps {
-            let apply = match &step.predicate { None => true, Some(alias) => self.predicates.get_mut(alias).ok_or_else(|| error("undeclared-predicate", alias))?.test(&record)? != step.negate };
+            let apply = match step.predicate { None => true, Some(slot) => self.predicates[slot].test(&record)? != step.negate };
             if apply {
                 if let Some(reservation) = record.reservations.first() {
                     let bound = step.transform.allocation_bound(&record)?.checked_add(step.configuration_bytes.checked_mul(8).ok_or_else(|| error("allocation-overflow", "Transform configuration bound overflow"))?).ok_or_else(|| error("allocation-overflow", "Transform allocation bound overflow"))?;
