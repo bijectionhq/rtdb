@@ -1,0 +1,27 @@
+= Local Rustls client-certificate request adapter
+
+This directory contains the published Rustls 0.23.46 source from the local Cargo registry source cache.
+The upstream package is https://crates.io/crates/rustls/0.23.46[Rustls 0.23.46] and its repository is https://github.com/rustls/rustls[rustls/rustls].
+`UPSTREAM.sha256` records the original contents of every copied source, manifest, build script, example, benchmark, README, and license before local changes.
+The manifest SHA-256 is `0357340433a76253e46bed7ab1e5b1b6efed92a89e7515e583fb9af6b2759c9c`.
+The source cache did not contain an archive checksum; the manifest identifies the available source without asserting an independently verified release archive.
+The Apache-2.0, ISC, and MIT licenses are retained alongside the source.
+
+The workspace patches the crates.io package so direct Kafka, reqwest, and tokio-rustls consumers use one Rustls crate identity.
+The local adapter adds `client::ClientCertificateRequest` and the defaulted `ResolvesClientCert::resolve_with_request` method.
+The borrowed request exposes the peer's certificate signature preferences separately from its protocol-compatible CertificateVerify schemes, and preserves TLS 1.2 certificate-type bytes.
+TLS 1.3 parses `signature_algorithms_cert` and falls back to the unfiltered `signature_algorithms` list when the former is absent.
+Existing resolvers receive the same protocol-compatible schemes through the default adapter.
+CertificateRequest serialization and parsing reject duplicate or empty certificate signature lists.
+
+The request view is passive and borrows the current handshake only for resolver invocation.
+It adds no independently scheduled work or retained connection state.
+TLS 1.2 temporarily maps the at-most-255 certificate-type enum values to wire bytes during that invocation.
+The common resolver still requires a key capable of producing a CertificateVerify signature from the protocol-compatible scheme list.
+
+Source audit covers every workspace client and resolver, Rustls's built-in resolvers, and reqwest 0.13.4's client identity and preconfigured-client paths.
+Kafka's Registry client is the workspace's only custom client-certificate resolver.
+The pgwire, pg-source, and server consumers retain their existing default resolver behavior.
+The published Cargo package omits upstream `src/testdata` and integration-test assets; those omissions are unchanged.
+Focused request parser and resolver adapter regression sources are included in the existing unit-test modules.
+Builds and test execution remain subject to the repository's source-completeness gate.
