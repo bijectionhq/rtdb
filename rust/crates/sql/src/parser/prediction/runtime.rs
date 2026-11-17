@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 use rtdb_types::AllocationScope;
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
-use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TransitionView};
+use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TokenType, TransitionView};
 use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
 use super::adaptive;
 use super::closure::{ClosureOptions, ClosureRound, with_closure_round_result};
@@ -11,6 +11,9 @@ use super::storage::{Retained, with_prediction_storage, with_prediction_storage_
 #[path = "bail_fallback.rs"]
 mod bail_fallback;
 pub(super) use bail_fallback::{PassError, PassResult, with_bail_fallback};
+
+#[path = "inline_match.rs"]
+mod inline_match;
 
 #[path = "no_viable_report.rs"]
 mod no_viable_report;
@@ -283,6 +286,12 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     }
     pub(super) fn note_eof_match(&mut self) -> RuntimeResult<'sql, ()> { let result = self.ready().map(|()| self.matched_eof = true); self.finish(result) }
     pub(super) fn lookahead(&mut self, offset: isize) -> RuntimeResult<'sql, Option<IndexedLexeme<'sql>>> { let result = self.ready().and_then(|()| self.input.lt(offset).map_err(RuntimeError::Input)); self.finish(result) }
+    fn lookahead_token(&mut self, offset: isize) -> RuntimeResult<'sql, (IndexedLexeme<'sql>, TokenType)> {
+        let token = self.lookahead(offset)?.expect("positive lookahead");
+        let kind = self.environment.storage.grammar_view().token_type(token.lexeme().kind())
+            .map_err(RuntimeError::from);
+        Ok((token, self.finish(kind)?))
+    }
     pub(super) fn advance_input(&mut self) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.input.consume().map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn seek_input(&mut self, index: usize) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.input.seek(index).map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn rewind_input(&mut self) -> RuntimeResult<'sql, ()> {
@@ -323,6 +332,12 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
         let state = self.state;
         let offending = self.lookahead(1)?.expect("positive lookahead");
         Ok((invocation, InputMismatch { offending, state }))
+    }
+
+    fn pend_input_mismatch<T>(&mut self, expected: TokenSet) -> RuntimeResult<'sql, T> {
+        let (invocation, cause) = self.capture_input_mismatch()?;
+        self.control = ParserControl::PendingInputMismatch(PendingInputMismatch { invocation, cause, expected });
+        Err(RuntimeError::InputMismatch(cause))
     }
 
     fn pending_no_viable_report(&self) -> Option<&PendingNoViableReport<'parse, 'sql>> {

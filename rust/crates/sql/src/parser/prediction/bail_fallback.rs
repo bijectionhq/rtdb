@@ -70,15 +70,18 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             Ok(())
         });
         self.finish(entered)?;
-        let matched = self.lookahead(1)?.expect("positive lookahead");
-        let actual = self.environment.storage.grammar_view().token_type(matched.lexeme().kind())
-            .map_err(RuntimeError::from);
-        if self.finish(actual)? != expected {
+        let (matched, actual) = self.lookahead_token(1)?;
+        if actual != expected {
             let (current, cause) = self.capture_input_mismatch()?;
             self.records[current.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
             return self.cancel_bail(current, BailRecovery::Clear);
         }
 
+        self.consume_match(expected)?;
+        Ok(matched)
+    }
+
+    pub(super) fn consume_match(&mut self, expected: TokenType) -> RuntimeResult<'sql, ()> {
         if expected == TokenType::EOF {
             self.matched_eof = true;
         }
@@ -86,7 +89,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         if consumed.lexeme().kind() != Kind::Eof {
             self.advance_input()?;
         }
-        Ok(matched)
+        Ok(())
     }
 
     pub(in crate::parser::prediction) fn catch_recognition<T>(

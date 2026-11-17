@@ -586,7 +586,7 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment, LL inline recovery, expected-token capabilities and production adoption remain open.
+Generated context and terminal attachment, expected-token capabilities and production adoption remain open.
 
 == Required isolation block synchronization
 
@@ -612,7 +612,30 @@ Both report messages quote the raw token spelling or `<EOF>` and use the pinned 
 Recovery starts before parser message admission.
 Notification increments the syntax error count after the parser message is complete and before the listener admits its retained diagnostic.
 The report leaves the cursor at the offending token and can be followed by the caller's existing finally operations.
-Nullable decisions, loop synchronization, LL inline recovery and full generated rule adoption remain required.
+Nullable decisions, loop synchronization and full generated rule adoption remain required.
+
+== Inline match recovery in the isolation rules
+
+The ISOLATION branch of `commonTxMode` uses the atom states 2882 and 2883.
+`levelOfIsolation` uses the atom states 3007 through 3013.
+The session checks the current invocation and obtains each expected token from the actual ATN atom.
+SLL and LL matches return the first current occurrence on success.
+Both profiles reach successful matching with recovery clear, so the inherited `reportMatch` step has no recovery state to clear.
+The successful path uses the same separate consume demand in both modes.
+
+On an LL mismatch, deletion first demands `LA(2)` and then obtains the current state's expected set.
+An expected second type reports the unwanted current token through the throwing listener.
+Otherwise insertion demands `LA(1)` again and computes LOOK from transition zero's target in the current invocation context.
+A viable insertion reports the expected type as missing at the current occurrence.
+An unwanted or missing token report begins recovery, reads the current token and notifies with a null cause.
+The listener throws before consumption, synthetic token construction or any generated recognition catch.
+
+When both checks fail, the ordinary mismatch constructor captures the current invocation, state and its own offending-token read.
+The required sync sites have no epsilon and an accepted sync clears the source's prior next-token context.
+These inline paths therefore use the ordinary constructor.
+The existing generated catch assigns the cause to the local record and reports it through the admitted listener path.
+The source error and finally ordering remains the same for native input and allocation failures.
+Terminal attachment, nullable sync context capture, additional match sites and full generated rule adoption require their own source increments.
 
 == Finishing-alternative selection
 

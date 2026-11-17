@@ -548,3 +548,6 @@ fn denied_normal_use_preserves_the_recovery_state_of_each_cancelled_path() {
 
 #[path = "required_block_sync_tests.rs"]
 mod required_block_sync_tests;
+
+#[path = "inline_match_tests.rs"]
+mod inline_match_tests;
