@@ -15,7 +15,7 @@ use rtdb_types::{Anomaly, LogicalType, Result, Value};
 use crate::{MemoryReservation, OwnedColumn, Selection};
 use storage::NodeLayout;
 pub use storage::{PhysicalLayout, RetainedBuffer};
-pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnionEncoding, VectorDescriptor};
+pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
 use descriptor::Declaration;
 
 /// Controls primitive validity checks for an individual physical read.
@@ -119,8 +119,11 @@ impl ExecutionVector {
     pub fn arrow_field(&self) -> Result<RetainedArrowField> { self.descriptor().arrow_field() }
     /// Borrows original Arrow provenance, or the authoritative native descriptor when no Arrow declaration exists.
     pub fn ingress_field(&self) -> DeclarationRef<'_> { self.node().declaration() }
-    /// Borrows the normalized execution type; physical selected-leg identity is retained independently.
-    pub fn logical_type(&self) -> &LogicalType { self.descriptor().logical_type() }
+    /// Borrows logical metadata; native unsupported run-end value types return their typed source failure.
+    /// Field projection and concrete reads do not implicitly request this metadata.
+    pub fn logical_type(&self) -> VectorTypeResult<&LogicalType> { self.descriptor().logical_type() }
+    /// Reports the concrete reader's nullability, separately from physical Field nullability.
+    pub fn reader_nullable(&self) -> bool { self.descriptor().reader_nullable() }
     pub fn len(&self) -> usize { self.address.len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     /// Borrows a checked selected position without allocating.

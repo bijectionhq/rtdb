@@ -129,7 +129,7 @@ fn dense_union_retains_nullable_duration_leaf_and_explicit_null_distinction() {
     let union = UnionArray::try_new(fields, ScalarBuffer::from(vec![7, 2, 7]), Some(ScalarBuffer::from(vec![1, 0, 0])), vec![duration, Arc::new(NullArray::new(1))]).unwrap();
     let field = Field::new("u", union.data_type().clone(), false);
     let vector = open(field, Arc::new(union), &budget).select(&Selection::Indices(vec![1, 0, 2])).unwrap();
-    assert_eq!(vector.logical_type(), &LogicalType::Scalar(ScalarType::Duration(TimeUnit::Microsecond)).maybe());
+    assert_eq!(vector.logical_type().unwrap(), &LogicalType::Scalar(ScalarType::Duration(TimeUnit::Microsecond)).maybe());
     let duration = vector.cell(1).unwrap();
     assert_eq!(duration.leaf_descriptor().unwrap().name(), "duration-micro");
     assert_eq!(duration.getter_index().unwrap(), 1);

@@ -66,7 +66,7 @@ impl<'a> CellRef<'a> {
 
     fn numeric(&self) -> Result<ResolvedCell<'a>> {
         let (ReaderView::Direct(node), Address::Identity { .. }) = (&self.vector.view, &self.vector.address) else { return Err(unsupported("NumericVector")); };
-        let scalar = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
+        let scalar = node.descriptor.scalar().ok_or_else(|| unsupported("NumericVector"))?.value_type();
         if !matches!(scalar, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Decimal { .. })) { return Err(unsupported("NumericVector")); }
         Ok(ResolvedCell { node, row: PhysicalIndex::from_position(self.index)? })
     }
