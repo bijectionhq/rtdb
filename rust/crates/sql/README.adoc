@@ -183,6 +183,9 @@ Its optional ordinality is a signed 64-bit sequence for the materialized page.
 A direct captured UNNEST under a cross Apply stages the collection expression for the full independent page before expansion.
 That expansion produces signed 32-bit positions per input collection.
 The binding pass chooses the expansion shape before resolving expressions that read the output fields.
+Predicates using independent columns can move before collection staging.
+Predicates using the generated element or ordinal remain above expansion.
+Predicates in a dependent subtree can retain their captured parameters when moving below expansion.
 Comma-separated sources, CROSS and inner joins emit every matching dependent row; left joins filter their dependent rows before adding one null-extended row when none match.
 USING and NATURAL joins retain their ordinary common-column and qualified-column visibility.
 Binding scopes distinguish lexical outer queries from preceding FROM items, so an ordinary derived table cannot expose a sibling merely by containing a nested LATERAL query.

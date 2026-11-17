@@ -26,6 +26,9 @@ fn context() -> Arc<QueryContext> {
             ("films", Value::List(films.into_iter().map(|film| Value::Utf8(film.into())).collect())),
         ]).collect()),
         ("docs", vec![vec![("_id", Value::I64(1)), ("xs", Value::List(vec![Value::I64(2)])), ("ys", Value::List(vec![Value::I64(3)]))]]),
+        ("foo", vec![vec![("_id", Value::I64(1)), ("vs", Value::List((1..=2).map(|i| Value::Struct(BTreeMap::from([
+            ("t".into(), Value::I64(i)), ("v".into(), Value::I64(i)),
+        ]))).collect()))]]),
     ] {
         for row in rows { transaction.put(TableRef::new("public", table), row.into_iter().map(|(name, value)| (name.into(), value)).collect(), Interval::ALL).unwrap(); }
     }
@@ -292,6 +295,73 @@ fn multiple_unnests_unnest_distinct_columns() {
 }
 
 #[tokio::test]
+async fn unnest_filters_base_columns_before_staging_and_generated_columns_after() {
+    let context = context();
+    let baseline = context.memory.used_bytes();
+    for (predicate, excludes_invalid_input) in [("k=1", true), ("v=1", false), ("n=1", false)] {
+        let sql = format!("SELECT v FROM (VALUES (1),(0)) AS t(k), UNNEST(ARRAY[1/k]) WITH ORDINALITY AS u(v,n) WHERE {predicate}");
+        let prepared = prepare(&sql, &context.catalog, &PrepareOptions::default()).unwrap();
+        let query_plan = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+        let mut cursor = query_plan.execute(Arc::clone(&context), vec![]).await.unwrap();
+        if excludes_invalid_input {
+            let page = cursor.next_batch().await.unwrap().unwrap();
+            assert_eq!(page.batch().num_rows(), 1);
+            assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::I64(1));
+            assert!(cursor.next_batch().await.unwrap().is_none());
+        } else {
+            assert_eq!(cursor.next_batch().await.unwrap_err().code, "xtdb.expression/division-by-zero", "{predicate}");
+        }
+        drop(cursor);
+        drop(query_plan);
+        assert_eq!(context.memory.used_bytes(), baseline);
+    }
+}
+
+#[tokio::test]
+async fn unnest_selection_preserves_the_three_original_row_and_predicate_placements() {
+    let context = context();
+    let queries = [
+        ("FROM foo AS f, UNNEST(vs) AS uvs(v) WHERE f._id < 2 SELECT f._id, (v).t AS t, (v).v AS v", true),
+        ("FROM foo AS f, UNNEST(vs) AS uvs(v) WHERE (uvs.v).v < 2 SELECT f._id, (v).t AS t, (v).v AS v", false),
+        ("FROM foo AS f, UNNEST(vs) WITH ORDINALITY AS uvs (v, ord) WHERE uvs.ord < 2 SELECT f._id, (v).t AS t, (v).v AS v", false),
+    ];
+    fn find(relation: &Relation, accepts: fn(&RelationNode) -> bool) -> Option<&RelationNode> {
+        if accepts(relation.node()) { return Some(relation.node()); }
+        relation.children().into_iter().find_map(|child| find(child, accepts))
+    }
+    for (source, base_filter) in queries {
+        let prepared = prepare(source, &context.catalog, &PrepareOptions::default()).unwrap();
+        let optimized = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+        assert_eq!(
+            optimized.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),
+            ["_id", "t", "v"],
+            "{source}",
+        );
+        let relation = optimized.relation();
+        let Some(RelationNode::Scan(scan)) = find(relation, |node| matches!(node, RelationNode::Scan(_))) else { panic!("Missing original table scan") };
+        if base_filter {
+            assert_eq!(scan.predicates.len(), 1, "{source}");
+            assert!(matches!(&scan.predicates[0], rtdb_plan::Expr::Binary { op: rtdb_plan::BinaryOp::Lt, .. }));
+            assert!(find(relation, |node| matches!(node, RelationNode::Filter { .. })).is_none(), "{source}");
+        } else {
+            assert!(scan.predicates.is_empty(), "{source}");
+            let Some(RelationNode::Filter { input, .. }) = find(relation, |node| matches!(node, RelationNode::Filter { .. })) else { panic!("Missing post-UNNEST filter") };
+            assert!(matches!(input.node(), RelationNode::Unnest { .. }), "{source}");
+        }
+        let mut cursor = optimized.execute(Arc::clone(&context), vec![]).await.unwrap();
+        let mut rows = Vec::new();
+        while let Some(batch) = cursor.next_batch().await.unwrap() {
+            for row in 0..batch.batch().num_rows() {
+                rows.push(batch.batch().schema().fields().iter().zip(batch.batch().columns())
+                    .map(|(field, column)| read_value(field, column.as_ref(), row).unwrap()).collect::<Vec<_>>());
+            }
+        }
+        let count = if base_filter { 2 } else { 1 };
+        assert_eq!(rows, (1..=count).map(|i| vec![Value::I64(1), Value::I64(i), Value::I64(i)]).collect::<Vec<_>>(), "{source}");
+    }
+}
+
+#[tokio::test]
 async fn from_first_filters_and_projections_bind_in_source_order() {
     let sql = "FROM (VALUES (?),(?)) AS t(k) WHERE k > ? SELECT k + ? AS k WHERE k < ? SELECT k * ? AS result";
     let args = [0, 3, 1, 4, 8, 2].into_iter().map(Value::I64).collect();
@@ -345,5 +415,28 @@ async fn from_first_select_keyword_can_also_name_a_projected_column() {
         ("FROM (VALUES (2)) AS t(v) SELECT SELECT 1 AS n", 1),
     ] {
         assert_eq!(query(sql, vec![]).await.unwrap(), vec![vec![Value::I64(value)]], "{sql}");
+    }
+}
+
+#[tokio::test]
+async fn unnest_predicate_movement_respects_local_and_captured_column_demand() {
+    let context = context();
+    for (sql, value) in [
+        (
+            "FROM (VALUES (1)) AS o(k) LEFT JOIN LATERAL (FROM (VALUES (1),(0)) AS t(x), UNNEST(ARRAY[1/t.x]) AS u(v) WHERE t.x = o.k SELECT v) AS d ON TRUE SELECT d.v",
+            Value::I64(1),
+        ),
+        (
+            "FROM (VALUES (0)) AS o(k) LEFT JOIN LATERAL (FROM (VALUES (1)) AS t(x), UNNEST(CASE WHEN x=1 THEN ARRAY[] ELSE ARRAY[x] END) AS u(v) WHERE 1/o.k = 1 SELECT v) AS d ON TRUE SELECT d.v",
+            Value::Null,
+        ),
+    ] {
+        let prepared = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap();
+        let plan = PreparedQuery::from_prepared(prepared, &context.memory).unwrap();
+        let mut cursor = plan.execute(Arc::clone(&context), vec![]).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(page.batch().num_rows(), 1);
+        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), value);
+        assert!(cursor.next_batch().await.unwrap().is_none());
     }
 }

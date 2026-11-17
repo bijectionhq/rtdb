@@ -101,18 +101,44 @@ fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
     if let Expr::Binary { op: BinaryOp::And, left, right } = predicate {
         return select(select(input, *left)?, *right);
     }
-    let mut correlated = false;
-    predicate.visit(&mut |expr| { correlated |= matches!(expr, Expr::Correlated { .. }); });
-    if correlated || predicate.referenced_columns().len() != 1 { return Ok(Arc::new(input.filter(predicate)?)); }
+    let columns = predicate.referenced_columns();
+    if columns.is_empty() {
+        return Ok(Arc::new(input.filter(predicate)?));
+    }
     match input.node() {
-        RelationNode::Rename { input: child, prefix, expressions } if expressions.iter().all(|named| matches!(named.expr, Expr::Column { .. })) => {
-            let replacements = expressions.iter().filter_map(|named| match &named.expr { Expr::Column { id, data_type } => Some((named.field.id, (*id, data_type.clone()))), _ => None }).collect();
+        RelationNode::Project { input: child, expressions }
+        | RelationNode::Rename { input: child, expressions, .. }
+        | RelationNode::Extend { input: child, expressions } => {
+            let retains_child_fields = matches!(input.node(), RelationNode::Extend { .. });
+            let mut replacements = BTreeMap::new();
+            for id in &columns {
+                match expressions.iter().find(|named| named.field.id == *id) {
+                    Some(rtdb_plan::NamedExpr { expr: Expr::Column { id: source, data_type }, .. }) => {
+                        replacements.insert(*id, (*source, data_type.clone()));
+                    }
+                    None if retains_child_fields && child.schema().get(*id).is_some() => {}
+                    _ => return Ok(Arc::new(input.filter(predicate)?)),
+                }
+            }
             let child = select(Arc::clone(child), replace(predicate, &replacements))?;
-            Ok(Arc::new(Relation::new(input.schema().clone(), RelationNode::Rename { input: child, prefix: prefix.clone(), expressions: expressions.clone() })?))
+            let node = match input.node() {
+                RelationNode::Project { .. } => RelationNode::Project { input: child, expressions: expressions.clone() },
+                RelationNode::Extend { .. } => RelationNode::Extend { input: child, expressions: expressions.clone() },
+                RelationNode::Rename { prefix, .. } => RelationNode::Rename { input: child, prefix: prefix.clone(), expressions: expressions.clone() },
+                _ => unreachable!(),
+            };
+            Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
         }
-        RelationNode::Scan(scan) => {
+        RelationNode::Unnest { input: child, expr, element, ordinality, outer }
+            if columns.iter().all(|id| child.schema().get(*id).is_some()) => {
+            let child = select(Arc::clone(child), predicate)?;
+            let node = RelationNode::Unnest {
+                input: child, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer,
+            };
+            Ok(Arc::new(Relation::new(input.schema().clone(), node)?))
+        }
+        RelationNode::Scan(scan) if columns.len() == 1 => {
             let mut scan = scan.clone();
-            let columns = predicate.referenced_columns();
             if let Some(existing) = scan.predicates.iter_mut().find(|existing| existing.referenced_columns() == columns) {
                 *existing = Expr::binary(BinaryOp::And, predicate, existing.clone());
             } else { scan.predicates.push(predicate); }
@@ -167,4 +193,47 @@ fn replace(mut expression: Expr, columns: &BTreeMap<ColumnId, (ColumnId, rtdb_ty
         _ => {}
     });
     expression
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_plan::{ApplyKind, Field};
+    use rtdb_types::{LogicalType, ScalarType, Value};
+
+    fn field(id: u32) -> Field {
+        Field {
+            id: ColumnId(id), name: format!("column_{id}"), qualifier: None,
+            qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64),
+        }
+    }
+
+    #[test]
+    fn selection_moves_below_unnest_inside_a_dependent_plan() {
+        let source_field = field(0);
+        let element = field(1);
+        let input = Arc::new(Relation::new(
+            Schema::new(vec![source_field.clone()]).unwrap(),
+            RelationNode::Values { rows: vec![vec![Expr::Literal(Value::I64(1))]] },
+        ).unwrap());
+        let unnest = Arc::new(Relation::new(
+            Schema::new(vec![source_field.clone(), element.clone()]).unwrap(),
+            RelationNode::Unnest {
+                input, expr: Expr::List(vec![source_field.expression()]), element, ordinality: None, outer: false,
+            },
+        ).unwrap());
+        let predicate = Expr::binary(BinaryOp::Eq, source_field.expression(), Expr::Parameter {
+            index: 0, data_type: source_field.data_type,
+        });
+        let filtered = Arc::new(unnest.filter(predicate).unwrap());
+        let external = prepare(Arc::clone(&filtered)).unwrap();
+        assert!(matches!(external.node(), RelationNode::Unnest { input, .. } if matches!(input.node(), RelationNode::Filter { .. })));
+        let applied = Arc::new(Relation::new(filtered.schema().clone(), RelationNode::Apply {
+            input: Arc::new(Relation::unit()), dependent: filtered,
+            arguments: vec![(0, Expr::Literal(Value::I64(1)))], kind: ApplyKind::Inner, output: None,
+        }).unwrap());
+        let prepared = prepare(applied).unwrap();
+        let RelationNode::Apply { dependent, .. } = prepared.node() else { panic!("Expected captured application") };
+        assert!(matches!(dependent.node(), RelationNode::Unnest { input, .. } if matches!(input.node(), RelationNode::Filter { .. })));
+    }
 }
