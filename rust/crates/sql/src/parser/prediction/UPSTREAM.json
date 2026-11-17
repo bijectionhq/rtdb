@@ -66,8 +66,95 @@
         "source": "misc/MurmurHash.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/MurmurHash.java",
         "sha256": "baf1ae863ce343f4a3812e80c4ab9b0d1c661c833efc18fba3473334979353b0"
+      },
+      {
+        "source": "atn/ATNConfig.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNConfig.java",
+        "sha256": "077e41382b431c4e30d90e617a54e888c0af0beb5f4c376292c8cf5610b9e2be"
+      },
+      {
+        "source": "atn/ATNConfigSet.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNConfigSet.java",
+        "sha256": "803f19259f6b6ae6fe844edd651af034f179cb6a835f10449b35183ed3f44777"
+      },
+      {
+        "source": "atn/SemanticContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SemanticContext.java",
+        "sha256": "73cd6eb4531a493f3571bb61e646a50d3548b750e3d50cf009f68ad94c5655ce"
+      },
+      {
+        "source": "atn/PredictionMode.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PredictionMode.java",
+        "sha256": "0f741f18234b692e0ed815741c80d1ff14a7ee7bf20c6ae756d3f9519716697d"
+      },
+      {
+        "source": "misc/FlexibleHashMap.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/FlexibleHashMap.java",
+        "sha256": "ee74948c05e025af84eb025a031c711b8b1322b44654f114e849aac740504b38"
+      },
+      {
+        "source": "misc/Array2DHashSet.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/Array2DHashSet.java",
+        "sha256": "b76949bebc9dce6e6e100af77f90cbc4b5e6fec25c51d99e5871b2e2175d0877"
+      },
+      {
+        "source": "dfa/DFAState.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/dfa/DFAState.java",
+        "sha256": "98430af9dc1884161ddf877ab0ca9b912c1aa14db93aa6a868e5b9126063e310"
+      },
+      {
+        "source": "atn/ATNState.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNState.java",
+        "sha256": "825c020effdac6ecb0ab5f64fef810478b60020ebd215482863b59276b2f0600"
       }
     ]
   },
-  "scope": "Prediction-context values, merging and SLL cached-context publication; no token prediction or production parser adapter."
+  "scope": "Prediction-context values, cached and uncached merging, SLL cached-context publication, live ordered configuration identities, pinned semantic algebra and prediction-mode facts; no token prediction or production parser adapter.",
+  "configuration_domain": {
+    "decision_count": 372,
+    "maximum_alternative": 87,
+    "maximum_decision": 65,
+    "maximum_state": 848,
+    "maximum_rule": 23,
+    "precedence_transitions": 42,
+    "ordinary_predicate_transitions": 0,
+    "precedence_values": [
+      1,
+      2,
+      3,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      58,
+      60,
+      61,
+      64,
+      65,
+      66,
+      67
+    ]
+  }
 }
