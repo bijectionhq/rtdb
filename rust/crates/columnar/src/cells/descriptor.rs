@@ -1,7 +1,45 @@
 use std::collections::{BTreeMap, HashMap};
-use rtdb_types::{ListKind, RunEndWidth};
+use rtdb_types::{ListKind, RunEndWidth, ScalarType};
 
 use super::*;
+
+/// Source value whose logical type rejects a run-end encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnencodedBottom { Null, Nothing }
+
+/// A logical-metadata failure produced by the source vector type, before host adaptation.
+/// UnsupportedRunEnd is an Unsupported Caller anomaly with the displayed message and no error-code key.
+/// It owns no allocation and does not convert implicitly to Anomaly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VectorTypeFailure { UnsupportedRunEnd { value: UnencodedBottom, width: RunEndWidth } }
+
+impl std::fmt::Display for VectorTypeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedRunEnd { value, width } => write!(formatter, "{value:?} can't be laid out as RunEnd(width={width:?})"),
+        }
+    }
+}
+impl std::error::Error for VectorTypeFailure {}
+
+/// Result of a logical-metadata request, with an allocation-free source failure.
+pub type VectorTypeResult<T> = std::result::Result<T, VectorTypeFailure>;
+
+#[derive(Debug)]
+enum LogicalMetadata { Known(LogicalType), Failed(VectorTypeFailure) }
+impl LogicalMetadata {
+    fn borrow(&self) -> VectorTypeResult<&LogicalType> {
+        match self { Self::Known(logical) => Ok(logical), Self::Failed(failure) => Err(*failure) }
+    }
+    fn nullable(self, nullable: bool) -> Self {
+        match self { Self::Known(logical) if nullable => Self::Known(logical.maybe()), metadata => metadata }
+    }
+}
+impl From<VectorTypeResult<LogicalType>> for LogicalMetadata {
+    fn from(result: VectorTypeResult<LogicalType>) -> Self {
+        match result { Ok(logical) => Self::Known(logical), Err(failure) => Self::Failed(failure) }
+    }
+}
 
 /// Discriminator interpretation for ordered dense-union children.
 /// Native ordinals narrow to signed bytes on writes; every child remains in the descriptor.
@@ -24,8 +62,53 @@ pub enum ContainerKind {
 
 #[derive(Debug)]
 enum DescriptorShape {
-    Scalar(Field),
-    Container { name: String, nullable: bool, metadata: HashMap<String, String>, kind: ContainerKind },
+    Scalar { field: Field, logical: LogicalType },
+    Container { name: String, nullable: bool, metadata: HashMap<String, String>, kind: ContainerKind, logical: LogicalMetadata },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct ScalarDescriptorRef<'a> { field: &'a Field, logical: &'a LogicalType }
+impl<'a> ScalarDescriptorRef<'a> {
+    pub fn field(self) -> &'a Field { self.field }
+    pub fn logical_type(self) -> &'a LogicalType { self.logical }
+    pub fn value_type(self) -> &'a LogicalType { match self.logical { LogicalType::Maybe(inner) => inner, logical => logical } }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ContainerShapeRef<'a> {
+    Struct(&'a [Arc<VectorDescriptor>]),
+    List(&'a Arc<VectorDescriptor>),
+    Set(&'a Arc<VectorDescriptor>),
+    FixedList { size: i32, elements: &'a Arc<VectorDescriptor> },
+    TimestampRange(&'a Arc<VectorDescriptor>),
+    Map { sorted: bool, entries: &'a Arc<VectorDescriptor> },
+    OrdinalUnion(&'a [Arc<VectorDescriptor>]),
+    RunEnd { ends: &'a Arc<VectorDescriptor>, values: &'a Arc<VectorDescriptor> },
+}
+impl<'a> ContainerShapeRef<'a> {
+    fn child_count(self) -> usize {
+        match self { Self::Struct(children) | Self::OrdinalUnion(children) => children.len(), Self::RunEnd { .. } => 2, _ => 1 }
+    }
+    fn child(self, index: usize) -> Option<&'a Arc<VectorDescriptor>> {
+        match self {
+            Self::Struct(children) | Self::OrdinalUnion(children) => children.get(index),
+            Self::RunEnd { ends, values } => match index { 0 => Some(ends), 1 => Some(values), _ => None },
+            Self::List(child) | Self::Set(child) | Self::TimestampRange(child)
+            | Self::FixedList { elements: child, .. } | Self::Map { entries: child, .. } => (index == 0).then_some(child),
+        }
+    }
+    fn retain(self) -> ContainerKind {
+        match self {
+            Self::Struct(children) => ContainerKind::Struct(children.to_vec()),
+            Self::List(child) => ContainerKind::List(Arc::clone(child)),
+            Self::Set(child) => ContainerKind::Set(Arc::clone(child)),
+            Self::FixedList { size, elements } => ContainerKind::FixedList { size, elements: Arc::clone(elements) },
+            Self::TimestampRange(child) => ContainerKind::TimestampRange(Arc::clone(child)),
+            Self::Map { sorted, entries } => ContainerKind::Map { sorted, entries: Arc::clone(entries) },
+            Self::OrdinalUnion(children) => ContainerKind::DenseUnion { encoding: UnionEncoding::Ordinal, children: children.to_vec() },
+            Self::RunEnd { ends, values } => ContainerKind::RunEnd { ends: Arc::clone(ends), values: Arc::clone(values) },
+        }
+    }
 }
 
 /// Immutable opened vector metadata, retained independently of payload storage.
@@ -34,7 +117,6 @@ enum DescriptorShape {
 #[derive(Debug)]
 pub struct VectorDescriptor {
     shape: DescriptorShape,
-    logical: LogicalType,
     reservation: Arc<MemoryReservation>,
 }
 
@@ -71,50 +153,76 @@ impl ContainerKind {
             | Self::FixedList { elements: child, .. } | Self::Map { entries: child, .. } => (index == 0).then_some(child),
         }
     }
-    fn logical(&self) -> Result<LogicalType> {
-        Ok(match self {
+    fn logical(&self) -> Result<LogicalMetadata> {
+        if let Self::Struct(children) = self {
+            for (index, child) in children.iter().enumerate() {
+                if children[..index].iter().any(|earlier| earlier.name() == child.name()) { return Err(layout()); }
+            }
+        }
+        let logical = match self {
             Self::Struct(children) => {
-                let mut fields = BTreeMap::new();
-                for child in children {
-                    if fields.insert(child.name().to_owned(), child.logical.clone()).is_some() { return Err(layout()); }
+                let fields = children.iter().map(|child| child.logical_type().map(|logical| (child.name().to_owned(), logical.clone())))
+                    .collect::<VectorTypeResult<BTreeMap<_, _>>>();
+                fields.map(LogicalType::Struct)
+            },
+            Self::DenseUnion { children, .. } => {
+                let types = children.iter().map(|child| child.logical_type()).collect::<VectorTypeResult<Vec<_>>>();
+                types.map(|types| match LogicalType::join_all(types) { LogicalType::Nothing => LogicalType::Null, logical => logical })
+            },
+            Self::List(child) => child.logical_type().map(|logical| LogicalType::list(logical.clone())),
+            Self::Set(child) => child.logical_type().map(|logical| LogicalType::List { kind: ListKind::Set, element: Box::new(logical.clone()) }),
+            Self::FixedList { size, elements } => elements.logical_type().map(|logical| LogicalType::List { kind: ListKind::FixedSizeList(*size), element: Box::new(logical.clone()) }),
+            Self::Map { sorted, entries } => entries.logical_type().map(|logical| LogicalType::List { kind: ListKind::Map { sorted: *sorted }, element: Box::new(logical.clone()) }),
+            Self::TimestampRange(_) => Ok(LogicalType::List {
+                kind: ListKind::TimestampTzRange,
+                element: Box::new(LogicalType::Scalar(rtdb_types::ScalarType::Timestamp { unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".to_owned()) })),
+            }),
+            Self::RunEnd { ends, values } => {
+                let value = match values.logical_type() { Ok(value) => value, Err(failure) => return Ok(LogicalMetadata::Failed(failure)) };
+                let width = ends.run_end_width().ok_or_else(layout)?;
+                let value = match value { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), value => value };
+                match value {
+                    LogicalType::Null => Err(VectorTypeFailure::UnsupportedRunEnd { value: UnencodedBottom::Null, width }),
+                    LogicalType::Nothing => Err(VectorTypeFailure::UnsupportedRunEnd { value: UnencodedBottom::Nothing, width }),
+                    value => Ok(LogicalType::RunEndEncoded { width, value: Box::new(value.clone()) }),
                 }
-                LogicalType::Struct(fields)
             },
-            Self::DenseUnion { children, .. } => match LogicalType::join_all(children.iter().map(|child| &child.logical)) {
-                LogicalType::Nothing => LogicalType::Null,
-                logical => logical,
-            },
-            Self::RunEnd { ends, values } => LogicalType::RunEndEncoded {
-                width: match ends.scalar_field().map(Field::data_type) {
-                    Some(DataType::Int16) => RunEndWidth::I16,
-                    Some(DataType::Int32) => RunEndWidth::I32,
-                    Some(DataType::Int64) => RunEndWidth::I64,
-                    _ => return Err(layout()),
-                },
-                value: Box::new(values.logical.clone()),
-            },
-            kind => {
-                let (kind, child) = match kind {
-                    Self::List(child) => (ListKind::List, child),
-                    Self::Set(child) => (ListKind::Set, child),
-                    Self::FixedList { size, elements } => (ListKind::FixedSizeList(*size), elements),
-                    Self::TimestampRange(child) => (ListKind::TimestampTzRange, child),
-                    Self::Map { sorted, entries } => (ListKind::Map { sorted: *sorted }, entries),
-                    _ => return Err(layout()),
-                };
-                LogicalType::List { kind, element: Box::new(child.logical.clone()) }
-            },
-        })
+        };
+        Ok(logical.into())
     }
 }
 
 impl VectorDescriptor {
-    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar(field) => field.name(), DescriptorShape::Container { name, .. } => name } }
-    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar(field) => field.is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
-    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar(field) => field.metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
-    pub fn logical_type(&self) -> &LogicalType { &self.logical }
+    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar { field, .. } => field.name(), DescriptorShape::Container { name, .. } => name } }
+    /// Physical Field nullability; run-end fields are nonnullable even when their value reader admits nulls.
+    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar { field, .. } => field.is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
+    /// Concrete reader nullability without demanding its logical type.
+    /// Run-end readers delegate to values; dense unions report false independently of their legs.
+    pub fn reader_nullable(&self) -> bool {
+        match self.container() { Some(ContainerKind::RunEnd { values, .. }) => values.reader_nullable(), Some(ContainerKind::DenseUnion { .. }) => false, _ => self.is_nullable() }
+    }
+    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar { field, .. } => field.metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
+    /// Borrows cached logical metadata without allocation or payload access.
+    /// Native run-end types over Null/Nothing return their source Unsupported outcome, including through enclosing types.
+    /// Physical field projection and reader nullability remain independently available.
+    pub fn logical_type(&self) -> VectorTypeResult<&LogicalType> {
+        match &self.shape { DescriptorShape::Scalar { logical, .. } => Ok(logical), DescriptorShape::Container { logical, .. } => logical.borrow() }
+    }
     /// Borrows the sole canonical scalar Field; containers return None and require checked SDK projection.
-    pub fn scalar_field(&self) -> Option<&Field> { match &self.shape { DescriptorShape::Scalar(field) => Some(field), _ => None } }
+    pub fn scalar_field(&self) -> Option<&Field> { self.scalar().map(ScalarDescriptorRef::field) }
+    pub(super) fn scalar(&self) -> Option<ScalarDescriptorRef<'_>> {
+        match &self.shape { DescriptorShape::Scalar { field, logical } => Some(ScalarDescriptorRef { field, logical }), _ => None }
+    }
+    pub(super) fn is_bottom_scalar(&self) -> bool { self.scalar().is_some_and(|scalar| scalar.logical_type() == &LogicalType::Nothing) }
+    fn run_end_width(&self) -> Option<RunEndWidth> {
+        if let Some(ContainerKind::RunEnd { values, .. }) = self.container() { return values.run_end_width(); }
+        match self.scalar()?.value_type() {
+            LogicalType::Scalar(ScalarType::I16) => Some(RunEndWidth::I16),
+            LogicalType::Scalar(ScalarType::I32) => Some(RunEndWidth::I32),
+            LogicalType::Scalar(ScalarType::I64) => Some(RunEndWidth::I64),
+            _ => None,
+        }
+    }
     pub fn container(&self) -> Option<&ContainerKind> { match &self.shape { DescriptorShape::Container { kind, .. } => Some(kind), _ => None } }
 
     /// Allocates checked SDK metadata under a retained lease without changing this descriptor.
@@ -128,7 +236,7 @@ impl VectorDescriptor {
 
     fn bound(&self, depth: usize) -> Result<(usize, usize)> {
         if depth > 128 { return Err(Anomaly::unsupported("rtdb/vector-schema-depth", "Execution vector schema exceeds 128 levels")); }
-        if let DescriptorShape::Scalar(field) = &self.shape { return super::open::schema_bound(field, depth); }
+        if let DescriptorShape::Scalar { field, .. } = &self.shape { return super::open::schema_bound(field, depth); }
         let mut bytes = 4096usize.checked_add(self.name().len()).and_then(|n| n.checked_add(self.metadata().capacity().checked_mul(128)?)).ok_or_else(allocation)?;
         for (key, value) in self.metadata() { bytes = bytes.checked_add(key.len()).and_then(|n| n.checked_add(value.len())).ok_or_else(allocation)?; }
         let mut maximum = depth;
@@ -143,7 +251,7 @@ impl VectorDescriptor {
     }
 
     fn project(&self) -> Result<Field> {
-        let DescriptorShape::Container { name, nullable, metadata, kind } = &self.shape else { return Ok(self.scalar_field().ok_or_else(layout)?.clone()); };
+        let DescriptorShape::Container { name, nullable, metadata, kind, .. } = &self.shape else { return Ok(self.scalar_field().ok_or_else(layout)?.clone()); };
         let data_type = match kind {
             ContainerKind::Struct(children) => DataType::Struct(children.iter().map(|child| child.project().map(Arc::new)).collect::<Result<Vec<_>>>()?.into()),
             ContainerKind::List(child) | ContainerKind::Set(child) => DataType::List(Arc::new(child.project()?)),
@@ -166,7 +274,7 @@ impl VectorDescriptor {
             (NodeLayout::Leaf { .. } | NodeLayout::Scalar(_), data_type) => {
                 let field = ingress.clone().with_data_type(super::open::scalar_data_type(data_type)?);
                 let logical = crate::execution_field_type(&field)?;
-                return Ok(Arc::new(Self { shape: DescriptorShape::Scalar(field), logical, reservation }));
+                return Ok(Arc::new(Self { shape: DescriptorShape::Scalar { field, logical }, reservation }));
             },
             (NodeLayout::Struct { children, .. }, DataType::Struct(_)) => ContainerKind::Struct(children.iter().map(|child| Arc::clone(&child.descriptor)).collect()),
             (NodeLayout::List { elements, .. }, DataType::List(_)) => {
@@ -187,24 +295,46 @@ impl VectorDescriptor {
             _ => return Err(layout()),
         };
         let nullable = !matches!(&kind, ContainerKind::DenseUnion { .. } | ContainerKind::RunEnd { .. }) && ingress.is_nullable();
-        let logical = if nullable { kind.logical()?.maybe() } else { kind.logical()? };
-        logical.validate()?;
-        Ok(Arc::new(Self { shape: DescriptorShape::Container { name: ingress.name().clone(), nullable, metadata: ingress.metadata().clone(), kind }, logical, reservation }))
+        let logical = kind.logical()?.nullable(nullable);
+        logical.borrow().map_err(|_| layout())?.validate()?;
+        Ok(Arc::new(Self { shape: DescriptorShape::Container { name: ingress.name().clone(), nullable, metadata: ingress.metadata().clone(), kind, logical }, reservation }))
     }
 
     pub(super) fn ordinal_union(name: &str, children: &[Arc<Self>], memory: &Arc<crate::MemoryBudget>) -> Result<Arc<Self>> {
-        vector_length(children.len())?;
-        let mut bytes = 4096usize.checked_add(name.len()).and_then(|n| n.checked_add(children.len().checked_mul(std::mem::size_of::<Arc<Self>>())?)).ok_or_else(allocation)?;
-        for child in children {
+        Self::native_container(name, false, ContainerShapeRef::OrdinalUnion(children), memory)
+    }
+
+    pub(super) fn native_container(name: &str, nullable: bool, shape: ContainerShapeRef<'_>, memory: &Arc<crate::MemoryBudget>) -> Result<Arc<Self>> {
+        vector_length(shape.child_count())?;
+        if let ContainerShapeRef::RunEnd { ends, .. } = shape {
+            if ends.reader_nullable() || ends.run_end_width().is_none() { return Err(layout()); }
+        }
+        let mut bytes = 4096usize.checked_add(name.len()).and_then(|n| n.checked_add(shape.child_count().checked_mul(std::mem::size_of::<Arc<Self>>())?)).ok_or_else(allocation)?;
+        for index in 0..shape.child_count() {
+            let child = shape.child(index).ok_or_else(layout)?;
             let (_, join_depth) = child.bound(2)?;
-            // LogicalType::join_all retains cloned ancestor Struct maps while recursively joining their fields.
-            let join_bytes = child.logical.retained_bytes()?.checked_mul(join_depth).ok_or_else(allocation)?;
-            bytes = bytes.checked_add(join_bytes).ok_or_else(allocation)?;
+            if matches!(shape, ContainerShapeRef::Struct(_)) { bytes = bytes.checked_add(child.name().len()).ok_or_else(allocation)?; }
+            let demands_type = match shape { ContainerShapeRef::TimestampRange(_) => false, ContainerShapeRef::RunEnd { .. } => index == 1, _ => true };
+            if demands_type {
+                let mut logical_bytes = match child.logical_type() { Ok(logical) => logical.retained_bytes()?, Err(_) => std::mem::size_of::<VectorTypeFailure>() };
+                if matches!(shape, ContainerShapeRef::OrdinalUnion(_)) {
+                    // LogicalType::join_all retains cloned ancestor Struct maps while recursively joining their fields.
+                    logical_bytes = logical_bytes.checked_mul(join_depth).ok_or_else(allocation)?;
+                }
+                bytes = bytes.checked_add(logical_bytes).ok_or_else(allocation)?;
+            }
         }
         let reservation = memory.reserve(bytes.checked_mul(8).ok_or_else(allocation)?)?;
-        let kind = ContainerKind::DenseUnion { encoding: UnionEncoding::Ordinal, children: children.to_vec() };
-        let logical = kind.logical()?;
-        Ok(Arc::new(Self { shape: DescriptorShape::Container { name: name.to_owned(), nullable: false, metadata: HashMap::new(), kind }, logical, reservation }))
+        let kind = shape.retain();
+        let nullable = nullable && !matches!(&kind, ContainerKind::RunEnd { .. } | ContainerKind::DenseUnion { .. });
+        let logical = kind.logical()?.nullable(nullable);
+        let mut metadata = HashMap::new();
+        let extension = match &kind { ContainerKind::Set(_) => Some("set"), ContainerKind::TimestampRange(_) => Some("xt/tstz-range"), _ => None };
+        if let Some(extension) = extension {
+            metadata.insert(crate::EXTENSION_NAME_KEY.to_owned(), extension.to_owned());
+            metadata.insert(crate::EXTENSION_METADATA_KEY.to_owned(), String::new());
+        }
+        Ok(Arc::new(Self { shape: DescriptorShape::Container { name: name.to_owned(), nullable, metadata, kind, logical }, reservation }))
     }
 
     pub(super) fn union_type_id(&self, index: usize) -> Result<i8> {
@@ -224,6 +354,9 @@ impl VectorDescriptor {
 }
 
 fn unrepresentable() -> Anomaly { Anomaly::unsupported("rtdb/unrepresentable-vector-schema", "Native vector metadata cannot be represented by the Arrow SDK field model") }
+
+#[cfg(test)]
+mod metadata_tests;
 
 #[cfg(test)]
 mod tests {
@@ -315,7 +448,7 @@ mod tests {
         let projected = vector.arrow_field().unwrap();
         let DataType::Union(fields, UnionMode::Dense) = projected.field().data_type() else { panic!(); };
         assert_eq!(fields.iter().map(|(id, field)| (id, field.name().as_str())).collect::<Vec<_>>(), vec![(7, "z-custom"), (2, "a-custom")]);
-        assert_eq!(vector.logical_type(), &crate::execution_field_type(projected.field()).unwrap());
+        assert_eq!(vector.logical_type().unwrap(), &crate::execution_field_type(projected.field()).unwrap());
         drop(projected);
         drop(vector);
         assert_eq!(memory.used_bytes(), 0);
@@ -385,15 +518,15 @@ mod tests {
         let bottom = ExecutionVector::with_reservation(Arc::new(Field::new("bottom", DataType::Null, false)), array, reservation).unwrap();
         for children in [vec![], vec![Arc::clone(&bottom.node().descriptor)]] {
             let descriptor = VectorDescriptor::ordinal_union("u", &children, &memory).unwrap();
-            assert_eq!(descriptor.logical_type(), &LogicalType::Null);
+            assert_eq!(descriptor.logical_type().unwrap(), &LogicalType::Null);
             let projected = descriptor.arrow_field().unwrap();
-            assert_eq!(descriptor.logical_type(), &crate::execution_field_type(projected.field()).unwrap());
+            assert_eq!(descriptor.logical_type().unwrap(), &crate::execution_field_type(projected.field()).unwrap());
         }
         let fields = UnionFields::try_new(Vec::<i8>::new(), Vec::<Field>::new()).unwrap();
         let vector = ExecutionVector::from_physical(Arc::new(Field::new("u", DataType::Union(fields, UnionMode::Dense), false)), PhysicalLayout::DenseUnion {
             type_ids: bytes(&[255], &memory), offsets: bytes(&[0; 4], &memory), children: vec![],
         }, &memory).unwrap();
-        assert_eq!(vector.logical_type(), &LogicalType::Null);
+        assert_eq!(vector.logical_type().unwrap(), &LogicalType::Null);
         assert!(vector.cell(0).unwrap().is_null().unwrap());
         drop(vector);
         drop(bottom);
@@ -431,7 +564,7 @@ mod tests {
         assert!(matches!(children[5].container(), Some(ContainerKind::RunEnd { .. })));
         let projected = vector.arrow_field().unwrap();
         assert_eq!(projected.field(), &expected);
-        assert_eq!(vector.logical_type(), &crate::execution_field_type(projected.field()).unwrap());
+        assert_eq!(vector.logical_type().unwrap(), &crate::execution_field_type(projected.field()).unwrap());
         drop(vector);
         assert_eq!(memory.used_bytes(), projected._reservation.bytes());
         drop(projected);
@@ -465,7 +598,7 @@ mod tests {
         let source_charge = source_memory.used_bytes();
         let source_references = Arc::strong_count(&child);
         let tight_memory = MemoryBudget::new(1024 * 1024);
-        let one_tree_allowance = 8 * (4096 + "parent".len() + std::mem::size_of::<Arc<VectorDescriptor>>() + child.logical_type().retained_bytes().unwrap());
+        let one_tree_allowance = 8 * (4096 + "parent".len() + std::mem::size_of::<Arc<VectorDescriptor>>() + child.logical_type().unwrap().retained_bytes().unwrap());
         assert!(one_tree_allowance < tight_memory.limit_bytes());
         assert_eq!(VectorDescriptor::ordinal_union("parent", std::slice::from_ref(&child), &tight_memory).unwrap_err().code, "rtdb/memory-budget-exceeded");
         assert_eq!(tight_memory.used_bytes(), 0);
@@ -475,7 +608,7 @@ mod tests {
 
         let parent_memory = MemoryBudget::new(64 * 1024 * 1024);
         let parent = VectorDescriptor::ordinal_union("parent", std::slice::from_ref(&child), &parent_memory).unwrap();
-        assert_eq!(parent.logical_type(), child.logical_type());
+        assert_eq!(parent.logical_type().unwrap(), child.logical_type().unwrap());
         assert!(parent_memory.used_bytes() > one_tree_allowance);
         assert_eq!(source_memory.used_bytes(), source_charge);
         drop(child);

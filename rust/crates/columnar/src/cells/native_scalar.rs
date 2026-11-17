@@ -108,7 +108,7 @@ pub(super) fn value_bound(node: &PhysicalNode, row: usize) -> Result<usize> {
 }
 
 pub(super) fn value(node: &PhysicalNode, row: usize) -> Result<Value> {
-    let scalar = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
+    let scalar = node.descriptor.scalar().ok_or_else(layout)?.value_type();
     let LogicalType::Scalar(scalar) = scalar else { return Err(layout()); };
     let data = ScalarStorageRef::node(node)?;
     let int = || Ok::<_, Anomaly>(i32::from_le_bytes(data.lane(row)?));

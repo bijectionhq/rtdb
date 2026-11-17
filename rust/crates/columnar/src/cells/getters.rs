@@ -42,7 +42,7 @@ impl<'a> CellRef<'a> {
 
     fn primitive(&self, getter: Getter, checks: NullChecks) -> VectorReadResult<PayloadCell<'a>> {
         let cell = self.resolve_primitive()?;
-        if !getter.admits(cell.node.descriptor.logical_type()) { return Err(unsupported(getter.name()).into()); }
+        if !cell.node.descriptor.scalar().is_some_and(|scalar| getter.admits(scalar.logical_type())) { return Err(unsupported(getter.name()).into()); }
         if checks == NullChecks::Enabled && cell.node.null(cell.row)? {
             return Err(Anomaly::fault("xtdb.error/unknown", format!("null at index {}", cell.row.0)).into());
         }

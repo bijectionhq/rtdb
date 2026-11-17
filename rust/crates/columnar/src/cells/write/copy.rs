@@ -2,14 +2,15 @@ use super::*;
 use super::scalar::{MutableScalarData, ScalarState};
 
 #[derive(Clone, Copy)]
-pub(crate) struct ScalarSource<'a> { vector: &'a ExecutionVector, node: &'a PhysicalNode }
+pub(crate) struct ScalarSource<'a> { vector: &'a ExecutionVector, node: &'a PhysicalNode, descriptor: super::super::descriptor::ScalarDescriptorRef<'a> }
 impl<'a> ScalarSource<'a> {
     pub(crate) fn new(vector: &'a ExecutionVector) -> WriteResult<Self> {
         let ReaderView::Direct(node) = &vector.view else { return Err(unsupported_write("ScalarSource")); };
         if !matches!(&node.storage, NodeLayout::Leaf { .. } | NodeLayout::Scalar(_)) { return Err(unsupported_write("ScalarSource")); }
-        Ok(Self { vector, node })
+        let descriptor = node.descriptor.scalar().ok_or_else(|| unsupported_write("ScalarSource"))?;
+        Ok(Self { vector, node, descriptor })
     }
-    fn scalar_type(&self) -> &LogicalType { match self.node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner, logical => logical } }
+    fn scalar_type(&self) -> &LogicalType { self.descriptor.value_type() }
     fn translate(&self, index: i32) -> WriteResult<i32> { Ok(self.vector.address.translate(PhysicalIndex(index))?.0) }
     fn position(&self, row: i32) -> WriteResult<usize> { Ok(self.node.checked_position(PhysicalIndex(row))?) }
     fn storage(&self) -> WriteResult<ScalarStorageRef<'a>> { Ok(ScalarStorageRef::node(self.node)?) }

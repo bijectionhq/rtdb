@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use rtdb_types::ListKind;
 use super::*;
 
 pub(super) fn object(cell: &CellRef<'_>) -> Result<OwnedValue> {
@@ -11,7 +10,7 @@ pub(super) fn object(cell: &CellRef<'_>) -> Result<OwnedValue> {
 
 fn leaf(node: &PhysicalNode, row: PhysicalIndex) -> Result<ResolvedCell<'_>> {
     match resolve_node(node, row)? {
-        ResolvedAccess::Leaf(cell) if cell.node.descriptor.logical_type() == &LogicalType::Nothing => Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")),
+        ResolvedAccess::Leaf(cell) if cell.node.descriptor.is_bottom_scalar() => Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")),
         ResolvedAccess::Leaf(cell) => Ok(cell),
         ResolvedAccess::AbsentUnion { type_id, row } => Err(absent(type_id, row)),
     }
@@ -29,7 +28,7 @@ fn bound(node: &PhysicalNode, row: PhysicalIndex) -> Result<usize> {
             for child in children {
                 bytes = add(bytes, add(1024, mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?)?)?;
                 bytes = add(bytes, mul(child.descriptor.name().len(), 2)?)?;
-                if child.descriptor.logical_type() != &LogicalType::Nothing { bytes = add(bytes, bound(child, row)?)?; }
+                if !child.descriptor.is_bottom_scalar() { bytes = add(bytes, bound(child, row)?)?; }
             }
         }
         NodeLayout::List { .. } | NodeLayout::FixedList { .. } => {
@@ -58,7 +57,7 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
         NodeLayout::Struct { children, .. } => {
             let mut fields = BTreeMap::new();
             for child in children {
-                let value = if child.descriptor.logical_type() == &LogicalType::Nothing { Value::Undefined } else { read(child, row)? };
+                let value = if child.descriptor.is_bottom_scalar() { Value::Undefined } else { read(child, row)? };
                 fields.insert(child.descriptor.name().to_owned(), value);
             }
             Ok(Value::Struct(fields))
@@ -67,23 +66,22 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
             let (child, start, end) = node.elements(node.checked_position(row)?)?;
             let mut values = Vec::with_capacity(end - start);
             for row in start..end { values.push(read(child, PhysicalIndex::from_position(row)?)?); }
-            let logical = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
-            let LogicalType::List { kind, .. } = logical else { return Err(layout()); };
-            match kind {
-                ListKind::List => Ok(Value::List(values)),
-                ListKind::Set => Ok(Value::Set(values)),
-                ListKind::FixedSizeList(_) => Ok(Value::FixedSizeList(values)),
-                ListKind::TimestampTzRange => match values.as_slice() {
+            match node.descriptor.container() {
+                Some(ContainerKind::List(_)) => Ok(Value::List(values)),
+                Some(ContainerKind::Set(_)) => Ok(Value::Set(values)),
+                Some(ContainerKind::FixedList { .. }) => Ok(Value::FixedSizeList(values)),
+                Some(ContainerKind::TimestampRange(_)) => match values.as_slice() {
                     [Value::Timestamp { value: lower, .. }, Value::Timestamp { value: upper, .. }] => Ok(Value::TimestampTzRange { lower: *lower, upper: *upper }),
                     _ => Err(Anomaly::incorrect("rtdb/timestamp-range", "Timestamp range requires two non-null timestamps")),
                 },
-                ListKind::Map { sorted } => {
+                Some(ContainerKind::Map { sorted, .. }) => {
                     let entries = values.into_iter().map(|value| match value {
                         Value::Struct(mut fields) => Ok((fields.remove("key").ok_or_else(layout)?, fields.remove("value").ok_or_else(layout)?)),
                         _ => Err(layout()),
                     }).collect::<Result<Vec<_>>>()?;
                     Ok(Value::Map { entries, sorted: *sorted })
                 }
+                _ => Err(layout()),
             }
         }
         _ => Err(layout()),

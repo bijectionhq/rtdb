@@ -511,7 +511,7 @@ fn opened_metadata_canonicalizes_signed_width_and_zone_without_changing_ingress(
     let integers = open(Field::new("unsigned-name", DataType::UInt32, false), Arc::new(UInt32Array::from(vec![u32::MAX])), &memory);
     assert_eq!(integers.ingress_field().arrow().unwrap().data_type(), &DataType::UInt32);
     assert_eq!(integers.descriptor().scalar_field().unwrap().data_type(), &DataType::Int32);
-    assert_eq!(integers.logical_type(), &LogicalType::Scalar(ScalarType::I32));
+    assert_eq!(integers.logical_type().unwrap(), &LogicalType::Scalar(ScalarType::I32));
     assert_eq!(integers.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), -1);
     assert_eq!(integers.cell(0).unwrap().object().unwrap().value(), &Value::I32(-1));
     let array = TimestampMicrosecondArray::from(vec![123]).with_timezone("+01");
@@ -704,7 +704,7 @@ fn union_opened_parent_has_no_validity_even_when_ingress_declares_nullable() {
     }, &memory).unwrap();
     assert!(vector.ingress_field().arrow().unwrap().is_nullable());
     assert!(!vector.descriptor().is_nullable());
-    assert_eq!(vector.logical_type(), &LogicalType::Scalar(ScalarType::I64));
+    assert_eq!(vector.logical_type().unwrap(), &LogicalType::Scalar(ScalarType::I64));
 }
 
 #[test]

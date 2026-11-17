@@ -50,7 +50,16 @@ Native union descriptors retain all ordered children and wrapping ordinal discri
 Native union construction reserves logical-join scratch for cloned ancestor maps across the bounded descriptor depth before retaining children; their existing metadata leases remain independent.
 SDK projection rejects a native union with more than 128 children without removing its children or changing its native descriptor.
 The native descriptor and its SDK projection preserve custom child/leg names and declaration order.
-`logical_type()` retains existing execution type normalization; `CellRef::leaf_descriptor()` separately preserves the actual selected union leaf even when that leaf is null.
+`logical_type()` borrows cached execution metadata or returns an allocation-free `VectorTypeFailure`.
+Native run-end types over Null or Nothing retain the exact source Unsupported outcome, including its width; enclosing types propagate the first child failure in source order.
+The typed outcome has no implicit `Anomaly` conversion, because its source Unsupported error has no error-code key.
+Scalar descriptors retain a guaranteed logical type beside their validated Field.
+`CellRef::leaf_descriptor()` preserves the actual selected union leaf even when that leaf is null.
+Physical Field nullability, concrete reader nullability and logical type admission are independent: run-end fields are nonnullable, while `reader_nullable()` delegates to their values.
+Field projection and concrete getters do not request logical type metadata.
+Structural logical Value reads use concrete descriptor kinds, so a nested type failure does not introduce an unrelated read failure.
+Native nested run-end metadata replaces the outer encoding and retains child encodings; timestamp-range logical metadata uses its fixed timestamp element type while its Field retains the actual child.
+Native signed fixed-list widths remain representable as metadata and SDK Fields, while strict external schema and array admission continue rejecting negative widths.
 
 `from_physical` admits immutable Struct, List/Map, FixedSizeList, DenseUnion and RunEndEncoded containers without requiring a parent Arrow array.
 Scalar children retain either admitted Arrow or immutable native scalar storage.
@@ -116,6 +125,7 @@ Raw access does not mask a child's payload with its parent's null bit and does n
 `tests/execution_cells.rs` covers primitive null payloads, unsigned interpretation, getter admission, nonnullable validity, union leaf identity, composed selections, run-end slices and end-domain admission, nested retention, DateMilli units and allocation failure release.
 `tests/physical_layout.rs` adds native absent-leg containers, raw primitive failure routing, delayed inactive-offset admission, named-reader selection exceptions, canonical declarations, direct numeric/byte methods, shorter logical run lengths, malformed layout rejection and retained-owner failure cases.
 `cells/descriptor.rs` covers nested checked metadata projection, retained projection charges, allocation failure release, declared and ordinal discriminator identity, wrapped named-leg reads, custom child order, empty union types, descriptor depth admission and deep Struct joins under independent finite budgets.
+`cells/descriptor/metadata_tests.rs` covers independent field/type/nullability demand, typed failure ordering, delegated run-end admission, source-native fixed widths, structural reads and retained charges on failed metadata admission.
 Native partial container storage and writer construction remain separate from this descriptor prerequisite; public `from_physical` retains its strict SDK-declared input validation.
 These are unexecuted source regressions.
 Query frames, parameters, spill transport and expression consumers still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
