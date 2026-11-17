@@ -10,7 +10,7 @@ fn fingerprint(hex: &str) -> Fingerprint {
     Fingerprint(bytes)
 }
 
-fn certificate(bits: u32, digest: MessageDigest, issued: i64, usage: Option<KeyUsage>) -> X509 {
+pub(super) fn certificate(bits: u32, digest: MessageDigest, issued: i64, usage: Option<KeyUsage>) -> X509 {
     let key = PKey::from_rsa(Rsa::generate(bits).unwrap()).unwrap();
     let mut name = X509NameBuilder::new().unwrap(); name.append_entry_by_text("CN", "policy fixture").unwrap(); let name = name.build();
     let mut certificate = X509::builder().unwrap(); certificate.set_version(2).unwrap();
