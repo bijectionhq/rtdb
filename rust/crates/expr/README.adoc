@@ -466,6 +466,13 @@ The shared analyzer's checked cumulative-width admission and existing finite pat
 `tests/java_pattern.rs` and vendor `tests/java_utf16.rs` retain the unexecuted matcher and ownership regressions.
 The ordinary matcher dispatch gaps covered here are separate from the wider UTF16 text-carrier and raw host-form evaluator work.
 
+The private pattern adapter accepts borrowed `JavaText` and preprocesses exact code points before emitting matcher grammar.
+Quotation, comments, ranges and supplementary decisions retain unmatched units until their grammar operation consumes them; boolean search supplies exact UTF16 units to the existing matcher.
+Source admission counts the UTF8 width of scalar code points and three accounting bytes for each unmatched unit, preserving existing UTF8 limits without encoding the source.
+Raw compilation failures retain their source and dynamic diagnostic storage with independent leases; proven Java syntax mappings retain descriptions and post-quotation code-point indices separately from native/backend failures.
+The existing UTF8 entry points keep their current diagnostic adapter.
+Full Java failure-message rendering, the remaining syntax-error mappings, exact-unit replacement input and serialized SQL/XTQL/host text admission remain required boundaries.
+
 Stored Transit Path values retain Unix byte identity separately from runtime-image path identity.
 URI validation precedes path construction; Unix slash normalization preserves dot segments, and the exact `file:///` spelling selects raw escaped octets.
 Other file URI spellings decode text before constructing a path, while `jrt` paths use their registered module prefix and provider constraints.

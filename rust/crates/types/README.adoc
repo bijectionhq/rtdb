@@ -125,6 +125,7 @@ Frontend semantic admission, shared UTF16, reader singleton identity and host co
 
 `java_text::JavaString` retains exact UTF16 units in shared immutable UTF8 or UTF16 backing.
 Charged constructors admit the boxed backing, shared owner and bookkeeping before allocation; their leases survive until the final clone is destroyed.
+`AllocationScope::memory_budget` lets a retained value acquire its own lease from the caller's budget without transferring the scope's existing charges.
 Explicitly named untracked constructors serve programmatic contexts with the same native size checks.
 Owned strings admit at most `i32::MAX` units, while borrowed `JavaText` views require no allocation.
 Equality compares units across representations; shared backing does not establish Java object identity.

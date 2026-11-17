@@ -249,3 +249,28 @@ fn explicit_untracked_values_and_borrowed_views_do_not_need_a_budget() {
     assert!(utf8.retained_bytes() > 0);
     assert!(utf16.retained_bytes() > 0);
 }
+
+#[test]
+fn scope_budget_builds_an_independently_retained_java_string() {
+    let memory = MemoryBudget::new(8192);
+    let value = {
+        let scope = AllocationScope::new(&memory).unwrap();
+        assert!(std::sync::Arc::ptr_eq(scope.memory_budget(), &memory));
+        JavaString::copy_utf16(&[0xd800, 0x61], scope.memory_budget()).unwrap()
+    };
+    assert_eq!(memory.used_bytes(), value.retained_bytes());
+    assert_eq!(value.view().units().collect::<Vec<_>>(), [0xd800, 0x61]);
+    drop(value);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn scope_budget_does_not_transfer_or_bypass_existing_charges() {
+    let bound = JavaString::allocation_bound_utf16(&[0xd800]).unwrap();
+    let memory = MemoryBudget::new(4096 + bound - 1);
+    let scope = AllocationScope::new(&memory).unwrap();
+    assert_eq!(JavaString::copy_utf16(&[0xd800], scope.memory_budget()).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(memory.used_bytes(), 4096);
+    drop(scope);
+    assert_eq!(memory.used_bytes(), 0);
+}

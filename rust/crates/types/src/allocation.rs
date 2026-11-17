@@ -9,6 +9,10 @@ pub struct AllocationScope {
 }
 
 impl AllocationScope {
+    /// Borrows the budget for values that acquire and retain their own allocation leases.
+    /// This does not transfer the scope's charges; admit owned storage before allocation.
+    pub fn memory_budget(&self) -> &Arc<MemoryBudget> { &self.memory }
+
     /// Acquires the scope's bookkeeping reservation from the supplied finite budget.
     pub fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         let initial = memory.reserve(4096)?;

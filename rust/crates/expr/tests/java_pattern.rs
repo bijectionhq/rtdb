@@ -477,3 +477,30 @@ fn java_node_and_utf16_replacement_reservations_release_on_success_and_error() {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[test]
+fn utf8_pattern_wrapper_preserves_its_existing_diagnostic_boundary() {
+    for (pattern, message) in [
+        (")", "Unmatched closing ')'"),
+        ("😀(", "Unclosed group"),
+        ("\\", "Trailing backslash"),
+        (r"\uGGGG", "Invalid hexadecimal escape"),
+        (r"\p{UnknownThing}", "Unknown character property name {UnknownThing}"),
+    ] {
+        let error = scalar_call("like_regex", &[text(""), text(pattern), text("")], &EvalContext::default()).unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/illegal-argument-exception");
+        assert_eq!(error.message.as_deref(), Some(message));
+    }
+}
+
+#[test]
+fn utf8_pattern_wrappers_keep_quotation_comments_and_supplementary_matches() {
+    for (source, pattern) in [
+        ("😀.*", "\\Q😀.*\\E"),
+        ("ab", "(?x)a # 😀 ignored\nb"),
+        ("😀x", "(?<=😀)x"),
+        ("1.*", r"\Q1.*\E"),
+    ] {
+        assert_eq!(scalar_call("like_regex", &[text(source), text(pattern), text("")], &EvalContext::default()).unwrap(), Value::Bool(true));
+    }
+}
