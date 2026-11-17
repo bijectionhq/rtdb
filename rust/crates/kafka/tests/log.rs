@@ -37,6 +37,7 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     let opened = KafkaLog::open(&configuration, options.clone(), Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
     let cancellation = CancellationToken::new();
     let driver = tokio::spawn(opened.driver.unwrap().run(cancellation.clone()));
+    let before = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 * 1000;
     let first = opened.log.enqueue(Bytes::from_static(b"first"), Timestamp(42)).await.unwrap().durable().await.unwrap();
     let second = opened.log.enqueue(Bytes::from_static(b"second"), Timestamp(43)).await.unwrap().durable().await.unwrap();
     assert_eq!(first.offset, LogOffset(0));
@@ -48,12 +49,18 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     assert!(reader.driver.is_none());
     assert!(matches!(reader.log.enqueue(Bytes::new(), Timestamp(0)).await, Err(Error::ReadOnlyLog(_))));
     let records = reader.log.read_range(LogOffset(0), LogOffset(2)).await.unwrap();
+    let after = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 * 1000;
     assert_eq!(records.len(), 2);
+    for record in &records {
+        assert!((before..=after).contains(&record.metadata.timestamp.0));
+        assert_eq!(record.metadata.timestamp.0 % 1000, 0);
+    }
     assert_eq!(records[0].payload, Bytes::from_static(b"first"));
-    assert_eq!(records[1].metadata, second);
+    assert_eq!(records[1].metadata.offset, second.offset);
+    assert_eq!(second.timestamp, Timestamp(1_234_000));
     let mut range = reader.log.range(LogOffset(0), LogOffset(1)).await.unwrap();
     let bound = range.allocation_bound();
-    assert_eq!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().unwrap().metadata, first);
+    assert_eq!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().unwrap().metadata, records[0].metadata);
     assert!(range.next(rtdb_storage::object_store::ReadReservation::new(bound, ())).await.unwrap().is_none());
     let mut tail = reader.log.tail(second.offset).await.unwrap();
     assert!(tail.poll(Duration::from_millis(20)).await.unwrap().is_empty());
