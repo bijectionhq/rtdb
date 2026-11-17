@@ -176,3 +176,73 @@ async fn host_exact_decimal_failures_preserve_jvm_arithmetic_messages() {
         assert_eq!(error.message,message,"{form}");
     }
 }
+
+#[tokio::test]
+async fn host_numeric_comparisons_cross_categories_and_keep_nan_unordered() {
+    for (form,expected) in [
+        ("(< 1 2)",true),("(<= 2 2)",true),("(> 3 2)",true),("(>= 2 2)",true),
+        ("(== 1 1.0 1M 1N)",true),("(== (/ 1 2) 0.5M)",true),
+        ("(< 9007199254740992N 9007199254740993N)",true),
+        ("(== 9007199254740993N 9007199254740992.0)",true),
+        ("(< 1E-2147483647M 1M)",true),("(> -1E-2147483647M -1M)",true),
+        ("(== 1.200M 1.2M)",true),("(< -1.21M -1.200M)",true),
+        ("(zero? -0.0)",true),("(pos? 1N)",true),("(neg? (/ -1 3))",true),
+        ("(zero? ##NaN)",false),("(pos? ##NaN)",false),("(neg? ##NaN)",false),
+        ("(< ##NaN 1)",false),("(<= 1 ##NaN)",false),("(> ##NaN ##NaN)",false),
+        ("(>= ##NaN 1)",false),("(== ##NaN ##NaN)",false),
+        ("(let [f <] (f 1 2))",true),("(clojure.core/pos? 1)",true),
+    ] {
+        let expected = if expected { "true" } else { "false" };
+        assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str {form}) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
+    }
+    assert_eq!(project(r#"(regexp-replace "a" (str (== (/ 1 3) 0.3M)) "x")"#).await.unwrap_err().message,"Non-terminating decimal expansion; no exact representable decimal result.");
+}
+
+#[tokio::test]
+async fn host_comparison_chains_evaluate_arguments_before_short_circuiting_numeric_pairs() {
+    for (form,expected) in [(r#"(< "not numeric")"#,true),("(== nil)",true),(r#"(< 3 2 "not numeric")"#,false),(r#"(== 1 2 "not numeric")"#,false)] {
+        let expected = if expected { "true" } else { "false" };
+        assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str {form}) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+    for form in [r#"(< 3 2 (subs "x" -1))"#,r#"(let [f <] (f 3 2 (subs "x" -1)))"#,r#"(== 1 2 (subs "x" -1))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,"Host substring indexes are out of range");
+    }
+    for pattern in [r#"(if true "a" (<))"#,r#"(if true "a" (==))"#,r#"(let [f zero?] (if true "a" (f)))"#,r#"(let [< str] (< "a"))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+    for pattern in [r#"(if true "a" (zero?))"#,r#"(if true "a" (pos? 1 2))"#,r#"(if true "a" (neg?))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().code,"xtdb.error/unknown");
+    }
+}
+
+#[tokio::test]
+async fn host_primitive_boolean_metadata_preserves_unresolved_static_calls() {
+    for form in [
+        "(byte (if true 127.9 (+ 1.0 (boolean nil))))",
+        "(byte (if true 127.9 (+ 1.0 (zero? 0))))",
+        "(byte (if true 127.9 (+ 1.0 (< 1 2))))",
+        "(byte (if true 127.9 (+ 1.0 (zero? true))))",
+        "(let [b (boolean nil)] (byte (if true 127.9 (+ 1.0 b))))",
+        "(byte (if true 127.9 (+ 1.0 (if true (boolean nil) (pos? 1)))))",
+        "(byte (if true 127.9 (+ 1.0 (do 0 (boolean nil)))))",
+        "(byte (if true 127.9 (+ 1.0 (and (boolean nil) (pos? 1)))))",
+        "(byte (if true 127.9 (+ 1.0 (or (boolean nil) (pos? 1)))))",
+        "(byte (if true 127.9 (+ 1.0 (boolean (identity 1)))))",
+        "(byte (if true 127.9 (double (boolean nil))))",
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "127" (str {form}) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{form}");
+    }
+    for form in [
+        "(byte (if true 127.9 (+ 1.0 true)))",
+        "(byte (if true 127.9 (+ 1.0 'false)))",
+        "(byte (if true 127.9 (+ 1.0 (boolean 1))))",
+        "(byte (if true 127.9 (+ 1.0 (zero? (boolean nil)))))",
+        "(let [f boolean] (byte (if true 127.9 (+ 1.0 (f nil)))))",
+        "(byte (if true 127.9 (+ 1.0 (not nil))))",
+        "(byte (if true 127.9 (double true)))",
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err().message,"Host numeric cast is out of range","{form}");
+    }
+    assert_eq!(project(r#"(regexp-replace "NaN" (str (/ (boolean nil) ##NaN)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
+    assert_eq!(project(r#"(regexp-replace "a" (str (/ false ##NaN)) "x")"#).await.unwrap_err().message,"Host value is not a Number");
+}

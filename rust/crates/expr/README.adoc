@@ -398,11 +398,15 @@ Checked `byte`, `short`, `int`, `long`, `float` and `double` calls preserve prim
 Host `+`, `-`, `*`, `/`, `inc` and `dec`, including their promoting apostrophe variants, retain checked long operations, BigInt and ratio categories, and exact BigDecimal scale arithmetic.
 Direct n-ary arithmetic executes left-nested operations before later arguments; lexical function invocation evaluates all arguments before boxed operations.
 Primitive floating division retains IEEE results, while boxed division checks NaN operands before zero admission.
+Host `<`, `<=`, `>`, `>=` and `==` compare numeric values across categories, and `zero?`, `pos?` and `neg?` retain JVM floating and exact-number behavior.
+Comparison chains evaluate every argument before short-circuiting adjacent numeric comparisons; a one-argument comparison returns true without numeric conversion.
+Decimal comparison checks signs and adjusted magnitudes before aligning coefficients, so extreme scale differences do not require expanded powers.
+Compiled numeric calls distinguish primitive booleans from boxed Boolean literals and preserve unresolved static-call metadata through locals and control forms.
 Substring indexes require Number objects before boxed integer conversion; Character indexes require an explicit numeric cast.
 Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.
 The host admission limits are 128 nested forms or generated instruction levels and 65536 instructions, with a 16MiB limit per computed text temporary or numeric scratch reservation.
 Numeric scratch admission includes decimal scale alignment before powers or expanded coefficients are allocated.
-Remaining host numeric functions and dynamic arithmetic bindings, interop and effects, namespace state, destructuring/functions/macros, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
+Remaining host numeric functions, including quotient/remainder/modulo and bit operations, and dynamic arithmetic bindings, interop and effects, namespace state, destructuring/functions/macros, collection/object rendering, tagged objects, emitted-local multiplicity and isolated-surrogate text remain required work.
 Forms outside the implemented host subset report `rtdb.expr/regex-host-form` explicitly.
 `tests/regex_host.rs` records lexical, phase, empty-input and ownership regressions as unexecuted source.
 `tests/regex_replace_metadata.rs` contains unexecuted source regressions for phase, full vector types, empty batches, per-row scope release and cancellation.

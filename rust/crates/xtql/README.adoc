@@ -203,5 +203,8 @@ Simple lexical bindings and pure string/control forms compile independently of X
 Host BigInt and BigDecimal literals preserve exact numeric text, and checked primitive conversions retain the difference between direct inline calls and calls through lexical function values.
 Host arithmetic supports checked and promoting addition, subtraction, multiplication, increment and decrement, plus exact or floating division.
 Direct n-ary forms retain left-nested execution and primitive overloads; calls through lexical functions retain strict argument evaluation and boxed numeric dispatch.
+Host numeric comparisons and sign predicates preserve cross-category comparison and NaN behavior.
+Comparison chains evaluate all argument expressions before skipping later numeric pairs after a false result.
+The host compiler retains primitive-boolean and unresolved static-call metadata separately from boxed Boolean values, including through dead branches and lexical bindings.
 `tests/regex_host.rs` records computed patterns, shadowing, strict arguments, UTF16 substring indexes and dead-branch compilation as unexecuted source.
 Remaining host numeric functions and dynamic arithmetic bindings, interop, effects, object rendering and generated-local multiplicity remain required follow-on work.

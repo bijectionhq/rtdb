@@ -92,3 +92,34 @@ fn host_arithmetic_bounds_generated_nary_instruction_depth() {
     let expression = replace(call("str",vec![call("+",vec![F::Literal(V::I64(1));129])]));
     assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
 }
+
+#[test]
+fn host_numeric_comparison_reserves_cross_product_storage_before_allocation() {
+    let number = F::BigInteger("9".repeat(512));
+    let expression = replace(call("str",vec![call("==",vec![number.clone(),number])]));
+    let memory = MemoryBudget::new(64 << 10);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        let schema = Schema::default();
+        assert_eq!(ExpressionInvocation::prepare(&expression,&schema,&context).err().unwrap().code,"rtdb/memory-budget-exceeded");
+        assert!(memory.peak_bytes() <= memory.limit_bytes());
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn host_decimal_comparison_admits_extreme_scale_without_expanding_coefficients() {
+    let pattern = call("str",vec![call("<",vec![F::Decimal("1E-2147483647".into()),F::Decimal("1E+2147483647".into())])]);
+    let expression = Expr::regex_replace(Expr::Literal(V::Utf8("true".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
+    let memory = MemoryBudget::new(128 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        let schema = Schema::default();
+        let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+        assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+        assert!(memory.peak_bytes() < memory.limit_bytes());
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
