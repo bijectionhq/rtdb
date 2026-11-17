@@ -31,7 +31,16 @@ Every global assertion identity must remain in the comparison report.
 Unselected assertion groups remain missing evidence; summary counts and parity are checked against the captured ledger.
 `controls_verified` requires every selected control to pass; `full_inventory_parity` retains the global comparison outcome.
 Fixture `expected_observations` are transcribed assertions, not reference execution receipts.
-The control runners call the production JVM and Rust temporal calculators and replica envelope codecs.
+The observation adapters call the production JVM and Rust temporal calculators, replica envelope codecs and column-table operators.
+Column-table fixture inputs support null, I64, F64 and flat lists of those scalar values; unsupported shapes fail the adapter.
+The adapters observe actual result column names, vector types and typed rows, preserving IEEE floating-point bits.
+Their regression tests require changed expectations to leave observations unchanged and changed inputs to alter them.
+The column-table assertion adapter checks those observations against the immutable original names, types and rows.
+Its negative control changes one nested integer cell.
+The default control selection retains the two mandatory controls; column-table execution requires an explicit selection after the source completeness gate opens.
+The external Gradle adapter tasks use the pinned root test task's Java launcher, JVM arguments, heap sizing, character encoding, system properties and assertion setting.
+The adapters set the JVM timezone to UTC.
+They resolve fixture and output arguments only for the selected task, so an adapter test does not require an unselected observer's output path.
 Fixture selection names the event index and observable field; expected observations are never inputs to either implementation.
 The JVM adapter is loaded through an external Gradle init script against the clean pinned reference checkout.
 Its artifact manifest hashes the actual runtime classpath, adapter, Java executable, and runtime modules.

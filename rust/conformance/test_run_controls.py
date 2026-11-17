@@ -169,6 +169,28 @@ os._exit(0)
                 runner.validate_native_revision(execution, "current")
         runner.validate_native_revision({"artifact_revision": "current", "source_dirty": False}, "current")
 
+    def test_column_table_assertions_check_original_names_types_cells_and_negative_control(self):
+        fixture = json.loads((runner.HERE / "fixtures/table-column.json").read_bytes())
+        execution = {"observations": [{"id": case["id"], "outcome": {"kind": "returned",
+                      "typed_value": {case["column"]: copy.deepcopy(case["expected"])}}} for case in fixture["cases"]]}
+        runner.validate_assertions(execution, fixture)
+        for field in ("name", "type", "cell"):
+            changed = copy.deepcopy(execution)
+            value = changed["observations"][0]["outcome"]["typed_value"]
+            if field == "name":
+                value["wrong"] = value.pop("x5")
+            elif field == "type":
+                value["x5"]["data_type"] = {"Scalar": "F64"}
+            else:
+                value["x5"]["rows"][0][0] = {"I64": 1.0}
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                runner.validate_assertions(changed, fixture)
+        control = fixture["negative_control"]
+        target = next(item for item in execution["observations"] if item["id"] == control["observation"])
+        runner.replace_pointer(target["outcome"]["typed_value"], control["path"], control["replacement"])
+        with self.assertRaises(ValueError):
+            runner.validate_assertions(execution, fixture)
+
     def test_manifest_errors_other_than_incomplete_inventory_block_control_verification(self):
         mappings = [mapping("first"), mapping("second")]
         report = comparison([case_report("first"), case_report("second")])

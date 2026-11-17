@@ -207,6 +207,8 @@ def validate_assertions(execution, fixture):
     elif fixture["kind"] == "replica_term_sequence":
         expected = {value["name"] + "/decoded": {"term": value["expected_term"],
                     "term_sequence": value["expected_term_sequence"]} for value in fixture["envelopes"]}
+    elif fixture["kind"] == "table_column_assertions":
+        expected = {case["id"]: {case["column"]: case["expected"]} for case in fixture["cases"]}
     else:
         raise ValueError("control fixture has no immutable assertion adapter")
     actual = {}

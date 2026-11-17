@@ -159,5 +159,10 @@
         "rows": []
       }
     }
-  ]
+  ],
+  "negative_control": {
+    "observation": "integers",
+    "path": "/x5/rows/0/0/I64",
+    "replacement": -1
+  }
 }

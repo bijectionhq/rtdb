@@ -1,7 +1,8 @@
 (ns rtdb.conformance.controls
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
-            [jsonista.core :as json])
+            [jsonista.core :as json]
+            [rtdb.conformance.table-column :as table-column])
   (:import (com.carrotsearch.hppc LongArrayList)
            (java.io File)
            (java.nio ByteBuffer)
@@ -11,7 +12,7 @@
            (org.apache.arrow.memory RootAllocator)
            (org.apache.arrow.vector.types.pojo ArrowType$Struct)
            (xtdb.api.log ReplicaMessage ReplicaMessage$Codec)
-           (xtdb.arrow Encoding$Plain Relation Vector)
+           (xtdb.arrow Relation Vector)
            (xtdb.bitemporal Polygon PolygonCalculator)
            (xtdb.trie EventRowPointer Trie)
            (xtdb.util TemporalBounds TemporalDimension)))
@@ -80,7 +81,7 @@
 
 (defn- temporal-observations [{:keys [events observations query_bounds]}]
   (with-open [allocator (RootAllocator.)
-              relation (Trie/openLogDataWriter allocator (.dataRelSchema Trie/INSTANCE nil Encoding$Plain/INSTANCE))]
+              relation (Trie/openLogDataWriter allocator (Trie/dataRelSchema nil))]
     (doseq [event events] (write-event relation event))
     (let [calculator (PolygonCalculator. (bounds query_bounds))
           pointer (EventRowPointer. relation (byte-array 0))
@@ -108,7 +109,8 @@
         fixture (json/read-value input json/keyword-keys-object-mapper)
         observations (case (:kind fixture)
                        "temporal_ceilings" (temporal-observations fixture)
-                       "replica_term_sequence" (replica-observations fixture))
+                       "replica_term_sequence" (replica-observations fixture)
+                       "table_column_assertions" (table-column/observe (:cases fixture)))
         ids (mapv :id observations)
         artifacts (artifacts)]
     (when (or (empty? ids) (some str/blank? ids) (not= (count ids) (count (distinct ids))))

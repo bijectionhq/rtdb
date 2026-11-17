@@ -7,6 +7,8 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeSet, fs::File, io::Read, path::Path};
 
+mod table_column;
+
 type Error = Box<dyn std::error::Error>;
 
 #[derive(Deserialize)]
@@ -18,6 +20,7 @@ enum Fixture {
         observations: Vec<PolygonObservation>,
     },
     ReplicaTermSequence { envelopes: Vec<Envelope> },
+    TableColumnAssertions { cases: Vec<table_column::Input> },
 }
 
 #[derive(Deserialize)]
@@ -76,8 +79,10 @@ fn returned(id: String, typed_value: serde_json::Value) -> ObservationReceipt {
     ObservationReceipt { id, executed: true, outcome: Outcome::Returned { typed_value } }
 }
 
-/// Executes fixture inputs through production codecs; expected values and control mutations are ignored.
-pub fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
+/// Executes temporal-ceilings, replica-term-sequence and table-column JSON fixtures through production operators and codecs.
+/// Fixture examples are retained in `rust/conformance/fixtures/`; returned observation IDs must be distinct and nonempty.
+/// Expected values and control mutations are ignored.
+pub async fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
     let fixture: Fixture = serde_json::from_slice(bytes)?;
     let result = match fixture {
         Fixture::TemporalCeilings { events, query_bounds, observations } => {
@@ -111,6 +116,7 @@ pub fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
                 })))
             }).collect::<Result<Vec<_>, Error>>()?
         }
+        Fixture::TableColumnAssertions { cases } => table_column::observe(cases).await?,
     };
     let mut ids = BTreeSet::new();
     if result.is_empty() || result.iter().any(|value| value.id.is_empty() || !ids.insert(&value.id)) {
@@ -119,9 +125,9 @@ pub fn observe(bytes: &[u8]) -> Result<Vec<ObservationReceipt>, Error> {
     Ok(result)
 }
 
-pub fn execute(fixture: &Path) -> Result<ControlExecution, Error> {
+pub async fn execute(fixture: &Path) -> Result<ControlExecution, Error> {
     let bytes = std::fs::read(fixture)?;
-    let observations = observe(&bytes)?;
+    let observations = observe(&bytes).await?;
     Ok(ControlExecution {
         schema_version: 1,
         fixture_sha256: format!("{:x}", Sha256::digest(&bytes)),

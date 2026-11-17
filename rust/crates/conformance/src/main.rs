@@ -22,7 +22,8 @@ fn run() -> Result<bool, Box<dyn std::error::Error>> {
         return Ok(execution["execution_complete"] == true);
     }
     if arguments.len() == 2 && arguments[0] == "observe" {
-        let execution = rtdb_conformance::controls::execute(Path::new(&arguments[1]))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+        let execution = runtime.block_on(rtdb_conformance::controls::execute(Path::new(&arguments[1])))?;
         println!("{}", serde_json::to_string(&execution)?);
         return Ok(true);
     }

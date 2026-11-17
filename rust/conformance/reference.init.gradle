@@ -1,73 +1,79 @@
 import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.tasks.testing.Test
+import org.gradle.process.CommandLineArgumentProvider
 
 gradle.projectsEvaluated {
     def root = gradle.rootProject
-    root.tasks.register("rtdbConformanceObserve", JavaExec) {
+    def fixture = root.providers.gradleProperty("rtdb.fixture")
+    def output = root.providers.gradleProperty("rtdb.output")
+    def referenceTest = root.tasks.named("test", Test)
+    def configureRuntime = { JavaExec task ->
+        def test = referenceTest.get()
+        task.javaLauncher.set(test.javaLauncher)
+        task.jvmArgs(test.jvmArgs)
+        task.systemProperties(test.systemProperties)
+        task.minHeapSize = test.minHeapSize
+        task.maxHeapSize = test.maxHeapSize
+        task.defaultCharacterEncoding = test.defaultCharacterEncoding
+        task.enableAssertions = test.enableAssertions
+        task.systemProperty("user.timezone", "UTC")
+    }
+    root.tasks.register("rtdbConformanceObserve", JavaExec) { task ->
+        configureRuntime(task)
         dependsOn root.tasks.named("testClasses")
         classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
             root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         mainClass = "clojure.main"
-        jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED",
-            "--enable-native-access=ALL-UNNAMED",
-            "-Dio.netty.tryReflectionSetAccessible=true",
-            "-Dio.netty.noUnsafe=false",
-            "-Duser.timezone=UTC",
-            "-Darrow.memory.debug.allocator=true"
-        args "-m", "rtdb.conformance.controls",
-            root.providers.gradleProperty("rtdb.fixture").get(),
-            root.providers.gradleProperty("rtdb.output").get()
+        argumentProviders.add({ ["-m", "rtdb.conformance.controls", fixture.get(), output.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
-    root.tasks.register("rtdbConformanceHistory", JavaExec) {
+    root.tasks.register("rtdbConformanceHistory", JavaExec) { task ->
+        configureRuntime(task)
         dependsOn root.tasks.named("testClasses")
         classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
             root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         mainClass = "clojure.main"
-        jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED",
-            "--enable-native-access=ALL-UNNAMED",
-            "-Dio.netty.tryReflectionSetAccessible=true",
-            "-Dio.netty.noUnsafe=false",
-            "-Duser.timezone=UTC",
-            "-Darrow.memory.debug.allocator=true"
-        args "-m", "rtdb.conformance.history",
-            root.providers.gradleProperty("rtdb.fixture").get(),
-            root.providers.gradleProperty("rtdb.output").get()
+        argumentProviders.add({ ["-m", "rtdb.conformance.history", fixture.get(), output.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
-    root.tasks.register("rtdbConformanceHistoryAdapterTest", JavaExec) {
+    root.tasks.register("rtdbConformanceColumnTableAdapterTest", JavaExec) { task ->
+        configureRuntime(task)
         dependsOn root.tasks.named("testClasses")
         classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
             root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         mainClass = "clojure.main"
-        jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED",
-            "--enable-native-access=ALL-UNNAMED",
-            "-Dio.netty.tryReflectionSetAccessible=true",
-            "-Duser.timezone=UTC"
+        argumentProviders.add({ ["-m", "rtdb.conformance.table-column-test", fixture.get()] } as CommandLineArgumentProvider)
+        outputs.upToDateWhen { false }
+    }
+    root.tasks.register("rtdbConformanceHistoryAdapterTest", JavaExec) { task ->
+        configureRuntime(task)
+        dependsOn root.tasks.named("testClasses")
+        classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
+            root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+        mainClass = "clojure.main"
         args "-m", "rtdb.conformance.history-test"
         outputs.upToDateWhen { false }
     }
-    root.tasks.register("rtdbConformanceSqlLogic", JavaExec) {
+    root.tasks.register("rtdbConformanceSqlLogic", JavaExec) { task ->
+        configureRuntime(task)
+        systemProperty "user.language", "en"
+        systemProperty "user.country", "US"
         dependsOn root.tasks.named("testClasses")
         classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
             root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         mainClass = "clojure.main"
-        jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED",
-            "--enable-native-access=ALL-UNNAMED",
-            "-Dio.netty.tryReflectionSetAccessible=true",
-            "-Duser.timezone=UTC", "-Duser.language=en", "-Duser.country=US"
-        args "-m", "rtdb.conformance.sql-logic",
-            root.providers.gradleProperty("rtdb.fixture").get(),
-            root.providers.gradleProperty("rtdb.output").get()
+        argumentProviders.add({ ["-m", "rtdb.conformance.sql-logic", fixture.get(), output.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
-    root.tasks.register("rtdbConformanceSqlLogicAdapterTest", JavaExec) {
+    root.tasks.register("rtdbConformanceSqlLogicAdapterTest", JavaExec) { task ->
+        configureRuntime(task)
+        systemProperty "user.language", "en"
+        systemProperty "user.country", "US"
         dependsOn root.tasks.named("testClasses")
         classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath +
             root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
         mainClass = "clojure.main"
-        jvmArgs "--add-opens=java.base/java.nio=ALL-UNNAMED", "--enable-native-access=ALL-UNNAMED",
-            "-Dio.netty.tryReflectionSetAccessible=true", "-Duser.timezone=UTC", "-Duser.language=en", "-Duser.country=US"
         args "-m", "rtdb.conformance.sql-logic-test"
         outputs.upToDateWhen { false }
     }
