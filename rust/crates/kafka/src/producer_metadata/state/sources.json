@@ -1,0 +1,220 @@
+{
+  "kafka_archive": {
+    "file": "/tmp/rtdb-kafka-connect-sources/kafka-clients-sources.jar",
+    "sha256": "5782400b3bf0ee4b92d45478b075194e9539bad9cbec9ed2caba992b4deee0c4",
+    "members": {
+      "org/apache/kafka/clients/Metadata.java": {
+        "sha256": "14c3e3e12dc652edf82da8e2dc46c5c0bb7990e1bba4554e0747292fe6e3ae75",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/clients/MetadataSnapshot.java": {
+        "sha256": "d5c4ebc3fe2da75631e234a6ad0d2e529886d0be1037ba58c1a08472b85cdeed",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/clients/NetworkClient.java": {
+        "sha256": "6db4453663f0412cdc608b397af2eee246343ce511442193411eb316ba6b1a28",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/clients/producer/internals/ProducerMetadata.java": {
+        "sha256": "71a470a6abffb5ee66d0d9336441e247f0168b3d3f4ac3af8a5a975bbff4a63f",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/clients/producer/RoundRobinPartitioner.java": {
+        "sha256": "f7fad39033bbdd0b7762ea5baffd222733b093e09cde87b6e00dc605f1d338db",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/common/requests/MetadataResponse.java": {
+        "sha256": "4bc7c408c4f884734dd793c9ad3fb0f04de640f0287b47342becd776a23d94b5",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/common/requests/RequestUtils.java": {
+        "sha256": "07f05a19c401f3e926f6f763ea92b1721ed6cd1a3e9471cec184e63493e6d957",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/common/record/internal/RecordBatch.java": {
+        "sha256": "b6940ee70bc81d7b2fd92c30b5e40dc5bbde2e1866058f7f449cccb9992b4dab",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/common/Cluster.java": {
+        "sha256": "ce43a2870701690ba5351de05df1c46cd8702b3855507d43cfc0d59ec13bc510",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/Node.java": {
+        "sha256": "f82353cccc5435fc4ca958dbaaf73741750f629b466fedfec4e145c13a7f953f",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/Uuid.java": {
+        "sha256": "67e34b19c05b69a7bf72ed4da49cea467c55ad9c9fc81b58f8b9b613f06ae481",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/TopicPartition.java": {
+        "sha256": "f3b2806057771948762f8966ef52f060265eafcea622b653e6ebcf9d25a184b9",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/protocol/Errors.java": {
+        "sha256": "610d17c8e62cfae4a1f7c1dc24c96f9c2cb6f9976a8f4d929686b9e33f78d07e",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
+      "org/apache/kafka/common/utils/internals/ImplicitLinkedHashCollection.java": {
+        "sha256": "c1a8855087e2a97244de5930f9d5ff9f4f13abf29f5a297d511d8b5246fb857f",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/utils/internals/ImplicitLinkedHashMultiCollection.java": {
+        "sha256": "00c26972793c3312cddbdf5497d1bd603258c872a14c64fda6ac2b2ff1aaacda",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/InvalidMetadataException.java": {
+        "sha256": "8c3871291202762b839854b627cc9a9f6db69c200ec1d3dc49ff124660dfc247",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/RefreshRetriableException.java": {
+        "sha256": "5eaf7124c59bd1f8b44b6ecd8c9ff89e0f4c92f9a639abd60328836a86c39aac",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/RetriableException.java": {
+        "sha256": "29937e5919338db505d66e476457963b43e07f74427410aa3b09f0b661c5b82d",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/UnknownTopicOrPartitionException.java": {
+        "sha256": "a221fe79b5620b78966b1ac2275996807233399631bc75b17b0fdb17c4d1d84c",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/LeaderNotAvailableException.java": {
+        "sha256": "2c6692d05e51a278275a31f59996ed88f3dab7d4abcfe672f6f76b966a5b85f7",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/NotLeaderOrFollowerException.java": {
+        "sha256": "b60ac43296fbfd328209a2b09bf9e6877d232a0e7f75008424eeaf5c1ce03cdd",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/ReplicaNotAvailableException.java": {
+        "sha256": "37be092c126f35c01a5e0804765fcf82467a307601594c49c60a4e97564b8055",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/NetworkException.java": {
+        "sha256": "9042db8d459020d4dba1c987ee87713f272e3c0b7afa58371817d5b23cd41e52",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/KafkaStorageException.java": {
+        "sha256": "dfcfd2b882cc3f5c09167fe18ececa740e47382dba1c8a87c5df5b278a10b345",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/ListenerNotFoundException.java": {
+        "sha256": "f625ddb0ee0cc8eb31e78cd4085b27720ef43d8cf56d28150d0abf0d949aa094",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/FencedLeaderEpochException.java": {
+        "sha256": "a0ac434ee83f0cf9bdb7eda4ee1a0ee35d662f2b87e3a68cd9137e339a6a12bd",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/PreferredLeaderNotAvailableException.java": {
+        "sha256": "2fce8be847125696648e477810132c6e22a7ab86a2aedb521e8cefcfee1a8612",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/EligibleLeadersNotAvailableException.java": {
+        "sha256": "054d60a463ab29b59445134f377d682d6ff1a480fc33ad6fcca4ef53b3a472e5",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/ElectionNotNeededException.java": {
+        "sha256": "993da4980bd811457f7122d566f4f54fbbfd3c9ec8f6785f0dc20e6d3dab6522",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/UnknownTopicIdException.java": {
+        "sha256": "e1bd59d48989a41d98e6c5a8eaaee6d8f6eaad565f0227de543390bd44c319e5",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "org/apache/kafka/common/errors/InconsistentTopicIdException.java": {
+        "sha256": "b20edc57ad106827e2332eb801e4b175f34444d369e98abfa85afd5dd6af50b6",
+        "prefix_bytes": 800,
+        "prefix_sha256": "d0fc36e9b35c74438b9453dba28bfdc13317f00044292f6a0ddf53da7effe3ac"
+      },
+      "LICENSE": {
+        "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+      },
+      "NOTICE": {
+        "sha256": "e10a1d2b5812b6eeac08ec087512bbf649739ca23cb7ee610702acb976f42936"
+      }
+    }
+  },
+  "jdk_archive": {
+    "file": "/tmp/rtdb-provider-sources/openjdk25-time/src.zip",
+    "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+    "members": {
+      "java.base/java/util/HashMap.java": {
+        "sha256": "f3f1d144fdd482730280697ebd94971cfff0480e6016dd5c7e46c47f4b9e3d44",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "0f56c6daa65499e0d68c4942623effbb3c9c258cc4a78b4ded8c552463ec403f"
+      },
+      "java.base/java/util/HashSet.java": {
+        "sha256": "ba15878b13e4fc41b45ac53b9e5ebd32e9c58a2cf2559540ccdffbf47e2b481c",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "a9ec17ced6c58f7ead1240e1e7351e8d35cff5684d5643db9638fbfe4f5d3b91"
+      },
+      "java.base/java/util/concurrent/ConcurrentHashMap.java": {
+        "sha256": "cf47348e18d1bdfcd32f2fe2c9ea1efa2764c7e5d1297f9c63206cc06a536c08",
+        "prefix_bytes": 1559,
+        "prefix_sha256": "288eadb6c115199325622c59af077f2d93d35df2cdda3691e4bc0899b32879f3"
+      },
+      "java.base/java/util/stream/Collectors.java": {
+        "sha256": "72b8996a818ad9f29113160db1fde9ffffb869455bbf1b9922333f65635651dd",
+        "prefix_bytes": 1213,
+        "prefix_sha256": "4e6b246a0708d9aab71d38575390f92b7ff6dd33383913364f9f8b2f4db9176d"
+      },
+      "java.base/java/lang/Integer.java": {
+        "sha256": "939ad5a221a4963ed61887d5860dc7d5a7f830ef3d91c7e5408f156a0eab7725",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "a4cb0557ff2358b3b7b5ac0cc8720d65e776e923df2ddee0aa54c9ee3ab4bd24"
+      },
+      "java.base/java/lang/String.java": {
+        "sha256": "15cc88d0676a2193b72f56e6f1bb7efcebff9bf97ce5d1fdc01732636a23e38a",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "a4cb0557ff2358b3b7b5ac0cc8720d65e776e923df2ddee0aa54c9ee3ab4bd24"
+      },
+      "java.base/java/lang/StringLatin1.java": {
+        "sha256": "5fe7ee0677d47fba9957ecba865779eee7ddd51923b888af5b68c97fc1def6e0",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "b2954544393c73f8580d575dd08af4c78869150306e25b9f01c028bb3ba82a0c"
+      },
+      "java.base/java/lang/StringUTF16.java": {
+        "sha256": "c35534168fa008192936362530a877ed323f924228361df1395f81d9d5edf6e3",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "b2954544393c73f8580d575dd08af4c78869150306e25b9f01c028bb3ba82a0c"
+      }
+    }
+  },
+  "jdk_legal": {
+    "LICENSE": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726",
+    "ASSEMBLY_EXCEPTION": "75292f03bf23d3db7c985aecc191029b93883200721ed23ed34a2e601463df33",
+    "ADDITIONAL_LICENSE_INFO": "a69bce275ba7a3570af6579cb0f55682cd75fedfcd49e0e8e9022270c447c916"
+  }
+}

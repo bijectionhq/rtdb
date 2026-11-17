@@ -1,0 +1,62 @@
+= Producer metadata state
+
+* D1: `ProducerMetadata` is a passive owner driven by one serialized caller.
+** It owns topic expiry, request membership, refresh state, last-seen epochs and producer-lifetime RoundRobin counters.
+** `MetadataRequest` retains the chosen request version and topic sequence until its response arrives.
+** `PreparedSend` retains one selected partition with the record and the immutable generation used for selection.
+Retries reuse that selected partition.
+
+* D2: `Snapshot` is an independently retained immutable generation.
+** Its broker, partition, topic-ID and set collections retain the shared Java HashMap engine's table/tree encounter geometry and leases.
+** Partial updates build the merge map, then replay its values into the final snapshot map.
+** The reverse UUID collector rejects duplicate IDs before the final partition map is constructed.
+** Broker duplicate rejection occurs in the response holder before topic wrappers are built.
+** Partition availability requires a resolved leader node, including a node with an empty host or negative port.
+** `brokers()` exposes holder-map encounter order.
+The shuffled `Cluster.nodes()` list used by a Java network client belongs to the network adapter.
+
+* D3: Response application preserves source mutation stages.
+** The holder and the network response error map precede the rebootstrap/empty-broker branches.
+`MetadataResponse.errors` rejects every null topic name before checking its error code.
+** Refresh mutation precedes snapshot construction.
+** Snapshot publication precedes recoverable error-set copies and epoch pruning.
+** Epoch pruning uses HashMap iterator removal with its saved-next traversal, stored hash and `movable=false` tree geometry.
+** Errors, nullable names and epoch sentinels follow the pinned Java wrappers.
+Only epoch `-1` is absent; all negative leader IDs are absent.
+Unknown Kafka error codes become `UNKNOWN_SERVER_ERROR`.
+** New-topic membership prevents expiry until the topic appears in a successful update's response.
+The expiry boundary is `expiry <= now` after that membership is removed.
+
+* D4: Admission follows the retained native owners.
+** `Text` retains replacement-decoded UTF8 bytes, its Java string hash and a lazy identity witness.
+** Partition keys, replica arrays, brokers and snapshots retain their own shared payload reservations.
+** Vector replacement admits the new storage before moving values and freeing the old storage.
+** Shared-map collection reservations remain with the actual table owner.
+** Each reservation adds a checked control allowance for the budget and every ancestor reported by `MemoryBudget::reservation_lease_count`.
+The per-control allowance is `size_of::<MemoryReservation>() + 4 * size_of::<usize>()`.
+Allocator metadata and the already constructed budget graph remain part of the enclosing infrastructure domain.
+** Native admission, allocation or unsupported-profile failure ends the mutable producer capability.
+Already retained snapshots remain readable and charged until their last owner drops.
+This termination policy is native resource behavior, not Java recovery parity.
+
+* C1: Activation requires the remaining collection and owner profiles.
+** Active topics implement the single-writer ConcurrentHashMap ordinary-bin profile, including append order, resize threshold and last-run transfer geometry.
+Tree-bin construction returns `rtdb/kafka-concurrent-map-tree` before a request can expose invented order.
+** HashMap tree ties request a Java identity witness only at the actual `KeyOps.identity_hash_code` boundary.
+The default provider rejects a required witness.
+Native addresses, region IDs and allocation counters do not supply Java identity hashes.
+** String comparisons use unsigned UTF16 units; UUID comparisons use signed 64-bit halves.
+Primitive integer and UUID lookup operations have no externally supplied callbacks.
+** Java math/random operations remain supplied through the refresh observation provider.
+** The network adapter must own bootstrap/rebootstrap generations, broker selection, throttles, fatal errors and waiter notification.
+It must carry the captured request scope into `apply` after connection throttling and use `PreparedSend` for actual enqueue retries.
+** Construction, broker/thread growth, automatic native metadata caches, ApiVersions, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
+Receive-frame and ordered-request accounting do not bound those owners.
+** The production module is awaiting its coordinated registration and DLQ adapter.
+The standalone integration fixture imports these production sources directly.
+
+`sources.json` records the exact consulted Kafka and OpenJDK archive members.
+`COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
+The accompanying license and notice files are verbatim copies.
+The source regressions cover duplicate failure stages, UTF8 replacement, epochs and UUID changes, both partial map replays, expiry, request versions, topic errors, rebootstrap ordering, immutable selection ownership, admission release, ordinary-bin transfer, unsupported identity profiles and native admission failure.
+Runtime validation remains gated by the source-only phase.
