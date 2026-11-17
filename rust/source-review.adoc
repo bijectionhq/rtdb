@@ -1063,6 +1063,21 @@ Recursive replacements use the original outer call link, and unroll pops the cur
 The prediction round carries its merge history from Local to Full and restores the input origin after prediction work and collection finish.
 Full producers have source regressions for start context, precedence, stop ordering and EOF, alongside session and failure regressions.
 
-Host policy capture, production cache ownership, adaptive control, generated rule schedules, diagnostics and embedded cause capability remain open.
 Generated tree and listener effects require a new review of failed rule entry cleanup.
 The 64 new regression cases remain unexecuted, and Phase 2 remains gated on source completeness.
+
+== Adaptive prediction and canonical regex metadata
+
+Private adaptive prediction drives the real token stream through cold and cached SLL decisions.
+An LL conflict can carry the existing prediction round into Full context, and failures retain the original start and offending occurrences after the token cursor returns to the prediction origin.
+The private no-viable handler builds its message from the original token interval and counts the report before LL listener admission.
+Generated rules, remaining error handling, host policy and production cache integration remain required, together with the embedded cause capability.
+
+A canonical UTF8 regex form retains its backing reservation across statement and plan clones.
+The native source call sites use their existing budgets, and independent conformance copies begin after all catalog occurrences resolve.
+The SQL, XTQL and Explain source regressions cover the budget, wire and rendering contracts for the represented domain.
+Exact-unit producers, dependent host semantics and whole-plan allocation remain open.
+
+The read, write, recovery and shutdown paths retain their existing session, log and lifecycle ordering.
+The source updates carry the current budget into preparation and resolution, including the existing staged snapshot and static submission paths.
+Compilation and regression execution remain pending under the Phase 1 gate.

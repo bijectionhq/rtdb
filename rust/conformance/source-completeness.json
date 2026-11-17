@@ -118,9 +118,9 @@
       ],
       "evidence": {
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
-        "rust/crates/node/src/statement.rs": "c23c62efb2345f44f2644c6cd6cef4aa98b38a4f433cad4eadee500184efa42a",
-        "rust/crates/tx/src/submission.rs": "4be2b77f816b203708d408c4132db776f227466dd57e10168b22304b2026b696",
-        "rust/crates/tx/src/resolver.rs": "5de2a6f21839cbc23ab47688adc14e1b5ab3e9d904659e7683301102a2ecdc91",
+        "rust/crates/node/src/statement.rs": "56deebeaaa4e91d9e956e0c6b0dce306dac62d8d2512cfc64e5440317c1f4fd8",
+        "rust/crates/tx/src/submission.rs": "cb379ba6639fad3683854be5e5e92c59facd4fc702e5e657dea59ba7f18ba20f",
+        "rust/crates/tx/src/resolver.rs": "557628bb3e04dffba304b004cf41e86e210ba24e6fc8d131cc0937c0e508e7e0",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
         "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e"
@@ -140,7 +140,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
-        "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
+        "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
         "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e",
         "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
@@ -207,8 +207,8 @@
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
         "rust/crates/ffi/src/lib.rs": "724ed33aadefe5696ea930ee2bbe9a111920fb13855be6b03846f52519f06826",
-        "rust/crates/node/src/node.rs": "26eb2e6929a8b7eb6c1788d8a9c6eb57c1c35f78f7e02db5afa4c53ab95064c0",
-        "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
+        "rust/crates/node/src/node.rs": "983581e9a3c7e7239d06c2d709745896aa3bf6cf75889ad32ef1150a5f2fa3ba",
+        "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
         "rust/crates/ffi/src/region.rs": "ea8bad0f3363ecfd402468455a3a7c7fe235767ecb05697fd29df250c722ca44"
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration/private actual-root DFA, ordered configuration/mode, exact-unit literal decoder, private tree JSON, parser runtime and Local/Full producers over one merge round through adaptive prediction and cache insertion, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects. Complete host policy capture, production parser and cache ownership, and admitted parsed ownership across every frontend."
+      "requirement": "Integrate the private native scanner, token stream, owned grammar, expected-token traversal, retained adaptive SLL/LL prediction and no-viable reporting with generated rule control, the remaining diagnostic and reset schedules, exact-unit literal and private tree JSON producers, canonical text and codec consumers, and whole-batch syntax validation before simple-query effects. Complete host policy capture, production parser and cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
