@@ -139,6 +139,13 @@ impl Context<'_> {
             }
             return Ok(SettingValue::Unevaluated { parameter_count });
         }
+        if let ast::Expr::Interval(interval) = expression {
+            crate::temporal_syntax::interval_literal(interval)?;
+            return Ok(SettingValue::Unevaluated { parameter_count: 0 });
+        }
+        if let ast::Expr::Floor { field, .. } | ast::Expr::Ceil { field, .. } = expression {
+            if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(unsupported("CEIL/FLOOR precision fields")); }
+        }
         if let ast::Expr::Extract { field,syntax,.. } = expression { crate::temporal_syntax::extract_field(field,syntax)?; }
         if let ast::Expr::Cast { data_type, kind, format, .. } = expression {
             if format.is_some() || !matches!(kind, ast::CastKind::Cast | ast::CastKind::DoubleColon) { return Err(unsupported("TRY_CAST or cast format")); }

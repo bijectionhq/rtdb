@@ -88,6 +88,12 @@ impl Context<'_> {
                     },
                 }
             },
+            ast::Expr::Interval(interval) => crate::temporal_syntax::interval_literal(interval)?,
+            ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field } => {
+                if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(unsupported("CEIL/FLOOR precision fields")); }
+                let name = if matches!(expression, ast::Expr::Floor { .. }) { "floor" } else { "ceil" };
+                call(name.into(), vec![self.expr_bound(expr, input, replacements)?])?
+            }
             ast::Expr::Nested(expr) => self.expr_bound(expr, input, replacements)?,
             ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } if matches!(expr.as_ref(), ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if value == "9223372036854775808")) => Expr::Literal(Value::I64(i64::MIN)),
             ast::Expr::UnaryOp { op, expr } => {
@@ -559,7 +565,7 @@ pub(crate) fn reject_ambiguous_columns(expr: &ast::Expr, schema: &Schema) -> Res
 
 pub(crate) fn children(expr: &ast::Expr) -> Vec<&ast::Expr> {
     match expr {
-        ast::Expr::Nested(expr) | ast::Expr::UnaryOp { expr, .. } | ast::Expr::Cast { expr, .. } | ast::Expr::IsNull(expr) | ast::Expr::IsNotNull(expr) | ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) | ast::Expr::IsNotTrue(expr) | ast::Expr::IsNotFalse(expr) | ast::Expr::IsNotUnknown(expr) => vec![expr],
+        ast::Expr::Floor { expr, .. } | ast::Expr::Ceil { expr, .. } | ast::Expr::Nested(expr) | ast::Expr::UnaryOp { expr, .. } | ast::Expr::Cast { expr, .. } | ast::Expr::IsNull(expr) | ast::Expr::IsNotNull(expr) | ast::Expr::IsTrue(expr) | ast::Expr::IsFalse(expr) | ast::Expr::IsUnknown(expr) | ast::Expr::IsNotTrue(expr) | ast::Expr::IsNotFalse(expr) | ast::Expr::IsNotUnknown(expr) => vec![expr],
         ast::Expr::BinaryOp { left, right, .. } | ast::Expr::IsDistinctFrom(left, right) | ast::Expr::IsNotDistinctFrom(left, right) | ast::Expr::AnyOp { left, right, .. } | ast::Expr::AllOp { left, right, .. } => vec![left, right],
         ast::Expr::Between { expr, low, high, .. } => vec![expr, low, high],
         ast::Expr::InList { expr, list, .. } => std::iter::once(expr.as_ref()).chain(list).collect(),

@@ -409,9 +409,11 @@ DISTINCT, grouping, DISTINCT aggregates, set membership and window partitions ap
 Empty inputs and aggregate rows excluded by a filter do not construct that implicit comparator.
 `tests/set_equality.rs` covers prepared arguments, declared empty collection types and implicit relational equality as unexecuted regression source.
 
-SQL interval values retain the `INTERVAL` grammar surface.
+Qualified SQL interval values retain the `INTERVAL` grammar surface.
+Unqualified interval literals report unsupported syntax during preparation.
 The shared internal names `single_field_interval` and `multi_field_interval` are available through XTQL generic calls and remain outside SQL named-function syntax.
-`tests/interval_constructors.rs` records that dialect boundary as unexecuted regression source.
+Numeric FLOOR and CEIL parser forms lower to the shared scalar evaluators.
+`tests/interval_constructors.rs` records the interval dialect boundary and literal qualifier checks.
 
 == PostgreSQL JSON access operators
 
