@@ -10,11 +10,14 @@ mod security;
 mod rules;
 mod reader;
 mod dlq;
+mod http;
+#[cfg(test)]
+mod http_tests;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RegistryFormat { Avro, Json }
 pub(super) struct RegistryConverter {
-    client: Option<(reqwest::Client, Arc<MemoryReservation>)>,
+    client: Option<(http::Client, Arc<MemoryReservation>)>,
     urls: Vec<reqwest::Url>,
     security: security::Security,
     format: RegistryFormat,
@@ -161,12 +164,19 @@ impl RegistryConverter {
             let mut url = base.clone();
             url.path_segments_mut().map_err(|_| error("invalid-plugin-config", "Schema Registry URL cannot contain path segments"))?.pop_if_empty().extend(path.iter().map(String::as_str));
             if !query.is_empty() { url.query_pairs_mut().extend_pairs(query.iter().map(|(key, value)| (key.as_str(), value.as_str()))); }
-            let headers = self.security.headers(&url, context).await?;
+            let mut headers = self.security.headers(&url, context).await?;
             url.set_username("").map_err(|_| error("invalid-plugin-config", "Registry URL cannot remove user info"))?;
             url.set_password(None).map_err(|_| error("invalid-plugin-config", "Registry URL cannot remove user info"))?;
-            let request = match body { Some(body) => client.post(url).json(body), None => client.get(url) }.headers(headers);
-            let response = match request.send().await { Ok(response) => response, Err(cause) => { failure = Some(error("schema-registry", cause.without_url())); continue; } };
-            if !response.status().is_success() {
+            let (method, body) = match body {
+                Some(body) => {
+                    headers.insert(::http::header::CONTENT_TYPE, ::http::HeaderValue::from_static("application/json"));
+                    (::http::Method::POST, serde_json::to_vec(body).map_err(|cause| error("schema-registry", cause))?)
+                }
+                None => (::http::Method::GET, Vec::new()),
+            };
+            let response = match client.request(method, url, headers, body).await { Ok(response) => response, Err(cause) => { failure = Some(error("schema-registry", cause.without_url())); continue; } };
+            if response.status() == ::http::StatusCode::NO_CONTENT { return Ok(Json::Null); }
+            if response.status() != ::http::StatusCode::OK {
                 let cause = error("schema-registry", format!("Schema Registry returned HTTP {}", response.status()));
                 if response.status().is_server_error() { failure = Some(cause); continue; } return Err(cause);
             }

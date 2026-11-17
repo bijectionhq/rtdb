@@ -1,0 +1,61 @@
+= Registry HTTP transport ownership
+
+The HTTP/1 connector runs protocol and TLS progress on the requesting caller.
+Each response owns its connection until completion or cancellation.
+The connection drops before the retained configuration, and that configuration drops its OpenSSL context before its native TLS owner and library contexts.
+Connections use `Connection: close`; there is no connection pool or detached HTTP driver.
+
+The connector supports direct HTTP and HTTPS requests, absolute HTTP request targets through a configured HTTP proxy, and HTTPS through CONNECT.
+TCP connection and idle read timeouts default to 60 seconds.
+A zero timeout disables that limit.
+Hostname resolution precedes the TCP connection timeout; CONNECT response and TLS handshake reads use the read timeout.
+The pinned JDK response-header allowance is 384 KiB: each completed field contributes its normalized name and value lengths plus 32 bytes, while the current unfolded record is checked before trimming.
+The passive header normalizer retains one bounded raw record and one bounded normalized head, then supplies canonical header lines to Hyper.
+Aggregate wire whitespace can exceed 384 KiB when each record and the normalized fields remain within Java's allowance.
+The fixed pending-input buffer retains at most 8 KiB, including body bytes read with the final head.
+Each interim response receives its own header allowance, and final-response body bytes pass through unchanged.
+The buffered Registry and OAuth routes follow the pinned `HttpClient` default: skip 100 and 102 through 199, and reject 101 protocol upgrades.
+Header parsing yields after 64 KiB of caller-driven work; cancellation releases the parser with the response connection.
+CONNECT uses the same header admission and normalization without reading beyond its final response into TLS.
+Hyper's 384 KiB input allowance and 12,288-header allowance cover the normalized head.
+Hyper still validates HTTP/1.0 or HTTP/1.1 syntax and body framing after normalization.
+Malformed fields without a colon remain a compatibility gap: Java's `MessageHeader` can retain unnamed entries that Hyper rejects.
+Each request reserves sixteen times the header allowance plus eight times its URL, header and body bytes before opening a connection.
+The native parser allocation bound requires Phase 2 measurement.
+
+Redirects follow the pinned `HttpURLConnection` status set: 300 through 303, 305 and 307, up to twenty responses, within the same scheme.
+POST becomes GET and loses its request headers on non-307 location redirects.
+Other cross-destination redirects remove authorization and cookie headers.
+Status 305 changes the request's proxy while preserving its destination.
+Registry calls accept HTTP 200 or 204; 204 produces the absent JSON result.
+
+Numeric IPv4 and IPv6 addresses require no resolver job.
+Other hostnames use the system resolver and select its first returned address, following the single-address connection shape of Java's `InetSocketAddress`.
+System address ordering remains platform-dependent.
+Each resolver operation reserves 2 MiB plus four times the hostname byte length before copying the hostname or dispatching work.
+The operation owns its hostname and reservation inside the blocking job.
+That conservative native allocation allowance requires allocator qualification during Phase 2.
+
+Cancelling a waiting request aborts a queued resolver job.
+An already running operating system lookup cannot be interrupted by Tokio cancellation and may finish after its requesting future has been dropped.
+Its reservation remains held until the actual lookup and owned hostname have been released, so additional cancelled requests still face memory admission.
+No connection is opened by a lookup that finishes after its caller has cancelled.
+
+Regression sources cover numeric bypass, admission failure before dispatch, successful and failed lookup release, cancellation during a running lookup, and aborting a queued lookup.
+Header regression sources cover aggregate wire whitespace beyond the allowance, raw-record rejection before trimming, folded fields and line endings, interim responses, chunked body pass-through, CONNECT boundaries, and cancellation during a partial head.
+No Rust execution or network qualification has occurred during Phase 1.
+
+== OAuth reference qualification
+
+The reference Gradle definitions pin Apache Kafka clients 4.4.0 alongside Confluent Schema Registry client 7.8.0.
+The published Confluent client binary's `OauthCredentialProvider` and `SaslOauthCredentialProvider` still reference `org.apache.kafka.common.security.oauthbearer.internals.secured.HttpAccessTokenRetriever`.
+That class and its `AccessTokenRetriever` interface are absent from the inspected Kafka clients 4.4.0, Schema Registry client 7.8.0, `common-utils` 7.8.0 and `common-config` 7.8.0 binaries.
+The Confluent artifacts do not provide shaded compatibility copies of those class names.
+ZIP-entry and class-reference inspection establishes the unresolved linkage in these artifacts; the reference OAuth route remains a runtime qualification gap until its effective classpath is checked in Phase 2.
+
+Native Registry OAuth uses Kafka 3.8's `HttpAccessTokenRetriever` as its explicit compatibility target for buffered POST requests and default `HttpURLConnection` redirect behavior.
+Kafka 4.4's replacement `HttpJwtRetriever` retains that HTTP behavior, but it does not supply the class name required by Confluent 7.8.
+Both implementations set `Content-Length` and `setDoOutput` without enabling a streaming mode or disabling redirects.
+Confluent's provider supplies null connection/read timeouts; the native OAuth client selects zero, preserving unlimited waits for that route.
+
+The inspected binaries came from https://repo.maven.apache.org/maven2/org/apache/kafka/kafka-clients/4.4.0/kafka-clients-4.4.0.jar[Maven Central's Kafka client] and Confluent's published https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0.jar[Registry client], https://packages.confluent.io/maven/io/confluent/common-utils/7.8.0/common-utils-7.8.0.jar[common utilities] and https://packages.confluent.io/maven/io/confluent/common-config/7.8.0/common-config-7.8.0.jar[common configuration] artifacts.

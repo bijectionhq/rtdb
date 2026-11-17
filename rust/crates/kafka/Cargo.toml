@@ -31,6 +31,11 @@ reqwest = { version = "=0.13.4", default-features = false, features = ["rustls",
 jsonschema = { package = "rtdb-validation-jsonschema", path = "../../vendor/validation-jsonschema", version = "=0.33.0", default-features = false }
 validation_json = { package = "rtdb-validation-json", path = "../../vendor/validation-json", version = "=1.0.151", features = ["arbitrary_precision"] }
 futures.workspace = true
+http.workspace = true
+hyper = { version = "=1.12.0", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "=0.1.18", default-features = false, features = ["tokio"] }
+http-body-util = "=0.1.3"
+tokio-openssl = "=0.6.5"
 rdkafka = { version = "=0.38.0", path = "../../vendor/rdkafka", features = ["cmake-build", "tokio", "ssl-vendored", "sasl"] }
 openssl = { version = "=0.10.81", features = ["vendored"] }
 openssl-sys = "=0.9.117"

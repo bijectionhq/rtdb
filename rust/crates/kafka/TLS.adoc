@@ -22,8 +22,15 @@ Absent Java and native CA configuration uses the pinned Temurin 25.0.1+8 `cacert
 The native client receives a fresh trust store containing exactly those decoded anchors.
 Clients with retained Java or pinned trust material skip native platform-root discovery before installing that trust store.
 Explicit native CA, CRL and identity settings retain their own loading and validation.
-Registry HTTPS clients decode the same pinned resource into their Rustls root store, with the client retaining its admitted allocation.
+Registry HTTPS clients decode the same pinned resource into their native trust store, with the client retaining its admitted allocation.
 They retain an explicitly empty Java truststore as empty.
+Registry HTTPS constructs the pinned SSL context defaults, including Java-enabled TLS 1.2 CBC suites.
+Registry's `cipher.suites` and `enabled.protocols` options are unused by the pinned `SslFactory` and socket consumer; their values do not change negotiation.
+Registry treats password, inline-key and inline-certificate strings containing only characters through U+0020 as absent while preserving the bytes of other values.
+An empty JKS or PKCS12 path supplies no store, while an explicitly empty PEM key path is opened and fails as a file.
+The Registry hostname override disables name checks for an absent, empty or exact `none` endpoint-identification option; other values retain HTTPS name checks.
+OAuth HTTPS retains its default hostname verification.
+The link:src/connect/registry/http/README.adoc[Registry HTTP connector] retains caller-driven connection ownership and Java redirect, timeout and response-header behavior.
 Explicit `ssl.ca.location` or `ssl.ca.pem` retains native CA loading; an explicit Java truststore, including an empty store, replaces the pinned anchors.
 A per-connection certificate callback checks the peer's certificate types, signature algorithms, curves and acceptable issuer names through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
 `ssl.keymanager.algorithm` selects `SunX509` by default; `NewSunX509` and its `PKIX` alias select the alternative built-in manager.
@@ -41,7 +48,7 @@ Certificate preferences set key-type priority, while the signing list must permi
 `NewSunX509` checks every candidate certificate's signature algorithm against those certificate preferences, including the final supplied certificate.
 Its peer check follows Java's JCA algorithm names, so the RSA-PSS wire schemes share one algorithm name even when their digest identifiers differ.
 The native message callback retains the admitted certificate-request allocation on its SSL connection until replacement or connection destruction.
-Registry uses the additive request view documented in link:../../vendor/rustls/XTDB.adoc[the Rustls fork].
+Registry HTTPS uses the same native certificate-request callback and TLS owners as the producer.
 The selected entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
 `ssl.trustmanager.algorithm` and `schema.registry.ssl.trustmanager.algorithm` default to `PKIX`, with the aliases `SunPKIX`, `X509` and `X.509`.
@@ -64,7 +71,7 @@ Policy processing starts with Java's default anyPolicy set and enforces explicit
 The four policy extensions use Java's BER parsing and duplicate handling: malformed noncritical extensions are absent, malformed critical extensions fail, and two successfully parsed copies of one extension fail.
 Unknown critical extensions and certificate signatures remain subject to native path validation.
 The selected path is checked against the pinned blocked-certificate list, digest and key-size constraints, JDK-root SHA-1 restriction, and Symantec, Entrust and Camerfirma distrust cutoffs.
-Registry uses the same native PKIX path verifier while retaining Rustls handshake signature verification.
+Registry uses the same native PKIX path verifier and handshake signature implementation.
 Native handshake security uses OpenSSL level 1 with Java certificate key limits, the EC-224 minimum, and compression disabled.
 Certificate SHA-1 remains subject to the pinned path policy; SHA-1 handshake signatures remain disabled.
 Trusted certificates follow Java HashSet bucket and tree ordering; ties between distinct certificates with the same hash use native object identity and are specific to the process.
@@ -77,6 +84,7 @@ The vendored callback contract is documented in link:../../vendor/rdkafka/XTDB.a
 
 `ssl.secure.random.implementation` selects the pinned built-in secure-random algorithms documented in link:src/tls/random/README.adoc[the random-provider adapter].
 Kafka applies Java ConfigDef trimming; an empty supplied algorithm is invalid.
+Registry uses the same algorithms through `schema.registry.ssl.secure.random.implementation`, preserving supplied whitespace and rejecting an empty algorithm.
 Each TLS owner retains separate library contexts for selected protocol randomness and default signature randomness.
 Private keys are destroyed before their library context, and native SSL objects are destroyed before their retained TLS owner.
 Context reservations and shared native-device reservations remain admitted through their final owner.

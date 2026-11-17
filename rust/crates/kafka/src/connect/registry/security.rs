@@ -1,7 +1,8 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE, URL_SAFE_NO_PAD}};
 use futures::StreamExt;
-use reqwest::{Client, Url, header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION}};
+use reqwest::{Url, header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION}};
+use super::http::Client;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use serde_json::Value as Json;
@@ -90,7 +91,9 @@ impl OAuth {
         let form = form.finish();
         let started = tokio::time::Instant::now(); let mut backoff = Duration::from_millis(100);
         let response = loop {
-            let response = client.post(self.endpoint.clone()).header(AUTHORIZATION, &self.authorization).header("accept", "application/json").header("cache-control", "no-cache").header("content-type", "application/x-www-form-urlencoded").body(form.clone()).send().await;
+            let mut headers = HeaderMap::new();
+            for (name, value) in [("authorization", self.authorization.as_str()), ("accept", "application/json"), ("cache-control", "no-cache"), ("content-type", "application/x-www-form-urlencoded")] { insert_header(&mut headers, name, value)?; }
+            let response = client.request(::http::Method::POST, self.endpoint.clone(), headers, form.as_bytes().to_vec()).await;
             match response {
                 Ok(response) if matches!(response.status().as_u16(), 200 | 201) => break response,
                 Ok(response) if matches!(response.status().as_u16(), 400..=407 | 409..=415 | 501 | 505) => return Err(error("schema-registry-auth", format!("OAuth token endpoint returned HTTP {}", response.status()))),
@@ -170,7 +173,7 @@ mod tests {
             (request, String::from_utf8(form).unwrap())
         });
         let config = BTreeMap::from([("bearer.auth.credentials.source".into(), "OAUTHBEARER".into()), ("bearer.auth.client.id".into(), "client".into()), ("bearer.auth.client.secret".into(), "secret".into()), ("bearer.auth.issuer.endpoint.url".into(), format!("http://{address}/token")), ("bearer.auth.scope".into(), "read write".into()), ("bearer.auth.logical.cluster".into(), "registry".into())]);
-        let memory = rtdb_columnar::MemoryBudget::new(1 << 24); let mut context = ConversionContext::new(Arc::clone(&memory));
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 27); let mut context = ConversionContext::new(Arc::clone(&memory));
         let mut security = Security::open(&config).unwrap(); let url = Url::parse("http://registry.invalid").unwrap();
         let first = security.headers(&url, &mut context).await.unwrap();
         let (request, form) = server.await.unwrap(); assert!(request.starts_with("POST /token ")); assert!(request.to_ascii_lowercase().contains("authorization: basic y2xpzw50onnly3jlda==")); assert_eq!(form, "grant_type=client_credentials&scope=read+write");
