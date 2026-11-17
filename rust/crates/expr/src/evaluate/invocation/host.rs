@@ -2,7 +2,7 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Binary,Bit,Cast,Comparison,Dispatch,Error as NumberError,Integral,Number,Predicate,Unary,bit_not,bit_test};
+use crate::jvm_number::{Binary,Bit,Cast,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
@@ -16,6 +16,8 @@ enum Expression<'a> {
     Predicate { operation: Predicate,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
     Comparison { operation: Comparison,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
     Integral { operation: Integral,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
+    Absolute { resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
+    Extremum { operation: Extremum,resolution: Resolution<ExtremumCall>,values: Box<[Expression<'a>;2]> },
     BitNot { resolution: Resolution<()>,value: Box<Expression<'a>> },
     Bit { operation: Bit,resolution: Resolution<()>,values: Box<[Expression<'a>;2]> },
     If(Box<[Expression<'a>;3]>),Body(Vec<Expression<'a>>),
@@ -24,7 +26,7 @@ enum Expression<'a> {
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest,Absolute,Extremum(Extremum) }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
@@ -57,6 +59,13 @@ impl Resolution<()> {
     fn bits(left: Emission,right: Emission) -> Self {
         match (Self::bit(left),Self::bit(right)) { (Self::Resolved(()),Self::Resolved(())) => Self::Resolved(()),_ => Self::Reflective }
     }
+}
+impl Resolution<ExtremumCall> {
+    fn extremum(left: Emission,right: Emission) -> Self {
+        if left == Emission::Boolean || right == Emission::Boolean { Self::Reflective }
+        else { Self::Resolved(ExtremumCall { left: Dispatch::unary(left.number()),right: Dispatch::unary(right.number()) }) }
+    }
+    fn call(self) -> ExtremumCall { match self { Self::Resolved(value) => value,Self::Reflective => ExtremumCall::BOXED } }
 }
 
 impl<'a> Program<'a> {
@@ -134,6 +143,13 @@ impl<'a> Compiler<'a,'_,'_> {
             let left = self.expression(&args[0],depth)?;let right = self.expression(&args[1],depth)?;
             let resolution = Resolution::integral(left.emission(),right.emission());
             return Ok(Expression::Integral { operation,resolution,values: Box::new([left,right]) });
+        }
+        if matches!(operation.and_then(function),Some(Function::Absolute)) && args.len() == 1 {
+            let value = self.expression(&args[0],depth)?;
+            return Ok(Expression::Absolute { resolution: Resolution::unary(value.emission()),value: Box::new(value) });
+        }
+        if let Some(Function::Extremum(operation)) = operation.and_then(function) {
+            if args.len() > 1 { return self.extremum(operation,args,depth); }
         }
         if matches!(operation.and_then(function),Some(Function::BitNot)) {
             arity(args.len(),1,1)?;
@@ -225,13 +241,28 @@ impl<'a> Compiler<'a,'_,'_> {
         if result.stack_depth() > 128 { return Err(limit()); }
         Ok(result)
     }
+    fn extremum(&mut self,operation: Extremum,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+        if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
+        let mut args = args.iter();
+        let mut result = self.expression(args.next().ok_or_else(||error("Missing host argument"))?,depth)?;
+        for value in args {
+            self.nodes += 1;
+            if self.nodes > 65_536 { return Err(limit()); }
+            self.context.reserve(256)?;
+            let right = self.expression(value,depth)?;
+            let resolution = Resolution::extremum(result.emission(),right.emission());
+            result = Expression::Extremum { operation,resolution,values: Box::new([result,right]) };
+        }
+        if result.stack_depth() > 128 { return Err(limit()); }
+        Ok(result)
+    }
 }
 
 impl<'a> Expression<'a> {
     fn stack_depth(&self) -> usize {
         let children = match self {
-            Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } | Self::BitNot { value,.. } => value.stack_depth(),
-            Self::Binary { values,.. } | Self::Comparison { values,.. } | Self::Integral { values,.. } | Self::Bit { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } | Self::BitNot { value,.. } | Self::Absolute { value,.. } => value.stack_depth(),
+            Self::Binary { values,.. } | Self::Comparison { values,.. } | Self::Integral { values,.. } | Self::Bit { values,.. } | Self::Extremum { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::If(values) => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Body(values) | Self::Vector(values) | Self::Logical { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Let { bindings,body,.. } => bindings.iter().map(Self::stack_depth).max().unwrap_or(0).max(body.stack_depth()),
@@ -250,6 +281,8 @@ impl<'a> Expression<'a> {
             Self::Unary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::Binary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::Integral { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
+            Self::Absolute { resolution,.. } => resolution.emission(|dispatch|dispatch.result(false).map_or(Emission::Reference,Emission::Number)),
+            Self::Extremum { resolution,.. } => resolution.emission(|call|call.primitive().map_or(Emission::Reference,Emission::Number)),
             Self::BitNot { resolution,.. } | Self::Bit { resolution,.. } => resolution.emission(|_|Emission::Number(Cast::Long)),
             Self::If(branches) => branches[1].emission().branch(branches[2].emission()),
             Self::Body(values) => values.last().map_or(Emission::Reference,Self::emission),Self::Let { body,.. } => body.emission(),
@@ -278,6 +311,11 @@ impl<'a> Expression<'a> {
             Self::Integral { operation,resolution,values } => {
                 let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
                 numeric_integral(*operation,resolution.dispatch(),&left,&right,context)?
+            }
+            Self::Absolute { resolution,value } => numeric_absolute(resolution.dispatch(),value.evaluate(locals,context)?,context)?,
+            Self::Extremum { operation,resolution,values } => {
+                let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
+                numeric_extremum(*operation,resolution.call(),left,right,context)?
             }
             Self::BitNot { value,.. } => numeric_bit_not(&value.evaluate(locals,context)?,context)?,
             Self::Bit { operation,values,.. } => {
@@ -350,6 +388,14 @@ impl Function {
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
             Self::Arithmetic(operation) => operation.apply(args,context)?,
             Self::Integral(operation) => { arity(args.len(),2,2)?;numeric_integral(operation,Dispatch::Object,&args[0],&args[1],context)? }
+            Self::Absolute => { arity(args.len(),1,1)?;numeric_absolute(Dispatch::Object,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,context)? }
+            Self::Extremum(operation) => {
+                arity(args.len(),1,usize::MAX)?;
+                let mut args = args.into_iter();
+                let mut result = args.next().ok_or_else(||error("Missing host argument"))?;
+                for value in args { result = numeric_extremum(operation,ExtremumCall::BOXED,result,value,context)?; }
+                result
+            }
             Self::Modulo => {
                 arity(args.len(),2,2)?;
                 let remainder = numeric_integral(Integral::Remainder,Dispatch::Object,&args[0],&args[1],context)?;
@@ -414,6 +460,7 @@ fn function(name: &str) -> Option<Function> {
         "<" => Function::Comparison(Comparison::Less),"<=" => Function::Comparison(Comparison::LessEqual),">" => Function::Comparison(Comparison::Greater),">=" => Function::Comparison(Comparison::GreaterEqual),"==" => Function::Comparison(Comparison::Equivalent),
         "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),
         "quot" => Function::Integral(Integral::Quotient),"rem" => Function::Integral(Integral::Remainder),"mod" => Function::Modulo,
+        "min" => Function::Extremum(Extremum::Min),"max" => Function::Extremum(Extremum::Max),"abs" => Function::Absolute,
         "bit-not" => Function::BitNot,"bit-and" => Function::Bit(Bit::And),"bit-or" => Function::Bit(Bit::Or),"bit-xor" => Function::Bit(Bit::Xor),"bit-and-not" => Function::Bit(Bit::AndNot),
         "bit-clear" => Function::Bit(Bit::Clear),"bit-set" => Function::Bit(Bit::Set),"bit-flip" => Function::Bit(Bit::Flip),"bit-test" => Function::BitTest,
         "bit-shift-left" => Function::Bit(Bit::ShiftLeft),"bit-shift-right" => Function::Bit(Bit::ShiftRight),"unsigned-bit-shift-right" => Function::Bit(Bit::UnsignedShiftRight),_ => return None })
@@ -480,6 +527,27 @@ fn numeric_binary<'a>(operation: Binary,dispatch: Dispatch,left: HostValue<'a>,r
 fn reserve_numeric(bytes: usize,context: &EvalContext<'_>) -> Result<()> {
     if bytes > 16 * 1024 * 1024 { return Err(limit()); }
     context.reserve(bytes)
+}
+fn numeric_extremum<'a>(operation: Extremum,call: ExtremumCall,left: HostValue<'a>,right: HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    let selected = if left.nan() { Selected::Left } else if right.nan() { Selected::Right } else {
+        let left = left.number(context)?;let right = right.number(context)?;
+        reserve_numeric(left.comparison_bound(&right).map_err(|_|limit())?,context)?;
+        left.select_extremum(operation,&right,call).map_err(numeric_error)?
+    };
+    let (value,parameter) = selected.choose((left,call.left),(right,call.right));
+    let kind = match parameter { Dispatch::Object => return Ok(value),Dispatch::Long => Cast::Long,Dispatch::Double => Cast::Double };
+    context.reserve(std::mem::size_of::<Number>() + 2 * std::mem::size_of::<usize>())?;
+    Ok(HostValue::Number(Arc::new(Number::cast(kind,&value.number(context)?).map_err(numeric_error)?)))
+}
+fn numeric_absolute<'a>(dispatch: Dispatch,value: HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    let result = {
+        let number = value.number(context)?;
+        let capacity = number.absolute_bound(dispatch).map_err(|_|limit())?;
+        if capacity != 0 { reserve_numeric(capacity,context)?; }
+        let absolute = number.absolute(dispatch).map_err(numeric_error)?;
+        match absolute { Cow::Borrowed(_) => None,Cow::Owned(number) => Some(number) }
+    };
+    Ok(match result { Some(number) => HostValue::Number(Arc::new(number)),None => value })
 }
 fn numeric_integral<'a>(operation: Integral,dispatch: Dispatch,left: &HostValue<'a>,right: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
     let (left,right) = if dispatch == Dispatch::Object {
@@ -557,3 +625,76 @@ fn arity(length: usize,min: usize,max: usize) -> Result<()> { if (min..=max).con
 fn error(message: &str) -> Anomaly { Anomaly::fault("xtdb.error/unknown",message) }
 fn unsupported(message: &str) -> Anomaly { Anomaly::unsupported("rtdb.expr/regex-host-form",message) }
 fn limit() -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-host-limit","Host pattern exceeds its instruction, depth or temporary text limit") }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::EvaluationScope;
+    use rtdb_columnar::MemoryBudget;
+
+    fn number(value: HostValue<'_>) -> Arc<Number> { match value { HostValue::Number(value) => value,_ => panic!("number expected") } }
+
+    #[test]
+    fn extrema_return_selected_object_identity_and_box_widened_primitive_parameters() {
+        let context = EvalContext::default();
+        let vector: Arc<[HostValue<'_>]> = vec![HostValue::Nil].into();
+        let result = Function::Extremum(Extremum::Min).apply(vec![HostValue::Vector(Arc::clone(&vector))],&context).unwrap();
+        assert!(matches!(result,HostValue::Vector(value) if Arc::ptr_eq(&value,&vector)));
+        let left = Arc::new(Number::decimal("1.0").unwrap());let right = Arc::new(Number::decimal("1.00").unwrap());
+        for operation in [Extremum::Min,Extremum::Max] {
+            let result = number(numeric_extremum(operation,ExtremumCall::BOXED,HostValue::Number(Arc::clone(&left)),HostValue::Number(Arc::clone(&right)),&context).unwrap());
+            assert!(Arc::ptr_eq(&result,&right));
+        }
+        let float = Arc::new(Number::Float(1.2));let one = Arc::new(Number::Long(1));
+        let result = number(numeric_extremum(Extremum::Max,ExtremumCall { left: Dispatch::Double,right: Dispatch::Long },HostValue::Number(Arc::clone(&float)),HostValue::Number(Arc::clone(&one)),&context).unwrap());
+        assert!(!Arc::ptr_eq(&result,&float));
+        assert_eq!(*result,Number::Double(f64::from(1.2f32)));
+        let result = number(numeric_extremum(Extremum::Max,ExtremumCall::BOXED,HostValue::Number(Arc::clone(&float)),HostValue::Number(one),&context).unwrap());
+        assert!(Arc::ptr_eq(&result,&float));
+        let byte = Arc::new(Number::Byte(2));
+        let result = number(numeric_extremum(Extremum::Max,ExtremumCall { left: Dispatch::Long,right: Dispatch::Object },HostValue::Number(Arc::clone(&byte)),HostValue::Number(Arc::new(Number::Long(1))),&context).unwrap());
+        assert_eq!(*result,Number::Long(2));
+        assert!(!Arc::ptr_eq(&result,&byte));
+    }
+    #[test]
+    fn extrema_nan_admission_and_nonnegative_decimal_abs_preserve_existing_objects() {
+        let memory = MemoryBudget::new(64 << 10);
+        let huge = Arc::new(Number::integer(&"9".repeat(8192)).unwrap());
+        let decimal = Arc::new(Number::decimal(&"9".repeat(8192)).unwrap());
+        let nan = Arc::new(Number::Float(f32::NAN));
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let retained = memory.used_bytes();
+            let result = number(numeric_extremum(Extremum::Min,ExtremumCall::BOXED,HostValue::Number(huge),HostValue::Number(Arc::clone(&nan)),&context).unwrap());
+            assert!(Arc::ptr_eq(&result,&nan));
+            let result = number(numeric_absolute(Dispatch::Object,HostValue::Number(Arc::clone(&decimal)),&context).unwrap());
+            assert!(Arc::ptr_eq(&result,&decimal));
+            assert_eq!(memory.used_bytes(),retained);
+            let result = number(numeric_extremum(Extremum::Max,ExtremumCall::BOXED,HostValue::Number(Arc::clone(&nan)),HostValue::Bool(true),&context).unwrap());
+            assert!(Arc::ptr_eq(&result,&nan));
+            let result = number(numeric_extremum(Extremum::Max,ExtremumCall { left: Dispatch::Double,right: Dispatch::Object },HostValue::Number(Arc::clone(&nan)),HostValue::Bool(true),&context).unwrap());
+            assert!(matches!(result.as_ref(),Number::Double(value) if value.is_nan()));
+            assert!(!Arc::ptr_eq(&result,&nan));
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+    #[test]
+    fn absolute_numeric_copy_is_reserved_before_allocation_and_released_on_error() {
+        let memory = MemoryBudget::new(64 << 10);
+        let huge = Arc::new(Number::integer(&format!("-{}","9".repeat(8192))).unwrap());
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let error = numeric_absolute(Dispatch::Object,HostValue::Number(Arc::clone(&huge)),&context).err().unwrap();
+            assert_eq!(error.code,"rtdb/memory-budget-exceeded");
+            assert_eq!(Arc::strong_count(&huge),1);
+            assert!(memory.peak_bytes() <= memory.limit_bytes());
+        }
+        assert_eq!(memory.used_bytes(),0);
+        let negative = Arc::new(Number::decimal("-1.00").unwrap());
+        let result = number(numeric_absolute(Dispatch::Object,HostValue::Number(Arc::clone(&negative)),&EvalContext::default()).unwrap());
+        assert!(!Arc::ptr_eq(&result,&negative));
+        assert_eq!(*result,Number::decimal("1.00").unwrap());
+    }
+}

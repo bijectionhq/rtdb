@@ -12,6 +12,8 @@ mod integral;
 pub(crate) use integral::Integral;
 mod bit;
 pub(crate) use bit::{Bit,bit_not,bit_test};
+mod extrema;
+pub(crate) use extrema::{Extremum,ExtremumCall,Selected};
 
 #[derive(Debug)]
 pub(crate) enum Error { Invalid,External(Anomaly) }
