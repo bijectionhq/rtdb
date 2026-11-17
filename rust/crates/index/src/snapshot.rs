@@ -48,6 +48,10 @@ impl Snapshot {
     pub fn tables(&self) -> BTreeSet<TableRef> {
         self.table_catalog.tables().keys().chain(self.durable.tables().keys()).chain(self.layered.keys()).cloned().collect()
     }
+    /// Tests this snapshot's table names without allocating, including empty declarations and superseded live tables.
+    pub fn contains_table(&self, table: &TableRef) -> bool {
+        self.table_catalog.tables().contains_key(table) || self.durable.tables().contains_key(table) || self.layered.contains_key(table)
+    }
     /// Conservative allocation allowance for enumerating and merging this snapshot's table schemas.
     /// It borrows the schema sources and allocates nothing; event buffers and HLLs are excluded.
     pub fn schema_allocation_bound(&self, database: &str) -> Result<usize> {

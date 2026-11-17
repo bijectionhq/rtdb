@@ -131,7 +131,7 @@ impl SystemCursor {
                 let table = &binding.name.table;
                 match name {
                     "live_tables" => {
-                        if !snapshot.tables().contains(table) { continue; }
+                        if !snapshot.contains_table(table) { continue; }
                         let count = snapshot.segments(table).iter().map(|segment| i64::from(segment.row_count())).sum();
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("row_count", Value::I64(count))]));
                     }
