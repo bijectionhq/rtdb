@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use rtdb_types::Result;
 use super::error;
+mod double_byte;
 mod single_byte;
 
 #[derive(Clone, Copy)]
@@ -9,6 +10,7 @@ pub(super) enum Charset {
     Cesu8,
     Latin1,
     Ascii,
+    DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
     Utf16(Utf16Order),
     Utf32(Utf32Order),
@@ -49,7 +51,11 @@ impl Charset {
             "utf-32" | "utf_32" | "utf32" => Self::Utf32(Utf32Order::Detect),
             "utf-32be" | "utf_32be" | "x-utf-32be" | "x-utf-32be-bom" | "utf_32be_bom" | "utf-32be-bom" => Self::Utf32(Utf32Order::Big),
             "utf-32le" | "utf_32le" | "x-utf-32le" | "x-utf-32le-bom" | "utf_32le_bom" | "utf-32le-bom" => Self::Utf32(Utf32Order::Little),
-            normalized => Self::SingleByte(single_byte::lookup(normalized).ok_or_else(|| error("invalid-plugin-config", format!("Unsupported string encoding '{name}'")))?),
+            normalized => {
+                if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
+                else if let Some(table) = double_byte::lookup(normalized) { Self::DoubleByte(table) }
+                else { return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{name}'"))); }
+            },
         })
     }
 
@@ -59,6 +65,7 @@ impl Charset {
             Self::Cesu8 => decode_cesu8(bytes),
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
+            Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
             Self::Utf16(order) => decode_utf16(bytes, order),
             Self::Utf32(order) => decode_utf32(bytes, order),
