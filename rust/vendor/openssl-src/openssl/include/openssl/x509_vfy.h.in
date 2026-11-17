@@ -148,6 +148,21 @@ int X509_check_trust(X509 *x, int id, int flags);
 
 int X509_verify_cert(X509_STORE_CTX *ctx);
 int X509_STORE_CTX_verify(X509_STORE_CTX *ctx);
+/*
+ * Verify a caller-selected leaf-first chain with its final certificate as anchor.
+ * - The caller validates Java names, identifiers, critical extensions and policy.
+ *   Anchor extensions, dates and signature are excluded from this call's checks.
+ * - Inputs are borrowed during this call, with 2 <= count == chain length <= INT_MAX.
+ *   self_issued[i] is 1 when chain[i]'s subject and issuer names are equal under Java rules, otherwise 0.
+ * - The freshly initialized context's certificate must be chain[0].
+ *   It requires purpose ANY, auth level zero and only time, PARTIAL_CHAIN or TRUSTED_FIRST flags.
+ *   DANE, raw public keys, bare trust anchors, parent contexts, revocation and custom verify functions are rejected.
+ * - The context retains references to the original chain through normal cleanup.
+ *   Temporary non-anchor metadata copies exclude noncritical identifiers and are freed before return.
+ * - Returns 1 on success, 0 on validation failure, -1 on error.
+ */
+int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
+    STACK_OF(X509) *chain, const unsigned char *self_issued, size_t count);
 STACK_OF(X509) *X509_build_chain(X509 *target, STACK_OF(X509) *certs,
     X509_STORE *store, int with_self_signed,
     OSSL_LIB_CTX *libctx, const char *propq);

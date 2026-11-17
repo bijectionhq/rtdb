@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::BTreeSet, ptr, sync::Arc};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{asn1::{Asn1BitString, Asn1Object, Asn1TimeRef}, nid::Nid, stack::Stack, x509::{X509, X509NameRef, X509Ref}};
+use openssl::{asn1::{Asn1BitString, Asn1Object, Asn1TimeRef}, nid::Nid, stack::Stack, x509::{X509, X509Ref}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use super::invalid;
@@ -82,8 +82,6 @@ impl SimpleTrust {
         Ok(chain)
     }
 }
-
-fn same_name(left: &X509NameRef, right: &X509NameRef) -> bool { left.try_cmp(right).is_ok_and(|order| order == Ordering::Equal) }
 
 fn ca_extensions(certificate: &X509Ref, mut maximum_path: usize, self_issued: bool) -> Result<usize> {
     let flags = unsafe { openssl_sys::X509_get_extension_flags(certificate.as_ptr()) };

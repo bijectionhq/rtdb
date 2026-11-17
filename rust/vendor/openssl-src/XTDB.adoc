@@ -31,3 +31,19 @@ The file entry point delegates to that parser after opening its original file BI
 `OPENSSL_RTDB_MATERIAL_BIO` identifies these additive interfaces to the bundled librdkafka build.
 Native Kafka snapshot and loader-order regression sources live in `../../crates/kafka/src/client/material/tests.rs`.
 These changes do not alter the recorded upstream manifest and have not been compiled or executed during Phase 1.
+
+`X509_STORE_CTX_verify_selected_chain` verifies a caller-selected leaf-first chain with a final trust anchor and borrowed Java self-issued facts.
+The caller owns Java issuer matching, identifier parsing, critical-extension recognition, algorithm constraints and certificate policy.
+The fresh context retains references to the original chain through normal context cleanup.
+Its purpose is `ANY`, its native authentication level is zero, and its flags are limited to time checking, `PARTIAL_CHAIN` and `TRUSTED_FIRST`.
+DANE, raw-public-key validation, revocation flags, proxy flags, strict-native validation and custom chain-verification functions are rejected at this boundary.
+The ordinary OpenSSL verification entry points retain their existing behavior.
+
+A passive call-local metadata owner duplicates non-anchor certificates and excludes only noncritical AKI/SKID extensions after the caller's Java parser has handled them.
+This prevents OpenSSL's identifier-cache failures from overriding Java's noncritical-extension rules.
+Metadata copies supply extension and name-constraint checks; original certificates supply every signature check, callback certificate and returned chain.
+Neither shared X509 self-issued flags nor original certificate encodings are rewritten.
+The final anchor is excluded from path-extension, name-constraint, date and signature checks.
+Version-1/version-2 intermediates require Java self-issuance and immediate placement below the anchor.
+Per-certificate metadata allocation is admitted before the native call and released after all copies are destroyed.
+The regression sources are `../../crates/kafka/src/tls/validation/pkix/tests/selected_chain.rs`; they have not been compiled or executed during Phase 1.

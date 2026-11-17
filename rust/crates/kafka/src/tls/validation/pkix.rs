@@ -39,7 +39,7 @@ fn configure_parameters(context: &mut X509StoreContextRef, now: &Asn1TimeRef) ->
 }
 
 type VerifyCallback = unsafe extern "C" fn(i32, *mut openssl_sys::X509_STORE_CTX) -> i32;
-struct DateCheck<'a> { previous: Option<VerifyCallback>, now: &'a Asn1TimeRef, links: &'a [(*mut openssl_sys::X509, *mut openssl_sys::X509)] }
+struct DateCheck<'a> { previous: Option<VerifyCallback>, now: &'a Asn1TimeRef }
 struct RestoreCallback { context: *mut openssl_sys::X509_STORE_CTX, previous: Option<VerifyCallback>, data: *mut c_void, index: i32 }
 impl Drop for RestoreCallback {
     fn drop(&mut self) {
@@ -58,19 +58,20 @@ fn date_index() -> Result<i32> {
     }).as_ref().copied().map_err(invalid)
 }
 
-fn verify_with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, links: &[(*mut openssl_sys::X509, *mut openssl_sys::X509)]) -> Result<bool> {
+fn verify_with_dates(context: &mut X509StoreContextRef, now: &Asn1TimeRef, originals: &StackRef<X509>, self_issued: &[u8]) -> Result<bool> {
     let index = date_index()?;
     let previous = unsafe { X509_STORE_CTX_get_verify_cb(context.as_ptr()) };
     let data = unsafe { openssl_sys::X509_STORE_CTX_get_ex_data(context.as_ptr(), index) };
-    let state = DateCheck { previous, now, links };
+    let state = DateCheck { previous, now };
     let result = unsafe { X509_STORE_CTX_set_ex_data(context.as_ptr(), index, (&state as *const DateCheck<'_>).cast_mut().cast()) };
     if result != 1 { return Err(invalid(openssl::error::ErrorStack::get())); }
     let _restore = RestoreCallback { context: context.as_ptr(), previous, data, index };
     unsafe { X509_STORE_CTX_set_verify_cb(context.as_ptr(), Some(check_date)); }
-    context.verify_cert().map_err(invalid)
+    let verified = unsafe { X509_STORE_CTX_verify_selected_chain(context.as_ptr(), originals.as_ptr(), self_issued.as_ptr(), self_issued.len()) };
+    if verified < 0 { Err(invalid(openssl::error::ErrorStack::get())) } else { Ok(verified == 1) }
 }
 
-// DateCheck is borrowed only during synchronous X509_verify_cert; RestoreCallback clears its pointer before the borrow ends.
+// DateCheck is borrowed only during synchronous selected-chain verification; RestoreCallback clears its pointer before the borrow ends.
 unsafe extern "C" fn check_date(mut verified: i32, context: *mut openssl_sys::X509_STORE_CTX) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let Ok(index) = date_index() else { return 0; };
@@ -126,6 +127,7 @@ unsafe extern "C" fn verify_native(context: *mut openssl_sys::X509_STORE_CTX, op
 }
 
 unsafe extern "C" {
+    fn X509_STORE_CTX_verify_selected_chain(context: *mut openssl_sys::X509_STORE_CTX, chain: *mut openssl_sys::stack_st_X509, self_issued: *const u8, count: usize) -> i32;
     fn SSL_CTX_set_cert_verify_callback(context: *mut openssl_sys::SSL_CTX, callback: Option<unsafe extern "C" fn(*mut openssl_sys::X509_STORE_CTX, *mut c_void) -> i32>, opaque: *mut c_void);
     fn X509_STORE_CTX_get0_cert(context: *const openssl_sys::X509_STORE_CTX) -> *mut openssl_sys::X509;
     fn X509_STORE_CTX_get0_untrusted(context: *const openssl_sys::X509_STORE_CTX) -> *mut openssl_sys::stack_st_X509;
