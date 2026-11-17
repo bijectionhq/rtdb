@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from source_gate import require_phase_two
@@ -270,7 +271,10 @@ def execute_case(mapping, side, args, directory, config, revision):
     return receipt
 
 
-def compare_files(args, ledger, reference, native, directory):
+def compare_files(args, selection, reference, native, directory):
+    ledger = args.output / "ledger.json"
+    if digest(ledger) != selection.ledger_sha256:
+        raise ValueError("captured global ledger changed before comparison")
     directory.mkdir()
     output = directory / "report.json"
     status = run_process([args.native, "compare", ledger, reference, native], REPOSITORY, output,
@@ -279,17 +283,112 @@ def compare_files(args, ledger, reference, native, directory):
     if not status["completed"] or status["exit_code"] not in (0, 1):
         raise RuntimeError(f"comparator process failed; inspect {directory}")
     report = json.loads(output.read_bytes())
+    if digest(ledger) != selection.ledger_sha256:
+        raise ValueError("captured global ledger changed during comparison")
     return report
 
 
-def require_agreement(report):
-    allowed = {"source inventory is incomplete", "runtime discovery has not been reconciled"}
-    if any(error not in allowed for error in report.get("manifest_errors", [])):
-        raise ValueError("comparison manifest contains an invalid mapping or unsupported schema")
-    if report["required_groups"] == 0 or report["missing_evidence"] or report["mismatches"]:
-        raise ValueError("mandatory controls did not agree; inspect comparison report")
-    if report["passing_both"] != report["required_groups"]:
-        raise ValueError("control observations did not execute successfully on both engines")
+IDENTITY_FIELDS = ("reference_revision", "source", "qualified_name", "parameter_fixture", "configuration")
+
+
+def case_key(identity):
+    if not isinstance(identity, dict) or set(identity) != set(IDENTITY_FIELDS):
+        raise ValueError("control selection requires a complete case identity")
+    values = tuple(identity[field] for field in IDENTITY_FIELDS)
+    if any(not isinstance(value, str) or not value.strip() for value in values):
+        raise ValueError("control case identity fields must be nonempty strings")
+    return values
+
+
+def _select_cases(ledger, selection):
+    if not isinstance(ledger, dict) or type(ledger.get("schema_version")) is not int or ledger["schema_version"] != 1 or ledger.get("inventory_revision") != REFERENCE:
+        raise ValueError("control ledger does not identify the pinned inventory")
+    if not isinstance(selection, dict) or type(selection.get("schema_version")) is not int or selection["schema_version"] != 1 or selection.get("inventory_revision") != REFERENCE:
+        raise ValueError("control selection does not identify the pinned inventory")
+    mappings = {}
+    cases = ledger.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("control ledger has no case array")
+    for mapping in cases:
+        key = case_key(mapping.get("identity") if isinstance(mapping, dict) else None)
+        if key[0] != REFERENCE or key in mappings:
+            raise ValueError("control ledger has an unpinned or duplicate case identity")
+        mappings[key] = mapping
+    identities = selection.get("cases")
+    if not isinstance(identities, list) or not identities:
+        raise ValueError("control selection has no cases")
+    keys = [case_key(identity) for identity in identities]
+    if len(keys) != len(set(keys)) or any(key not in mappings for key in keys):
+        raise ValueError("control selection contains a duplicate or unmapped case")
+    return [mappings[key] for key in keys]
+
+
+@dataclass(frozen=True)
+class ControlSelection:
+    ledger_bytes: bytes
+    selection_bytes: bytes
+    _global_identities: frozenset = field(init=False, repr=False)
+    _selected_identities: tuple = field(init=False, repr=False)
+    _case_json: tuple = field(init=False, repr=False)
+    _manifest_errors: frozenset = field(init=False, repr=False)
+
+    def __post_init__(self):
+        if not isinstance(self.ledger_bytes, bytes) or not isinstance(self.selection_bytes, bytes):
+            raise ValueError("control inputs require immutable bytes")
+        ledger, selection = json.loads(self.ledger_bytes), json.loads(self.selection_bytes)
+        mappings = _select_cases(ledger, selection)
+        if any(type(ledger.get(flag)) is not bool for flag in ("inventory_complete", "runtime_reconciled")):
+            raise ValueError("control ledger lacks explicit inventory completeness flags")
+        errors = set()
+        if not ledger["inventory_complete"]:
+            errors.add("source inventory is incomplete")
+        if not ledger["runtime_reconciled"]:
+            errors.add("runtime discovery has not been reconciled")
+        object.__setattr__(self, "_global_identities", frozenset(case_key(mapping["identity"]) for mapping in ledger["cases"]))
+        object.__setattr__(self, "_selected_identities", tuple(case_key(mapping["identity"]) for mapping in mappings))
+        object.__setattr__(self, "_case_json", tuple(json.dumps(mapping) for mapping in mappings))
+        object.__setattr__(self, "_manifest_errors", frozenset(errors))
+
+    @property
+    def ledger_sha256(self):
+        return hashlib.sha256(self.ledger_bytes).hexdigest()
+
+    @property
+    def selection_sha256(self):
+        return hashlib.sha256(self.selection_bytes).hexdigest()
+
+    def mappings(self):
+        return [json.loads(mapping) for mapping in self._case_json]
+
+    def reports(self, report):
+        errors = report.get("manifest_errors", [])
+        if len(errors) != len(self._manifest_errors) or set(errors) != self._manifest_errors:
+            raise ValueError("comparison manifest differs from the complete captured inventory")
+        cases = {}
+        for case in report["cases"]:
+            key = case_key(case["identity"])
+            if key in cases:
+                raise ValueError("comparison contains duplicate case reports")
+            cases[key] = case
+        if set(cases) != self._global_identities or type(report.get("required_groups")) is not int or report["required_groups"] != len(self._global_identities):
+            raise ValueError("comparison omitted or added global assertion groups")
+        fields = {"passing_both": "passing_both", "matching_expected_failure": "matching_expected_failure",
+                  "missing_evidence": "missing_evidence", "mismatches": "mismatch"}
+        counts = {field: sum(case["disposition"] == disposition for case in cases.values()) for field, disposition in fields.items()}
+        if sum(counts.values()) != len(cases) or any(type(report.get(field)) is not int or report[field] != count for field, count in counts.items()):
+            raise ValueError("comparison summary differs from its global case dispositions")
+        agreement = None if errors else (counts["passing_both"] + counts["matching_expected_failure"]) / len(cases)
+        parity = not errors and counts["missing_evidence"] == 0 and counts["mismatches"] == 0
+        agreement_valid = report.get("strict_agreement") is None if agreement is None else type(report.get("strict_agreement")) is float and report["strict_agreement"] == agreement
+        if "strict_agreement" not in report or not agreement_valid or report.get("complete_parity") is not parity:
+            raise ValueError("comparison completeness differs from the captured global inventory")
+        if any(case["disposition"] != "missing_evidence" for key, case in cases.items() if key not in self._selected_identities):
+            raise ValueError("comparison contains unexpected evidence outside the control selection")
+        return [cases[key] for key in self._selected_identities]
+
+    def require_agreement(self, report):
+        if any(case["disposition"] != "passing_both" for case in self.reports(report)):
+            raise ValueError("mandatory control observations did not execute successfully on both engines")
 
 
 def replace_pointer(value, path, replacement):
@@ -304,7 +403,7 @@ def replace_pointer(value, path, replacement):
     value[key] = replacement
 
 
-def negative_control(args, ledger, reference, native_path, mapping, directory):
+def negative_control(args, selection, reference, native_path, mapping, directory):
     mutated = copy.deepcopy(reference)
     fixture = json.loads((REPOSITORY / mapping["identity"]["parameter_fixture"]).read_bytes())
     control = fixture["negative_control"]
@@ -319,9 +418,10 @@ def negative_control(args, ledger, reference, native_path, mapping, directory):
     case["trace_sha256"] = digest(directory / "mutation.json")
     reference_path = directory / "mutated-reference.json"
     write_json(reference_path, mutated)
-    report = compare_files(args, ledger, reference_path, native_path, directory / "comparison")
-    differences = [(case["identity"], difference) for case in report["cases"] for difference in case["differences"]]
-    if report["mismatches"] != 1 or report["missing_evidence"] != 0 or len(differences) != 1:
+    report = compare_files(args, selection, reference_path, native_path, directory / "comparison")
+    selected = selection.reports(report)
+    differences = [(case["identity"], difference) for case in selected for difference in case["differences"]]
+    if report["mismatches"] != 1 or any(case["disposition"] != ("mismatch" if case["identity"] == mapping["identity"] else "passing_both") for case in selected) or len(differences) != 1:
         raise ValueError("negative control did not produce exactly its designated mismatch")
     identity, difference = differences[0]
     if identity != mapping["identity"] or difference["observation"] != control["observation"] or difference["path"] != control["path"]:
@@ -337,31 +437,38 @@ def run(args):
     revision = git(REPOSITORY, "rev-parse", "HEAD")
     if git(REPOSITORY, "status", "--porcelain", "--untracked-files=all"):
         raise ValueError("commit the implementation and fixture sources before collecting reproducible receipts")
-    ledger = json.loads(args.ledger.read_bytes())
-    config = json.loads(args.configuration.read_bytes())
-    if not ledger["cases"] or ledger["inventory_revision"] != REFERENCE:
-        raise ValueError("control ledger has no pinned cases")
+    selection = ControlSelection(args.ledger.read_bytes(), args.selection.read_bytes())
+    configuration_bytes = args.configuration.read_bytes()
+    config = json.loads(configuration_bytes)
+    mappings = selection.mappings()
     args.output.mkdir(parents=True, exist_ok=False)
     args.created_output = True
     write_json(args.output / "run.json", {"reference_revision": REFERENCE, "implementation_revision": revision,
-               "ledger_sha256": digest(args.ledger), "configuration_sha256": digest(args.configuration),
+               "ledger_sha256": selection.ledger_sha256, "selection_sha256": selection.selection_sha256, "configuration_sha256": hashlib.sha256(configuration_bytes).hexdigest(),
                "native_binary_sha256": digest(args.native), "status": "running"})
+    for name, payload in [("ledger.json", selection.ledger_bytes), ("selection.json", selection.selection_bytes), ("configuration.json", configuration_bytes)]:
+        with (args.output / name).open("xb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    execution_args = copy.copy(args)
+    execution_args.configuration = args.output / "configuration.json"
     reference, repeat, native = [], [], []
-    for index, mapping in enumerate(ledger["cases"]):
-        reference.append(execute_case(mapping, "reference", args, args.output / f"{index:04d}-reference", config, REFERENCE))
-        repeat.append(execute_case(mapping, "reference", args, args.output / f"{index:04d}-reference-repeat", config, REFERENCE))
-        native.append(execute_case(mapping, "native", args, args.output / f"{index:04d}-native", config, revision))
+    for index, mapping in enumerate(mappings):
+        reference.append(execute_case(mapping, "reference", execution_args, args.output / f"{index:04d}-reference", config, REFERENCE))
+        repeat.append(execute_case(mapping, "reference", execution_args, args.output / f"{index:04d}-reference-repeat", config, REFERENCE))
+        native.append(execute_case(mapping, "native", execution_args, args.output / f"{index:04d}-native", config, revision))
         write_json(args.output / "reference.json", reference)
         write_json(args.output / "reference-repeat.json", repeat)
         write_json(args.output / "native.json", native)
-    repeat_report = compare_files(args, args.ledger, args.output / "reference.json", args.output / "reference-repeat.json", args.output / "reference-repeat-comparison")
-    require_agreement(repeat_report)
-    report = compare_files(args, args.ledger, args.output / "reference.json", args.output / "native.json", args.output / "comparison")
-    require_agreement(report)
-    for index, mapping in enumerate(ledger["cases"]):
-        negative_control(args, args.ledger, reference, args.output / "native.json", mapping, args.output / f"{index:04d}-negative-control")
+    repeat_report = compare_files(args, selection, args.output / "reference.json", args.output / "reference-repeat.json", args.output / "reference-repeat-comparison")
+    selection.require_agreement(repeat_report)
+    report = compare_files(args, selection, args.output / "reference.json", args.output / "native.json", args.output / "comparison")
+    selection.require_agreement(report)
+    for index, mapping in enumerate(mappings):
+        negative_control(args, selection, reference, args.output / "native.json", mapping, args.output / f"{index:04d}-negative-control")
     write_json(args.output / "result.json", {"controls_verified": True, "full_inventory_parity": report["complete_parity"],
-               "paired_groups": report["required_groups"], "report_sha256": digest(args.output / "comparison/report.json")})
+               "paired_groups": len(mappings), "inventory_groups": report["required_groups"], "report_sha256": digest(args.output / "comparison/report.json")})
 
 
 def main():
@@ -371,11 +478,12 @@ def main():
     parser.add_argument("--native", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--ledger", type=Path, default=HERE / "assertion-ledger.json")
+    parser.add_argument("--selection", type=Path, default=HERE / "configurations/control-selection.json")
     parser.add_argument("--configuration", type=Path, default=HERE / "configurations/controls.json")
     parser.add_argument("--timeout", type=float, default=1800)
     args = parser.parse_args()
     args.created_output = False
-    for field in ("reference", "native", "output", "ledger", "configuration"):
+    for field in ("reference", "native", "output", "ledger", "selection", "configuration"):
         setattr(args, field, getattr(args, field).resolve())
     try:
         run(args)

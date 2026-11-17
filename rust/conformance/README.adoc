@@ -21,7 +21,13 @@ link:source-completeness.adoc[The source completeness record] separates missing 
 Every execution runner validates that record and its reviewed implementation revision before starting project code.
 
 The initial `assertion-ledger.json` maps the two mandatory comparison controls.
-It is an incomplete ledger: the source inventory remains the record of unmapped files and candidate cases.
+The ledger is incomplete: the source inventory remains the record of unmapped files and candidate cases.
+`configurations/control-selection.json` selects those controls by complete ledger identity.
+The runner retains exact ledger, selection and configuration input snapshots with their digests.
+The comparator reads the retained global ledger; its digest is checked before and after comparison.
+Every global assertion identity must remain in the comparison report.
+Unselected assertion groups remain missing evidence; summary counts and parity are checked against the captured ledger.
+`controls_verified` requires every selected control to pass; `full_inventory_parity` retains the global comparison outcome.
 Fixture `expected_observations` are transcribed assertions, not reference execution receipts.
 The control runners call the production JVM and Rust temporal calculators and replica envelope codecs.
 Fixture selection names the event index and observable field; expected observations are never inputs to either implementation.
