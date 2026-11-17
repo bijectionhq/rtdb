@@ -21,7 +21,7 @@ impl RunEndReader {
 
     pub(super) fn index(&self, row: PhysicalIndex) -> Result<PhysicalIndex> {
         let logical = row.0.wrapping_add(i32::try_from(self.storage.logical_offset).map_err(|_| index_error())?);
-        let count = i32::try_from(self.ends().length).map_err(|_| index_error())?;
+        let count = self.ends().count.get();
         let hint = self.hint.load(Ordering::Relaxed);
         let next = hint.wrapping_add(1);
         let index = if hint < count && logical >= self.start(hint)? && logical < self.end(hint)? {

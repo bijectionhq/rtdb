@@ -81,7 +81,7 @@ impl PhysicalNode {
             _ => return Err(layout()),
         })
     }
-    pub(super) fn check(&self, row: usize) -> Result<()> { if row < self.length { Ok(()) } else { Err(index_error()) } }
+    pub(super) fn check(&self, row: usize) -> Result<()> { if self.count.contains(row) { Ok(()) } else { Err(index_error()) } }
     pub(super) fn checked_position(&self, row: PhysicalIndex) -> Result<usize> { let row = row.position()?; self.check(row)?; Ok(row) }
     pub(super) fn union_id(&self, row: PhysicalIndex) -> Result<i8> {
         let Some(ContainerStorageRef::Union { type_ids, .. }) = self.container() else { return Err(unsupported("getTypeId")); };
@@ -126,7 +126,7 @@ impl PhysicalNode {
             }
             _ => return Err(unsupported("getListStartIndex")),
         };
-        if start > end || end > child.length { return Err(layout()); }
+        if start > end || end > child.count.checked_len()? { return Err(layout()); }
         Ok((child, start, end))
     }
 }
@@ -154,9 +154,10 @@ pub(super) fn run_end(ends: &PhysicalNode, row: usize) -> Result<usize> {
 }
 
 pub(super) fn check_runs(ends: &PhysicalNode, values: &PhysicalNode, length: usize) -> Result<()> {
-    if ends.descriptor.is_nullable() || !matches!(ends.scalar_field()?.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) || ends.length != values.length { return Err(layout()); }
+    if ends.descriptor.is_nullable() || !matches!(ends.scalar_field()?.data_type(), DataType::Int16 | DataType::Int32 | DataType::Int64) || ends.count != values.count { return Err(layout()); }
+    let run_count = ends.count.checked_len()?;
     let mut previous = 0;
-    for row in 0..ends.length {
+    for row in 0..run_count {
         let next = run_end(ends, row)?;
         vector_length(next)?;
         if next <= previous { return Err(layout()); }
@@ -180,6 +181,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
     let direct = |vector: ExecutionVector, declaration: &Field| -> Result<Arc<PhysicalNode>> {
         let node = vector.into_direct()?;
         if node.ingress_arrow()? != declaration { return Err(layout()); }
+        node.count.checked_len()?;
         Ok(node)
     };
     let validity = |length: usize, bits: Option<RetainedBuffer>| -> Result<Option<NullBuffer>> {
@@ -192,7 +194,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
         (DataType::Struct(fields), PhysicalLayout::Struct { length, validity: bits, children }) => {
             if fields.len() != children.len() { return Err(layout()); }
             let children = children.into_iter().zip(fields).map(|(child, field)| direct(child, field)).collect::<Result<Vec<_>>>()?;
-            if children.iter().any(|child| child.length != length) { return Err(layout()); }
+            if children.iter().any(|child| child.count.get() != length as i32) { return Err(layout()); }
             (length, NodeLayout::Struct { validity: validity(length, bits)?, children })
         }
         (DataType::List(child) | DataType::Map(child, _), PhysicalLayout::List { length, validity: bits, offsets, elements }) => {
@@ -201,7 +203,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
             let mut previous = 0;
             for row in 0..=length {
                 let next = usize::try_from(offsets.i32(row)?).map_err(|_| layout())?;
-                if next < previous || next > elements.length { return Err(layout()); }
+                if next < previous || next > elements.count.checked_len()? { return Err(layout()); }
                 previous = next;
             }
             (length, NodeLayout::List { validity: validity(length, bits)?, offsets, elements })
@@ -209,7 +211,7 @@ pub(super) fn native(field: Arc<Field>, input: PhysicalLayout, memory: &Arc<crat
         (DataType::FixedSizeList(child, size), PhysicalLayout::FixedSizeList { length, validity: bits, elements }) => {
             let elements = direct(elements, child)?;
             let size = usize::try_from(*size).map_err(|_| layout())?;
-            if length.checked_mul(size) != Some(elements.length) { return Err(layout()); }
+            if length.checked_mul(size) != Some(elements.count.checked_len()?) { return Err(layout()); }
             (length, NodeLayout::FixedList { validity: validity(length, bits)?, size, elements })
         }
         (DataType::Union(fields, arrow_schema::UnionMode::Dense), PhysicalLayout::DenseUnion { type_ids, offsets, children }) => {

@@ -126,6 +126,10 @@ The nullable anomaly carrier is shared; the physical producer-to-host adapters r
 
 Direct ranges and composed selections preserve source row indices without taking Arrow payload copies.
 `CellRef` borrows a selected position; `OwnedCell` retains its buffer, metadata and normalized index owners.
+`ExecutionVector::value_count` returns the captured signed i32 source count independently of initialized spans, append cursors and child counts.
+`checked_len` admits that count for a native allocation or iteration boundary and rejects negative counts with `rtdb/vector-length`; `is_empty` tests only zero.
+Native captured counts may be negative after source wrapping arithmetic, while SDK and `from_physical` ingress retain their nonnegative length validation.
+Checked cell admission rejects positions outside the signed count without changing constant nullness or unsupported-method ordering through an already admitted outer reader.
 Primitive getters resolve dense-union offsets and run-end physical indices before method admission and validity checks.
 `NullChecks` is an explicit read parameter on this library surface.
 It does not expose disabled checks through production configuration.
@@ -147,6 +151,7 @@ Those offsets may be negative or outside an empty/inactive child; selecting them
 A range on an already indirect leg reader preserves the mask, matching `IndirectVector.select(start, len)`.
 A first direct range retains Slice topology; another range over an indirect reader reserves and materializes translated selection indices even when its rows are contiguous.
 `Selection::All` invokes the same range behavior over the complete reader.
+The current checked `Selection` surface requires a nonnegative source count; a source-facing signed Slice constructor remains required in the later writer/reader rollout.
 `struct_child` also admits a named Struct leg, while `list_elements` and list offsets admit the corresponding plain or named-leg list reader.
 `list_start_index` and `list_count` return signed i32 values.
 Fixed lists compute start with wrapping multiplication and return the declared count without accessing row storage.
@@ -162,6 +167,11 @@ Raw access does not mask a child's payload with its parent's null bit and does n
 `cells/descriptor.rs` covers nested checked metadata projection, retained projection charges, allocation failure release, declared and ordinal discriminator identity, wrapped named-leg reads, custom child order, empty union types, descriptor depth admission and deep Struct joins under independent finite budgets.
 `cells/descriptor/metadata_tests.rs` covers independent field/type/nullability demand, typed failure ordering, delegated run-end admission, source-native fixed widths, structural reads and retained charges on failed metadata admission.
 `cells/native_container/tests.rs` covers partial native container counts, initialized spans and cursors, direct and selected child identity, independent Struct keys and child names, capture-input admission, wrapped offsets and ordinals, snapshot failure cleanup and retained leases.
+`cells/count_tests.rs` covers signed captured counts, nested reader admission, wrapped terminal-offset reads, run-count and hint interactions, strict-ingress rejection, and failure/retry/drop under independent budgets.
+Reader snapshots retain signed counts without allocating logical rows.
+For variable scalar and List/Set/Map snapshots, only a zero count skips the terminal-offset read; a nonzero count multiplies its signed i32 index by four with wrapping before retained byte-span admission.
+Thus `i32::MIN` reads initialized offset slot zero, while a genuinely negative byte address fails safely after the source-defined captures.
+Snapshot failure releases new captures without changing original counts, cursors or run-end hints.
 Writer construction remains separate from immutable native capture; public `from_physical` retains its strict SDK-declared input validation.
 These are unexecuted source regressions.
 Query frames, parameters, spill transport and expression consumers still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
@@ -220,3 +230,4 @@ The existing raw absent-primitive read failure still requires an explicit Kotlin
 The source has not been compiled or executed under the Phase 1 gate.
 No production expression/query/format consumer or process null-check setting is switched by this foundation.
 Full-object writers/readers, container promotion, relation writers, physical transport and production adoption remain required follow-on work.
+Mutable scalar and container count arithmetic, including the actual writer transitions to negative counts, remains a separate required increment from signed immutable capture.

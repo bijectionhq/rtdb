@@ -41,7 +41,7 @@ fn empty_required_leg_admits_methods_before_signed_payload_bounds() {
     let selected = named.select(&Selection::All).unwrap();
     let composed = selected.select(&Selection::Range { offset: 0, length: 3 }).unwrap().select(&Selection::Indices(vec![2, 0, 1])).unwrap();
     for reader in [&named, &selected, &composed] {
-        for row in 0..reader.len() {
+        for row in 0..reader.checked_len().unwrap() {
             let cell = reader.cell(row).unwrap();
             assert_eq!(cell.leaf_descriptor().unwrap().name(), "numbers");
             for checks in [NullChecks::Enabled, NullChecks::Disabled] {
@@ -249,8 +249,8 @@ fn absent_primitive_receivers_remain_raw_through_indirect_and_run_end_readers() 
     let field = Arc::new(Field::new("r", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
     let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 5, run_ends: ends, values: values.clone() }, &memory).unwrap();
     for vector in [&values, &runs] {
-        for row in 0..vector.len() { assert_absent_primitives(vector.cell(row).unwrap()); }
-        let selected = vector.select(&Selection::Indices(vec![(vector.len() - 1) as u32, 0])).unwrap();
+        for row in 0..vector.checked_len().unwrap() { assert_absent_primitives(vector.cell(row).unwrap()); }
+        let selected = vector.select(&Selection::Indices(vec![(vector.checked_len().unwrap() - 1) as u32, 0])).unwrap();
         let selected = selected.select(&Selection::All).unwrap();
         assert_absent_primitives(selected.cell(0).unwrap());
         assert_absent_primitives(selected.cell(1).unwrap());
@@ -383,7 +383,7 @@ fn inactive_leg_offset_is_checked_only_when_the_reader_consumes_it() {
     assert!(leg.cell(0).unwrap().is_null().unwrap());
     assert_eq!(anomaly(leg.cell(0).unwrap().get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/row-index");
     let selected = leg.select(&Selection::All).unwrap();
-    assert_eq!(selected.len(), 1);
+    assert_eq!(selected.value_count(), 1);
     assert_eq!(anomaly(selected.cell(0).unwrap().get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/row-index");
 }
 
@@ -398,13 +398,13 @@ fn absent_union_empty_leg_selects_before_final_child_bounds_are_consumed() {
     let leg = vector.vector_for("numbers").unwrap().unwrap();
     for selection in [Selection::All, Selection::Range { offset: 0, length: 3 }, Selection::Indices(vec![2, 1, 0])] {
         let selected = leg.select(&selection).unwrap();
-        assert_eq!(selected.len(), 3);
+        assert_eq!(selected.value_count(), 3);
         assert_eq!(selected.descriptor().name(), "numbers");
         for row in 0..3 {
             assert_eq!(anomaly(selected.cell(row).unwrap().get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/row-index");
         }
         let composed = selected.select(&Selection::Range { offset: 1, length: 2 }).unwrap().select(&Selection::Indices(vec![1, 0])).unwrap();
-        assert_eq!(composed.len(), 2);
+        assert_eq!(composed.value_count(), 2);
         assert_eq!(anomaly(composed.cell(0).unwrap().get_long(NullChecks::Disabled).unwrap_err()).code, "rtdb/row-index");
     }
     let retained = leg.select(&Selection::Indices(vec![1])).unwrap().owned_cell(0).unwrap();
@@ -708,9 +708,9 @@ fn native_short_run_lengths_keep_all_covering_values_owned() {
         let values = open(Field::new("values", DataType::Int64, false), Arc::new(Int64Array::from(vec![42, 73])), &memory);
         let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
         let vector = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length, run_ends: ends, values }, &memory).unwrap();
-        assert_eq!(vector.len(), length);
+        assert_eq!(vector.checked_len().unwrap(), length);
         let selected = vector.select(&Selection::All).unwrap();
-        assert_eq!(selected.len(), length);
+        assert_eq!(selected.checked_len().unwrap(), length);
         if length == 0 {
             assert!(selected.cell(0).is_err());
         } else {

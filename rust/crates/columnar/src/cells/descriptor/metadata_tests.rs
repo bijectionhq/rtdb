@@ -224,7 +224,7 @@ fn negative_native_fixed_width_is_representable_metadata_but_not_external_ingres
 
 fn node(descriptor: Arc<VectorDescriptor>, length: usize, storage: NodeLayout) -> ExecutionVector {
     let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: Arc::clone(&descriptor.reservation) });
-    ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, length, storage, owner }))
+    ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count: SourceCount::from_len(length).unwrap(), storage, owner }))
 }
 
 #[test]

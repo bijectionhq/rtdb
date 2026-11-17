@@ -23,9 +23,13 @@ pub(super) enum NativeScalarData {
 pub(super) enum ScalarOffsets<'a> { Native(&'a [u8]), Sdk(&'a [i32]) }
 impl ScalarOffsets<'_> {
     pub fn get(self, row: usize) -> Result<i32> {
+        self.get_index(PhysicalIndex::from_position(row)?)
+    }
+    pub fn get_index(self, index: PhysicalIndex) -> Result<i32> {
+        let start = usize::try_from(index.0.wrapping_mul(4)).map_err(|_| index_error())?;
         match self {
-            Self::Native(bytes) => Ok(i32::from_le_bytes(span(bytes, wrapped_stride(row, 4)?, 4)?.try_into().map_err(|_| layout())?)),
-            Self::Sdk(offsets) => offsets.get(wrapped_stride(row, 4)? / 4).copied().ok_or_else(index_error),
+            Self::Native(bytes) => Ok(i32::from_le_bytes(span(bytes, start, 4)?.try_into().map_err(|_| layout())?)),
+            Self::Sdk(offsets) => offsets.get(start / 4).copied().ok_or_else(index_error),
         }
     }
 }

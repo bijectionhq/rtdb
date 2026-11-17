@@ -29,16 +29,16 @@ pub(super) enum NativeContainerStorage {
 #[derive(Clone, Copy)]
 pub(super) enum ContainerValidity<'a> {
     Absent,
-    Sdk { bits: Option<&'a arrow_buffer::NullBuffer>, length: usize },
+    Sdk { bits: Option<&'a arrow_buffer::NullBuffer>, count: SourceCount },
     Native(&'a StoredBits),
 }
 impl ContainerValidity<'_> {
     pub(super) fn is_null(self, row: PhysicalIndex) -> Result<bool> {
         match self {
             Self::Absent => Ok(false),
-            Self::Sdk { bits, length } => {
+            Self::Sdk { bits, count } => {
                 let row = row.position()?;
-                if row >= length { return Err(index_error()); }
+                if !count.contains(row) { return Err(index_error()); }
                 Ok(bits.is_some_and(|bits| bits.is_null(row)))
             },
             Self::Native(bits) => Ok(!super::native_scalar::bit(bits.bytes.as_slice(), row.position()?)?),
@@ -84,7 +84,7 @@ pub(super) enum ContainerStorageRef<'a> {
 
 impl PhysicalNode {
     fn sdk_validity<'a>(&'a self, bits: Option<&'a arrow_buffer::NullBuffer>) -> ContainerValidity<'a> {
-        if self.descriptor.is_nullable() { ContainerValidity::Sdk { bits, length: self.length } } else { ContainerValidity::Absent }
+        if self.descriptor.is_nullable() { ContainerValidity::Sdk { bits, count: self.count } } else { ContainerValidity::Absent }
     }
     pub(super) fn container(&self) -> Option<ContainerStorageRef<'_>> {
         Some(match &self.storage {
@@ -113,8 +113,7 @@ fn check_bits(bits: Option<&StoredBits>) -> Result<()> {
     if bits.is_some_and(|bits| bits.byte_append > bits.bytes.len()) { Err(layout()) } else { Ok(()) }
 }
 
-pub(super) fn publish_native(name: &str, length: usize, parts: NativeContainerParts, memory: &Arc<crate::MemoryBudget>) -> Result<ExecutionVector> {
-    vector_length(length)?;
+pub(super) fn publish_native(name: &str, count: SourceCount, parts: NativeContainerParts, memory: &Arc<crate::MemoryBudget>) -> Result<ExecutionVector> {
     let slots = match &parts {
         NativeContainerParts::Struct { children, .. } => children.capacity(),
         NativeContainerParts::Union { children, .. } => children.capacity(),
@@ -171,7 +170,7 @@ pub(super) fn publish_native(name: &str, length: usize, parts: NativeContainerPa
         },
     };
     let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata });
-    Ok(ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, length, storage, owner })))
+    Ok(ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count, storage, owner })))
 }
 
 #[cfg(test)]

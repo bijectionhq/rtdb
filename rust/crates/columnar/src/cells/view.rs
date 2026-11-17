@@ -7,33 +7,36 @@ impl ExecutionVector {
     /// Range selection does the same for a direct leg; a range over an already indirect reader retains that reader's mask.
     /// A direct range retains a Slice; another range over any indirect reader allocates translated selection indices.
     /// `All` is a range covering every row; metadata allocation can fail without changing the input.
+    /// This checked selection boundary rejects negative source counts with rtdb/vector-length.
     pub fn select(&self, selection: &Selection) -> Result<Self> {
         if let Selection::Indices(indices) = selection { vector_length(indices.len())?; }
-        selection.validate(self.len())?;
+        let total = self.checked_len()?;
+        selection.validate(total)?;
         let (offset, length) = match selection {
-            Selection::All => (0, self.len()),
+            Selection::All => (0, total),
             Selection::Range { offset, length } => (*offset, *length),
             Selection::Indices(indices) => return self.select_indices(indices.iter().map(|index| *index as usize), indices.len()),
         };
+        let count = SourceCount::from_len(length)?;
         if matches!((&self.view, &self.address), (ReaderView::UnionLeg { .. }, Address::Identity { .. })) {
             self.select_indices(offset..offset + length, length)
         } else if matches!(&self.address, Address::Identity { .. }) {
-            Ok(Self { view: self.view.clone(), address: Address::Range { offset, len: length } })
+            Ok(Self { view: self.view.clone(), address: Address::Range { offset, count } })
         } else {
             let reservation = self.budget().reserve(index_bytes(length)?)?;
             let mut rows = Vec::with_capacity(length);
             for index in offset..offset + length { rows.push(self.address.translate(PhysicalIndex::from_position(index)?)?); }
-            let address = Address::Indices { selection: Arc::new(Indices { rows, _reservation: reservation }), offset: 0, len: length };
+            let address = Address::Indices { selection: Arc::new(Indices { rows, _reservation: reservation }), offset: 0, count };
             Ok(Self { view: self.view.clone(), address })
         }
     }
 
     fn select_indices(&self, indices: impl Iterator<Item = usize>, length: usize) -> Result<Self> {
-        vector_length(length)?;
+        let count = SourceCount::from_len(length)?;
         let reservation = self.budget().reserve(index_bytes(length)?)?;
         let mut rows = Vec::with_capacity(length);
         for index in indices { rows.push(self.selected_row(PhysicalIndex::from_position(index)?)?); }
-        let address = Address::Indices { selection: Arc::new(Indices { rows, _reservation: reservation }), offset: 0, len: length };
+        let address = Address::Indices { selection: Arc::new(Indices { rows, _reservation: reservation }), offset: 0, count };
         Ok(Self { view: ReaderView::Direct(Arc::clone(self.selected_node())), address })
     }
 
@@ -160,7 +163,7 @@ mod tests {
         let reservation = memory.reserve(array.get_array_memory_size()).unwrap();
         let vector = ExecutionVector::with_reservation(Arc::new(Field::new("i", DataType::Int64, false)), array, reservation).unwrap();
         let slice = vector.select(&Selection::Range { offset: 1, length: 2 }).unwrap();
-        assert!(matches!(&slice.address, Address::Range { offset: 1, len: 2 }));
+        assert!(matches!(&slice.address, Address::Range { offset: 1, count: SourceCount(2) }));
         let selected = slice.select(&Selection::Range { offset: 1, length: 1 }).unwrap();
         let Address::Indices { selection: first, .. } = &selected.address else { panic!() };
         assert_eq!(first.rows[0].0, 2);

@@ -74,7 +74,7 @@ fn fixed_short_and_long_long_writes_retain_actual_initialized_extents() {
     let mut wide = writer(DataType::FixedSizeBinary(256), false, &memory);
     wide.write_bytes(&[1]).unwrap();
     let wide = frozen(wide);
-    assert_eq!(wide.len(), 1);
+    assert_eq!(wide.value_count(), 1);
     assert!(wide.cell(0).unwrap().get_bytes().is_err());
     let mut pair = writer(DataType::FixedSizeBinary(4), false, &memory);
     pair.write_long_long(i64::MIN + 1, i64::MAX - 1).unwrap();
@@ -541,7 +541,7 @@ fn partial_fixed_copy_reference_failure_retains_data_cursor_without_completing_r
     assert_eq!(output.len(), 0);
     output.write_bytes(&[9; 256]).unwrap();
     let output = frozen(output);
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.value_count(), 1);
     assert_eq!(output.cell(0).unwrap().get_bytes().unwrap(), &[1; 256]);
     let NativeScalarData::Fixed(bytes) = native_data(&output) else { panic!(); };
     assert_eq!(bytes.append, 512);

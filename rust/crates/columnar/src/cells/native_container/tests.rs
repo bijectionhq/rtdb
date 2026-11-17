@@ -3,6 +3,10 @@ use arrow_buffer::Buffer;
 use crate::MemoryBudget;
 use super::*;
 
+fn publish_native(name: &str, length: usize, parts: NativeContainerParts, memory: &Arc<MemoryBudget>) -> Result<ExecutionVector> {
+    super::publish_native(name, SourceCount::from_len(length)?, parts, memory)
+}
+
 fn open(name: &str, array: ArrayRef, nullable: bool, memory: &Arc<MemoryBudget>) -> ExecutionVector {
     let field = Arc::new(Field::new(name, array.data_type().clone(), nullable));
     let reservation = memory.reserve(array.get_array_memory_size()).unwrap();
@@ -74,26 +78,26 @@ fn native_struct_retains_independent_parent_and_child_counts() {
     assert!(parent.ingress_field().arrow().is_none());
     assert!(!parent.cell(1).unwrap().is_null().unwrap());
     let field = parent.vector_for("child").unwrap().unwrap();
-    assert_eq!(field.len(), 1);
-    assert!(matches!(&field.address, Address::Identity { len: 1 }));
+    assert_eq!(field.value_count(), 1);
+    assert!(matches!(&field.address, Address::Identity { count: SourceCount(1) }));
     assert_eq!(field.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
     assert!(field.cell(1).is_err());
     assert!(parent.cell(1).unwrap().raw_struct_field("child").is_err());
     let sliced = parent.select(&Selection::All).unwrap().vector_for("child").unwrap().unwrap();
-    assert_eq!(sliced.len(), 2);
-    assert!(matches!(&sliced.address, Address::Range { offset: 0, len: 2 }));
+    assert_eq!(sliced.value_count(), 2);
+    assert!(matches!(&sliced.address, Address::Range { offset: 0, count: SourceCount(2) }));
     assert_eq!(anomaly(sliced.cell(1).unwrap().get_int(NullChecks::Enabled).unwrap_err()).code, "rtdb/row-index");
     let selected = parent.select(&Selection::Indices(vec![1, 0])).unwrap().vector_for("child").unwrap().unwrap();
-    assert_eq!(selected.len(), 2);
-    assert!(matches!(&selected.address, Address::Indices { len: 2, .. }));
+    assert_eq!(selected.value_count(), 2);
+    assert!(matches!(&selected.address, Address::Indices { count: SourceCount(2), .. }));
     assert_eq!(anomaly(selected.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap_err()).code, "rtdb/row-index");
     assert_eq!(selected.cell(1).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
     let behind = publish_native("behind", 0, NativeContainerParts::Struct { validity: None, children: fields([child.clone()], &memory) }, &memory).unwrap();
     let behind_child = behind.vector_for("child").unwrap().unwrap();
-    assert_eq!(behind_child.len(), 1);
+    assert_eq!(behind_child.value_count(), 1);
     assert_eq!(behind_child.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
-    assert_eq!(behind.select(&Selection::All).unwrap().vector_for("child").unwrap().unwrap().len(), 0);
-    assert_eq!(behind.map_keys().unwrap().len(), 1);
+    assert_eq!(behind.select(&Selection::All).unwrap().vector_for("child").unwrap().unwrap().value_count(), 0);
+    assert_eq!(behind.map_keys().unwrap().value_count(), 1);
     let Some(ContainerKind::Struct(fields)) = parent.descriptor().container() else { panic!() };
     assert!(Arc::ptr_eq(fields[0].descriptor(), &child.node().descriptor));
     let Some(ContainerStorageRef::Struct { children, .. }) = parent.node().container() else { panic!() };
@@ -199,7 +203,7 @@ fn fixed_list_preserves_signed_width_and_partial_child_count() {
         assert_eq!(fixed.cell(0).unwrap().list_count().unwrap(), width);
         assert_eq!(fixed.cell(0).unwrap().list_start_index().unwrap(), 0);
         if width != 0 { assert!(fixed.cell(0).unwrap().raw_list_elements().is_err()); }
-        else { assert_eq!(fixed.cell(0).unwrap().raw_list_elements().unwrap().len(), 0); }
+        else { assert_eq!(fixed.cell(0).unwrap().raw_list_elements().unwrap().value_count(), 0); }
         assert!(fixed.arrow_field().is_ok());
         let parent = union(fixed, &[i32::MAX, -1], &[255, 255], &memory);
         let selected = parent.vector_for("fixed").unwrap().unwrap().select(&Selection::All).unwrap();
@@ -275,7 +279,7 @@ fn list_wrappers_retain_descriptor_identity_and_only_concrete_reader_methods() {
             kind, validity: None, offsets: offsets(&[0, 0], 8, &memory), last_offset: 0, elements: ints("item", &[], &memory),
         }, &memory).unwrap();
         assert_eq!(list.cell(0).unwrap().list_count().unwrap(), 0);
-        assert_eq!(list.list_elements().unwrap().len(), 0);
+        assert_eq!(list.list_elements().unwrap().value_count(), 0);
         assert!(list.vector_for("item").is_err());
         assert!(list.cell(0).unwrap().get_int(NullChecks::Enabled).is_err());
         assert!(list.key_names().is_none());

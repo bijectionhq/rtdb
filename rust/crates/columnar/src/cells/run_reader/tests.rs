@@ -19,7 +19,7 @@ fn bytes(value: &[u8], memory: &Arc<MemoryBudget>) -> RetainedBuffer {
 }
 fn native(descriptor: Arc<VectorDescriptor>, length: usize, storage: NodeLayout, memory: &Arc<MemoryBudget>) -> ExecutionVector {
     let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: memory.reserve(512).unwrap() });
-    ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, length, storage, owner }))
+    ExecutionVector::direct(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count: SourceCount::from_len(length).unwrap(), storage, owner }))
 }
 fn run(ends: ExecutionVector, values: ExecutionVector, length: usize, logical_offset: usize, memory: &Arc<MemoryBudget>) -> ExecutionVector {
     let ends = ends.into_direct().unwrap();

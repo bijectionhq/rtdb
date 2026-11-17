@@ -495,7 +495,7 @@ mod tests {
         assert_eq!(memory.used_bytes(), before);
         let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: Arc::clone(&descriptor.reservation) });
         let vector = ExecutionVector::direct(Arc::new(PhysicalNode {
-            declaration: Declaration::Native, descriptor, length: 3,
+            declaration: Declaration::Native, descriptor, count: SourceCount::new(3),
             storage: NodeLayout::Union { type_ids: bytes(&[0, 128, 0], &memory), offsets: bytes(&[0; 12], &memory), children }, owner,
         }));
         assert!(matches!(vector.ingress_field(), DeclarationRef::Native(_)));

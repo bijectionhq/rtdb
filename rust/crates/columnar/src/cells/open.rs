@@ -151,9 +151,10 @@ fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Ar
 }
 
 pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
+    let count = SourceCount::from_len(length)?;
     if let (NodeLayout::RunEnd(reader), DataType::RunEndEncoded(_, _)) = (&storage, ingress.data_type()) { storage::check_runs(reader.ends(), reader.values(), length)?; }
     let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
-    Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, length, storage, owner }))
+    Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, count, storage, owner }))
 }
 
 pub(super) fn scalar_data_type(data_type: &DataType) -> Result<DataType> {

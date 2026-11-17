@@ -66,7 +66,7 @@ fn snapshot_node(node: &PhysicalNode, reservation: &Arc<MemoryReservation>) -> R
                 let elements = snapshot_node(elements, reservation)?;
                 let validity = validity.clone();
                 let offsets = offsets.clone();
-                let last_offset = if node.length == 0 { 0 } else { node.list_offset(PhysicalIndex::from_position(node.length)?, false)? };
+                let last_offset = if node.count.is_zero() { 0 } else { node.list_offset(node.count.index(), false)? };
                 NativeContainerStorage::List { validity, offsets, last_offset, elements }
             },
             NativeContainerStorage::FixedList { validity, elements } => {
@@ -85,15 +85,15 @@ fn snapshot_node(node: &PhysicalNode, reservation: &Arc<MemoryReservation>) -> R
         NodeLayout::Scalar(storage) => {
             let mut storage = storage.clone();
             if let NativeScalarData::Variable { offsets, last_offset, .. } = &mut storage.data {
-                *last_offset = if node.length == 0 { 0 } else { super::native_scalar::ScalarOffsets::Native(offsets.bytes.as_slice()).get(node.length)? };
+                *last_offset = if node.count.is_zero() { 0 } else { super::native_scalar::ScalarOffsets::Native(offsets.bytes.as_slice()).get_index(node.count.index())? };
             }
             NodeLayout::Scalar(storage)
         },
         NodeLayout::Leaf { array, payload, payload_offset } => {
             let array = Arc::clone(array);
             let payload = payload.clone();
-            if node.length != 0 {
-                if let ScalarStorageRef::Variable { offsets, .. } = ScalarStorageRef::node(node)? { offsets.get(node.length)?; }
+            if !node.count.is_zero() {
+                if let ScalarStorageRef::Variable { offsets, .. } = ScalarStorageRef::node(node)? { offsets.get_index(node.count.index())?; }
             }
             NodeLayout::Leaf { array, payload, payload_offset: *payload_offset }
         },
@@ -107,7 +107,7 @@ fn snapshot_node(node: &PhysicalNode, reservation: &Arc<MemoryReservation>) -> R
             let elements = snapshot_node(elements, reservation)?;
             let validity = validity.clone();
             let offsets = offsets.clone();
-            if node.length != 0 { node.list_offset(PhysicalIndex::from_position(node.length)?, false)?; }
+            if !node.count.is_zero() { node.list_offset(node.count.index(), false)?; }
             NodeLayout::List { validity, offsets, elements }
         },
         NodeLayout::FixedList { validity, size, elements } => {
@@ -130,5 +130,5 @@ fn snapshot_node(node: &PhysicalNode, reservation: &Arc<MemoryReservation>) -> R
     };
     let declaration = match &node.declaration { Declaration::Arrow(field) => Declaration::Arrow(Arc::clone(field)), Declaration::Native => Declaration::Native };
     let owner = Arc::new(NodeOwner { backing: node.owner.backing.clone(), metadata: Arc::clone(reservation) });
-    Ok(Arc::new(PhysicalNode { declaration, descriptor: Arc::clone(&node.descriptor), length: node.length, storage, owner }))
+    Ok(Arc::new(PhysicalNode { declaration, descriptor: Arc::clone(&node.descriptor), count: node.count, storage, owner }))
 }

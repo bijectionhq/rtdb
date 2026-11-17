@@ -10,6 +10,8 @@ mod run_reader;
 mod snapshot;
 mod storage;
 mod view;
+#[cfg(test)]
+mod count_tests;
 
 use std::sync::Arc;
 use arrow_array::{Array, ArrayRef};
@@ -62,7 +64,7 @@ enum ReaderView {
 
 #[derive(Debug)]
 struct PhysicalNode {
-    declaration: Declaration, descriptor: Arc<VectorDescriptor>, length: usize,
+    declaration: Declaration, descriptor: Arc<VectorDescriptor>, count: SourceCount,
     storage: NodeLayout, owner: Arc<NodeOwner>,
 }
 impl PhysicalNode {
@@ -79,9 +81,22 @@ enum BackingOwner { Arrow { _array: ArrayRef, reservation: Arc<MemoryReservation
 
 #[derive(Clone, Debug)]
 enum Address {
-    Identity { len: usize },
-    Range { offset: usize, len: usize },
-    Indices { selection: Arc<Indices>, offset: usize, len: usize },
+    Identity { count: SourceCount },
+    Range { offset: usize, count: SourceCount },
+    Indices { selection: Arc<Indices>, offset: usize, count: SourceCount },
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SourceCount(i32);
+impl SourceCount {
+    fn new(count: i32) -> Self { Self(count) }
+    fn from_len(length: usize) -> Result<Self> { vector_length(length)?; Ok(Self(length as i32)) }
+    fn get(self) -> i32 { self.0 }
+    fn is_zero(self) -> bool { self.0 == 0 }
+    fn checked_len(self) -> Result<usize> {
+        usize::try_from(self.0).map_err(|_| Anomaly::incorrect("rtdb/vector-length", "Negative execution vector count cannot be used as a native length"))
+    }
+    fn contains(self, row: usize) -> bool { i32::try_from(row).is_ok_and(|row| row < self.0) }
+    fn index(self) -> PhysicalIndex { PhysicalIndex(self.0) }
 }
 #[derive(Debug)]
 struct Indices { rows: Vec<PhysicalIndex>, _reservation: Arc<MemoryReservation> }
@@ -92,15 +107,15 @@ impl PhysicalIndex {
     fn position(self) -> Result<usize> { usize::try_from(self.0).map_err(|_| index_error()) }
 }
 impl Address {
-    fn len(&self) -> usize { match self { Self::Identity { len } | Self::Range { len, .. } | Self::Indices { len, .. } => *len } }
+    fn count(&self) -> SourceCount { match self { Self::Identity { count } | Self::Range { count, .. } | Self::Indices { count, .. } => *count } }
     fn row(&self, index: usize) -> Result<PhysicalIndex> { self.translate(PhysicalIndex::from_position(index)?) }
     fn translate(&self, index: PhysicalIndex) -> Result<PhysicalIndex> {
         match self {
             Self::Identity { .. } => Ok(index),
             Self::Range { offset, .. } => Ok(PhysicalIndex((*offset as i32).wrapping_add(index.0))),
-            Self::Indices { selection, offset, len } => {
+            Self::Indices { selection, offset, count } => {
                 let index = index.position()?;
-                if index >= *len { return Err(index_error()); }
+                if !count.contains(index) { return Err(index_error()); }
                 selection.rows.get(offset + index).copied().ok_or_else(index_error)
             }
         }
@@ -130,11 +145,15 @@ impl ExecutionVector {
     pub fn logical_type(&self) -> VectorTypeResult<&LogicalType> { self.descriptor().logical_type() }
     /// Reports the concrete reader's nullability, separately from physical Field nullability.
     pub fn reader_nullable(&self) -> bool { self.descriptor().reader_nullable() }
-    pub fn len(&self) -> usize { self.address.len() }
-    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    /// Returns the captured signed source count, independently of initialized payload spans and child counts.
+    pub fn value_count(&self) -> i32 { self.address.count().get() }
+    /// Admits this reader's count as a native length; negative counts return rtdb/vector-length.
+    pub fn checked_len(&self) -> Result<usize> { self.address.count().checked_len() }
+    /// Reports a zero source count; a negative count is not empty.
+    pub fn is_empty(&self) -> bool { self.address.count().is_zero() }
     /// Borrows a checked selected position without allocating.
     pub fn cell(&self, index: usize) -> Result<CellRef<'_>> {
-        if index >= self.len() { return Err(index_error()); }
+        if !self.address.count().contains(index) { return Err(index_error()); }
         Ok(CellRef { vector: self, index })
     }
     /// Retains a checked cell's buffers, metadata and reader view without materialization.
@@ -144,10 +163,10 @@ impl ExecutionVector {
     }
     fn node(&self) -> &PhysicalNode { match &self.view { ReaderView::Direct(node) => node, ReaderView::UnionLeg { inner, .. } => inner.node() } }
     fn budget(&self) -> &Arc<crate::MemoryBudget> { self.node().owner.metadata.budget() }
-    fn direct(node: Arc<PhysicalNode>) -> Self { let len = node.length; Self { view: ReaderView::Direct(node), address: Address::Identity { len } } }
+    fn direct(node: Arc<PhysicalNode>) -> Self { let count = node.count; Self { view: ReaderView::Direct(node), address: Address::Identity { count } } }
     fn into_direct(self) -> Result<Arc<PhysicalNode>> {
         match (self.view, self.address) {
-            (ReaderView::Direct(node), Address::Identity { len }) if len == node.length => Ok(node),
+            (ReaderView::Direct(node), Address::Identity { count }) if count == node.count => Ok(node),
             _ => Err(Anomaly::incorrect("rtdb/physical-child-view", "Physical container children must be complete direct vectors")),
         }
     }

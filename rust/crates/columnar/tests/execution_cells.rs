@@ -208,7 +208,7 @@ fn sdk_i32_max_run_coverage_survives_slicing_selection_and_owner_drop() {
         let selected = vector.select(&Selection::All).unwrap();
         drop(vector);
         assert!(budget.used_bytes() > 0);
-        assert_eq!(selected.len(), length);
+        assert_eq!(selected.checked_len().unwrap(), length);
         if length == 0 {
             assert!(selected.cell(0).is_err());
         } else {
@@ -229,7 +229,7 @@ fn raw_run_end_list_access_does_not_grant_reference_nested_methods() {
     assert_eq!(vector.list_elements().unwrap_err().code, "rtdb/unsupported-vector-reader");
     assert_eq!(vector.struct_child("item").unwrap_err().code, "rtdb/unsupported-vector-reader");
     let elements = vector.cell(1).unwrap().raw_list_elements().unwrap();
-    assert_eq!(elements.len(), 2);
+    assert_eq!(elements.value_count(), 2);
     assert_eq!(elements.cell(1).unwrap().get_long(NullChecks::Disabled).unwrap(), 29);
     assert_eq!(anomaly(elements.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
     drop(vector);
@@ -404,7 +404,7 @@ fn null_parent_lists_keep_raw_offsets_and_nullable_children() {
     let child = selected.cell(0).unwrap().raw_list_elements().unwrap();
     assert_eq!(child.cell(0).unwrap().getter_index().unwrap(), 1);
     assert_eq!(child.cell(0).unwrap().get_int(NullChecks::Disabled).unwrap(), 17);
-    assert_eq!(selected.list_elements().unwrap().len(), 2);
+    assert_eq!(selected.list_elements().unwrap().value_count(), 2);
 }
 
 #[test]
@@ -420,7 +420,7 @@ fn map_entries_retain_raw_child_payloads_and_reference_container_access() {
     let value = entries.struct_child("value").unwrap().unwrap().owned_cell(0).unwrap();
     assert_eq!(value.as_ref().getter_index().unwrap(), 1);
     assert_eq!(value.as_ref().get_long(NullChecks::Disabled).unwrap(), 29);
-    assert_eq!(vector.list_elements().unwrap().len(), 2);
+    assert_eq!(vector.list_elements().unwrap().value_count(), 2);
     drop(entries);
     drop(vector);
     assert_eq!(anomaly(value.as_ref().get_long(NullChecks::Enabled).unwrap_err()).message.as_deref(), Some("null at index 1"));
