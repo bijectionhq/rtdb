@@ -66,7 +66,7 @@ fn referenced_constraints_and_scratch_admission_cover_schema_operands() {
     let plan = JsonPlan::parse(r#"{"type":"object","properties":{"x":{"$ref":"number.json"}}}"#, &references, &options).unwrap();
     assert!(accepts(&plan, r#"{"x":18446744073709551617}"#));
     assert!(!accepts(&plan, r#"{"x":18446744073709551616}"#));
-    let schema = format!(r#"{{"type":"integer","multipleOf":{}}}"#, "3".repeat(900));
+    let schema = format!(r#"{{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"integer","multipleOf":{}}}"#, "3".repeat(900));
     let plan = strict(&schema);
     assert!(plan.validation_scratch >= 900 * 512);
     let memory = rtdb_columnar::MemoryBudget::new(1 << 22);

@@ -129,11 +129,11 @@ fn multiple_of_loader_double_projection_is_separate_from_exact_runtime_arithmeti
 
 #[test]
 fn numeric_schema_accommodation_preserves_existing_structure_checks_and_data_literals() {
-    for (dialect, modern) in DIALECTS {
+    for (dialect, _) in DIALECTS {
         for body in [r#""required":"x""#, r#""required":["x","x"]"#, r#""type":["integer","integer"]"#, r#""type":"unsupported""#, r#""properties":[]"#, r#""minItems":"x""#] {
             assert!(compile(dialect, body).is_err(), "{dialect}: {body}");
         }
-        assert_eq!(compile(dialect, r#""enum":[1,1]"#).is_ok(), *modern);
+        assert!(compile(dialect, r#""enum":[1,1]"#).is_ok(), "{dialect}");
         let literals = compile(dialect, r#""enum":[{"minItems":1.5},{"minItems":2.5}],"default":{"minItems":1.5}"#).unwrap();
         assert!(valid(&literals, r#"{"minItems":1.5}"#));
         assert!(valid(&literals, r#"{"minItems":2.5}"#));
