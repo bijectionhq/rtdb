@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Complete generated SQL rule recognition and production parser integration remain required beyond the bounded SLL isolation path.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation paths.
 
 == Owner and keys
 
@@ -564,8 +564,8 @@ Only after the second seek succeeds does reset clear recovery, current context, 
 This profile has no trace listener and the pinned interpreter's reset has no state effects.
 Recognizer state, previous invocation records, buffered tokens and retained DFA history persist.
 The wrapper then selects the LL strategy, listener and prediction profile, and calls the same action once more.
-This private adapter covers the caught adaptive no-viable path.
-Generated rule bodies, other recognition variants, the remaining inline recovery paths and production adoption remain required.
+The adapter runs the generated isolation action for caught adaptive no-viable and inline mismatch cancellation.
+Further generated rule bodies, recognition and recovery branches, and production adoption remain required.
 
 == SLL Bail token matches
 
@@ -586,7 +586,7 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment beyond the bounded SLL isolation path, expected-token capabilities and production adoption remain open.
+Generated context and terminal attachment beyond the bounded isolation path, further expected-token capabilities and production adoption remain open.
 
 == Required isolation block synchronization
 
@@ -635,15 +635,19 @@ The required sync sites have no epsilon and an accepted sync clears the source's
 These inline paths therefore use the ordinary constructor.
 The existing generated catch assigns the cause to the local record and reports it through the admitted listener path.
 The source error and finally ordering remains the same for native input and allocation failures.
-LL terminal attachment, nullable sync context capture, additional match sites and full generated rule adoption remain required.
+Nullable sync context capture, additional match sites and full generated rule adoption remain required.
 
-== Generated SLL isolation contexts
+== Generated isolation contexts and retry
 
-The private generated path implements all four SLL alternatives of `levelOfIsolation`, decision 371, and only the ISOLATION branch of its `commonTxMode` caller.
-It uses the actual SLL strategy, real required-block sync, real token matches, adaptive catch and Bail cancellation.
-Build-tree behavior is fixed on, parse-tree listeners are absent, and syntax listener dispatch is empty.
-The caller checks its real first token at state 2886; TIME, TIMEZONE and the direct generated no-viable branch are outside this entry's domain and return a private site error.
-LL rule bodies and production parser entry adoption remain required.
+The private generated path implements all four alternatives of `levelOfIsolation`, decision 371, and the ISOLATION branch of its `commonTxMode` caller in both profiles.
+The session's profile selects the prediction and error strategy before the generated context is allocated.
+The existing retry wrapper can run the generated action and invoke the same rule bodies in LL after a surviving SLL Bail cancellation.
+The action can observe primary context keys within the wrapper's callback and return results independent of the parse brand.
+Build-tree behavior is fixed on and parse-tree listeners are absent.
+SLL syntax listener dispatch is empty and LL uses the existing throwing listener.
+The caller checks its actual first token at state 2886 and the ISOLATION atom before selecting its branch.
+TIME, TIMEZONE and the direct generated no-viable branch are outside this entry's domain and return a private site error when reached.
+Additional generated paths and production parser entry adoption remain required.
 
 Each primary invocation record owns its optional exact labelled class and optional ordered child vector.
 Children are closed context keys or indexed terminal lexemes in that same branded parse region.
@@ -654,13 +658,13 @@ Unreachable generic records remain in the admitted arena until session destructi
 
 Ordinary tree entry sets the real state and current record, demands `LT(1)`, then attaches that context to its actual parent.
 The label constructor admits a fresh same-rule primary record and copies parent, invoking state, start and stop before any current or parent-tail mutation.
-Its predecessor has no children or exception in this reached SLL profile.
+Its predecessor has no children or exception at the reached label constructors.
 General error-leaf copying and reparenting stay outside the closed label constructor.
 Outer-alt entry replaces the actual parent's last generic child with the fresh labelled key, then changes current.
 The validated pop/push reuses existing capacity and has no fallible operation between those effects.
 Alternative numbers are not stored because the pinned context's setter is empty.
 
-The normal terminal is attached only after the actual match and consume finish.
+The normal terminal is attached only after the shared match and consume finish.
 A following lexer failure leaves that attempted terminal absent.
 After successful consumption, child growth admission can fail while retaining the advanced real cursor.
 Child lists start at one slot and double by checked capacity; checked layouts and scope admission precede fallible replacement allocation.
@@ -670,9 +674,14 @@ The primary record arena continues to use its existing admission policy.
 The generated constructor and tree enter remain outside each rule's try.
 An entered body runs its actual catch and always calls the real `exit_rule` afterward, including native errors and catch/report failures.
 Finally reads actual current and its real `LT(-1)` stop; its failure supersedes the body result.
-An adaptive no-viable catch stores the one cause in the generated local, reports through the empty SLL syntax listener, then links the live parent chain and cancels through Bail.
-Inline mismatch cancellation skips that catch and creates no normal terminal for the mismatched attempt.
-Lexer and native allocation errors bypass recognition assignment and cannot authorize LL retry.
+An SLL adaptive no-viable catch stores the one cause in the generated local and reports through the empty syntax listener.
+After a successful report, Bail links the live parent chain and cancels.
+SLL inline mismatch cancellation skips that catch.
+The LL catch stores an ordinary pending adaptive or mismatch cause in its generated local before the throwing listener.
+A required sync mismatch can therefore attach to a generic context, while an inline mismatch after alternative selection attaches to the labelled context.
+LL unwanted and missing token reports retain a null cause and bypass recognition assignment.
+A listener failure or cancellation during a match returns before terminal attachment.
+A lexer or native allocation failure in the body bypasses recognition assignment and cannot authorize LL retry.
 
 If the child enter's parent append fails after current and start are set, that child body and child finally were never entered.
 The already-entered common caller's finally therefore exits the actual child once.

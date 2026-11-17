@@ -8,10 +8,11 @@ use super::super::PredictionMode;
 mod tests;
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
-    fn generated_sll(&mut self) -> RuntimeResult<'sql, ()> {
-        let result = self.ready().and_then(|()| {
-            if self.profile == ParserProfile::SllBail { Ok(()) }
-            else { Err(RuntimeError::Control(RuntimeProblem::PredictionSite)) }
+    fn generated_mode(&mut self) -> RuntimeResult<'sql, PredictionMode> {
+        let result = self.ready().and_then(|()| match self.profile {
+            ParserProfile::SllBail => Ok(PredictionMode::Sll),
+            ParserProfile::LlDefault => Ok(PredictionMode::Ll),
+            ParserProfile::Kernel => Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
         });
         self.finish(result)
     }
@@ -30,21 +31,20 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
 
     fn match_tree_at(&mut self, state: u32) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
         self.set_state(state)?;
-        let expected = self.expected_at(state)?;
-        let token = self.match_bail(expected)?;
+        let token = self.match_isolation_atom()?;
         let current = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
         self.append_child(current, ContextChild::Terminal(token))?;
         Ok(token)
     }
 
-    pub(in crate::parser::prediction) fn level_of_isolation_sll(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
-        self.generated_sll()?;
+    pub(in crate::parser::prediction) fn level_of_isolation(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        let mode = self.generated_mode()?;
         let mut local = self.new_invocation(175)?;
         self.enter_tree_rule(local)?;
         let body = (|| {
             self.set_state(3014)?;
             self.sync_required_block()?;
-            let alternative = self.adaptive_predict(371, PredictionMode::Sll)?.number();
+            let alternative = self.adaptive_predict(371, mode)?.number();
             let (class, states): (ContextClass, &[u32]) = match alternative {
                 1 => (ContextClass::ReadUncommittedIsolation, &[3007, 3008]),
                 2 => (ContextClass::ReadCommittedIsolation, &[3009, 3010]),
@@ -58,23 +58,21 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             Ok(local)
         })();
         let result = match body {
-            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_))) => self.catch_recognition(local),
+            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_) | RuntimeError::InputMismatch(_))) => self.catch_recognition(local),
             result => result,
         };
         self.exit_rule()?;
         result
     }
 
-    pub(in crate::parser::prediction) fn common_tx_mode_isolation_sll(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
-        self.generated_sll()?;
+    pub(in crate::parser::prediction) fn common_tx_mode_isolation(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_mode()?;
         let mut local = self.new_invocation(164)?;
         self.enter_tree_rule(local)?;
         let body = (|| {
             self.set_state(2886)?;
             self.sync_required_block()?;
-            let token = self.lookahead(1)?.expect("positive lookahead");
-            let actual = self.environment.storage.grammar_view().token_type(token.lexeme().kind()).map_err(RuntimeError::from);
-            let actual = self.finish(actual)?;
+            let (_, actual) = self.lookahead_token(1)?;
             if actual != self.expected_at(2882)? {
                 return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from);
             }
@@ -83,11 +81,11 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             self.match_tree_at(2882)?;
             self.match_tree_at(2883)?;
             self.set_state(2884)?;
-            self.level_of_isolation_sll()?;
+            self.level_of_isolation()?;
             Ok(local)
         })();
         let result = match body {
-            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_))) => self.catch_recognition(local),
+            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_) | RuntimeError::InputMismatch(_))) => self.catch_recognition(local),
             result => result,
         };
         self.exit_rule()?;
