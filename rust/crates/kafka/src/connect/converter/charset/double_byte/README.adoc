@@ -11,6 +11,8 @@ IBM942C owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`.
 `cp949` and `cp950` resolve to IBM charsets, while `windows-949` and `windows-950` resolve to their Microsoft variants.
 link:charsets.tsv[The charset manifest] records canonical names, classes, source hashes, ASCII flags, trail ranges, present lead rows, resource sizes, mapping digests, decoded probe digests, and provider aliases.
 link:big5-solaris.tsv[The Big5-Solaris manifest] records its canonical name, `Big5_Solaris` alias, seven shared-row updates, source hashes, and pair-probe digest after initialization.
+The four additional HKSCS variants use a separate decoder with BMP and supplementary overlays and shared Big5 or immutable MS950 fallback.
+Their 14 registered names, mappings, and two-byte replacement rules are described in link:hkscs/README.adoc[the HKSCS reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.

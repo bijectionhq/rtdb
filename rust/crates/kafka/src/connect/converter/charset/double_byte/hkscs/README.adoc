@@ -1,0 +1,60 @@
+= Java 25 HKSCS character mappings
+
+The String converter supports `Big5-HKSCS`, `x-Big5-HKSCS-2001`, `x-MS950-HKSCS`, and `x-MS950-HKSCS-XP`, with 14 distinct case-insensitive registered names.
+link:charsets.tsv[The charset manifest] records every canonical name and provider alias, the source class and hash, the overlay and base mapping, and decoded probe digests.
+Aliases retain their punctuation, including `big5-hkscs:unicode3.0` for the 2001 variant.
+
+`Hkscs` and its overlay are passive immutable objects; the descriptor borrows its base through an explicit `Base` variant.
+The two Big5 variants borrow the process-lifetime `Big5Family` initialization monitor, and the two Microsoft variants borrow the immutable MS950 mapping.
+The input cursor and UTF8 output belong to the decode call.
+The three shared static overlays occupy 79,464 bytes and add no retained allocation per converter or record.
+The existing String scalar memory admission precedes decoding, and output reserves at most three UTF8 bytes per input byte.
+
+== Decode behavior and initialization
+
+OpenJDK25 `String(byte[], Charset)` creates the decoder before its ASCII fastpath and calls `HKSCS.Decoder.decode(byte[], int, int, char[])` through `ArrayDecoder` for other input.
+Every variant maps ASCII bytes directly and treats each higher byte as a lead requiring a second byte.
+A complete candidate consumes both bytes, including an ASCII or zero trail that is unmappable; an unmatched final lead produces one replacement.
+For trails 0x40 through 0xFE, BMP overlay entries take precedence, then supplementary entries, then the base mapping.
+Supplementary source entries are offsets from U+20000; the resource stores the resulting Unicode scalar.
+The XP decoder overrides supplementary lookup to return unmappable and falls back to MS950 after its BMP overlay.
+Its 0x8BC2 result is U+F53A, while the other three variants produce U+21BC1.
+Source-derived BMP entries contain no surrogate units.
+
+HKSCS charset lookup and decoder initialization do not activate Big5-Solaris.
+Java's HKSCS decoder holders initialize their own tables and create a base Big5 or MS950 decoder.
+The Big5 fallbacks read `Big5Family` on each lookup and retain its shared publication behavior described in link:../README.adoc[the double-byte reference].
+All three overlays already define the seven F9D6–F9DC Solaris additions, so those HKSCS results remain the same before, during, and after Solaris initialization.
+Serializer configuration validates charset names without invoking an encoder.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:overlays.tsv[The overlay manifest] identifies `HKSCSMapping`, `HKSCS2001Mapping`, and `HKSCS_XPMapping`, their source hashes, row counts, sizes, and resource hashes.
+link:sources.sha256[The supporting source manifest] pins the providers, decoder algorithms, base mappings, charset lookup, and String construction path.
+link:COPYRIGHT[Copyright notices] retain the upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+Each overlay starts with 256 big-endian unsigned 16-bit row indices; 0xFFFF identifies an absent row.
+The remaining bytes hold compact rows of 191 big-endian unsigned 32-bit scalars for trails 0x40 through 0xFE.
+U+FFFD identifies a missing overlay entry that falls back to the base.
+Combining BMP and supplementary tables at derivation retains their precedence and shares the modern overlay between its Big5 and Microsoft descriptors.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-hkscs
+----
+
+The derivation verifies archive hashes, source constructors, base selection, XP's supplementary override, row dimensions, ASCII identity, BMP surrogate exclusions, the seven overlay additions, and exact alias ownership.
+The single-byte digest concatenates all 256 bytes decoded as independent records.
+The pair digest concatenates all 65,536 two-byte records in unsigned order, appending a U+0000 separator to each decoded result.
+Regression sources decode each probe independently before appending that separator.
+Putting a zero byte after an ASCII byte and a high byte would consume the zero as the high byte's invalid trail, so input separators cannot isolate these records.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes and pairs, BMP and supplementary overlays, MS950 private-use fallbacks, malformed groups, truncated records, null values, key/value configuration, punctuation, trimming, and memory admission.
+A local Big5 owner test covers the fallback's observation of partially published entries.
+The existing separate Solaris integration process checks HKSCS decoding before and after Solaris activation while retaining the ordinary Big5 lifecycle assertions.

@@ -100,6 +100,10 @@ IBM control remappings, yen/overline/won signs, Windows extensions, and private-
 Big5-Solaris adds the `x-Big5-Solaris` and `Big5_Solaris` names, bringing this family to 21 charsets and 102 registered names.
 Its first admitted nonempty record updates seven Big5 mappings process-wide, including converters opened earlier; configuration, null records, and empty records leave those mappings unchanged.
 The link:src/connect/converter/charset/double_byte/README.adoc[double-byte mapping reference] records the source-derived tables, aliases, and replacement rules.
+Big5-HKSCS, Big5-HKSCS-2001, MS950-HKSCS, and MS950-HKSCS-XP add four charsets with 14 registered names, including the Java `x-` prefixes where required.
+Their overlays preserve BMP and supplementary mappings, XP private-use characters, and Big5 or MS950 fallback; each complete unmappable pair consumes both bytes, including an ASCII or zero trail.
+HKSCS decoding does not activate Big5-Solaris, and its existing seven overlay mappings remain unchanged by Solaris activation.
+The link:src/connect/converter/charset/double_byte/hkscs/README.adoc[HKSCS reference] records their source provenance, aliases, and replacement behavior.
 Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
