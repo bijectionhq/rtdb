@@ -1,7 +1,7 @@
 use super::*;
 use std::{io::{Read, Write}, net::TcpListener};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use openssl::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, pkey::PKey, rsa::Rsa, ssl::{SslAcceptor, SslMethod}, x509::{X509, X509NameBuilder, extension::{BasicConstraints, SubjectAlternativeName}}};
+use openssl::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, pkey::PKey, rsa::Rsa, ssl::{SslAcceptor, SslMethod}, x509::{X509, X509NameBuilder, extension::{BasicConstraints, ExtendedKeyUsage, SubjectAlternativeName}}};
 use url::Url;
 
 type ServerTask = tokio::task::JoinHandle<Vec<String>>;
@@ -21,7 +21,8 @@ fn server(responses: impl FnOnce(&Url) -> Vec<(u16, String)>) -> (Url, reqwest::
     certificate.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
     certificate.set_subject_name(&name).unwrap(); certificate.set_issuer_name(&name).unwrap(); certificate.set_pubkey(&key).unwrap();
     certificate.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap(); certificate.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
-    certificate.append_extension(BasicConstraints::new().critical().ca().build().unwrap()).unwrap();
+    certificate.append_extension(BasicConstraints::new().critical().build().unwrap()).unwrap();
+    certificate.append_extension(ExtendedKeyUsage::new().server_auth().build().unwrap()).unwrap();
     let san = SubjectAlternativeName::new().ip("127.0.0.1").build(&certificate.x509v3_context(None, None)).unwrap();
     certificate.append_extension(san).unwrap(); certificate.sign(&key, MessageDigest::sha256()).unwrap(); let certificate = certificate.build();
     let mut acceptor = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
@@ -68,6 +69,13 @@ fn credential(endpoint: &Url, client: reqwest::Client, realm: bool) -> PasswordC
     }
 }
 fn form(request: &str) -> BTreeMap<String, String> { url::form_urlencoded::parse(request.split_once("\r\n\r\n").unwrap().1.as_bytes()).into_owned().collect() }
+
+#[tokio::test]
+async fn password_endpoint_fixture_validates_the_server_certificate() {
+    let (endpoint, client, server) = server(|_| vec![(200, "ready".into())]);
+    assert_eq!(client.get(endpoint).send().await.unwrap().text().await.unwrap(), "ready");
+    assert_eq!(server.await.unwrap().len(), 1);
+}
 
 #[tokio::test]
 async fn managed_password_flow_discovers_realm_exchanges_form_and_reuses_cached_token() {
