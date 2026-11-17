@@ -4,9 +4,12 @@ mod source;
 mod token;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod ownership_tests;
 
 use std::fmt;
-use rtdb_types::{AllocationScope, Anomaly};
+use std::sync::Arc;
+use rtdb_types::{AllocationScope, Anomaly, MemoryBudget};
 pub(crate) use token::{ExpectedSymbol, TokenSet, TokenType};
 
 type Result<T> = std::result::Result<T, GrammarError>;
@@ -51,12 +54,45 @@ struct RuleId(u16);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct DecisionId(u16);
 
-pub(crate) struct Grammar<'scope> {
+struct GrammarData {
     states: Vec<StateData>,
     rules: Vec<RuleData>,
     decisions: Vec<StateId>,
     sets: Vec<TokenSet>,
     vocabulary: source::Vocabulary,
+}
+
+impl GrammarData {
+    fn load(allocation: &AllocationScope) -> Result<Self> {
+        let source = source::Source::read(source::PINNED)?;
+        let words = source.words(allocation)?;
+        let layout = deserialize::Layout::read(&words)?;
+        let vocabulary = source.vocabulary(allocation, layout.rule_count())?;
+        deserialize::load_data(&words, layout, vocabulary, allocation)
+    }
+}
+
+enum GrammarStorage<'owner> { Owned(GrammarData), Borrowed(&'owner GrammarData) }
+
+pub(crate) struct OwnedGrammar {
+    data: GrammarData,
+    allocation: AllocationScope,
+}
+
+impl OwnedGrammar {
+    pub(crate) fn load(memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let allocation = AllocationScope::new(memory).map_err(GrammarError::Admission)?;
+        let data = GrammarData::load(&allocation)?;
+        Ok(Self { data, allocation })
+    }
+
+    pub(crate) fn view(&self) -> Grammar<'_> {
+        Grammar { storage: GrammarStorage::Borrowed(&self.data), allocation: &self.allocation }
+    }
+}
+
+pub(crate) struct Grammar<'scope> {
+    storage: GrammarStorage<'scope>,
     allocation: &'scope AllocationScope,
 }
 
@@ -66,34 +102,38 @@ impl Drop for Grammar<'_> {
 
 impl<'scope> Grammar<'scope> {
     pub(crate) fn load(allocation: &'scope AllocationScope) -> Result<Self> {
-        let source = source::Source::read(source::PINNED)?;
-        let words = source.words(allocation)?;
-        let layout = deserialize::Layout::read(&words)?;
-        let vocabulary = source.vocabulary(allocation, layout.rule_count())?;
-        deserialize::load(&words, layout, vocabulary, allocation)
+        Ok(Self::from_data(GrammarData::load(allocation)?, allocation))
+    }
+
+    fn from_data(data: GrammarData, allocation: &'scope AllocationScope) -> Self {
+        Self { storage: GrammarStorage::Owned(data), allocation }
+    }
+
+    fn data(&self) -> &GrammarData {
+        match &self.storage { GrammarStorage::Owned(data) => data, GrammarStorage::Borrowed(data) => data }
     }
 
     pub(crate) fn state(&self, number: u32) -> Result<State<'_, 'scope>> {
-        self.states.get(number as usize).ok_or_else(|| issue(IssueKind::State, number as usize))?;
+        self.data().states.get(number as usize).ok_or_else(|| issue(IssueKind::State, number as usize))?;
         Ok(self.view(StateId(number)))
     }
 
     pub(crate) fn rule(&self, number: u16) -> Result<Rule<'_, 'scope>> {
-        self.rules.get(usize::from(number)).ok_or_else(|| issue(IssueKind::Rule, usize::from(number)))?;
+        self.data().rules.get(usize::from(number)).ok_or_else(|| issue(IssueKind::Rule, usize::from(number)))?;
         Ok(Rule { grammar: self, id: RuleId(number) })
     }
 
     pub(crate) fn decision(&self, number: u16) -> Result<Decision<'_, 'scope>> {
-        self.decisions.get(usize::from(number)).ok_or_else(|| issue(IssueKind::Decision, usize::from(number)))?;
+        self.data().decisions.get(usize::from(number)).ok_or_else(|| issue(IssueKind::Decision, usize::from(number)))?;
         Ok(Decision { grammar: self, id: DecisionId(number) })
     }
 
     pub(crate) fn token_type(&self, kind: crate::lexer::Kind) -> Result<TokenType> {
-        self.vocabulary.token_type(kind)
+        self.data().vocabulary.token_type(kind)
     }
 
     pub(crate) fn display_name(&self, token: TokenType) -> &'static str {
-        self.vocabulary.display_name(token)
+        self.data().vocabulary.display_name(token)
     }
 
     fn view(&self, id: StateId) -> State<'_, 'scope> { State { grammar: self, id } }
@@ -203,19 +243,19 @@ pub(crate) enum TransitionView<'g, 'scope> {
 }
 
 impl<'g, 'scope> State<'g, 'scope> {
-    pub(crate) fn belongs_to(self, grammar: &Grammar<'_>) -> bool { std::ptr::eq(self.grammar, grammar) }
+    pub(crate) fn belongs_to(self, grammar: &Grammar<'_>) -> bool { std::ptr::eq(self.grammar.data(), grammar.data()) }
     pub(crate) fn number(self) -> u32 { self.id.0 }
     pub(crate) fn rule(self) -> Rule<'g, 'scope> {
-        Rule { grammar: self.grammar, id: self.grammar.states[self.id.0 as usize].rule }
+        Rule { grammar: self.grammar, id: self.grammar.data().states[self.id.0 as usize].rule }
     }
-    pub(crate) fn epsilon_only(self) -> bool { self.grammar.states[self.id.0 as usize].epsilon_only }
+    pub(crate) fn epsilon_only(self) -> bool { self.grammar.data().states[self.id.0 as usize].epsilon_only }
 
     pub(crate) fn kind(self) -> StateKindView<'g, 'scope> {
         let state = |id| self.grammar.view(id);
         let decision = |value: DecisionData| DecisionView {
             decision: value.number.map(|id| Decision { grammar: self.grammar, id }), non_greedy: value.non_greedy,
         };
-        match self.grammar.states[self.id.0 as usize].kind {
+        match self.grammar.data().states[self.id.0 as usize].kind {
             StateKind::Basic => StateKindView::Basic,
             StateKind::RuleStart { stop, left_recursive } => StateKindView::RuleStart { stop: state(stop), left_recursive },
             StateKind::BlockStart { end, decision: d } => StateKindView::BlockStart { end: state(end), decision: decision(d) },
@@ -231,7 +271,7 @@ impl<'g, 'scope> State<'g, 'scope> {
     }
 
     pub(crate) fn transitions(self) -> impl ExactSizeIterator<Item = TransitionView<'g, 'scope>> {
-        self.grammar.states[self.id.0 as usize].transitions.iter().map(move |transition| {
+        self.grammar.data().states[self.id.0 as usize].transitions.iter().map(move |transition| {
             let state = |id| self.grammar.view(id);
             let rule = |id| Rule { grammar: self.grammar, id };
             match *transition {
@@ -239,7 +279,7 @@ impl<'g, 'scope> State<'g, 'scope> {
                 Transition::Rule { target, rule: r, precedence, follow } => TransitionView::Rule { target: state(target), rule: rule(r), precedence, follow: state(follow) },
                 Transition::Atom { target, token } => TransitionView::Atom { target: state(target), token },
                 Transition::Action { target, rule: r, action, context_dependent } => TransitionView::Action { target: state(target), rule: rule(r), action, context_dependent },
-                Transition::Set { target, set } => TransitionView::Set { target: state(target), tokens: &self.grammar.sets[set] },
+                Transition::Set { target, set } => TransitionView::Set { target: state(target), tokens: &self.grammar.data().sets[set] },
                 Transition::Precedence { target, precedence } => TransitionView::Precedence { target: state(target), precedence },
             }
         })
@@ -248,12 +288,12 @@ impl<'g, 'scope> State<'g, 'scope> {
 
 impl<'g, 'scope> Rule<'g, 'scope> {
     pub(crate) fn number(self) -> u16 { self.id.0 }
-    pub(crate) fn name(self) -> &'static str { self.grammar.vocabulary.rules[usize::from(self.id.0)] }
-    pub(crate) fn start(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.rules[usize::from(self.id.0)].start) }
-    pub(crate) fn stop(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.rules[usize::from(self.id.0)].stop) }
+    pub(crate) fn name(self) -> &'static str { self.grammar.data().vocabulary.rules[usize::from(self.id.0)] }
+    pub(crate) fn start(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.data().rules[usize::from(self.id.0)].start) }
+    pub(crate) fn stop(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.data().rules[usize::from(self.id.0)].stop) }
 }
 
 impl<'g, 'scope> Decision<'g, 'scope> {
     pub(crate) fn number(self) -> u16 { self.id.0 }
-    pub(crate) fn state(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.decisions[usize::from(self.id.0)]) }
+    pub(crate) fn state(self) -> State<'g, 'scope> { self.grammar.view(self.grammar.data().decisions[usize::from(self.id.0)]) }
 }

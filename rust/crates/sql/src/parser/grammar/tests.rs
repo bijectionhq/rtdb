@@ -55,13 +55,13 @@ fn published_artifact_builds_the_complete_pinned_graph() {
     let digest = format!("{:x}", Sha256::digest(source::PINNED.as_bytes()));
     assert_eq!(digest, provenance["artifacts"]["Sql.interp"]["sha256"].as_str().unwrap());
     let grammar = Grammar::load(&allocation).unwrap();
-    assert_eq!(grammar.states.len(), 3_017);
-    assert_eq!(grammar.rules.len(), 176);
-    assert_eq!(grammar.decisions.len(), 372);
-    assert_eq!(grammar.sets.len(), 43);
+    assert_eq!(grammar.data().states.len(), 3_017);
+    assert_eq!(grammar.data().rules.len(), 176);
+    assert_eq!(grammar.data().decisions.len(), 372);
+    assert_eq!(grammar.data().sets.len(), 43);
     let mut kinds = [0usize; 13];
     let mut transitions = [0usize; 11];
-    for state in &grammar.states {
+    for state in &grammar.data().states {
         let kind = match state.kind {
             StateKind::Basic => 1, StateKind::RuleStart { .. } => 2, StateKind::BlockStart { .. } => 3,
             StateKind::PlusBlockStart { .. } => 4, StateKind::StarBlockStart { .. } => 5,
@@ -267,7 +267,7 @@ fn every_construction_allocation_is_admitted_before_publication() {
                 let result = Grammar::load(&allocation);
                 if index == stages.len() - 1 && limit == next {
                     let grammar = result.unwrap();
-                    assert_eq!(grammar.states.len(), 3017);
+                    assert_eq!(grammar.data().states.len(), 3017);
                     drop(grammar);
                 } else { admission(result); }
                 assert_eq!(memory.used_bytes(), if limit == next { next } else { admitted });
@@ -318,7 +318,7 @@ fn malformed_artifacts_fail_without_a_partial_graph_or_owned_diagnostic() {
         let allocation = AllocationScope::new(&memory).unwrap();
         for end in 0..SIMPLE.len() { artifact(source_load(&SIMPLE[..end], &allocation), IssueKind::Extent); }
         let grammar = source_load(SIMPLE, &allocation).unwrap();
-        assert_eq!(grammar.states.len(), 3);
+        assert_eq!(grammar.data().states.len(), 3);
         let TransitionView::Atom { token, .. } = grammar.state(1).unwrap().transitions().next().unwrap() else { panic!("atom") };
         assert_eq!(token, TokenType::EOF);
         drop(grammar);
