@@ -47,5 +47,38 @@ EOF's vocabulary name is `EOF`; expected-set formatting uses `<EOF>` and `<EPSIL
 `write_display` writes to caller-provided storage whose capacity and lifetime the caller has already admitted.
 Neither operation returns an owned string.
 
+== Expected tokens
+
+`State::next_tokens` computes the tokens reachable within the state's rule, adding epsilon when the local rule end is reachable.
+`next_tokens_with_context` follows the supplied caller path and adds EOF at the full root end.
+`expected_tokens` starts with the within-rule result and visits caller follow states only while epsilon remains; its result excludes epsilon and includes EOF when the caller chain ends on a nullable path.
+These operations adapt ANTLR 4.13.2's https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/LL1Analyzer.java[`LL1Analyzer`] and `ATN.getExpectedTokens`.
+
+Caller invocation views run from innermost to outermost and exclude the root sentinel.
+Full-context conversion collects the path and resolves its rule-follow transitions from outermost to innermost before traversal.
+Expected-token chaining demands the next invocation only while the preceding follow set contains epsilon.
+A demanded invocation must belong to the state's grammar and have a rule transition first.
+Foreign grammar ownership is rejected before graph dereference.
+
+Each operation owns a passive traversal workspace under its explicit allocation scope.
+The workspace contains DFS continuation frames, immutable return-context nodes, visited membership and temporary invocation views.
+Called-rule bits occupy three inline words for the pinned 176-rule universe.
+Transitions are visited in source order, with called-rule bits cleared after descent and temporarily cleared and restored when returning through a rule stop.
+Actions and precedence predicates contribute epsilon traversal without executing an action or predicate.
+
+Local-end contexts and the canonical full-root context remain distinct.
+Singleton contexts retain arena identity: aliases compare equal, while separately created singletons with null parents remain unequal even when their return states match.
+Other singleton comparisons follow their nonnull parents iteratively.
+Visited membership uses state and context equality; called-rule bits do not form part of that key.
+Membership bucket order does not control traversal.
+
+Frame, context and invocation vectors request 16 elements on first growth and double thereafter.
+The visited table requests 16 slots on first insertion and doubles before exceeding one-half occupancy; a repeated visit does not cause growth.
+Each growth admits the full replacement backing store before allocation while the old backing store remains charged.
+Expected-token chaining clears and reuses that storage between within-rule traversals.
+All reservations remain with the caller's scope until it is dropped.
+The workspace retains its scope borrow through destruction and returns only an inline `TokenSet`.
+Failure drops the private workspace; traversal and context equality have no input-depth native recursion.
+
 The graph is private and is not connected to production SQL entry points.
-Context-sensitive expected-token traversal, all generated rule schedules, prediction, SLL/Bail-to-LL retry and diagnostic orchestration remain required parser work.
+All generated rule schedules, prediction, SLL/Bail-to-LL retry and diagnostic orchestration remain required parser work.
