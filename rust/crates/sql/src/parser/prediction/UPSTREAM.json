@@ -171,10 +171,46 @@
         "source": "Recognizer.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/Recognizer.java",
         "sha256": "125fe54ea24213ee9c6e04d85f18ff5668fbeb266e41a8135e383b3542dbd558"
+      },
+      {
+        "source": "DefaultErrorStrategy.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/DefaultErrorStrategy.java",
+        "sha256": "f8c0c1e724b45214376948206d564fae0ce3c9536059a3d56f113bc9fbfcdeaf"
+      },
+      {
+        "source": "BailErrorStrategy.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/BailErrorStrategy.java",
+        "sha256": "b74e89fb6a7ee9042bf433b56598363d015880f6c5b2b00a7514b1a405378b2a"
+      },
+      {
+        "source": "BufferedTokenStream.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/BufferedTokenStream.java",
+        "sha256": "e8914a408d193f4d6b44a63818758079710f30a26ca4dd22c5aa8d31832f7599"
+      },
+      {
+        "source": "NoViableAltException.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/NoViableAltException.java",
+        "sha256": "e9c406bb8be28a80c396f868ab202ba08677df964e96b8c93299feda78674096"
+      },
+      {
+        "source": "RecognitionException.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/RecognitionException.java",
+        "sha256": "d648890eb025ae8cfbd1d7f430b54b22d695d805b0e4610b729e1267c9241c08"
+      },
+      {
+        "source": "ProxyErrorListener.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/ProxyErrorListener.java",
+        "sha256": "df888d3cc8a2bf2ba3edbc92f67b8c1ea98e01100d55572773d1ea0478ec7e85"
       }
     ]
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round. Generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "sql_wrapper": {
+    "revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+    "path": "core/src/main/kotlin/xtdb/query/SqlParser.kt",
+    "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
+    "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
+  },
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and a terminal no-viable report path. Generated schedules, host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -292,7 +328,7 @@
       "Actual host snapshot/assertion producer",
       "Production classloader/cache realm, budget and concurrent writer policy",
       "embedded-parser-error-capability",
-      "All 176 generated rule schedules, trees, listeners, diagnostics and reset",
+      "All 176 generated rule schedules, trees, remaining strategy and diagnostic branches, and reset",
       "Phase2 and executed compiler/discovery/tests"
     ]
   }

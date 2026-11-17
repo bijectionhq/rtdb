@@ -62,7 +62,7 @@ fn ordinary_constructor_rejects_all_five_recursive_rules_before_append() {
 }
 #[test]
 fn ordinary_stale_captured_state_rejects_before_source_entry() {
-    let result=fixture("1",|s,_| {let frame=s.new_invocation(32)?;s.set_state(955)?;let result=s.enter_rule(frame);control(&result);assert_eq!(s.input_index(),None);assert!(s.current.is_none());assert!(s.records[frame.index].start.is_none());assert!(s.failed);result});control(&result);
+    let result=fixture("1",|s,_| {let frame=s.new_invocation(32)?;s.set_state(955)?;let result=s.enter_rule(frame);control(&result);assert_eq!(s.input_index(),None);assert!(s.current.is_none());assert!(s.records[frame.index].start.is_none());assert!(!s.control.is_ready());result});control(&result);
 }
 #[test]
 fn ordinary_reentry_of_entered_or_exited_record_rejects() {
@@ -134,19 +134,19 @@ fn prediction_error_moves_through_all_factories_and_restores_before_rule_finally
 }
 #[test]
 fn prediction_unwind_drops_inner_work_before_real_buffered_origin_restore() {
-    fixture("1 2",|s,_| {let mut entry=recursive(s,26,0)?;let panic=catch_unwind(AssertUnwindSafe(|| {let _:RuntimeResult<'_,()>=s.with_prediction(83,|round,_,input| {let _=round.local_start()?;input.advance()?;panic!("prediction unwind")});}));assert!(panic.is_err());assert_eq!(s.input_index(),Some(0));assert!(s.failed);s.unroll_recursion(&mut entry)?;Ok(())}).unwrap();
+    fixture("1 2",|s,_| {let mut entry=recursive(s,26,0)?;let panic=catch_unwind(AssertUnwindSafe(|| {let _:RuntimeResult<'_,()>=s.with_prediction(83,|round,_,input| {let _=round.local_start()?;input.advance()?;panic!("prediction unwind")});}));assert!(panic.is_err());assert_eq!(s.input_index(),Some(0));assert!(!s.control.is_ready());s.unroll_recursion(&mut entry)?;Ok(())}).unwrap();
 }
 #[test]
 fn real_origin_seek_disarms_and_returns_original_prediction_error() {
-    fixture("1 2",|s,_| {ordinary(s,32)?;let origin=s.input.index().unwrap();let mut failed=false;let mut guard=PredictionRestoration::new(&mut s.input,&mut failed,origin);guard.input.consume()?;let result=guard.finish::<()>(Err(PredictionError::Artifact(Problem::LocalClosure).into()));assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Artifact(Problem::LocalClosure)))));assert!(matches!(guard.state,RestorationState::Finished));assert_eq!(guard.input.index(),Some(origin));Ok(())}).unwrap();
+    fixture("1 2",|s,_| {ordinary(s,32)?;let origin=s.input.index().unwrap();let mut control=ParserControl::Ready;let mut guard=PredictionRestoration::new(&mut s.input,&mut control,origin);guard.input.consume()?;let result=guard.finish::<()>(Err(PredictionError::Artifact(Problem::LocalClosure).into()));assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Artifact(Problem::LocalClosure)))));assert!(matches!(guard.state,RestorationState::Finished));assert_eq!(guard.input.index(),Some(origin));Ok(())}).unwrap();
 }
 #[test]
 fn source_seek_error_overrides_original_and_guard_never_retries() {
-    fixture("1 @",|s,_| {ordinary(s,32)?;let mut failed=false;let mut guard=PredictionRestoration::new(&mut s.input,&mut failed,100);let result=guard.finish::<()>(Err(PredictionError::Aborted.into()));assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));assert!(matches!(guard.state,RestorationState::Finished));drop(guard);assert_eq!(s.input_index(),Some(0));Ok(())}).unwrap();
+    fixture("1 @",|s,_| {ordinary(s,32)?;let mut control=ParserControl::Ready;let mut guard=PredictionRestoration::new(&mut s.input,&mut control,100);let result=guard.finish::<()>(Err(PredictionError::Aborted.into()));assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));assert!(matches!(guard.state,RestorationState::Finished));drop(guard);assert_eq!(s.input_index(),Some(0));Ok(())}).unwrap();
 }
 #[test]
 fn failed_session_blocks_normal_resume_but_retains_real_cleanup_and_records() {
-    let result=fixture("1 @",|s,_| {let frame=ordinary(s,32)?;let error=match s.lookahead(2){Err(error)=>error,Ok(_)=>panic!("recognition error")};assert!(matches!(&error,RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_)))));control(&s.advance_input());s.exit_rule()?;s.rewind_input()?;s.clear_rule_control()?;assert!(s.failed);assert_eq!(s.records.len(),1);assert!(s.records[frame.index].start.is_some());control(&s.new_invocation(32));Err::<(),_>(error)});assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));
+    let result=fixture("1 @",|s,_| {let frame=ordinary(s,32)?;let error=match s.lookahead(2){Err(error)=>error,Ok(_)=>panic!("recognition error")};assert!(matches!(&error,RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_)))));control(&s.advance_input());s.exit_rule()?;s.rewind_input()?;s.clear_rule_control()?;assert!(!s.control.is_ready());assert_eq!(s.records.len(),1);assert!(s.records[frame.index].start.is_some());control(&s.new_invocation(32));Err::<(),_>(error)});assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));
 }
 #[test]
 fn enlarged_primary_and_precedence_elements_are_admitted_under_actual_sizes() {
@@ -179,7 +179,7 @@ fn every_recursive_rule_constructs_two_replacements_from_its_original_saved_root
 }
 #[test]
 fn ordinary_root_initialization_failure_keeps_source_current_and_no_invented_exit() {
-    let result=fixture("@",|s,_|{let key=s.new_invocation(32)?;let result=s.enter_rule(key);assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));assert_eq!(s.current,Some(key));assert_eq!(s.state(),ParserState::State(64));assert!(s.records[key.index].start.is_none());assert!(s.failed);result});assert!(matches!(result,Err(RuntimeError::Input(_))));
+    let result=fixture("@",|s,_|{let key=s.new_invocation(32)?;let result=s.enter_rule(key);assert!(matches!(result,Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));assert_eq!(s.current,Some(key));assert_eq!(s.state(),ParserState::State(64));assert!(s.records[key.index].start.is_none());assert!(!s.control.is_ready());result});assert!(matches!(result,Err(RuntimeError::Input(_))));
 }
 #[test]
 fn environment_cache_start_number_and_hit_survive_failure_and_new_sessions() {
@@ -202,7 +202,7 @@ fn unrooted_full_work_recycles_across_sessions_without_retained_capacity_growth(
 }
 #[test]
 fn actual_invocation_conversion_admission_error_crosses_generic_factories_before_restoration() {
-    let result=fixture("1",|s,memory|{ordinary(s,32)?;s.set_state(983)?;let mut entry=recursive(s,26,0)?;let _lease=exhaust(memory);let result=s.with_prediction(83,|round,_,input|{let mut full=round.enter_full(input)?;full.full_start().map(|_|())});assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Admission(_)))));assert_eq!(s.input_index(),Some(0));assert!(s.failed);s.unroll_recursion(&mut entry)?;result});assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Admission(_)))));
+    let result=fixture("1",|s,memory|{ordinary(s,32)?;s.set_state(983)?;let mut entry=recursive(s,26,0)?;let _lease=exhaust(memory);let result=s.with_prediction(83,|round,_,input|{let mut full=round.enter_full(input)?;full.full_start().map(|_|())});assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Admission(_)))));assert_eq!(s.input_index(),Some(0));assert!(!s.control.is_ready());s.unroll_recursion(&mut entry)?;result});assert!(matches!(result,Err(RuntimeError::Prediction(PredictionError::Admission(_)))));
 }
 #[test]
 fn owner_local_committed_closing_prefix_cannot_pop_again() {

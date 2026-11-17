@@ -504,7 +504,7 @@ The pinned SQL wrapper removes parser listeners for SLL.
 Its LL listener overrides syntax errors and inherits the empty ambiguity, attempting-Full-context and context-sensitivity methods of `BaseErrorListener`.
 These report sites therefore have no listener effects in the private wrapper profiles.
 The attempting-Full-context site is after Full start and before seeking the origin, the Local ambiguity site follows predicate evaluation, and the Full reports follow unique or common-viable resolution.
-Exact-ambiguity mode, production listeners, diagnostics and error-strategy effects remain open.
+Exact-ambiguity mode, production listeners and the remaining diagnostic and error-strategy branches stay open.
 
 On a Local ERROR edge or absent Full reach, candidate construction first observes the already buffered indexed start token and then demands the current real `LT(1)`.
 The candidate carries both original lexemes and the captured recognizer state.
@@ -515,6 +515,32 @@ The candidate is a private diagnostic projection.
 The JVM dead-end configuration set, recognizer and observable shared-cache capabilities remain open under the embedded cause capability gate.
 The production host and cache mapping remain open.
 Compiler and runtime qualification remain part of Phase 2.
+
+== No-viable reports
+
+An adaptive no-viable error becomes reportable after its final cursor restoration succeeds.
+The session retains one pending report with the captured start and offending tokens, recognizer state, current invocation and prediction profile.
+That report can run while ordinary parser operations are sealed.
+A denied ordinary operation consumes the pending report without reading input.
+The report requires the original invocation and restored cursor, and takes the pending value once before rendering.
+
+The report enters error recovery before token-text demand.
+A start token of EOF uses the literal `<EOF>`.
+Otherwise the existing token stream concatenates the inclusive start-to-offending interval, excluding skipped input and EOF display text.
+The parser message escapes carriage return, newline and tab and adds single quote delimiters.
+It retains the original token spelling, including any quote characters.
+Token text and the parser message have separate admitted capacities while they overlap.
+
+Notification increments the syntax error count after the parser message is complete.
+It reads the line and code-point column from the captured offending token, which can differ from the restored current token.
+The SLL profile completes notification with empty listener dispatch.
+The LL profile returns the throwing listener's `xtdb/sql-error` projection with the captured tokens and recognizer state.
+The projection owns its admitted message and code through a retained lease.
+A failure during token text or parser message construction leaves recovery entered and the count unchanged.
+A failure admitting the LL listener's message occurs after the count increments.
+The session remains sealed after either dispatch, and the existing rule-finally path can still run.
+
+Production exposure of the embedded recognition cause and its live capabilities remains under the open `embedded-parser-error-capability` gate.
 
 == Finishing-alternative selection
 
