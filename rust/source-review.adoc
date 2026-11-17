@@ -930,3 +930,22 @@ Specific/reflection Avro adapters, broader parser/Java-string behavior and opera
 Independent reviews cover the bounded source changes and preservation of the existing assertions.
 This workflow has executed none of the new regression sources or the Phase 2 qualification matrix.
 The implementation revision remains unset and the source-completeness gate remains false.
+
+== Common mutable vector tree source checkpoint
+
+A private mutable vector root owns the complete native tree and one publication gate.
+Its admitted descriptor entry constructs concrete empty Struct, List, FixedList, Map, Set, timestamp-range, Union and RunEnd states, with existing scalar state as private leaves.
+Common writes retain independent signed counts, buffer cursors and child prefixes through reference failures; native failure after mutation requires whole-root clear.
+Construction and teardown retain their physical depth bound, full scalar clone scratch, child/key/slot leases and old/new capture overlap.
+Run-end singleton methods use actual child counts and concrete end receivers; union null insertion remains distinct from union-valued nullable-setter failure.
+Consuming publication captures actual child descriptors and raw spans without an intervening checked SDK array.
+Independent source review covers 28 new regression sources and preservation of all 265 existing test bodies and the original scalar implementation.
+Source scalar parameters, complete Field factories, mutable getters/hints/LongLong, routed child writers, promotion, recursive copying, relations, objects/hash, transport and production adoption remain required.
+The independent signed-Slice and mutable-selection alias obligations remain open.
+
+The incoming static INSERT fix admits renamed Values projections through the existing expression-only static materializer.
+Data-dependent sources remain deferred to the resolver, and static evaluation and document ownership still complete before durable submission.
+The bounded write-trace conclusion is unchanged; its submission-source digest identifies the reviewed bytes.
+
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
