@@ -15,19 +15,20 @@ fn long_long_reader(node: &PhysicalNode) -> bool {
 
 impl<'a> CellRef<'a> {
     /// Borrows the getPointer byte span for fixed-width or variable-width storage without a validity check.
+    /// Fixed-width pointer strides wrap as i32 before retained-span checks.
     /// Indirect/run-end and extension readers delegate; Boolean, Null, containers and union/named-leg readers reject it.
     pub fn byte_span(&self) -> Result<&'a [u8]> {
         let cell = self.run_delegate(RunGetter::Pointer)?;
-        let array = cell.node.array().map_err(|_| unsupported("getPointer"))?;
-        if matches!(array.data_type(), DataType::Utf8 | DataType::Binary) {
+        let data_type = cell.node.field.data_type();
+        if matches!(data_type, DataType::Utf8 | DataType::Binary) {
             return bytes(&cell);
         }
-        let width = fixed_width(array.data_type()).ok_or_else(|| unsupported("getPointer"))?;
+        let width = fixed_width(data_type).ok_or_else(|| unsupported("getPointer"))?;
         let cell = cell.payload()?;
-        fixed_bytes(&cell, width, cell.row.checked_mul(width).ok_or_else(allocation)?, width)
+        fixed_bytes(&cell, width, super::native_scalar::wrapped_stride(cell.row, width)?, width)
     }
 
-    /// Reads the first big-endian long at the fixed binary reader's 16-byte row stride, without a validity check.
+    /// Reads the first big-endian long at the fixed binary reader's 16-byte row stride with i32 wrapping, without a validity check.
     /// Plain/indirect fixed binary and run-end wrappers expose it; extension and union readers do not.
     /// A read beyond the retained byte span returns a bounds error.
     pub fn get_long_long_high(&self) -> Result<i64> { self.long_long(0) }
@@ -41,7 +42,8 @@ impl<'a> CellRef<'a> {
         let DataType::FixedSizeBinary(width) = cell.node.field.data_type() else { return Err(unsupported("LongLongVectorReader")); };
         let width = usize::try_from(*width).map_err(|_| layout())?;
         let cell = cell.payload()?;
-        let offset = cell.row.checked_mul(16).and_then(|offset| offset.checked_add(part)).ok_or_else(allocation)?;
+        let lane = (cell.row as i32).wrapping_mul(2).wrapping_add((part / 8) as i32);
+        let offset = usize::try_from(lane.wrapping_mul(8)).map_err(|_| index_error())?;
         Ok(i64::from_be_bytes(fixed_bytes(&cell, width, offset, 8)?.try_into().map_err(|_| layout())?))
     }
 
@@ -115,6 +117,7 @@ impl<'a> CellRef<'a> {
     }
 
     /// Materializes the concrete DecimalVector coefficient and full logical parameters without a null guard.
+    /// Coefficient offsets use wide index multiplication.
     /// Only direct Decimal readers expose getDecimal; the returned logical value retains its allocation lease.
     pub fn get_decimal(&self) -> Result<OwnedValue> {
         let cell = self.numeric()?;
@@ -130,21 +133,14 @@ impl<'a> CellRef<'a> {
 }
 
 fn bytes<'a>(cell: &ResolvedCell<'a>) -> Result<&'a [u8]> {
-    let array = cell.node.array()?;
-    match array.data_type() {
-        DataType::Utf8 => Ok(downcast::<arrow_array::StringArray>(array)?.value(cell.payload()?.row).as_bytes()),
-        DataType::Binary => Ok(downcast::<arrow_array::BinaryArray>(array)?.value(cell.payload()?.row)),
-        _ => Err(unsupported("getPointer")),
-    }
+    super::native_scalar::ScalarStorageRef::node(cell.node)?.bytes(cell.payload()?.row, cell.node.field.data_type())
 }
 
-fn fixed_bytes<'a>(cell: &PayloadCell<'a>, width: usize, relative: usize, length: usize) -> Result<&'a [u8]> {
-    let NodeLayout::Leaf { payload: Some(buffer), payload_offset, .. } = &cell.node.storage else { return Err(layout()); };
-    let start = payload_offset.checked_mul(width).and_then(|start| start.checked_add(relative)).ok_or_else(allocation)?;
-    buffer.as_slice().get(start..start.checked_add(length).ok_or_else(allocation)?).ok_or_else(index_error)
+fn fixed_bytes<'a>(cell: &PayloadCell<'a>, _width: usize, relative: usize, length: usize) -> Result<&'a [u8]> {
+    super::native_scalar::ScalarStorageRef::node(cell.node)?.fixed(relative, length)
 }
 
-fn fixed_width(data_type: &DataType) -> Option<usize> {
+pub(super) fn fixed_width(data_type: &DataType) -> Option<usize> {
     Some(match data_type {
         DataType::Int8 | DataType::UInt8 => 1,
         DataType::Int16 | DataType::UInt16 => 2,

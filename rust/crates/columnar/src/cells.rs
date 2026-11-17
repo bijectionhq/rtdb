@@ -1,5 +1,7 @@
 mod getters;
 mod materialize;
+mod native_scalar;
+mod write;
 mod open;
 mod scalar;
 mod storage;
@@ -39,6 +41,7 @@ impl std::error::Error for VectorReadError {
 
 /// Immutable physical vector with shared buffer, schema and selection reservations.
 /// Clones and child views retain their owners; selection does not copy payload buffers.
+/// Fixed-width primitive byte addresses use source i32 products after logical row admission.
 #[derive(Clone, Debug)]
 pub struct ExecutionVector { view: ReaderView, address: Address }
 
@@ -190,6 +193,7 @@ impl<'a> CellRef<'a> {
     /// Returns actual selected leaf metadata, including nullable leaf identity; an absent union leg is an error.
     pub fn leaf_field(&self) -> Result<&'a Field> { Ok(&self.resolve()?.node.field) }
     /// Returns a checked source leaf row after all indirection; absent legs and addresses outside that leaf return errors.
+    /// Concrete getter byte-stride arithmetic is applied after this logical row admission.
     pub fn getter_index(&self) -> Result<usize> { Ok(self.resolve()?.payload()?.row) }
     /// Applies reader nullness, including named-leg discriminator masks and absent union rows.
     pub fn is_null(&self) -> Result<bool> { self.vector.null(PhysicalIndex::from_position(self.index)?) }

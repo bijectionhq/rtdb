@@ -48,6 +48,7 @@ pub enum PhysicalLayout {
 
 #[derive(Debug)]
 pub(super) enum NodeLayout {
+    Scalar(super::native_scalar::NativeScalarStorage),
     Leaf { array: ArrayRef, payload: Option<Buffer>, payload_offset: usize },
     Struct { validity: Option<NullBuffer>, children: Vec<Arc<PhysicalNode>> },
     List { validity: Option<NullBuffer>, offsets: RetainedBuffer, elements: Arc<PhysicalNode> },
@@ -62,6 +63,11 @@ impl PhysicalNode {
     }
     pub(super) fn null(&self, row: PhysicalIndex) -> Result<bool> {
         Ok(match &self.storage {
+            NodeLayout::Scalar(storage) => {
+                if self.field.data_type() == &DataType::Null { true }
+                else if let Some(bits) = &storage.validity { !super::native_scalar::bit(bits.bytes.as_slice(), self.checked_position(row)?)? }
+                else { false }
+            },
             NodeLayout::Leaf { array, .. } if array.data_type() == &DataType::Null => true,
             NodeLayout::Leaf { array, .. } => self.field.is_nullable() && array.is_null(self.checked_position(row)?),
             NodeLayout::Struct { validity, .. } | NodeLayout::List { validity, .. } | NodeLayout::FixedList { validity, .. } => {
@@ -133,6 +139,17 @@ impl PhysicalNode {
 }
 
 pub(super) fn run_end(ends: &PhysicalNode, row: usize) -> Result<usize> {
+    ends.check(row)?;
+    if let NodeLayout::Scalar(storage) = &ends.storage {
+        let data = storage.borrow();
+        let value = match ends.field.data_type() {
+            DataType::Int16 => i64::from(i16::from_le_bytes(data.lane(row)?)),
+            DataType::Int32 => i64::from(i32::from_le_bytes(data.lane(row)?)),
+            DataType::Int64 => i64::from_le_bytes(data.lane(row)?),
+            _ => return Err(layout()),
+        };
+        return usize::try_from(value).map_err(|_| layout());
+    }
     let array = ends.array()?;
     let value = match array.data_type() {
         DataType::Int16 => i64::from(downcast::<arrow_array::Int16Array>(array)?.value(row)),

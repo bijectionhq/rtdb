@@ -1,21 +1,20 @@
-use arrow_array::*;
-use arrow_schema::{IntervalUnit as ArrowIntervalUnit, TimeUnit as ArrowTimeUnit};
+use super::native_scalar::ScalarStorageRef;
 use rtdb_types::{IntervalUnit, ScalarType};
 
 use super::*;
 
 #[derive(Clone, Copy)]
-enum Getter { Boolean, Byte, Short, Int, Long, Float, Double }
+pub(super) enum Getter { Boolean, Byte, Short, Int, Long, Float, Double }
 
 impl Getter {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Boolean => "getBoolean", Self::Byte => "getByte", Self::Short => "getShort", Self::Int => "getInt",
             Self::Long => "getLong", Self::Float => "getFloat", Self::Double => "getDouble",
         }
     }
 
-    fn admits(self, logical: &LogicalType) -> bool {
+    pub(super) fn admits(self, logical: &LogicalType) -> bool {
         let logical = if let LogicalType::Maybe(inner) = logical { inner.as_ref() } else { logical };
         let LogicalType::Scalar(scalar) = logical else { return false; };
         use ScalarType::*;
@@ -36,15 +35,9 @@ impl<'a> CellRef<'a> {
     /// Union, run-end and named-leg readers delegate; other leaf classes reject getBytes without a null check.
     pub fn get_bytes(&self) -> VectorReadResult<&'a [u8]> {
         let cell = self.resolve_primitive()?;
-        let array = cell.node.array().map_err(|_| unsupported("getBytes"))?;
-        if !matches!(array.data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
+        if !matches!(cell.node.field.data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
         let cell = cell.payload()?;
-        match array.data_type() {
-            DataType::Utf8 => Ok(downcast::<StringArray>(array)?.value(cell.row).as_bytes()),
-            DataType::Binary => Ok(downcast::<BinaryArray>(array)?.value(cell.row)),
-            DataType::FixedSizeBinary(_) => Ok(downcast::<FixedSizeBinaryArray>(array)?.value(cell.row)),
-            _ => Err(unsupported("getBytes").into()),
-        }
+        Ok(ScalarStorageRef::node(cell.node)?.bytes(cell.row, cell.node.field.data_type())?)
     }
 
     fn primitive(&self, getter: Getter, checks: NullChecks) -> VectorReadResult<PayloadCell<'a>> {
@@ -59,17 +52,13 @@ impl<'a> CellRef<'a> {
     /// Reads Boolean payload bits after method admission and the requested validity check.
     pub fn get_boolean(&self, checks: NullChecks) -> VectorReadResult<bool> {
         let cell = self.primitive(Getter::Boolean, checks)?;
-        Ok(downcast::<BooleanArray>(cell.node.array()?)?.value(cell.row))
+        Ok(ScalarStorageRef::node(cell.node)?.bit(cell.row)?)
     }
 
     /// Reads signed byte bits from I8/U8 storage; other vector classes reject the method before checking nullness.
     pub fn get_byte(&self, checks: NullChecks) -> VectorReadResult<i8> {
         let cell = self.primitive(Getter::Byte, checks)?;
-        Ok(match cell.node.array()?.data_type() {
-            DataType::Int8 => downcast::<Int8Array>(cell.node.array()?)?.value(cell.row),
-            DataType::UInt8 => downcast::<UInt8Array>(cell.node.array()?)?.value(cell.row) as i8,
-            _ => return Err(layout().into()),
-        })
+        Ok(ScalarStorageRef::node(cell.node)?.lane::<1>(cell.row)?[0] as i8)
     }
 
     /// Reads signed short bits from I16/U16 storage with the requested validity check.
@@ -90,67 +79,42 @@ impl<'a> CellRef<'a> {
     /// DateDay, Time32, OID extensions, intervals and Byte do not expose this getter.
     pub fn get_long(&self, checks: NullChecks) -> VectorReadResult<i64> {
         let cell = self.primitive(Getter::Long, checks)?;
-        let array = cell.node.array()?;
-        let row = cell.row;
-        Ok(match cell.node.array()?.data_type() {
-            DataType::Int16 | DataType::UInt16 | DataType::Int32 | DataType::UInt32 => i64::from(int(&cell)?),
-            DataType::Int64 => downcast::<Int64Array>(array)?.value(row),
-            DataType::UInt64 => downcast::<UInt64Array>(array)?.value(row) as i64,
-            DataType::Date64 => downcast::<Date64Array>(array)?.value(row) / 86_400_000,
-            DataType::Time64(ArrowTimeUnit::Microsecond) => downcast::<Time64MicrosecondArray>(array)?.value(row),
-            DataType::Time64(ArrowTimeUnit::Nanosecond) => downcast::<Time64NanosecondArray>(array)?.value(row),
-            DataType::Timestamp(unit, _) => match unit {
-                ArrowTimeUnit::Second => downcast::<TimestampSecondArray>(array)?.value(row),
-                ArrowTimeUnit::Millisecond => downcast::<TimestampMillisecondArray>(array)?.value(row),
-                ArrowTimeUnit::Microsecond => downcast::<TimestampMicrosecondArray>(array)?.value(row),
-                ArrowTimeUnit::Nanosecond => downcast::<TimestampNanosecondArray>(array)?.value(row),
-            },
-            DataType::Duration(unit) => match unit {
-                ArrowTimeUnit::Second => downcast::<DurationSecondArray>(array)?.value(row),
-                ArrowTimeUnit::Millisecond => downcast::<DurationMillisecondArray>(array)?.value(row),
-                ArrowTimeUnit::Microsecond => downcast::<DurationMicrosecondArray>(array)?.value(row),
-                ArrowTimeUnit::Nanosecond => downcast::<DurationNanosecondArray>(array)?.value(row),
-            },
-            _ => return Err(layout().into()),
-        })
+        Ok(long(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row)?)
     }
 
     /// Reads F32 payload bits with the requested validity check; HALF and Double are not Float getters.
     pub fn get_float(&self, checks: NullChecks) -> VectorReadResult<f32> {
         let cell = self.primitive(Getter::Float, checks)?;
-        Ok(downcast::<Float32Array>(cell.node.array()?)?.value(cell.row))
+        Ok(f32::from_le_bytes(ScalarStorageRef::node(cell.node)?.lane(cell.row)?))
     }
 
     /// Reads F64 or widens F32 after the requested validity check.
     pub fn get_double(&self, checks: NullChecks) -> VectorReadResult<f64> {
         let cell = self.primitive(Getter::Double, checks)?;
-        Ok(match cell.node.array()?.data_type() {
-            DataType::Float32 => f64::from(downcast::<Float32Array>(cell.node.array()?)?.value(cell.row)),
-            DataType::Float64 => downcast::<Float64Array>(cell.node.array()?)?.value(cell.row),
-            _ => return Err(layout().into()),
-        })
+        Ok(double(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row)?)
     }
 }
 
 fn short(cell: &PayloadCell<'_>) -> Result<i16> {
-    Ok(match cell.node.array()?.data_type() {
-        DataType::Int16 => downcast::<Int16Array>(cell.node.array()?)?.value(cell.row),
-        DataType::UInt16 => downcast::<UInt16Array>(cell.node.array()?)?.value(cell.row) as i16,
-        _ => return Err(layout()),
+    Ok(i16::from_le_bytes(ScalarStorageRef::node(cell.node)?.lane(cell.row)?))
+}
+fn int(cell: &PayloadCell<'_>) -> Result<i32> { integer(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row) }
+pub(super) fn integer(data: ScalarStorageRef<'_>, data_type: &DataType, row: usize) -> Result<i32> {
+    Ok(match data_type {
+        DataType::Int16 | DataType::UInt16 => i32::from(i16::from_le_bytes(data.lane(row)?)),
+        _ => i32::from_le_bytes(data.lane(row)?),
     })
 }
-
-fn int(cell: &PayloadCell<'_>) -> Result<i32> {
-    let array = cell.node.array()?;
-    let row = cell.row;
-    Ok(match cell.node.array()?.data_type() {
-        DataType::Int16 | DataType::UInt16 => i32::from(short(cell)?),
-        DataType::Int32 => downcast::<Int32Array>(array)?.value(row),
-        DataType::UInt32 => downcast::<UInt32Array>(array)?.value(row) as i32,
-        DataType::Date32 => downcast::<Date32Array>(array)?.value(row),
-        DataType::Time32(ArrowTimeUnit::Second) => downcast::<Time32SecondArray>(array)?.value(row),
-        DataType::Time32(ArrowTimeUnit::Millisecond) => downcast::<Time32MillisecondArray>(array)?.value(row),
-        DataType::Interval(ArrowIntervalUnit::YearMonth) => downcast::<IntervalYearMonthArray>(array)?.value(row),
-        _ => return Err(layout()),
+pub(super) fn long(data: ScalarStorageRef<'_>, data_type: &DataType, row: usize) -> Result<i64> {
+    Ok(match data_type {
+        DataType::Int16 | DataType::UInt16 | DataType::Int32 | DataType::UInt32 => i64::from(integer(data, data_type, row)?),
+        DataType::Date64 => i64::from_le_bytes(data.lane(row)?) / 86_400_000,
+        _ => i64::from_le_bytes(data.lane(row)?),
+    })
+}
+pub(super) fn double(data: ScalarStorageRef<'_>, data_type: &DataType, row: usize) -> Result<f64> {
+    Ok(match data_type {
+        DataType::Float32 => f64::from(f32::from_le_bytes(data.lane(row)?)),
+        _ => f64::from_le_bytes(data.lane(row)?),
     })
 }

@@ -48,7 +48,8 @@ Both preserve custom child/leg names and declaration order.
 `logical_type()` retains existing execution type normalization; `CellRef::leaf_field()` separately preserves the actual selected union leaf even when that leaf is null.
 
 `from_physical` admits immutable Struct, List/Map, FixedSizeList, DenseUnion and RunEndEncoded containers without requiring a parent Arrow array.
-Their scalar children use the existing validated Arrow opener.
+Scalar children retain either admitted Arrow or immutable native scalar storage.
+Public scalar ingress continues to use the validated Arrow opener.
 Each `RetainedBuffer` owns its buffer allocation reservation; child vectors retain their own owners, and native metadata is reserved before cloning or publishing it.
 Container admission checks declarations, complete direct children, row counts, validity spans and child offsets.
 Native and Arrow run-end admission checks every retained end, including unused runs behind sliced, empty and nested readers.
@@ -72,7 +73,7 @@ At each absent DenseUnion receiver, failure precedes reading that union's offset
 Object reads retain their distinct `no leg for index` diagnostic.
 No implicit conversion chooses an anomaly message for a raw absent receiver.
 Production adapters must still select the actual host conversion route: Kotlin's `toAnomaly` supplies its Fault default, while Clojure's primary constructor preserves a nil message.
-Those adapters and the shared nullable-message carrier are outside this reader increment.
+The nullable anomaly carrier is shared; the physical producer-to-host adapters remain outside this reader increment.
 
 Direct ranges and composed selections preserve source row indices without taking Arrow payload copies.
 `CellRef` borrows a selected position; `OwnedCell` retains its buffer, metadata and normalized index owners.
@@ -110,6 +111,59 @@ Raw access does not mask a child's payload with its parent's null bit and does n
 `tests/execution_cells.rs` covers primitive null payloads, unsigned interpretation, getter admission, nonnullable validity, union leaf identity, composed selections, run-end slices and end-domain admission, nested retention, DateMilli units and allocation failure release.
 `tests/physical_layout.rs` adds native absent-leg containers, raw primitive failure routing, delayed inactive-offset admission, named-reader selection exceptions, canonical declarations, direct numeric/byte methods, shorter logical run lengths, malformed layout rejection and retained-owner failure cases.
 These are unexecuted source regressions.
-Query frames, parameters, spill transport, expression consumers and writeNull/setNull/raw-copy builders still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
-Raw copy/write builders, physical page transport, hash/metadata factories and production consumers remain separate work.
+Query frames, parameters, spill transport and expression consumers still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
+Container writers, physical page transport, hash/metadata factories and production consumers remain separate work.
 Full object readers require tagged custom union legs, null-field omission, collection equality and registered extension decoding; `object()` remains the logical `Value` materializer and canonicalizes its timestamp zone only.
+
+
+== Private scalar write and copy foundation
+
+The crate-private `ScalarWriter` is a single-writer transient whose completed native storage is consumed into an `ExecutionVector`.
+It supports Null, Boolean, fixed-width and variable-width storage, including the concrete primitive and byte methods admitted by scalar extension wrappers.
+It does not publish mutable buffers or construct an unchecked Arrow array.
+`ScalarReader` borrows the transient for primitive and byte reads; Rust borrowing excludes mutation while that reader is used.
+The immutable reader and the transient reader share borrowed scalar storage kernels with SDK ingress.
+Logical row admission remains separate from initialized byte-span admission.
+A native buffer owns and charges its explicitly initialized extent, including zeroed growth from the source's minimum-128/doubling schedule.
+SDK reads remain confined to their retained buffer slices.
+
+Logical row count, byte/bit append positions and initialized extent are retained separately.
+`ensure_capacity` and setters can create logical rows without advancing append positions.
+Fixed setters widen their index before applying the setter stride.
+Capacity requests, primitive getter strides, pointer spans, fixed copier products and variable offset reads preserve the source's wrapping i32 arithmetic.
+Decimal object/coefficient reads retain Arrow Java DecimalUtility's wide index multiplication.
+Every resulting span is still checked against retained initialized bytes.
+`set_null` extends count where required and changes existing validity without promoting a nonnullable vector or clearing its payload.
+`write_null` promotes nullability and then writes an undefined cell.
+`clear` zeroes the complete retained allocations, resets count and append positions, and preserves established nullability and capacity charges.
+DateMilli appends multiply epoch days with JVM wrapping; inherited Long setters and raw copies retain milliseconds.
+Fixed byte writes retain their actual input length, and FixedSizeBinary LongLong methods retain their independent 16-byte stride.
+A source-produced row with too few retained bytes for a particular getter remains safely representable; that getter returns a checked bounds failure.
+`finish` does not truncate setter-created rows or add missing payload bytes.
+
+`ScalarCopier` borrows one admitted scalar source view and a mutable destination.
+Its outer type check and class-specific storage factory preserve their separate admission and nullability-promotion order.
+The Null-source override belongs to outer dispatch; a direct storage factory still applies the destination's class or extension requirement.
+It implements row, selected-row and range schedules separately.
+Variable row and range preflight read the ending offset before the starting offset; selected-row preflight and payload copying read the starting offset first.
+Indirect bulk copies reserve and translate their indices before mutating destination storage.
+Fixed and variable copies preserve raw validity and payload, including nonzero payload under null bits.
+Variable row copying appends validity ones for nonnullable sources and selected validity bits for nullable sources, retaining their distinct byte cursors.
+Boolean copying uses the source null guard and writes a cleared null payload.
+A Null source writes destination nulls without reading a source payload.
+Variable ranges with nonpositive length return without touching buffers after factory admission; indirect ranges retain their selection translation contract.
+This is an internal scalar kernel, not a universal recursive copier or a resource-only transport format.
+
+`WriteError::Reference` retains unsupported-method, invalid-copy-source, concrete class-check, extension-requirement and determinate reference bounds failures without choosing a host exception adapter.
+`CheckFailed` and `RequireFailed` preserve Kotlin's distinct IllegalStateException and IllegalArgumentException producers; neither matches the promotion-caught `InvalidCopySource`.
+Those failures preserve completed mutations and leave the writer usable for a subsequent operation or promotion.
+A native budget, arithmetic or retained-storage admission failure before mutation also leaves the writer usable.
+A native admission failure after mutation marks the private writer `NativeAborted`; further writes and publication fail until `clear` resets it.
+Safe borrowed reads remain possible, and dropping either state releases every retained lease.
+There is no rollback or unconditional failure latch for reference semantic errors.
+The existing raw absent-primitive read failure still requires an explicit Kotlin or Clojure adapter at a future production boundary.
+
+`cells/write/tests.rs` records scalar method admission, signed setter behavior, mutation prefixes, recovery, copying, initialized spans, SDK/native reads, malformed UTF-8, exact floating/decimal bits, DateMilli units and reservation retention.
+The source has not been compiled or executed under the Phase 1 gate.
+No production expression/query/format consumer or process null-check setting is switched by this foundation.
+Full-object writers/readers, container promotion, relation writers, physical transport and production adoption remain required follow-on work.

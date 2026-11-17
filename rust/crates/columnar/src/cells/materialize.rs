@@ -24,6 +24,7 @@ fn bound(node: &PhysicalNode, row: PhysicalIndex) -> Result<usize> {
     if node.null(row)? { return Ok(bytes); }
     if let NodeLayout::Leaf { array, .. } = &node.storage { return crate::estimate_read_value_bytes(&node.ingress, array.as_ref(), node.checked_position(row)?); }
     match &node.storage {
+        NodeLayout::Scalar(_) => return super::native_scalar::value_bound(node, node.checked_position(row)?),
         NodeLayout::Struct { children, .. } => {
             for child in children {
                 bytes = add(bytes, add(1024, mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?)?)?;
@@ -53,6 +54,7 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
         return Ok(value);
     }
     match &node.storage {
+        NodeLayout::Scalar(_) => super::native_scalar::value(node, node.checked_position(row)?),
         NodeLayout::Struct { children, .. } => {
             let mut fields = BTreeMap::new();
             for child in children {

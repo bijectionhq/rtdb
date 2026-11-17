@@ -162,16 +162,20 @@ pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayou
             storage::check_runs(ends, values, length)?;
             DataType::RunEndEncoded(Arc::clone(&ends.field), Arc::clone(&values.field))
         }
-        (NodeLayout::Leaf { .. }, data_type) => match data_type {
-            DataType::UInt8 => DataType::Int8, DataType::UInt16 => DataType::Int16,
-            DataType::UInt32 => DataType::Int32, DataType::UInt64 => DataType::Int64,
-            DataType::Timestamp(unit, Some(zone)) => DataType::Timestamp(*unit, Some(rtdb_types::ZoneId::parse(zone)?.to_string().into())),
-            other => other.clone(),
-        },
+        (NodeLayout::Leaf { .. } | NodeLayout::Scalar(_), data_type) => scalar_data_type(data_type)?,
         _ => return Err(layout()),
     };
     let nullable = if matches!(&storage, NodeLayout::Union { .. } | NodeLayout::RunEnd { .. }) { false } else { ingress.is_nullable() };
     let field = Arc::new(ingress.as_ref().clone().with_data_type(data_type).with_nullable(nullable));
     let logical = crate::execution_field_type(&field)?;
     Ok(Arc::new(PhysicalNode { ingress, field, logical, length, storage, owner }))
+}
+
+pub(super) fn scalar_data_type(data_type: &DataType) -> Result<DataType> {
+    Ok(match data_type {
+        DataType::UInt8 => DataType::Int8, DataType::UInt16 => DataType::Int16,
+        DataType::UInt32 => DataType::Int32, DataType::UInt64 => DataType::Int64,
+        DataType::Timestamp(unit, Some(zone)) => DataType::Timestamp(*unit, Some(rtdb_types::ZoneId::parse(zone)?.to_string().into())),
+        other => other.clone(),
+    })
 }
