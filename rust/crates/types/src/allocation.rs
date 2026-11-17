@@ -1,15 +1,14 @@
 use std::sync::{Arc, Mutex};
-use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_types::{Anomaly, Result};
+use crate::{Anomaly, MemoryBudget, MemoryReservation, Result};
 
-/// Call-owned reservations for expression intermediates and returned values.
+/// Call-owned reservations for intermediates and returned values.
 /// Keep the scope alive until returned values have been dropped or transferred to another charged owner.
-pub struct EvaluationScope {
+pub struct AllocationScope {
     memory: Arc<MemoryBudget>,
     reservations: Mutex<Vec<Arc<MemoryReservation>>>,
 }
 
-impl EvaluationScope {
+impl AllocationScope {
     /// Acquires the scope's bookkeeping reservation from the supplied finite budget.
     pub fn new(memory: &Arc<MemoryBudget>) -> Result<Self> {
         let initial = memory.reserve(4096)?;

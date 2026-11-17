@@ -71,4 +71,8 @@ Child scopes charge the same ancestor limits while retaining their own counters.
 A `MemoryReservation` keeps its budget chain alive until the final shared lease drops.
 Exclusive `shrink_to` releases excess bytes from that chain without lowering peaks; attempts to grow the lease fail before changing counters.
 Columnar allocation owners re-export these same types and retain their leases through Arrow slices and clones.
+`AllocationScope` retains caller-owned intermediate and result charges until the scope is dropped.
+The scope must outlive every allocation it admits, unless another charged owner takes over that allocation.
+Calls may share one scope across threads; each reservation includes bookkeeping and charges the same finite budget chain.
+Expression callers use the same concrete type through the `EvaluationScope` reexport.
 Frontend planning admission still requires reservations before parsing and catalog-dependent binding; shared budget availability alone does not provide those reservations.
