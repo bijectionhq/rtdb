@@ -463,3 +463,431 @@ fn the_retained_region_moves_and_outlives_its_constructor_budget_handles() {
     drop(storage);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+use super::super::{ConfigChange, ConfigKey, ContextKey, Semantic, SetMode};
+
+fn joint_config<'cfg, 'id, 'g, 'scope>(configs: &mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, contexts: &PredictionContexts<'id, 'g, 'scope, Retained>, context: ContextKey<'id>, alternative: usize) -> Result<ConfigKey<'cfg>> {
+    let alternative = configs.alternative(contexts.grammar().decision(65)?, alternative)?;
+    configs.create(contexts.grammar().state(352)?, alternative, context, Semantic::Unpredicated)
+}
+
+#[test]
+fn retained_sets_keep_shared_config_identities_and_current_contexts_across_accesses() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, grammar_memory) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let (a, b, detached_set, first, detached, original_context) = with_prediction_storage(&mut storage, &work, |access| {
+        let (a, b, c, first, detached, one) = {
+            let (configs, contexts) = access.parts();
+            let one = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+            let first = joint_config(configs, contexts, one, 1)?;
+            let detached = configs.copy(first, ConfigChange::Same)?;
+            let a = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(a, first, contexts)?;
+            let b = configs.copy_set(a, contexts)?;
+            let c = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(c, detached, contexts)?;
+            (a, b, c, first.identity(), detached.identity(), one.identity())
+        };
+        access.fixture_state(0, Some((a, b)))?;
+        access.fixture_state(1, Some((c, c)))?;
+        Ok((a.identity(), b.identity(), c.identity(), first, detached, one))
+    }).unwrap();
+    drop(work);
+    assert_eq!(work_memory.used_bytes(), 0);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let merged = with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let a = configs.restore_set(a)?;
+        let b = configs.restore_set(b)?;
+        let c = configs.restore_set(detached_set)?;
+        let first = configs.restore_config(first)?;
+        let detached = configs.restore_config(detached)?;
+        assert_eq!(configs.view_set(a).entry(0), Some(first));
+        assert_eq!(configs.view_set(b).entry(0), Some(first));
+        assert_eq!(configs.view_set(c).entry(0), Some(detached));
+        let two = contexts.singleton(contexts.empty(), contexts.grammar().state(2)?)?;
+        let incoming = joint_config(configs, contexts, two, 1)?;
+        configs.increment_outer(incoming)?;
+        configs.set_suppressed(incoming, true)?;
+        configs.add_uncached(b, incoming, contexts)?;
+        let current = configs.view(first).context();
+        assert_eq!(contexts.view(current).len(), 2);
+        assert_eq!(configs.view(first).outer_depth(), 1);
+        assert!(configs.view(first).suppressed());
+        assert_eq!(configs.view(detached).context().identity(), original_context);
+        assert_eq!(configs.view(detached).packed_outer(), 0);
+        Ok(current.identity())
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (2, 3, 0));
+    assert_eq!(storage.contexts.live(), 2);
+    drop(work);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let first = configs.restore_config(first)?;
+        assert_eq!(configs.view(first).context().identity(), merged);
+        assert_eq!(contexts.view(configs.view(first).context()).len(), 2);
+        Ok(())
+    }).unwrap();
+    drop(storage);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(grammar_memory.used_bytes(), 0);
+}
+
+#[test]
+fn readonly_hash_and_conflict_identity_survive_later_shared_alias_updates() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, _) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let (a, b, old_hash, first_conflict, second_conflict) = with_prediction_storage(&mut storage, &work, |access| {
+        let (a, b, hash, first_conflict, second_conflict) = {
+            let (configs, contexts) = access.parts();
+            let one = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+            let key = joint_config(configs, contexts, one, 1)?;
+            let a = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(a, key, contexts)?;
+            let mut bits = super::super::AlternativeSet::default();
+            bits.insert(configs.view(key).alternative());
+            let first_conflict = configs.publish_conflict(bits)?;
+            configs.set_conflicting(a, Some(first_conflict))?;
+            configs.mark_readonly(a)?;
+            let hash = configs.set_hash(a, contexts)?;
+            assert_ne!(hash, -1);
+            let b = configs.copy_set(a, contexts)?;
+            let second_conflict = configs.publish_conflict(bits)?;
+            configs.set_conflicting(b, Some(second_conflict))?;
+            (a, b, hash, first_conflict.identity(), second_conflict.identity())
+        };
+        access.fixture_state(0, Some((a, b)))?;
+        Ok((a.identity(), b.identity(), hash, first_conflict, second_conflict))
+    }).unwrap();
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let a = configs.restore_set(a)?;
+        let b = configs.restore_set(b)?;
+        let two = contexts.singleton(contexts.empty(), contexts.grammar().state(2)?)?;
+        let incoming = joint_config(configs, contexts, two, 1)?;
+        configs.add_uncached(b, incoming, contexts)?;
+        assert_eq!(configs.set_hash(a, contexts)?, old_hash);
+        assert_ne!(configs.set_hash(b, contexts)?, old_hash);
+        let first = configs.restore_conflict(first_conflict)?;
+        let second = configs.restore_conflict(second_conflict)?;
+        assert_ne!(first, second);
+        assert_eq!(configs.conflict(first), configs.conflict(second));
+        assert_eq!(configs.view_set(a).conflicting(), Some(first));
+        configs.clear(b)?;
+        assert_eq!(configs.view_set(b).len(), 0);
+        assert_eq!(configs.view_set(b).conflicting(), Some(second));
+        Ok(())
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (1, 2, 2));
+    assert_eq!(storage.contexts.live(), 1);
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let a = configs.restore_set(a)?;
+        assert_eq!(configs.set_hash(a, contexts)?, old_hash);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn rooted_building_membership_retains_a_config_published_before_failed_ordered_append() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, _) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let (set, member, context) = with_prediction_storage(&mut storage, &work, |access| {
+        let (set, member, context) = {
+            let (configs, contexts) = access.parts();
+            let first = joint_config(configs, contexts, contexts.empty(), 1)?;
+            let set = configs.new_set(SetMode::Full)?;
+            for _ in 0..7 { configs.add_uncached(set, first, contexts)?; }
+            let mut context = contexts.empty();
+            for _ in 0..64 { context = contexts.singleton(context, contexts.grammar().state(2)?)?; }
+            let member = joint_config(configs, contexts, context, 2)?;
+            configs.increment_outer(member)?;
+            (set, member, context)
+        };
+        access.fixture_state(0, Some((set, set)))?;
+        {
+            let (configs, contexts) = access.parts();
+            let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+            admission(configs.add_uncached(set, member, contexts));
+            assert_eq!(configs.view_set(set).len(), 7);
+            assert!(configs.view_set(set).dips_outer());
+            drop(blocker);
+            assert!(matches!(configs.clear(set), Err(PredictionError::Aborted)));
+        }
+        Ok((set.identity(), member.identity(), context.identity()))
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (2, 1, 0));
+    assert_eq!(storage.contexts.live(), 64);
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let set = configs.restore_set(set)?;
+        let member = configs.restore_config(member)?;
+        assert_eq!(configs.view(member).context().identity(), context);
+        let equal = configs.copy(member, ConfigChange::Same)?;
+        configs.add_uncached(set, equal, contexts)?;
+        assert_eq!(configs.view_set(set).len(), 7);
+        configs.add_uncached(set, member, contexts)?;
+        assert_eq!(configs.view_set(set).len(), 8);
+        assert_eq!(configs.view_set(set).entry(7), Some(member));
+        Ok(())
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (2, 1, 0));
+}
+
+#[test]
+fn context_only_access_and_full_budget_cleanup_follow_actual_config_roots() {
+    let memory = MemoryBudget::new(64 << 20);
+    let (mut storage, grammar_memory) = storage(&memory);
+    let work_memory = MemoryBudget::new(1 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let blocker = with_prediction_storage(&mut storage, &work, |access| {
+        let set = {
+            let (configs, contexts) = access.parts();
+            let mut context = contexts.empty();
+            for _ in 0..20_000 { context = contexts.singleton(context, contexts.grammar().state(1)?)?; }
+            let config = joint_config(configs, contexts, context, 1)?;
+            let set = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(set, config, contexts)?;
+            set
+        };
+        access.fixture_state(0, Some((set, set)))?;
+        Ok(memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap())
+    }).unwrap();
+    assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    assert_eq!(storage.configs.live(), (1, 1, 0));
+    assert_eq!(storage.contexts.live(), 20_000);
+    drop(work);
+    assert_eq!(work_memory.used_bytes(), 0);
+    let context_work_memory = MemoryBudget::new(4096);
+    let context_work = AllocationScope::new(&context_work_memory).unwrap();
+    storage.with_contexts(&context_work, |contexts| {
+        assert!(contexts.view(contexts.empty()).is_empty());
+        Ok(())
+    }).unwrap();
+    assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    assert_eq!(storage.configs.live(), (1, 1, 0));
+    assert_eq!(storage.contexts.live(), 20_000);
+    drop(blocker);
+    with_prediction_storage(&mut storage, &context_work, |access| access.fixture_state(0, None)).unwrap();
+    assert_eq!(storage.configs.live(), (0, 0, 0));
+    assert_eq!(storage.contexts.live(), 0);
+    drop(storage);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(grammar_memory.used_bytes(), 0);
+}
+
+#[test]
+fn fixture_map_keys_and_values_retain_independent_sets_until_actual_replacement() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, _) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let (a, b, c) = with_prediction_storage(&mut storage, &work, |access| {
+        let (a, b, c) = {
+            let (configs, contexts) = access.parts();
+            let mut sets = [None; 3];
+            for state in 1..=3 {
+                let context = contexts.singleton(contexts.empty(), contexts.grammar().state(state)?)?;
+                let config = joint_config(configs, contexts, context, 1)?;
+                let set = configs.new_set(SetMode::Full)?;
+                configs.add_uncached(set, config, contexts)?;
+                sets[(state - 1) as usize] = Some(set);
+            }
+            (sets[0].unwrap(), sets[1].unwrap(), sets[2].unwrap())
+        };
+        access.fixture_state(0, Some((a, b)))?;
+        access.fixture_state(1, Some((c, a)))?;
+        Ok((a.identity(), b.identity(), c.identity()))
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (3, 3, 0));
+    with_prediction_storage(&mut storage, &work, |access| {
+        let b = { let (configs, _) = access.parts(); configs.restore_set(b)? };
+        access.fixture_state(0, Some((b, b)))?;
+        access.fixture_state(1, None)
+    }).unwrap();
+    assert_eq!(storage.configs.live(), (1, 1, 0));
+    assert_eq!(storage.contexts.live(), 1);
+    for stale in [a, c] {
+        with_prediction_storage(&mut storage, &work, |access| {
+            let (configs, _) = access.parts();
+            let kept = configs.restore_set(b)?;
+            assert_eq!(configs.view_set(kept).len(), 1);
+            assert!(matches!(configs.restore_set(stale), Err(PredictionError::Artifact(Problem::Context))));
+            Ok(())
+        }).unwrap();
+    }
+}
+
+#[test]
+fn joint_errors_and_unwinding_collect_unrooted_state_and_keep_completed_roots() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, _) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let root = with_prediction_storage(&mut storage, &work, |access| {
+        let set = {
+            let (configs, contexts) = access.parts();
+            let config = joint_config(configs, contexts, contexts.empty(), 1)?;
+            let set = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(set, config, contexts)?;
+            set
+        };
+        access.fixture_state(0, Some((set, set)))?;
+        Ok(set.identity())
+    }).unwrap();
+    let result: Result<()> = with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let context = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+        let config = joint_config(configs, contexts, context, 2)?;
+        let set = configs.new_set(SetMode::Full)?;
+        configs.add_uncached(set, config, contexts)?;
+        Err(PredictionError::Artifact(Problem::Context))
+    });
+    assert!(matches!(result, Err(PredictionError::Artifact(Problem::Context))));
+    assert_eq!(storage.configs.live(), (1, 1, 0));
+    assert_eq!(storage.contexts.live(), 0);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        with_prediction_storage(&mut storage, &work, |access| -> Result<()> {
+            let (configs, contexts) = access.parts();
+            let context = contexts.singleton(contexts.empty(), contexts.grammar().state(2)?)?;
+            let config = joint_config(configs, contexts, context, 3)?;
+            let set = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(set, config, contexts)?;
+            panic!("caller unwinds joint access");
+        })
+    }));
+    assert!(result.is_err());
+    assert_eq!(storage.configs.live(), (1, 1, 0));
+    assert_eq!(storage.contexts.live(), 0);
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, _) = access.parts();
+        let root = configs.restore_set(root)?;
+        assert_eq!(configs.view_set(root).len(), 1);
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn completed_optimization_updates_survive_a_later_failed_access() {
+    let memory = MemoryBudget::new(4 << 20);
+    let (mut storage, _) = storage(&memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let (set, first, second, canonical, old_equal, deep) = with_prediction_storage(&mut storage, &work, |access| {
+        let (set, first, second, canonical, equal, deep) = {
+            let (configs, contexts) = access.parts();
+            let canonical = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+            contexts.canonicalize(canonical)?;
+            let equal = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+            let mut deep = contexts.empty();
+            for _ in 0..64 { deep = contexts.singleton(deep, contexts.grammar().state(2)?)?; }
+            let first = joint_config(configs, contexts, equal, 1)?;
+            let second = joint_config(configs, contexts, deep, 2)?;
+            let set = configs.new_set(SetMode::Full)?;
+            configs.add_uncached(set, first, contexts)?;
+            configs.add_uncached(set, second, contexts)?;
+            (set, first.identity(), second.identity(), canonical.identity(), equal.identity(), deep.identity())
+        };
+        access.fixture_state(0, Some((set, set)))?;
+        Ok((set.identity(), first, second, canonical, equal, deep))
+    }).unwrap();
+    drop(work);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let canonical_key = contexts.restore(canonical)?;
+        contexts.canonicalize(canonical_key)?;
+        let set = configs.restore_set(set)?;
+        let blocker = work_memory.reserve(work_memory.limit_bytes() - work_memory.used_bytes()).unwrap();
+        let first = configs.restore_config(first)?;
+        let second = configs.restore_config(second)?;
+        admission(configs.optimize(set, contexts));
+        assert_eq!(configs.view(first).context().identity(), canonical);
+        assert_eq!(configs.view(second).context().identity(), deep);
+        drop(blocker);
+        Ok(())
+    }).unwrap();
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let first = configs.restore_config(first)?;
+        let second = configs.restore_config(second)?;
+        assert_eq!(configs.view(first).context().identity(), canonical);
+        assert_eq!(configs.view(second).context().identity(), deep);
+        assert!(matches!(contexts.restore(old_equal), Err(PredictionError::Artifact(Problem::Context))));
+        Ok(())
+    }).unwrap();
+}
+
+#[test]
+fn empty_joint_access_returns_only_independent_facts_without_allocating_stores() {
+    let memory = MemoryBudget::new(0);
+    let (mut storage, grammar_memory) = storage(&memory);
+    let work_memory = MemoryBudget::new(4096);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let facts = with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let alternative = configs.alternative(contexts.grammar().decision(65)?, 1)?;
+        Ok((alternative.number(), contexts.view(contexts.empty()).shape()))
+    }).unwrap();
+    assert_eq!(facts, (1, ContextShape::Empty));
+    assert_eq!(storage.configs.live(), (0, 0, 0));
+    assert_eq!(storage.contexts.live(), 0);
+    assert_eq!(memory.used_bytes(), 0);
+    assert!(std::mem::needs_drop::<Configurations<'_, '_, '_, '_, Retained>>());
+    assert!(std::mem::needs_drop::<PredictionAccess<'_, '_, '_, '_>>());
+    drop(work);
+    assert_eq!(work_memory.used_bytes(), 0);
+    drop(storage);
+    assert_eq!(grammar_memory.used_bytes(), 0);
+}
+
+#[test]
+fn joint_region_moves_and_keeps_config_leases_after_creator_budget_handles_drop() {
+    let memory = MemoryBudget::new(16 << 20);
+    let (mut storage, root) = {
+        let grammar_memory = memory.scope();
+        let retained_memory = memory.scope();
+        let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+        let mut storage = PredictionStorage::new(grammar, &retained_memory);
+        let work_memory = MemoryBudget::new(1 << 20);
+        let work = AllocationScope::new(&work_memory).unwrap();
+        let root = with_prediction_storage(&mut storage, &work, |access| {
+            let set = {
+                let (configs, contexts) = access.parts();
+                let context = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+                let config = joint_config(configs, contexts, context, 1)?;
+                let set = configs.new_set(SetMode::Full)?;
+                configs.add_uncached(set, config, contexts)?;
+                set
+            };
+            access.fixture_state(0, Some((set, set)))?;
+            Ok(set.identity())
+        }).unwrap();
+        (storage, root)
+    };
+    let retained = memory.used_bytes();
+    assert!(retained > 0);
+    let work_memory = MemoryBudget::new(1 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        let root = configs.restore_set(root)?;
+        let config = configs.view_set(root).entry(0).unwrap();
+        assert_eq!(contexts.view(configs.view(config).context()).follow(0)?.unwrap().number(), 1);
+        configs.increment_outer(config)?;
+        assert_eq!(configs.view(config).outer_depth(), 1);
+        Ok(())
+    }).unwrap();
+    assert_eq!(memory.used_bytes(), retained);
+    drop(work);
+    assert_eq!(work_memory.used_bytes(), 0);
+    drop(storage);
+    assert_eq!(memory.used_bytes(), 0);
+}

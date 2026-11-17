@@ -1,6 +1,7 @@
 use rtdb_types::AllocationScope;
 use super::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, Configurations, ContextKey, PredictionContexts, PredictionError, Problem, Result, Semantic, SetMode, reserve, vector};
 use super::context::{finish_hash, update_hash};
+use super::storage::StoreMemory;
 #[cfg(test)]
 #[path = "mode_tests.rs"]
 mod tests;
@@ -98,17 +99,17 @@ impl<'cfg, 'id, 'scope> ModeWorkspace<'cfg, 'id, 'scope> {
         Self { allocation, groups: Vec::new(), groups_by_hash: Index::new(), states: Vec::new(), states_by_number: Index::new(), aborted: false }
     }
     fn ready(&self) -> Result<()> { if self.aborted { Err(PredictionError::Aborted) } else { Ok(()) } }
-    fn finish<T>(&mut self, configs: &mut Configurations<'cfg, 'id, '_, 'scope>, result: Result<T>) -> Result<T> {
+    fn finish<T, M: StoreMemory>(&mut self, configs: &mut Configurations<'cfg, 'id, '_, 'scope, M>, result: Result<T>) -> Result<T> {
         if result.is_err() { self.aborted = true; }
         configs.finish(result)
     }
-    fn enter<'g>(&mut self, configs: &mut Configurations<'cfg, 'id, 'g, 'scope>, contexts: &mut PredictionContexts<'id, 'g, 'scope>) -> Result<()> {
+    fn enter<'g, M: StoreMemory>(&mut self, configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<()> {
         let result = self.ready().and_then(|()| configs.ready()).and_then(|()| contexts.ready());
         let result = contexts.finish(result);
         self.finish(configs, result)
     }
-    pub(crate) fn conflicting_subsets<'g>(
-        &mut self, configs: &mut Configurations<'cfg, 'id, 'g, 'scope>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope>,
+    pub(crate) fn conflicting_subsets<'g, M: StoreMemory>(
+        &mut self, configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>,
     ) -> Result<SubsetsView<'_, 'cfg, 'id>> {
         self.enter(configs, contexts)?;
         let result = self.build_groups(configs, set, contexts);
@@ -116,7 +117,7 @@ impl<'cfg, 'id, 'scope> ModeWorkspace<'cfg, 'id, 'scope> {
         self.finish(configs, result)?;
         Ok(SubsetsView { groups: &self.groups })
     }
-    fn build_groups<'g>(&mut self, configs: &Configurations<'cfg, 'id, 'g, 'scope>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope>) -> Result<()> {
+    fn build_groups<'g, M: StoreMemory>(&mut self, configs: &Configurations<'cfg, 'id, 'g, 'scope, M>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<()> {
         self.groups.clear(); self.groups_by_hash.clear();
         let set = configs.view_set(set);
         for index in 0..set.len() {
@@ -152,13 +153,13 @@ impl<'cfg, 'id, 'scope> ModeWorkspace<'cfg, 'id, 'scope> {
         }
         Ok(())
     }
-    pub(crate) fn has_state_with_one_alt(&mut self, configs: &mut Configurations<'cfg, 'id, '_, 'scope>, set: ConfigSetKey<'cfg>) -> Result<bool> {
+    pub(crate) fn has_state_with_one_alt<M: StoreMemory>(&mut self, configs: &mut Configurations<'cfg, 'id, '_, 'scope, M>, set: ConfigSetKey<'cfg>) -> Result<bool> {
         let result = self.ready().and_then(|()| configs.ready());
         self.finish(configs, result)?;
         let result = self.state_one_alt(configs, set);
         self.finish(configs, result)
     }
-    fn state_one_alt(&mut self, configs: &Configurations<'cfg, 'id, '_, 'scope>, set: ConfigSetKey<'cfg>) -> Result<bool> {
+    fn state_one_alt<M: StoreMemory>(&mut self, configs: &Configurations<'cfg, 'id, '_, 'scope, M>, set: ConfigSetKey<'cfg>) -> Result<bool> {
         self.states.clear(); self.states_by_number.clear();
         let set = configs.view_set(set);
         for index in 0..set.len() {
@@ -177,8 +178,8 @@ impl<'cfg, 'id, 'scope> ModeWorkspace<'cfg, 'id, 'scope> {
         }
         Ok(self.states.iter().any(|state| state.alternatives.count() == 1))
     }
-    pub(crate) fn has_sll_conflict<'g>(
-        &mut self, mode: PredictionMode, configs: &mut Configurations<'cfg, 'id, 'g, 'scope>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope>,
+    pub(crate) fn has_sll_conflict<'g, M: StoreMemory>(
+        &mut self, mode: PredictionMode, configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, set: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>,
     ) -> Result<bool> {
         self.enter(configs, contexts)?;
         let result = (|| {

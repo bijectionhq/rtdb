@@ -3,6 +3,9 @@ use rtdb_types::{AllocationScope, MemoryBudget, MemoryReservation};
 use crate::parser::grammar::OwnedGrammar;
 use super::{PredictionContexts, PredictionError, Result, capacity_error};
 use super::context::ContextStore;
+use super::config::{Configurations, ConfigurationStore};
+#[cfg(test)]
+use super::config::{ConfigSetKey, SetId};
 
 #[cfg(test)]
 #[path = "storage_tests.rs"]
@@ -57,6 +60,13 @@ impl<T, M: StoreMemory> Block<T, M> {
             Self::Allocated { values, .. } if values.len() < values.capacity() => values.push(value),
             _ => panic!("prediction block capacity was admitted before append"),
         }
+    }
+    pub(super) fn clear(&mut self) { if let Self::Allocated { values, .. } = self { values.clear(); } }
+    pub(super) fn reserve(&mut self, additional: usize, memory: &M) -> Result<()> {
+        let required = self.len().checked_add(additional).ok_or_else(capacity_error)?;
+        if required <= self.capacity() { return Ok(()); }
+        let capacity = required.max(self.capacity().checked_mul(2).ok_or_else(capacity_error)?).max(16);
+        self.grow(memory, capacity)
     }
     pub(super) fn grow(&mut self, memory: &M, capacity: usize) -> Result<()> {
         let mut replacement = Self::with_capacity(memory, capacity)?;
@@ -122,6 +132,19 @@ impl<T, M: StoreMemory> Pool<T, M> {
             _ => None,
         }
     }
+    pub(super) fn get_mut(&mut self, id: SlotId) -> Option<&mut T> {
+        match self.slots.get_mut(id.index)? {
+            Slot::Occupied { generation, value, .. } if *generation == id.generation => Some(value),
+            _ => None,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_generation(&mut self, id: SlotId, next: u64) -> SlotId {
+        let Slot::Occupied { generation, .. } = &mut self.slots[id.index] else { panic!("occupied fixture slot") };
+        assert_eq!(*generation, id.generation);
+        *generation = next;
+        SlotId { index: id.index, generation: next }
+    }
     pub(super) fn mark(&mut self, id: SlotId) {
         match &mut self.slots[id.index] {
             Slot::Occupied { generation, trace, .. } if *generation == id.generation => {
@@ -175,12 +198,15 @@ impl<T> DerefMut for StoreRef<'_, T> {
 }
 
 pub(crate) struct PredictionStorage {
+    configs: ConfigurationStore<Retained>,
     contexts: ContextStore<Retained>,
     grammar: OwnedGrammar,
+    #[cfg(test)]
+    roots: FixtureRoots,
 }
 impl PredictionStorage {
     pub(crate) fn new(grammar: OwnedGrammar, memory: &Arc<MemoryBudget>) -> Self {
-        Self { contexts: ContextStore::new(Retained::new(memory)), grammar }
+        Self { configs: ConfigurationStore::new(Retained::new(memory)), contexts: ContextStore::new(Retained::new(memory)), grammar, #[cfg(test)] roots: FixtureRoots::new() }
     }
     pub(crate) fn with_contexts<R>(
         &mut self, work: &AllocationScope,
@@ -194,5 +220,55 @@ impl PredictionStorage {
 }
 struct BorrowSession<'owner> { owner: &'owner mut PredictionStorage }
 impl Drop for BorrowSession<'_> {
-    fn drop(&mut self) { self.owner.contexts.collect(); }
+    fn drop(&mut self) {
+        #[cfg(test)]
+        self.owner.roots.mark(&mut self.owner.configs);
+        self.owner.configs.collect(&mut self.owner.contexts);
+        self.owner.contexts.collect();
+    }
+}
+
+pub(crate) struct PredictionAccess<'cfg, 'id, 'g, 'scope> {
+    configs: Configurations<'cfg, 'id, 'g, 'scope, Retained>,
+    contexts: PredictionContexts<'id, 'g, 'scope, Retained>,
+    #[cfg(test)]
+    roots: &'g mut FixtureRoots,
+}
+impl<'cfg, 'id, 'g, 'scope> PredictionAccess<'cfg, 'id, 'g, 'scope> {
+    pub(crate) fn parts(&mut self) -> (&mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
+        (&mut self.configs, &mut self.contexts)
+    }
+    #[cfg(test)]
+    pub(super) fn fixture_state(&mut self, index: usize, pair: Option<(ConfigSetKey<'cfg>, ConfigSetKey<'cfg>)>) -> Result<()> {
+        self.configs.ready()?;
+        let pair = pair.map(|(key, value)| -> Result<(SetId, SetId)> {
+            self.configs.bind_set(key.identity())?;
+            self.configs.bind_set(value.identity())?;
+            Ok((key.identity(), value.identity()))
+        }).transpose()?;
+        self.roots.states[index] = pair;
+        Ok(())
+    }
+}
+
+pub(crate) fn with_prediction_storage<R>(
+    storage: &mut PredictionStorage, work: &AllocationScope,
+    use_store: impl for<'id, 'cfg, 'access> FnOnce(&mut PredictionAccess<'cfg, 'id, 'access, 'access>) -> Result<R>,
+) -> Result<R> {
+    let session = BorrowSession { owner: storage };
+    let grammar = session.owner.grammar.view();
+    let contexts = PredictionContexts::borrowed(&grammar, work, &mut session.owner.contexts);
+    let configs = Configurations::borrowed(&grammar, work, &mut session.owner.configs);
+    let mut access = PredictionAccess { configs, contexts, #[cfg(test)] roots: &mut session.owner.roots };
+    use_store(&mut access)
+}
+
+#[cfg(test)]
+struct FixtureRoots { states: [Option<(SetId, SetId)>; 2] }
+#[cfg(test)]
+impl FixtureRoots {
+    fn new() -> Self { Self { states: [None; 2] } }
+    fn mark(&self, configs: &mut ConfigurationStore<Retained>) {
+        for (key, value) in self.states.iter().flatten() { configs.mark_set(*key); configs.mark_set(*value); }
+    }
 }

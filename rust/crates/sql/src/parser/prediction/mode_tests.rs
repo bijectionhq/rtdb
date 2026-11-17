@@ -17,16 +17,16 @@ fn fixture<R>(limit: usize, run: impl for<'cfg, 'id, 'g, 'scope> FnOnce(&mut Con
     assert_eq!(memory.used_bytes(), 0);
     result
 }
-fn alternative<'id, 'g, 'scope>(configs: &mut Configurations<'_, 'id, 'g, 'scope>, contexts: &PredictionContexts<'id, 'g, 'scope>, number: usize) -> Result<Alternative> {
+fn alternative<'id, 'g, 'scope, M: StoreMemory>(configs: &mut Configurations<'_, 'id, 'g, 'scope, M>, contexts: &PredictionContexts<'id, 'g, 'scope, M>, number: usize) -> Result<Alternative> {
     configs.alternative(contexts.grammar().decision(65)?, number)
 }
-fn add<'cfg, 'id, 'g, 'scope>(configs: &mut Configurations<'cfg, 'id, 'g, 'scope>, contexts: &mut PredictionContexts<'id, 'g, 'scope>, set: ConfigSetKey<'cfg>, state: u32, number: usize, context: ContextKey<'id>, semantic: Semantic) -> Result<ConfigKey<'cfg>> {
+fn add<'cfg, 'id, 'g, 'scope, M: StoreMemory>(configs: &mut Configurations<'cfg, 'id, 'g, 'scope, M>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>, set: ConfigSetKey<'cfg>, state: u32, number: usize, context: ContextKey<'id>, semantic: Semantic) -> Result<ConfigKey<'cfg>> {
     let alt = alternative(configs, contexts, number)?;
     let key = configs.create(contexts.grammar().state(state)?, alt, context, semantic)?;
     configs.add_uncached(set, key, contexts)?;
     Ok(key)
 }
-fn predicate<'id, 'g, 'scope>(configs: &mut Configurations<'_, 'id, 'g, 'scope>, contexts: &PredictionContexts<'id, 'g, 'scope>, expected: i32) -> Result<Semantic> {
+fn predicate<'id, 'g, 'scope, M: StoreMemory>(configs: &mut Configurations<'_, 'id, 'g, 'scope, M>, contexts: &PredictionContexts<'id, 'g, 'scope, M>, expected: i32) -> Result<Semantic> {
     for number in 0..3017 {
         let state = contexts.grammar().state(number)?;
         for (index, transition) in state.transitions().enumerate() {
@@ -35,7 +35,7 @@ fn predicate<'id, 'g, 'scope>(configs: &mut Configurations<'_, 'id, 'g, 'scope>,
     }
     Err(PredictionError::Artifact(Problem::Precedence))
 }
-fn single<'id>(contexts: &mut PredictionContexts<'id, '_, '_>, parent: ContextKey<'id>, number: u32) -> Result<ContextKey<'id>> {
+fn single<'id, M: StoreMemory>(contexts: &mut PredictionContexts<'id, '_, '_, M>, parent: ContextKey<'id>, number: u32) -> Result<ContextKey<'id>> {
     contexts.singleton(parent, contexts.grammar().state(number)?)
 }
 fn admission<T>(result: Result<T>) {
@@ -418,4 +418,77 @@ fn config_abort_at_state_map_entry_seals_workspace_without_allocating() {
         assert_eq!(memory.used_bytes(), before);
         Ok(())
     });
+}
+
+use super::super::{PredictionStorage, with_prediction_storage};
+use super::super::storage::Retained;
+use crate::parser::grammar::OwnedGrammar;
+
+fn retained_mode<R>(run: impl for<'cfg, 'id, 'g, 'scope> FnOnce(&mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>, &Arc<MemoryBudget>) -> Result<R>) -> R {
+    let grammar_memory = MemoryBudget::new(8 << 20);
+    let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+    let memory = MemoryBudget::new(4 << 20);
+    let mut storage = PredictionStorage::new(grammar, &memory);
+    let work_memory = MemoryBudget::new(4 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let result = with_prediction_storage(&mut storage, &work, |access| {
+        let (configs, contexts) = access.parts();
+        run(configs, contexts, &work_memory)
+    }).unwrap();
+    drop(storage);
+    assert_eq!(memory.used_bytes(), 0);
+    result
+}
+
+#[test]
+fn retained_mode_uses_the_shared_ll_grouping_and_fresh_sll_strip_kernels() {
+    retained_mode(|configs, contexts, _| {
+        let empty = contexts.empty();
+        let one = single(contexts, empty, 1)?;
+        let full = contexts.merge_uncached(empty, one, super::super::MergeMode::FullExact)?;
+        let semantic = predicate(configs, contexts, 1)?;
+        let set = configs.new_set(SetMode::Local)?;
+        let a = add(configs, contexts, set, 352, 1, empty, semantic)?;
+        let b = add(configs, contexts, set, 352, 1, one, Semantic::Unpredicated)?;
+        let c = add(configs, contexts, set, 352, 2, full, Semantic::Unpredicated)?;
+        let mut mode = configs.mode_workspace();
+        assert!(!mode.has_sll_conflict(PredictionMode::Ll, configs, set, contexts)?);
+        assert!(mode.has_sll_conflict(PredictionMode::Sll, configs, set, contexts)?);
+        assert_eq!(mode.groups.len(), 1);
+        assert!(![a, b, c].contains(&mode.groups[0].representative));
+        assert!(contexts.equivalent(mode.groups[0].context, full)?);
+        assert_eq!(configs.view(a).context(), empty);
+        assert_eq!(configs.view(a).semantic(), semantic);
+        assert_eq!(configs.view(b).context(), one);
+        assert_eq!(configs.view(c).context(), full);
+        assert_eq!(configs.view_set(set).len(), 3);
+        Ok(())
+    });
+}
+
+#[test]
+fn retained_mode_checks_aborted_participants_before_empty_and_state_map_shortcuts() {
+    for context_failed in [false, true] {
+        retained_mode(|configs, contexts, work_memory| {
+            let set = configs.new_set(SetMode::Full)?;
+            let mut mode = configs.mode_workspace();
+            if context_failed {
+                let empty = contexts.empty();
+                let context = single(contexts, empty, 1)?;
+                let blocker = work_memory.reserve(work_memory.limit_bytes() - work_memory.used_bytes()).unwrap();
+                admission(contexts.canonicalize(context));
+                drop(blocker);
+                assert!(matches!(mode.has_sll_conflict(PredictionMode::Sll, configs, set, contexts), Err(PredictionError::Aborted)));
+                assert!(matches!(configs.clear(set), Err(PredictionError::Aborted)));
+            } else {
+                assert!(matches!(configs.alternative(contexts.grammar().decision(65)?, 0), Err(PredictionError::Artifact(Problem::Alternative))));
+                assert!(matches!(mode.has_state_with_one_alt(configs, set), Err(PredictionError::Aborted)));
+            }
+            assert!(mode.aborted);
+            assert!(mode.groups.is_empty());
+            assert!(mode.states.is_empty());
+            assert!(matches!(mode.has_state_with_one_alt(configs, set), Err(PredictionError::Aborted)));
+            Ok(())
+        });
+    }
 }

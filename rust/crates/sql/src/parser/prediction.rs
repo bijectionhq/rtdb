@@ -10,7 +10,7 @@ pub(crate) use context::{ContextKey, ContextShape, ContextView, MergeMode, Merge
 pub(crate) use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, ConfigView, ConfigSetView, Configurations, ConflictKey, SetMode};
 pub(crate) use semantic::Semantic;
 pub(crate) use mode::{AlternativeChoice, ModeWorkspace, PredictionMode, SubsetsView};
-pub(crate) use storage::PredictionStorage;
+pub(crate) use storage::{PredictionAccess, PredictionStorage, with_prediction_storage};
 
 type Result<T> = std::result::Result<T, PredictionError>;
 

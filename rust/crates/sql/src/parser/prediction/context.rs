@@ -16,6 +16,8 @@ pub(super) enum ContextId { Empty, Node(SlotId) }
 impl ContextKey<'_> {
     fn at(id: ContextId) -> Self { Self { id, brand: PhantomData } }
     fn empty() -> Self { Self::at(ContextId::Empty) }
+    pub(super) fn stored(self) -> ContextId { self.id }
+    pub(super) fn from_stored(id: ContextId) -> Self { Self::at(id) }
     fn index(self) -> usize { match self.id { ContextId::Empty => usize::MAX, ContextId::Node(id) => id.index } }
     #[cfg(test)]
     pub(super) fn identity(self) -> ContextId { self.id }
@@ -92,6 +94,7 @@ impl<M: StoreMemory> ContextStore<M> {
     fn contains(&self, id: ContextId) -> bool {
         match id { ContextId::Empty => true, ContextId::Node(id) => self.nodes.get(id).is_some() }
     }
+    pub(super) fn mark(&mut self, id: ContextId) { if let ContextId::Node(id) = id { self.nodes.mark(id); } }
     pub(super) fn collect(&mut self) {
         for record in self.canonical.slots.iter().flatten() {
             if let ContextId::Node(id) = record.key { self.nodes.mark(id); }

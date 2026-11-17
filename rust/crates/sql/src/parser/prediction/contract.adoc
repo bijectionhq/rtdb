@@ -101,9 +101,9 @@ Completed canonical publications survive later failures, including failure to re
 An unpublished array payload is dropped if admitting its node slot fails.
 The failed access remains sealed, but a subsequent access has fresh work and abort state under the same retained budget.
 Canonical entries are strong roots and are not evicted or reset to recover memory.
-Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its context blocks and then its owned grammar.
+Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its configuration and context blocks before its owned grammar.
 The region exposes neither raw stores nor graph replacement, and takes no ambient budget or cache.
-Configuration storage, DFA root integration and parser-environment sharing remain separate required work.
+DFA root integration and parser-environment sharing remain separate required work.
 
 == Configuration objects and ordered sets
 
@@ -178,13 +178,50 @@ Mode and configuration failures seal their reached work, and mode failures also 
 An operation accepting a context owner or merge round checks that collaborator before flags, membership, identity, empty-set or cached-hash shortcuts.
 An aborted collaborator seals the configuration owner on entry; mode entry propagates a failed participant check to every supplied owner before returning.
 Completed nonallocating views remain available; no owned error string or cloned anomaly is cached.
-Native reservations remain with the scope until its destruction, including discarded scratch and copied set storage.
+Scoped reservations remain with the scope until its destruction, including discarded scratch and copied set storage.
 
 The factory and view signatures also carry the lifetime tests as source contracts.
 Returning a `ConfigKey`, `ConfigSetKey`, `ConflictKey` or a workspace carrying that brand as the factory's independent result is not permitted by the invariant callback lifetime.
 A key from an enclosing configuration factory cannot be passed into another factory, and context keys retain their separate owner brand.
 A view cannot outlive the region borrow; the region's `Drop` requires its allocation scope through destruction.
 These lifetime contracts and all regression sources remain unexecuted.
+
+== Joint retained access
+
+`with_prediction_storage` borrows the retained region and an explicit work scope, then lends one locally owned `PredictionAccess` to its callback.
+The access groups separate invariant configuration and context brands; `parts` lends the two facades without transferring their stores.
+Keys, views, access and mode work cannot leave through the callback's independent result.
+Configurations, sets and conflicts retain typed slot identities across accesses when actual retained roots reach them.
+Stored configuration values contain unbranded context IDs; their closed links are traced before context reclamation and receive the current access brand when read.
+Loading a persistent root into an access checks its occupied generation in that region.
+Private raw IDs are confined to the prediction constituents and are not exposed to parser callers.
+
+Scoped and retained configurations use one policy-generic membership, copy, merge, equality, hash and optimization implementation.
+Mode work remains call-owned and uses those same supplied collaborators.
+The context-free state-map operation retains its existing participant checks without requiring a context owner.
+A new set admits seven ordered IDs, 32 membership slots and its set slot in source order.
+A retained read-only transition releases the actual membership capacity; scoped reservations remain with their work scope.
+The ordered aliases and independent metadata remain live through that transition.
+Cached read-only hashes, including stale values and the `-1` recomputation sentinel, survive storage reopening unchanged.
+Distinct conflict objects retain distinct identities even when their alternative bits are equal.
+
+== Retained configuration roots
+
+The retained region owns the configuration, set and conflict pools before its context store and owned grammar.
+After all facades drop, actual set roots are marked before collection follows their ordered entries, building membership entries and conflict metadata.
+Building membership is traced independently of ordered storage because publication into that index can precede a failed ordered append.
+Marked configurations trace their current context values before the existing canonical-context and parent traversal runs.
+A cached hash does not retain an obsolete context; the current graph links and canonical cache determine its lifetime.
+A cleared building set can retain conflict metadata independently of its empty ordered list.
+The three pools use the existing generation, intrusive marking and checked capacity kernels; cleanup performs no allocation or input-depth recursion.
+Unrooted variable payloads release their leases, while reusable pool capacities remain charged.
+A failed access retains completed rooted updates and releases unrooted work; a later access has fresh abort flags and scratch.
+Neither callback errors nor memory exhaustion reset canonical membership or read-only cached hashes.
+
+This component has no production DFA root constituent yet, so configuration values without actual persistent roots are collected at access end.
+The private test-only fixture supplies two fixed key/value set pairs at the future cache traversal boundary.
+It is absent from production and does not model DFA insertion, equality or hash behavior.
+The real DFA constituent must trace its actual keys, values, starts, synthetic precedence configurations and completed edge/predicate references through this same owner boundary.
 
 == Remaining parser work
 

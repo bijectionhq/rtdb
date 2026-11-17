@@ -1,7 +1,9 @@
 use std::{mem::size_of, sync::Arc};
 use rtdb_types::{MemoryBudget, murmur3_32};
 use super::*;
-use super::super::{with_configurations, with_prediction_contexts};
+use super::super::{PredictionAccess, PredictionStorage, with_configurations, with_prediction_contexts, with_prediction_storage};
+use crate::parser::grammar::OwnedGrammar;
+use super::super::storage::Slot;
 
 fn fixture<R>(limit: usize, run: impl for<'cfg, 'id, 'g, 'scope> FnOnce(&mut Configurations<'cfg, 'id, 'g, 'scope>, &mut PredictionContexts<'id, 'g, 'scope>, &Arc<MemoryBudget>) -> Result<R>) -> R {
     let grammar_memory = MemoryBudget::new(8 << 20);
@@ -88,7 +90,7 @@ fn readding_the_same_identity_appends_while_distinct_equal_membership_merges() {
         assert_eq!(configs.view_set(set).len(), 2);
         assert_eq!(configs.view_set(set).entry(0), Some(first));
         assert_eq!(configs.view_set(set).entry(1), Some(first));
-        let MembershipState::Building(index) = &configs.sets[set.index].membership else { panic!() };
+        let MembershipState::Building(index) = &configs.set(set).membership else { panic!() };
         assert_eq!(index.count, 1);
         Ok(())
     });
@@ -147,7 +149,7 @@ fn readonly_hash_retains_the_cached_value_across_shared_context_changes() {
         let current = configs.set_hash(writable, contexts)?;
         assert_ne!(current, before);
         assert_eq!(configs.set_hash(readonly, contexts)?, before);
-        configs.sets[readonly.index].membership = MembershipState::Readonly { cached_hash: -1 };
+        configs.set_mut(readonly).membership = MembershipState::Readonly { cached_hash: -1 };
         assert_eq!(configs.set_hash(readonly, contexts)?, current);
         assert!(matches!(configs.add_uncached(readonly, next, contexts), Err(PredictionError::Artifact(Problem::Readonly))));
         assert!(matches!(configs.increment_outer(first), Err(PredictionError::Aborted)));
@@ -203,15 +205,15 @@ fn packed_outer_merge_uses_signed_max_then_only_incoming_suppression() {
         for (left, right, expected) in [(SUPPRESSED | 1, 7, SUPPRESSED | 1), (i32::MIN | SUPPRESSED | 1, 7, 7), (0, i32::MIN | SUPPRESSED, SUPPRESSED)] {
             let a = config(configs, contexts.empty(), 352, 1)?;
             let b = configs.copy(a, ConfigChange::Same)?;
-            configs.objects[a.index].outer = left;
-            configs.objects[b.index].outer = right;
+            configs.store.objects.get_mut(a.id.0).unwrap().outer = left;
+            configs.store.objects.get_mut(b.id.0).unwrap().outer = right;
             let set = configs.new_set(SetMode::Local)?;
             configs.add_uncached(set, a, contexts)?;
             configs.add_uncached(set, b, contexts)?;
             assert_eq!(configs.view(a).packed_outer(), expected);
         }
         let key = config(configs, contexts.empty(), 352, 1)?;
-        configs.objects[key.index].outer = i32::MAX;
+        configs.store.objects.get_mut(key.id.0).unwrap().outer = i32::MAX;
         configs.increment_outer(key)?;
         assert_eq!(configs.view(key).packed_outer(), i32::MIN);
         let set = configs.new_set(SetMode::Local)?;
@@ -432,11 +434,11 @@ fn first_object_admission_and_replacement_storage_are_reserved_before_publicatio
     fixture(1 << 20, |configs, contexts, memory| {
         let first = config(configs, contexts.empty(), 352, 1)?;
         for _ in 1..16 { configs.copy(first, ConfigChange::Same)?; }
-        let replacement = 256 + 32 * size_of::<ConfigData<'_>>();
+        let replacement = 256 + 32 * size_of::<Slot<ConfigData>>();
         let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - replacement + 1).unwrap();
         let before = memory.used_bytes();
         admission(configs.copy(first, ConfigChange::Same));
-        assert_eq!(configs.objects.len(), 16);
+        assert_eq!(configs.store.objects.len(), 16);
         assert_eq!(memory.used_bytes(), before);
         drop(blocker);
         assert!(matches!(configs.copy(first, ConfigChange::Same), Err(PredictionError::Aborted)));
@@ -444,7 +446,7 @@ fn first_object_admission_and_replacement_storage_are_reserved_before_publicatio
     });
     fixture(4096, |configs, contexts, _| {
         admission(config(configs, contexts.empty(), 352, 1));
-        assert!(configs.objects.is_empty());
+        assert!(configs.store.objects.is_empty());
         Ok(())
     });
 }
@@ -453,7 +455,7 @@ fn first_object_admission_and_replacement_storage_are_reserved_before_publicatio
 fn new_set_and_duplicate_append_failures_do_not_publish_a_successful_result() {
     fixture(4096, |configs, _, _| {
         admission(configs.new_set(SetMode::Full));
-        assert!(configs.sets.is_empty());
+        assert!(configs.store.sets.is_empty());
         Ok(())
     });
     fixture(1 << 20, |configs, contexts, memory| {
@@ -481,7 +483,7 @@ fn membership_replacement_failure_preserves_the_admitted_ordered_prefix() {
         let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
         admission(configs.add_uncached(set, next, contexts));
         assert_eq!(configs.view_set(set).len(), 16);
-        let MembershipState::Building(index) = &configs.sets[set.index].membership else { panic!() };
+        let MembershipState::Building(index) = &configs.set(set).membership else { panic!() };
         assert_eq!(index.count, 16);
         assert_eq!(index.slots.len(), 32);
         drop(blocker);
@@ -508,13 +510,13 @@ fn sll_strip_admits_each_new_object_in_order_after_its_new_set() {
         let original = configs.new_set(SetMode::Local)?;
         configs.add_uncached(original, first, contexts)?;
         configs.add_uncached(original, second, contexts)?;
-        let next_set = 256 + 7 * size_of::<ConfigKey<'_>>() + 256 + 32 * size_of::<Option<ConfigKey<'_>>>();
+        let next_set = 256 + 7 * size_of::<ConfigId>() + 256 + 32 * size_of::<Option<ConfigId>>();
         let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - next_set).unwrap();
         let mut mode = configs.mode_workspace();
         admission(mode.has_sll_conflict(super::super::PredictionMode::Sll, configs, original, contexts));
-        assert_eq!(configs.objects.len(), 16);
-        assert_eq!(configs.sets.len(), 2);
-        assert_eq!(configs.sets[1].ordered.len(), 1);
+        assert_eq!(configs.store.objects.len(), 16);
+        assert_eq!(configs.store.sets.len(), 2);
+        assert_eq!(configs.store.sets.values().nth(1).unwrap().ordered.len(), 1);
         assert_eq!(configs.view(first).semantic(), semantic);
         assert_eq!(configs.view_set(original).len(), 2);
         drop(blocker);
@@ -536,8 +538,208 @@ fn membership_growth_retains_first_representatives_and_order() {
         }
         assert_eq!(configs.view_set(set).len(), 87);
         assert_eq!(configs.view_set(set).alternatives().count(), 87);
-        let MembershipState::Building(index) = &configs.sets[set.index].membership else { panic!() };
+        let MembershipState::Building(index) = &configs.set(set).membership else { panic!() };
         assert_eq!(index.slots.len(), 256);
+        Ok(())
+    });
+}
+
+fn retained_fixture<R>(limit: usize, run: impl for<'cfg, 'id, 'access> FnOnce(&mut PredictionAccess<'cfg, 'id, 'access, 'access>, &Arc<MemoryBudget>) -> Result<R>) -> R {
+    let grammar_memory = MemoryBudget::new(8 << 20);
+    let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+    let memory = MemoryBudget::new(limit);
+    let mut storage = PredictionStorage::new(grammar, &memory);
+    let work_memory = MemoryBudget::new(16 << 20);
+    let work = AllocationScope::new(&work_memory).unwrap();
+    let result = with_prediction_storage(&mut storage, &work, |access| run(access, &memory)).unwrap();
+    drop(storage);
+    assert_eq!(memory.used_bytes(), 0);
+    result
+}
+
+#[test]
+fn retained_new_sets_admit_ordered_index_and_slot_in_source_order() {
+    let ordered = 256 + 7 * size_of::<ConfigId>();
+    let membership = 256 + 32 * size_of::<Option<ConfigId>>();
+    let slots = 256 + 16 * size_of::<Slot<ConfigSet<Retained>>>();
+    for limit in [ordered - 1, ordered + membership - 1, ordered + membership + slots - 1] {
+        retained_fixture(limit, |access, memory| {
+            let (configs, _) = access.parts();
+            admission(configs.new_set(SetMode::Full));
+            assert!(configs.store.sets.is_empty());
+            assert_eq!(memory.used_bytes(), 0);
+            assert!(matches!(configs.new_set(SetMode::Local), Err(PredictionError::Aborted)));
+            Ok(())
+        });
+    }
+    retained_fixture(ordered + membership + slots, |access, memory| {
+        let (configs, _) = access.parts();
+        let set = configs.new_set(SetMode::Full)?;
+        assert_eq!(configs.view_set(set).len(), 0);
+        assert_eq!(memory.used_bytes(), ordered + membership + slots);
+        assert_eq!(memory.peak_bytes(), memory.used_bytes());
+        Ok(())
+    });
+}
+
+#[test]
+fn readonly_retained_membership_releases_its_lease_before_later_hash_demands() {
+    retained_fixture(1 << 20, |access, memory| {
+        let (configs, contexts) = access.parts();
+        let alternative = configs.alternative(configs.grammar.decision(65)?, 1)?;
+        let key = configs.create(configs.grammar.state(352)?, alternative, contexts.empty(), Semantic::Unpredicated)?;
+        let set = configs.new_set(SetMode::Full)?;
+        configs.add_uncached(set, key, contexts)?;
+        let before = memory.used_bytes();
+        let membership = 256 + 32 * size_of::<Option<ConfigId>>();
+        configs.mark_readonly(set)?;
+        assert_eq!(memory.used_bytes(), before - membership);
+        configs.mark_readonly(set)?;
+        assert_eq!(memory.used_bytes(), before - membership);
+        let hash = configs.set_hash(set, contexts)?;
+        assert_eq!(hash, 31i32.wrapping_add(configs.config_hash(key, contexts)?));
+        assert_eq!(memory.used_bytes(), before - membership);
+        Ok(())
+    });
+}
+
+#[test]
+fn retained_readonly_negative_one_hash_recomputes_after_shared_alias_mutation() {
+    retained_fixture(1 << 20, |access, _| {
+        let (configs, contexts) = access.parts();
+        let alternative = configs.alternative(configs.grammar.decision(65)?, 1)?;
+        let one = contexts.singleton(contexts.empty(), contexts.grammar().state(1)?)?;
+        let two = contexts.singleton(contexts.empty(), contexts.grammar().state(2)?)?;
+        let key = configs.create(configs.grammar.state(352)?, alternative, one, Semantic::Unpredicated)?;
+        let set = configs.new_set(SetMode::Full)?;
+        configs.add_uncached(set, key, contexts)?;
+        configs.mark_readonly(set)?;
+        let original = configs.set_hash(set, contexts)?;
+        let writable = configs.copy_set(set, contexts)?;
+        let incoming = configs.create(configs.grammar.state(352)?, alternative, two, Semantic::Unpredicated)?;
+        configs.add_uncached(writable, incoming, contexts)?;
+        assert_eq!(configs.set_hash(set, contexts)?, original);
+        configs.set_mut(set).membership = MembershipState::Readonly { cached_hash: -1 };
+        assert_eq!(configs.set_hash(set, contexts)?, configs.set_hash(writable, contexts)?);
+        Ok(())
+    });
+}
+
+#[test]
+fn retained_object_replacement_admits_old_and_new_slots_before_publishing() {
+    retained_fixture(1 << 20, |access, memory| {
+        let (configs, contexts) = access.parts();
+        let alternative = configs.alternative(configs.grammar.decision(65)?, 1)?;
+        let first = configs.create(configs.grammar.state(352)?, alternative, contexts.empty(), Semantic::Unpredicated)?;
+        for _ in 1..16 { configs.copy(first, ConfigChange::Same)?; }
+        let replacement = 256 + 32 * size_of::<Slot<ConfigData>>();
+        let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - replacement + 1).unwrap();
+        let before = memory.used_bytes();
+        admission(configs.copy(first, ConfigChange::Same));
+        assert_eq!(configs.store.objects.len(), 16);
+        assert_eq!(memory.used_bytes(), before);
+        assert_eq!(configs.view(first).context(), contexts.empty());
+        drop(blocker);
+        assert!(matches!(configs.copy(first, ConfigChange::Same), Err(PredictionError::Aborted)));
+        Ok(())
+    });
+}
+
+#[test]
+fn all_three_retained_pools_reject_stale_generations_and_retire_exhausted_slots() {
+    enum Identity { Config(ConfigId), Set(SetId), Conflict(ConflictId) }
+    for retire in [false, true] {
+        for kind in 0..3 {
+            let grammar_memory = MemoryBudget::new(8 << 20);
+            let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+            let memory = MemoryBudget::new(1 << 20);
+            let mut storage = PredictionStorage::new(grammar, &memory);
+            let work_memory = MemoryBudget::new(1 << 20);
+            let work = AllocationScope::new(&work_memory).unwrap();
+            let old = with_prediction_storage(&mut storage, &work, |access| {
+                let (configs, contexts) = access.parts();
+                let id = match kind {
+                    0 => {
+                        let alternative = configs.alternative(configs.grammar.decision(65)?, 1)?;
+                        let key = configs.create(configs.grammar.state(352)?, alternative, contexts.empty(), Semantic::Unpredicated)?;
+                        let id = if retire { ConfigId(configs.store.objects.fixture_generation(key.id.0, u64::MAX)) } else { key.id };
+                        Identity::Config(id)
+                    }
+                    1 => {
+                        let key = configs.new_set(SetMode::Full)?;
+                        let id = if retire { SetId(configs.store.sets.fixture_generation(key.id.0, u64::MAX)) } else { key.id };
+                        Identity::Set(id)
+                    }
+                    _ => {
+                        let key = configs.publish_conflict(AlternativeSet::default())?;
+                        let id = if retire { ConflictId(configs.store.conflicts.fixture_generation(key.id.0, u64::MAX)) } else { key.id };
+                        Identity::Conflict(id)
+                    }
+                };
+                Ok(id)
+            }).unwrap();
+            with_prediction_storage(&mut storage, &work, |access| {
+                let (configs, contexts) = access.parts();
+                let (old_slot, new_slot, rejected) = match old {
+                    Identity::Config(old) => {
+                        let alternative = configs.alternative(configs.grammar.decision(65)?, 1)?;
+                        let key = configs.create(configs.grammar.state(352)?, alternative, contexts.empty(), Semantic::Unpredicated)?;
+                        (old.0, key.id.0, configs.restore_config(old).map(|_| ()))
+                    }
+                    Identity::Set(old) => {
+                        let key = configs.new_set(SetMode::Full)?;
+                        (old.0, key.id.0, configs.restore_set(old).map(|_| ()))
+                    }
+                    Identity::Conflict(old) => {
+                        let key = configs.publish_conflict(AlternativeSet::default())?;
+                        (old.0, key.id.0, configs.restore_conflict(old).map(|_| ()))
+                    }
+                };
+                assert!(matches!(rejected, Err(PredictionError::Artifact(Problem::Context))));
+                if retire { assert_ne!(new_slot.index, old_slot.index); assert_eq!(new_slot.generation, 0); }
+                else { assert_eq!(new_slot.index, old_slot.index); assert_eq!(new_slot.generation, old_slot.generation + 1); }
+                assert!(matches!(configs.new_set(SetMode::Full), Err(PredictionError::Aborted)));
+                Ok(())
+            }).unwrap();
+            drop(storage);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn retained_set_and_conflict_replacements_keep_full_overlap_and_prior_values() {
+    retained_fixture(1 << 20, |access, memory| {
+        let (configs, _) = access.parts();
+        let first = configs.new_set(SetMode::Full)?;
+        for _ in 1..16 { configs.new_set(SetMode::Local)?; }
+        let temporary = 256 + 7 * size_of::<ConfigId>() + 256 + 32 * size_of::<Option<ConfigId>>();
+        let replacement = 256 + 32 * size_of::<Slot<ConfigSet<Retained>>>();
+        let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - temporary - replacement + 1).unwrap();
+        let before = memory.used_bytes();
+        admission(configs.new_set(SetMode::Full));
+        assert_eq!(memory.used_bytes(), before);
+        assert_eq!(configs.store.sets.len(), 16);
+        assert_eq!(configs.view_set(first).mode(), SetMode::Full);
+        assert_eq!(configs.view_set(first).len(), 0);
+        drop(blocker);
+        assert!(matches!(configs.new_set(SetMode::Full), Err(PredictionError::Aborted)));
+        Ok(())
+    });
+    retained_fixture(1 << 20, |access, memory| {
+        let (configs, _) = access.parts();
+        let bits = AlternativeSet::default();
+        let first = configs.publish_conflict(bits)?;
+        for _ in 1..16 { configs.publish_conflict(bits)?; }
+        let replacement = 256 + 32 * size_of::<Slot<AlternativeSet>>();
+        let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - replacement + 1).unwrap();
+        let before = memory.used_bytes();
+        admission(configs.publish_conflict(bits));
+        assert_eq!(memory.used_bytes(), before);
+        assert_eq!(configs.store.conflicts.len(), 16);
+        assert_eq!(configs.conflict(first), bits);
+        drop(blocker);
+        assert!(matches!(configs.publish_conflict(bits), Err(PredictionError::Aborted)));
         Ok(())
     });
 }
