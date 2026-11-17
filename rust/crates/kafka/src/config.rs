@@ -62,15 +62,15 @@ pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeM
 }
 
 pub(crate) fn parse_jaas(jaas: &str) -> Result<(String, BTreeMap<String, String>)> {
-    let mut tokens = jaas_tokens(jaas)?.into_iter();
+    let mut tokens = jaas_tokens(jaas).into_iter();
     let Some(JaasToken::Value(module)) = tokens.next() else { return Err(jaas_error()); };
     if !matches!(tokens.next(), Some(JaasToken::Value(flag)) if jaas_flag(&flag)) { return Err(jaas_error()); }
     let mut options = BTreeMap::new();
     loop {
-        let key = match tokens.next() { Some(JaasToken::End) => break, Some(JaasToken::Value(key)) => key, _ => return Err(jaas_error()) };
+        let key = match tokens.next() { Some(JaasToken::End) => break, Some(JaasToken::Value(key)) => Some(key), Some(_) => None, None => return Err(jaas_error()) };
         if !matches!(tokens.next(), Some(JaasToken::Equals)) { return Err(jaas_error()); }
         let Some(JaasToken::Value(value)) = tokens.next() else { return Err(jaas_error()); };
-        options.insert(key, value);
+        if let Some(key) = key { options.insert(key, value); }
     }
     if tokens.next().is_some() { return Err(jaas_error()); }
     Ok((module, options))
@@ -93,32 +93,72 @@ fn jaas_flag(flag: &str) -> bool {
 
 fn jaas_error() -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka JAAS requires one supported login module, a valid control flag, and username/password options") }
 
-enum JaasToken { Value(String), Equals, End }
+enum JaasToken { Value(String), Equals, End, Other }
 
-fn jaas_tokens(input: &str) -> Result<Vec<JaasToken>> {
+fn jaas_word(character: char) -> bool { character >= '\u{a0}' || character.is_ascii_alphabetic() || matches!(character, '_' | '$' | '-') }
+
+fn jaas_tokens(input: &str) -> Vec<JaasToken> {
     let mut characters = input.chars().peekable();
     let mut tokens = Vec::new();
     while let Some(character) = characters.next() {
-        if character.is_ascii_whitespace() { continue; }
+        if character <= '\u{20}' { continue; }
         if character == '=' { tokens.push(JaasToken::Equals); continue; }
         if character == ';' { tokens.push(JaasToken::End); continue; }
+        if character == '/' {
+            if characters.next() == Some('*') {
+                let mut previous = None;
+                for next in characters.by_ref() {
+                    if previous == Some('*') && next == '/' { break; }
+                    previous = Some(next);
+                }
+            } else {
+                while characters.next().is_some_and(|next| !matches!(next, '\r' | '\n')) {}
+            }
+            continue;
+        }
+        if character.is_ascii_digit() || matches!(character, '.' | '-') {
+            if character != '-' || characters.peek().is_some_and(|next| next.is_ascii_digit() || *next == '.') {
+                let mut decimal = character == '.';
+                while let Some(next) = characters.peek() {
+                    if *next == '.' && !decimal { decimal = true; }
+                    else if !next.is_ascii_digit() { break; }
+                    characters.next();
+                }
+            }
+            tokens.push(JaasToken::Other);
+            continue;
+        }
         let mut value = String::new();
         if matches!(character, '\'' | '"') {
-            let delimiter = character;
-            loop {
-                let character = characters.next().ok_or_else(jaas_error)?;
-                if character == delimiter { break; }
-                value.push(if character == '\\' {
-                    match characters.next().ok_or_else(jaas_error)? { 'n' => '\n', 'r' => '\r', 't' => '\t', 'b' => '\u{8}', 'f' => '\u{c}', character => character }
-                } else { character });
+            while let Some(next) = characters.peek().copied() {
+                if matches!(next, '\r' | '\n') { break; }
+                characters.next();
+                if next == character { break; }
+                if next != '\\' { value.push(next); continue; }
+                let escaped = characters.next().unwrap_or('\u{ffff}');
+                if matches!(escaped, '0'..='7') {
+                    let mut octal = escaped as u32 - '0' as u32;
+                    for _ in 0..if escaped <= '3' { 2 } else { 1 } {
+                        let Some(next @ '0'..='7') = characters.peek().copied() else { break; };
+                        characters.next(); octal = octal * 8 + next as u32 - '0' as u32;
+                    }
+                    value.push(char::from_u32(octal).expect("octal byte"));
+                } else {
+                    value.push(match escaped {
+                        'a' => '\u{7}', 'b' => '\u{8}', 'f' => '\u{c}', 'n' => '\n',
+                        'r' => '\r', 't' => '\t', 'v' => '\u{b}', other => other,
+                    });
+                }
             }
-        } else {
+        } else if jaas_word(character) {
             value.push(character);
-            while characters.peek().is_some_and(|character| !character.is_ascii_whitespace() && !matches!(*character, '=' | ';')) { value.push(characters.next().ok_or_else(jaas_error)?); }
-        }
+            while characters.peek().is_some_and(|next| jaas_word(*next) || next.is_ascii_digit() || *next == '.') {
+                value.push(characters.next().expect("peeked word character"));
+            }
+        } else { tokens.push(JaasToken::Other); continue; }
         tokens.push(JaasToken::Value(value));
     }
-    Ok(tokens)
+    tokens
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

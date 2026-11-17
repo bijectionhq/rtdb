@@ -25,6 +25,8 @@ The source and replica topic names and storage epoch use the existing protobuf s
 
 Configuration properties merge bootstrap servers, the property map, then the ISO-8859-1 Java properties file.
 The documented PLAIN JAAS configuration and SCRAM username/password configuration translate to native SASL properties.
+JAAS lexical rules follow the pinned Java tokenizer: slash comments, Java control whitespace, quoted octal escapes and word/number boundaries.
+Quote numeric values and credentials containing punctuation outside Java word characters.
 Both modules accept `required`, `requisite`, `sufficient`, and `optional` with Java's locale-independent uppercase matching; later duplicate options replace earlier values.
 Other login modules and Java client extensions require an explicit native adapter and return an error.
 Kafka log clients and Connect source consumers accept Java TLS properties through the shared native TLS adapter.
