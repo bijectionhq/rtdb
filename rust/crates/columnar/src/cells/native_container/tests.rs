@@ -15,13 +15,13 @@ fn open(name: &str, array: ArrayRef, nullable: bool, memory: &Arc<MemoryBudget>)
 fn ints(name: &str, values: &[i32], memory: &Arc<MemoryBudget>) -> ExecutionVector { open(name, Arc::new(Int32Array::from(values.to_vec())), false, memory) }
 fn bytes(value: &[u8], append: usize, memory: &Arc<MemoryBudget>) -> StoredBytes {
     let reservation = memory.reserve(value.len() + 128).unwrap();
-    StoredBytes { bytes: RetainedBuffer::with_reservation(Buffer::from_slice_ref(value), reservation).unwrap(), append }
+    StoredBytes { bytes: RetainedBuffer::with_reservation(Buffer::from_slice_ref(value), reservation).unwrap(), append: i64::try_from(append).unwrap() }
 }
 fn offsets(value: &[i32], append: usize, memory: &Arc<MemoryBudget>) -> StoredBytes {
     bytes(&value.iter().flat_map(|n| n.to_le_bytes()).collect::<Vec<_>>(), append, memory)
 }
 fn bits(value: &[u8], append: i32, byte_append: usize, memory: &Arc<MemoryBudget>) -> StoredBits {
-    StoredBits { bytes: bytes(value, byte_append, memory).bytes, append, byte_append }
+    StoredBits { bytes: bytes(value, byte_append, memory).bytes, append, byte_append: i64::try_from(byte_append).unwrap() }
 }
 fn captured(children: impl ExactSizeIterator<Item = ExecutionVector>, memory: &Arc<MemoryBudget>) -> CapturedChildren<ExecutionVector> {
     let mut output = CapturedChildren::new(children.len(), memory).unwrap();

@@ -3,9 +3,9 @@ use rtdb_types::{DecimalValue, ScalarType};
 use super::*;
 
 #[derive(Clone, Debug)]
-pub(super) struct StoredBytes { pub bytes: RetainedBuffer, pub append: usize }
+pub(super) struct StoredBytes { pub bytes: RetainedBuffer, pub append: i64 }
 #[derive(Clone, Debug)]
-pub(super) struct StoredBits { pub bytes: RetainedBuffer, pub append: i32, pub byte_append: usize }
+pub(super) struct StoredBits { pub bytes: RetainedBuffer, pub append: i32, pub byte_append: i64 }
 #[derive(Clone, Debug)]
 pub(super) struct NativeScalarStorage {
     pub validity: Option<StoredBits>,

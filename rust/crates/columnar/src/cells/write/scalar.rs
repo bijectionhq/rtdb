@@ -11,7 +11,7 @@ pub(super) enum MutableScalarData {
 struct ScalarDescriptor { ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType }
 pub(super) struct ScalarState {
     descriptor: ScalarDescriptor,
-    pub(super) count: usize,
+    pub(super) count: SourceCount,
     pub(super) validity: Option<MutableBits>,
     pub(super) data: MutableScalarData,
     metadata: Arc<MemoryReservation>,
@@ -30,9 +30,9 @@ impl ScalarState {
             data_type => MutableScalarData::Fixed { width: super::super::scalar::fixed_width(data_type).ok_or_else(|| unsupported("ScalarWriter"))?, data: MutableBytes::new(&memory) },
         };
         let validity = (field.is_nullable() && field.data_type() != &DataType::Null).then(|| MutableBits::new(&memory));
-        Ok(Self { descriptor: ScalarDescriptor { ingress, field, logical }, count: 0, validity, data, metadata })
+        Ok(Self { descriptor: ScalarDescriptor { ingress, field, logical }, count: SourceCount::new(0), validity, data, metadata })
     }
-    pub(super) fn len(&self) -> usize { self.count }
+    pub(super) fn value_count(&self) -> i32 { self.count.get() }
     pub(super) fn field(&self) -> &Field { &self.descriptor.field }
     pub(super) fn logical(&self) -> &LogicalType { &self.descriptor.logical }
     fn scalar_type(&self) -> Option<&ScalarType> {
@@ -48,62 +48,58 @@ impl ScalarState {
         mutation.mark();
         if !matches!(&self.data, MutableScalarData::Null) {
             self.validity = Some(MutableBits::new(self.metadata.budget()));
-            self.validity.as_mut().expect("validity installed").ones(self.count, mutation)?;
+            self.validity.as_mut().expect("validity installed").ones(self.count.get(), mutation)?;
         }
         Ok(())
     }
-    pub(super) fn increment_count(&mut self, count: usize, mutation: &mut Mutation) -> WriteResult<()> {
-        self.count = checked_count(self.count.checked_add(count).ok_or_else(native_size)?)?;
+    pub(super) fn increment_count(&mut self, count: i32, mutation: &mut Mutation) -> WriteResult<()> {
+        self.count = SourceCount::new(self.count.get().wrapping_add(count));
         if count != 0 { mutation.mark(); }
         Ok(())
     }
-    fn next_count(&self) -> WriteResult<()> { checked_count(self.count.checked_add(1).ok_or_else(native_size)?)?; Ok(()) }
     pub(super) fn not_null(&mut self, mutation: &mut Mutation) -> WriteResult<()> {
-        if let Some(validity) = &mut self.validity { validity.write_at(self.count, true, mutation)?; }
+        if let Some(validity) = &mut self.validity { validity.write_at(self.count.get(), true, mutation)?; }
         self.increment_count(1, mutation)
     }
     fn offset(&mut self, new_offset: i32, mutation: &mut Mutation) -> WriteResult<()> {
         let MutableScalarData::Variable { offsets, last_offset, .. } = &mut self.data else { return Err(unsupported_write("writeOffset")); };
-        if self.count == 0 { offsets.append(&0i32.to_le_bytes(), mutation)?; }
-        offsets.append(&new_offset.to_le_bytes(), mutation)?;
+        if self.count.is_zero() { offsets.append_primitive(&0i32.to_le_bytes(), mutation)?; }
+        offsets.append_primitive(&new_offset.to_le_bytes(), mutation)?;
         *last_offset = new_offset;
         mutation.mark();
         Ok(())
     }
     pub(super) fn undefined(&mut self, mutation: &mut Mutation) -> WriteResult<()> {
-        self.next_count()?;
         match &self.data {
             MutableScalarData::Variable { last_offset, .. } => self.offset(*last_offset, mutation)?,
             _ => (),
         }
-        if let Some(validity) = &mut self.validity { validity.write_at(self.count, false, mutation)?; }
+        if let Some(validity) = &mut self.validity { validity.write_at(self.count.get(), false, mutation)?; }
         match &mut self.data {
             MutableScalarData::Null | MutableScalarData::Variable { .. } => self.increment_count(1, mutation),
             MutableScalarData::Fixed { width, data } => { data.zero(*width, mutation)?; self.increment_count(1, mutation) },
             MutableScalarData::Bits(bits) => {
-                let row = self.count;
-                self.count += 1;
+                let row = self.count.get();
+                self.count = SourceCount::new(row.wrapping_add(1));
                 mutation.mark();
                 bits.write_at(row, false, mutation)
             },
         }
     }
-    fn capacity(&mut self, count: usize, mutation: &mut Mutation) -> WriteResult<()> {
-        checked_count(count)?;
+    fn capacity(&mut self, count: i32, mutation: &mut Mutation) -> WriteResult<()> {
         match &mut self.data {
-            MutableScalarData::Null => { if count > self.count { self.count = count; mutation.mark(); } },
+            MutableScalarData::Null => { if count > self.count.get() { self.count = SourceCount::new(count); mutation.mark(); } },
             MutableScalarData::Bits(bits) => {
-                if count > self.count { self.count = count; mutation.mark(); }
-                if let Some(validity) = &mut self.validity { validity.ensure_capacity(count, mutation)?; }
-                bits.ensure_capacity(count, mutation)?;
+                if count > self.count.get() { self.count = SourceCount::new(count); mutation.mark(); }
+                if let Some(validity) = &mut self.validity { validity.ensure_capacity_signed(count, mutation)?; }
+                bits.ensure_capacity_signed(count, mutation)?;
             },
             MutableScalarData::Fixed { width, data } => {
-                if count > self.count {
-                    self.count = count;
+                if count > self.count.get() {
+                    self.count = SourceCount::new(count);
                     mutation.mark();
-                    if let Some(validity) = &mut self.validity { validity.ensure_capacity(count, mutation)?; }
-                    let extent = (count as i32).wrapping_mul(*width as i32);
-                    if extent > 0 { data.ensure_capacity(extent as usize, mutation)?; }
+                    if let Some(validity) = &mut self.validity { validity.ensure_capacity_signed(count, mutation)?; }
+                    data.ensure_capacity_signed(i64::from(count.wrapping_mul(*width as i32)), mutation)?;
                 }
             },
             MutableScalarData::Variable { .. } => return Err(unsupported_write("ensureCapacity")),
@@ -111,30 +107,23 @@ impl ScalarState {
         Ok(())
     }
     fn capacity_after_index(&mut self, index: i32, mutation: &mut Mutation) -> WriteResult<()> {
-        let count = index.wrapping_add(1);
-        if count > 0 { self.capacity(count as usize, mutation)?; }
-        else if let MutableScalarData::Bits(bits) = &mut self.data {
-            if let Some(validity) = &mut self.validity { validity.ensure_capacity_signed(count, mutation)?; }
-            bits.ensure_capacity_signed(count, mutation)?;
-        }
-        Ok(())
+        self.capacity(index.wrapping_add(1), mutation)
     }
-    pub(super) fn ensure_capacity(&mut self, count: usize, mutation: &mut Mutation) -> WriteResult<()> {
+    pub(super) fn ensure_capacity(&mut self, count: i32, mutation: &mut Mutation) -> WriteResult<()> {
         if self.extension() { return Err(unsupported_write("ensureCapacity")); }
         self.capacity(count, mutation)
     }
     pub(super) fn set_null(&mut self, index: i32, mutation: &mut Mutation) -> WriteResult<()> {
         if self.extension() || matches!(&self.data, MutableScalarData::Variable { .. }) { return Err(unsupported_write("setNull")); }
         self.capacity_after_index(index, mutation)?;
-        if let Some(validity) = &mut self.validity { validity.set(usize::try_from(index).map_err(|_| bounds())?, false, mutation)?; }
+        if let Some(validity) = &mut self.validity { validity.set_signed(index, false, mutation)?; }
         Ok(())
     }
     pub(super) fn boolean(&mut self, value: bool, mutation: &mut Mutation) -> WriteResult<()> {
         if !matches!(self.scalar_type(), Some(ScalarType::Bool)) { return Err(unsupported_write("writeBoolean")); }
-        self.next_count()?;
-        if let Some(validity) = &mut self.validity { validity.write_at(self.count, true, mutation)?; }
-        let row = self.count;
-        self.count += 1;
+        if let Some(validity) = &mut self.validity { validity.write_at(self.count.get(), true, mutation)?; }
+        let row = self.count.get();
+        self.count = SourceCount::new(row.wrapping_add(1));
         mutation.mark();
         let MutableScalarData::Bits(bits) = &mut self.data else { return Err(native_size()); };
         bits.write_at(row, value, mutation)
@@ -147,7 +136,6 @@ impl ScalarState {
             _ => false,
         };
         if !admitted { return Err(unsupported_write(method)); }
-        self.next_count()?;
         let mut converted = [0; 8];
         let bytes = if method == "writeLong" {
             let value = i64::from_le_bytes(bytes.try_into().map_err(|_| native_size())?);
@@ -159,7 +147,7 @@ impl ScalarState {
         } else { bytes };
         if method == "writeFloat" { self.not_null(mutation)?; }
         let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
-        data.append(bytes, mutation)?;
+        data.append_primitive(bytes, mutation)?;
         if method != "writeFloat" { self.not_null(mutation)?; }
         Ok(())
     }
@@ -168,42 +156,38 @@ impl ScalarState {
             MutableScalarData::Fixed { .. } | MutableScalarData::Variable { .. } => (),
             _ => return Err(unsupported_write("writeBytes")),
         }
-        self.next_count()?;
         if let MutableScalarData::Variable { last_offset, .. } = &self.data {
             let length = i32::try_from(bytes.len()).map_err(|_| native_size())?;
             self.offset(last_offset.wrapping_add(length), mutation)?;
             self.not_null(mutation)?;
             let MutableScalarData::Variable { data, .. } = &mut self.data else { return Err(native_size()); };
-            data.append(bytes, mutation)
+            data.append_array(bytes, mutation)
         } else {
             let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
-            data.append(bytes, mutation)?;
+            data.append_array(bytes, mutation)?;
             self.not_null(mutation)
         }
     }
     pub(super) fn long_long(&mut self, high: i64, low: i64, mutation: &mut Mutation) -> WriteResult<()> {
         if self.extension() || !matches!(self.field().data_type(), DataType::FixedSizeBinary(_)) { return Err(unsupported_write("writeLongLong")); }
-        self.next_count()?;
         let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
-        data.append(&high.to_be_bytes(), mutation)?;
-        data.append(&low.to_be_bytes(), mutation)?;
+        data.append_primitive(&high.to_be_bytes(), mutation)?;
+        data.append_primitive(&low.to_be_bytes(), mutation)?;
         self.not_null(mutation)
     }
     pub(super) fn setter(&mut self, method: &'static str, index: i32, bytes: &[u8], mutation: &mut Mutation) -> WriteResult<()> {
         if self.extension() || !matches!(&self.data, MutableScalarData::Fixed { .. }) { return Err(unsupported_write(method)); }
         self.capacity_after_index(index, mutation)?;
-        let row = usize::try_from(index).map_err(|_| bounds())?;
-        if let Some(validity) = &mut self.validity { validity.set(row, true, mutation)?; }
+        if let Some(validity) = &mut self.validity { validity.set_signed(index, true, mutation)?; }
         let MutableScalarData::Fixed { data, .. } = &mut self.data else { return Err(native_size()); };
-        data.set(row.checked_mul(bytes.len()).ok_or_else(native_size)?, bytes, mutation)
+        data.set(i64::from(index) * bytes.len() as i64, bytes, mutation)
     }
     pub(super) fn set_boolean(&mut self, index: i32, value: bool, mutation: &mut Mutation) -> WriteResult<()> {
         if !matches!(&self.data, MutableScalarData::Bits(_)) { return Err(unsupported_write("setBoolean")); }
         self.capacity_after_index(index, mutation)?;
-        let row = usize::try_from(index).map_err(|_| bounds())?;
-        if let Some(validity) = &mut self.validity { validity.set(row, true, mutation)?; }
+        if let Some(validity) = &mut self.validity { validity.set_signed(index, true, mutation)?; }
         let MutableScalarData::Bits(bits) = &mut self.data else { return Err(native_size()); };
-        bits.set(row, value, mutation)
+        bits.set_signed(index, value, mutation)
     }
     fn clear(&mut self) {
         if let Some(validity) = &mut self.validity { validity.clear(); }
@@ -211,7 +195,7 @@ impl ScalarState {
             MutableScalarData::Null => (), MutableScalarData::Bits(bits) => bits.clear(), MutableScalarData::Fixed { data, .. } => data.clear(),
             MutableScalarData::Variable { offsets, data, last_offset } => { offsets.clear(); data.clear(); *last_offset = 0; },
         }
-        self.count = 0;
+        self.count = SourceCount::new(0);
     }
     fn finish(self) -> Result<ExecutionVector> {
         let validity = self.validity.map(MutableBits::finish).transpose()?;
@@ -222,7 +206,7 @@ impl ScalarState {
             MutableScalarData::Variable { offsets, data, last_offset } => NativeScalarData::Variable { offsets: offsets.finish()?, data: data.finish()?, last_offset },
         };
         let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: self.metadata });
-        let node = super::super::open::finish_node(self.descriptor.ingress, self.count, NodeLayout::Scalar(NativeScalarStorage { validity, data }), owner)?;
+        let node = super::super::open::finish_native_scalar(self.descriptor.ingress, self.count, NativeScalarStorage { validity, data }, owner)?;
         Ok(ExecutionVector::direct(node))
     }
 }
@@ -235,7 +219,8 @@ impl ScalarWriter {
     pub(crate) fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { scalar: ScalarState::new(ingress, memory)?, state: PublicationState::Ready })
     }
-    pub(crate) fn len(&self) -> usize { self.scalar.len() }
+    pub(crate) fn value_count(&self) -> i32 { self.scalar.value_count() }
+    pub(crate) fn checked_len(&self) -> Result<usize> { self.scalar.count.checked_len() }
     pub(crate) fn field(&self) -> &Field { self.scalar.field() }
     pub(super) fn logical(&self) -> &LogicalType { self.scalar.logical() }
     #[cfg(test)]
@@ -252,7 +237,7 @@ impl ScalarWriter {
     }
     pub(crate) fn write_undefined(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| writer.undefined(mutation)) }
     pub(crate) fn write_null(&mut self) -> WriteResult<()> { self.operation(|writer, mutation| { writer.promote(mutation)?; writer.undefined(mutation) }) }
-    pub(crate) fn ensure_capacity(&mut self, count: usize) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.ensure_capacity(count, mutation)) }
+    pub(crate) fn ensure_capacity(&mut self, count: i32) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.ensure_capacity(count, mutation)) }
     pub(crate) fn set_null(&mut self, index: i32) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.set_null(index, mutation)) }
     pub(crate) fn write_boolean(&mut self, value: bool) -> WriteResult<()> { self.operation(|writer, mutation| writer.boolean(value, mutation)) }
     fn primitive(&mut self, method: &'static str, bytes: &[u8]) -> WriteResult<()> { self.operation(|scalar, mutation| scalar.primitive(method, bytes, mutation)) }
@@ -291,7 +276,7 @@ impl ScalarReader<'_> {
             MutableScalarData::Variable { offsets, data, .. } => ScalarStorageRef::Variable { offsets: ScalarOffsets::Native(offsets.bytes()), data: data.bytes() },
         }
     }
-    fn row(&self, row: i32) -> Result<usize> { let row = usize::try_from(row).map_err(|_| index_error())?; if row >= self.scalar.count { Err(index_error()) } else { Ok(row) } }
+    fn row(&self, row: i32) -> Result<usize> { let row = usize::try_from(row).map_err(|_| index_error())?; if self.scalar.count.contains(row) { Ok(row) } else { Err(index_error()) } }
     pub(crate) fn is_null(&self, row: i32) -> Result<bool> {
         if matches!(&self.scalar.data, MutableScalarData::Null) { return Ok(true); }
         match &self.scalar.validity { None => Ok(false), Some(bits) => Ok(!native_scalar::bit(bits.bytes(), self.row(row)?)?) }

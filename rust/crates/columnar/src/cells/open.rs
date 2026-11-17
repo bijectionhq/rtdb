@@ -153,6 +153,14 @@ fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Ar
 pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
     let count = SourceCount::from_len(length)?;
     if let (NodeLayout::RunEnd(reader), DataType::RunEndEncoded(_, _)) = (&storage, ingress.data_type()) { storage::check_runs(reader.ends(), reader.values(), length)?; }
+    finish_counted_node(ingress, count, storage, owner)
+}
+
+pub(super) fn finish_native_scalar(ingress: Arc<Field>, count: SourceCount, storage: super::native_scalar::NativeScalarStorage, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
+    finish_counted_node(ingress, count, NodeLayout::Scalar(storage), owner)
+}
+
+fn finish_counted_node(ingress: Arc<Field>, count: SourceCount, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
     let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
     Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, count, storage, owner }))
 }

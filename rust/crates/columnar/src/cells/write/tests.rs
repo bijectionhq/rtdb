@@ -39,7 +39,7 @@ fn setters_leave_the_append_cursor_and_initialized_rows_separate() {
     assert_eq!(output.reader().get_long(0, NullChecks::Enabled).unwrap(), 0);
     output.set_long(0, 42).unwrap();
     output.write_long(9).unwrap();
-    assert_eq!(output.len(), 2);
+    assert_eq!(output.value_count(), 2);
     let vector = frozen(output);
     assert_eq!(vector.cell(0).unwrap().get_long(NullChecks::Enabled).unwrap(), 9);
     assert_eq!(vector.cell(1).unwrap().get_long(NullChecks::Enabled).unwrap(), 0);
@@ -55,10 +55,10 @@ fn reference_setter_bounds_leave_count_and_payload_recoverable() {
     let memory = memory();
     let mut output = writer(DataType::Int32, false, &memory);
     assert!(matches!(output.set_long(20, 99), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-    assert_eq!(output.len(), 21);
+    assert_eq!(output.value_count(), 21);
     assert_eq!(output.reader().get_int(20, NullChecks::Enabled).unwrap(), 0);
     output.write_int(7).unwrap();
-    assert_eq!(output.len(), 22);
+    assert_eq!(output.value_count(), 22);
     let vector = frozen(output);
     assert_eq!(vector.cell(0).unwrap().get_int(NullChecks::Enabled).unwrap(), 7);
     assert_eq!(vector.cell(20).unwrap().get_int(NullChecks::Enabled).unwrap(), 0);
@@ -121,12 +121,12 @@ fn scalar_null_undefined_and_set_null_have_distinct_storage_effects() {
     bottom.set_null(3).unwrap();
     assert!(!bottom.field().is_nullable());
     assert!(bottom.reader().is_null(-1).unwrap());
-    assert_eq!(bottom.len(), 4);
+    assert_eq!(bottom.value_count(), 4);
     bottom.write_null().unwrap();
     assert!(bottom.field().is_nullable());
     bottom.clear();
     assert!(bottom.field().is_nullable());
-    assert_eq!(bottom.len(), 0);
+    assert_eq!(bottom.value_count(), 0);
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn every_scalar_primitive_and_inherited_fixed_setter_keeps_its_stride() {
     let mut bits = writer(DataType::Boolean, false, &memory);
     bits.set_boolean(2, true).unwrap();
     bits.write_boolean(false).unwrap();
-    assert_eq!(bits.len(), 4);
+    assert_eq!(bits.value_count(), 4);
     assert!(bits.reader().get_boolean(2, NullChecks::Enabled).unwrap());
     assert!(!bits.reader().get_boolean(3, NullChecks::Enabled).unwrap());
 }
@@ -336,7 +336,7 @@ fn null_source_copier_writes_null_without_reading_a_source_payload() {
     let source = frozen(source);
     let mut output = writer(DataType::Int64, false, &memory);
     ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_rows(&[-1, i32::MAX]).unwrap();
-    assert_eq!(output.len(), 2);
+    assert_eq!(output.value_count(), 2);
     assert!(output.reader().is_null(0).unwrap());
     assert_eq!(output.reader().get_long(0, NullChecks::Disabled).unwrap(), 0);
 }
@@ -349,7 +349,7 @@ fn reference_copy_bounds_keep_completed_validity_and_payload_prefixes() {
     let source = frozen(source);
     let mut output = writer(DataType::FixedSizeBinary(256), false, &memory);
     assert!(matches!(ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_row(0), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-    assert_eq!(output.len(), 0);
+    assert_eq!(output.value_count(), 0);
     assert!(output.field().is_nullable());
     output.write_bytes(&[8; 256]).unwrap();
     assert_eq!(frozen(output).cell(0).unwrap().get_bytes().unwrap(), &[8; 256]);
@@ -363,7 +363,7 @@ fn failed_indirect_translation_precedes_destination_mutation() {
     let mut output = writer(DataType::Int32, false, &memory);
     assert!(matches!(ScalarCopier::new(ScalarSource::new(&selected).unwrap(), &mut output).unwrap().copy_rows(&[0, 2]), Err(WriteError::Native(_))));
     output.write_int(7).unwrap();
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.value_count(), 1);
 }
 
 #[test]
@@ -388,7 +388,7 @@ fn growth_failure_before_mutation_preserves_the_old_allocation() {
     let before = memory.used_bytes();
     let pressure = memory.reserve(memory.limit_bytes() - before).unwrap();
     assert!(matches!(output.write_long(16), Err(WriteError::Native(_))));
-    assert_eq!(output.len(), 16);
+    assert_eq!(output.value_count(), 16);
     assert_eq!(output.reader().get_long(15, NullChecks::Enabled).unwrap(), 15);
     drop(pressure);
     assert_eq!(memory.used_bytes(), before);
@@ -403,7 +403,7 @@ fn float_count_before_payload_failure_aborts_publication_until_clear() {
     let mut output = writer(DataType::Float32, false, &memory);
     let pressure = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
     assert!(matches!(output.write_float(1.0), Err(WriteError::Native(_))));
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.value_count(), 1);
     assert!(output.reader().get_float(0, NullChecks::Disabled).is_err());
     drop(pressure);
     assert!(output.write_float(2.0).is_err());
@@ -418,7 +418,7 @@ fn failed_native_writer_drops_all_charges_when_finish_rejects_it() {
     let mut output = writer(DataType::Binary, false, &memory);
     let pressure = memory.reserve(memory.limit_bytes() - memory.used_bytes() - 256).unwrap();
     assert!(matches!(output.write_bytes(b"payload"), Err(WriteError::Native(_))));
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.value_count(), 1);
     drop(pressure);
     assert_eq!(output.finish().unwrap_err().code, "rtdb/aborted-vector-writer");
     assert_eq!(memory.used_bytes(), 0);
@@ -469,15 +469,15 @@ fn signed_set_null_preserves_constant_nonnullable_and_null_receiver_paths() {
         let mut output = writer(data_type, false, &memory);
         output.set_null(-1).unwrap();
         output.set_null(i32::MAX).unwrap();
-        assert_eq!(output.len(), 0);
+        assert_eq!(output.value_count(), 0);
         assert!(!output.field().is_nullable());
         output.write_null().unwrap();
-        assert_eq!(output.len(), 1);
+        assert_eq!(output.value_count(), 1);
     }
     let mut output = writer(DataType::Int64, false, &memory);
     assert!(matches!(output.set_long(-1, 4), Err(WriteError::Reference(ReferenceFailure::Bounds))));
     assert!(matches!(output.set_long(i32::MAX, 4), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-    assert_eq!(output.len(), 0);
+    assert_eq!(output.value_count(), 0);
     output.write_long(8).unwrap();
     assert_eq!(output.reader().get_long(0, NullChecks::Enabled).unwrap(), 8);
 }
@@ -489,7 +489,7 @@ fn default_scalar_range_loops_ignore_nonpositive_lengths_but_indirect_translatio
         let source = frozen(writer(data_type.clone(), true, &memory));
         let mut output = writer(data_type.clone(), false, &memory);
         ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_range(i32::MAX, -1).unwrap();
-        assert_eq!(output.len(), 0);
+        assert_eq!(output.value_count(), 0);
         assert!(!output.field().is_nullable());
         let indirect = source.select(&Selection::All).unwrap();
         assert!(ScalarCopier::new(ScalarSource::new(&indirect).unwrap(), &mut output).unwrap().copy_range(0, -1).is_err());
@@ -538,7 +538,7 @@ fn partial_fixed_copy_reference_failure_retains_data_cursor_without_completing_r
     let source = frozen(source);
     let mut output = writer(DataType::FixedSizeBinary(256), false, &memory);
     assert!(matches!(ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_rows(&[0, 2]), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-    assert_eq!(output.len(), 0);
+    assert_eq!(output.value_count(), 0);
     output.write_bytes(&[9; 256]).unwrap();
     let output = frozen(output);
     assert_eq!(output.value_count(), 1);
@@ -567,7 +567,7 @@ fn wrapped_capacity_and_getters_preserve_wide_setter_addresses() {
     let row = 1_073_741_824;
     let mut integer = writer(DataType::Int32, false, &memory);
     assert!(matches!(integer.set_int(row, 9), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-    assert_eq!(integer.len(), row as usize + 1);
+    assert_eq!(integer.checked_len().unwrap(), row as usize + 1);
     assert_eq!(integer.reader().get_int(row, NullChecks::Enabled).unwrap(), 0);
     integer.write_int(7).unwrap();
     let integer = frozen(integer);
@@ -601,11 +601,11 @@ fn wrapped_fixed_range_copies_zero_bytes_and_retains_its_logical_count() {
     let memory = MemoryBudget::new(1024 * 1024);
     let length = 1_073_741_824;
     let mut source = writer(DataType::Int32, false, &memory);
-    source.ensure_capacity(length as usize + 1).unwrap();
+    source.ensure_capacity(length + 1).unwrap();
     let source = frozen(source);
     let mut output = writer(DataType::Int32, false, &memory);
     ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_range(0, length).unwrap();
-    assert_eq!(output.len(), length as usize);
+    assert_eq!(output.checked_len().unwrap(), length as usize);
     assert!(output.reader().get_int(0, NullChecks::Disabled).is_err());
     output.write_int(5).unwrap();
     assert_eq!(output.reader().get_int(length, NullChecks::Disabled).unwrap(), 5);
@@ -617,13 +617,13 @@ fn long_long_wraps_but_decimal_utility_keeps_its_wide_byte_index() {
     let memory = MemoryBudget::new(1024 * 1024);
     let row = 268_435_456;
     let mut pair = writer(DataType::FixedSizeBinary(16), false, &memory);
-    pair.ensure_capacity(row + 1).unwrap();
+    pair.ensure_capacity(i32::try_from(row + 1).unwrap()).unwrap();
     pair.write_long_long(13, 29).unwrap();
     let pair = frozen(pair);
     assert_eq!(pair.cell(row).unwrap().get_long_long_high().unwrap(), 13);
     assert_eq!(pair.cell(row).unwrap().get_long_long_low().unwrap(), 29);
     let mut decimal = writer(DataType::Decimal128(32, 0), false, &memory);
-    decimal.ensure_capacity(row + 1).unwrap();
+    decimal.ensure_capacity(i32::try_from(row + 1).unwrap()).unwrap();
     decimal.write_bytes(&37i128.to_le_bytes()).unwrap();
     let decimal = frozen(decimal);
     assert_eq!(decimal.cell(row).unwrap().byte_span().unwrap(), &37i128.to_le_bytes());
@@ -732,7 +732,7 @@ fn direct_null_source_factories_keep_destination_checks_and_promotion_prefixes()
             assert!(!target.field().is_nullable());
             if data_type == DataType::Boolean { target.write_boolean(true).unwrap(); }
             else { target.write_bytes(b"a").unwrap(); }
-            assert_eq!(target.len(), 1);
+            assert_eq!(target.value_count(), 1);
         }
         let mut extension = typed(ScalarType::Oid, &memory);
         assert!(matches!(ScalarCopier::storage_factory(ScalarSource::new(&source).unwrap(), &mut extension), Err(WriteError::Reference(ReferenceFailure::RequireFailed))));
@@ -741,13 +741,13 @@ fn direct_null_source_factories_keep_destination_checks_and_promotion_prefixes()
         assert_eq!(extension.reader().get_int(0, NullChecks::Enabled).unwrap(), 9);
         let mut null = writer(DataType::Null, false, &memory);
         ScalarCopier::storage_factory(ScalarSource::new(&source).unwrap(), &mut null).unwrap().copy_rows(&[-1, i32::MAX]).unwrap();
-        assert_eq!(null.len(), 2);
+        assert_eq!(null.value_count(), 2);
         assert!(null.field().is_nullable());
     }
     let source = frozen(writer(DataType::Int32, false, &memory));
     let mut null = writer(DataType::Null, false, &memory);
     ScalarCopier::storage_factory(ScalarSource::new(&source).unwrap(), &mut null).unwrap().copy_row(i32::MAX).unwrap();
-    assert_eq!(null.len(), 1);
+    assert_eq!(null.value_count(), 1);
     assert!(null.field().is_nullable());
 }
 
@@ -761,7 +761,7 @@ fn outer_null_copy_still_rejects_a_native_aborted_destination_until_clear() {
     assert!(matches!(ScalarCopier::new(ScalarSource::new(&null).unwrap(), &mut output), Err(WriteError::Native(_))));
     output.clear();
     ScalarCopier::new(ScalarSource::new(&null).unwrap(), &mut output).unwrap().copy_row(-1).unwrap();
-    assert_eq!(output.len(), 1);
+    assert_eq!(output.value_count(), 1);
     assert!(output.reader().is_null(0).unwrap());
 }
 
@@ -770,7 +770,7 @@ fn variable_preflight_offset_failure_leaves_destination_buffers_unchanged() {
     let memory = memory();
     let mut source = writer(DataType::Binary, false, &memory);
     source.write_bytes(b"a").unwrap();
-    source.fixture_state().count = 32;
+    source.fixture_state().count = SourceCount::new(32);
     let source = frozen(source);
     for method in 0..3 {
         let mut output = writer(DataType::Binary, true, &memory);
@@ -781,7 +781,7 @@ fn variable_preflight_offset_failure_leaves_destination_buffers_unchanged() {
         assert!(matches!(result, Err(WriteError::Reference(ReferenceFailure::Bounds))));
         drop(copier);
         assert_eq!(memory.used_bytes(), before);
-        assert_eq!(output.len(), 1);
+        assert_eq!(output.value_count(), 1);
         assert_eq!(output.reader().get_bytes(0).unwrap(), b"old");
         let validity = output.fixture_state().validity.as_ref().unwrap();
         assert_eq!(validity.append, 1);
@@ -803,7 +803,7 @@ fn bit_capacity_receives_the_wrapped_signed_request_even_without_count_growth() 
     let memory = MemoryBudget::new(1024 * 1024);
     let mut output = writer(DataType::Boolean, false, &memory);
     assert!(matches!(output.set_null(i32::MAX), Err(WriteError::Native(_))));
-    assert_eq!(output.len(), 0);
+    assert_eq!(output.value_count(), 0);
     output.write_boolean(true).unwrap();
     assert!(output.reader().get_boolean(0, NullChecks::Enabled).unwrap());
 }
@@ -835,7 +835,7 @@ fn native_negative_variable_spans_keep_reference_failure_after_offset_prefixes()
         let source = frozen(source);
         let mut output = writer(DataType::Binary, false, &memory);
         assert!(matches!(ScalarCopier::new(ScalarSource::new(&source).unwrap(), &mut output).unwrap().copy_row(0), Err(WriteError::Reference(ReferenceFailure::Bounds))));
-        assert_eq!(output.len(), 0);
+        assert_eq!(output.value_count(), 0);
         let scalar::MutableScalarData::Variable { offsets, .. } = &output.fixture_state().data else { panic!(); };
         assert_eq!(offsets.append, 8);
         output.write_bytes(b"z").unwrap();
@@ -855,7 +855,7 @@ fn bulk_nonnullable_validity_copy_clears_a_seeded_high_bit_in_its_new_tail() {
     copy(&source, &mut output, &[0]);
     assert!(output.reader().is_null(7).unwrap());
     assert_eq!(output.reader().get_int(7, NullChecks::Disabled).unwrap(), 99);
-    assert_eq!(output.len(), 9);
+    assert_eq!(output.value_count(), 9);
 }
 
 #[test]

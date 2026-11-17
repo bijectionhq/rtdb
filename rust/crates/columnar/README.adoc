@@ -231,4 +231,15 @@ The existing raw absent-primitive read failure still requires an explicit Kotlin
 The source has not been compiled or executed under the Phase 1 gate.
 No production expression/query/format consumer or process null-check setting is switched by this foundation.
 Full-object writers/readers, container promotion, relation writers, physical transport and production adoption remain required follow-on work.
-Mutable scalar and container count arithmetic, including the actual writer transitions to negative counts, remains a separate required increment from signed immutable capture.
+Scalar writers retain signed counts with wrapping increments, signed capacity maxima and method-specific validity/data ordering.
+Their byte cursors are signed facts independent of the retained buffer extents; checked reader lengths and ordinary logical row admission remain explicit consuming boundaries.
+Scalar copies retain signed ranges until the concrete copy method consumes them, including wrapped fixed byte spans and the distinct direct-versus-bulk validity reader rules.
+SDK source arrays retain their checked logical row/range boundary before validity, data or offset access, including sliced arrays with retained backing beyond their logical rows.
+An admitted SDK nullable field with no stored null bitmap retains its all-valid source adapter and selected-validity cursor schedule.
+Checked byte-array writes, raw-buffer copies, absolute setters and nonempty zero fills retain their source bounds failures and completed prefixes.
+Unchecked Arrow primitive appends first perform the source writable-count check, then return native `rtdb/unsafe-arrow-write-cursor` admission if their signed cursor would address memory outside the retained allocation.
+That native admission preserves prior mutations and applies the existing abort-until-clear publication gate; it does not reproduce an unsafe JVM memory write.
+Zero-width zero fills skip payload admission, while empty array and raw-buffer copies still check their signed destination span.
+Native scalar finish preserves captured negative counts and cursors without normalizing or padding payloads.
+`cells/write/count_tests.rs` adds source regressions for wrapped counts, raw copy demands, cursor failure order, native admission and retained ownership.
+Container count arithmetic, source signed reader slices, recursive copier factories, relations, full objects, transport and production adoption remain required follow-on work.

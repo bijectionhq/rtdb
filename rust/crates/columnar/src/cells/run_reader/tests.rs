@@ -39,14 +39,14 @@ fn move_past_end(vector: &ExecutionVector) { assert_eq!(reader(vector).index(Phy
 fn raw_fixed(name: &str, length: usize, payload: &[u8], memory: &Arc<MemoryBudget>) -> ExecutionVector {
     let template = ints(name, &[], memory);
     native(Arc::clone(&template.node().descriptor), length, NodeLayout::Scalar(NativeScalarStorage {
-        validity: None, data: NativeScalarData::Fixed(StoredBytes { bytes: bytes(payload, memory), append: payload.len() }),
+        validity: None, data: NativeScalarData::Fixed(StoredBytes { bytes: bytes(payload, memory), append: i64::try_from(payload.len()).unwrap() }),
     }), memory)
 }
 fn variable(length: usize, offsets: &[u8], last_offset: i32, memory: &Arc<MemoryBudget>) -> ExecutionVector {
     let template = arrow("bytes", Arc::new(arrow_array::BinaryArray::from(Vec::<&[u8]>::new())), false, memory);
     native(Arc::clone(&template.node().descriptor), length, NodeLayout::Scalar(NativeScalarStorage {
         validity: None, data: NativeScalarData::Variable {
-            offsets: StoredBytes { bytes: bytes(offsets, memory), append: offsets.len() },
+            offsets: StoredBytes { bytes: bytes(offsets, memory), append: i64::try_from(offsets.len()).unwrap() },
             data: StoredBytes { bytes: bytes(b"abc", memory), append: 3 }, last_offset,
         },
     }), memory)
@@ -341,8 +341,8 @@ fn absent_parent(child: ExecutionVector, positions: &[i32], memory: &Arc<MemoryB
     children.push(child).unwrap();
     let ids = vec![255; positions.len()];
     let offsets = positions.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
-    let type_ids = StoredBytes { bytes: bytes(&ids, memory), append: ids.len() };
-    let offsets = StoredBytes { bytes: bytes(&offsets, memory), append: offsets.len() };
+    let type_ids = StoredBytes { bytes: bytes(&ids, memory), append: i64::try_from(ids.len()).unwrap() };
+    let offsets = StoredBytes { bytes: bytes(&offsets, memory), append: i64::try_from(offsets.len()).unwrap() };
     publish_native("parent", SourceCount::from_len(positions.len()).unwrap(), NativeContainerParts::Union { type_ids, offsets, children }, memory).unwrap()
 }
 

@@ -108,9 +108,9 @@ impl PhysicalNode {
     }
 }
 
-fn check_bytes(bytes: &StoredBytes) -> Result<()> { if bytes.append <= bytes.bytes.len() { Ok(()) } else { Err(layout()) } }
+fn check_bytes(bytes: &StoredBytes) -> Result<()> { if bytes.append <= bytes.bytes.len() as i64 { Ok(()) } else { Err(layout()) } }
 fn check_bits(bits: Option<&StoredBits>) -> Result<()> {
-    if bits.is_some_and(|bits| bits.byte_append > bits.bytes.len()) { Err(layout()) } else { Ok(()) }
+    if bits.is_some_and(|bits| bits.byte_append > bits.bytes.len() as i64) { Err(layout()) } else { Ok(()) }
 }
 
 pub(super) fn publish_native(name: &str, count: SourceCount, parts: NativeContainerParts, memory: &Arc<crate::MemoryBudget>) -> Result<ExecutionVector> {
