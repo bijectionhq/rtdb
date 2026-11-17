@@ -103,12 +103,9 @@ void rd_kafka_buf_push0(rd_kafka_buf_t *rkbuf,
 
 
 /**
- * @brief Create a new buffer with \p segcmt initial segments and \p size bytes
+ * @brief Create a new buffer with \p segcnt initial segments and \p size bytes
  *        of initial backing memory.
  *        The underlying buffer will grow as needed.
- *
- * If \p rk is non-NULL (typical case):
- * Additional space for the Kafka protocol headers is inserted automatically.
  */
 rd_kafka_buf_t *rd_kafka_buf_new0(int segcnt, size_t size, int flags) {
         rd_kafka_buf_t *rkbuf;
@@ -197,15 +194,14 @@ rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
                                          rd_false);
 }
 
-rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata_size(
-    rd_kafka_broker_t *rkb, int16_t version, size_t length, size_t *charge) {
+static rd_kafka_resp_err_t rd_kafka_buf_accounted_request_size(
+    rd_kafka_broker_t *rkb, rd_bool_t flexible, size_t length, size_t *charge) {
         rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
         const rd_kafkap_str_t *client_id = rkb->rkb_rk->rk_client_id;
-        rd_bool_t flexible = version >= 9;
         size_t header;
         size_t fixed = sizeof(rd_kafka_buf_t) +
                        2 * RD_ROUNDUP(sizeof(rd_segment_t), 8);
-        if (!account || version < 0 || version > 13)
+        if (!account)
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         if (client_id->len < RD_KAFKAP_STR_LEN_NULL)
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
@@ -220,26 +216,45 @@ rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata_size(
         return RD_KAFKA_RESP_ERR_NO_ERROR;
 }
 
-rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
-    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata_size(
+    rd_kafka_broker_t *rkb, int16_t version, size_t length, size_t *charge) {
+        if (version < 0 || version > 13)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        return rd_kafka_buf_accounted_request_size(rkb, version >= 9, length, charge);
+}
+
+rd_kafka_resp_err_t rd_kafka_buf_new_accounted_request(
+    rd_kafka_broker_t *rkb, int16_t api_key, rd_bool_t flexible, size_t length,
     rd_kafka_buf_t **result) {
         rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
-        rd_bool_t flexible = version >= 9;
         rd_kafka_resp_err_t error;
         size_t charge;
         rd_kafka_buf_t *request;
         *result = NULL;
-        if (!body && length)
-                return RD_KAFKA_RESP_ERR__INVALID_ARG;
-        error = rd_kafka_buf_accounted_metadata_size(rkb, version, length, &charge);
+        error = rd_kafka_buf_accounted_request_size(rkb, flexible, length, &charge);
         if (error)
                 return error;
         if (!rd_kafka_byte_account_acquire(account, charge))
                 return RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
-        request = rd_kafka_buf_new_request1(rkb, RD_KAFKAP_Metadata, 1, length,
-                                            flexible, rd_true);
+        request = rd_kafka_buf_new_request1(rkb, api_key, 1, length, flexible, rd_true);
         request->rkbuf_byte_account = account;
         request->rkbuf_byte_charge = charge;
+        *result = request;
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_buf_t **result) {
+        rd_kafka_resp_err_t error;
+        rd_kafka_buf_t *request;
+        *result = NULL;
+        if ((!body && length) || version < 0 || version > 13)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        error = rd_kafka_buf_new_accounted_request(
+            rkb, RD_KAFKAP_Metadata, version >= 9, length, &request);
+        if (error)
+                return error;
         rd_kafka_buf_ApiVersion_set(request, version, 0);
         if (length)
                 rd_kafka_buf_write(request, body, length);

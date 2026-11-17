@@ -16,8 +16,10 @@ It also admits decoded ApiVersions range arrays and stored legacy fallback copie
 The old and candidate arrays keep separate charges until the broker installs the replacement and frees the old array.
 Parser failure and downgrade discard their ranges through the same release path, and the broker releases its final stored ranges during teardown.
 Admission denial leaves an existing array intact and ends the current connection setup with the native resource error.
+Initial and downgraded ApiVersions requests admit their contiguous frame and buffer owner before entering the broker's outbound queue.
+Their charge persists to final buffer release, including overlap with an earlier request during a downgrade.
 It does not establish a complete producer allocation bound.
-Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions request and sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
+Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 

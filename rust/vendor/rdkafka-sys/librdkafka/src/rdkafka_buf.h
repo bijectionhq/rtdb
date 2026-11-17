@@ -1001,6 +1001,10 @@ void rd_kafka_buf_push0(rd_kafka_buf_t *rkbuf,
         rd_kafka_buf_push0(rkbuf, buf, len, 1 /*allow_crc*/, free_cb)
 rd_kafka_buf_t *rd_kafka_buf_new0(int segcnt, size_t size, int flags);
 #define rd_kafka_buf_new(segcnt, size) rd_kafka_buf_new0(segcnt, size, 0)
+/* The caller may write at most length body bytes before broker finalization adds flexible root tags. */
+rd_kafka_resp_err_t rd_kafka_buf_new_accounted_request(
+    rd_kafka_broker_t *rkb, int16_t api_key, rd_bool_t flexible, size_t length,
+    rd_kafka_buf_t **result);
 rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_buf_t **result);

@@ -431,11 +431,11 @@ rd_kafka_handle_ApiVersion(rd_kafka_t *rk,
                            rd_kafka_buf_t *request,
                            struct rd_kafka_ApiVersion **apis,
                            size_t *api_cnt);
-void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
-                                int16_t ApiVersion,
-                                rd_kafka_replyq_t replyq,
-                                rd_kafka_resp_cb_t *resp_cb,
-                                void *opaque);
+rd_kafka_resp_err_t rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
+                                              int16_t ApiVersion,
+                                              rd_kafka_replyq_t replyq,
+                                              rd_kafka_resp_cb_t *resp_cb,
+                                              void *opaque);
 
 void rd_kafka_SaslHandshakeRequest(rd_kafka_broker_t *rkb,
                                    const char *mechanism,

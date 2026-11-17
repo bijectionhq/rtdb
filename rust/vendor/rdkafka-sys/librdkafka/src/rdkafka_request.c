@@ -3213,30 +3213,57 @@ done:
  *
  * @param ApiVersion If -1 use the highest supported version, else use the
  *                   specified value.
+ * @returns an error before enqueue or response callback when admission fails.
+ * Owns replyq on both return paths.
  */
-void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
-                                int16_t ApiVersion,
-                                rd_kafka_replyq_t replyq,
-                                rd_kafka_resp_cb_t *resp_cb,
-                                void *opaque) {
+rd_kafka_resp_err_t rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
+                                              int16_t ApiVersion,
+                                              rd_kafka_replyq_t replyq,
+                                              rd_kafka_resp_cb_t *resp_cb,
+                                              void *opaque) {
         rd_kafka_buf_t *rkbuf;
+        const rd_kafka_conf_t *conf = &rkb->rkb_rk->rk_conf;
+        rd_kafka_resp_err_t error;
 
         if (ApiVersion == -1)
                 ApiVersion = 3;
 
-        rkbuf = rd_kafka_buf_new_flexver_request(
-            rkb, RD_KAFKAP_ApiVersion, 1, 3, ApiVersion >= 3 /*flexver*/);
+        if (rkb->rkb_rk->rk_byte_account) {
+                uint64_t size = 0;
+                if (ApiVersion >= 3) {
+                        size_t name = conf->sw_name ? strlen(conf->sw_name) : 0;
+                        size_t version = conf->sw_version ? strlen(conf->sw_version) : 0;
+                        char prefix[RD_UVARINT_ENC_SIZEOF(uint64_t)];
+                        if (name > INT32_MAX || version > INT32_MAX) {
+                                error = RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
+                                goto reject;
+                        }
+                        size = (uint64_t)name + version;
+                        size += rd_uvarint_enc_u64(prefix, sizeof(prefix), (uint64_t)name + 1);
+                        size += rd_uvarint_enc_u64(prefix, sizeof(prefix), (uint64_t)version + 1);
+                }
+                if (size > INT32_MAX) {
+                        error = RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
+                        goto reject;
+                }
+                error = rd_kafka_buf_new_accounted_request(
+                    rkb, RD_KAFKAP_ApiVersion, ApiVersion >= 3, (size_t)size, &rkbuf);
+                if (error)
+                        goto reject;
+        } else {
+                rkbuf = rd_kafka_buf_new_flexver_request(
+                    rkb, RD_KAFKAP_ApiVersion, 1, 3, ApiVersion >= 3);
+        }
 
         if (ApiVersion >= 3) {
                 /* KIP-511 adds software name and version through the optional
                  * protocol fields defined in KIP-482. */
 
                 /* ClientSoftwareName */
-                rd_kafka_buf_write_str(rkbuf, rkb->rkb_rk->rk_conf.sw_name, -1);
+                rd_kafka_buf_write_str(rkbuf, conf->sw_name, -1);
 
                 /* ClientSoftwareVersion */
-                rd_kafka_buf_write_str(rkbuf, rkb->rkb_rk->rk_conf.sw_version,
-                                       -1);
+                rd_kafka_buf_write_str(rkbuf, conf->sw_version, -1);
         }
 
         /* Should be sent before any other requests since it is part of
@@ -3260,6 +3287,11 @@ void rd_kafka_ApiVersionRequest(rd_kafka_broker_t *rkb,
                                                opaque);
         else /* in broker thread */
                 rd_kafka_broker_buf_enq1(rkb, rkbuf, resp_cb, opaque);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+
+reject:
+        rd_kafka_replyq_destroy(&replyq);
+        return error;
 }
 
 

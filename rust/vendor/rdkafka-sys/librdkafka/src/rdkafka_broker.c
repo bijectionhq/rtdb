@@ -2684,9 +2684,12 @@ static void rd_kafka_broker_handle_ApiVersion(rd_kafka_t *rk,
                     "retrying with v%hd",
                     request->rkbuf_reqhdr.ApiVersion, rd_kafka_err2name(err),
                     retry_ApiVersion);
-                rd_kafka_ApiVersionRequest(
+                err = rd_kafka_ApiVersionRequest(
                     rkb, retry_ApiVersion, RD_KAFKA_NO_REPLYQ,
                     rd_kafka_broker_handle_ApiVersion, NULL);
+                if (err)
+                        rd_kafka_broker_fail(rkb, LOG_WARNING, err,
+                                             "ApiVersions retry request admission failed");
                 return;
         }
 
@@ -2768,6 +2771,7 @@ void rd_kafka_broker_connect_done(rd_kafka_broker_t *rkb, const char *errstr) {
         }
 
         if (rkb->rkb_features & RD_KAFKA_FEATURE_APIVERSION) {
+                rd_kafka_resp_err_t err;
                 /* Query broker for supported API versions.
                  * This may fail with a disconnect on non-supporting brokers
                  * so hold off any other requests until we get a response,
@@ -2777,10 +2781,13 @@ void rd_kafka_broker_connect_done(rd_kafka_broker_t *rkb, const char *errstr) {
                     rkb, RD_KAFKA_BROKER_STATE_APIVERSION_QUERY);
                 rd_kafka_broker_unlock(rkb);
 
-                rd_kafka_ApiVersionRequest(
+                err = rd_kafka_ApiVersionRequest(
                     rkb, -1 /* Use highest version we support */,
                     RD_KAFKA_NO_REPLYQ, rd_kafka_broker_handle_ApiVersion,
                     NULL);
+                if (err)
+                        rd_kafka_broker_fail(rkb, LOG_WARNING, err,
+                                             "ApiVersions request admission failed");
         } else {
                 rd_kafka_broker_unlock(rkb);
 

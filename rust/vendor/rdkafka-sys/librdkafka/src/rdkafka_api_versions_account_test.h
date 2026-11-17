@@ -108,6 +108,79 @@ static int ut_accounted_api_versions_overlap(void) {
         RD_UT_PASS();
 }
 
+static int ut_accounted_api_versions_request(void) {
+        const unsigned char body[] = {2, 'n', 2, 'v', 0};
+        const size_t fixed = sizeof(rd_kafka_buf_t) + 2 * RD_ROUNDUP(sizeof(rd_segment_t), 8);
+        const size_t header = RD_KAFKAP_REQHDR_SIZE + 3;
+        const size_t flexible_charge = fixed + header + 1 + sizeof(body);
+        rd_kafka_t rk = RD_ZERO_INIT;
+        rd_kafka_broker_t broker = RD_ZERO_INIT;
+        rd_kafka_buf_t *request;
+        rd_slice_t reader;
+        unsigned char bytes[64];
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(flexible_charge);
+
+        RD_UT_ASSERT(account, "create handshake account");
+#if defined(_TTHREAD_WIN32_)
+        RD_UT_ASSERT(DuplicateHandle(GetCurrentProcess(), thrd_current(),
+                                    GetCurrentProcess(), &broker.rkb_thread,
+                                    0, FALSE, DUPLICATE_SAME_ACCESS), "retain broker thread identity");
+#else
+        broker.rkb_thread = thrd_current();
+#endif
+        rk.rk_byte_account = account;
+        rk.rk_client_id = rd_kafkap_str_new("x", -1);
+        rk.rk_conf.sw_name = "n";
+        rk.rk_conf.sw_version = "v";
+        rk.rk_conf.socket_timeout_ms = 10000;
+        rk.rk_conf.api_version_request_timeout_ms = 1000;
+        broker.rkb_rk = &rk;
+        rd_kafka_bufq_init(&broker.rkb_outbufs);
+        rd_refcnt_init(&broker.rkb_refcnt, 1);
+
+        RD_UT_ASSERT(!rd_kafka_ApiVersionRequest(&broker, -1, RD_KAFKA_NO_REPLYQ, NULL, NULL),
+                     "highest handshake version admits exact retained storage");
+        request = TAILQ_FIRST(&broker.rkb_outbufs.rkbq_bufs);
+        RD_UT_ASSERT(request && request->rkbuf_reqhdr.ApiKey == RD_KAFKAP_ApiVersion &&
+                         request->rkbuf_reqhdr.ApiVersion == 3 &&
+                         request->rkbuf_prio == RD_KAFKA_PRIO_FLASH &&
+                         request->rkbuf_max_retries == RD_KAFKA_REQUEST_NO_RETRIES &&
+                         request->rkbuf_abs_timeout > 0,
+                     "preserve actual handshake request policy");
+        reader = request->rkbuf_reader;
+        RD_UT_ASSERT(rd_slice_remains(&reader) == header + 1 + sizeof(body) &&
+                         rd_slice_read(&reader, bytes, header + 1 + sizeof(body)) == header + 1 + sizeof(body) &&
+                         bytes[header] == 0 && !memcmp(bytes + header + 1, body, sizeof(body)),
+                     "exact flexible header tags and compact software identity");
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == flexible_charge &&
+                         rd_kafka_ApiVersionRequest(&broker, 0, RD_KAFKA_NO_REPLYQ, NULL, NULL) ==
+                             RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE &&
+                         rd_kafka_bufq_cnt(&broker.rkb_outbufs) == 1,
+                     "retained flexible request blocks a second handshake allocation");
+        rd_kafka_bufq_deq(&broker.rkb_outbufs, request);
+        rd_kafka_buf_destroy(request);
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == 0 &&
+                         !rd_kafka_ApiVersionRequest(&broker, 0, RD_KAFKA_NO_REPLYQ, NULL, NULL),
+                     "legacy handshake can proceed after final flexible release");
+        request = TAILQ_FIRST(&broker.rkb_outbufs.rkbq_bufs);
+        RD_UT_ASSERT(request && request->rkbuf_reqhdr.ApiVersion == 0 &&
+                         rd_slice_remains(&request->rkbuf_reader) == header &&
+                         rd_kafka_byte_account_used(account) == fixed + header,
+                     "legacy retry has no software fields or flexible tags");
+        rd_kafka_bufq_deq(&broker.rkb_outbufs, request);
+        rd_kafka_buf_destroy(request);
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == 0 && rd_refcnt_sub(&broker.rkb_refcnt) == 0,
+                     "handshake queue drains its request and broker references");
+        rd_refcnt_destroy(&broker.rkb_refcnt);
+        rd_kafkap_str_destroy(rk.rk_client_id);
+        rd_kafka_byte_account_destroy(account);
+#if defined(_TTHREAD_WIN32_)
+        RD_UT_ASSERT(CloseHandle(broker.rkb_thread), "release retained broker thread identity");
+#endif
+        RD_UT_PASS();
+}
+
 int unittest_producer_api_versions_account(void) {
-        return ut_accounted_api_versions_decode() + ut_accounted_api_versions_overlap();
+        return ut_accounted_api_versions_decode() + ut_accounted_api_versions_overlap() +
+               ut_accounted_api_versions_request();
 }

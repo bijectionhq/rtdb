@@ -56,7 +56,7 @@ Primitive integer and UUID lookup operations have no externally supplied callbac
 ** Java math/random operations remain supplied through the refresh observation provider.
 ** The network adapter must resolve source bootstrap endpoints, supply the qualified Java shuffle authority, select brokers and own throttles, fatal errors and waiter notification.
 It must carry the captured request scope into `apply` after connection throttling and use `PreparedSend` for actual enqueue retries.
-** Construction, broker/thread growth, automatic native metadata caches, ApiVersions request and sort storage, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
+** Construction, broker/thread growth, automatic native metadata caches, ApiVersions sort storage, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
 Receive-frame and ordered-request accounting do not bound those owners.
 ** The production module is awaiting its coordinated registration and DLQ adapter.
 The standalone integration fixture imports these production sources directly.
