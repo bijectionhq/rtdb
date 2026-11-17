@@ -19,6 +19,8 @@ The six mixed EBCDIC charsets IBM1364/930/933/935/937/939 have 30 further regist
 Their mappings, SO/SI transitions, and replacement boundaries are described in link:ebcdic/README.adoc[the mixed EBCDIC reference].
 EUC-JP, x-euc-jp-linux, and x-eucJP-Open support 14 registered names through ASCII, JIS0201, JIS0208, and optional JIS0212 decoding.
 Their Linux/Solaris differences and replacement boundaries are described in link:euc_jp/README.adoc[the EUC-JP reference].
+The IBM29626C and IBM33722 Japanese EUC charsets add 13 registered names with C1 controls, extra SS2 symbols, private-use mappings, and distinct malformed-input consumption.
+Their mapping composition and IBM943 encoder filtering are described in link:ibm_euc/README.adoc[the IBM Japanese EUC reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.

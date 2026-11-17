@@ -1,0 +1,81 @@
+= Java 25 IBM Japanese EUC character mappings
+
+The String converter supports `x-IBM29626C` and `x-IBM33722`, with 13 distinct case-insensitive registered names.
+link:charsets.tsv[The manifest] records canonical names, class and source hashes, resource sizes and hashes, aliases, and decoded probe digests.
+The aliases include `ibm-eucjp` for IBM29626C and `ibm-5050` and `ibm-33722_vascii_vpua` for IBM33722.
+
+`Charset::IbmEuc` contains a passive immutable `IbmEuc` variant borrowing one static `Tables` resource.
+The input cursor and UTF8 output belong to one decode call, and no state persists across records or converters.
+The two runtime resources occupy 71,704 bytes and contain 35,852 UTF16 units.
+The existing String scalar memory admission precedes decoding, and the output reserves at most three UTF8 bytes per input byte.
+Java's decoder holders initialize immutable tables and have no process-wide mapping updates.
+
+== Character groups and source composition
+
+Both charsets preserve C1 control values outside the SS2 and SS3 prefixes.
+IBM29626C preserves ASCII backslash and tilde, while IBM33722 maps those bytes to U+00A5 and U+203E.
+SS2 (0x8E) selects halfwidth JIS0201 characters plus U+00A2, U+00A3, U+00AC, backslash, and tilde for trails 0xE0 through 0xE4.
+Ordinary two-byte input selects G1, and SS3 (0x8F) selects G3.
+Both groups use trails and leads from 0xA1 through 0xFE.
+Each charset maps G1 0xF5A1 through 0xFEFE to U+E000 through U+E3AB, and G3 0x8FF5A1 through 0x8FFEFE to U+E3AC through U+E757.
+
+IBM29626C's resources compose the pinned JIS0201, JIS0208, and JIS0212 tables with its G2/G3 overrides and private-use fallback ranges.
+The source's `G2` override applies to ordinary two-byte G1 input; its `g1_c` overrides apply to SS2 input.
+G3 overrides use Java `String.indexOf` first-match selection, so repeated key 0xF3B8 resolves to the first U+2116 entry.
+When no G3 override matches, the source rejects base JIS0212 U+2116 and requires the remaining character to be encodable by IBM943 before using its private-use fallback.
+Thus 0x8FA2F1 is unmappable while 0x8FF3B8 produces U+2116.
+
+IBM943 encoder availability is derived through `DoubleByte.Encoder.initC2B`, applying its 398 byte-to-character non-roundtrip removal pairs before its 45 character-to-byte additions.
+The 45 additions include U+FF5E, which preserves IBM29626C's JIS0212 mapping at 0x8FA2B7.
+JIS0212 U+02D8 at 0x8FA2AF is filtered out.
+link:ibm943-can-encode.bin[The availability provenance artifact] contains 9,442 encodable BMP units and is used by regression source, with no runtime decoder lookup.
+Its bit for unit `n` is the high-to-low bit `n % 8` of byte `n / 8`.
+
+IBM33722's resource retains its four literal source tables directly.
+Its G1/G3 repertoire differs from IBM29626C, including an unmappable 0xADA1 where IBM29626C produces U+2460.
+
+== Replacement boundaries
+
+OpenJDK25 `String(byte[], Charset)` uses `CharsetDecoder` with replacement enabled and `endOfInput` true for both charsets.
+Neither decoder implements `ArrayDecoder`.
+An incomplete terminal group produces one replacement for all its remaining bytes, including a two-byte SS3 prefix.
+Every record starts independently.
+
+IBM29626C consumes two bytes for each complete unmappable nonsingle group and three for each complete unmappable SS3 group.
+This includes lead bytes 0xA0 and 0xFF followed by ASCII, NUL, or another prefix.
+For example, `[0x8F, 0x41, 0x42]` produces one replacement.
+
+IBM33722 replaces 0xA0 and 0xFF individually and processes the next byte again.
+For a complete SS3 group with an invalid second byte, it consumes the prefix and that byte, then processes the third byte again.
+For example, `[0x8F, 0x41, 0x42]` produces a replacement followed by `B`, while `[0x8F, 0x41]` remains one terminal replacement.
+An invalid third byte consumes the full three-byte group.
+An invalid SS2 trail or ordinary G1 trail consumes the full pair.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins the charset classes, JIS and IBM943 providers, encoder initialization, shared decoding helpers, and the String/CharsetDecoder replacement path.
+link:COPYRIGHT[Copyright notices] retain upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+Each runtime resource contains 17,926 big-endian UTF16 units: 160 G0 singles, 8,836 G1 pairs, 94 G2 SS2 trails, and 8,836 G3 SS3 pairs.
+G1/G3 pairs use unsigned lead order, then unsigned trail order within the 0xA1 through 0xFE square.
+G0 stores U+FFFD at the SS2/SS3 prefix positions, whose decoding is handled by the prefix branches.
+All character units are BMP values without surrogates, and U+FFFD denotes an unmapped entry.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-ibm-euc
+----
+
+It verifies archive hashes, provider alias ownership, source dimensions and initialization, decoder helper calls, IBM943 encoder filtering, duplicate override precedence, and surrogate exclusions.
+The single-byte digest concatenates all 256 bytes decoded as independent records.
+The raw-pair digest concatenates all 65,536 two-byte records in unsigned order, appending U+0000 to each decoded result.
+The two triple digests cover those same pairs prefixed with SS2 or SS3 in each independent record.
+Regression sources append separators to decoded results because an input zero may be consumed inside a pair or triple.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes, pairs and prefix triples, C1 controls, Japanese text, symbol differences, IBM943-filtered JIS0212 values, duplicate overrides, both complete private-use ranges, variant-specific error lengths, terminal truncation, record independence, null values, configuration, and memory admission.
