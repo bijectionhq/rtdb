@@ -26,3 +26,16 @@ Constructed OCTET STRING processing is iterative, with temporary ownership bound
 Admission failures propagate without becoming identifier absence, and the reservation releases when decoding fails or the result drops.
 The regression sources cover signed serials, canonical versus original encodings, all general-name choices, malformed and duplicate extensions, BER forms, deep constructed octets, environmental URI errors, and allocation release.
 No identifier regression has been compiled or executed during Phase 1.
+
+`CertificateAlternativeNames` is a separate passive immutable view of a parsed subject-alternative-name extension.
+
+* Its original inner extension bytes implement `SunCertPathBuilder.altNamesEqual`, which compares `SubjectAlternativeNameExtension.getExtensionValue()` with `Arrays.equals`.
+Case, name order and accepted BER encodings remain significant even when the parsed names denote the same values.
+* Malformed noncritical SAN is absent.
+* A parsed copy survives unparseable copies.
+* Two parsed copies or a malformed critical copy fail.
+* The view reuses the same `GeneralNames` parser and environmental URI errors as certificate identifiers.
+* The certificate-framing scanner is shared with `CertificateIdentifiers`.
+* It owns its parsing reservation independently until the view drops.
+
+SAN regression sources cover original-byte equality, empty and malformed names, duplicate handling, BER retention, environmental URI errors and reservation lifetime.
