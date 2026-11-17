@@ -288,7 +288,7 @@ No public cause behavior is removed or waived by this slice.
 == Remaining parser work
 
 The private runtime, Full producer and adaptive prediction paths are described below.
-All 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+All 176 generated rule schedules and the remaining SLL/Bail-to-LL error branches stay open.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
@@ -399,7 +399,8 @@ Push binds the same active entry/current head, then updates previous parent/invo
 Unroll reads actual current, pops the checked actual top once before real `LT(-1)`, writes stop/current saved parent/retctx parent and closes that entry.
 It does not restore Recognizer state.
 Closing and Closed reject repeated cleanup; stale, cross-entry and wrong-role capabilities reject before effects and latch failure.
-Eligible source finally and rewind remain callable after a body error; normal work remains sealed.
+Eligible source finally remains callable after a body error, while ordinary work stays sealed.
+A pending Bail cancellation reserves rewind for the wrapper.
 
 The bounded cleanup theorem uses the existing stream's immutable buffered prefix: a successfully entered parent makes nested `LT(1)` and `LT(-1)` cached reads.
 Root initialization and constructor/precedence admission retain their real failure stages, including rule-start state before failed precedence growth.
@@ -441,7 +442,7 @@ This does not claim JVM Empty identity hashes, collision/tree layout or Java hea
 Existing collector traversal reaches actual C3 roots and their current configuration contexts; unrooted Full work is swept by the same guard.
 
 The embedded cause/recognizer/config/DFA capability gate remains OPEN and distinct from wire results.
-All 176 generated schedules, trees, labels, listeners, the full reset/error strategy, diagnostics and production adapters remain required.
+All 176 generated schedules, trees, labels, listeners, the remaining error-strategy and diagnostic branches, and production adapters stay open.
 
 == Private adaptive DFA paths
 
@@ -541,6 +542,30 @@ A failure admitting the LL listener's message occurs after the count increments.
 The session remains sealed after either dispatch, and the existing rule-finally path can still run.
 
 Production exposure of the embedded recognition cause and its live capabilities remains under the open `embedded-parser-error-capability` gate.
+
+== Catch and Bail retry
+
+The adaptive no-viable catch runs under the wrapper's SLL or LL profile and requires the original local invocation, current invocation and restored input position.
+It stores one exception in that primary record before reporting.
+The throwing LL listener or a failure during reporting exits the catch with that local assignment in place.
+A successful SLL report proceeds to Bail recovery.
+Bail visits the actual parent chain and links every record to the exception already stored in the catching record.
+All linked views borrow that same record and resolve the same exception.
+The pass then returns a separate parse-branded cancellation carrying the exception identity.
+
+The wrapper opens one parser session and calls the same action first under SLL.
+The cancellation, after the action's rule-finally operations, authorizes one LL retry.
+An unrelated error or a failure that escapes the action's finally operations returns directly.
+Ordinary operations remain sealed until the wrapper resets, and generic control clearing and rewind cannot stand in for the cancellation and unwind.
+
+The wrapper seeks to token zero before the parser reset's own seek to zero.
+Both real operations use the retained token buffer.
+Only after the second seek succeeds does reset clear recovery, current context, syntax-error count and the matched-EOF flag, then restore the base precedence frame.
+This profile has no trace listener and the pinned interpreter's reset has no state effects.
+Recognizer state, previous invocation records, buffered tokens and retained DFA history persist.
+The wrapper then selects the LL strategy, listener and prediction profile, and calls the same action once more.
+This private adapter covers the caught adaptive no-viable path.
+Generated rule bodies, other recognition variants, inline recovery and production adoption remain required.
 
 == Finishing-alternative selection
 

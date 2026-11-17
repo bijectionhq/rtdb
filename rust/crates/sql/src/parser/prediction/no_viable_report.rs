@@ -26,13 +26,12 @@ impl<'sql> NoViableDiagnostic<'sql> {
 
 impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     pub(in crate::parser::prediction) fn report_no_viable_alternative(&mut self) -> RuntimeResult<'sql, ()> {
-        let ParserControl::PendingNoViable(report) = &self.control else {
+        let Some(report) = self.pending_no_viable_report() else {
+            if matches!(self.control, ParserControl::PendingNoViable(_)) {
+                self.control.abort();
+            }
             return Err(RuntimeError::Control(RuntimeProblem::Aborted));
         };
-        if self.current != Some(report.invocation) || self.input.index() != Some(report.cause.start.index()) {
-            self.control.abort();
-            return Err(RuntimeError::Control(RuntimeProblem::Aborted));
-        }
 
         let (cause, mode) = (report.cause, report.mode);
         self.control = ParserControl::InErrorRecovery;
