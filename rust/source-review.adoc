@@ -560,11 +560,21 @@ Aggregate primitive factory and update schedules have bounded source review, inc
 Further source tracing found that logical null values erase nullable child-vector payloads, selected union legs and underlying getter indexes.
 Preserving those physical reader properties through views, copies, expression evaluation and spill is required even for some default-checking paths, and before disabled null checks can be supported.
 The reviewed primitive aggregate slice does not close that physical-reader work.
+The admitted-Arrow reader foundation retains buffer owners, normalized selections, actual primitive leaf types and getter indexes, including nullable payloads.
+Its source review repaired NullArray logical-null admission and opening-time timestamp ZoneId validation.
+Native absent union legs, exact write/copy operations, full object reads and production consumer transport remain required follow-ons.
+The shared memory budget and reservation implementation now lives in `types`; `columnar` reexports the same concrete owners.
+`AllocationScope` also lives in `types`, with the expression `EvaluationScope` name reexporting that exact retained owner.
+These dependency moves enable frontend admission without importing Arrow or expression execution and do not themselves account for parser or binder allocation.
 
-Shared host Number parsing, casts, arithmetic, numeric comparisons and sign predicates have bounded source review for the default checked-math and exact-decimal context.
+Shared host Number parsing, casts, arithmetic, numeric comparisons, sign predicates, quotient/remainder/modulo, bit operations and min/max/abs have bounded source review for the default checked-math and exact-decimal context.
 The reviews repaired direct Long-to-Float rounding, Number admission for substring indexes, boxed-divisor error precedence and decimal arithmetic diagnostics.
 Comparison chains retain strict argument evaluation before adjacent numeric comparisons, and decimal comparisons bound scale alignment by checking adjusted magnitudes first.
 Primitive Boolean results remain distinct from boxed Boolean literals and unresolved static-call metadata through local bindings and control forms.
+Quotient and remainder preserve primitive versus boxed result categories, decimal preferred scales, wrapping long division and the pinned floating algorithm.
+Bit calls preserve fixed-integer admission, long count masking, direct nested versus indirect strict argument schedules, and unresolved primitive overload metadata.
+Extrema preserve selected Object identity, per-node primitive metadata, NaN admission and JDK signed-zero selection.
+Absolute value retains numeric category and Decimal scale, including fixed-long wrapping and nonnegative Decimal identity under nil MathContext.
 General host numeric functions, dynamic bindings, interop, effects, namespace state, functions/macros, semantic object text and isolated UTF16 carriers remain required work.
 
 Unknown Transit tagged objects retain decoded alias identity before representation equality, with separate content hashing and canonical wire output.
@@ -572,8 +582,18 @@ Its alias/null and numeric-class regressions have independent source review.
 Remaining registry families and semantic rendering, equality and inspection consumers stay open.
 Registered TableRef decoding and scalar/readable object text have bounded source review, including flat-map duplicate handling and ByteBuffer alias identity.
 Date environment providers, readable ExceptionInfo stacks, nondefault print settings and type-descriptor construction remain required source work.
+Reached Transit decoding now requires a caller-owned evaluation scope through field selection and canonical output.
+Generated text, native decimal conversion and wire output acquire separate charges before allocation; raw input size alone cannot bound recursively escaped derived names.
+Public equality callers supply the scope, and query comparisons release it after each comparison.
+The output-admission walker follows the encoder's nesting boundary, including its compact tagged-string path.
 
 The additive embedded property entry reuses the existing startup, retained handle and close owners.
 Its bounded decoding and public allocation contract have source review; the shutdown trace's FFI evidence includes this entry and its region constructor.
 Frontend planning admission remains open: PostgreSQL preparation can tokenize and build an AST before its first reservation, and completed-plan reservations do not cover earlier catalog-dependent binding allocations.
+Snapshot membership now borrows the captured catalog, durable and staged name sources, preserving empty declarations and superseded live tables while removing full-name-set allocation from membership-only callers.
+This equivalence has independent source review; the recovery and shutdown trace evidence reflects the unchanged role-membership preflight behavior.
+SQL query, control and protocol-split lexing skip all nested block comments, including executable-hint spellings that the generic tokenizer previously expanded.
+That independently reviewed correction removes recursive hint retokenization.
+Regular and quoted identifier admission now follows the pinned lexer across query, control and split entry points, including first-invalid-token error precedence.
+Other token boundaries, literal rules and grammar compatibility remain required work.
 All regression sources remain unexecuted; the source gate remains false and no implementation-completeness revision is recorded.

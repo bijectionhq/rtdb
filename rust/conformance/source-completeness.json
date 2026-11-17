@@ -138,7 +138,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
-        "rust/crates/node/src/runtime.rs": "c12183ea68cae8e37663e2e948182aba43ac8cb13844cf7bf7195f142746f906",
+        "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
         "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30",
         "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
@@ -206,7 +206,7 @@
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
         "rust/crates/ffi/src/lib.rs": "55f47e1553f75719b7850f73c07c19e232c76beedcc9c5fd2395e4c03bde3715",
         "rust/crates/node/src/node.rs": "26eb2e6929a8b7eb6c1788d8a9c6eb57c1c35f78f7e02db5afa4c53ab95064c0",
-        "rust/crates/node/src/runtime.rs": "c12183ea68cae8e37663e2e948182aba43ac8cb13844cf7bf7195f142746f906",
+        "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
         "rust/crates/storage/src/io_region.rs": "0113b3f0778db0c1111afe87cce05b33d21156e9b4cf8ac8e9e87379de843faa",
         "rust/crates/ffi/src/region.rs": "ea8bad0f3363ecfd402468455a3a7c7fe235767ecb05697fd29df250c722ca44"
@@ -244,6 +244,16 @@
         "client_read"
       ],
       "requirement": "Complete remaining expression invocation boundaries; preserve physical vector null payloads, selected union legs and getter indexes through execution views, copies and native spilling."
+    },
+    {
+      "id": "planning-allocation",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Admit lexer, parser, AST and catalog-dependent binding allocation before construction, retain prepared outputs through their last owner, and cover every production preparation/control path with the caller-owned finite budget."
     },
     {
       "id": "azure-desktop-credentials",
