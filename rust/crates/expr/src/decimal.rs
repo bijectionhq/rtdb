@@ -209,6 +209,7 @@ fn modulo(a: BigInt, ls: i64, b: BigInt, rs: i64, target: i64, output_digits: us
     } else {
         let shift = rs - ls;
         let remainder = (&left % &right) * BigInt::from(10u8).modpow(&BigInt::from(shift), &right) % &right;
+        if !remainder.is_zero() && shift > i64::from(i32::MAX) { return Err(overflow()); }
         let quotient_zeros = if shift <= (left.bits() + right.bits() + 1) as i64 {
             let quotient = left.clone() * power(shift)? / &right;
             quotient.to_str_radix(10).bytes().rev().take_while(|byte| *byte == b'0').count() as i64

@@ -129,6 +129,7 @@ fn modulo_keeps_lub_metadata_and_remainder_scale_write_failures() {
     assert_eq!(arithmetic(B::Modulo, &value(0, i32::MAX), &V::I64(-3)).unwrap(), value(0, i32::MAX));
     assert!(arithmetic(B::Modulo, &V::I64(0), &value(1, -1000)).is_err());
     assert!(arithmetic(B::Modulo, &value(1, i32::MIN), &value(3, i32::MAX)).is_err());
+    assert!(arithmetic(B::Modulo, &value(-1, i32::MIN), &value(3, i32::MAX)).is_err());
 }
 
 #[test]
