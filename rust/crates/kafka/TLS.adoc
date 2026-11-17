@@ -3,6 +3,10 @@
 Registry dead-letter action options use Kafka's Java configuration names.
 An explicit `ssl.engine.factory.class=org.apache.kafka.common.security.ssl.DefaultSslEngineFactory` selects the same native Java-configuration adapter as the omitted default.
 Other factory classes require a native adapter.
+`ssl.provider=SunJSSE` and `schema.registry.ssl.provider=SunJSSE` select the built-in native context adapter used by the omitted default.
+Provider names are case-sensitive.
+Kafka trims Java configuration strings through U+0020; Registry preserves provider strings and treats an empty value as the omitted default.
+Other Java context providers require their own native adapter.
 `ssl.keystore.location` accepts JKS or PKCS12 private-key stores and PEM files; PEM material also accepts `ssl.keystore.key` and `ssl.keystore.certificate.chain`.
 Store and private-key passwords are independent.
 `ssl.truststore.location` accepts the same store formats, and PEM roots also accept `ssl.truststore.certificates`.
@@ -57,7 +61,7 @@ OpenSSL's certificate validation, key-size limits, signature restrictions and al
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 Alternative built-in trust-manager algorithm selection remains unfinished.
 These are open standard-configuration gaps.
-Configured Java providers and credential extensions also require native implementations.
+Additional Java providers and credential extensions require native implementations.
 The conservative material reservation bound still requires allocator measurement with large stores and concurrent handshakes.
 
 == Regression sources

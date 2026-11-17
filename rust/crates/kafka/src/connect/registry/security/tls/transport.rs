@@ -25,7 +25,7 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
     let roots = roots(trust, Arc::clone(&charge))?;
     let verify_names = !options.get("endpoint.identification.algorithm").map_or(registry_hostname_policy, |algorithm| matches!(*algorithm, "" | "none"));
     let verifier = ChainVerifier { roots, algorithms: provider.signature_verification_algorithms, verify_names, _charge: Arc::clone(&charge) };
-    let algorithm = Algorithm::parse(options.get("keymanager.algorithm").copied().filter(|name| !name.is_empty()))?;
+    let algorithm = Algorithm::parse(options.get("keymanager.algorithm").copied().filter(|name| !name.is_empty())).map_err(|cause| error("invalid-plugin-config", cause))?;
     let resolver = ClientKeys::new(identities, &provider, algorithm, charge)?;
     Ok(ClientConfig::builder_with_provider(provider).with_protocol_versions(&versions).map_err(|cause| error("invalid-plugin-config", cause))?
         .dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_client_cert_resolver(Arc::new(resolver)))
@@ -113,6 +113,7 @@ mod tests {
             let charge = memory.reserve(crate::tls::trust::allocation_bound().unwrap()).unwrap();
             let result = configuration(&BTreeMap::from([("keymanager.algorithm", algorithm)]), None, None, true, charge);
             assert_eq!(result.is_ok(), valid, "{algorithm:?}");
+            if let Err(error) = &result { assert_eq!(error.code, "xtdb.kafka-connect-source/invalid-plugin-config"); }
             drop(result);
             assert_eq!(memory.used_bytes(), 0);
         }
