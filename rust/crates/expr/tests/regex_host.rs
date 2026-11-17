@@ -138,6 +138,37 @@ fn host_classifications_reject_undefined_literal_carriers_without_reading_quoted
 }
 
 #[test]
+fn host_call_admission_rejects_unknown_carriers_before_arguments_and_ignores_quoted_children() {
+    let failing = call("subs",vec![string("x"),F::Literal(V::I64(-1))]);
+    let decimal = rtdb_types::DecimalValue::new(vec![0;16],1,0,128).unwrap();
+    for raw in [F::Literal(V::I8(1)),F::Literal(V::F32(1.0)),F::Literal(V::U64(1)),F::Literal(V::Decimal(decimal)),F::Literal(V::Transit(vec![0xff])),F::Tagged { tag: "unresolved-host-class".into(),value: Box::new(F::default()) }] {
+        let function = call("quote",vec![raw.clone()]);
+        let expression = replace(F::List(vec![function,failing.clone()]));
+        let error = ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap();
+        assert_eq!(error.code,"rtdb.expr/regex-host-form");
+        assert_eq!(error.message.as_deref(),Some("Host call admission requires an established host literal carrier"));
+        for container in [F::Vector(vec![raw.clone()]),F::Map(vec![(string("k"),raw.clone())]),F::Set(vec![raw.clone()])] {
+            let expression = replace(F::List(vec![call("quote",vec![container]),failing.clone()]));
+            assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().message.as_deref(),Some("Host substring indexes are out of range"));
+        }
+    }
+}
+
+#[test]
+fn host_call_admission_failure_releases_preparation_scope() {
+    let failing = call("subs",vec![string("x"),F::Literal(V::I64(-1))]);
+    let expression = replace(F::List(vec![F::Literal(V::Bool(false)),failing]));
+    let memory = MemoryBudget::new(128 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&context).err().unwrap().message.as_deref(),Some("Host value is not callable"));
+        assert!(memory.peak_bytes() < memory.limit_bytes());
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
 fn host_numeric_comparison_reserves_cross_product_storage_before_allocation() {
     let number = F::BigInteger("9".repeat(512));
     let expression = replace(call("str",vec![call("==",vec![number.clone(),number])]));
