@@ -3,6 +3,10 @@
 Registry dead-letter action options use Kafka's Java configuration names.
 An explicit `ssl.engine.factory.class=org.apache.kafka.common.security.ssl.DefaultSslEngineFactory` selects the same native Java-configuration adapter as the omitted default.
 Other factory classes require a native adapter.
+`ssl.provider=SunJSSE` and `schema.registry.ssl.provider=SunJSSE` select the built-in native context adapter used by the omitted default.
+Provider names are case-sensitive.
+Kafka trims Java configuration strings through U+0020; Registry preserves provider strings and treats an empty value as the omitted default.
+Other Java context providers require their own native adapter.
 `ssl.keystore.location` accepts JKS or PKCS12 private-key stores and PEM files; PEM material also accepts `ssl.keystore.key` and `ssl.keystore.certificate.chain`.
 Store and private-key passwords are independent.
 `ssl.truststore.location` accepts the same store formats, and PEM roots also accept `ssl.truststore.certificates`.
@@ -20,7 +24,15 @@ Registry HTTPS clients decode the same pinned resource into their Rustls root st
 They retain an explicitly empty Java truststore as empty.
 Explicit `ssl.ca.location` or `ssl.ca.pem` retains native CA loading; an explicit Java truststore, including an empty store, replaces the pinned anchors.
 A per-connection certificate callback checks the peer's certificate types, signature algorithms, curves and acceptable issuer names through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
-The first compatible retained entry supplies its key and certificate chain.
+`ssl.keymanager.algorithm` selects `SunX509` by default; `NewSunX509` and its `PKIX` alias select the alternative built-in manager.
+Registry HTTPS accepts the same names through `schema.registry.ssl.keymanager.algorithm`.
+Algorithm names are case-insensitive.
+Kafka applies Java ConfigDef trimming to algorithm names; Registry HTTPS preserves supplied whitespace and treats an empty name as the default.
+`SunX509` chooses by requested key-type priority, then Java `HashMap` alias iteration order.
+`NewSunX509` scans the Java store's alias enumeration, preferring a valid client certificate for the first requested key type.
+It otherwise chooses the first valid certificate, then an expired certificate before one with incompatible client key usage or extended key usage.
+Fallback ties use requested key-type priority, then store enumeration.
+The selected entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
 All parsed keys, chains, roots and their memory reservations belong to one immutable TLS value retained by the native client.
 Native client destruction joins librdkafka's activity and destroys its OpenSSL objects before releasing that value.
@@ -43,13 +55,13 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 == Open parity gaps
 
-Several simultaneously compatible identities can select a different alias from SunX509, whose choice depends on its credential map and requested key-type ordering.
-The shared keystore codec does not retain aliases for reproducing that ordering.
+Separate `signature_algorithms_cert` preferences require transport integration beyond the exposed peer signing-scheme list.
+`NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
 OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
-Alternative built-in key-manager and trust-manager algorithm selection remains unfinished.
+Alternative built-in trust-manager algorithm selection remains unfinished.
 These are open standard-configuration gaps.
-Configured Java providers and credential extensions also require native implementations.
+Additional Java providers and credential extensions require native implementations.
 The conservative material reservation bound still requires allocator measurement with large stores and concurrent handshakes.
 
 == Regression sources
@@ -57,5 +69,5 @@ The conservative material reservation bound still requires allocator measurement
 `tests/connect_registry_tls.rs` exercises public converter construction, Registry rule failure, the native dead-letter producer and an authenticated TLS listener.
 It covers nonfirst issuer selection, EC signature selection, Java TLS 1.2 and TLS 1.3 cipher names, explicit overrides of context defaults, rejected protocol fallback, unmatched issuers and converter cleanup.
 `tests/native_tls_ownership.rs` covers native configuration duplication, producer/consumer/admin retention, pre-TLS errors and setup callback errors or panics.
-Unit sources cover admission before material loading, independent JKS passwords and mixed invalid cipher lists.
+Unit sources cover admission before material loading, independent JKS passwords, mixed invalid cipher lists, both key-manager selection strategies, certificate usage and validity ranking, and native TLS 1.2/TLS 1.3 alias selection.
 These sources have not been compiled or executed during the source-only phase.
