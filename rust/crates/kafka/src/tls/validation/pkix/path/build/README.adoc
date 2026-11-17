@@ -1,0 +1,39 @@
+= PKIX builder search
+
+The passive builder follows the pinned Temurin 25.0.1+8 `PKIXValidator`, `PKIXParameters`, `ForwardBuilder`, `ForwardState`, `CollectionCertStore`, and `SunCertPathBuilder` search.
+
+* *Candidate insertion uses Java collection traversal.*
+  Certificate hashes use Java `Arrays.hashCode` over the original certificate encoding.
+  Trusted certificate and subject sets use the pinned `HashSet.newHashSet` capacities, and peer matches pass through the default `CollectionCertStore` HashSet before candidate insertion.
+** Anchor objects use native process identity as the ambient hash input; certificate and principal collision trees use native identity for non-Comparable ties.
+   Those inputs do not reproduce `System.identityHashCode` values from a particular JVM run.
+   The collection algorithms reproduce Java traversal for the supplied hashes, identities and insertion order.
+
+* *Candidate preference uses the asymmetric `ForwardBuilder.PKIXCertComparator`.*
+  It prefers a raw SKID match for the previous certificate's canonical AKI key identifier, then an issuer equal to a trusted subject, then proximity to the first trusted subject sharing a non-geographical RDN ancestor.
+** Distinct equally preferred certificates compare as less in either direction.
+   The candidate list uses `TreeMap.put`, rotations, insertion balancing and in-order traversal.
+   Trusted certificates enter that tree before peer-store candidates.
+
+* *Repeated certificates are excluded before a search frame is retained.*
+  `SunCertPathBuilder.addVertices` removes candidates already represented by the same DER or by subject/public-key equality and the same parsed SAN extension bytes.
+** SAN absence includes malformed noncritical values; accepted BER encodings, name order and case remain significant in the original parsed extension bytes.
+** Public-key equality normalizes absent and BER-encoded empty NULL algorithm parameters.
+   Non-NULL BER parameter canonicalization, OID validation, unaligned BIT STRING handling and additional provider acceptance remain open compatibility work.
+
+* *Forward selectors and branch rules bound the search.*
+  Candidate validity, legacy-anchor validity coverage, CA path length and the default maximum of five non-self-issued intermediates follow the forward selectors.
+** Forward blocklist, critical-extension and CA key-usage checks precede path completion and the successive-self-issued branch return.
+   A selected anchor completes the path before that branch rule applies.
+
+* *Path failures and post-selection failures have distinct retry boundaries.*
+  Path signatures, algorithms, certificate policy and constraints may reject a candidate and continue the search.
+** `PKIXValidator.toArray` anchor CA/key-usage checks and `Validator` TLS end-entity/distrust checks run after selection and do not retry another anchor.
+
+* *Retained search data and comparison scratch have separate lifetimes.*
+  The selected original-certificate references remain covered by the enclosing verification reservation until the verified-chain or SSL owner receives them.
+** Candidate DER and hashes are compact retained values; canonical trusted-subject copies have independent actual-size reservations.
+** Distinguished names, identifiers, SAN and CA-extension parsers are call-local and release their larger scratch reservations after each comparison or check.
+** DFS frames own their candidate reservations, and failed attempts release their scratch before another candidate is visited.
+
+The regression sources cover asymmetric rotations, hash-to-tree insertion, comparator precedence, SAN and BER-NULL key repetition, depth, branch return, post-selection failures, and reservation release with a default-sized trust set.
