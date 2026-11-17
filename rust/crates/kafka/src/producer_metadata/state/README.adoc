@@ -40,8 +40,13 @@ Already retained snapshots remain readable and charged until their last owner dr
 This termination policy is native resource behavior, not Java recovery parity.
 
 * C1: Activation requires the remaining collection and owner profiles.
-** Active topics implement the single-writer ConcurrentHashMap ordinary-bin profile, including append order, resize threshold and last-run transfer geometry.
-Tree-bin construction returns `rtdb/kafka-concurrent-map-tree` before a request can expose invented order.
+** Active topics implement the single-writer ConcurrentHashMap String-key profile, including ordinary append order, resize threshold and last-run transfer geometry.
+Treeification retains the first-list order, subsequent tree insertions prepend to that list, and the lookup root remains independent of the encounter head.
+Removal balances tree links and uses the source shape criterion for untreeification.
+Transfer retains first-list split order, flattens sides of at most six entries and preserves an unsplit larger tree's original root.
+Tree links occupy admitted inline entry storage; tree conversion, insertion and removal allocate no separate native tree node or bin.
+Only non-null immutable String keys are accepted by this owner.
+Their equal-hash comparison uses unsigned UTF16 units, and distinct String values cannot reach the generic Java identity tie-break.
 ** HashMap tree ties request a Java identity witness only at the actual `KeyOps.identity_hash_code` boundary.
 The default provider rejects a required witness.
 Native addresses, region IDs and allocation counters do not supply Java identity hashes.
@@ -59,4 +64,5 @@ The standalone integration fixture imports these production sources directly.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
 The source regressions cover duplicate failure stages, UTF8 replacement, epochs and UUID changes, both partial map replays, expiry, request versions, topic errors, rebootstrap ordering, immutable selection ownership, admission release, ordinary-bin transfer, unsupported identity profiles and native admission failure.
+Twelve additional source functions cover active-topic trees: independent first/root geometry, small-table collision presizing, equal-string identity retention, shape-triggered flattening, deletion balance, both transfer profiles, unsigned UTF16 comparison, admission failure, slot reuse, full request order and response-driven expiry.
 Runtime validation remains gated by the source-only phase.

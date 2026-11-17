@@ -344,3 +344,40 @@ fn retained_payload_admits_every_ancestor_reservation_control() {
     assert_eq!(middle.used_bytes(), 0);
     assert_eq!(leaf.used_bytes(), 0);
 }
+
+#[test]
+fn active_topic_trees_publish_full_request_order_and_retain_request_owners() {
+    let memory = MemoryBudget::new(1 << 24);
+    let mut p = producer(Arc::clone(&memory));
+    let empty = p.snapshot();
+    let names = ["AaAaAaAa", "AaAaAaBB", "AaAaBBAa", "AaAaBBBB", "AaBBAaAa", "AaBBAaBB", "AaBBBBAa", "AaBBBBBB", "BBAaAaAa", "BBAaAaBB", "BBAaBBAa"];
+    p.add_topics(names, 0, &mut NoIdentityWitness).unwrap();
+    let request = p.request(0).unwrap();
+    assert_eq!(request.scope().kind(), RequestKind::Full);
+    assert_eq!(request.topics().collect::<Vec<_>>(), [names[10]].into_iter().chain(names[..10].iter().copied()).collect::<Vec<_>>());
+    p.add_topics([names[0]], 1, &mut NoIdentityWitness).unwrap();
+    assert_eq!(p.request(1).unwrap().topics().collect::<Vec<_>>(), request.topics().collect::<Vec<_>>());
+    drop(p);
+    assert!(memory.used_bytes() > 0);
+    assert_eq!(request.topics().count(), names.len());
+    drop(request);
+    assert!(memory.used_bytes() > 0);
+    assert_eq!(empty.brokers().len(), 0);
+    drop(empty);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn active_topic_tree_entries_expire_through_successful_response_application() {
+    let mut p = producer(MemoryBudget::new(1 << 24));
+    let names = ["AaAaAaAa", "AaAaAaBB", "AaAaBBAa", "AaAaBBBB", "AaBBAaAa", "AaBBAaBB", "AaBBBBAa", "AaBBBBBB", "BBAaAaAa", "BBAaAaBB", "BBAaBBAa", "BBAaBBBB", "BBBBAaAa", "BBBBAaBB", "BBBBBBAa", "BBBBBBBB"];
+    p.add_topics(names, 0, &mut NoIdentityWitness).unwrap();
+    let topics: Vec<_> = names.iter().enumerate().map(|(index, name)| topic(name.as_bytes(), index as u8 + 1, &[])).collect();
+    assert!(matches!(apply(&mut p, 12, &topics, 0), Ok(ResponseAction::Published)));
+    p.request_full(false).unwrap();
+    assert_eq!(p.request(99).unwrap().topics().count(), names.len());
+    assert!(matches!(apply(&mut p, 12, &topics, 100), Ok(ResponseAction::Published)));
+    p.request_full(false).unwrap();
+    assert_eq!(p.request(100).unwrap().topics().count(), 0);
+    assert_eq!(p.snapshot().brokers().len(), 1);
+}
