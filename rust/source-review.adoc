@@ -562,7 +562,7 @@ Preserving those physical reader properties through views, copies, expression ev
 The reviewed primitive aggregate slice does not close that physical-reader work.
 The admitted-Arrow reader foundation retains buffer owners, normalized selections, actual primitive leaf types and getter indexes, including nullable payloads.
 Its source review repaired NullArray logical-null admission and opening-time timestamp ZoneId validation.
-Native absent union legs, exact write/copy operations, full object reads and production consumer transport remain required follow-ons.
+Container write/copy operations, full object reads and production consumer transport remain required follow-ons.
 The shared memory budget and reservation implementation now lives in `types`; `columnar` reexports the same concrete owners.
 `AllocationScope` also lives in `types`, with the expression `EvaluationScope` name reexporting that exact retained owner.
 These dependency moves enable frontend admission without importing Arrow or expression execution and do not themselves account for parser or binder allocation.
@@ -609,7 +609,7 @@ Native physical layouts retain absent signed union discriminators, concrete chil
 Method admission retains signed receiver addresses until actual payload access, preserving unsupported methods and constant nullness before bounds checks.
 Run-end ingress requires positive increasing i32 ends whose coverage may exceed the logical length, including sliced SDK inputs.
 Primitive absent receivers retain a distinct raw failure until the caller's Kotlin or Clojure conversion boundary.
-Full JVM object visitors, native scalar writers, copies, physical transport, production execution adoption and the actual origin-sensitive adapters remain required work.
+Full JVM object visitors, container writers and copies, physical transport, production execution adoption and the actual origin-sensitive adapters remain required work.
 
 Nullable shared anomalies preserve absent messages separately from empty strings through Transit, transaction retention, client codecs and native bindings.
 Each transport applies its own message policy; the optional carrier does not reconstruct raw Throwable origin.
@@ -624,5 +624,38 @@ COPY forwards an unknown first format to its frontend diagnostic and validates l
 Quoted identifiers preserve doubled interior delimiters through query and control binding.
 The generic lexer still differs in E-string admission, numeric/binary and operator token boundaries and exact parser-demand scheduling.
 Pinned simple-query parsing validates the complete grammar before any statement dispatch; native lexical splitting currently permits earlier effects before a later syntax failure.
-Native scanner implementation, raw UTF16 literal intermediates, syntax-demand parity and admitted parsed ownership remain required implementation work.
+Native scanner and token-stream production integration, raw UTF16 literal intermediates, grammar prediction, diagnostic demand and admitted parsed ownership remain required implementation work.
 No compiler or test command has executed; the completeness gate remains false and no implementation-completeness revision is recorded.
+
+
+== Native SQL demand and host call source checkpoint
+
+The isolated native scanner retains the pinned keyword/operator vocabulary, raw lexemes and recursive-comment fallback.
+Borrowed recognition errors and scoped rendered diagnostics preserve source positions and allocation ownership.
+The private token stream retains lazy initialization, one-token fetches, buffered rewind, EOF clamping and separate text synchronization.
+Recognition failures retain the fetched prefix, while admission failures prevent further allocating work on that stream.
+Owned token buffers and extracted text borrow the allocation scope through destruction.
+Its production query, control and batch consumers still require the complete grammar recognizer and literal adapters.
+
+Host numeric classification retains Number runtime categories without conversion, coefficient copying or decimal scale expansion.
+The eleven predicates use ordinary strict unary calls and unresolved emitted result metadata.
+Generic host calls perform IFn cast admission immediately after function evaluation, before argument allocation or evaluation.
+Nil and supported callable collection, keyword and symbol carriers pass this cast step; their complete invocation and raw JVM diagnostic paths remain required work.
+These bounded increments have independent source reviews and unexecuted regression sources.
+No implementation-completeness revision or runtime compatibility claim is recorded.
+
+
+== Native scalar storage source checkpoint
+
+Private scalar writers retain initialized buffer extents, logical row counts and byte/bit append positions independently.
+Their completed native leaves share borrowed reader kernels with admitted Arrow leaves.
+Setters, appends and row/selected/range copies preserve their concrete mutation schedules, raw nullable payloads and wrapping or widened address arithmetic.
+Reference failures retain completed mutation prefixes and remain recoverable; native admission failure after mutation requires clearing before further writes or publication.
+Outer copy-type failure, concrete class checks and extension requirements retain distinct raw producers for later host adaptation.
+Independent source review repaired nonnullable variable validity copying, extension failure classification, Null-source dispatch and variable range preflight order.
+All 45 scalar regression sources remain unexecuted.
+Container promotion and copying, relation assembly, full object/ValueReader adapters, metadata/hash behavior, lossless transport and production adoption remain required implementation work.
+
+Stored-object text now shares a borrowed syntax kernel while retaining its original allocation owner and append order.
+Host collection construction/order, function identity, literal carriers and environment-dependent text remain required work.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
