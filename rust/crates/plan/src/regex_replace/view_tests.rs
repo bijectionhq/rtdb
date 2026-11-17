@@ -1,4 +1,5 @@
 use super::*;
+use crate::RegexForm;
 use rtdb_types::{CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, TimeUnit};
 
 fn form_label(form: RegexFormView<'_>) -> &'static str {
