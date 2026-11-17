@@ -2,7 +2,7 @@ use std::sync::{Arc, OnceLock};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use openssl::{error::ErrorStack, ex_data::Index, pkey::{PKey, Private}, ssl::{Ssl, SslRef}, stack::Stack, x509::X509};
 use rtdb_columnar::MemoryReservation;
-use rtdb_tls::{KeyStore, ProtectedKeyStore, StoreFormat, StoreUse};
+use rtdb_tls::{KeyStore, ProtectedKeyStore, StoreFormat, StoreUse, SunX509JksStore};
 use rtdb_types::Result;
 use zeroize::Zeroizing;
 use super::{Algorithm, KeyManager, KeyType, invalid, overflow, random, security};
@@ -10,7 +10,7 @@ use super::{Algorithm, KeyManager, KeyType, invalid, overflow, random, security}
 #[derive(Clone)]
 /// Admitted client material; every exposed identity has a nonempty leaf-first certificate chain.
 /// Deferred entries retain their protected store and zeroized effective password through the last owner.
-pub(crate) enum Material { Eager(Arc<KeyStore>), Deferred(Arc<ProtectedKeys>) }
+pub(crate) enum Material { Eager(Arc<KeyStore>), SunJks(Arc<SunX509JksStore>), Deferred(Arc<ProtectedKeys>) }
 pub(crate) struct ProtectedKeys { store: Arc<ProtectedKeyStore>, password: Option<Zeroizing<String>>, _password_charge: Arc<MemoryReservation> }
 pub(super) struct NativeIdentities { entries: Vec<ClientIdentity>, manager: KeyManager, charge: Arc<MemoryReservation> }
 pub(super) struct ClientIdentity { pub certificate: X509, pub chain: Stack<X509>, pub kind: KeyType, pub eligible: bool, key: Key }
@@ -18,21 +18,28 @@ enum Key { Eager { key: PKey<Private>, _random: Arc<random::Context> }, Deferred
 struct SelectedKey { key: PKey<Private>, _charge: Arc<MemoryReservation>, _random: Arc<random::Context>, _signature_random: Arc<random::Context> }
 
 impl Material {
-    /// Initial decode charge; deferred passwords and expanded PKCS12 chains reserve additional memory from the same budget.
+    /// Initial decode charge; key recovery, deferred passwords and expanded PKCS12 chains reserve additional memory from the same budget.
     pub(crate) fn allocation_bound(length: usize, format: StoreFormat, usage: StoreUse, algorithm: Algorithm, password: Option<&str>, key_password: Option<&str>) -> Result<usize> {
         if format == StoreFormat::Java && usage != StoreUse::Trust && algorithm == Algorithm::NewSunX509 {
             ProtectedKeyStore::allocation_bound(length, password)
+        } else if format == StoreFormat::Java && usage != StoreUse::Trust && algorithm == Algorithm::SunX509 {
+            SunX509JksStore::allocation_bound(length, password, key_password.or(password))
         } else { KeyStore::allocation_bound_with_passwords(length, password, key_password) }
     }
 
     /// The supplied charge must cover `allocation_bound` before decoding or allocating the input buffer.
-    /// Java NewSunX509 leaves private-key recovery pending; PEM and SunX509 validate keys here.
+    /// Java NewSunX509 leaves recovery pending; SunX509 JKS recovers keys without matching leaf certificates.
+    /// Native provider acceptance is checked when creating native identities.
     pub(crate) fn decode(bytes: &[u8], format: StoreFormat, usage: StoreUse, algorithm: Algorithm, password: Option<&str>, key_password: Option<&str>, charge: Arc<MemoryReservation>) -> Result<Self> {
         if format == StoreFormat::Java && usage != StoreUse::Trust && algorithm == Algorithm::NewSunX509 {
             let password_charge = charge.budget().reserve(key_password.or(password).map_or(0, str::len).checked_add(256).ok_or_else(overflow)?)?;
             let store = Arc::new(ProtectedKeyStore::decode(bytes, password, charge)?);
             if usage == StoreUse::Identity && store.identities().is_empty() { return Err(invalid("Keystore contains no private key and certificate chain")); }
             Ok(Self::Deferred(Arc::new(ProtectedKeys { store, password: key_password.or(password).map(|password| Zeroizing::new(password.to_owned())), _password_charge: password_charge })))
+        } else if format == StoreFormat::Java && usage != StoreUse::Trust && algorithm == Algorithm::SunX509 && bytes.starts_with(&0xfeedfeedu32.to_be_bytes()) {
+            let store = SunX509JksStore::decode(bytes, password, key_password.or(password), charge)?;
+            if usage == StoreUse::Identity && store.identities().is_empty() { return Err(invalid("Keystore contains no private key and certificate chain")); }
+            Ok(Self::SunJks(Arc::new(store)))
         } else { KeyStore::decode(bytes, format, usage, password, key_password, charge).map(|store| Self::Eager(Arc::new(store))) }
     }
 
@@ -40,9 +47,14 @@ impl Material {
     /// Deferred material requires NewSunX509; loading metadata does not attempt private-key recovery.
     pub(super) fn native(&self, algorithm: Algorithm, random: &Arc<random::Context>, charge: &Arc<MemoryReservation>) -> Result<NativeIdentities> {
         if matches!(self, Self::Deferred(_)) && algorithm != Algorithm::NewSunX509 { return Err(invalid("Deferred private keys require NewSunX509")); }
+        if matches!(self, Self::SunJks(_)) && algorithm != Algorithm::SunX509 { return Err(invalid("Eager SunX509 JKS material requires SunX509")); }
         let mut bound = 65_536usize;
         match self {
             Self::Eager(store) => for identity in store.identities() {
+                bound = native_bound(bound, identity.private_key_pkcs8().len())?;
+                for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
+            },
+            Self::SunJks(store) => for identity in store.identities() {
                 bound = native_bound(bound, identity.private_key_pkcs8().len())?;
                 for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
             },
@@ -54,6 +66,15 @@ impl Material {
         let (manager, identities) = match self {
             Self::Eager(store) => {
                 let manager = KeyManager::new(algorithm, store.identities());
+                let identities = store.identities().iter().map(|identity| {
+                    let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
+                    ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm)
+                }).collect::<Result<Vec<_>>>()?;
+                (manager, identities)
+            }
+            Self::SunJks(store) => {
+                let aliases = store.identities().iter().map(|identity| identity.alias()).collect::<Vec<_>>();
+                let manager = KeyManager::from_aliases(algorithm, &aliases);
                 let identities = store.identities().iter().map(|identity| {
                     let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
                     ClientIdentity::new(identity.certificates(), Key::Eager { key, _random: Arc::clone(random) }, algorithm)

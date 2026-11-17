@@ -12,6 +12,8 @@ mod x500;
 pub use x500::DistinguishedName;
 mod protected;
 pub use protected::{ProtectedIdentity, ProtectedKeyStore, RecoveredKey};
+mod sun_jks;
+pub use sun_jks::{SunX509JksIdentity, SunX509JksStore};
 mod java_der;
 mod identifiers;
 pub use identifiers::{CertificateAlternativeNames, CertificateBasicConstraints, CertificateExtendedKeyUsage, CertificateIdentifiers, CertificateKeyUsage, CertificatePublicKeyEncoding};
