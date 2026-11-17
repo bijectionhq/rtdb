@@ -99,8 +99,8 @@ pub(super) fn span(data: &[u8], start: usize, length: usize) -> Result<&[u8]> { 
 
 pub(super) fn value_bound(node: &PhysicalNode, row: usize) -> Result<usize> {
     let data = ScalarStorageRef::node(node)?;
-    let payload = match node.field.data_type() {
-        DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => data.bytes(row, node.field.data_type())?.len(),
+    let payload = match node.scalar_field()?.data_type() {
+        DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_) => data.bytes(row, node.scalar_field()?.data_type())?.len(),
         DataType::Timestamp(_, Some(zone)) => zone.len().checked_add(64).ok_or_else(allocation)?,
         _ => 64,
     };
@@ -108,12 +108,12 @@ pub(super) fn value_bound(node: &PhysicalNode, row: usize) -> Result<usize> {
 }
 
 pub(super) fn value(node: &PhysicalNode, row: usize) -> Result<Value> {
-    let scalar = match &node.logical { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
+    let scalar = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
     let LogicalType::Scalar(scalar) = scalar else { return Err(layout()); };
     let data = ScalarStorageRef::node(node)?;
     let int = || Ok::<_, Anomaly>(i32::from_le_bytes(data.lane(row)?));
     let long = || Ok::<_, Anomaly>(i64::from_le_bytes(data.lane(row)?));
-    let bytes = || data.bytes(row, node.field.data_type());
+    let bytes = || data.bytes(row, node.scalar_field()?.data_type());
     use ScalarType::*;
     Ok(match scalar {
         Bool => Value::Bool(data.bit(row)?),

@@ -9,7 +9,7 @@ impl<'a> ScalarSource<'a> {
         if !matches!(&node.storage, NodeLayout::Leaf { .. } | NodeLayout::Scalar(_)) { return Err(unsupported_write("ScalarSource")); }
         Ok(Self { vector, node })
     }
-    fn scalar_type(&self) -> &LogicalType { match &self.node.logical { LogicalType::Maybe(inner) => inner, logical => logical } }
+    fn scalar_type(&self) -> &LogicalType { match self.node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner, logical => logical } }
     fn translate(&self, index: i32) -> WriteResult<i32> { Ok(self.vector.address.translate(PhysicalIndex(index))?.0) }
     fn position(&self, row: i32) -> WriteResult<usize> { Ok(self.node.checked_position(PhysicalIndex(row))?) }
     fn storage(&self) -> WriteResult<ScalarStorageRef<'a>> { Ok(ScalarStorageRef::node(self.node)?) }
@@ -17,12 +17,12 @@ impl<'a> ScalarSource<'a> {
         result.map_err(|error| if matches!(&self.node.storage, NodeLayout::Scalar(_)) { bounds() } else { WriteError::Native(error) })
     }
     fn valid(&self, row: i32) -> WriteResult<bool> {
-        if !self.node.field.is_nullable() { return Ok(true); }
+        if !self.node.descriptor.is_nullable() { return Ok(true); }
         let position = self.position(row)?;
         match &self.node.storage {
             NodeLayout::Scalar(storage) => match &storage.validity {
                 Some(bits) => self.payload(native_scalar::bit(bits.bytes.as_slice(), position)),
-                None => Ok(self.node.field.data_type() != &DataType::Null),
+                None => Ok(self.node.scalar_field()?.data_type() != &DataType::Null),
             },
             _ => Ok(!self.node.null(PhysicalIndex(row))?),
         }
@@ -65,7 +65,7 @@ enum CopyKind { Null, Bits, Fixed(usize), Variable }
 pub(crate) struct ScalarCopier<'a, 'b> { source: ScalarSource<'a>, destination: &'b mut ScalarWriter, kind: CopyKind }
 impl<'a, 'b> ScalarCopier<'a, 'b> {
     pub(crate) fn new(source: ScalarSource<'a>, destination: &'b mut ScalarWriter) -> WriteResult<Self> {
-        if source.node.field.data_type() == &DataType::Null {
+        if source.node.scalar_field()?.data_type() == &DataType::Null {
             destination.ready()?;
             return Ok(Self { source, destination, kind: CopyKind::Null });
         }
@@ -75,8 +75,8 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
     }
     pub(super) fn storage_factory(source: ScalarSource<'a>, destination: &'b mut ScalarWriter) -> WriteResult<Self> {
         let kind = destination.operation(|writer, mutation| {
-            let source_type = source.node.field.data_type();
-            let source_extension = source.node.ingress.metadata().contains_key(crate::EXTENSION_NAME_KEY);
+            let source_type = source.node.scalar_field()?.data_type();
+            let source_extension = source.node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY);
             if writer.extension() && !source_extension { return Err(WriteError::Reference(ReferenceFailure::RequireFailed)); }
             let same_wrapper = source_extension == writer.extension();
             match &writer.data {
@@ -87,13 +87,13 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
                 },
                 MutableScalarData::Fixed { width, .. } => {
                     let width = *width;
-                    if source.node.field.is_nullable() { writer.promote(mutation)?; }
+                    if source.node.descriptor.is_nullable() { writer.promote(mutation)?; }
                     if !same_wrapper || super::super::scalar::fixed_width(source_type) != Some(width) { return Err(WriteError::Reference(ReferenceFailure::CheckFailed)); }
                     Ok(CopyKind::Fixed(width))
                 },
                 MutableScalarData::Variable { .. } => {
                     if !same_wrapper || !matches!(source_type, DataType::Utf8 | DataType::Binary) { return Err(WriteError::Reference(ReferenceFailure::CheckFailed)); }
-                    if source.node.field.is_nullable() { writer.promote(mutation)?; }
+                    if source.node.descriptor.is_nullable() { writer.promote(mutation)?; }
                     Ok(CopyKind::Variable)
                 },
             }
@@ -127,7 +127,7 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
             CopyKind::Null => self.destination.operation(|writer, mutation| { for _ in 0..rows.len() { writer.promote(mutation)?; writer.undefined(mutation)?; } Ok(()) }),
             CopyKind::Bits => self.destination.operation(|writer, mutation| {
                 for index in 0..rows.len() {
-                    if source.node.field.is_nullable() { writer.promote(mutation)?; }
+                    if source.node.descriptor.is_nullable() { writer.promote(mutation)?; }
                     let row = rows.at(index);
                     if !source.valid(row)? { writer.promote(mutation)?; writer.undefined(mutation)?; }
                     else { writer.boolean(source.payload(source.storage()?.bit(source.position(row)?))?, mutation)?; }
@@ -171,12 +171,12 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
 
 fn copy_validity(destination: &mut MutableBits, source: ScalarSource<'_>, rows: Rows<'_>, mutation: &mut Mutation) -> WriteResult<()> {
     match rows {
-        Rows::One(row) if matches!(source.node.field.data_type(), DataType::Utf8 | DataType::Binary) => {
-            if source.node.field.is_nullable() { destination.selected(1, |_| source.valid(row), mutation) }
+        Rows::One(row) if matches!(source.node.scalar_field()?.data_type(), DataType::Utf8 | DataType::Binary) => {
+            if source.node.descriptor.is_nullable() { destination.selected(1, |_| source.valid(row), mutation) }
             else { destination.ones(1, mutation) }
         },
         Rows::One(row) => destination.write(source.valid(row)?, mutation),
-        _ if !source.node.field.is_nullable() => destination.ones(rows.len(), mutation),
+        _ if !source.node.descriptor.is_nullable() => destination.ones(rows.len(), mutation),
         _ => destination.selected(rows.len(), |index| source.valid(rows.at(index)), mutation),
     }
 }

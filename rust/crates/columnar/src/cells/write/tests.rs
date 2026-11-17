@@ -90,7 +90,7 @@ fn native_extent_does_not_admit_an_inactive_leg_past_its_logical_count() {
     let mut output = writer(DataType::Int64, false, &memory);
     output.ensure_capacity(1).unwrap();
     let child = frozen(output);
-    let field = Arc::new(Field::new("u", DataType::Union(UnionFields::try_new([0], [child.ingress_field().clone()]).unwrap(), UnionMode::Dense), false));
+    let field = Arc::new(Field::new("u", DataType::Union(UnionFields::try_new([0], [child.ingress_field().arrow().unwrap().clone()]).unwrap(), UnionMode::Dense), false));
     let parent = ExecutionVector::from_physical(field, PhysicalLayout::DenseUnion {
         type_ids: retained(&[255, 255, 255], &memory),
         offsets: retained(&[1i32, -1, i32::MAX].into_iter().flat_map(i32::to_le_bytes).collect::<Vec<_>>(), &memory),
@@ -457,7 +457,7 @@ fn native_run_ends_validate_every_retained_end_with_the_shared_getter() {
     values.write_long(3).unwrap();
     values.write_long(7).unwrap();
     let values = frozen(values);
-    let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().clone()), Arc::new(values.ingress_field().clone())), false));
+    let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
     let vector = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 3, run_ends: ends, values }, &memory).unwrap();
     assert_eq!(vector.cell(2).unwrap().get_long(NullChecks::Enabled).unwrap(), 7);
 }

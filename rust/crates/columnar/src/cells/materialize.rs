@@ -11,7 +11,7 @@ pub(super) fn object(cell: &CellRef<'_>) -> Result<OwnedValue> {
 
 fn leaf(node: &PhysicalNode, row: PhysicalIndex) -> Result<ResolvedCell<'_>> {
     match resolve_node(node, row)? {
-        ResolvedAccess::Leaf(cell) if cell.node.logical == LogicalType::Nothing => Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")),
+        ResolvedAccess::Leaf(cell) if cell.node.descriptor.logical_type() == &LogicalType::Nothing => Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")),
         ResolvedAccess::Leaf(cell) => Ok(cell),
         ResolvedAccess::AbsentUnion { type_id, row } => Err(absent(type_id, row)),
     }
@@ -22,14 +22,14 @@ fn bound(node: &PhysicalNode, row: PhysicalIndex) -> Result<usize> {
     let (node, row) = (cell.node, cell.row);
     let mut bytes = add(1024, mul(std::mem::size_of::<Value>(), 4)?)?;
     if node.null(row)? { return Ok(bytes); }
-    if let NodeLayout::Leaf { array, .. } = &node.storage { return crate::estimate_read_value_bytes(&node.ingress, array.as_ref(), node.checked_position(row)?); }
+    if let NodeLayout::Leaf { array, .. } = &node.storage { return crate::estimate_read_value_bytes(node.ingress_arrow()?, array.as_ref(), node.checked_position(row)?); }
     match &node.storage {
         NodeLayout::Scalar(_) => return super::native_scalar::value_bound(node, node.checked_position(row)?),
         NodeLayout::Struct { children, .. } => {
             for child in children {
                 bytes = add(bytes, add(1024, mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?)?)?;
-                bytes = add(bytes, mul(child.field.name().len(), 2)?)?;
-                if child.logical != LogicalType::Nothing { bytes = add(bytes, bound(child, row)?)?; }
+                bytes = add(bytes, mul(child.descriptor.name().len(), 2)?)?;
+                if child.descriptor.logical_type() != &LogicalType::Nothing { bytes = add(bytes, bound(child, row)?)?; }
             }
         }
         NodeLayout::List { .. } | NodeLayout::FixedList { .. } => {
@@ -47,8 +47,8 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
     let (node, row) = (cell.node, cell.row);
     if node.null(row)? { return Ok(Value::Null); }
     if let NodeLayout::Leaf { array, .. } = &node.storage {
-        let mut value = crate::read_execution_value(&node.ingress, array.as_ref(), node.checked_position(row)?)?;
-        if let (Value::Timestamp { timezone, .. }, DataType::Timestamp(_, zone)) = (&mut value, node.field.data_type()) {
+        let mut value = crate::read_execution_value(node.ingress_arrow()?, array.as_ref(), node.checked_position(row)?)?;
+        if let (Value::Timestamp { timezone, .. }, DataType::Timestamp(_, zone)) = (&mut value, node.scalar_field()?.data_type()) {
             *timezone = zone.as_ref().map(|zone| zone.to_string());
         }
         return Ok(value);
@@ -58,8 +58,8 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
         NodeLayout::Struct { children, .. } => {
             let mut fields = BTreeMap::new();
             for child in children {
-                let value = if child.logical == LogicalType::Nothing { Value::Undefined } else { read(child, row)? };
-                fields.insert(child.field.name().clone(), value);
+                let value = if child.descriptor.logical_type() == &LogicalType::Nothing { Value::Undefined } else { read(child, row)? };
+                fields.insert(child.descriptor.name().to_owned(), value);
             }
             Ok(Value::Struct(fields))
         }
@@ -67,7 +67,7 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
             let (child, start, end) = node.elements(node.checked_position(row)?)?;
             let mut values = Vec::with_capacity(end - start);
             for row in start..end { values.push(read(child, PhysicalIndex::from_position(row)?)?); }
-            let logical = match &node.logical { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
+            let logical = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
             let LogicalType::List { kind, .. } = logical else { return Err(layout()); };
             match kind {
                 ListKind::List => Ok(Value::List(values)),

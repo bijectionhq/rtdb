@@ -35,14 +35,14 @@ impl<'a> CellRef<'a> {
     /// Union, run-end and named-leg readers delegate; other leaf classes reject getBytes without a null check.
     pub fn get_bytes(&self) -> VectorReadResult<&'a [u8]> {
         let cell = self.resolve_primitive()?;
-        if !matches!(cell.node.field.data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
+        if !matches!(cell.node.descriptor.scalar_field().map(Field::data_type), Some(DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_))) { return Err(unsupported("getBytes").into()); }
         let cell = cell.payload()?;
-        Ok(ScalarStorageRef::node(cell.node)?.bytes(cell.row, cell.node.field.data_type())?)
+        Ok(ScalarStorageRef::node(cell.node)?.bytes(cell.row, cell.node.scalar_field()?.data_type())?)
     }
 
     fn primitive(&self, getter: Getter, checks: NullChecks) -> VectorReadResult<PayloadCell<'a>> {
         let cell = self.resolve_primitive()?;
-        if !getter.admits(&cell.node.logical) { return Err(unsupported(getter.name()).into()); }
+        if !getter.admits(cell.node.descriptor.logical_type()) { return Err(unsupported(getter.name()).into()); }
         if checks == NullChecks::Enabled && cell.node.null(cell.row)? {
             return Err(Anomaly::fault("xtdb.error/unknown", format!("null at index {}", cell.row.0)).into());
         }
@@ -79,7 +79,7 @@ impl<'a> CellRef<'a> {
     /// DateDay, Time32, OID extensions, intervals and Byte do not expose this getter.
     pub fn get_long(&self, checks: NullChecks) -> VectorReadResult<i64> {
         let cell = self.primitive(Getter::Long, checks)?;
-        Ok(long(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row)?)
+        Ok(long(ScalarStorageRef::node(cell.node)?, cell.node.scalar_field()?.data_type(), cell.row)?)
     }
 
     /// Reads F32 payload bits with the requested validity check; HALF and Double are not Float getters.
@@ -91,14 +91,14 @@ impl<'a> CellRef<'a> {
     /// Reads F64 or widens F32 after the requested validity check.
     pub fn get_double(&self, checks: NullChecks) -> VectorReadResult<f64> {
         let cell = self.primitive(Getter::Double, checks)?;
-        Ok(double(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row)?)
+        Ok(double(ScalarStorageRef::node(cell.node)?, cell.node.scalar_field()?.data_type(), cell.row)?)
     }
 }
 
 fn short(cell: &PayloadCell<'_>) -> Result<i16> {
     Ok(i16::from_le_bytes(ScalarStorageRef::node(cell.node)?.lane(cell.row)?))
 }
-fn int(cell: &PayloadCell<'_>) -> Result<i32> { integer(ScalarStorageRef::node(cell.node)?, cell.node.field.data_type(), cell.row) }
+fn int(cell: &PayloadCell<'_>) -> Result<i32> { integer(ScalarStorageRef::node(cell.node)?, cell.node.scalar_field()?.data_type(), cell.row) }
 pub(super) fn integer(data: ScalarStorageRef<'_>, data_type: &DataType, row: usize) -> Result<i32> {
     Ok(match data_type {
         DataType::Int16 | DataType::UInt16 => i32::from(i16::from_le_bytes(data.lane(row)?)),

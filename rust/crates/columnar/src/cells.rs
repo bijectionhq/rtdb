@@ -1,4 +1,5 @@
 mod getters;
+mod descriptor;
 mod materialize;
 mod native_scalar;
 mod write;
@@ -14,6 +15,8 @@ use rtdb_types::{Anomaly, LogicalType, Result, Value};
 use crate::{MemoryReservation, OwnedColumn, Selection};
 use storage::NodeLayout;
 pub use storage::{PhysicalLayout, RetainedBuffer};
+pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnionEncoding, VectorDescriptor};
+use descriptor::Declaration;
 
 /// Controls primitive validity checks for an individual physical read.
 /// Logical object reads always retain their own null guard.
@@ -53,8 +56,15 @@ enum ReaderView {
 
 #[derive(Debug)]
 struct PhysicalNode {
-    ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType, length: usize,
+    declaration: Declaration, descriptor: Arc<VectorDescriptor>, length: usize,
     storage: NodeLayout, owner: Arc<NodeOwner>,
+}
+impl PhysicalNode {
+    fn declaration(&self) -> DeclarationRef<'_> {
+        match &self.declaration { Declaration::Arrow(field) => DeclarationRef::Arrow(field), Declaration::Native => DeclarationRef::Native(&self.descriptor) }
+    }
+    fn ingress_arrow(&self) -> Result<&Field> { self.declaration().arrow().ok_or_else(layout) }
+    fn scalar_field(&self) -> Result<&Field> { self.descriptor.scalar_field().ok_or_else(layout) }
 }
 #[derive(Debug)]
 struct NodeOwner { backing: BackingOwner, metadata: Arc<MemoryReservation> }
@@ -102,12 +112,15 @@ impl ExecutionVector {
     /// Length and schema-depth checks precede metadata reservation; layout validation follows it, and failure drops the adopted inputs.
     /// Absent union discriminators are retained without constructing invalid Arrow arrays.
     pub fn from_physical(field: Arc<Field>, layout: PhysicalLayout, memory: &Arc<crate::MemoryBudget>) -> Result<Self> { storage::native(field, layout, memory) }
-    /// Borrows canonical opened metadata, including signed integer widths and ZoneId spelling.
-    pub fn field(&self) -> &Field { &self.node().field }
-    /// Borrows the original declaration separately from canonical opened metadata.
-    pub fn ingress_field(&self) -> &Field { &self.node().ingress }
+    /// Borrows canonical native metadata, including signed integer widths, ZoneId spelling and ordered container children.
+    pub fn descriptor(&self) -> &VectorDescriptor { &self.node().descriptor }
+    /// Projects canonical metadata into checked SDK fields under a retained lease.
+    /// Native union shapes outside the SDK discriminator domain fail without changing this vector.
+    pub fn arrow_field(&self) -> Result<RetainedArrowField> { self.descriptor().arrow_field() }
+    /// Borrows original Arrow provenance, or the authoritative native descriptor when no Arrow declaration exists.
+    pub fn ingress_field(&self) -> DeclarationRef<'_> { self.node().declaration() }
     /// Borrows the normalized execution type; physical selected-leg identity is retained independently.
-    pub fn logical_type(&self) -> &LogicalType { &self.node().logical }
+    pub fn logical_type(&self) -> &LogicalType { self.descriptor().logical_type() }
     pub fn len(&self) -> usize { self.address.len() }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     /// Borrows a checked selected position without allocating.
@@ -146,7 +159,7 @@ impl ExecutionVector {
     fn leg_name(&self, index: PhysicalIndex) -> Result<Option<&str>> {
         fn name(node: &PhysicalNode, row: PhysicalIndex) -> Result<Option<&str>> {
             match &node.storage {
-                NodeLayout::Union { .. } => Ok(node.union_leg(row)?.map(|child| child.field.name().as_str())),
+                NodeLayout::Union { .. } => Ok(node.union_leg(row)?.map(|child| child.descriptor.name())),
                 NodeLayout::RunEnd { values, .. } => name(values, node.run_index(row)?),
                 _ => Err(unsupported("getLeg")),
             }
@@ -191,7 +204,7 @@ fn resolve_node(mut node: &PhysicalNode, mut row: PhysicalIndex) -> Result<Resol
 }
 impl<'a> CellRef<'a> {
     /// Returns actual selected leaf metadata, including nullable leaf identity; an absent union leg is an error.
-    pub fn leaf_field(&self) -> Result<&'a Field> { Ok(&self.resolve()?.node.field) }
+    pub fn leaf_descriptor(&self) -> Result<&'a VectorDescriptor> { Ok(&self.resolve()?.node.descriptor) }
     /// Returns a checked source leaf row after all indirection; absent legs and addresses outside that leaf return errors.
     /// Concrete getter byte-stride arithmetic is applied after this logical row admission.
     pub fn getter_index(&self) -> Result<usize> { Ok(self.resolve()?.payload()?.row) }
@@ -210,7 +223,7 @@ impl<'a> CellRef<'a> {
     pub fn raw_struct_field(&self, name: &str) -> Result<Option<OwnedCell>> {
         let cell = self.resolve()?;
         let NodeLayout::Struct { children, .. } = &cell.node.storage else { return Err(unsupported("raw_struct_field")); };
-        children.iter().find(|child| child.field.name() == name).map(|child| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
+        children.iter().find(|child| child.descriptor.name() == name).map(|child| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
     }
     /// Returns retained raw elements, including null-parent payload, after physical indirection.
     /// This is distinct from listElements admission on union/run-end readers.

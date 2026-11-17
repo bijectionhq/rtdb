@@ -10,7 +10,7 @@ impl RunGetter {
 
 fn long_long_reader(node: &PhysicalNode) -> bool {
     matches!(&node.storage, NodeLayout::RunEnd { .. })
-        || matches!(node.field.data_type(), DataType::FixedSizeBinary(_)) && !node.ingress.metadata().contains_key(crate::EXTENSION_NAME_KEY)
+        || matches!(node.descriptor.scalar_field().map(Field::data_type), Some(DataType::FixedSizeBinary(_))) && !node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY)
 }
 
 impl<'a> CellRef<'a> {
@@ -19,7 +19,7 @@ impl<'a> CellRef<'a> {
     /// Indirect/run-end and extension readers delegate; Boolean, Null, containers and union/named-leg readers reject it.
     pub fn byte_span(&self) -> Result<&'a [u8]> {
         let cell = self.run_delegate(RunGetter::Pointer)?;
-        let data_type = cell.node.field.data_type();
+        let data_type = cell.node.descriptor.scalar_field().ok_or_else(|| unsupported("getPointer"))?.data_type();
         if matches!(data_type, DataType::Utf8 | DataType::Binary) {
             return bytes(&cell);
         }
@@ -38,8 +38,8 @@ impl<'a> CellRef<'a> {
 
     fn long_long(&self, part: usize) -> Result<i64> {
         let cell = self.run_delegate(RunGetter::LongLong)?;
-        if cell.node.ingress.metadata().contains_key(crate::EXTENSION_NAME_KEY) { return Err(unsupported("LongLongVectorReader")); }
-        let DataType::FixedSizeBinary(width) = cell.node.field.data_type() else { return Err(unsupported("LongLongVectorReader")); };
+        if cell.node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY) { return Err(unsupported("LongLongVectorReader")); }
+        let Some(DataType::FixedSizeBinary(width)) = cell.node.descriptor.scalar_field().map(Field::data_type) else { return Err(unsupported("LongLongVectorReader")); };
         let width = usize::try_from(*width).map_err(|_| layout())?;
         let cell = cell.payload()?;
         let lane = (cell.row as i32).wrapping_mul(2).wrapping_add((part / 8) as i32);
@@ -66,7 +66,7 @@ impl<'a> CellRef<'a> {
 
     fn numeric(&self) -> Result<ResolvedCell<'a>> {
         let (ReaderView::Direct(node), Address::Identity { .. }) = (&self.vector.view, &self.vector.address) else { return Err(unsupported("NumericVector")); };
-        let scalar = match &node.logical { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
+        let scalar = match node.descriptor.logical_type() { LogicalType::Maybe(inner) => inner.as_ref(), other => other };
         if !matches!(scalar, LogicalType::Scalar(ScalarType::I8 | ScalarType::I16 | ScalarType::I32 | ScalarType::I64 | ScalarType::F32 | ScalarType::F64 | ScalarType::Decimal { .. })) { return Err(unsupported("NumericVector")); }
         Ok(ResolvedCell { node, row: PhysicalIndex::from_position(self.index)? })
     }
@@ -79,7 +79,7 @@ impl<'a> CellRef<'a> {
     /// Numeric-class admission is separate from the forwarding VectorReader primitive methods.
     pub fn get_as_long(&self, checks: NullChecks) -> VectorReadResult<i64> {
         let cell = self.numeric()?;
-        match cell.node.field.data_type() {
+        match cell.node.scalar_field()?.data_type() {
             DataType::Int8 => Ok(i64::from(self.get_byte(checks)?)),
             DataType::Int16 => Ok(i64::from(self.get_short(checks)?)),
             DataType::Int32 => Ok(i64::from(self.get_int(checks)?)),
@@ -92,7 +92,7 @@ impl<'a> CellRef<'a> {
     /// Primitive classes apply the requested null check; temporary decimal conversion storage is budgeted.
     pub fn get_as_float(&self, checks: NullChecks) -> VectorReadResult<f32> {
         let cell = self.numeric()?;
-        match cell.node.field.data_type() {
+        match cell.node.scalar_field()?.data_type() {
             DataType::Float32 => self.get_float(checks),
             DataType::Float64 => Ok(self.get_double(checks)? as f32),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(self.get_as_long(checks)? as f32),
@@ -106,7 +106,7 @@ impl<'a> CellRef<'a> {
     /// Converts a concrete NumericVector to f64 with the same admission and null behavior as get_as_float.
     pub fn get_as_double(&self, checks: NullChecks) -> VectorReadResult<f64> {
         let cell = self.numeric()?;
-        match cell.node.field.data_type() {
+        match cell.node.scalar_field()?.data_type() {
             DataType::Float32 | DataType::Float64 => self.get_double(checks),
             DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => Ok(self.get_as_long(checks)? as f64),
             _ => {
@@ -121,9 +121,9 @@ impl<'a> CellRef<'a> {
     /// Only direct Decimal readers expose getDecimal; the returned logical value retains its allocation lease.
     pub fn get_decimal(&self) -> Result<OwnedValue> {
         let cell = self.numeric()?;
-        if crate::decimal_parameters(cell.node.field.data_type()).is_none() { return Err(unsupported("getDecimal")); }
+        if crate::decimal_parameters(cell.node.scalar_field()?.data_type()).is_none() { return Err(unsupported("getDecimal")); }
         let reservation = self.vector.budget().reserve(4096)?;
-        let parameters = crate::decimal_field_parameters(&cell.node.field)?.ok_or_else(|| unsupported("getDecimal"))?;
+        let parameters = crate::decimal_field_parameters(cell.node.scalar_field()?)?.ok_or_else(|| unsupported("getDecimal"))?;
         let width = usize::from(parameters.bit_width / 8);
         let cell = cell.payload()?;
         let raw = fixed_bytes(&cell, width, cell.row.checked_mul(width).ok_or_else(allocation)?, width)?;
@@ -133,7 +133,7 @@ impl<'a> CellRef<'a> {
 }
 
 fn bytes<'a>(cell: &ResolvedCell<'a>) -> Result<&'a [u8]> {
-    super::native_scalar::ScalarStorageRef::node(cell.node)?.bytes(cell.payload()?.row, cell.node.field.data_type())
+    super::native_scalar::ScalarStorageRef::node(cell.node)?.bytes(cell.payload()?.row, cell.node.scalar_field()?.data_type())
 }
 
 fn fixed_bytes<'a>(cell: &PayloadCell<'a>, _width: usize, relative: usize, length: usize) -> Result<&'a [u8]> {
@@ -154,7 +154,7 @@ pub(super) fn fixed_width(data_type: &DataType) -> Option<usize> {
 }
 
 fn decimal_text(cell: &ResolvedCell<'_>) -> Result<String> {
-    let parameters = crate::decimal_field_parameters(&cell.node.field)?.ok_or_else(|| unsupported("NumericVector"))?;
+    let parameters = crate::decimal_field_parameters(cell.node.scalar_field()?)?.ok_or_else(|| unsupported("NumericVector"))?;
     let width = usize::from(parameters.bit_width / 8);
     let cell = cell.payload()?;
     let raw = fixed_bytes(&cell, width, cell.row.checked_mul(width).ok_or_else(allocation)?, width)?;
