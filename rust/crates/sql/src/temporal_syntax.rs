@@ -47,33 +47,37 @@ pub(crate) fn function(name: &str,function: &ast::Function) -> Result<()> {
 }
 
 
-pub(crate) fn interval_literal(interval: &ast::Interval) -> Result<rtdb_plan::Expr> {
-    use rtdb_plan::{Expr, IntervalField};
-    let (value, negative) = match interval.value.as_ref() {
-        ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => (expr.as_ref(), true),
-        ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr } => (expr.as_ref(), false),
-        value => (value, false),
-    };
-    let value = Expr::Literal(Value::Utf8(character_string(value)?.ok_or_else(|| error("INTERVAL requires a character string literal"))?));
-    let expression = if let Some(start) = &interval.leading_field {
-        let start = IntervalField::parse(&start.to_string())?;
-        let fractional = match (start, interval.last_field.as_ref(), interval.leading_precision, interval.fractional_seconds_precision) {
-            (IntervalField::Second, None, Some(precision), None) => precision,
-            (_, _, None, precision) => precision.unwrap_or(6),
-            _ => return Err(error("Unsupported interval leading precision")),
+impl crate::bind::Context<'_> {
+    pub(crate) fn interval_literal(&mut self, interval: &ast::Interval) -> Result<rtdb_plan::Expr> {
+        use sqlparser::ast::Spanned;
+        use rtdb_plan::{Expr, IntervalField};
+        let (value, negative) = match interval.value.as_ref() {
+            ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr } => (expr.as_ref(), true),
+            ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr } => (expr.as_ref(), false),
+            value => (value, false),
         };
-        let fractional = Expr::Literal(Value::I64(i64::try_from(fractional).map_err(error)?));
-        let leading = Expr::Literal(Value::I64(2));
-        let unit = |field: IntervalField| Expr::Literal(Value::Utf8(field.name().into()));
-        let (name, args) = if let Some(end) = &interval.last_field {
-            ("multi_field_interval", vec![value, unit(start), leading, unit(IntervalField::parse(&end.to_string())?), fractional])
+        let text = character_string(value)?.ok_or_else(|| error("INTERVAL requires a character string literal"))?;
+        let expression = if let Some(start) = &interval.leading_field {
+            let value = Expr::Literal(Value::Utf8(text));
+            let start = IntervalField::parse(&start.to_string())?;
+            let fractional = match (start, interval.last_field.as_ref(), interval.leading_precision, interval.fractional_seconds_precision) {
+                (IntervalField::Second, None, Some(precision), None) => precision,
+                (_, _, None, precision) => precision.unwrap_or(6),
+                _ => return Err(error("Unsupported interval leading precision")),
+            };
+            let fractional = Expr::Literal(Value::I64(i64::try_from(fractional).map_err(error)?));
+            let leading = Expr::Literal(Value::I64(2));
+            let unit = |field: IntervalField| Expr::Literal(Value::Utf8(field.name().into()));
+            let (name, args) = if let Some(end) = &interval.last_field {
+                ("multi_field_interval", vec![value, unit(start), leading, unit(IntervalField::parse(&end.to_string())?), fractional])
+            } else {
+                ("single_field_interval", vec![value, unit(start), leading, fractional])
+            };
+            let return_type = rtdb_plan::function_type_with_args(name, &args)?;
+            Expr::Call { name: name.into(), args, return_type }
         } else {
-            ("single_field_interval", vec![value, unit(start), leading, fractional])
+            Expr::Literal(self.literals.interval(interval.value.span(), text))
         };
-        let return_type = rtdb_plan::function_type_with_args(name, &args)?;
-        Expr::Call { name: name.into(), args, return_type }
-    } else {
-        return Err(crate::bind::unsupported("Unqualified INTERVAL literals"));
-    };
-    Ok(if negative { Expr::unary(rtdb_plan::UnaryOp::Negate, expression) } else { expression })
+        Ok(if negative { Expr::unary(rtdb_plan::UnaryOp::Negate, expression) } else { expression })
+    }
 }

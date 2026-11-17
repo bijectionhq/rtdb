@@ -4321,6 +4321,7 @@ name = "rtdb-sql"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "regex",
  "rtdb-columnar",
  "rtdb-format",
  "rtdb-index",

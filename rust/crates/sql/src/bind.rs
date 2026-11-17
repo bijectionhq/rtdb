@@ -19,6 +19,7 @@ enum TablePurpose { Query, Mutation, Erase }
 enum ListTableKind { Series, Unnest }
 
 pub(crate) struct Context<'a> {
+    pub(crate) literals: crate::literal_admission::LiteralAdmission,
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
     pub options: &'a PrepareOptions,
@@ -49,19 +50,24 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
-    context.expr(expression, &Schema::default(), &BTreeMap::new())
+    let mut context = Context { literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
+    context.admit_expression_literals(expression)?;
+    let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
+    context.literals.check()?;
+    Ok(expression)
 }
 
 pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();
-    let mut context = Context { source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = parsed.settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
+    context.admit_statement_literals(&parsed.statement)?;
     let statement = context.statement(&parsed.statement)?;
+    context.literals.check()?;
     Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: source.to_owned(), notices: context.notices, settings })
 }
 
@@ -614,6 +620,14 @@ impl Context<'_> {
             }
             _ => Err(unsupported("Table source")),
         }
+    }
+
+    pub(crate) fn admit_table_temporal_literals(&mut self, name: &ast::ObjectName) -> Result<()> {
+        let end = name.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
+        let clauses = self.temporal.iter().filter(|clause| Some(clause.owner_end) == end);
+        let extents = clauses.clone().filter(|clause| !clause.system).chain(clauses.filter(|clause| clause.system)).map(|clause| clause.extent.clone()).collect::<Vec<_>>();
+        for extent in &extents { self.admit_extent_literals(extent)?; }
+        Ok(())
     }
 
     fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {

@@ -414,10 +414,15 @@ Empty inputs and aggregate rows excluded by a filter do not construct that impli
 `tests/set_equality.rs` covers prepared arguments, declared empty collection types and implicit relational equality as unexecuted regression source.
 
 Qualified SQL interval values retain the `INTERVAL` grammar surface.
-Unqualified interval literals report unsupported syntax during preparation.
+Unqualified interval literals decode ISO period/duration components or PostgreSQL unit strings during preparation.
+The decoded interval retains year-month, month-day-micro or month-day-nano metadata according to its day/time components and nanosecond precision.
+Invalid literals fail during preparation with the original input and parser message in the SQL planning error, including in unused expressions and settings.
+The planner accumulates interval diagnostics in encounter order and constructs their error envelope before publishing a prepared statement.
+Query literal admission precedes group-expression replacement; HAVING, SELECT and GROUP BY retain the source planner's diagnostic order, including nested queries.
 The shared internal names `single_field_interval` and `multi_field_interval` are available through XTQL generic calls and remain outside SQL named-function syntax.
 Numeric FLOOR and CEIL parser forms lower to the shared scalar evaluators.
 `tests/interval_constructors.rs` records the interval dialect boundary and literal qualifier checks.
+`tests/temporal_casts.rs` covers the original interval literal assertions and their prepared schema, Arrow output and RANGE stride.
 
 == PostgreSQL JSON access operators
 

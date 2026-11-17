@@ -48,3 +48,51 @@ async fn interval_sql_qualifiers_keep_source_dependent_output_types() {
     assert_eq!(query("SELECT CAST('1970-01-01T00:00:00' AS TIMESTAMPTZ)","UTC").await.unwrap_err().code,"xtdb.expression/invalid-temporal-string");
     assert_eq!(query("SELECT CAST('1970-01-01Z' AS TIMESTAMPTZ)","Europe/Paris").await.unwrap().0,LogicalType::Scalar(ScalarType::Timestamp { unit: U::Microsecond, timezone: Some("Europe/Paris".into()) }));
 }
+
+#[tokio::test]
+async fn unqualified_interval_literals_keep_their_prepared_and_vector_types() {
+    for (text, expected) in [
+        ("P",V::IntervalYearMonth(0)),
+        ("PT",V::IntervalYearMonth(0)),
+        ("P1Y",V::IntervalYearMonth(12)),
+        ("P1Y-2M3D",V::IntervalMonthDayMicro { months: 10,days: 3,nanoseconds: 0 }),
+        ("PT5H6M12.912S",V::IntervalMonthDayMicro { months: 0,days: 0,nanoseconds: 18_372_912_000_000 }),
+        ("PT5H-6M-12.912S",V::IntervalMonthDayMicro { months: 0,days: 0,nanoseconds: 17_627_088_000_000 }),
+        ("P1Y3DT12H52S",V::IntervalMonthDayMicro { months: 12,days: 3,nanoseconds: 43_252_000_000_000 }),
+        ("P1Y10M3DT12H52S",V::IntervalMonthDayMicro { months: 22,days: 3,nanoseconds: 43_252_000_000_000 }),
+        ("P1W",V::IntervalMonthDayMicro { months: 0,days: 7,nanoseconds: 0 }),
+        ("-P1Y2DT3S",V::IntervalMonthDayMicro { months: -12,days: -2,nanoseconds: -3_000_000_000 }),
+        ("PT0.000000001S",V::IntervalMonthDayNano { months: 0,days: 0,nanoseconds: 1 }),
+        ("PT-0.000000001S",V::IntervalMonthDayNano { months: 0,days: 0,nanoseconds: -1 }),
+        ("P0D",V::IntervalYearMonth(0)),
+        ("P1DT0.000001S",V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 1000 }),
+        ("1 year 2 months",V::IntervalYearMonth(14)),
+        ("-30 day",V::IntervalMonthDayMicro { months: 0,days: -30,nanoseconds: 0 }),
+        ("30 day",V::IntervalMonthDayMicro { months: 0,days: 30,nanoseconds: 0 }),
+        ("prefix 2 days suffix",V::IntervalMonthDayMicro { months: 0,days: 2,nanoseconds: 0 }),
+        ("2days",V::IntervalMonthDayMicro { months: 0,days: 2,nanoseconds: 0 }),
+        ("PT0.S",V::IntervalYearMonth(0)),
+        ("-P-1Y-2DT-3S",V::IntervalMonthDayMicro { months: 12,days: 2,nanoseconds: 3_000_000_000 }),
+        ("P-2147483648D",V::IntervalMonthDayMicro { months: 0,days: i32::MIN,nanoseconds: 0 }),
+        ("P306783378W",V::IntervalMonthDayMicro { months: 0,days: 2_147_483_646,nanoseconds: 0 }),
+        ("1 day -1 day",V::IntervalYearMonth(0)),
+        ("PT-0.S",V::IntervalYearMonth(0)),
+        ("P1Y-12M",V::IntervalYearMonth(0)),
+        ("P1DT",V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 0 }),
+        ("1 SECOND",V::IntervalMonthDayMicro { months: 0,days: 0,nanoseconds: 1_000_000_000 }),
+        ("0.5 second",V::IntervalMonthDayMicro { months: 0,days: 0,nanoseconds: 5_000_000_000 }),
+        ("year1day",V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 0 }),
+        ("1\u{b}day",V::IntervalMonthDayMicro { months: 0,days: 1,nanoseconds: 0 }),
+    ] {
+        assert_eq!(query(&format!("SELECT INTERVAL '{text}'"),"UTC").await.unwrap(),(expected.logical_type(),expected),"{text}");
+    }
+    assert_eq!(query("SELECT INTERVAL - 'P1D'","UTC").await.unwrap(),(LogicalType::Scalar(ScalarType::IntervalMonthDayMicro),V::IntervalMonthDayMicro { months: 0,days: -1,nanoseconds: 0 }));
+}
+
+#[tokio::test]
+async fn range_accepts_the_original_unqualified_interval_stride() {
+    let timestamps = [1_577_836_800_000_000,1_577_923_200_000_000,1_578_009_600_000_000].into_iter()
+        .map(|value| V::Timestamp { value,unit: U::Microsecond,timezone: None }).collect();
+    let expected = V::List(timestamps);
+    assert_eq!(query("SELECT RANGE(DATE '2020-01-01',DATE '2020-01-04',INTERVAL 'P1D')","UTC").await.unwrap(),(expected.logical_type(),expected));
+}

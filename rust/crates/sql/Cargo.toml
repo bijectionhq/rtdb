@@ -12,6 +12,7 @@ rtdb-plan.workspace = true
 rtdb-xtql.workspace = true
 sqlparser = { workspace = true, features = ["visitor"] }
 chrono.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

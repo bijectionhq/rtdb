@@ -88,7 +88,7 @@ impl Context<'_> {
                     },
                 }
             },
-            ast::Expr::Interval(interval) => crate::temporal_syntax::interval_literal(interval)?,
+            ast::Expr::Interval(interval) => self.interval_literal(interval)?,
             ast::Expr::Floor { expr, field } | ast::Expr::Ceil { expr, field } => {
                 if !matches!(field, ast::CeilFloorKind::DateTimeField(ast::DateTimeField::NoDateTime)) { return Err(unsupported("CEIL/FLOOR precision fields")); }
                 let name = if matches!(expression, ast::Expr::Floor { .. }) { "floor" } else { "ceil" };

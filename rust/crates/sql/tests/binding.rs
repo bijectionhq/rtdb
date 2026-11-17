@@ -7,6 +7,27 @@ use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
 struct Fixture;
 
 #[test]
+fn invalid_interval_default_reports_its_source_occurrence_once() {
+    let error = prepare("SETTING DEFAULT VALID_TIME AS OF INTERVAL 'bad' SELECT * FROM foo",&Fixture,&PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: bad - failed with message null"));
+    assert_eq!(serde_json::to_value(&error.context).unwrap(),serde_json::json!({"errors":[{"i-str":"bad","msg":null}]}));
+}
+
+#[test]
+fn update_interval_diagnostics_admit_assignments_before_the_predicate() {
+    let error = prepare("UPDATE foo SET v=INTERVAL 'set-bad' WHERE INTERVAL 'where-bad' IS NULL",&Fixture,&PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: set-bad - failed with message null\n  - Cannot parse interval: where-bad - failed with message null"));
+    assert_eq!(serde_json::to_value(&error.context).unwrap(),serde_json::json!({"errors":[{"i-str":"set-bad","msg":null},{"i-str":"where-bad","msg":null}]}));
+}
+
+#[test]
+fn table_interval_diagnostics_admit_valid_time_before_system_time() {
+    let error = prepare("SELECT 1 FROM foo FOR SYSTEM_TIME AS OF INTERVAL 'system-bad' FOR VALID_TIME AS OF INTERVAL 'valid-bad'",&Fixture,&PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: valid-bad - failed with message null\n  - Cannot parse interval: system-bad - failed with message null"));
+    assert_eq!(serde_json::to_value(&error.context).unwrap(),serde_json::json!({"errors":[{"i-str":"valid-bad","msg":null},{"i-str":"system-bad","msg":null}]}));
+}
+
+#[test]
 fn parsed_parameter_count_precedes_dml_table_binding() {
     let parsed = parse("UPDATE absent SET value = $3 WHERE _id = ?").unwrap();
     assert_eq!(parsed[0].kind(), rtdb_sql::StatementKind::Dml);

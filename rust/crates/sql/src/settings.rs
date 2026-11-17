@@ -140,7 +140,7 @@ impl Context<'_> {
             return Ok(SettingValue::Unevaluated { parameter_count });
         }
         if let ast::Expr::Interval(interval) = expression {
-            crate::temporal_syntax::interval_literal(interval)?;
+            self.interval_literal(interval)?;
             return Ok(SettingValue::Unevaluated { parameter_count: 0 });
         }
         if let ast::Expr::Floor { field, .. } | ast::Expr::Ceil { field, .. } = expression {
