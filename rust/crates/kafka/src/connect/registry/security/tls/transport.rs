@@ -4,7 +4,6 @@ use rtdb_tls::{IssuerNames, KeyStore};
 use rtdb_types::Result;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme, client::{ResolvesClientCert, danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier}}, crypto::{CryptoProvider, WebPkiSupportedAlgorithms}, pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime}, server::ParsedCertificate, sign::CertifiedKey};
 use super::error;
-pub(super) const ROOT_RESERVATION: usize = 8 * 1024 * 1024;
 
 pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeyStore>, identities: Option<&KeyStore>, registry_hostname_policy: bool, charge: Arc<MemoryReservation>) -> Result<ClientConfig> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -18,21 +17,19 @@ pub(super) fn configuration(options: &BTreeMap<&str, &str>, trust: Option<&KeySt
         if protocols.iter().any(|protocol| !matches!(*protocol, "TLSv1.2" | "TLSv1.3")) { return Err(error("invalid-plugin-config", "Unsupported registry TLS enabled protocol")); }
         versions.retain(|version| match version.version { rustls::ProtocolVersion::TLSv1_2 => protocols.contains(&"TLSv1.2"), rustls::ProtocolVersion::TLSv1_3 => protocols.contains(&"TLSv1.3"), _ => false });
     }
-    let mut roots = RootCertStore::empty();
-    if let Some(trust) = trust {
-        for certificate in trust.trusted_certificates() { roots.add(CertificateDer::from(certificate.as_slice())).map_err(|cause| error("invalid-plugin-config", cause))?; }
-    } else {
-        let native = rustls_native_certs::load_native_certs();
-        let size = native.certs.iter().try_fold(0usize, |size, certificate| size.checked_add(certificate.len()).ok_or_else(|| error("allocation-overflow", "Native trust store exceeds range")))?;
-        if size > ROOT_RESERVATION / 8 || native.certs.len() > 4096 { return Err(error("invalid-plugin-config", "Native trust store exceeds its reserved bound")); }
-        let (accepted, _) = roots.add_parsable_certificates(native.certs);
-        if accepted == 0 { return Err(error("invalid-plugin-config", "Native trust store contains no usable certificates")); }
-    }
+    let roots = roots(trust, Arc::clone(&charge))?;
     let verify_names = !options.get("endpoint.identification.algorithm").map_or(registry_hostname_policy, |algorithm| matches!(*algorithm, "" | "none"));
     let verifier = ChainVerifier { roots, algorithms: provider.signature_verification_algorithms, verify_names, _charge: Arc::clone(&charge) };
     let resolver = ClientKeys::new(identities, &provider, charge)?;
     Ok(ClientConfig::builder_with_provider(provider).with_protocol_versions(&versions).map_err(|cause| error("invalid-plugin-config", cause))?
         .dangerous().with_custom_certificate_verifier(Arc::new(verifier)).with_client_cert_resolver(Arc::new(resolver)))
+}
+fn roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<RootCertStore> {
+    let defaults = if trust.is_none() { Some(crate::tls::trust::decode(charge)?) } else { None };
+    let trust = trust.or(defaults.as_ref()).expect("explicit or default trust store");
+    let mut roots = RootCertStore::empty();
+    for certificate in trust.trusted_certificates() { roots.add(CertificateDer::from(certificate.as_slice())).map_err(|cause| error("invalid-plugin-config", cause))?; }
+    Ok(roots)
 }
 struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames }
 struct ClientKeys { identities: Vec<ClientIdentity>, _charge: Arc<MemoryReservation> }
@@ -82,6 +79,18 @@ mod tests {
     use rtdb_columnar::MemoryBudget;
     use rtdb_tls::{StoreFormat, StoreUse};
     #[test]
+    fn registry_default_roots_match_the_pinned_java_store_and_explicit_empty_trust_wins() {
+        let memory = MemoryBudget::new(1 << 25);
+        let charge = memory.reserve(crate::tls::trust::allocation_bound().unwrap()).unwrap();
+        let defaults = roots(None, Arc::clone(&charge)).unwrap();
+        assert_eq!(defaults.len(), 146);
+        let empty = include_bytes!("../../../../../../../../rust/crates/tls/tests/fixtures/empty.jks");
+        let empty = KeyStore::decode(empty, StoreFormat::Java, StoreUse::Trust, Some("12345678"), None, Arc::clone(&charge)).unwrap();
+        assert!(roots(Some(&empty), Arc::clone(&charge)).unwrap().is_empty());
+        drop(defaults); drop(empty); drop(charge);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
     fn client_identity_selection_checks_issuer_hints_and_signature_schemes() {
         let bytes = include_bytes!("../../../../../../../../src/test/resources/xtdb/pgwire/xtdb.example.com.p12");
         let memory = MemoryBudget::new(1 << 24); let charge = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes.len(),Some("password123"),None).unwrap()).unwrap();
@@ -118,7 +127,7 @@ mod tests {
     #[test]
     fn disabling_hostnames_preserves_chain_and_validity_verification() {
         let (root,leaf) = certificates(); let leaf = CertificateDer::from(leaf); let mut roots = RootCertStore::empty(); roots.add(CertificateDer::from(root)).unwrap();
-        let memory = MemoryBudget::new(1 << 24); let charge = memory.reserve(ROOT_RESERVATION).unwrap();
+        let memory = MemoryBudget::new(1 << 24); let charge = memory.reserve(1 << 20).unwrap();
         let provider = rustls::crypto::aws_lc_rs::default_provider();
         let mut verifier = ChainVerifier { roots, algorithms: provider.signature_verification_algorithms, verify_names:false,_charge:charge };
         let wrong_name = ServerName::try_from("wrong.test").unwrap(); let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_700_000_000));
