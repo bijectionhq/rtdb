@@ -4,6 +4,8 @@ use rtdb_types::Anomaly;
 use crate::decimal::decimal_parts_text as decimal_text;
 mod parse;
 mod hash;
+mod arithmetic;
+pub(crate) use arithmetic::{Binary,Dispatch,Unary};
 
 #[derive(Debug)]
 pub(crate) enum Error { Invalid,External(Anomaly) }

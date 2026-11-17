@@ -201,5 +201,7 @@ The owned carrier preserves nonliteral host pattern syntax through the native ho
 Native REGEXP_REPLACE host patterns retain their own lexical compilation and invocation phases.
 Simple lexical bindings and pure string/control forms compile independently of XTQL row variables, while raw replacement and flag fields retain their metadata contracts.
 Host BigInt and BigDecimal literals preserve exact numeric text, and checked primitive conversions retain the difference between direct inline calls and calls through lexical function values.
+Host arithmetic supports checked and promoting addition, subtraction, multiplication, increment and decrement, plus exact or floating division.
+Direct n-ary forms retain left-nested execution and primitive overloads; calls through lexical functions retain strict argument evaluation and boxed numeric dispatch.
 `tests/regex_host.rs` records computed patterns, shadowing, strict arguments, UTF16 substring indexes and dead-branch compilation as unexecuted source.
-General host arithmetic, interop, effects, object rendering and generated-local multiplicity remain required follow-on work.
+Remaining host numeric functions and dynamic arithmetic bindings, interop, effects, object rendering and generated-local multiplicity remain required follow-on work.
