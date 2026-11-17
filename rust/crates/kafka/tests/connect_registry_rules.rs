@@ -93,8 +93,8 @@ async fn json_null_is_a_read_rule_message_and_rule_runs_before_connect_conversio
 
 #[tokio::test]
 async fn configured_rule_failure_expansion_is_reserved_before_cache_publication() {
-    let rules = json!({"domainRules":(0..16).map(|index| json!({"name":format!("rule-{index}"),"type":"absent"})).collect::<Vec<_>>()});
-    let options = BTreeMap::from([("rule.executors._default_.onFailure".into(), "x".repeat(1 << 20))]);
+    let rules = json!({"domainRules":(0..64).map(|index| json!({"name":format!("rule-{index}"),"type":"absent"})).collect::<Vec<_>>()});
+    let options = BTreeMap::from([("rule.executors._default_.onFailure".into(), "x".repeat(1 << 18))]);
     let (mut converter, server) = registry_options(r#""long""#, "AVRO", rules, options).await;
     let memory = MemoryBudget::new(1 << 27);
     let mut context = ConversionContext::with_limit(Arc::clone(&memory), 32 << 20);
