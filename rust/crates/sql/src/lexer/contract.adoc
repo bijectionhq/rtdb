@@ -1,0 +1,24 @@
+= Native SQL lexemes
+
+The scanner borrows the original UTF8 source and yields raw lexemes with byte offsets, code-point offsets, one-based lines and zero-based columns.
+Only LF advances the line counter.
+Keyword aliases share their grammar token kind and retain their original spelling.
+Quoted identifiers and string bodies retain doubled delimiters and escape text.
+Dollar strings expose their start, text and end tokens separately and compare closing tags case-sensitively.
+EOF in dollar mode remains EOF for the parser to diagnose.
+
+The scanner follows `core/src/main/antlr/xtdb/antlr/SqlLexer.g4`.
+Longer token candidates retain the last accepted endpoint when their continuation fails.
+Recursive comments preserve ordered recursive and wildcard paths through the nongreedy loop; an earlier accepted outer-comment endpoint remains available when a preferred nested continuation fails.
+The corresponding ANTLR 4.13.2 rules are `ParserATNFactory.star`, `LexerATNConfig.checkNonGreedyDecision`, and `LexerATNSimulator.getReachableConfigSet`, `closure` and `failOrAccept`.
+
+The caller supplies a finite `AllocationScope` before scanning.
+Raw lexemes and recognition failures borrow source text without allocating copies.
+Comment configuration storage and rendered error text acquire reservations before growth.
+Reservations remain with the supplied scope until it is dropped.
+A recognition failure retains its source span; rendering it requires allocation admission.
+The rendered diagnostic owns its message and borrows that allocation scope through destruction.
+Callers can borrow its anomaly; the diagnostic provides no owned extraction or cloning operation.
+
+The scanner is isolated from production parse, control and statement-splitting entry points pending their integration review.
+Query C-escape decoding, opaque control strings, UTF16 literal values, parser prediction/error order, validated batch dispatch and AST/binder admission are separate required consumers.

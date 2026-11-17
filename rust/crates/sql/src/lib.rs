@@ -16,6 +16,7 @@ mod json_access;
 mod materialized;
 mod wildcard;
 mod returning;
+mod lexer;
 
 pub use parse::{ParsedStatement, StatementKind, parse};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_patch, prepare_static};
