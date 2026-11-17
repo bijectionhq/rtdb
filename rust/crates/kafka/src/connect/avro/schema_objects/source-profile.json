@@ -1,0 +1,15 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "jdk_source_archive_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "jdk_source_profile": "Temurin25.0.1+8 source archive reused from the existing source-only provider evidence",
+  "jdk_release_tag": "jdk-25.0.1+8",
+  "jdk_release_url": "https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.1%2B8",
+  "consulted_members": 12,
+  "kafka_api_profile": "4.4.0",
+  "new_kafka_source_members": [
+    "Field.java"
+  ],
+  "existing_kafka_body_sources": "../default_materialize/sources.sha256",
+  "existing_avro_data_source": "../names/selector-sources.sha256"
+}

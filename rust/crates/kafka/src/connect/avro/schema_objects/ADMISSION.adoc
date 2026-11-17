@@ -1,0 +1,117 @@
+= Admitted schema objects and typed values
+
+This registered internal capability has no production callers.
+It supplies an immutable owner for source schema-object identity, default values and their allocation leases.
+It does not activate Java parsing, source-ordered graph/default construction, arbitrary MapEntry keys, union conversion or an export/SMT route.
+
+== Objects and regions
+
+SchemaObjectsBuilder is a passive single-writer transient over unfinished object bodies, local IDs, completed imports and admission leases.
+SchemaObjects is the passive immutable arena produced by finishing that transient.
+SchemaHandle is a passive owned root handle retaining its arena; ObjectView and BodyView are passive borrowed views.
+ObjectId is a copied region-tagged identity using a genuinely nonreused checked nonce.
+A passive process-wide atomic identity allocator assigns that nonce synchronously and refuses exhaustion instead of wrapping.
+The nonce does not depend on an arena allocation address, so a stale copied token cannot become valid after its original allocation is freed and reused.
+The allocator retains no object registry, callback or task.
+Foreign IDs are rejected before an edge or schema handle can use them.
+Recursive local references are IDs and create no Arc back edge.
+Imported handles point to completed immutable arenas and preserve their original object identity and reservation ownership.
+Imports therefore form an older-owner DAG.
+Stored Struct IDs remain in their actual owning arena, or become local forwarding imports that preserve that original schema identity.
+Copying a default into a new region cannot reinterpret an old object index as belonging to the new arena.
+
+A builder object owns one current body while unfinished.
+Completing it creates a distinct built-schema object and prohibits all later mutations through this builder API.
+Both objects can then share the completed immutable body without copying a snapshot that can subsequently change.
+A wrapper owns its target ID and captured optionality override; it does not combine optionality with Boolean OR.
+The wrapper target remains the actual builder or built object supplied by the source context.
+CyclicSchemaWrapper.schema() returns that target directly, including a live builder identity during source recursion.
+
+JavaValue is a passive typed value tree covering primitive wrapper classes, String, binary classes, Date, BigDecimal, List, Map and Struct.
+Its Struct variant retains the creating schema-object ID and ordered value slots.
+JavaValue has no unchecked Clone implementation; later payload/tree copies require their own admitted construction and retained owner.
+BigDecimal is a passive immutable nonempty signed coefficient and scale with no 64-digit restriction.
+The arena builder is a source-stage construction core, rather than a replay of every public SchemaBuilder mutator call; the real Avro graph caller must preserve checkCanSet and metadata assignment timing.
+
+== Identity, equality and validation
+
+Ordinary schema equality preserves concrete object classes.
+Different builders are unequal by identity even when their bodies match.
+Built schemas compare their metadata, typed defaults and ordered child schemas.
+Wrappers compare captured optionality and then ordinary equality of their actual targets.
+An imported cached object normalizes to its original identity before those operations.
+
+The separate property comparison models AvroData.schemaEquals metadata/default/child traversal and uses an admitted temporary pair cache with provisional true entries for cycles.
+It is not Avro Java Schema.equals and cannot be substituted for ToConnectContext's detected-cycle relation.
+The current pair cache is indexed by object identity; concrete Java Pair/HashMap hashing, ordinary-equal key collapse, collision order and error/scratch timing remain an explicit activation implementation obligation.
+Typed Map equality currently performs ordinary key/value matching over retained entries; the complete Java key hashing/lookup/replacement order remains required with the arbitrary-key integration.
+The current private JavaValue::Map vector can represent duplicate Java keys or a different encounter order and is not a proof that its input is an actual normalized Java Map.
+Before activation, the concrete admitted HashMap constructor/insertion/collision/order capability must enforce unique visible keys and source iteration order before these values can be used.
+These qualifications are not source-parity or activation-closure claims.
+
+Default objects use Object.deepEquals at the default-object boundary.
+An ordinary List or Map invokes its own ordinary element/value equality, rather than propagating deep mode into every descendant.
+Pinned Struct.equals first uses ordinary schema equality, then Arrays.deepEquals over its Object[] value slots.
+A direct byte-array Struct slot consequently compares deeply, while a List nested in that slot still invokes List.equals and retains byte-array identity.
+Float and Double defaults keep Java NaN equivalence and distinguish signed zero.
+BigDecimal defaults compare coefficient value and scale independently of sign-extension storage width.
+
+Default installation admits construction before invoking its materializer, then validates the result at the current builder stage.
+Semantic class/schema failures use DefaultAttempt::Invalid; native admission, region, overflow, traversal and unchecked failures remain outer Result.
+Struct validation preserves creating-schema equality and source rules for unset optional/defaulted slots.
+Map validation visits each retained key before its value and skips key/value validation for an empty map.
+Logical Date values retain full milliseconds during class validation; writer/encoding ranges are separate operations.
+Installing a declared logical name later does not revalidate or rewrite the already-installed primitive default.
+
+== Binary values and writer demands
+
+ByteStorage is a passive immutable byte identity and reservation owner.
+A byte-array value retains that owner directly, making ordinary equality identity-based and deep equality content-based.
+A ByteBuffer is a separate passive value retaining its backing owner, heap/direct/read-only layout, capacity, position, limit, mark and byte order.
+Its constructor validates signed 32-bit capacity, backing bounds and position/limit/mark invariants without cloning the payload.
+Its equality uses remaining content, independently of object identity or backing offset/layout.
+Backing-array access preserves the distinct direct and read-only unchecked failure cases.
+Binary storage retains its own lease even when its temporary builder/context has dropped.
+Cached arena retention also visits binary owners supplied from a different arena, so their existing charges count against a fresh conversion context's limit.
+
+An admitted source BigDecimal can exceed the later RTDB writer's 64-digit domain.
+An earlier SMT can remove or replace that value before the writer demands it.
+The full source class/value must therefore remain with its typed owner until an actual consumer requires a lossy public Value or writer projection.
+The same obligation applies to every source-valid binary class/layout that such a projection cannot preserve.
+No export adapter or downstream erasure proof is supplied by this prerequisite.
+The eventual data/schema owner must retain semantic provenance even when an SMT removes the public schema.
+
+== Admission and cache ownership
+
+An initial 4096-byte reservation precedes the initial lease vector allocation.
+Each object, field, lease or temporary traversal-vector growth checks its doubled requested capacity and admits 16 times that slot storage plus 256 bytes before allocation.
+Old leases remain retained while old/new growth buffers can overlap.
+Names/docs admit their byte length plus 256 bytes, and parameter entries admit both string lengths plus 1024 bytes.
+Binary storage admits its full bytes plus 4096 bytes before copying the payload and publishing its shared owner.
+Default construction receives a caller-proved checked bound covering its typed container slots and payloads.
+The shared borrowed Measure/Materialize integration must supply that proof before creating any typed output tree.
+
+The finished arena retains all its own charges, so dropping a temporary ConversionContext cannot release live cached defaults or object bodies.
+Importing a cached root retains its original arena and charges without reserving its heap a second time.
+A new conversion context retains those existing charges against its own per-record limit before demanding imported objects.
+Its bounded admitted seen-vector avoids repeatedly traversing the same imported arena.
+Property-comparison pair scratch and cache-retention traversal scratch belong to the temporary context, which retains their leases through the call.
+Typed values and separately exported Value/ConnectSchema copies may coexist and require separate retained admission.
+
+== Source and regression scope
+
+The exact new source hashes and complete pre-package prefixes are retained in link:sources.sha256[the source manifest] and link:COPYRIGHT[the source notices].
+The manifest adds twelve Temurin 25.0.1+8 source members and Kafka 4.4 Field.java.
+The reused source archive digest and static profile are recorded in link:source-profile.json[the source profile], without runtime or dependency discovery.
+JDK sources retain the existing link:../names/LICENSE[GPLv2 license] and link:../names/ASSEMBLY_EXCEPTION[assembly exception]; the full per-file headers carry their Classpath exception.
+Kafka/Avro source references use the existing link:../names/LICENSE-APACHE[Apache license].
+
+SchemaBuilder.java127–136 and422–425, ConnectSchema.java219–282 and309–323, and Struct.java214–251 are pinned by link:../default_materialize/sources.sha256[the container manifest] with their full headers in link:../default_materialize/COPYRIGHT[its notices].
+AvroData.java2499–2639 and its exact source header are retained in link:../names/selector-sources.sha256[the selector manifest] and link:../names/SELECTOR-COPYRIGHT[its notices].
+The nonempty BigInteger coefficient rule retains the existing link:../default_scalar/sources.sha256[scalar source pin] and link:../default_scalar/COPYRIGHT[full source header].
+Object/Objects/Arrays, AbstractList/AbstractMap, ByteBuffer/Buffer/ByteOrder, Float/Double, Date and BigDecimal supply the newly pinned value/class operations.
+
+Twenty-four regression functions cover object classes and builder identity, cyclic property equality, captured optionality, Struct-default provenance, cache imports, foreign/stale IDs, allocator exhaustion, admission-before-construction, retained leases, exact class validation, unset slots, metadata/field order, binary deep versus ordinary equality, buffer layouts/ranges and large source BigDecimal values.
+All current production assertions and prior Avro cursor/scalar/default/union observations remain untouched.
+The original A09 explicit-null assertion remains disputed against the pinned actual-NullNode prediction for Phase2 reconciliation.
+No compilation, formatter, test or runtime execution occurred in Phase1.

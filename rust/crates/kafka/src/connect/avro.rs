@@ -18,6 +18,7 @@ mod default_scalar;
 mod default_property;
 mod default_materialize;
 mod to_connect_context;
+mod schema_objects;
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;
