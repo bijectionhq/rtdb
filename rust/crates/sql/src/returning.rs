@@ -37,18 +37,21 @@ impl ReturningClause<'_> {
         }
         tokens.extend(ignored_xtql(self.items, source)?);
         let (tokens, _) = crate::wildcard::extract(tokens, source)?;
-        let tokens = crate::materialized::cte_tokens(crate::parse::quantified_values(tokens, source)?, source)?;
-        let (tokens, _) = crate::parse::extract_temporal(tokens, source)?;
+        let (tokens, materialized) = crate::materialized::cte_tokens(crate::parse::quantified_values(tokens, source)?, source)?;
+        let (tokens, mut temporal) = crate::parse::extract_temporal(tokens, source)?;
+        let mut materialized = crate::materialized::MarkerVisitor::new(materialized, source)?;
+        materialized.apply_temporal(&mut temporal)?;
         let dialect = SqlDialect::default();
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens.into_iter().skip(1).collect());
         let mut saw_star = false;
         let mut at_start = true;
         loop {
             let token = parser.peek_token();
-            if token.token == Token::EOF { return Ok(()); }
+            if token.token == Token::EOF { break; }
             if parser.consume_token(&Token::Comma) { at_start = false; continue; }
             if ["ALL", "DISTINCT"].iter().any(|keyword| word(Some(&token), keyword)) { return Err(sql_error("RETURNING accepts a select list without a set quantifier", source, token.span)); }
-            let item = dialect.checked(parser.parse_select_item()).map_err(|error| sql_error(error.to_string(), source, token.span))?;
+            let mut item = dialect.checked(parser.parse_select_item()).map_err(|error| sql_error(error.to_string(), source, token.span))?;
+            materialized.apply(&mut item)?;
             let wildcard = match &item {
                 ast::SelectItem::Wildcard(options) => {
                     if saw_star { return Err(sql_error("RETURNING permits one unqualified wildcard", source, token.span)); }
@@ -69,15 +72,16 @@ impl ReturningClause<'_> {
             }
             if !at_start && matches!(item, ast::SelectItem::Wildcard(_)) {
                 if parser.peek_token().token != Token::EOF { return Err(sql_error("A trailing RETURNING wildcard must end the select list", source, parser.peek_token().span)); }
-                return Ok(());
+                break;
             }
             at_start = false;
             match parser.peek_token().token {
-                Token::EOF => return Ok(()),
+                Token::EOF => break,
                 Token::Comma => { parser.next_token(); }
                 _ => return Err(sql_error("Expected comma or end of RETURNING select list", source, parser.peek_token().span)),
             }
         }
+        materialized.finish()
     }
 }
 

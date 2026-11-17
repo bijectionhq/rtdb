@@ -127,9 +127,9 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
         let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(prefix, sql)?;
         let (tokens, settings) = crate::settings::extract(tokens, sql)?;
         let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
-        let tokens = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
-        let (mut tokens, temporal) = extract_temporal(tokens, sql)?;
-        let statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
+        let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
+        let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
+        let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
             let patch = word(tokens.first(), "PATCH");
             let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
             let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
@@ -193,6 +193,7 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
         if !settings.is_empty() && !matches!(&statement, Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. })) {
             return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
         }
+        crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
         statements.push(ParsedStatement { span, parameter_count, statement, temporal, inline_xtql, period_columns, settings, wildcard_renames });
     }
     Ok(statements)

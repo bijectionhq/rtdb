@@ -10,7 +10,7 @@ publish.workspace = true
 rtdb-types.workspace = true
 rtdb-plan.workspace = true
 rtdb-xtql.workspace = true
-sqlparser.workspace = true
+sqlparser = { workspace = true, features = ["visitor"] }
 chrono.workspace = true
 serde_json.workspace = true
 
