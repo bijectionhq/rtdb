@@ -9,6 +9,13 @@ It opens the Rust server composition, including configured storage, logs, authen
 For an embedded node without network listeners, set `server: null` and `flightSql: null` in the native YAML configuration.
 `all-backends` enables the native backend features exposed by `rtdb-server`.
 
+`rtdb_v1_database_open` selects the default TimSort object sorter.
+The additive `rtdb_v1_database_open_with_properties` entry accepts a borrowed UTF-8 JSON object of string values, limited to 4096 bytes, under the startup allocation budget.
+Only `java.util.Arrays.useLegacyMergeSort` is accepted; duplicate keys use their last value, case-insensitive `true` enables legacy sorting, and other strings select TimSort without trimming.
+Unknown names, nonstring values, malformed JSON, oversized input and exhausted startup memory fail before node resources open.
+The resolved selection remains immutable through the native node's lifetime.
+This entry does not read JVM properties; an embedded host supplies the value it captured for the reference lifetime it is matching.
+
 All operations use the native session, SQL preparation, query cursor and transaction resolver.
 The library does not load the JVM database implementation.
 The JVM adapter is in `bindings/jvm`; existing Python PostgreSQL/Flight clients and `lang/rust` remain external clients.

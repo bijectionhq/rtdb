@@ -18,10 +18,14 @@ pub(crate) struct EmbeddedRegion {
 
 impl EmbeddedRegion {
     pub fn open(yaml: &str, memory_bytes: usize) -> Result<Arc<Self>> {
+        Self::open_with_properties(yaml,memory_bytes,"{}")
+    }
+    pub fn open_with_properties(yaml: &str,memory_bytes: usize,properties: &str) -> Result<Arc<Self>> {
         blocking_caller()?;
         if memory_bytes == 0 { return Err(super::invalid("A positive allocation limit is required")); }
         let bootstrap = MemoryBudget::new(memory_bytes);
-        let parsed = ParsedConfiguration::from_yaml(yaml, &ProcessEnvironment, &bootstrap, false)?;
+        let object_sort = rtdb_server::config::object_sort_properties(properties,&bootstrap)?;
+        let parsed = ParsedConfiguration::from_yaml(yaml, &ProcessEnvironment, &bootstrap, false)?.with_object_sort(object_sort);
         let (configuration, memory, configuration_charge) = parsed.into_execution(memory_bytes)?;
         drop(bootstrap);
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;

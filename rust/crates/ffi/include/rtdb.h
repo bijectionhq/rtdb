@@ -51,6 +51,15 @@ struct ArrowArray {
  */
 uint32_t rtdb_v1_abi_version(void);
 int32_t rtdb_v1_database_open(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes, RtdbHandle *out, RtdbHandle *error);
+/* Properties is a UTF-8 JSON object of string values, at most 4096 bytes, borrowed until return.
+ * Only java.util.Arrays.useLegacyMergeSort is accepted; absent selects TimSort.
+ * Case-insensitive true selects legacy sorting; other strings select TimSort without trimming.
+ * Unknown keys, nonstring values, invalid JSON and exhausted startup memory fail before opening node resources.
+ * Duplicate keys use the last value; the resolved selection is retained for this database lifetime.
+ * This reads no JVM properties; the host supplies its captured values.
+ */
+int32_t rtdb_v1_database_open_with_properties(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes,
+                                           const uint8_t *properties, size_t properties_length, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_retain(RtdbHandle handle, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_release(RtdbHandle handle, RtdbHandle *error);
 

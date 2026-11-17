@@ -51,7 +51,7 @@ async fn secondary_unknown_sort_keys_validate_union_types_across_spill_runs() {
 }
 
 #[tokio::test]
-async fn sorted_percentiles_cross_spill_runs_and_release_every_file() {
+async fn sorted_percentiles_use_spilled_record_backing_and_release_every_file() {
     for (kind, expected) in [(PercentileKind::Continuous, Value::F64(256.75)), (PercentileKind::Discrete, Value::I64(256))] {
         let context = context(1 << 24);
         let plan = percentile(integers(1024), kind, PercentileFraction::Literal(0.25), false, false);
@@ -107,7 +107,7 @@ async fn cancellation_between_group_pages_releases_percentile_spools() {
 }
 
 #[tokio::test]
-async fn percentile_spill_quota_failure_cleans_retained_input_and_sort_runs() {
+async fn percentile_spill_quota_failure_cleans_retained_input_and_record_backing() {
     let context = context(4096);
     let plan = percentile(integers(1024), PercentileKind::Discrete, PercentileFraction::Literal(0.5), false, false);
     let mut cursor = PreparedQuery::new(plan).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();

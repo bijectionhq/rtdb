@@ -29,6 +29,7 @@ final class NativeAbi {
         Linker linker = Linker.nativeLinker();
         register(library, linker, "abi_version");
         register(library, linker, "database_open", PTR, I64, I64, PTR, PTR);
+        register(library, linker, "database_open_with_properties", PTR, I64, I64, PTR, I64, PTR, PTR);
         register(library, linker, "retain", I64, PTR, PTR);
         register(library, linker, "release", I64, PTR);
         register(library, linker, "close", I64, PTR);

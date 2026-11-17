@@ -20,6 +20,7 @@ impl NodeConfiguration {
         options.default_timezone = self.default_timezone.clone();
         options.query.join_build_rows = self.join_build_rows;
         options.query.generate_series_end_exclusive = self.generate_series_end_exclusive;
+        options.query.object_sort = self.object_sort;
         options.cache_bytes = cache_bytes;
         options.execution_memory_bytes = execution_memory_bytes;
         options.trie = rtdb_trie::TrieConfig::new(self.indexer.log_limit, self.indexer.page_limit)?;

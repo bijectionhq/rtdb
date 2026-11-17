@@ -13,6 +13,26 @@ fn ok(status: i32, error: u64) {
     assert_eq!(error, 0);
 }
 struct Native { database: u64, session: u64, retained: Vec<u64> }
+
+#[test]
+fn database_properties_reject_unknown_and_oversized_inputs_before_node_configuration() {
+    let yaml = b"not: [valid YAML";
+    for properties in [r#"{"xtdb.vector.null-checks":"false"}"#,r#"{"java.util.Arrays.useLegacyMergeSort":true}"#] {
+        let mut database = 42;let mut error = 0;
+        assert_eq!(unsafe { rtdb_v1_database_open_with_properties(yaml.as_ptr(),yaml.len(),1 << 20,properties.as_ptr(),properties.len(),&mut database,&mut error) },1);
+        assert_eq!(database,0);
+        let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
+        assert_eq!(diagnostic.error.code,"xtdb/invalid-node-config");
+        assert!(diagnostic.error.message.contains("system propert"));
+        handles::release(error).unwrap();
+    }
+    let mut database = 42;let mut error = 0;
+    assert_eq!(unsafe { rtdb_v1_database_open_with_properties(yaml.as_ptr(),yaml.len(),1 << 20,std::ptr::null(),4097,&mut database,&mut error) },1);
+    assert_eq!(database,0);
+    let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
+    assert!(diagnostic.error.message.contains("4096"));handles::release(error).unwrap();
+}
+
 impl Native {
     fn open() -> Self {
         let yaml = b"server: null\nflightSql: null\nnodeId: ffi-test\n";

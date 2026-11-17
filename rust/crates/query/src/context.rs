@@ -103,9 +103,11 @@ pub struct QueryOptions {
     pub bypass_temporal_pruning: bool,
     /// SQL GENERATE_SERIES excludes its endpoint when the process compatibility setting is enabled.
     pub generate_series_end_exclusive: bool,
+    /// Stable object-index algorithm for sort runs and complete percentile groups.
+    pub object_sort: rtdb_types::ObjectSort,
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false } }
+    fn default() -> Self { Self { batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
 }
 
 pub struct QueryContext {

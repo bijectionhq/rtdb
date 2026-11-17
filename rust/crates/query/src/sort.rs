@@ -8,7 +8,9 @@ use crate::{context::Execution, cursor::{BoxCursor, OwnedRow, RowCursor}, invali
 
 mod records;
 mod timsort;
-use records::{RecordBuffer, RecordCursor, RecordStore};
+mod legacy;
+pub(crate) use records::{RecordBuffer, RecordStore};
+use records::RecordCursor;
 
 const BLOCK_ROWS: usize = 102_400;
 const MERGE_FAN_IN: usize = 4;
@@ -95,19 +97,9 @@ impl SortPlan {
     }
     fn indices(&self, store: &RecordStore, keys: &KeyTypes) -> Result<Indices> {
         keys.validate()?;
-        let scratch = timsort::scratch_bytes(store.len())?;
-        let bytes = store.len().checked_mul(std::mem::size_of::<usize>()).and_then(|size| size.checked_add(scratch)).and_then(|size| size.checked_add(256)).ok_or_else(size_error)?;
-        let reservation = self.execution.context.memory.reserve(bytes)?;
-        let mut indices: Vec<_> = (0..store.len()).collect();
-        let mut access = store.access()?;
-        timsort::sort(&mut indices, |left, right| {
-            self.execution.context.check_cancelled()?;
-            let left = access.get(left)?;
-            let right = access.get(right)?;
-            self.compare(left.values(), right.values())
-        })?;
-        indices.truncate(usize::try_from(self.limit).unwrap_or(usize::MAX));
-        Ok(Indices { values: indices, _reservation: reservation })
+        let mut indices = sort_records(store,&self.execution.context,|left,right|self.compare(left,right))?;
+        indices.values.truncate(usize::try_from(self.limit).unwrap_or(usize::MAX));
+        Ok(indices)
     }
     fn compare(&self, left: &[Value], right: &[Value]) -> Result<Ordering> {
         for (index, order) in self.order.iter().enumerate() {
@@ -176,7 +168,27 @@ impl SortPlan {
         Ok(Some(SortOutput { rows: OutputRows::Spill(run.file.reader(Arc::clone(&self.execution.context.memory))?), remaining: run.rows, page_rows: run.page_rows, empty_callback: false }))
     }
 }
-struct Indices { values: Vec<usize>, _reservation: Arc<MemoryReservation> }
+pub(crate) struct Indices { pub(crate) values: Vec<usize>, _reservation: Arc<MemoryReservation> }
+pub(crate) fn sort_records(store: &RecordStore,context: &Arc<crate::QueryContext>,mut compare: impl FnMut(&[Value],&[Value]) -> Result<Ordering>) -> Result<Indices> {
+    let scratch = match context.options.object_sort {
+        rtdb_types::ObjectSort::TimSort => timsort::scratch_bytes(store.len())?,
+        rtdb_types::ObjectSort::LegacyMergeSort => legacy::scratch_bytes(store.len())?,
+    };
+    let bytes = store.len().checked_mul(std::mem::size_of::<usize>()).and_then(|size|size.checked_add(scratch)).and_then(|size|size.checked_add(256)).ok_or_else(size_error)?;
+    let reservation = context.memory.reserve(bytes)?;
+    let mut indices: Vec<_> = (0..store.len()).collect();
+    let mut access = store.access()?;
+    let compare = |left,right| {
+        context.check_cancelled()?;
+        let left = access.get(left)?;let right = access.get(right)?;
+        compare(left.values(),right.values())
+    };
+    match context.options.object_sort {
+        rtdb_types::ObjectSort::TimSort => timsort::sort(&mut indices,compare)?,
+        rtdb_types::ObjectSort::LegacyMergeSort => legacy::sort(&mut indices,compare)?,
+    }
+    Ok(Indices { values: indices,_reservation: reservation })
+}
 fn size_error() -> rtdb_types::Anomaly { invalid("sort-size", "Sort state exceeds addressable memory") }
 
 struct KeyTypes { values: Vec<LogicalType>, _reservation: Arc<MemoryReservation> }
@@ -416,3 +428,6 @@ mod page_layout_tests {
 
 #[cfg(test)]
 mod schedule_tests;
+
+#[cfg(test)]
+mod object_sort_tests;
