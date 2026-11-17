@@ -1,0 +1,13 @@
+= Native plan representation
+
+The canonical expression, relation and statement types define the native plan representation.
+Their current public serialization traits remain part of that API while exact-text tree ownership and format-specific replacements are implemented.
+
+== Private JSON prerequisite
+
+The private JSON module retains exact string units, emits the existing valid-UTF8 JSON spelling and escapes isolated units as JSON string escapes.
+Its borrowed recipe encoder preserves raw form variants, physical value variants, ordered entries and the five replacement fields without evaluating metadata.
+A shared iterative traversal handles recursive raw forms and physical values under admitted call-local storage.
+Counting and filling share the encoder and retain the admitted traversal capacity; output scratch remains charged while the completed document acquires an independent lease.
+The private regression sources preserve existing JSON schemas, unit distinctions, failure prefixes and allocation lifetimes.
+Public tree serialization, canonical node ownership, semantic consumers and production literal binding require their dependent migrations before exact-unit tree input is exposed.
