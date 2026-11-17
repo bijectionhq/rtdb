@@ -8,6 +8,8 @@ mod arithmetic;
 pub(crate) use arithmetic::{Binary,Dispatch,Unary};
 mod comparison;
 pub(crate) use comparison::{Comparison,Predicate};
+mod classification;
+pub(crate) use classification::Classification;
 mod integral;
 pub(crate) use integral::Integral;
 mod bit;

@@ -2,7 +2,7 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Binary,Bit,Cast,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
+use crate::jvm_number::{Binary,Bit,Cast,Classification,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
@@ -26,7 +26,7 @@ enum Expression<'a> {
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest,Absolute,Extremum(Extremum) }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Classification(Classification),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest,Absolute,Extremum(Extremum) }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
@@ -363,6 +363,17 @@ impl HostValue<'_> {
     fn number(&self,context: &EvalContext<'_>) -> Result<Cow<'_,Number>> {
         match self { Self::Number(value) => Ok(Cow::Borrowed(value)),Self::Constant(form) => literal_number(form,context).map(Cow::Owned),_ => Err(error("Host value is not a Number")) }
     }
+    fn classifies(&self,classification: Classification) -> Result<bool> {
+        Ok(match self {
+            Self::Number(value) => value.classifies(classification),
+            Self::Constant(Form::Literal(Value::I64(value))) => Number::Long(*value).classifies(classification),
+            Self::Constant(Form::Literal(Value::F64(value))) => Number::Double(*value).classifies(classification),
+            Self::Constant(Form::Literal(Value::Null | Value::Bool(_) | Value::Utf8(_) | Value::Keyword(_))) => false,
+            Self::Constant(Form::Character(_) | Form::Symbol(_) | Form::List(_) | Form::Vector(_) | Form::Set(_) | Form::Map(_) | Form::AnonymousFunction(_)) => false,
+            Self::Constant(Form::Literal(_) | Form::BigInteger(_) | Form::Decimal(_) | Form::Tagged { .. }) => return Err(unsupported("Host classification requires an established host literal carrier")),
+            Self::Nil | Self::Bool(_) | Self::Text(_) | Self::Function(_) | Self::Vector(_) => false,
+        })
+    }
     fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(Form::Literal(Value::F64(value))) => value.is_nan(),_ => false } }
     fn nil(&self) -> bool { matches!(self,Self::Nil | Self::Constant(Form::Literal(Value::Null))) }
     fn index(&self,context: &EvalContext<'_>) -> Result<i32> {
@@ -410,6 +421,7 @@ impl Function {
                 HostValue::Bool(bit_test(left,right))
             }
             Self::Predicate(operation) => { arity(args.len(),1,1)?;numeric_predicate(operation,&args[0],context)? }
+            Self::Classification(operation) => { arity(args.len(),1,1)?;HostValue::Bool(args[0].classifies(operation)?) }
             Self::Comparison(operation) => {
                 arity(args.len(),1,usize::MAX)?;
                 let mut result = true;
@@ -459,6 +471,10 @@ fn function(name: &str) -> Option<Function> {
         "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),
         "<" => Function::Comparison(Comparison::Less),"<=" => Function::Comparison(Comparison::LessEqual),">" => Function::Comparison(Comparison::Greater),">=" => Function::Comparison(Comparison::GreaterEqual),"==" => Function::Comparison(Comparison::Equivalent),
         "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),
+        "number?" => Function::Classification(Classification::Numeric),"integer?" => Function::Classification(Classification::Integer),"int?" => Function::Classification(Classification::FixedInteger),
+        "double?" => Function::Classification(Classification::Double),"float?" => Function::Classification(Classification::Floating),"ratio?" => Function::Classification(Classification::Ratio),
+        "decimal?" => Function::Classification(Classification::Decimal),"rational?" => Function::Classification(Classification::Rational),
+        "pos-int?" => Function::Classification(Classification::PositiveInteger),"neg-int?" => Function::Classification(Classification::NegativeInteger),"nat-int?" => Function::Classification(Classification::NaturalInteger),
         "quot" => Function::Integral(Integral::Quotient),"rem" => Function::Integral(Integral::Remainder),"mod" => Function::Modulo,
         "min" => Function::Extremum(Extremum::Min),"max" => Function::Extremum(Extremum::Max),"abs" => Function::Absolute,
         "bit-not" => Function::BitNot,"bit-and" => Function::Bit(Bit::And),"bit-or" => Function::Bit(Bit::Or),"bit-xor" => Function::Bit(Bit::Xor),"bit-and-not" => Function::Bit(Bit::AndNot),
@@ -696,5 +712,30 @@ mod tests {
         let result = number(numeric_absolute(Dispatch::Object,HostValue::Number(Arc::clone(&negative)),&EvalContext::default()).unwrap());
         assert!(!Arc::ptr_eq(&result,&negative));
         assert_eq!(*result,Number::decimal("1.00").unwrap());
+    }
+    #[test]
+    fn classifications_borrow_retained_numbers_without_scratch_or_coefficient_copies() {
+        let memory = MemoryBudget::new(4096);
+        let values = [
+            Arc::new(Number::integer(&"9".repeat(8192)).unwrap()),
+            Arc::new(Number::decimal("1E-2147483647").unwrap()),
+            Arc::new(Number::divide(&Number::Long(1),&Number::Long(3)).unwrap()),
+        ];
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let retained = memory.used_bytes();
+            for _ in 0..4 {
+                for value in &values {
+                    for classification in [Classification::Numeric,Classification::Rational] {
+                        let result = Function::Classification(classification).apply(vec![HostValue::Number(Arc::clone(value))],&context).unwrap();
+                        assert!(matches!(result,HostValue::Bool(true)));
+                        assert_eq!(Arc::strong_count(value),1);
+                        assert_eq!(memory.used_bytes(),retained);
+                    }
+                }
+            }
+        }
+        assert_eq!(memory.used_bytes(),0);
     }
 }

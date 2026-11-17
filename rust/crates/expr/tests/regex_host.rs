@@ -94,6 +94,50 @@ fn host_arithmetic_bounds_generated_nary_instruction_depth() {
 }
 
 #[test]
+fn host_classifications_admit_exact_numbers_without_scale_expansion_and_release_scopes() {
+    for (argument,predicate) in [
+        (F::BigInteger("9".repeat(8192)),"integer?"),
+        (F::Decimal("1E-2147483647".into()),"decimal?"),
+        (F::Decimal("1E+2147483647".into()),"rational?"),
+        (call("/",vec![F::Literal(V::I64(1)),F::Literal(V::I64(3))]),"ratio?"),
+    ] {
+        let expression = replace(call("if",vec![call(predicate,vec![argument]),string("a"),string("b")]));
+        let memory = MemoryBudget::new(128 << 20);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let schema = Schema::default();
+            let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+            assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+            assert!(memory.peak_bytes() < memory.limit_bytes());
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+    let expression = replace(call("str",vec![call("number?",vec![call("subs",vec![string("x"),F::Literal(V::I64(-1))])])]));
+    let memory = MemoryBudget::new(128 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&context).err().unwrap().message.as_deref(),Some("Host substring indexes are out of range"));
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn host_classifications_reject_undefined_literal_carriers_without_reading_quoted_contents() {
+    let decimal = rtdb_types::DecimalValue::new(vec![0;16],1,0,128).unwrap();
+    for value in [V::I8(1),V::I16(1),V::I32(1),V::U8(1),V::U16(1),V::U32(1),V::U64(1),V::F16(0),V::F32(1.0),V::Decimal(decimal),V::Transit(vec![0xff])] {
+        let expression = replace(call("str",vec![call("number?",vec![F::Literal(value.clone())])]));
+        assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-form");
+        let quoted = call("quote",vec![F::Vector(vec![F::Literal(value)])]);
+        let expression = replace(call("if",vec![call("number?",vec![quoted]),string("b"),string("a")]));
+        let schema = Schema::default();
+        let context = EvalContext::default();
+        assert_eq!(ExpressionInvocation::prepare(&expression,&schema,&context).unwrap().evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+    }
+}
+
+#[test]
 fn host_numeric_comparison_reserves_cross_product_storage_before_allocation() {
     let number = F::BigInteger("9".repeat(512));
     let expression = replace(call("str",vec![call("==",vec![number.clone(),number])]));
