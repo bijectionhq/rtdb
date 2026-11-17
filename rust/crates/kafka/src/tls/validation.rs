@@ -58,7 +58,7 @@ impl SimpleTrust {
     fn trusted(&self, certificate: &X509Ref) -> Result<Option<&X509Ref>> {
         for anchor in &self.anchors {
             if same_name(anchor.subject_name(), certificate.subject_name()) && same_name(anchor.issuer_name(), certificate.issuer_name())
-                && anchor.public_key().map_err(invalid)?.public_eq(&certificate.public_key().map_err(invalid)?) { return Ok(Some(anchor)); }
+                && super::public_key::same(anchor, certificate)? { return Ok(Some(anchor)); }
         }
         Ok(None)
     }

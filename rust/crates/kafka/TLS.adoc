@@ -44,6 +44,7 @@ The selected entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
 `ssl.trustmanager.algorithm` and `schema.registry.ssl.trustmanager.algorithm` default to `PKIX`, with the aliases `SunPKIX`, `X509` and `X.509`.
 `SunX509` selects the built-in simple validator: it follows the supplied certificate order, replaces matching reissued trust anchors, and appends a trusted issuer when needed.
+Reissued-anchor matching compares encoded public-key parameters with Java's NULL-parameter normalization, retaining distinctions such as RSA-PSS restrictions on the same modulus and exponent.
 Its validation covers certificate signatures, validity, issuer chaining, CA path lengths, key usage, Netscape certificate types and unsupported critical extensions.
 Intermediate extended key usage does not constrain the simple validator.
 A directly trusted leaf bypasses certificate validity and usage checks while retaining explicit certificate distrust checks.
