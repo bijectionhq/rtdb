@@ -1,0 +1,19 @@
+{
+  "profile": "Eclipse Temurin OpenJDK 25.0.1+8 Linux x64, Apache Avro 1.11.4",
+  "units": 65536,
+  "packing": "four UTF16 units per byte; unit index modulo4 chooses its low-to-high two-bit slot; bit0 first, bit1 later",
+  "bytes": 16384,
+  "sha256": "ae0fd805864b967c6563eda7fdd00287e1c8bbc66bcc88096178af04e9420f5c",
+  "first_units": 48974,
+  "later_units": 49344,
+  "decimal_digit_units": 370,
+  "latin1_units_compared": 256,
+  "surrogate_units_rejected": 2048,
+  "unicode_expectation_units_compared": 65536,
+  "unicode_expectation_ranges": 821,
+  "unicode_expectation_sha256": "1e1eb5256ea2158b556ba36cf6fc0e4e657ab5c334303af57356aef4be46a970",
+  "source_zip_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "avro_sources_jar_sha256": "0151e4f35e319f3291b7defc90e879109ad4a4b90c6a465e06617f7f2dc436b7",
+  "host_unicode_tables": false,
+  "java_or_rust_execution": false
+}

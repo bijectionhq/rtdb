@@ -1,0 +1,65 @@
+= Java Avro name-unit categories
+
+link:bmp-flags.bin[The category flags] describe Apache Avro 1.11.4 name validation against the pinned Java 25 character data.
+Avro tests UTF16 char units: the first unit must be a letter or underscore, and later units must be letters, decimal digits, or underscore.
+A name must contain at least one unit.
+This directory supplies immutable passive source data and independently derived expectations.
+It contains no production parser registration or name-policy activation.
+Field lookup, namespace handling, ordered reference validation, and allocation admission belong to the consuming conversion implementation.
+
+== Representation
+
+The binary has 16,384 bytes covering all 65,536 UTF16 units.
+Four consecutive units occupy one byte, starting at the least significant two bits.
+For unit u, read byte u/4 and shift by 2*(u%4).
+Bit 0 admits the unit in the first position; bit 1 admits it in a later position.
+The only flag values are 0, 2, and 3.
+
+The first-position set contains 48,974 units, including underscore.
+The later-position set contains 49,344 units, including the 370 BMP decimal digits.
+All 2,048 surrogate units are rejected.
+A supplementary letter supplies two surrogate units when traversed as UTF16 and therefore fails this name rule.
+Combining marks, letter numbers, and other Unicode identifier categories are not admitted merely because they can appear in a different language's identifiers.
+The flags have SHA256 `ae0fd805864b967c6563eda7fdd00287e1c8bbc66bcc88096178af04e9420f5c`.
+
+link:expected-ranges.tsv[The independent expectation ranges] cover the same complete unit domain in ascending, adjacent inclusive ranges.
+Their flag column uses the same bit meanings.
+These ranges come from Unicode 16 category records, including First/Last ranges, without consulting the generated JDK table or packed flags.
+The deriver compares the two constructions at every unit before writing an artifact.
+link:audit.json[The audit] records coverage, counts and digests.
+
+== Source proof
+
+The Java profile is Eclipse Temurin OpenJDK `25.0.1+8`, Linux x64.
+Its `src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+The Apache Avro source JAR is https://repo.maven.apache.org/maven2/org/apache/avro/avro/1.11.4/avro-1.11.4-sources.jar[version 1.11.4], SHA256 `0151e4f35e319f3291b7defc90e879109ad4a4b90c6a465e06617f7f2dc436b7`.
+The independent category records are https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt[UnicodeData 16.0.0], SHA256 `ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f`.
+link:sources.sha256[The source manifest] pins all 12 inspected source and license inputs.
+
+Schema.validateName uses Character.isLetter(char) and Character.isLetterOrDigit(char), with underscore handled explicitly.
+The char overloads delegate to the int overloads for that one zero-extended unit.
+Character.isLetter tests general categories 1 through 5; isLetterOrDigit adds category 9.
+CharacterData dispatches units below 256 to CharacterDataLatin1 and other BMP units to CharacterData00.
+The generated plane-zero table selects properties through X/Y/A, with the low five bits holding the category.
+The deriver decodes Java UTF16 string literals and A_DATA's high/low word assembly, then compares all 256 Latin1 categories independently.
+Latin1's signed hexadecimal literals retain their sign before conversion to 32 bits.
+Surrogate units have category 19.
+No host Unicode category predicates, case folding, normalization, Java execution, or Rust execution are used.
+
+link:COPYRIGHT[Original Java source headers], link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], link:ADDITIONAL_LICENSE_INFO[additional license information], link:LICENSE-APACHE[Apache License 2.0], link:NOTICE-APACHE[the Apache Avro notice], and link:LICENSE-UNICODE[Unicode License V3] retain their input bytes.
+
+== Reproduction
+
+link:derive.py[The Python standard-library deriver] accepts the source ZIP, Avro source JAR, UnicodeData file, the JDK legal/java.base directory, the Unicode V3 license file, and an output directory.
+Every input digest is checked before derivation.
+The Unicode license is also retained at `rust/crates/expr/LICENSE-UNICODE` in this repository.
+
+[source,bash]
+----
+python3 derive.py /path/to/src.zip /path/to/avro-1.11.4-sources.jar /path/to/UnicodeData.txt /path/to/jdk/legal/java.base /path/to/LICENSE-UNICODE /tmp/java25-avro-name-units
+----
+
+The output contains the packed flags, independent expectation ranges, audit, original copyright headers, licenses/notices, and source/artifact manifests.
+link:artifacts.sha256[The artifact manifest] pins all generated output bytes except itself.
+The deriver and this reference are authored files, outside that generated manifest.
+The source-only derivation and exhaustive input-data comparison were performed; compilation and regression execution remain pending under the Phase 1 work order.
