@@ -83,6 +83,36 @@ fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
 }
 
 #[tokio::test]
+async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for sql in ["SELEC 1", "extra SELECT 1"] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"EZ");
+        assert_eq!(frames[1].1, b"I");
+        let body = &frames[0].1;
+        assert!(body.ends_with(b"\0\0"));
+        let mut fields = body.split(|&byte| byte == 0);
+        assert_eq!(fields.next(), Some(b"SERROR".as_slice()));
+        assert_eq!(fields.next(), Some(b"VERROR".as_slice()));
+        assert_eq!(fields.next(), Some(b"C08P01".as_slice()));
+        let message = fields.next().unwrap().strip_prefix(b"M").unwrap();
+        let message = std::str::from_utf8(message).unwrap();
+        assert!(!message.is_empty());
+        let detail = fields.next().unwrap().strip_prefix(b"D").unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(detail).unwrap();
+        assert_eq!(detail["category"], "incorrect");
+        assert_eq!(detail["code"], "xtdb/sql-error");
+        assert_eq!(detail["message"], message);
+        assert!(detail.get("cause").is_none());
+        assert!(fields.all(|field| field.is_empty()));
+    }
+    assert_eq!(rows(&client.query("SELECT 42 AS answer").await), vec![vec![Some(b"42".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn percentile_planning_warning_precedes_simple_and_extended_results_without_repeating_at_bind() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

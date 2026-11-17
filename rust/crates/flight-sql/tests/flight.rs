@@ -218,6 +218,28 @@ async fn bearer_cookie_disagreement_and_replayed_different_basic_header_are_reje
 }
 
 #[tokio::test]
+async fn sql_parse_failures_return_anomaly_metadata_on_remote_flight() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for sql in ["SELEC 1", "extra SELECT 1"] {
+        let command = CommandStatementQuery { query: sql.into(), transaction_id: None };
+        let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
+        let request = client.request(descriptor);
+        let error = client.client.get_flight_info(request).await.unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(!error.message().is_empty());
+        let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+        let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+        assert_eq!(detail["category"], "incorrect");
+        assert_eq!(detail["code"], "xtdb/sql-error");
+        assert_eq!(detail["message"], error.message());
+        assert!(detail.get("cause").is_none());
+    }
+    assert_eq!(integer(&client.query("SELECT 42::bigint AS answer").await[0], 0, 0), 42);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn write_transaction_rejects_queries_and_sql_transaction_control_names_the_api() {
     let running = Running::start(None, FlightConfig::default()).await; let mut client = Client::connect(&running.server, None).await;
     let tx = client.begin().await; client.update("INSERT INTO docs (_id) VALUES (1)", Some(tx.clone())).await;
