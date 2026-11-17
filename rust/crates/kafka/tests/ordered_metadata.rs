@@ -84,3 +84,39 @@ fn borrowed_view_preserves_unsorted_legacy_partition_ids_and_all_truncations_fai
     for end in 0..body.len() { assert!(MetadataView::parse(0,&body[..end]).is_err()); }
     assert_eq!(MetadataView::parse(14,&body).unwrap_err(),ProtocolError::UnsupportedVersion);
 }
+
+#[test]
+fn broker_only_metadata_omits_existing_topics_and_retains_the_response() {
+    let account = NativeByteAccount::new(4 * 1024 * 1024, ()).unwrap();
+    let producer: BaseProducer = ClientConfig::new()
+        .set("test.mock.num.brokers", "1")
+        .set_native_byte_account(Arc::clone(&account))
+        .create()
+        .unwrap();
+    producer.client().mock_cluster().unwrap().create_topic("present", 2, 1).unwrap();
+
+    let named = start(&producer, "present");
+    assert_eq!(wait(&named).summary().topics, 1);
+    drop(named);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = loop {
+        match producer.client().start_ordered_metadata_brokers(65536, Duration::from_secs(5)) {
+            Ok(request) => break request,
+            Err(OrderedMetadataError::BrokerNotReady) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => panic!("broker-only submission: {result:?}"),
+        }
+    };
+    let view = wait(&request);
+    assert!((1..=13).contains(&view.version()));
+    assert_eq!(view.summary().brokers, 1);
+    assert_eq!(view.summary().topics, 0);
+    assert_eq!(view.summary().partitions, 0);
+    drop(producer);
+
+    assert_eq!(request.poll_raw().unwrap().unwrap().summary(), view.summary());
+    assert!(account.used() >= 65536);
+    drop(request);
+    assert_eq!(account.used(), 0);
+}

@@ -6,7 +6,12 @@ The operation uses the first selected Up broker's negotiated Metadata API range,
 A disabled auto-creation setting requires version 4 or later.
 An absent ready broker returns BrokerNotReady without accepting work; the native sparse-connection machinery schedules connection attempts.
 The caller bounds readiness retries separately from the accepted request's deadline.
-Empty topic sets, unsupported profiles and invalid lengths are rejected explicitly.
+The named-topic entry point requires at least one topic.
+Client::start_ordered_metadata_brokers sends an explicit empty topic array with the same completion and admission contracts.
+It requires version 1 or later because version 0 interprets that array as a request for every topic.
+The legacy array count is zero and its compact equivalent is one, distinct from the compact null marker.
+The broker's existing flexible request finalizer appends the empty body tag count after the authorization flags.
+Both entry points reject unsupported profiles and invalid lengths.
 Ordinary fetch_metadata, MetadataRequest wrappers, native cache parsing and their version ceilings are unchanged.
 
 == Ownership and release
@@ -93,6 +98,8 @@ Generated-reader boundaries include every fifth varint byte, all four string slo
 The native header fixtures pass through actual correlation lookup and ordered request dispatch, including rejected headers, the 10,000-tag boundary and fifth-byte truncation.
 The Kafka integration sources use the safe API with the native mock producer, retain a response after producer destruction and exercise abandonment followed by teardown.
 The raw-string integration fixture configures malformed rack bytes through the existing native mock API, observes the original bytes through poll_raw, retains the UTF8 facade's error and keeps the raw result through producer destruction.
+The broker-only sources check the v0 exclusion, v1 and v4 negotiation floors and explicit empty wire counts.
+The native mock integration fixture creates an existing topic and verifies that broker-only Metadata returns the broker and zero topics, including when read after producer destruction.
 Additional raw-view sources retain all supported versions, nullable names, original string-size ceilings, tag/suffix bytes, and validation before visitation.
 All previously published assertions remain unchanged.
 Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.

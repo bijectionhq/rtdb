@@ -101,6 +101,9 @@ extern "C" {
         topics: *const rd_kafka_ordered_metadata_topic_t, count: usize,
         body_capacity: usize, timeout_ms: c_int,
         result: *mut *mut rd_kafka_ordered_metadata_t) -> rd_kafka_resp_err_t;
+    pub fn rd_kafka_ordered_metadata_start_brokers(rk: *mut rd_kafka_t,
+        body_capacity: usize, timeout_ms: c_int,
+        result: *mut *mut rd_kafka_ordered_metadata_t) -> rd_kafka_resp_err_t;
     pub fn rd_kafka_ordered_metadata_poll(result: *mut rd_kafka_ordered_metadata_t,
         error: *mut rd_kafka_resp_err_t, version: *mut i16,
         body: *mut *const c_void, length: *mut usize) -> c_int;

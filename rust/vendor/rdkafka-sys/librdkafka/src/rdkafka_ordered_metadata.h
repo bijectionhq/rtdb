@@ -131,7 +131,8 @@ static rd_kafka_resp_err_t rd_kafka_ordered_body_size(
     size_t *size) {
         size_t i;
         size_t total;
-        if (!topics || !count || count > INT32_MAX || version < 0 || version > 13)
+        if (count > INT32_MAX || version < 0 || version > 13 ||
+            (count == 0 ? topics != NULL || version == 0 : topics == NULL))
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         total = version >= 9 ? rd_kafka_ordered_varint_size((uint32_t)count + 1) : 4;
         total += (version >= 4) + (version >= 8) + (version >= 8 && version <= 10);
@@ -237,9 +238,19 @@ release:
         return error;
 }
 
-rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
+static int16_t rd_kafka_ordered_metadata_version(rd_kafka_broker_t *rkb,
+                                                  rd_bool_t brokers_only) {
+        int16_t minimum = rkb->rkb_rk->rk_conf.allow_auto_create_topics
+                              ? (brokers_only ? 1 : 0)
+                              : 4;
+        return rd_kafka_broker_ApiVersion_supported(
+            rkb, RD_KAFKAP_Metadata, minimum, 13, NULL);
+}
+
+static rd_kafka_resp_err_t rd_kafka_ordered_metadata_start0(
     rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
-    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result) {
+    rd_bool_t brokers_only, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **result) {
         rd_kafka_broker_t *rkb;
         rd_kafka_resp_err_t error;
         int16_t version;
@@ -251,6 +262,8 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
         if (rk->rk_type != RD_KAFKA_PRODUCER || !rk->rk_byte_account)
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        if (!brokers_only && count == 0)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
         error = rd_kafka_ordered_body_size(topics, count, 13, &ignored);
         if (error)
                 return error;
@@ -258,9 +271,7 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
                                         "ordered Metadata request");
         if (!rkb)
                 return RD_KAFKA_RESP_ERR__TRANSPORT;
-        version = rd_kafka_broker_ApiVersion_supported(
-            rkb, RD_KAFKAP_Metadata,
-            rk->rk_conf.allow_auto_create_topics ? 0 : 4, 13, NULL);
+        version = rd_kafka_ordered_metadata_version(rkb, brokers_only);
         if (version < 0)
                 error = RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         else
@@ -268,4 +279,18 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
                     rkb, topics, count, version, body_capacity, timeout_ms, result);
         rd_kafka_broker_destroy(rkb);
         return error;
+}
+
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
+    rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
+    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result) {
+        return rd_kafka_ordered_metadata_start0(
+            rk, topics, count, rd_false, body_capacity, timeout_ms, result);
+}
+
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_brokers(
+    rd_kafka_t *rk, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **result) {
+        return rd_kafka_ordered_metadata_start0(
+            rk, NULL, 0, rd_true, body_capacity, timeout_ms, result);
 }

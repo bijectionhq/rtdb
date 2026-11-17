@@ -6,6 +6,48 @@ static const unsigned char ut_ordered_response[] = {
         0,0,0,0, 1,0, 255,255,255,255, 1,0,0,0
 };
 
+static int ut_ordered_brokers_only(rd_kafka_broker_t *rkb) {
+        struct rd_kafka_ApiVersion api = {
+                .ApiKey = RD_KAFKAP_Metadata, .MinVer = 0, .MaxVer = 0
+        };
+        unsigned char bytes[16];
+        const unsigned char legacy[] = {0, 0, 0, 0};
+        const unsigned char flexible[] = {1, 1, 0, 0};
+        size_t size;
+        int16_t v0_named, v0_brokers, v1_brokers, v1_disabled, v4_disabled;
+
+        rkb->rkb_ApiVersions = &api;
+        rkb->rkb_ApiVersions_cnt = 1;
+        v0_named = rd_kafka_ordered_metadata_version(rkb, rd_false);
+        v0_brokers = rd_kafka_ordered_metadata_version(rkb, rd_true);
+        api.MaxVer = 1;
+        v1_brokers = rd_kafka_ordered_metadata_version(rkb, rd_true);
+        rkb->rkb_rk->rk_conf.allow_auto_create_topics = rd_false;
+        v1_disabled = rd_kafka_ordered_metadata_version(rkb, rd_true);
+        api.MaxVer = 4;
+        v4_disabled = rd_kafka_ordered_metadata_version(rkb, rd_true);
+        rkb->rkb_rk->rk_conf.allow_auto_create_topics = rd_true;
+        rkb->rkb_ApiVersions = NULL;
+        rkb->rkb_ApiVersions_cnt = 0;
+
+        RD_UT_ASSERT(v0_named == 0 && v0_brokers == -1, "v0 empty means all topics");
+        RD_UT_ASSERT(v1_brokers == 1, "v1 supports empty requests");
+        RD_UT_ASSERT(v1_disabled == -1 && v4_disabled == 4,
+                     "disabled auto creation requires v4");
+        RD_UT_ASSERT(rd_kafka_ordered_body_size(NULL, 0, 0, &size) ==
+                         RD_KAFKA_RESP_ERR__INVALID_ARG,
+                     "forbid all-topic v0 empty array");
+        RD_UT_ASSERT(!rd_kafka_ordered_body_size(NULL, 0, 1, &size) &&
+                         size == sizeof(legacy), "v1 empty body size");
+        rd_kafka_ordered_body_write(bytes, NULL, 0, 1, rd_true);
+        RD_UT_ASSERT(!memcmp(bytes, legacy, size), "v1 empty topic array");
+        RD_UT_ASSERT(!rd_kafka_ordered_body_size(NULL, 0, 9, &size) &&
+                         size == sizeof(flexible), "v9 empty body size");
+        rd_kafka_ordered_body_write(bytes, NULL, 0, 9, rd_true);
+        RD_UT_ASSERT(!memcmp(bytes, flexible, size), "v9 non-null empty compact array and flags");
+        RD_UT_PASS();
+}
+
 static int ut_ordered_encode(void) {
         unsigned char bytes[64];
         size_t size;
@@ -319,6 +361,7 @@ int unittest_ordered_metadata(void) {
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"encoding retains no broker reference");
         fails+=ut_ordered_version_intersection(&rkb);
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"version selection releases broker references");
+        fails += ut_ordered_brokers_only(&rkb);
         fails+=ut_ordered_header_boundary(&rkb);
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"header cases release broker references: %d",rd_refcnt_get(&rkb.rkb_refcnt));
         fails+=ut_ordered_invalid_header_before_admission(&rkb);

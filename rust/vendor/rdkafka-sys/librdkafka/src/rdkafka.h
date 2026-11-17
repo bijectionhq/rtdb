@@ -3175,6 +3175,18 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
     size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
 
 /**
+ * Starts Metadata with an explicit empty topic array on the wire.
+ * timeout_ms must be positive and body_capacity must fit INT32_MAX bytes.
+ * The producer, result, lifetime, admission and error contracts are those of rd_kafka_ordered_metadata_start.
+ * Negotiates Metadata 1..13 with an Up broker because version 0 treats an empty array as all topics.
+ * Disabling auto creation requires version 4 or newer.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_brokers(
+    rd_kafka_t *rk, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **result);
+
+/**
  * Returns 0 while pending or 1 after terminal publication, with error, version and body set.
  * All arguments must be non-NULL and result must have a live caller reference.
  * Pending polls leave the output arguments unchanged.

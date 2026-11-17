@@ -66,11 +66,27 @@ impl<C: ClientContext> Client<C> {
     /// Topic inputs are consumed synchronously and need not remain alive afterward.
     /// No cache mutation, result decoding or Rust callback runs on native completion.
     pub fn start_ordered_metadata(&self, topics: &[MetadataTopic<'_>], body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
+        self.start_ordered_metadata_request(Some(topics), body_capacity, timeout)
+    }
+
+    /// Starts a broker-only Metadata request using an explicit empty topic list.
+    /// Negotiates Metadata versions 1 through 13, or 4 through 13 with auto creation disabled.
+    /// Uses the admission, timeout and completion ownership of [`Self::start_ordered_metadata`].
+    pub fn start_ordered_metadata_brokers(&self, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
+        self.start_ordered_metadata_request(None, body_capacity, timeout)
+    }
+
+    fn start_ordered_metadata_request(&self, topics: Option<&[MetadataTopic<'_>]>, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
         let account = self.native_client().byte_account().ok_or(OrderedMetadataError::AccountRequired)?;
         let millis = timeout.as_millis().checked_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0)).ok_or(OrderedMetadataError::InvalidTimeout)?;
         let millis = i32::try_from(millis).ok().filter(|value| *value > 0).ok_or(OrderedMetadataError::InvalidTimeout)?;
         let mut result = std::ptr::null_mut();
-        let error = unsafe { sys::rd_kafka_ordered_metadata_start(self.native_ptr(), topics.as_ptr().cast(), topics.len(), body_capacity, millis, &mut result) };
+        let error = unsafe {
+            match topics {
+                Some(topics) => sys::rd_kafka_ordered_metadata_start(self.native_ptr(), topics.as_ptr().cast(), topics.len(), body_capacity, millis, &mut result),
+                None => sys::rd_kafka_ordered_metadata_start_brokers(self.native_ptr(), body_capacity, millis, &mut result),
+            }
+        };
         if error == sys::rd_kafka_resp_err_t::RD_KAFKA_RESP_ERR__TRANSPORT {
             return Err(OrderedMetadataError::BrokerNotReady);
         }
