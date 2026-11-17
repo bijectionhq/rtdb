@@ -7,6 +7,14 @@ Transport-specific certificate selection, TLS policy, and connection lifetime be
 A transport that copies key material retains the store's reservation until those copies are released.
 `IssuerNames` and `PemIdentity` are passive result owners with separate reservations for each conversion call.
 Their borrowed slices remain valid until the result drops; copying those slices requires another reservation.
+`DistinguishedName` is a passive immutable Java principal value with an independent reservation covering decoding and its retained canonical spelling.
+It follows OpenJDK 25.0.1 `X500Name`, `RDN`, and `AVA` canonicalization: RDN order remains significant, assertions within an RDN are sorted, and repeated assertions are retained.
+Standard RFC2253 keywords decode UTF8String and PrintableString values, including Java's Latin-1 decoding of PrintableString bytes.
+Other value types and attribute identifiers retain their encoded value in hexadecimal form.
+Escaping, ASCII space collapse and Java trimming precede pinned locale-US case conversion and Unicode 16 NFKD normalization.
+Peer issuer hints and certificate issuer or subject names can therefore compare through the same canonical representation.
+Malformed UTF-8 uses the shared Java replacement decoder.
+The source regressions cover Unicode equivalence, encoding distinctions, RDN order, arbitrary-size OID arcs, BER framing and allocation ownership.
 
 The codec reads JKS and PKCS12 stores, PEM trust certificates, and plain or encrypted PKCS8 PEM identities.
 JKS store integrity and private-key protection use independent passwords.

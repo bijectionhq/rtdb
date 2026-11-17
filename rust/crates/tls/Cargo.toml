@@ -14,6 +14,7 @@ openssl = { version = "=0.10.81", features = ["vendored"] }
 sha1 = "=0.10.6"
 subtle = "2.6.1"
 zeroize = "1.8"
+unicode-normalization.workspace = true
 
 [lints]
 workspace = true

@@ -8,6 +8,8 @@ use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 mod pkcs12;
 mod aliases;
+mod x500;
+pub use x500::DistinguishedName;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }
