@@ -77,6 +77,11 @@ Avro conversion retains narrow integer annotations, field defaults, Connect meta
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.
 Confluent 7.8.0 applies scrubbing to record-field lookup during ingestion; it is the identity for the ASCII field names admitted by the native Avro parser.
 Java Avro 1.11.4 also accepts Unicode letters in names, while the native Avro 0.21.0 parser restricts names to ASCII; those schemas and their scrubbed lookup behavior remain source-completeness work.
+`specific.avro.reader` and `schema.reflection` admit bare primitive writer schemas through Confluent's generic-reader path; custom schema properties can prevent that selection.
+Specific mode also admits anonymous arrays, maps, and unions of scalar/container schemas, and explicitly selected anonymous reader schemas, when they require no Java class or logical-type adapter.
+Reflection takes precedence when both options are enabled.
+Outside the generic primitive path, named schemas and Java class annotations in specific mode, other reflection routes, and enabled logical conversions that need an adapter remain explicit unsupported cases.
+Migration decoding uses the generic writer reader and checks the configured mode when rebuilding the selected reader datum from JSON.
 JSON Schema payload validation follows `json.fail.invalid.schema`, whose default is false.
 The transform implementation covers ExtractField, ReplaceField, HoistField, ValueToKey, Filter, DropHeaders, HeaderFrom, InsertField, InsertHeader, Cast, MaskField, Flatten, RegexRouter, TimestampConverter, TimestampRouter, and SetSchemaMetadata, with the three shipped predicates.
 Header and InsertHeader literal parsing retains Kafka numeric widths, collection schema inference, top-level quoting, and millisecond temporal types.

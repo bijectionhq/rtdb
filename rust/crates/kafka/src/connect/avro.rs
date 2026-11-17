@@ -10,11 +10,12 @@ mod migration;
 mod datum;
 mod output;
 mod default_json;
+mod reader;
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;
 
-pub(super) struct AvroDatumPlan { root: Schema, names: BTreeMap<String, Schema>, metadata: metadata::Metadata, defaults: default_json::Defaults, unions: graph::UnionOptions, schema_bytes: usize }
+pub(super) struct AvroDatumPlan { root: Schema, names: BTreeMap<String, Schema>, metadata: metadata::Metadata, defaults: default_json::Defaults, unions: graph::UnionOptions, reader: reader::ReaderMode, schema_bytes: usize }
 pub(super) struct AvroPlan { datum: Arc<AvroDatumPlan>, branch: Option<u32>, connect: Arc<ConnectSchema>, charges: Vec<Arc<rtdb_columnar::MemoryReservation>> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum AvroOutput { Writer, Reader { branch: Option<u32> } }
@@ -46,6 +47,7 @@ impl AvroPlan {
     }
     #[cfg(test)]
     pub fn decode(&self, bytes: &[u8], context: &mut ConversionContext) -> Result<ConnectData> {
+        self.datum.validate_reader(None)?;
         self.convert(self.datum.decode_datum(bytes, context)?, &mut 0, context)
     }
 }
@@ -56,6 +58,7 @@ impl AvroDatumPlan {
         let metadata_references = references.iter().map(|text| default_json::metadata_text(text)).collect::<Result<Vec<_>>>()?;
         let metadata = metadata::Metadata::new(&metadata_text, &metadata_references, options, None)?;
         let unions = graph::UnionOptions::parse(options)?;
+        let reader = reader::ReaderMode::parse(options)?;
         let schema_bytes = references.iter().try_fold(text.len(), |bytes, text| bytes.checked_add(text.len()).ok_or_else(|| error("allocation-overflow", "Avro schema size overflow")))?;
         let text = physical_logical_types(&metadata_text)?;
         let references = metadata_references.iter().map(|text| physical_logical_types(text)).collect::<Result<Vec<_>>>()?;
@@ -66,8 +69,9 @@ impl AvroDatumPlan {
         for schema in &mut references { restore_field_defaults(schema, metadata.root(), &metadata); }
         let mut names = BTreeMap::new(); collect_names(&root, &mut names);
         for reference in &references { collect_names(reference, &mut names); }
-        Ok(Self { root, names, metadata, defaults, unions, schema_bytes })
+        Ok(Self { root, names, metadata, defaults, unions, reader, schema_bytes })
     }
+    pub fn validate_reader(&self, selected: Option<&Self>) -> Result<()> { self.reader.validate(self, selected) }
     pub fn connect_plan(self: &Arc<Self>, branch: Option<u32>, version: Option<i32>, next_union: &mut i32, context: &mut ConversionContext) -> Result<AvroPlan> {
         let bytes = self.connect_allocation_bound(branch)?;
         let charge = context.reserve(bytes)?;
