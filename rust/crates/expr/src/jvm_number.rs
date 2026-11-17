@@ -10,6 +10,8 @@ mod comparison;
 pub(crate) use comparison::{Comparison,Predicate};
 mod integral;
 pub(crate) use integral::Integral;
+mod bit;
+pub(crate) use bit::{Bit,bit_not,bit_test};
 
 #[derive(Debug)]
 pub(crate) enum Error { Invalid,External(Anomaly) }

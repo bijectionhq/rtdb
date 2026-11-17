@@ -207,6 +207,8 @@ Host numeric comparisons and sign predicates preserve cross-category comparison 
 Comparison chains evaluate all argument expressions before skipping later numeric pairs after a false result.
 Host `quot`, `rem` and `mod` preserve fixed-integer wrapping, BigInt and ratio results, decimal quotient scales and JVM floating remainder behavior.
 Fixed inline `quot` and `rem` retain their compilation-time arity checks and primitive-versus-boxed result metadata; `mod` remains a strict boxed function call.
+Host bit operations retain fixed-integer admission, signed-long results, Boolean bit tests and low-six-bit shift/index masking.
+Direct variadic bit calls execute left-nested operations, while lexical function calls evaluate every argument before folding; inline and ordinary bit forms retain their distinct arity and result-metadata rules.
 The host compiler retains primitive-boolean and unresolved static-call metadata separately from boxed Boolean values, including through dead branches and lexical bindings.
 `tests/regex_host.rs` records computed patterns, shadowing, strict arguments, UTF16 substring indexes and dead-branch compilation as unexecuted source.
 Remaining host numeric functions and dynamic arithmetic bindings, interop, effects, object rendering and generated-local multiplicity remain required follow-on work.
