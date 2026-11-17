@@ -74,6 +74,6 @@ mod tests {
         assert!(!available("zz-ZZ"));
         assert!(matches!(Family::Format.value("fr", "MonthNames", true), Some(LocaleValue::Array(names)) if names[0] == "janvier"));
         assert!(Family::Calendar.value("", "firstDayOfWeek", true).is_some());
-        assert!(canonical_zone("Asia/Calcutta").is_some());
+        assert_eq!(canonical_zone("Asia/Kolkata"), Some("Asia/Calcutta"));
     }
 }
