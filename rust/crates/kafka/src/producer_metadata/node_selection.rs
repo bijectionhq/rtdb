@@ -21,6 +21,14 @@ pub trait ConnectionObservations<N> {
     fn last_connect_attempt_ms(&mut self, node: &N) -> Result<i64>;
 }
 
+pub(crate) fn can_send_request<N>(
+    observations: &mut impl ConnectionObservations<N>, node: &N, now_ms: i64,
+) -> Result<bool> {
+    Ok(observations.connection_ready(node, now_ms)?
+        && observations.channel_ready(node)?
+        && observations.can_send_more(node)?)
+}
+
 /// Initial bootstrap disposition consulted when the fetched cluster list is empty.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Bootstrap {
@@ -119,10 +127,7 @@ pub(crate) fn least_loaded_node_indexed<'a, N: 'a>(
             connection_ready = true;
         }
 
-        if observations.connection_ready(node, now_ms)?
-            && observations.channel_ready(node)?
-            && observations.can_send_more(node)?
-        {
+        if can_send_request(observations, node, now_ms)? {
             let in_flight = observations.in_flight_count(node)?;
             if in_flight < 0 {
                 return Err(Anomaly::incorrect(

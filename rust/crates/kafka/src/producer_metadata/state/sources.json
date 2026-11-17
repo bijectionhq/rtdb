@@ -23,6 +23,11 @@
         "prefix_bytes": 799,
         "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
       },
+      "org/apache/kafka/clients/producer/ProducerConfig.java": {
+        "sha256": "912b886014d69a943a9702cce7fb82b3466a35f5d16a64ea0383bf3a541840b4",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
       "org/apache/kafka/clients/producer/RoundRobinPartitioner.java": {
         "sha256": "f7fad39033bbdd0b7762ea5baffd222733b093e09cde87b6e00dc605f1d338db",
         "prefix_bytes": 799,

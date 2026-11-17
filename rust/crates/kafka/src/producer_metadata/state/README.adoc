@@ -125,6 +125,17 @@ Polling the native exchange returns the original scope with the borrowed respons
 The transport retains the response and its account through producer shutdown.
 The network owner still needs to qualify the target, manage the request lifecycle, process throttles and apply each response once.
 
+== NetworkClient refresh decisions
+
+`MetadataUpdater` owns the source in-progress request scope and the rebootstrap attempt start.
+It computes refresh backoff before the in-progress wait in `maybe_update` and skips that computation in `is_update_due` while a request is pending.
+It starts or resets the attempt clock at the source mutations and repeats the node scan after a successful rebootstrap.
+The selected node's send eligibility is checked again, followed by the cluster's connecting states and the selected node's reconnect eligibility.
+The updater retains the distinct attempt-clock outcome of a published response, an empty response and a server-requested rebootstrap.
+A synchronous unsupported-version send reports the fatal cause and failed refresh before publishing the original request scope.
+Disconnect bookkeeping records any due failure before a fatal authentication cause and the request for a full refresh.
+The caller owns actual native completion, connection and clock observations, diagnostics, response application and waiter delivery.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
