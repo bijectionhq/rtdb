@@ -541,3 +541,28 @@ The parser repair and its regression sources remain unexecuted.
 
 Transit Throwable structural equality, normalized exception data, retained causes and Java object hashing are independently source-reviewed.
 ExceptionInfo identity and the corresponding JSON/MessagePack regression sources remain unexecuted.
+
+=== Default Sort scheduling and numeric object follow-ups
+
+Shared native Java URI descriptors, UTF8 decoding, calendars and zone rules have bounded source review.
+The calendar source includes extreme supported dates, temporal text and retained zone data; process-default Date rendering remains separate required work.
+Run-end layout replacement preserves its child layouts and has a same-increment regression source.
+
+Sort has independent source reviews for indexed memory/spill backing, the default OpenJDK25 TimSort algorithm and complete callback/run/merge scheduling.
+The scheduling review repaired source-run retention across merge groups and added spill-quota cleanup and all-input-before-merge error-order regressions.
+Top-k reduction, empty callbacks, priority-queue tie order and final successor reinsertion have unexecuted regression sources.
+Alternate legacy-sort configuration and complete-group percentile sorting remain required implementation work.
+
+Aggregate primitive factory and update schedules have bounded source review, including unsigned Boolean vector setter admission.
+Further source tracing found that logical null values erase nullable child-vector payloads, selected union legs and underlying getter indexes.
+Preserving those physical reader properties through views, copies, expression evaluation and spill is required even for some default-checking paths, and before disabled null checks can be supported.
+The reviewed primitive aggregate slice does not close that physical-reader work.
+
+Shared host Number parsing, casts and arithmetic have bounded source review for the default checked-math and exact-decimal context.
+The reviews repaired direct Long-to-Float rounding, Number admission for substring indexes, boxed-divisor error precedence and decimal arithmetic diagnostics.
+General host numeric functions, dynamic bindings, interop, effects, namespace state, functions/macros, semantic object text and isolated UTF16 carriers remain required work.
+
+Unknown Transit tagged objects retain decoded alias identity before representation equality, with separate content hashing and canonical wire output.
+Its alias/null and numeric-class regressions have independent source review.
+Remaining registry families and semantic rendering, equality and inspection consumers stay open.
+All regression sources remain unexecuted; the source gate remains false and no implementation-completeness revision is recorded.
