@@ -64,19 +64,34 @@ pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeM
 pub(crate) fn parse_jaas(jaas: &str) -> Result<(String, BTreeMap<String, String>)> {
     let mut tokens = jaas_tokens(jaas)?.into_iter();
     let Some(JaasToken::Value(module)) = tokens.next() else { return Err(jaas_error()); };
-    if !matches!(tokens.next(), Some(JaasToken::Value(flag)) if flag == "required") { return Err(jaas_error()); }
+    if !matches!(tokens.next(), Some(JaasToken::Value(flag)) if jaas_flag(&flag)) { return Err(jaas_error()); }
     let mut options = BTreeMap::new();
     loop {
         let key = match tokens.next() { Some(JaasToken::End) => break, Some(JaasToken::Value(key)) => key, _ => return Err(jaas_error()) };
         if !matches!(tokens.next(), Some(JaasToken::Equals)) { return Err(jaas_error()); }
         let Some(JaasToken::Value(value)) = tokens.next() else { return Err(jaas_error()); };
-        if options.insert(key, value).is_some() { return Err(jaas_error()); }
+        options.insert(key, value);
     }
     if tokens.next().is_some() { return Err(jaas_error()); }
     Ok((module, options))
 }
 
-fn jaas_error() -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka JAAS requires one supported login module, required control flag, and quoted username/password options") }
+fn jaas_flag(flag: &str) -> bool {
+    let mut upper = String::with_capacity(flag.len());
+    // Java25 Locale.ROOT uppercase mappings whose entire result is ASCII (Unicode16).
+    for character in flag.chars() {
+        match character {
+            '\u{131}' => upper.push('I'), '\u{17f}' => upper.push('S'), '\u{df}' => upper.push_str("SS"),
+            '\u{fb00}' => upper.push_str("FF"), '\u{fb01}' => upper.push_str("FI"), '\u{fb02}' => upper.push_str("FL"),
+            '\u{fb03}' => upper.push_str("FFI"), '\u{fb04}' => upper.push_str("FFL"), '\u{fb05}' | '\u{fb06}' => upper.push_str("ST"),
+            character if character.is_ascii() => upper.push(character.to_ascii_uppercase()),
+            _ => return false,
+        }
+    }
+    matches!(upper.as_str(), "REQUIRED" | "REQUISITE" | "SUFFICIENT" | "OPTIONAL")
+}
+
+fn jaas_error() -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-jaas-config", "Kafka JAAS requires one supported login module, a valid control flag, and username/password options") }
 
 enum JaasToken { Value(String), Equals, End }
 
