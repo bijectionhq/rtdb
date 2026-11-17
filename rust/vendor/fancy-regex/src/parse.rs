@@ -441,7 +441,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_numbered_backref(&mut self, ix: usize) -> Result<(usize, Expr)> {
-        let (end, group) = self.parse_numbered_backref_or_subroutine_call(ix)?;
+        let (end, group) = self.parse_numbered_backref_or_subroutine_call(ix, self.flag(FLAG_JAVA))?;
         self.numeric_backrefs = true;
         self.backrefs.insert(group);
         Ok((
@@ -454,7 +454,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_numbered_subroutine_call(&mut self, ix: usize) -> Result<(usize, Expr)> {
-        let (end, group) = self.parse_numbered_backref_or_subroutine_call(ix)?;
+        let (end, group) = self.parse_numbered_backref_or_subroutine_call(ix, false)?;
         self.numeric_backrefs = true;
         self.contains_subroutines = true;
         if group == 0 {
@@ -463,10 +463,10 @@ impl<'a> Parser<'a> {
         Ok((end, Expr::SubroutineCall(group)))
     }
 
-    fn parse_numbered_backref_or_subroutine_call(&self, ix: usize) -> Result<(usize, usize)> {
+    fn parse_numbered_backref_or_subroutine_call(&self, ix: usize, java_backref: bool) -> Result<(usize, usize)> {
         if let Some((end, group)) = parse_decimal(self.re, ix) {
             // protect BitSet against unreasonably large value
-            if group < self.re.len() / 2 {
+            if group < self.re.len() / 2 || java_backref && group <= 9 {
                 return Ok((end, group));
             }
         }

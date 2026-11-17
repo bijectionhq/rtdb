@@ -107,4 +107,5 @@ fn missing_groups_fail_dynamically_without_aliasing_internal_save_slots() {
     }
     assert!(RegexBuilder::new(r"(?<=\9)").java_matching(true).build().is_err());
     assert!(Regex::new(r"\9").is_err());
+    assert!(RegexBuilder::new(r"\99999999").java_matching(true).build().is_err());
 }
