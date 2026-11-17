@@ -2,6 +2,7 @@ use super::*;
 use openssl::{asn1::{Asn1Object, Asn1OctetString}, bn::BigNum, hash::MessageDigest, pkey::{PKey, Private}, rsa::Rsa, x509::{X509Extension, X509NameBuilder, store::X509StoreBuilder, extension::{BasicConstraints, ExtendedKeyUsage, KeyUsage}}};
 use rtdb_columnar::MemoryBudget;
 mod policy_integration;
+mod selected_chain;
 
 const VALID: (i64, i64) = (1_600_000_000, 1_800_000_000);
 fn now() -> Asn1Time { Asn1Time::from_unix(1_700_000_000).unwrap() }

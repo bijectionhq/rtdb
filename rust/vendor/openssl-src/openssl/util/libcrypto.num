@@ -5948,3 +5948,4 @@ CRYPTO_clear_realloc_array              6075	3_6_0	EXIST::FUNCTION:
 CRYPTO_secure_malloc_array              6076	3_6_0	EXIST::FUNCTION:
 CRYPTO_secure_calloc                    6077	3_6_0	EXIST::FUNCTION:
 X509_load_cert_crl_bio_ex                6078	3_6_3	EXIST::FUNCTION:
+X509_STORE_CTX_verify_selected_chain    6079	3_6_3	EXIST::FUNCTION:

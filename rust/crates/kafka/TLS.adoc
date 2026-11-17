@@ -62,15 +62,20 @@ A directly trusted leaf bypasses certificate validity and usage checks while ret
 The builder retries candidates rejected by certificate policy and limits paths to five non-self-issued intermediate certificates; ordered validation has no builder depth limit.
 Search state and candidate validation are admitted against the connection's memory budget, and admission failures stop the search.
 An exactly trusted leaf takes Java's PKIX early return; other paths require a version-3 anchor to assert CA basic constraints and, when present, certificate-signing key usage.
-The native path validator uses a temporary anchor assertion with the original subject, issuer, serial number, public key and subject-key identifier, with unrestricted CA signing extensions.
-Its retained signature bytes are not signatures over the modified certificate and are never validated or transmitted.
-Original anchors supply Java's policy checks and the returned chain, keeping anchor path lengths, name constraints and critical extensions outside the validated certificate path.
+The native verifier accepts the exact selected chain and call-local Java self-issued classifications, with issuer names compared through Java X500Principal canonicalization.
+Original certificates supply every signature check, callback certificate and returned chain; original anchors supply Java's anchor policy checks.
+Anchor path lengths, name constraints, critical extensions, dates and self-signatures remain outside native path validation.
+Temporary non-anchor metadata copies exclude noncritical AKI and SKID only after the shared Java identifier parser accepts their criticality, duplicate and malformed-extension rules.
+These copies supply extension checks and are never used for signature verification or transmitted.
+Ordered validation screens candidate anchors using canonical AKI key identifiers against original SKID extension bytes and signed serial numbers; absent SKID and pre-version-3 anchor serials follow Java's compatibility rules.
+Builder anchor screening uses its distinct legacy-certificate validity-period rule.
+Java self-issued intermediates retain the path-length and name-constraint exceptions, including version-1/version-2 key rollover immediately below an anchor in ordered validation.
 Certificate validity is checked on every non-anchor member, while intermediate extended key usage does not restrict the path.
 Leaf usage checks follow the Java TLS-server rules after path validation has consumed critical extensions.
 Critical ordinary-policy qualifiers are rejected while Java's policy tree remains live; an absent or exhausted policy tree leaves later qualifiers unchecked, and anyPolicy qualifiers do not trigger rejection.
 Policy processing starts with Java's default anyPolicy set and enforces explicit-policy, mapping and anyPolicy-inhibition counters, including the self-issued and final-certificate rules.
 The four policy extensions use Java's BER parsing and duplicate handling: malformed noncritical extensions are absent, malformed critical extensions fail, and two successfully parsed copies of one extension fail.
-Unknown critical extensions and certificate signatures remain subject to native path validation.
+The default Java PKIX critical-extension set is enforced independently of OpenSSL's larger supported-extension list; native signature verification uses the original certificates.
 The selected path is checked against the pinned blocked-certificate list, digest and key-size constraints, JDK-root SHA-1 restriction, and Symantec, Entrust and Camerfirma distrust cutoffs.
 Registry uses the same native PKIX path verifier and handshake signature implementation.
 Native handshake security uses OpenSSL level 1 with Java certificate key limits, the EC-224 minimum, and compression disabled.
@@ -107,8 +112,8 @@ A list containing only disabled suites or protocols produces no usable handshake
 == Open parity gaps
 
 `NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
-OpenSSL's PKIX path-building choices, name constraints, and algorithm availability still require qualification against Java's validator.
-PKIX issuer chaining and self-issued classification still use OpenSSL canonicalization; their Java name integration remains pending.
+PKIX builder candidate preference, TreeSet traversal and subject/key/subject-alternative-name repetition rules still require the exact Java search-order implementation.
+Native name-constraint matching beyond Java self-issued exceptions and native algorithm availability still require qualification against Java's validator.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 These are open standard-configuration gaps.
 Additional Java providers and credential extensions require native implementations.
