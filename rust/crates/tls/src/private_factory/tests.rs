@@ -190,6 +190,7 @@ fn pss_uncovered_nested_parameter_services_return_explicit_errors() {
 }
 
 mod iv_parameters;
+mod legacy_pbe;
 
 #[test]
 fn dsa_accepts_signed_scalars_and_ignored_scalar_tails_with_optional_parameters() {
