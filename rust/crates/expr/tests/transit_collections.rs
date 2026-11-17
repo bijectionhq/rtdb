@@ -88,6 +88,7 @@ fn record_fixed_field_equality_precedes_extension_count_mismatch() {
 fn tagged_value_hashes_select_bucket_order_and_preserve_zero_hash_collisions() {
     let first = tag("x",T::Integer(1));let second = tag("x",T::Integer(2));
     assert_eq!(set_values(selected(tag("set",T::Array(vec![first.clone(),second.clone()]))).unwrap()),vec![second,first]);
-    let first = tag("a",T::Integer(0));let second = tag("b",T::Integer(0));
+    let first = tag("a",T::Integer(0));let second = tag("unregistered",T::Integer(0));
     assert_eq!(set_values(selected(tag("set",T::Array(vec![first.clone(),second.clone()]))).unwrap()),vec![first,second]);
+    assert!(selected(tag("b",T::Integer(0))).is_err());
 }
