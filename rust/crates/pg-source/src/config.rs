@@ -42,7 +42,8 @@ pub enum SslMode { Disable, Prefer(Arc<tokio_rustls::rustls::ClientConfig>), Req
 impl Default for SslMode {
     fn default() -> Self {
         let roots = tokio_rustls::rustls::RootCertStore { roots: webpki_roots::TLS_SERVER_ROOTS.to_vec() };
-        Self::Prefer(Arc::new(tokio_rustls::rustls::ClientConfig::builder().with_root_certificates(roots).with_no_client_auth()))
+        Self::Prefer(Arc::new(tokio_rustls::rustls::ClientConfig::builder_with_provider(Arc::new(tokio_rustls::rustls::crypto::aws_lc_rs::default_provider()))
+            .with_safe_default_protocol_versions().expect("AWS-LC supports the default TLS versions").with_root_certificates(roots).with_no_client_auth()))
     }
 }
 #[derive(Clone)]

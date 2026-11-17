@@ -91,3 +91,9 @@ fn json_retains_large_integers_and_decodes_json_ld_values() {
     assert_eq!(read_text(114, r#"{"@type":"xt:set","@value":[1,1,2]}"#).unwrap(), Value::Set(vec![Value::I64(1), Value::I64(2)]));
     assert_eq!(read_text(16384, r#"["^ ","~:xt/id",1,"~:Some/Field-Name",2]"#).unwrap(), Value::Struct(std::collections::BTreeMap::from([("_id".into(), Value::I64(1)), ("some$field_name".into(), Value::I64(2))])));
 }
+
+#[test]
+fn default_remote_tls_uses_an_explicit_provider() {
+    let rtdb_pg_source::SslMode::Prefer(config) = rtdb_pg_source::SslMode::default() else { panic!("default remote must prefer TLS"); };
+    assert!(!config.crypto_provider().cipher_suites.is_empty());
+}
