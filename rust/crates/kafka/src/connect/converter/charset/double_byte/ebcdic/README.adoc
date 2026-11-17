@@ -1,0 +1,63 @@
+= Java 25 mixed EBCDIC character mappings
+
+The String converter supports `x-IBM1364`, `x-IBM930`, `x-IBM933`, `x-IBM935`, `x-IBM937`, and `x-IBM939`, with 30 distinct case-insensitive registered names.
+Each canonical name has the aliases `cp` followed by its number, `ibm` followed by its number, `ibm-` followed by its number, and the number alone.
+link:charsets.tsv[The manifest] records those names, source hashes, ASCII flags, trail ranges, present row counts, sizes, mapping digests, and decoded probe digests.
+
+`Charset::Ebcdic` is passive immutable configuration borrowing a static `Mapping`.
+Its input cursor, `ShiftState`, and UTF8 output belong to one decode call, and no state persists across records or converters.
+Six static resources occupy 220,076 bytes and add no retained allocation per converter or record.
+IBM933's resource is byte-identical to the IBM933 source table used by the DBCS-only IBM834 decoder.
+The existing String scalar memory admission precedes decoding, and the output reserves at most three UTF8 bytes per input byte.
+Java's decoder holders initialize immutable tables and have no process-wide mapping updates.
+
+== Shift state and replacement boundaries
+
+OpenJDK25 `String(byte[], Charset)` invokes `DoubleByte.Decoder_EBCDIC.decode(byte[], int, int, char[])` through ArrayDecoder.
+Every constructor sets `isASCIICompatible` to false, so ASCII-range input still uses the selected EBCDIC table.
+Each call starts in single-byte mode.
+SO (0x0E) enters double-byte mode and SI (0x0F) returns to single-byte mode, producing no character when the transition is valid.
+SO in double-byte mode and SI in single-byte mode each produce one replacement and retain the current state.
+
+Single-byte mode uses the source single-byte table for every other byte, with one replacement for an unmapped entry.
+In double-byte mode, any other lead consumes its next byte as a trail, including SO or SI, and a malformed or unmapped pair produces one replacement.
+Controls consumed as trails do not change the state.
+The pair lookup uses the source rows and trail range 0x40 through 0xFE.
+The Java `isDoubleByte` helper classifies errors in its ByteBuffer decoder route and does not filter the ArrayDecoder mapping path.
+An unmatched final double-byte lead produces one replacement; ending immediately after a valid SO or SI produces no replacement.
+
+The source tables preserve distinct EBCDIC controls and symbols.
+Byte 0x15 maps to U+0085 in IBM1364 and IBM933, and to line feed in the other four charsets.
+Byte 0x41 maps to halfwidth U+FF61 in IBM930 and is unmapped in the other five.
+IBM1364 adds mappings absent from IBM933, including 0x4995 to the euro sign and 0x4C41 to U+1100.
+IBM834 uses IBM933's pair mappings as raw DBCS-only input, while IBM933 requires SO to enter that mode.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The supporting source manifest] pins the providers, decoder algorithm, charset lookup, and String construction path.
+link:COPYRIGHT[Copyright notices] retain the upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+The resources use the immutable `Mapping` format described in link:../README.adoc[the double-byte reference]: two trail-bound bytes, 256 single-byte units, 256 row indices, then compact pair rows.
+Source single-byte and pair units remain unchanged, including U+FFFD single-byte entries for SO and SI whose decoding is handled by shift transitions.
+The row-index marker 0xFFFF occupies a separate field from the unmapped character marker U+FFFD.
+All source units are BMP values without surrogate units.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-ebcdic
+----
+
+It verifies archive hashes, decoder constructors and ASCII flags, ArrayDecoder state reset and shift transitions, holder initialization, row dimensions, surrogate exclusions, and exact provider alias ownership.
+The single-byte digest concatenates all 256 bytes decoded as independent records, including SO's empty result and SI's replacement result.
+The raw-pair digest concatenates all 65,536 two-byte records in unsigned order, appending U+0000 to each decoded result.
+The two triple digests cover those same pairs with an initial SO or SI byte in every independent record.
+Regression sources decode each record separately and append the separator to the result, since an input zero can be consumed in double-byte mode.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes, raw pairs and control-prefixed triples, mixed EBCDIC and Japanese/Korean/Chinese text, control and symbol differences, private-use mappings, invalid repeated shifts, controls consumed as trails, malformed pairs, truncation, trailing shifts, record resets, null values, configuration, and memory admission.
+They also pin the IBM933 resource's equality with the earlier IBM834 mapping bytes and the distinct behavior selected by those two charset names.

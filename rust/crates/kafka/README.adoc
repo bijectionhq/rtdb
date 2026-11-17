@@ -107,6 +107,9 @@ The link:src/connect/converter/charset/double_byte/hkscs/README.adoc[HKSCS refer
 The DBCS-only JIS0208, JIS0212, IBM300, and IBM834 decoders map raw pairs with no ASCII or shift-mode bypass; each unmappable pair and unmatched final byte produces a replacement.
 The simple EUC IBM1383 and IBM970 decoders preserve ASCII and C1 controls, retry the byte after an unmappable SS2/SS3 prefix, and consume other unmappable pairs together.
 These six charsets have 36 registered names documented in the link:src/connect/converter/charset/double_byte/subclasses/README.adoc[DBCS-only and simple EUC reference].
+The mixed EBCDIC IBM1364/930/933/935/937/939 charsets support all 30 registered names and begin every record in single-byte mode.
+SO and SI switch modes; invalid repeated shifts produce a replacement, and controls consumed as double-byte trails remain part of the replaced pair.
+Their EBCDIC controls, symbols, text mappings, and record-local shift behavior are documented in the link:src/connect/converter/charset/double_byte/ebcdic/README.adoc[mixed EBCDIC reference].
 Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
