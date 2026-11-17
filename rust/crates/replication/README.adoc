@@ -31,6 +31,7 @@ A driver publishes that value only after the corresponding effects apply.
 It validates a persisted source boundary against the configured log before returning a handle, including when indexing is disabled or the database cannot lead.
 A newer source epoch is accepted; an older epoch or a same-epoch log ending before the persisted boundary fails database opening.
 The node owns the task running `run`, invokes `ReplicationHandle::shutdown` to cancel it, and joins it before releasing storage, logs, or transaction dependencies.
+An append pump completing successfully during that cancellation is an orderly shutdown, including when its completion wins the driver's event selection.
 The driver cancels and joins its append pump at term end.
 An in-flight transaction future owns its resolver and external writer; demotion drops that future and fails its receipt.
 A block-production future observes cancellation between pages and completed storage operations, and the driver awaits it before the region ends.

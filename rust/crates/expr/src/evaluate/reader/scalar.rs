@@ -41,14 +41,14 @@ fn retained_type(ty: &LogicalType,frame: &EvaluationFrame<'_>) -> Result<Logical
 pub(super) fn emitted_type(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {
     let child = |expr: &Expr| emitted_type(expr,frame);
     Ok(match expr {
-        Expr::Literal(value) => { frame.context.reserve(value.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
+        Expr::Literal(value) => { frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;value.logical_type() }
         Expr::RegexReplace { source,recipe,.. } => recipe.output_type(&child(source)?)?,
         Expr::Column { id,.. } => retained_type(&frame.schema.get(*id).ok_or_else(||Anomaly::fault("rtdb.expr/missing-column","Expression input column is unavailable"))?.data_type,frame)?,
         Expr::Parameter { index,data_type } => {
             if let Some(ty) = frame.context.parameter_types.and_then(|types| types.get(*index)) { retained_type(ty,frame)? }
             else if *data_type == LogicalType::Nothing {
                 let value = frame.context.parameters.get(*index).ok_or_else(||Anomaly::incorrect("xtdb/missing-parameter",format!("Missing parameter ${}",index + 1)))?;
-                frame.context.reserve(value.retained_bytes()?.checked_mul(8).ok_or_else(overflow)?)?;
+                frame.context.reserve(value_type_bound(value)?.checked_mul(8).ok_or_else(overflow)?)?;
                 value.logical_type()
             } else { retained_type(data_type,frame)? }
         }
@@ -90,7 +90,13 @@ pub(super) fn emitted_type(expr: &Expr,frame: &EvaluationFrame<'_>) -> Result<Lo
             else {
                 let types = args.iter().map(child).collect::<Result<Vec<_>>>()?;
                 if ["null_eq","null-eq","distinct_from","distinct-from","nullif"].iter().any(|candidate|name.eq_ignore_ascii_case(candidate)) && types.len() == 2 { rtdb_plan::validate_equality_types(&types[0],&types[1])?; }
-                let arguments = args.iter().zip(types).enumerate().map(|(index,(arg,ty))| if literal_argument(name,index) || matches!(arg,Expr::Literal(_)) { arg.clone() } else { Expr::Parameter { index: 0,data_type: ty } }).collect::<Vec<_>>();
+                let arguments = args.iter().zip(types).enumerate().map(|(index,(arg,ty))| {
+                    if literal_argument(name,index) {
+                        frame.context.reserve(expression_type_bound(arg)?.checked_mul(8).ok_or_else(overflow)?)?;
+                        frame.context.reserve(literal_payload_bound(arg)?)?;
+                        Ok(arg.clone())
+                    } else { Ok(Expr::Parameter { index: 0,data_type: ty }) }
+                }).collect::<Result<Vec<_>>>()?;
                 rtdb_plan::function_type_with_args(name,&arguments)?
             }
         }

@@ -366,6 +366,8 @@ Scalar emission derives every declared type alternative from the complete runtim
 Query execution supplies it for external arguments and correlated captures; direct callers omitting it use expression annotations and infer untyped parameters from their values.
 CASE boxing, nullable boolean control and lazy list metadata retain those alternatives even when a row selects only one leg.
 `expression_type` exposes the same admission step to page bindings and physical key layouts without evaluating row payloads.
+Type inference releases its temporary metadata when the call returns and transfers only its result-type charge to the caller's scope.
+Ordinary function arguments borrow literal payloads during typing; required constants admit their expression copies before allocation.
 
 Transit default object handlers apply Java numeric string and binary decoding rules before field selection.
 Double representations accept decimal and hexadecimal literals with Java whitespace and suffixes; hexadecimal conversion rounds once to the nearest binary64 value, including subnormals and signed zero.

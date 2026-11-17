@@ -317,7 +317,11 @@ impl ReplicationDriver {
                 Event::Command(None) => return Ok(()),
                 Event::Appender(result) => {
                     if let Some(leader) = &mut self.leader { leader.job = None; }
-                    return match result { Err(error) => Err(error), Ok(()) => Err(invalid("Replica append pump exited during an active term")) };
+                    return match result {
+                        Err(error) => Err(error),
+                        Ok(()) if self.cancellation.is_cancelled() => Ok(()),
+                        Ok(()) => Err(invalid("Replica append pump exited during an active term")),
+                    };
                 }
             }
         }

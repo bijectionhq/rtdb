@@ -46,19 +46,32 @@ fn target_bound(target: &CastTarget) -> Result<usize> {
     bytes.checked_add(4096).ok_or_else(overflow)
 }
 
+fn value_type_bound(value: &Value) -> Result<usize> {
+    let mut bytes = 512usize;
+    let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?; Ok(()) };
+    match value {
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => for value in values { add(value_type_bound(value)?)?; },
+        Value::Struct(fields) => for (name, value) in fields { add(name.len())?; add(value_type_bound(value)?)?; },
+        Value::Map { entries, .. } => for (key, value) in entries { add(value_type_bound(key)?)?; add(value_type_bound(value)?)?; },
+        Value::Timestamp { timezone: Some(zone), .. } => add(zone.len())?,
+        _ => {}
+    }
+    Ok(bytes)
+}
+
 fn expression_type_bound(expr: &Expr) -> Result<usize> {
-    let mut bytes = 4096usize;
+    let mut bytes = 512usize;
     let mut add = |value: usize| -> Result<()> { bytes = bytes.checked_add(value).ok_or_else(overflow)?;Ok(()) };
     match expr {
-        Expr::Literal(value) => add(value.retained_bytes()?)?,
+        Expr::Literal(value) => add(value_type_bound(value)?)?,
         Expr::Column { data_type,.. } | Expr::Parameter { data_type,.. } | Expr::Correlated { data_type,.. } => add(data_type.retained_bytes()?)?,
         Expr::Field { data_type,expr,.. } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?; }
         Expr::Subscript { data_type,expr,index } => { add(data_type.retained_bytes()?)?;add(expression_type_bound(expr)?)?;add(expression_type_bound(index)?)?; }
         Expr::Unary { expr,.. } => add(expression_type_bound(expr)?)?,
         Expr::Cast { expr,target } => { add(expression_type_bound(expr)?)?;add(target_bound(target)?)?; }
         Expr::Binary { left,right,.. } => { add(expression_type_bound(left)?)?;add(expression_type_bound(right)?)?; }
-        Expr::Call { args,return_type,.. } => { add(return_type.retained_bytes()?)?;for expr in args { add(expression_type_bound(expr)?)?; } }
-        Expr::RegexReplace { source,recipe,return_type } => { add(return_type.retained_bytes()?)?;add(recipe.retained_bytes()?)?;add(expression_type_bound(source)?)?; }
+        Expr::Call { name,args,return_type } => { add(name.len())?;add(return_type.retained_bytes()?)?;for expr in args { add(expression_type_bound(expr)?)?; } }
+        Expr::RegexReplace { source,return_type,.. } => { add(return_type.retained_bytes()?)?;add(expression_type_bound(source)?)?; }
         Expr::List(items) | Expr::Coalesce(items) => for expr in items { add(expression_type_bound(expr)?)?; },
         Expr::Struct(fields) => for (name,expr) in fields { add(name.len())?;add(expression_type_bound(expr)?)?; },
         Expr::RowCopy(fields) => for field in fields { add(field.name.len())?;add(field.data_type.retained_bytes()?)?; },
@@ -69,6 +82,19 @@ fn expression_type_bound(expr: &Expr) -> Result<usize> {
         Expr::Like { expr,pattern,.. } => { add(expression_type_bound(expr)?)?;add(expression_type_bound(pattern)?)?; }
     }
     Ok(bytes)
+}
+
+fn literal_payload_bound(expr: &Expr) -> Result<usize> {
+    let bytes = match expr {
+        Expr::Literal(value) => value.retained_bytes()?,
+        Expr::RegexReplace { recipe, .. } => recipe.retained_bytes()?,
+        Expr::Field { name, .. } | Expr::Call { name, .. } => name.len(),
+        Expr::RowCopy(fields) => fields.iter().try_fold(0usize, |bytes, field| {
+            bytes.checked_add(field.qualifier.as_ref().map_or(Ok(0), |qualifier| qualifier.retained_bytes())?).ok_or_else(overflow)
+        })?,
+        _ => 0,
+    };
+    expr.children().into_iter().try_fold(bytes, |bytes, child| bytes.checked_add(literal_payload_bound(child)?).ok_or_else(overflow))
 }
 
 fn value_type(value: &EvalValue<'_>,frame: &EvaluationFrame<'_>) -> Result<LogicalType> {

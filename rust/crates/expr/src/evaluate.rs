@@ -15,7 +15,11 @@ pub use invocation::ExpressionInvocation;
 /// Derives all emitted type alternatives from the complete input and outer schemas and bound parameters.
 /// Performs expression admission without reading row payloads; metadata allocations use the caller's evaluation scope.
 pub fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) -> Result<LogicalType> {
-    reader::expression_type(expr,schema,context)
+    let Some(allocation) = context.allocation else { return reader::expression_type(expr,schema,context); };
+    let scratch = crate::EvaluationScope::new(allocation.memory_budget())?;
+    let result = reader::expression_type(expr,schema,&context.with_allocation(&scratch))?;
+    context.reserve(result.retained_bytes()?)?;
+    Ok(result)
 }
 
 pub struct OuterRow<'a> { pub schema: &'a Schema, pub values: &'a [Value] }
@@ -43,6 +47,10 @@ impl Default for EvalContext<'_> {
 }
 
 impl EvalContext<'_> {
+    fn with_allocation<'a>(&'a self, allocation: &'a crate::EvaluationScope) -> EvalContext<'a> {
+        EvalContext { parameters: self.parameters, parameter_types: self.parameter_types, current_time: self.current_time, timezone: self.timezone,
+            outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog }
+    }
     pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { match self.allocation { Some(scope) => scope.reserve(bytes), None => Ok(()) } }
 }
 

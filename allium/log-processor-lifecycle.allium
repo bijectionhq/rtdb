@@ -123,6 +123,10 @@ contract Election {
     claim: (processor: LogProcessor) -> MessageId
     confers: (processor: LogProcessor, at: MessageId) -> Boolean
 
+    @invariant DatabaseShutdownJoinsTermTasks
+        -- Database shutdown cancels and joins the live leader term's tasks.
+        -- Successful task completion during that cancellation is orderly termination, including when it reaches the driver before the cancellation event.
+
     @invariant PositionDecidesTheClaim
         -- A claim confers leadership exactly when nothing at or above its term precedes it in the log.
         --   The claim's position is the whole of the answer, so every node computes the same one from the same prefix and nothing passes between nodes.

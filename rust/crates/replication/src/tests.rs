@@ -51,6 +51,22 @@ fn upload(index: i64, source: i64) -> ReplicaBody {
 }
 
 #[tokio::test]
+async fn shutting_down_a_live_leader_joins_the_append_pump_without_an_ingestion_fault() {
+    for election_seed in 0..64 {
+        let fixture = fixture(ReplicationConfig { assertion_interval: Duration::from_millis(1), election_seed, ..Default::default() }, 1 << 27).await;
+        let mut status = fixture.handle.watch_status();
+        let driver = tokio::spawn(fixture.driver.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(status.borrow_and_update().role, Role::Leading(_)) { status.changed().await.unwrap(); }
+        }).await.unwrap();
+        fixture.handle.shutdown();
+        tokio::time::timeout(Duration::from_secs(5), driver).await.unwrap().unwrap().unwrap();
+        assert!(fixture.handle.progress().fault().is_none());
+        assert_eq!(fixture.handle.status().role, Role::Stopped);
+    }
+}
+
+#[tokio::test]
 async fn skipped_malformed_arrow_payload_is_archived_and_applied_as_an_abort() {
     let fixture = fixture(ReplicationConfig { skipped_transactions: [SourcePosition(0)].into_iter().collect(), ..Default::default() }, 1 << 27).await;
     let message = rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::Tx(proto::Tx {
@@ -264,6 +280,7 @@ async fn demotion_fails_queued_gc_publication_without_failing_the_progress_monit
 #[tokio::test]
 async fn compactor_reset_receipt_requires_block_adoption_and_fails_on_term_loss() {
     let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 27).await;
+    fixture.logs.append_source(&rtdb_format::envelope::SourceMessage::Protobuf(rtdb_format::envelope::SourceBody::FlushBlock(Default::default())), Timestamp(1)).await.unwrap();
     fixture.driver.consume(raw(0, 1, 0, resolved(1, 0))).await.unwrap();
     fixture.driver.promote().await.unwrap();
     let value = fixture.driver.partition.value();
