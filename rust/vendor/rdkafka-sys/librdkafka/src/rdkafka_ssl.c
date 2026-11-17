@@ -698,8 +698,14 @@ static EVP_PKEY *rd_kafka_ssl_PKEY_from_string(rd_kafka_t *rk,
         BIO *bio = BIO_new_mem_buf((void *)str, -1);
         EVP_PKEY *pkey;
 
+#if OPENSSL_VERSION_NUMBER >= 0x30000000
+        pkey = PEM_read_bio_PrivateKey_ex(
+            bio, NULL, rd_kafka_transport_ssl_passwd_cb, rk,
+            rk->rk_conf.ssl.libctx, NULL);
+#else
         pkey = PEM_read_bio_PrivateKey(bio, NULL,
-                                       rd_kafka_transport_ssl_passwd_cb, rk);
+                                      rd_kafka_transport_ssl_passwd_cb, rk);
+#endif
 
         BIO_free(bio);
 
@@ -1496,7 +1502,7 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                 X509 *cert         = NULL;
                 STACK_OF(X509) *ca = NULL;
                 BIO *bio;
-                PKCS12 *p12;
+                PKCS12 *p12 = NULL;
 
                 rd_kafka_dbg(rk, SECURITY, "SSL",
                              "Loading client's keystore file from %s",
@@ -1511,8 +1517,17 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                         return -1;
                 }
 
-                p12 = d2i_PKCS12_bio(bio, NULL);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000
+                p12 = PKCS12_init_ex(NID_pkcs7_data, rk->rk_conf.ssl.libctx, NULL);
                 if (!p12) {
+                        BIO_free(bio);
+                        rd_snprintf(errstr, errstr_size,
+                                    "Failed to initialize PKCS#12 context: ");
+                        return -1;
+                }
+#endif
+                if (!d2i_PKCS12_bio(bio, &p12)) {
+                        PKCS12_free(p12);
                         BIO_free(bio);
                         rd_snprintf(errstr, errstr_size,
                                     "Error reading ssl.keystore.location "
@@ -1772,7 +1787,7 @@ static rd_bool_t rd_kafka_ssl_ctx_load_providers(rd_kafka_t *rk,
                                          (void *)&buildinfo, 0, 0},
                                         {NULL, 0, NULL, 0, 0}};
 
-                prov = OSSL_PROVIDER_load(NULL, provider);
+                prov = OSSL_PROVIDER_load(rk->rk_conf.ssl.libctx, provider);
                 if (!prov) {
                         rd_snprintf(errstr, errstr_size,
                                     "Failed to load OpenSSL provider \"%s\": ",
@@ -1849,7 +1864,9 @@ int rd_kafka_ssl_ctx_init(rd_kafka_t *rk, char *errstr, size_t errstr_size) {
         }
 #endif
 
-#if OPENSSL_VERSION_NUMBER >= 0x10100000
+#if OPENSSL_VERSION_NUMBER >= 0x30000000
+        ctx = SSL_CTX_new_ex(rk->rk_conf.ssl.libctx, NULL, TLS_client_method());
+#elif OPENSSL_VERSION_NUMBER >= 0x10100000
         ctx = SSL_CTX_new(TLS_client_method());
 #else
         ctx = SSL_CTX_new(SSLv23_client_method());

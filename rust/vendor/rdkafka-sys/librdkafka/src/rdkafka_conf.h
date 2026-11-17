@@ -278,6 +278,7 @@ struct rd_kafka_conf_s {
                 int (*ctx_configure_cb)(void *ctx, void *opaque,
                                         char *errstr, size_t errstr_size);
                 void *ctx_configure_opaque;
+                void *libctx;
                 int (*cert_verify_cb)(rd_kafka_t *rk,
                                       const char *broker_name,
                                       int32_t broker_id,

@@ -792,6 +792,7 @@ typedef struct {
 
 struct ssl_ctx_st {
     OSSL_LIB_CTX *libctx;
+    OSSL_LIB_CTX *signature_libctx;
 
     const SSL_METHOD *method;
     STACK_OF(SSL_CIPHER) *cipher_list;

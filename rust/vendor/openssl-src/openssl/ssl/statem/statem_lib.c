@@ -353,7 +353,7 @@ CON_FUNC_RETURN tls_construct_cert_verify(SSL_CONNECTION *s, WPACKET *pkt)
 
     if (EVP_DigestSignInit_ex(mctx, &pctx,
             md == NULL ? NULL : EVP_MD_get0_name(md),
-            sctx->libctx, sctx->propq, pkey,
+            SSL_CTX_get0_signature_libctx(sctx), sctx->propq, pkey,
             NULL)
         <= 0) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_EVP_LIB);

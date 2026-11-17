@@ -15,9 +15,12 @@ pub(crate) mod validation;
 pub(crate) mod security;
 pub(crate) mod request;
 mod public_key;
+pub(crate) mod random;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
+    random: Arc<random::Context>,
+    signature_random: Arc<random::Context>,
     key_manager: KeyManager,
     trust: Option<Vec<X509>>,
     simple_trust: Option<validation::SimpleTrust>,
@@ -35,6 +38,8 @@ impl NativeTls {
         let policy = Policy::from_java(options)?;
         let algorithm = Algorithm::parse(options.get("ssl.keymanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let trust_algorithm = validation::Algorithm::parse(options.get("ssl.trustmanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
+        let random = random::Context::new(options.get("ssl.secure.random.implementation").map(|name| name.trim_matches(|character| character <= '\u{20}')), reservations[0].budget())?;
+        let signature_random = random::Context::new(None, reservations[0].budget())?;
         let mut key_manager = KeyManager::new(algorithm, &[]);
         let mut identities = Vec::new();
         let mut trust = None;
@@ -55,7 +60,7 @@ impl NativeTls {
                         for identity in material.identities() {
                             let certificate = X509::from_der(&identity.certificates()[0]).map_err(invalid)?;
                             let kind = KeyType::of(&certificate)?;
-                            let key = PKey::private_key_from_pkcs8(identity.private_key_pkcs8()).map_err(invalid)?;
+                            let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
                             let mut chain = Stack::new().map_err(invalid)?;
                             for certificate in &identity.certificates()[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
                             let eligible = algorithm == Algorithm::SunX509 || {
@@ -72,13 +77,14 @@ impl NativeTls {
             let anchors = trust.as_ref().ok_or_else(|| invalid("SunX509 trust management requires Java-style trust material"))?.clone();
             Some(validation::SimpleTrust::new(anchors, Arc::clone(&reservations[0]))?)
         } else { None };
-        Ok(Some(Arc::new(Self { identities, key_manager, trust, simple_trust, policy, reservations })))
+        Ok(Some(Arc::new(Self { identities, random, signature_random, key_manager, trust, simple_trust, policy, reservations })))
     }
 
     pub(crate) fn reservations(&self) -> &[Arc<MemoryReservation>] { &self.reservations }
 
     // The installed certificate callback borrows self until this context and its SSL objects are destroyed.
     unsafe fn configure_context(&self, context: &mut SslContextBuilder) -> Result<()> {
+        unsafe { self.signature_random.configure_signatures(context); }
         context.set_min_proto_version(Some(SslVersion::TLS1_2)).map_err(invalid)?;
         context.set_max_proto_version(Some(SslVersion::TLS1_3)).map_err(invalid)?;
         context.clear_options(SslOptions::NO_TLSV1_2 | SslOptions::NO_TLSV1_3);
@@ -119,6 +125,7 @@ impl NativeTls {
 }
 
 impl rdkafka::config::SslContextConfigurer for NativeTls {
+    unsafe fn library_context(&self) -> *mut c_void { self.random.as_ptr().cast() }
     unsafe fn configure(&self, context: *mut c_void) -> std::result::Result<(), String> {
         let context = context.cast::<openssl_sys::SSL_CTX>();
         if unsafe { openssl_sys::SSL_CTX_up_ref(context) } != 1 { return Err("Unable to retain TLS context".into()); }
@@ -199,3 +206,5 @@ pub(crate) fn validate_provider(name: Option<&str>) -> Result<()> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod random_integration;

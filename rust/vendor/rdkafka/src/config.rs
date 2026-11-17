@@ -90,6 +90,13 @@ pub struct NativeClientConfig {
 /// Configures the client's OpenSSL context before any connection is started.
 /// Implementations may install callbacks borrowing themselves until client destruction.
 pub trait SslContextConfigurer: Send + Sync {
+    /// Supplies an OpenSSL 3 library context for TLS construction, or null for the default context.
+    ///
+    /// # Safety
+    /// The caller must retain `self` until the SSL context and its connections have been destroyed.
+    /// A non-null result must identify a live library context from the linked OpenSSL library.
+    unsafe fn library_context(&self) -> *mut c_void { ptr::null_mut() }
+
     /// Applies configuration to the borrowed OpenSSL `SSL_CTX`.
     ///
     /// # Safety
@@ -310,6 +317,9 @@ impl ClientConfig {
         }
         conf.ssl_context = self.ssl_context.clone();
         if let Some(configuration) = &conf.ssl_context {
+            let context = unsafe { configuration.0.library_context() };
+            let result = unsafe { rdsys::rd_kafka_conf_set_ssl_ctx_libctx(conf.ptr(), context) };
+            if result.is_error() { return Err(KafkaError::ClientCreation("TLS library contexts require OpenSSL 3 support".into())); }
             let result = unsafe { rdsys::rd_kafka_conf_set_ssl_ctx_configure_cb(conf.ptr(), Some(configure_ssl_context), Arc::as_ptr(configuration) as *mut c_void) };
             if result.is_error() { return Err(KafkaError::ClientCreation("TLS context callbacks require SSL support".into())); }
         }

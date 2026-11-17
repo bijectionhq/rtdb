@@ -1,0 +1,56 @@
+= Secure random providers
+
+The built-in algorithm names follow Temurin 25.0.1+8 https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/classes/sun/security/provider/SunEntries.java[SunEntries], `NativePRNG`, `SecureRandom`, `DRBG`, `HashDrbg` and `AbstractDrbg` in the pinned JDK source archive.
+Names are case-insensitive.
+An empty supplied name is an error in both Kafka's `DefaultSslEngineFactory` and Registry's `SslFactory`.
+The Kafka caller applies ConfigDef string trimming; the Registry caller passes the supplied name unchanged.
+The omitted selection uses `NativePRNG` where both Unix random devices are available, and `DRBG` otherwise.
+`Windows-PRNG` is available only on Windows.
+
+`SHA1PRNG` implements the Sun signed-byte state update and retains unused output between requests.
+`DRBG` implements Hash_DRBG with SHA-256, 128-bit entropy requests, a synchronized incrementing 128-bit nonce and the pinned automatic reseed interval.
+The pinned `java.security` contains an empty `securerandom.drbg.config` value and `securerandom.source=file:/dev/random`.
+https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/classes/sun/security/provider/AbstractDrbg.java[AbstractDrbg.DEFAULT_STRENGTH and NonceProvider] and `AbstractHashDrbg.chooseAlgorithmAndStrength` determine those defaults.
+`NativePRNG`, `NativePRNGBlocking` and `NativePRNGNonBlocking` retain separate device inputs and XOR their output with the Sun SHA1PRNG mixer.
+Their cached input expires after 100 milliseconds and adapts between 32 and 65,536 bytes.
+Each native source reserves its maximum buffer once.
+Native contexts using the same algorithm and memory budget share one device cache and mixer while callers retain it.
+Independent memory budgets own separate sources, so one node or client region cannot retain another region's source admission.
+The registry contains weak references and removes each entry when its final source owner releases the device handles, secret state and reservation.
+Its tree nodes are reclaimed as entries disappear, and their allocation is covered by the source reservation.
+The JVM instead shares each algorithm's singleton across the process and retains it until process exit.
+The shared state is protected by a mutex and advances only on a caller's request.
+Initialization draws four bytes, as `SSLContextImpl.engineInit` does before creating connections.
+The adapter exposes no caller-supplied seed or process-wide generator replacement.
+
+Entropy comes from the native operating system.
+On Unix, software generators use `/dev/random`, with OpenSSL's operating-system entropy source if the device cannot be opened.
+`Windows-PRNG` owns a Windows CryptoAPI `PROV_RSA_FULL` context acquired with `CRYPT_VERIFYCONTEXT` and generates bytes with `CryptGenRandom`.
+This follows the pinned https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/jdk.crypto.mscapi/windows/native/libsunmscapi/security.cpp[SunMSCAPI native provider], including context acquisition failures and release.
+Software generator initialization acquires operating-system entropy independently rather than using Java's process-global seed-generator hierarchy.
+Entropy acquisition counts and timing can therefore differ across multiple client constructions.
+The native fallback therefore does not reproduce Java's threaded entropy collector on systems without random devices.
+JVM `java.security.egd`, `securerandom.source`, `securerandom.drbg.config` overrides and additional Java security providers require separate native configuration adapters.
+
+The OpenSSL adapter installs `OSSL_FUNC_PROVIDER_RANDOM_BYTES` in a private library context and selects it with `RAND_set1_random_provider`, both supplied by the pinned OpenSSL 3.6.3 source.
+Public and private random requests use the selected generator for protocol randomness and TLS ephemeral keys.
+Private keys are imported into the same context.
+The native Kafka configuration borrows that context through its existing retained TLS owner.
+Destruction releases TLS objects before the provider and library context.
+Each context owns an independently admitted 262,144-byte reservation; a shared native source owns a separate 73,728-byte reservation covering its maximum buffer, generator state and registry overhead.
+The native TLS owner retains context admission through the final connection's release.
+These conservative bounds still require allocator qualification during Phase 2.
+
+Certificate signatures use a separate default random context.
+The pinned https://github.com/openjdk/jdk25u/blob/jdk-25.0.1%2B8/src/java.base/share/classes/sun/security/ssl/SignatureScheme.java[SignatureScheme.getSigner] passes a null random source through `SignatureUtil.initSignWithParam` and `Signature.engineInitSign`.
+`RSAPSSSignature` and `ECDSASignature` then obtain `JCAUtil`'s cached default `SecureRandom`.
+The local OpenSSL signature-library-context hook preserves this separation for CertificateVerify and TLS 1.2 ServerKeyExchange.
+OpenSSL exports existing private keys into the signature provider, including keys loaded through native librdkafka properties.
+The selected and signature contexts remain alive until the last native SSL object and cached key are destroyed.
+
+The Hash_DRBG assertion uses the SHA-256, no prediction resistance, first NIST CAVP vector in https://github.com/openssl/openssl/blob/openssl-3.6.3/test/recipes/30-test_evp_data/evprand.txt[OpenSSL's vector collection].
+That collection is Apache-2.0 licensed and identifies NIST CAVP as the vector source.
+Its expected output follows two generation requests, matching https://github.com/openssl/openssl/blob/openssl-3.6.3/test/evp_test.c[the upstream harness].
+The test sources also cover name parsing, partial SHA1PRNG requests, native buffer expiry and entropy failures, and isolated provider contexts sharing public and private draws within one selected stream.
+Additional sources cover default DRBG initialization, admission rollback, same-budget source sharing, independent budget release, concurrent source replacement, and TLS 1.2/TLS 1.3 RSA-PSS and ECDSA signature-context routing with native keys.
+No Rust or reference execution has occurred during Phase 1.

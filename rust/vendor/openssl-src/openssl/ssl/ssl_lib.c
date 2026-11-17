@@ -4467,6 +4467,16 @@ void SSL_CTX_free(SSL_CTX *a)
     OPENSSL_free(a);
 }
 
+void SSL_CTX_set_signature_libctx(SSL_CTX *ctx, OSSL_LIB_CTX *libctx)
+{
+    ctx->signature_libctx = libctx;
+}
+
+OSSL_LIB_CTX *SSL_CTX_get0_signature_libctx(const SSL_CTX *ctx)
+{
+    return ctx->signature_libctx != NULL ? ctx->signature_libctx : ctx->libctx;
+}
+
 void SSL_CTX_set_default_passwd_cb(SSL_CTX *ctx, pem_password_cb *cb)
 {
     ctx->default_passwd_callback = cb;
