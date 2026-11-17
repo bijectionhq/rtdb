@@ -73,6 +73,8 @@ fn digest(input: &mut Der<'_>) -> Result<Algorithm> {
             [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1] => primitive_iv(parameter, 16)?,
             [0x2b, 0x0e, 3, 2, 17] | [0x2b, 6, 1, 4, 1, 0x97, 0x55, 1, 1, 2] => primitive_iv(parameter, 8)?,
             [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
+            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3]
+                | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6] => legacy_pbe(parameter)?,
             PSS | [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(unsupported()),
             oid if registered_parameter_service(oid) => return Err(unsupported()),
             _ => {},
@@ -95,13 +97,22 @@ fn chacha_nonce(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn legacy_pbe(bytes: &[u8]) -> Result<()> {
+    let mut input = Der(bytes);
+    let sequence = expect(&mut input, 0x30)?;
+    input.end()?;
+    let mut fields = Der(&sequence);
+    expect(&mut fields, 4)?;
+    integer::int(&mut fields)?;
+    fields.end()
+}
+
 fn is_mgf_digest(oid: &[u8]) -> bool { matches!(oid, SHA1 | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1..=10]) }
 
 fn registered_parameter_service(oid: &[u8]) -> bool {
     matches!(oid,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3 | 13]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6])
+        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13])
 }
 
 impl Pss {
