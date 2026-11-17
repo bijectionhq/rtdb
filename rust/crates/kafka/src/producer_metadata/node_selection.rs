@@ -75,14 +75,24 @@ pub fn least_loaded_node<'a, N>(
     now_ms: i64,
     observations: &mut impl ConnectionObservations<N>,
 ) -> std::result::Result<LeastLoadedNode<'a, N>, SelectionFailure> {
-    if nodes.is_empty() {
+    least_loaded_node_indexed(nodes.len(), |index| &nodes[index], bootstrap, now_ms, observations)
+}
+
+pub(crate) fn least_loaded_node_indexed<'a, N: 'a>(
+    len: usize,
+    node_at: impl Fn(usize) -> &'a N,
+    bootstrap: Bootstrap,
+    now_ms: i64,
+    observations: &mut impl ConnectionObservations<N>,
+) -> std::result::Result<LeastLoadedNode<'a, N>, SelectionFailure> {
+    if len == 0 {
         return match bootstrap {
             Bootstrap::Pending => Ok(LeastLoadedNode { node: None, connection_ready: false }),
             Bootstrap::Complete | Bootstrap::Disabled => Err(SelectionFailure::NoClusterNodes),
         };
     }
 
-    let count = i32::try_from(nodes.len()).map_err(|_| Anomaly::unsupported(
+    let count = i32::try_from(len).map_err(|_| Anomaly::unsupported(
         "rtdb/unsupported-producer-node-list", "Producer node count exceeds Java List size",
     ))?;
     let offset = observations.next_offset(count)?;
@@ -100,7 +110,7 @@ pub fn least_loaded_node<'a, N>(
     for step in 0..count {
         let index = offset.wrapping_add(step) % count;
         let index = usize::try_from(index).map_err(|_| SelectionFailure::NodeIndex(index))?;
-        let node = &nodes[index];
+        let node = node_at(index);
 
         if !connection_ready
             && observations.connection_ready(node, now_ms)?
@@ -144,7 +154,3 @@ pub fn least_loaded_node<'a, N>(
 
     Ok(LeastLoadedNode { node: sendable.or(preparing).or(connectable), connection_ready })
 }
-
-#[cfg(test)]
-#[path = "node_selection/tests.rs"]
-mod tests;

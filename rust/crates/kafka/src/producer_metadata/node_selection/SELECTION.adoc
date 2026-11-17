@@ -4,6 +4,9 @@ The selector borrows the retained shuffled `Cluster.nodes()` list and reads the 
 The returned borrow identifies the original node, including its address, and can be used by the network owner to acquire a request slot or start a connection.
 The selector itself only reads the network state and consumes an offset observation.
 
+`Snapshot::select_node` ranks the retained Cluster node list without copying it or replacing bootstrap Node objects with entries from the broker map.
+An unqualified snapshot fails before the first random draw or connection observation.
+
 `NetworkClient.leastLoadedNode` makes one bounded `Random.nextInt` call for a nonempty list and scans from that offset in Java integer order.
 It returns immediately for a sendable node with zero in-flight requests.
 Otherwise the first sendable minimum wins, followed by the last preparing node, then the first connectable node whose last attempt is oldest.
@@ -34,4 +37,5 @@ Read `NetworkClient.java` lines 439–441, 595–598 and 835–915 for state che
 
 The standalone fixture imports the same selector source.
 Its cases cover rotated call order, early return, tie priorities, readiness without a send slot, bootstrap emptiness and invalid observation boundaries.
+The snapshot fixture checks that selection borrows a retained bootstrap node and makes no budget reservation.
 Source regressions remain unexecuted under the Phase 1 work order.

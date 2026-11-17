@@ -1,6 +1,7 @@
 use rtdb_types::java_hash_map::{Map, PutOutcome};
 use super::{Failure, JavaShuffleObservations, Outcome, bootstrap::shuffle_nodes, keys::{IdentityWitness, Ops, TopicId, TopicPartitionKey}, owned::{Budget, Lease, Shared, Text, Vector}, response::{Node, Partition, Table}};
 use super::super::round_robin::PartitionChoice;
+use super::super::node_selection::{Bootstrap, ConnectionObservations, LeastLoadedNode, SelectionFailure, least_loaded_node_indexed};
 
 pub(super) type Names = Map<Option<Text>, (), Lease>;
 pub(super) struct Sets { pub unauthorized: Names, pub invalid: Names, pub internal: Names }
@@ -114,11 +115,29 @@ impl Snapshot {
     /// Borrows the qualified Cluster node order, including an empty list for initial metadata.
     /// Returns `None` for an unqualified generation built without a shuffle capability.
     pub fn cluster_nodes(&self) -> Option<impl ExactSizeIterator<Item = &Node>> {
+        Some(self.cluster_node_list()?.iter().map(|node| &**node))
+    }
+
+    fn cluster_node_list(&self) -> Option<&[Shared<Node>]> {
         let nodes = match &self.0.cluster {
             ClusterProfile::Response { nodes, .. } => nodes.as_ref()?,
             ClusterProfile::Bootstrap { nodes } => nodes,
         };
-        Some(nodes.as_slice().iter().map(|node| &**node))
+        Some(nodes.as_slice())
+    }
+
+    /// Ranks the retained Cluster node list using the serialized connection observations at `now_ms`.
+    /// Returns a borrow of the original selected Cluster node and independent connection readiness.
+    /// Ranking, observation failures and caller-owned connection actions follow [`least_loaded_node`](super::super::node_selection::least_loaded_node).
+    /// An empty qualified list returns no node or readiness for `Pending`, and `NoClusterNodes` for `Complete` or `Disabled`.
+    /// An unqualified generation fails before demanding a connection or random observation.
+    pub fn select_node(
+        &self, bootstrap: Bootstrap, now_ms: i64, observations: &mut impl ConnectionObservations<Node>,
+    ) -> std::result::Result<LeastLoadedNode<'_, Node>, SelectionFailure> {
+        let nodes = self.cluster_node_list().ok_or_else(|| rtdb_types::Anomaly::unsupported(
+            "rtdb/kafka-cluster-node-order-required", "Producer selection requires a qualified Cluster node order",
+        ))?;
+        least_loaded_node_indexed(nodes.len(), |index| &*nodes[index], bootstrap, now_ms, observations)
     }
     /// Borrows one partition by Java-decoded topic value and signed partition ID without allocating.
     pub fn partition(&self, topic: &str, id: i32) -> Option<&Partition> {
