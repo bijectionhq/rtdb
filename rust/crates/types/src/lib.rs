@@ -18,6 +18,7 @@ mod version;
 mod object_sort;
 mod memory;
 mod allocation;
+mod clojure_index;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
@@ -37,6 +38,7 @@ pub use version::{BuildInfo, compiled_build_info, runtime_version, runtime_revis
 pub use object_sort::ObjectSort;
 pub use memory::{MemoryBudget, MemoryReservation};
 pub use allocation::AllocationScope;
+pub use clojure_index::{CheckedIndex,ClojureKeyIndex,DuplicateKey,KeySemantics};
 
 mod decimal_text;
 pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};

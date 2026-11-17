@@ -88,3 +88,23 @@ Frontend planning admission still requires reservations before parsing and catal
 `new_nullable` preserves an absent message separately from an empty message.
 Native serde retains absence as JSON null; native display prints the code alone when the message is absent and `code: message` when present.
 Wire adapters apply their own message rendering rules.
+
+== Checked Clojure collection construction
+
+`ClojureKeyIndex` moves caller-admitted entries into an immutable array-map or HAMT index while semantic hash and equality callbacks borrow their keys.
+Checked maps use earlier-key/later-key comparison order through eight entries and transient HAMT insertion above that threshold; checked sets always use the HAMT constructor.
+Null hash keys bypass hash and equality callbacks, and hash collisions retain the pinned incoming-key comparison and resident-key rehash order.
+Logical bitmap spare capacity is independent of Rust buffer capacity: fresh bitmaps promote on their seventeenth occupied slot, while collision wrappers promote on their nineteenth.
+`DuplicateKey` retains every input entry and identifies the earlier key for an array-map diagnostic or the incoming key for a hashed diagnostic.
+Callbacks stop at the first error or duplicate, and traversal yields original source ordinals without semantic callbacks or allocation.
+
+Both completed and duplicate owners retain their optional `AllocationScope` borrow through destruction.
+Callers admit input storage before construction; the index reserves each new capacity while old buffers and their charges remain live.
+`None` explicitly selects unscoped construction, and callers remain responsible for their input and work limits.
+The cumulative index allocation bound includes per-reservation bookkeeping but excludes input payloads and the scope's initial charge.
+For `n > 0` inputs, the 32-bit trie has at most eight levels including collision leaves, at most `8n` arena nodes, `256n` live bitmap-buffer slots and `2n` live collision ordinals.
+Native geometric growth and retained old charges are covered by `allocation_bound`; checked arithmetic rejects an unrepresentable bound.
+`clojure_index/tests.rs` and the scope-lifetime documentation examples remain unexecuted regression sources.
+
+This constructor has no production host or reader adapter yet.
+Shared UTF16 and numeric carriers, reader admission and singleton identity, quoted constant reconstruction, function-root identity and semantic host text remain required work.
