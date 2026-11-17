@@ -436,6 +436,7 @@ Searched `CASE` tests use `IS TRUE`, so a nonboolean monomorphic test can return
 `CHAR_LENGTH` lowers to the shared `character_length` function.
 
 Dynamic PATCH lowering preserves direct datetime, parameter and current-timestamp endpoints for PatchGaps.
+Session timezone binding around a direct current-timestamp call retains its captured instant endpoint.
 Literal NULL or FALSE bounds in a FROM/TO clause become start/end-of-time, while a missing clause starts at the query clock.
 PATCH rejects ALL VALID_TIME before static or dynamic planning.
 Scalar endpoint expressions and explicit current-timestamp precision are rejected at the operator boundary.

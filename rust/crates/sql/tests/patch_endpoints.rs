@@ -19,12 +19,12 @@ fn check(input: &Relation) -> usize {
 
 #[test]
 fn patch_lowering_preserves_direct_endpoint_forms_and_rejects_scalar_operators() {
-    for clause in ["","FOR VALID_TIME FROM NULL TO NULL","FOR VALID_TIME FROM FALSE TO FALSE","FOR VALID_TIME FROM CURRENT_TIMESTAMP","FOR VALID_TIME FROM NOW()","FOR VALID_TIME FROM DATE '2020-01-01' TO TIMESTAMP '2021-01-01Z'","FOR VALID_TIME FROM $1 TO $2"] {
+    for clause in ["","FOR VALID_TIME FROM NULL TO NULL","FOR VALID_TIME FROM FALSE TO FALSE","FOR VALID_TIME FROM CURRENT_TIMESTAMP","FOR VALID_TIME FROM NOW()","FOR VALID_TIME FROM CURRENT_TIMESTAMP() TO NOW()","FOR VALID_TIME FROM DATE '2020-01-01' TO TIMESTAMP '2021-01-01Z'","FOR VALID_TIME FROM $1 TO $2"] {
         let sql = format!("PATCH INTO docs {clause} RECORDS {{_id: 1, v: 2}}");
-        let Mutation::Put { input,.. } = prepare_tx(&sql,&EmptyCatalog,&PrepareOptions::default()).unwrap() else { panic!() };
+        let Mutation::Put { input,.. } = prepare_tx(&sql,&EmptyCatalog,&PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error:?}")) else { panic!() };
         assert_eq!(check(&input),1,"{sql}");
     }
-    for bound in ["CURRENT_TIMESTAMP(6)","CURRENT_DATE","COALESCE($1, TIMESTAMP '2020-01-01Z')","CAST('2020-01-01Z' AS TIMESTAMP)","'2020-01-01Z'","1","TIMESTAMP '2020-01-01Z' + INTERVAL '1' DAY"] {
+    for bound in ["CURRENT_TIMESTAMP(6)","CURRENT_DATE","COALESCE($1, TIMESTAMP '2020-01-01Z')","CAST('2020-01-01Z' AS TIMESTAMP)","CAST(CURRENT_TIMESTAMP AS TIMESTAMP WITH TIME ZONE)","CAST(NOW() AS TIMESTAMP)","'2020-01-01Z'","1","TIMESTAMP '2020-01-01Z' + INTERVAL '1' DAY"] {
         let sql = format!("PATCH INTO docs FOR VALID_TIME FROM {bound} RECORDS {{_id: 1, v: 2}}");
         assert_eq!(prepare_tx(&sql,&EmptyCatalog,&PrepareOptions::default()).unwrap_err().code,"rtdb.plan/patch-endpoint","{sql}");
     }

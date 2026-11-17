@@ -156,6 +156,8 @@ pub fn prepare_patch(table: QualifiedTable, input: Arc<Relation>, valid_time: Te
 fn patch_bound(expression: Expr, fallback: i64) -> Expr {
     match expression {
         Expr::Literal(Value::Null | Value::Bool(false)) => timestamp_literal(fallback),
+        Expr::Cast { expr, target: CastTarget::Temporal(rtdb_plan::TemporalCast { kind: rtdb_plan::TemporalKind::TimestampZone(_), precision: None, .. }) }
+            if matches!(expr.as_ref(), Expr::Call { name, args, .. } if matches!(name.as_str(), "current_timestamp" | "now") && args.is_empty()) => patch_bound(*expr, fallback),
         Expr::Call { name,args,return_type } if name == "now" && args.is_empty() => Expr::Call { name: "current_timestamp".into(),args,return_type },
         expression => expression,
     }
