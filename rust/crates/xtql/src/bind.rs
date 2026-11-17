@@ -1,6 +1,6 @@
-use crate::{Binding, Clause, Expr, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, error, parse_query, read};
+use crate::{Binding, Clause, Expr, FormAllocation, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, error, read};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, Binder, Catalog, Expr as PExpr, Field, Identifier, JoinKind, NamedExpr, PreparedStatement, QualifiedTable, Relation, RelationNode, Scan, Schema, SetOperator, SortExpr, Statement, TableBinding, TemporalFilter as PTemporal, UnaryOp};
-use rtdb_types::{ListKind, LogicalType, Result, ScalarType, TimeUnit, Value};
+use rtdb_types::{ListKind, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
 #[derive(Clone, Debug)]
@@ -21,13 +21,23 @@ impl Default for CompileOptions {
 /// Binds all sources against one retained catalog and emits a native query plan.
 /// Parameter types describe the supplied arguments; nested function arguments receive separate apply-local positions.
 pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) -> Result<PreparedStatement> {
-    let query = parse_query(&read(source)?)?;
+    compile_with(source, catalog, options, FormAllocation::Untracked)
+}
+
+/// Binds source at its existing parse/bind demand points, retaining raw metadata in the supplied budget.
+/// Size, native allocation and admission errors propagate without an untracked fallback.
+pub fn compile_in(source: &str, catalog: &dyn Catalog, options: &CompileOptions, memory: &Arc<MemoryBudget>) -> Result<PreparedStatement> {
+    compile_with(source, catalog, options, FormAllocation::Tracked(memory))
+}
+
+fn compile_with(source: &str, catalog: &dyn Catalog, options: &CompileOptions, forms: FormAllocation<'_>) -> Result<PreparedStatement> {
+    let query = crate::ast::parse_query_with(&read(source)?, forms)?;
     let mut next_parameter = options.parameter_types.len();
     for index in options.named_parameters.values().map(|(index, _)| index).chain(options.parameter_indices.iter().flatten()) {
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
     }
     let mut binder = Binder::default();
-    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone };
+    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms };
     let mut parameters = BTreeMap::new();
     for (name, (index, data_type)) in &options.named_parameters {
         parameters.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
@@ -54,6 +64,16 @@ pub fn compile(source: &str, catalog: &dyn Catalog, options: &CompileOptions) ->
 /// The allocator starts above every parameter owned by the containing statement and advances for nested applies.
 /// `timezone` binds session-dependent cast result metadata to the containing statement's execution zone.
 pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str) -> Result<Arc<Relation>> {
+    compile_query_with(query, catalog, binder, next_parameter, arguments, timezone, FormAllocation::Untracked)
+}
+
+/// Binds a possibly foreign AST while copying every reached raw recipe into the caller's budget.
+/// Catalog/argument/source order is unchanged; native copy/admission errors leave the input AST unchanged.
+pub fn compile_query_in(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<Relation>> {
+    compile_query_with(query, catalog, binder, next_parameter, arguments, timezone, FormAllocation::Tracked(memory))
+}
+
+fn compile_query_with(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, next_parameter: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str, forms: FormAllocation<'_>) -> Result<Arc<Relation>> {
     let mut parameters = BTreeMap::new();
     let body = if let Query::Function { parameters: names, body } = query {
         if names.len() != arguments.len() { return Err(error("xtql/fn-arity-error", format!("XTQL fn expects {} argument(s), got {}", names.len(), arguments.len()))); }
@@ -63,7 +83,7 @@ pub fn compile_query(query: &Query, catalog: &dyn Catalog, binder: &mut Binder, 
         }
         body.as_ref()
     } else { query };
-    let mut compiler = Compiler { catalog, binder, next_parameter, timezone };
+    let mut compiler = Compiler { catalog, binder, next_parameter, timezone, forms };
     Ok(compiler.query(body, &parameters)?.relation)
 }
 
@@ -74,6 +94,7 @@ struct Compiler<'a, 'b> {
     binder: &'b mut Binder,
     next_parameter: &'b mut usize,
     timezone: &'a str,
+    forms: FormAllocation<'a>,
 }
 
 struct Bound { relation: Arc<Relation>, variables: BTreeMap<String, Field> }
@@ -414,7 +435,7 @@ impl Compiler<'_, '_> {
     fn expr(&mut self, expr: &Expr, bound: &mut Bound, parameters: &Parameters) -> Result<PExpr> {
         Ok(match expr {
             Expr::Literal(value) => PExpr::Literal(value.clone()),
-            Expr::RegexReplace { source,recipe } => PExpr::regex_replace(self.expr(source,bound,parameters)?,recipe.clone()),
+            Expr::RegexReplace { source,recipe } => PExpr::regex_replace(self.expr(source,bound,parameters)?,self.forms.copy(recipe)?),
             Expr::Cast { expr, target } => {
                 let expr = self.expr(expr, bound, parameters)?;
                 target.validate_source(&expr.data_type())?;
@@ -651,5 +672,58 @@ fn contains_aggregate(expr: &Expr) -> bool {
         Expr::List(values) | Expr::Set(values) => values.iter().any(contains_aggregate),
         Expr::Map(values) => values.iter().any(|(_, value)| contains_aggregate(value)),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod owner_tests {
+    use super::*;
+    struct EmptyCatalog;
+    impl Catalog for EmptyCatalog {
+        fn default_database(&self) -> &str { "xtdb" }
+        fn databases(&self) -> BTreeSet<String> { BTreeSet::new() }
+        fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Ok(None) }
+        fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Ok(Vec::new()) }
+    }
+    #[test]
+    fn native_compile_retains_raw_metadata_after_source_and_creator_locals_drop() {
+        let memory = MemoryBudget::new(1 << 20);
+        let source = r#"(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))"#;
+        let prepared = compile_in(source, &EmptyCatalog, &CompileOptions::default(), &memory).unwrap();
+        let legacy = compile(source, &EmptyCatalog, &CompileOptions::default()).unwrap();
+        assert_eq!(serde_json::to_string(&prepared).unwrap(), serde_json::to_string(&legacy).unwrap());
+        let retained = memory.used_bytes(); assert!(retained > 0);
+        let clone = prepared.clone(); drop(prepared);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(clone);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
+    fn foreign_ast_import_uses_the_destination_budget_and_does_not_reuse_foreign_raw_leases() {
+        let form = read(r#"(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))"#).unwrap();
+        let query = crate::parse_query(&form).unwrap();
+        let denied = MemoryBudget::new(0);
+        let error = compile_query_in(&query, &EmptyCatalog, &mut Binder::default(), &mut 0, &[], "UTC", &denied).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(denied.used_bytes(), 0);
+        let memory = MemoryBudget::new(1 << 20);
+        let relation = compile_query_in(&query, &EmptyCatalog, &mut Binder::default(), &mut 0, &[], "UTC", &memory).unwrap();
+        drop(query); drop(form);
+        let retained = memory.used_bytes(); assert!(retained > 0);
+        let clone = Arc::clone(&relation); drop(relation);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(clone);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
+    fn native_expression_parser_admits_current_domain_without_interpreting_raw_host_forms() {
+        let memory = MemoryBudget::new(1 << 20);
+        let form = read(r#"(regexp-replace nil #opaque[unresolved \😀] nil)"#).unwrap();
+        let expression = crate::ast::parse_expr_in(&form, &memory).unwrap();
+        let Expr::RegexReplace { recipe, .. } = &expression else { panic!() };
+        assert_eq!(serde_json::to_string(&recipe.pattern).unwrap(), r#"{"Tagged":{"tag":"opaque","value":{"Vector":[{"Symbol":"unresolved"},{"Character":"😀"}]}}}"#);
+        assert!(memory.used_bytes() > 0);
+        drop(expression);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

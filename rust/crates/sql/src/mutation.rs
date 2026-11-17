@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use rtdb_plan::*;
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TimeUnit, Value};
+use rtdb_types::{Anomaly, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
 
 #[derive(Clone, Debug)]
 pub enum Mutation {
@@ -25,7 +25,16 @@ pub struct StaticMutation {
 /// Returns an expression-only source for literal/parameter INSERT and PATCH statements.
 /// A syntax error remains an error; a data-dependent statement returns `None`.
 pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions) -> Result<Option<StaticMutation>> {
-    let mut parsed = crate::parse(sql)?;
+    prepare_static_with(sql, catalog, options, crate::bind::FormAllocation::Untracked)
+}
+
+/// Preserves static eligibility and error order while admitting reached raw owners in the supplied budget.
+pub fn prepare_static_in(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions, memory: &Arc<MemoryBudget>) -> Result<Option<StaticMutation>> {
+    prepare_static_with(sql, catalog, options, crate::bind::FormAllocation::Tracked(memory))
+}
+
+fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Option<StaticMutation>> {
+    let mut parsed = crate::parse::parse_with(sql, forms)?;
     if parsed.len() != 1 { return Err(invalid("A transaction operation must contain one statement")); }
     let statement = parsed.remove(0);
     let eligible = match &statement.statement {
@@ -34,7 +43,7 @@ pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::Prepare
         _ => false,
     };
     if !eligible { return Ok(None); }
-    let prepared = crate::bind::bind(statement, sql, catalog, options)?;
+    let prepared = crate::bind::bind(statement, sql, catalog, options, forms)?;
     let output = match prepared.statement {
         Statement::Dml(Dml::Insert { table, input }) => StaticMutation { table, input, patch: false, valid_time: TemporalFilter::Default },
         Statement::Dml(Dml::Patch { table, input, valid_time }) => StaticMutation { table, input, patch: true, valid_time },
@@ -64,7 +73,16 @@ pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::Prepare
 }
 
 pub fn prepare_tx(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions) -> Result<Mutation> {
-    let prepared = crate::prepare(sql, catalog, options)?;
+    prepare_tx_with(sql, catalog, options, crate::bind::FormAllocation::Untracked)
+}
+
+/// Lowers a transaction source with independently retained raw owners charged to the existing caller budget.
+pub fn prepare_tx_in(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions, memory: &Arc<MemoryBudget>) -> Result<Mutation> {
+    prepare_tx_with(sql, catalog, options, crate::bind::FormAllocation::Tracked(memory))
+}
+
+fn prepare_tx_with(sql: &str, catalog: &dyn Catalog, options: &crate::PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Mutation> {
+    let prepared = crate::prepare_with(sql, catalog, options, forms)?;
     let Statement::Dml(dml) = prepared.statement else { return Err(Anomaly::incorrect("xtdb.query/invalid-sql-tx-op", "Invalid SQL query sent as transaction operation")); };
     lower(dml, catalog)
 }

@@ -54,6 +54,13 @@ fn host_pattern_forms_remain_owned_raw_metadata_without_variable_dependencies() 
     let Statement::Query(relation) = compile(source,&EmptyCatalog,&CompileOptions::default()).unwrap().statement else { panic!() };
     let RelationNode::Project { expressions,.. } = relation.node() else { panic!() };
     let rtdb_plan::Expr::RegexReplace { recipe,.. } = &expressions[0].expr else { panic!() };
-    assert!(matches!(&recipe.pattern,rtdb_plan::RegexForm::List(values) if matches!(values.first(),Some(rtdb_plan::RegexForm::Symbol(name)) if name == "str")));
+    assert!(raw_list_begins_with_str(recipe.pattern.view()));
     assert_eq!(expressions[0].expr.parameter_count(),0);
+}
+
+fn raw_list_begins_with_str(form: rtdb_plan::RegexFormView<'_>) -> bool {
+    match form.kind() {
+        rtdb_plan::RegexFormKind::List(values) => matches!(values.first(), Some(first) if matches!(first.kind(), rtdb_plan::RegexFormKind::Symbol(name) if name == "str")),
+        _ => false,
+    }
 }

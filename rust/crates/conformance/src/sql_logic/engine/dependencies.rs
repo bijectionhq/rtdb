@@ -1,11 +1,36 @@
 use std::sync::Arc;
-use rtdb_plan::{Catalog, MaterializedBinding, Relation, RelationNode, Schema, TableBinding};
-use rtdb_types::{Anomaly, Result};
+use rtdb_plan::{Catalog, Expr, MaterializedBinding, RegexReplacement, Relation, RelationNode, Schema, TableBinding, TemporalFilter};
+use rtdb_types::{Anomaly, MemoryBudget, Result};
 use super::gap;
 
-pub(super) fn restore_dependencies(source: &Relation, catalog: &dyn Catalog) -> Result<Arc<Relation>> {
+#[cfg(test)]
+fn restore_dependencies(source: &Relation, catalog: &dyn Catalog) -> Result<Arc<Relation>> {
+    restore_with(source, catalog, FormAllocation::Untracked)
+}
+
+pub(super) fn restore_dependencies_in(source: &Relation, catalog: &dyn Catalog, memory: &Arc<MemoryBudget>) -> Result<Arc<Relation>> {
+    restore_with(source, catalog, FormAllocation::Tracked(memory))
+}
+
+fn restore_with(source: &Relation, catalog: &dyn Catalog, forms: FormAllocation<'_>) -> Result<Arc<Relation>> {
     let tables = ResolvedTables::resolve(source, catalog)?;
-    Rebuilder { bindings: tables.bindings.into_iter() }.rebuild(source)
+    Rebuilder { bindings: tables.bindings.into_iter(), forms }.rebuild(source)
+}
+
+#[derive(Clone, Copy)]
+enum FormAllocation<'a> {
+    Tracked(&'a Arc<MemoryBudget>),
+    #[cfg(test)]
+    Untracked,
+}
+impl FormAllocation<'_> {
+    fn copy(self, recipe: &RegexReplacement) -> Result<RegexReplacement> {
+        match self {
+            Self::Tracked(memory) => recipe.copy_in(memory),
+            #[cfg(test)]
+            Self::Untracked => recipe.copy_untracked(),
+        }
+    }
 }
 
 struct ResolvedTables { bindings: Vec<TableBinding> }
@@ -43,9 +68,9 @@ fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBin
     Ok(())
 }
 
-struct Rebuilder { bindings: std::vec::IntoIter<TableBinding> }
+struct Rebuilder<'a> { bindings: std::vec::IntoIter<TableBinding>, forms: FormAllocation<'a> }
 
-impl Rebuilder {
+impl Rebuilder<'_> {
     fn rebuild(mut self, source: &Relation) -> Result<Arc<Relation>> {
         let relation = self.relation(source)?;
         if self.bindings.next().is_some() { return Err(occurrence_error()); }
@@ -64,26 +89,92 @@ impl Rebuilder {
         let schema = Schema::new(source.schema().fields().to_vec()).map_err(projection_error)?;
         let mut node = source.node().clone();
         match &mut node {
-            RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
-            RelationNode::Scan(scan) => scan.table = self.next_table()?,
-            RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
-            | RelationNode::Filter { input, .. } | RelationNode::Aggregate { input, .. }
-            | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
-            | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
-            | RelationNode::Distinct { input } | RelationNode::Unnest { input, .. }
-            | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => *input = self.relation(input)?,
+            RelationNode::Values { rows } => self.expressions(rows.iter_mut().flatten())?,
+            RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => self.expression(expr)?,
+            RelationNode::Scan(scan) => {
+                scan.table = self.next_table()?;
+                self.temporal(&mut scan.valid_time)?;
+                self.temporal(&mut scan.system_time)?;
+                self.expressions(&mut scan.predicates)?;
+            }
+            RelationNode::Project { input, expressions } | RelationNode::Extend { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+                *input = self.relation(input)?;
+                self.expressions(expressions.iter_mut().map(|expression| &mut expression.expr))?;
+            }
+            RelationNode::Filter { input, predicate } => { *input = self.relation(input)?; self.expression(predicate)?; }
+            RelationNode::Aggregate { input, groups, aggregates } => {
+                *input = self.relation(input)?;
+                self.expressions(groups.iter_mut().map(|group| &mut group.expr))?;
+                for aggregate in aggregates {
+                    self.expressions(aggregate.argument.iter_mut())?;
+                    self.expressions(aggregate.filter.iter_mut())?;
+                    self.expressions(aggregate.order_by.iter_mut().map(|order| &mut order.expr))?;
+                }
+            }
+            RelationNode::Window { input, order_by, .. } | RelationNode::Sort { input, order_by } => {
+                *input = self.relation(input)?;
+                self.expressions(order_by.iter_mut().map(|order| &mut order.expr))?;
+            }
+            RelationNode::SortLimit { input, order_by, offset, fetch } => {
+                *input = self.relation(input)?;
+                self.expressions(order_by.iter_mut().map(|order| &mut order.expr))?;
+                self.expressions(offset.iter_mut())?; self.expressions(fetch.iter_mut())?;
+            }
+            RelationNode::Limit { input, offset, fetch } => { *input = self.relation(input)?; self.expressions(offset.iter_mut())?; self.expressions(fetch.iter_mut())?; }
+            RelationNode::Distinct { input } | RelationNode::PageOrdinality { input, .. } => *input = self.relation(input)?,
+            RelationNode::Unnest { input, expr, .. } => { *input = self.relation(input)?; self.expression(expr)?; }
+            RelationNode::PatchGaps { input, from, to, .. } => { *input = self.relation(input)?; self.expression(from)?; self.expression(to)?; }
             RelationNode::Let { binding, body } => { *binding = self.binding(binding)?; *body = self.relation(body)?; }
             RelationNode::Reference { binding } => *binding = self.binding(binding)?,
-            RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => {
+            RelationNode::Join { left, right, condition, .. } => {
                 *left = self.relation(left)?;
                 *right = self.relation(right)?;
+                self.expressions(condition.iter_mut())?;
             }
-            RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => {
+            RelationNode::Set { left, right, .. } => { *left = self.relation(left)?; *right = self.relation(right)?; }
+            RelationNode::Apply { input, dependent, arguments, .. } => {
                 *input = self.relation(input)?;
                 *dependent = self.relation(dependent)?;
+                self.expressions(arguments.iter_mut().map(|(_, expression)| expression))?;
+            }
+            RelationNode::Mark { input, dependent, arguments, comparison, .. } => {
+                *input = self.relation(input)?;
+                *dependent = self.relation(dependent)?;
+                self.expressions(arguments.iter_mut().map(|(_, expression)| expression))?;
+                self.expression(comparison)?;
             }
         }
         Ok(Arc::new(Relation::new(schema, node).map_err(projection_error)?))
+    }
+
+    fn temporal(&mut self, filter: &mut TemporalFilter) -> Result<()> {
+        match filter {
+            TemporalFilter::Default | TemporalFilter::All => (),
+            TemporalFilter::At(at) => self.expression(at)?,
+            TemporalFilter::FromTo { from, to } | TemporalFilter::Between { from, to } => { self.expression(from)?; self.expression(to)?; }
+        }
+        Ok(())
+    }
+    fn expressions<'a>(&mut self, expressions: impl IntoIterator<Item = &'a mut Expr>) -> Result<()> {
+        for expression in expressions { self.expression(expression)?; }
+        Ok(())
+    }
+    fn expression(&mut self, expression: &mut Expr) -> Result<()> {
+        match expression {
+            Expr::Literal(_) | Expr::Column { .. } | Expr::Parameter { .. } | Expr::Correlated { .. } | Expr::RowCopy(_) => (),
+            Expr::Unary { expr, .. } | Expr::Cast { expr, .. } | Expr::Field { expr, .. } => self.expression(expr)?,
+            Expr::Binary { left, right, .. } => { self.expression(left)?; self.expression(right)?; }
+            Expr::Call { args, .. } | Expr::Coalesce(args) | Expr::List(args) => self.expressions(args)?,
+            Expr::RegexReplace { source, recipe, .. } => { self.expression(source)?; *recipe = self.forms.copy(recipe)?; }
+            Expr::Case { branches, otherwise } => { for (condition, value) in branches { self.expression(condition)?; self.expression(value)?; } self.expression(otherwise)?; }
+            Expr::SimpleCase { operand, branches, otherwise } => { self.expression(operand)?; for (condition, value) in branches { self.expression(condition)?; self.expression(value)?; } self.expression(otherwise)?; }
+            Expr::Between { operand, low, high, .. } => { self.expression(operand)?; self.expression(low)?; self.expression(high)?; }
+            Expr::Subscript { expr, index, .. } => { self.expression(expr)?; self.expression(index)?; }
+            Expr::Struct(fields) => self.expressions(fields.iter_mut().map(|(_, expression)| expression))?,
+            Expr::In { expr, values, .. } => { self.expression(expr)?; self.expressions(values)?; }
+            Expr::Like { expr, pattern, .. } => { self.expression(expr)?; self.expression(pattern)?; }
+        }
+        Ok(())
     }
 }
 
@@ -99,12 +190,25 @@ mod tests {
     use std::{cell::RefCell, collections::{BTreeMap, BTreeSet, VecDeque}};
     use rtdb_plan::{AggregateExpr, AggregateFunction, AggregateName, ApplyKind, BinaryOp, CastOption, CastTarget,
         CastTimezone, ColumnId, ColumnQualifier, DeferredCast, Expr, Field, JoinKind, NamedExpr, PreparedStatement,
-        PercentileFraction, PercentileKind, QualifiedTable, RegexForm as F, RegexReplacement, Scan, SetOperator, SortExpr, Statement, TemporalFilter,
+        PercentileFraction, PercentileKind, QualifiedTable, RegexForm as F, RegexFormBuilder, RegexFormKind, RegexLiteralKind, RegexReplacement, Scan, SetOperator, SortExpr, Statement, TemporalFilter,
         TemporalKind, WindowExpr, WindowFunction};
     use rtdb_query::PreparedQuery;
     use rtdb_types::{AnomalyCategory, CalendarDate, CivilDate, DateUnit, DecimalValue, Keyword, LogicalType as L,
         MemoryBudget, ScalarType as S, TableRef, TimeUnit, Value as V};
     use serde_json::{Value as Json, json};
+
+    fn raw_build(emit: impl FnOnce(&mut RegexFormBuilder<'_>) -> Result<()>) -> F { let mut builder = RegexFormBuilder::new_untracked(); emit(&mut builder).unwrap(); builder.finish().unwrap() }
+    fn raw_literal(value: V) -> F { raw_build(|builder| builder.literal(&value)) }
+    fn raw_character(value: char) -> F { raw_build(|builder| builder.character(value)) }
+    fn raw_symbol(value: String) -> F { raw_build(|builder| builder.symbol(&value)) }
+    fn raw_big_integer(value: String) -> F { raw_build(|builder| builder.big_integer(&value)) }
+    fn raw_decimal(value: String) -> F { raw_build(|builder| builder.decimal(&value)) }
+    fn raw_list(values: Vec<F>) -> F { raw_build(|builder| { builder.begin_list()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+    fn raw_vector(values: Vec<F>) -> F { raw_build(|builder| { builder.begin_vector()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+    fn raw_set(values: Vec<F>) -> F { raw_build(|builder| { builder.begin_set()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+    fn raw_map(values: Vec<(F,F)>) -> F { raw_build(|builder| { builder.begin_map()?; for (key,value) in values { builder.append_view(key.view())?; builder.append_view(value.view())?; } builder.end() }) }
+    fn raw_tagged(tag: String, value: F) -> F { raw_build(|builder| { builder.begin_tagged(&tag)?; builder.append_view(value.view())?; builder.end() }) }
+    fn raw_anonymous(value: F) -> F { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }
 
     #[derive(Default)]
     struct RecordingCatalog {
@@ -376,11 +480,11 @@ mod tests {
             assert_eq!(tables.bindings, [table("a")]);
             tables
         };
-        let restored = Rebuilder { bindings: tables.bindings.into_iter() }.rebuild(&source).unwrap();
+        let restored = Rebuilder { bindings: tables.bindings.into_iter(), forms: FormAllocation::Untracked }.rebuild(&source).unwrap();
         let RelationNode::Scan(scan) = restored.node() else { panic!() };
         assert_eq!(scan.table, table("a"));
         for bindings in [Vec::new(), vec![table("a"), table("extra")]] {
-            let error = Rebuilder { bindings: bindings.into_iter() }.rebuild(&source).unwrap_err();
+            let error = Rebuilder { bindings: bindings.into_iter(), forms: FormAllocation::Untracked }.rebuild(&source).unwrap_err();
             assert_eq!(error, occurrence_error());
         }
     }
@@ -423,11 +527,11 @@ mod tests {
 
     #[test]
     fn unsupported_host_metadata_stays_uninterpreted_with_its_raw_duplicates() {
-        let pattern = F::Tagged { tag: "opaque/reader".into(), value: Box::new(F::AnonymousFunction(Box::new(F::List(vec![
-            F::Symbol("unresolved/host".into()), F::Literal(V::Utf8("[".into())), F::BigInteger("00099".into()), F::Decimal("1.00M".into()),
-        ])))) };
-        let flags = F::Map(vec![(F::Character('i'), F::Symbol("first".into())), (F::Character('i'), F::Symbol("second".into()))]);
-        let expected = RegexReplacement { pattern, replacement: F::Literal(V::Utf8("$bad".into())), flags, ..Default::default() };
+        let pattern = raw_tagged("opaque/reader".into(), raw_anonymous(raw_list(vec![
+            raw_symbol("unresolved/host".into()), raw_literal(V::Utf8("[".into())), raw_big_integer("00099".into()), raw_decimal("1.00M".into()),
+        ])));
+        let flags = raw_map(vec![(raw_character('i'), raw_symbol("first".into())), (raw_character('i'), raw_symbol("second".into()))]);
+        let expected = RegexReplacement { pattern, replacement: raw_literal(V::Utf8("$bad".into())), flags, ..Default::default() };
         let source = values(Expr::regex_replace(Expr::Literal(V::Null), expected.clone()), 0);
         let restored = assert_projection(&source);
         assert_eq!(recipe(&restored), &expected);
@@ -439,10 +543,14 @@ mod tests {
     fn nonfinite_float_payloads_and_signed_zero_keep_exact_nested_wire_bits() {
         let value = V::List(vec![V::F32(f32::from_bits(0x7fc00001)), V::F32(f32::INFINITY), V::F32(f32::NEG_INFINITY), V::F32(-0.0),
             V::F64(f64::from_bits(0x7ff8000000000001)), V::F64(f64::INFINITY), V::F64(f64::NEG_INFINITY), V::F64(-0.0)]);
-        let source = recipe_form(F::Literal(value), 0);
+        let source = recipe_form(raw_literal(value), 0);
         let restored = assert_projection(&source);
-        let F::Literal(V::List(values)) = &recipe(&restored).pattern else { panic!() };
-        let bits = values.iter().map(|value| match value { V::F32(value) => u64::from(value.to_bits()), V::F64(value) => value.to_bits(), _ => panic!() }).collect::<Vec<_>>();
+        let RegexFormKind::Literal(value) = recipe(&restored).pattern.view().kind() else { panic!() };
+        let RegexLiteralKind::List(values) = value.kind() else { panic!() };
+        let bits = values.iter().map(|value| {
+            let RegexLiteralKind::Leaf(leaf) = value.kind() else { panic!() };
+            match leaf.value() { V::F32(value) => u64::from(value.to_bits()), V::F64(value) => value.to_bits(), _ => panic!() }
+        }).collect::<Vec<_>>();
         assert_eq!(bits, [0x7fc00001, 0x7f800000, 0xff800000, 0x80000000, 0x7ff8000000000001, 0x7ff0000000000000, 0xfff0000000000000, 0x8000000000000000]);
         assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), r#"{"Literal":{"List":[{"F32":2143289345},{"F32":2139095040},{"F32":4286578688},{"F32":2147483648},{"F64":9221120237041090561},{"F64":9218868437227405312},{"F64":18442240474082181120},{"F64":9223372036854775808}]}}"#);
         for bits in [0x7ff8000000000001u64, 0x7ff0000000000000, 0xfff0000000000000, 0x8000000000000000] {
@@ -465,9 +573,11 @@ mod tests {
             (CivilDate::MIN, DateUnit::Day, r#"{"Literal":{"Date":{"date":"-999999999-01-01","unit":"Day"}}}"#),
             (CivilDate::MAX, DateUnit::Millisecond, r#"{"Literal":{"Date":{"date":"+999999999-12-31","unit":"Millisecond"}}}"#),
         ] {
-            let restored = assert_projection(&recipe_form(F::Literal(V::Date(CalendarDate::new(date, unit))), 0));
+            let restored = assert_projection(&recipe_form(raw_literal(V::Date(CalendarDate::new(date, unit))), 0));
             assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), expected);
-            let F::Literal(V::Date(value)) = &recipe(&restored).pattern else { panic!() };
+            let RegexFormKind::Literal(literal) = recipe(&restored).pattern.view().kind() else { panic!() };
+            let RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!() };
+            let V::Date(value) = leaf.value() else { panic!() };
             assert_eq!(value.date(), date); assert_eq!(value.unit(), unit);
         }
         let input = scan("a", 0);
@@ -485,7 +595,7 @@ mod tests {
         assert_eq!(first_expression(&restored), &cast);
         let physical = V::Struct(BTreeMap::from([("z".into(), V::Set(vec![V::I64(2), V::I64(1), V::I64(2)])),
             ("a".into(), V::Map { entries: vec![(V::Utf8("z".into()), V::I64(1)), (V::Utf8("z".into()), V::I64(2))], sorted: true })]));
-        let restored = assert_projection(&recipe_form(F::Literal(physical), 0));
+        let restored = assert_projection(&recipe_form(raw_literal(physical), 0));
         assert_eq!(serde_json::to_string(&recipe(&restored).pattern).unwrap(), r#"{"Literal":{"Struct":{"a":{"Map":{"entries":[[{"Utf8":"z"},{"I64":1}],[{"Utf8":"z"},{"I64":2}]],"sorted":true}},"z":{"Set":[{"I64":2},{"I64":1},{"I64":2}]}}}}"#);
     }
 
@@ -493,7 +603,7 @@ mod tests {
     fn restored_values_and_bindings_outlive_the_source_and_catalog() {
         let restored = {
             let catalog = RecordingCatalog::default();
-            let source = cross(scan("a", 0), recipe_form(F::Literal(V::Utf8("owned-pattern".into())), 1));
+            let source = cross(scan("a", 0), recipe_form(raw_literal(V::Utf8("owned-pattern".into())), 1));
             let result = restore_dependencies(&source, &catalog).unwrap();
             assert_eq!(catalog.calls(), ["a"]);
             result
@@ -501,7 +611,7 @@ mod tests {
         let RelationNode::Join { left, right, .. } = restored.node() else { panic!() };
         let RelationNode::Scan(scan) = left.node() else { panic!() };
         assert_eq!(scan.table, table("a"));
-        assert_eq!(recipe(right).pattern, F::Literal(V::Utf8("owned-pattern".into())));
+        assert_eq!(recipe(right).pattern, raw_literal(V::Utf8("owned-pattern".into())));
         assert_eq!(restored.schema().fields().iter().map(|field| field.id).collect::<Vec<_>>(), [ColumnId(0), ColumnId(1)]);
     }
 
@@ -528,14 +638,15 @@ mod tests {
         for child in source.children() { expression_addresses(child, addresses); }
     }
     fn pattern_pointer(source: &Relation) -> *const u8 {
-        let F::Literal(V::Utf8(value)) = &recipe(source).pattern else { panic!() };
+        let RegexFormKind::Literal(value) = recipe(source).pattern.view().kind() else { panic!() };
+        let RegexLiteralKind::Text(value) = value.kind() else { panic!() };
         assert!(!value.is_empty());
         value.as_ptr()
     }
 
     #[test]
     fn repeated_relation_occurrences_have_fresh_expression_and_raw_payload_addresses() {
-        let input = recipe_form(F::Literal(V::Utf8("owned-pattern".into())), 0);
+        let input = recipe_form(raw_literal(V::Utf8("owned-pattern".into())), 0);
         let source = relation(input.schema().clone(), RelationNode::Set { left: Arc::clone(&input), right: Arc::clone(&input), operator: SetOperator::Union, all: true });
         let restored = assert_projection(&source);
         let RelationNode::Set { left, right, .. } = restored.node() else { panic!() };
@@ -558,17 +669,17 @@ mod tests {
     #[test]
     fn all_raw_forms_and_physical_literals_keep_explicit_projection_wires() {
         let raw = vec![
-            (F::Literal(V::Null), r#"{"Literal":"Null"}"#),
-            (F::Character('😀'), r#"{"Character":"😀"}"#),
-            (F::Symbol("ns/x".into()), r#"{"Symbol":"ns/x"}"#),
-            (F::BigInteger("00099".into()), r#"{"BigInteger":"00099"}"#),
-            (F::Decimal("1.00M".into()), r#"{"Decimal":"1.00M"}"#),
-            (F::List(vec![F::Symbol("unresolved".into())]), r#"{"List":[{"Symbol":"unresolved"}]}"#),
-            (F::Vector(vec![F::Character('x')]), r#"{"Vector":[{"Character":"x"}]}"#),
-            (F::Set(vec![F::Symbol("x".into()), F::Symbol("x".into())]), r#"{"Set":[{"Symbol":"x"},{"Symbol":"x"}]}"#),
-            (F::Map(vec![(F::Symbol("x".into()), F::Character('a')), (F::Symbol("x".into()), F::Character('b'))]), r#"{"Map":[[{"Symbol":"x"},{"Character":"a"}],[{"Symbol":"x"},{"Character":"b"}]]}"#),
-            (F::Tagged { tag: "opaque/tag".into(), value: Box::new(F::Literal(V::Null)) }, r#"{"Tagged":{"tag":"opaque/tag","value":{"Literal":"Null"}}}"#),
-            (F::AnonymousFunction(Box::new(F::Symbol("%".into()))), r#"{"AnonymousFunction":{"Symbol":"%"}}"#),
+            (raw_literal(V::Null), r#"{"Literal":"Null"}"#),
+            (raw_character('😀'), r#"{"Character":"😀"}"#),
+            (raw_symbol("ns/x".into()), r#"{"Symbol":"ns/x"}"#),
+            (raw_big_integer("00099".into()), r#"{"BigInteger":"00099"}"#),
+            (raw_decimal("1.00M".into()), r#"{"Decimal":"1.00M"}"#),
+            (raw_list(vec![raw_symbol("unresolved".into())]), r#"{"List":[{"Symbol":"unresolved"}]}"#),
+            (raw_vector(vec![raw_character('x')]), r#"{"Vector":[{"Character":"x"}]}"#),
+            (raw_set(vec![raw_symbol("x".into()), raw_symbol("x".into())]), r#"{"Set":[{"Symbol":"x"},{"Symbol":"x"}]}"#),
+            (raw_map(vec![(raw_symbol("x".into()), raw_character('a')), (raw_symbol("x".into()), raw_character('b'))]), r#"{"Map":[[{"Symbol":"x"},{"Character":"a"}],[{"Symbol":"x"},{"Character":"b"}]]}"#),
+            (raw_tagged("opaque/tag".into(), raw_literal(V::Null)), r#"{"Tagged":{"tag":"opaque/tag","value":{"Literal":"Null"}}}"#),
+            (raw_anonymous(raw_symbol("%".into())), r#"{"AnonymousFunction":{"Symbol":"%"}}"#),
         ];
         assert_eq!(raw.len(), 11);
         for (form, expected) in raw { assert_form_projection(form, expected); }
@@ -596,7 +707,7 @@ mod tests {
             (V::Struct(BTreeMap::from([("z".into(), V::Null), ("a".into(), V::Bool(true))])), r#"{"Struct":{"a":{"Bool":true},"z":"Null"}}"#),
         ];
         assert_eq!(physical.len(), 41);
-        for (value, expected) in physical { assert_form_projection(F::Literal(value), &format!(r#"{{"Literal":{expected}}}"#)); }
+        for (value, expected) in physical { assert_form_projection(raw_literal(value), &format!(r#"{{"Literal":{expected}}}"#)); }
     }
 
     fn binary(source: &Relation) -> &Vec<u8> {
@@ -624,5 +735,47 @@ mod tests {
         let retained = memory.used_bytes(); assert!(retained > 0); assert!(retained < memory.limit_bytes());
         let clone = query.clone(); drop(query); assert_eq!(memory.used_bytes(), retained);
         drop(clone); assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn native_raw_copy_begins_only_after_every_catalog_occurrence_has_resolved() {
+        let source = cross(recipe_form(raw_literal(V::Utf8("owned-pattern".into())), 0), scan("lookup", 1));
+        let catalog = RecordingCatalog::with(vec![Err(Anomaly::incorrect("fixture/catalog-first", "lookup precedes raw copy"))]);
+        let memory = MemoryBudget::new(0);
+        let pointer = pattern_pointer(source.children()[0]);
+        let error = restore_dependencies_in(&source, &catalog, &memory).unwrap_err();
+        assert_eq!(error.code, "fixture/catalog-first");
+        assert_eq!(catalog.calls(), ["lookup"]);
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(pattern_pointer(source.children()[0]), pointer);
+    }
+
+    #[test]
+    fn native_raw_copy_failure_releases_destination_and_preserves_completed_lookup_order() {
+        let source = cross(recipe_form(raw_literal(V::Utf8("owned-pattern".into())), 0), scan("lookup", 1));
+        let catalog = RecordingCatalog::default();
+        let memory = MemoryBudget::new(0);
+        let pointer = pattern_pointer(source.children()[0]);
+        let error = restore_dependencies_in(&source, &catalog, &memory).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(catalog.calls(), ["lookup"]);
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(pattern_pointer(source.children()[0]), pointer);
+    }
+
+    #[test]
+    fn native_fresh_raw_owners_survive_prepared_publication_and_clones_independently_of_the_source() {
+        let source = recipe_form(raw_literal(V::Utf8("owned-pattern".into())), 0);
+        let memory = MemoryBudget::new(16 << 20);
+        let restored = restore_dependencies_in(&source, &RecordingCatalog::default(), &memory).unwrap();
+        assert_ne!(pattern_pointer(&restored), pattern_pointer(&source));
+        let raw_retained = memory.used_bytes(); assert!(raw_retained > 0);
+        let query = PreparedQuery::from_prepared(prepared(&restored), &memory).unwrap();
+        drop(restored); drop(source);
+        let retained = memory.used_bytes(); assert!(retained >= raw_retained);
+        let clone = query.clone(); drop(query);
+        assert_eq!(memory.used_bytes(), retained);
+        drop(clone);
+        assert_eq!(memory.used_bytes(), 0);
     }
 }

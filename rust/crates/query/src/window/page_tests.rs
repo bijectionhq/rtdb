@@ -83,7 +83,7 @@ async fn later_window_column_overflow_discards_completed_prior_column_and_sorted
 #[tokio::test]
 async fn empty_semantic_window_input_still_prepares_its_computed_order_key() {
     let execution = execution(1);let baseline = execution.context.memory.used_bytes();
-    let expr = Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),rtdb_plan::RegexReplacement { pattern: rtdb_plan::RegexForm::Literal(Value::Utf8("[".into())),replacement: rtdb_plan::RegexForm::Literal(Value::Utf8("x".into())),..Default::default() });
+    let expr = Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),rtdb_plan::RegexReplacement { pattern: raw_literal(Value::Utf8("[".into())),replacement: raw_literal(Value::Utf8("x".into())),..Default::default() });
     let order = vec![SortExpr { expr,descending: false,nulls_first: false }];
     let mut cursor = WindowCursor::new(input(vec![vec![]],&execution),runtime(&execution),vec![],order.clone(),expressions(&[WindowFunction::RowNumber]),execution.clone());
     assert_eq!(cursor.next_page().await.err().unwrap().code,"xtdb.expression/illegal-argument-exception");drop(cursor);
@@ -110,3 +110,10 @@ async fn partition_hash_precedes_cross_unit_timestamp_equality() {
     drop(page);drop(cursor);
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }

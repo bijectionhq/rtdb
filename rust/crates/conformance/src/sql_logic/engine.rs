@@ -174,9 +174,9 @@ impl Engine {
         let context = self.session.query_context_at(&basis, &token).await?;
         let sql = record.sql.as_deref().unwrap_or("");
         let catalog = HiddenIdCatalog { delegate: &context.catalog, hide: !options.direct_sql };
-        let mut prepared = rtdb_sql::prepare(sql, &catalog, &rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..rtdb_sql::PrepareOptions::default() })?;
+        let mut prepared = rtdb_sql::prepare_in(sql, &catalog, &rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..rtdb_sql::PrepareOptions::default() }, &context.memory)?;
         let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement is not a query")); };
-        let relation = if options.direct_sql { relation } else { dependencies::restore_dependencies(&relation, &context.catalog)? };
+        let relation = if options.direct_sql { relation } else { dependencies::restore_dependencies_in(&relation, &context.catalog, &context.memory)? };
         prepared.statement = Statement::Query(relation);
         let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), vec![]).await?;
         let mut bytes = cursor.schema().fields().iter().try_fold(8192usize, |bytes, field| {

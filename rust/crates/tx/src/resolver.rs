@@ -259,7 +259,7 @@ impl<'a> OpenTransaction<'a> {
     pub async fn open_query(&self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.context.query_context(self.snapshot()?, self.tx_key().system_time, &self.options.default_tz, self.trace_parent)?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
+        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)?.execute_with_text(context, arguments, Some(sql)).await
     }
 
@@ -275,7 +275,7 @@ impl<'a> OpenTransaction<'a> {
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let mutation = rtdb_sql::prepare_tx(sql, &context.catalog, &options)?;
+        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory)?;
         self.execute_mutation(mutation, context, arguments).await.map_err(|error| error.with_context("sql", sql.into()))
     }
 

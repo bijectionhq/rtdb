@@ -7,6 +7,16 @@ use sqlparser::{parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 use crate::{PrepareOptions, parse::{source_span, sql_error}};
 
 pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<ControlStatement>> {
+    parse_control_with(source, options, crate::bind::FormAllocation::Untracked)
+}
+
+/// Parses control expressions using the caller's existing budget at the original source-demand point.
+/// A non-control probe creates no raw owner; native allocation/admission errors propagate.
+pub fn parse_control_in(source: &str, options: &PrepareOptions, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<ControlStatement>> {
+    parse_control_with(source, options, crate::bind::FormAllocation::Tracked(memory))
+}
+
+fn parse_control_with(source: &str, options: &PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Option<ControlStatement>> {
     let mut tokens: Vec<_> = crate::parse::tokenize(source)?
         .into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     if tokens.last().is_some_and(|token| token.token == Token::SemiColon) { tokens.pop(); }
@@ -22,13 +32,13 @@ pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<Co
             }
         }
     }
-    let mut parser = ControlParser { source, options, tokens, index: 0 };
+    let mut parser = ControlParser { source, options, tokens, index: 0, forms };
     let statement = parser.statement()?;
     if parser.index != parser.tokens.len() { return Err(parser.error("Unexpected input after control statement")); }
     Ok(Some(statement))
 }
 
-struct ControlParser<'a> { source: &'a str, options: &'a PrepareOptions, tokens: Vec<TokenWithSpan>, index: usize }
+struct ControlParser<'a> { source: &'a str, options: &'a PrepareOptions, tokens: Vec<TokenWithSpan>, index: usize, forms: crate::bind::FormAllocation<'a> }
 
 impl ControlParser<'_> {
     fn error(&self, message: impl Into<String>) -> rtdb_types::Anomaly {
@@ -68,7 +78,7 @@ impl ControlParser<'_> {
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
         let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
         self.index += parser.index();
-        crate::bind::control_expression(self.source, &expression, self.options)
+        crate::bind::control_expression(self.source, &expression, self.options, self.forms)
     }
     fn option_value(&mut self, clock: bool) -> Result<ControlValue> {
         self.token(Token::Eq);
@@ -80,7 +90,7 @@ impl ControlParser<'_> {
             self.index += parser.index();
             return match crate::settings::clock_timestamp_literal(&expression)? {
                 Some(text) => Ok(ControlValue::TimestampLiteral(text)),
-                None => crate::bind::control_expression(self.source,&expression,self.options).map(ControlValue::Expression),
+                None => crate::bind::control_expression(self.source,&expression,self.options,self.forms).map(ControlValue::Expression),
             };
         }
         self.expression().map(ControlValue::Expression)

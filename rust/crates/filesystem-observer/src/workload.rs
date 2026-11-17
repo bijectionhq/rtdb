@@ -42,14 +42,14 @@ pub fn validate_workload(bytes:&[u8])->Result<Value,Box<dyn std::error::Error+Se
         if selected.sql.is_empty() || selected.sql.len()>65536 || selected.location.len()>1024 || !locations.insert(selected.location.clone()) {return Err("workload statement exceeds source/identity bound".into());}
         let wire=if selected.psycopg_parameters {postgres_sql(&selected.sql)?} else {selected.sql.clone()};
         let _scratch=memory.reserve(wire.len()*256+1024*1024)?;
-        let controls=rtdb_sql::parse_control(&wire,&PrepareOptions::default())?;
+        let controls=rtdb_sql::parse_control_in(&wire,&PrepareOptions::default(),&memory)?;
         let accepted=match controls {
             Some(ControlStatement::Begin(_))=>selected.kind=="begin" || selected.kind=="generated",
             Some(ControlStatement::Commit(_) | ControlStatement::Rollback | ControlStatement::SetAwaitToken(_))=>selected.kind=="generated",
             Some(ControlStatement::Show {name})=>selected.kind=="generated" && ["latest_submitted_tx","latest_completed_txs","snapshot_token","await_token"].contains(&name.as_str()),
             Some(_)=>false,
             None=>{
-                let parsed=rtdb_sql::parse(&wire)?;
+                let parsed=rtdb_sql::parse_in(&wire,&memory)?;
                 parsed.len()==1 && parsed[0].is_local_workload_statement() && match selected.kind.as_str() {
                     "read" | "generated"=>parsed[0].kind()==StatementKind::Query,
                     "mutation"=>parsed[0].kind()==StatementKind::Dml,

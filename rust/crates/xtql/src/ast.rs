@@ -1,5 +1,5 @@
-use crate::{Edn, EdnKind, error, literal};
-use rtdb_types::{Result, TableRef, Value};
+use crate::{Edn, EdnKind, FormAllocation, error, literal};
+use rtdb_types::{MemoryBudget, Result, TableRef, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -59,52 +59,69 @@ pub enum Tail {
 
 /// Parses query syntax without consulting a catalog or assigning parameter positions.
 pub fn parse_query(form: &Edn) -> Result<Query> {
+    parse_query_with(form, FormAllocation::Untracked)
+}
+
+/// Parses query syntax with raw metadata retained in the supplied budget; no catalog is read.
+pub fn parse_query_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Result<Query> {
+    parse_query_with(form, FormAllocation::Tracked(memory))
+}
+
+pub(crate) fn parse_query_with(form: &Edn, forms: FormAllocation<'_>) -> Result<Query> { Syntax { forms }.parse_query(form) }
+
+#[cfg(test)]
+pub(crate) fn parse_expr_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Result<Expr> { Syntax { forms: FormAllocation::Tracked(memory) }.parse_expr(form) }
+
+struct Syntax<'a> { forms: FormAllocation<'a> }
+
+impl Syntax<'_> {
+fn parse_query(&self, form: &Edn) -> Result<Query> {
     if let EdnKind::AnonymousFunction(body) = &form.kind {
         let mut maximum = 0;
         anonymous_parameters(body, &mut maximum)?;
         let parameters = (1..=maximum).map(|index| format!("%{index}")).collect();
-        return Ok(Query::Function { parameters, body: Box::new(parse_query(body)?) });
+        return Ok(Query::Function { parameters, body: Box::new(self.parse_query(body)?) });
     }
     let (op, args) = form_list(form, "xtql/malformed-query")?;
     Ok(match op {
-        "quote" if args.len() == 1 => return parse_query(&args[0]),
+        "quote" if args.len() == 1 => return self.parse_query(&args[0]),
         "fn" | "fn*" => {
             if args.len() != 2 { return Err(error("xtql/malformed-fn-params", "Query functions require a parameter vector and one body")); }
             let parameters = args[0].vector().ok_or_else(|| error("xtql/malformed-fn-params", "Malformed fn params"))?
                 .iter().map(|value| value.symbol().map(str::to_owned).ok_or_else(|| error("xtql/malformed-fn-params", "Function parameters must be symbols"))).collect::<Result<Vec<_>>>()?;
             if parameters.iter().collect::<BTreeSet<_>>().len() != parameters.len() { return Err(error("xtql/malformed-fn-params", "Function parameters must be distinct")); }
-            Query::Function { parameters, body: Box::new(parse_query(&args[1])?) }
+            Query::Function { parameters, body: Box::new(self.parse_query(&args[1])?) }
         }
         "->" => {
             let Some((head, tails)) = args.split_first() else { return Err(error("xtql/malformed-pipeline", "Pipeline must contain at least one operator")); };
-            Query::Pipeline { head: Box::new(parse_query(head)?), tails: tails.iter().map(parse_tail).collect::<Result<_>>()? }
+            Query::Pipeline { head: Box::new(self.parse_query(head)?), tails: tails.iter().map(|tail| self.parse_tail(tail)).collect::<Result<_>>()? }
         }
-        "from" => Query::From(parse_from(args)?),
+        "from" => Query::From(self.parse_from(args)?),
         "rel" => {
             if args.len() != 2 { return Err(error("xtql/rel", "rel takes a relation and a binding vector")); }
             let input = match &args[0].kind {
                 EdnKind::Symbol(name) => RelationInput::Parameter(name.clone()),
                 EdnKind::Vector(documents) => RelationInput::Documents(documents.iter().map(|document| {
                     let entries = document.map().ok_or_else(|| error("xtql/rel", "Explicit relation entries must be maps"))?;
-                    entries.iter().map(|(key, value)| Ok((keyword(key, "xtql/rel")?.to_owned(), parse_expr(value)?))).collect::<Result<_>>()
+                    entries.iter().map(|(key, value)| Ok((keyword(key, "xtql/rel")?.to_owned(), self.parse_expr(value)?))).collect::<Result<_>>()
                 }).collect::<Result<_>>()?),
                 _ => return Err(error("xtql/rel", "rel takes a parameter or explicit relation")),
             };
-            Query::Rel { input, bindings: output_bindings(&args[1])? }
+            Query::Rel { input, bindings: self.output_bindings(&args[1])? }
         }
         "unify" => {
             if args.is_empty() { return Err(error("xtql/malformed-unify", "Unify must contain at least one sub clause")); }
-            Query::Unify(args.iter().map(parse_clause).collect::<Result<_>>()?)
+            Query::Unify(args.iter().map(|clause| self.parse_clause(clause)).collect::<Result<_>>()?)
         }
         "union-all" => {
             if args.is_empty() { return Err(error("xtql/malformed-union", "Union must contain at least one sub query")); }
-            Query::UnionAll(args.iter().map(parse_query).collect::<Result<_>>()?)
+            Query::UnionAll(args.iter().map(|query| self.parse_query(query)).collect::<Result<_>>()?)
         }
         _ => return Err(error("xtql/unknown-query-op", format!("Unknown query op: {op}"))),
     })
 }
 
-pub fn parse_expr(form: &Edn) -> Result<Expr> {
+fn parse_expr(&self, form: &Edn) -> Result<Expr> {
     Ok(match &form.kind {
         EdnKind::Symbol(name) if name == "xtdb/end-of-time" => Expr::Literal(Value::Timestamp { value: i64::MAX, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }),
         EdnKind::Symbol(name) => Expr::Variable(if name == "%" { "%1".into() } else { name.clone() }),
@@ -112,41 +129,41 @@ pub fn parse_expr(form: &Edn) -> Result<Expr> {
             let (op, args) = form_list(form, "xtql/malformed-call")?;
             match op {
                 "regexp-replace" | "regexp_replace" => Expr::RegexReplace {
-                    source: Box::new(args.first().map(parse_expr).transpose()?.unwrap_or(Expr::Literal(Value::Null))),
-                    recipe: crate::regex_replace::metadata(args),
+                    source: Box::new(args.first().map(|source| self.parse_expr(source)).transpose()?.unwrap_or(Expr::Literal(Value::Null))),
+                    recipe: crate::regex_replace::metadata(args, self.forms)?,
                 },
                 "cast" => {
                     if !(2..=3).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "cast requires an expression, target type, and optional cast options")); }
-                    Expr::Cast { expr: Box::new(parse_expr(&args[0])?), target: crate::cast::target(&args[1], args.get(2))? }
+                    Expr::Cast { expr: Box::new(self.parse_expr(&args[0])?), target: crate::cast::target(&args[1], args.get(2))? }
                 }
                 "cast-tstz" | "cast_tstz" | "cast-interval" | "cast_interval" => {
                     if !(1..=2).contains(&args.len()) { return Err(error("xtdb.expression/arity-error", "Temporal cast requires an expression and optional cast options")); }
                     let target = if matches!(op,"cast-tstz" | "cast_tstz") { crate::cast::session_timestamp(args.get(1))? } else { crate::cast::interval_alias(args.get(1))? };
-                    Expr::Cast { expr: Box::new(parse_expr(&args[0])?), target }
+                    Expr::Cast { expr: Box::new(self.parse_expr(&args[0])?), target }
                 }
                 "." => {
                     if args.len() != 2 || matches!(args[0].kind,EdnKind::Nil | EdnKind::Bool(false)) || args[1].symbol().is_none() { return Err(error("xtql/malformed-get", "Malformed get")); }
-                    Expr::Get { object: Box::new(parse_expr(&args[0])?), field: args[1].symbol().unwrap_or_default().into() }
+                    Expr::Get { object: Box::new(self.parse_expr(&args[0])?), field: args[1].symbol().unwrap_or_default().into() }
                 }
                 "q" | "exists?" | "pull" | "pull*" => {
                     if args.is_empty() || args.len() > 2 || (args.len() == 2 && args[1].map().is_none() && !matches!(args[1].kind, EdnKind::Nil)) {
                         return Err(error("xtql/malformed-subquery", "Malformed subquery"));
                     }
-                    let (query, arguments) = query_arguments(&args[0])?;
+                    let (query, arguments) = self.query_arguments(&args[0])?;
                     let kind = match op { "q" => SubqueryKind::Scalar, "exists?" => SubqueryKind::Exists, "pull" => SubqueryKind::Pull, _ => SubqueryKind::PullMany };
                     Expr::Subquery { kind, query: Box::new(query), arguments }
                 }
-                _ => Expr::Call { function: op.into(), arguments: args.iter().map(parse_expr).collect::<Result<_>>()? },
+                _ => Expr::Call { function: op.into(), arguments: args.iter().map(|value| self.parse_expr(value)).collect::<Result<_>>()? },
             }
         }
-        EdnKind::Vector(values) => Expr::List(values.iter().map(parse_expr).collect::<Result<_>>()?),
-        EdnKind::Set(values) => Expr::Set(values.iter().map(parse_expr).collect::<Result<_>>()?),
-        EdnKind::Map(entries) => Expr::Map(entries.iter().map(|(name, value)| Ok((keyword(name, "xtql/malformed-col-spec")?.into(), parse_expr(value)?))).collect::<Result<_>>()?),
+        EdnKind::Vector(values) => Expr::List(values.iter().map(|value| self.parse_expr(value)).collect::<Result<_>>()?),
+        EdnKind::Set(values) => Expr::Set(values.iter().map(|value| self.parse_expr(value)).collect::<Result<_>>()?),
+        EdnKind::Map(entries) => Expr::Map(entries.iter().map(|(name, value)| Ok((keyword(name, "xtql/malformed-col-spec")?.into(), self.parse_expr(value)?))).collect::<Result<_>>()?),
         _ => Expr::Literal(literal::value(form)?),
     })
 }
 
-fn parse_from(args: &[Edn]) -> Result<From> {
+fn parse_from(&self, args: &[Edn]) -> Result<From> {
     if args.len() != 2 { return Err(error("xtql/missing-bind", "From requires a table and explicit bindings")); }
     let (database, table) = if args[0].map().is_some() {
         let table = args[0].option("table").ok_or_else(|| error("xtql/malformed-from", "table key must be present in table map"))?;
@@ -161,12 +178,13 @@ fn parse_from(args: &[Edn]) -> Result<From> {
     let (bind, valid_time, system_time) = if args[1].map().is_some() {
         check_options(&args[1], &["bind", "for-valid-time", "for-system-time"])?;
         let bind = args[1].option("bind").ok_or_else(|| error("xtql/missing-bind", "Missing bind"))?;
-        (bind, args[1].option("for-valid-time").map(parse_temporal).transpose()?, args[1].option("for-system-time").map(parse_temporal).transpose()?)
+        (bind, args[1].option("for-valid-time").map(|form| self.parse_temporal(form)).transpose()?, args[1].option("for-system-time").map(|form| self.parse_temporal(form)).transpose()?)
     } else { (&args[1], None, None) };
     let bindings = bind.vector().ok_or_else(|| error("xtql/malformed-bind", "Malformed bind"))?;
     let star = bindings.iter().any(|value| value.symbol() == Some("*"));
-    let bindings = binding_forms(bindings.iter().filter(|value| value.symbol() != Some("*")), false, true)?;
+    let bindings = self.binding_forms(bindings.iter().filter(|value| value.symbol() != Some("*")), false, true)?;
     Ok(From { database, table, bindings, star, valid_time, system_time })
+}
 }
 
 fn table_ref(form: &Edn, in_options: bool) -> Result<TableRef> {
@@ -184,15 +202,16 @@ fn table_ref(form: &Edn, in_options: bool) -> Result<TableRef> {
     }
 }
 
-fn parse_tail(form: &Edn) -> Result<Tail> {
+impl Syntax<'_> {
+fn parse_tail(&self, form: &Edn) -> Result<Tail> {
     let (op, args) = form_list(form, "xtql/malformed-query-tail")?;
     Ok(match op {
-        "where" => Tail::Where(predicates(args)?),
-        "with" => Tail::With(binding_forms(args.iter(), false, true)?),
-        "return" => Tail::Return(binding_forms(args.iter(), false, true)?),
-        "aggregate" => Tail::Aggregate(binding_forms(args.iter(), false, true)?),
+        "where" => Tail::Where(self.predicates(args)?),
+        "with" => Tail::With(self.binding_forms(args.iter(), false, true)?),
+        "return" => Tail::Return(self.binding_forms(args.iter(), false, true)?),
+        "aggregate" => Tail::Aggregate(self.binding_forms(args.iter(), false, true)?),
         "without" => Tail::Without(args.iter().map(|arg| keyword(arg, "xtql/malformed-without").map(str::to_owned)).collect::<Result<_>>()?),
-        "unnest" => Tail::Unnest(unnest(args, false)?),
+        "unnest" => Tail::Unnest(self.unnest(args, false)?),
         "order-by" => Tail::OrderBy(args.iter().map(|arg| {
             let (expression, descending, nulls_first) = if arg.map().is_some() {
                 check_options(arg, &["val", "dir", "nulls"])?;
@@ -209,55 +228,55 @@ fn parse_tail(form: &Edn) -> Result<Tail> {
                     Some(EdnKind::Keyword(value)) if value == "last" => Some(false),
                     _ => return Err(error("xtql/malformed-order-by-nulls", "Malformed order-by nulls")),
                 };
-                (parse_expr(expression)?, descending, nulls_first)
-            } else { (parse_expr(arg)?, false, None) };
+                (self.parse_expr(expression)?, descending, nulls_first)
+            } else { (self.parse_expr(arg)?, false, None) };
             Ok(OrderSpec { expression, descending, nulls_first })
         }).collect::<Result<_>>()?),
         "limit" | "offset" => {
             if args.len() != 1 { return Err(error(&format!("xtql/{op}"), "Limit and offset take exactly one value")); }
-            if op == "limit" { Tail::Limit(parse_expr(&args[0])?) } else { Tail::Offset(parse_expr(&args[0])?) }
+            if op == "limit" { Tail::Limit(self.parse_expr(&args[0])?) } else { Tail::Offset(self.parse_expr(&args[0])?) }
         }
         _ => return Err(error("xtql/unknown-query-tail", format!("Unknown query tail: {op}"))),
     })
 }
 
-fn parse_clause(form: &Edn) -> Result<Clause> {
+fn parse_clause(&self, form: &Edn) -> Result<Clause> {
     let (op, args) = form_list(form, "xtql/malformed-unify-clause")?;
     Ok(match op {
-        "from" | "rel" => Clause::Source(parse_query(form)?),
-        "where" => Clause::Where(predicates(args)?),
-        "with" => Clause::With(binding_forms(args.iter(), true, false)?),
-        "unnest" => Clause::Unnest(unnest(args, true)?),
+        "from" | "rel" => Clause::Source(self.parse_query(form)?),
+        "where" => Clause::Where(self.predicates(args)?),
+        "with" => Clause::With(self.binding_forms(args.iter(), true, false)?),
+        "unnest" => Clause::Unnest(self.unnest(args, true)?),
         "join" | "left-join" => {
             if !(1..=2).contains(&args.len()) { return Err(error("xtql/malformed-bind", "Join requires a query and optional binding vector")); }
-            let (query, arguments) = query_arguments(&args[0])?;
-            let bindings = args.get(1).map(output_bindings).transpose()?.unwrap_or_default();
+            let (query, arguments) = self.query_arguments(&args[0])?;
+            let bindings = args.get(1).map(|form| self.output_bindings(form)).transpose()?.unwrap_or_default();
             Clause::Join { left: op == "left-join", query, arguments, bindings }
         }
         _ => return Err(error("xtql/unknown-unify-clause", format!("Unknown unify clause: {op}"))),
     })
 }
 
-fn query_arguments(form: &Edn) -> Result<(Query, Option<Vec<Expr>>)> {
+fn query_arguments(&self, form: &Edn) -> Result<(Query, Option<Vec<Expr>>)> {
     let (query, arguments) = if let Some(forms) = form.vector() {
         let Some((query, arguments)) = forms.split_first() else { return Err(error("xtql/malformed-subquery", "Empty query application")); };
-        (parse_query(query)?, Some(arguments.iter().map(parse_expr).collect::<Result<Vec<_>>>()?))
-    } else { (parse_query(form)?, None) };
+        (self.parse_query(query)?, Some(arguments.iter().map(|argument| self.parse_expr(argument)).collect::<Result<Vec<_>>>()?))
+    } else { (self.parse_query(form)?, None) };
     let arity = if let Query::Function { parameters, .. } = &query { parameters.len() } else { 0 };
     if arguments.as_ref().is_some_and(|arguments| arguments.len() != arity) { return Err(error("xtql/subquery-arity-error", "Subquery arity error")); }
     Ok((query, arguments))
 }
 
-fn predicates(args: &[Edn]) -> Result<Vec<Expr>> {
+fn predicates(&self, args: &[Edn]) -> Result<Vec<Expr>> {
     if args.is_empty() { return Err(error("xtql/malformed-where", "Where must contain at least one predicate")); }
-    args.iter().map(parse_expr).collect()
+    args.iter().map(|value| self.parse_expr(value)).collect()
 }
 
-fn output_bindings(form: &Edn) -> Result<Vec<Binding>> {
-    binding_forms(form.vector().ok_or_else(|| error("xtql/malformed-bind", "Malformed bind"))?.iter(), false, true)
+fn output_bindings(&self, form: &Edn) -> Result<Vec<Binding>> {
+    self.binding_forms(form.vector().ok_or_else(|| error("xtql/malformed-bind", "Malformed bind"))?.iter(), false, true)
 }
 
-fn binding_forms<'a>(forms: impl IntoIterator<Item = &'a Edn>, symbols: bool, shorthand: bool) -> Result<Vec<Binding>> {
+fn binding_forms<'a>(&self, forms: impl IntoIterator<Item = &'a Edn>, symbols: bool, shorthand: bool) -> Result<Vec<Binding>> {
     let mut result = Vec::new();
     for form in forms {
         match &form.kind {
@@ -265,7 +284,7 @@ fn binding_forms<'a>(forms: impl IntoIterator<Item = &'a Edn>, symbols: bool, sh
             EdnKind::Map(entries) => for (key, value) in entries {
                 let name = if symbols { key.symbol() } else { key.keyword() }
                     .ok_or_else(|| error(if symbols { "xtql/malformed-var-spec" } else { "xtql/malformed-bind-spec" }, "Binding key has the wrong symbol/keyword kind"))?;
-                result.push(Binding { name: name.into(), expression: parse_expr(value)? });
+                result.push(Binding { name: name.into(), expression: self.parse_expr(value)? });
             },
             _ => return Err(error(if symbols { "xtql/malformed-var-spec" } else { "xtql/malformed-col-spec" }, "Binding must be a map or permitted symbol shorthand")),
         }
@@ -273,24 +292,25 @@ fn binding_forms<'a>(forms: impl IntoIterator<Item = &'a Edn>, symbols: bool, sh
     Ok(result)
 }
 
-fn unnest(args: &[Edn], symbols: bool) -> Result<Binding> {
+fn unnest(&self, args: &[Edn], symbols: bool) -> Result<Binding> {
     if args.len() != 1 || args[0].map().is_none_or(|entries| entries.len() != 1) { return Err(error("xtql/unnest", "Unnest takes only a single binding")); }
-    binding_forms(args.iter(), symbols, false)?.pop().ok_or_else(|| error("xtql/unnest", "Missing unnest binding"))
+    self.binding_forms(args.iter(), symbols, false)?.pop().ok_or_else(|| error("xtql/unnest", "Missing unnest binding"))
 }
 
-fn parse_temporal(form: &Edn) -> Result<TemporalFilter> {
+fn parse_temporal(&self, form: &Edn) -> Result<TemporalFilter> {
     if form.keyword() == Some("all-time") { return Ok(TemporalFilter::All); }
     let (op, args) = form_list(form, "xtql/malformed-temporal-filter")?;
     Ok(match (op, args) {
-        ("at", [at]) => TemporalFilter::At(parse_expr(at)?),
-        ("in", [from, to]) => TemporalFilter::In { from: optional_expr(from)?, to: optional_expr(to)? },
-        ("from", [from]) => TemporalFilter::In { from: optional_expr(from)?, to: None },
-        ("to", [to]) => TemporalFilter::In { from: None, to: optional_expr(to)? },
+        ("at", [at]) => TemporalFilter::At(self.parse_expr(at)?),
+        ("in", [from, to]) => TemporalFilter::In { from: self.optional_expr(from)?, to: self.optional_expr(to)? },
+        ("from", [from]) => TemporalFilter::In { from: self.optional_expr(from)?, to: None },
+        ("to", [to]) => TemporalFilter::In { from: None, to: self.optional_expr(to)? },
         _ => return Err(error("xtql/malformed-temporal-filter", "Malformed temporal filter")),
     })
 }
 
-fn optional_expr(form: &Edn) -> Result<Option<Expr>> { if matches!(form.kind, EdnKind::Nil) { Ok(None) } else { parse_expr(form).map(Some) } }
+fn optional_expr(&self, form: &Edn) -> Result<Option<Expr>> { if matches!(form.kind, EdnKind::Nil) { Ok(None) } else { self.parse_expr(form).map(Some) } }
+}
 fn keyword<'a>(form: &'a Edn, code: &str) -> Result<&'a str> { form.keyword().ok_or_else(|| error(code, "Expected a keyword")) }
 fn check_options(form: &Edn, allowed: &[&str]) -> Result<()> {
     for (key, _) in form.map().unwrap_or_default() {

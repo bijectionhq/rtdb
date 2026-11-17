@@ -47,7 +47,14 @@ After binding, the adapter restores the captured dependency metadata for the pro
 The native adapter resolves each scan occurrence in declaration order, including materialized-reference definitions, then rebuilds typed plan nodes before constructing the prepared query.
 Typed copies preserve values, float bits, metadata and lexical fields; their buffer capacities determine the existing native allocation bounds.
 Native memory admission can therefore differ from the former generic JSON roundtrip's buffer-growth thresholds.
-Restoration lookup storage and clone construction remain untracked work awaiting an explicit ownership admission boundary; the prepared-query reservation begins after restoration and lasts through its prepared clones and cursors.
+The native Engine passes its existing query budget to source preparation and dependency restoration.
+Every restored expression occurrence makes a fresh fallible canonical raw-metadata copy after all catalog lookups, preserving distinct nonempty payload addresses and fresh expression occurrences.
+Those paired raw-storage leases survive through statement, prepared-query and cursor clones; a failed destination copy releases its own buffers while preserving the source.
+The comparison fixtures can restore dependencies with explicitly untracked storage.
+Native raw-copy admission can now fail during reconstruction before a later validation step; adequate-budget lookup, schema, lexical-field and semantic error order remains unchanged.
+Restoration lookup storage and whole Expr/Relation clone construction remain untracked work awaiting their ownership admission boundary; raw-storage leases do not close that gap.
+The prepared-query reservation still begins after restoration and lasts through prepared clones and cursors, independently of the raw-storage leases.
+The existing 384MiB capacity/admission witness remains unchanged for nonmetadata binary payloads.
 Missing tables and columns remain production errors.
 Direct mode submits original SQL unchanged.
 Both requested `decorrelate?` variants execute separately through the native production Apply operators.

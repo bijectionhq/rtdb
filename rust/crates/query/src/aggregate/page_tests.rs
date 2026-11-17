@@ -37,7 +37,7 @@ fn divide_filter() -> Expr {
     Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,Expr::Literal(Value::I64(1)),Expr::Literal(Value::I64(0))),Expr::Literal(Value::I64(1)))
 }
 fn bad_regex() -> Expr {
-    Expr::binary(BinaryOp::Eq,Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),rtdb_plan::RegexReplacement { pattern: rtdb_plan::RegexForm::Literal(Value::Utf8("[".into())),replacement: rtdb_plan::RegexForm::Literal(Value::Utf8("x".into())),..Default::default() }),Expr::Literal(Value::Utf8("x".into())))
+    Expr::binary(BinaryOp::Eq,Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),rtdb_plan::RegexReplacement { pattern: raw_literal(Value::Utf8("[".into())),replacement: raw_literal(Value::Utf8("x".into())),..Default::default() }),Expr::Literal(Value::Utf8("x".into())))
 }
 fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,groups: Vec<NamedExpr>,aggregates: Vec<AggregateExpr>,fail_after: Option<usize>) -> (AggregateCursor,Arc<AtomicUsize>) {
     let input = Arc::new(Relation::new(schema.clone(),RelationNode::Values { rows: vec![] }).unwrap());
@@ -381,3 +381,10 @@ async fn boolean_reducer_separates_emitted_setter_admission_from_selected_first_
     }
     assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }

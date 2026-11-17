@@ -66,7 +66,7 @@ impl StatementHandle {
             let schema = parts.next().unwrap_or("public");
             if table.is_empty() || schema.is_empty() { return Err(super::invalid("Bulk ingest requires a table name")); }
             Source::Bulk(TableRef { schema: schema.into(), table: table.into() })
-        } else if let Some(control) = rtdb_sql::parse_control(text, &Default::default())? {
+        } else if let Some(control) = rtdb_sql::parse_control_in(text, &Default::default(), session.region.memory())? {
             if matches!(&control, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
                 return Err(Anomaly::incorrect("xtdb.adbc/tx-control-as-sql", "Use the transaction API to begin, commit, or roll back transactions"));
             }

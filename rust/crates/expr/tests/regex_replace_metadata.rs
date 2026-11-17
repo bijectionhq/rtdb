@@ -7,7 +7,7 @@ use rtdb_types::{LogicalType as L,Result,ScalarType as S,TimeUnit,Value as V};
 
 fn literal(value: V) -> Expr { Expr::Literal(value) }
 fn text(value: &str) -> Expr { literal(V::Utf8(value.into())) }
-fn form(value: &str) -> F { F::Literal(V::Utf8(value.into())) }
+fn form(value: &str) -> F { raw_literal(V::Utf8(value.into())) }
 fn replace(source: Expr,pattern: &str) -> Expr { Expr::regex_replace(source,RegexReplacement { pattern: form(pattern),replacement: form("x"),..Default::default() }) }
 fn call(name: &str,args: Vec<Expr>) -> Expr { Expr::Call { name: name.into(),return_type: function_type_with_args(name,&args).unwrap(),args } }
 fn divide() -> Expr { Expr::binary(B::Divide,literal(V::I64(1)),literal(V::I64(0))) }
@@ -28,7 +28,7 @@ fn replacement_bindings_run_before_controls_and_unread_list_elements() {
 
 #[test]
 fn replacement_metadata_is_uninterpreted_for_null_and_omitted_coalesce_tails() {
-    let invalid = RegexReplacement { pattern: F::Symbol("unresolved".into()),replacement: F::default(),start: F::Literal(V::I64(1)),flags: F::Literal(V::Bool(false)),..Default::default() };
+    let invalid = RegexReplacement { pattern: raw_symbol("unresolved".into()),replacement: F::default(),start: raw_literal(V::I64(1)),flags: raw_literal(V::Bool(false)),..Default::default() };
     assert_eq!(run(&Expr::regex_replace(literal(V::Null),invalid.clone())).unwrap(),V::Null);
     let unused = Expr::regex_replace(text("a"),invalid);
     assert_eq!(run(&Expr::Coalesce(vec![text("kept"),unused])).unwrap(),V::Utf8("kept".into()));
@@ -95,3 +95,11 @@ async fn cancelled_replacement_source_drops_row_work_and_invocation_charges() {
     }
     assert_eq!(memory.used_bytes(),0);
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+fn raw_symbol(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.symbol(&value)) }

@@ -145,17 +145,17 @@ fn literal_events(body: Vec<Event>) -> Vec<Event> {
 #[test]
 fn all_eleven_raw_variants_keep_generic_serde_method_names_indices_and_payloads() {
     let cases = vec![
-        (F::Literal(V::Null), vec![NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null")]),
-        (F::Character('😀'), vec![NewtypeVariant("RegexForm", 1, "Character"), Char('😀')]),
-        (F::Symbol("ns/x".into()), vec![NewtypeVariant("RegexForm", 2, "Symbol"), s("ns/x")]),
-        (F::BigInteger("00099".into()), vec![NewtypeVariant("RegexForm", 3, "BigInteger"), s("00099")]),
-        (F::Decimal("1.00M".into()), vec![NewtypeVariant("RegexForm", 4, "Decimal"), s("1.00M")]),
-        (F::List(vec![F::Character('x')]), vec![NewtypeVariant("RegexForm", 5, "List"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("RegexForm", 1, "Character"), Char('x'), SeqEnd]),
-        (F::Vector(vec![]), vec![NewtypeVariant("RegexForm", 6, "Vector"), CollectSeq, Seq(Some(0)), SeqEnd]),
-        (F::Set(vec![]), vec![NewtypeVariant("RegexForm", 7, "Set"), CollectSeq, Seq(Some(0)), SeqEnd]),
-        (F::Map(vec![(F::Character('k'), F::Character('v'))]), vec![NewtypeVariant("RegexForm", 8, "Map"), CollectSeq, Seq(Some(1)), SeqElement, Tuple(2), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('k'), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('v'), TupleEnd, SeqEnd]),
-        (F::Tagged { tag: "reader/tag".into(), value: Box::new(F::Literal(V::Null)) }, vec![StructVariant("RegexForm", 9, "Tagged", 2), VariantField("tag"), s("reader/tag"), VariantField("value"), NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null"), StructVariantEnd]),
-        (F::AnonymousFunction(Box::new(F::Character('%'))), vec![NewtypeVariant("RegexForm", 10, "AnonymousFunction"), NewtypeVariant("RegexForm", 1, "Character"), Char('%')]),
+        (raw_literal(V::Null), vec![NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null")]),
+        (raw_character('😀'), vec![NewtypeVariant("RegexForm", 1, "Character"), Char('😀')]),
+        (raw_symbol("ns/x".into()), vec![NewtypeVariant("RegexForm", 2, "Symbol"), s("ns/x")]),
+        (raw_big_integer("00099".into()), vec![NewtypeVariant("RegexForm", 3, "BigInteger"), s("00099")]),
+        (raw_decimal("1.00M".into()), vec![NewtypeVariant("RegexForm", 4, "Decimal"), s("1.00M")]),
+        (raw_list(vec![raw_character('x')]), vec![NewtypeVariant("RegexForm", 5, "List"), CollectSeq, Seq(Some(1)), SeqElement, NewtypeVariant("RegexForm", 1, "Character"), Char('x'), SeqEnd]),
+        (raw_vector(vec![]), vec![NewtypeVariant("RegexForm", 6, "Vector"), CollectSeq, Seq(Some(0)), SeqEnd]),
+        (raw_set(vec![]), vec![NewtypeVariant("RegexForm", 7, "Set"), CollectSeq, Seq(Some(0)), SeqEnd]),
+        (raw_map(vec![(raw_character('k'), raw_character('v'))]), vec![NewtypeVariant("RegexForm", 8, "Map"), CollectSeq, Seq(Some(1)), SeqElement, Tuple(2), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('k'), TupleElement, NewtypeVariant("RegexForm", 1, "Character"), Char('v'), TupleEnd, SeqEnd]),
+        (raw_tagged("reader/tag".into(), raw_literal(V::Null)), vec![StructVariant("RegexForm", 9, "Tagged", 2), VariantField("tag"), s("reader/tag"), VariantField("value"), NewtypeVariant("RegexForm", 0, "Literal"), UnitVariant("Value", 1, "Null"), StructVariantEnd]),
+        (raw_anonymous(raw_character('%')), vec![NewtypeVariant("RegexForm", 10, "AnonymousFunction"), NewtypeVariant("RegexForm", 1, "Character"), Char('%')]),
     ];
     assert_eq!(cases.len(), 11);
     for (value, expected) in cases {
@@ -211,7 +211,7 @@ fn all_forty_one_literal_variants_keep_generic_serde_shapes_widths_and_bit_paylo
     assert_eq!(cases.len(), 41);
     for (value, body) in cases {
         let expected = literal_events(body);
-        let form = F::Literal(value);
+        let form = raw_literal(value);
         for human_readable in [true, false] { assert_eq!(trace(&form, human_readable), expected); }
     }
 }
@@ -219,8 +219,8 @@ fn all_forty_one_literal_variants_keep_generic_serde_shapes_widths_and_bit_paylo
 #[test]
 fn recipe_generic_serde_and_json_keep_all_five_fields_in_declaration_order() {
     let recipe = RegexReplacement {
-        pattern: F::Symbol("p".into()), replacement: F::Literal(V::Utf8("r".into())),
-        start: F::Literal(V::I64(1)), occurrence: F::Literal(V::Bool(false)), flags: F::Vector(vec![F::Character('m')]),
+        pattern: raw_symbol("p".into()), replacement: raw_literal(V::Utf8("r".into())),
+        start: raw_literal(V::I64(1)), occurrence: raw_literal(V::Bool(false)), flags: raw_vector(vec![raw_character('m')]),
     };
     let expected = vec![Struct("RegexReplacement", 5),
         Field("pattern"), NewtypeVariant("RegexForm", 2, "Symbol"), s("p"),
@@ -237,10 +237,10 @@ fn recipe_generic_serde_and_json_keep_all_five_fields_in_declaration_order() {
 
 #[test]
 fn optional_timezone_and_remaining_unit_discriminants_keep_their_serde_methods() {
-    let timestamp = F::Literal(V::Timestamp { value: 1, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) });
+    let timestamp = raw_literal(V::Timestamp { value: 1, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) });
     let expected = literal_events(vec![StructVariant("Value", 22, "Timestamp", 3), VariantField("value"), I64(1), VariantField("unit"), UnitVariant("TimeUnit", 1, "Millisecond"), VariantField("timezone"), OptionSome, s("UTC"), StructVariantEnd]);
     for human_readable in [true, false] { assert_eq!(trace(&timestamp, human_readable), expected); }
-    let date = F::Literal(V::Date(CalendarDate::new(CivilDate::from_ymd(2000, 1, 2).unwrap(), DateUnit::Millisecond)));
+    let date = raw_literal(V::Date(CalendarDate::new(CivilDate::from_ymd(2000, 1, 2).unwrap(), DateUnit::Millisecond)));
     let expected = literal_events(vec![NewtypeVariant("Value", 18, "Date"), Struct("CalendarDate", 2), Field("date"), CollectStr("2000-01-02".into()), Field("unit"), UnitVariant("DateUnit", 1, "Millisecond"), StructEnd]);
     for human_readable in [true, false] { assert_eq!(trace(&date, human_readable), expected); }
 }
@@ -248,21 +248,27 @@ fn optional_timezone_and_remaining_unit_discriminants_keep_their_serde_methods()
 #[test]
 fn float_wire_bits_preserve_nan_payloads_infinities_and_signed_zero() {
     for bits in [0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00001, 0x7fa00002] {
-        let form = F::Literal(V::F32(f32::from_bits(bits)));
+        let form = raw_literal(V::F32(f32::from_bits(bits)));
         let expected = literal_events(vec![NewtypeVariant("Value", 12, "F32"), U32(bits)]);
         for human_readable in [true, false] { assert_eq!(trace(&form, human_readable), expected); }
         let json = format!(r#"{{"Literal":{{"F32":{bits}}}}}"#);
         assert_eq!(serde_json::to_string(&form).unwrap(), json);
-        let F::Literal(V::F32(decoded)) = serde_json::from_str::<F>(&json).unwrap() else { panic!("expected F32") };
+        let decoded_form = serde_json::from_str::<F>(&json).unwrap();
+        let rtdb_plan::RegexFormKind::Literal(literal) = decoded_form.view().kind() else { panic!("expected F32") };
+        let rtdb_plan::RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!("expected F32") };
+        let V::F32(decoded) = leaf.value() else { panic!("expected F32") };
         assert_eq!(decoded.to_bits(), bits);
     }
     for bits in [0u64, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000001, 0x7ff0000000000002] {
-        let form = F::Literal(V::F64(f64::from_bits(bits)));
+        let form = raw_literal(V::F64(f64::from_bits(bits)));
         let expected = literal_events(vec![NewtypeVariant("Value", 13, "F64"), U64(bits)]);
         for human_readable in [true, false] { assert_eq!(trace(&form, human_readable), expected); }
         let json = format!(r#"{{"Literal":{{"F64":{bits}}}}}"#);
         assert_eq!(serde_json::to_string(&form).unwrap(), json);
-        let F::Literal(V::F64(decoded)) = serde_json::from_str::<F>(&json).unwrap() else { panic!("expected F64") };
+        let decoded_form = serde_json::from_str::<F>(&json).unwrap();
+        let rtdb_plan::RegexFormKind::Literal(literal) = decoded_form.view().kind() else { panic!("expected F64") };
+        let rtdb_plan::RegexLiteralKind::Leaf(leaf) = literal.kind() else { panic!("expected F64") };
+        let V::F64(decoded) = leaf.value() else { panic!("expected F64") };
         assert_eq!(decoded.to_bits(), bits);
     }
 }
@@ -279,7 +285,7 @@ fn data_error<T: serde::de::DeserializeOwned>(value: serde_json::Value, expected
 
 #[test]
 fn rust_recipe_default_is_nil_but_serde_requires_every_field() {
-    let expected = RegexReplacement { pattern: F::Literal(V::Null), replacement: F::Literal(V::Null), start: F::Literal(V::Null), occurrence: F::Literal(V::Null), flags: F::Literal(V::Null) };
+    let expected = RegexReplacement { pattern: raw_literal(V::Null), replacement: raw_literal(V::Null), start: raw_literal(V::Null), occurrence: raw_literal(V::Null), flags: raw_literal(V::Null) };
     assert_eq!(RegexReplacement::default(), expected);
     assert_eq!(serde_json::from_value::<RegexReplacement>(nil_recipe()).unwrap(), expected);
     data_error::<RegexReplacement>(serde_json::json!({}), "missing field `pattern`");
@@ -301,9 +307,9 @@ fn null_and_missing_payloads_retain_their_distinct_errors() {
     data_error::<F>(serde_json::json!({"Tagged":{"value":{"Literal":"Null"}}}), "missing field `tag`");
     data_error::<F>(serde_json::json!({"Literal":{"Map":{"entries":[]}}}), "missing field `sorted`");
     let decoded = serde_json::from_value::<F>(serde_json::json!({"Literal":{"Timestamp":{"value":0,"unit":"Second"}}})).unwrap();
-    assert_eq!(decoded, F::Literal(V::Timestamp { value: 0, unit: TimeUnit::Second, timezone: None }));
+    assert_eq!(decoded, raw_literal(V::Timestamp { value: 0, unit: TimeUnit::Second, timezone: None }));
     let decoded = serde_json::from_value::<F>(serde_json::json!({"Literal":{"Timestamp":{"value":0,"unit":"Second","timezone":null}}})).unwrap();
-    assert_eq!(decoded, F::Literal(V::Timestamp { value: 0, unit: TimeUnit::Second, timezone: None }));
+    assert_eq!(decoded, raw_literal(V::Timestamp { value: 0, unit: TimeUnit::Second, timezone: None }));
 }
 
 #[test]
@@ -326,14 +332,14 @@ fn known_duplicate_fields_error_while_unknown_fields_are_consumed() {
     input["unknown"] = serde_json::json!({"nested":[1,{"ignored":true}]});
     assert_eq!(serde_json::from_value::<RegexReplacement>(input).unwrap(), RegexReplacement::default());
     let input = r#"{"Tagged":{"unknown":[1,{"ignored":true}],"tag":"reader","value":{"Literal":"Null"},"unknown":false}}"#;
-    assert_eq!(serde_json::from_str::<F>(input).unwrap(), F::Tagged { tag: "reader".into(), value: Box::new(F::Literal(V::Null)) });
+    assert_eq!(serde_json::from_str::<F>(input).unwrap(), raw_tagged("reader".into(), raw_literal(V::Null)));
 }
 
 #[test]
 fn character_serde_accepts_one_supplementary_scalar_and_rejects_other_payload_shapes() {
-    assert_eq!(serde_json::to_string(&F::Character('😀')).unwrap(), r#"{"Character":"😀"}"#);
-    assert_eq!(serde_json::from_str::<F>(r#"{"Character":"\ud83d\ude00"}"#).unwrap(), F::Character('😀'));
-    assert_eq!(serde_json::from_str::<F>(r#"{"Character":"😀"}"#).unwrap(), F::Character('😀'));
+    assert_eq!(serde_json::to_string(&raw_character('😀')).unwrap(), r#"{"Character":"😀"}"#);
+    assert_eq!(serde_json::from_str::<F>(r#"{"Character":"\ud83d\ude00"}"#).unwrap(), raw_character('😀'));
+    assert_eq!(serde_json::from_str::<F>(r#"{"Character":"😀"}"#).unwrap(), raw_character('😀'));
     data_error::<F>(serde_json::json!({"Character":""}), "invalid value: string \"\", expected a character");
     data_error::<F>(serde_json::json!({"Character":"ab"}), "invalid value: string \"ab\", expected a character");
     data_error::<F>(serde_json::json!({"Character":null}), "invalid type: null, expected a character");
@@ -361,7 +367,7 @@ fn generic_json_strings_reject_isolated_reversed_and_mismatched_surrogate_escape
 fn physical_structs_keep_the_last_duplicate_and_utf8_key_order() {
     let input = r#"{"Literal":{"Struct":{"z":{"I64":1},"a":{"I64":2},"z":{"I64":3},"😀":"Null","\ue000":"Undefined"}}}"#;
     let form = serde_json::from_str::<F>(input).unwrap();
-    let expected = F::Literal(V::Struct(BTreeMap::from([("a".into(), V::I64(2)), ("z".into(), V::I64(3)), ("\u{e000}".into(), V::Undefined), ("😀".into(), V::Null)])));
+    let expected = raw_literal(V::Struct(BTreeMap::from([("a".into(), V::I64(2)), ("z".into(), V::I64(3)), ("\u{e000}".into(), V::Undefined), ("😀".into(), V::Null)])));
     assert_eq!(form, expected);
     assert_eq!(serde_json::to_string(&form).unwrap(), "{\"Literal\":{\"Struct\":{\"a\":{\"I64\":2},\"z\":{\"I64\":3},\"\u{e000}\":\"Undefined\",\"😀\":\"Null\"}}}");
 }
@@ -377,22 +383,22 @@ fn raw_map_set_and_physical_map_set_keep_order_and_duplicates() {
         let form = serde_json::from_str::<F>(input).unwrap();
         assert_eq!(serde_json::to_string(&form).unwrap(), input);
     }
-    assert_ne!(F::Set(vec![F::Symbol("a".into()), F::Symbol("b".into())]), F::Set(vec![F::Symbol("b".into()), F::Symbol("a".into())]));
-    assert_ne!(F::Set(vec![F::Symbol("a".into())]), F::Set(vec![F::Symbol("a".into()), F::Symbol("a".into())]));
-    assert_ne!(F::Literal(V::Set(vec![V::I64(1), V::I64(2)])), F::Literal(V::Set(vec![V::I64(2), V::I64(1)])));
+    assert_ne!(raw_set(vec![raw_symbol("a".into()), raw_symbol("b".into())]), raw_set(vec![raw_symbol("b".into()), raw_symbol("a".into())]));
+    assert_ne!(raw_set(vec![raw_symbol("a".into())]), raw_set(vec![raw_symbol("a".into()), raw_symbol("a".into())]));
+    assert_ne!(raw_literal(V::Set(vec![V::I64(1), V::I64(2)])), raw_literal(V::Set(vec![V::I64(2), V::I64(1)])));
 }
 
 #[test]
 fn shallow_debug_retains_normal_pretty_escaping_and_formatter_options() {
-    let form = F::Tagged { tag: "tag".into(), value: Box::new(F::Literal(V::Null)) };
+    let form = raw_tagged("tag".into(), raw_literal(V::Null));
     assert_eq!(format!("{form:?}"), "Tagged { tag: \"tag\", value: Literal(Null) }");
     assert_eq!(format!("{form:#?}"), "Tagged {\n    tag: \"tag\",\n    value: Literal(\n        Null,\n    ),\n}");
-    let form = F::List(vec![F::Character('\n'), F::Literal(V::Utf8("a\"\\\t".into()))]);
+    let form = raw_list(vec![raw_character('\n'), raw_literal(V::Utf8("a\"\\\t".into()))]);
     assert_eq!(format!("{form:?}"), r#"List([Character('\n'), Literal(Utf8("a\"\\\t"))])"#);
-    assert_eq!(format!("{:?}", F::Literal(V::Keyword(Keyword::from_name(":x")))), r#"Literal(Keyword(Keyword(":x")))"#);
-    let nil = F::Literal(V::Null);
+    assert_eq!(format!("{:?}", raw_literal(V::Keyword(Keyword::from_name(":x")))), r#"Literal(Keyword(Keyword(":x")))"#);
+    let nil = raw_literal(V::Null);
     assert_eq!(format!("{:>32.2?}", nil), "Literal(Null)");
-    let integer = F::Literal(V::I64(31));
+    let integer = raw_literal(V::I64(31));
     assert_eq!(format!("{:x?}", integer), "Literal(I64(1f))");
     assert_eq!(format!("{:X?}", integer), "Literal(I64(1F))");
     assert_eq!(format!("{:?}", RegexReplacement::default()), "RegexReplacement { pattern: Literal(Null), replacement: Literal(Null), start: Literal(Null), occurrence: Literal(Null), flags: Literal(Null) }");
@@ -400,7 +406,7 @@ fn shallow_debug_retains_normal_pretty_escaping_and_formatter_options() {
 
 #[test]
 fn structural_equality_retains_nonreflexive_nan_and_signed_zero_rules() {
-    for form in [F::Literal(V::F32(f32::from_bits(0x7fc00001))), F::Literal(V::F64(f64::from_bits(0x7ff8000000000001)))] {
+    for form in [raw_literal(V::F32(f32::from_bits(0x7fc00001))), raw_literal(V::F64(f64::from_bits(0x7ff8000000000001)))] {
         let same_form = &form;
         assert_ne!(&form, same_form);
         assert_ne!(form, form.clone());
@@ -409,9 +415,26 @@ fn structural_equality_retains_nonreflexive_nan_and_signed_zero_rules() {
         assert_ne!(&recipe, same_recipe);
         assert_ne!(recipe, recipe.clone());
     }
-    assert_eq!(F::Literal(V::F32(0.0)), F::Literal(V::F32(-0.0)));
-    assert_eq!(F::Literal(V::F64(0.0)), F::Literal(V::F64(-0.0)));
-    assert_ne!(F::Literal(V::F16(0)), F::Literal(V::F16(0x8000)));
-    assert_ne!(serde_json::to_string(&F::Literal(V::F32(0.0))).unwrap(), serde_json::to_string(&F::Literal(V::F32(-0.0))).unwrap());
-    assert_ne!(serde_json::to_string(&F::Literal(V::F64(0.0))).unwrap(), serde_json::to_string(&F::Literal(V::F64(-0.0))).unwrap());
+    assert_eq!(raw_literal(V::F32(0.0)), raw_literal(V::F32(-0.0)));
+    assert_eq!(raw_literal(V::F64(0.0)), raw_literal(V::F64(-0.0)));
+    assert_ne!(raw_literal(V::F16(0)), raw_literal(V::F16(0x8000)));
+    assert_ne!(serde_json::to_string(&raw_literal(V::F32(0.0))).unwrap(), serde_json::to_string(&raw_literal(V::F32(-0.0))).unwrap());
+    assert_ne!(serde_json::to_string(&raw_literal(V::F64(0.0))).unwrap(), serde_json::to_string(&raw_literal(V::F64(-0.0))).unwrap());
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+fn raw_character(value: char) -> rtdb_plan::RegexForm { raw_build(|builder| builder.character(value)) }
+fn raw_symbol(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.symbol(&value)) }
+fn raw_big_integer(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.big_integer(&value)) }
+fn raw_decimal(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.decimal(&value)) }
+fn raw_list(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_list()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_vector(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_vector()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_set(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_set()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_map(values: Vec<(rtdb_plan::RegexForm, rtdb_plan::RegexForm)>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_map()?; for (key, value) in values { builder.append_view(key.view())?; builder.append_view(value.view())?; } builder.end() }) }
+fn raw_tagged(tag: String, value: rtdb_plan::RegexForm) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_tagged(&tag)?; builder.append_view(value.view())?; builder.end() }) }
+fn raw_anonymous(value: rtdb_plan::RegexForm) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }

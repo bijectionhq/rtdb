@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use rtdb_plan::*;
-use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, Value};
+use rtdb_types::{Anomaly, LogicalType, MemoryBudget, Result, ScalarType, TableRef, Value};
 use sqlparser::ast as ast;
 
 use crate::parse::{ParsedStatement, Syntax, TemporalClause, TemporalExtent};
@@ -18,7 +18,24 @@ enum TablePurpose { Query, Mutation, Erase }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ListTableKind { Series, Unnest }
 
+#[derive(Clone, Copy)]
+pub(crate) enum FormAllocation<'a> { Tracked(&'a Arc<MemoryBudget>), Untracked }
+impl FormAllocation<'_> {
+    pub(crate) fn literal(self, value: &Value) -> Result<RegexForm> {
+        let mut builder = match self { Self::Tracked(memory) => RegexFormBuilder::new_in(memory), Self::Untracked => RegexFormBuilder::new_untracked() };
+        builder.literal(value)?;
+        builder.finish()
+    }
+    pub(crate) fn query(self, form: &rtdb_xtql::Edn) -> Result<rtdb_xtql::Query> {
+        match self { Self::Tracked(memory) => rtdb_xtql::parse_query_in(form, memory), Self::Untracked => rtdb_xtql::parse_query(form) }
+    }
+    fn compile_query(self, query: &rtdb_xtql::Query, catalog: &dyn Catalog, binder: &mut Binder, next: &mut usize, arguments: &[(usize, LogicalType)], timezone: &str) -> Result<Arc<Relation>> {
+        match self { Self::Tracked(memory) => rtdb_xtql::compile_query_in(query, catalog, binder, next, arguments, timezone, memory), Self::Untracked => rtdb_xtql::compile_query(query, catalog, binder, next, arguments, timezone) }
+    }
+}
+
 pub(crate) struct Context<'a> {
+    pub(crate) forms: FormAllocation<'a>,
     pub(crate) literals: crate::literal_admission::LiteralAdmission,
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
@@ -42,7 +59,7 @@ pub(crate) struct Context<'a> {
 #[derive(Clone)]
 enum Cte { Inline(Arc<Relation>), Materialized(Arc<MaterializedBinding>) }
 
-pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions) -> Result<Expr> {
+pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions, forms: FormAllocation<'_>) -> Result<Expr> {
     struct ScalarCatalog;
     impl Catalog for ScalarCatalog {
         fn default_database(&self) -> &str { "xtdb" }
@@ -50,18 +67,18 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
         fn table(&self, _: &QualifiedTable) -> Result<Option<TableBinding>> { Err(error("Control expression cannot read a table")) }
         fn tables(&self, _: &str) -> Result<Vec<TableBinding>> { Err(error("Control expression cannot read a table")) }
     }
-    let mut context = Context { literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog: &ScalarCatalog, options, cast_timezone: None, binder: Binder::default(), temporal: Vec::new(), inline_xtql: Vec::new(), wildcard_renames: Vec::new(), ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter: 0, period_columns: BTreeSet::new(), notices: Vec::new(), default_valid: None, default_system: None };
     context.admit_expression_literals(expression)?;
     let expression = context.expr(expression, &Schema::default(), &BTreeMap::new())?;
     context.literals.check()?;
     Ok(expression)
 }
 
-pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
+pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog, options: &PrepareOptions, forms: FormAllocation<'_>) -> Result<PreparedStatement> {
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();
-    let mut context = Context { literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let mut context = Context { forms, literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
     let (settings, valid, system) = parsed.settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
@@ -597,7 +614,7 @@ impl Context<'_> {
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
                     let arguments = inline.parameters.iter().map(|index| (*index,self.options.parameter_types.get(index).cloned().unwrap_or(LogicalType::Nothing))).collect::<Vec<_>>();
-                    let relation = rtdb_xtql::compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments,&self.options.default_timezone).map_err(|error| inline.error(error,self.source))?;
+                    let relation = self.forms.compile_query(&inline.query,self.catalog,&mut self.binder,&mut self.next_parameter,&arguments,&self.options.default_timezone).map_err(|error| inline.error(error,self.source))?;
                     return match alias { Some(alias) => self.alias(relation,alias),None => Ok(relation) };
                 }
                 let names = identifiers(name)?;

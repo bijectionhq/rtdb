@@ -147,7 +147,7 @@ async fn observe(node: &Node, reads: &Reads, prefix: &str, layout: &str, query: 
     let system = rtdb_types::Instant::parse_iso(&query.system_time)?.to_iso_string()?;
     let sql = format!("SELECT price, _valid_from AS valid_from, _valid_to AS valid_to, _system_from AS system_from, _system_to AS system_to FROM products FOR VALID_TIME AS OF TIMESTAMP '{valid}' FOR SYSTEM_TIME AS OF TIMESTAMP '{system}' WHERE _id = '{id}'");
     let before = reads.snapshot();
-    let prepared = rtdb_sql::prepare(&sql, &context.catalog, &Default::default())?;
+    let prepared = rtdb_sql::prepare_in(&sql, &context.catalog, &Default::default(), &context.memory)?;
     let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, vec![]).await?;
     let schema = cursor.schema().fields().iter().map(|field| Ok(json!({"name":field.name,"types":type_tag(&field.data_type)?}))).collect::<Result<Vec<_>, Error>>()?;
     let mut rows = Vec::new();

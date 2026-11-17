@@ -365,7 +365,7 @@ mod page_layout_tests {
     }
     fn invalid_regex() -> rtdb_plan::Expr {
         rtdb_plan::Expr::regex_replace(rtdb_plan::Expr::Literal(Value::Utf8("source".into())),rtdb_plan::RegexReplacement {
-            pattern: rtdb_plan::RegexForm::Literal(Value::Utf8("[".into())),replacement: rtdb_plan::RegexForm::Literal(Value::Utf8("x".into())),..Default::default()
+            pattern: raw_literal(Value::Utf8("[".into())),replacement: raw_literal(Value::Utf8("x".into())),..Default::default()
         })
     }
     fn expression_sort(pages: Vec<Vec<i64>>,expressions: Vec<rtdb_plan::Expr>,execution: &Execution) -> SortCursor {
@@ -424,6 +424,14 @@ mod page_layout_tests {
         assert!(cursor.next_page().await.unwrap().is_none());
         drop(page);drop(cursor);assert_eq!(context.memory.used_bytes(),0);assert_eq!(context.spill_bytes(),0);
     }
+
+    fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+        let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+        emit(&mut builder).unwrap();
+        builder.finish().unwrap()
+    }
+    fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+
 }
 
 #[cfg(test)]

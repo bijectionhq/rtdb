@@ -242,7 +242,7 @@ impl Node {
         let basis = QueryBasis { snapshot: self.snapshot_basis()?, snapshot_time: None, current_time: self.query_instant(), timezone: self.factory.options.default_timezone.clone() };
         let context = self.query_context(database, &basis, identity, cancellation).await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: BTreeMap::from([(0, LogicalType::Scalar(rtdb_types::ScalarType::I64))]), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let prepared = rtdb_sql::prepare("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context.catalog, &options)?;
+        let prepared = rtdb_sql::prepare_in("SELECT system_time, committed, error FROM xt.txs FOR ALL VALID_TIME WHERE _id = ?", &context.catalog, &options, &context.memory)?;
         let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, vec![Value::I64(tx_id.0)]).await?;
         let batch = cursor.next_batch().await?.ok_or_else(|| Anomaly::fault("xtdb/tx-await-missing", format!("tx {tx_id} not found after await")))?;
         let schema = batch.batch().schema();
@@ -397,13 +397,13 @@ impl NativeSession {
     pub async fn query_sql(&mut self, sql: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_sql::PrepareOptions { parameter_types: arguments.iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(), default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let prepared = rtdb_sql::prepare(sql, &context.catalog, &options)?;
+        let prepared = rtdb_sql::prepare_in(sql, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
     }
     pub async fn query_xtql(&mut self, source: &str, arguments: Vec<Value>) -> Result<QueryCursor> {
         let context = self.query_context().await?;
         let options = rtdb_xtql::CompileOptions { parameter_types: arguments.iter().map(|value| rtdb_columnar::execution_type(&value.logical_type())).collect(), default_timezone: context.timezone.clone(), ..Default::default() };
-        let prepared = rtdb_xtql::compile(source, &context.catalog, &options)?;
+        let prepared = rtdb_xtql::compile_in(source, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
     }
 }

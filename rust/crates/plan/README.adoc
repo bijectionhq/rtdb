@@ -22,23 +22,49 @@ Metadata admission, SQL metadata classification, host compilation, explain rende
 Physical literal strings and keyword names have separate borrowed UTF8 cases, and five recursive literal container cases expose borrowed children.
 The sealed physical leaf view admits the other 34 variants; the private JSON adapter retains its existing 35-variant guard and serializer, including its independent UTF8 support.
 The recipe encoder writes borrowed UTF8 through the existing JSON string kernel and passes proved physical leaves through that unchanged guard.
-The owned enums, their generic serialization traits and their programmatic constructors retain their existing contracts.
+The canonical owner retains its generic serialization traits and exposes fallible construction through the builder.
 The views add no text or node owner, retained lease, exact-unit producer or alternate representation.
 
 == Public raw-form contracts
 
-`RegexForm` remains a public enum with direct constructors such as `Literal(Value)`, `Character(char)`, `List(Vec<RegexForm>)` and `Tagged { tag, value }`, and `RegexReplacement` retains its five public fields.
+The unreleased Rust `RegexForm` API is an opaque canonical root; direct enum construction is replaced by the fallible `RegexFormBuilder` event API.
+`RegexReplacement` retains its five public fields.
 Both types retain their public `Clone`, `Debug`, `PartialEq`, `Serialize` and `Deserialize` traits.
+The builder preserves the current UTF8 and legacy `Character(char)` domain, including supplementary scalar characters.
+It publishes one complete flat tree with private typed child links, separate raw syntax and physical literal kinds, and no owning subtree handles.
+Its closed physical leaf contains exactly 34 nonrecursive variants; strings, keyword names and five recursive physical containers are stored in their distinct canonical forms.
+Invalid event order poisons the builder and destroys unpublished buffers before releasing their reservations.
+`new_in` admits retained buffers and traversal scratch against the supplied budget before allocating; `new_untracked` is an explicit programmatic compatibility entry.
+Default nil needs no backing allocation or reservation.
+`Clone` shares the complete backing and its paired reservation, while `copy_in` and `copy_untracked` make independent copies in declaration order.
 The raw-form fixtures pin generic serde calls as well as JSON bytes, including enum names and indices, scalar methods, collection and field order, float-bit payloads and legacy supplementary `Character(char)` values.
 They preserve the distinction between Rust's nil-filled recipe `Default` and serde's required recipe fields, duplicate-field errors, ignored unknown fields and literal nulls.
 Physical structs retain the last duplicate field and UTF8 key order, while raw and physical map/set vectors retain their entry order and duplicates.
-The fixtures also pin shallow normal and alternate Debug output, formatter options, NaN's nonreflexive structural equality and the different equality and wire behavior of signed zero.
+The fixtures also pin normal and alternate Debug output, formatter options, NaN's nonreflexive structural equality and the different equality and wire behavior of signed zero.
+Equality, ordinary Debug traversal and backing destruction use flat traversal; equality does not shortcut shared owners containing NaN.
+Alternate Debug with newline fill uses borrowed native Debug callbacks to preserve padding and inherits their recursive stack behavior.
 Generic serde retains its current format-dependent recursion and UTF8 input contracts, including rejection of isolated surrogate escapes by the generic JSON reader.
-Canonical ownership, fallible construction APIs and exact-unit producer/codec changes require their own reviewed migration; these contract fixtures add no production owner or behavior.
+Serde seeds and serializers consume canonical rows directly; they do not reconstruct recursive raw forms or physical Value containers.
+Generic deserialization is explicitly untracked because its trait signature has no native budget argument.
+Exact-unit producers, character and domain-qualified URI/timezone APIs, dependent host/format/raw-error semantics and production qualification remain open.
+
+Native SQL, XTQL and control source entry points use their existing caller budgets through the `*_in` APIs; the original programmatic names are explicitly untracked wrappers.
+Foreign XTQL AST metadata is copied into the destination budget, and conformance dependency restoration makes fresh metadata backings per occurrence.
+Copied roots retain independent real reservations through statement, prepared-plan and cursor ownership; creator scopes do not release their storage charges.
+This changes native allocation admission amounts and failure points while preserving adequate-budget source and semantic error order.
+Existing whole Expr/Relation/parser/interval-admission allocation work, allocator metadata and ancestor reservation-control infrastructure retain their explicit qualification gaps.
+This ownership stage does not adopt the reservation-control count API or strengthen those infrastructure accounting premises.
 
 == Allocation measurements
 
-`RegexReplacement::retained_bytes` measures retained recipe storage.
-`RegexReplacement::work_bound` supplies the recipe contribution to RuntimeSchema's allocation-work estimates.
-The current work contribution uses the same size calculation as retained storage.
+`RegexReplacement::retained_bytes` measures the complete backing retained by each root, including capacities, headers and unreachable charged tombstones.
+`RegexReplacement::work_bound` measures reachable rows, live edges and payload lengths, counted for each field occurrence even when clones share backing.
+The existing emitted-relation, operator and prepared-query work factors consume this logical estimate without discounting already retained leases.
+Reader argument-copy admission still reserves the conservative retained-byte bound before cloning an argument.
 A work-bound measurement does not acquire or release a memory reservation.
+
+Explain rendering retains its existing structural base reservation and admits cumulative output construction separately, including replacement overlap and output-map insertion attempts.
+Its sealed count/fill pieces contain already evaluated borrowed data; URI, Decimal, float and temporal transformations run once at their original leaf positions under their separate bounds.
+Traversal and larger formatting-wrapper scratch remain independently charged while temporary and copied output buffers coexist.
+Final checks and shrink run while the building work region owns the unique reservation, and only the complete rows/schema/lease value is published afterward.
+Existing nonliteral type/cast semantic-helper temporaries remain the prior structural-work premise, with their overlap retained while copying their results into admitted output.

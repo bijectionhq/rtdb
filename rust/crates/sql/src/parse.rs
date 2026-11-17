@@ -105,6 +105,16 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
 }
 
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
+    parse_with(sql, crate::bind::FormAllocation::Untracked)
+}
+
+/// Parses statements while charging reached inline XTQL raw metadata to the existing caller budget.
+/// Syntax, statement-span and source-read order are unchanged; allocation/admission errors propagate.
+pub fn parse_in(sql: &str, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<ParsedStatement>> {
+    parse_with(sql, crate::bind::FormAllocation::Tracked(memory))
+}
+
+pub(crate) fn parse_with(sql: &str, forms: crate::bind::FormAllocation<'_>) -> Result<Vec<ParsedStatement>> {
     let dialect = SqlDialect::default();
     let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
@@ -124,7 +134,7 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
             }
             _ => None,
         }).collect();
-        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(prefix, sql)?;
+        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(prefix, sql, forms)?;
         let (tokens, settings) = crate::settings::extract(tokens, sql)?;
         let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
         let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;

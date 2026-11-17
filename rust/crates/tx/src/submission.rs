@@ -42,7 +42,7 @@ pub fn prepare_submission_with_sql_options(operations: Vec<TxOp>, options: Submi
 fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, database: &str, memory: &Arc<MemoryBudget>, sql_options: &rtdb_sql::PrepareOptions) -> Result<Option<Vec<TxOp>>> {
     let scope = rtdb_expr::EvaluationScope::new(memory)?;
     let prepare = rtdb_sql::PrepareOptions { parameter_types: args.map(|args| args.execution_types().enumerate().collect()).unwrap_or_default(), default_timezone: options.default_tz.clone(), ..sql_options.clone() };
-    let Some(plan) = rtdb_sql::prepare_static(sql, &SubmissionCatalog(database), &prepare)? else { return Ok(None); };
+    let Some(plan) = rtdb_sql::prepare_static_in(sql, &SubmissionCatalog(database), &prepare, scope.memory_budget())? else { return Ok(None); };
     fn resolve_only(expr: &rtdb_plan::Expr) -> bool {
         let mut requires_clock = false;
         expr.visit(&mut |expr| if let rtdb_plan::Expr::Cast { expr, target } = expr { requires_clock |= target.requires_current_time(&expr.data_type()); });

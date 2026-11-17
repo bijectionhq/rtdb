@@ -14,7 +14,7 @@ impl Service {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        if let Some(control) = rtdb_sql::parse_control(source, &options).map_err(status)? {
+        if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
             native.prepare_context(&token).await.map_err(status)?;
             return Ok(Shape { schema: control_schema(&control).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
         }
@@ -37,7 +37,7 @@ impl Service {
     async fn execute_update_in(&self, native: &mut NativeSession, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        if let Some(control) = rtdb_sql::parse_control(source, &options).map_err(status)? {
+        if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
             if control_schema(&control).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
             let params = arguments.as_ref().and_then(|arguments| arguments.rows().next()).unwrap_or(&[]);
             match native.execute_control_with(&control, params, &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
@@ -54,7 +54,7 @@ impl Service {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        let control = rtdb_sql::parse_control(source, &options).map_err(status)?;
+        let control = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)?;
         let query = if let Some(control) = &control { control_schema(control).map_err(status)?.is_some() } else {
             let context = native.prepare_context(&token).await.map_err(status)?;
             !PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(status)?.is_dml()
@@ -89,7 +89,7 @@ impl Service {
             let options = options(&native);
             let params = params.as_ref().map(|value| STANDARD.decode(value).map(Bytes::from).map_err(|_| invalid("invalid ticket parameters"))).transpose()?;
             let arguments = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory()).and_then(|batch| wire::arguments(batch.batch(), self.memory()))).transpose()?;
-            let cursor = if let Some(control) = rtdb_sql::parse_control(&sql, &options).map_err(status)? {
+            let cursor = if let Some(control) = rtdb_sql::parse_control_in(&sql, &options, self.memory()).map_err(status)? {
                 if control_schema(&control).map_err(status)?.is_none() { return Err(invalid("ticket query cannot execute an update")); }
                 match native.execute_control_with(&control, &[], &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
                     ControlResult::Rows(cursor) => cursor, _ => return Err(invalid("ticket query has no result set")),

@@ -34,17 +34,17 @@ fn measures(source: &RegexReplacement) -> (usize, usize) {
 #[test]
 fn every_raw_form_variant_keeps_its_existing_tagged_shape() {
     for (form, pattern) in [
-        (RegexForm::Literal(Value::Null), r#"{"Literal":"Null"}"#),
-        (RegexForm::Character('😀'), r#"{"Character":"😀"}"#),
-        (RegexForm::Symbol("a/b".into()), r#"{"Symbol":"a/b"}"#),
-        (RegexForm::BigInteger("999999999999999999999".into()), r#"{"BigInteger":"999999999999999999999"}"#),
-        (RegexForm::Decimal("1.00M".into()), r#"{"Decimal":"1.00M"}"#),
-        (RegexForm::List(vec![]), r#"{"List":[]}"#),
-        (RegexForm::Vector(vec![RegexForm::Character('x')]), r#"{"Vector":[{"Character":"x"}]}"#),
-        (RegexForm::Set(vec![RegexForm::Literal(Value::I64(2)), RegexForm::Literal(Value::I64(1))]), r#"{"Set":[{"Literal":{"I64":2}},{"Literal":{"I64":1}}]}"#),
-        (RegexForm::Map(vec![(RegexForm::Symbol("k".into()), RegexForm::Character('v'))]), r#"{"Map":[[{"Symbol":"k"},{"Character":"v"}]]}"#),
-        (RegexForm::Tagged { tag: "tag".into(), value: Box::new(RegexForm::Literal(Value::Null)) }, r#"{"Tagged":{"tag":"tag","value":{"Literal":"Null"}}}"#),
-        (RegexForm::AnonymousFunction(Box::new(RegexForm::List(vec![]))), r#"{"AnonymousFunction":{"List":[]}}"#),
+        (raw_literal(Value::Null), r#"{"Literal":"Null"}"#),
+        (raw_character('😀'), r#"{"Character":"😀"}"#),
+        (raw_symbol("a/b".into()), r#"{"Symbol":"a/b"}"#),
+        (raw_big_integer("999999999999999999999".into()), r#"{"BigInteger":"999999999999999999999"}"#),
+        (raw_decimal("1.00M".into()), r#"{"Decimal":"1.00M"}"#),
+        (raw_list(vec![]), r#"{"List":[]}"#),
+        (raw_vector(vec![raw_character('x')]), r#"{"Vector":[{"Character":"x"}]}"#),
+        (raw_set(vec![raw_literal(Value::I64(2)), raw_literal(Value::I64(1))]), r#"{"Set":[{"Literal":{"I64":2}},{"Literal":{"I64":1}}]}"#),
+        (raw_map(vec![(raw_symbol("k".into()), raw_character('v'))]), r#"{"Map":[[{"Symbol":"k"},{"Character":"v"}]]}"#),
+        (raw_tagged("tag".into(), raw_literal(Value::Null)), r#"{"Tagged":{"tag":"tag","value":{"Literal":"Null"}}}"#),
+        (raw_anonymous(raw_list(vec![])), r#"{"AnonymousFunction":{"List":[]}}"#),
     ] { assert_form(form, pattern); }
 }
 
@@ -83,28 +83,28 @@ fn all_forty_one_physical_value_variants_keep_their_wire_shapes() {
         (Value::Struct(BTreeMap::from([("v".into(), Value::I64(3))])), r#"{"Struct":{"v":{"I64":3}}}"#),
     ];
     assert_eq!(cases.len(), 41);
-    for (value, wire) in cases { assert_form(RegexForm::Literal(value), &format!(r#"{{"Literal":{wire}}}"#)); }
+    for (value, wire) in cases { assert_form(raw_literal(value), &format!(r#"{{"Literal":{wire}}}"#)); }
 }
 
 #[test]
 fn float_payload_bits_and_optional_timezone_are_not_normalized() {
     for bits in [0u32, 0x80000000, 0x7f800000, 0xff800000, 0x7fc00001, 0x7fa00002] {
-        assert_form(RegexForm::Literal(Value::F32(f32::from_bits(bits))), &format!(r#"{{"Literal":{{"F32":{bits}}}}}"#));
+        assert_form(raw_literal(Value::F32(f32::from_bits(bits))), &format!(r#"{{"Literal":{{"F32":{bits}}}}}"#));
     }
     for bits in [0u64, 0x8000000000000000, 0x7ff0000000000000, 0xfff0000000000000, 0x7ff8000000000001, 0x7ff0000000000002] {
-        assert_form(RegexForm::Literal(Value::F64(f64::from_bits(bits))), &format!(r#"{{"Literal":{{"F64":{bits}}}}}"#));
+        assert_form(raw_literal(Value::F64(f64::from_bits(bits))), &format!(r#"{{"Literal":{{"F64":{bits}}}}}"#));
     }
-    assert_form(RegexForm::Literal(Value::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: None }), r#"{"Literal":{"Timestamp":{"value":0,"unit":"Millisecond","timezone":null}}}"#);
+    assert_form(raw_literal(Value::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: None }), r#"{"Literal":{"Timestamp":{"value":0,"unit":"Millisecond","timezone":null}}}"#);
 }
 
 #[test]
 fn recipe_fields_and_recursive_map_keys_keep_source_order_without_metadata_admission() {
     let source = RegexReplacement {
-        pattern: RegexForm::Symbol("pattern-effect".into()),
-        replacement: RegexForm::Literal(Value::I64(9)),
-        start: RegexForm::List(vec![RegexForm::Symbol("start-effect".into())]),
-        occurrence: RegexForm::AnonymousFunction(Box::new(RegexForm::Symbol("n-effect".into()))),
-        flags: RegexForm::Literal(Value::Map { entries: vec![(Value::List(vec![Value::I64(2)]), Value::Struct(BTreeMap::from([("z".into(), Value::Null), ("a".into(), Value::Bool(true))])))], sorted: false }),
+        pattern: raw_symbol("pattern-effect".into()),
+        replacement: raw_literal(Value::I64(9)),
+        start: raw_list(vec![raw_symbol("start-effect".into())]),
+        occurrence: raw_anonymous(raw_symbol("n-effect".into())),
+        flags: raw_literal(Value::Map { entries: vec![(Value::List(vec![Value::I64(2)]), Value::Struct(BTreeMap::from([("z".into(), Value::Null), ("a".into(), Value::Bool(true))])))], sorted: false }),
     };
     let memory = MemoryBudget::new(1 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
@@ -117,7 +117,7 @@ fn recipe_fields_and_recursive_map_keys_keep_source_order_without_metadata_admis
 
 #[test]
 fn shared_count_and_fill_reuse_the_entire_admitted_frame_history() {
-    let source = recipe(RegexForm::List(vec![RegexForm::Literal(Value::List(vec![Value::I64(1), Value::Map { entries: vec![], sorted: false }]))]));
+    let source = recipe(raw_list(vec![raw_literal(Value::List(vec![Value::I64(1), Value::Map { entries: vec![], sorted: false }]))]));
     let memory = MemoryBudget::new(1 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
     let mut traversal = Traversal::new(&allocation);
@@ -137,7 +137,7 @@ fn shared_count_and_fill_reuse_the_entire_admitted_frame_history() {
 
 #[test]
 fn exact_and_one_byte_short_combined_budgets_target_retained_publication() {
-    let source = recipe(RegexForm::Literal(Value::Keyword(Keyword::from_name("plain/name"))));
+    let source = recipe(raw_literal(Value::Keyword(Keyword::from_name("plain/name"))));
     let (length, frames) = measures(&source);
     let retained = JsonDocument::allocation_bound(length).unwrap();
     let scratch = length + 256;
@@ -158,37 +158,29 @@ fn exact_and_one_byte_short_combined_budgets_target_retained_publication() {
     let allocation = AllocationScope::new(&memory).unwrap();
     assert!(matches!(encode(&source, &allocation), Err(JsonWriteFailure::Admission(error)) if error.code == "rtdb/memory-budget-exceeded"));
     assert_eq!(memory.used_bytes(), 4096 + frames + scratch);
-    assert_eq!(source.pattern, RegexForm::Literal(Value::Keyword(Keyword::from_name("plain/name"))));
+    assert_eq!(source.pattern, raw_literal(Value::Keyword(Keyword::from_name("plain/name"))));
     drop(allocation);
     assert_eq!(memory.used_bytes(), 0);
 }
 
-struct DeepFixture { recipe: Option<RegexReplacement>, forms: Vec<RegexForm>, values: Vec<Value> }
+struct DeepFixture { recipe: RegexReplacement }
 impl DeepFixture {
-    fn new(pattern: RegexForm, nodes: usize) -> Self {
-        Self { recipe: Some(recipe(pattern)), forms: Vec::with_capacity(nodes + 5), values: Vec::with_capacity(nodes + 5) }
-    }
-    fn source(&self) -> &RegexReplacement { self.recipe.as_ref().unwrap() }
+    fn new(pattern: RegexForm) -> Self { Self { recipe: recipe(pattern) } }
+    fn source(&self) -> &RegexReplacement { &self.recipe }
 }
-impl Drop for DeepFixture {
+struct LegacyValueSource { value: Option<Value>, pending: Vec<Value> }
+impl LegacyValueSource {
+    fn new(value: Value, nodes: usize) -> Self { Self { value: Some(value), pending: Vec::with_capacity(nodes + 5) } }
+    fn value(&self) -> &Value { self.value.as_ref().unwrap() }
+}
+impl Drop for LegacyValueSource {
     fn drop(&mut self) {
-        if let Some(RegexReplacement { pattern, replacement, start, occurrence, flags }) = self.recipe.take() {
-            self.forms.extend([pattern, replacement, start, occurrence, flags]);
-        }
-        while let Some(form) = self.forms.pop() {
-            match form {
-                RegexForm::Literal(value) => self.values.push(value),
-                RegexForm::List(values) | RegexForm::Vector(values) | RegexForm::Set(values) => self.forms.extend(values),
-                RegexForm::Map(entries) => for (key, value) in entries { self.forms.extend([key, value]); },
-                RegexForm::Tagged { value, .. } | RegexForm::AnonymousFunction(value) => self.forms.push(*value),
-                _ => (),
-            }
-        }
-        while let Some(value) = self.values.pop() {
+        if let Some(value) = self.value.take() { self.pending.push(value); }
+        while let Some(value) = self.pending.pop() {
             match value {
-                Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => self.values.extend(values),
-                Value::Map { entries, .. } => for (key, value) in entries { self.values.extend([key, value]); },
-                Value::Struct(fields) => self.values.extend(fields.into_values()),
+                Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => self.pending.extend(values),
+                Value::Map { entries, .. } => for (key, value) in entries { self.pending.extend([key, value]); },
+                Value::Struct(fields) => self.pending.extend(fields.into_values()),
                 _ => (),
             }
         }
@@ -200,13 +192,16 @@ fn twenty_thousand_deep_physical_values_inside_a_literal_use_flat_work() {
     const DEPTH: usize = 20_000;
     let mut value = Value::I64(7);
     for _ in 0..DEPTH { value = Value::List(vec![value]); }
-    let fixture = DeepFixture::new(RegexForm::Literal(value), DEPTH + 1);
+    let source = LegacyValueSource::new(value, DEPTH + 1);
+    let pattern = raw_build(|builder| builder.literal(source.value()));
+    drop(source);
+    let fixture = DeepFixture::new(pattern);
     let memory = MemoryBudget::new(64 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
     let output = encode(fixture.source(), &allocation).unwrap();
     assert_eq!(output.as_str().matches(r#"{"List":["#).count(), DEPTH);
     assert_eq!(output.as_str().matches(r#"{"I64":7}"#).count(), 1);
-    let shallow = serde_json::to_string(&recipe(RegexForm::Literal(Value::I64(7)))).unwrap();
+    let shallow = serde_json::to_string(&recipe(raw_literal(Value::I64(7)))).unwrap();
     assert_eq!(output.as_str().len(), shallow.len() + DEPTH * 11);
     drop(fixture);
     drop(allocation);
@@ -218,9 +213,13 @@ fn twenty_thousand_deep_physical_values_inside_a_literal_use_flat_work() {
 #[test]
 fn twenty_thousand_nested_raw_forms_use_the_same_flat_traversal() {
     const DEPTH: usize = 20_000;
-    let mut form = RegexForm::Literal(Value::Null);
-    for _ in 0..DEPTH { form = RegexForm::List(vec![form]); }
-    let fixture = DeepFixture::new(form, DEPTH + 1);
+    let form = raw_build(|builder| {
+        for _ in 0..DEPTH { builder.begin_list()?; }
+        builder.literal(&Value::Null)?;
+        for _ in 0..DEPTH { builder.end()?; }
+        Ok(())
+    });
+    let fixture = DeepFixture::new(form);
     let memory = MemoryBudget::new(64 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
     let output = encode(fixture.source(), &allocation).unwrap();
@@ -242,7 +241,10 @@ fn deep_mixed_containers_include_recursive_map_keys_and_struct_values() {
             _ => Value::Struct(BTreeMap::from([("nested".into(), value)])),
         };
     }
-    let fixture = DeepFixture::new(RegexForm::Vector(vec![RegexForm::Literal(value)]), DEPTH * 2 + 2);
+    let source = LegacyValueSource::new(value, DEPTH * 2 + 2);
+    let pattern = raw_build(|builder| { builder.begin_vector()?; builder.literal(source.value())?; builder.end() });
+    drop(source);
+    let fixture = DeepFixture::new(pattern);
     let memory = MemoryBudget::new(64 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
     let output = encode(fixture.source(), &allocation).unwrap();
@@ -256,7 +258,10 @@ fn deep_mixed_containers_include_recursive_map_keys_and_struct_values() {
 #[test]
 fn wide_physical_values_inside_raw_maps_keep_order_without_a_width_sized_stack() {
     let values = (0..1024).map(|index| Value::Map { entries: vec![(Value::I64(index), Value::List(vec![Value::Null]))], sorted: index % 2 == 0 }).collect();
-    let fixture = DeepFixture::new(RegexForm::Map(vec![(RegexForm::Symbol("rows".into()), RegexForm::Literal(Value::List(values)))]), 6000);
+    let source = LegacyValueSource::new(Value::List(values), 6000);
+    let pattern = raw_build(|builder| { builder.begin_map()?; builder.symbol("rows")?; builder.literal(source.value())?; builder.end() });
+    drop(source);
+    let fixture = DeepFixture::new(pattern);
     let (length, frames) = measures(fixture.source());
     assert_eq!(frames, frame_charge(16));
     let memory = MemoryBudget::new(4 << 20);
@@ -269,14 +274,17 @@ fn wide_physical_values_inside_raw_maps_keep_order_without_a_width_sized_stack()
 
 #[test]
 fn first_frame_and_full_replacement_failures_preserve_unpublished_input() {
-    let source = recipe(RegexForm::Literal(Value::I64(3)));
+    let source = recipe(raw_literal(Value::I64(3)));
     let memory = MemoryBudget::new(4096 + frame_charge(16) - 1);
     let allocation = AllocationScope::new(&memory).unwrap();
     assert!(matches!(encode(&source, &allocation), Err(JsonWriteFailure::Admission(_))));
     assert_eq!(memory.used_bytes(), 4096);
     let mut value = Value::I64(8);
     for _ in 0..64 { value = Value::List(vec![value]); }
-    let fixture = DeepFixture::new(RegexForm::Literal(value), 65);
+    let source = LegacyValueSource::new(value, 65);
+    let pattern = raw_build(|builder| builder.literal(source.value()));
+    drop(source);
+    let fixture = DeepFixture::new(pattern);
     let memory = MemoryBudget::new(4096 + frame_charge(16) + frame_charge(32) - 1);
     let allocation = AllocationScope::new(&memory).unwrap();
     let mut traversal = Traversal::new(&allocation);
@@ -284,7 +292,7 @@ fn first_frame_and_full_replacement_failures_preserve_unpublished_input() {
     assert!(matches!(traversal.write(fixture.source(), &mut count, Growth::Admit), Err(JsonWriteFailure::Admission(_))));
     assert_eq!(traversal.limit, 16);
     assert_eq!(memory.used_bytes(), 4096 + frame_charge(16));
-    assert!(matches!(fixture.source().pattern, RegexForm::Literal(Value::List(_))));
+    assert!(matches!(fixture.source().pattern.view().kind(), crate::RegexFormKind::Literal(value) if matches!(value.kind(), crate::RegexLiteralKind::List(_))));
 }
 
 struct FailingSink { bytes: Vec<u8>, limit: usize }
@@ -298,7 +306,7 @@ impl JsonSink for FailingSink {
 
 #[test]
 fn sink_and_leaf_serializer_failures_return_the_original_prefix_error() {
-    let source = recipe(RegexForm::Literal(Value::Utf8("é\n😀".into())));
+    let source = recipe(raw_literal(Value::Utf8("é\n😀".into())));
     let expected = serde_json::to_string(&source).unwrap();
     let memory = MemoryBudget::new(1 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
@@ -324,7 +332,7 @@ fn delegated_leaf_admission_excludes_recursive_values_and_keyword_cloning() {
 
 #[test]
 fn scratch_admission_failure_leaves_a_live_sibling_and_all_scope_charges_intact() {
-    let source = recipe(RegexForm::Literal(Value::I64(5)));
+    let source = recipe(raw_literal(Value::I64(5)));
     let (length, frames) = measures(&source);
     let sibling_bound = JsonDocument::allocation_bound(1).unwrap();
     let memory = MemoryBudget::new(4096 + sibling_bound + frames + length + 256 - 1);
@@ -345,7 +353,7 @@ fn recipe_document_and_its_clone_retain_storage_after_all_creators_drop() {
     let output = {
         let child = memory.scope();
         let allocation = AllocationScope::new(&child).unwrap();
-        let source = recipe(RegexForm::Literal(Value::Utf8("é😀".into())));
+        let source = recipe(raw_literal(Value::Utf8("é😀".into())));
         encode(&source, &allocation).unwrap()
     };
     let retained = output.retained_bytes();
@@ -386,7 +394,7 @@ fn literal_view_leaf_bridge_preserves_the_existing_utf8_guard_membership() {
 
 #[test]
 fn proved_physical_leaf_serializer_failures_keep_the_original_prefix_error() {
-    let source = recipe(RegexForm::Literal(Value::I64(123456789)));
+    let source = recipe(raw_literal(Value::I64(123456789)));
     let expected = serde_json::to_string(&source).unwrap();
     let memory = MemoryBudget::new(1 << 20);
     let allocation = AllocationScope::new(&memory).unwrap();
@@ -399,3 +407,20 @@ fn proved_physical_leaf_serializer_failures_keep_the_original_prefix_error() {
     }
     assert_eq!(serde_json::to_string(&source).unwrap(), expected);
 }
+
+fn raw_build(emit: impl FnOnce(&mut crate::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> crate::RegexForm {
+    let mut builder = crate::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> crate::RegexForm { raw_build(|builder| builder.literal(&value)) }
+fn raw_character(value: char) -> crate::RegexForm { raw_build(|builder| builder.character(value)) }
+fn raw_symbol(value: String) -> crate::RegexForm { raw_build(|builder| builder.symbol(&value)) }
+fn raw_big_integer(value: String) -> crate::RegexForm { raw_build(|builder| builder.big_integer(&value)) }
+fn raw_decimal(value: String) -> crate::RegexForm { raw_build(|builder| builder.decimal(&value)) }
+fn raw_list(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_list()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_vector(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_vector()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_set(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_set()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_map(values: Vec<(crate::RegexForm, crate::RegexForm)>) -> crate::RegexForm { raw_build(|builder| { builder.begin_map()?; for (key, value) in values { builder.append_view(key.view())?; builder.append_view(value.view())?; } builder.end() }) }
+fn raw_tagged(tag: String, value: crate::RegexForm) -> crate::RegexForm { raw_build(|builder| { builder.begin_tagged(&tag)?; builder.append_view(value.view())?; builder.end() }) }
+fn raw_anonymous(value: crate::RegexForm) -> crate::RegexForm { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }

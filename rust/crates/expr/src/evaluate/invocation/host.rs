@@ -721,6 +721,22 @@ mod tests {
     use crate::EvaluationScope;
     use rtdb_columnar::MemoryBudget;
 
+    use rtdb_plan::RegexFormBuilder;
+
+    fn raw_build(emit: impl FnOnce(&mut RegexFormBuilder) -> Result<()>) -> Form {
+        let mut builder = RegexFormBuilder::new_untracked();
+        emit(&mut builder).unwrap();
+        builder.finish().unwrap()
+    }
+    fn raw_literal(value: Value) -> Form { raw_build(|builder| builder.literal(&value)) }
+    fn raw_character(value: char) -> Form { raw_build(|builder| builder.character(value)) }
+    fn raw_symbol(value: &str) -> Form { raw_build(|builder| builder.symbol(value)) }
+    fn raw_list() -> Form { raw_build(|builder| { builder.begin_list()?; builder.end() }) }
+    fn raw_vector() -> Form { raw_build(|builder| { builder.begin_vector()?; builder.end() }) }
+    fn raw_map() -> Form { raw_build(|builder| { builder.begin_map()?; builder.end() }) }
+    fn raw_set() -> Form { raw_build(|builder| { builder.begin_set()?; builder.end() }) }
+    fn raw_anonymous(value: Form) -> Form { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }
+
     fn number(value: HostValue<'_>) -> Arc<Number> { match value { HostValue::Number(value) => value,_ => panic!("number expected") } }
 
     #[test]
@@ -813,10 +829,10 @@ mod tests {
     }
     #[test]
     fn non_ifn_calls_fail_before_argument_budget_admission() {
-        let raw = [Form::Literal(Value::Bool(false)),Form::Literal(Value::I64(1)),Form::Literal(Value::Utf8("x".into())),Form::Character('x'),Form::List(vec![]),Form::AnonymousFunction(Box::new(Form::List(vec![])))];
+        let raw = [raw_literal(Value::Bool(false)),raw_literal(Value::I64(1)),raw_literal(Value::Utf8("x".into())),raw_character('x'),raw_list(),raw_anonymous(raw_list())];
         let mut functions = raw.iter().map(|form|HostValue::Constant(form.view())).collect::<Vec<_>>();
         functions.extend([HostValue::Bool(true),HostValue::Text(Arc::from("x")),HostValue::Number(Arc::new(Number::Long(1)))]);
-        let argument = Form::Literal(Value::I64(1));
+        let argument = raw_literal(Value::I64(1));
         for function in functions {
             let memory = MemoryBudget::new(4096);
             let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(argument.view())] };
@@ -834,10 +850,10 @@ mod tests {
     }
     #[test]
     fn null_and_ifn_values_reach_argument_budget_admission() {
-        let raw = [Form::Literal(Value::Null),Form::Literal(Value::Keyword(rtdb_types::Keyword::from_name("k"))),Form::Symbol("k".into()),Form::Vector(vec![]),Form::Map(vec![]),Form::Set(vec![])];
+        let raw = [raw_literal(Value::Null),raw_literal(Value::Keyword(rtdb_types::Keyword::from_name("k"))),raw_symbol("k"),raw_vector(),raw_map(),raw_set()];
         let mut functions = raw.iter().map(|form|HostValue::Constant(form.view())).collect::<Vec<_>>();
         functions.extend([HostValue::Nil,HostValue::Function(Function::Identity),HostValue::Vector(Vec::new().into())]);
-        let argument = Form::Literal(Value::I64(1));
+        let argument = raw_literal(Value::I64(1));
         for function in functions {
             let memory = MemoryBudget::new(4096);
             let expression = Expression::Call { function: Box::new(Expression::Local { index: 0,emission: Emission::Unknown }),arguments: vec![Expression::Constant(argument.view())] };

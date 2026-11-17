@@ -436,7 +436,7 @@ Host `abs` preserves fixed-long wrapping, widens Float to Double, retains BigInt
 Host `number?`, `integer?`, `int?`, `double?`, `float?`, `ratio?`, `decimal?`, `rational?`, `pos-int?`, `neg-int?` and `nat-int?` inspect numeric categories without coercing or copying their payloads.
 `integer?` includes BigInt, while `int?` and its sign refinements accept only fixed-width integers; `float?` includes both Float and Double, and `rational?` excludes floating values.
 These predicates remain strict ordinary unary calls with boxed result metadata and invocation-time arity checks; nonnumeric host values return false without inspecting collection contents.
-Programmatic `RegexForm::Literal` carriers beyond the established null, Boolean, signed64, double, string and keyword literals require shared host-literal interpretation and report `rtdb.expr/regex-host-form` when classification reaches them.
+Programmatic raw literal carriers beyond the established null, Boolean, signed64, double, string and keyword literals require shared host-literal interpretation and report `rtdb.expr/regex-host-form` when classification reaches them.
 Compiled numeric calls distinguish primitive booleans from boxed Boolean literals and preserve unresolved static-call metadata through locals and control forms.
 Substring indexes require Number objects before boxed integer conversion; Character indexes require an explicit numeric cast.
 Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.

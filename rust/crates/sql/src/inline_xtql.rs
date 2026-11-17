@@ -18,7 +18,7 @@ impl InlineXtql {
     pub fn error(&self, error: Anomaly, source: &str) -> Anomaly { located(error, source, self.span) }
 }
 
-pub(crate) fn extract(tokens: &[TokenWithSpan], source: &str) -> Result<(Vec<TokenWithSpan>, Vec<InlineXtql>, usize)> {
+pub(crate) fn extract(tokens: &[TokenWithSpan], source: &str, forms: crate::bind::FormAllocation<'_>) -> Result<(Vec<TokenWithSpan>, Vec<InlineXtql>, usize)> {
     let mut output = Vec::new();
     let mut inline = Vec::new();
     let mut position = 0;
@@ -45,7 +45,7 @@ pub(crate) fn extract(tokens: &[TokenWithSpan], source: &str) -> Result<(Vec<Tok
             continue;
         }
         let literal = literal.ok_or_else(|| sql_error("XTQL requires a query string",source,token.span))?;
-        let query = rtdb_xtql::read(literal).and_then(|form| rtdb_xtql::parse_query(&form)).map_err(|error| located(error,source,tokens[literal_position].span))?;
+        let query = rtdb_xtql::read(literal).and_then(|form| forms.query(&form)).map_err(|error| located(error,source,tokens[literal_position].span))?;
         let arity = match &query { Query::Function { parameters,.. } => Some(parameters.len()), _ => None };
         let mut end = literal_position+1;
         let mut parameters = Vec::new();

@@ -43,12 +43,12 @@ fn cursor_traits<I: Iterator + DoubleEndedIterator + ExactSizeIterator + FusedIt
 #[test]
 fn all_eleven_raw_kinds_keep_their_source_distinctions() {
     let cases = [
-        (RegexForm::Literal(Value::Null), "literal"), (RegexForm::Character('😀'), "character"),
-        (RegexForm::Symbol("ns/name".into()), "symbol"), (RegexForm::BigInteger("00099".into()), "big-integer"),
-        (RegexForm::Decimal("1.00M".into()), "decimal"), (RegexForm::List(vec![]), "list"),
-        (RegexForm::Vector(vec![]), "vector"), (RegexForm::Set(vec![]), "set"), (RegexForm::Map(vec![]), "map"),
-        (RegexForm::Tagged { tag: "reader/tag".into(), value: Box::new(RegexForm::Symbol("body".into())) }, "tagged"),
-        (RegexForm::AnonymousFunction(Box::new(RegexForm::Symbol("%".into()))), "anonymous"),
+        (raw_literal(Value::Null), "literal"), (raw_character('😀'), "character"),
+        (raw_symbol("ns/name".into()), "symbol"), (raw_big_integer("00099".into()), "big-integer"),
+        (raw_decimal("1.00M".into()), "decimal"), (raw_list(vec![]), "list"),
+        (raw_vector(vec![]), "vector"), (raw_set(vec![]), "set"), (raw_map(vec![]), "map"),
+        (raw_tagged("reader/tag".into(), raw_symbol("body".into())), "tagged"),
+        (raw_anonymous(raw_symbol("%".into())), "anonymous"),
     ];
     assert_eq!(cases.len(), 11);
     for (source, label) in &cases { assert_eq!(form_label(source.view()), *label); }
@@ -99,10 +99,16 @@ fn all_forty_one_physical_kinds_have_exactly_thirty_four_borrowed_leaves() {
 
 #[test]
 fn child_and_text_borrows_outlive_temporary_views_and_cursors() {
-    let raw = RegexForm::List(vec![RegexForm::Symbol("borrowed".into())]);
+    let raw = raw_list(vec![raw_symbol("borrowed".into())]);
     let child = first_form(&raw).unwrap();
-    let RegexForm::List(children) = &raw else { panic!("expected list") };
-    let RegexForm::Symbol(source) = &children[0] else { panic!("expected symbol") };
+    let storage = match &raw.0 {
+        super::super::Backing::Tracked { storage, .. } | super::super::Backing::Untracked(storage) => storage.as_ref(),
+        super::super::Backing::InlineNull => panic!("expected list"),
+    };
+    let super::super::storage::RawKind::List(children) = &storage.forms[0].kind else { panic!("expected list") };
+    let child_id = storage.raw_children[children.start];
+    let super::super::storage::RawKind::Symbol(text_id) = &storage.forms[child_id.0].kind else { panic!("expected symbol") };
+    let source = &storage.texts[text_id.0];
     assert_eq!(symbol(child).as_ptr(), source.as_ptr());
     let values = Value::List(vec![Value::Utf8("physical".into())]);
     let value = first_literal(&values).unwrap();
@@ -119,7 +125,7 @@ fn child_and_text_borrows_outlive_temporary_views_and_cursors() {
 
 #[test]
 fn raw_sequences_keep_bounds_ranges_and_independent_exact_cursors() {
-    let source = RegexForm::Vector(vec![RegexForm::Symbol("a".into()), RegexForm::Symbol("b".into()), RegexForm::Symbol("c".into())]);
+    let source = raw_vector(vec![raw_symbol("a".into()), raw_symbol("b".into()), raw_symbol("c".into())]);
     let RegexFormKind::Vector(values) = source.view().kind() else { panic!("expected vector") };
     assert_eq!(values.len(), 3);
     assert!(!values.is_empty());
@@ -153,7 +159,7 @@ fn raw_sequences_keep_bounds_ranges_and_independent_exact_cursors() {
 
 #[test]
 fn empty_raw_sequence_has_no_first_or_split_child() {
-    let source = RegexForm::List(vec![]);
+    let source = raw_list(vec![]);
     let RegexFormKind::List(values) = source.view().kind() else { panic!("expected list") };
     assert!(values.is_empty());
     assert!(values.first().is_none());
@@ -164,7 +170,7 @@ fn empty_raw_sequence_has_no_first_or_split_child() {
     assert_eq!(cursor.size_hint(), (0, Some(0)));
     assert!(cursor.next().is_none());
     assert!(cursor.next_back().is_none());
-    let source = RegexForm::Map(vec![]);
+    let source = raw_map(vec![]);
     let RegexFormKind::Map(entries) = source.view().kind() else { panic!("expected map") };
     assert!(entries.is_empty());
     assert_eq!(entries.len(), 0);
@@ -178,7 +184,7 @@ fn empty_raw_sequence_has_no_first_or_split_child() {
 #[test]
 #[should_panic]
 fn raw_sequence_at_len_panics_like_slice_indexing() {
-    let source = RegexForm::List(vec![]);
+    let source = raw_list(vec![]);
     let RegexFormKind::List(values) = source.view().kind() else { panic!("expected list") };
     values.at(0);
 }
@@ -186,7 +192,7 @@ fn raw_sequence_at_len_panics_like_slice_indexing() {
 #[test]
 #[should_panic]
 fn raw_sequence_reversed_range_panics_like_slice_indexing() {
-    let source = RegexForm::List(vec![RegexForm::default()]);
+    let source = raw_list(vec![RegexForm::default()]);
     let RegexFormKind::List(values) = source.view().kind() else { panic!("expected list") };
     let start = 1;
     let end = 0;
@@ -196,14 +202,14 @@ fn raw_sequence_reversed_range_panics_like_slice_indexing() {
 #[test]
 #[should_panic]
 fn raw_sequence_range_past_end_panics_like_slice_indexing() {
-    let source = RegexForm::List(vec![]);
+    let source = raw_list(vec![]);
     let RegexFormKind::List(values) = source.view().kind() else { panic!("expected list") };
     values.slice(0..1);
 }
 
 #[test]
 fn raw_pairs_preserve_entry_order_and_source_lifetimes() {
-    let source = RegexForm::Map(vec![(RegexForm::Symbol("z".into()), RegexForm::Symbol("first".into())), (RegexForm::Symbol("a".into()), RegexForm::Symbol("last".into()))]);
+    let source = raw_map(vec![(raw_symbol("z".into()), raw_symbol("first".into())), (raw_symbol("a".into()), raw_symbol("last".into()))]);
     let RegexFormKind::Map(entries) = source.view().kind() else { panic!("expected map") };
     assert_eq!(entries.len(), 2);
     assert!(!entries.is_empty());
@@ -305,3 +311,20 @@ fn empty_physical_containers_have_exact_exhausted_cursors() {
     assert!(cursor.next().is_none());
     assert!(cursor.next_back().is_none());
 }
+
+fn raw_build(emit: impl FnOnce(&mut crate::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> crate::RegexForm {
+    let mut builder = crate::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> crate::RegexForm { raw_build(|builder| builder.literal(&value)) }
+fn raw_character(value: char) -> crate::RegexForm { raw_build(|builder| builder.character(value)) }
+fn raw_symbol(value: String) -> crate::RegexForm { raw_build(|builder| builder.symbol(&value)) }
+fn raw_big_integer(value: String) -> crate::RegexForm { raw_build(|builder| builder.big_integer(&value)) }
+fn raw_decimal(value: String) -> crate::RegexForm { raw_build(|builder| builder.decimal(&value)) }
+fn raw_list(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_list()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_vector(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_vector()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_set(values: Vec<crate::RegexForm>) -> crate::RegexForm { raw_build(|builder| { builder.begin_set()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_map(values: Vec<(crate::RegexForm, crate::RegexForm)>) -> crate::RegexForm { raw_build(|builder| { builder.begin_map()?; for (key, value) in values { builder.append_view(key.view())?; builder.append_view(value.view())?; } builder.end() }) }
+fn raw_tagged(tag: String, value: crate::RegexForm) -> crate::RegexForm { raw_build(|builder| { builder.begin_tagged(&tag)?; builder.append_view(value.view())?; builder.end() }) }
+fn raw_anonymous(value: crate::RegexForm) -> crate::RegexForm { raw_build(|builder| { builder.begin_anonymous()?; builder.append_view(value.view())?; builder.end() }) }

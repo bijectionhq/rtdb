@@ -5,8 +5,8 @@ use rtdb_expr::{CompiledExpr,EvalContext,EvaluationScope,ExpressionInvocation,ev
 use rtdb_plan::{Expr,RegexForm as F,RegexReplacement,Schema};
 use rtdb_types::Value as V;
 
-fn string(value: &str) -> F { F::Literal(V::Utf8(value.into())) }
-fn call(name: &str,args: Vec<F>) -> F { F::List(std::iter::once(F::Symbol(name.into())).chain(args).collect()) }
+fn string(value: &str) -> F { raw_literal(V::Utf8(value.into())) }
+fn call(name: &str,args: Vec<F>) -> F { raw_list(std::iter::once(raw_symbol(name.into())).chain(args).collect()) }
 fn replace(pattern: F) -> Expr { Expr::regex_replace(Expr::Literal(V::Utf8("a".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() }) }
 
 #[test]
@@ -42,7 +42,7 @@ fn host_program_temporaries_stay_on_the_preparation_scope() {
 
 #[test]
 fn host_numeric_literal_storage_is_admitted_before_parsing_and_released_on_failure() {
-    let expression = replace(call("str",vec![F::BigInteger("9".repeat(4096))]));
+    let expression = replace(call("str",vec![raw_big_integer("9".repeat(4096))]));
     let memory = MemoryBudget::new(64 << 10);
     {
         let scope = EvaluationScope::new(&memory).unwrap();
@@ -56,7 +56,7 @@ fn host_numeric_literal_storage_is_admitted_before_parsing_and_released_on_failu
 
 #[test]
 fn host_arithmetic_reserves_scratch_before_big_integer_products() {
-    let number = F::BigInteger("9".repeat(512));
+    let number = raw_big_integer("9".repeat(512));
     let expression = replace(call("str",vec![call("*",vec![number.clone(),number])]));
     let memory = MemoryBudget::new(64 << 10);
     {
@@ -72,8 +72,8 @@ fn host_arithmetic_reserves_scratch_before_big_integer_products() {
 #[test]
 fn host_arithmetic_admits_decimal_scale_growth_before_constructing_powers() {
     for name in ["+","inc"] {
-        let mut args = vec![F::Decimal("1E-2147483647".into())];
-        if name == "+" { args.push(F::Literal(V::I64(1))); }
+        let mut args = vec![raw_decimal("1E-2147483647".into())];
+        if name == "+" { args.push(raw_literal(V::I64(1))); }
         let expression = replace(call("str",vec![call(name,args)]));
         let memory = MemoryBudget::new(128 << 20);
         {
@@ -89,17 +89,17 @@ fn host_arithmetic_admits_decimal_scale_growth_before_constructing_powers() {
 
 #[test]
 fn host_arithmetic_bounds_generated_nary_instruction_depth() {
-    let expression = replace(call("str",vec![call("+",vec![F::Literal(V::I64(1));129])]));
+    let expression = replace(call("str",vec![call("+",vec![raw_literal(V::I64(1));129])]));
     assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
 }
 
 #[test]
 fn host_classifications_admit_exact_numbers_without_scale_expansion_and_release_scopes() {
     for (argument,predicate) in [
-        (F::BigInteger("9".repeat(8192)),"integer?"),
-        (F::Decimal("1E-2147483647".into()),"decimal?"),
-        (F::Decimal("1E+2147483647".into()),"rational?"),
-        (call("/",vec![F::Literal(V::I64(1)),F::Literal(V::I64(3))]),"ratio?"),
+        (raw_big_integer("9".repeat(8192)),"integer?"),
+        (raw_decimal("1E-2147483647".into()),"decimal?"),
+        (raw_decimal("1E+2147483647".into()),"rational?"),
+        (call("/",vec![raw_literal(V::I64(1)),raw_literal(V::I64(3))]),"ratio?"),
     ] {
         let expression = replace(call("if",vec![call(predicate,vec![argument]),string("a"),string("b")]));
         let memory = MemoryBudget::new(128 << 20);
@@ -113,7 +113,7 @@ fn host_classifications_admit_exact_numbers_without_scale_expansion_and_release_
         }
         assert_eq!(memory.used_bytes(),0);
     }
-    let expression = replace(call("str",vec![call("number?",vec![call("subs",vec![string("x"),F::Literal(V::I64(-1))])])]));
+    let expression = replace(call("str",vec![call("number?",vec![call("subs",vec![string("x"),raw_literal(V::I64(-1))])])]));
     let memory = MemoryBudget::new(128 << 20);
     {
         let scope = EvaluationScope::new(&memory).unwrap();
@@ -127,9 +127,9 @@ fn host_classifications_admit_exact_numbers_without_scale_expansion_and_release_
 fn host_classifications_reject_undefined_literal_carriers_without_reading_quoted_contents() {
     let decimal = rtdb_types::DecimalValue::new(vec![0;16],1,0,128).unwrap();
     for value in [V::I8(1),V::I16(1),V::I32(1),V::U8(1),V::U16(1),V::U32(1),V::U64(1),V::F16(0),V::F32(1.0),V::Decimal(decimal),V::Transit(vec![0xff])] {
-        let expression = replace(call("str",vec![call("number?",vec![F::Literal(value.clone())])]));
+        let expression = replace(call("str",vec![call("number?",vec![raw_literal(value.clone())])]));
         assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-form");
-        let quoted = call("quote",vec![F::Vector(vec![F::Literal(value)])]);
+        let quoted = call("quote",vec![raw_vector(vec![raw_literal(value)])]);
         let expression = replace(call("if",vec![call("number?",vec![quoted]),string("b"),string("a")]));
         let schema = Schema::default();
         let context = EvalContext::default();
@@ -139,16 +139,16 @@ fn host_classifications_reject_undefined_literal_carriers_without_reading_quoted
 
 #[test]
 fn host_call_admission_rejects_unknown_carriers_before_arguments_and_ignores_quoted_children() {
-    let failing = call("subs",vec![string("x"),F::Literal(V::I64(-1))]);
+    let failing = call("subs",vec![string("x"),raw_literal(V::I64(-1))]);
     let decimal = rtdb_types::DecimalValue::new(vec![0;16],1,0,128).unwrap();
-    for raw in [F::Literal(V::I8(1)),F::Literal(V::F32(1.0)),F::Literal(V::U64(1)),F::Literal(V::Decimal(decimal)),F::Literal(V::Transit(vec![0xff])),F::Tagged { tag: "unresolved-host-class".into(),value: Box::new(F::default()) }] {
+    for raw in [raw_literal(V::I8(1)),raw_literal(V::F32(1.0)),raw_literal(V::U64(1)),raw_literal(V::Decimal(decimal)),raw_literal(V::Transit(vec![0xff])),raw_tagged("unresolved-host-class".into(), F::default())] {
         let function = call("quote",vec![raw.clone()]);
-        let expression = replace(F::List(vec![function,failing.clone()]));
+        let expression = replace(raw_list(vec![function,failing.clone()]));
         let error = ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap();
         assert_eq!(error.code,"rtdb.expr/regex-host-form");
         assert_eq!(error.message.as_deref(),Some("Host call admission requires an established host literal carrier"));
-        for container in [F::Vector(vec![raw.clone()]),F::Map(vec![(string("k"),raw.clone())]),F::Set(vec![raw.clone()])] {
-            let expression = replace(F::List(vec![call("quote",vec![container]),failing.clone()]));
+        for container in [raw_vector(vec![raw.clone()]),raw_map(vec![(string("k"),raw.clone())]),raw_set(vec![raw.clone()])] {
+            let expression = replace(raw_list(vec![call("quote",vec![container]),failing.clone()]));
             assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().message.as_deref(),Some("Host substring indexes are out of range"));
         }
     }
@@ -156,8 +156,8 @@ fn host_call_admission_rejects_unknown_carriers_before_arguments_and_ignores_quo
 
 #[test]
 fn host_call_admission_failure_releases_preparation_scope() {
-    let failing = call("subs",vec![string("x"),F::Literal(V::I64(-1))]);
-    let expression = replace(F::List(vec![F::Literal(V::Bool(false)),failing]));
+    let failing = call("subs",vec![string("x"),raw_literal(V::I64(-1))]);
+    let expression = replace(raw_list(vec![raw_literal(V::Bool(false)),failing]));
     let memory = MemoryBudget::new(128 << 20);
     {
         let scope = EvaluationScope::new(&memory).unwrap();
@@ -170,7 +170,7 @@ fn host_call_admission_failure_releases_preparation_scope() {
 
 #[test]
 fn host_numeric_comparison_reserves_cross_product_storage_before_allocation() {
-    let number = F::BigInteger("9".repeat(512));
+    let number = raw_big_integer("9".repeat(512));
     let expression = replace(call("str",vec![call("==",vec![number.clone(),number])]));
     let memory = MemoryBudget::new(64 << 10);
     {
@@ -185,7 +185,7 @@ fn host_numeric_comparison_reserves_cross_product_storage_before_allocation() {
 
 #[test]
 fn host_decimal_comparison_admits_extreme_scale_without_expanding_coefficients() {
-    let pattern = call("str",vec![call("<",vec![F::Decimal("1E-2147483647".into()),F::Decimal("1E+2147483647".into())])]);
+    let pattern = call("str",vec![call("<",vec![raw_decimal("1E-2147483647".into()),raw_decimal("1E+2147483647".into())])]);
     let expression = Expr::regex_replace(Expr::Literal(V::Utf8("true".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
     let memory = MemoryBudget::new(128 << 20);
     {
@@ -202,9 +202,9 @@ fn host_decimal_comparison_admits_extreme_scale_without_expanding_coefficients()
 #[test]
 fn host_integral_division_admits_products_and_scale_expansion_before_allocation() {
     for (left,right,budget,code) in [
-        (F::BigInteger("9".repeat(512)),F::BigInteger("7".repeat(512)),64 << 10,"rtdb/memory-budget-exceeded"),
-        (call("/",vec![F::BigInteger("9".repeat(128)),F::Literal(V::I64(7))]),call("/",vec![F::Literal(V::I64(1)),F::Literal(V::I64(3))]),64 << 10,"rtdb/memory-budget-exceeded"),
-        (F::Decimal("1E+2147483647".into()),F::Literal(V::I64(3)),128 << 20,"rtdb.expr/regex-host-limit"),
+        (raw_big_integer("9".repeat(512)),raw_big_integer("7".repeat(512)),64 << 10,"rtdb/memory-budget-exceeded"),
+        (call("/",vec![raw_big_integer("9".repeat(128)),raw_literal(V::I64(7))]),call("/",vec![raw_literal(V::I64(1)),raw_literal(V::I64(3))]),64 << 10,"rtdb/memory-budget-exceeded"),
+        (raw_decimal("1E+2147483647".into()),raw_literal(V::I64(3)),128 << 20,"rtdb.expr/regex-host-limit"),
     ] {
         for operation in ["quot","rem","mod"] {
             let expression = replace(call("str",vec![call(operation,vec![left.clone(),right.clone()])]));
@@ -223,7 +223,7 @@ fn host_integral_division_admits_products_and_scale_expansion_before_allocation(
 #[test]
 fn host_decimal_zero_quotient_keeps_extreme_scales_without_expanding_coefficients() {
     for operation in ["quot","rem","mod"] {
-        let result = call(operation,vec![F::Decimal("1E-2147483647".into()),F::Decimal("1E+2147483647".into())]);
+        let result = call(operation,vec![raw_decimal("1E-2147483647".into()),raw_decimal("1E+2147483647".into())]);
         let expected = operation == "quot";
         let pattern = call("if",vec![call("zero?",vec![result]),string(if expected { "a" } else { "b" }),string(if expected { "b" } else { "a" })]);
         let expression = replace(pattern);
@@ -243,14 +243,14 @@ fn host_decimal_zero_quotient_keeps_extreme_scales_without_expanding_coefficient
 #[test]
 fn host_bit_nary_expansion_retains_the_instruction_depth_limit() {
     for operation in ["bit-and","bit-or","bit-xor","bit-and-not"] {
-        let expression = replace(call("str",vec![call(operation,vec![F::Literal(V::I64(1));129])]));
+        let expression = replace(call("str",vec![call(operation,vec![raw_literal(V::I64(1));129])]));
         assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
     }
 }
 
 #[test]
 fn host_bit_rejection_borrows_big_integer_payloads_and_releases_preparation_charges() {
-    let expression = replace(call("str",vec![call("bit-and",vec![F::BigInteger("9".repeat(1024)),string("not numeric")])]));
+    let expression = replace(call("str",vec![call("bit-and",vec![raw_big_integer("9".repeat(1024)),string("not numeric")])]));
     let memory = MemoryBudget::new(64 << 10);
     {
         let scope = EvaluationScope::new(&memory).unwrap();
@@ -266,7 +266,7 @@ fn host_bit_rejection_borrows_big_integer_payloads_and_releases_preparation_char
 fn host_bit_count_magnitude_does_not_expand_preparation_storage() {
     let mut retained = None;
     for count in [0,-1,64,4294967296,i64::MIN,i64::MAX] {
-        let pattern = call("str",vec![call("bit-shift-right",vec![F::Literal(V::I64(-1)),F::Literal(V::I64(count))])]);
+        let pattern = call("str",vec![call("bit-shift-right",vec![raw_literal(V::I64(-1)),raw_literal(V::I64(count))])]);
         let expression = Expr::regex_replace(Expr::Literal(V::Utf8("-1".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
         let memory = MemoryBudget::new(128 << 20);
         {
@@ -285,7 +285,7 @@ fn host_bit_count_magnitude_does_not_expand_preparation_storage() {
 #[test]
 fn host_extrema_nary_expansion_retains_the_instruction_depth_limit() {
     for operation in ["min","max"] {
-        let expression = replace(call("str",vec![call(operation,vec![F::Literal(V::I64(1));129])]));
+        let expression = replace(call("str",vec![call(operation,vec![raw_literal(V::I64(1));129])]));
         assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
     }
 }
@@ -293,9 +293,9 @@ fn host_extrema_nary_expansion_retains_the_instruction_depth_limit() {
 #[test]
 fn host_extrema_and_absolute_value_reserve_numeric_scratch_before_allocation() {
     for (operation,arguments) in [
-        ("min",vec![F::BigInteger("9".repeat(512)),F::BigInteger("8".repeat(512))]),
-        ("max",vec![F::BigInteger("9".repeat(512)),F::BigInteger("8".repeat(512))]),
-        ("abs",vec![F::BigInteger(format!("-{}","9".repeat(512)))]),
+        ("min",vec![raw_big_integer("9".repeat(512)),raw_big_integer("8".repeat(512))]),
+        ("max",vec![raw_big_integer("9".repeat(512)),raw_big_integer("8".repeat(512))]),
+        ("abs",vec![raw_big_integer(format!("-{}","9".repeat(512)))]),
     ] {
         let expression = replace(call("str",vec![call(operation,arguments)]));
         let memory = MemoryBudget::new(64 << 10);
@@ -312,8 +312,8 @@ fn host_extrema_and_absolute_value_reserve_numeric_scratch_before_allocation() {
 #[test]
 fn host_decimal_extrema_and_abs_keep_extreme_scales_without_expanding_coefficients() {
     for pattern in [
-        call("if",vec![call("pos?",vec![call("min",vec![F::Decimal("1E-2147483647".into()),F::Decimal("1E+2147483647".into())])]),string("a"),string("b")]),
-        call("if",vec![call("pos?",vec![call("abs",vec![F::Decimal("-1E-2147483647".into())])]),string("a"),string("b")]),
+        call("if",vec![call("pos?",vec![call("min",vec![raw_decimal("1E-2147483647".into()),raw_decimal("1E+2147483647".into())])]),string("a"),string("b")]),
+        call("if",vec![call("pos?",vec![call("abs",vec![raw_decimal("-1E-2147483647".into())])]),string("a"),string("b")]),
     ] {
         let expression = replace(pattern);
         let memory = MemoryBudget::new(128 << 20);
@@ -328,3 +328,18 @@ fn host_decimal_extrema_and_abs_keep_extreme_scales_without_expanding_coefficien
         assert_eq!(memory.used_bytes(),0);
     }
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
+fn raw_symbol(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.symbol(&value)) }
+fn raw_big_integer(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.big_integer(&value)) }
+fn raw_decimal(value: String) -> rtdb_plan::RegexForm { raw_build(|builder| builder.decimal(&value)) }
+fn raw_list(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_list()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_vector(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_vector()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_set(values: Vec<rtdb_plan::RegexForm>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_set()?; for value in values { builder.append_view(value.view())?; } builder.end() }) }
+fn raw_map(values: Vec<(rtdb_plan::RegexForm, rtdb_plan::RegexForm)>) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_map()?; for (key, value) in values { builder.append_view(key.view())?; builder.append_view(value.view())?; } builder.end() }) }
+fn raw_tagged(tag: String, value: rtdb_plan::RegexForm) -> rtdb_plan::RegexForm { raw_build(|builder| { builder.begin_tagged(&tag)?; builder.append_view(value.view())?; builder.end() }) }

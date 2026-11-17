@@ -40,7 +40,7 @@ impl CatalogRuntime for NodeCatalogRuntime {
         if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let context = QueryContext::with_owner(catalog, Arc::clone(self.node.memory()), self.node.now(), "UTC", QueryOptions::default(), &self.cancellation, self.node.cancellation())?;
-        let prepared = rtdb_sql::prepare("SELECT \"user\", \"role\" FROM xt.role_membership", &context.catalog, &Default::default())?;
+        let prepared = rtdb_sql::prepare_in("SELECT \"user\", \"role\" FROM xt.role_membership", &context.catalog, &Default::default(), &context.memory)?;
         let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, Vec::new()).await?;
         let mut rows = Vec::new();
         let mut reservations = Vec::<Arc<MemoryReservation>>::new();

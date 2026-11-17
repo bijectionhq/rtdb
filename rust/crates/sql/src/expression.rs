@@ -183,7 +183,7 @@ impl Context<'_> {
                     let metadata = |index| -> Result<rtdb_plan::RegexForm> {
                         let expr = argument(index)?;
                         if let ast::Expr::Value(value) = expr {
-                            if let Ok(Value::Utf8(value)) = crate::types::literal(&value.value) { return Ok(rtdb_plan::RegexForm::Literal(Value::Utf8(value))); }
+                            if let Ok(Value::Utf8(value)) = crate::types::literal(&value.value) { return self.forms.literal(&Value::Utf8(value)); }
                         }
                         let (sign,value) = match expr {
                             ast::Expr::UnaryOp { op: ast::UnaryOperator::Minus,expr } => ("-",expr.as_ref()),
@@ -193,7 +193,7 @@ impl Context<'_> {
                         let ast::Expr::Value(value) = value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
                         let ast::Value::Number(value,_) = &value.value else { return Err(error("REGEXP_REPLACE requires an integer literal")); };
                         let value = format!("{sign}{value}").parse::<i64>().map_err(|_|error("REGEXP_REPLACE integer literal exceeds signed 64-bit range"))?;
-                        Ok(rtdb_plan::RegexForm::Literal(Value::I64(value)))
+                        self.forms.literal(&Value::I64(value))
                     };
                     let mut recipe = rtdb_plan::RegexReplacement { pattern: metadata(1)?,replacement: metadata(2)?,..Default::default() };
                     for index in 3..arguments.len() {

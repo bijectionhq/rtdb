@@ -27,7 +27,7 @@ mod json;
 
 pub use catalog::*;
 pub use expr::*;
-pub use regex_replace::{RegexForm,RegexReplacement};
+pub use regex_replace::{RegexForm,RegexFormBuilder,RegexReplacement};
 #[doc(hidden)]
 pub use regex_replace::{RegexFormView, RegexFormKind, RegexForms, RegexFormIter, RegexFormPairs, RegexFormPairIter,
     RegexLiteralView, RegexLiteralKind, RegexLiterals, RegexLiteralIter, RegexLiteralPairs, RegexLiteralPairIter,

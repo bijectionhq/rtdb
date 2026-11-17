@@ -5,7 +5,7 @@ use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor};
 use rtdb_sql::{PrepareOptions, StatementKind};
 use rtdb_tx::{SqlArguments, TxOp};
-use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, PgType, Result, Value};
+use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResultSignaturePolicy { Dynamic, Exact, PostgreSql }
@@ -32,7 +32,7 @@ impl PreparedSql {
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
-        let parsed = one_statement(source)?;
+        let parsed = one_statement(source, &context.memory)?;
         if parsed.kind() == StatementKind::Dml {
             return Self::prepare_inner(source, context, PrepareOptions { search_path, ..Default::default() }, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty());
         }
@@ -54,7 +54,7 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
         let source_reservation = context.memory.reserve(source.len().checked_add(256).ok_or_else(size_error)?)?;
-        let parsed = one_statement(source)?;
+        let parsed = one_statement(source, &context.memory)?;
         let count = parsed.parameter_count();
         if options.parameter_types.keys().any(|index| *index >= count) { return Err(parameter_error("Declared parameter lies outside the statement")); }
         let parameter_bytes = options.parameter_types.values().try_fold(count.checked_mul(1024).and_then(|n| n.checked_add(1024)).ok_or_else(size_error)?, |bytes, ty| bytes.checked_add(ty.retained_bytes()?).ok_or_else(size_error))?;
@@ -63,11 +63,11 @@ impl PreparedSql {
         let mut notices = Vec::new();
         let result = match parsed.kind() {
             StatementKind::Dml => {
-                if dml_notices { notices = rtdb_sql::prepare(source, &context.catalog, &options).map(|prepared| prepared.notices).unwrap_or_default(); }
+                if dml_notices { notices = rtdb_sql::prepare_in(source, &context.catalog, &options, &context.memory).map(|prepared| prepared.notices).unwrap_or_default(); }
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let prepared = rtdb_sql::prepare(source, &context.catalog, &options)?;
+                let prepared = rtdb_sql::prepare_in(source, &context.catalog, &options, &context.memory)?;
                 for (index, ty) in &prepared.parameter_types {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
@@ -139,7 +139,7 @@ impl PreparedSql {
         options.default_timezone = context.timezone.clone();
         if execution { for ty in options.parameter_types.values_mut() { *ty = rtdb_columnar::execution_type(ty); } }
         for (index, ty) in argument_types.iter().enumerate() { options.parameter_types.entry(index).or_insert_with(|| if execution { rtdb_columnar::execution_type(ty) } else { ty.clone() }); }
-        let prepared = rtdb_sql::prepare(&self.0.source, &context.catalog, &options)?;
+        let prepared = rtdb_sql::prepare_in(&self.0.source, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)
     }
 
@@ -156,8 +156,8 @@ impl PreparedSql {
     }
 }
 
-fn one_statement(source: &str) -> Result<rtdb_sql::ParsedStatement> {
-    let mut parsed = rtdb_sql::parse(source)?;
+fn one_statement(source: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_sql::ParsedStatement> {
+    let mut parsed = rtdb_sql::parse_in(source, memory)?;
     if parsed.len() != 1 { return Err(Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
     Ok(parsed.remove(0))
 }

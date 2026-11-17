@@ -129,7 +129,7 @@ impl ProtocolSession {
         let options = self.options(); let token = self.token();
         let (kind, columns, count) = if source.is_empty() { (PreparedKind::Empty, None, 0) }
         else if source.to_ascii_lowercase().starts_with("select string_agg(word, ',') from pg_catalog.pg_get_keywords()") { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
-        else if let Some(control) = rtdb_sql::parse_control(source, &options)? {
+        else if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.node.memory())? {
             let count = match &control { ControlStatement::Execute { .. } => control.parameter_count(), ControlStatement::Show { .. } => 0, _ => oids.len() }; let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })).collect::<Result<_>>()).transpose()?;
             (PreparedKind::Control(control), columns, count)
         } else {
@@ -265,7 +265,7 @@ impl ProtocolSession {
         let spans = rtdb_sql::split_statements(source)?;
         if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
         for span in spans {
-            let sql = &source[span.start..span.end]; let control = rtdb_sql::parse_control(sql, &self.options())?;
+            let sql = &source[span.start..span.end]; let control = rtdb_sql::parse_control_in(sql, &self.options(), self.node.memory())?;
             if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
             let result: Result<()> = async {
                 let prepared = self.prepare(sql, Vec::new()).await?;

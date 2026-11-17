@@ -24,7 +24,7 @@ async fn actual_empty_probe_callback_prepares_theta_while_absent_callback_does_n
         let context = QueryContext::new(catalog,MemoryBudget::new(1 << 25),Timestamp(0),"UTC",QueryOptions::default(),&CancellationToken::new()).unwrap();
         let execution = Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context: Arc::clone(&context),bindings: None,analysis: None };
         let baseline = context.memory.used_bytes();
-        let replacement = Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),RegexReplacement { pattern: RegexForm::Literal(Value::Utf8("[".into())),replacement: RegexForm::Literal(Value::Utf8("b".into())),..Default::default() });
+        let replacement = Expr::regex_replace(Expr::Literal(Value::Utf8("a".into())),RegexReplacement { pattern: raw_literal(Value::Utf8("[".into())),replacement: raw_literal(Value::Utf8("b".into())),..Default::default() });
         let theta = Expr::binary(BinaryOp::Eq,replacement,Expr::Literal(Value::Utf8("x".into())));
         let layout = JoinLayout::new(&Relation::empty(schema(0)),&Relation::empty(schema(1)),Some(&theta),&context.memory).unwrap();
         let table = BuildTable::new(HashedPage::new(PageBuilder::new(0,&context.memory).unwrap().finish(),|_|Ok(0),&context.memory).unwrap(),false,&context.memory).unwrap();
@@ -38,6 +38,13 @@ async fn actual_empty_probe_callback_prepares_theta_while_absent_callback_does_n
         drop(cursor);assert_eq!(context.memory.used_bytes(),baseline);assert_eq!(context.spill_bytes(),0);
     }
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> RegexForm { raw_build(|builder| builder.literal(&value)) }
 
 #[test]
 fn extension_retains_the_input_cardinality_used_for_outer_join_build_selection() {

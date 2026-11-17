@@ -31,8 +31,8 @@ fn cursor(rows: Vec<i64>,expressions: Vec<Expr>,execution: &Execution) -> PagePr
 fn int(value: i64) -> Expr { Expr::Literal(Value::I64(value)) }
 fn invalid_pattern() -> Expr {
     Expr::regex_replace(Expr::Literal(Value::Utf8("value".into())),rtdb_plan::RegexReplacement {
-        pattern: rtdb_plan::RegexForm::Literal(Value::Utf8("[".into())),
-        replacement: rtdb_plan::RegexForm::Literal(Value::Utf8("replacement".into())),
+        pattern: raw_literal(Value::Utf8("[".into())),
+        replacement: raw_literal(Value::Utf8("replacement".into())),
         ..Default::default()
     })
 }
@@ -130,3 +130,10 @@ fn failed_cell_growth_keeps_the_previous_row_and_reservation() {
     assert_eq!(row.values,[Value::Null]);assert_eq!(row.bytes(),before);assert_eq!(memory.used_bytes(),before);
     drop(row);assert_eq!(memory.used_bytes(),0);
 }
+
+fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
+    let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
+    emit(&mut builder).unwrap();
+    builder.finish().unwrap()
+}
+fn raw_literal(value: rtdb_types::Value) -> rtdb_plan::RegexForm { raw_build(|builder| builder.literal(&value)) }
