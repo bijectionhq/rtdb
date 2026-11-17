@@ -551,18 +551,29 @@ Run-end layout replacement preserves its child layouts and has a same-increment 
 Sort has independent source reviews for indexed memory/spill backing, the default OpenJDK25 TimSort algorithm and complete callback/run/merge scheduling.
 The scheduling review repaired source-run retention across merge groups and added spill-quota cleanup and all-input-before-merge error-order regressions.
 Top-k reduction, empty callbacks, priority-queue tie order and final successor reinsertion have unexecuted regression sources.
-Alternate legacy-sort configuration and complete-group percentile sorting remain required implementation work.
+Object-sort selection and complete-group percentile sorting now have independent source review.
+Each runtime retains its captured TimSort or legacy merge-sort selection through CLI, configuration and embedded startup.
+Percentiles sort one complete nonnull group before rank selection; descending percentile comparison swaps operands, while ordinary ORDER BY retains result negation.
+The explicit JVM binding overload accepts a host's earlier captured selection where the current property cannot recover Arrays initialization.
 
 Aggregate primitive factory and update schedules have bounded source review, including unsigned Boolean vector setter admission.
 Further source tracing found that logical null values erase nullable child-vector payloads, selected union legs and underlying getter indexes.
 Preserving those physical reader properties through views, copies, expression evaluation and spill is required even for some default-checking paths, and before disabled null checks can be supported.
 The reviewed primitive aggregate slice does not close that physical-reader work.
 
-Shared host Number parsing, casts and arithmetic have bounded source review for the default checked-math and exact-decimal context.
+Shared host Number parsing, casts, arithmetic, numeric comparisons and sign predicates have bounded source review for the default checked-math and exact-decimal context.
 The reviews repaired direct Long-to-Float rounding, Number admission for substring indexes, boxed-divisor error precedence and decimal arithmetic diagnostics.
+Comparison chains retain strict argument evaluation before adjacent numeric comparisons, and decimal comparisons bound scale alignment by checking adjusted magnitudes first.
+Primitive Boolean results remain distinct from boxed Boolean literals and unresolved static-call metadata through local bindings and control forms.
 General host numeric functions, dynamic bindings, interop, effects, namespace state, functions/macros, semantic object text and isolated UTF16 carriers remain required work.
 
 Unknown Transit tagged objects retain decoded alias identity before representation equality, with separate content hashing and canonical wire output.
 Its alias/null and numeric-class regressions have independent source review.
 Remaining registry families and semantic rendering, equality and inspection consumers stay open.
+Registered TableRef decoding and scalar/readable object text have bounded source review, including flat-map duplicate handling and ByteBuffer alias identity.
+Date environment providers, readable ExceptionInfo stacks, nondefault print settings and type-descriptor construction remain required source work.
+
+The additive embedded property entry reuses the existing startup, retained handle and close owners.
+Its bounded decoding and public allocation contract have source review; the shutdown trace's FFI evidence includes this entry and its region constructor.
+Frontend planning admission remains open: PostgreSQL preparation can tokenize and build an AST before its first reservation, and completed-plan reservations do not cover earlier catalog-dependent binding allocations.
 All regression sources remain unexecuted; the source gate remains false and no implementation-completeness revision is recorded.
