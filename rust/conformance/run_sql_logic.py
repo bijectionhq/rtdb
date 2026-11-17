@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from source_gate import require_phase_two
 from history_results import verify_runtime_artifacts
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, owned_cancellation, run_process, validate_native_revision, write_json
 from sql_logic_records import write_records
@@ -50,9 +51,7 @@ def execute(args, engine, directory, plan_path, plan, revision):
 
 
 def run(args):
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not args.phase_two or state.get("phase_2_authorized_by_completeness_gate") is not True:
-        raise ValueError("SQL logic execution belongs to Phase 2 after the source completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     if args.timeout <= 0 or not 0 < args.max_rows <= 2**63 - 1 or not 0 < args.max_result_bytes <= 512 * 1024 * 1024 or args.query_limit is not None and not 0 <= args.query_limit <= 2**63 - 1:
         raise ValueError("invalid SQL logic execution limit")
     if git(args.reference, "rev-parse", "HEAD") != REFERENCE or git(args.reference, "status", "--porcelain", "--untracked-files=all"):

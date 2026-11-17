@@ -1,0 +1,52 @@
+= Source completeness and the first compilation
+
+`source-completeness.json` records the seven implementation areas and six public-entry traces required by the implementation handoff.
+Each entry identifies production source paths and a review conclusion.
+The recorded complete traces originate in `rust/source-review.adoc`; their source hashes retain the files reviewed at that checkpoint.
+The implementation revision remains unset while the final source review is incomplete.
+
+Findings have one of three dispositions.
+
+* `implementation` identifies missing required behavior and blocks the first compilation.
+* `review` identifies an unfinished source check and blocks the first compilation.
+* `qualification` identifies Phase 2 evidence, including compilation, runtime discovery, interoperability and performance, and does not block the first compilation.
+
+A resolved finding carries its resolution.
+An entry becomes `reviewed` after its complete source path has been checked and its evidence records the SHA256 of every listed implementation file.
+Extra evidence may include the relevant specification, regression source and review record.
+The validator checks the review's coverage and retained evidence; the semantic completeness conclusion belongs to the source reviewer.
+It cannot infer implementation completeness from the existence of files.
+
+The following command reads the manifest and current source files without loading project modules, building artifacts, discovering tests or starting services.
+It prints the pending reviews, implementation blockers and later qualification work separately.
+It exits with status 1 while a source review or implementation finding remains open, and rejects missing paths or stale reviewed evidence.
+
+[source,shell]
+----
+python3 rust/conformance/source_gate.py --repository .
+----
+
+`--output` writes the report to a new file and refuses to replace an existing artifact.
+The report preserves `compatibility_claim: none` even after source completion.
+The source inventory and two control ledger mappings remain separate: source candidates are not an executed assertion denominator, and the full ledger remains runtime-reconciled in Phase 2.
+
+To record the phase transition:
+
+. Resolve the required implementation findings and finish all seven area reviews and six traces.
+. Commit the reviewed implementation with the execution gate still closed.
+. Set `implementation_revision` in this manifest and `rust/implementation-status.json` to that full commit ID.
+. Record `source_completeness_review: complete` and `phase_2_authorized_by_completeness_gate: true` in the status file, and commit the phase-transition record.
+. Begin Phase 2 compilation and verification.
+
+The conformance runners, native test discovery, release builder and release matrix all call the same `require_phase_two` validator before project execution.
+The explicit `--phase-two` option and a literal Boolean authorization remain required.
+The gate also requires the complete manifest, matching pinned design/reference revisions, matching implementation revision, no open source blockers and valid evidence hashes at that implementation commit.
+The recorded commit must be an ancestor of the current checkout.
+Later compiler and test repairs may descend from it; their source changes do not rewrite the original Phase 1 completion boundary.
+The runners retain their existing clean-checkout and artifact-provenance checks for the actual revision being executed.
+
+The review manifest, report and source-reader functions are passive values and capabilities.
+The validator completes on its caller and starts only read-only Git commands when validating historical evidence.
+It neither mutates implementation status nor owns a background process or monitor.
+
+The gate and its regression sources have not been executed during Phase 1.

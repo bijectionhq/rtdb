@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 
 mod policy;
 use policy::Policy;
+pub(crate) mod trust;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
@@ -26,7 +27,11 @@ impl NativeTls {
         let mut identities = Vec::new();
         let mut trust = None;
         for (store, usage) in [("truststore", StoreUse::Trust), ("keystore", StoreUse::OptionalIdentity)] {
-            if let Some(material) = material(options, store, usage, reserve)? {
+            let material = material(options, store, usage, reserve)?;
+            let material = if usage == StoreUse::Trust && material.is_none() && !trust::native_override(options) {
+                Some(trust::defaults(reserve)?)
+            } else { material };
+            if let Some(material) = material {
                 reservations.push(material.reservation());
                 match usage {
                     StoreUse::Trust => {

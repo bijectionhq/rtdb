@@ -11,6 +11,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 CONFORMANCE = HERE.parent / "conformance"
 sys.path.insert(0, str(CONFORMANCE))
+from source_gate import require_phase_two
 from run_controls import REFERENCE, REPOSITORY, ProcessCancelled, digest, git, owned_cancellation, run_process, write_json
 from client_results import parse_libtest
 from runtime_inventory import read_plan as read_junit_plan
@@ -290,9 +291,7 @@ def main():
     parser.add_argument("--timeout", type=float, default=7200)
     args = parser.parse_args()
     args.plan, args.reference, args.output = args.plan.resolve(), args.reference.resolve(), args.output.resolve()
-    state = read_json(REPOSITORY / "rust/implementation-status.json")
-    if not args.phase_two or state.get("phase_2_authorized_by_completeness_gate") is not True:
-        raise ValueError("release execution requires the Phase 2 completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     revision = git(REPOSITORY, "rev-parse", "HEAD")
     for repository, expected in ((REPOSITORY, revision), (args.reference, REFERENCE)):
         if git(repository, "rev-parse", "HEAD") != expected or git(repository, "status", "--porcelain", "--untracked-files=all"):

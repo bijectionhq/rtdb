@@ -13,7 +13,6 @@ rtdb-tls.workspace = true
 zeroize = "1.8"
 libc = "0.2"
 rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
-rustls-native-certs = "=0.8.1"
 rtdb-format.workspace = true
 rtdb-columnar.workspace = true
 rtdb-replication.workspace = true

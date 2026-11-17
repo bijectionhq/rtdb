@@ -14,6 +14,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "conformance"))
+from source_gate import require_phase_two
 from run_controls import REFERENCE, REPOSITORY, digest, git, owned_cancellation, write_json
 from run_clients import Commands, image_record, verify_native_build_info
 
@@ -187,9 +188,7 @@ def extract_artifacts(commands, image, engine, output):
 
 
 def build(args):
-    state = json.loads((REPOSITORY / "rust/implementation-status.json").read_bytes())
-    if not args.phase_two or not state["phase_2_authorized_by_completeness_gate"]:
-        raise ValueError("release compilation belongs to Phase 2 after the source completeness gate")
+    require_phase_two(REPOSITORY, args.phase_two)
     immutable_image(args.builder_image)
     immutable_image(args.runtime_image)
     if args.timeout <= 0 or not re.fullmatch(r"\d{8}T\d{6}Z", args.debian_snapshot):

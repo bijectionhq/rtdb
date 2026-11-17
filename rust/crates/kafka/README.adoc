@@ -63,6 +63,11 @@ Decoder, transform, or indexer errors stop the assignment without an aborted pla
 The current submission adapter waits for admitted read-back per record; the reference document indexer hands off after resolution and can pipeline read-back.
 
 Native converters cover String, ByteArray, numeric, Boolean, schema-bearing or schemaless JSON, and the core Confluent Avro and JSON Schema wire paths.
+The String converter selects the key or value deserializer encoding before decoding, with `converter.encoding` supplying the fallback to both serializer and deserializer configuration.
+Selected serializer encodings are validated during opening even for ingestion.
+The six standard Java charsets and their Java aliases are supported, along with BOM-sensitive little-endian UTF16.
+UTF8 and UTF16 replacement consumes malformed byte groups at the Java decoder boundary; fixed-endian UTF16 preserves its initial byte-order mark as text.
+Other Java charset families and installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 JSON Schema payload validation follows `json.fail.invalid.schema`, whose default is false.
@@ -100,7 +105,7 @@ Java protocol and cipher-suite configuration uses the native OpenSSL client adap
 Additional Java producer extensions, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
 Client certificate selection retains all keystore identities and matches signature schemes and acceptable issuer names.
 PKCS12 store and private-key passwords are independent.
-System trust roots retain an 8 MiB reservation; configured trust material retains its keystore decode reservation.
+Registry default trust uses the pinned Temurin 25.0.1+8 certificate store under a retained decode reservation; configured trust retains its keystore reservation.
 The native trust-store allocation bound requires runtime qualification.
 Date patterns use native hybrid Gregorian, Buddhist and five-era Japanese calendars with the pinned CLDR locale data, week fields, localized names/numbers, named zones and construction-time two-digit-year pivots.
 link:LEGACY-DATES.adoc[Connect date conversion] records the raw-millisecond boundary, process environment, resource ownership and remaining provider qualifications.
