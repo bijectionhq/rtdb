@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and source constructor counts/allocation history/existing-inner aliases, Field factories, mutable getter/hint/LongLong, signed Slice and mutable-selection alias, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree and fresh source scalar declaration/signed write-copy/borrowed-byte foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and source constructor/allocator/bounds environments, existing-inner aliases, Field factories, mutable getter/hint/LongLong, signed Slice and mutable-selection alias, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree, source scalar declaration/signed write-copy/borrowed-byte foundations and typed Null/stock-Arrow19-enabled-bounds Int initial-count constructors; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",

@@ -986,7 +986,7 @@ Nullable replacement retains overlapping metadata leases and completed validity 
 Borrowed byte and pointer facts preserve wrapping offsets and source view failures before a separate native retained-payload demand.
 The existing checked row gates and whole-root publication gate retain their contracts.
 Independent source review covers 34 new regression sources and preservation of all 293 prior columnar test bodies.
-Initial constructor counts and allocation history, existing-inner aliases, custom ZoneRulesProvider rules, full Field factories, raw primitive/object/meta/hint operations, signed Slice, recursive writes/copies, relations, hashing, transport and production adoption remain required.
+Other constructor environments and allocation histories, existing-inner aliases, custom ZoneRulesProvider rules, full Field factories, raw primitive/object/meta/hint operations, signed Slice, recursive writes/copies, relations, hashing, transport and production adoption remain required.
 
 The conformance engine restores catalog dependencies through typed relation plans, resolving all table occurrences before rebuilding each owned expression occurrence.
 It preserves lexical bindings, structural validation and serialized error projection without constructing a whole-plan JSON value.
@@ -995,5 +995,22 @@ Construction before prepared ownership remains an open allocation obligation.
 Independent source review covers 15 regression groups and preservation of the existing engine and raw-form assertions.
 Canonical form ownership and exact-unit producer and codec migration remain required.
 
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+
+== Initial source scalar count checkpoint
+
+Private Null constructors retain every signed initial count without payload or validity allocation.
+The named stock Arrow19 Int constructor widens the count before its four-byte request and retains the default exposed capacity, full zeroing and enabled-bounds behavior.
+Negative requests fail before metadata admission; data allocation precedes the optional validity allocation, and all append cursors start at zero independently of the logical count.
+Initial capacity remains separate from later growth, preserving checked setter and copy failure prefixes.
+The closed constructor identity survives native capture and snapshots, while descriptor rebuilding starts a fresh zero count and empty buffers in the target budget.
+Both scalar and root writers use the same state kernels and their existing single publication gate.
+Borrowed Int pointer facts retain wrapped offsets before a separate native retained-span demand.
+Independent source review covers 38 new regression sources and preservation of all 327 prior columnar test bodies.
+
+Custom rounding and default page/order properties, unsafe-memory-access settings and initialization capture, allocator backends, listeners, liveness and callback cleanup remain mandatory environment work.
+Existing-inner aliases, full Field factories, raw getter/object/hash behavior, custom ZoneRulesProvider rules, signed Slice, routed writers and recursive copies, relations, physical transport and production adoption remain required.
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
