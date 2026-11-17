@@ -55,7 +55,7 @@ fn decoded_roots(trust: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Re
     let anchors = trust.trusted_certificates().iter().map(|certificate| X509::from_der(certificate).map_err(|cause| error("invalid-plugin-config", cause))).collect::<Result<Vec<_>>>()?;
     Ok((anchors, charge))
 }
-struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames, chain: Vec<X509>, kind: KeyType, eligible: bool, _certificate_charge: Arc<MemoryReservation> }
+struct ClientIdentity { key: Arc<CertifiedKey>, issuers: IssuerNames, chain: Vec<X509>, kind: KeyType, eligible: bool, usage_eligible: bool, _certificate_charge: Arc<MemoryReservation> }
 struct ClientKeys { identities: Vec<ClientIdentity>, manager: KeyManager, _charge: Arc<MemoryReservation> }
 impl ClientKeys {
     fn new(store: Option<&KeyStore>, provider: &CryptoProvider, algorithm: Algorithm, charge: Arc<MemoryReservation>) -> Result<Self> {
@@ -67,8 +67,9 @@ impl ClientKeys {
             let certificate_charge = charge.budget().reserve(certificate_bound)?;
             let chain = identity.certificates().iter().map(|certificate| X509::from_der(certificate).map_err(|cause| error("invalid-plugin-config", cause))).collect::<Result<Vec<_>>>()?;
             let kind = KeyType::of(&chain[0])?;
-            let eligible = algorithm == Algorithm::SunX509 || crate::tls::security::verify_client_chain(&chain.iter().map(X509::as_ref).collect::<Vec<_>>()).is_ok();
-            Ok(ClientIdentity { key: Arc::new(CertifiedKey::from_der(certificates, key, provider).map_err(|cause| error("invalid-plugin-config", cause))?), issuers: identity.issuer_names(charge.budget())?, chain, kind, eligible, _certificate_charge: certificate_charge })
+            let usage_eligible = algorithm == Algorithm::SunX509 || keys::client_extensions(&chain[0], charge.budget())?;
+            let eligible = algorithm == Algorithm::SunX509 || crate::tls::security::java_client_chain_eligible(&chain.iter().map(X509::as_ref).collect::<Vec<_>>(), charge.budget())?;
+            Ok(ClientIdentity { key: Arc::new(CertifiedKey::from_der(certificates, key, provider).map_err(|cause| error("invalid-plugin-config", cause))?), issuers: identity.issuer_names(charge.budget())?, chain, kind, eligible, usage_eligible, _certificate_charge: certificate_charge })
         }).collect::<Result<Vec<_>>>()?;
         Ok(Self { identities, manager, _charge: charge })
     }
@@ -89,9 +90,39 @@ impl ResolvesClientCert for ClientKeys {
             identity.eligible && identity.kind == kind && identity.key.key.choose_scheme(schemes).is_some()
                 && (!self.manager.constrains_certificates() || identity.chain.iter().all(|certificate| crate::tls::security::permits_client_certificate(certificate, request.certificate_signature_schemes.iter().map(|scheme| u16::from(*scheme)), request.certificate_types.is_none())))
                 && (authorities.is_empty() || identity.issuers.as_slice().iter().any(|issuer| authorities.contains(&issuer.as_slice())))
-        }, |index| keys::client_status(&self.identities[index].chain[0], &now)).map(|index| Arc::clone(&self.identities[index].key))
+        }, |index| keys::status_with_usage(&self.identities[index].chain[0], &now, self.identities[index].usage_eligible)).map(|index| Arc::clone(&self.identities[index].key))
     }
     fn has_certs(&self) -> bool { !self.identities.is_empty() }
+}
+
+#[cfg(test)]
+mod client_usage_tests {
+    use super::*;
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_tls::{StoreFormat, StoreUse};
+
+    #[test]
+    fn rustls_reference_adapter_surfaces_new_sun_usage_admission_from_construction() {
+        let bytes = include_bytes!("../../../../../../tls/tests/fixtures/rsa1024.jks");
+        let memory = MemoryBudget::new(32 << 20);
+        let charge = memory.reserve(KeyStore::allocation_bound_with_passwords(bytes.len(), Some("12345678"), None).unwrap()).unwrap();
+        let store = KeyStore::decode(bytes, StoreFormat::Java, StoreUse::Identity, Some("12345678"), None, Arc::clone(&charge)).unwrap();
+        assert_eq!(store.identities().len(), 1);
+        let certificates = store.identities()[0].certificates();
+        let native_bound = certificates.iter().fold(65_536usize, |bytes, certificate| bytes + certificate.len() * 32);
+        let encoding_bound = certificates[0].len() + 64;
+        let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes() - native_bound - encoding_bound + 1).unwrap();
+        let retained = memory.used_bytes();
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let result = ClientKeys::new(Some(&store), &provider, Algorithm::NewSunX509, Arc::clone(&charge));
+        assert_eq!(result.unwrap_err().code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), retained);
+        drop(blocker);
+        let resolver = ClientKeys::new(Some(&store), &provider, Algorithm::NewSunX509, Arc::clone(&charge)).unwrap();
+        assert!(resolver.identities[0].usage_eligible);
+        drop(resolver); drop(store); drop(charge);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }
 enum Trust { Pkix(PkixRoots), SunX509(SimpleTrust) }
 struct ChainVerifier { roots: Trust, algorithms: WebPkiSupportedAlgorithms, verify_names: bool, _charge: Arc<MemoryReservation> }

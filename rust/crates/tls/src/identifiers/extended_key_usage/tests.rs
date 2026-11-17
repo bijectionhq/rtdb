@@ -100,3 +100,58 @@ fn eku_admission_covers_absent_unparseable_and_parsed_states_until_drop() {
     drop(parsed); assert_eq!(memory.used_bytes(), 0);
     assert_eq!(CertificateExtendedKeyUsage::decode(&[0xff], &MemoryBudget::new(0)).unwrap_err().code, "rtdb/memory-budget-exceeded");
 }
+
+#[test]
+fn client_usage_accepts_absence_any_and_client_purposes_without_server_sgc_permissions() {
+    assert!(decode(&[]).permits_client_authentication().unwrap());
+    for (oid, expected) in [(CLIENT, true), (ANY, true), (SERVER, false), (MICROSOFT_SGC, false), (NETSCAPE_SGC, false), (&[0x2a, 3, 4][..], false)] {
+        for critical in [false, true] {
+            assert_eq!(decode(&[extension(critical, &usages(&[oid]))]).permits_client_authentication().unwrap(), expected);
+            assert!(decode(&[extension(critical, &usages(&[oid, CLIENT, oid]))]).permits_client_authentication().unwrap());
+        }
+    }
+    assert!(!decode(&[extension(true, &usages(&[]))]).permits_client_authentication().unwrap());
+}
+
+#[test]
+fn client_usage_preserves_unparseable_and_parsed_duplicate_decisions_independently_of_server_usage() {
+    let bad = encoded(5, &[]);
+    assert_eq!(decode(&[extension(false, &bad)]).permits_client_authentication().unwrap_err().code, "rtdb.tls/invalid-keystore");
+    for (good, client, server) in [(usages(&[]), false, false), (usages(&[CLIENT]), true, false), (usages(&[SERVER]), false, true), (usages(&[ANY]), true, true)] {
+        for extensions in [vec![extension(false, &bad), extension(false, &good)], vec![extension(false, &good), extension(false, &bad)]] {
+            let usage = decode(&extensions);
+            assert_eq!(usage.permits_client_authentication().unwrap(), client);
+            assert_eq!(usage.permits_server_authentication().unwrap(), server);
+        }
+        for extensions in [vec![extension(false, &good), extension(false, &good)], vec![extension(false, &good), extension(true, &bad)]] {
+            assert!(CertificateExtendedKeyUsage::decode(&certificate(&extensions), &MemoryBudget::new(1 << 20)).is_err());
+        }
+    }
+}
+
+#[test]
+fn accepted_client_oid_requires_every_later_purpose_to_parse() {
+    for oid in [vec![], vec![0x80, 0], vec![0x2a, 0x80, 0], vec![0x2a, 0x81], vec![1; 4097]] {
+        let value = encoded(0x30, &[encoded(6, CLIENT), encoded(6, &oid)].concat());
+        assert!(decode(&[extension(false, &value)]).permits_client_authentication().is_err());
+        assert!(CertificateExtendedKeyUsage::decode(&certificate(&[extension(true, &value)]), &MemoryBudget::new(16 << 20)).is_err());
+    }
+    let mut large = vec![0xff; 4096]; large[4095] = 0x7f;
+    assert!(decode(&[extension(true, &usages(&[CLIENT, &large]))]).permits_client_authentication().unwrap());
+}
+
+#[test]
+fn client_usage_accepts_java_ber_framing_and_releases_its_admission() {
+    for value in [
+        [vec![0x30, 0x81, 10], encoded(6, CLIENT)].concat(),
+        [vec![0x30, 0x80], encoded(6, CLIENT), vec![0, 0]].concat(),
+    ] {
+        let memory = MemoryBudget::new(1 << 20);
+        let usage = CertificateExtendedKeyUsage::decode(&certificate(&[extension(true, &value)]), &memory).unwrap();
+        assert!(usage.permits_client_authentication().unwrap());
+        assert!(!usage.permits_server_authentication().unwrap());
+        assert!(memory.used_bytes() > 0);
+        drop(usage);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

@@ -63,18 +63,20 @@ Constraint regression sources cover Java defaults, signed integer limits, ignore
 
 `CertificateExtendedKeyUsage` is a separate passive immutable view with independent parsing admission.
 
-* The view follows `ExtendedKeyUsageExtension`, `CertificateExtensions`, `X509CertImpl.getExtendedKeyUsage` and `EndEntityChecker`.
-  Every usage OID is validated, including unrecognized purposes after an accepted server purpose.
-* Absence permits TLS server authentication.
-  Parsed lists permit `serverAuth`, `anyExtendedKeyUsage`, Microsoft SGC or Netscape SGC; an empty parsed list denies permission.
+* The view follows `ExtendedKeyUsageExtension`, `CertificateExtensions`, `X509CertImpl.getExtendedKeyUsage`, `EndEntityChecker` and `X509KeyManagerImpl.CheckType`.
+  Every usage OID is validated, including unrecognized purposes after an accepted purpose.
+* Absence permits TLS server and client authentication.
+  Server authentication accepts parsed `serverAuth`, `anyExtendedKeyUsage`, Microsoft SGC or Netscape SGC purposes.
+  Client authentication accepts parsed `clientAuth` or `anyExtendedKeyUsage` purposes.
+  An empty parsed list denies both permissions, and each decision is retained independently in the same admitted value.
 * An unparseable-only noncritical extension remains a decoded state.
-  Requesting its server-authentication decision returns a TLS-material error.
+  Requesting either authentication decision returns a TLS-material error.
 * A parsed copy wins over malformed noncritical copies in either order.
   Malformed critical copies and two parsed copies fail during decoding.
 * The view validates extension contents independently of certificate signature, validity and trust.
   Its admission remains owned through the last use of its decision state.
 
-Extended-usage regression sources cover every accepted server purpose, empty and unrelated purpose lists, malformed and duplicate copies, OID framing and size limits, BER conversion and reservation cleanup.
+Extended-usage regression sources cover every accepted client and server purpose, empty and unrelated purpose lists, malformed and duplicate copies, OID framing and size limits, BER conversion and reservation cleanup.
 
 `CertificatePublicKeyEncoding` owns the normalized SubjectPublicKeyInfo encoding used by OpenJDK 25.0.1 `X509Key`.
 It is a passive immutable view with independent memory admission.

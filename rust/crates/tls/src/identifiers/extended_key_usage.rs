@@ -4,7 +4,7 @@ use super::*;
 #[derive(Debug)]
 pub struct CertificateExtendedKeyUsage { usage: Usage, _reservation: Arc<MemoryReservation> }
 #[derive(Clone, Copy, Debug)]
-enum Usage { Absent, Parsed { server_authentication: bool }, Unparseable }
+enum Usage { Absent, Parsed { server_authentication: bool, client_authentication: bool }, Unparseable }
 
 impl CertificateExtendedKeyUsage {
     /// Reads ExtendedKeyUsage from an already decoded X.509 certificate's encoding.
@@ -21,10 +21,10 @@ impl CertificateExtendedKeyUsage {
         let mut usage = Usage::Absent;
         scan_certificate(certificate_der, |oid, critical, encoded| {
             if oid != [0x55, 0x1d, 0x25] { return Ok(()); }
-            match decode_server_authentication(&encoded) {
-                Ok(server_authentication) => {
+            match decode_authentication(&encoded) {
+                Ok((server_authentication, client_authentication)) => {
                     if matches!(usage, Usage::Parsed { .. }) { return Err(invalid("Certificate contains duplicate parsed extended-key-usage extensions")); }
-                    usage = Usage::Parsed { server_authentication };
+                    usage = Usage::Parsed { server_authentication, client_authentication };
                 }
                 Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {
                     if !matches!(usage, Usage::Parsed { .. }) { usage = Usage::Unparseable; }
@@ -44,26 +44,41 @@ impl CertificateExtendedKeyUsage {
     pub fn permits_server_authentication(&self) -> Result<bool> {
         match self.usage {
             Usage::Absent => Ok(true),
-            Usage::Parsed { server_authentication } => Ok(server_authentication),
+            Usage::Parsed { server_authentication, .. } => Ok(server_authentication),
+            Usage::Unparseable => Err(invalid("Certificate extended key usage is unparseable")),
+        }
+    }
+
+    /// Applies Java X509KeyManagerImpl's TLS client extended-usage decision.
+    ///
+    /// - Absence, anyExtendedKeyUsage and clientAuth permit client authentication.
+    /// - Other parsed lists, including server-only and SGC purposes, deny permission.
+    /// - Unparseable-only noncritical copies return a TLS-material error, following X509CertImpl.getExtendedKeyUsage.
+    pub fn permits_client_authentication(&self) -> Result<bool> {
+        match self.usage {
+            Usage::Absent => Ok(true),
+            Usage::Parsed { client_authentication, .. } => Ok(client_authentication),
             Usage::Unparseable => Err(invalid("Certificate extended key usage is unparseable")),
         }
     }
 }
 
-fn decode_server_authentication(encoded: &[u8]) -> Result<bool> {
+fn decode_authentication(encoded: &[u8]) -> Result<(bool, bool)> {
     let sequence = single(encoded, 0x30)?;
     let mut usages = Der(&sequence);
-    let mut permits = false;
+    let mut server = false;
+    let mut client = false;
     while !usages.0.is_empty() {
         let oid = usages.expect(6)?;
         valid_oid(&oid)?;
-        permits |= matches!(oid.as_ref(),
+        server |= matches!(oid.as_ref(),
             [0x55, 0x1d, 0x25, 0]
             | [0x2b, 6, 1, 5, 5, 7, 3, 1]
             | [0x2b, 6, 1, 4, 1, 0x82, 0x37, 0x0a, 3, 3]
             | [0x60, 0x86, 0x48, 1, 0x86, 0xf8, 0x42, 4, 1]);
+        client |= matches!(oid.as_ref(), [0x55, 0x1d, 0x25, 0] | [0x2b, 6, 1, 5, 5, 7, 3, 2]);
     }
-    Ok(permits)
+    Ok((server, client))
 }
 
 #[cfg(test)]

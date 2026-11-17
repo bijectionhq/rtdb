@@ -43,6 +43,10 @@ Kafka applies Java ConfigDef trimming to algorithm names; Registry HTTPS preserv
 It otherwise chooses the first valid certificate, then an expired certificate before one with incompatible client key usage or extended key usage.
 Fallback ties use requested key-type priority, then store enumeration.
 `NewSunX509` also applies the pinned Java algorithm constraints to every certificate in each candidate chain.
+Both its chain primitive gate and leaf usage ranking use the shared Java KeyUsage interpretation, including malformed noncritical copies and declared-bit masking.
+Client EKU permits only absence, `clientAuth` or `anyExtendedKeyUsage`, with malformed-only noncritical values ranked as extension mismatch.
+Extension parsing reserves memory before allocation; admission failure aborts construction or selection without returning an ineligible identity or previous fallback.
+The link:src/tls/keys/README.adoc[client identity ranking reference] describes usage decisions, ownership and remaining native key-import boundaries.
 Java JKS and PKCS12 stores under `NewSunX509` retain encrypted private keys and select using certificate metadata before recovering the chosen entry.
 An unavailable key password or malformed protected key on an unselected entry does not fail configuration.
 Ordinary recovery failure on the selected entry supplies no client certificate and does not select another alias; memory-admission failures fail the callback.

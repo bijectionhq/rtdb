@@ -112,12 +112,12 @@ impl NativeTls {
             issuer_matches.push(names::matches_issuer(std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()), &authorities, memory)?);
         }
         let required = CERT_PKEY_VALID | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
-        let selected = key_manager.choose(&types, |index, kind| {
+        let selected = key_manager.try_choose(&types, |index, kind| {
             let identity = &identities[index];
             identity.eligible && identity.kind == kind && issuer_matches[index]
                 && (!key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
                 && (key_manager.constrains_certificates() || identity.eager_compatible(ssl, required))
-        }, |index| keys::client_status(&identities[index].certificate, &now));
+        }, |index| keys::client_status(&identities[index].certificate, &now, memory))?;
         if let Some(index) = selected {
             identities[index].install(ssl, &self.random, &self.signature_random)?;
         }

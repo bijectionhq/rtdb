@@ -1,0 +1,41 @@
+= Java client identity ranking
+
+`KeyManager` is passive immutable configuration owning the selected algorithm and alias enumeration order.
+Its selection runs on the calling handshake and retains no candidate state between calls.
+`SunX509` returns the first compatible alias in requested-key-type order without consulting usage or dates.
+`NewSunX509` ranks matching aliases using OpenJDK25 `X509KeyManagerImpl.CheckType.CLIENT` before its existing expiration and key-type fallback order.
+
+The preceding client-chain primitive gate also uses the Java KeyUsage view for every certificate.
+It accepts absent or malformed noncritical usage, masks undeclared bits and requires a primitive in bits zero through six.
+Native key-size and signature-policy checks retain their existing order.
+Policy and TLS-material rejection make an identity ineligible, while admission failures abort identity construction.
+Its DER and parser reservations belong to one certificate check and release before the next check.
+
+Client extension decisions use the admitted Java `CertificateExtendedKeyUsage` and `CertificateKeyUsage` views.
+An absent EKU permits the client, while a parsed list must contain `clientAuth` or `anyExtendedKeyUsage`.
+ServerAuth and the Microsoft/Netscape SGC purposes do not authorize client authentication.
+Unparseable-only noncritical EKU yields extension mismatch, and a parsed copy wins over malformed noncritical copies in either order.
+Malformed critical values and duplicate parsed copies also yield mismatch when this ranker receives a native certificate containing them.
+Their acceptance during certificate loading remains a separate boundary.
+
+Absent or malformed noncritical KU permits the client.
+Parsed KU requires digitalSignature for RSA, DSA and EC, and keyAgreement for DH and DHX.
+RSASSA-PSS and the other native key kinds have no client KU bit requirement in this check.
+Java's declared-bit masking applies before these decisions.
+Permitted signature and agreement bits avoid native public-key import, including when KU is absent.
+Otherwise native public-key import failure yields mismatch; Java fallback keys and custom-provider algorithm naming remain separate compatibility work.
+Extension checks precede validity checks, so an expired certificate with incompatible usage receives extension mismatch.
+
+The native certificate encoding receives an independent reservation before `to_der` allocates it.
+Each shared extension view reserves its own parsing scratch and releases it when its decision is consumed.
+TLS-material parse failures become extension mismatch, while budget failures propagate through `try_choose` and terminate selection without choosing a previous fallback or visiting later identities.
+Kafka and production Schema Registry connections share this `NativeTls::select` path.
+The native certificate callback reports selection failure to the TLS handshake as a fatal callback result.
+It does not transport the original typed anomaly across the native handshake boundary.
+
+The Rustls Registry adapter is compiled only for tests.
+Its fallible constructor precomputes one immutable `usage_eligible` value for each `ClientIdentity`, with `true` for the SunX509 bypass.
+This adapter reports admission failure during construction because its certificate resolver returns an optional key without an error channel.
+It checks current validity during resolution, and its eager usage admission is distinct from production's lazy candidate evaluation.
+
+Regression sources retain the previous alias-order and fallback assertions and cover Java malformed-copy precedence, EKU purposes, BER framing, declared KU bits, native key algorithms, absent usage with unimportable keys, memory admission and failure-stop behavior.
