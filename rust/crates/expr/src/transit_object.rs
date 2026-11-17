@@ -136,6 +136,23 @@ impl Object {
     fn sequence(&self) -> Option<&[Self]> { if matches!(self,Self::Null) { Some(&[]) } else { self.list() } }
     fn truthy(&self) -> bool { !matches!(self,Self::Null | Self::Bool(false)) }
     fn entries(&self) -> Option<Entries<'_>> { match self { Self::Map(map) => Some(map.entries()),Self::TxKey(record) => Some(record.entries()),_ => None } }
+    fn destructure_map(self) -> Result<Self> {
+        Ok(match self {
+            Self::List(mut values) => match values.len() {
+                0 => Self::Map(Map::new()),1 => values.pop().unwrap(),_ => Self::Map(Map::from_flat_sequence(values)?),
+            },
+            value => value,
+        })
+    }
+    fn lookup_keyword(&self,name: &str) -> Result<Self> {
+        let key = Self::Keyword(name.into());
+        Ok(match self {
+            Self::Map(map) => map.get(&key)?.cloned().unwrap_or(Self::Null),
+            Self::TxKey(record) => record.get(&key)?.cloned().unwrap_or(Self::Null),
+            Self::Set(set) => if set.get(&key)?.is_some() { key } else { Self::Null },
+            _ => Self::Null,
+        })
+    }
     fn assoc_keyword(&mut self,name: &str,value: Self) -> Result<()> {
         match self { Self::Map(map) => map.assoc(Self::Keyword(name.into()),value),Self::TxKey(record) => record.assoc_keyword(name,value),_ => Err(invalid()) }
     }
