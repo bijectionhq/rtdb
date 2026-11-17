@@ -6,6 +6,7 @@ mod storage;
 mod dfa;
 mod closure;
 mod runtime;
+mod adaptive;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};

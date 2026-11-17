@@ -269,7 +269,7 @@ Under the internal stable-producer and nonescaping-capability premise, complete 
 Actual internal ordinary successors are fresh except for unchanged skipped stop identities, and cold precedence filtering runs before ordinary publication.
 The actual SLL context producers exclude escaping one-entry Arrays and traversable null parents, so optimization preserves their class-sensitive equality and hash.
 The generic one-entry Array reconstruction, mutable alias, stale hash and conflict-identity regressions remain valid and unchanged.
-This premise does not authorize a generic mutable JVM cache surface or implement adaptive prediction.
+This premise applies to the private start and Local edge paths described below.
 
 == Embedded parser cause capability gate
 
@@ -287,8 +287,8 @@ No public cause behavior is removed or waived by this slice.
 
 == Remaining parser work
 
-The private Full producer and runtime are described below.
-Adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+The private runtime, Full producer and adaptive DFA paths are described below.
+The adaptive execution loops, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
@@ -368,8 +368,8 @@ Collection follows round/facade destruction and traverses actual C3 maps, starts
 Source assertions are selected explicitly rather than inferred from a Rust build profile.
 Reached checks retain the RuleStop-Empty and MIN_VALUE-before-pop/falloff sites as owned inline no-message `AssertionError` facts for the future diagnostic owner.
 Disabled checks retain Java wrapping arithmetic without an artificial depth cap.
-No-reach `None` is a producer fact; later adaptive control constructs the actual no-viable exception at its source location.
-The private runtime and Full producer described below extend this local kernel; adaptive control, generated schedules and diagnostic adapters remain mandatory successors.
+No-reach `None` lets the adaptive target path publish an ERROR edge.
+The future adaptive execution loop constructs the actual no-viable exception at its source location.
 The OPEN `embedded-parser-error-capability` gate still blocks production adoption and compatibility closure; wire projection does not discharge the embedded cause/recognizer/config/DFA obligation.
 Compiler and runtime qualification remain unrun.
 
@@ -421,8 +421,7 @@ No Drop retry, error clone, `Ok(Err)` channel or raw cache capability escape is 
 `ClosureRound` transitions terminally from Local to Full while retaining the same merge round and its exact Absent/Present history.
 Every Local owning method checks phase before shortcut, memo, cache binding or allocation.
 Full start is single-entry; first Full reach activates the existing memo before intermediate admission.
-Private `parts` and generic keys remain a closed-controller discipline boundary: later adaptive code must exclude nested/reset rounds, arbitrary cached alias mutation and Local publication after Full.
-Brands alone do not prove that call-graph condition.
+Private `parts` and generic keys require a closed call graph that excludes nested/reset rounds, arbitrary cached alias mutation and Local publication after Full.
 
 Local and Full policies select one iterative closure and epsilon kernel.
 Full start converts the actual current primary parent path through existing `from_invocations`, then creates fresh packed-zero Unpredicated configurations in source alternative order.
@@ -441,6 +440,44 @@ This does not claim JVM Empty identity hashes, collision/tree layout or Java hea
 Existing collector traversal reaches actual C3 roots and their current configuration contexts; unrooted Full work is swept by the same guard.
 
 The embedded cause/recognizer/config/DFA capability gate remains OPEN and distinct from wire results.
-The actual adaptive controller, all176 generated schedules, tree/labels/listeners, full reset/error strategy, diagnostics and production adapters remain required.
-No declared operation substitutes a placeholder for those successors.
-Source review of this private precursor does not authorize Phase2, production adoption or compiler/runtime qualification.
+All 176 generated schedules, trees, labels, listeners, the full reset/error strategy, diagnostics and production adapters remain required.
+
+== Private adaptive DFA paths
+
+Start and target operations run inside the existing `ParserSession` prediction callback, using its bound input, DFA access and closure round.
+Both check live input and Local phase before looking up cached state.
+Warm lookup returns the actual cached start or edge target without creating a configuration set, activating the memo, classifying the target or touching the token stream.
+The ordinary start is a single field, and precedence starts are indexed by the actual signed stack top.
+A cold precedence start installs the unfiltered Local start set on the synthetic state before applying the filter.
+Cold starts draft and intern the finished set, then publish the returned canonical state as the start.
+A negative precedence leaves the synthetic start edge absent and can reuse an interned state from a prior call.
+A failure during start-edge publication retains the synthetic prefilter and any completed ordinary interning.
+
+On a missed edge, the driver binds the previous interned state to the same Local round and runs reach for the supplied token type.
+An empty reach publishes the real ERROR edge.
+A nonempty reach admits a draft before checking unique alternative and then the mode-specific terminating-conflict heuristic.
+Unique metadata is written before predication.
+A terminating conflict recomputes subsets on the original reach, including when the heuristic used stripped semantic copies or returned immediately for all stops.
+The original union becomes a new configuration-set conflict object, and its smallest alternative supplies the plain prediction.
+Only an accepting state with `hasSemanticContext` reaches predication.
+For each selected alternative, accumulation starts absent and follows configuration occurrence order.
+An encountered unpredicated configuration absorbs every other semantic context for its alternative.
+Predicate pairs are retained in alternative order, including selected alternatives whose pair is unpredicated, if at least one real predicate remains.
+When no predicate remains, acceptance retains the smallest selected alternative as its plain prediction.
+Transient predicate scratch is admitted only at that preparation site and bounded by the selected decision's transition count.
+The completed draft is interned before edge publication, and the edge stores the actual representative returned by interning.
+Cache population uses the selected SLL or LL heuristic at the miss, and the same retained cache supplies subsequent lookups in either mode.
+
+Local reach copies every consuming successor.
+Its only input aliases in the output are skipped EOF stops added after all fresh output entries.
+If a previously inserted fresh stop shares their membership triple, it receives the merge.
+Otherwise each skipped triple contributes a single configuration identity with possible repeated occurrences from the source, and repeated insertion of that identity leaves its configuration unchanged.
+Skipped stop contexts are canonical Empty, which remains identical through ordinary interning.
+The cold precedence filter can share or merge original objects with the current synthetic prefilter before any ordinary publication.
+Subsequent cold starts use newly produced objects, and the classifier's semantic stripping copies configurations.
+The private production path therefore preserves each previously interned configuration's values and set hash across later start, reach and classification work.
+This proof depends on ordinary rows originating at the bounded Local producer and on use through the existing exclusive access.
+
+The adaptive execution loops, predicate evaluation, Full dispatch and report, no-viable construction and error localization remain open.
+The production host and cache mapping and the embedded cause capability gate remain open.
+Compiler and runtime qualification remain part of Phase 2.

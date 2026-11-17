@@ -186,7 +186,7 @@ impl<'call, 'round, 'cfg, 'id, 'g, 'scope, M: StoreMemory> ClosureRound<'call, '
         self.finish(result)
     }
     pub(super) fn abort(&mut self) { let _ = self.finish::<()>(Err(PredictionError::Aborted)); }
-    fn enter_local(&mut self) -> Result<()> {
+    pub(super) fn enter_local(&mut self) -> Result<()> {
         self.enter()?;
         let result = if self.phase == ClosurePhase::Local { Ok(()) } else { Err(PredictionError::Artifact(Problem::ClosurePhase)) };
         self.finish(result)
