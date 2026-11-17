@@ -305,6 +305,9 @@ impl Context<'_> {
     }
 
     fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
+        let wildcard = [ast::SelectItem::Wildcard(Default::default())];
+        let from_first = matches!(&select.select_token.0.token, sqlparser::tokenizer::Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("FROM"));
+        let projection = if from_first && select.projection.is_empty() { &wildcard[..] } else { &select.projection };
         if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension")); }
         let mut input = Arc::new(Relation::unit());
         for (index, table) in select.from.iter().enumerate() {
@@ -317,7 +320,7 @@ impl Context<'_> {
         if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
         let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
         let mut aggregate_calls = Vec::new();
-        for item in &select.projection {
+        for item in projection {
             if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; crate::expression::aggregate_notices(expr, &mut self.notices); }
         }
         if let Some(having) = &select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
@@ -325,7 +328,7 @@ impl Context<'_> {
         if !groups.is_empty() || !aggregate_calls.is_empty() {
             let mut named_groups = Vec::new();
             for (index, group) in groups.iter().enumerate() {
-                let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
+                let group = ordinal_projection(group, projection)?.unwrap_or(group);
                 let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
                 let qualifier = match &expr { Expr::Column { id, .. } => input.schema().get(*id).and_then(|field| field.qualifier.clone()), _ => None };
                 let mut field = self.binder.field(expression_name(group, index), None, expr.data_type())?;
@@ -344,7 +347,7 @@ impl Context<'_> {
         }
         if let Some(having) = &select.having { let predicate = self.relational_expr(having, &mut input, &replacements)?; input = Arc::new(input.filter(predicate)?); }
         let mut windows = Vec::new();
-        for item in &select.projection {
+        for item in projection {
             if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
         }
         if windows.len() > 1 { return Err(unsupported("Only one window function per SELECT is supported")); }
@@ -354,7 +357,7 @@ impl Context<'_> {
             replacements.insert(ReplacementKey::Expression(key), field);
         }
         let mut projected = Vec::new();
-        for (index, item) in select.projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
+        for (index, item) in projection.iter().filter(|item| !matches!(item, ast::SelectItem::Wildcard(_))).enumerate() {
             match item {
                 ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } => {
                     let expression = self.relational_expr(expr, &mut input, &replacements)?;
@@ -369,9 +372,9 @@ impl Context<'_> {
                 _ => return Err(unsupported("Projection shape")),
             }
         }
-        let wildcards = select.projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
+        let wildcards = projection.iter().enumerate().filter_map(|(index, item)| match item { ast::SelectItem::Wildcard(options) => Some((index, options)), _ => None }).collect::<Vec<_>>();
         if let Some((index, options)) = wildcards.first() {
-            if wildcards.len() != 1 || (*index != 0 && *index + 1 != select.projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
+            if wildcards.len() != 1 || (*index != 0 && *index + 1 != projection.len()) { return Err(error("Unqualified wildcard must occur once, at the beginning or end of the projection")); }
             let explicit_names = projected.iter().map(|projection| projection.field.name.clone()).collect::<BTreeSet<_>>();
             let mut expanded = self.wildcard(input.schema(), None, options, &explicit_names)?;
             expanded.extend(projected);
@@ -393,7 +396,7 @@ impl Context<'_> {
             input = Arc::new(input.project(retained)?);
             let mut order_replacements = replacements.clone();
             for group in groups {
-                let group = ordinal_projection(group, &select.projection)?.unwrap_or(group);
+                let group = ordinal_projection(group, projection)?.unwrap_or(group);
                 if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&ReplacementKey::Expression(group.to_string())); }
             }
             let mut order = Vec::new();
@@ -622,7 +625,7 @@ impl Context<'_> {
         element.unnamed = true;
         let ordinality = if with_ordinality {
             let name = self.symbol("_ordinal")?;
-            let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I64))?;
+            let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I32))?;
             field.unnamed = true;
             Some(field)
         } else { None };

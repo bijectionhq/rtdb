@@ -56,11 +56,13 @@ async fn lateral_derived_table_and_join_lateral_preserve_original_query_forms() 
 
 #[tokio::test]
 async fn select_star_lateral_join_and_lateral_with_unnest_4009_keep_aliases_and_arrays() {
+    assert_eq!(query("FROM UNNEST(ARRAY[1,2]) AS u(v)", vec![]).await.unwrap(), vec![vec![Value::I64(1)], vec![Value::I64(2)]]);
+    assert_eq!(query("SELECT FROM (VALUES (1),(2)) AS t(v)", vec![]).await.unwrap(), vec![vec![],vec![]]);
     assert_eq!(query("SELECT * FROM (SELECT y.b FROM y) AS x (x_b), LATERAL (SELECT y.b AS z_b, x_b FROM y) AS z (z_b, outer_b)", vec![]).await.unwrap(), vec![vec![Value::Utf8("one".into()), Value::Utf8("one".into()), Value::Utf8("one".into())]]);
     let array = Value::List(vec![Value::I64(1), Value::I64(2), Value::I64(3)]);
     assert_eq!(query("SELECT * FROM nested_table nt, LATERAL (SELECT nt.nest) t(a)", vec![]).await.unwrap(), vec![vec![Value::I64(1), array.clone(), array.clone()]]);
     assert_eq!(query("SELECT * FROM nested_table nt, LATERAL (FROM UNNEST(nt.nest) AS foo(id)) t(a)", vec![]).await.unwrap(), (1..=3).map(|id| vec![Value::I64(1), array.clone(), Value::I64(id)]).collect::<Vec<_>>());
-    assert_eq!(query("SELECT nt._id, value, ordinal FROM nested_table nt, UNNEST(nt.nest) WITH ORDINALITY AS items(value, ordinal)", vec![]).await.unwrap(), (1..=3).map(|id| vec![Value::I64(1), Value::I64(id), Value::I64(id)]).collect::<Vec<_>>());
+    assert_eq!(query("SELECT nt._id, value, ordinal FROM nested_table nt, UNNEST(nt.nest) WITH ORDINALITY AS items(value, ordinal)", vec![]).await.unwrap(), (1..=3).map(|id| vec![Value::I64(1), Value::I64(id), Value::I32(id as i32)]).collect::<Vec<_>>());
 }
 
 #[tokio::test]

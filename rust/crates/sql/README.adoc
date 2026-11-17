@@ -360,9 +360,13 @@ Series table forms require a table alias and accept an optional single column na
 Their arguments bind against the preceding FROM scope, permitting correlated series for each preceding row.
 Unnamed table fields retain internal binding identities; wildcard projections assign `_column_1`, `_column_2` and subsequent labels within that wildcard expansion.
 UNNEST uses the same table-column naming contract.
-Integer series table iteration retains a constant-size reader and copies only requested rows, including when a LIMIT stops a large range early.
+FROM-first queries with an omitted projection expand the visible wildcard; an explicit empty SELECT projection retains zero-column rows.
+WITH ORDINALITY declares signed 32-bit positions, matching the expansion operator.
+Integer series retain a constant-size input reader.
+UNNEST expands the complete semantic input page before a downstream LIMIT slices the result.
+The query budget admits that complete expansion before publishing any rows.
 Temporal series retain eager construction.
-The series regressions include unnamed and named projection schemas, lateral arguments, ordinality and a limited read from a signed 32-bit maximum-length range.
+The series regressions include unnamed and named projection schemas, lateral arguments, ordinality and bounded admission failure for a signed 32-bit maximum-length expansion.
 
 URI literals validate during binding, and casts from text validate when their value is consumed.
 The seven dedicated URI component functions accept one URI argument and return null for an absent component.
