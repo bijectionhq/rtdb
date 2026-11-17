@@ -108,12 +108,46 @@ Main hash names are not restricted to that allowlist.
 OAEP's pSource must be PSpecified with present non-NULL parameters containing primitive or constructed OCTET STRING data.
 An empty label is accepted.
 
+== PBES2 parameter names
+
+A nested PBES2 AlgorithmIdentifier selects the general SunJCE PBES2 parameter service before initialization.
+Successful initialization derives one of fourteen names of the form `PBEWith<PRF>AndAES_<bits>`.
+The PRFs are HmacSHA1, HmacSHA224, HmacSHA256, HmacSHA384, HmacSHA512, HmacSHA512/224, and HmacSHA512/256; the AES sizes are 128 and 256.
+AES-192 is rejected by this parameter service.
+The initialized names have no reverse OID in the pinned KnownOIDs registry or default provider alias lookup.
+A CRT key therefore retains valid PBES2 parameters, while non-CRT PSS reconstruction fails if its final hash name is an initialized PBES2 name.
+Absent and NULL PBES2 parameters retain the ordinary PBES2 name and OID.
+A PSS or OAEP main hash containing a PBES2 descendant keeps the ancestor service's own name after the descendant validates.
+Initialized PBES2 names are not admitted MGF digest names.
+
+`DigestName` is a passive value distinguishing an OID-backed name from a typed initialized PBES2 name.
+The PBES2 `Name` enum represents exactly the fourteen derived names, while `Prf` and `Aes` are call-local passive selections.
+Only the outer PSS result retains its resolved hash name.
+The encoded parameter bytes remain owned by the existing AlgorithmIdentifier and key buffers.
+No salt, IV, iteration count, key length, or PBES2 parsing state escapes the validation call.
+
+The parameter service requires an outer SEQUENCE, PBKDF2's OID and a SEQUENCE of PBKDF2 parameters.
+Salt is a primitive OCTET STRING of any length, including zero.
+Iteration count and an optional key-length INTEGER accept the full signed 32-bit range, including zero and negative values.
+Key length is parsed before being overwritten by the selected AES size and imposes no further constraint.
+An optional PRF is selected only by an immediate SEQUENCE tag; otherwise HmacSHA1 is retained.
+Its contents require one admitted Hmac OID and optionally one NULL-tagged value of any content length, followed by end of input.
+The encryption value's outer tag is not checked, and its IV must be a primitive OCTET STRING of any length.
+These are parameter-admission rules; cipher initialization has separate salt, count, key, and IV constraints.
+
+Unconsumed PBKDF2, KDF, encryption, and outer sequence tails are ignored.
+An optional field whose tag matches is parsed and can fail, while an unmatched trailing tag is left unread.
+A historical wrapper whose first value has OID tag six skips that value and treats the next value as the real PBES2 parameter sequence.
+The skipped OID's contents are not validated or required to identify PBES2.
+The real parameter value still requires a SEQUENCE after its KDF is parsed.
+The historical wrapper's remaining tail is ignored.
+
 == Admission and remaining source work
 
 Decode reserves `384 * input_bytes + 65,536` before parsing, with checked arithmetic.
 The source estimate allocates `128 * input_bytes` to the existing normalized PKCS8 and algorithm owners, provider views, encoded fragments, final output, and one active Java BER conversion.
 On a 64-bit target, the converter's section payload is at most 40 bytes per section, with each section requiring at least two input bytes; old and replacement vector capacities can overlap during growth.
-RSA component collections have eight members, optional PKCS8 fields have at most two members, and only the outer PSS result retains its last digest, MGF digest, and salt values.
+RSA component collections have eight members, optional PKCS8 fields have at most two members, and only the outer PSS result retains its last resolved hash name, MGF digest, and salt values.
 
 Nested PSS and OAEP services use a passive iterative evaluator on the caller's task.
 Its `Frame` values are call-local transients: a field continuation owns only its compact undecoded sibling suffix and parsing position, while an MGF continuation owns an OID and its allowlist choice.
@@ -128,6 +162,10 @@ A compile-time assertion bounds its payload to 64 bytes on the target.
 Allowing old and replacement vector capacities during growth, frame storage is bounded by `96 * input_bytes` in the source estimate.
 An additional `32 * input_bytes` covers simultaneous frontier, suffix-copy, OID, and shallow parameter-encoding buffers, including BER-normalized views.
 The remaining `128 * input_bytes` is margin for normalization expansion and overlap between those categories.
+PBES2 adds a bounded number of DER views and normalized temporary owners, without another growing collection or traversal stack.
+Its deepest path retains at most the parameter, historical wrapper, KDF, PBKDF2, and PRF views; each owned BER view is bounded by the containing input.
+Those views fit within the existing frontier-copy and normalization allowances, and `Frame` keeps its existing size and compile-time bound.
+The retained derived name is a fixed-size enum.
 There is no fixed nesting-depth limit.
 Repeated suffix copying and BER conversion can take quadratic time for adversarially nested inputs, while simultaneously owned byte storage remains linear.
 The fixed allowance covers small owner/control allocations and bounded OID representations.
@@ -136,13 +174,13 @@ Temporary owners drop before the reservation shrinks to retained encoded capacit
 Malformed data, unsupported factories, unsupported nested parameters, and budget exhaustion release their reservations.
 
 Nested PSS hash identifiers can select arbitrary AlgorithmParameters services.
-This decoder validates nested PSS, OAEP, DSA, DH, EC, AES, DESede, Blowfish, ChaCha20-Poly1305, and legacy PBE parameters for the six services above.
+This decoder validates nested PSS, OAEP, PBES2, DSA, DH, EC, AES, DESede, Blowfish, ChaCha20-Poly1305, and legacy PBE parameters for the six services above.
 It preserves parameters for identifiers without a registered service.
-The PBES2 parameter service currently returns an explicit unsupported-parameters error.
-The parameter-dependent `SpecifiedSHA2withECDSA` name is also unsupported in that nested position.
+The parameter-dependent `SpecifiedSHA2withECDSA` name remains unsupported in that nested position.
 Successful factory admission does not establish native TLS import, signing, key/certificate consistency, or cryptographic validity.
 
 Regression sources cover PKCS8 fields and BER framing, provider aliases, RSA range and CRT fallback behavior, PSS defaults and errors, signed DSA/DH values and retained tails, all registered EC curves, nested EC public bits, XDH/EdDSA scalar lengths, named post-quantum acceptance, HSS rejection, and reservation lifetime.
 Nested IV regressions cover encoded-length boundaries, primitive versus constructed OCTET acceptance, BER forms, malformed components, absent and NULL parameters, CRT retention, non-CRT regeneration, cipher-specific OIDs, and admission release.
 Legacy PBE regressions cover all six services, arbitrary salt lengths, signed iteration boundaries and padding, primitive-only salt, complete sequence consumption, BER framing, absent and NULL parameters, CRT retention, non-CRT regeneration, unregistered nearby OIDs, and reservation release.
 Recursive parameter regressions cover defaults, outer and context tags, ordering, duplicate and tail handling, PSS preframing, MGF allowlists, pSource labels, child initialization order, fixed-service descendants, BER views, CRT retention, non-CRT name-only reconstruction, deep alternating nesting, and admission cleanup.
+PBES2 regressions cover all fourteen derived names, signed counts and key lengths, salt and IV shapes, PRF and cipher restrictions, selective tails, historical wrappers, BER retention, nested descendants, duplicate hash names, non-CRT reverse-name failure, initialization ordering, and reservation cleanup.

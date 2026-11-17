@@ -3,7 +3,9 @@ use super::*;
 const SHA1: &[u8] = &[0x2b, 0x0e, 3, 2, 26];
 const MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 8];
 
-pub(super) struct Pss { digest: Zeroizing<Vec<u8>>, mgf_digest: Zeroizing<Vec<u8>>, salt: i32 }
+enum DigestName { Oid(Zeroizing<Vec<u8>>), Pbes2(pbes2::Name) }
+
+pub(super) struct Pss { digest: DigestName, mgf_digest: Zeroizing<Vec<u8>>, salt: i32 }
 
 pub(super) fn validate(algorithm: &Algorithm, family: Family) -> Result<Option<Pss>> {
     let parameter = parameter(algorithm)?;
@@ -36,6 +38,7 @@ fn curve(bytes: &[u8]) -> Result<()> {
     if curves::CURVES.iter().any(|(_, candidate)| *candidate == &*oid) { Ok(()) } else { Err(malformed()) }
 }
 
+mod pbes2;
 mod recursive;
 
 fn pss(bytes: &[u8]) -> Result<Pss> { recursive::pss(bytes) }
@@ -50,8 +53,7 @@ fn fixed_service(oid: &[u8], parameter: &[u8]) -> Result<()> {
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3]
             | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6] => legacy_pbe(parameter)?,
-        [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3]
-            | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13] => return Err(unsupported()),
+        [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(unsupported()),
         _ => {},
     }
     Ok(())
@@ -86,7 +88,7 @@ fn is_mgf_digest(oid: &[u8]) -> bool { matches!(oid, SHA1 | [0x60, 0x86, 0x48, 1
 impl Pss {
     pub(super) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {
         let mut fields = Vec::with_capacity(3);
-        let digest = canonical_oid(&self.digest)?;
+        let digest = match &self.digest { DigestName::Oid(oid) => canonical_oid(oid)?, DigestName::Pbes2(name) => name.reencoding_oid()? };
         if digest != SHA1 { fields.push(encode(0xa0, &make_algorithm(digest, None)?.encoded)); }
         if self.mgf_digest.as_slice() != SHA1 {
             let digest = make_algorithm(&self.mgf_digest, None)?;

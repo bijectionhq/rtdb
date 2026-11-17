@@ -17,7 +17,7 @@ const _: () = assert!(std::mem::size_of::<Frame>() <= 64);
 struct Identifier { oid: Zeroizing<Vec<u8>>, parameter: Option<Zeroizing<Vec<u8>>> }
 
 pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
-    let mut result = Pss { digest: Zeroizing::new(SHA1.to_vec()), mgf_digest: Zeroizing::new(SHA1.to_vec()), salt: 20 };
+    let mut result = Pss { digest: DigestName::Oid(Zeroizing::new(SHA1.to_vec())), mgf_digest: Zeroizing::new(SHA1.to_vec()), salt: 20 };
     let mut frames = vec![fields(bytes, Fields::Pss, true)?];
     while let Some(frame) = frames.pop() {
         match frame {
@@ -44,8 +44,8 @@ pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
                 match tag {
                     0x80 => {
                         let algorithm = identifier(value)?;
-                        if root { result.digest = Zeroizing::new(algorithm.oid.to_vec()); }
-                        schedule(algorithm, &mut frames)?;
+                        let name = schedule(algorithm, &mut frames)?;
+                        if root { result.digest = name; }
                     }
                     0x81 => {
                         let algorithm = identifier(value)?;
@@ -120,13 +120,14 @@ fn identifier(value: secret_der::Value<'_>) -> Result<Identifier> {
     Ok(Identifier { oid, parameter })
 }
 
-fn schedule(algorithm: Identifier, frames: &mut Vec<Frame>) -> Result<()> {
+fn schedule(algorithm: Identifier, frames: &mut Vec<Frame>) -> Result<DigestName> {
     if let Some(parameter) = algorithm.parameter {
         match algorithm.oid.as_slice() {
             PSS => frames.push(fields(&parameter, Fields::Pss, false)?),
             OAEP => frames.push(fields(&parameter, Fields::Oaep { next: 0 }, false)?),
+            pbes2::OID => return pbes2::decode(&parameter).map(DigestName::Pbes2),
             oid => fixed_service(oid, &parameter)?,
         }
     }
-    Ok(())
+    Ok(DigestName::Oid(algorithm.oid))
 }

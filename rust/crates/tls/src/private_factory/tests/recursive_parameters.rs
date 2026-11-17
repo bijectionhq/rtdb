@@ -2,7 +2,7 @@ use super::*;
 
 const OAEP: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7];
 const P_SPECIFIED: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 9];
-const PBES2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13];
+const SPECIFIED_SHA2: &[u8] = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3];
 const SHA256: &[u8] = &[0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1];
 
 fn nested_key(oid: &[u8], parameter: &[u8]) -> Vec<u8> {
@@ -140,8 +140,8 @@ fn recursive_pss_oaep_validate_inner_identifier_cardinality_and_all_fixed_servic
 
 #[test]
 fn recursive_parameter_initialization_precedes_mgf_and_psource_oid_rejection() {
-    for field in [mgf(PBES2, &der(0x30, &[])), der(0xa1, &algorithm(PBES2, &der(0x30, &[]))),
-        der(0xa2, &algorithm(PBES2, &der(0x30, &[])))] {
+    for field in [mgf(SPECIFIED_SHA2, &der(0x30, &[])), der(0xa1, &algorithm(SPECIFIED_SHA2, &der(0x30, &[]))),
+        der(0xa2, &algorithm(SPECIFIED_SHA2, &der(0x30, &[])))] {
         let error = decode(&nested_key(OAEP, &pss(&[field]))).err().unwrap();
         assert!(error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
     }
@@ -149,12 +149,12 @@ fn recursive_parameter_initialization_precedes_mgf_and_psource_oid_rejection() {
 
 #[test]
 fn pss_preframes_all_fields_but_oaep_initializes_each_field_before_reading_the_next() {
-    let content = [hash(PBES2, &der(0x30, &[])), vec![0xff]].concat();
+    let content = [hash(SPECIFIED_SHA2, &der(0x30, &[])), vec![0xff]].concat();
     let pss_error = decode(&nested_key(PSS, &der(0x30, &content))).err().unwrap();
     assert!(!pss_error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
     let oaep_error = decode(&nested_key(OAEP, &der(0x30, &content))).err().unwrap();
     assert!(oaep_error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
-    let nonexact = der(0xa0, &[algorithm(PBES2, &der(0x30, &[])), der(5, &[])].concat());
+    let nonexact = der(0xa0, &[algorithm(SPECIFIED_SHA2, &der(0x30, &[])), der(5, &[])].concat());
     assert!(!decode(&nested_key(OAEP, &pss(&[nonexact]))).err().unwrap().to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
 }
 
