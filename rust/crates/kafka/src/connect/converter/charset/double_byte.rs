@@ -54,18 +54,22 @@ mod tests {
 
     #[test]
     fn registered_names_borrow_complete_static_mapping_rows() {
-        assert_eq!(tables::TABLES.len(), 2);
-        assert_eq!(aliases::ALIASES.len(), 10);
+        assert_eq!(tables::TABLES.len(), 20);
+        assert_eq!(aliases::ALIASES.len(), 100);
         for pair in aliases::ALIASES.windows(2) { assert!(pair[0].0 < pair[1].0); }
         for &(name, index) in aliases::ALIASES {
             assert!(std::ptr::eq(lookup(name).unwrap(), &tables::TABLES[index]));
+        }
+        for name in ["shift_jis", "windows-31j"] {
+            for byte in 0u8..128 { assert_eq!(lookup(name).unwrap().single(byte), u16::from(byte)); }
         }
         for table in tables::TABLES {
             let width = usize::from(table.0[1] - table.0[0]) + 1;
             assert_eq!((table.0.len() - 1026) % (width * 2), 0);
             let row_count = (table.0.len() - 1026) / (width * 2);
+            assert!(table.0[0] > 0);
+            assert_eq!(table.single(0), 0);
             for byte in 0u8..=255 {
-                if byte < 128 { assert_eq!(table.single(byte), u16::from(byte)); }
                 if let Some(row) = table.row(byte) { assert!(row < row_count); }
             }
         }
