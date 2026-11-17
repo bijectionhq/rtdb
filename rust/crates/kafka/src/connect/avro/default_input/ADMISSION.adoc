@@ -27,6 +27,7 @@ Absent fields and empty arrays do not demand their child schema.
 
 Prepared field-object record selection scrubs the destination lookup name but retains the selected raw child's physical schema.
 Repeated destinations can borrow the same child, and present JSON null remains distinct from a missing map key.
+Prepared array element selection also retains the demanded child's physical source schema without constructing an intermediate collection.
 The future default materializer applies the child default only on absence and must feed that selected default through the source conversion rules rather than assuming a logical native Value can always be cloned unchanged.
 JsonNode selection uses exact raw field names and preserves missing versus explicit null without invoking scrubbed lookup or child-default fallback.
 

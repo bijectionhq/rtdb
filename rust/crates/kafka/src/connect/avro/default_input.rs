@@ -103,6 +103,11 @@ impl<'a> FieldObject<'a> {
         };
         Ok(Some(Self {value,schema,names:self.names}))
     }
+    pub(super) fn element(self, index: usize) -> Result<Option<Self>> {
+        let Some(value)=self.value.as_array().and_then(|values| values.get(index)) else { return Ok(None); };
+        let schema=match prepared_schema(self.schema,self.names)? { None => None,Some(Schema::Array(array)) => Some(array.items.as_ref()),_ => return Err(error("avro-schema", "Prepared array default has a nonarray source schema")) };
+        Ok(Some(Self {value,schema,names:self.names}))
+    }
     pub(super) fn raw(self) -> &'a DefaultJson { self.value }
 }
 impl<'a> JsonNode<'a> {

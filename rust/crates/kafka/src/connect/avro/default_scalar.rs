@@ -222,6 +222,10 @@ fn scale_value(text: &str) -> Option<i32> {
     Some(if negative { -magnitude } else { magnitude } as i32)
 }
 
+pub(in crate::connect::avro) fn validate_string_class(destination: SchemaView<'_>, logical_name: Option<&str>) -> DefaultAttempt<()> {
+    PreparedScalar { value: PreparedValue::Text(Text::Borrowed("")) }.validate_destination(destination, logical_name)
+}
+
 impl PreparedScalar<'_> {
     pub(in crate::connect::avro) fn is_missing(&self) -> bool { matches!(self.value, PreparedValue::Missing) }
     pub(in crate::connect::avro) fn is_null(&self) -> bool { matches!(self.value, PreparedValue::Null) }

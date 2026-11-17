@@ -1,0 +1,76 @@
+= Admitted borrowed default containers
+
+The default materializer is an inactive prerequisite with no production callers.
+Its supported container domain is records, arrays and required-String-key maps over prepared FieldObject, actual JsonNode and existing native defaults.
+Structured union selection, arbitrary-key MapEntry conversion, cross-kind JsonNode containers and Struct schema-object provenance remain explicit integration obligations.
+An unsupported boundary is an outer native Result, rather than a source DataException eligible for default suppression.
+Production Java policy activation requires the complete domain and all existing source observations to be reconciled.
+
+== Objects and ownership
+
+ScalarInput is a passive borrowed value with three explicit origins.
+Walk is a passive caller-local single-writer transient containing checked allocation counters and borrowed source/schema/admission references.
+Converted is a passive call-local result containing an optional materialized Value and the output-class validation result for the caller's actual validation stage.
+No callback, source borrow, lookup table or output cache escapes the call.
+The caller retains every admission lease while its returned default lives.
+Each later graph/view/cache clone needs separate admission and a lease retained by the actual graph or AvroPlan owner.
+Retaining a temporary ConversionContext or only the base schema reservation does not cover a cached amplified default.
+
+== Demand and admission
+
+The same const-generic traversal performs Measure and Materialize.
+Measure constructs no Value output tree or payload clone.
+It counts selected destination demands, including repeated selections of one raw source and native fallback defaults.
+All addition and multiplication checks overflow before allocation.
+A remaining ceiling bounds the walk before output construction, while the final admission callback remains authoritative.
+Depth greater than 128 is an outer native resource failure.
+
+Each scalar delegates to the borrowed scalar preparer's checked bound before materialization.
+Each container counts a Value header and exact requested array/entry slots.
+A Struct field counts its name bytes, 16 times the pair-slot width and 256 bytes for BTree node overhead.
+String-map replay admits 8192 bytes per input entry plus 4096 bytes before allocating borrowed-key, validation or replay vectors.
+That allowance covers the existing native Java HashMap replay's table/tree/resizing scratch and both auxiliary vectors.
+Measure subtracts first-pass scratch from the remaining ceiling and includes another full scratch allowance in the final output demand.
+The first-pass scratch lease remains live during Materialize, where the final reservation covers the second pass's scratch and output together.
+The original source/default owner also remains live through construction.
+Invalid semantic results never suppress a native admission, overflow or traversal failure.
+
+== Conversion and validation order
+
+FieldObject preparation has already traversed the complete source object before destination demand.
+Record conversion selects the scrubbed destination name and keeps the selected raw child's physical schema.
+An absent key uses the existing child default through ordinary conversion; present null does not use that fallback.
+Native Byte/Short, logical Date/Decimal and Struct defaults retain their actual Java input classes rather than being cloned as Avro Integer, bytes or IndexedRecord values.
+JsonNode record conversion walks the actual raw Avro fields with exact raw keys and no child-default fallback.
+Missing JsonNode returns null without demanding its source reference or empty union.
+The JsonNode input must already represent the actual post-property-roundtrip node, as described by link:../default_property/REFERENCE.adoc[the schema-property profile].
+
+Struct.put validates each child immediately.
+Array.add and Map.put defer recursive destination validation until the enclosing validation stage, so conversion of a later child can fail before an earlier child's deferred class mismatch.
+Maps convert every input entry before selecting replacement entries and traversing Java HashMap order.
+Only the final retained entries contribute deferred map validation, in that order.
+Each retained entry validates its String key's actual class against the key schema's final logical name before the entry's deferred value validation.
+The scalar String-class seam creates no output value or payload; an invalid result still constructs the existing diagnostic anomaly.
+Empty maps demand no key-class validation.
+Known parent logical conversion runs after ordinary child conversion.
+The ordinary Map-to-Struct branch returns directly before its parent's common logical conversion; its caller can still reject the returned Struct class during destination validation.
+The default wrapper applies its own logical converter after that ordinary branch.
+The logical name is supplied explicitly for the source stage: constructor-installed logical names are visible before the default, while declared connect.name and ordinary named fullnames are installed later.
+Already-built child schemas use their final names.
+
+== Reference and regression scope
+
+AvroData.java1430–1435,1610–1698 and2130–2251 define ordinary conversion, Map Struct early return and the separate raw JsonNode/default wrapper.
+AvroData.java2045–2095 orders default installation, declared names, optionality and cycle cleanup.
+The exact source pins and complete notices are retained in link:../names/selector-sources.sha256[the selector manifest] and link:../names/SELECTOR-COPYRIGHT[its source headers].
+Field-object preprocessing is independently pinned by link:../default_input/sources.sha256[the JacksonUtils manifest] and link:../default_input/COPYRIGHT[its source header].
+Scalar accessor/class/logical behavior and its additional source provenance remain in link:../default_scalar/SCALARS.adoc[the scalar reference].
+SchemaBuilder.java127–136 and422–425, ConnectSchema.java219–282 and Struct.java214–237 supply default installation and recursive validation timing.
+Their exact source hashes and complete source prefixes are retained in link:sources.sha256[the container source manifest] and link:COPYRIGHT[the container notices], with the existing link:../names/LICENSE-APACHE[Apache license].
+
+Fifteen regression functions cover origin-specific record lookup, absent versus null fallback, actual native classes, exponential collision demand, authoritative admission, prior retained charges, arrays and String maps, Map Struct logical timing, builder-time names, missing-source laziness, deferred validation order and actual NullNode accessors.
+The collision family includes depths 0, 1, 4 and 8 with 1024-byte leaves, exact admitted limits and one-byte-below rejection.
+Map replay has its own exact-limit and one-byte-below retained-lease control.
+The actual JsonNode array[String][null] fixture preserves the pinned accessor prediction while the old production A09 expectation remains unchanged for Phase2 reconciliation.
+This slice does not assert parity or activation closure for that source conflict.
+No build, formatter, test or runtime execution occurred in Phase1.
