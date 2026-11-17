@@ -12,8 +12,10 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
             return Ok(if strict { Some(is_null(&left) && is_null(&right)) } else { None });
         }
         match (&left,&right) {
-            (EvalValue::Scalar(a),EvalValue::Scalar(b)) => if strict { crate::strict_eq(a,b).map(Some) }
-                else { frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;crate::sql_eq_in_timezone(a,b,frame.context.timezone) },
+            (EvalValue::Scalar(a),EvalValue::Scalar(b)) => {
+                frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;
+                if strict { crate::strict_eq(a,b).map(Some) } else { crate::sql_eq_in_timezone(a,b,frame.context.timezone) }
+            },
             (EvalValue::List(a,_),EvalValue::List(b,_)) if a == b && *a != Kind::Set => {
                 let size = len(&left)?;
                 if size != len(&right)? { return Ok(Some(false)); }
@@ -40,6 +42,7 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
             (EvalValue::List(Kind::Set,_),EvalValue::List(Kind::Set,_)) => {
                 let a = materialize(left,frame)?.await?;
                 let b = materialize(right,frame)?.await?;
+                frame.context.reserve(crate::equality_allocation_bound(&a,&b)?)?;
                 if strict { crate::strict_eq(&a,&b).map(Some) } else { crate::compare::sql_eq_value(&a,&b,frame.context.timezone) }
             }
             _ => Ok(Some(false)),
