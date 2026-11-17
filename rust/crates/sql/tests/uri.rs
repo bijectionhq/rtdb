@@ -30,10 +30,10 @@ fn text(value: &str) -> V { V::Utf8(value.into()) }
 #[tokio::test]
 async fn sql_uri_literals_casts_and_all_seven_extractors_reach_the_shared_parser() {
     let source = "HtTp://user%3Apass@EXAMPLE.com:80/path%20name?q=%ED%A0%80+#";
-    assert_eq!(query(&format!("SELECT URI '{source}',CAST('{source}' AS URI),CAST(URI '{source}' AS VARCHAR)")).await.unwrap(),[vec![V::Uri(source.into()),V::Uri(source.into()),text(source)]]);
+    assert_eq!(query(&format!("SELECT URI '{source}',CAST('{source}' AS URI),CAST(URI '{source}' AS VARCHAR) AS test_output_3")).await.unwrap(),[vec![V::Uri(source.into()),V::Uri(source.into()),text(source)]]);
     assert_eq!(query(&format!("SELECT URI_SCHEME(u),URI_USER_INFO(u),URI_HOST(u),URI_PORT(u),URI_PATH(u),URI_QUERY(u),URI_FRAGMENT(u) FROM (VALUES (URI '{source}')) AS t(u)")).await.unwrap(),
         [vec![text("HtTp"),text("user:pass"),text("EXAMPLE.com"),V::I32(80),text("/path name"),text("q=�+"),text("")]]);
-    assert_eq!(query("SELECT URI_PATH(URI 'mailto:x?y'),URI_QUERY(URI 'mailto:x?y'),URI_HOST(URI 'http://bad_host'),URI_PORT(URI 'http://host:'),URI_PATH(URI 'http://host'),URI_QUERY(URI 'http://host?')").await.unwrap(),
+    assert_eq!(query("SELECT URI_PATH(URI 'mailto:x?y'),URI_QUERY(URI 'mailto:x?y'),URI_HOST(URI 'http://bad_host'),URI_PORT(URI 'http://host:'),URI_PATH(URI 'http://host') AS test_output_5,URI_QUERY(URI 'http://host?') AS test_output_6").await.unwrap(),
         [vec![V::Null,V::Null,V::Null,V::Null,text(""),text("")]]);
     assert_eq!(query("SELECT URI_PATH(URI $u$/a%20b$u$),URI_HOST(URI E'https://example.com')").await.unwrap(),[vec![text("/a b"),text("example.com")]]);
     assert_eq!(query("SELECT CASE WHEN FALSE THEN CAST('bad space' AS URI) ELSE URI 'relative' END").await.unwrap(),[vec![V::Uri("relative".into())]]);

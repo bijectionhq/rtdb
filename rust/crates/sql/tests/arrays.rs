@@ -29,7 +29,7 @@ async fn query(source: &str) -> Result<Vec<Vec<V>>> {
 async fn sql_array_bounds_and_trim_preserve_reference_results() {
     assert_eq!(query("SELECT ARRAY_UPPER(ARRAY[1,2],1),ARRAY_LOWER(ARRAY[],1),ARRAY_LENGTH(ARRAY[],1),TRIM_ARRAY(ARRAY[42,43],1)").await.unwrap(),
         [vec![V::I32(2), V::I32(1), V::I32(0), V::List(vec![V::I64(42)])]]);
-    assert_eq!(query("SELECT ARRAY_LENGTH(TRIM_ARRAY(ARRAY[1,2],-1),1),ARRAY_LOWER(TRIM_ARRAY(ARRAY[],-2147483648),1),TRIM_ARRAY(NULL,1),TRIM_ARRAY(ARRAY[1],NULL)").await.unwrap(),
+    assert_eq!(query("SELECT ARRAY_LENGTH(TRIM_ARRAY(ARRAY[1,2],-1),1),ARRAY_LOWER(TRIM_ARRAY(ARRAY[],-2147483648),1),TRIM_ARRAY(NULL,1),TRIM_ARRAY(ARRAY[1],NULL) AS test_output_4").await.unwrap(),
         [vec![V::I32(3), V::I32(1), V::Null, V::Null]]);
     for sql in ["SELECT ARRAY_UPPER(ARRAY[1],2)", "SELECT ARRAY_LENGTH(ARRAY[1],0)", "SELECT ARRAY_LOWER(ARRAY[],2)"] {
         assert_eq!(query(sql).await.unwrap_err().code, "xtdb.expression/array-dimension-error");

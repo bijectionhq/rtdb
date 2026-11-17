@@ -99,7 +99,7 @@ async fn virtual_runtime_type_narrowing_preserves_negative_round_scale() {
 #[tokio::test]
 async fn virtual_null_vectors_preserve_aggregate_factories_and_promote_array_elements() {
     let context = context();
-    let sql = "SELECT ARRAY_AGG(_valid_from),ARRAY_AGG(ARRAY[_valid_from]),SUM(CAST(_valid_from AS DECIMAL)),AVG(CAST(_valid_from AS DECIMAL)),MIN(_valid_from),MAX(_valid_from) FROM (SELECT _valid_from FROM pg_catalog.pg_namespace LIMIT 1) s";
+    let sql = "SELECT ARRAY_AGG(_valid_from),ARRAY_AGG(ARRAY[_valid_from]) AS test_output_2,SUM(CAST(_valid_from AS DECIMAL)),AVG(CAST(_valid_from AS DECIMAL)),MIN(_valid_from),MAX(_valid_from) FROM (SELECT _valid_from FROM pg_catalog.pg_namespace LIMIT 1) s";
     let Statement::Query(relation) = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("Expected query") };
     let mut cursor = PreparedQuery::new(relation).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();
     let instant = timestamp(0).logical_type();

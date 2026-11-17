@@ -176,11 +176,21 @@ fn comments_and_string_semicolons_preserve_statement_spans() {
 #[test]
 fn aggregate_projection_has_group_then_aggregate_input() {
     let relation = query("SELECT region, sum(price) AS total FROM docs GROUP BY region HAVING count(*) > 0 ORDER BY total DESC NULLS LAST");
-    let RelationNode::Sort { input, order_by } = relation.node() else { panic!("Expected sort") };
+    let mut ordered = relation.as_ref();
+    while let RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } = ordered.node() { ordered = input; }
+    let RelationNode::Sort { input, order_by } = ordered.node() else { panic!("Expected sort") };
     assert!(order_by[0].descending);
     assert!(!order_by[0].nulls_first);
-    assert_eq!(input.schema().fields()[1].name, "total");
-    assert!(matches!(input.children()[0].children()[0].node(), RelationNode::Aggregate { .. }));
+    assert_eq!(relation.schema().fields()[1].name, "total");
+    let mut grouped = input.as_ref();
+    while !matches!(grouped.node(), RelationNode::Aggregate { .. }) {
+        let children = grouped.children();
+        assert_eq!(children.len(), 1);
+        grouped = children[0];
+    }
+    let RelationNode::Aggregate { groups, aggregates, .. } = grouped.node() else { unreachable!() };
+    assert_eq!(groups.len(), 1);
+    assert_eq!(aggregates.len(), 2);
 }
 
 #[test]

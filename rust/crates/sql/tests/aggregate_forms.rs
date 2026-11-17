@@ -27,7 +27,7 @@ async fn sql(context: &Arc<QueryContext>, query: &str) -> Result<Vec<Vec<Value>>
     collect(context, prepare(query, &context.catalog, &PrepareOptions::default()).unwrap()).await
 }
 fn aggregate_forms(rows: &[Vec<Value>]) -> Vec<String> {
-    rows.iter().filter_map(|row| row[2].field("aggregates")).flat_map(|value| {
+    rows.iter().filter_map(|row| row[2].field("aggregates").filter(|value| !matches!(value, Value::Null))).flat_map(|value| {
         let Value::List(aggregates) = value else { panic!("Expected aggregate forms") };
         aggregates.iter().map(|value| {
             let Value::List(pair) = value else { panic!("Expected output/form pair") };

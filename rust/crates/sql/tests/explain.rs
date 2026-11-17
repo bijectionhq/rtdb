@@ -172,7 +172,7 @@ async fn api_test_explain_analyze_counts_production_pages_and_subtracts_direct_c
     let rows = query(&context, "EXPLAIN ANALYZE SELECT n FROM (VALUES (1), (2), (3)) AS t(n)").await.unwrap();
     assert_eq!(rows.iter().map(|row| &row["op"]).collect::<Vec<_>>(), [&op("project"), &op("rename"), &op("table")]);
     for (index, row) in rows.iter().enumerate() {
-        assert_eq!(row["page_count"], Value::I64(2));
+        assert_eq!(row["page_count"], Value::I64(1));
         assert_eq!(row["row_count"], Value::I64(3));
         assert!(matches!(row["time_to_first_page"], Value::Duration { .. }));
         assert!(matches!(row["peak_memory_bytes"], Value::I64(value) if value > 0));
@@ -222,7 +222,7 @@ async fn materialized_reference_opens_before_limit_and_shares_one_replay_across_
     assert!(query.execute(Arc::clone(&context), vec![]).await.is_err());
     drop(query);
     assert_eq!(context.memory.used_bytes(), 0);
-    let rows = self::query(&context, "EXPLAIN ANALYZE WITH MATERIALIZED c AS (SELECT n FROM (VALUES (1), (2)) AS t(n)) SELECT a.n, b.n FROM c AS a CROSS JOIN c AS b").await.unwrap();
+    let rows = self::query(&context, "EXPLAIN ANALYZE WITH MATERIALIZED c AS (SELECT n FROM (VALUES (1), (2)) AS t(n)) SELECT a.n, b.n AS other_n FROM c AS a CROSS JOIN c AS b").await.unwrap();
     assert_eq!(rows[0]["op"], op("let"));
     let references = rows.iter().filter(|row| row["op"] == op("relation")).collect::<Vec<_>>();
     assert_eq!(references.len(), 2);

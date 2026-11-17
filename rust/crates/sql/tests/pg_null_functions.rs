@@ -27,7 +27,7 @@ async fn query(source: &str) -> Result<Vec<Vec<V>>> {
 }
 #[tokio::test]
 async fn postgres_null_functions_accept_catalog_rows_and_oid_casts() {
-    assert_eq!(query("SELECT COL_DESCRIPTION(12345,1),COL_DESCRIPTION(12345::OID,1),PG_INDEXAM_HAS_PROPERTY(403,'can_order')").await.unwrap(), [vec![V::Null,V::Null,V::Null]]);
+    assert_eq!(query("SELECT COL_DESCRIPTION(12345,1),COL_DESCRIPTION(12345::OID,1) AS test_output_2,PG_INDEXAM_HAS_PROPERTY(403,'can_order')").await.unwrap(), [vec![V::Null,V::Null,V::Null]]);
     assert_eq!(query("SELECT amname,pg_indexam_has_property(oid,'can_order') FROM pg_am ORDER BY amname").await.unwrap(),
         [vec![V::Utf8("btree".into()),V::Null],vec![V::Utf8("hash".into()),V::Null],vec![V::Utf8("heap".into()),V::Null]]);
 }

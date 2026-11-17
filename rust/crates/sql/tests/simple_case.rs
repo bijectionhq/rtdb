@@ -50,7 +50,6 @@ async fn sql_simple_case_admits_later_when_types_and_preserves_literal_coercion(
 async fn simple_case_survives_column_replacement_and_explain_rendering() {
     assert_eq!(query("SELECT CASE v WHEN 1 THEN v + 10 WHEN 2 THEN v + 20 ELSE 0 END FROM (VALUES (1),(2),(3)) AS t(v) ORDER BY v",vec![]).await.unwrap(),[vec![V::I64(11)],vec![V::I64(22)],vec![V::I64(0)]]);
     let rows = query("EXPLAIN SELECT CASE 1 WHEN 1 THEN 2 ELSE 3 END AS v",vec![]).await.unwrap();
-    let V::Struct(explain) = &rows[0][0] else { panic!() };
-    let V::Utf8(project) = &explain["project"] else { panic!() };
+    let project = rows.iter().filter_map(|row| row[2].field("project")).find_map(|value| match value { V::Utf8(project) => Some(project), _ => None }).expect("project explanation");
     assert!(project.contains("(case 1 1 2 3)"),"{project}");
 }

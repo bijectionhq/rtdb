@@ -34,10 +34,11 @@ async fn short_sql_in_lists_keep_literal_casts_and_larger_lists_keep_row_values(
             [Value::Bool(count <= 8), Value::Bool(count > 8)]);
     }
     assert_eq!(query("SELECT DATE '1970-01-01' = '1970-01-01', '1970-01-01' <> DATE '1970-01-01'", "UTC").await.unwrap(), [Value::Bool(true), Value::Bool(false)]);
-    assert_eq!(query("SELECT NULLIF(DATE '1970-01-01', '1970-01-01'), NULLIF('1970-01-01', DATE '1970-01-01')", "UTC").await.unwrap(), [Value::Null, Value::Utf8("1970-01-01".into())]);
+    assert_eq!(query("SELECT NULLIF(DATE '1970-01-01', '1970-01-01'), NULLIF('1970-01-01', DATE '1970-01-01') AS test_output_2", "UTC").await.unwrap(), [Value::Null, Value::Utf8("1970-01-01".into())]);
 }
 
 #[tokio::test]
-async fn greatest_and_least_keep_empty_and_null_short_circuit_results() {
-    assert_eq!(query("SELECT GREATEST(), LEAST(), GREATEST(NULL, 1 / 0), LEAST(NULL, 1 / 0)", "UTC").await.unwrap(), [Value::Null, Value::Null, Value::Null, Value::Null]);
+async fn greatest_and_least_reject_empty_calls_and_keep_null_short_circuit_results() {
+    for source in ["SELECT GREATEST()", "SELECT LEAST()"] { assert!(query(source, "UTC").await.is_err()); }
+    assert_eq!(query("SELECT GREATEST(NULL, 1 / 0), LEAST(NULL, 1 / 0)", "UTC").await.unwrap(), [Value::Null, Value::Null]);
 }

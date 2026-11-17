@@ -28,7 +28,7 @@ async fn query(source: &str,zone: &str) -> Result<Vec<Vec<V>>> {
 
 #[tokio::test]
 async fn sql_extract_and_trunc_normalize_fields_and_execute_real_projection() {
-    assert_eq!(query("SELECT EXTRACT(WEEK FROM DATE '2021-01-01'),EXTRACT(DOW FROM DATE '2021-01-01'),DATE_TRUNC(month,DATE '2024-03-19'),DATE_TRUNC('year',DATE '2024-03-19')","UTC").await.unwrap(),[vec![V::I32(53),V::I32(5),V::DateDay(19783),V::DateDay(19723)]]);
+    assert_eq!(query("SELECT EXTRACT(WEEK FROM DATE '2021-01-01'),EXTRACT(DOW FROM DATE '2021-01-01') AS test_output_2,DATE_TRUNC(month,DATE '2024-03-19'),DATE_TRUNC('year',DATE '2024-03-19') AS test_output_4","UTC").await.unwrap(),[vec![V::I32(53),V::I32(5),V::DateDay(19783),V::DateDay(19723)]]);
     assert_eq!(query("SELECT AGE(DATE '2024-01-01',DATE '2023-01-01')","UTC").await.unwrap(),[vec![V::IntervalMonthDayMicro { months: 12,days: 0,nanoseconds: 0 }]]);
     assert_eq!(query("SELECT DATE_BIN(INTERVAL '15' MINUTE,TIMESTAMP '1969-12-31T23:50:00Z')","UTC").await.unwrap(),[vec![V::Timestamp { value: 0,unit: U::Microsecond,timezone: Some("UTC".into()) }]]);
 }

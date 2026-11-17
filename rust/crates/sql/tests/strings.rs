@@ -29,7 +29,7 @@ fn text(value: &str) -> V { V::Utf8(value.into()) }
 
 #[tokio::test]
 async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
-    assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1),CONCAT(1),CONCAT(NULL),CONCAT(X'0102',TRUE)").await.unwrap(),
+    assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1) AS test_output_2,CONCAT(1) AS test_output_3,CONCAT(NULL) AS test_output_4,CONCAT(X'0102',TRUE) AS test_output_5").await.unwrap(),
         [vec![text("a"), text("a1"), text("1"), text(""), text("\\x0102true")]]);
     assert_eq!(query("SELECT 'a'||NULL,X'01'||X'02'").await.unwrap(), [vec![V::Null, V::Binary(vec![1, 2])]]);
     for sql in ["SELECT CONCAT()", "SELECT STR()"] { assert!(prepare(sql, &context().catalog, &PrepareOptions::default()).is_err(), "{sql}"); }
@@ -37,8 +37,8 @@ async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
 
 #[tokio::test]
 async fn stringutil_sql_overlay_position_units_and_binary_functions() {
-    assert_eq!(query("SELECT POSITION('é' IN 'a😀éz'),POSITION('é' IN 'a😀éz' USING OCTETS),POSITION('é' IN 'a😀éz' USING CHARACTERS)").await.unwrap(), [vec![V::I32(3), V::I32(6), V::I32(3)]]);
-    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING 'zz' FROM 2),OVERLAY('abcdef' PLACING 'zz' FROM 2 FOR 3),SUBSTRING(X'010203' FROM 2 FOR 1),TRIM(X'00' FROM X'000100')").await.unwrap(), [vec![text("azzdef"), text("azzef"), V::Binary(vec![2]), V::Binary(vec![1])]]);
+    assert_eq!(query("SELECT POSITION('é' IN 'a😀éz'),POSITION('é' IN 'a😀éz' USING OCTETS) AS test_output_2,POSITION('é' IN 'a😀éz' USING CHARACTERS) AS test_output_3").await.unwrap(), [vec![V::I32(3), V::I32(6), V::I32(3)]]);
+    assert_eq!(query("SELECT OVERLAY('abcdef' PLACING 'zz' FROM 2),OVERLAY('abcdef' PLACING 'zz' FROM 2 FOR 3) AS test_output_2,SUBSTRING(X'010203' FROM 2 FOR 1),TRIM(X'00' FROM X'000100')").await.unwrap(), [vec![text("azzdef"), text("azzef"), V::Binary(vec![2]), V::Binary(vec![1])]]);
     assert_eq!(query("SELECT OVERLAY('abcdef' PLACING LOWER('ZZ') FROM 2 FOR 1),X'01'||X'02'").await.unwrap(), [vec![text("azzcdef"), V::Binary(vec![1, 2])]]);
 }
 
@@ -81,8 +81,8 @@ async fn regexp_replace_reports_source_exception_category_only_after_a_match() {
 #[tokio::test]
 async fn regclass_and_regproc_text_casts_resolve_captured_catalog_and_search_path() {
     let oid = rtdb_types::pg_table_oid(None, &rtdb_types::TableRef::new("pg_catalog", "pg_class"));
-    assert_eq!(query("SELECT CAST('pg_class' AS REGCLASS),CAST(CAST('pg_catalog.pg_class' AS REGCLASS) AS TEXT),STR(CAST('pg_class' AS REGCLASS))").await.unwrap(), [vec![V::RegClass(oid), text("pg_class"), text("pg_class")]]);
-    assert_eq!(query("SELECT CAST(CAST(42 AS REGCLASS) AS TEXT),CAST(CAST('pg_catalog.array_in' AS REGPROC) AS TEXT),CAST(CAST('array_in' AS REGPROC) AS INTEGER)").await.unwrap(), [vec![text("42"), text("array_in"), V::I32(rtdb_types::pg_name_oid("array_in"))]]);
+    assert_eq!(query("SELECT CAST('pg_class' AS REGCLASS),CAST(CAST('pg_catalog.pg_class' AS REGCLASS) AS TEXT) AS test_output_2,STR(CAST('pg_class' AS REGCLASS))").await.unwrap(), [vec![V::RegClass(oid), text("pg_class"), text("pg_class")]]);
+    assert_eq!(query("SELECT CAST(CAST(42 AS REGCLASS) AS TEXT),CAST(CAST('pg_catalog.array_in' AS REGPROC) AS TEXT) AS test_output_2,CAST(CAST('array_in' AS REGPROC) AS INTEGER) AS test_output_3").await.unwrap(), [vec![text("42"), text("array_in"), V::I32(rtdb_types::pg_name_oid("array_in"))]]);
     assert_eq!(query("SELECT CAST('does_not_exist' AS REGCLASS)").await.unwrap_err().code, "xtdb.expression.pg/unknown-relation");
     assert_eq!(query("SELECT CAST('does_not_exist' AS REGPROC)").await.unwrap_err().code, "xtdb.expression.pg/unknown-proc");
 }
@@ -92,7 +92,7 @@ async fn position_full_predicate_needles_reach_string_type_admission() {
     for source in ["SELECT POSITION(TRUE=TRUE IN 'x')","SELECT POSITION(TRUE IN (TRUE) IN ('x'))","SELECT POSITION(FALSE OR TRUE IN 'x')"] {
         assert_eq!(query(source).await.unwrap_err().code,"xtdb.expression/function-type-mismatch","{source}");
     }
-    assert_eq!(query("SELECT POSITION(CASE WHEN TRUE IN (TRUE) THEN 'b' ELSE 'a' END IN ('abc')),POSITION('b' IN CASE WHEN TRUE THEN 'abc' ELSE 'x' END USING OCTETS)").await.unwrap(),[vec![V::I32(2),V::I32(2)]]);
+    assert_eq!(query("SELECT POSITION(CASE WHEN TRUE IN (TRUE) THEN 'b' ELSE 'a' END IN ('abc')),POSITION('b' IN CASE WHEN TRUE THEN 'abc' ELSE 'x' END USING OCTETS) AS test_output_2").await.unwrap(),[vec![V::I32(2),V::I32(2)]]);
 }
 
 #[test]

@@ -44,7 +44,7 @@ async fn query(context: Arc<QueryContext>, sql: &str, parameters: Vec<V>) -> Res
 
 #[tokio::test]
 async fn defaults_reach_nested_scans_and_explicit_extents_override_each_dimension() {
-    let sql = "SETTING DEFAULT VALID_TIME TO ALL, DEFAULT SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000150Z' SELECT a.v,b.v FROM foo a CROSS JOIN (SELECT v FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000200Z') b";
+    let sql = "SETTING DEFAULT VALID_TIME TO ALL, DEFAULT SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000150Z' SELECT a.v,b.v AS test_output_2 FROM foo a CROSS JOIN (SELECT v FROM foo FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000200Z') b";
     assert_eq!(query(context(), sql, vec![]).await.unwrap(), [vec![V::Utf8("old".into()), V::Utf8("new".into())]]);
     assert!(query(context(), "SETTING DEFAULT VALID_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000050Z' SELECT * FROM foo", vec![]).await.unwrap().is_empty());
     assert_eq!(query(context(), "SETTING DEFAULT VALID_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000050Z' SELECT v FROM foo FOR ALL VALID_TIME", vec![]).await.unwrap(), [vec![V::Utf8("new".into())]]);
@@ -57,7 +57,8 @@ async fn defaults_reach_nested_scans_and_explicit_extents_override_each_dimensio
 async fn scalar_settings_keep_lexical_parameter_indices_and_snapshot_caps_explicit_time() {
     let sql = "SETTING SNAPSHOT_TOKEN = ?, CLOCK_TIME = ? SELECT v,CURRENT_TIMESTAMP,SNAPSHOT_TOKEN,? AS tail FROM foo FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '1970-01-01T00:00:00.000300Z'";
     assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 3);
-    let rows = query(context(), sql, vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap();
+    assert!(query(context(), sql, vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap().is_empty());
+    let rows = query(context(), &sql.replace("000300Z", "000100Z"), vec![V::Utf8(token(150)), timestamp(999), V::I64(7)]).await.unwrap();
     assert_eq!(rows, [vec![V::Utf8("old".into()), timestamp(999), V::Utf8(token(150)), V::I64(7)]]);
     assert_eq!(query(context(), &format!("SETTING SNAPSHOT_TOKEN = '{}' SELECT 1 WHERE FALSE", token(201)), vec![]).await.unwrap_err().code, "xtdb/unindexed-tx");
     assert_eq!(query(context(), "SETTING SNAPSHOT_TOKEN = 'bad token' SELECT 1", vec![]).await.unwrap_err().code, "xtdb.basis/invalid-basis");
@@ -153,7 +154,7 @@ fn settings_are_top_level_query_prefixes_and_all_duplicate_occurrences_are_plann
 async fn clock_settings_preserve_exact_literals_strings_parameters_and_fallback() {
     let nanos = |value| V::Timestamp { value,unit: TimeUnit::Nanosecond,timezone: Some("UTC".into()) };
     for literal in ["TIMESTAMP '1970-01-01T00:00:00.000000999Z'","+(TIMESTAMP '1970-01-01T00:00:00.000000999Z')","'1970-01-01T00:00:00.000000999Z'"] {
-        assert_eq!(query(context(),&format!("SETTING CLOCK_TIME={literal} SELECT CURRENT_TIMESTAMP(9),CURRENT_TIMESTAMP(6)"),vec![]).await.unwrap(),[vec![nanos(999),timestamp(0)]]);
+        assert_eq!(query(context(),&format!("SETTING CLOCK_TIME={literal} SELECT CURRENT_TIMESTAMP(9),CURRENT_TIMESTAMP(6) AS test_output_2"),vec![]).await.unwrap(),[vec![nanos(999),timestamp(0)]]);
     }
     assert_eq!(query(context(),"SETTING CLOCK_TIME=? SELECT CURRENT_TIMESTAMP(9)",vec![nanos(-1)]).await.unwrap(),[vec![nanos(-1)]]);
     let context = context().with_read_options(&basis(200),None,rtdb_types::Instant::new(0,123).unwrap()).unwrap();

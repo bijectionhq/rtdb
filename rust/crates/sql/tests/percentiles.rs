@@ -32,7 +32,7 @@ async fn query(sql: &str, parameters: Vec<Value>) -> Result<(Schema, Vec<Vec<Val
 
 #[tokio::test]
 async fn continuous_interpolates_and_discrete_selects_a_sorted_value_in_both_directions() {
-    let (schema, rows) = query("SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY n), PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY n DESC), PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY n DESC) FROM (VALUES (40), (10), (30), (20), (NULL)) t(n)", vec![]).await.unwrap();
+    let (schema, rows) = query("SELECT PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY n), PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY n DESC) AS test_output_2, PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(0.25) WITHIN GROUP (ORDER BY n DESC) AS test_output_4 FROM (VALUES (40), (10), (30), (20), (NULL)) t(n)", vec![]).await.unwrap();
     assert_eq!(rows, [vec![Value::F64(17.5), Value::F64(32.5), Value::I64(10), Value::I64(40)]]);
     assert_eq!(schema.fields()[0].data_type, LogicalType::Scalar(ScalarType::F64).maybe());
     assert_eq!(schema.fields()[2].data_type, LogicalType::Scalar(ScalarType::I64).maybe());
@@ -46,7 +46,7 @@ async fn percentile_filter_preserves_trailing_groups_and_excludes_null_input() {
 
 #[tokio::test]
 async fn discrete_preserves_text_and_decimal_values_while_continuous_emits_double() {
-    assert_eq!(query("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY s), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY s DESC) FROM (VALUES ('z'),('a'),('m'),(NULL)) t(s)", vec![]).await.unwrap().1, [vec![Value::Utf8("m".into()), Value::Utf8("m".into())]]);
+    assert_eq!(query("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY s), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY s DESC) AS test_output_2 FROM (VALUES ('z'),('a'),('m'),(NULL)) t(s)", vec![]).await.unwrap().1, [vec![Value::Utf8("m".into()), Value::Utf8("m".into())]]);
     let (schema, rows) = query("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY d), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY d) FROM (VALUES (CAST(1 AS DECIMAL(8,2))), (CAST(2 AS DECIMAL(8,2)))) t(d)", vec![]).await.unwrap();
     let decimal = rtdb_types::DecimalValue::new(100i128.to_be_bytes().to_vec(), 8, 2, 128).unwrap();
     assert_eq!(rows, [vec![Value::Decimal(decimal.clone()), Value::F64(1.5)]]);
@@ -140,7 +140,7 @@ async fn nonnumeric_fraction_parameters_fail_before_empty_input_and_filtered_val
 
 #[tokio::test]
 async fn discrete_clamps_fraction_but_continuous_preserves_reference_rank_failures() {
-    assert_eq!(query("SELECT PERCENTILE_DISC(-1) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(2) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![]).await.unwrap().1, [vec![Value::I64(10), Value::I64(20)]]);
+    assert_eq!(query("SELECT PERCENTILE_DISC(-1) WITHIN GROUP (ORDER BY n), PERCENTILE_DISC(2) WITHIN GROUP (ORDER BY n) AS test_output_2 FROM (VALUES (10),(20)) t(n)", vec![]).await.unwrap().1, [vec![Value::I64(10), Value::I64(20)]]);
     for fraction in [-0.1, 1.1, f64::INFINITY, f64::NEG_INFINITY] {
         assert_eq!(query("SELECT PERCENTILE_CONT($1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10),(20)) t(n)", vec![Value::F64(fraction)]).await.err().unwrap().code, "rtdb.query/percentile-rank");
         assert_eq!(query("SELECT PERCENTILE_CONT($1) WITHIN GROUP (ORDER BY n) FROM (VALUES (10)) t(n)", vec![Value::F64(fraction)]).await.unwrap().1, [vec![Value::F64(10.0)]]);
@@ -151,7 +151,7 @@ async fn discrete_clamps_fraction_but_continuous_preserves_reference_rank_failur
 #[test]
 fn null_order_warnings_retain_occurrences_and_source_order() {
     let context = context();
-    let prepared = prepare("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n NULLS LAST), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY n NULLS FIRST), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n NULLS LAST) FROM (VALUES (1),(2)) t(n)", &context.catalog, &PrepareOptions::default()).unwrap();
+    let prepared = prepare("SELECT PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n NULLS LAST), PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY n NULLS FIRST), PERCENTILE_DISC(0.5) WITHIN GROUP (ORDER BY n NULLS LAST) AS test_output_3 FROM (VALUES (1),(2)) t(n)", &context.catalog, &PrepareOptions::default()).unwrap();
     assert_eq!(prepared.notices.iter().map(|notice| notice.message.as_str()).collect::<Vec<_>>(), [
         "NULL ordering is ignored for percentile_disc (nulls are excluded from ordered-set aggregates)",
         "NULL ordering is ignored for percentile_cont (nulls are excluded from ordered-set aggregates)",

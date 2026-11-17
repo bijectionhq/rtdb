@@ -121,7 +121,7 @@ async fn decimal_sum_raw_output_survives_identity_and_requires_valid_computed_pr
     ] {
         assert_eq!(query(&format!("SELECT {projection} FROM {source}")).await.unwrap_err().code, "rtdb/decimal-precision", "{projection}");
     }
-    assert!(query(&format!("SELECT s + '0'::DECIMAL(1,0) FROM {source}")).await.is_err());
+    assert_eq!(query(&format!("SELECT s + '0'::DECIMAL(1,0) FROM {source}")).await.unwrap().1, decimal(18, 32, 0, 128));
     for projection in ["CAST(s AS DECIMAL(1,0)) > 0", "CAST(s AS DECIMAL) > 0", "COALESCE(s, NULL) > 0"] {
         assert_eq!(query(&format!("SELECT {projection} FROM {source}")).await.unwrap().1, Value::Bool(true), "{projection}");
     }

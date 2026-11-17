@@ -29,7 +29,7 @@ async fn query(source: &str,arguments: Vec<V>) -> Result<Vec<Vec<V>>> {
 
 #[tokio::test]
 async fn ordinary_sql_java_patterns_preserve_utf16_positions_without_marker_atoms() {
-    assert_eq!(query("SELECT REGEXP_REPLACE('😀','','x'),REGEXP_REPLACE('😀','','')",vec![]).await.unwrap(),[vec![V::Utf8("x?x?x".into()),V::Utf8("😀".into())]]);
+    assert_eq!(query("SELECT REGEXP_REPLACE('😀','','x'),REGEXP_REPLACE('😀','','') AS test_output_2",vec![]).await.unwrap(),[vec![V::Utf8("x?x?x".into()),V::Utf8("😀".into())]]);
     assert_eq!(query(r"SELECT REGEXP_REPLACE('😀b','(?<=(.))b','$1'), '😀b' LIKE_REGEX '(?<=\uDE00)b', '😀' LIKE_REGEX '\uDE00'",vec![]).await.unwrap(),[vec![V::Utf8("😀?".into()),V::Bool(true),V::Bool(false)]]);
     assert_eq!(query(r"SELECT REGEXP_REPLACE('😀','\G','x')",vec![]).await.unwrap(),[vec![V::Utf8("x😀".into())]]);
 }
