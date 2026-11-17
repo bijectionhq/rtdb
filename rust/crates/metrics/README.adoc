@@ -23,6 +23,7 @@ Connection gauges observe authenticated registrations and the bounded pending-so
 Timer count and elapsed-time sum retain the reference signed-long accumulation.
 The native histogram implements the precision-one HdrHistogram double layout for the timer's nonnegative signed-long nanosecond domain.
 Its fixed arrays retain the full representable timer domain, while range admission, recorder swaps and snapshot accumulation follow HdrHistogram's auto-ranging rules.
+The registry builds its timer collection on the heap within the supplied memory budget, including when opened from a Java thread.
 Percentiles rotate three slots every twenty seconds; maximum slots rotate every sixty seconds.
 Rotation uses wall-clock milliseconds, including backward clock changes and the reference histogram's bounded catch-up after long idle periods.
 The exported snapshot retains all six configured quantiles and the cumulative sum independently of the catalog's truncated integer-duration fields.

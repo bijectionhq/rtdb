@@ -25,7 +25,7 @@ impl Counters {
         for counter in [&mut self.query_errors, &mut self.transaction_errors, &mut self.collection_errors].into_iter().chain(self.kafka_warnings.iter_mut()).chain(self.connections.iter_mut()) { counter.poll(now, closing); }
     }
 }
-struct State { timers: [histogram::Timer; 5], counters: Counters }
+struct State { timers: Vec<histogram::Timer>, counters: Counters }
 struct Provider { value: Arc<dyn CatalogMetrics>, _reservation: Arc<MemoryReservation> }
 #[derive(Default)]
 struct Providers { next: u64, entries: BTreeMap<u64, Provider> }
@@ -45,10 +45,10 @@ impl Registry {
     /// Registry allocations and returned catalog snapshots share the supplied execution budget.
     /// Callbacks allocate no metric names or labels; source registrations retain their own charges until removed.
     pub fn new(node_id: &str, memory: Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(node_id.len()).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let reservation = memory.reserve(std::mem::size_of::<Self>().checked_add(TIMERS.len() * std::mem::size_of::<histogram::Timer>()).and_then(|bytes| bytes.checked_add(node_id.len())).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let now = wall_time_millis();
         Ok(Arc::new(Self { node_id: node_id.to_owned(), memory,
-            state: Mutex::new(State { timers: std::array::from_fn(|_| histogram::Timer::new(now)), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
+            state: Mutex::new(State { timers: TIMERS.iter().map(|_| histogram::Timer::new(now)).collect(), counters: Counters { query_errors: step::Counter::new(now), transaction_errors: step::Counter::new(now), collection_errors: step::Counter::new(now), kafka_warnings: [step::Counter::new(now); 5], connections: [step::Counter::new(now); 3] } }), _reservation: reservation, providers: Arc::new(Mutex::new(Providers::default())),
             #[cfg(feature = "kafka")]
             sources: Arc::new(Mutex::new(kafka::Sources::default())),
         }))
@@ -172,6 +172,17 @@ fn wall_time_millis() -> i64 { match SystemTime::now().duration_since(UNIX_EPOCH
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_initialization_fits_a_java_thread_stack() {
+        std::thread::Builder::new().stack_size(1 << 20).spawn(|| {
+            let memory = MemoryBudget::new(1 << 22);
+            let registry = Registry::new("embedded", Arc::clone(&memory)).unwrap();
+            registry.record_duration(ExecutionTimer::Query, Duration::from_millis(1));
+            assert!(registry.metrics().unwrap().rows().iter().any(|row| matches!(row, CatalogMetric::Timer { count: 1, .. })));
+            drop(registry);
+            assert_eq!(memory.used_bytes(), 0);
+        }).unwrap().join().unwrap();
+    }
     #[tokio::test]
     async fn closing_step_preserves_cumulative_catalog_totals_and_timer_percentiles() {
         let memory = MemoryBudget::new(1 << 22);
