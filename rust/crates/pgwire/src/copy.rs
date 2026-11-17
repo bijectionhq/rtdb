@@ -16,7 +16,7 @@ use crate::error::{cancelled, protocol};
 pub(crate) struct CopyInput { file: NamedTempFile, format: CopyFormat, table: TableRef, length: u64, limit: u64, _reservation: Arc<MemoryReservation> }
 impl CopyInput {
     pub fn new(table: Vec<Identifier>, format: Option<CopyFormat>, memory: &Arc<MemoryBudget>, limit: u64) -> Result<Self> {
-        let format = format.ok_or_else(|| Anomaly::incorrect("xtdb.pgwire/invalid-copy-format", "COPY IN requires a valid format: 'arrow-file', 'arrow-stream', 'transit-json', 'transit-msgpack'"))?;
+        let format = format.ok_or_else(|| Anomaly::incorrect("xtdb.pgwire/invalid-copy-format", "COPY IN requires a valid format: 'arrow-file', 'arrow-stream', 'transit-json', 'transit-msgpack'").with_context("format", serde_json::Value::Null))?;
         let table = match table.as_slice() { [table] => TableRef::new("public", table.normalized()), [schema, table] => TableRef::new(schema.normalized(), table.normalized()), _ => return Err(protocol("COPY table requires a table or schema.table")) };
         let reservation = memory.reserve(table.schema.len() + table.table.len() + 8192)?;
         Ok(Self { file: NamedTempFile::new().map_err(io_error)?, format, table, length: 0, limit, _reservation: reservation })
@@ -130,6 +130,21 @@ fn io_error(error: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_and_unrecognized_copy_formats_fail_before_table_or_file_admission() {
+        for options in ["", "FORMAT 'unknown'", "FORMAT 'ARROW-STREAM'", "FORMAT 'unknown', FORMAT 'arrow-stream'"] {
+            let source = format!("COPY docs FROM STDIN WITH ({options})");
+            let Some(rtdb_plan::ControlStatement::CopyIn { format, .. }) = rtdb_sql::parse_control(&source, &rtdb_sql::PrepareOptions::default()).unwrap() else { panic!() };
+            let memory = MemoryBudget::new(0);
+            let error = match CopyInput::new(Vec::new(), format, &memory, 0) { Err(error) => error, Ok(_) => panic!() };
+            assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
+            assert_eq!(error.code, "xtdb.pgwire/invalid-copy-format");
+            assert_eq!(error.context.get("format"), Some(&serde_json::Value::Null));
+            assert_eq!(serde_json::to_value(&error).unwrap()["message"], "COPY IN requires a valid format: 'arrow-file', 'arrow-stream', 'transit-json', 'transit-msgpack'");
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
 
     #[tokio::test]
     async fn copy_disk_limit_and_drop_release_temp_file_and_memory() {
