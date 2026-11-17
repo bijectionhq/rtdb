@@ -3200,6 +3200,21 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
     rd_kafka_ordered_metadata_t **result);
 
 /**
+ * Submits to the authenticated connection of an exact configured bootstrap endpoint.
+ * host contains host_length nonzero bytes matching the configured hostname or address.
+ * The length must be positive, and the formatted host and unsigned port must fit the native node name.
+ * A missing or unavailable connection returns TRANSPORT without initiating a connection.
+ * An accepted request completes with a transport error if the connection changes before send.
+ * Neither transport errors nor timeouts retry this request.
+ * All other request, result and lifetime contracts follow rd_kafka_ordered_metadata_start_at.
+ */
+RD_EXPORT
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_endpoint(
+    rd_kafka_t *rk, const char *host, size_t host_length, uint16_t port,
+    const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
+    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
+
+/**
  * Returns 0 while pending or 1 after terminal publication, with error, version and body set.
  * All arguments must be non-NULL and result must have a live caller reference.
  * Pending polls leave the output arguments unchanged.

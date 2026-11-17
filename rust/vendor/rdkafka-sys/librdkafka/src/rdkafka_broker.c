@@ -1198,16 +1198,22 @@ void rd_kafka_broker_buf_enq1(rd_kafka_broker_t *rkb,
 }
 
 
+static rd_bool_t rd_kafka_broker_request_on_connection(
+    const rd_kafka_broker_t *rkb, const rd_kafka_buf_t *request) {
+        return !request->rkbuf_ordered_connection_generation ||
+               request->rkbuf_ordered_connection_generation ==
+                   rkb->rkb_connection_generation;
+}
+
 /**
- * Enqueue buffer on broker's xmit queue, but fail buffer immediately
- * if broker is not up.
- *
  * Locality: broker thread
  */
 static int rd_kafka_broker_buf_enq2(rd_kafka_broker_t *rkb,
                                     rd_kafka_buf_t *rkbuf) {
-        if (unlikely(rkb->rkb_source == RD_KAFKA_INTERNAL)) {
-                /* Fail request immediately if this is the internal broker. */
+        if (unlikely(rkb->rkb_source == RD_KAFKA_INTERNAL ||
+                     (rkbuf->rkbuf_ordered_connection_generation &&
+                      rkb->rkb_state != RD_KAFKA_BROKER_STATE_UP) ||
+                     !rd_kafka_broker_request_on_connection(rkb, rkbuf))) {
                 rd_kafka_buf_callback(rkb->rkb_rk, rkb,
                                       RD_KAFKA_RESP_ERR__TRANSPORT, NULL,
                                       rkbuf);
@@ -1266,17 +1272,10 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
 
 
 
-rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
-    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
-    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque) {
-        return rd_kafka_broker_accounted_metadata_timeout(
-            rkb, version, body, length, queue, completion, opaque, 0);
-}
-
-rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
+static rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_fenced(
     rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
     rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque,
-    int timeout_ms) {
+    int timeout_ms, uint64_t connection_generation) {
         rd_kafka_replyq_t replyq = RD_ZERO_INIT;
         rd_kafka_buf_t *request;
         rd_kafka_resp_err_t err;
@@ -1285,12 +1284,28 @@ rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
         err = rd_kafka_buf_accounted_metadata(rkb, version, body, length, &request);
         if (err)
                 return err;
+        request->rkbuf_ordered_connection_generation = connection_generation;
         if (timeout_ms > 0)
                 rd_kafka_buf_set_abs_timeout(request, timeout_ms, 0);
         if (queue)
                 replyq.q = rd_kafka_q_keep(queue);
         rd_kafka_broker_buf_enq_replyq(rkb, request, replyq, completion, opaque);
         return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata_timeout(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque,
+    int timeout_ms) {
+        return rd_kafka_broker_accounted_metadata_fenced(
+            rkb, version, body, length, queue, completion, opaque, timeout_ms, 0);
+}
+
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque) {
+        return rd_kafka_broker_accounted_metadata_timeout(
+            rkb, version, body, length, queue, completion, opaque, 0);
 }
 
 
@@ -2745,6 +2760,8 @@ void rd_kafka_broker_connect_done(rd_kafka_broker_t *rkb, const char *errstr) {
         rd_kafka_transport_poll_set(rkb->rkb_transport, POLLIN);
 
         rd_kafka_broker_lock(rkb);
+        if (rkb->rkb_connection_generation < UINT64_MAX)
+                rkb->rkb_connection_generation++;
 
         if (rkb->rkb_rk->rk_conf.api_version_request &&
             rd_interval_immediate(&rkb->rkb_ApiVersion_fail_intvl, 0, 0) > 0) {
@@ -2850,6 +2867,14 @@ int rd_kafka_send(rd_kafka_broker_t *rkb) {
                 ssize_t r;
                 size_t pre_of = rd_slice_offset(&rkbuf->rkbuf_reader);
                 rd_ts_t now;
+
+                if (unlikely(!rd_kafka_broker_request_on_connection(rkb, rkbuf))) {
+                        rd_kafka_bufq_deq(&rkb->rkb_outbufs, rkbuf);
+                        rd_kafka_buf_callback(rkb->rkb_rk, rkb,
+                                              RD_KAFKA_RESP_ERR__TRANSPORT,
+                                              NULL, rkbuf);
+                        continue;
+                }
 
                 if (unlikely(rkbuf->rkbuf_flags & RD_KAFKA_OP_F_NEED_MAKE)) {
                         /* Request has not been created/baked yet,

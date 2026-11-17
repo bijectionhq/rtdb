@@ -19,7 +19,13 @@ The inventory lookup retains that broker while the client lock is held and retur
 Sparse connection scheduling can start the existing target's initial connection.
 The request uses the selected native broker owner through completion and retries.
 The same owner can change its advertised endpoint and reconnect.
-The negative Java bootstrap IDs and exact endpoint or connection-incarnation qualification require their own transport capability.
+
+`Client::start_ordered_metadata_endpoint` submits the same forms to an authenticated configured bootstrap broker matched by its exact native host bytes and unsigned port.
+The caller supplies the bytes as configured in the broker inventory, including any retained IPv6 brackets.
+The broker lock captures the negotiated Metadata version and socket generation while the current configured endpoint matches the connected address epoch.
+The broker thread checks the socket generation before queueing and again before transmitting.
+Missing endpoints return BrokerNotReady and an accepted request reports a stale connection as a terminal transport error.
+The caller owns connection establishment, Java bootstrap identity mapping and rescheduling after failure.
 
 == Ownership and release
 
@@ -33,7 +39,8 @@ Client-ID/header and complete request size validation run before completion admi
 
 The accepted operation and Rust caller hold separate completion references.
 Retries retain the operation reference through the absolute deadline, including a nested inline retry-node denial.
-A transport, timeout or broker request-timeout error retries through the native retry path when permitted by that deadline and the existing request retry limit.
+On the any-broker and learned-ID routes a transport, timeout or broker request-timeout error retries through the native retry path when permitted by that deadline and the existing request retry limit.
+An endpoint request has one socket generation and completes without a native retry.
 Terminal publication records the original native error before considering body-copy errors.
 A successful body must fit the pre-admitted completion capacity and be fully readable; excess size reports MSG_SIZE_TOO_LARGE and a missing or truncated body reports BAD_MSG.
 The callback allocates no output and invokes no Rust closure, destructor or waker.
@@ -110,6 +117,8 @@ The broker-only sources check the v0 exclusion, v1 and v4 negotiation floors and
 The native mock integration fixture creates an existing topic and verifies that broker-only Metadata returns the broker and zero topics, including when read after producer destruction.
 The targeted lookup cases distinguish two broker owners, unavailable or terminating targets and balanced references.
 The targeted mock integration submits named and broker-only requests to learned IDs and checks missing-target readiness with other brokers already usable.
+The endpoint source fixtures distinguish configured and learned brokers at the same address, check exact host and port, reject a changed address epoch and pass a stale socket generation through the actual broker send loop.
+The endpoint mock source fixture uses the configured bootstrap address and keeps the result through producer destruction.
 Additional raw-view sources retain all supported versions, nullable names, original string-size ceilings, tag/suffix bytes, and validation before visitation.
 All previously published assertions remain unchanged.
 Compilation, formatting, project scripts and runtime tests were not executed under the Phase 1 work order.

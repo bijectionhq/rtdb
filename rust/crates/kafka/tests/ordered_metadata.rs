@@ -164,3 +164,45 @@ fn targeted_metadata_uses_learned_broker_ids_without_readiness_fallback() {
     drop(producer);
     assert_eq!(account.used(), 0);
 }
+
+#[test]
+fn endpoint_metadata_uses_the_exact_configured_bootstrap_connection() {
+    let cluster = rdkafka::mocking::MockCluster::new(1).unwrap();
+    cluster.create_topic("endpoint", 2, 1).unwrap();
+    let endpoint = cluster.bootstrap_servers();
+    let (host, port) = endpoint.rsplit_once(':').unwrap();
+    let port: u16 = port.parse().unwrap();
+    let account = NativeByteAccount::new(4 * 1024 * 1024, ()).unwrap();
+    let producer: BaseProducer = ClientConfig::new()
+        .set("bootstrap.servers", &endpoint)
+        .set("enable.sparse.connections", "false")
+        .set_native_byte_account(Arc::clone(&account))
+        .create()
+        .unwrap();
+    let client = producer.client();
+    let timeout = Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let request = loop {
+        match client.start_ordered_metadata_endpoint(host, port, &[], 65536, timeout) {
+            Ok(request) => break request,
+            Err(OrderedMetadataError::BrokerNotReady) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => panic!("endpoint submission: {result:?}"),
+        }
+    };
+    assert_eq!(wait(&request).summary().brokers, 1);
+    assert_eq!(wait(&request).summary().topics, 0);
+    assert!(matches!(
+        client.start_ordered_metadata_endpoint(host, port ^ 1, &[], 65536, timeout),
+        Err(OrderedMetadataError::BrokerNotReady),
+    ));
+    assert!(matches!(
+        client.start_ordered_metadata_endpoint("invalid\0host", port, &[], 65536, timeout),
+        Err(OrderedMetadataError::Native(_)),
+    ));
+    drop(producer);
+    assert_eq!(request.poll_raw().unwrap().unwrap().summary().topics, 0);
+    drop(request);
+    assert_eq!(account.used(), 0);
+}

@@ -107,6 +107,94 @@ static int ut_ordered_target_selection(void) {
         RD_UT_PASS();
 }
 
+static int ut_ordered_endpoint_selection(void) {
+        rd_kafka_t rk = RD_ZERO_INIT;
+        rd_kafka_broker_t brokers[2] = {RD_ZERO_INIT, RD_ZERO_INIT};
+        struct rd_kafka_ApiVersion api = {
+                .ApiKey = RD_KAFKAP_Metadata, .MinVer = 1, .MaxVer = 12
+        };
+        struct rd_kafka_ordered_endpoint selected, alias, wrong_port, moved;
+        char host[] = "host";
+        size_t index;
+
+        rwlock_init(&rk.rk_lock);
+        rd_atomic32_init(&rk.rk_terminate, 0);
+        TAILQ_INIT(&rk.rk_brokers);
+        rk.rk_conf.allow_auto_create_topics = rd_true;
+        for (index = 0; index < RD_ARRAYSIZE(brokers); index++) {
+                rd_kafka_broker_t *broker = &brokers[index];
+                broker->rkb_rk = &rk;
+                broker->rkb_source = index == 0 ? RD_KAFKA_LEARNED : RD_KAFKA_CONFIGURED;
+                broker->rkb_state = RD_KAFKA_BROKER_STATE_UP;
+                broker->rkb_origname = host;
+                rd_strlcpy(broker->rkb_nodename, "host:9092", sizeof(broker->rkb_nodename));
+                broker->rkb_port = 9092;
+                broker->rkb_connection_generation = index + 1;
+                broker->rkb_ApiVersions = &api;
+                broker->rkb_ApiVersions_cnt = 1;
+                mtx_init(&broker->rkb_lock, mtx_plain);
+                rd_refcnt_init(&broker->rkb_refcnt, 1);
+                rd_atomic32_init(&broker->termination_in_progress, 0);
+                TAILQ_INSERT_TAIL(&rk.rk_brokers, broker, rkb_link);
+        }
+        selected = rd_kafka_ordered_metadata_find_endpoint(&rk, "host", "host:9092", 9092, rd_true);
+        if (selected.broker)
+                rd_kafka_broker_destroy(selected.broker);
+        alias = rd_kafka_ordered_metadata_find_endpoint(&rk, "HOST", "HOST:9092", 9092, rd_true);
+        wrong_port = rd_kafka_ordered_metadata_find_endpoint(&rk, "host", "host:9093", 9093, rd_true);
+        brokers[1].rkb_nodename_epoch++;
+        moved = rd_kafka_ordered_metadata_find_endpoint(&rk, "host", "host:9092", 9092, rd_true);
+        RD_UT_ASSERT(selected.broker == &brokers[1] && selected.generation == 2 &&
+                         selected.version == 12, "configured connection and its negotiated version");
+        RD_UT_ASSERT(!alias.broker && !wrong_port.broker && !moved.broker,
+                     "exact configured endpoint and connected address epoch");
+        for (index = 0; index < RD_ARRAYSIZE(brokers); index++) {
+                RD_UT_ASSERT(rd_refcnt_sub(&brokers[index].rkb_refcnt) == 0,
+                             "endpoint lookup balances broker references");
+                rd_refcnt_destroy(&brokers[index].rkb_refcnt);
+                mtx_destroy(&brokers[index].rkb_lock);
+        }
+        rwlock_destroy(&rk.rk_lock);
+        RD_UT_PASS();
+}
+
+static int ut_ordered_stale_connection(rd_kafka_broker_t *rkb) {
+        rd_kafka_t *rk = rkb->rkb_rk;
+        rd_kafka_byte_account_t *account = rd_kafka_byte_account_new(65536);
+        rd_kafka_ordered_metadata_t *result;
+        rd_kafka_resp_err_t error;
+        int16_t version;
+        const void *body;
+        size_t length;
+
+        RD_UT_ASSERT(account, "allocate native account");
+        rk->rk_ops = NULL;
+        rk->rk_byte_account = account;
+        rkb->rkb_source = RD_KAFKA_CONFIGURED;
+        rkb->rkb_state = RD_KAFKA_BROKER_STATE_UP;
+        rkb->rkb_connection_generation = 1;
+        rkb->rkb_max_inflight = 1;
+        rd_kafka_bufq_init(&rkb->rkb_outbufs);
+        RD_UT_ASSERT(!rd_kafka_ordered_metadata_submit_on_connection(
+                         rkb, NULL, 0, 13, 64, 1000, 1, &result),
+                     "admit request on generation one");
+        RD_UT_ASSERT(rd_kafka_bufq_cnt(&rkb->rkb_outbufs) == 1,
+                     "request queued before reconnect");
+        rkb->rkb_connection_generation = 2;
+        RD_UT_ASSERT(rd_kafka_send(rkb) == 0 && rd_kafka_bufq_cnt(&rkb->rkb_outbufs) == 0,
+                     "no request bytes transmitted on generation two");
+        RD_UT_ASSERT(rd_kafka_ordered_metadata_poll(result, &error, &version, &body, &length) &&
+                         error == RD_KAFKA_RESP_ERR__TRANSPORT && version == 13 && length == 0,
+                     "stale connection is terminal without retry");
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == sizeof(*result) + 64,
+                     "only the caller completion remains charged");
+        rd_kafka_ordered_metadata_destroy(result);
+        RD_UT_ASSERT(rd_kafka_byte_account_used(account) == 0, "release final completion");
+        rd_kafka_byte_account_destroy(account);
+        rk->rk_byte_account = NULL;
+        RD_UT_PASS();
+}
+
 static int ut_ordered_encode(void) {
         unsigned char bytes[64];
         size_t size;
@@ -429,6 +517,8 @@ int unittest_ordered_metadata(void) {
         fails+=ut_ordered_queue_cases_joined(&rkb);
         RD_UT_ASSERT(rd_refcnt_get(&rkb.rkb_refcnt)==1,"joined queue cases release broker references: %d",rd_refcnt_get(&rkb.rkb_refcnt));
         RD_UT_ASSERT(thrd_is_current(rkb.rkb_thread),"broker identity retained after joined queue cases");
+        fails += ut_ordered_endpoint_selection();
+        fails += ut_ordered_stale_connection(&rkb);
         RD_UT_ASSERT(rd_refcnt_sub(&rkb.rkb_refcnt)==0,"last ordered broker reference");
         rd_refcnt_destroy(&rkb.rkb_refcnt); mtx_destroy(&rkb.rkb_logname_lock); mtx_destroy(&rkb.rkb_lock);
         rd_avg_destroy(&rkb.rkb_avg_rtt);

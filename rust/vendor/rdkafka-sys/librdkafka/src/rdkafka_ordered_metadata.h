@@ -82,7 +82,8 @@ static void rd_kafka_ordered_metadata_complete(
         rd_kafka_ordered_metadata_t *result = opaque;
         size_t length = 0;
         (void)rk;
-        if ((error == RD_KAFKA_RESP_ERR__TRANSPORT ||
+        if (!request->rkbuf_ordered_connection_generation &&
+            (error == RD_KAFKA_RESP_ERR__TRANSPORT ||
              error == RD_KAFKA_RESP_ERR__TIMED_OUT ||
              error == RD_KAFKA_RESP_ERR_REQUEST_TIMED_OUT) &&
             rd_kafka_buf_retry(rkb, request))
@@ -191,9 +192,9 @@ static void rd_kafka_ordered_body_write(unsigned char *out,
                 *out = 0;
 }
 
-static rd_kafka_resp_err_t rd_kafka_ordered_metadata_submit(
+static rd_kafka_resp_err_t rd_kafka_ordered_metadata_submit_on_connection(
     rd_kafka_broker_t *rkb, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
-    int16_t version, size_t body_capacity, int timeout_ms,
+    int16_t version, size_t body_capacity, int timeout_ms, uint64_t generation,
     rd_kafka_ordered_metadata_t **output) {
         rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
         rd_kafka_ordered_metadata_t *result;
@@ -223,9 +224,9 @@ static rd_kafka_resp_err_t rd_kafka_ordered_metadata_submit(
         rd_kafka_ordered_body_write(body, topics, count, version,
                                    rkb->rkb_rk->rk_conf.allow_auto_create_topics);
         rd_kafka_ordered_metadata_keep(result);
-        error = rd_kafka_broker_accounted_metadata_timeout(
+        error = rd_kafka_broker_accounted_metadata_fenced(
             rkb, version, body, size, rkb->rkb_rk->rk_ops,
-            rd_kafka_ordered_metadata_complete, result, timeout_ms);
+            rd_kafka_ordered_metadata_complete, result, timeout_ms, generation);
         if (error)
                 rd_kafka_ordered_metadata_destroy(result);
         free(body);
@@ -238,13 +239,27 @@ release:
         return error;
 }
 
-static int16_t rd_kafka_ordered_metadata_version(rd_kafka_broker_t *rkb,
-                                                  rd_bool_t brokers_only) {
+static rd_kafka_resp_err_t rd_kafka_ordered_metadata_submit(
+    rd_kafka_broker_t *rkb, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
+    int16_t version, size_t body_capacity, int timeout_ms,
+    rd_kafka_ordered_metadata_t **output) {
+        return rd_kafka_ordered_metadata_submit_on_connection(
+            rkb, topics, count, version, body_capacity, timeout_ms, 0, output);
+}
+
+static int16_t rd_kafka_ordered_metadata_version0(rd_kafka_broker_t *rkb,
+                                                   rd_bool_t brokers_only,
+                                                   rd_bool_t do_lock) {
         int16_t minimum = rkb->rkb_rk->rk_conf.allow_auto_create_topics
                               ? (brokers_only ? 1 : 0)
                               : 4;
-        return rd_kafka_broker_ApiVersion_supported(
-            rkb, RD_KAFKAP_Metadata, minimum, 13, NULL);
+        return rd_kafka_broker_ApiVersion_supported0(
+            rkb, RD_KAFKAP_Metadata, minimum, 13, NULL, do_lock);
+}
+
+static int16_t rd_kafka_ordered_metadata_version(rd_kafka_broker_t *rkb,
+                                                  rd_bool_t brokers_only) {
+        return rd_kafka_ordered_metadata_version0(rkb, brokers_only, rd_true);
 }
 
 static rd_kafka_broker_t *rd_kafka_ordered_metadata_find_broker(
@@ -318,4 +333,84 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_at(
     rd_kafka_ordered_metadata_t **result) {
         return rd_kafka_ordered_metadata_start0(
             rk, topics, count, count == 0, &node_id, body_capacity, timeout_ms, result);
+}
+
+struct rd_kafka_ordered_endpoint {
+        rd_kafka_broker_t *broker;
+        uint64_t generation;
+        int16_t version;
+};
+
+static struct rd_kafka_ordered_endpoint rd_kafka_ordered_metadata_find_endpoint(
+    rd_kafka_t *rk, const char *host, const char *nodename, uint16_t port,
+    rd_bool_t brokers_only) {
+        struct rd_kafka_ordered_endpoint endpoint = RD_ZERO_INIT;
+        rd_kafka_broker_t *rkb;
+        rd_kafka_rdlock(rk);
+        TAILQ_FOREACH(rkb, &rk->rk_brokers, rkb_link) {
+                if (rkb->rkb_source != RD_KAFKA_CONFIGURED ||
+                    rd_kafka_broker_or_instance_terminating(rkb))
+                        continue;
+                rd_kafka_broker_lock(rkb);
+                if (rkb->rkb_state == RD_KAFKA_BROKER_STATE_UP &&
+                    rkb->rkb_connect_epoch == rkb->rkb_nodename_epoch &&
+                    rkb->rkb_connection_generation &&
+                    rkb->rkb_connection_generation < UINT64_MAX &&
+                    rkb->rkb_port == port &&
+                    !strcmp(rkb->rkb_origname, host) &&
+                    !strcmp(rkb->rkb_nodename, nodename)) {
+                        rd_kafka_broker_keep(rkb);
+                        endpoint.broker = rkb;
+                        endpoint.generation = rkb->rkb_connection_generation;
+                        endpoint.version = rd_kafka_ordered_metadata_version0(
+                            rkb, brokers_only, rd_false);
+                }
+                rd_kafka_broker_unlock(rkb);
+                if (endpoint.broker)
+                        break;
+        }
+        rd_kafka_rdunlock(rk);
+        return endpoint;
+}
+
+rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_endpoint(
+    rd_kafka_t *rk, const char *host_bytes, size_t host_length, uint16_t port,
+    const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
+    size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result) {
+        struct rd_kafka_ordered_endpoint endpoint;
+        char host[RD_KAFKA_NODENAME_SIZE];
+        char nodename[RD_KAFKA_NODENAME_SIZE];
+        rd_kafka_resp_err_t error;
+        size_t ignored;
+        int length;
+        if (!result)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        *result = NULL;
+        if (!rk || timeout_ms <= 0 || body_capacity > INT32_MAX)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        if (rk->rk_type != RD_KAFKA_PRODUCER || !rk->rk_byte_account)
+                return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        if (!host_bytes || !host_length || host_length >= sizeof(host) ||
+            memchr(host_bytes, '\0', host_length))
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        memcpy(host, host_bytes, host_length);
+        host[host_length] = '\0';
+        length = rd_snprintf(nodename, sizeof(nodename), "%s:%hu", host, port);
+        if (length < 0 || (size_t)length >= sizeof(nodename))
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        error = rd_kafka_ordered_body_size(topics, count, 13, &ignored);
+        if (error)
+                return error;
+        endpoint = rd_kafka_ordered_metadata_find_endpoint(
+            rk, host, nodename, port, count == 0);
+        if (!endpoint.broker)
+                return RD_KAFKA_RESP_ERR__TRANSPORT;
+        if (endpoint.version < 0)
+                error = RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
+        else
+                error = rd_kafka_ordered_metadata_submit_on_connection(
+                    endpoint.broker, topics, count, endpoint.version, body_capacity,
+                    timeout_ms, endpoint.generation, result);
+        rd_kafka_broker_destroy(endpoint.broker);
+        return error;
 }

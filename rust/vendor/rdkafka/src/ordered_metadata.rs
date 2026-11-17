@@ -61,6 +61,7 @@ enum MetadataTarget<'a> {
     AnyNamed(&'a [MetadataTopic<'a>]),
     AnyBrokers,
     Broker { id: i32, topics: &'a [MetadataTopic<'a>] },
+    Endpoint { host: &'a str, port: u16, topics: &'a [MetadataTopic<'a>] },
 }
 
 impl<C: ClientContext> Client<C> {
@@ -91,6 +92,18 @@ impl<C: ClientContext> Client<C> {
         self.start_ordered_metadata_request(MetadataTarget::Broker { id: broker_id, topics }, body_capacity, timeout)
     }
 
+    /// Starts ordered Metadata on the currently authenticated connection of a configured bootstrap endpoint.
+    /// Host must match the native configured hostname or address bytes, including any retained IPv6 brackets.
+    /// An empty host, embedded NUL or formatted endpoint exceeding the native node-name capacity returns a native argument error.
+    /// A missing or unavailable connection returns `BrokerNotReady` without starting a connection.
+    /// An accepted request uses the captured connection and completes on transport failure or timeout without retry.
+    /// Topic list, timeout validation and rounding, response admission and ownership follow [`Self::start_ordered_metadata_at`].
+    pub fn start_ordered_metadata_endpoint(
+        &self, host: &str, port: u16, topics: &[MetadataTopic<'_>], body_capacity: usize, timeout: Duration,
+    ) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
+        self.start_ordered_metadata_request(MetadataTarget::Endpoint { host, port, topics }, body_capacity, timeout)
+    }
+
     fn start_ordered_metadata_request(&self, target: MetadataTarget<'_>, body_capacity: usize, timeout: Duration) -> Result<OrderedMetadataRequest, OrderedMetadataError> {
         let account = self.native_client().byte_account().ok_or(OrderedMetadataError::AccountRequired)?;
         let millis = timeout.as_millis().checked_add(u128::from(timeout.subsec_nanos() % 1_000_000 != 0)).ok_or(OrderedMetadataError::InvalidTimeout)?;
@@ -103,6 +116,13 @@ impl<C: ClientContext> Client<C> {
                 MetadataTarget::Broker { id, topics } => {
                     let pointer = if topics.is_empty() { std::ptr::null() } else { topics.as_ptr().cast() };
                     sys::rd_kafka_ordered_metadata_start_at(self.native_ptr(), id, pointer, topics.len(), body_capacity, millis, &mut result)
+                }
+                MetadataTarget::Endpoint { host, port, topics } => {
+                    let pointer = if topics.is_empty() { std::ptr::null() } else { topics.as_ptr().cast() };
+                    sys::rd_kafka_ordered_metadata_start_endpoint(
+                        self.native_ptr(), host.as_ptr().cast(), host.len(), port,
+                        pointer, topics.len(), body_capacity, millis, &mut result,
+                    )
                 }
             }
         };

@@ -268,6 +268,7 @@ struct rd_kafka_broker_s { /* rd_kafka_broker_t */
                                                     *   rkb_nodename_epoch at the
                                                     *   last connection attempt.
                                                     */
+        uint64_t rkb_connection_generation;
 
         /* Logging name is a copy of rkb_name, protected by its own mutex */
         char *rkb_logname;
