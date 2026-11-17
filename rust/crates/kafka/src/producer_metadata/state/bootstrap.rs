@@ -24,13 +24,27 @@ pub trait JavaShuffleObservations {
     /// Returns an integer in [0, bound); the source shuffle requests decreasing signed bounds through two.
     fn next_int(&mut self, bound: i32, admit: &mut ShuffleAdmission<'_>) -> Result<i32>;
 }
-/// Rejects bootstrap shuffle construction without a qualified source random profile.
+/// Rejects Cluster shuffle construction without a qualified source random profile.
 pub struct MissingShuffleObservations;
 impl JavaShuffleObservations for MissingShuffleObservations {
     fn begin(&mut self, _: &mut ShuffleAdmission<'_>) -> Result<()> { Err(missing_shuffle()) }
     fn next_int(&mut self, _: i32, _: &mut ShuffleAdmission<'_>) -> Result<i32> { Err(missing_shuffle()) }
 }
 fn missing_shuffle() -> Anomaly { Anomaly::unsupported("rtdb/kafka-java-shuffle-required", "A qualified Java Collections.shuffle observation is required") }
+
+pub(super) fn shuffle_nodes(nodes: &mut Vector<Shared<Node>>, budget: &mut Budget, shuffle: &mut dyn JavaShuffleObservations) -> Outcome<()> {
+    let mut admit = |bytes| budget.reserve(bytes);
+    shuffle.begin(&mut admit)?;
+    for bound in (2..=nodes.len()).rev() {
+        let bound = i32::try_from(bound).map_err(|_| owned::overflow())?;
+        let selected = shuffle.next_int(bound, &mut admit)?;
+        if !(0..bound).contains(&selected) {
+            return Err(Anomaly::unsupported("rtdb/kafka-java-shuffle-range", "Java shuffle observation is outside its requested bound").into());
+        }
+        nodes.as_mut_slice().swap(bound as usize - 1, selected as usize);
+    }
+    Ok(())
+}
 
 impl BootstrapAddresses {
     pub fn len(&self) -> usize { self.endpoints.len() }
@@ -105,18 +119,8 @@ impl Snapshot {
             cluster_nodes.push(Shared::new(Node { id, host: endpoint.host.clone(), port: i32::from(endpoint.port), rack: None }, budget)?, budget)?;
             id = id.wrapping_sub(1);
         }
-        {
-            let mut admit = |bytes| budget.reserve(bytes);
-            shuffle.begin(&mut admit)?;
-            for bound in (2..=cluster_nodes.len()).rev() {
-                let bound = i32::try_from(bound).map_err(|_| owned::overflow())?;
-                let selected = shuffle.next_int(bound, &mut admit)?;
-                if selected < 0 || selected >= bound { return Err(Anomaly::unsupported("rtdb/kafka-java-shuffle-range", "Java shuffle observation is outside its requested bound").into()); }
-                cluster_nodes.as_mut_slice().swap(bound as usize - 1, selected as usize);
-            }
-        }
-        let profile = ClusterProfile::Bootstrap { nodes: cluster_nodes };
+        shuffle_nodes(&mut cluster_nodes, budget, shuffle)?;
         let input = Input { nodes, cluster_id: None, controller: -1, partitions: Vector::new(), sets: Sets::new()?, topic_ids: Map::new(None)? };
-        Self::build_with_profile(input, profile, budget, identity)
+        Self::build_with_cluster(input, budget, identity, |_, _, _| Ok(ClusterProfile::Bootstrap { nodes: cluster_nodes }))
     }
 }

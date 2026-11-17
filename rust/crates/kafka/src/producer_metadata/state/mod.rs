@@ -97,11 +97,24 @@ pub struct ProducerMetadata {
 impl ProducerMetadata {
     /// Constructs empty metadata using the caller's retained budget and Java math observations.
     /// Settings must satisfy Kafka's nonnegative duration validation.
+    /// Use `new_with_cluster_nodes` when a caller needs qualified Cluster node order.
     pub fn new(settings: Settings, budget: Arc<MemoryBudget>, observations: &mut impl JavaBackoffObservations, identity: &mut impl IdentityWitness) -> Outcome<Self> {
+        Self::new_inner(settings, budget, observations, identity, None)
+    }
+
+    /// Constructs empty metadata after observing the default shuffle generator acquisition.
+    /// The same caller-owned generator history must supply all later Cluster constructions.
+    /// Settings and capacity follow `new`.
+    pub fn new_with_cluster_nodes(settings: Settings, budget: Arc<MemoryBudget>, observations: &mut impl JavaBackoffObservations, identity: &mut impl IdentityWitness, shuffle: &mut dyn JavaShuffleObservations) -> Outcome<Self> {
+        Self::new_inner(settings, budget, observations, identity, Some(shuffle))
+    }
+
+    fn new_inner(settings: Settings, budget: Arc<MemoryBudget>, observations: &mut impl JavaBackoffObservations, identity: &mut impl IdentityWitness, shuffle: Option<&mut dyn JavaShuffleObservations>) -> Outcome<Self> {
         let mut budget = Budget(budget);
+        let snapshot = Snapshot::empty(&mut budget, identity, shuffle)?;
         let refresh = RefreshState::new(settings.refresh_backoff_ms, settings.refresh_backoff_max_ms, settings.metadata_expire_ms, observations);
         Ok(Self {
-            snapshot: Snapshot::empty(&mut budget, identity)?, bootstrap_addresses: None, refresh, idle_ms: settings.metadata_idle_ms,
+            snapshot, bootstrap_addresses: None, refresh, idle_ms: settings.metadata_idle_ms,
             active: ActiveTopics::new(), new_topics: Map::new(None)?, epochs: Map::new(None)?,
             counters: Vector::new(), errors: None, invalid: Map::new(None)?.finish(&mut budget)?,
             unauthorized: Map::new(None)?.finish(&mut budget)?, budget, failed: false,
@@ -227,13 +240,23 @@ impl ProducerMetadata {
     /// Applies one validated raw response after connection throttling.
     /// Holder construction precedes empty-broker/rebootstrap handling; source refresh mutations precede snapshot construction.
     /// Native failure terminates mutation and may follow snapshot publication.
+    /// Newly published generations have unqualified Cluster node order. Use `apply_with_cluster_nodes` to retain qualified order.
     pub fn apply(&mut self, view: RawMetadataView<'_>, scope: RequestScope, now_ms: i64, rebootstrap_enabled: bool, identity: &mut impl IdentityWitness) -> Outcome<ResponseAction> {
         self.usable()?;
-        let result = self.apply_inner(view, scope, now_ms, rebootstrap_enabled, identity);
+        let result = self.apply_inner(view, scope, now_ms, rebootstrap_enabled, identity, None);
         self.completed(result)
     }
 
-    fn apply_inner(&mut self, view: RawMetadataView<'_>, scope: RequestScope, now_ms: i64, rebootstrap_enabled: bool, identity: &mut impl IdentityWitness) -> Outcome<ResponseAction> {
+    /// Applies a response and qualifies the new generation's Cluster node order before publication.
+    /// A shuffle failure leaves the previous snapshot installed, retains earlier refresh mutations, and ends native mutation.
+    /// All response, ownership and identity contracts of `apply` still hold.
+    pub fn apply_with_cluster_nodes(&mut self, view: RawMetadataView<'_>, scope: RequestScope, now_ms: i64, rebootstrap_enabled: bool, identity: &mut impl IdentityWitness, shuffle: &mut dyn JavaShuffleObservations) -> Outcome<ResponseAction> {
+        self.usable()?;
+        let result = self.apply_inner(view, scope, now_ms, rebootstrap_enabled, identity, Some(shuffle));
+        self.completed(result)
+    }
+
+    fn apply_inner(&mut self, view: RawMetadataView<'_>, scope: RequestScope, now_ms: i64, rebootstrap_enabled: bool, identity: &mut impl IdentityWitness, shuffle: Option<&mut dyn JavaShuffleObservations>) -> Outcome<ResponseAction> {
         let holder = Holder::read(view, &mut self.budget, identity)?;
         let _network_errors = holder.errors(&mut self.budget, identity)?;
         if rebootstrap_enabled && holder.top_error == 129 { return Ok(ResponseAction::Rebootstrap); }
@@ -265,7 +288,7 @@ impl ProducerMetadata {
         }
         let mut input = Input { nodes: holder.nodes.clone(), cluster_id: holder.cluster_id.clone(), controller: holder.controller, partitions, sets, topic_ids };
         if scope.kind() == RequestKind::NewTopics { input = self.merge(input, &seen, now_ms, identity)?; }
-        self.snapshot = Snapshot::build(input, &mut self.budget, identity)?;
+        self.snapshot = Snapshot::build(input, &mut self.budget, identity, shuffle)?;
         self.invalid = Map::new(None)?.finish(&mut self.budget)?;
         self.unauthorized = Map::new(None)?.finish(&mut self.budget)?;
         if !self.snapshot.0.invalid.is_empty() { self.invalid = merge::copy_set(&self.snapshot.0.invalid, &mut self.budget, identity)?.finish(&mut self.budget)?; }

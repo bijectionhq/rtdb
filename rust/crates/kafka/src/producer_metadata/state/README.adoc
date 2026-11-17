@@ -13,8 +13,8 @@ Retries reuse that selected partition.
 ** Broker duplicate rejection occurs in the response holder before topic wrappers are built.
 ** Partition availability requires a resolved leader node, including a node with an empty host or negative port.
 ** `brokers()` exposes holder-map encounter order.
-Ordinary response `Cluster.nodes()` shuffle remains a network-adapter observation.
-Bootstrap generations separately retain their qualified source-shuffled Cluster node list.
+Qualified ordinary responses retain a shuffled `Cluster.nodes()` list sharing the map's original Node owners.
+Bootstrap generations retain a shuffled list of independent Node owners built in resolved endpoint order.
 
 * D3: Response application preserves source mutation stages.
 ** The holder and the network response error map precede the rebootstrap/empty-broker branches.
@@ -56,7 +56,7 @@ Primitive integer and UUID lookup operations have no externally supplied callbac
 ** Java math/random operations remain supplied through the refresh observation provider.
 ** The network adapter must resolve source bootstrap endpoints, supply the qualified Java shuffle authority, select brokers and own throttles, fatal errors and waiter notification.
 It must carry the captured request scope into `apply` after connection throttling and use `PreparedSend` for actual enqueue retries.
-** Construction, broker/thread growth, automatic native metadata caches, ApiVersions, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
+** Construction, broker/thread growth, automatic native metadata caches, ApiVersions request and sort storage, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
 Receive-frame and ordered-request accounting do not bound those owners.
 ** The production module is awaiting its coordinated registration and DLQ adapter.
 The standalone integration fixture imports these production sources directly.
@@ -82,7 +82,7 @@ The provider retains its own source generator state, including class-global Rand
 It admits its native state and scratch through the supplied synchronous byte authority and retains those leases through actual final release.
 The producer and snapshots retain no provider or callback.
 Missing, exhausted or out-of-range observations fail explicitly; this implementation supplies no native random fallback or invented fixed order.
-Earlier source Cluster.empty acquisition remains part of the enclosing qualified profile, rather than an assumption of a newly seeded generator.
+The caller supplies the history shared with the initial and ordinary Cluster constructors.
 
 A completed Snapshot is published before the already prepared address owner is installed.
 Construction failure keeps the previous snapshot and addresses while preserving the source full-refresh/version prefix.
@@ -92,6 +92,20 @@ Missing-address rebootstrap instead preserves that prefix as a distinct source s
 It neither resolves addresses again nor adds a closed-metadata guard absent from the inspected source.
 Endpoint vectors/text, both Node collections, HashMap storage, shuffled list storage and immutable Snapshot owners are admitted before their actual allocations.
 Thirteen additive source cases cover those orders, lifetime/failure boundaries and state preservation; no runtime result is claimed.
+
+== Initial and ordinary Cluster node order
+
+`new_with_cluster_nodes` observes the default Random acquisition for `Cluster.empty()` before initializing the source backoff.
+`apply_with_cluster_nodes` shares the response holder's Node objects, starts from its broker map's values in encounter order, and shuffles that independent list.
+It observes the shuffle after the reverse topic-ID and partition maps are complete and before the Cluster's grouped index work.
+Both full and partial response publication use this same node-list constructor.
+Responses with duplicate brokers, duplicate reversed topic IDs, REBOOTSTRAP_REQUIRED, no brokers or closed metadata can end before any shuffle is requested.
+A native shuffle failure preserves the previous generation after the source refresh prefix and ends mutation.
+`Snapshot::cluster_nodes()` borrows the node order from the retained ordinary or bootstrap generation.
+The unqualified `new` and `apply` entry points preserve the fixtures that inspect response state without a shuffle observation.
+They yield an unqualified snapshot instead of a node-order substitute.
+Transport scheduling and the actual shared Random provider remain separate obligations.
+Five additive source cases cover initial, full and partial observation demand, shared Node identity, failure order and retained ownership.
 
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.

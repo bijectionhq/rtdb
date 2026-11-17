@@ -1,5 +1,5 @@
 use rtdb_types::java_hash_map::{Map, PutOutcome};
-use super::{Failure, Outcome, keys::{IdentityWitness, Ops, TopicId, TopicPartitionKey}, owned::{Budget, Lease, Shared, Text, Vector}, response::{Node, Partition, Table}};
+use super::{Failure, JavaShuffleObservations, Outcome, bootstrap::shuffle_nodes, keys::{IdentityWitness, Ops, TopicId, TopicPartitionKey}, owned::{Budget, Lease, Shared, Text, Vector}, response::{Node, Partition, Table}};
 use super::super::round_robin::PartitionChoice;
 
 pub(super) type Names = Map<Option<Text>, (), Lease>;
@@ -26,20 +26,31 @@ pub(super) struct SnapshotValue {
     groups: Table<Option<Text>, usize>, choices: Vector<Vector<PartitionChoice>>,
 }
 
-pub(super) enum ClusterProfile { Response { controller: i32 }, Bootstrap { nodes: Vector<Shared<Node>> } }
+pub(super) enum ClusterProfile {
+    Response { controller: i32, nodes: Option<Vector<Shared<Node>>> },
+    Bootstrap { nodes: Vector<Shared<Node>> },
+}
 
 impl Snapshot {
-    pub(super) fn empty(budget: &mut Budget, identity: &mut impl IdentityWitness) -> Outcome<Self> {
+    pub(super) fn empty(budget: &mut Budget, identity: &mut impl IdentityWitness, shuffle: Option<&mut dyn JavaShuffleObservations>) -> Outcome<Self> {
         let nodes = Shared::new(Map::new(None)?.finish(budget)?, budget)?;
-        Self::build(Input { nodes, cluster_id: None, controller: -1, partitions: Vector::new(), sets: Sets::new()?, topic_ids: Map::new(None)? }, budget, identity)
+        let input = Input { nodes, cluster_id: None, controller: -1, partitions: Vector::new(), sets: Sets::new()?, topic_ids: Map::new(None)? };
+        Self::build(input, budget, identity, shuffle)
     }
 
-    pub(super) fn build(input: Input, budget: &mut Budget, identity: &mut impl IdentityWitness) -> Outcome<Self> {
-        let cluster = ClusterProfile::Response { controller: input.controller };
-        Self::build_with_profile(input, cluster, budget, identity)
+    pub(super) fn build(input: Input, budget: &mut Budget, identity: &mut impl IdentityWitness, shuffle: Option<&mut dyn JavaShuffleObservations>) -> Outcome<Self> {
+        Self::build_with_cluster(input, budget, identity, |brokers, controller, budget| {
+            let nodes = if let Some(shuffle) = shuffle {
+                let mut nodes = Vector::with_capacity(brokers.len(), budget)?;
+                for (_, node) in brokers.iter() { nodes.push(node.clone(), budget)?; }
+                shuffle_nodes(&mut nodes, budget, shuffle)?;
+                Some(nodes)
+            } else { None };
+            Ok(ClusterProfile::Response { controller, nodes })
+        })
     }
 
-    pub(super) fn build_with_profile(input: Input, cluster: ClusterProfile, budget: &mut Budget, identity: &mut impl IdentityWitness) -> Outcome<Self> {
+    pub(super) fn build_with_cluster(input: Input, budget: &mut Budget, identity: &mut impl IdentityWitness, cluster: impl FnOnce(&Table<i32, Shared<Node>>, i32, &mut Budget) -> Outcome<ClusterProfile>) -> Outcome<Self> {
         let topic_ids = input.topic_ids.finish(budget)?;
         let mut topic_names = Map::new(None)?;
         for (name, id) in topic_ids.iter() {
@@ -53,6 +64,7 @@ impl Snapshot {
             partitions.put(partition.key.clone(), partition.clone(), &mut Ops(identity), budget)?;
         }
         let partitions = partitions.finish(budget)?;
+        let cluster = cluster(&input.nodes, input.controller, budget)?;
         let mut groups = Map::new(None)?;
         let mut choices: Vector<Vector<PartitionChoice>> = Vector::new();
         for (_, partition) in partitions.iter() {
@@ -87,7 +99,7 @@ impl Snapshot {
     /// Borrows the resolved controller, including a negative ID if the response actually contained it.
     /// Bootstrap generations have no controller.
     pub fn controller(&self) -> Option<&Node> {
-        let ClusterProfile::Response { controller } = &self.0.cluster else { return None; };
+        let ClusterProfile::Response { controller, .. } = &self.0.cluster else { return None; };
         self.0.nodes.iter().find(|(id, _)| *id == controller).map(|(_, node)| &**node)
     }
     /// Reports the source Cluster bootstrap flag for this generation.
@@ -98,6 +110,15 @@ impl Snapshot {
             ClusterProfile::Bootstrap { nodes } => Some(nodes.as_slice().iter().map(|node| &**node)),
             ClusterProfile::Response { .. } => None,
         }
+    }
+    /// Borrows the qualified Cluster node order, including an empty list for initial metadata.
+    /// Returns `None` for an unqualified generation built without a shuffle capability.
+    pub fn cluster_nodes(&self) -> Option<impl ExactSizeIterator<Item = &Node>> {
+        let nodes = match &self.0.cluster {
+            ClusterProfile::Response { nodes, .. } => nodes.as_ref()?,
+            ClusterProfile::Bootstrap { nodes } => nodes,
+        };
+        Some(nodes.as_slice().iter().map(|node| &**node))
     }
     /// Borrows one partition by Java-decoded topic value and signed partition ID without allocating.
     pub fn partition(&self, topic: &str, id: i32) -> Option<&Partition> {
