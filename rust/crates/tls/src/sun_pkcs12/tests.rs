@@ -108,7 +108,7 @@ fn sun_pkcs12_java_friendly_name_matching_and_generated_names_survive_missing_id
     let (key, cert) = fixture(); let memory = MemoryBudget::new(32 << 20); let protected = protect(&key.private_key_to_pkcs8().unwrap(), "key");
     let bytes = pfx(&[key_bag(&protected, Some(1), Some("İ")), certificate_bag(&cert, Some(2), Some("i"), false)]);
     let loaded = load(&bytes, Some("key"), &memory).unwrap(); assert_eq!(loaded.identities().len(), 1); drop(loaded);
-    let bytes = pfx(&[key_bag(&protected, None, None), key_bag(b"not recovered", None, None), certificate_bag(&cert, Some(1), Some("1"), false)]);
+    let bytes = pfx(&[key_bag(&protected, None, None), key_bag(&encoded(5, &[]), None, None), certificate_bag(&cert, Some(1), Some("1"), false)]);
     let loaded = load(&bytes, Some("key"), &memory).unwrap(); assert_eq!(loaded.identities()[0].alias(), &[b'1' as u16]); drop(loaded);
     assert_eq!(memory.used_bytes(), 0);
 }
@@ -128,7 +128,7 @@ fn sun_pkcs12_missing_id_certificate_fallback_uses_index_zero_of_each_safe_conte
 
 #[test]
 fn sun_pkcs12_builds_overwritten_private_chains_before_filtering_final_trusted_bindings() {
-    let (_, cert) = fixture(); let bytes = pfx(&[key_bag(b"not recovered", Some(1), Some("same")), certificate_bag(&cert, Some(1), None, false), certificate_bag(&cert, None, Some("SAME"), true)]);
+    let (_, cert) = fixture(); let bytes = pfx(&[key_bag(&encoded(5, &[]), Some(1), Some("same")), certificate_bag(&cert, Some(1), None, false), certificate_bag(&cert, None, Some("SAME"), true)]);
     let memory = MemoryBudget::new(32 << 20);
     let charge = memory.reserve(SunX509Pkcs12Store::allocation_bound(bytes.len(), None, None).unwrap() + 192 * bytes.len()).unwrap();
     let loaded = loader::load(&bytes, None, &memory).unwrap();
