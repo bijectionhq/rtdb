@@ -324,8 +324,8 @@ pub(crate) fn uri_hashes_match(left: &[Value], right: &[Value], memory: &Arc<rtd
 pub(crate) fn rows_equal(left: &[Value], right: &[Value], timezone: &str, memory: &Arc<rtdb_columnar::MemoryBudget>) -> Result<bool> {
     if left.len() != right.len() || !uri_hashes_match(left,right,memory)? { return Ok(false); }
     for (left, right) in left.iter().zip(right) {
-        let _types = memory.reserve(rtdb_expr::equality_allocation_bound(left,right)?)?;
-        if !null_eq_in_timezone(left, right, timezone)? { return Ok(false); }
+        let allocation = rtdb_expr::EvaluationScope::new(memory)?;
+        if !null_eq_in_timezone(left, right, timezone, &allocation)? { return Ok(false); }
     }
     Ok(true)
 }
@@ -540,17 +540,40 @@ mod join_page_tests;
 mod uri_equality_tests {
     use super::*;
 
+    fn equality_scope() -> rtdb_expr::EvaluationScope {
+        rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
+    }
+
     #[test]
     fn uri_candidate_hash_scratch_is_reserved_and_released_before_object_equality() {
         let left = [Value::Uri("HTTP://EXAMPLE.com/%ab".into())];
         let right = [Value::Uri("http://example.com/%AB".into())];
         let memory = rtdb_columnar::MemoryBudget::new(4096);
-        assert!(rtdb_expr::null_eq(&left[0],&right[0]).unwrap());
+        assert!(rtdb_expr::null_eq(&left[0],&right[0], &equality_scope()).unwrap());
         assert!(!rows_equal(&left,&right,"UTC",&memory).unwrap());
         assert!(rows_equal(&left,&left,"UTC",&memory).unwrap());
         assert_eq!(memory.used_bytes(),0);
         let too_small = rtdb_columnar::MemoryBudget::new(4095);
         assert!(rows_equal(&left,&right,"UTC",&too_small).is_err());
         assert_eq!(too_small.used_bytes(),0);
+    }
+}
+
+#[cfg(test)]
+mod equality_allocation_tests {
+    use super::*;
+    use rtdb_format::transit::{TransitValue,encode_msgpack};
+
+    #[test]
+    fn transit_comparison_scopes_release_between_cells_rows_and_failures() {
+        let value = Value::Transit(encode_msgpack(&TransitValue::Integer(7)).unwrap());
+        let row = [value.clone(),value];
+        let memory = rtdb_columnar::MemoryBudget::new(32 * 1024);
+        for _ in 0..64 {
+            assert!(rows_equal(&row,&row,"UTC",&memory).unwrap());
+            assert_eq!(memory.used_bytes(),0);
+        }
+        assert!(rows_equal(&[Value::Transit(vec![0xc1])],&row[..1],"UTC",&memory).is_err());
+        assert_eq!(memory.used_bytes(),0);
     }
 }

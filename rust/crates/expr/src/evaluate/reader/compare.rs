@@ -10,8 +10,7 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
     boxed(async move {
         if strict {
             if let (EvalValue::Scalar(a),EvalValue::Scalar(b)) = (&left,&right) {
-                frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;
-                return crate::strict_eq(a,b).map(Some);
+                return crate::compare::strict_eq_scoped(a,b,frame.context.allocation).map(Some);
             }
         }
         if is_null(&left) || is_null(&right) {
@@ -19,8 +18,7 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
         }
         match (&left,&right) {
             (EvalValue::Scalar(a),EvalValue::Scalar(b)) => {
-                frame.context.reserve(crate::equality_allocation_bound(a,b)?)?;
-                crate::sql_eq_in_timezone(a,b,frame.context.timezone)
+                crate::compare::sql_eq_scoped(a,b,frame.context.timezone, frame.context.allocation)
             },
             (EvalValue::List(a,_),EvalValue::List(b,_)) if a == b && *a != Kind::Set => {
                 let size = len(&left)?;
@@ -49,8 +47,7 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
             (EvalValue::List(Kind::Set,_),EvalValue::List(Kind::Set,_)) => {
                 let a = materialize(left,frame)?.await?;
                 let b = materialize(right,frame)?.await?;
-                frame.context.reserve(crate::equality_allocation_bound(&a,&b)?)?;
-                crate::compare::sql_eq_value(&a,&b,frame.context.timezone)
+                crate::compare::sql_eq_value(&a,&b,frame.context.timezone, frame.context.allocation)
             }
             _ => Ok(Some(false)),
         }

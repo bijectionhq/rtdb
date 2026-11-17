@@ -50,11 +50,11 @@ fn uri_expression_equality_uses_objects_and_ordering_reaches_the_byte_buffer_err
     use rtdb_expr::{compare, ordered_compare_in_timezone, sql_eq, sql_not_eq_in_timezone, strict_eq};
     let left = V::Uri("HTTP://EXAMPLE.com/%ab".into());
     let right = V::Uri("http://example.COM/%AB".into());
-    assert_eq!(sql_eq(&left,&right).unwrap(),Some(true));
-    assert_eq!(sql_not_eq_in_timezone(&left,&right,"UTC").unwrap(),Some(false));
-    assert!(strict_eq(&left,&right).unwrap());
-    assert_eq!(sql_eq(&V::List(vec![left.clone()]),&V::List(vec![right.clone()])).unwrap(),Some(true));
-    assert_eq!(sql_eq(&left,&text("HTTP://EXAMPLE.com/%ab")).unwrap(),Some(false));
+    assert_eq!(sql_eq(&left,&right, &equality_scope()).unwrap(),Some(true));
+    assert_eq!(sql_not_eq_in_timezone(&left,&right,"UTC", &equality_scope()).unwrap(),Some(false));
+    assert!(strict_eq(&left,&right, &equality_scope()).unwrap());
+    assert_eq!(sql_eq(&V::List(vec![left.clone()]),&V::List(vec![right.clone()]), &equality_scope()).unwrap(),Some(true));
+    assert_eq!(sql_eq(&left,&text("HTTP://EXAMPLE.com/%ab"), &equality_scope()).unwrap(),Some(false));
     assert!(compare(&left,&right,false).is_err());
     assert!(ordered_compare_in_timezone(&left,&right,false,"UTC").is_err());
     assert!(compare(&left,&V::Null,false).is_ok());
@@ -101,4 +101,8 @@ fn transit_uri_rendering_rejects_invalid_object_construction() {
         let value = V::Transit(encode_msgpack(&T::Tagged { tag: "r".into(),representation: Box::new(representation) }).unwrap());
         assert!(scalar_call("str",&[value],&EvalContext::default()).is_err());
     }
+}
+
+fn equality_scope() -> rtdb_expr::EvaluationScope {
+    rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

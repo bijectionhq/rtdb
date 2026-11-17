@@ -285,7 +285,7 @@ Pattern payloads are consumed before source payloads after argument controls sel
 SQL equality and inequality reject Set/Set type pairs before reading values, collection sizes or selected branches.
 Admission descends through ordinary list element alternatives and matching struct field sets; different struct field sets retain their constant result.
 Null-safe equality and distinctness share this admission, while strict `===` retains its object-equality contract.
-Direct equality callers reserve `equality_allocation_bound` for set-relevant temporary type metadata.
+Public equality calls borrow an `EvaluationScope` and admit set-relevant temporary type metadata before constructing it.
 `tests/set_equality.rs` retains direct API, nested union, empty typed list and unselected-branch regression sources; execution remains pending.
 
 `single_field_interval` and `multi_field_interval` expose the interval constructors used by the reference expression lowering, including hyphenated aliases.
@@ -353,7 +353,12 @@ Millisecond date scalars supply signed64 days by truncating their stored millise
 Interval scalars compare their months, days and nanoseconds.
 Strict equality reads a Transit object even against native NULL; a decoded Transit null equals native NULL, while ordinary SQL equality keeps outer NULL propagation.
 Collection equality follows decoded values and identity-bearing objects retain their separate read identities, including when the serialized bytes match.
-The evaluator and direct scalar calls reserve decoded-graph scratch before parsing; direct equality API callers own the charge reported by `equality_allocation_bound`.
+Reached Transit equality and field access require a caller-owned `EvaluationScope`, including direct evaluation with `EvalContext`.
+Decoded objects borrow that scope through field selection and canonical encoding.
+Semantic text growth, native Decimal conversion and canonical output acquire their charges before allocation.
+Query comparisons release their scopes after each comparison.
+`equality_allocation_bound` describes temporary type metadata; reached object decoding owns its separate admission.
+`tests/transit_allocation.rs` records missing-capability, demand-order, native-peer admission, derived output and reservation cleanup regressions; execution remains pending.
 `tests/transit_equality.rs` records MessagePack/JSON equality, nested native list and struct values, identity, malformed objects, and admission failures as unexecuted regression source.
 
 Scalar emission derives every declared type alternative from the complete runtime input and outer schemas and bound parameter types before selecting a payload.

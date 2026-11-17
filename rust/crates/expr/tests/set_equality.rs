@@ -14,14 +14,14 @@ fn direct_sql_equality_rejects_sets_and_union_child_pairs_before_length_or_value
         (V::List(vec![V::I64(1),set()]),V::List(vec![set(),V::I64(2)])),
         (V::Struct(BTreeMap::from([("a".into(),set())])),V::Struct(BTreeMap::from([("a".into(),set())]))),
     ] {
-        assert_eq!(sql_eq(&left,&right).unwrap_err().code,"xtdb.expression/set-equality");
-        assert!(sql_not_eq_in_timezone(&left,&right,"UTC").is_err());
+        assert_eq!(sql_eq(&left,&right, &equality_scope()).unwrap_err().code,"xtdb.expression/set-equality");
+        assert!(sql_not_eq_in_timezone(&left,&right,"UTC", &equality_scope()).is_err());
         for name in ["distinct_from","null_eq"] { assert!(scalar_call(name,&[left.clone(),right.clone()],&EvalContext::default()).is_err()); }
     }
-    assert_eq!(sql_eq(&V::Null,&set()).unwrap(),None);
-    assert_eq!(sql_eq(&set(),&V::I64(1)).unwrap(),Some(false));
-    assert_eq!(sql_eq(&V::Struct(BTreeMap::from([("a".into(),set())])),&V::Struct(BTreeMap::from([("b".into(),set())]))).unwrap(),Some(false));
-    assert!(strict_eq(&set(),&set()).unwrap());
+    assert_eq!(sql_eq(&V::Null,&set(), &equality_scope()).unwrap(),None);
+    assert_eq!(sql_eq(&set(),&V::I64(1), &equality_scope()).unwrap(),Some(false));
+    assert_eq!(sql_eq(&V::Struct(BTreeMap::from([("a".into(),set())])),&V::Struct(BTreeMap::from([("b".into(),set())])), &equality_scope()).unwrap(),Some(false));
+    assert!(strict_eq(&set(),&set(), &equality_scope()).unwrap());
 }
 
 #[tokio::test]
@@ -56,4 +56,8 @@ async fn strict_set_expressions_compare_reader_identity_without_demanding_elemen
         assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext::default()).unwrap(), V::Bool(false));
         assert_eq!(evaluate_async(&expression, &Schema::default(), &[], &EvalContext::default()).await.unwrap(), V::Bool(false));
     }
+}
+
+fn equality_scope() -> rtdb_expr::EvaluationScope {
+    rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

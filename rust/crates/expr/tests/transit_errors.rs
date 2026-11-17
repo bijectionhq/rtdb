@@ -17,7 +17,8 @@ fn selected(value: T,json: bool,context: &EvalContext<'_>) -> Result<T> {
     decode_msgpack(&bytes)
 }
 fn set_values(values: Vec<T>,json: bool) -> Vec<T> {
-    let T::Tagged { representation,.. } = selected(tag("set",T::Array(values)),json,&EvalContext::default()).unwrap() else { panic!("set") };
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
+    let T::Tagged { representation,.. } = selected(tag("set",T::Array(values)),json,&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap() else { panic!("set") };
     let T::Array(values) = *representation else { panic!("members") };values
 }
 
@@ -52,12 +53,13 @@ fn exception_info_and_exception_info_causes_retain_object_identity() {
 
 #[test]
 fn anomaly_data_preserves_present_null_and_false_error_codes_until_writing() {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     for json in [false,true] {
         let absent = anomaly("message",vec![]);
         for value in [T::Null,T::Bool(false)] {
             let present = anomaly("message",vec![(keyword("xtdb.error/code"),value.clone())]);
             let entries = T::Map(vec![(absent.clone(),T::Integer(1)),(present,T::Integer(2))]);
-            let T::Map(entries) = selected(entries,json,&EvalContext::default()).unwrap() else { panic!("map") };
+            let T::Map(entries) = selected(entries,json,&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap() else { panic!("map") };
             assert_eq!(entries.len(),2);
             assert_eq!(entries[0],(absent.clone(),T::Integer(1)));
             assert_eq!(entries[1],(tag("xt/error",T::Array(vec![keyword("incorrect"),value,text("message"),T::Map(vec![])])),T::Integer(2)));
@@ -67,9 +69,10 @@ fn anomaly_data_preserves_present_null_and_false_error_codes_until_writing() {
 
 #[test]
 fn anomaly_data_uses_clojure_equivalence_and_java_map_hashing() {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     let left = anomaly("message",vec![(keyword("x"),tag("f",text("1.0")))]);
     let right = anomaly("message",vec![(keyword("x"),tag("f",text("1.00")))]);
-    let T::Map(entries) = selected(T::Map(vec![(left.clone(),T::Integer(1)),(right.clone(),T::Integer(2))]),false,&EvalContext::default()).unwrap() else { panic!("map") };
+    let T::Map(entries) = selected(T::Map(vec![(left.clone(),T::Integer(1)),(right.clone(),T::Integer(2))]),false,&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap() else { panic!("map") };
     assert_eq!(entries,[(left.clone(),T::Integer(2))]);
     assert_eq!(set_values(vec![left,right],false).len(),2);
 }

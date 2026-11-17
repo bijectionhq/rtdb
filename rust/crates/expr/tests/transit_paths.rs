@@ -6,9 +6,10 @@ use rtdb_types::{Result,Value as V};
 fn tag(name: &str,value: T) -> T { T::Tagged { tag: name.into(),representation: Box::new(value) } }
 fn path(text: &str) -> T { tag("xtdb/path",T::String(text.into())) }
 fn field(object: T,json: bool) -> Result<V> {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     let bytes = if json { encode_json(&object)? } else { encode_msgpack(&object)? };
     let source = Expr::Literal(V::Transit(bytes));
-    evaluate(&Expr::Field { data_type: field_type(&source.data_type(),"chosen"),expr: Box::new(source),name: "chosen".into() },&Schema::default(),&[],&EvalContext::default())
+    evaluate(&Expr::Field { data_type: field_type(&source.data_type(),"chosen"),expr: Box::new(source),name: "chosen".into() },&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() })
 }
 fn selected(value: T,json: bool) -> Result<T> {
     let V::Transit(bytes) = field(T::Map(vec![(T::Keyword("chosen".into()),value)]),json)? else { panic!("Transit") };

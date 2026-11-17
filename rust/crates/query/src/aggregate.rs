@@ -175,8 +175,8 @@ impl AggregateColumn {
                 while let Some(previous) = reader.next()? {
                     execution.context.check_cancelled()?;
                     if group_id(&previous.values)? != *group || previous.values.get(1) != Some(&Value::U32(hash)) { continue; }
-                    let _types = execution.context.memory.reserve(rtdb_expr::equality_allocation_bound(value,&previous.values[2])?)?;
-                    if sql_eq_in_timezone(value,&previous.values[2],&execution.context.timezone)? == Some(true) { *selected = false; break; }
+                    let allocation = rtdb_expr::EvaluationScope::new(&execution.context.memory)?;
+                    if sql_eq_in_timezone(value,&previous.values[2],&execution.context.timezone,&allocation)? == Some(true) { *selected = false; break; }
                 }
                 if *selected {
                     let key = OwnedRow::copy_parts(&[&[Value::U64(*group as u64),Value::U32(hash)],std::slice::from_ref(value)],0,0,&execution.context.memory)?;

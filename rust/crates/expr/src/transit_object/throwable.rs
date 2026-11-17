@@ -34,15 +34,15 @@ impl Throwable {
         Ok(Self::Anomaly { message: message.clone(),data,cause })
     }
     pub(super) fn data(&self) -> &Object { match self { Self::Anomaly { data,.. } | Self::ExceptionInfo { data,.. } => data } }
-    pub(super) fn wire(&self) -> Result<T> {
+    pub(super) fn wire(&self,allocation: &crate::EvaluationScope) -> Result<T> {
         Ok(match self {
-            Self::ExceptionInfo { message,data } => tagged("xtdb/exception-info",T::Array(vec![message.wire()?,data.wire()?])),
+            Self::ExceptionInfo { message,data } => tagged("xtdb/exception-info",T::Array(vec![message.wire(allocation)?,data.wire(allocation)?])),
             Self::Anomaly { message,data,.. } => {
                 let Object::Keyword(category) = keyword_value(data,"cognitect.anomalies/category") else { return Err(invalid()); };
                 let category = category.strip_prefix("cognitect.anomalies/").ok_or_else(invalid)?;
-                let code = keyword_value(data,"xtdb.error/code").wire()?;
+                let code = keyword_value(data,"xtdb.error/code").wire(allocation)?;
                 let mut data = data.clone();data.strip_error_metadata()?;
-                tagged("xt/error",T::Array(vec![T::Keyword(category.into()),code,message.wire()?,data.wire()?]))
+                tagged("xt/error",T::Array(vec![T::Keyword(category.into()),code,message.wire(allocation)?,data.wire(allocation)?]))
             }
         })
     }

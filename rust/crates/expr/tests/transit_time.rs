@@ -6,11 +6,12 @@ use rtdb_types::{Result,Value as V};
 fn tag(name: &str,value: T) -> T { T::Tagged { tag: name.into(),representation: Box::new(value) } }
 fn text(value: &str) -> T { T::String(value.into()) }
 fn selected(value: T,json: bool) -> Result<V> {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     let object = T::Map(vec![(T::Keyword("chosen".into()),value)]);
     let bytes = if json { encode_json(&object)? } else { encode_msgpack(&object)? };
     let source = Expr::Literal(V::Transit(bytes));
     let expr = Expr::Field { data_type: field_type(&source.data_type(),"chosen"),expr: Box::new(source),name: "chosen".into() };
-    evaluate(&expr,&Schema::default(),&[],&EvalContext::default())
+    evaluate(&expr,&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() })
 }
 
 #[test]

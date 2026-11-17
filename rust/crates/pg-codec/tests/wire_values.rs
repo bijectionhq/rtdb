@@ -17,7 +17,7 @@ fn numeric_base_10000_matches_pinned_numeric_bin_including_negative_zero_sign() 
         let expected: Vec<u8> = words.into_iter().flat_map(i16::to_be_bytes).collect();
         assert_eq!(output(PgType::Numeric, Format::Binary, &value), expected, "{text}");
         let decoded = decode(PgType::Numeric, Format::Binary, &expected, &MemoryBudget::new(1 << 20)).unwrap();
-        assert!(rtdb_expr::sql_eq(&value, decoded.value()).unwrap().unwrap());
+        assert!(rtdb_expr::sql_eq(&value, decoded.value(), &equality_scope()).unwrap().unwrap());
     }
 }
 
@@ -238,4 +238,8 @@ fn session_environment_retains_copied_parameters_and_selects_fallback() {
 fn malformed_arrays_and_unbounded_interval_exponents_are_rejected() {
     for value in ["{\"unfinished}", "{{1}}", "{a\\}"] { assert!(read_text(1009, value).is_err()); }
     assert!(read_text(1186, "PT1e999999999S").is_err());
+}
+
+fn equality_scope() -> rtdb_expr::EvaluationScope {
+    rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

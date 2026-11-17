@@ -103,9 +103,9 @@ fn coalesce_preserves_the_selected_union_leg_and_nullif_observes_null() {
 
 #[test]
 fn integer_comparison_does_not_round_through_f64() {
-    assert_eq!(sql_eq(&V::I64(i64::MAX), &V::I64(i64::MAX - 1)).unwrap(), Some(false));
+    assert_eq!(sql_eq(&V::I64(i64::MAX), &V::I64(i64::MAX - 1), &equality_scope()).unwrap(), Some(false));
     assert_eq!(compare(&V::I64(i64::MAX), &V::I64(i64::MAX - 1), false).unwrap(), std::cmp::Ordering::Greater);
-    assert_eq!(sql_eq(&decimal(i64::MAX as i128, 0), &V::I64(i64::MAX - 1)).unwrap(), Some(false));
+    assert_eq!(sql_eq(&decimal(i64::MAX as i128, 0), &V::I64(i64::MAX - 1), &equality_scope()).unwrap(), Some(false));
 }
 
 #[test]
@@ -169,10 +169,10 @@ fn character_length_counts_code_points_and_like_does_not_match_newline() {
 fn missing_members_and_nulls_do_not_become_boolean_false() {
     let a = V::Struct(BTreeMap::from([("a".into(), V::I64(1))]));
     let b = V::Struct(BTreeMap::from([("a".into(), V::I64(1)), ("b".into(), V::Null)]));
-    assert_eq!(sql_eq(&a, &b).unwrap(), Some(false));
-    assert_eq!(sql_eq(&b, &b).unwrap(), None);
+    assert_eq!(sql_eq(&a, &b, &equality_scope()).unwrap(), Some(false));
+    assert_eq!(sql_eq(&b, &b, &equality_scope()).unwrap(), None);
     assert!(!is_true(&V::Null).unwrap());
-    assert_eq!(sql_eq(&V::List(vec![V::I64(1), V::Null]), &V::List(vec![V::I64(1), V::Null])).unwrap(), None);
+    assert_eq!(sql_eq(&V::List(vec![V::I64(1), V::Null]), &V::List(vec![V::I64(1), V::Null]), &equality_scope()).unwrap(), None);
 }
 
 #[test]
@@ -236,8 +236,8 @@ fn distinct_from_handles_outer_nulls_and_retains_compound_unknown_comparisons() 
 #[test]
 fn null_eq_keeps_reference_nonreflexive_nested_null_comparison() {
     let value = V::Struct(BTreeMap::from([("nested".into(), V::List(vec![V::Null, V::I64(4)]))]));
-    assert_eq!(sql_eq(&value, &value).unwrap(), None);
-    assert!(!null_eq(&value, &value).unwrap());
+    assert_eq!(sql_eq(&value, &value, &equality_scope()).unwrap(), None);
+    assert!(!null_eq(&value, &value, &equality_scope()).unwrap());
 }
 
 #[test]
@@ -292,4 +292,8 @@ fn pre_epoch_casts_between_timestamp_types_floor_to_the_coarser_unit() {
         let target = T::Scalar(S::Timestamp { unit: TimeUnit::Microsecond, timezone: target_timezone.clone() });
         assert_eq!(cast(&value, &target, "UTC").unwrap(), V::Timestamp { value: -1, unit: TimeUnit::Microsecond, timezone: target_timezone });
     }
+}
+
+fn equality_scope() -> rtdb_expr::EvaluationScope {
+    rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap()
 }

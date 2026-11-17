@@ -1,5 +1,5 @@
-use crate::{arithmetic_in_timezone, compare_in_timezone, functions::scalar_call, sql_eq_in_timezone, sql_not_eq_in_timezone};
-use crate::compare::nullish;
+use crate::{arithmetic_in_timezone, compare_in_timezone, functions::scalar_call};
+use crate::compare::{nullish,sql_eq_scoped,sql_not_eq_scoped};
 use crate::numeric::{inapplicable, integer, integer_value, number, overflow};
 use arrow_array::RecordBatch;
 use rtdb_columnar::{MemoryBudget, OwnedBatch, copy_array, estimate_builder_bytes, to_field};
@@ -21,7 +21,8 @@ pub fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) ->
 pub struct OuterRow<'a> { pub schema: &'a Schema, pub values: &'a [Value] }
 
 /// Borrowed scalar inputs and allocation scope.
-/// With no allocation scope, the caller must reserve expression intermediates and returned values independently.
+/// With no allocation scope, the caller must reserve primitive expression intermediates and returned values independently.
+/// Reached stored Transit object decoding requires an allocation scope, including equality and field access.
 /// Catalog-dependent evaluation borrows the captured catalog and requires an allocation scope for enumeration.
 pub struct EvalContext<'a> {
     pub parameters: &'a [Value],
@@ -149,17 +150,16 @@ fn unary_value(op: UnaryOp, value: Value) -> Result<Value> {
 
 fn binary_value(op: BinaryOp, left: Value, right: Value, context: &EvalContext<'_>) -> Result<Value> {
     use BinaryOp as B;
-    if matches!(op, B::Eq | B::NotEq | B::IsDistinctFrom | B::IsNotDistinctFrom) { context.reserve(crate::equality_allocation_bound(&left, &right)?)?; }
     match op {
         B::And => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(false), _) | (_, Some(false)) => Some(false), (Some(true), Some(true)) => Some(true), _ => None })),
         B::Or => Ok(boolean(match (truth(&left)?, truth(&right)?) { (Some(true), _) | (_, Some(true)) => Some(true), (Some(false), Some(false)) => Some(false), _ => None })),
         B::IsDistinctFrom | B::IsNotDistinctFrom => {
             let distinct = if nullish(&left) || nullish(&right) { Some(nullish(&left) != nullish(&right)) }
-                else { sql_not_eq_in_timezone(&left, &right, context.timezone)? };
+                else { sql_not_eq_scoped(&left, &right, context.timezone, context.allocation)? };
             Ok(boolean(distinct.map(|distinct| if op == B::IsDistinctFrom { distinct } else { !distinct })))
         }
-        B::Eq => Ok(boolean(sql_eq_in_timezone(&left, &right, context.timezone)?)),
-        B::NotEq => Ok(boolean(sql_not_eq_in_timezone(&left, &right, context.timezone)?)),
+        B::Eq => Ok(boolean(sql_eq_scoped(&left, &right, context.timezone, context.allocation)?)),
+        B::NotEq => Ok(boolean(sql_not_eq_scoped(&left, &right, context.timezone, context.allocation)?)),
         _ if nullish(&left) || nullish(&right) => Ok(Value::Null),
         B::Lt | B::LtEq | B::Gt | B::GtEq => {
             if number(&left).is_some_and(f64::is_nan) || number(&right).is_some_and(f64::is_nan) { return Ok(Value::Bool(false)); }
@@ -233,8 +233,7 @@ macro_rules! expression_body {
             let mut left = $eval!(&args[0])?;
             let mut right = $eval!(&args[1])?;
             coerce_comparison_literals(false, matches!(&args[1], Expr::Literal(Value::Utf8(_))), &mut left, &mut right, context.timezone)?;
-            context.reserve(crate::equality_allocation_bound(&left,&right)?)?;
-            Ok(if sql_eq_in_timezone(&left, &right, context.timezone)? == Some(true) { Value::Null } else { left })
+            Ok(if sql_eq_scoped(&left, &right, context.timezone, context.allocation)? == Some(true) { Value::Null } else { left })
         }
         Expr::Call { name, args, .. } if name == "greatest" || name == "least" => {
             let Some(first) = args.first() else { return Ok(Value::Null); };
@@ -294,8 +293,7 @@ macro_rules! expression_body {
             let mut unknown = false;
             for candidate in values {
                 let candidate = $eval!(candidate)?;
-                context.reserve(crate::equality_allocation_bound(&value,&candidate)?)?;
-                match sql_eq_in_timezone(&value, &candidate, context.timezone)? { Some(true) => return Ok(Value::Bool(!*negated)), None => unknown = true, _ => () }
+                match sql_eq_scoped(&value, &candidate, context.timezone, context.allocation)? { Some(true) => return Ok(Value::Bool(!*negated)), None => unknown = true, _ => () }
             }
             Ok(if unknown { Value::Null } else { Value::Bool(*negated) })
         }

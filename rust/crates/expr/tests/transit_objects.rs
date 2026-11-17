@@ -9,7 +9,8 @@ fn text(value: &str) -> T { T::String(value.into()) }
 fn expression(bytes: Vec<u8>) -> Expr { let expr = Expr::Literal(V::Transit(bytes));Expr::Field { data_type: field_type(&expr.data_type(),"chosen"),expr: Box::new(expr),name: "chosen".into() } }
 fn object(value: T) -> T { T::Map(vec![(T::Keyword("chosen".into()),value)]) }
 fn selected(value: T) -> Result<T> {
-    let value = evaluate(&expression(encode_msgpack(&object(value))?),&Schema::default(),&[],&EvalContext::default())?;
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
+    let value = evaluate(&expression(encode_msgpack(&object(value))?),&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() })?;
     let V::Transit(bytes) = value else { panic!("Transit") };decode_msgpack(&bytes)
 }
 
@@ -58,6 +59,7 @@ fn registered_scalar_objects_validate_and_canonicalize_their_writer_forms() {
 
 #[tokio::test]
 async fn registered_children_are_constructed_before_selection_and_unknown_wrapping() {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     for malformed in [
         tag("r",text("http://[")),tag("u",text("bad")),tag("i8",T::Integer(128)),tag("f",text("1e2147483649")),
         tag("xtdb/byte-array",text("0x0")),tag("xtdb/key-fn",T::Keyword("unknown".into())),tag("xtdb/clj-form",T::Null),
@@ -66,8 +68,8 @@ async fn registered_children_are_constructed_before_selection_and_unknown_wrappi
         let value = T::Map(vec![(T::Keyword("chosen".into()),T::Integer(1)),(T::Keyword("ignored".into()),tag("unknown/wrapper",malformed))]);
         for encoded in [encode_msgpack(&value).unwrap(),encode_json(&value).unwrap()] {
             let expr = expression(encoded);
-            assert!(evaluate(&expr,&Schema::default(),&[],&EvalContext::default()).is_err());
-            assert!(evaluate_async(&expr,&Schema::default(),&[],&EvalContext::default()).await.is_err());
+            assert!(evaluate(&expr,&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).is_err());
+            assert!(evaluate_async(&expr,&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).await.is_err());
         }
     }
     assert!(selected(tag("u",T::Array(vec![T::Integer(0),T::Integer(0),tag("i8",T::Integer(128))]))).is_err());
@@ -103,12 +105,13 @@ fn registered_object_failures_release_the_call_reservation() {
 
 #[test]
 fn selected_float_objects_keep_single_precision_payloads_and_map_keys() {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     for (value,expected) in [
         (tag("f32",T::Float(1.5)),vec![0x92,0xa3,b'~',b'#',b'\'',0xca,0x3f,0xc0,0,0]),
         (T::Array(vec![tag("f32",T::Float(1.5))]),vec![0x91,0xca,0x3f,0xc0,0,0]),
         (T::Map(vec![(tag("f32",T::Float(1.5)),T::Integer(2))]),vec![0x81,0xca,0x3f,0xc0,0,0,2]),
     ] {
-        let result = evaluate(&expression(encode_msgpack(&object(value)).unwrap()),&Schema::default(),&[],&EvalContext::default()).unwrap();
+        let result = evaluate(&expression(encode_msgpack(&object(value)).unwrap()),&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap();
         assert_eq!(result,V::Transit(expected));
     }
 }
@@ -124,9 +127,10 @@ fn record_entry_replacement_retains_the_original_equal_decimal_key() {
 
 #[test]
 fn cached_byte_array_and_nan_keys_retain_identity_through_record_construction() {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     for key in [T::Bytes(vec![1]),T::Float(f64::NAN)] {
         let value = object(tag("xtdb/tx-key",T::Array(vec![T::Map(vec![(key.clone(),T::Integer(1))]),T::Map(vec![(key,T::Integer(2))])])));
-        let result = evaluate(&expression(encode_msgpack(&value).unwrap()),&Schema::default(),&[],&EvalContext::default()).unwrap();
+        let result = evaluate(&expression(encode_msgpack(&value).unwrap()),&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap();
         let V::Transit(bytes) = result else { panic!("Transit") };
         let T::Tagged { representation,.. } = decode_msgpack(&bytes).unwrap() else { panic!("record") };
         let T::Map(entries) = *representation else { panic!("map") };
@@ -138,7 +142,7 @@ fn cached_byte_array_and_nan_keys_retain_identity_through_record_construction() 
         br#"["^ ","~:chosen",["~#xtdb/tx-key",[{"~zNaN":1},{"^2":2}]]]"#.as_slice(),
         br#"["^ ","~:chosen",["~#xtdb/tx-key",[{"~zNaN":1},[["~#ratio",["^2",0]],2]]]]"#.as_slice(),
     ] {
-        let result = evaluate(&expression(bytes.to_vec()),&Schema::default(),&[],&EvalContext::default()).unwrap();
+        let result = evaluate(&expression(bytes.to_vec()),&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).unwrap();
         let V::Transit(bytes) = result else { panic!("Transit") };
         let T::Tagged { representation,.. } = decode_msgpack(&bytes).unwrap() else { panic!("record") };
         let T::Map(entries) = *representation else { panic!("map") };

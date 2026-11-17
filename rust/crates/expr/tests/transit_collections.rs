@@ -9,8 +9,9 @@ fn field(value: T) -> Result<V> {
     field_bytes(encode_msgpack(&value)?)
 }
 fn field_bytes(bytes: Vec<u8>) -> Result<V> {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap();
     let value = Expr::Literal(V::Transit(bytes));
-    evaluate(&Expr::Field { data_type: field_type(&value.data_type(),"chosen"),expr: Box::new(value),name: "chosen".into() },&Schema::default(),&[],&EvalContext::default())
+    evaluate(&Expr::Field { data_type: field_type(&value.data_type(),"chosen"),expr: Box::new(value),name: "chosen".into() },&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() })
 }
 fn selected(value: T) -> Result<T> {
     let V::Transit(bytes) = field(T::Map(vec![(T::Keyword("chosen".into()),value)]))? else { panic!("Transit") };decode_msgpack(&bytes)

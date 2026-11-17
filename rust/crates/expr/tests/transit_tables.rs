@@ -14,7 +14,8 @@ fn field(object: T,json: bool,context: &EvalContext<'_>) -> Result<T> {
     let expr = Expr::Field { data_type: field_type(&source.data_type(),"chosen"),expr: Box::new(source),name: "chosen".into() };
     let V::Transit(bytes) = evaluate(&expr,&Schema::default(),&[],context)? else { panic!("Transit") };decode_msgpack(&bytes)
 }
-fn selected(value: T,json: bool) -> Result<T> { field(T::Map(vec![(keyword("chosen"),value)]),json,&EvalContext::default()) }
+fn selected(value: T,json: bool) -> Result<T> {
+    let default_allocation = rtdb_expr::EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(64 * 1024 * 1024)).unwrap(); field(T::Map(vec![(keyword("chosen"),value)]),json,&EvalContext { allocation: Some(&default_allocation),..Default::default() }) }
 
 #[test]
 fn table_handlers_apply_null_defaults_and_unrestricted_object_names() {

@@ -13,6 +13,9 @@ mod throwable;
 mod tagged_value;
 mod render;
 mod table;
+mod allocation;
+use crate::EvaluationScope;
+use allocation::wire_charge;
 use collection::{Array,Map,Record,Entries};
 use number::Number;
 use time::Time;
@@ -24,15 +27,42 @@ use tagged_value::Tagged;
 pub(crate) enum Object {
     Null,Bool(bool),Number(Arc<Number>),String(String),Keyword(String),Symbol(String),Character(u16),
     Bytes(Arc<Vec<u8>>),Vector(Vec<Self>),List(Vec<Self>),Set(Map),Map(Map),
-    Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(TableRef),
+    Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(Arc<TableRef>),
     TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),
 }
 
 fn invalid() -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-transit-object", "Invalid stored Transit object representation") }
 fn tagged(tag: &str,representation: T) -> T { T::Tagged { tag: tag.into(),representation: Box::new(representation) } }
 
-struct ObjectReadBuilder;
-impl TransitReadBuilder for ObjectReadBuilder {
+pub(crate) struct Decoded<'a> { value: Object,allocation: &'a EvaluationScope }
+
+pub(crate) fn scope(allocation: Option<&EvaluationScope>) -> Result<&EvaluationScope> {
+    allocation.ok_or_else(||Anomaly::incorrect("rtdb.expr/missing-allocation-scope", "Stored Transit object evaluation requires an allocation scope"))
+}
+
+impl<'a> Decoded<'a> {
+    pub(crate) fn read(bytes: &[u8],allocation: &'a EvaluationScope) -> Result<Self> {
+        let count = bytes.len();
+        let bytes_required = count.checked_mul(count).and_then(|bytes|bytes.checked_mul(16)).and_then(|bytes|count.checked_mul(64).and_then(|raw|bytes.checked_add(raw))).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(crate::numeric::overflow)?;
+        allocation.reserve(bytes_required)?;
+        let value = decode_with(bytes,&mut ObjectReadBuilder { allocation })?;
+        Ok(Self { value,allocation })
+    }
+    pub(crate) fn field(self,name: Option<&str>) -> Result<Option<Self>> {
+        let Self { value,allocation } = self;
+        Ok(value.field(name)?.map(|value|Self { value,allocation }))
+    }
+    pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+        let value = self.value.wire(self.allocation)?;
+        self.allocation.reserve(rtdb_format::transit::msgpack_allocation_bound(&value)?)?;
+        rtdb_format::transit::encode_msgpack(&value)
+    }
+    pub(crate) fn equivalent(&self,other: &Self) -> Result<bool> { self.value.equivalent(&other.value) }
+    pub(crate) fn equivalent_emitted(&self,other: &rtdb_types::Value) -> Result<bool> { self.value.equivalent_emitted(other,self.allocation) }
+}
+
+struct ObjectReadBuilder<'a> { allocation: &'a EvaluationScope }
+impl TransitReadBuilder for ObjectReadBuilder<'_> {
     type Value = Object;
     type Array = Array;
     type Map = Map;
@@ -52,13 +82,12 @@ impl TransitReadBuilder for ObjectReadBuilder {
     fn start_map(&mut self,_size: usize) -> Result<Map> { Ok(Map::new()) }
     fn map_entry(&mut self,map: &mut Map,key: Object,value: Object) -> Result<()> { map.assoc(key,value) }
     fn finish_map(&mut self,map: Map) -> Result<Object> { Ok(Object::Map(map)) }
-    fn tagged(&mut self,tag: String,representation: Object) -> Result<Object> { Object::registered(tag,representation) }
+    fn tagged(&mut self,tag: String,representation: Object) -> Result<Object> { Object::registered(tag,representation,self.allocation) }
 }
 
 impl Object {
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Self> { decode_with(bytes,&mut ObjectReadBuilder) }
     fn number(value: Number) -> Self { Self::Number(Arc::new(value)) }
-    fn registered(tag: String,representation: Self) -> Result<Self> {
+    fn registered(tag: String,representation: Self,allocation: &EvaluationScope) -> Result<Self> {
         Ok(match tag.as_str() {
             "'" => representation,
             "cmap" => Self::Null,
@@ -96,7 +125,7 @@ impl Object {
             "link" => match representation { Self::Map(map) => Self::Link(Arc::new(map.into_entries())),Self::TxKey(record) => Self::Link(Arc::new(record.into_entries())),_ => return Err(invalid()) },
             "xtdb/tx-key" => Self::TxKey(Record::read(representation)?),
             "xtdb/path" => Self::Path(Path::read(representation.text()?)?),
-            "xt/table" => Self::TableRef(table::read(representation)?),
+            "xt/table" => Self::TableRef(Arc::new(table::read(representation,allocation)?)),
             "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Self::Throwable(Arc::new(Throwable::read(&tag,&representation)?)),
             tag if Time::recognizes(tag) => Time::read(tag,&representation)?.map_or(Self::Null,Self::Time),
             _ => Self::Tagged(Arc::new(Tagged::new(tag,representation))),
@@ -119,7 +148,7 @@ impl Object {
     fn take_error_cause(&mut self) -> Result<Option<Self>> {
         match self { Self::Map(map) => Ok(map.remove_keyword("xtdb.error/cause")),Self::TxKey(record) => Ok(record.take_error_cause()),_ => Err(invalid()) }
     }
-    pub(crate) fn field(self,name: Option<&str>) -> Result<Option<Self>> {
+    fn field(self,name: Option<&str>) -> Result<Option<Self>> {
         let object = match self {
             Self::Throwable(value) => value.data().clone(),value => value,
         };
@@ -133,30 +162,39 @@ impl Object {
             }
         })
     }
-    pub(crate) fn wire(&self) -> Result<T> {
+    fn wire(&self,allocation: &EvaluationScope) -> Result<T> {
+        wire_charge(self,allocation)?;
         Ok(match self {
             Self::Null => T::Null,Self::Bool(value) => T::Bool(*value),Self::Number(value) => number::wire(value),Self::String(value) => T::String(value.clone()),Self::Keyword(value) => T::Keyword(value.clone()),Self::Symbol(value) => T::Symbol(value.clone()),
             Self::Character(value) => tagged("c",T::String(char::from_u32(u32::from(*value)).unwrap_or('?').to_string())),
             Self::Bytes(value) => T::Bytes(value.as_ref().clone()),
-            Self::Vector(values) => T::Array(values.iter().map(Self::wire).collect::<Result<_>>()?),
-            Self::List(values) => tagged("list",T::Array(values.iter().map(Self::wire).collect::<Result<_>>()?)),
-            Self::Set(values) => tagged("set",T::Array(values.entries().map(|(key,_)|key.wire()).collect::<Result<_>>()?)),
-            Self::Map(map) => map_wire(map)?,
-            Self::TxKey(record) => tagged("xtdb/tx-key",map_wire(&Map::from_entries(record.entries().map(|(key,value)|(key.clone(),value.clone())))?)?),
+            Self::Vector(values) => T::Array(wire_values(values.iter(),values.len(),allocation)?),
+            Self::List(values) => tagged("list",T::Array(wire_values(values.iter(),values.len(),allocation)?)),
+            Self::Set(values) => tagged("set",T::Array(wire_values(values.entries().map(|(key,_)|key),values.len(),allocation)?)),
+            Self::Map(map) => map_wire(map,allocation)?,
+            Self::TxKey(record) => tagged("xtdb/tx-key",map_wire(&Map::from_entries(record.entries().map(|(key,value)|(key.clone(),value.clone())))?,allocation)?),
             Self::Uri(value) => tagged("r",T::String(value.clone())),Self::Uuid(values) => tagged("u",T::Array(values.iter().map(|value|T::Integer(*value)).collect())),
-            Self::ByteBuffer(value) => { let mut text = String::from("0x");const HEX: &[u8] = b"0123456789abcdef";for byte in value.iter() { text.push(HEX[(byte >> 4) as usize] as char);text.push(HEX[(byte & 15) as usize] as char); }tagged("xtdb/byte-array",T::String(text)) }
-            Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire()?),
+            Self::ByteBuffer(value) => { let mut text = String::with_capacity(value.len().checked_mul(2).and_then(|bytes|bytes.checked_add(2)).ok_or_else(crate::numeric::overflow)?);text.push_str("0x");const HEX: &[u8] = b"0123456789abcdef";for byte in value.iter() { text.push(HEX[(byte >> 4) as usize] as char);text.push(HEX[(byte & 15) as usize] as char); }tagged("xtdb/byte-array",T::String(text)) }
+            Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire(allocation)?),
             Self::Time(value) => value.wire()?,
             Self::Path(value) => value.wire(),
             Self::TableRef(value) => table::wire(value),
-            Self::Link(entries) => tagged("link",T::Map(entries.iter().map(|(key,value)|Ok((key.wire()?,value.wire()?))).collect::<Result<_>>()?)),
-            Self::Throwable(value) => value.wire()?,
-            Self::Tagged(value) => value.wire()?,
+            Self::Link(entries) => tagged("link",T::Map(wire_entries(entries.iter().map(|(key,value)|(key,value)),entries.len(),allocation)?)),
+            Self::Throwable(value) => value.wire(allocation)?,
+            Self::Tagged(value) => value.wire(allocation)?,
         })
     }
 }
 
-fn map_wire(map: &Map) -> Result<T> { Ok(T::Map(map.entries().map(|(key,value)|Ok((key.wire()?,value.wire()?))).collect::<Result<_>>()?)) }
+fn wire_values<'a>(values: impl Iterator<Item=&'a Object>,count: usize,allocation: &EvaluationScope) -> Result<Vec<T>> {
+    let mut output = Vec::with_capacity(count);
+    for value in values { output.push(value.wire(allocation)?); }Ok(output)
+}
+fn wire_entries<'a>(values: impl Iterator<Item=(&'a Object,&'a Object)>,count: usize,allocation: &EvaluationScope) -> Result<Vec<(T,T)>> {
+    let mut output = Vec::with_capacity(count);
+    for (key,value) in values { output.push((key.wire(allocation)?,value.wire(allocation)?)); }Ok(output)
+}
+fn map_wire(map: &Map,allocation: &EvaluationScope) -> Result<T> { Ok(T::Map(wire_entries(map.entries(),map.len(),allocation)?)) }
 fn keyword_value<'a>(object: &'a Object,name: &str) -> &'a Object { object.entries().and_then(|mut entries|entries.find(|(key,_)|matches!(key,Object::Keyword(key) if key == name))).map_or(&Object::Null,|(_,value)|value) }
 fn uuid(value: &Object) -> Result<[i64;2]> {
     if let Object::String(value) = value {
