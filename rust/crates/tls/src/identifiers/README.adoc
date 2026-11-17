@@ -57,3 +57,20 @@ The parser accepts one primitive OCTET STRING wrapper and ignores nonzero BER pa
 * Malformed critical extensions and duplicate parsed copies fail.
 
 Thirteen CA-extension regression sources cover Java defaults, signed integer limits, ignored fields, bit boundaries, framing, duplicate handling and reservation lifetime.
+
+`CertificatePublicKeyEncoding` owns the normalized SubjectPublicKeyInfo encoding used by OpenJDK 25.0.1 `X509Key`.
+It is a passive immutable view with independent memory admission.
+
+* `AlgorithmId.parse` and `AlgorithmId.encode` normalize absent and empty NULL parameters and emit NULL only for their pinned OID set.
+  Non-NULL parameters retain their content after Java BER conversion while their outer length becomes canonical.
+* `ObjectIdentifier` validation rejects empty, unterminated, overlong and nonminimal base-128 encodings.
+  Accepted OID content remains unchanged.
+* `DerValue.getUnalignedBitString`, `BitArray` and `DerOutputStream.putUnalignedBitString` preserve the declared bit count and clear unused bits.
+  Signed integer wrapping and the backing-buffer capacity check follow the pinned implementations.
+* Parsing scratch is reserved before decoding and released before the view returns.
+  The surviving reservation covers the retained encoding capacity and its owner until drop.
+* The view does not instantiate `AlgorithmParameters` or `KeyFactory` providers and does not validate their accepted parameter or key values.
+  Equality is encoded `X509Key` equality; SunJCE `DHPublicKey.equals` compares numeric `y`, `p` and `g` independently of optional private-value length and requires a separate provider-aware comparison.
+  Certificate signatures, validity and trust are outside this view.
+
+Public-key regression sources cover parameter framing, converter padding and opaque nested values, the NULL-emitting OID set, OID validity and size boundaries, unaligned bits, integer wrapping, nested conversion and reservation cleanup.

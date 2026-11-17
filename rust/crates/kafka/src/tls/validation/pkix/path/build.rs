@@ -206,7 +206,7 @@ impl<'a, 'source> Builder<'a, 'source> {
     fn repeated(&self, left: usize, right: usize) -> Result<bool> {
         let left = &self.candidates[left]; let right = &self.candidates[right];
         if left.encoded == right.encoded { return Ok(true); }
-        if !self.source.same_name(left.certificate.subject_name(), right.certificate.subject_name())? || !public_key::same(left.certificate, right.certificate)? { return Ok(false); }
+        if !self.source.same_name(left.certificate.subject_name(), right.certificate.subject_name())? || !public_key::same(left.certificate, right.certificate, self.source.charge.budget())? { return Ok(false); }
         let left = CertificateAlternativeNames::decode(&left.encoded, self.source.charge.budget()).map_err(material_error)?;
         let right = CertificateAlternativeNames::decode(&right.encoded, self.source.charge.budget()).map_err(material_error)?;
         Ok(left.extension_value() == right.extension_value())

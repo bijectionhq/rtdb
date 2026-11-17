@@ -61,7 +61,7 @@ impl SimpleTrust {
     fn trusted(&self, certificate: &X509Ref) -> Result<Option<&X509Ref>> {
         for anchor in &self.anchors {
             if super::names::same(anchor.subject_name(), certificate.subject_name(), self._charge.budget())? && super::names::same(anchor.issuer_name(), certificate.issuer_name(), self._charge.budget())?
-                && super::public_key::same(anchor, certificate)? { return Ok(Some(anchor)); }
+                && super::public_key::same(anchor, certificate, self._charge.budget())? { return Ok(Some(anchor)); }
         }
         Ok(None)
     }
