@@ -2,7 +2,7 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Binary,Cast,Comparison,Dispatch,Error as NumberError,Number,Predicate,Unary};
+use crate::jvm_number::{Binary,Cast,Comparison,Dispatch,Error as NumberError,Integral,Number,Predicate,Unary};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
@@ -15,13 +15,14 @@ enum Expression<'a> {
     Binary { operation: Binary,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
     Predicate { operation: Predicate,resolution: Resolution<Dispatch>,value: Box<Expression<'a>> },
     Comparison { operation: Comparison,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
+    Integral { operation: Integral,resolution: Resolution<Dispatch>,values: Box<[Expression<'a>;2]> },
     If(Box<[Expression<'a>;3]>),Body(Vec<Expression<'a>>),
     Let { first: usize,bindings: Vec<Expression<'a>>,body: Box<Expression<'a>> },
     Logical { conjunction: bool,values: Vec<Expression<'a>> },
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate) }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Integral(Integral),Modulo }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
@@ -43,6 +44,10 @@ impl<T: Copy> Resolution<T> {
 impl Resolution<Dispatch> {
     fn unary(value: Emission) -> Self { if value == Emission::Boolean { Self::Reflective } else { Self::Resolved(Dispatch::unary(value.number())) } }
     fn binary(left: Emission,right: Emission) -> Self { if left == Emission::Boolean || right == Emission::Boolean { Self::Reflective } else { Self::Resolved(Dispatch::binary(left.number(),right.number())) } }
+    fn integral(left: Emission,right: Emission) -> Self {
+        if left == Emission::Boolean || right == Emission::Boolean { Self::Reflective }
+        else { Self::Resolved(match (left.number(),right.number()) { (Some(left),Some(right)) => Dispatch::binary(Some(left),Some(right)),_ => Dispatch::Object }) }
+    }
     fn dispatch(self) -> Dispatch { match self { Self::Resolved(value) => value,Self::Reflective => Dispatch::Object } }
 }
 
@@ -116,6 +121,12 @@ impl<'a> Compiler<'a,'_,'_> {
                 return Ok(Expression::Comparison { operation,resolution,values: Box::new([left,right]) });
             }
         }
+        if let Some(Function::Integral(operation)) = operation.and_then(function) {
+            arity(args.len(),2,2)?;
+            let left = self.expression(&args[0],depth)?;let right = self.expression(&args[1],depth)?;
+            let resolution = Resolution::integral(left.emission(),right.emission());
+            return Ok(Expression::Integral { operation,resolution,values: Box::new([left,right]) });
+        }
         if let Some(Function::Arithmetic(operation)) = operation.and_then(function) {
             if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
         }
@@ -188,7 +199,7 @@ impl<'a> Expression<'a> {
     fn stack_depth(&self) -> usize {
         let children = match self {
             Self::Cast { value,.. } | Self::Boolean { value,.. } | Self::Unary { value,.. } | Self::Predicate { value,.. } => value.stack_depth(),
-            Self::Binary { values,.. } | Self::Comparison { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Binary { values,.. } | Self::Comparison { values,.. } | Self::Integral { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::If(values) => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Body(values) | Self::Vector(values) | Self::Logical { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
             Self::Let { bindings,body,.. } => bindings.iter().map(Self::stack_depth).max().unwrap_or(0).max(body.stack_depth()),
@@ -206,6 +217,7 @@ impl<'a> Expression<'a> {
             Self::Predicate { resolution,.. } | Self::Comparison { resolution,.. } => resolution.emission(|_|Emission::Boolean),
             Self::Unary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::Binary { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
+            Self::Integral { operation,resolution,.. } => resolution.emission(|dispatch|operation.primitive(dispatch).map_or(Emission::Reference,Emission::Number)),
             Self::If(branches) => branches[1].emission().branch(branches[2].emission()),
             Self::Body(values) => values.last().map_or(Emission::Reference,Self::emission),Self::Let { body,.. } => body.emission(),
             Self::Logical { values,.. } => values.iter().map(Self::emission).reduce(Emission::branch).unwrap_or(Emission::Reference),
@@ -229,6 +241,10 @@ impl<'a> Expression<'a> {
             Self::Comparison { operation,resolution,values } => {
                 let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
                 HostValue::Bool(numeric_compare(*operation,resolution.dispatch(),&left,&right,context)?)
+            }
+            Self::Integral { operation,resolution,values } => {
+                let left = values[0].evaluate(locals,context)?;let right = values[1].evaluate(locals,context)?;
+                numeric_integral(*operation,resolution.dispatch(),&left,&right,context)?
             }
             Self::If(branches) => if branches[0].evaluate(locals,context)?.truthy() { branches[1].evaluate(locals,context)? } else { branches[2].evaluate(locals,context)? },
             Self::Body(expressions) => {
@@ -295,6 +311,13 @@ impl Function {
             Self::Identity => { arity(args.len(),1,1)?;args.into_iter().next().ok_or_else(||error("Missing host argument"))? }
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
             Self::Arithmetic(operation) => operation.apply(args,context)?,
+            Self::Integral(operation) => { arity(args.len(),2,2)?;numeric_integral(operation,Dispatch::Object,&args[0],&args[1],context)? }
+            Self::Modulo => {
+                arity(args.len(),2,2)?;
+                let remainder = numeric_integral(Integral::Remainder,Dispatch::Object,&args[0],&args[1],context)?;
+                if numeric_predicate(Predicate::Zero,&remainder,context)?.truthy() || numeric_predicate(Predicate::Positive,&args[0],context)?.truthy() == numeric_predicate(Predicate::Positive,&args[1],context)?.truthy() { remainder }
+                else { numeric_binary(Binary::Add(false),Dispatch::Object,remainder,args[1].clone(),context)? }
+            }
             Self::Predicate(operation) => { arity(args.len(),1,1)?;numeric_predicate(operation,&args[0],context)? }
             Self::Comparison(operation) => {
                 arity(args.len(),1,usize::MAX)?;
@@ -344,7 +367,8 @@ fn function(name: &str) -> Option<Function> {
         "*" => Function::Arithmetic(Arithmetic::Multiply(false)),"*'" => Function::Arithmetic(Arithmetic::Multiply(true)),"/" => Function::Arithmetic(Arithmetic::Divide),
         "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),
         "<" => Function::Comparison(Comparison::Less),"<=" => Function::Comparison(Comparison::LessEqual),">" => Function::Comparison(Comparison::Greater),">=" => Function::Comparison(Comparison::GreaterEqual),"==" => Function::Comparison(Comparison::Equivalent),
-        "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),_ => return None })
+        "zero?" => Function::Predicate(Predicate::Zero),"pos?" => Function::Predicate(Predicate::Positive),"neg?" => Function::Predicate(Predicate::Negative),
+        "quot" => Function::Integral(Integral::Quotient),"rem" => Function::Integral(Integral::Remainder),"mod" => Function::Modulo,_ => return None })
 }
 impl Arithmetic {
     fn inline(self,count: usize) -> bool {
@@ -397,6 +421,15 @@ fn numeric_binary<'a>(operation: Binary,dispatch: Dispatch,left: HostValue<'a>,r
 fn reserve_numeric(bytes: usize,context: &EvalContext<'_>) -> Result<()> {
     if bytes > 16 * 1024 * 1024 { return Err(limit()); }
     context.reserve(bytes)
+}
+fn numeric_integral<'a>(operation: Integral,dispatch: Dispatch,left: &HostValue<'a>,right: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    let (left,right) = if dispatch == Dispatch::Object {
+        let right = right.number(context)?;
+        right.admit_divisor().map_err(numeric_error)?;
+        (left.number(context)?,right)
+    } else { (left.number(context)?,right.number(context)?) };
+    reserve_numeric(left.integral_bound(&right).map_err(|_|limit())?,context)?;
+    Ok(HostValue::Number(Arc::new(left.integral(operation,&right,dispatch).map_err(numeric_error)?)))
 }
 fn numeric_error(error: NumberError) -> Anomaly { match error { NumberError::External(error) => error,NumberError::Invalid => self::error("Invalid host arithmetic operation") } }
 fn numeric_predicate<'a>(operation: Predicate,value: &HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
