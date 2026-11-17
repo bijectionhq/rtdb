@@ -135,9 +135,12 @@ impl RegistryConverter {
         let latest = reader::LatestCache::open(options)?;
         let capacity = options.get("max.schemas.per.subject").map(|value| value.parse::<usize>().map_err(|cause| error("invalid-plugin-config", cause))).transpose()?.unwrap_or(1000);
         if capacity == 0 { return Err(error("invalid-plugin-config", "Schema cache capacity must be positive")); }
-        if format == RegistryFormat::Avro { super::converter::option_bool(options, "scrub.invalid.names", false)?; }
+        if format == RegistryFormat::Avro {
+            super::converter::option_bool(options, "scrub.invalid.names", false)?;
+            super::converter::option_bool(options, "avro.use.logical.type.converters", false)?;
+        }
         for key in ["specific.avro.reader", "schema.reflection"] {
-            if super::converter::option_bool(options, key, false)? { return Err(rtdb_types::Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-registry-option", format!("Registry option '{key}' requires a native reader-schema adapter"))); }
+            super::converter::option_bool(options, key, false)?;
         }
         Ok(Self { client: None, urls, security, format, is_key, options: options.clone(), schemas: BTreeMap::new(), order: VecDeque::new(), capacity, maximum_schema_bytes: 256 * 1024, next_avro_union: 0, reader_selection, latest, bindings: BTreeMap::new(), binding_order: VecDeque::new(), dlq: BTreeMap::new() })
     }
@@ -302,11 +305,12 @@ impl RegistryConverter {
                 let writer = self.avro_plan(&writer)?;
                 let selection = if let Some(selected) = &selected {
                     let reader = self.avro_plan(selected)?;
+                    if migrations.is_empty() { writer.validate_reader(Some(&reader))?; }
                     let decode = if !migrations.is_empty() { AvroRead::Migration }
                         else if writer.raw_bytes() { AvroRead::RawBytes }
                         else { AvroRead::Binary(super::avro::AvroResolution::compile(&writer, &reader, context)?) };
                     AvroSelection::Reader { plan: reader, decode }
-                } else { AvroSelection::Writer };
+                } else { writer.validate_reader(None)?; AvroSelection::Writer };
                 ReaderPlan::Avro { writer, selection, outputs: BTreeMap::new() }
             }
         };
@@ -377,6 +381,58 @@ impl RegistryConverter {
 #[cfg(test)]
 mod configuration_tests {
     use super::*;
+
+    fn configured(mode: &str, value: &str) -> Result<RegistryConverter> {
+        let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([
+            ("schema.registry.url".into(), "http://registry.invalid".into()), (mode.into(), value.into()),
+        ]) };
+        RegistryConverter::open(&spec, RegistryFormat::Avro, false)
+    }
+
+    fn document(schema: &str, context: &mut ConversionContext) -> Arc<SchemaDocument> {
+        Arc::new(SchemaDocument {
+            root: RegistrySchema { schema: schema.into(), schema_type: Some("AVRO".into()), references: Vec::new(), rule_set: None, metadata: None },
+            references: BTreeMap::new(), subject: "events-value".into(), version: 1, bytes: schema.len(),
+            charge: context.reserve(schema.len() * 4 + 1024).unwrap(),
+        })
+    }
+
+    #[tokio::test]
+    async fn configured_avro_reader_modes_admit_tombstones_and_primitive_bindings() {
+        assert!(configured("avro.use.logical.type.converters", "invalid").is_err());
+        for mode in ["specific.avro.reader", "schema.reflection"] {
+            assert!(configured(mode, "invalid").is_err());
+            let mut converter = configured(mode, "true").unwrap();
+            let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+            assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, rtdb_types::Value::Null);
+            let writer = document(r#""int""#, &mut context);
+            let key = converter.bind_reader("events", 1, writer, None, &mut context).await.unwrap();
+            let Decoded::Data(value) = converter.bindings.get_mut(&key).unwrap().decode(&[14], &converter.options, &mut converter.next_avro_union, &mut context).unwrap() else { panic!("expected decoded primitive") };
+            assert_eq!(value.value, rtdb_types::Value::I32(7));
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_binding_rejects_class_dependent_schemas_after_configuration() {
+        for mode in ["specific.avro.reader", "schema.reflection"] {
+            let mut converter = configured(mode, "true").unwrap();
+            let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+            for schema in [r#"{"type":"record","name":"Missing","fields":[]}"#, r#"{"type":"int","custom":"property"}"#] {
+                let writer = document(schema, &mut context);
+                assert!(converter.bind_reader("events", 1, writer, None, &mut context).await.is_err());
+                assert!(converter.bindings.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_specific_reader_binding_bypasses_primitive_class_construction() {
+        let mut converter = configured("specific.avro.reader", "true").unwrap();
+        let mut context = ConversionContext::new(rtdb_columnar::MemoryBudget::new(1 << 24));
+        let writer = document(r#"{"type":"int","custom":"property"}"#, &mut context);
+        let reader = document(r#""long""#, &mut context);
+        assert!(converter.bind_reader("events", 1, writer, Some(reader), &mut context).await.is_ok());
+    }
 
     #[test]
     fn avro_accepts_name_scrubbing_and_validates_its_boolean() {

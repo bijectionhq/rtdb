@@ -18,6 +18,7 @@ impl AvroDatumPlan {
     }
 
     pub fn from_json_datum(self: &std::sync::Arc<Self>, value: Json, context: &mut ConversionContext) -> Result<AvroDatum> {
+        self.validate_reader(Some(self))?;
         context.reserve(json_bound(&value, 0)?.checked_add(self.schema_bytes.checked_mul(16).ok_or_else(overflow)?).ok_or_else(overflow)?)?;
         Ok(AvroDatum { value: decode(&self.root, &value, &self.names, 0)?, plan: std::sync::Arc::clone(self) })
     }
