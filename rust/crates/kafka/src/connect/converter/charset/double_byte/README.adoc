@@ -1,0 +1,71 @@
+= Java 25 double-byte character mappings
+
+The String converter supports Java25's `Shift_JIS` and `windows-31j` charsets and all ten distinct case-insensitive registered names.
+The Shift_JIS aliases are `sjis`, `shift_jis`, `shift-jis`, `ms_kanji`, `x-sjis`, and `csShiftJIS`.
+The Windows-31J aliases are `MS932`, `windows-932`, and `csWindows31J`.
+Name matching preserves punctuation and follows the standard provider's alias ownership.
+The separate IBM942C charset owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`; those names do not select Windows-31J.
+link:charsets.tsv[The charset manifest] records canonical names, classes, source hashes, ASCII flags, trail ranges, present lead rows, resource sizes, mapping digests, decoded probe digests, and provider aliases.
+
+`Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
+`Mapping` owns immutable encoded table bytes and decodes on the caller's task.
+The decoder's byte cursor and output buffer belong to one call, so partial input never survives a record boundary.
+Its result buffer reserves three bytes per input byte, within the scalar converter's four-bytes-per-input-byte plus 16384-byte admission.
+No runtime mapping cache or decoder allocation is required.
+
+== Decoding and replacement
+
+Both Java classes construct the same `DoubleByte.Decoder` with their own `DecodeHolder` tables and trail range 0x40 through 0xFC.
+`String` selects its `ArrayDecoder.decode` entry point and uses U+FFFD replacements.
+The ASCII fastpath has the same result as the tables, whose first 128 single-byte entries are identity mappings.
+Bytes 0xA1 through 0xDF decode to halfwidth katakana; other bytes above 0x7F require a double-byte mapping or replacement.
+
+* When the first byte has a single-byte mapping, the decoder consumes it alone.
+* Otherwise, a mapped pair consumes two bytes.
+* For an unmapped pair:
+** The decoder consumes one byte if the first byte has no lead row, the second byte has a lead row, or the second byte has a single-byte mapping.
+** It consumes both bytes in the remaining case.
+* A final unmapped byte produces one replacement.
+
+Lead-row presence is part of this rule even when the selected pair is unmapped; an absent row is distinct from a present row containing unmapped entries.
+For example, 0x88 0x87 produces one replacement in Shift_JIS and two in Windows-31J, where 0x87 is a lead byte.
+Decoded UTF16 units cross the native UTF8 boundary by combining adjacent surrogates and replacing isolated surrogates; these pinned mappings contain no surrogates.
+
+The tables preserve Java's distinctions between these charsets.
+For example, 0x815C decodes to U+2014 in Shift_JIS and U+2015 in Windows-31J, while 0x8160 decodes to U+301C and U+FF5E respectively.
+Windows-31J also retains the NEC/IBM extension mappings and private-use range U+E000 through U+E757.
+
+== Sources and representation
+
+The data comes from Eclipse Temurin 25.0.1+8's https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz[Linux x64 JDK archive].
+The archive SHA-256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
+Its `jdk-25.0.1+8/lib/src.zip` member has SHA-256 `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[Supporting source hashes] pin the provider registrations, `DoubleByte`, `ArrayDecoder`, `CharsetMapping`, `String`, `Charset`, and `AbstractCharsetProvider`.
+The manifest pins each charset class's original source bytes.
+`COPYRIGHT` retains source copyright and license headers; `LICENSE`, `ASSEMBLY_EXCEPTION`, and `ADDITIONAL_LICENSE_INFO` retain the archive's license bytes, including the Classpath exception.
+
+Each mapping resource contains a two-byte minimum/maximum trail header, 256 big-endian `u16` single-byte mappings, and 256 big-endian `u16` lead-row indexes followed by the present rows' big-endian `u16` mappings.
+A lead-row index of 0xFFFF represents Java's shared `B2C_UNMAPPABLE` row; every other index selects a compact row whose width is maximum minus minimum plus one.
+Unmapped character entries contain U+FFFD.
+`shift_jis.bin` contains 39 lead rows and 15768 bytes, with SHA-256 `315c3ae24f7fc41e8928dddec73ad8312a7f13e82216e16167aa936cb1a85d13`.
+`windows-31j.bin` contains 55 lead rows and 21816 bytes, with SHA-256 `f4a3961137be202c450776887c715e01cf44ca031d99493478991cca71e61f67`.
+`aliases.rs` maps sorted lowercase names to `tables.rs` entries.
+Neither decoder table is modified by its encoder's non-round-trip mapping setup.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] accepts the pinned archive path and an output directory:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-double-byte
+----
+
+It verifies the archive and source-member hashes, the decoder constructors, the table initialization, row dimensions, ASCII identity, surrogate exclusions, and exact provider alias ownership before emitting the resources.
+It reads Java source text and archive contents only and requires no JDK execution.
+The decoded single-byte digest concatenates the result of every byte decoded as a separate record.
+The pair-probe digest concatenates the result of every two-byte record in unsigned order, with a U+0000 separator after each record.
+The regression source decodes each row of byte pairs with embedded 0x00 separators, which cannot be consumed as an invalid trail because it has a single-byte mapping.
+These probes cover every input pair, including malformed recovery and table holes, for every registered name and uppercase spelling.
+
+Independent regression anchors cover Japanese text, controls, halfwidth katakana, differing symbols, Windows extensions, private-use values, replacement grouping, truncated records, key/value precedence, null values, alias punctuation, and memory admission.

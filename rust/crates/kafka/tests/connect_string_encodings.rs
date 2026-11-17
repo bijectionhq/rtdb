@@ -447,3 +447,165 @@ async fn single_byte_decoders_admit_worst_case_storage_before_decoding() {
         assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8(expected.repeat(bytes.len())));
     }
 }
+
+const DOUBLE_BYTE_MANIFEST: &str = include_str!("../src/connect/converter/charset/double_byte/charsets.tsv");
+
+#[test]
+fn shift_jis_resources_retain_pinned_source_and_mapping_provenance() {
+    let mappings: [&[u8]; 2] = [
+        include_bytes!("../src/connect/converter/charset/double_byte/shift_jis.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/windows-31j.bin"),
+    ];
+    assert_eq!(sha256_hex(DOUBLE_BYTE_MANIFEST.as_bytes()), "7a178b00038c0baa4de1bd3a099639a39f3b24a733527bd2fa9aedfc8a09595e");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/aliases.rs")), "951d4ff7d361a2f8a1c7355fada705357f4566e3f5afe9a9db78cdb422e09e1c");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/tables.rs")), "c69e5c8ebd2d2d64bfdf19364d12055ac4df8a90f0b50ea25abaa4b1635206fe");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/sources.sha256")), "7e4ddd5ae3690e645ba3fb2827bea0723e3afef51f9eab350a736ac9b347ce54");
+    assert_eq!(DOUBLE_BYTE_MANIFEST.lines().skip(1).count(), 2);
+    for (line, mapping) in DOUBLE_BYTE_MANIFEST.lines().skip(1).zip(mappings) {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 13);
+        assert_eq!(fields[3].len(), 64);
+        assert!(fields[3].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(mapping.len(), fields[8].parse::<usize>().unwrap());
+        assert_eq!(sha256_hex(mapping), fields[9]);
+        assert_eq!(mapping[0], u8::from_str_radix(fields[5], 16).unwrap());
+        assert_eq!(mapping[1], u8::from_str_radix(fields[6], 16).unwrap());
+        let unit = |offset: usize| u16::from_be_bytes([mapping[offset], mapping[offset + 1]]);
+        let rows = fields[7].parse::<usize>().unwrap();
+        let width = usize::from(mapping[1] - mapping[0]) + 1;
+        assert_eq!(mapping.len(), 1026 + rows * width * 2);
+        assert_eq!((0..256).filter(|index| unit(514 + index * 2) != 0xffff).count(), rows);
+        for index in 0..256 {
+            let row = unit(514 + index * 2);
+            assert!(row == 0xffff || usize::from(row) < rows);
+            assert!(!(0xd800..=0xdfff).contains(&unit(2 + index * 2)));
+            if index < 128 { assert_eq!(unit(2 + index * 2), index as u16); }
+        }
+        for pair in mapping[1026..].chunks_exact(2) {
+            assert!(!(0xd800..=0xdfff).contains(&u16::from_be_bytes([pair[0], pair[1]])));
+        }
+    }
+}
+
+#[tokio::test]
+async fn shift_jis_canonical_names_and_every_provider_alias_decode_single_bytes_and_pairs() {
+    let mut names = std::collections::BTreeSet::new();
+    for line in DOUBLE_BYTE_MANIFEST.lines().skip(1) {
+        let fields: Vec<_> = line.split('\t').collect();
+        for name in std::iter::once(fields[0]).chain(fields[12].split('|')) {
+            names.insert(name.to_ascii_lowercase());
+            for selected in [name.to_owned(), name.to_ascii_uppercase()] {
+                let mut singles = String::new();
+                for byte in 0u8..=255 { singles.push_str(&decode(&selected, &[byte]).await); }
+                assert_eq!(sha256_hex(singles.as_bytes()), fields[10], "{selected}");
+                let mut pairs = String::new();
+                for first in 0u8..=255 {
+                    let bytes: Vec<_> = (0u8..=255).flat_map(|second| [first, second, 0]).collect();
+                    pairs.push_str(&decode(&selected, &bytes).await);
+                }
+                assert_eq!(sha256_hex(pairs.as_bytes()), fields[11], "{selected}");
+                assert_eq!(decode(&selected, &[]).await, "");
+            }
+        }
+    }
+    assert_eq!(names.len(), 10);
+}
+
+#[tokio::test]
+async fn shift_jis_decodes_japanese_ascii_controls_and_halfwidth_katakana() {
+    for name in ["Shift_JIS", "windows-31j"] {
+        assert_eq!(decode(name, &[0x93, 0xfa, 0x96, 0x7b, 0x8c, 0xea, 0x82, 0xa0, 0x82, 0xa2, 0x83, 0x41]).await, "日本語あいア");
+        assert_eq!(decode(name, &[0, b'\t', b'\n', 0x5c, 0x7e, 0x7f, 0xa1, 0xdf]).await, "\0\t\n\\~\u{7f}｡ﾟ");
+        assert_eq!(decode(name, &[0x81, 0x40, 0x81, 0x41, 0x81, 0x42, 0x88, 0x9f]).await, "\u{3000}、。亜");
+    }
+}
+
+#[tokio::test]
+async fn windows31j_retains_distinct_symbols_extensions_and_private_use_characters() {
+    let symbols = [0x81, 0x5c, 0x81, 0x60, 0x81, 0x61, 0x81, 0x7c, 0x81, 0x91, 0x81, 0x92, 0x81, 0xca];
+    assert_eq!(decode("Shift_JIS", &symbols).await, "—〜‖−¢£¬");
+    assert_eq!(decode("windows-31j", &symbols).await, "―～∥－￠￡￢");
+    assert_eq!(decode("windows-31j", &[0x87, 0x40, 0xed, 0x40, 0xfa, 0x40, 0xf0, 0x40, 0xf9, 0xfc]).await, "①纊ⅰ\u{e000}\u{e757}");
+    for first in [0x87, 0xed, 0xfa, 0xf0, 0xf9] {
+        assert_eq!(decode("Shift_JIS", &[first, 0x40]).await, "\u{fffd}@");
+    }
+}
+
+#[tokio::test]
+async fn shift_jis_replacement_replays_single_bytes_and_present_lead_rows() {
+    for name in ["Shift_JIS", "windows-31j"] {
+        for (bytes, expected) in [
+            (&[0x81][..], "\u{fffd}"),
+            (&[0x81, b' '][..], "\u{fffd} "),
+            (&[0x81, 0x7f][..], "\u{fffd}\u{7f}"),
+            (&[0x83, 0xdf][..], "\u{fffd}ﾟ"),
+            (&[0x85, 0x81, 0x40][..], "\u{fffd}\u{3000}"),
+            (&[0x88, 0x81, 0x40][..], "\u{fffd}\u{3000}"),
+            (&[0x81, 0xfd, b'a'][..], "\u{fffd}a"),
+            (&[0xfd, 0xfd, b'a'][..], "\u{fffd}\u{fffd}a"),
+            (&[0x81, 0xff, 0x81][..], "\u{fffd}\u{fffd}"),
+            (&[0x81, 0xfd, 0x82, 0xa0][..], "\u{fffd}あ"),
+        ] { assert_eq!(decode(name, bytes).await, expected, "{name} {bytes:?}"); }
+    }
+    assert_eq!(decode("Shift_JIS", &[0x88, 0x87, 0x40]).await, "\u{fffd}@");
+    assert_eq!(decode("windows-31j", &[0x88, 0x87, 0x40]).await, "\u{fffd}①");
+    assert_eq!(decode("Shift_JIS", &[0x88, 0x87]).await, "\u{fffd}");
+    assert_eq!(decode("windows-31j", &[0x88, 0x87]).await, "\u{fffd}\u{fffd}");
+}
+
+#[tokio::test]
+async fn shift_jis_decoding_resets_partial_pairs_for_every_record() {
+    for name in ["Shift_JIS", "windows-31j"] {
+        let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", name)]), false).unwrap();
+        let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+        for (bytes, expected) in [(&[0x81][..], "\u{fffd}"), (&[0x40][..], "@"), (&[0x81, 0x40][..], "\u{3000}"), (&[][..], "")] {
+            assert_eq!(converter.decode("events", Some(bytes), &mut context).await.unwrap().value, Value::Utf8(expected.into()));
+        }
+        assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null);
+    }
+}
+
+#[tokio::test]
+async fn shift_jis_encodings_follow_key_and_value_overrides_and_serializer_validation() {
+    let options = spec(&[
+        ("converter.encoding", "invalid"),
+        ("key.serializer.encoding", "MS932"),
+        ("key.deserializer.encoding", "SJIS"),
+        ("value.serializer.encoding", "Shift_JIS"),
+        ("value.deserializer.encoding", "windows-932"),
+    ]);
+    let plugins = PluginRegistry::default();
+    for (is_key, expected) in [(true, "〜"), (false, "～")] {
+        let mut converter = plugins.converter(&options, is_key).unwrap();
+        let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+        assert_eq!(converter.decode("events", Some(&[0x81, 0x60]), &mut context).await.unwrap().value, Value::Utf8(expected.into()));
+        let serializer = if is_key { "key.serializer.encoding" } else { "value.serializer.encoding" };
+        for invalid in ["ShiftJIS", "windows_31j", "ms-932", " SJIS "] {
+            let mut invalid_options = options.clone();
+            invalid_options.options.insert(serializer.into(), invalid.into());
+            assert!(plugins.converter(&invalid_options, is_key).is_err(), "{serializer}={invalid}");
+        }
+    }
+    assert_eq!(decode("\0\tSJIS\r\u{1f}", &[0x81, 0x60]).await, "〜");
+}
+
+#[test]
+fn shift_jis_lookup_rejects_unregistered_spellings() {
+    for name in ["ShiftJIS", "windows_31j", "ms-932", "Shift_JIS-2004", "csWindows932"] {
+        assert!(PluginRegistry::default().converter(&spec(&[("converter.encoding", name)]), false).is_err(), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn shift_jis_decoders_admit_replacement_and_mapping_storage_before_decoding() {
+    for name in ["Shift_JIS", "windows-31j"] {
+        for (byte, expected) in [(0xff, "\u{fffd}"), (0xa1, "｡")] {
+            let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", name)]), false).unwrap();
+            let bytes = [byte; 1024];
+            let mut rejected = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4 - 1));
+            assert!(converter.decode("events", Some(&bytes), &mut rejected).await.is_err());
+            let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
+            assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8(expected.repeat(bytes.len())));
+        }
+    }
+}
