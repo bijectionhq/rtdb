@@ -878,8 +878,8 @@ Container writers and their complete source constructor, getter, promotion and c
 
 The pinned direct FixedSizeBinary constructor accepts negative signed widths and retains them in type and field metadata.
 A width of -1 permits an actual byte append before the count advances; a later byte getter fails at Java25 MemorySegment reinterpretation with a negative size.
-The current native scalar constructor rejects that identity at strict schema admission.
-A separate source-native declaration, signed-width kernels and exact reader failure boundary are required while checked SDK admission retains its contract.
+A separate source-native declaration now retains that identity through signed write/copy kernels and borrowed byte facts while checked SDK admission retains its contract.
+Existing-inner adoption, complete raw object and ByteBuffer behavior, selected readers and production transport remain required.
 
 Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
 That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
@@ -940,7 +940,7 @@ Construction and teardown retain their physical depth bound, full scalar clone s
 Run-end singleton methods use actual child counts and concrete end receivers; union null insertion remains distinct from union-valued nullable-setter failure.
 Consuming publication captures actual child descriptors and raw spans without an intervening checked SDK array.
 Independent source review covers 28 new regression sources and preservation of all 265 existing test bodies and the original scalar implementation.
-Source scalar parameters, complete Field factories, mutable getters/hints/LongLong, routed child writers, promotion, recursive copying, relations, objects/hash, transport and production adoption remain required.
+Remaining source constructor history and alias adoption, complete Field factories, mutable getters/hints/LongLong, routed child writers, promotion, recursive copying, relations, objects/hash, transport and production adoption remain required.
 The independent signed-Slice and mutable-selection alias obligations remain open.
 
 The incoming static INSERT fix admits renamed Values projections through the existing expression-only static materializer.
@@ -961,10 +961,39 @@ Private map probes use admitted linked continuations through the shared context 
 Independent source review covers all 38 added regression sources and preservation of the 98 existing parser prediction test bodies.
 The native map substitution remains conditional on stable internal producers and a nonescaping cache boundary.
 Supported embedded recognition-exception capabilities remain an open compatibility requirement before production adoption.
-Parser-produced closure/reach sets, adaptive prediction, shared parser ownership, generated rule control, diagnostics and production integration remain required.
+Full-context configuration production, adaptive prediction, shared parser ownership, generated rule control, diagnostics and production integration remain required.
 
 Incoming submission changes only adjust the computed-series regression source; production submission bodies and the bounded write-trace conclusion are unchanged.
 The submission evidence digest now identifies those current committed bytes.
+
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+== Local prediction, source scalar and conformance dependency checkpoint
+
+The private local/SLL prediction producer implements start, iterative closure, consuming reach, EOF filtering, cold precedence filtering and loop-entry pruning for the pinned grammar.
+Cold work and later consuming reaches share the same merge round, with memo activation at the source demand.
+Busy membership uses its separate local stability proof, while live configuration handles retain source continuation and failure prefixes.
+Source assertion selection is explicit and retains reached no-message assertion sites.
+Independent source review covers 53 new regression sources and preservation of all 136 prior prediction test bodies.
+Cache binding does not certify logical producer provenance; actual insertion and caller closure remain required before production adoption.
+Full-context work must preserve that same round through the real parser invocation, precedence and token owners.
+The embedded cause/recognizer/cache capability requirement remains open.
+
+Fresh source scalar declarations retain every signed FixedBinary and UUID inner width and all four units on each concrete Time32/Time64 class.
+Their complete metadata value is rebuilt in the writer budget and transferred through typed fixed capture, independently of strict SDK field validation.
+Nullable replacement retains overlapping metadata leases and completed validity prefixes; failed publication retains charged metadata through cleanup.
+Borrowed byte and pointer facts preserve wrapping offsets and source view failures before a separate native retained-payload demand.
+The existing checked row gates and whole-root publication gate retain their contracts.
+Independent source review covers 34 new regression sources and preservation of all 293 prior columnar test bodies.
+Initial constructor counts and allocation history, existing-inner aliases, custom ZoneRulesProvider rules, full Field factories, raw primitive/object/meta/hint operations, signed Slice, recursive writes/copies, relations, hashing, transport and production adoption remain required.
+
+The conformance engine restores catalog dependencies through typed relation plans, resolving all table occurrences before rebuilding each owned expression occurrence.
+It preserves lexical bindings, structural validation and serialized error projection without constructing a whole-plan JSON value.
+The deliberate native capacity policy uses exact typed clone capacities; the fixed-budget regression records the resulting admission difference.
+Construction before prepared ownership remains an open allocation obligation.
+Independent source review covers 15 regression groups and preservation of the existing engine and raw-form assertions.
+Canonical form ownership and exact-unit producer and codec migration remain required.
 
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.

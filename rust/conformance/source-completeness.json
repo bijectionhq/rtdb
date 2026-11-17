@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and the source scalar parameter/Field factory, remaining container mutation/getter/hint/LongLong, signed Slice and mutable-selection alias, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector writer/count/cursor, descriptor, metadata-demand, reader-identity, immutable native-container and keyed Struct foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and source constructor counts/allocation history/existing-inner aliases, Field factories, mutable getter/hint/LongLong, signed Slice and mutable-selection alias, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree and fresh source scalar declaration/signed write-copy/borrowed-byte foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration and private actual-root DFA storage, ordered configuration/mode, exact-unit literal-decoder and private tree-JSON foundations with parser-produced closure/reach sets, adaptive prediction and cache insertion, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration/private actual-root DFA, ordered configuration/mode, exact-unit literal-decoder, private tree-JSON and local/SLL start/closure/reach/cold-precedence foundations with full-context producers over the same round, adaptive prediction and cache insertion, shared parser ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "source-signed-binary-width",
@@ -266,7 +266,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Preserve source-native FixedSizeBinary signed constructor parameters independently of checked SDK schema admission: negative widths retain successful type/field metadata and byte-write prefixes; implement signed write/copy/read demands and distinguish the negative MemorySegment reinterpretation size failure from Arrow bounds failures, including exact retained owner and span lifetimes."
+      "requirement": "Complete source-native signed FixedSizeBinary behavior through remaining existing-inner adoption, raw object/pointer-reuse/ByteBuffer, selected-reader, transport and production paths beyond the reviewed fresh declaration, signed write-copy and borrowed-byte fact foundation; retain constructor parameters, the negative reinterpretation versus Arrow bounds failure distinction and actual owner/span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
