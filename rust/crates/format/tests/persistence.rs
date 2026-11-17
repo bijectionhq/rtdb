@@ -172,4 +172,9 @@ fn committed_jvm_data_files_are_read_through_the_event_schema() {
         let batch = EventBatch::new(file.read_page(page).unwrap()).unwrap();
         for row in 0..batch.len() { batch.read_event(row).unwrap(); }
     }
+    let mut projected = ipc::ArrowFile::open(Arc::from(bytes.as_slice()), Some(vec![0])).unwrap();
+    assert_eq!(projected.schema().fields().len(), 1);
+    let page = projected.read_page(0).unwrap();
+    assert_eq!(page.num_columns(), 1);
+    page.column(0).to_data().validate_full().unwrap();
 }

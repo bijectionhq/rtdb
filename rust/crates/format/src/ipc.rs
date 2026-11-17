@@ -11,10 +11,13 @@ use arrow_schema::{Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result};
 
+mod nulls;
+
 pub struct ArrowFile {
     reader: Box<dyn RetainedReader>,
     decoder: FileDecoder,
     schema: SchemaRef,
+    source_schema: SchemaRef,
     blocks: Vec<arrow_ipc::Block>,
     next_page: usize,
     encoded_page_sizes: Vec<usize>,
@@ -71,13 +74,13 @@ impl ArrowFile {
         if !ipc_schema.endianness().equals_to_target_endianness() { return Err(invalid("Arrow file endianness differs from the host")); }
         let full_schema = Arc::new(crate::ipc_decimal::decode(ipc_schema)?);
         let schema = if let Some(projection) = &projection { Arc::new(full_schema.project(projection).map_err(invalid)?) } else { Arc::clone(&full_schema) };
-        let mut decoder = FileDecoder::new(full_schema, footer.version());
+        let mut decoder = FileDecoder::new(Arc::clone(&full_schema), footer.version());
         if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
         if let Some(dictionaries) = footer.dictionaries() {
-            for block in dictionaries { let buffer = read_block(reader.as_mut(), block)?; decoder.read_dictionary(block, &buffer).map_err(invalid)?; }
+            for block in dictionaries { let buffer = read_block(reader.as_mut(), block, &full_schema)?; decoder.read_dictionary(block, &buffer).map_err(invalid)?; }
         }
         let blocks = footer.recordBatches().ok_or_else(|| invalid("Arrow footer has no record-batch inventory"))?.iter().copied().collect();
-        Ok(Self { reader, decoder, schema, blocks, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
+        Ok(Self { reader, decoder, schema, source_schema: full_schema, blocks, next_page: 0, encoded_page_sizes: layout.page_encoded_bytes, page_decoding_bounds: layout.page_decoding_bounds })
     }
 
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.schema) }
@@ -99,7 +102,7 @@ impl ArrowFile {
             return Err(invalid(format!("Page {page} is outside a {}-page file", self.page_count())));
         }
         let block = &self.blocks[page];
-        let buffer = read_block(self.reader.as_mut(), block)?;
+        let buffer = read_block(self.reader.as_mut(), block, &self.source_schema)?;
         let batch = self.decoder.read_record_batch(block, &buffer).map_err(invalid)?.ok_or_else(|| invalid("Arrow file ended before its declared page"))?;
         self.next_page = page + 1;
         Ok(batch)
@@ -114,7 +117,7 @@ impl Iterator for ArrowFile {
         Some(self.read_page(page))
     }
 }
-fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Result<Buffer> {
+fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block, schema: &Schema) -> Result<Buffer> {
     let size = allocation_add(usize::try_from(block.metaDataLength()).map_err(invalid)?, usize::try_from(block.bodyLength()).map_err(invalid)?)?;
     reader.seek(SeekFrom::Start(u64::try_from(block.offset()).map_err(invalid)?)).map_err(invalid)?;
     let mut bytes = vec![0; size]; reader.read_exact(&mut bytes).map_err(invalid)?;
@@ -125,6 +128,8 @@ fn read_block(reader: &mut dyn RetainedReader, block: &arrow_ipc::Block) -> Resu
     let header_end = allocation_add(prefix, usize::try_from(length).map_err(invalid)?)?;
     let header = bytes.get(prefix..header_end).filter(|_| header_end <= metadata_end).ok_or_else(|| invalid("Arrow block header exceeds its metadata"))?;
     validate_lz4_lengths(&arrow_ipc::root_as_message(header).map_err(invalid)?, &bytes[metadata_end..])?;
+    let (metadata, body) = bytes.split_at_mut(metadata_end);
+    nulls::normalize(&mut metadata[prefix..header_end], body, schema)?;
     Ok(Buffer::from(bytes))
 }
 
@@ -218,9 +223,11 @@ impl<R: Read> ArrowStream<R> {
     }
     pub fn schema(&self) -> SchemaRef { Arc::clone(&self.projected) }
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        while let Some((metadata, body)) = read_message(&mut self.reader)? {
+        while let Some((mut metadata, body)) = read_message(&mut self.reader)? {
             let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
             validate_lz4_lengths(&message, &body)?;
+            nulls::normalize(&mut metadata, &body, &self.schema)?;
+            let message = arrow_ipc::root_as_message(&metadata).map_err(invalid)?;
             let body = Buffer::from(body);
             if let Some(batch) = message.header_as_record_batch() {
                 return arrow_ipc::reader::read_record_batch(&body, batch, Arc::clone(&self.schema), &self.dictionaries, self.projection.as_deref(), &message.version()).map(Some).map_err(invalid);

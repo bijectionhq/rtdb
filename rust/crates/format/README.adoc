@@ -6,6 +6,8 @@ Immutable-file inspection reads compressed length prefixes without loading each 
 File and stream readers validate LZ4 output length with a fixed scratch buffer before Arrow 58.4.1's decoder materializes it.
 Bounds include the complete framed metadata length and conservative decoder scratch allowances: 64 MiB for LZ4 frame buffers and their reallocation, and 1 MiB for Zstandard's bulk decoder context.
 Zstandard output uses Arrow's declared-size bulk decoder.
+File and stream readers derive unknown field null counts from physical validity before checked decoding, including compressed and dictionary buffers.
+Projection retains the full source schema for that traversal, and null counts below the unknown sentinel remain invalid.
 Callers reserve those bounds before decoding and retain their guards until the decoded buffers are released.
 Generated protobuf messages retain field presence from XTDB's edition-2023 schemas.
 The build script generates bindings from the original source files and maps their explicit-presence fields to prost's proto2 descriptor model.
