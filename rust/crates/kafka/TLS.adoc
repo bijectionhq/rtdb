@@ -32,8 +32,17 @@ Kafka applies Java ConfigDef trimming to algorithm names; Registry HTTPS preserv
 `NewSunX509` scans the Java store's alias enumeration, preferring a valid client certificate for the first requested key type.
 It otherwise chooses the first valid certificate, then an expired certificate before one with incompatible client key usage or extended key usage.
 Fallback ties use requested key-type priority, then store enumeration.
+`NewSunX509` also applies the pinned Java algorithm constraints to every certificate in each candidate chain.
 The selected entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
+`ssl.trustmanager.algorithm` and `schema.registry.ssl.trustmanager.algorithm` default to `PKIX`, with the aliases `SunPKIX`, `X509` and `X.509`.
+`SunX509` selects the built-in simple validator: it follows the supplied certificate order, replaces matching reissued trust anchors, and appends a trusted issuer when needed.
+Its validation covers certificate signatures, validity, issuer chaining, CA path lengths, key usage, Netscape certificate types and unsupported critical extensions.
+Intermediate extended key usage does not constrain the simple validator.
+A directly trusted leaf bypasses certificate validity and usage checks while retaining explicit certificate distrust checks.
+Trusted certificates follow Java HashSet bucket and tree ordering; ties between distinct certificates with the same hash use native object identity and are specific to the process.
+The native simple validator checks the connection's configured DNS name or IP address and retains its peer-chain reservation until the connection is destroyed.
+`SunX509` uses the pinned roots or Java-style trust material; native `ssl.ca.location` and `ssl.ca.pem` overrides remain available with `PKIX`.
 All parsed keys, chains, roots and their memory reservations belong to one immutable TLS value retained by the native client.
 Native client destruction joins librdkafka's activity and destroys its OpenSSL objects before releasing that value.
 Configuration duplication retains the same value, and creation failures release both the native configuration and its TLS ownership.
@@ -58,8 +67,8 @@ A list containing only disabled suites or protocols produces no usable handshake
 Separate `signature_algorithms_cert` preferences require transport integration beyond the exposed peer signing-scheme list.
 `NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
 OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
+Distinguished-name matching still uses OpenSSL canonicalization; Java's Unicode case folding and NFKD normalization need a shared native adapter.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
-Alternative built-in trust-manager algorithm selection remains unfinished.
 These are open standard-configuration gaps.
 Additional Java providers and credential extensions require native implementations.
 The conservative material reservation bound still requires allocator measurement with large stores and concurrent handshakes.

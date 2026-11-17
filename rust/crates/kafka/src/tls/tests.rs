@@ -1,7 +1,7 @@
 use super::*;
 use rtdb_columnar::MemoryBudget;
 #[path = "../../tests/support/kafka_tls.rs"]
-mod support;
+pub(super) mod support;
 
 fn options() -> BTreeMap<String, String> { BTreeMap::from([("security.protocol".into(), "SSL".into())]) }
 
@@ -18,6 +18,33 @@ fn producer_sunjsse_provider_uses_java_string_trim_and_exact_provider_case() {
         let mut options = options(); options.insert("ssl.provider".into(), provider.into());
         assert!(NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).is_err());
         assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn new_sunx509_rejects_weak_keys_in_the_complete_client_chain() {
+    use openssl::{bn::BigNum, hash::MessageDigest, rsa::Rsa, x509::{X509NameBuilder, extension::{BasicConstraints, KeyUsage}}};
+    let key = PKey::from_rsa(Rsa::generate(512).unwrap()).unwrap();
+    let mut name = X509NameBuilder::new().unwrap(); name.append_entry_by_text("CN", "weak issuer").unwrap(); let name = name.build();
+    let mut root = X509::builder().unwrap(); root.set_version(2).unwrap();
+    root.set_serial_number(&BigNum::from_u32(1).unwrap().to_asn1_integer().unwrap()).unwrap();
+    root.set_subject_name(&name).unwrap(); root.set_issuer_name(&name).unwrap(); root.set_pubkey(&key).unwrap();
+    root.set_not_before(&Asn1Time::days_from_now(0).unwrap()).unwrap(); root.set_not_after(&Asn1Time::days_from_now(1).unwrap()).unwrap();
+    root.append_extension(BasicConstraints::new().ca().build().unwrap()).unwrap(); root.append_extension(KeyUsage::new().key_cert_sign().build().unwrap()).unwrap();
+    root.sign(&key, MessageDigest::sha256()).unwrap();
+    let root = support::Credential { key, certificate: root.build(), chain: vec![] };
+    let client = support::Credential::new("client", false, Some(&root));
+    let directory = tempfile::tempdir().unwrap(); let file = directory.path().join("client.jks");
+    std::fs::write(&file, support::jks(&[("client", &client)], "store", "key")).unwrap();
+    for (algorithm, eligible) in [("SunX509", true), ("NewSunX509", false), ("PKIX", false)] {
+        let mut options = options(); options.insert("ssl.keymanager.algorithm".into(), algorithm.into());
+        options.insert("ssl.keystore.location".into(), file.to_str().unwrap().into());
+        options.insert("ssl.keystore.password".into(), "store".into()); options.insert("ssl.key.password".into(), "key".into());
+        options.insert("ssl.ca.pem".into(), "native-owned".into());
+        let memory = MemoryBudget::new(1 << 24);
+        let material = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
+        assert_eq!(material.identities.len(), 1); assert_eq!(material.identities[0].eligible, eligible);
+        drop(material); assert_eq!(memory.used_bytes(), 0);
     }
 }
 
@@ -91,7 +118,7 @@ fn java_default_roots_replace_host_trust_unless_native_roots_are_explicit() {
 }
 
 #[test]
-fn native_builtin_key_managers_select_their_java_alias_order_for_both_protocols() {
+fn native_builtin_managers_select_java_alias_order_and_verify_trust_for_both_protocols() {
     use std::net::TcpStream;
     use std::time::Duration;
     use openssl::ssl::{Ssl, SslMethod, SslStream, SslVerifyMode};
@@ -106,6 +133,7 @@ fn native_builtin_key_managers_select_their_java_alias_order_for_both_protocols(
             let (address, broker) = support::broker(&server, &root, version, Some("rsa_pss_rsae_sha256"));
             let mut options = options();
             options.insert("ssl.keymanager.algorithm".into(), algorithm.into());
+            options.insert("ssl.trustmanager.algorithm".into(), if algorithm == "PKIX" { "SunX509" } else { "PKIX" }.into());
             options.insert("ssl.truststore.type".into(), "PEM".into());
             options.insert("ssl.truststore.certificates".into(), String::from_utf8(root.certificate.to_pem().unwrap()).unwrap());
             options.insert("ssl.keystore.location".into(), file.to_str().unwrap().into());
@@ -119,7 +147,8 @@ fn native_builtin_key_managers_select_their_java_alias_order_for_both_protocols(
             let context = context.build();
             let socket = TcpStream::connect(address).unwrap();
             socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-            let mut stream = SslStream::new(Ssl::new(&context).unwrap(), socket).unwrap();
+            let mut ssl = Ssl::new(&context).unwrap(); ssl.param_mut().set_host("localhost").unwrap();
+            let mut stream = SslStream::new(ssl, socket).unwrap();
             stream.connect().unwrap();
             let observed = broker.join().unwrap().unwrap();
             assert_eq!(observed.certificate, expected.certificate.to_der().unwrap());
