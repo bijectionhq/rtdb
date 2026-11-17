@@ -53,3 +53,42 @@ fn host_numeric_literal_storage_is_admitted_before_parsing_and_released_on_failu
     }
     assert_eq!(memory.used_bytes(),0);
 }
+
+#[test]
+fn host_arithmetic_reserves_scratch_before_big_integer_products() {
+    let number = F::BigInteger("9".repeat(512));
+    let expression = replace(call("str",vec![call("*",vec![number.clone(),number])]));
+    let memory = MemoryBudget::new(64 << 10);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        let schema = Schema::default();
+        assert_eq!(ExpressionInvocation::prepare(&expression,&schema,&context).err().unwrap().code,"rtdb/memory-budget-exceeded");
+        assert!(memory.peak_bytes() <= memory.limit_bytes());
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn host_arithmetic_admits_decimal_scale_growth_before_constructing_powers() {
+    for name in ["+","inc"] {
+        let mut args = vec![F::Decimal("1E-2147483647".into())];
+        if name == "+" { args.push(F::Literal(V::I64(1))); }
+        let expression = replace(call("str",vec![call(name,args)]));
+        let memory = MemoryBudget::new(128 << 20);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            let schema = Schema::default();
+            assert_eq!(ExpressionInvocation::prepare(&expression,&schema,&context).err().unwrap().code,"rtdb.expr/regex-host-limit");
+            assert!(memory.peak_bytes() < 64 << 10);
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
+}
+
+#[test]
+fn host_arithmetic_bounds_generated_nary_instruction_depth() {
+    let expression = replace(call("str",vec![call("+",vec![F::Literal(V::I64(1));129])]));
+    assert_eq!(ExpressionInvocation::prepare(&expression,&Schema::default(),&EvalContext::default()).err().unwrap().code,"rtdb.expr/regex-host-limit");
+}

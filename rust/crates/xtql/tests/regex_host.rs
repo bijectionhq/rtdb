@@ -108,3 +108,71 @@ async fn host_inline_casts_preserve_primitive_selection_and_compile_time_arity()
         assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
 }
+
+#[tokio::test]
+async fn host_arithmetic_keeps_numeric_categories_scale_and_primitive_overloads() {
+    for (source,pattern) in [
+        ("0",r#"(str (+))"#),("1",r#"(str (*))"#),("",r#"(str (+ nil))"#),
+        ("6",r#"(str (+ 1 2 3))"#),("24",r#"(str (* 2 3 4))"#),
+        ("5",r#"(str (- 10 3 2))"#),("-3",r#"(str (- 3))"#),
+        ("1/2",r#"(str (/ 2))"#),("2",r#"(str (/ 12 3 2))"#),
+        ("1/4",r#"(str (* (/ 1 2) (/ 1 2)))"#),("1",r#"(str (+ (/ 1 2) (/ 1 2)))"#),
+        ("3.50",r#"(str (+ 1.20M 2.3M))"#),("2.760",r#"(str (* 1.20M 2.3M))"#),
+        ("1.70",r#"(str (+ 1.20M (/ 1 2)))"#),("1.00",r#"(str (/ 2.00M 2))"#),
+        ("9223372036854775808",r#"(str (+' 9223372036854775807 1))"#),
+        ("9223372036854775808",r#"(str (-' -9223372036854775808))"#),
+        ("9223372036854775808",r#"(str (*' -9223372036854775808 -1))"#),
+        ("9223372036854775808",r#"(str (inc' 9223372036854775807))"#),
+        ("-9223372036854775809",r#"(str (dec' -9223372036854775808))"#),
+        ("0",r#"(str (- -9223372036854775808 -9223372036854775808))"#),
+        ("0",r#"(str (- (+ -9223372036854775808 0) -9223372036854775808))"#),
+        ("Infinity",r#"(str (/ 1.0 0.0))"#),("Infinity",r#"(str (/ 1.0 (identity 0)))"#),
+        ("Infinity",r#"(str (/ (identity 1) 0.0))"#),("Infinity",r#"(str (/ (float 1) 0))"#),
+        ("NaN",r#"(let [f /] (str (f ##NaN "not numeric")))"#),
+        ("NaN",r#"(let [f /] (str (f "not numeric" ##NaN)))"#),
+        ("3",r#"(let [f +] (str (f 1 2)))"#),("3",r#"(let [+ str] (+ "3"))"#),
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace "{source}" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{pattern}");
+    }
+}
+
+#[tokio::test]
+async fn host_direct_arithmetic_runs_each_nested_operation_before_later_arguments() {
+    let direct = project(r#"(regexp-replace "a" (str (+ 9223372036854775807 1 (subs "x" -1))) "x")"#).await.unwrap_err();
+    assert_eq!(direct.message,"long overflow");
+    let indirect = project(r#"(regexp-replace "a" (let [f +] (str (f 9223372036854775807 1 (subs "x" -1)))) "x")"#).await.unwrap_err();
+    assert_eq!(indirect.message,"Host substring indexes are out of range");
+    let boxed = project(r#"(regexp-replace "a" (let [f -] (str (f -9223372036854775808 -9223372036854775808))) "x")"#).await.unwrap_err();
+    assert_eq!(boxed.message,"long overflow");
+    let promoted = project(r#"(regexp-replace "a" (str (- (+' -9223372036854775808 0) -9223372036854775808)) "x")"#).await.unwrap_err();
+    assert_eq!(promoted.message,"long overflow");
+    for pattern in [r#"(let [f /] (str (f 1.0 0.0)))"#,r#"(str (/ (identity 1.0) 0))"#,r#"(str (/ 1 0))"#,
+        r#"(str (/ (identity "not numeric") 0))"#,r#"(let [f /] (str (f "not numeric" 0)))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().message,"Divide by zero","{pattern}");
+    }
+}
+
+#[tokio::test]
+async fn host_arithmetic_preserves_inline_arity_and_selected_runtime_errors() {
+    for pattern in [r#"(if true "a" (inc))"#,r#"(if true "a" (dec' 1 2))"#,r#"(str (+ 9223372036854775807 1))"#,r#"(str (/ 1M 3M))"#,r#"(str (+ 1M (/ 1 3)))"#,r#"(str (/ ##NaN "not numeric"))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().code,"xtdb.error/unknown","{pattern}");
+    }
+    for pattern in [r#"(if true "a" (-))"#,r#"(if true "a" (/))"#,r#"(if true "a" (+ 9223372036854775807 1))"#,r#"(let [f inc] (if true "a" (f)))"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{pattern}");
+    }
+}
+
+#[tokio::test]
+async fn host_exact_decimal_failures_preserve_jvm_arithmetic_messages() {
+    for (form,message) in [
+        ("(/ 1M 3M)","Non-terminating decimal expansion; no exact representable decimal result."),
+        ("(+ 1M (/ 1 3))","Non-terminating decimal expansion; no exact representable decimal result."),
+        ("(* 1M (/ 1 3))","Non-terminating decimal expansion; no exact representable decimal result."),
+        ("(* 1E-2147483647M 1.0M)","Underflow"),
+        ("(* 1E+2147483647M 1E+2M)","Overflow"),
+    ] {
+        let error = project(&format!(r#"(regexp-replace "a" (str {form}) "x")"#)).await.unwrap_err();
+        assert_eq!(error.code,"xtdb.error/unknown");
+        assert_eq!(error.message,message,"{form}");
+    }
+}

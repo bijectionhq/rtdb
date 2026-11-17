@@ -2,7 +2,7 @@ use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::RegexForm as Form;
 use rtdb_types::{Anomaly,Result,Value};
 use crate::EvalContext;
-use crate::jvm_number::{Cast,Number};
+use crate::jvm_number::{Binary,Cast,Dispatch,Error as NumberError,Number,Unary};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
@@ -10,13 +10,17 @@ impl AsRef<str> for PatternText<'_> { fn as_ref(&self) -> &str { match self { Se
 enum Expression<'a> {
     Constant(&'a Form),Number(Arc<Number>),Nil,Local { index: usize,primitive: Option<Cast> },Function(Function),
     Cast { kind: Cast,primitive: bool,value: Box<Expression<'a>> },
+    Unary { operation: Unary,dispatch: Dispatch,value: Box<Expression<'a>> },
+    Binary { operation: Binary,dispatch: Dispatch,values: Box<[Expression<'a>;2]> },
     If(Box<[Expression<'a>;3]>),Body(Vec<Expression<'a>>),
     Let { first: usize,bindings: Vec<Expression<'a>>,body: Box<Expression<'a>> },
     Logical { conjunction: bool,values: Vec<Expression<'a>> },
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast) }
+enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic) }
+#[derive(Clone,Copy)]
+enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
 enum HostValue<'a> { Constant(&'a Form),Number(Arc<Number>),Nil,Bool(bool),Text(Arc<str>),Function(Function),Vector(Arc<[HostValue<'a>]>) }
 struct Compiler<'a,'c,'context> { symbols: BTreeMap<&'a str,(usize,Option<Cast>)>,active: usize,slots: usize,nodes: usize,context: &'c EvalContext<'context> }
@@ -25,6 +29,7 @@ impl<'a> Program<'a> {
     pub(super) fn compile(form: &'a Form,context: &EvalContext<'_>) -> Result<Self> {
         let mut compiler = Compiler { symbols: BTreeMap::new(),active: 0,slots: 0,nodes: 0,context };
         let expression = compiler.expression(form,0)?;
+        if expression.stack_depth() > 128 { return Err(limit()); }
         Ok(Self { expression,locals: compiler.slots })
     }
     pub(super) fn pattern(&self,context: &EvalContext<'_>) -> Result<PatternText<'a>> {
@@ -72,6 +77,9 @@ impl<'a> Compiler<'a,'_,'_> {
             let value = self.expression(&args[0],depth)?;
             return Ok(Expression::Cast { kind,primitive: value.primitive().is_some(),value: Box::new(value) });
         }
+        if let Some(Function::Arithmetic(operation)) = operation.and_then(function) {
+            if operation.inline(args.len()) { return self.arithmetic(operation,args,depth); }
+        }
         Ok(match operation {
             Some("quote") => { arity(args.len(),1,1)?;match &args[0] { Form::BigInteger(_) | Form::Decimal(_) => Expression::Number(Arc::new(literal_number(&args[0],self.context)?)),_ => Expression::Constant(&args[0]) } }
             Some("if") => {
@@ -114,13 +122,47 @@ impl<'a> Compiler<'a,'_,'_> {
             _ => Expression::Call { function: Box::new(self.expression(&forms[0],depth)?),arguments: self.expressions(args,depth)? },
         })
     }
+    fn arithmetic(&mut self,operation: Arithmetic,args: &'a [Form],depth: usize) -> Result<Expression<'a>> {
+        if matches!(operation,Arithmetic::Increment(_) | Arithmetic::Decrement(_)) { arity(args.len(),1,1)?; }
+        if depth.checked_add(args.len()).is_none_or(|depth|depth > 128) { return Err(limit()); }
+        let mut args = args.iter();
+        let first = self.expression(args.next().ok_or_else(||error("Missing host argument"))?,depth)?;
+        if let Some(unary) = operation.unary() {
+            if args.len() == 0 { return Ok(Expression::Unary { operation: unary,dispatch: Dispatch::unary(first.primitive()),value: Box::new(first) }); }
+        }
+        let binary = operation.binary().ok_or_else(||error("Invalid host arithmetic arity"))?;
+        let mut result = first;
+        for value in args {
+            self.nodes += 1;
+            if self.nodes > 65_536 { return Err(limit()); }
+            self.context.reserve(256)?;
+            let right = self.expression(value,depth)?;
+            let dispatch = Dispatch::binary(result.primitive(),right.primitive());
+            result = Expression::Binary { operation: binary,dispatch,values: Box::new([result,right]) };
+        }
+        if result.stack_depth() > 128 { return Err(limit()); }
+        Ok(result)
+    }
 }
 
 impl<'a> Expression<'a> {
+    fn stack_depth(&self) -> usize {
+        let children = match self {
+            Self::Cast { value,.. } | Self::Unary { value,.. } => value.stack_depth(),
+            Self::Binary { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::If(values) => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Body(values) | Self::Vector(values) | Self::Logical { values,.. } => values.iter().map(Self::stack_depth).max().unwrap_or(0),
+            Self::Let { bindings,body,.. } => bindings.iter().map(Self::stack_depth).max().unwrap_or(0).max(body.stack_depth()),
+            Self::Call { function,arguments } => function.stack_depth().max(arguments.iter().map(Self::stack_depth).max().unwrap_or(0)),
+            _ => 0,
+        };
+        children + 1
+    }
     fn primitive(&self) -> Option<Cast> {
         match self {
             Self::Constant(Form::Literal(Value::I64(_))) => Some(Cast::Long),Self::Constant(Form::Literal(Value::F64(_))) => Some(Cast::Double),
             Self::Local { primitive,.. } => *primitive,Self::Cast { kind,.. } => Some(*kind),
+            Self::Unary { operation,dispatch,.. } => operation.primitive(*dispatch),Self::Binary { operation,dispatch,.. } => operation.primitive(*dispatch),
             Self::If(branches) => branches[1].primitive().filter(|kind|branches[2].primitive() == Some(*kind)),
             Self::Body(values) => values.last().and_then(Self::primitive),Self::Let { body,.. } => body.primitive(),
             Self::Logical { values,.. } => values.first().and_then(Self::primitive).filter(|kind|values.iter().all(|value|value.primitive() == Some(*kind))),
@@ -132,6 +174,12 @@ impl<'a> Expression<'a> {
             Self::Constant(form) => HostValue::Constant(form),Self::Number(value) => HostValue::Number(Arc::clone(value)),Self::Nil => HostValue::Nil,
             Self::Local { index,.. } => locals[*index].clone(),Self::Function(function) => HostValue::Function(*function),
             Self::Cast { kind,primitive,value } => numeric_cast(*kind,value.evaluate(locals,context)?,*primitive,context)?,
+            Self::Unary { operation,dispatch,value } => numeric_unary(*operation,*dispatch,value.evaluate(locals,context)?,context)?,
+            Self::Binary { operation,dispatch,values } => {
+                let left = values[0].evaluate(locals,context)?;
+                let right = values[1].evaluate(locals,context)?;
+                numeric_binary(*operation,*dispatch,left,right,context)?
+            }
             Self::If(branches) => if branches[0].evaluate(locals,context)?.truthy() { branches[1].evaluate(locals,context)? } else { branches[2].evaluate(locals,context)? },
             Self::Body(expressions) => {
                 let mut value = HostValue::Nil;
@@ -173,6 +221,8 @@ impl HostValue<'_> {
     fn number(&self,context: &EvalContext<'_>) -> Result<Cow<'_,Number>> {
         match self { Self::Number(value) => Ok(Cow::Borrowed(value)),Self::Constant(form) => literal_number(form,context).map(Cow::Owned),_ => Err(error("Host value is not a Number")) }
     }
+    fn nan(&self) -> bool { match self { Self::Number(value) => value.is_nan(),Self::Constant(Form::Literal(Value::F64(value))) => value.is_nan(),_ => false } }
+    fn nil(&self) -> bool { matches!(self,Self::Nil | Self::Constant(Form::Literal(Value::Null))) }
     fn index(&self,context: &EvalContext<'_>) -> Result<i32> {
         drop(self.number(context)?);
         let value = numeric_cast(Cast::Int,self.clone(),false,context)?;
@@ -194,6 +244,7 @@ impl Function {
             }
             Self::Identity => { arity(args.len(),1,1)?;args.into_iter().next().ok_or_else(||error("Missing host argument"))? }
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
+            Self::Arithmetic(operation) => operation.apply(args,context)?,
             Self::Boolean | Self::Not => { arity(args.len(),1,1)?;HostValue::Bool(args[0].truthy() == matches!(self,Self::Boolean)) }
             Self::Name | Self::Namespace => {
                 arity(args.len(),1,1)?;
@@ -231,8 +282,64 @@ impl Function {
 fn function(name: &str) -> Option<Function> {
     let name = name.strip_prefix("clojure.core/").unwrap_or(name);
     Some(match name { "str" => Function::Str,"identity" => Function::Identity,"name" => Function::Name,"namespace" => Function::Namespace,"subs" => Function::Subs,"not" => Function::Not,"boolean" => Function::Boolean,
-        "byte" => Function::Cast(Cast::Byte),"short" => Function::Cast(Cast::Short),"int" => Function::Cast(Cast::Int),"long" => Function::Cast(Cast::Long),"float" => Function::Cast(Cast::Float),"double" => Function::Cast(Cast::Double),_ => return None })
+        "byte" => Function::Cast(Cast::Byte),"short" => Function::Cast(Cast::Short),"int" => Function::Cast(Cast::Int),"long" => Function::Cast(Cast::Long),"float" => Function::Cast(Cast::Float),"double" => Function::Cast(Cast::Double),
+        "+" => Function::Arithmetic(Arithmetic::Add(false)),"+'" => Function::Arithmetic(Arithmetic::Add(true)),"-" => Function::Arithmetic(Arithmetic::Subtract(false)),"-'" => Function::Arithmetic(Arithmetic::Subtract(true)),
+        "*" => Function::Arithmetic(Arithmetic::Multiply(false)),"*'" => Function::Arithmetic(Arithmetic::Multiply(true)),"/" => Function::Arithmetic(Arithmetic::Divide),
+        "inc" => Function::Arithmetic(Arithmetic::Increment(false)),"inc'" => Function::Arithmetic(Arithmetic::Increment(true)),"dec" => Function::Arithmetic(Arithmetic::Decrement(false)),"dec'" => Function::Arithmetic(Arithmetic::Decrement(true)),_ => return None })
 }
+impl Arithmetic {
+    fn inline(self,count: usize) -> bool {
+        match self { Self::Add(_) | Self::Multiply(_) | Self::Divide => count > 1,Self::Subtract(_) => count > 0,Self::Increment(_) | Self::Decrement(_) => true }
+    }
+    fn unary(self) -> Option<Unary> {
+        match self { Self::Subtract(promote) => Some(Unary::Negate(promote)),Self::Increment(promote) => Some(Unary::Increment(promote)),Self::Decrement(promote) => Some(Unary::Decrement(promote)),_ => None }
+    }
+    fn binary(self) -> Option<Binary> {
+        match self { Self::Add(promote) => Some(Binary::Add(promote)),Self::Subtract(promote) => Some(Binary::Subtract(promote)),Self::Multiply(promote) => Some(Binary::Multiply(promote)),Self::Divide => Some(Binary::Divide),_ => None }
+    }
+    fn apply<'a>(self,args: Vec<HostValue<'a>>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+        match self { Self::Increment(_) | Self::Decrement(_) => arity(args.len(),1,1)?,Self::Subtract(_) | Self::Divide => arity(args.len(),1,usize::MAX)?,_ => {} }
+        let mut args = args.into_iter();
+        let Some(first) = args.next() else { context.reserve(64)?;return Ok(HostValue::Number(Arc::new(Number::Long(if matches!(self,Self::Multiply(_)) { 1 } else { 0 })))); };
+        if args.len() == 0 {
+            if let Some(operation) = self.unary() { return numeric_unary(operation,Dispatch::Object,first,context); }
+            if matches!(self,Self::Divide) {
+                context.reserve(64)?;
+                let one = HostValue::Number(Arc::new(Number::Long(1)));
+                return numeric_binary(Binary::Divide,Dispatch::Object,one,first,context);
+            }
+            if !first.nil() { drop(first.number(context)?); }
+            return Ok(first);
+        }
+        let operation = self.binary().ok_or_else(||error("Invalid host arithmetic arity"))?;
+        let mut result = first;
+        for value in args { result = numeric_binary(operation,Dispatch::Object,result,value,context)?; }
+        Ok(result)
+    }
+}
+fn numeric_unary<'a>(operation: Unary,dispatch: Dispatch,value: HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    let number = value.number(context)?;
+    reserve_numeric(number.unary_bound(operation).map_err(|_|limit())?,context)?;
+    Ok(HostValue::Number(Arc::new(number.unary(operation,dispatch).map_err(numeric_error)?)))
+}
+fn numeric_binary<'a>(operation: Binary,dispatch: Dispatch,left: HostValue<'a>,right: HostValue<'a>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+    if operation == Binary::Divide && dispatch != Dispatch::Double {
+        if left.nan() { return Ok(left); }
+        if right.nan() { return Ok(right); }
+    }
+    let (left,right) = if operation == Binary::Divide && dispatch != Dispatch::Double {
+        let right = right.number(context)?;
+        right.admit_divisor().map_err(numeric_error)?;
+        (left.number(context)?,right)
+    } else { (left.number(context)?,right.number(context)?) };
+    reserve_numeric(left.binary_bound(operation,&right).map_err(|_|limit())?,context)?;
+    Ok(HostValue::Number(Arc::new(left.binary(operation,&right,dispatch).map_err(numeric_error)?)))
+}
+fn reserve_numeric(bytes: usize,context: &EvalContext<'_>) -> Result<()> {
+    if bytes > 16 * 1024 * 1024 { return Err(limit()); }
+    context.reserve(bytes)
+}
+fn numeric_error(error: NumberError) -> Anomaly { match error { NumberError::External(error) => error,NumberError::Invalid => self::error("Invalid host arithmetic operation") } }
 fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<Arc<str>> {
     match value {
         HostValue::Text(value) => Ok(Arc::clone(value)),HostValue::Nil => text("",context),HostValue::Bool(value) => text(if *value { "true" } else { "false" },context),
