@@ -1,0 +1,58 @@
+{
+  "2.16.0": {
+    "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.16.0/jackson-databind-2.16.0-sources.jar",
+    "jar_sha256": "9967c9d76cd6cabdce763149d643bc0b66e580208d635684b1bda5e09da44b30",
+    "members": {
+      "com/fasterxml/jackson/databind/JsonNode.java": "4559f0f0697bed1ae32207899d3cc274ccd48db9eb360023a9da13adbf2ff108",
+      "com/fasterxml/jackson/databind/node/JsonNodeFactory.java": "db94c4cf4b705744fb3677ccf1639c4d4576b1fc6fbcb5542cc31d5cb56d5047",
+      "com/fasterxml/jackson/databind/node/BaseJsonNode.java": "15bdb3126c43bd45012a9b80f6941670aef4e3a2b7147c2e9e32cfeffed5b08f",
+      "com/fasterxml/jackson/databind/node/ContainerNode.java": "88cd76975bbd34f466ea535a9719affe4af3c98a51b8bc323a3c32ba18021524",
+      "com/fasterxml/jackson/databind/node/ValueNode.java": "23892be56319d0acc4175fc6a8a68d5bcf161c315eae858534749c49aec7066b",
+      "com/fasterxml/jackson/databind/node/IntNode.java": "49bca9c20af557f4e147a2cd1e68905f7f5b5d2646fa54a705a824dae3dd1774",
+      "com/fasterxml/jackson/databind/node/LongNode.java": "fcfda8687eb46fb6316534db58309d780b0ed20b401980e1859f582353934256",
+      "com/fasterxml/jackson/databind/node/BigIntegerNode.java": "3869b742942dac7b4106a56dfa93b4134a3b5b5415186d4bde473c96ebd8b3e3",
+      "com/fasterxml/jackson/databind/node/DoubleNode.java": "617f6da3bc7d9189d8a4e12606b8a2210874017c6627e4733ee73acff95d1b8e",
+      "com/fasterxml/jackson/databind/node/FloatNode.java": "e23e2e8a5e241d6899929fb8117064645dbe48717680f3356eb6e9e29bad346e",
+      "com/fasterxml/jackson/databind/node/DecimalNode.java": "e4de7ac8c4680d475ce71fe77ed0cf05260fc01ec88710a7ada62cf76155328c",
+      "com/fasterxml/jackson/databind/node/TextNode.java": "59c1c4f6f0fa3b527ad63d774a243570dc78d6dab716be3960dbb474a184d208",
+      "com/fasterxml/jackson/databind/node/BooleanNode.java": "93f4eed2106691a7b67f1b09e0aed723d332d8c40e5be5176338213456508fa1",
+      "com/fasterxml/jackson/databind/node/NullNode.java": "0db0b689aa9ce8205c564571a52fbb4ced0e4db48aff20d9030c25d8e6cea21f",
+      "com/fasterxml/jackson/databind/node/ObjectNode.java": "e24b1fbf1aa67e2c48cb1e33c138ac38a7174db9f60c441b15625a1aad4f0f12",
+      "com/fasterxml/jackson/databind/node/ArrayNode.java": "3dcac794fb04b395737944b2edbf6396a95f0378600d8b068ac0b348bb475c77",
+      "com/fasterxml/jackson/databind/node/BinaryNode.java": "7795e979b822e59cdfbeeb5871c7484d1ba10404a7ba50039bc7a8b47ec37acd",
+      "com/fasterxml/jackson/databind/node/NumericNode.java": "ef022c4c9a83fe2b708636ad944bd7933868e4d756db2ffef7160e7e4cf1c8b3"
+    },
+    "notices": {
+      "META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+      "META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  },
+  "2.21.7": {
+    "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.21.7/jackson-databind-2.21.7-sources.jar",
+    "jar_sha256": "9d0088f4990df572c2e3aa1c14d4c03fd8200283d801836c8044d01b9ccb7e73",
+    "members": {
+      "com/fasterxml/jackson/databind/JsonNode.java": "ca5294f97d227a042164382325b3818ea8ac5b6dd4d48a59bbb064cc38e7b06a",
+      "com/fasterxml/jackson/databind/node/JsonNodeFactory.java": "db94c4cf4b705744fb3677ccf1639c4d4576b1fc6fbcb5542cc31d5cb56d5047",
+      "com/fasterxml/jackson/databind/node/BaseJsonNode.java": "15bdb3126c43bd45012a9b80f6941670aef4e3a2b7147c2e9e32cfeffed5b08f",
+      "com/fasterxml/jackson/databind/node/ContainerNode.java": "f8195aa803f209bfe3b93fb08c049ccb6f782b43183cb7e0eac4c8bc08c20203",
+      "com/fasterxml/jackson/databind/node/ValueNode.java": "23892be56319d0acc4175fc6a8a68d5bcf161c315eae858534749c49aec7066b",
+      "com/fasterxml/jackson/databind/node/IntNode.java": "49bca9c20af557f4e147a2cd1e68905f7f5b5d2646fa54a705a824dae3dd1774",
+      "com/fasterxml/jackson/databind/node/LongNode.java": "fcfda8687eb46fb6316534db58309d780b0ed20b401980e1859f582353934256",
+      "com/fasterxml/jackson/databind/node/BigIntegerNode.java": "32e5cc428dd5ac1dcbe0725b91cd33dd04c9821536cf1d18d9df0a6a7d97d888",
+      "com/fasterxml/jackson/databind/node/DoubleNode.java": "617f6da3bc7d9189d8a4e12606b8a2210874017c6627e4733ee73acff95d1b8e",
+      "com/fasterxml/jackson/databind/node/FloatNode.java": "8bb16107da469cb6c04090dd63a1cd8caa94ada415de1aead9b38d39ee4f4e9b",
+      "com/fasterxml/jackson/databind/node/DecimalNode.java": "ef09e665233dfd30f1c3c40e0e1cd0293305525413d5be42f90127c5bb61d524",
+      "com/fasterxml/jackson/databind/node/TextNode.java": "87c83256b57eb314ce6b5104483574d250520c0877c4ccbc77a5e718804834e8",
+      "com/fasterxml/jackson/databind/node/BooleanNode.java": "93f4eed2106691a7b67f1b09e0aed723d332d8c40e5be5176338213456508fa1",
+      "com/fasterxml/jackson/databind/node/NullNode.java": "3cd1dbfef1792455d8de87043458a7379ae68494e3ee1f0b6fa6b19c29648a22",
+      "com/fasterxml/jackson/databind/node/ObjectNode.java": "87545566cdde43a5c1ff66c035cb4dff3c3326696a05e4cd20eaf3a4fe1e652c",
+      "com/fasterxml/jackson/databind/node/ArrayNode.java": "51be87f5b5c1cbc446bd67cd13b5b63da7824e45b34d3f28b0b66ecd534bcadc",
+      "com/fasterxml/jackson/databind/node/BinaryNode.java": "39e7604f2fd380069e62d75b09f3133a42672ace2c4306c6543077c9e16b8885",
+      "com/fasterxml/jackson/databind/node/NumericNode.java": "ef022c4c9a83fe2b708636ad944bd7933868e4d756db2ffef7160e7e4cf1c8b3"
+    },
+    "notices": {
+      "META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+      "META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
+    }
+  }
+}
