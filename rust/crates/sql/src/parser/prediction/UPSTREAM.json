@@ -1,0 +1,73 @@
+{
+  "archive": {
+    "coordinates": "com.xtdb:xtdb-core:2.x-20261106.153107-1:sources",
+    "url": "https://central.sonatype.com/repository/maven-snapshots/com/xtdb/xtdb-core/2.x-SNAPSHOT/xtdb-core-2.x-20261106.153107-1-sources.jar",
+    "sha256": "00d5777611aaa0af9eb98058d2bac8b9373bba7a6baa064d8f467f989cade472"
+  },
+  "artifacts": {
+    "Sql.java": {
+      "path": "xtdb/antlr/Sql.java",
+      "sha256": "74eb25b3c9039d91cd6f575e98a8d09e3909db8740a6123d4c9a37753b0fb438"
+    },
+    "Sql.g4": {
+      "path": "xtdb/antlr/Sql.g4",
+      "sha256": "46ac30b2a5b2cd94b60d4dba7f3e0e89e0bacdc05ab86f7d6367aed2d891840e"
+    },
+    "Sql.interp": {
+      "path": "xtdb/antlr/Sql.interp",
+      "sha256": "7ddd4e07bfee31ae4fb58775221992a4ec5310e0e5f1fc24d9b61af9ff9253c5"
+    }
+  },
+  "antlr": {
+    "version": "4.13.2",
+    "license": "../../../LICENSE-ANTLR",
+    "sources": [
+      {
+        "source": "atn/ParserATNSimulator.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ParserATNSimulator.java",
+        "sha256": "b296e18054e0e90289f809baaf70c280dd1853cc949cb342693cfc01cb9f8620"
+      },
+      {
+        "source": "atn/ATNSimulator.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNSimulator.java",
+        "sha256": "4c6ef2cf2492b649d25a2b7fafc03ac0a30fa0d207baea4717021ffac10c22cb"
+      },
+      {
+        "source": "atn/PredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PredictionContext.java",
+        "sha256": "af228bbc8c2373c086bf15b64d89c0f2ccb141405bf3b804269e36651b71ad91"
+      },
+      {
+        "source": "atn/SingletonPredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/SingletonPredictionContext.java",
+        "sha256": "6473a3fdb2e32680644fea0df5efa9b437fd0224e13040f906afecff32d3ada3"
+      },
+      {
+        "source": "atn/EmptyPredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/EmptyPredictionContext.java",
+        "sha256": "950278da93427419b0a1425d4a4a3fdd2e7a177e9ef2078557b2b674e303bd1e"
+      },
+      {
+        "source": "atn/ArrayPredictionContext.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ArrayPredictionContext.java",
+        "sha256": "388806c3269dc7b8d03c05d57328ce77f41c416418790ef6fd603c57728bc0e1"
+      },
+      {
+        "source": "atn/PredictionContextCache.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/PredictionContextCache.java",
+        "sha256": "d82f36d1f7924699a97051019a694461eef1952e3f17ebfcc4f378bcea97babc"
+      },
+      {
+        "source": "misc/DoubleKeyMap.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/DoubleKeyMap.java",
+        "sha256": "61e9600a7ce6f6af6da6e6a30d84dc6d53e78a76dc3a7d76fcca0718f3636f1b"
+      },
+      {
+        "source": "misc/MurmurHash.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/MurmurHash.java",
+        "sha256": "baf1ae863ce343f4a3812e80c4ab9b0d1c661c833efc18fba3473334979353b0"
+      }
+    ]
+  },
+  "scope": "Prediction-context values, merging and SLL cached-context publication; no token prediction or production parser adapter."
+}

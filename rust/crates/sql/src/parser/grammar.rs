@@ -203,6 +203,7 @@ pub(crate) enum TransitionView<'g, 'scope> {
 }
 
 impl<'g, 'scope> State<'g, 'scope> {
+    pub(crate) fn belongs_to(self, grammar: &Grammar<'_>) -> bool { std::ptr::eq(self.grammar, grammar) }
     pub(crate) fn number(self) -> u32 { self.id.0 }
     pub(crate) fn rule(self) -> Rule<'g, 'scope> {
         Rule { grammar: self.grammar, id: self.grammar.states[self.id.0 as usize].rule }
