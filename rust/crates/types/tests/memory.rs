@@ -136,3 +136,55 @@ fn competing_exclusive_lease_growth_cannot_overdraw_a_shared_ancestor() {
     drop(results);
     assert_eq!(root.used_bytes(), 0);
 }
+
+#[test]
+fn reservation_control_count_follows_nested_and_sibling_owners_without_changing_them() {
+    let root = MemoryBudget::new(1000);
+    let child = root.scope();
+    let leaf = child.scope();
+    let sibling = root.scope();
+    let reservation = leaf.reserve(13).unwrap();
+    let retained = Arc::clone(&reservation);
+    let references = [Arc::strong_count(&root), Arc::strong_count(&child), Arc::strong_count(&leaf), Arc::strong_count(&sibling)];
+    assert_eq!(root.reservation_lease_count().unwrap(), 1);
+    assert_eq!(child.reservation_lease_count().unwrap(), 2);
+    assert_eq!(leaf.reservation_lease_count().unwrap(), 3);
+    assert_eq!(sibling.reservation_lease_count().unwrap(), 2);
+    assert_eq!(references, [Arc::strong_count(&root), Arc::strong_count(&child), Arc::strong_count(&leaf), Arc::strong_count(&sibling)]);
+    for budget in [&root, &child, &leaf] { assert_eq!((budget.used_bytes(), budget.peak_bytes()), (13, 13)); }
+    assert_eq!((sibling.used_bytes(), sibling.peak_bytes()), (0, 0));
+    drop(reservation);
+    assert_eq!(root.used_bytes(), 13);
+    assert_eq!(retained.budget().reservation_lease_count().unwrap(), 3);
+    drop(retained);
+    assert_eq!(root.used_bytes(), 0);
+    let empty = leaf.reserve(0).unwrap();
+    assert_eq!(empty.budget().reservation_lease_count().unwrap(), 3);
+    drop(empty);
+    assert_eq!(root.used_bytes(), 0);
+}
+
+#[test]
+fn a_caller_control_allowance_is_admitted_with_payload_before_reservation_construction() {
+    for limit in [199, 200] {
+        let root = MemoryBudget::new(limit);
+        let child = root.scope();
+        let leaf = child.scope();
+        let controls = leaf.reservation_lease_count().unwrap();
+        let required = 8 + controls * 64;
+        assert_eq!(required, 200);
+        let reservation = leaf.reserve(required);
+        if limit == 199 {
+            assert_eq!(reservation.unwrap_err().code, "rtdb/memory-budget-exceeded");
+            for budget in [&root, &child, &leaf] { assert_eq!(budget.used_bytes(), 0); }
+        } else {
+            let reservation = reservation.unwrap();
+            for budget in [&root, &child, &leaf] { assert_eq!(budget.used_bytes(), required); }
+            let retained = Arc::clone(&reservation);
+            drop(reservation);
+            assert_eq!(root.used_bytes(), required);
+            drop(retained);
+            for budget in [&root, &child, &leaf] { assert_eq!(budget.used_bytes(), 0); }
+        }
+    }
+}

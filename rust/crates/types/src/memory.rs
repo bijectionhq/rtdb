@@ -32,6 +32,20 @@ impl MemoryBudget {
         Ok(Arc::new(MemoryReservation { budget: Arc::clone(self), bytes, parent }))
     }
 
+    /// Counts the reservation controls created by a successful `reserve`, including this budget and every ancestor.
+    /// Includes zero-byte reservations; failed reservations may construct fewer controls.
+    /// Walks the immutable chain without allocating, reserving or changing counters; the count is stable for this budget's lifetime.
+    /// Returns an error if the count exceeds usize.
+    pub fn reservation_lease_count(&self) -> Result<usize> {
+        let mut count = 1usize;
+        let mut budget = self;
+        while let Some(parent) = &budget.parent {
+            count = count.checked_add(1).ok_or_else(|| Anomaly::incorrect("rtdb/allocation-overflow", "Reservation ancestor count exceeds range"))?;
+            budget = parent;
+        }
+        Ok(count)
+    }
+
     fn acquire(&self, bytes: usize) -> Result<()> {
         let mut current = self.used_bytes.load(Ordering::Relaxed);
         loop {
@@ -53,7 +67,6 @@ impl MemoryBudget {
 }
 
 /// Retained byte charge keeping its budget and ancestor leases alive.
-/// Arc clones share one charge; only exclusive access permits resizing.
 #[derive(Debug)]
 pub struct MemoryReservation {
     budget: Arc<MemoryBudget>,
@@ -66,7 +79,7 @@ impl MemoryReservation {
     pub fn budget(&self) -> &Arc<MemoryBudget> { &self.budget }
 
     /// - Admits additional bytes through this lease and every ancestor before the caller allocates them.
-    /// - Requires exclusive access and a total at least as large as the held bytes; allocations are not resized.
+    /// - Requires a total at least as large as the held bytes; allocations are not resized.
     /// - An admission failure preserves retained bytes and lease sizes; ancestor peaks may record temporary admission.
     pub fn grow_to(&mut self, bytes: usize) -> Result<()> {
         let additional = bytes.checked_sub(self.bytes)
@@ -86,7 +99,7 @@ impl MemoryReservation {
 
     /// Releases excess capacity from this lease and its parent leases without lowering recorded peaks.
     /// The requested bytes must cover every allocation retained under this lease; this method does not resize allocations.
-    /// Requires exclusive access; requesting more than the held bytes returns an error without changing any counters.
+    /// Requesting more than the held bytes returns an error without changing any counters.
     pub fn shrink_to(&mut self, bytes: usize) -> Result<()> {
         if bytes > self.bytes {
             return Err(Anomaly::incorrect("rtdb/reservation-growth", "A memory reservation can only shrink"));
