@@ -246,12 +246,13 @@
     {
       "id": "azure-desktop-credentials",
       "kind": "implementation",
-      "status": "open",
+      "status": "resolved",
       "targets": [
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
-      "requirement": "Complete the required IntelliJ credential path and the unavailable-provider behavior of the pinned default chain; absent broker dependencies and SharedTokenCache outside that chain do not require invented providers."
+      "requirement": "Complete the required IntelliJ credential path and the unavailable-provider behavior of the pinned default chain; absent broker dependencies and SharedTokenCache outside that chain do not require invented providers.",
+      "resolution": "Native IntelliJ cache readers, authority discovery and account/scope token sessions are implemented and source-reviewed in crates/azure/src/desktop.rs and desktop/{cache,json,authority}.rs. The environment username/password branch includes managed and MEX/WS-Trust federation flows. Pinned broker absence and SharedTokenCache exclusion retain their actual unavailable/unsupported behavior. Native platform and service execution remains Phase 2 qualification."
     },
     {
       "id": "kafka-configurations",

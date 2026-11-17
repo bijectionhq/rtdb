@@ -1,0 +1,42 @@
+= Native Rust adapter configuration
+
+The Rust implementation retains the pinned JVM adapter configuration names at its native boundaries.
+Source coverage and execution evidence are tracked separately in `rust/conformance/source-completeness.json` and the conformance ledger.
+The paths described here have regression sources; platform and service qualification belongs to Phase 2.
+
+== Azure credentials
+
+The Azure storage bridge selects environment credentials, workload identity, managed identity, and developer credentials through `rust/crates/azure/src/credential.rs`.
+Environment client secrets take precedence over certificates and username/password credentials.
+The username/password path requires `AZURE_CLIENT_ID`, `AZURE_USERNAME`, and `AZURE_PASSWORD` and uses `AZURE_TENANT_ID` when supplied.
+Its default tenant is `organizations`.
+The public-client authority follows `AZURE_AUTHORITY_HOST`, performs AAD instance discovery, and uses the discovered preferred network host for token exchange.
+
+Managed accounts use the password grant.
+Federated accounts follow user-realm discovery, MEX policy selection, WS-Trust, and the resulting SAML bearer exchange.
+Token responses, identity metadata, cache refresh, and scopes retain the pinned MSAL behavior.
+HTTP and XML work runs on the requesting future with bounded response bodies and deadlines.
+
+Developer selection follows IntelliJ, Visual Studio Code, Azure CLI, PowerShell, Azure Developer CLI, and OS broker order.
+The IntelliJ provider reads the Azure Toolkit cache through macOS Keychain, Linux libsecret, or Windows DPAPI and defaults its tenant to `common`.
+Native cache work belongs to the database's existing I/O region; closing that region joins admitted work before releasing its resources.
+The pinned distribution lacks `azure-identity-broker`, so Visual Studio Code and OS broker providers report unavailable.
+`SharedTokenCacheCredential` is outside that distribution's default chain.
+
+`AZURE_TOKEN_CREDENTIALS` accepts `prod`, `dev`, or an individual supported provider name, including `IntelliJCredential` and `VisualStudioCodeCredential`.
+Provider cache limits, ownership details, and regression-source coverage are recorded in `rust/crates/azure/README.adoc`.
+
+== Kafka and Schema Registry TLS
+
+Kafka dead-letter producers accept the Java SSL configuration names through the native TLS adapter.
+Schema Registry HTTPS uses the corresponding `schema.registry.ssl.*` options.
+JKS, PKCS12, and PEM stores retain independent store and private-key passwords.
+The default trust anchors come from the pinned Temurin resource; explicit trust material overrides them, including an explicitly empty store.
+
+`ssl.keymanager.algorithm` selects `SunX509`, `NewSunX509`, or the latter's `PKIX` alias.
+The managers retain their distinct alias ordering and client-certificate preferences.
+An explicit `ssl.provider=SunJSSE` selects the built-in native context adapter.
+Registry accepts these names through its prefixed properties.
+Kafka applies Java ConfigDef trimming; Registry preserves raw provider and algorithm names and treats an empty name as the default.
+
+`rust/crates/kafka/TLS.adoc` records TLS policy coverage, retained-memory ownership, and remaining source and qualification work.

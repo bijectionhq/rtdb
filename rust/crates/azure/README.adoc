@@ -8,8 +8,8 @@ The native store creates its container idempotently before returning.
 Object keys include the configured prefix and the supplied storage-version and epoch root.
 Shared immutable publication retains conditional creation and exact retry comparisons.
 
-The passive default-credential bridge uses official Azure Identity clients for application, workload, and development credentials.
-It selects configured environment client secrets or certificates, workload federation, managed identity, IntelliJ, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
+The passive default-credential bridge uses official Azure Identity clients alongside native providers for application, workload, and development credentials.
+It selects configured environment client secrets, certificates, or username/password credentials, workload federation, managed identity, IntelliJ, or Azure CLI, PowerShell, and Azure Developer CLI credentials.
 Credential refresh occurs inside the selected provider on each request; the bridge has no background loop.
 Credential commands run in owned process groups with a 30-second deadline, bounded output, and joined output readers.
 Command execution occupies the caller's thread until the group exits or is terminated.
@@ -51,8 +51,17 @@ The pinned distribution does not include `azure-identity-broker`; Visual Studio 
 `SharedTokenCacheCredential` is absent from the pinned default chain and is not an accepted selector.
 Native desktop APIs and authority-specific sign-in behavior require Phase 2 qualification on each platform.
 The pinned Rust certificate credential reads `AZURE_CLIENT_SEND_CERTIFICATE_CHAIN` and includes the leaf and retained CA chain when requested.
-The deprecated environment username/password branch remains source-completeness work.
+The environment username/password branch requires `AZURE_CLIENT_ID`, `AZURE_USERNAME`, and `AZURE_PASSWORD`, and follows client-secret and certificate selection before workload identity.
+Present empty values remain configured values and fail acquisition without selecting a different principal.
+Its missing tenant defaults to `organizations`; IntelliJ explicitly defaults to `common`.
+The passive password credential owns its application ID and immutable credentials, and uses the same account-aware session monitor as IntelliJ.
+AAD password acquisition performs user-realm discovery, then uses a direct password grant for managed accounts or MEX policy discovery and WS-Trust for federated accounts.
+WS-Trust 1.3 takes precedence over WS-Trust 2005, and the returned SAML assertion is exchanged with the configured application ID.
+ADFS and CIAM authorities skip user-realm discovery.
+Federation requests and responses have a one MiB limit; parsed XML has depth, node-count, and eight-MiB retained-data limits and rejects document types and external entities.
+XML documents, realm results, binding policies, and assertions are passive values owned by the acquisition call.
+The process-wide legacy security-namespace flag retains the pinned MSAL namespace-map mutation.
 
 Source references are `modules/azure/src/main/kotlin/xtdb/azure/BlobStorage.kt`, `azure.proto`, and the shared remote-storage contract.
-Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, failure precedence, actual HTTP credential requests, IMDS probes, Arc challenge exchange, FIFO rejection, closed-region admission, desktop cache parsing, refresh-token rotation and fallback, and error-envelope classification.
+Rust test sources cover alias serialization, secret redaction, connection-string precedence, SAS escaping, emulator paths, credential refresh, failure precedence, actual HTTP credential requests, IMDS probes, Arc challenge exchange, FIFO rejection, closed-region admission, desktop cache parsing, refresh-token rotation and fallback, environment password selection, managed and federated password HTTP exchanges, MEX policy ordering, SOAP and SAML serialization, bounded XML parsing, and error-envelope classification.
 No Azure requests, credential commands, compilation, or tests have been run during Phase 1.
