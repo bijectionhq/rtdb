@@ -1,0 +1,44 @@
+= Borrowed default input origins
+
+DefaultInput separates an Avro field-object default from a Connect JsonNode default.
+These helpers are additive and are not selected by production metadata/default conversion yet.
+DefaultAttempt carries either a semantic value or an invalid-default anomaly inside the outer native Result.
+Native traversal-limit and future allocation/overflow failures propagate through the outer Result, which invalid-default suppression must not discard.
+
+FieldObject is a passive borrowed value pairing raw JSON with its actual physical schema and immutable name definitions.
+Its constructor traverses the complete JacksonUtils.toObject source shape before returning a prepared cursor.
+Semantic failures from field.defaultVal are suppressed by AvroData's exception catch before child-schema construction; later default DataException suppression remains a separate boundary.
+Object maps against an actual record require an exact raw source field; a native field alias does not supply that field.
+An unknown source key fails preparation even when a future scrubbed destination lookup would ignore it.
+A nonempty array requires an actual array source schema whenever one is present.
+An empty array does not demand getElementType and can prepare successfully against a nonarray schema; later destination conversion remains separate.
+Object maps against nonrecord/nonmap schemas have untyped child values, matching Jackson's null-schema recursion.
+No intermediate Java-object tree, Value tree, namespace copy or retained lookup map is constructed.
+
+The cursor's kind exposes the Java class that JacksonUtils.toObject would produce.
+Boolean nodes retain their Boolean class independently of the supplied schema.
+Integral nodes use Integer, Long, Float or Double according to their width and the physical source schema; integers beyond signed 64 bits fall through to Java null.
+Floating nodes produce Float or Double only where the physical schema permits them.
+Integral Float coercion uses the Double accessor before its narrowing cast, preserving Java's double rounding.
+Text nodes produce String or a deferred ISO8859-1 byte string for bytes/fixed schemas; incompatible primitive/schema combinations become Java null.
+Logical native schema variants are interpreted as their underlying Avro primitive type.
+An empty union is a distinct physical result, rather than an untyped schema, and invalidates a demanded source before JSON inspection.
+Absent fields and empty arrays do not demand their child schema.
+
+Prepared field-object record selection scrubs the destination lookup name but retains the selected raw child's physical schema.
+Repeated destinations can borrow the same child, and present JSON null remains distinct from a missing map key.
+The future default materializer applies the child default only on absence and must feed that selected default through the source conversion rules rather than assuming a logical native Value can always be cloned unchanged.
+JsonNode selection uses exact raw field names and preserves missing versus explicit null without invoking scrubbed lookup or child-default fallback.
+
+The ordinary IndexedRecord logical-conversion order and the field-object Map branch are separate obligations.
+AvroData's Map Struct branch returns directly, while defaultValueFromAvro applies its own logical boundary after defaultValueFromAvroWithoutLogical.
+These cursors do not claim to implement those materialization, union-context, default-amplification, metadata timing or retained reservation responsibilities.
+Production Java policy activation remains gated on their complete implementation.
+
+== Sources and regression scope
+
+Apache Avro 1.11.4 JacksonUtils.java is pinned in link:sources.sha256[the source manifest], with its exact source header in link:COPYRIGHT[the retained notice] and the existing link:../names/LICENSE-APACHE[Apache license].
+Its toObject branch at lines 104–174 supplies source class coercion, first-union-member selection, recursive array access and record/map child-schema selection.
+Confluent AvroData's field-default Map and raw JsonNode paths are pinned in link:../names/selector-sources.sha256[the selector source manifest].
+Fifteen regression sources cover early unknown fields, aliases excluded from raw source fields, selected physical identity, repeated lookup, missing/null distinction, origin-specific raw lookup, primitive class coercion, array source shape, nested source validation, references/first union branch and propagation of native traversal limits.
+No Rust/Java compilation or regression execution has occurred under the Phase 1 work order.
