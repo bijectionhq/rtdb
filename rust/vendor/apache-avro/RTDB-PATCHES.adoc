@@ -1,0 +1,66 @@
+= RTDB scoped schema-name parsing
+
+This directory preserves Apache Avro Rust 0.21.0 from the published source archive.
+link:UPSTREAM.json[The upstream manifest] records the archive SHA256 and every original file's SHA256.
+The source archive SHA256 is 36fa98bc79671c7981272d91a8753a928ff6a1cd8e4f20a44c45bd5d313840bf.
+Original license and notice files, fixtures, examples, source tests, and their assertions are retained.
+Only Cargo.toml and src/schema.rs modify original files; the scoped policy module and its regression sources are additions.
+
+Kafka depends directly on this path at the same pinned version.
+There is no workspace-wide registry patch.
+Its production Avro parsing still calls the original parse_str_with_list API and therefore retains the original global validator behavior.
+The root Cargo.lock changes only this package's source identity, removing the registry source and archive checksum while preserving its dependency list.
+No dependency resolution or Cargo command was executed during the adaptation.
+
+== Scoped policy
+
+Schema::parse_str_with_list_with_name_policy adds a synchronous parser-local policy.
+The policy is a passive borrowed object for name construction, field and enum validation, and an optional second reference candidate.
+The Parser remains a passive single-writer call-local transient, owning its existing schema maps and parse order.
+Its new optional reference is borrowed only for the parse call and never escapes into returned schema values.
+Name, Alias, and Schema remain passive immutable values with their existing shapes.
+No global validator registration, thread-local setting, lock, task, background state, or mutable process cache is introduced.
+
+Every dynamic root/reference declaration, type alias, reference candidate, field, enum symbol, and nested type-name hint in the scoped path uses the supplied policy.
+Names and validation results must be stable for the same inputs and construction context during a call; policy callbacks may reenter parsing.
+Object-valued type wrappers use the inner declaration name and namespace selected by ordinary parsing, retaining one effective definition key through input indexing, parsing, and ordered output.
+Duplicate policy-resolved input names return NameCollision, including global names normalized from None and explicit empty namespaces.
+The returned tuple contains the root and a vector of referenced schemas in input iterator order.
+Parsed record, enum, and fixed aliases produce references to the canonical definition name.
+Scoped fixed logical conversion updates both the canonical entry and its aliases to the final duration, UUID, or fixed-decimal schema, including nested definitions.
+As in the original parser, aliases of unparsed external definitions are not preindexed.
+References to those forward aliases may therefore fail before their declaring input has been parsed.
+That retained limitation requires a separate production behavior decision before activating Java name policies.
+The existing unscoped constructors and parser routes retain their global hooks, panic/error boundaries, and diagnostics.
+A scoped policy must return a name whose namespace has already been resolved against its construction context.
+The parser normalizes a returned None namespace to Some("").
+This explicit empty namespace is retained by Name::fully_qualified_name and gives global definitions, aliases, and references the same Eq/Hash key.
+Name::fullname ignores an empty namespace even when a default namespace is supplied.
+Definitions retaining a Name (records, enums, ordinary fixed, and fixed decimal) serialize namespace:"" explicitly; ordinary reference serialization continues to emit the fullname and reparsing follows the caller's policy candidate rules.
+Fixed definitions converted to Uuid or Duration discard their original name and namespace.
+
+The qualification audit covers parser fetch and alias registration, schema resolution helpers, default-value validation in types.rs, and later encoder/decoder reference qualification.
+All of those retain an already present empty namespace instead of applying their enclosing-namespace fallback.
+No absolute-name boolean is added to Name.
+The internal ASCII duration name is created only by serialization, while dynamic duration declarations go through the policy before conversion to Schema::Duration.
+Scoped default-error diagnostics use Debug schema descriptions rather than invoking a serializer that could consult that global duration-name constructor.
+The unscoped path retains canonical-form descriptions.
+Debug schema descriptions use existing structural Debug implementations and do not serialize or construct names.
+
+== Allocation and verification
+
+The policy adds one borrowed fat pointer to the call-local Parser and no additional retained collection or output owner.
+Normalizing None to an empty String allocates no string payload.
+The second reference candidate is constructed only after the primary is absent from parsed, resolving, and input schema maps.
+Its one Name value uses the policy's ordinary owned name/namespace strings and drops with that lookup.
+Existing parser collections and returned schemas retain their original ownership.
+Final logical registration replaces entries in the existing parsed-schema map; temporary owned names and alias vectors remain bounded by the declaration already being parsed.
+Logical references clone the final logical schema, as the upstream helper already does when parsing an external logical definition on demand.
+A policy is responsible for its own allocations; the future Kafka Java policy and conversion admission are separate work.
+
+Thirteen new unit regressions and one isolated integration regression cover initialized global defaults, globals that reject every name, fields, enum symbols, fixed/record declarations, named and field alias distinctions, cyclic and external references, nested unions, explicit empty namespaces, hash/qualification identity, serialization/reparse, candidate precedence, nested policies, policy errors, wrapper identity and input order, normalized duplicate names, canonical alias resolution, and nested/external fixed logical types.
+Resolver and value-resolution assertions check returned canonical reference identities against actual definitions.
+The isolated integration target owns its rejecting global validators without changing another target's globals.
+All original schema.rs test bodies and the complete original validator.rs remain byte-identical to the archive.
+Compilation, tests, formatters, and runtime discovery remain unexecuted under the Phase1 work order.
+This adaptation does not enable Unicode schema names in Kafka production or close its Connect scrubbing and allocation obligations.
