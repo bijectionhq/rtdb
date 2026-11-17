@@ -114,30 +114,41 @@ def group_alive(process):
         return True
     except ProcessLookupError:
         return False
+    except PermissionError:
+        return True
 
 
-def signal_group(process, sig):
+def _signal_group(process, sig):
     try:
         os.killpg(process.pid, sig)
+        return True
     except ProcessLookupError:
-        pass
+        return True
+    except PermissionError:
+        return False
 
 
-def wait_group(process, seconds):
-    deadline = time.monotonic() + seconds
-    while group_alive(process):
+def drain_group(process, signal_number, timeout_seconds):
+    """Deliver a signal to an owned POSIX process group and wait under a monotonic deadline.
+    - Denied sends are retried until accepted; accepted signals are not repeated.
+    - True requires a reaped leader and a group probe reporting absence.
+    - False leaves the unresolved group with the caller for its next cleanup phase.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if signal_number is not None and _signal_group(process, signal_number):
+            signal_number = None
+        if not group_alive(process):
+            process.wait()
+            return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
-    process.wait()
-    return True
 
 
 def terminate(process, grace=10):
-    signal_group(process, signal.SIGTERM)
-    if not wait_group(process, grace):
-        signal_group(process, signal.SIGKILL)
-        if not wait_group(process, 10):
+    if not drain_group(process, signal.SIGTERM, grace):
+        if not drain_group(process, signal.SIGKILL, 10):
             raise RuntimeError(f"owned process group {process.pid} did not drain after SIGKILL")
 
 

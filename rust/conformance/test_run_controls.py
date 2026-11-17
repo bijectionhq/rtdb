@@ -178,5 +178,25 @@ os._exit(0)
             self.assertEqual(list(Path(directory).iterdir()), [path])
 
 
+class GroupDrainTests(unittest.TestCase):
+    def test_permission_denial_retains_the_group_until_absence_is_proved(self):
+        process = mock.Mock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        calls = [PermissionError(1, "denied"), PermissionError(1, "denied"), None, None, ProcessLookupError(3, "gone")]
+        with mock.patch.object(runner.os, "killpg", side_effect=calls) as killpg, mock.patch.object(runner.time, "sleep"):
+            self.assertTrue(runner.drain_group(process, signal.SIGTERM, 1))
+        self.assertEqual(killpg.call_args_list, [mock.call(12345, signal.SIGTERM), mock.call(12345, 0),
+                                               mock.call(12345, signal.SIGTERM), mock.call(12345, 0), mock.call(12345, 0)])
+        process.wait.assert_called_once_with()
+
+    def test_permanent_signal_denial_cannot_report_a_joined_group(self):
+        process = mock.Mock(pid=12345, returncode=None)
+        process.poll.return_value = None
+        with mock.patch.object(runner.os, "killpg", side_effect=PermissionError(1, "denied")), \
+             mock.patch.object(runner.time, "monotonic", side_effect=[0, 0.5, 1]), mock.patch.object(runner.time, "sleep"):
+            self.assertFalse(runner.drain_group(process, signal.SIGTERM, 1))
+        process.wait.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

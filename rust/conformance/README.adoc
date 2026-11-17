@@ -54,6 +54,8 @@ It independently checks both engines against the immutable transcribed upstream 
 Each negative control must produce exactly one mismatch at its designated case, observation, and JSON pointer.
 The original fixture and execution receipts remain unchanged.
 The process owner requires POSIX process groups and drains the owned group even when its leader exits before a child.
+Permission denial keeps the group pending until its drain deadline.
+A requested signal is retried until accepted; successful signalling still requires a subsequent absence check.
 Linux runs enable descendant reaping; the runner treats an undrained group or unexpected surviving child as failed evidence.
 `controls_verified` establishes the control harness only; the incomplete inventory still blocks `complete_parity`.
 No runner or test in this directory has executed during Phase 1.

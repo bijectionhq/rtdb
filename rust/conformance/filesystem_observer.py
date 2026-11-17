@@ -11,7 +11,7 @@ import time
 import urllib.request
 from pathlib import Path, PurePosixPath
 
-from run_controls import digest, owned_cancellation, signal_group, wait_group, write_json
+from run_controls import digest, owned_cancellation, drain_group, write_json
 from clients.performance import sequenced_begin, await_token_sql
 
 FILESYSTEM_BOUNDARY = "successful_backing_filesystem_payload_and_requests"
@@ -231,7 +231,7 @@ def verify_evidence(value, measurement, nodes, workload, namespace=None):
     for field in ("successful_read_requests", "successful_read_bytes", "successful_write_requests", "successful_write_bytes", "successful_metadata_requests"):
         if type(ready.get(field)) is not int or type(final.get(field)) is not int or not 0 <= ready[field] <= final[field]:
             raise ValueError("filesystem provider counter regressed or is absent")
-    if final.get("joined") is not True or final.get("unmounted") is not True or final.get("errors") or value.get("process_exit") != 0 or value.get("forced_termination") is not False or value.get("node_containers_removed") is not True:
+    if final.get("joined") is not True or final.get("unmounted") is not True or final.get("errors") or value.get("process_exit") != 0 or value.get("forced_termination") is not False or value.get("node_containers_removed") is not True or value.get("process_group_drained") is not True:
         raise ValueError("filesystem observer did not unmount and join cleanly")
     if final.get("in_flight_requests") != 0 or final["successful_read_requests"] + final["successful_write_requests"] <= 0:
         raise ValueError("filesystem observer lacks successful provider activity or quiescence")
@@ -414,17 +414,18 @@ class FilesystemObserver:
         Otherwise it kills and waits the owned process group, retaining the unresolved mount/backing namespace as failed evidence.
         """
         errors = []
+        process_drained = self.process is None
         if not node_containers_removed:
             errors.append("node container removal is unresolved; normal unmount is forbidden")
         if self.process is not None:
             try:
                 if not node_containers_removed:
                     self.forced = True
-                signal_group(self.process, signal.SIGTERM if node_containers_removed else signal.SIGKILL)
-                if not wait_group(self.process, 60):
+                process_drained = drain_group(self.process, signal.SIGTERM if node_containers_removed else signal.SIGKILL, 60)
+                if not process_drained:
                     self.forced = True
-                    signal_group(self.process, signal.SIGKILL)
-                    if not wait_group(self.process, 10):
+                    process_drained = drain_group(self.process, signal.SIGKILL, 10)
+                    if not process_drained:
                         errors.append("filesystem observer process group did not drain")
             except BaseException as error:
                 errors.append(str(error))
@@ -449,8 +450,8 @@ class FilesystemObserver:
             errors.append(str(error))
         value = {"ready": self.ready, "final": None, "configurations": self.configurations, "routes": self.routes, "workload": self.workload_proof,
                  "forced_termination": self.forced, "node_containers_removed": node_containers_removed,
-                 "process_exit": self.process.poll() if self.process else None, "cleanup_errors": errors,
-                 "unresolved_mount": None if unmounted else str(self.mount), "unresolved_backing": None if unmounted else str(self.backing)}
+                 "process_exit": self.process.poll() if self.process else None, "process_group_drained": process_drained, "cleanup_errors": errors,
+                 "unresolved_mount": None if unmounted else str(self.mount), "unresolved_backing": None if unmounted and process_drained else str(self.backing)}
         if (self.directory / "final.json").is_file():
             try:
                 value["final"] = _read_json(self.directory / "final.json")
@@ -463,7 +464,7 @@ class FilesystemObserver:
                 errors.append(str(error))
         for path in reversed(self.created):
             try:
-                if not unmounted or self.process is not None and self.process.poll() is None:
+                if not unmounted or not process_drained:
                     raise ValueError("retaining backing namespace because its I/O owner or mount remains active")
                 if path == self.mount:
                     if os.path.ismount(path):

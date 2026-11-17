@@ -1,5 +1,6 @@
 import copy
 import hashlib
+import json
 import tempfile
 import signal
 import unittest
@@ -48,7 +49,7 @@ def fixture():
              "environment_sha256": environment_digest(node_selection(), "case"),
              "attached_databases_allowed": False, "runtime_configuration_changes_allowed": False,
              "databases": [{"storage_path": "/measured-objects", "log_path": "/runtime/log"}]}
-    value = {"ready": ready, "final": final, "routes": [route], "configurations": [proof], "forced_termination": False, "process_exit": 0, "node_containers_removed": True,
+    value = {"ready": ready, "final": final, "routes": [route], "configurations": [proof], "forced_termination": False, "process_exit": 0, "node_containers_removed": True, "process_group_drained": True,
              "workload": workload_proof(workload_request(case_selection(), [node_selection()]))}
     return selection, value
 
@@ -74,7 +75,7 @@ class FilesystemEvidence(unittest.TestCase):
             bad["final"][field] = replacement
             with self.subTest(field=field), self.assertRaises(ValueError):
                 verify_evidence(bad, selection)
-        for field, replacement in (("forced_termination", True), ("routes", []), ("configurations", [])):
+        for field, replacement in (("forced_termination", True), ("routes", []), ("configurations", []), ("process_group_drained", False), ("process_group_drained", None)):
             bad = copy.deepcopy(value)
             bad[field] = replacement
             with self.assertRaises(ValueError):
@@ -149,11 +150,34 @@ class FilesystemEvidence(unittest.TestCase):
                 def run(self, *args, **kwargs):
                     raise AssertionError("unmount must not run before container removal")
             line = f"42 1 0:99 / {owner.mount} rw - fuse.rtdb-observer case rw"
-            with patch("filesystem_observer.os.uname", return_value=SimpleNamespace(sysname="Linux")), patch("filesystem_observer._read_text", return_value=line), patch("filesystem_observer.signal_group") as sent, patch("filesystem_observer.wait_group", return_value=True):
+            with patch("filesystem_observer.os.uname", return_value=SimpleNamespace(sysname="Linux")), patch("filesystem_observer._read_text", return_value=line), patch("filesystem_observer.drain_group", return_value=True) as drained:
                 with self.assertRaisesRegex(ValueError, "container removal is unresolved"):
                     owner.close(Commands(), False)
-                sent.assert_called_once_with(owner.process, signal.SIGKILL)
+                drained.assert_called_once_with(owner.process, signal.SIGKILL, 60)
             self.assertTrue(owner.backing.is_dir()); self.assertTrue(owner.mount.is_dir())
+
+    def test_exited_leader_and_absent_mount_cannot_reclaim_an_undrained_group_namespace(self):
+        selection, _ = fixture()
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "evidence"
+            directory.mkdir()
+            selection["backing_parent"] = root
+            owner = FilesystemObserver(selection, Path(root) / "binary", directory, "case", "disk", "b" * 40, "linux/amd64", [node_selection()], case_selection())
+            owner.mount.mkdir(); owner.backing.mkdir()
+            payload = owner.backing / "retained.arrow"
+            payload.write_bytes(b"owned payload")
+            owner.created = [owner.mount, owner.backing]
+            owner.process = SimpleNamespace(poll=lambda: 0)
+            with patch("filesystem_observer.os.uname", return_value=SimpleNamespace(sysname="Linux")), \
+                 patch("filesystem_observer._read_text", return_value=""), patch("filesystem_observer.drain_group", return_value=False) as drained:
+                with self.assertRaisesRegex(ValueError, "process group did not drain"):
+                    owner.close(None, True)
+                self.assertEqual(drained.call_count, 2)
+            self.assertEqual(payload.read_bytes(), b"owned payload")
+            self.assertTrue(owner.mount.is_dir())
+            evidence = json.loads((directory / "evidence.json").read_bytes())
+            self.assertFalse(evidence["process_group_drained"])
+            self.assertEqual(evidence["unresolved_backing"], str(owner.backing))
 
     def test_offline_path_proof_rejects_dot_segments_and_neighboring_namespaces(self):
         selection, value = fixture()

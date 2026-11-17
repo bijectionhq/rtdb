@@ -13,8 +13,8 @@ from source_gate import require_phase_two
 from history_results import inspect_execution, verify_artifacts, verify_runtime_artifacts
 from recovery_results import clone_closed, compare_recovery, manifest, verify_files, verify_partial
 from run_controls import (HERE, REFERENCE, REPOSITORY, ProcessCancelled, digest, enable_child_reaping, git, group_alive,
-                          owned_cancellation, run_process, signal_group, terminate, validate_native_revision,
-                          wait_group, write_json)
+                          owned_cancellation, run_process, terminate, validate_native_revision,
+                          drain_group, write_json)
 from run_history import input_receipt, verify_inputs
 
 
@@ -71,8 +71,7 @@ def kill_at_boundary(command, cwd, directory, request, binary, timeout):
                 raise ValueError("fault boundary is wrong or its writer already exited")
             status["boundary_sha256"] = digest(marker)
             cancellation.begin_cleanup()
-            signal_group(process, signal.SIGKILL)
-            if not wait_group(process, 10):
+            if not drain_group(process, signal.SIGKILL, 10):
                 raise RuntimeError("crashed writer process group did not join")
             status.update(completed=True, closure="forced_kill", exit_code=process.returncode)
             if process.returncode != -signal.SIGKILL:
