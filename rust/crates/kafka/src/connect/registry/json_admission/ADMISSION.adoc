@@ -1,0 +1,41 @@
+= Registry HTTP JSON response admission
+
+The actual RegistryConverter HTTP response path calls link:../json_admission.rs[the admitted parser] before creating its serde_json::Value tree.
+The receive-byte allowance remains separate from decoded tree storage.
+All response values, source object keys and decoded string payloads contribute to checked additional demand.
+Duplicate object members contribute their original values and keys even when the final map replaces them.
+
+Measure is a passive call-local single-writer transient borrowing immutable response bytes and the existing ConversionContext.
+Node, Key and Raw are passive borrowed serde seeds and visitors.
+They construct no output collection, key set, default tree or retained index.
+The existing response path remains passive and creates no task, thread, monitor or persistent state.
+
+Each parser invocation admits four source-byte lengths plus 4096 bytes before decoding strings or constructing parser errors.
+The borrowed walk uses the same serde_json deserializer and depth guard as the final parse.
+Each value occurrence contributes sixteen target Value slots plus 512 bytes.
+Each source key contributes sixteen target entry/hash slots plus 512 bytes, two decoded UTF8 lengths and 256 bytes.
+String values contribute two decoded UTF8 lengths plus256 bytes.
+These conservative allowances cover native container growth and retained payloads; they do not assert an allocator-exact byte count.
+
+For arrays, the per-value allowance includes geometric old/new Vec capacity overlap and the container's minimum allocation.
+With preserve_order enabled, objects use IndexMap entry storage and a hashbrown index table.
+The entry allowance includes the stored hash and key/value tuple, rounded capacities, simultaneous old/new storage, control bytes and minimum table size.
+IndexMap rounds its entry capacity to the index capacity; hashbrown uses power-of-two bucket counts and an 87.5-percent maximum load outside its small-table cases.
+The pinned source identities and complete package licenses are in link:sources.json[the source manifest] and link:COPYRIGHT[the notices].
+
+The workspace enables serde_json raw_value.
+Its Value visitor treats a first object key named `$serde_json::private::RawValue` as an encoded JSON string and recursively parses that string.
+Measurement preserves that existing branch and admits each nested parser's scratch and owned raw-string overlap separately.
+A later key with that spelling stays an ordinary object member.
+This parser does not normalize those private-key semantics to Java bean behavior.
+The dedicated rtdb-validation-json dependency owns its separate arbitrary_precision feature; this regular serde_json path retains the workspace's bounded numeric representation.
+Changes to that feature separation require a new admission review.
+
+Measurement stops when checked demand exceeds the current remaining per-record allocation.
+The final context reservation is authoritative against the shared memory budget and precedes serde_json::from_slice.
+An admission, overflow or ancestor-budget failure retains its resource anomaly rather than becoming a schema syntax error.
+All reservations remain in the caller's existing record region through later typed response coercion and plan use.
+
+Eleven regression source functions cover exact/below limits, dense arrays, duplicate members, escaped text, first/later/nested raw keys, syntax and numeric failures, malformed UTF8, depth, ancestor-budget admission and release.
+They have not been compiled or executed in Phase 1.
+Typed response coercion, version-request timing, HTTP transport construction/background allocations and complete process-wide memory qualification remain separate requirements.

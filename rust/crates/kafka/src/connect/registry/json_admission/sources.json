@@ -1,0 +1,47 @@
+{
+  "workspace_features": [
+    "preserve_order",
+    "raw_value"
+  ],
+  "separate_arbitrary_precision_package": "rtdb-validation-json",
+  "packages": [
+    {
+      "name": "serde_json",
+      "version": "1.0.154",
+      "archive_sha256": "e7e9cc8b1b85264074fbcc02a88680c4096b1e47df8f739dceb03bf482f04bd6",
+      "members": {
+        "src/de.rs": "cb55666913c47d86130e7bd48a9c35081ea9a4bb0e2c45ab6429912d905629c5",
+        "src/read.rs": "523eec008a92c1be499978ee96bce7a8dc7d6ddff9a63b5ed404c19d01fb953a",
+        "src/value/de.rs": "ceda1bf415aafde89caa83bf275811b70d393717d4e1038e0c61822d2da02993",
+        "src/raw.rs": "0e6ae2ade492a3c5c090dfaf31f03ff4e54123a5a47b59def5f1b3dcc035a2e3",
+        "src/map.rs": "1ba8afd6c643740462171713fd523966920bd726af37963cb8f21e76e9beb69f",
+        "src/number.rs": "1730b1c1a9b2a75f9e52b165191ca77cb3dbd82fec3b23f41f097f4f07f3410e",
+        "LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
+        "LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      }
+    },
+    {
+      "name": "indexmap",
+      "version": "2.14.2",
+      "archive_sha256": "cc4e190f5d26ca7051642629da2c52fc03bde85a03197c99408dcd291734c855",
+      "members": {
+        "src/inner.rs": "f38e7efe24d29807830bb96c0b5e77bc1065747e2c2165aae809e292564d1442",
+        "src/map.rs": "3c02a5a60bf0caa5910a0b41165a84d85a91c6ba0e83426a090bb109a9e785fb",
+        "src/lib.rs": "c8e2f1c0e488ab63d832392a83e34fa82293854bfb5ff3def8eeca9545ab2bdd",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "ecc269ef87fd38a1d98e30bfac9ba964a9dbd9315c3770fed98d4d7cb5882055"
+      }
+    },
+    {
+      "name": "hashbrown",
+      "version": "0.17.1",
+      "archive_sha256": "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a",
+      "members": {
+        "src/raw.rs": "0c8ad353ba95817e72b0a8fea48fa2599099ea3def374f254ab6402a9c468d22",
+        "src/table.rs": "9d37739758f9df08d23c3ab792d29547b04bfd29b08900407a0d2b8ecd26cda9",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "ff8f68cb076caf8cefe7a6430d4ac086ce6af2ca8ce2c4e5a2004d4552ef52a2"
+      }
+    }
+  ]
+}

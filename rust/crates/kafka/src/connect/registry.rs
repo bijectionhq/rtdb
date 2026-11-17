@@ -12,6 +12,7 @@ mod reader;
 mod dlq;
 mod http;
 mod references;
+mod json_admission;
 use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
@@ -198,7 +199,7 @@ impl RegistryConverter {
                 if bytes.len().checked_add(chunk.len()).is_none_or(|size| size > self.maximum_schema_bytes) { return Err(error("schema-registry", "Schema response exceeds its byte limit")); }
                 bytes.extend_from_slice(&chunk);
             }
-            return serde_json::from_slice(&bytes).map_err(|cause| error("schema-registry", cause));
+            return json_admission::parse(&bytes, context);
         }
         Err(failure.unwrap_or_else(|| error("schema-registry", "No Schema Registry endpoint is configured")))
     }
