@@ -34,10 +34,7 @@ impl Object {
             (Self::Map(_),Self::Map(_)) => self.map_equal(other,java)?,
             (Self::TxKey(left),Self::TxKey(right)) => if java { self.map_equal(other,true)? } else { left.equivalent(right)? },
             (Self::Map(_),Self::TxKey(_)) | (Self::TxKey(_),Self::Map(_)) if java => self.map_equal(other,true)?,
-            (Self::Tagged { tag: left,representation: lv },Self::Tagged { tag: right,representation: rv }) => {
-                if left != right { return Ok(false); }
-                if matches!(lv.as_ref(),Self::Null) { return Err(invalid()); }lv.java_equal(rv)?
-            }
+            (Self::Tagged(left),Self::Tagged(right)) => super::Tagged::equal(left,right)?,
             (Self::ClojureForm(left),Self::ClojureForm(right)) => left.java_equal(right)?,
             _ => false,
         })

@@ -55,10 +55,7 @@ impl Object {
                 })?;
                 if equivalent { collection(hash,count) ^ if matches!(self,Self::TxKey(_)) { symbol("xtdb.serde.TxKey",true) } else { 0 } } else { hash }
             }
-            Self::Tagged { tag,representation } => {
-                if matches!(representation.as_ref(),Self::Null) { return Err(invalid()); }
-                17i32.wrapping_mul(31).wrapping_mul(string(tag)).wrapping_mul(31).wrapping_mul(representation.java_hash_code()?)
-            }
+            Self::Tagged(value) => value.hash_code()?,
         })
     }
 }
