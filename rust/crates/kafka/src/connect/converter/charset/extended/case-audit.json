@@ -1,0 +1,26 @@
+[
+  {
+    "codepoint": "U+0130",
+    "upper": "U+0130",
+    "folded_ascii": "i",
+    "properties": "0x07fff001"
+  },
+  {
+    "codepoint": "U+0131",
+    "upper": "U+0049",
+    "folded_ascii": "i",
+    "properties": "0x03a17002"
+  },
+  {
+    "codepoint": "U+017F",
+    "upper": "U+0053",
+    "folded_ascii": "s",
+    "properties": "0x07fd7002"
+  },
+  {
+    "codepoint": "U+212A",
+    "upper": "U+212A",
+    "folded_ascii": "k",
+    "properties": "0x07fe7001"
+  }
+]

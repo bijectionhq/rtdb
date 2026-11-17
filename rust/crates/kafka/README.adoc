@@ -127,6 +127,8 @@ GB18030 and its `gb18030-2022` alias use the pinned default Java 25 mappings, in
 The conditional `gb18030-2000` alias is outside the default-provider configuration, as described in the link:src/connect/converter/charset/double_byte/gb18030/README.adoc[GB18030 reference].
 x-SJIS_0213 and x-MS932_0213 support all 13 registered names, including the `sjis:2004` and `windows-932:2004` aliases.
 Their MS932 BMP precedence, supplementary scalars, combining sequences, and replacement boundaries are documented in the link:src/connect/converter/charset/double_byte/jis0213/README.adoc[JIS0213 reference].
+Extended-provider names accept Java's four Unicode case equivalents through their own canonical-name and alias inventory, as described in the link:src/connect/converter/charset/extended/README.adoc[extended name lookup reference].
+Standard-provider names retain ASCII-only case handling.
 The built-in JISAutoDetect family and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.

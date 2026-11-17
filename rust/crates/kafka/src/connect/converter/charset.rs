@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use rtdb_types::Result;
 use super::error;
 mod double_byte;
+mod extended;
 mod iscii91;
 mod single_byte;
 
@@ -49,7 +50,8 @@ impl Charset {
     }
 
     fn parse(name: &str) -> Result<Self> {
-        Ok(match name.to_ascii_lowercase().as_str() {
+        let selected = if name.is_ascii() { name } else { extended::lookup(name).unwrap_or(name) };
+        Ok(match selected.to_ascii_lowercase().as_str() {
             "utf-8" | "utf8" | "unicode-1-1-utf-8" => Self::Utf8,
             "cesu-8" | "cesu8" | "cscesu-8" => Self::Cesu8,
             "iso-8859-1" | "iso-ir-100" | "iso_8859-1" | "latin1" | "l1" | "ibm819"

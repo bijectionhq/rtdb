@@ -1,0 +1,46 @@
+= Extended-provider charset names
+
+The pinned Java extended charset provider uses `String.CASE_INSENSITIVE_ORDER` for its canonical-name and alias maps.
+Charset lookup consults that provider before checking whether an unresolved name contains only nominal charset-name characters.
+Non-ASCII names can therefore resolve when they compare equal to a registered extended name.
+
+Exactly four non-ASCII code points compare equal to ASCII letters under the pinned comparator:
+
+* U+0130 and U+0131 compare equal to ASCII i.
+* U+017F compares equal to ASCII s.
+* U+212A compares equal to ASCII k.
+
+The comparator applies simple uppercase followed by simple lowercase, without expanding a code point into several characters.
+All supplementary case mappings remain supplementary, and isolated surrogate units remain unchanged.
+Neither can match an ASCII registry character.
+For example, `x-ıSCII91`, `x-ISCIİ91`, and `x-ſJIS_0213` resolve their corresponding extended charsets.
+Standard-provider names retain their ASCII-only case handling; `ſhift_jis` and `İSO-8859-1` do not resolve.
+
+The passive immutable link:names.rs[lookup inventory] contains all 550 normalized keys for the pinned provider's 113 charsets.
+There is no overlap with the standard provider's 377 keys.
+Lookup compares the caller's borrowed name against that inventory using call-local iterators and returns a static ASCII canonical name.
+It allocates no buffer and retains no per-call state.
+The existing decoder lookup then consumes that canonical name.
+Decoder state, mapping resources, output ownership, and memory admission retain their existing contracts.
+The two JISAutoDetect keys are included in the provider inventory; decoder implementation remains a separate source-completeness obligation.
+
+== Source provenance and reproduction
+
+The source profile is Eclipse Temurin OpenJDK `25.0.1+8`, Linux x64.
+The JDK archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`; its `src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The manifest] pins 17 sources for provider registration, lookup order, String comparison, and generated CharacterData mappings.
+link:COPYRIGHT[Upstream headers] and link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information] retain their archive bytes.
+
+link:derive.py[The Python standard-library derivation] reads source and archive bytes only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-extended-names
+----
+
+It derives link:names.tsv[canonical targets] directly from provider declarations and applies the generated BMP and supplementary simple-case tables to every code point through U+10FFFF.
+link:case-audit.json[The case audit] records the four non-ASCII matches.
+Host Unicode tables, Java execution, native decoders, and project test targets are not used by that derivation.
+
+Regression sources cover every provider key and canonical target, every eligible single-position Unicode substitution, combined substitutions, standard-provider rejection, unknown characters, configuration precedence, trimming, decoding, null records, and resource hashes.
+Compilation and execution remain pending under the Phase 1 work order.
