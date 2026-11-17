@@ -46,6 +46,21 @@ impl JavaString {
         Self::copy(Source::Utf16(source), Some(memory))
     }
 
+    /// Copies exact UTF16 units after the caller admits `allocation_bound_utf16(source)` bytes.
+    /// Calls `admit` once with that byte bound before copying storage; size errors precede that call and authority errors propagate unchanged.
+    /// The admitted bytes must cover this copy in addition to the source and every other live allocation.
+    /// Rejects a returned reservation smaller than the bound; larger reservations remain retained in full through the final clone.
+    /// The authority is not retained, and the source's own charge must remain held until the copy completes.
+    pub fn copy_utf16_with_admission(source: &[u16], admit: impl FnOnce(usize) -> Result<Arc<MemoryReservation>>) -> Result<Self> {
+        let source = Source::Utf16(source);
+        let (units, retained_bytes) = source.allocation()?;
+        let reservation = admit(retained_bytes)?;
+        if reservation.bytes() < retained_bytes {
+            return Err(Anomaly::incorrect("rtdb.types/java-text-admission", "Caller returned an insufficient Java text reservation"));
+        }
+        Ok(Self::copy_storage(source, units, retained_bytes, Some(reservation)))
+    }
+
     /// Copies without a reservation for explicitly untracked programmatic contexts.
     /// The native unit-count and storage-size checks still apply.
     pub fn copy_utf8_untracked(source: &str) -> Result<Self> { Self::copy(Source::Utf8(source), None) }
@@ -69,8 +84,9 @@ impl JavaString {
     /// Returns the full reservation required by `copy_utf16`, or its size error, without allocating.
     pub fn allocation_bound_utf16(source: &[u16]) -> Result<usize> { Source::Utf16(source).allocation().map(|(_, bytes)| bytes) }
 
-    /// Returns the backing's accounting bound, shared by every clone.
-    /// This includes bookkeeping, excludes containing nodes, and acquires no additional charge.
+    /// Returns the entire tracked reservation, shared by every clone, including any caller-supplied excess admission.
+    /// Untracked backing returns its calculated copy bound, including bookkeeping and excluding containing nodes.
+    /// Acquires no additional charge.
     pub fn retained_bytes(&self) -> usize {
         match &self.0 {
             Backing::Tracked { reservation, .. } => reservation.bytes(),

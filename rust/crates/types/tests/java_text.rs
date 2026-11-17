@@ -274,3 +274,64 @@ fn scope_budget_does_not_transfer_or_bypass_existing_charges() {
     drop(scope);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn admitted_utf16_copy_uses_the_supplied_authority_once_and_retains_its_full_lease() {
+    let source = [0xd800, 0x61, 0xdc00];
+    let bound = JavaString::allocation_bound_utf16(&source).unwrap();
+    for extra in [0, 37] {
+        let memory = MemoryBudget::new(bound + extra);
+        let weak = std::sync::Arc::downgrade(&memory);
+        let mut calls = 0;
+        let value = JavaString::copy_utf16_with_admission(&source, |bytes| {
+            calls += 1;
+            assert_eq!(bytes, bound);
+            assert_eq!(memory.used_bytes(), 0);
+            memory.reserve(bytes + extra)
+        }).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(value.view().units().collect::<Vec<_>>(), source);
+        assert_eq!(value.retained_bytes(), bound + extra);
+        assert_eq!(memory.used_bytes(), bound + extra);
+        let clone = value.clone();
+        drop(value);
+        assert_eq!(memory.used_bytes(), bound + extra);
+        drop(memory);
+        assert_eq!(weak.upgrade().unwrap().used_bytes(), bound + extra);
+        assert_eq!(clone.view().units().collect::<Vec<_>>(), source);
+        drop(clone);
+        assert!(weak.upgrade().is_none());
+    }
+}
+
+#[test]
+fn admitted_utf16_copy_preserves_authority_failure_before_copying_storage() {
+    let source = [0xd800, 0xdc00];
+    let mut calls = 0;
+    let cause = JavaString::copy_utf16_with_admission(&source, |bytes| {
+        calls += 1;
+        assert_eq!(bytes, JavaString::allocation_bound_utf16(&source).unwrap());
+        Err(rtdb_types::Anomaly::incorrect("fixture/text-admission-denied", "denied by caller"))
+    }).unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(cause.code, "fixture/text-admission-denied");
+    assert_eq!(cause.message.as_deref(), Some("denied by caller"));
+    assert_eq!(source, [0xd800, 0xdc00]);
+}
+
+#[test]
+fn admitted_utf16_copy_rejects_insufficient_leases_and_releases_the_returned_owner() {
+    for source in [&[][..], &[0xd800, 0x61][..]] {
+        let bound = JavaString::allocation_bound_utf16(source).unwrap();
+        let memory = MemoryBudget::new(bound);
+        let mut calls = 0;
+        let cause = JavaString::copy_utf16_with_admission(source, |bytes| {
+            calls += 1;
+            assert_eq!(bytes, bound);
+            memory.reserve(bytes - 1)
+        }).unwrap_err();
+        assert_eq!(calls, 1);
+        assert_eq!(cause.code, "rtdb.types/java-text-admission");
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
