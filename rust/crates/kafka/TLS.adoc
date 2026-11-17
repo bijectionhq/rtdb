@@ -56,6 +56,12 @@ Native client destruction joins librdkafka's activity and destroys its OpenSSL o
 Configuration duplication retains the same value, and creation failures release both the native configuration and its TLS ownership.
 The vendored callback contract is documented in link:../../vendor/rdkafka/XTDB.adoc[the rdkafka fork].
 
+`ssl.secure.random.implementation` selects the pinned built-in secure-random algorithms documented in link:src/tls/random/README.adoc[the random-provider adapter].
+Kafka applies Java ConfigDef trimming; an empty supplied algorithm is invalid.
+Each TLS owner retains separate library contexts for selected protocol randomness and default signature randomness.
+Private keys are destroyed before their library context, and native SSL objects are destroyed before their retained TLS owner.
+Context reservations and shared native-device reservations remain admitted through their final owner.
+
 `ssl.enabled.protocols` restricts negotiation to the configured protocols.
 TLS 1.2 and TLS 1.3 are usable under the pinned OpenJDK 25.0.1 defaults; SSLv3, TLSv1 and TLSv1.1 remain disabled.
 An empty protocol list uses the SSL context's default protocols, as in Kafka's https://github.com/apache/kafka/blob/4.4.0/clients/src/main/java/org/apache/kafka/common/security/ssl/DefaultSslEngineFactory.java[DefaultSslEngineFactory].

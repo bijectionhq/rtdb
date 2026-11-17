@@ -10,3 +10,16 @@ The manifest SHA-256 is `f513696ac0a80fb28ce9ac16d4ecbcf76b441973be5afd9a3836583
 The source cache contained no package archive checksum, so this manifest identifies the available source without asserting independent archive verification.
 The workspace patch gives all OpenSSL consumers one source identity.
 This source copy has not been compiled or executed during Phase 1.
+
+The TLS context adds a borrowed signature library context through `SSL_CTX_set_signature_libctx` and `SSL_CTX_get0_signature_libctx`.
+An omitted override preserves upstream behavior.
+The setter must run before connections are created, and the supplied library context must outlive the TLS context and every connection.
+CertificateVerify and TLS 1.2 ServerKeyExchange signatures use the override.
+Protocol randomness, key generation, binder HMACs, cookie HMACs and record MACs retain the original TLS context.
+These are all `EVP_DigestSignInit_ex` call sites in the pinned SSL source.
+
+OpenSSL's signing setup fetches the signature implementation from the supplied library context and exports a preexisting key into that implementation's provider.
+Keys loaded through native librdkafka options therefore use the signature override as well as keys decoded by the Java configuration adapter.
+The Rust TLS owner retains both library contexts beyond native context destruction.
+It does not rely on SSL context ex-data destruction, which occurs before native certificate keys are released.
+Regression sources in `../../crates/kafka/src/tls/random` exercise TLS 1.2 and TLS 1.3 client certificates with RSA-PSS and ECDSA and retain the owners through connection teardown.

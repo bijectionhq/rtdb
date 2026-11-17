@@ -2481,6 +2481,16 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb(
 
 
 /**
+ * @brief Supply the borrowed OpenSSL 3 library context used to create TLS contexts.
+ * Configuration copies borrow the same pointer, which must outlive their clients.
+ * A null pointer selects OpenSSL's default library context.
+ * @returns RD_KAFKA_CONF_INVALID when a non-null context requires unavailable support.
+ */
+RD_EXPORT
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_ctx_libctx(rd_kafka_conf_t *conf,
+                                                  void *libctx);
+
+/**
  * @brief Configure the OpenSSL context after built-in TLS setup and before connections start.
  * The callback receives a borrowed SSL_CTX and returns 0 on success, otherwise
  * writes a nul-terminated diagnostic bounded by errstr_size and returns -1.

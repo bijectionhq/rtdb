@@ -6,6 +6,11 @@ The upstream distributions and their license notices are retained.
 `SslContextConfigurer` is a passive, shared configuration capability.
 Its callback receives the linked OpenSSL `SSL_CTX` after native certificate and verification setup and before any connection starts.
 The callback may install per-connection callbacks that borrow its immutable state.
+The optional `library_context` method supplies a borrowed OpenSSL 3 library context before native `SSL_CTX_new_ex` construction.
+Its omitted implementation selects OpenSSL's default context.
+The same retained capability owns that library context through the last native TLS object's destruction.
+Explicit `ssl.providers` loads into that context, as do inline PEM keys and native PKCS12 stores.
+PKCS12 decoding reuses an initialized context-bearing object, preserving the selected provider scope through integrity checking, decryption and private-key import.
 `ClientConfig`, `NativeClientConfig` and every native configuration clone retain the capability.
 A successfully created `NativeClient` takes ownership until `rd_kafka_destroy` returns.
 The native pointer is destroyed before its retained callback capability.
@@ -15,6 +20,8 @@ The temporary main-queue reference is also released.
 
 The C API adds `rd_kafka_conf_set_ssl_ctx_configure_cb` with a borrowed opaque pointer and a bounded error buffer.
 Configuration duplication copies both callback and opaque fields.
+`rd_kafka_conf_set_ssl_ctx_libctx` adds the borrowed library-context pointer to that duplication contract.
+Unsupported native builds reject a non-null library context.
 The Rust wrapper supplies ownership for that borrowed pointer through an `Arc` and catches setup callback unwinding at the C boundary.
 A native creation failure after TLS context setup destroys the context and loaded providers before librdkafka clears its copied configuration.
 The fork requires its bundled C source; dynamic linking and external prebuilt librdkafka are rejected by the build script because those binaries lack this callback ABI.
