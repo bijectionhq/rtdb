@@ -17,7 +17,33 @@ Client/broker construction, overlapping broker threads/stacks, automatic Metadat
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 
-Four new regression source functions exercise actual DlqProducer attachment, response ownership after producer/context destruction, failed native configuration cleanup, pre-construction capacity rejection and checked capacity arithmetic.
+== Delivery event ownership
+
+The SDK retains a native delivery event through all its Rust delivery callbacks.
+Destroying that event subsequently frees its native messages, keys and headers.
+DeliveryContext owns each pre-admitted Delivery receipt before enqueue, while the SDK opaque value carries only its live object identity.
+A call-scoped registration guard removes an unaccepted receipt on errors or cancellation; successful enqueue consumes that guard.
+Receipt reporting marks the already-owned receipt as reported and links its existing completion field without allocating or releasing the original record reservation.
+It publishes that state before diagnostic output.
+SDK diagnostic formatting retains its existing String allocation; only receipt reporting is allocation-free.
+Diagnostic I/O errors cannot unwind the delivery callback.
+
+DeliveryContext is a passive region owning the receipt objects and completion head as one mutex-protected value, with a retained header allowance.
+It introduces no waiter, task, native callback or thread.
+The private DlqProducer remains its sole polling owner and releases completed receipts only after the SDK poll or flush has returned.
+That return follows native delivery-event destruction and pointer-array release.
+Pending receipts remain owned until later reporting or client teardown.
+The SDK's finite shutdown flush need not deliver every report, so no Rust Box is owned exclusively by an opaque native pointer.
+Client teardown destroys its native field before its context; final context teardown removes every remaining pending or reported receipt after native destruction.
+Both cleanup routes free each removed receipt Box before dropping its moved reservation fields.
+
+An additional checked receipt allowance precedes header/Box creation and native enqueue.
+Per-record receipt storage includes sixteen target receipt/pointer slots plus 4096 bytes for its Box, map-node growth and SDK delivery pointer-array storage.
+The context has a separate checked sixteen-header-slots-plus 4096 allowance retained through its private client ownership, including the region's empty-root minimum.
+These allowances concern receipt/event bookkeeping and record lease lifetime; they do not establish bounds for encoded/compressed requests or all native outbound owners.
+link:delivery-sources.json[The source manifest] pins the consulted SDK/event/message destruction chain at the implementation revision.
+
+Nine regression source functions exercise actual DlqProducer attachment, response ownership after producer/context destruction, failed native configuration cleanup, capacity/receipt admission rejection, checked capacity arithmetic, actual post-callback record retention, accepted/unaccepted registration, duplicate-report handling, pending/reported cleanup and poisoned-lock recovery.
 The native account and ordered response primitives are the existing reviewed production implementations, and the integration source uses a real native mock cluster.
 Original DLQ/config/cancellation assertions remain unchanged.
 No compiler, formatter, runtime or regression execution occurred in Phase 1.

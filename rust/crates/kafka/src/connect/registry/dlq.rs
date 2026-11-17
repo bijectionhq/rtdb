@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::{Duration, Instant}};
+use std::{collections::BTreeMap, io::Write as _, mem::size_of, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, message::{Header, OwnedHeaders}, native_byte_account::NativeByteAccount, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
@@ -55,14 +55,71 @@ impl Record {
     }
 
 }
-struct Delivery { _charge: Arc<MemoryReservation> }
-struct DeliveryContext;
+struct Delivery { _charge: Arc<MemoryReservation>, _receipt_charge: Arc<MemoryReservation>, state: DeliveryState }
+#[derive(Clone, Copy)]
+enum DeliveryState { Pending, Reported { next: Option<usize> } }
+#[derive(Default)]
+struct Deliveries { receipts: BTreeMap<usize, Box<Delivery>>, completed: Option<usize> }
+struct DeliveryContext { deliveries: Mutex<Deliveries>, _charge: Arc<MemoryReservation> }
+struct PendingReceipt<'a> { context: &'a DeliveryContext, identity: usize }
+impl PendingReceipt<'_> {
+    fn native_enqueue_accepted(self) { std::mem::forget(self); }
+}
+impl Drop for PendingReceipt<'_> {
+    fn drop(&mut self) {
+        let mut deliveries = self.context.deliveries.lock().unwrap_or_else(|cause| cause.into_inner());
+        if matches!(deliveries.receipts.get(&self.identity).map(|receipt| receipt.state), Some(DeliveryState::Pending)) {
+            if let Some(receipt) = deliveries.receipts.remove(&self.identity) { drop(DeliveryContext::deallocate_receipt(receipt)); }
+        }
+    }
+}
+impl DeliveryContext {
+    fn new(charge: Arc<MemoryReservation>) -> Self { Self { deliveries: Mutex::new(Deliveries::default()), _charge: charge } }
+    fn register(&self, charge: Arc<MemoryReservation>, receipt_charge: Arc<MemoryReservation>) -> PendingReceipt<'_> {
+        let receipt = Box::new(Delivery { _charge: charge, _receipt_charge: receipt_charge, state: DeliveryState::Pending });
+        let identity = receipt.as_ref() as *const Delivery as usize;
+        self.deliveries.lock().unwrap_or_else(|cause| cause.into_inner()).receipts.insert(identity, receipt);
+        PendingReceipt { context: self, identity }
+    }
+    fn completed(&self, identity: usize) {
+        let mut deliveries = self.deliveries.lock().unwrap_or_else(|cause| cause.into_inner());
+        let next = deliveries.completed;
+        if let Some(receipt) = deliveries.receipts.get_mut(&identity) {
+            if matches!(receipt.state, DeliveryState::Pending) {
+                receipt.state = DeliveryState::Reported { next };
+                deliveries.completed = Some(identity);
+            }
+        }
+    }
+    /// The producer poll or flush that delivered these reports must have returned.
+    fn release_completed(&self) {
+        loop {
+            let receipt = {
+                let mut deliveries = self.deliveries.lock().unwrap_or_else(|cause| cause.into_inner());
+                let Some(identity) = deliveries.completed else { break; };
+                let receipt = deliveries.receipts.remove(&identity).expect("completed receipt remains owned");
+                let DeliveryState::Reported { next } = receipt.state else { unreachable!("completion links contain reported receipts"); };
+                deliveries.completed = next;
+                receipt
+            };
+            drop(Self::deallocate_receipt(receipt));
+        }
+    }
+    fn deallocate_receipt(delivery: Box<Delivery>) -> Delivery { *delivery }
+}
+impl Drop for DeliveryContext {
+    fn drop(&mut self) {
+        let deliveries = self.deliveries.get_mut().unwrap_or_else(|cause| cause.into_inner());
+        while let Some((_, receipt)) = deliveries.receipts.pop_first() { drop(Self::deallocate_receipt(receipt)); }
+        deliveries.completed = None;
+    }
+}
 impl ClientContext for DeliveryContext {}
 impl ProducerContext for DeliveryContext {
-    type DeliveryOpaque = Box<Delivery>;
+    type DeliveryOpaque = usize;
     fn delivery(&self, result: &DeliveryResult<'_>, delivery: Self::DeliveryOpaque) {
-        if let Err((cause, _)) = result { eprintln!("Kafka Registry dead-letter delivery failed: {cause}"); }
-        drop(delivery);
+        self.completed(delivery);
+        if let Err((cause, _)) = result { let _ = writeln!(std::io::stderr().lock(), "Kafka Registry dead-letter delivery failed: {cause}"); }
     }
 }
 pub(super) struct DlqProducer {
@@ -87,22 +144,25 @@ impl DlqProducer {
         }
         let account = NativeByteAccount::new(native_capacity, native_charge).map_err(|cause| error("dlq", cause))?;
         client.set_native_byte_account(account);
-        let producer = client.create_with_context(DeliveryContext).map_err(|cause| error("dlq", cause))?;
+        let delivery_charge = context.reserve(size_of::<DeliveryContext>().checked_mul(16).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        charges.push(Arc::clone(&delivery_charge));
+        let producer = client.create_with_context(DeliveryContext::new(delivery_charge)).map_err(|cause| error("dlq", cause))?;
         Ok(Self { producer, settings, charges })
     }
     pub async fn send(&mut self, record: Record, context: &mut ConversionContext) -> Result<()> {
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         self.settings.validate_bytes(record.key.as_deref(), record.value.as_deref())?;
         if record.kafka_batch_upper_bound()? > self.settings.maximum_record_bytes { return Err(error("dlq", "Dead-letter record exceeds producer allocation or request size")); }
+        let receipt_charge = context.reserve(size_of::<Delivery>().checked_add(size_of::<*const ()>()).and_then(|bytes| bytes.checked_mul(16)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
+        let receipt = self.producer.context().register(Arc::clone(&record.charge), receipt_charge);
         let headers = record.headers.iter().fold(OwnedHeaders::new_with_capacity(5), |headers, (name, value)| headers.insert(Header { key: name, value: value.as_deref() }));
-        let delivery = Box::new(Delivery { _charge: Arc::clone(&record.charge) });
-        let mut pending = BaseRecord::<[u8], [u8], Box<Delivery>>::with_opaque_to(&record.topic, delivery).headers(headers);
+        let mut pending = BaseRecord::<[u8], [u8], usize>::with_opaque_to(&record.topic, receipt.identity).headers(headers);
         pending.key = record.key.as_deref(); pending.payload = record.value.as_deref();
         let start = Instant::now();
         loop {
-            self.producer.poll(Duration::ZERO);
+            self.poll();
             match self.producer.send(pending) {
-                Ok(()) => break,
+                Ok(()) => { receipt.native_enqueue_accepted(); break; }
                 Err((KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull), returned)) => {
                     pending = returned;
                     if start.elapsed() >= self.settings.maximum_block { return Err(error("dlq", "Dead-letter producer queue admission timed out")); }
@@ -114,12 +174,17 @@ impl DlqProducer {
         if self.settings.auto_flush { self.drain().await; }
         Ok(())
     }
+    fn poll(&self) {
+        self.producer.poll(Duration::ZERO);
+        self.producer.context().release_completed();
+    }
     pub async fn drain(&mut self) {
         while self.producer.in_flight_count() != 0 {
             let _ = self.producer.flush(Duration::ZERO);
-            self.producer.poll(Duration::ZERO);
+            self.poll();
             if self.producer.in_flight_count() != 0 { tokio::time::sleep(Duration::from_millis(10)).await; }
         }
+        self.producer.context().release_completed();
     }
 }
 fn varint_length(value: usize) -> Result<usize> {
@@ -130,6 +195,8 @@ fn overflow() -> rtdb_types::Anomaly { error("allocation-overflow", "Dead-letter
 
 #[cfg(test)]
 mod native_account_tests;
+#[cfg(test)]
+mod delivery_release_tests;
 
 #[cfg(test)]
 mod tests {

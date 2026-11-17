@@ -1,0 +1,20 @@
+{
+  "source_revision": "f7b7b0af52c4e17e5068d6786a58c7def942f487",
+  "members": {
+    "rust/vendor/rdkafka/src/producer/base_producer.rs": "4883f4457b62a64325b0e7339fa03b9ed04a75b106841be782754c3dcbff751b",
+    "rust/vendor/rdkafka/src/client.rs": "f57945f8d5e42fb50cc5bb171ab2629f8eef7e9b3afce2d30180dc9db505cd94",
+    "rust/vendor/rdkafka/src/admin.rs": "6e315415e6963caa8cde5639a18abeaf093a6498b6b14b444656ba4cfc1906c4",
+    "rust/vendor/rdkafka/src/message.rs": "5f7bbb3ac8e6cfc976496feff40db563e656132abd23ada84eccaf83fdba01ec",
+    "rust/vendor/rdkafka/src/util.rs": "b941545a74f0a290bcff6e35a928afad52e20f3b793c90bd4b6237c99cd96bcb",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_event.c": "f99de584d35e19cf9a0bf3139322ec92d75fbec4c16dd525bb8b36c8b48dd211",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_op.c": "92bd07cb6b7e9ac5ea205cd32f7384e238e6dbade46c5360d367d7c6ad20033e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msg.c": "661ee4ddaeb2850ef6f507285310d8efa1b35e65f8d485a63961da93b84f5dc7",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msg.h": "f8a1756d940815bbe10ac530740040a3331d1963a396a2c468e90fd680f97839",
+    "rust/crates/types/src/memory.rs": "52d3bbb4896976b12b7db7eb11f329ae1c3db2c9825fba646b768e393a668406",
+    "rust/crates/kafka/src/connect/registry/dlq.rs": "2a2c4a5fa318269548bae8706fb2add7ad2af2940eaeac43ca8180f07b62d13e",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka.c": "bdf87da6d05e91d61cc4740840589f465f7660e46b4823ccce74a3825b8f5d5b",
+    "rust/vendor/rdkafka/src/error.rs": "0640ea8bdeeec1ab9a315dcb66c377d21711de5140c4815b2a6c971873bb6379"
+  },
+  "source_only": true,
+  "upstream_notice_policy": "Original complete source notices remain in the pinned vendored source files; no upstream implementation text is copied by this region adapter."
+}
