@@ -55,5 +55,5 @@ async fn sql_replacement_patterns_prepare_before_rows_and_unselected_payloads() 
         "SELECT CARDINALITY(ARRAY[REGEXP_REPLACE('a','[','x')])",
         "SELECT CASE WHEN v IS NULL THEN 'kept' ELSE REGEXP_REPLACE(v,'[','x') END FROM (VALUES (NULL),('a')) AS t(v)",
     ] { assert_eq!(query(source,vec![]).await.unwrap_err().code,"xtdb.expression/illegal-argument-exception","{source}"); }
-    assert_eq!(query("SELECT REGEXP_REPLACE('a','a','x',1),REGEXP_REPLACE('b','[','x')",vec![]).await.unwrap_err().code,"xtdb.expression/unsupported");
+    assert_eq!(query("SELECT REGEXP_REPLACE('a','a','x',1),REGEXP_REPLACE('b','[','x') AS other",vec![]).await.unwrap_err().code,"xtdb.expression/unsupported");
 }

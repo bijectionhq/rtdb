@@ -86,7 +86,7 @@ async fn uncorrelated_marks_stop_comparison_but_correlated_values_project_the_wh
     let needle = V::List(vec![V::Timestamp { value: i64::MAX, unit: TimeUnit::Second, timezone: Some("UTC".into()) }]);
     let later = V::List(vec![V::Timestamp { value: 0, unit: TimeUnit::Millisecond, timezone: Some("UTC".into()) }]);
     assert_eq!(query("SELECT $1 IN ($1,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL)", vec![needle.clone(),later.clone()]).await.unwrap(), [vec![V::Bool(true)]]);
-    assert_eq!(query("SELECT x IN (x,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL) FROM (VALUES ($1)) t(x)", vec![needle,later]).await.unwrap_err().code, "xtdb.expression/overflow-error");
+    assert_eq!(query("SELECT x IN (x,$2,NULL,NULL,NULL,NULL,NULL,NULL,NULL) FROM (VALUES ($1)) t(x)", vec![needle,later]).await.unwrap_err().code, "xtdb/numeric-value-out-of-range");
 }
 
 #[tokio::test]
@@ -96,7 +96,7 @@ async fn scalar_shared_marks_select_hash_candidates_before_temporal_comparison()
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,$2)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Bool(false)]]);
     assert_eq!(query("SELECT $1 IN ($2,$2,$2,$2,$2,$2,$2,$2,NULL)", vec![needle.clone(),candidate.clone()]).await.unwrap(), [vec![V::Null]]);
     assert_eq!(query("SELECT NULL IN ($1,$1,$1,$1,$1,$1,$1,$1,$1)", vec![needle.clone()]).await.unwrap(), [vec![V::Null]]);
-    assert_eq!(query("SELECT x IN ($2,$2,$2,$2,$2,$2,$2,$2,x) FROM (VALUES ($1)) t(x)", vec![needle,candidate]).await.unwrap_err().code, "xtdb.expression/overflow-error");
+    assert_eq!(query("SELECT x IN ($2,$2,$2,$2,$2,$2,$2,$2,x) FROM (VALUES ($1)) t(x)", vec![needle,candidate]).await.unwrap_err().code, "xtdb/numeric-value-out-of-range");
 }
 
 #[tokio::test]
@@ -112,8 +112,9 @@ async fn scalar_shared_marks_keep_raw_uri_hash_selection_and_nested_object_equal
 #[test]
 fn list_candidates_share_scalar_admission_and_row_arity_at_every_length() {
     let context = context(&CancellationToken::new(), 1 << 27);
-    for suffix in ["", ",2,3,4,5,6,7,8,9"] {
-        for candidate in ["(SELECT 1)","MAX(x)","ROW_NUMBER() OVER ()"] {
+    assert!(prepare("SELECT x IN ((SELECT 1)) FROM (VALUES (1)) t(x) GROUP BY x", &context.catalog, &PrepareOptions::default()).is_ok());
+    for suffix in [",2", ",2,3,4,5,6,7,8,9"] {
+        for candidate in ["COALESCE((SELECT 1),0)","MAX(x)","ROW_NUMBER() OVER ()"] {
             let sql = format!("SELECT x IN ({candidate}{suffix}) FROM (VALUES (1)) t(x) GROUP BY x");
             let error = prepare(&sql, &context.catalog, &PrepareOptions::default()).unwrap_err();
             assert!(error.message.as_deref().is_some_and(|message| message.contains("not allowed in this context")), "{sql}: {error}");
@@ -138,11 +139,13 @@ async fn cancelled_candidate_construction_and_spill_failure_release_partial_owne
     let context = context(&cancellation, 1 << 27);
     let mut query = Box::pin(query_at(Arc::clone(&context), "SELECT 1 IN (1,2,3,4,5,6,7,8,COALESCE(NULLIF(PG_SLEEP(60.0),NULL),9))", vec![]));
     poll_fn(|cx| { assert!(query.as_mut().poll(cx).is_pending()); Poll::Ready(()) }).await;
-    assert!(context.spill_bytes() > 0);
+    assert!(context.memory.used_bytes() > 0);
+    assert_eq!(context.spill_bytes(), 0);
     cancellation.cancel();
     assert!(query.await.is_err());
     assert_eq!(context.memory.used_bytes(), 0);
     assert_eq!(context.spill_bytes(), 0);
-    let limited = self::context(&CancellationToken::new(), 1);
-    assert!(query_at(limited, "SELECT 1 IN (1,2,3,4,5,6,7,8,9)", vec![]).await.is_err());
+    let base = self::context(&CancellationToken::new(), 1);
+    let limited = QueryContext::new(base.catalog.clone(), MemoryBudget::new(1 << 27), Timestamp(0), "UTC", QueryOptions { join_build_rows: 0, ..base.options.clone() }, &CancellationToken::new()).unwrap();
+    assert_eq!(query_at(limited, "SELECT 1 IN (1,2,3,4,5,6,7,8,9)", vec![]).await.unwrap_err().code,"rtdb.query/spill-limit");
 }

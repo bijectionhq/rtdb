@@ -95,15 +95,19 @@ async fn empty_build_retains_empty_iid_descriptor_and_outer_joins_keep_unmatched
 
 #[tokio::test]
 async fn cancellation_drops_probe_filters_and_build_spool() {
-    let context = context();
-    let prepared = PreparedQuery::from_prepared(prepare("SELECT f.v, b.w FROM foo f JOIN bar b ON f._id = b._id", &context.catalog, &PrepareOptions::default()).unwrap(), &context.memory).unwrap();
-    let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
-    drop(cursor.next_batch().await.unwrap().unwrap());
-    assert!(context.memory.used_bytes() > 0); assert!(context.spill_bytes() > 0);
-    context.cancellation.cancel();
-    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb/query-cancelled");
-    drop(cursor); drop(prepared);
-    assert_eq!(context.memory.used_bytes(), 0); assert_eq!(context.spill_bytes(), 0);
+    for join_build_rows in [0, 100_000] {
+        let base = context();
+        let context = QueryContext::new(base.catalog.clone(), MemoryBudget::new(1 << 27), Timestamp(2), "UTC", QueryOptions { join_build_rows, ..base.options.clone() }, &CancellationToken::new()).unwrap();
+        let prepared = PreparedQuery::from_prepared(prepare("SELECT f.v, b.w FROM foo f JOIN bar b ON f._id = b._id", &context.catalog, &PrepareOptions::default()).unwrap(), &context.memory).unwrap();
+        let mut cursor = prepared.execute(Arc::clone(&context), vec![]).await.unwrap();
+        drop(cursor.next_batch().await.unwrap().unwrap());
+        assert!(context.memory.used_bytes() > 0);
+        assert_eq!(context.spill_peak_bytes() > 0, join_build_rows == 0);
+        context.cancellation.cancel();
+        assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb/query-cancelled");
+        drop(cursor); drop(prepared);
+        assert_eq!(context.memory.used_bytes(), 0); assert_eq!(context.spill_bytes(), 0);
+    }
 }
 
 #[tokio::test]
