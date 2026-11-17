@@ -44,6 +44,13 @@ The main hash identifier is not restricted to that list at factory admission.
 The CRT path retains its parameter encoding; the non-CRT path regenerates the parameter sequence from its resulting hash, MGF digest, and salt values, omitting defaults.
 Context-field contents may retain unused trailing bytes as Java does.
 
+Nested AES, DESede, and Blowfish hash parameters require primitive OCTET STRING IVs of 16, 8, and 8 bytes respectively.
+AES's parameter-spec overload accepts additional IV sizes, but encoded parameters do not.
+Nested ChaCha20-Poly1305 hash parameters accept primitive or constructed OCTET STRINGs containing exactly 12 nonce bytes.
+These services require complete parameter consumption, while absent or NULL parameters skip service initialization.
+The containing PSS CRT key retains those parameter bytes; non-CRT regeneration retains the hash algorithm name and omits its IV parameters.
+Cipher-specific OIDs without a registered parameter service retain opaque parameter values.
+
 DSA accepts absent or NULL parameters, or a sequence of exactly three signed integers for p, q, and g.
 Its private x value is signed, and trailing bytes after that integer inside the private-key octets are retained without parsing.
 The historical OIW DSA identifier dispatches to the same factory.
@@ -85,9 +92,10 @@ Temporary owners drop before the reservation shrinks to retained encoded capacit
 Malformed data, unsupported factories, unsupported nested parameters, and budget exhaustion release their reservations.
 
 Nested PSS hash identifiers can select arbitrary AlgorithmParameters services.
-This decoder validates nested DSA, DH, and EC parameters and preserves parameters for identifiers without a registered service.
-Nested PSS, OAEP, AES, legacy PBE, PBES2, DESede, Blowfish, and ChaCha20-Poly1305 parameter services currently return an explicit unsupported-parameters error.
+This decoder validates nested DSA, DH, EC, AES, DESede, Blowfish, and ChaCha20-Poly1305 parameters and preserves parameters for identifiers without a registered service.
+Nested PSS, OAEP, legacy PBE, and PBES2 parameter services currently return an explicit unsupported-parameters error.
 The parameter-dependent `SpecifiedSHA2withECDSA` name is also unsupported in that nested position.
 Successful factory admission does not establish native TLS import, signing, key/certificate consistency, or cryptographic validity.
 
 Regression sources cover PKCS8 fields and BER framing, provider aliases, RSA range and CRT fallback behavior, PSS defaults and errors, signed DSA/DH values and retained tails, all registered EC curves, nested EC public bits, XDH/EdDSA scalar lengths, named post-quantum acceptance, HSS rejection, and reservation lifetime.
+Nested IV regressions cover encoded-length boundaries, primitive versus constructed OCTET acceptance, BER forms, malformed components, absent and NULL parameters, CRT retention, non-CRT regeneration, cipher-specific OIDs, and admission release.
