@@ -123,7 +123,7 @@
         "rust/crates/tx/src/resolver.rs": "5de2a6f21839cbc23ab47688adc14e1b5ab3e9d904659e7683301102a2ecdc91",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30"
+        "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e"
       }
     },
     "replica_recovery": {
@@ -142,7 +142,7 @@
         "rust/crates/server/src/runtime.rs": "a084f5872c121623d4c7d9797e6a77e150df5dc5fe631792a6b8ff9256d872ed",
         "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
-        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30",
+        "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e",
         "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
       }
     },
@@ -162,10 +162,10 @@
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/maintenance/src/driver.rs": "72ce0b9147fd994dfc003768e856e594f96d638de9b534129fdb2142c0e5d0a2",
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
-        "rust/crates/maintenance/src/merge.rs": "8d98ac24d4936cc79fc04fe33df70cad55b549ce19a1ef5bb697027751ecf142",
+        "rust/crates/maintenance/src/merge.rs": "c48d933439beed33360993769d1b3f91a7a200b911955d70c7b1f6d471906151",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30",
-        "rust/crates/index/src/trie_catalog.rs": "e4a93d9e43bad76771738eb45d192c0783e18848e147ba12ae831ebf50c1a625"
+        "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e",
+        "rust/crates/index/src/trie_catalog.rs": "ec294a4c8554ef3123dadce80c7775116d3edfca4317f62c2fb1b897099f94c0"
       }
     },
     "cdc_restart": {
@@ -187,7 +187,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "4f73e6b8b465dae30475bc92a331112c3d566b690ec671ee86b43216644d2e30"
+        "rust/crates/replication/src/driver.rs": "6619f4e724c9bbc9d2f7d064d180f71ca1da07f09554c0965c2af39352244a5e"
       }
     },
     "database_shutdown": {
@@ -210,7 +210,7 @@
         "rust/crates/node/src/node.rs": "26eb2e6929a8b7eb6c1788d8a9c6eb57c1c35f78f7e02db5afa4c53ab95064c0",
         "rust/crates/node/src/runtime.rs": "d07bca61ae12f9201ada4039eb0ce92c98f928106ca873ec0362de6b41db952f",
         "rust/crates/node/src/database.rs": "0d216aab1cd58ac430872cc4bce9620a37748df871ef48732357823ae458090c",
-        "rust/crates/storage/src/io_region.rs": "0113b3f0778db0c1111afe87cce05b33d21156e9b4cf8ac8e9e87379de843faa",
+        "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
         "rust/crates/ffi/src/region.rs": "ea8bad0f3363ecfd402468455a3a7c7fe235767ecb05697fd29df250c722ca44"
       }
     }
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, prediction-context operations and ordered configuration/mode foundations with adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context storage, ordered configuration/mode and exact-unit literal-decoder foundations with retained configurations, adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "planning-allocation",

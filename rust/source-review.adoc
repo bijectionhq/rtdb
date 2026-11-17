@@ -780,7 +780,7 @@ Owned and scoped construction share one admitted loader; borrowing views allocat
 Views from distinct loaded graphs remain foreign even when their artifacts are equal.
 Graph storage is destroyed before its owned scope releases construction reservations.
 Independent source review covers six added ownership regression sources and preservation of the existing graph, LOOK and prediction assertions.
-Retained prediction storage, shared cache histories, closure and adaptive prediction, generated rules and production parsing remain required implementation work.
+Retained configuration and DFA storage, shared cache histories, closure and adaptive prediction, generated rules and production parsing remain required implementation work.
 All regression sources remain unexecuted.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
 
@@ -805,3 +805,29 @@ SunX509 JKS raw parsing, AlgorithmParameters initialization, and provider-specif
 Avro Java name policy, scrubbed field lookup, specific/reflection adapters, and shipped-classpath reconciliation remain open adapter work.
 The regression sources added by these slices remain unexecuted under the Phase 1 work order.
 This checkpoint does not close the source-completeness gate or establish runtime compatibility.
+
+
+== Literal conversion and retained prediction source checkpoint
+
+The private SQL literal decoder retains exact Java string units from borrowed standard, C-escape and dollar-string lexer views.
+Matched C fragments preserve partial octal conversion, unmatched hexadecimal prefixes, uppercase conversion failures and first-error order.
+Raw conversion failures retain the offending unit or signed code point, with independently admitted exact-unit Java messages.
+Scratch remains charged while completed output acquires its own retained lease.
+Independent source review covers all 25 added regression sources and preservation of the existing module and documentation content.
+Canonical semantic-tree ownership, format-specific codecs, host and typed-literal consumers, raw diagnostics and production visitor integration remain required.
+
+Retained prediction storage owns its completed grammar and canonical contexts independently of each access's traversal work.
+Scoped and retained storage share the existing equality, merge and canonicalization kernels.
+Actual canonical keys and values root context reclamation after the access's branded borrows have ended.
+Cleanup uses admitted slot links, preserves completed publications after later failures, and releases unreachable payloads without allocating or recursively destroying parent graphs.
+Independent source review covers 18 added regression sources and preservation of all 25 context tests and 38 configuration and mode tests.
+Retained configurations and DFA roots, mutable-key container semantics, closure and adaptive prediction, generated rules and production parsing remain required.
+
+The incoming build-repair commit `86e3f8c7ed3386ecbe66fc97b324b516ce1e51c4` reports a native build outside this source-review workflow.
+It supplies no qualification receipts to this checkpoint and does not close the source-completeness gate.
+Its changes to the reviewed merge, trie-catalog and I/O-region files only adjust imports and an explicit schema borrow; their trace conclusions remain unchanged.
+The subsequent driver cancellation fix preserves orderly shutdown when its completed append pump wins event selection after cancellation.
+Actual append errors and successful pump exit during an active, uncancelled term retain their failure paths; term-task joins still complete before dependencies are released.
+The evidence hashes identify those reviewed committed bytes.
+This workflow has executed none of the added regression sources or the Phase 2 qualification matrix.
+The source-completeness gate remains false.
