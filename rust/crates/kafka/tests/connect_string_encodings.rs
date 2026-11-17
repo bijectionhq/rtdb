@@ -311,3 +311,139 @@ async fn cesu8_decoder_admits_replacement_storage_before_decoding() {
     let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
     assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8("\u{fffd}".repeat(bytes.len())));
 }
+
+const SINGLE_BYTE_MANIFEST: &str = include_str!("../src/connect/converter/charset/single_byte/charsets.tsv");
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    openssl::sha::sha256(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+#[test]
+fn single_byte_resources_retain_pinned_source_and_mapping_provenance() {
+    let mappings = include_bytes!("../src/connect/converter/charset/single_byte/java25-single-byte.bin");
+    assert_eq!(mappings.len(), 102 * 512);
+    assert_eq!(sha256_hex(mappings), "29b4d331391a6e6505f5c10f8bfcd6516f4d5f09e22380502ee991d5dcdb195b");
+    assert_eq!(sha256_hex(SINGLE_BYTE_MANIFEST.as_bytes()), "b676ed640f72bad381b6ab3e80b977da514b9ea727c8b488963bab275fec7b20");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/single_byte/aliases.rs")), "1640af5230a0f41278500e2e9c7c7d61b538d41d56900b73b017b6664a0a1a91");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/single_byte/sources.sha256")), "f3f9619fd9954c2257a494c34a0bd90a6d520549ab17916ca0a681a5bc3af5bb");
+    assert_eq!(SINGLE_BYTE_MANIFEST.lines().skip(1).count(), 102);
+    for (index, line) in SINGLE_BYTE_MANIFEST.lines().skip(1).enumerate() {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 9);
+        assert_eq!(fields[3].len(), 64);
+        assert!(fields[3].bytes().all(|byte| byte.is_ascii_hexdigit()));
+        let table = &mappings[index * 512..(index + 1) * 512];
+        assert_eq!(sha256_hex(table), fields[6], "{}", fields[0]);
+        let units: Vec<_> = table.chunks_exact(2).map(|unit| u16::from_be_bytes([unit[0], unit[1]])).collect();
+        assert!(units.iter().all(|unit| !(0xd800..=0xdfff).contains(unit)));
+        if fields[4] == "true" { assert_eq!(&units[..128], &(0u16..128).collect::<Vec<_>>()); }
+        if fields[5] == "true" { assert!(units.iter().all(|unit| *unit <= 255)); }
+    }
+}
+
+#[tokio::test]
+async fn single_byte_canonical_names_and_every_provider_alias_decode_all_byte_values() {
+    let bytes: Vec<_> = (0u8..=255).collect();
+    let mut names = std::collections::BTreeSet::new();
+    for line in SINGLE_BYTE_MANIFEST.lines().skip(1) {
+        let fields: Vec<_> = line.split('\t').collect();
+        for name in std::iter::once(fields[0]).chain(fields[8].split('|').filter(|alias| !alias.is_empty())) {
+            names.insert(name.to_ascii_lowercase());
+            for selected in [name.to_owned(), name.to_ascii_uppercase()] {
+                let text = decode(&selected, &bytes).await;
+                assert_eq!(text.chars().count(), 256, "{selected}");
+                assert_eq!(sha256_hex(text.as_bytes()), fields[7], "{selected}");
+                assert_eq!(decode(&selected, &[]).await, "");
+            }
+        }
+    }
+    assert_eq!(names.len(), 589);
+}
+
+#[tokio::test]
+async fn single_byte_families_retain_distinct_symbols_scripts_and_private_use_values() {
+    for (encoding, bytes, expected) in [
+        ("windows-1252", &[0x80, 0x91, 0x92, 0x93, 0x94][..], "€‘’“”"),
+        ("ISO-8859-1", &[0x80, 0xa4][..], "\u{80}¤"),
+        ("ISO-8859-15", &[0xa4, 0xbc, 0xbd, 0xbe][..], "€ŒœŸ"),
+        ("ISO-8859-2", &[0xa1, 0xb1, 0xc8][..], "ĄąČ"),
+        ("ISO-8859-7", &[0xa4, 0xa5, 0xc1][..], "€₯Α"),
+        ("windows-1251", &[0xc0, 0xe0, 0x88][..], "Аа€"),
+        ("KOI8-R", &[0xe1, 0xc1, 0xb3][..], "АаЁ"),
+        ("KOI8-U", &[0xa4, 0xb4][..], "єЄ"),
+        ("IBM437", &[0x80, 0xb3, 0xdb][..], "Ç│█"),
+        ("IBM850", &[0xd5][..], "ı"),
+        ("IBM00858", &[0xd5][..], "€"),
+        ("IBM037", &[0x9f][..], "¤"),
+        ("IBM01140", &[0x9f][..], "€"),
+        ("JIS_X0201", &[0x5c, 0x7e, 0xa1, 0xdf][..], "\\~｡ﾟ"),
+        ("TIS-620", &[0xa0, 0xa1, 0xdf][..], "\u{a0}ก฿"),
+        ("x-windows-874", &[0x80, 0xa0, 0xa1, 0xdf][..], "€\u{a0}ก฿"),
+        ("x-MacRoman", &[0x80, 0xdb, 0xf0][..], "Ä€\u{f8ff}"),
+        ("x-MacSymbol", &[0x41, 0x57, 0x61, 0x77][..], "ΑΩαω"),
+        ("x-MacDingbat", &[0x21, 0x22, 0x23][..], "✁✂✃"),
+    ] { assert_eq!(decode(encoding, bytes).await, expected, "{encoding}"); }
+}
+
+#[tokio::test]
+async fn single_byte_ebcdic_controls_and_encoder_only_corrections_remain_decodable() {
+    assert_eq!(decode("IBM037", &[0x04, 0x05, 0x15, 0x25, 0x3f, 0x40, 0xc1, 0x81, 0xf0]).await, "\u{9c}\t\n\n\u{1a} Aa0");
+    for name in ["IBM037", "IBM500", "IBM01140", "IBM01148"] {
+        assert_eq!(decode(name, &[0x15, 0x25, 0x15, 0x25]).await, "\n\n\n\n", "{name}");
+    }
+    assert_eq!(decode("x-IBM874", &[0xa0, 0xdb, 0xdc, 0xdd, 0xde]).await, "\u{e48}\u{e49}\u{e4a}\u{e4b}\u{e4c}");
+    assert_eq!(decode("IBM-Thai", &[0x25, 0x51, 0xca, 0xe1, 0xfd, 0xfe]).await, "\n\u{e48}\u{e49}\u{e4a}\u{e4b}\u{e4c}");
+}
+
+#[tokio::test]
+async fn single_byte_unmappable_bytes_each_produce_one_replacement() {
+    for (encoding, bytes, expected) in [
+        ("windows-1252", &[0x81, 0x8d, b'a', 0x8f, 0x90, 0x9d][..], "\u{fffd}\u{fffd}a\u{fffd}\u{fffd}\u{fffd}"),
+        ("ISO-8859-3", &[0xa5, 0xae, b'a'][..], "\u{fffd}\u{fffd}a"),
+        ("JIS_X0201", &[0x80, 0x81, 0xa0, 0xa1, 0xe0, 0xff][..], "\u{fffd}\u{fffd}\u{fffd}｡\u{fffd}\u{fffd}"),
+    ] { assert_eq!(decode(encoding, bytes).await, expected, "{encoding}"); }
+}
+
+#[tokio::test]
+async fn single_byte_encodings_follow_key_and_value_precedence_and_serializer_validation() {
+    let options = spec(&[
+        ("converter.encoding", " no-such-encoding "),
+        ("key.serializer.encoding", "MacRoman"),
+        ("key.deserializer.encoding", "cp1251"),
+        ("value.serializer.encoding", "cp037"),
+        ("value.deserializer.encoding", "cp1252"),
+    ]);
+    let plugins = PluginRegistry::default();
+    for (is_key, expected) in [(true, "Ђ"), (false, "€")] {
+        let mut converter = plugins.converter(&options, is_key).unwrap();
+        let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+        assert_eq!(converter.decode("events", Some(&[0x80]), &mut context).await.unwrap().value, Value::Utf8(expected.into()));
+        assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null);
+        let serializer = if is_key { "key.serializer.encoding" } else { "value.serializer.encoding" };
+        for invalid in ["cp-1252", "windows1252", " MacRoman ", "no-such-encoding"] {
+            let mut invalid_options = options.clone();
+            invalid_options.options.insert(serializer.into(), invalid.into());
+            assert!(plugins.converter(&invalid_options, is_key).is_err(), "{serializer}={invalid}");
+        }
+    }
+    assert_eq!(decode("\0\tCp1252\r\u{1f}", &[0x80]).await, "€");
+}
+
+#[test]
+fn single_byte_lookup_rejects_unregistered_spellings() {
+    for encoding in ["windows1252", "cp-1252", "latin_9", "Mac-Roman", "IBM01150"] {
+        assert!(PluginRegistry::default().converter(&spec(&[("converter.encoding", encoding)]), false).is_err(), "{encoding}");
+    }
+}
+
+#[tokio::test]
+async fn single_byte_decoders_admit_worst_case_storage_before_decoding() {
+    for (encoding, byte, expected) in [("windows-1252", 0x81, "\u{fffd}"), ("JIS_X0201", 0xa1, "｡"), ("x-MacRoman", 0xf0, "\u{f8ff}")] {
+        let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", encoding)]), false).unwrap();
+        let bytes = [byte; 1024];
+        let mut rejected = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4 - 1));
+        assert!(converter.decode("events", Some(&bytes), &mut rejected).await.is_err());
+        let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
+        assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8(expected.repeat(bytes.len())));
+    }
+}

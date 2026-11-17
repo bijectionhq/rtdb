@@ -1,0 +1,56 @@
+= Java 25 single-byte character mappings
+
+The String converter supports the 102 built-in charsets whose decoder is OpenJDK's `SingleByte.Decoder`, in addition to its separate ASCII and ISO-8859-1 paths.
+link:charsets.tsv[The charset manifest] records every canonical name, implementation class, provider source path, source SHA-256, ASCII/Latin1 fastpath flags, mapping digest, decoded-output digest, and original provider aliases.
+The providers expose 589 distinct case-insensitive names for these 102 charsets.
+Name matching preserves punctuation and accepts only registered names.
+
+`Charset` is a passive immutable configuration value borrowing one process-lifetime mapping.
+The lookup and decoder are passive functions; their tables are immutable and require no runtime cache.
+The decoder's result buffer belongs to one call and reserves three bytes per input byte, within the scalar converter's existing four-bytes-per-input-byte plus 16384-byte admission.
+Every byte maps to one UTF16 unit, with U+FFFD for an unmappable byte.
+The native UTF8 boundary combines adjacent surrogate units and replaces isolated units; the pinned single-byte tables contain no surrogates.
+
+== Sources and representation
+
+The data comes from Eclipse Temurin 25.0.1+8's https://github.com/adoptium/temurin25-binaries/releases/download/jdk-25.0.1%2B8/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz[Linux x64 JDK archive].
+The archive SHA-256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
+Its `jdk-25.0.1+8/lib/src.zip` member has SHA-256 `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[Supporting source hashes] pin `SingleByte`, `String`, `Charset`, both provider registrations, and `AbstractCharsetProvider`.
+The per-class hashes in the manifest identify the original Java source bytes.
+`COPYRIGHT` retains those sources' copyright and license headers; `LICENSE`, `ASSEMBLY_EXCEPTION`, and `ADDITIONAL_LICENSE_INFO` retain the archive's licensing material, including the Classpath exception.
+
+`SingleByte.Decoder.decode(int)` indexes `b2c` with the signed byte plus 128.
+`java25-single-byte.bin` stores the same units in unsigned-byte order, as 102 consecutive 512-byte records sorted by lowercase canonical name.
+Each record contains 256 big-endian `u16` values.
+The resource has 52224 bytes and SHA-256 `29b4d331391a6e6505f5c10f8bfcd6516f4d5f09e22380502ee991d5dcdb195b`.
+The manifest's `mapping_sha256` covers each record, and `decoded_utf8_sha256` covers the UTF8 encoding of that charset's decoded bytes 0 through 255 in order.
+`aliases.rs` contains the sorted lowercase name-to-record index.
+
+All 102 decoder constructors pass the unmodified `Holder.b2c` array.
+The classes' encoder-only non-round-trip corrections mutate a separate `b2cMap` copy, and `SingleByte.initC2B` reads its input mapping without changing it.
+For example, IBM037 bytes 0x15 and 0x25 both decode to newline, and JIS X0201 bytes 0x5C and 0x7E decode to backslash and tilde.
+The `String` constructor's ASCII fastpath applies to 26 of these charsets and its Latin1 fastpath to 11; their tables satisfy the corresponding identity and range conditions.
+Both fastpaths therefore produce the same units as the extracted table.
+
+`Charset.lookup2` consults the standard provider before the extended provider.
+The derivation follows that order, including the standard provider's generated canonical and alias maps and the extended provider's first-registration alias ownership.
+Every selected canonical name and alias resolves to its declared class; none of these names is displaced by another built-in provider.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] accepts the pinned archive path and an output directory:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-single-byte
+----
+
+It verifies both archive hashes, scans the source archive for every `SingleByte.Decoder` constructor, and checks each constructor, table size, surrogate range, fastpath flag, decoder-table mutation, alias list, and provider resolution before emitting the data.
+Its output comprises the mapping resource, alias index, charset manifest, supporting source hashes, copyright headers, and license files.
+The derivation reads archive contents and Java source text only and requires no JDK execution.
+
+Regression sources separately cover resource hashes, all bytes for every canonical name and alias, independent representative characters, EBCDIC controls, encoder-only corrections, replacement grouping, key/value configuration, null values, and memory admission.
+Representative anchors include Windows punctuation, ISO currency distinctions, DOS line drawing, Cyrillic variants, Macintosh symbols and private-use characters, JIS backslash/tilde, and Thai mappings.
+Source extraction and data inspection were performed during Phase 1.
+Compilation and regression execution remain pending until the execution phase.

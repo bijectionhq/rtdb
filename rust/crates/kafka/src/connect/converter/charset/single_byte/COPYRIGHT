@@ -1,0 +1,265 @@
+java.base/sun/nio/cs/IBM437.java
+java.base/sun/nio/cs/IBM737.java
+java.base/sun/nio/cs/IBM775.java
+java.base/sun/nio/cs/IBM850.java
+java.base/sun/nio/cs/IBM852.java
+java.base/sun/nio/cs/IBM855.java
+java.base/sun/nio/cs/IBM857.java
+java.base/sun/nio/cs/IBM858.java
+java.base/sun/nio/cs/IBM862.java
+java.base/sun/nio/cs/IBM866.java
+java.base/sun/nio/cs/IBM874.java
+java.base/sun/nio/cs/ISO_8859_11.java
+java.base/sun/nio/cs/ISO_8859_13.java
+java.base/sun/nio/cs/ISO_8859_15.java
+java.base/sun/nio/cs/ISO_8859_16.java
+java.base/sun/nio/cs/ISO_8859_2.java
+java.base/sun/nio/cs/ISO_8859_3.java
+java.base/sun/nio/cs/ISO_8859_4.java
+java.base/sun/nio/cs/ISO_8859_5.java
+java.base/sun/nio/cs/ISO_8859_6.java
+java.base/sun/nio/cs/ISO_8859_7.java
+java.base/sun/nio/cs/ISO_8859_8.java
+java.base/sun/nio/cs/ISO_8859_9.java
+java.base/sun/nio/cs/JIS_X_0201.java
+java.base/sun/nio/cs/KOI8_R.java
+java.base/sun/nio/cs/KOI8_U.java
+java.base/sun/nio/cs/MS1250.java
+java.base/sun/nio/cs/MS1251.java
+java.base/sun/nio/cs/MS1252.java
+java.base/sun/nio/cs/MS1253.java
+java.base/sun/nio/cs/MS1254.java
+java.base/sun/nio/cs/MS1257.java
+java.base/sun/nio/cs/TIS_620.java
+jdk.charsets/sun/nio/cs/ext/IBM037.java
+jdk.charsets/sun/nio/cs/ext/IBM1006.java
+jdk.charsets/sun/nio/cs/ext/IBM1025.java
+jdk.charsets/sun/nio/cs/ext/IBM1026.java
+jdk.charsets/sun/nio/cs/ext/IBM1046.java
+jdk.charsets/sun/nio/cs/ext/IBM1047.java
+jdk.charsets/sun/nio/cs/ext/IBM1097.java
+jdk.charsets/sun/nio/cs/ext/IBM1098.java
+jdk.charsets/sun/nio/cs/ext/IBM1112.java
+jdk.charsets/sun/nio/cs/ext/IBM1122.java
+jdk.charsets/sun/nio/cs/ext/IBM1123.java
+jdk.charsets/sun/nio/cs/ext/IBM1124.java
+jdk.charsets/sun/nio/cs/ext/IBM1129.java
+jdk.charsets/sun/nio/cs/ext/IBM1140.java
+jdk.charsets/sun/nio/cs/ext/IBM1141.java
+jdk.charsets/sun/nio/cs/ext/IBM1142.java
+jdk.charsets/sun/nio/cs/ext/IBM1143.java
+jdk.charsets/sun/nio/cs/ext/IBM1144.java
+jdk.charsets/sun/nio/cs/ext/IBM1145.java
+jdk.charsets/sun/nio/cs/ext/IBM1146.java
+jdk.charsets/sun/nio/cs/ext/IBM1147.java
+jdk.charsets/sun/nio/cs/ext/IBM1148.java
+jdk.charsets/sun/nio/cs/ext/IBM1149.java
+jdk.charsets/sun/nio/cs/ext/IBM1166.java
+jdk.charsets/sun/nio/cs/ext/IBM273.java
+jdk.charsets/sun/nio/cs/ext/IBM277.java
+jdk.charsets/sun/nio/cs/ext/IBM278.java
+jdk.charsets/sun/nio/cs/ext/IBM280.java
+jdk.charsets/sun/nio/cs/ext/IBM284.java
+jdk.charsets/sun/nio/cs/ext/IBM285.java
+jdk.charsets/sun/nio/cs/ext/IBM290.java
+jdk.charsets/sun/nio/cs/ext/IBM297.java
+jdk.charsets/sun/nio/cs/ext/IBM420.java
+jdk.charsets/sun/nio/cs/ext/IBM424.java
+jdk.charsets/sun/nio/cs/ext/IBM500.java
+jdk.charsets/sun/nio/cs/ext/IBM833.java
+jdk.charsets/sun/nio/cs/ext/IBM838.java
+jdk.charsets/sun/nio/cs/ext/IBM856.java
+jdk.charsets/sun/nio/cs/ext/IBM860.java
+jdk.charsets/sun/nio/cs/ext/IBM861.java
+jdk.charsets/sun/nio/cs/ext/IBM863.java
+jdk.charsets/sun/nio/cs/ext/IBM864.java
+jdk.charsets/sun/nio/cs/ext/IBM865.java
+jdk.charsets/sun/nio/cs/ext/IBM868.java
+jdk.charsets/sun/nio/cs/ext/IBM869.java
+jdk.charsets/sun/nio/cs/ext/IBM870.java
+jdk.charsets/sun/nio/cs/ext/IBM871.java
+jdk.charsets/sun/nio/cs/ext/IBM875.java
+jdk.charsets/sun/nio/cs/ext/IBM918.java
+jdk.charsets/sun/nio/cs/ext/IBM921.java
+jdk.charsets/sun/nio/cs/ext/IBM922.java
+jdk.charsets/sun/nio/cs/ext/MS1255.java
+jdk.charsets/sun/nio/cs/ext/MS1256.java
+jdk.charsets/sun/nio/cs/ext/MS1258.java
+jdk.charsets/sun/nio/cs/ext/MS874.java
+jdk.charsets/sun/nio/cs/ext/MacArabic.java
+jdk.charsets/sun/nio/cs/ext/MacCentralEurope.java
+jdk.charsets/sun/nio/cs/ext/MacCroatian.java
+jdk.charsets/sun/nio/cs/ext/MacCyrillic.java
+jdk.charsets/sun/nio/cs/ext/MacDingbat.java
+jdk.charsets/sun/nio/cs/ext/MacGreek.java
+jdk.charsets/sun/nio/cs/ext/MacHebrew.java
+jdk.charsets/sun/nio/cs/ext/MacIceland.java
+jdk.charsets/sun/nio/cs/ext/MacRoman.java
+jdk.charsets/sun/nio/cs/ext/MacRomania.java
+jdk.charsets/sun/nio/cs/ext/MacSymbol.java
+jdk.charsets/sun/nio/cs/ext/MacThai.java
+jdk.charsets/sun/nio/cs/ext/MacTurkish.java
+jdk.charsets/sun/nio/cs/ext/MacUkraine.java
+
+/*
+ * Copyright (c) 2008, 2023, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+java.base/sun/nio/cs/StandardCharsets.java
+jdk.charsets/sun/nio/cs/ext/ExtendedCharsets.java
+
+/*
+ * Copyright (c) 2000, 2023, Oracle and/or its affiliates. All rights reserved.
+ *
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ *
+ */
+
+java.base/sun/nio/cs/SingleByte.java
+
+/*
+ * Copyright (c) 2008, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+java.base/java/lang/String.java
+
+/*
+ * Copyright (c) 1994, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+java.base/java/nio/charset/Charset.java
+
+/*
+ * Copyright (c) 2000, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+jdk.charsets/sun/nio/cs/ext/AbstractCharsetProvider.java
+
+/*
+ * Copyright (c) 2000, 2022, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */

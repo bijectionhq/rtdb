@@ -90,7 +90,10 @@ Its two- and three-byte malformed groups follow Java's replacement boundaries; d
 UTF8 and UTF16 replacement consumes malformed byte groups at the Java decoder boundary; fixed-endian UTF16 preserves its initial byte-order mark as text.
 UTF32 consumes a matching initial byte-order mark, including in fixed-endian modes, and defaults to big-endian order when no order is specified.
 Its malformed four-byte words and final one-to-three-byte fragment each produce one replacement; adjacent surrogate units emitted by Java's decoder combine into one Unicode scalar, while isolated units become replacements in native UTF8 values.
-Other built-in charset families and additional installed charset providers remain source-completeness work.
+The 102 Java25 built-in `SingleByte.Decoder` charsets and their 589 distinct canonical names and aliases are supported, including ISO-8859 variants, Windows code pages, IBM DOS and EBCDIC pages, KOI8, Macintosh encodings, JIS X0201, and Thai encodings.
+Their pinned mappings preserve control characters and non-round-trip decoding entries, and each unmappable byte produces one replacement.
+The link:src/connect/converter/charset/single_byte/README.adoc[single-byte mapping reference] records the complete inventory, provider aliases, source hashes, and derivation.
+Other built-in multibyte and stateful charset families, including Shift_JIS, GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.
