@@ -2,6 +2,16 @@ use std::collections::BTreeMap;
 use rtdb_kafka::{KafkaClusterConfig, KafkaLogConfig, native_properties, parse_properties, producer_properties};
 
 #[test]
+fn native_configuration_creation_and_duplication_cover_extended_property_offsets() {
+    let mut configuration = rdkafka::ClientConfig::new();
+    configuration.set("client.id", "extended-config");
+    let native = configuration.create_native_config().unwrap();
+    let duplicate = native.clone();
+    drop(native);
+    assert_eq!(duplicate.get("client.id").unwrap(), "extended-config");
+}
+
+#[test]
 fn producer_forces_durable_acknowledgements_and_preserves_order_without_idempotence() {
     let properties = BTreeMap::from([("acks".into(), "0".into()), ("enable.idempotence".into(), "false".into()), ("max.in.flight.requests.per.connection".into(), "5".into())]);
     let producer = producer_properties(&properties, false);
