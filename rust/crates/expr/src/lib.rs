@@ -14,7 +14,6 @@ mod interval_constructor;
 mod decimal;
 mod period;
 mod string;
-mod allocation;
 mod pg_catalog;
 mod session_info;
 mod collection;
@@ -22,7 +21,7 @@ mod bitwise;
 mod series;
 mod volatile;
 
-pub use allocation::EvaluationScope;
+pub use rtdb_types::AllocationScope as EvaluationScope;
 pub use pg_catalog::{PgCatalogLookup, requires_pg_catalog};
 pub use string::render::allocation_bound as text_allocation_bound;
 
