@@ -44,12 +44,14 @@ The opened schema is bounded to 128 levels and each vector length to the signed 
 HALF vectors are rejected by this execution opener.
 Timestamp timezone names are validated when opening, including empty and nested vectors.
 `descriptor()` borrows the canonical `VectorDescriptor`: unsigned integer widths become signed, timestamp zones use `ZoneId` spelling, and union/run-end parents have no validity field.
-Scalar descriptors retain one validated scalar `Field`; container descriptors retain their native kind and ordered children.
+SDK scalar descriptors retain one validated scalar `Field`; source scalar descriptors retain their typed declaration and actual signed width beside derived metadata.
+Container descriptors retain their native kind and ordered children.
 Each Struct entry retains its lookup key in `StructFieldDescriptor`, independently of the actual child descriptor's field name.
 Struct logical types, named/raw lookup and logical `Value` maps use entry keys; checked SDK field projection preserves the children's names, including equal names under distinct keys.
 Union leg lookup continues using child names.
 `ingress_field()` returns `DeclarationRef::Arrow` for an original admitted declaration and `DeclarationRef::Native` when only a native descriptor exists.
-`arrow_field()` allocates checked SDK metadata in a `RetainedArrowField`; every clone retains the projection's reservation.
+`arrow_field()` allocates declared metadata in a `RetainedArrowField`; every clone retains the projection's reservation.
+Source scalar parameters remain raw in that projection and require separate strict SDK admission; UUID's declared field omits its actual inner width.
 Native union descriptors retain all ordered children and wrapping ordinal discriminators independently of SDK schema limits.
 Native union construction reserves logical-join scratch for cloned ancestor maps across the bounded descriptor depth before retaining children; their existing metadata leases remain independent.
 SDK projection rejects a native union with more than 128 children without removing its children or changing its native descriptor.
@@ -57,7 +59,7 @@ The native descriptor and its SDK projection preserve custom child/leg names and
 `logical_type()` borrows cached execution metadata or returns an allocation-free `VectorTypeFailure`.
 Native run-end types over Null or Nothing retain the exact source Unsupported outcome, including its width; enclosing types propagate the first child failure in source order.
 The typed outcome has no implicit `Anomaly` conversion, because its source Unsupported error has no error-code key.
-Scalar descriptors retain a guaranteed logical type beside their validated Field.
+Scalar descriptors retain a guaranteed logical type beside their declared Field.
 `CellRef::leaf_descriptor()` preserves the actual selected union leaf even when that leaf is null.
 Physical Field nullability, concrete reader nullability and logical type admission are independent: run-end fields are nonnullable, while `reader_nullable()` delegates to their values.
 Field projection and concrete getters do not request logical type metadata.
@@ -250,7 +252,7 @@ The crate-private `VectorWriter::from_descriptor` constructs a fresh empty nativ
 It selects the concrete direct Struct, List, FixedList, Map, Set, timestamp-range, DenseUnion and RunEnd constructors, with existing scalar states as private leaves.
 Struct lookup keys remain independent of child names, and dense-union construction uses complete ordered children with ordinal byte discriminators.
 Negative fixed-list widths, zero-width fixed binary and failed run-end logical metadata retain their concrete native identities during construction.
-The current scalar descriptor domain excludes source-legal negative fixed-binary widths; their source-native scalar construction and metadata boundary remain required work.
+The crate-private source scalar declaration constructor also admits signed fixed-binary widths, concrete Time32/Time64 units and fresh UUID inner widths through its distinct native metadata boundary.
 
 One passive transient owns the complete tree, its attached metadata and buffer leases, and one `Ready`/`NativeAborted` publication gate.
 Its working root methods cover signed count/name/nullability inspection, common null/undefined and primitive/byte writes, `end_struct`, `end_list`, `clear` and consuming `finish`.
@@ -272,3 +274,41 @@ Immutable reader snapshots retain their existing terminal-offset and reader-iden
 Full Field/type factory construction, borrowed source getter/hint and LongLong kernels, routed child handles, promotion, recursive copying, relations, host objects/hash, physical transport and production adoption remain required increments.
 The independent source signed-Slice error, allocation and mutable-alias contract also remains open.
 The Phase 1 source gate remains in force; this private foundation has not been compiled or executed.
+
+== Source scalar declarations and borrowed byte facts
+
+`SourceScalarDeclaration` has four fresh empty constructor cases: `FixedBinary(i32)`, `Time32(TimeUnit)`, `Time64(TimeUnit)` and `Uuid { inner_width: i32 }`.
+FixedBinary and UUID inner widths retain every signed i32 parameter, including negative and zero widths.
+Concrete Time32 and Time64 declarations retain all four time units with their actual four-byte or eight-byte layout, even when strict SDK unit/width validation rejects the pair.
+UUID's declared type and field retain 16-byte UUID storage while its actual byte, undefined and copy layout follows the inner width.
+UUID capacity, setter and LongLong methods retain their extension-class unsupported admission before any mutation or allocation.
+Decimal construction still requires a bit width of 32, 64, 128 or 256; its full signed precision and scale remain covered by the existing native annotations.
+Global logical validation and SDK field, array, IPC and C ingress remain strict.
+
+One passive `SourceScalarMetadata` value owns the declaration, derived field and logical metadata under a trailing reservation.
+`VectorDescriptor::source_scalar` creates that native value, and both standalone scalar and tree writers rebuild it in their target budget before publishing fresh state.
+Source nullable promotion constructs a complete replacement while the old metadata remains retained, installs it before validity fill and never re-enters strict SDK type decoding.
+Consuming fixed capture transfers that same metadata value and the retained byte/bit storage into an immutable native descriptor.
+An Arrow field projection cannot reconstruct UUID's actual inner layout.
+Snapshots keep the descriptor and payload reservations independently of their original reader.
+
+`SourceScalarReader` admits only native source scalar fixed storage under a direct reader with identity addressing.
+SDK-backed readers, checked ranges/selections, containers, named union legs and run-end wrappers return factory absence rather than a source method failure.
+The mutable reader bridge borrows sealed metadata and fixed backing from its existing scalar owner without exposing mutable storage or another publication gate.
+It remains available for prefix inspection after `NativeAborted`, as does the existing checked reader, and does not change the gate.
+The only raw operations in this increment are byte-view and pointer facts, followed by explicitly named native payload demand.
+Pointer facts retain signed wrapped offsets and lengths without checking the row, validity or retained span.
+Byte-view construction rejects a negative length at the source `MemorySegment.reinterpret` producer and otherwise retains nonnegative view facts without payload admission.
+Time getBytes retains its source unsupported-method failure; raw Time primitive, null, object and metadata reads are not exposed here.
+`SourceScalarReadError::Reference` preserves only those unsupported and negative-view-length producers.
+`demand_native()` separately checks the complete retained span and returns native `rtdb/unretained-byte-view` admission before borrowing payload bytes.
+Facts and admitted slices borrow the actual writer/vector region and may outlive intermediate reader/view variables while that owner borrow remains live.
+They expose no raw address, mutable alias, relative ByteBuffer cursor, pointer-reuse cache, equality or hash operation.
+Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
+The checked UUID `Value` adapter requires exactly 16 bytes; source object underflow and surplus-byte behavior remain separate required work.
+
+`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, abort inspection and retained snapshot ownership.
+These tests are unexecuted source under the Phase 1 gate.
+Null initial counts, Int constructor allocation history, existing-inner wrapper adoption and mutable aliases remain required constructor work.
+Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.
+Full Field factories, source primitive/NPE/object/meta/LongLong/hash and ByteBuffer behavior, independent signed Slice semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.

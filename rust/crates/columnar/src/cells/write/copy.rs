@@ -44,10 +44,10 @@ impl<'a> ScalarSource<'a> {
         let ScalarStorageRef::Bits { data, offset } = self.storage()? else { return Err(WriteError::Native(layout())); };
         self.payload(BitSource { bytes: data, base: offset }.direct(row))
     }
-    fn span(&self, start: i32, count: i32, width: usize) -> WriteResult<&'a [u8]> {
+    fn span(&self, start: i32, count: i32, width: i32) -> WriteResult<&'a [u8]> {
         self.sdk_range(start, count)?;
-        let start = self.payload(usize::try_from(start.wrapping_mul(width as i32)).map_err(|_| index_error()))?;
-        let length = self.payload(usize::try_from(count.wrapping_mul(width as i32)).map_err(|_| index_error()))?;
+        let start = self.payload(usize::try_from(start.wrapping_mul(width)).map_err(|_| index_error()))?;
+        let length = self.payload(usize::try_from(count.wrapping_mul(width)).map_err(|_| index_error()))?;
         self.payload(self.storage()?.fixed(start, length))
     }
     fn variable_offsets(&self) -> WriteResult<(ScalarOffsets<'a>, &'a [u8])> {
@@ -104,7 +104,7 @@ impl Rows<'_> {
     fn at(self, index: i32) -> i32 { match self { Self::One(row) => row, Self::Selected(rows) => rows[index as usize], Self::Range { start, .. } => start.wrapping_add(index) } }
 }
 #[derive(Clone, Copy)]
-enum CopyKind { Null, Bits, Fixed(usize), Variable }
+enum CopyKind { Null, Bits, Fixed(i32), Variable }
 pub(crate) struct ScalarCopier<'a, 'b> { source: ScalarSource<'a>, destination: &'b mut ScalarWriter, kind: CopyKind }
 impl<'a, 'b> ScalarCopier<'a, 'b> {
     pub(crate) fn new(source: ScalarSource<'a>, destination: &'b mut ScalarWriter) -> WriteResult<Self> {
@@ -131,7 +131,7 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
                 MutableScalarData::Fixed { width, .. } => {
                     let width = *width;
                     if source.node.descriptor.is_nullable() { writer.promote(mutation)?; }
-                    if !same_wrapper || super::super::scalar::fixed_width(source_type) != Some(width) { return Err(WriteError::Reference(ReferenceFailure::CheckFailed)); }
+                    if !same_wrapper || source.descriptor.fixed_width()? != Some(width) { return Err(WriteError::Reference(ReferenceFailure::CheckFailed)); }
                     Ok(CopyKind::Fixed(width))
                 },
                 MutableScalarData::Variable { .. } => {
@@ -181,12 +181,12 @@ impl<'a, 'b> ScalarCopier<'a, 'b> {
             }),
             CopyKind::Fixed(width) => self.destination.operation(|writer, mutation| {
                 let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
-                data.ensure_writable_i32(rows.count().wrapping_mul(width as i32), mutation)?;
+                data.ensure_writable_i32(rows.count().wrapping_mul(width), mutation)?;
                 if let Some(validity) = &mut writer.validity { copy_validity(validity, source, rows, mutation)?; }
                 let MutableScalarData::Fixed { data, .. } = &mut writer.data else { return Err(native_size()); };
                 match rows {
-                    Rows::Range { start, length } => data.copy_from_reserved(i64::from(length.wrapping_mul(width as i32)), || source.span(start, length, width), mutation)?,
-                    _ => for index in 0..rows.count() { data.copy_from_reserved(width as i64, || source.span(rows.at(index), 1, width), mutation)?; },
+                    Rows::Range { start, length } => data.copy_from_reserved(i64::from(length.wrapping_mul(width)), || source.span(start, length, width), mutation)?,
+                    _ => for index in 0..rows.count() { data.copy_from_reserved(i64::from(width), || source.span(rows.at(index), 1, width), mutation)?; },
                 }
                 writer.increment_count(rows.count(), mutation)
             }),

@@ -37,7 +37,7 @@ impl<'a> CellRef<'a> {
         let cell = self.resolve_primitive()?;
         if !matches!(cell.node.descriptor.scalar_field().map(Field::data_type), Some(DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_))) { return Err(unsupported("getBytes").into()); }
         let cell = cell.payload()?;
-        Ok(ScalarStorageRef::node(cell.node)?.bytes(cell.row, cell.node.scalar_field()?.data_type())?)
+        Ok(ScalarStorageRef::node(cell.node)?.bytes(cell.row, cell.node.descriptor.scalar().ok_or_else(layout)?.fixed_width()?)?)
     }
 
     fn primitive(&self, getter: Getter, checks: NullChecks) -> VectorReadResult<PayloadCell<'a>> {

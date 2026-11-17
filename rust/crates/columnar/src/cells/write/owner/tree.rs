@@ -83,7 +83,7 @@ impl WriterNode {
         Ok(node)
     }
     pub(super) fn build(descriptor: &VectorDescriptor, memory: &Arc<MemoryBudget>) -> WriteResult<Self> {
-        let Some(kind) = descriptor.container() else { return Ok(Self::scalar(descriptor.scalar_field().ok_or_else(layout)?, memory)?); };
+        let Some(kind) = descriptor.container() else { return Ok(Self::Scalar(ScalarState::from_descriptor(descriptor, memory)?)); };
         let meta = NodeMeta::new(descriptor.name(), memory)?;
         let count = SourceCount::new(0);
         let validity = || descriptor.is_nullable().then(|| MutableBits::new(memory));

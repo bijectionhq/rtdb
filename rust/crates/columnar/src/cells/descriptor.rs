@@ -74,15 +74,22 @@ pub enum ContainerKind {
 #[derive(Debug)]
 enum DescriptorShape {
     Scalar { field: Field, logical: LogicalType },
+    NativeScalar(SourceScalarMetadata),
     Container { name: String, nullable: bool, metadata: HashMap<String, String>, kind: ContainerKind, logical: LogicalMetadata },
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ScalarDescriptorRef<'a> { field: &'a Field, logical: &'a LogicalType }
+pub(super) struct ScalarDescriptorRef<'a> { field: &'a Field, logical: &'a LogicalType, source: Option<&'a SourceScalarMetadata> }
 impl<'a> ScalarDescriptorRef<'a> {
     pub fn field(self) -> &'a Field { self.field }
     pub fn logical_type(self) -> &'a LogicalType { self.logical }
     pub fn value_type(self) -> &'a LogicalType { match self.logical { LogicalType::Maybe(inner) => inner, logical => logical } }
+    pub(super) fn source_metadata(self) -> Option<&'a SourceScalarMetadata> { self.source }
+    pub(super) fn source_declaration(self) -> Option<SourceScalarDeclaration> { self.source.map(SourceScalarMetadata::declaration) }
+    pub(super) fn fixed_width(self) -> Result<Option<i32>> {
+        if let Some(declaration) = self.source_declaration() { return Ok(Some(declaration.fixed_width())); }
+        super::scalar::fixed_width(self.field.data_type()).map(|width| i32::try_from(width).map_err(|_| layout())).transpose()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -127,7 +134,8 @@ impl<'a> ContainerShapeRef<'a> {
 }
 
 /// Immutable opened vector metadata, retained independently of payload storage.
-/// Scalar leaves hold one validated SDK Field; containers retain native ordered shape rather than an SDK projection.
+/// SDK scalar leaves retain their validated Field; source scalar declarations retain their concrete signed layout beside derived metadata.
+/// Containers retain native ordered shape rather than an SDK projection.
 /// Cloned child Arcs retain their descriptor reservations.
 #[derive(Debug)]
 pub struct VectorDescriptor {
@@ -135,7 +143,8 @@ pub struct VectorDescriptor {
     reservation: Arc<MemoryReservation>,
 }
 
-/// Checked SDK metadata whose lease survives every shallow clone.
+/// Arrow field projection whose lease survives every shallow clone.
+/// Source scalar parameters may still reject strict SDK admission; UUID projection omits its inner width.
 /// A caller copying the borrowed Field must account for that independently owned copy.
 #[derive(Clone, Debug)]
 pub struct RetainedArrowField { field: Arc<Field>, _reservation: Arc<MemoryReservation> }
@@ -210,25 +219,37 @@ impl ContainerKind {
 }
 
 impl VectorDescriptor {
-    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar { field, .. } => field.name(), DescriptorShape::Container { name, .. } => name } }
+    pub(crate) fn source_scalar(name: &str, nullable: bool, declaration: SourceScalarDeclaration, memory: &Arc<crate::MemoryBudget>) -> Result<Arc<Self>> {
+        Ok(Self::captured_source_scalar(SourceScalarMetadata::new(name, nullable, declaration, memory)?))
+    }
+    pub(super) fn captured_source_scalar(metadata: SourceScalarMetadata) -> Arc<Self> {
+        let reservation = Arc::clone(metadata.reservation());
+        Arc::new(Self { shape: DescriptorShape::NativeScalar(metadata), reservation })
+    }
+    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar { field, .. } => field.name(), DescriptorShape::NativeScalar(metadata) => metadata.field().name(), DescriptorShape::Container { name, .. } => name } }
     /// Physical Field nullability; run-end fields are nonnullable even when their value reader admits nulls.
-    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar { field, .. } => field.is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
+    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar { field, .. } => field.is_nullable(), DescriptorShape::NativeScalar(metadata) => metadata.field().is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
     /// Concrete reader nullability without demanding its logical type.
     /// Run-end readers delegate to values; dense unions report false independently of their legs.
     pub fn reader_nullable(&self) -> bool {
         match self.container() { Some(ContainerKind::RunEnd { values, .. }) => values.reader_nullable(), Some(ContainerKind::DenseUnion { .. }) => false, _ => self.is_nullable() }
     }
-    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar { field, .. } => field.metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
+    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar { field, .. } => field.metadata(), DescriptorShape::NativeScalar(metadata) => metadata.field().metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
     /// Borrows cached logical metadata without allocation or payload access.
     /// Native run-end types over Null/Nothing return their source Unsupported outcome, including through enclosing types.
     /// Physical field projection and reader nullability remain independently available.
     pub fn logical_type(&self) -> VectorTypeResult<&LogicalType> {
-        match &self.shape { DescriptorShape::Scalar { logical, .. } => Ok(logical), DescriptorShape::Container { logical, .. } => logical.borrow() }
+        match &self.shape { DescriptorShape::Scalar { logical, .. } => Ok(logical), DescriptorShape::NativeScalar(metadata) => Ok(metadata.logical()), DescriptorShape::Container { logical, .. } => logical.borrow() }
     }
-    /// Borrows the sole canonical scalar Field; containers return None and require checked SDK projection.
+    /// Borrows declared scalar metadata; source UUID physical width remains in its native descriptor.
+    /// Containers return None and require a retained field projection.
     pub fn scalar_field(&self) -> Option<&Field> { self.scalar().map(ScalarDescriptorRef::field) }
     pub(super) fn scalar(&self) -> Option<ScalarDescriptorRef<'_>> {
-        match &self.shape { DescriptorShape::Scalar { field, logical } => Some(ScalarDescriptorRef { field, logical }), _ => None }
+        match &self.shape {
+            DescriptorShape::Scalar { field, logical } => Some(ScalarDescriptorRef { field, logical, source: None }),
+            DescriptorShape::NativeScalar(metadata) => Some(ScalarDescriptorRef { field: metadata.field(), logical: metadata.logical(), source: Some(metadata) }),
+            _ => None,
+        }
     }
     pub(super) fn is_bottom_scalar(&self) -> bool { self.scalar().is_some_and(|scalar| scalar.logical_type() == &LogicalType::Nothing) }
     fn run_end_width(&self) -> Option<RunEndWidth> {
@@ -242,9 +263,10 @@ impl VectorDescriptor {
     }
     pub fn container(&self) -> Option<&ContainerKind> { match &self.shape { DescriptorShape::Container { kind, .. } => Some(kind), _ => None } }
 
-    /// Allocates checked SDK metadata under a retained lease without changing this descriptor.
+    /// Projects declared metadata under a retained lease without changing this descriptor.
+    /// Source scalar parameters retain their values; strict SDK admission is a separate boundary.
     /// Native union ordinals outside the SDK's unique nonnegative byte domain return an unsupported-schema error.
-    /// Budget, depth or SDK validation errors release every unpublished projection allocation.
+    /// Budget, depth or representation errors release every unpublished projection allocation.
     pub fn arrow_field(&self) -> Result<RetainedArrowField> {
         let (bytes, depth) = self.bound(1)?;
         let reservation = self.reservation.budget().reserve(bytes.checked_mul(depth).and_then(|n| n.checked_mul(8)).ok_or_else(allocation)?)?;
@@ -253,7 +275,7 @@ impl VectorDescriptor {
 
     fn bound(&self, depth: usize) -> Result<(usize, usize)> {
         if depth > 128 { return Err(Anomaly::unsupported("rtdb/vector-schema-depth", "Execution vector schema exceeds 128 levels")); }
-        if let DescriptorShape::Scalar { field, .. } = &self.shape { return super::open::schema_bound(field, depth); }
+        if let Some(scalar) = self.scalar() { return super::open::schema_bound(scalar.field(), depth); }
         let mut bytes = 4096usize.checked_add(self.name().len()).and_then(|n| n.checked_add(self.metadata().capacity().checked_mul(128)?)).ok_or_else(allocation)?;
         for (key, value) in self.metadata() { bytes = bytes.checked_add(key.len()).and_then(|n| n.checked_add(value.len())).ok_or_else(allocation)?; }
         let mut maximum = depth;

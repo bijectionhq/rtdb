@@ -2,6 +2,8 @@ mod getters;
 mod descriptor;
 mod materialize;
 mod native_scalar;
+mod scalar_declaration;
+mod source_scalar;
 mod native_container;
 mod write;
 mod open;
@@ -21,6 +23,9 @@ use crate::{MemoryReservation, OwnedColumn, Selection};
 use storage::NodeLayout;
 use native_container::{NativeContainerStorage, ContainerStorageRef};
 use run_reader::{RunEndReader, RunStorage};
+use scalar_declaration::SourceScalarMetadata;
+pub(crate) use scalar_declaration::SourceScalarDeclaration;
+pub(crate) use source_scalar::{SourceScalarReader, SourceScalarReadError, SourceScalarReadFailure, SourceScalarReadResult, SourceBytePointer, SourceByteView};
 pub use storage::{PhysicalLayout, RetainedBuffer};
 pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, StructFieldDescriptor, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
 use descriptor::Declaration;
@@ -135,7 +140,8 @@ impl ExecutionVector {
     pub fn from_physical(field: Arc<Field>, layout: PhysicalLayout, memory: &Arc<crate::MemoryBudget>) -> Result<Self> { storage::native(field, layout, memory) }
     /// Borrows canonical native metadata, including signed integer widths, ZoneId spelling and ordered container children.
     pub fn descriptor(&self) -> &VectorDescriptor { &self.node().descriptor }
-    /// Projects canonical metadata into checked SDK fields under a retained lease.
+    /// Projects declared metadata into Arrow fields under a retained lease; strict SDK admission remains separate.
+    /// Source scalar UUID projection omits its actual inner width and cannot reconstruct the native reader.
     /// Native union shapes outside the SDK discriminator domain fail without changing this vector.
     pub fn arrow_field(&self) -> Result<RetainedArrowField> { self.descriptor().arrow_field() }
     /// Borrows original Arrow provenance, or the authoritative native descriptor when no Arrow declaration exists.

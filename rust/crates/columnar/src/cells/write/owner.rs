@@ -10,16 +10,24 @@ mod tree_tests;
 pub(super) enum MutableScalarData {
     Null,
     Bits(MutableBits),
-    Fixed { width: usize, data: MutableBytes },
+    Fixed { width: i32, data: MutableBytes },
     Variable { offsets: MutableBytes, data: MutableBytes, last_offset: i32 },
 }
-struct ScalarDescriptor { ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType }
+enum ScalarDescriptor {
+    Sdk { ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType, reservation: Arc<MemoryReservation> },
+    Source(SourceScalarMetadata),
+}
+impl ScalarDescriptor {
+    fn field(&self) -> &Field { match self { Self::Sdk { field, .. } => field, Self::Source(metadata) => metadata.field() } }
+    fn logical(&self) -> &LogicalType { match self { Self::Sdk { logical, .. } => logical, Self::Source(metadata) => metadata.logical() } }
+    fn reservation(&self) -> &Arc<MemoryReservation> { match self { Self::Sdk { reservation, .. } => reservation, Self::Source(metadata) => metadata.reservation() } }
+    fn source_metadata(&self) -> Option<&SourceScalarMetadata> { match self { Self::Source(metadata) => Some(metadata), Self::Sdk { .. } => None } }
+}
 pub(super) struct ScalarState {
-    descriptor: ScalarDescriptor,
     pub(super) count: SourceCount,
     pub(super) validity: Option<MutableBits>,
     pub(super) data: MutableScalarData,
-    metadata: Arc<MemoryReservation>,
+    descriptor: ScalarDescriptor,
 }
 impl ScalarState {
     fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
@@ -32,27 +40,46 @@ impl ScalarState {
             DataType::Null => MutableScalarData::Null,
             DataType::Boolean => MutableScalarData::Bits(MutableBits::new(&memory)),
             DataType::Utf8 | DataType::Binary => MutableScalarData::Variable { offsets: MutableBytes::new(&memory), data: MutableBytes::new(&memory), last_offset: 0 },
-            data_type => MutableScalarData::Fixed { width: super::super::scalar::fixed_width(data_type).ok_or_else(|| unsupported("ScalarWriter"))?, data: MutableBytes::new(&memory) },
+            data_type => MutableScalarData::Fixed { width: i32::try_from(super::super::scalar::fixed_width(data_type).ok_or_else(|| unsupported("ScalarWriter"))?).map_err(|_| layout())?, data: MutableBytes::new(&memory) },
         };
         let validity = (field.is_nullable() && field.data_type() != &DataType::Null).then(|| MutableBits::new(&memory));
-        Ok(Self { descriptor: ScalarDescriptor { ingress, field, logical }, count: SourceCount::new(0), validity, data, metadata })
+        Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Sdk { ingress, field, logical, reservation: metadata } })
+    }
+    fn from_descriptor(descriptor: &VectorDescriptor, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let scalar = descriptor.scalar().ok_or_else(|| unsupported("ScalarWriter"))?;
+        if let Some(metadata) = scalar.source_metadata() {
+            let metadata = metadata.rebuilt(memory)?;
+            let data = MutableScalarData::Fixed { width: metadata.declaration().fixed_width(), data: MutableBytes::new(memory) };
+            let validity = metadata.field().is_nullable().then(|| MutableBits::new(memory));
+            return Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Source(metadata) });
+        }
+        let (bound, depth) = super::super::open::schema_bound(scalar.field(), 1)?;
+        let scratch = memory.reserve(bound.checked_mul(depth).and_then(|n| n.checked_mul(16)).ok_or_else(allocation)?)?;
+        let state = Self::new(Arc::new(scalar.field().clone()), Arc::clone(memory))?;
+        drop(scratch);
+        Ok(state)
     }
     pub(super) fn value_count(&self) -> i32 { self.count.get() }
-    pub(super) fn field(&self) -> &Field { &self.descriptor.field }
-    pub(super) fn logical(&self) -> &LogicalType { &self.descriptor.logical }
+    pub(super) fn field(&self) -> &Field { self.descriptor.field() }
+    pub(super) fn logical(&self) -> &LogicalType { self.descriptor.logical() }
     fn scalar_type(&self) -> Option<&ScalarType> {
         match self.logical() { LogicalType::Scalar(s) => Some(s), LogicalType::Maybe(inner) => match inner.as_ref() { LogicalType::Scalar(s) => Some(s), _ => None }, _ => None }
     }
     pub(super) fn extension(&self) -> bool { self.field().metadata().contains_key(crate::EXTENSION_NAME_KEY) }
     pub(super) fn promote(&mut self, mutation: &mut Mutation) -> WriteResult<()> {
         if self.field().is_nullable() { return Ok(()); }
-        let ingress = Arc::new(self.descriptor.ingress.as_ref().clone().with_nullable(true));
-        let field = Arc::new(self.descriptor.field.as_ref().clone().with_nullable(true));
-        let logical = crate::execution_field_type(&field)?;
-        self.descriptor = ScalarDescriptor { ingress, field, logical };
+        self.descriptor = match &self.descriptor {
+            ScalarDescriptor::Sdk { ingress, field, reservation, .. } => {
+                let ingress = Arc::new(ingress.as_ref().clone().with_nullable(true));
+                let field = Arc::new(field.as_ref().clone().with_nullable(true));
+                let logical = crate::execution_field_type(&field)?;
+                ScalarDescriptor::Sdk { ingress, field, logical, reservation: Arc::clone(reservation) }
+            },
+            ScalarDescriptor::Source(metadata) => ScalarDescriptor::Source(metadata.with_nullable(true)?),
+        };
         mutation.mark();
         if !matches!(&self.data, MutableScalarData::Null) {
-            self.validity = Some(MutableBits::new(self.metadata.budget()));
+            self.validity = Some(MutableBits::new(self.descriptor.reservation().budget()));
             self.validity.as_mut().expect("validity installed").ones(self.count.get(), mutation)?;
         }
         Ok(())
@@ -82,7 +109,7 @@ impl ScalarState {
         if let Some(validity) = &mut self.validity { validity.write_at(self.count.get(), false, mutation)?; }
         match &mut self.data {
             MutableScalarData::Null | MutableScalarData::Variable { .. } => self.increment_count(1, mutation),
-            MutableScalarData::Fixed { width, data } => { data.zero(*width, mutation)?; self.increment_count(1, mutation) },
+            MutableScalarData::Fixed { width, data } => { data.zero_signed(*width, mutation)?; self.increment_count(1, mutation) },
             MutableScalarData::Bits(bits) => {
                 let row = self.count.get();
                 self.count = SourceCount::new(row.wrapping_add(1));
@@ -104,7 +131,7 @@ impl ScalarState {
                     self.count = SourceCount::new(count);
                     mutation.mark();
                     if let Some(validity) = &mut self.validity { validity.ensure_capacity_signed(count, mutation)?; }
-                    data.ensure_capacity_signed(i64::from(count.wrapping_mul(*width as i32)), mutation)?;
+                    data.ensure_capacity_signed(i64::from(count.wrapping_mul(*width)), mutation)?;
                 }
             },
             MutableScalarData::Variable { .. } => return Err(unsupported_write("ensureCapacity")),
@@ -210,8 +237,19 @@ impl ScalarState {
             MutableScalarData::Fixed { data, .. } => NativeScalarData::Fixed(data.finish()?),
             MutableScalarData::Variable { offsets, data, last_offset } => NativeScalarData::Variable { offsets: offsets.finish()?, data: data.finish()?, last_offset },
         };
-        let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: self.metadata });
-        let node = super::super::open::finish_native_scalar(self.descriptor.ingress, self.count, NativeScalarStorage { validity, data }, owner)?;
+        let node = match self.descriptor {
+            ScalarDescriptor::Sdk { ingress, field, logical, reservation } => {
+                drop((field, logical));
+                let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: Arc::clone(&reservation) });
+                let node = super::super::open::finish_native_scalar(ingress, self.count, NativeScalarStorage { validity, data }, owner);
+                drop(reservation);
+                node?
+            },
+            ScalarDescriptor::Source(metadata) => {
+                let NativeScalarData::Fixed(bytes) = data else { return Err(layout()); };
+                super::super::open::finish_source_fixed(metadata, self.count, validity, bytes)?
+            },
+        };
         Ok(ExecutionVector::direct(node))
     }
 }
@@ -223,6 +261,14 @@ pub(crate) struct ScalarWriter {
 impl ScalarWriter {
     pub(crate) fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { scalar: ScalarState::new(ingress, memory)?, state: PublicationState::Ready })
+    }
+    pub(crate) fn from_descriptor(descriptor: &VectorDescriptor, memory: Arc<MemoryBudget>) -> Result<Self> {
+        Ok(Self { scalar: ScalarState::from_descriptor(descriptor, &memory)?, state: PublicationState::Ready })
+    }
+    pub(crate) fn source_reader(&self) -> Result<Option<SourceScalarReader<'_>>> {
+        let Some(metadata) = self.scalar.descriptor.source_metadata() else { return Ok(None); };
+        let MutableScalarData::Fixed { data, .. } = &self.scalar.data else { return Err(layout()); };
+        Ok(Some(SourceScalarReader::fixed(metadata.declaration(), data.bytes())))
     }
     pub(crate) fn value_count(&self) -> i32 { self.scalar.value_count() }
     pub(crate) fn checked_len(&self) -> Result<usize> { self.scalar.count.checked_len() }
@@ -300,7 +346,8 @@ impl ScalarReader<'_> {
     pub(crate) fn get_double(&self, row: i32, checks: NullChecks) -> VectorReadResult<f64> { Ok(super::super::getters::double(self.storage(), self.scalar.field().data_type(), self.primitive(Getter::Double, row, checks)?)?) }
     pub(crate) fn get_bytes(&self, row: i32) -> VectorReadResult<&[u8]> {
         if !matches!(self.scalar.field().data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
-        Ok(self.storage().bytes(self.row(row)?, self.scalar.field().data_type())?)
+        let width = match &self.scalar.data { MutableScalarData::Fixed { width, .. } => Some(*width), _ => None };
+        Ok(self.storage().bytes(self.row(row)?, width)?)
     }
 }
 

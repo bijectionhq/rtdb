@@ -23,7 +23,8 @@ impl<'a> CellRef<'a> {
         if matches!(data_type, DataType::Utf8 | DataType::Binary) {
             return bytes(&cell);
         }
-        let width = fixed_width(data_type).ok_or_else(|| unsupported("getPointer"))?;
+        let width = cell.node.descriptor.scalar().ok_or_else(|| unsupported("getPointer"))?.fixed_width()?.ok_or_else(|| unsupported("getPointer"))?;
+        let width = usize::try_from(width).map_err(|_| layout())?;
         let cell = cell.payload()?;
         fixed_bytes(&cell, width, super::native_scalar::wrapped_stride(cell.row, width)?, width)
     }
@@ -39,12 +40,11 @@ impl<'a> CellRef<'a> {
     fn long_long(&self, part: usize) -> Result<i64> {
         let cell = self.run_delegate(RunGetter::LongLong)?;
         if cell.node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY) { return Err(unsupported("LongLongVectorReader")); }
-        let Some(DataType::FixedSizeBinary(width)) = cell.node.descriptor.scalar_field().map(Field::data_type) else { return Err(unsupported("LongLongVectorReader")); };
-        let width = usize::try_from(*width).map_err(|_| layout())?;
+        let Some(DataType::FixedSizeBinary(_)) = cell.node.descriptor.scalar_field().map(Field::data_type) else { return Err(unsupported("LongLongVectorReader")); };
         let cell = cell.payload()?;
         let lane = (cell.row as i32).wrapping_mul(2).wrapping_add((part / 8) as i32);
         let offset = usize::try_from(lane.wrapping_mul(8)).map_err(|_| index_error())?;
-        Ok(i64::from_be_bytes(fixed_bytes(&cell, width, offset, 8)?.try_into().map_err(|_| layout())?))
+        Ok(i64::from_be_bytes(fixed_bytes(&cell, 16, offset, 8)?.try_into().map_err(|_| layout())?))
     }
 
     fn run_delegate(&self, getter: RunGetter) -> Result<ResolvedCell<'a>> {
@@ -133,7 +133,7 @@ impl<'a> CellRef<'a> {
 }
 
 fn bytes<'a>(cell: &ResolvedCell<'a>) -> Result<&'a [u8]> {
-    super::native_scalar::ScalarStorageRef::node(cell.node)?.bytes(cell.payload()?.row, cell.node.scalar_field()?.data_type())
+    super::native_scalar::ScalarStorageRef::node(cell.node)?.bytes(cell.payload()?.row, cell.node.descriptor.scalar().ok_or_else(layout)?.fixed_width()?)
 }
 
 fn fixed_bytes<'a>(cell: &PayloadCell<'a>, _width: usize, relative: usize, length: usize) -> Result<&'a [u8]> {

@@ -160,6 +160,15 @@ pub(super) fn finish_native_scalar(ingress: Arc<Field>, count: SourceCount, stor
     finish_counted_node(ingress, count, NodeLayout::Scalar(storage), owner)
 }
 
+pub(super) fn finish_source_fixed(metadata: SourceScalarMetadata, count: SourceCount, validity: Option<super::native_scalar::StoredBits>, bytes: super::native_scalar::StoredBytes) -> Result<Arc<PhysicalNode>> {
+    if metadata.field().is_nullable() != validity.is_some() { return Err(layout()); }
+    let reservation = Arc::clone(metadata.reservation());
+    let descriptor = VectorDescriptor::captured_source_scalar(metadata);
+    let storage = NodeLayout::Scalar(super::native_scalar::NativeScalarStorage { validity, data: super::native_scalar::NativeScalarData::Fixed(bytes) });
+    let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: reservation });
+    Ok(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count, storage, owner }))
+}
+
 fn finish_counted_node(ingress: Arc<Field>, count: SourceCount, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
     let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
     Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, count, storage, owner }))

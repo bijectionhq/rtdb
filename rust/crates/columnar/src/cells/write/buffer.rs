@@ -98,6 +98,12 @@ impl MutableBytes {
     }
     pub fn zero(&mut self, length: usize, mutation: &mut Mutation) -> WriteResult<()> {
         let length = i64::try_from(length).map_err(|_| native_size())?;
+        self.zero_extent(length, mutation)
+    }
+    pub fn zero_signed(&mut self, length: i32, mutation: &mut Mutation) -> WriteResult<()> {
+        self.zero_extent(i64::from(length), mutation)
+    }
+    fn zero_extent(&mut self, length: i64, mutation: &mut Mutation) -> WriteResult<()> {
         self.ensure_writable(length, mutation)?;
         self.fill(self.append, length, 0, mutation)?;
         self.advance(length, mutation);
