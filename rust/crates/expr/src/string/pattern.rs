@@ -1,7 +1,13 @@
 use crate::{EvalContext, numeric::overflow};
 use fancy_regex::{Expr, Regex, RegexBuilder};
 use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::java_text::JavaText;
 use super::{add, illegal, java_unicode, text};
+mod source;
+mod failure;
+#[cfg(test)] mod tests;
+use source::{PatternInput, supplementary, work_bytes};
+use failure::{CompileFailure, Description, Syntax};
 
 const PATTERN_BYTES: usize = 65_536;
 const STACK_BRANCHES: usize = 512;
@@ -13,61 +19,45 @@ const DFA_BYTES: usize = 65_536;
 struct Flags { insensitive: bool, unicode_case: bool, unicode_class: bool, multiline: bool, dotall: bool, unix: bool, comments: bool, canonical: bool }
 
 struct Translation { pattern: String, names: Vec<Option<String>>, supplementary: bool }
-struct Translator<'a> { source: &'a str, position: usize, flags: Flags, scopes: Vec<Flags>, output: String, names: Vec<Option<String>>, literals: Vec<u32>, supplementary: bool, predicate_bmp: bool }
+struct Translator<'a> { source: &'a PatternInput<'a>, position: usize, flags: Flags, scopes: Vec<Flags>, output: String, names: Vec<Option<String>>, literals: Vec<u32>, supplementary: bool, predicate_bmp: bool, syntax_prefix_verified: bool, syntax: Option<Syntax<'a>> }
 pub(crate) struct Pattern { regex: Regex, names: Vec<Option<String>> }
 pub(crate) struct LikePattern { pattern: Pattern, binary: bool }
 pub(crate) struct CompiledReplacement { pattern: Pattern,replacement: String }
 
 pub(crate) fn compile(pattern: &str, flags: &str, context: &EvalContext<'_>) -> Result<Pattern> {
     if pattern.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
-    context.reserve(pattern.len().checked_mul(16_384).map(|bytes| bytes.min(PATTERN_BYTES * 64)).and_then(|bytes| bytes.checked_mul(8)).and_then(|bytes| bytes.checked_add(524_288)).ok_or_else(overflow)?)?;
-    let mut options = Flags::default();
-    for flag in flags.chars() { match flag {
-        'i' => { options.insensitive = true; options.unicode_case = true; },
-        's' => options.dotall = true, 'm' => options.multiline = true, _ => {},
-    } }
-    let source = quoted_source(pattern);
-    let translation = Translator { source: &source, position: 0, flags: options, scopes: Vec::new(), output: String::new(), names: Vec::new(), literals: Vec::new(), supplementary: source.chars().any(|character| character.len_utf16() == 2), predicate_bmp: true }.translate()?;
-    context.reserve(translation.pattern.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow)?)?;
-    let tree = Expr::parse_java_tree(&translation.pattern).map_err(regex_error)?;
-    let mut metrics = Metrics::default();
-    metrics.visit(&tree.expr, 0)?;
-    let compilation = metrics.delegates.checked_mul((DELEGATE_BYTES + DFA_BYTES) * 4).and_then(|bytes| bytes.checked_add(translation.pattern.len().checked_mul(256)?)).ok_or_else(overflow)?;
-    let slots = metrics.nodes.checked_mul(4).and_then(|slots| slots.checked_add(64)).ok_or_else(overflow)?;
-    let matching = (STACK_BRANCHES + 1).checked_mul(slots.checked_mul(32).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow)?).ok_or_else(overflow)?;
-    context.reserve(compilation.checked_add(matching).ok_or_else(overflow)?)?;
-    context.reserve(BACKTRACKS * 64 + STACK_BRANCHES * 1024)?;
-    let regex = RegexBuilder::new(&translation.pattern).java_utf16(true).java_supplementary(translation.supplementary).backtrack_limit(BACKTRACKS).backtrack_stack_limit(STACK_BRANCHES)
-        .delegate_size_limit(DELEGATE_BYTES).delegate_dfa_size_limit(DFA_BYTES).build().map_err(regex_error)?;
-    Ok(Pattern { regex, names: translation.names })
+    compile_text(JavaText::from_utf8(pattern), JavaText::from_utf8(flags), context).map_err(CompileFailure::legacy)
 }
 
-fn quoted_source(pattern: &str) -> String {
-    let mut source = String::with_capacity(pattern.len());
-    let mut chars = pattern.chars().peekable();
-    let mut quoted = false;
-    let mut first = false;
-    while let Some(character) = chars.next() {
-        if !quoted {
-            if character == '\\' && chars.peek() == Some(&'Q') {
-                chars.next(); quoted = true; first = true; continue;
-            }
-            source.push(character);
-            if character == '\\' { if let Some(next) = chars.next() { source.push(next); } }
-        } else if character == '\\' && chars.peek() == Some(&'E') {
-            chars.next(); quoted = false;
-        } else if !character.is_ascii() || character.is_ascii_alphabetic() {
-            source.push(character);
-        } else if character.is_ascii_digit() {
-            if first { source.push_str("\\x3"); }
-            source.push(character);
-        } else {
-            source.push('\\');
-            source.push(character);
-        }
-        first = false;
-    }
-    source
+pub(crate) fn compile_text(pattern: JavaText<'_>, flags: JavaText<'_>, context: &EvalContext<'_>) -> std::result::Result<Pattern, CompileFailure> {
+    if pattern.len_units() > PATTERN_BYTES { return Err(CompileFailure::Resource(limit("Pattern exceeds 64 KiB"))); }
+    let bytes = work_bytes(pattern).map_err(CompileFailure::Resource)?;
+    if bytes > PATTERN_BYTES { return Err(CompileFailure::Resource(limit("Pattern exceeds 64 KiB"))); }
+    compile_admitted(pattern, flags, bytes, context)
+}
+
+fn compile_admitted(pattern: JavaText<'_>, flags: JavaText<'_>, bytes: usize, context: &EvalContext<'_>) -> std::result::Result<Pattern, CompileFailure> {
+    let retain = |error| CompileFailure::retain(error, pattern, None, None, context);
+    context.reserve(bytes.checked_mul(16_384).map(|bytes| bytes.min(PATTERN_BYTES * 64)).and_then(|bytes| bytes.checked_mul(8)).and_then(|bytes| bytes.checked_add(524_288)).ok_or_else(overflow).map_err(&retain)?).map_err(&retain)?;
+    let mut options = Flags::default();
+    for flag in flags.units() { match flag {
+        0x69 => { options.insensitive = true; options.unicode_case = true; },
+        0x73 => options.dotall = true, 0x6d => options.multiline = true, _ => {},
+    } }
+    let source = PatternInput::new(pattern, context).map_err(&retain)?;
+    let translation = Translator { source: &source, position: 0, flags: options, scopes: Vec::new(), output: String::new(), names: Vec::new(), literals: Vec::new(), supplementary: source.points.iter().copied().any(supplementary), predicate_bmp: true, syntax_prefix_verified: true, syntax: None }.translate(context)?;
+    context.reserve(translation.pattern.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow).map_err(&retain)?).map_err(&retain)?;
+    let tree = Expr::parse_java_tree(&translation.pattern).map_err(regex_error).map_err(&retain)?;
+    let mut metrics = Metrics::default();
+    metrics.visit(&tree.expr, 0).map_err(&retain)?;
+    let compilation = metrics.delegates.checked_mul((DELEGATE_BYTES + DFA_BYTES) * 4).and_then(|bytes| bytes.checked_add(translation.pattern.len().checked_mul(256)?)).ok_or_else(overflow).map_err(&retain)?;
+    let slots = metrics.nodes.checked_mul(4).and_then(|slots| slots.checked_add(64)).ok_or_else(overflow).map_err(&retain)?;
+    let matching = (STACK_BRANCHES + 1).checked_mul(slots.checked_mul(32).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow).map_err(&retain)?).ok_or_else(overflow).map_err(&retain)?;
+    context.reserve(compilation.checked_add(matching).ok_or_else(overflow).map_err(&retain)?).map_err(&retain)?;
+    context.reserve(BACKTRACKS * 64 + STACK_BRANCHES * 1024).map_err(&retain)?;
+    let regex = RegexBuilder::new(&translation.pattern).java_utf16(true).java_supplementary(translation.supplementary).backtrack_limit(BACKTRACKS).backtrack_stack_limit(STACK_BRANCHES)
+        .delegate_size_limit(DELEGATE_BYTES).delegate_dfa_size_limit(DFA_BYTES).build().map_err(regex_error).map_err(&retain)?;
+    Ok(Pattern { regex, names: translation.names })
 }
 
 #[derive(Default)]
@@ -94,54 +84,76 @@ impl Metrics {
 }
 
 impl Translator<'_> {
-    fn peek(&self) -> Option<char> { self.source[self.position..].chars().next() }
-    fn next(&mut self) -> Option<char> { let value = self.peek()?; self.position += value.len_utf8(); Some(value) }
-    fn take(&mut self, value: &str) -> bool { if self.source[self.position..].starts_with(value) { self.position += value.len(); true } else { false } }
+    fn peek_point(&self) -> Option<u32> { self.source.points.get(self.position).copied() }
+    fn next_point(&mut self) -> Option<u32> { let point = self.peek_point()?; self.position += 1; Some(point) }
+    fn peek(&self) -> Option<char> { self.peek_point().and_then(char::from_u32) }
+    fn next(&mut self) -> Option<char> { self.next_point().and_then(char::from_u32) }
+    fn take(&mut self, value: &str) -> bool {
+        let count = value.chars().count();
+        if self.source.points[self.position..].iter().take(count).copied().eq(value.chars().map(u32::from)) { self.position += count; true } else { false }
+    }
     fn skip_ignored(&mut self) {
         while self.flags.comments {
             match self.peek() {
-                Some(character @ (' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r' | '#')) => { self.next(); self.comment(character); }
+                Some(character @ (' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r' | '#')) => { self.next(); self.comment(character as u32); }
                 _ => break,
             }
         }
     }
     fn pattern_peek(&mut self) -> Option<char> { self.skip_ignored(); self.peek() }
     fn pattern_next(&mut self) -> Option<char> { self.skip_ignored(); self.next() }
-    fn translate(mut self) -> Result<Translation> {
-        while let Some(character) = self.next() {
-            if self.flags.comments && self.comment(character) { continue; }
-            if matches!(character, '[' | '(' | ')' | '.' | '^' | '$' | '|' | '{' | '*' | '+' | '?') {
-                self.flush_literals(matches!(character, '{' | '*' | '+' | '?'));
+    fn pattern_next_point(&mut self) -> Option<u32> { self.skip_ignored(); self.next_point() }
+    fn translate(mut self, context: &EvalContext<'_>) -> std::result::Result<Translation, CompileFailure> {
+        if let Err(error) = self.translate_inner() {
+            return Err(CompileFailure::retain(error, self.source.original, Some(self.position), self.syntax, context));
+        }
+        Ok(Translation { pattern: self.output, names: self.names, supplementary: self.supplementary })
+    }
+    fn translate_inner(&mut self) -> Result<()> {
+        while let Some(point) = self.next_point() {
+            if self.flags.comments && self.comment(point) { continue; }
+            let character = char::from_u32(point);
+            if matches!(character, Some('[' | '.' | '^' | '$' | '|' | '{' | '*' | '+' | '?')) { self.syntax_prefix_verified = false; }
+            if matches!(character, Some('[' | '(' | ')' | '.' | '^' | '$' | '|' | '{' | '*' | '+' | '?')) {
+                self.flush_literals(matches!(character, Some('{' | '*' | '+' | '?')));
             }
             match character {
-                '\\' => {
+                Some('\\') => {
                     let escaped = self.escape(false, false)?;
                     if let Some(value) = class_codepoint(&escaped) { self.literals.push(value); }
                     else { self.flush_literals(false); self.output.push_str(&escaped); }
                 },
-                '[' => { let class = self.class(0)?; if !self.flags.canonical && !self.predicate_bmp { self.supplementary = true; } self.output.push_str(&canonical_class(class, self.flags.canonical)); },
-                '(' => self.group()?,
-                ')' => { self.flags = self.scopes.pop().ok_or_else(|| illegal("Unmatched closing ')'"))?; self.output.push(')'); },
-                '.' => self.output.push_str(if self.flags.dotall { "[\\x00-\\x{10ffff}]" } else if self.flags.unix { "[^\\n]" } else { "[^\\n\\r\\x{85}\\x{2028}\\x{2029}]" }),
-                '^' => self.output.push_str(&opaque(if !self.flags.multiline { "\\A" } else if self.flags.unix { "(?:(?<=\\n)|\\A)(?!\\z)" } else { "(?:\\A|(?<=[\\n\\x{85}\\x{2028}\\x{2029}])|(?<=\\r)(?!\\n))(?!\\z)" })),
-                '$' => self.output.push_str(&opaque(end_anchor(self.flags.multiline, self.flags.unix))),
-                '{' => self.repetition()?,
-                '*' | '+' | '?' | '|' => self.output.push(character),
-                _ => self.literals.push(character as u32),
+                Some('[') => { let class = self.class(0)?; if !self.flags.canonical && !self.predicate_bmp { self.supplementary = true; } self.output.push_str(&canonical_class(class, self.flags.canonical)); },
+                Some('(') => self.group()?,
+                Some(')') => {
+                    let Some(flags) = self.scopes.pop() else { return Err(self.syntax_error("Unmatched closing ')'", "Unmatched closing ')'", self.position as i32 - 2)); };
+                    self.flags = flags; self.output.push(')');
+                },
+                Some('.') => self.output.push_str(if self.flags.dotall { "[\\x00-\\x{10ffff}]" } else if self.flags.unix { "[^\\n]" } else { "[^\\n\\r\\x{85}\\x{2028}\\x{2029}]" }),
+                Some('^') => self.output.push_str(&opaque(if !self.flags.multiline { "\\A" } else if self.flags.unix { "(?:(?<=\\n)|\\A)(?!\\z)" } else { "(?:\\A|(?<=[\\n\\x{85}\\x{2028}\\x{2029}])|(?<=\\r)(?!\\n))(?!\\z)" })),
+                Some('$') => self.output.push_str(&opaque(end_anchor(self.flags.multiline, self.flags.unix))),
+                Some('{') => self.repetition()?,
+                Some(character @ ('*' | '+' | '?' | '|')) => self.output.push(character),
+                _ => self.literals.push(point),
             }
             if self.output.len() > PATTERN_BYTES * 64 { return Err(limit("Translated pattern exceeds its bound")); }
         }
         self.flush_literals(false);
         if self.output.len() > PATTERN_BYTES * 64 { return Err(limit("Translated pattern exceeds its bound")); }
-        if !self.scopes.is_empty() { return Err(illegal("Unclosed group")); }
-        Ok(Translation { pattern: self.output, names: self.names, supplementary: self.supplementary })
+        if !self.scopes.is_empty() { return Err(self.syntax_error("Unclosed group", "Unclosed group", self.position as i32)); }
+        Ok(())
     }
-    fn comment(&mut self, character: char) -> bool {
+    fn syntax_error(&mut self, legacy: &'static str, description: &'static str, index: i32) -> Anomaly {
+        if self.syntax_prefix_verified { self.syntax = Some(Syntax { description: Description::Static(description), index }); }
+        illegal(legacy)
+    }
+    fn comment(&mut self, point: u32) -> bool {
+        let Some(character) = char::from_u32(point) else { return false; };
         if matches!(character, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r') { return true; }
         if character == '#' {
-            while let Some(next) = self.peek() {
-                if matches!(next, '\0' | '\n') || (!self.flags.unix && matches!(next, '\r' | '\u{85}' | '\u{2028}' | '\u{2029}')) { break; }
-                self.next();
+            while let Some(next) = self.peek_point() {
+                if matches!(next, 0 | 10) || (!self.flags.unix && matches!(next, 13 | 0x85 | 0x2028 | 0x2029)) { break; }
+                self.next_point();
             }
             return true;
         }
@@ -188,13 +200,14 @@ impl Translator<'_> {
         let previous = self.flags;
         self.skip_ignored();
         if self.take("?") {
+            self.syntax_prefix_verified = false;
             for prefix in ["=", "!", ">", ":"] {
                 if self.take(prefix) { self.scopes.push(previous); self.output.push_str("(?"); self.output.push_str(if prefix == ":" { "j:" } else { prefix }); return Ok(()); }
             }
             if self.take("<") {
                 if let Some(character @ ('=' | '!')) = self.pattern_peek() {
                     self.next(); self.scopes.push(previous);
-                    self.output.push_str(if self.source[self.position..].chars().any(|character| character.len_utf16() == 2) { "(?j<" } else { "(?<" });
+                    self.output.push_str(if self.source.points[self.position..].iter().copied().any(supplementary) { "(?j<" } else { "(?<" });
                     self.output.push(character); return Ok(());
                 }
                 let name = self.name('>')?;
@@ -203,16 +216,17 @@ impl Translator<'_> {
             } else {
                 let mut enabled = true;
                 loop {
-                    match self.pattern_next().ok_or_else(|| illegal("Unclosed flag group"))? {
-                        '-' if enabled => enabled = false,
-                        ')' => return Ok(()),
-                        ':' => { self.scopes.push(previous); self.output.push_str("(?j:"); return Ok(()); },
+                    let point = self.pattern_next_point().ok_or_else(|| illegal("Unclosed flag group"))?;
+                    match char::from_u32(point) {
+                        Some('-') if enabled => enabled = false,
+                        Some(')') => return Ok(()),
+                        Some(':') => { self.scopes.push(previous); self.output.push_str("(?j:"); return Ok(()); },
                         flag => { match flag {
-                            'i' => self.flags.insensitive = enabled, 'u' => self.flags.unicode_case = enabled,
-                            'U' => { self.flags.unicode_class = enabled; self.flags.unicode_case = enabled; },
-                            'm' => self.flags.multiline = enabled, 's' => self.flags.dotall = enabled,
-                            'd' => self.flags.unix = enabled, 'x' => self.flags.comments = enabled,
-                            'c' => self.flags.canonical = enabled,
+                            Some('i') => self.flags.insensitive = enabled, Some('u') => self.flags.unicode_case = enabled,
+                            Some('U') => { self.flags.unicode_class = enabled; self.flags.unicode_case = enabled; },
+                            Some('m') => self.flags.multiline = enabled, Some('s') => self.flags.dotall = enabled,
+                            Some('d') => self.flags.unix = enabled, Some('x') => self.flags.comments = enabled,
+                            Some('c') => self.flags.canonical = enabled,
                             _ => return Err(illegal("Unknown inline modifier")),
                         } },
                     }
@@ -247,8 +261,14 @@ impl Translator<'_> {
             else { opaque(&format!("(?i-u:{reference})")) })
     }
     fn escape(&mut self, class: bool, range: bool) -> Result<String> {
-        let character = self.next().ok_or_else(|| illegal("Trailing backslash"))?;
+        let point = self.next_point().ok_or_else(|| illegal("Trailing backslash"))?;
         self.predicate_bmp = true;
+        let Some(character) = char::from_u32(point) else {
+            self.predicate_bmp = false;
+            if !class { self.supplementary = true; }
+            return Ok(format!("\\x{{{point:x}}}"));
+        };
+        if character.is_ascii_alphanumeric() && !matches!(character, 'p' | 'P') { self.syntax_prefix_verified = false; }
         let result = match character {
             'd' | 'D' | 's' | 'S' | 'w' | 'W' => {
                 let inverse = character.is_ascii_uppercase();
@@ -292,19 +312,38 @@ impl Translator<'_> {
             },
             'p' | 'P' => {
                 self.skip_ignored();
-                let property = if self.take("{") {
+                let range = if self.take("{") {
                     self.skip_ignored();
                     let start = self.position;
                     loop {
-                        match self.pattern_next() {
-                            Some('}') => break,
+                        match self.pattern_next_point() {
+                            Some(0x7d) => break,
                             Some(_) => {},
                             None => return Err(illegal("Unclosed character property")),
                         }
                     }
-                    self.source[start..self.position - 1].to_owned()
-                } else { self.pattern_next().ok_or_else(|| illegal("Missing character property"))?.to_string() };
-                let body = java_unicode::property_class_utf16(&property, self.flags.unicode_class, self.flags.insensitive, true)?;
+                    start..self.position - 1
+                } else {
+                    self.skip_ignored();
+                    let start = self.position;
+                    self.next_point().ok_or_else(|| illegal("Missing character property"))?;
+                    start..self.position
+                };
+                let property = self.source.text(range.clone());
+                let body = property.as_deref().map(|property| java_unicode::property_class_utf16(property, self.flags.unicode_class, self.flags.insensitive, true))
+                    .unwrap_or_else(|| Err(illegal("Unknown character property name")));
+                let body = match body {
+                    Ok(body) => body,
+                    Err(error) => {
+                        let points = &self.source.points[range];
+                        if self.syntax_prefix_verified && !points.contains(&u32::from(b'=')) && !points.is_empty() {
+                            self.syntax = Some(Syntax { description: Description::Points { prefix: "Unknown character property name {", points, suffix: "}" }, index: self.position as i32 - 1 });
+                        }
+                        return Err(error);
+                    }
+                };
+                let property = property.expect("successful property lookup has scalar text");
+                self.syntax_prefix_verified = false;
                 self.predicate_bmp = character == 'p' && java_unicode::property_is_bmp(&property, self.flags.unicode_class);
                 if character == 'P' { self.supplementary = true; }
                 canonical_class(format!("[{}{body}]", if character == 'P' { "^" } else { "" }), self.flags.canonical && !class)
@@ -337,15 +376,15 @@ impl Translator<'_> {
                 for _ in 0..if first <= '3' { 2 } else { 1 } { if let Some(next) = self.pattern_peek().filter(|value| ('0'..='7').contains(value)) { self.next(); value = value * 8 + next as u32 - '0' as u32; } else { break; } }
                 format!("\\x{{{value:x}}}")
             },
-            'c' => { let value = self.pattern_next().ok_or_else(|| illegal("Illegal control escape"))? as u32 ^ 64; format!("\\x{{{value:x}}}") },
+            'c' => { let value = self.pattern_next_point().ok_or_else(|| illegal("Illegal control escape"))? ^ 64; format!("\\x{{{value:x}}}") },
             'a' => "\\x07".into(), 'e' => "\\x1b".into(), 't' => "\\t".into(), 'n' => "\\n".into(), 'r' => "\\r".into(), 'f' => "\\f".into(),
             'X' if !class => "\\X".into(),
             'N' => {
                 if self.pattern_next() != Some('{') { return Err(illegal("Illegal character name escape sequence")); }
                 let start = self.position;
-                while self.peek().is_some_and(|value| value != '}') { self.next(); }
-                let name = &self.source[start..self.position];
-                let value = java_unicode::named_character(name).ok_or_else(|| illegal("Unknown character name"))?;
+                while self.peek_point().is_some_and(|value| value != u32::from(b'}')) { self.next_point(); }
+                let name = self.source.text(start..self.position);
+                let value = name.as_deref().and_then(java_unicode::named_character).ok_or_else(|| illegal("Unknown character name"))?;
                 if !self.take("}") { return Err(illegal("Unclosed character name escape sequence")); }
                 format!("\\x{{{value:x}}}")
             },
@@ -372,21 +411,21 @@ impl Translator<'_> {
         let mut bmp = true;
         let mut first = true;
         loop {
-            let character = self.next().ok_or_else(|| illegal("Unclosed character class"))?;
-            if self.flags.comments && self.comment(character) { continue; }
-            match character {
-                ']' if !first => { result.push(']'); self.predicate_bmp = bmp && !negated; return Ok(result); },
-                '[' => { result.push_str(&self.class(depth + 1)?); bmp &= self.predicate_bmp; },
-                '&' if self.pattern_peek() == Some('&') => { self.next(); result.push_str("&&"); },
+            let point = self.next_point().ok_or_else(|| illegal("Unclosed character class"))?;
+            if self.flags.comments && self.comment(point) { continue; }
+            match char::from_u32(point) {
+                Some(']') if !first => { result.push(']'); self.predicate_bmp = bmp && !negated; return Ok(result); },
+                Some('[') => { result.push_str(&self.class(depth + 1)?); bmp &= self.predicate_bmp; },
+                Some('&') if self.pattern_peek() == Some('&') => { self.next(); result.push_str("&&"); },
                 value => {
-                    let range = self.source[self.position..].chars().nth(1) == Some('-');
-                    let atom = if value == '\\' { self.escape(true, range)? } else { format!("\\x{{{:x}}}", value as u32) };
-                    if value == '\\' && class_character(&atom).is_none() { bmp &= self.predicate_bmp; }
+                    let range = self.source.points.get(self.position + 1) == Some(&u32::from(b'-'));
+                    let atom = if value == Some('\\') { self.escape(true, range)? } else { format!("\\x{{{point:x}}}") };
+                    if value == Some('\\') && class_character(&atom).is_none() { bmp &= self.predicate_bmp; }
                     if let Some(start) = class_codepoint(&atom) {
-                        if self.pattern_peek() == Some('-') && !matches!(self.source[self.position + 1..].chars().next(), Some(']' | '[') | None) {
+                        if self.pattern_peek() == Some('-') && !matches!(self.source.points.get(self.position + 1).copied(), Some(0x5d | 0x5b) | None) {
                             self.next();
-                            let end = self.pattern_next().ok_or_else(overflow)?;
-                            let end = if end == '\\' { class_codepoint(&self.escape(true, true)?).ok_or_else(|| illegal("Illegal character range"))? } else { end as u32 };
+                            let end = self.pattern_next_point().ok_or_else(overflow)?;
+                            let end = if end == u32::from(b'\\') { class_codepoint(&self.escape(true, true)?).ok_or_else(|| illegal("Illegal character range"))? } else { end };
                             if start > end { return Err(illegal("Illegal character range")); }
                             bmp &= !self.flags.insensitive && (end < 0xd800 || start > 0xdfff && end < 0x10000);
                             result.push_str(&java_unicode::class_range_utf16(start, end, self.flags.insensitive, self.flags.unicode_case));
@@ -479,8 +518,14 @@ fn property_class(name: &str, unicode: bool, insensitive: bool) -> Result<String
 
 impl Pattern {
     pub(crate) fn search(&self,source: &str,context: &EvalContext<'_>) -> Result<bool> {
-        context.reserve(source.len().checked_mul(32).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?)?;
-        self.regex.is_match(source).map_err(regex_error)
+        self.search_text(JavaText::from_utf8(source), context)
+    }
+
+    pub(crate) fn search_text(&self, source: JavaText<'_>, context: &EvalContext<'_>) -> Result<bool> {
+        context.reserve(work_bytes(source)?.checked_mul(32).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?)?;
+        let mut units = Vec::with_capacity(source.len_units());
+        units.extend(source.units());
+        self.regex.captures_utf16(&units, 0, 0).map(|captures| captures.is_some()).map_err(regex_error)
     }
 }
 
