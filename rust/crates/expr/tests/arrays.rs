@@ -23,7 +23,7 @@ fn array_bounds_use_one_dimension_and_empty_arrays_keep_lower_bound_one() {
                 let error = run(&call(name, vec![input.clone(), count(dimension)])).unwrap_err();
                 assert_eq!(error.code, "xtdb.expression/array-dimension-error");
                 assert_eq!(error.context["dim"], serde_json::json!(dimension));
-                assert_eq!(error.message, format!("Unsupported: {} for dimension != 1", name.to_uppercase()));
+                assert_eq!(error.message, Some(format!("Unsupported: {} for dimension != 1", name.to_uppercase())));
             }
         }
     }
@@ -37,7 +37,7 @@ fn trim_preserves_elements_and_reports_overtrimmed_length() {
     }
     let error = run(&trim(list(), 3)).unwrap_err();
     assert_eq!(error.code, "xtdb.expression/array-element-error");
-    assert_eq!(error.message, "Data exception - array element error.");
+    assert_eq!(error.message.as_deref(), Some("Data exception - array element error."));
     assert_eq!(error.context["nlen"], serde_json::json!(-1));
     assert_eq!(run(&trim(Expr::List(vec![]), 0)).unwrap(), V::List(vec![]));
 }
@@ -69,7 +69,7 @@ fn negative_trim_counts_extend_the_view_and_size_cast_is_deferred() {
     assert_eq!(run(&call("array_lower", vec![oversized.clone(), count(1)])).unwrap(), V::I32(1));
     let error = run(&call("cardinality", vec![oversized])).unwrap_err();
     assert_eq!(error.code, "xtdb.expression/overflow-error");
-    assert_eq!(error.message, "data exception - overflow error");
+    assert_eq!(error.message.as_deref(), Some("data exception - overflow error"));
     let error = run(&trim(list(), i64::MIN)).unwrap_err();
     assert_eq!(error.context["nlen"], serde_json::json!(i64::MIN + 2));
 }

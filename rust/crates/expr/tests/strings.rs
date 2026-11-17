@@ -112,12 +112,12 @@ fn concat_requires_two_homogeneous_values_and_stops_at_null() {
     for values in [vec![], vec![text("one")]] {
         let error = scalar_call("concat", &values, &EvalContext::default()).unwrap_err();
         assert_eq!(error.code, "xtdb.expression/arity-error");
-        assert_eq!(error.message, "Arity error, concat requires at least two arguments");
+        assert_eq!(error.message.as_deref(), Some("Arity error, concat requires at least two arguments"));
     }
     assert_eq!(call("concat", &[V::Binary(vec![0, 255]), V::Binary(vec![1])]), V::Binary(vec![0, 255, 1]));
     assert_eq!(call("concat", &[text("a"), V::Null]), V::Null);
     assert_eq!(function_type("concat", &[L::Null, L::Null]).unwrap(), L::Null);
-    assert_eq!(scalar_call("concat", &[text("a"), V::Binary(vec![])], &EvalContext::default()).unwrap_err().message, "All arguments to `concat` must be of the same type.");
+    assert_eq!(scalar_call("concat", &[text("a"), V::Binary(vec![])], &EvalContext::default()).unwrap_err().message.as_deref(), Some("All arguments to `concat` must be of the same type."));
     let failure = Expr::Cast { expr: Box::new(Expr::binary(BinaryOp::Divide, Expr::Literal(V::I64(1)), Expr::Literal(V::I64(0)))), target: rtdb_plan::CastTarget::Fixed(L::Scalar(S::Utf8)) };
     let expression = Expr::Call { name: "concat".into(), args: vec![Expr::Literal(V::Null), failure], return_type: L::Scalar(S::Utf8).maybe() };
     assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext::default()).unwrap(), V::Null);
@@ -162,7 +162,7 @@ fn stringutil_substring_overlay_positions_and_i32_wrapping() {
     assert_eq!(call("overlay", &[V::Binary(vec![1, 2, 3]), V::Binary(vec![9]), V::I64(2), V::I64(1)]), V::Binary(vec![1, 9, 3]));
     let error = scalar_call("substring", &[text("abc"), V::I64(1), V::I64(-1)], &EvalContext::default()).unwrap_err();
     assert_eq!(error.code, "xtdb.expression/illegal-argument-exception");
-    assert_eq!(error.message, "Negative substring length");
+    assert_eq!(error.message.as_deref(), Some("Negative substring length"));
 }
 
 #[test]
@@ -203,7 +203,7 @@ fn pgformat_test_original_width_position_quoting_and_null_cases() {
         let mut values = vec![text(format)]; values.extend(arguments);
         assert_eq!(call("format", &values), text(expected));
     }
-    assert_eq!(scalar_call("format", &[text("%I"), V::Null], &EvalContext::default()).unwrap_err().message, "null values cannot be formatted as an SQL identifier");
+    assert_eq!(scalar_call("format", &[text("%I"), V::Null], &EvalContext::default()).unwrap_err().message.as_deref(), Some("null values cannot be formatted as an SQL identifier"));
 }
 
 #[test]

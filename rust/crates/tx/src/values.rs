@@ -197,7 +197,7 @@ pub(crate) fn anomaly_bytes(error: &Anomaly) -> Result<usize> {
             _ => Ok(128),
         }
     }
-    error.context.iter().try_fold(error.code.capacity().checked_add(error.message.capacity()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?, |bytes, (key, value)| bytes.checked_add(key.capacity()).and_then(|bytes| bytes.checked_add(256)).and_then(|bytes| bytes.checked_add(json(value).ok()?)).ok_or_else(overflow))
+    error.context.iter().try_fold(error.code.capacity().checked_add(error.message.as_ref().map_or(0, String::capacity)).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?, |bytes, (key, value)| bytes.checked_add(key.capacity()).and_then(|bytes| bytes.checked_add(256)).and_then(|bytes| bytes.checked_add(json(value).ok()?)).ok_or_else(overflow))
 }
 
 fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Transaction allocation exceeds address space") }
@@ -205,6 +205,20 @@ fn overflow() -> Anomaly { Anomaly::incorrect("rtdb.tx/allocation-overflow", "Tr
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_allocated_messages_retain_their_capacity_and_absent_messages_allocate_none() {
+        let absent = Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "test/error", None);
+        let capacity = String::with_capacity(4096);
+        let bytes = capacity.capacity();
+        let present = Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "test/error", Some(capacity));
+        assert_eq!(anomaly_bytes(&present).unwrap() - anomaly_bytes(&absent).unwrap(), bytes);
+        let memory = MemoryBudget::new(anomaly_bytes(&absent).unwrap() + 128);
+        assert!(RetainedAnomaly::new(present, &memory).is_err());
+        assert_eq!(memory.used_bytes(), 0);
+        let retained = RetainedAnomaly::new(absent, &memory).unwrap();
+        assert!(memory.used_bytes() > 0);
+        drop(retained); assert_eq!(memory.used_bytes(), 0);
+    }
     #[test]
     fn decoded_parameter_pages_reset_error_indices_but_coalesced_batches_continue() {
         let memory = MemoryBudget::new(1 << 20);

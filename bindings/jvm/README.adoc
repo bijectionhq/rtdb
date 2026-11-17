@@ -71,3 +71,6 @@ Existing remote JDBC, PostgreSQL, Python Flight SQL and Rust clients retain thei
 The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
 The test sources require a separately built library at `xtdb.native.library` when the full implementation gate permits execution.
 No native, JVM or Clojure test has been run in the implementation phase.
+
+`NativeException.getMessage()` preserves an absent native diagnostic message as Java null and an empty message as an empty string.
+The Clojure bridge retains that distinction when reading the diagnostic Transit payload.

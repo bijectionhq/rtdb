@@ -43,7 +43,7 @@ mod tests {
             (Number::Float(1.0),"java.lang.Float"),(Number::Double(1.0),"java.lang.Double"),
         ] {
             let Error::External(error) = value.bit_operand().unwrap_err() else { panic!() };
-            assert_eq!(error.message,format!("bit operation not supported for: class {class}"));
+            assert_eq!(error.message,Some(format!("bit operation not supported for: class {class}")));
         }
     }
     #[test]

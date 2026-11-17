@@ -36,7 +36,7 @@ fn object_decimal_inference_checks_storage_and_uses_actual_digits() {
     assert!(infer_decimal(&DecimalValue { unscaled: vec![0], precision: 32, scale: 0, bit_width: 128 }).is_err());
     let unsupported = infer_decimal(&DecimalValue::new(vec![127; 32], i32::MAX, 0, 256).unwrap()).unwrap_err();
     assert_eq!(unsupported.category, rtdb_types::AnomalyCategory::Unsupported);
-    assert_eq!(unsupported.message, "Unsupported precision: 77");
+    assert_eq!(unsupported.message.as_deref(), Some("Unsupported precision: 77"));
 }
 
 #[test]

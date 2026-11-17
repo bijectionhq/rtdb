@@ -83,7 +83,7 @@ mod tests {
                 trace.push((left,right));
                 if trace.len() == fail_at { Err(Anomaly::incorrect("test/comparator","original")) } else { Ok(keys[left].cmp(&keys[right])) }
             }).unwrap_err();
-            assert_eq!(error.code,"test/comparator");assert_eq!(error.message,"original");assert_eq!(trace.as_slice(),&full[..fail_at]);
+            assert_eq!(error.code,"test/comparator");assert_eq!(error.message.as_deref(),Some("original"));assert_eq!(trace.as_slice(),&full[..fail_at]);
         }
     }
     #[test]

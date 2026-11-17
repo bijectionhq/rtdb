@@ -20,6 +20,60 @@ fn errors_keep_xtdb_tags_and_keyword_context() {
 }
 
 #[test]
+fn nullable_anomaly_messages_round_trip_with_typed_context() {
+    use rtdb_types::AnomalyCategory as C;
+    let typed = V::Tagged { tag: "future/type".into(), representation: Box::new(V::Map(vec![(V::Integer(7), V::Keyword("typed/value".into()))])) };
+    for category in [C::Incorrect, C::Unsupported, C::NotFound, C::Forbidden, C::Conflict, C::Busy, C::Unavailable, C::Interrupted, C::Fault] {
+        for message in [None, Some(String::new()), Some("detail".into())] {
+            let error = Anomaly::new_nullable(category, "test/error", message.clone()).with_context("typed", to_json_value(&typed).unwrap());
+            let bytes = encode_anomaly(&error).unwrap();
+            let decoded = decode_anomaly(&bytes).unwrap();
+            assert_eq!(decoded, error);
+            assert_eq!(from_json_value(&decoded.context["typed"]).unwrap(), typed);
+            let V::Tagged { representation, .. } = decode_msgpack(&bytes).unwrap() else { panic!("anomaly tag") };
+            let V::Array(fields) = *representation else { panic!("anomaly fields") };
+            assert_eq!(fields[2], message.map_or(V::Null, V::String));
+        }
+    }
+}
+
+#[test]
+fn current_and_legacy_error_readers_keep_null_distinct_from_empty_text() {
+    use rtdb_types::AnomalyCategory as C;
+    for tag in ["xt/error", "xtdb/illegal-arg", "xtdb/runtime-err", "xtdb/exception-info"] {
+        for message in [None, Some(String::new()), Some("detail".into())] {
+            let wire_message = message.clone().map_or(V::Null, V::String);
+            let fields = match tag {
+                "xt/error" => vec![V::Keyword("incorrect".into()), V::Keyword("test/error".into()), wire_message, V::Map(vec![])],
+                "xtdb/exception-info" => vec![wire_message, V::Map(vec![])],
+                _ => vec![V::Keyword("test/error".into()), wire_message, V::Map(vec![]), V::Null],
+            };
+            let wire = V::Tagged { tag: tag.into(), representation: Box::new(V::Array(fields)) };
+            let decoded = decode_anomaly(&encode_msgpack(&wire).unwrap()).unwrap();
+            assert_eq!(decoded.message, message);
+            assert_eq!(decoded.category, if tag == "xtdb/exception-info" { C::Fault } else { C::Incorrect });
+            assert_eq!(decoded.code, if tag == "xtdb/exception-info" { "xtdb.error/unknown" } else { "test/error" });
+            assert_eq!(decode_anomaly(&encode_anomaly(&decoded).unwrap()).unwrap(), decoded);
+        }
+    }
+}
+
+#[test]
+fn error_readers_reject_messages_other_than_null_or_text() {
+    for tag in ["xt/error", "xtdb/illegal-arg", "xtdb/runtime-err", "xtdb/exception-info"] {
+        for message in [V::Bool(false), V::Integer(0), V::Array(vec![]), V::Map(vec![])] {
+            let fields = match tag {
+                "xt/error" => vec![V::Keyword("incorrect".into()), V::Null, message, V::Null],
+                "xtdb/exception-info" => vec![message, V::Null],
+                _ => vec![V::Null, message, V::Null],
+            };
+            let wire = V::Tagged { tag: tag.into(), representation: Box::new(V::Array(fields)) };
+            assert_eq!(decode_anomaly(&encode_msgpack(&wire).unwrap()).unwrap_err().message.as_deref(), Some("Error message is not text"));
+        }
+    }
+}
+
+#[test]
 fn legacy_errors_and_unknown_extension_tags_are_retained() {
     for tag in ["xtdb/illegal-arg", "xtdb/runtime-err", "xtdb/exception-info", "xtdb/clj-form", "future/type"] {
         let value = V::Tagged { tag: tag.into(), representation: Box::new(V::Array(vec![V::String("message".into()), V::Map(Vec::new())])) };
@@ -145,11 +199,11 @@ fn msgpack_allocation_admission_preserves_the_encoders_depth_boundary() {
         for _ in 0..128 { value = V::Array(vec![value]); }
         assert!(msgpack_allocation_bound(&value).unwrap() >= encode_msgpack(&value).unwrap().len());
         value = V::Array(vec![value]);
-        assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message, "Transit nesting limit exceeded");
-        assert_eq!(encode_msgpack(&value).unwrap_err().message, "Transit nesting limit exceeded");
+        assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
+        assert_eq!(encode_msgpack(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
     }
     let mut value = V::Tagged { tag: "xt/custom".into(), representation: Box::new(V::String("payload".into())) };
     for _ in 0..128 { value = V::Array(vec![value]); }
-    assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message, "Transit nesting limit exceeded");
-    assert_eq!(encode_msgpack(&value).unwrap_err().message, "Transit nesting limit exceeded");
+    assert_eq!(msgpack_allocation_bound(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
+    assert_eq!(encode_msgpack(&value).unwrap_err().message.as_deref(), Some("Transit nesting limit exceeded"));
 }

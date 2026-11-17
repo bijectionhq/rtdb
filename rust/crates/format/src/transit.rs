@@ -582,7 +582,7 @@ pub fn encode_anomaly(error: &Anomaly) -> Result<Vec<u8>> {
     let context = error.context.iter().map(|(key, value)| Ok((TransitValue::Keyword(key.clone()), from_json_value(value)?))).collect::<Result<_>>()?;
     encode_msgpack(&TransitValue::Tagged { tag: "xt/error".into(), representation: Box::new(TransitValue::Array(vec![
         TransitValue::Keyword(category.into()), if error.code.is_empty() { TransitValue::Null } else { TransitValue::Keyword(error.code.clone()) },
-        TransitValue::String(error.message.clone()), TransitValue::Map(context),
+        error.message.as_ref().map_or(TransitValue::Null, |message| TransitValue::String(message.clone())), TransitValue::Map(context),
     ])) })
 }
 
@@ -591,9 +591,9 @@ pub fn decode_anomaly(bytes: &[u8]) -> Result<Anomaly> {
     let TransitValue::Array(values) = representation.as_ref() else { return Err(invalid("Error representation is not an array")); };
     if tag == "xtdb/exception-info" {
         let [message, context] = values.as_slice() else { return Err(invalid("Legacy exception-info representation must have two fields")); };
-        let message = match message { TransitValue::Null => String::new(), TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error message is not text")) };
+        let message = match message { TransitValue::Null => None, TransitValue::String(value) => Some(value.clone()), _ => return Err(invalid("Error message is not text")) };
         if !matches!(context, TransitValue::Map(_) | TransitValue::Null) { return Err(invalid("Legacy exception-info data is not a map")); }
-        return Ok(Anomaly::fault("xtdb.error/unknown", message));
+        return Ok(Anomaly::new_nullable(AnomalyCategory::Fault, "xtdb.error/unknown", message));
     }
     let (category, code, message, context) = match (tag.as_str(), values.as_slice()) {
         ("xt/error", [TransitValue::Keyword(category), code, message, context]) => (anomaly_category(category)?, code, message, context),
@@ -601,7 +601,7 @@ pub fn decode_anomaly(bytes: &[u8]) -> Result<Anomaly> {
         _ => return Err(invalid(format!("Unsupported error representation {tag}"))),
     };
     let code = match code { TransitValue::Null => String::new(), TransitValue::Keyword(value) | TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error code is not a keyword")) };
-    let message = match message { TransitValue::Null => String::new(), TransitValue::String(value) => value.clone(), _ => return Err(invalid("Error message is not text")) };
+    let message = match message { TransitValue::Null => None, TransitValue::String(value) => Some(value.clone()), _ => return Err(invalid("Error message is not text")) };
     let context = match context {
         TransitValue::Null => BTreeMap::new(),
         TransitValue::Map(entries) => entries.iter().map(|(key, value)| {

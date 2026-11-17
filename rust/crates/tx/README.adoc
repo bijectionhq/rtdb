@@ -36,6 +36,8 @@ An external `TransactionWriter` must retain its resources within its cancellable
 Source transactions, argument chunks, metadata, encoded bytes, table buffers, and abort errors retain byte-budget reservations with their allocation owners.
 `RetainedBytes::into_bytes` transfers that ownership to a cloneable transport buffer.
 Decoded aborts retain their original Transit representation, including historical exception tags, while exposing a normalized anomaly to callers.
+Absent and present empty anomaly messages remain distinct through persistence, replay and retained transport clones.
+An abort containing an anomaly with no message still contains an error.
 Replica payloads contain only the transaction's deltas, including declared zero-row schemas.
 Follower decoding finishes all tables before returning a value that can be applied atomically.
 Typed source documents and SQL arguments, resolved query rows, and replica batches preserve exact decimal parameters and raw coefficient bytes.

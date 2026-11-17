@@ -94,7 +94,8 @@ def worker_failure(engine, text, job, gcs_audit=False, s3_audit=False):
             if (value.get("table") == job["table"]
                 and value.get("object_key") == job["metadata_key"] and value.get("operation") == "put_file"
                 and value.get("permission_denied") is True and value.get("anomaly_code") == "rtdb.storage/permission-denied"
-                and value.get("anomaly_category") == "forbidden" and re.fullmatch(r"[0-9a-f]{64}", value.get("message_sha256", ""))):
+                and value.get("anomaly_category") == "forbidden" and isinstance(value.get("message_sha256"), str)
+                and re.fullmatch(r"[0-9a-f]{64}", value["message_sha256"])):
                 return value
     else:
         marker = "error running compaction job: " + job["table"] + "/" + job["output"]

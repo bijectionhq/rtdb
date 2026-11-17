@@ -88,6 +88,47 @@ fn historical_exception_info_retains_original_wire_through_error_clones() {
 }
 
 #[test]
+fn nullable_abort_messages_preserve_error_presence_and_release_all_retained_charges() {
+    use rtdb_types::{Anomaly, AnomalyCategory, BlockIndex, Timestamp, TransactionKey, TxId};
+    for message in [None, Some(String::new()), Some("failed".into())] {
+        let memory = MemoryBudget::new(1 << 20);
+        let error = Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone());
+        let retained = RetainedAnomaly::new(error, &memory).unwrap();
+        let outcome = TransactionResult::Aborted { tx_key: TransactionKey { tx_id: TxId(1), system_time: Timestamp(2) }, error: Some(retained) };
+        assert!(!outcome.committed());
+        assert_eq!(outcome.error().unwrap().message, message);
+        let wire = outcome.encoded_error().unwrap().unwrap();
+        let encoded = rtdb_format::log::proto::ResolvedTx { tx_id: Some(1), system_time_micros: Some(2), committed: Some(false), error: Some(wire.as_slice().to_vec()), ..Default::default() };
+        let (staged, decoded) = decode_replica(&encoded, None, BlockIndex(0), &memory).unwrap();
+        assert_eq!(decoded, outcome);
+        let clone = decoded.clone();
+        drop(decoded); drop(outcome); drop(staged); drop(wire);
+        assert!(memory.used_bytes() > 0);
+        assert_eq!(clone.error().unwrap().message, message);
+        let bytes = clone.encoded_error().unwrap().unwrap();
+        assert_eq!(bytes.as_slice(), encoded.error.as_deref().unwrap());
+        drop(clone); assert!(memory.used_bytes() > 0);
+        drop(bytes); assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn historical_absent_and_empty_messages_keep_exact_wire_bytes() {
+    use rtdb_format::transit::{TransitValue as T, encode_msgpack};
+    for message in [T::Null, T::String(String::new())] {
+        let memory = MemoryBudget::new(1 << 20);
+        let wire = encode_msgpack(&T::Tagged { tag: "xtdb/exception-info".into(), representation: Box::new(T::Array(vec![message.clone(), T::Map(vec![])])) }).unwrap();
+        let error = RetainedAnomaly::from_transit(&wire, &memory).unwrap();
+        assert_eq!(error.message.as_deref(), if message == T::Null { None } else { Some("") });
+        let encoded = error.encode().unwrap();
+        drop(error);
+        assert_eq!(encoded.as_slice(), wire);
+        assert!(memory.used_bytes() >= wire.len());
+        drop(encoded); assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn coalescing_argument_batches_preserves_old_clones_and_joined_types() {
     let memory = MemoryBudget::new(1 << 24);
     let mut args = SqlArguments::from_rows(vec![vec![Value::I64(1)]], &memory).unwrap();

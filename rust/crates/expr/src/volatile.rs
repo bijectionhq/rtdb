@@ -36,7 +36,7 @@ mod tests {
         for (value, unit) in [(-1, Millisecond), (-1, Microsecond), (i64::MAX, Microsecond)] {
             let error = sleep_millis(&Value::Duration { value, unit }).unwrap_err();
             assert_eq!(error.code, "xtdb/illegal-argument");
-            assert_eq!(error.message, "timeout value is negative");
+            assert_eq!(error.message.as_deref(), Some("timeout value is negative"));
         }
         for value in [i64::MIN, 1i64 << 61] {
             assert_eq!(sleep_millis(&Value::Duration { value, unit: Microsecond }).unwrap(), 0);

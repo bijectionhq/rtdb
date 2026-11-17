@@ -467,6 +467,7 @@ The adapter currently represents the default UTF-8 Unix provider and the standar
 
 Decoded Transit anomalies retain their complete normalized exception data and cause while their writer omits the cause.
 Their object equality compares message, Clojure map equivalence and recursive cause equality; their hash follows the Java message/data/cause hash.
+Absent and empty messages remain distinct through the shared anomaly codec, Object Throwable construction, collection equality and wire output.
 Explicitly present null or false error-code entries remain distinct from an absent entry during object comparison.
 ExceptionInfo retains object identity, including when used as an anomaly cause.
 

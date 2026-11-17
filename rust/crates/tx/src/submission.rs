@@ -198,7 +198,7 @@ mod tests {
         let error = prepare_submission(vec![TxOp::Sql { sql: "INSERT INTO docs (_id, v) VALUES (1, ?)".into(), args: Some(args) }], SubmitOptions::default(), "xtdb", &memory).err().unwrap();
         assert_eq!(error.category, rtdb_types::AnomalyCategory::Unsupported);
         assert_eq!(error.code, "");
-        assert_eq!(error.message, "Unsupported precision: 77");
+        assert_eq!(error.message.as_deref(), Some("Unsupported precision: 77"));
         assert_eq!(memory.used_bytes(), 0);
     }
 }

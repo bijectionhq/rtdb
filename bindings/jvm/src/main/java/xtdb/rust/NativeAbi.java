@@ -102,6 +102,7 @@ final class NativeAbi {
     private NativeException diagnostic(long handle) throws AdbcException {
         try (Arena arena = Arena.ofConfined()) {
             byte[][] fields = new byte[4][];
+            String message = null;
             for (int field = 0; field < fields.length; field++) {
                 MemorySegment slice = arena.allocate(16, 8);
                 MemorySegment error = arena.allocate(I64);
@@ -111,10 +112,18 @@ final class NativeAbi {
                     invoke("release", secondary, ignored);
                     throw AdbcException.internal("Unable to read native diagnostic");
                 }
-                fields[field] = copySlice(slice);
+                if (field == 2) message = diagnosticMessage(slice);
+                else fields[field] = copySlice(slice);
             }
-            return new NativeException(new String(fields[0], StandardCharsets.UTF_8), new String(fields[1], StandardCharsets.UTF_8), new String(fields[2], StandardCharsets.UTF_8), fields[3]);
+            return new NativeException(new String(fields[0], StandardCharsets.UTF_8), new String(fields[1], StandardCharsets.UTF_8), message, fields[3]);
         } finally { dispose(handle, false); }
+    }
+    static String diagnosticMessage(MemorySegment slice) throws AdbcException {
+        if (slice.get(PTR, 0).address() == 0) {
+            if (slice.get(I64, 8) != 0) throw AdbcException.internal("Absent native diagnostic message has a nonzero length");
+            return null;
+        }
+        return new String(copySlice(slice), StandardCharsets.UTF_8);
     }
     private static byte[] copySlice(MemorySegment slice) {
         long length = slice.get(I64, 8);

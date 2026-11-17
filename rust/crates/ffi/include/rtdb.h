@@ -73,6 +73,7 @@ int32_t rtdb_v1_close(RtdbHandle handle, RtdbHandle *error);
 
 /* Fields: 0 category, 1 stable code, 2 message, 3 Transit MessagePack anomaly.
  * The returned slice borrows the diagnostic until release; do not concurrently release it while reading.
+ * An absent message has a null pointer and zero length; a present empty message has a nonnull pointer and zero length.
  * Emergency diagnostic 1 has an empty Transit field when the diagnostic budget is exhausted.
  */
 int32_t rtdb_v1_error_field(RtdbHandle handle, uint32_t field, RtdbSlice *out, RtdbHandle *error);

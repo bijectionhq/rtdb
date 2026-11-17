@@ -123,3 +123,9 @@ Interop with Java, Go, Python, R, and ADBC drivers, external authentication, flo
 
 Ticket `currentTime` retains the query clock's nanoseconds through serialization and later execution.
 The captured snapshot-time cap retains its separate microsecond representation.
+
+An existing anomaly with an absent message uses its `xtdb.api.error` category class name as the general Flight status description.
+An empty message remains empty.
+Bounded anomaly metadata and custom commit-result errors omit an absent message field.
+Authentication uses its separate policy: faults hide their message, unsupported errors have no description when absent, and other absent messages use `authentication failed`.
+Raw host failures still require their source-specific conversion before entering these anomaly adapters.

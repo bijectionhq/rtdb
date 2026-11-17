@@ -186,5 +186,5 @@ fn lz4_payload_cannot_exceed_a_forged_small_arrow_length() {
     };
     bytes[prefix..prefix + 8].copy_from_slice(&1i64.to_le_bytes());
     let mut reader = rtdb_format::ipc::ArrowFile::open(bytes.into(), None).unwrap();
-    assert!(reader.read_page(0).unwrap_err().message.contains("LZ4 data exceeds its declared Arrow buffer length"));
+    assert!(reader.read_page(0).unwrap_err().message.as_deref().is_some_and(|message| message.contains("LZ4 data exceeds its declared Arrow buffer length")));
 }

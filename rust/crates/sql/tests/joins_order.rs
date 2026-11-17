@@ -82,7 +82,7 @@ async fn named_join_wildcards_retain_each_side_and_duplicate_outputs_fail() {
         "SELECT * FROM (VALUES (1)) AS l(x) JOIN (VALUES (1)) AS r(x) USING(x)",
         "SELECT l.*,r.* FROM (VALUES (1)) AS l(x) NATURAL JOIN (VALUES (1)) AS r(x)",
         "SELECT 1 AS x,2 AS x",
-    ] { assert!(query(sql).await.unwrap_err().message.contains("Duplicate column projection"), "{sql}"); }
+    ] { assert!(query(sql).await.unwrap_err().message.as_deref().is_some_and(|message| message.contains("Duplicate column projection")), "{sql}"); }
 }
 
 #[tokio::test]

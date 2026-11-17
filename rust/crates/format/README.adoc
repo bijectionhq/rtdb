@@ -95,3 +95,8 @@ Read builders own array and map construction states and receive each decoded ent
 A selected array handler constructs raw array contents directly; a nested tag or JSON map marker can select another constructor.
 Read-cache rollover overwrites slots from index zero while retaining unwritten old slots, matching references in the same top-level value.
 Fresh top-level values still begin with an empty cache.
+
+Anomaly messages retain null separately from empty text in current `xt/error` and historical error readers.
+The writer emits null for an absent message and a string for every present message.
+Typed context continues to use the internal Transit JSON wrappers, including non-string map keys and tagged values.
+`tests/transit.rs` records current and legacy null, empty and text messages, typed-context retention and invalid message-type rejection as unexecuted regression source.

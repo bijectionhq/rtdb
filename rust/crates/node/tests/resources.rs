@@ -187,7 +187,7 @@ fn configuration(value: &[u8]) -> DatabaseConfig {
 #[tokio::test]
 async fn remote_resources_require_cache_and_scope_equal_keys_by_database() {
     let native = NativeResources::default().register_storage("test.Remote", Arc::new(Remote)).unwrap();
-    assert!(native.validate("first", &configuration(b"one")).unwrap_err().message.contains("disk cache"));
+    assert!(native.validate("first", &configuration(b"one")).unwrap_err().message.as_deref().is_some_and(|message| message.contains("disk cache")));
     let directory = tempfile::tempdir().unwrap();
     let cache = DiskCache::open(directory.path(), 1024, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
     let native = native.with_disk_cache(cache);

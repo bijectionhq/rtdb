@@ -19,8 +19,8 @@ pub struct CompactionFailure {
     pub object_key: Option<String>,
     /// True only for the `rtdb.storage/permission-denied` anomaly code.
     pub permission_denied: bool,
-    /// Lowercase SHA-256 of the original anomaly message's UTF-8 bytes.
-    pub message_sha256: String,
+    /// Lowercase SHA-256 of a present message's UTF-8 bytes; absent messages serialize as JSON null.
+    pub message_sha256: Option<String>,
 }
 
 impl CompactionFailure {
@@ -32,10 +32,13 @@ impl CompactionFailure {
             .map(str::to_owned);
         let object_key = error.context.get("key").and_then(serde_json::Value::as_str)
             .and_then(|key| ObjectKey::new(key).ok()).map(|key| key.to_string());
-        let digest = Sha256::digest(error.message.as_bytes());
-        let mut message_sha256 = String::with_capacity(64);
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        for byte in digest { message_sha256.push(HEX[usize::from(byte >> 4)] as char); message_sha256.push(HEX[usize::from(byte & 15)] as char); }
+        let message_sha256 = error.message.as_ref().map(|message| {
+            let digest = Sha256::digest(message.as_bytes());
+            let mut hex = String::with_capacity(64);
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            for byte in digest { hex.push(HEX[usize::from(byte >> 4)] as char); hex.push(HEX[usize::from(byte & 15)] as char); }
+            hex
+        });
         Self { event: "compaction_failed", table: table.schema_and_table(), output_trie_key: output.to_string(),
             anomaly_code: error.code.clone(), anomaly_category: error.category, operation, object_key,
             permission_denied: error.code == "rtdb.storage/permission-denied", message_sha256 }

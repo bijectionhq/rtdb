@@ -83,3 +83,7 @@ Executable ABI, allocator, parity and concurrency verification belongs to the im
 The C pointer preconditions remain the host's obligation.
 The library can reject stale numeric handles; it cannot make arbitrary invalid foreign pointers readable.
 Arrow release callbacks must not throw or re-enter this blocking API.
+
+Diagnostic message field 2 borrows a null pointer with zero length for absence and a nonnull pointer with zero length for an empty message.
+Other diagnostic fields retain their existing slice contracts.
+Retaining the diagnostic keeps both its optional message and Transit representation alive until the last handle is released.

@@ -61,12 +61,24 @@ fn failure_json_has_typed_identity_and_sha256_without_raw_messages_or_arbitrary_
     let text = String::from_utf8(bytes).unwrap();
     assert!(!text.contains("secret")); assert!(!text.contains("provider.invalid")); assert!(!text.contains("endpoint"));
     let known = CompactionFailure::new(&table, &output, &Anomaly::fault("test/hash", "abc"));
-    assert_eq!(known.message_sha256, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    assert_eq!(known.message_sha256.as_deref(), Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"));
     let misleading = Anomaly::new(AnomalyCategory::Forbidden, "test/other", "PermissionDenied");
     assert!(!CompactionFailure::new(&table, &output, &misleading).permission_denied);
     let invalid = misleading.with_context("operation", "https://secret.invalid".into()).with_context("key", "https://secret.invalid/object".into());
     let invalid = CompactionFailure::new(&table, &output, &invalid);
     assert!(invalid.operation.is_none()); assert!(invalid.object_key.is_none());
+}
+
+#[test]
+fn absent_messages_have_no_digest_and_empty_messages_hash_empty_bytes() {
+    let table = TableRef::new("public", "foo"); let output: TrieKey = "l01-rc-b00".parse().unwrap();
+    let absent = CompactionFailure::new(&table, &output, &Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", None));
+    assert!(absent.message_sha256.is_none());
+    let json = serde_json::to_value(&absent).unwrap();
+    assert_eq!(json.get("message_sha256"), Some(&serde_json::Value::Null));
+    assert!(json.get("message").is_none());
+    let empty = CompactionFailure::new(&table, &output, &Anomaly::fault("test/error", ""));
+    assert_eq!(empty.message_sha256.as_deref(), Some("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"));
 }
 
 #[test]
@@ -247,7 +259,7 @@ async fn actual_metadata_upload_failure_preserves_storage_anomaly_and_emits_the_
         assert_eq!(error.category, AnomalyCategory::Forbidden); assert_eq!(error.code, "rtdb.storage/permission-denied");
         assert_eq!(error.context["key"], metadata_key.to_string()); assert_eq!(error.context["operation"], "put_file");
         assert_eq!(error.context.contains_key("path"), local);
-        assert!(error.message.contains("secret endpoint token"));
+        assert!(error.message.as_deref().is_some_and(|message| message.contains("secret endpoint token")));
         assert_eq!(*store.uploads.lock().unwrap(), [data_key.clone(), metadata_key.clone()]);
         assert!(store.head(&data_key).await.is_ok()); assert!(matches!(store.head(&metadata_key).await, Err(StorageError::MissingObject(_))));
         let events = observer.events(); assert_eq!(events.len(), 1);

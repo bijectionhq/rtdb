@@ -56,3 +56,7 @@ Reservation estimates bound ordinary decoded payloads, but a proof covering ever
 
 Transit URI imports validate Java URI syntax before constructing the native URI value and preserve its original spelling.
 `tests/uri.rs` retains valid registry-authority cases and invalid input rejection as unexecuted regression source.
+
+Anomaly output omits an absent message in plain JSON and retains it as null in JSON-LD and Transit.
+A present empty message remains a string in every representation.
+JSON-LD error input retains absent, null and non-string message fields as an absent message, matching the pinned string accessor.

@@ -51,7 +51,7 @@ impl JsonValue {
     pub fn from_registry_str(text: &str) -> Result<Self> { Self::from_registry_slice(text.as_bytes()) }
     fn from_slice_mode(bytes: &[u8], mode: NumberMode) -> Result<Self> {
         let raw = serde_json::from_slice::<&RawValue>(bytes).map_err(|cause| error("conversion-error", cause))?;
-        Self::parse_mode(raw, 0, mode).map_err(|cause| error("conversion-error", cause.message))
+        Self::parse_mode(raw, 0, mode).map_err(|cause| rtdb_types::Anomaly::new_nullable(rtdb_types::AnomalyCategory::Incorrect, "xtdb.kafka-connect-source/conversion-error", cause.message))
     }
     pub fn from_str(text: &str) -> Result<Self> { Self::from_slice(text.as_bytes()) }
     pub fn from_serde(value: serde_json::Value) -> Self {

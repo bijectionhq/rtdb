@@ -15,6 +15,31 @@ fn ok(status: i32, error: u64) {
 struct Native { database: u64, session: u64, retained: Vec<u64> }
 
 #[test]
+fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
+    for message in [None, Some(String::new()), Some("échec".into())] {
+        let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));
+        assert_ne!(original, 1);
+        let mut retained = 0; let mut error = 0;
+        ok(unsafe { rtdb_v1_retain(original, &mut retained, &mut error) }, error);
+        handles::release(original).unwrap();
+        let mut slice = RtdbSlice { data: std::ptr::null(), length: 0 };
+        ok(unsafe { rtdb_v1_error_field(retained, 2, &mut slice, &mut error) }, error);
+        assert_eq!(slice.data.is_null(), message.is_none());
+        assert_eq!(slice.length, message.as_ref().map_or(0, String::len));
+        if let Some(message) = &message { assert_eq!(unsafe { std::slice::from_raw_parts(slice.data, slice.length) }, message.as_bytes()); }
+        for (field, expected) in [(0, b"fault".as_slice()), (1, b"test/error".as_slice())] {
+            ok(unsafe { rtdb_v1_error_field(retained, field, &mut slice, &mut error) }, error);
+            assert_eq!(unsafe { std::slice::from_raw_parts(slice.data, slice.length) }, expected);
+        }
+        ok(unsafe { rtdb_v1_error_field(retained, 3, &mut slice, &mut error) }, error);
+        assert!(!slice.data.is_null());
+        let decoded = rtdb_format::transit::decode_anomaly(unsafe { std::slice::from_raw_parts(slice.data, slice.length) }).unwrap();
+        assert_eq!(decoded.message, message);
+        handles::release(retained).unwrap();
+    }
+}
+
+#[test]
 fn database_properties_reject_unknown_and_oversized_inputs_before_node_configuration() {
     let yaml = b"not: [valid YAML";
     for properties in [r#"{"xtdb.vector.null-checks":"false"}"#,r#"{"java.util.Arrays.useLegacyMergeSort":true}"#] {
@@ -23,14 +48,14 @@ fn database_properties_reject_unknown_and_oversized_inputs_before_node_configura
         assert_eq!(database,0);
         let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
         assert_eq!(diagnostic.error.code,"xtdb/invalid-node-config");
-        assert!(diagnostic.error.message.contains("system propert"));
+        assert!(diagnostic.error.message.as_deref().is_some_and(|message| message.contains("system propert")));
         handles::release(error).unwrap();
     }
     let mut database = 42;let mut error = 0;
     assert_eq!(unsafe { rtdb_v1_database_open_with_properties(yaml.as_ptr(),yaml.len(),1 << 20,std::ptr::null(),4097,&mut database,&mut error) },1);
     assert_eq!(database,0);
     let Handle::Error(diagnostic) = handles::get(error).unwrap() else { panic!("expected diagnostic") };
-    assert!(diagnostic.error.message.contains("4096"));handles::release(error).unwrap();
+    assert!(diagnostic.error.message.as_deref().is_some_and(|message| message.contains("4096")));handles::release(error).unwrap();
 }
 
 impl Native {

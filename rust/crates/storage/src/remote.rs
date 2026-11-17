@@ -274,7 +274,7 @@ mod tests {
         assert_eq!(anomaly.category, rtdb_types::AnomalyCategory::Forbidden);
         assert_eq!(anomaly.code, "rtdb.storage/permission-denied");
         assert_eq!(anomaly.context["key"], key.as_str());
-        assert!(anomaly.message.contains("injected provider denial"));
+        assert!(anomaly.message.as_deref().is_some_and(|message| message.contains("injected provider denial")));
     }
 
     #[test]

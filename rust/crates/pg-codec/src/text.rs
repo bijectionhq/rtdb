@@ -165,10 +165,10 @@ fn json_error(kind: &str, text: &str) -> Result<Value> {
     use rtdb_types::AnomalyCategory as C;
     let object: BTreeMap<String, serde_json::Value> = serde_json::from_str(text).map_err(invalid)?;
     let category = match kind { "xt:incorrect" => C::Incorrect, "xt:unsupported" => C::Unsupported, "xt:conflict" => C::Conflict, "xt:interrupted" => C::Interrupted, "xt:not-found" => C::NotFound, "xt:forbidden" => C::Forbidden, "xt:busy" => C::Busy, "xt:unavailable" => C::Unavailable, _ => C::Fault };
-    let message = object.get("xtdb.error/message").and_then(serde_json::Value::as_str).unwrap_or_default();
+    let message = object.get("xtdb.error/message").and_then(serde_json::Value::as_str).map(str::to_owned);
     let data = object.get("xtdb.error/data").and_then(serde_json::Value::as_object);
     let code = data.and_then(|data| data.get("xtdb.error/code")).and_then(serde_json::Value::as_str).unwrap_or("xtdb/error");
-    let mut error = Anomaly::new(category, code, message);
+    let mut error = Anomaly::new_nullable(category, code, message);
     if let Some(data) = data { error.context = data.clone().into_iter().collect(); }
     Ok(Value::Transit(rtdb_format::transit::encode_anomaly(&error)?))
 }

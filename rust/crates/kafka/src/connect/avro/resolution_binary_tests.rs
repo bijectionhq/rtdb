@@ -108,7 +108,7 @@ fn projected_zero_width_blocks_do_not_materialize_or_walk_each_element() {
 fn skipped_negative_byte_lengths_can_rewind_inside_the_decoder_window() {
     for schema in [r#""bytes""#, r#""string""#] {
         assert_eq!(projected(schema, &[1]).unwrap(), Avro::Record(vec![("keep".into(), Avro::Long(-1))]));
-        assert!(projected(schema, &[3]).unwrap_err().message.contains("before the admitted decoder window"));
+        assert!(projected(schema, &[3]).unwrap_err().message.as_deref().is_some_and(|message| message.contains("before the admitted decoder window")));
     }
     let schema = plan(r#""string""#); let mut context = context();
     assert!(schema.decode_datum(&[1], &mut context).is_err());
@@ -118,9 +118,9 @@ fn skipped_negative_byte_lengths_can_rewind_inside_the_decoder_window() {
 #[test]
 fn skipped_negative_blocks_cannot_revisit_more_than_the_admitted_input_length() {
     let cause = projected(r#"{"type":"array","items":"null"}"#, &[1, 3]).unwrap_err();
-    assert!(cause.message.contains("rewind allowance"));
+    assert!(cause.message.as_deref().is_some_and(|message| message.contains("rewind allowance")));
     let cause = projected(r#"{"type":"array","items":"bytes"}"#, &[8, 1, 0]).unwrap_err();
-    assert!(cause.message.contains("rewind allowance"));
+    assert!(cause.message.as_deref().is_some_and(|message| message.contains("rewind allowance")));
 }
 
 #[test]
@@ -129,7 +129,7 @@ fn skipped_rewinds_cannot_cross_the_first_short_primitive_compaction() {
     let reader = plan(r#"{"type":"record","name":"R","fields":[{"name":"keep","type":"int"}]}"#);
     let mut context = context(); let resolution = AvroResolution::compile(&writer, &reader, &mut context).unwrap();
     let mut bytes = vec![0; 21]; bytes[12] = 3;
-    assert!(resolution.decode_datum(&bytes, &mut context).err().unwrap().message.contains("before the admitted decoder window"));
+    assert!(resolution.decode_datum(&bytes, &mut context).err().unwrap().message.as_deref().is_some_and(|message| message.contains("before the admitted decoder window")));
 }
 
 #[test]

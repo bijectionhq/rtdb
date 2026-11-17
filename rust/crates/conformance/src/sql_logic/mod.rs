@@ -53,7 +53,7 @@ fn error_value(error: &Anomaly) -> Json { json!({"category":error.category,"code
 fn caught(record: &Record, error: &Anomaly) -> &'static str {
     if error.code.starts_with("rtdb.conformance/slt-harness") || error.code == "rtdb.conformance/slt-format" { "harness_gap" }
     else if record.skipif.iter().any(|engine| engine == "postgresql") { "suppressed_postgresql_error" }
-    else if error.message.contains("Duplicate column projection") { "suppressed_duplicate_projection" }
+    else if error.message.as_deref().is_some_and(|message| message.contains("Duplicate column projection")) { "suppressed_duplicate_projection" }
     else { "error" }
 }
 fn expected_matches(record: &Record, result: &Json) -> bool {

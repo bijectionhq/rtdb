@@ -279,7 +279,7 @@ async fn duration_sum_wraps_conversion_and_distinguishes_null_vector_slots() {
     let milli = LogicalType::Scalar(ScalarType::Duration(TimeUnit::Millisecond));
     assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),second.clone(),vec![vec![Value::Duration { value: i64::MAX,unit: TimeUnit::Second }],vec![Value::Duration { value: 1,unit: TimeUnit::Second }]],None)).await,Value::Duration { value: 0,unit: TimeUnit::Millisecond });
     let mut cursor = primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),milli.clone().maybe(),vec![vec![Value::Duration { value: 5,unit: TimeUnit::Millisecond },Value::Null]],None);
-    let error = cursor.next_page().await.err().unwrap();assert_eq!(error.code,"xtdb.error/unknown");assert_eq!(error.message,"null at index 1");drop(cursor);
+    let error = cursor.next_page().await.err().unwrap();assert_eq!(error.code,"xtdb.error/unknown");assert_eq!(error.message.as_deref(),Some("null at index 1"));drop(cursor);
     for input in [LogicalType::Null,second.join(&milli).maybe()] {
         assert_eq!(primitive_result(primitive_cursor(&execution,AggregateFunction::Sum,milli.clone(),input,vec![vec![Value::Null]],None)).await,Value::Null);
     }

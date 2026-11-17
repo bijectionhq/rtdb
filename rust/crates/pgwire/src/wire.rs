@@ -58,11 +58,12 @@ impl<W: AsyncWrite + Unpin> Writer<W> {
         Ok(())
     }
     pub async fn error(&mut self, error: &Anomaly, fallback: PgType, fatal: bool) -> Result<()> {
-        let retained = error.context.iter().try_fold(error.message.len() + error.code.len() + 256, |bytes, (key, value)| bytes.checked_add(key.len()).and_then(|n| n.checked_add(json_bytes(value).ok()?)).ok_or_else(|| protocol("Error detail too large")))?;
+        let retained = error.message.as_ref().map_or(0, String::len).checked_add(error.code.len()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Error detail too large"))?;
+        let retained = error.context.iter().try_fold(retained, |bytes, (key, value)| bytes.checked_add(key.len()).and_then(|n| n.checked_add(json_bytes(value).ok()?)).ok_or_else(|| protocol("Error detail too large")))?;
         let _scratch = self.memory.reserve(retained.checked_mul(32).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Error detail too large"))?)?;
         let detail = if error.context.contains_key("sql-state") { None } else { rtdb_pg_codec::encode_error(error, fallback).ok().and_then(|bytes| String::from_utf8(bytes).ok()) };
         let severity = if fatal { "FATAL" } else { "ERROR" };
-        let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_str())];
+        let mut fields = vec![(b'S', severity), (b'V', severity), (b'C', crate::error::state(error)), (b'M', error.message.as_deref().unwrap_or(""))];
         if let Some(detail) = &detail { fields.push((b'D', detail)); }
         if matches!(error.code.as_str(), "xtdb/prepared-query-out-of-date" | "prepared-query-out-of-date") { fields.push((b'R', "RevalidateCachedQuery")); }
         self.fields(b'E', &fields).await
@@ -94,6 +95,29 @@ impl<'a> Input<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nullable_error_primary_text_and_structured_details_preserve_their_policies() {
+        for message in [None, Some(String::new()), Some("detail".into())] {
+            let error = Anomaly::new_nullable(rtdb_types::AnomalyCategory::Fault, "test/error", message.clone());
+            for fallback in [PgType::Json, PgType::JsonLd, PgType::Transit] {
+                let memory = MemoryBudget::new(1 << 20);
+                let mut writer = Writer::new(Vec::new(), Arc::clone(&memory));
+                writer.error(&error, fallback, false).await.unwrap();
+                let bytes = writer.into_inner();
+                assert_eq!(bytes[0], b'E');
+                assert_eq!(i32::from_be_bytes(bytes[1..5].try_into().unwrap()) as usize, bytes.len() - 1);
+                let mut input = Input::new(&bytes[5..]);
+                let mut fields = BTreeMap::new();
+                loop { let tag = input.byte().unwrap(); if tag == 0 { break; } fields.insert(tag, input.string().unwrap()); }
+                input.end().unwrap();
+                assert_eq!(fields[&b'M'], message.as_deref().unwrap_or(""));
+                assert_eq!(fields[&b'D'].as_bytes(), rtdb_pg_codec::encode_error(&error, fallback).unwrap());
+                assert_eq!(error.message, message);
+                assert_eq!(memory.used_bytes(), 0);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn declared_length_is_rejected_before_payload_reservation() {
