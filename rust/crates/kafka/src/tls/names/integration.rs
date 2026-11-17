@@ -24,6 +24,7 @@ fn broker(server: &Credential, root: &Credential, authority: &Credential, versio
                 Err(error) => return Err(error.to_string()),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut stream = SslStream::new(Ssl::new(&context).unwrap(), socket).unwrap();
         stream.accept().map_err(|error| error.to_string())?;

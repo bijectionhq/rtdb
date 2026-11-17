@@ -45,6 +45,7 @@ fn registry_default_context_negotiates_java_tls12_cbc() {
                 Err(error) => panic!("Registry fixture accept failed: {error}"),
             }
         };
+        socket.set_nonblocking(false).unwrap();
         socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut stream = SslStream::new(Ssl::new(&server_context).unwrap(), socket).unwrap(); stream.accept().unwrap();
         let mut byte = [0]; stream.read_exact(&mut byte).unwrap(); assert_eq!(byte, [7]);

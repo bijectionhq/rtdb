@@ -86,6 +86,7 @@ pub fn broker(server: &Credential, accepted_issuer: &Credential, version: SslVer
                 Err(error) => return Err(format!("accept: {error}")),
             }
         };
+        stream.set_nonblocking(false).unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap(); stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut stream = SslStream::new(Ssl::new(&context).unwrap(), stream).unwrap(); stream.accept().map_err(|error| format!("handshake: {error}"))?;
         Ok(Handshake { certificate: stream.ssl().peer_certificate().unwrap().to_der().unwrap(), protocol: stream.ssl().version_str().into(), cipher: stream.ssl().current_cipher().unwrap().standard_name().unwrap().into() })
