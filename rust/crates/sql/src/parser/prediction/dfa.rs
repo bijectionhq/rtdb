@@ -178,6 +178,9 @@ impl<'cfg, 'g, 'scope> PredictionDfas<'cfg, 'g, 'scope> {
         if result.is_err() { let _ = contexts.finish::<()>(Err(PredictionError::Aborted)); }
         self.finish_config(result, configs)
     }
+    pub(super) fn abort<'id>(&mut self, configs: &mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, contexts: &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
+        let _ = self.finish_all::<()>(Err(PredictionError::Aborted), configs, contexts);
+    }
     fn decision(&self, number: u16) -> Result<&DecisionDfa<Retained>> {
         self.store.decisions.get(usize::from(number)).ok_or(PredictionError::Artifact(Problem::DfaDecision))
     }

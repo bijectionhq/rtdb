@@ -5,6 +5,7 @@ mod mode;
 mod storage;
 mod dfa;
 mod closure;
+mod runtime;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};
@@ -26,10 +27,10 @@ pub(crate) enum PredictionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Problem { Capacity, Context, LocalClosure, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, Grammar(ArtifactIssue) }
+pub(crate) enum Problem { Capacity, Context, LocalClosure, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, ClosurePhase, Grammar(ArtifactIssue) }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SourceAssertionSite { ReachStopEmpty, PopDepth, FalloffDepth }
+pub(crate) enum SourceAssertionSite { ReachStopEmpty, PopDepth, FalloffDepth, FullNoOuter }
 
 impl From<GrammarError> for PredictionError {
     fn from(error: GrammarError) -> Self {
@@ -81,3 +82,8 @@ fn push<T>(values: &mut Vec<T>, value: T, allocation: &AllocationScope) -> Resul
     values.push(value);
     Ok(())
 }
+
+mod factory_error_sealed { pub trait Sealed {} }
+pub(super) trait FactoryError: factory_error_sealed::Sealed + From<PredictionError> {}
+impl factory_error_sealed::Sealed for PredictionError {}
+impl FactoryError for PredictionError {}

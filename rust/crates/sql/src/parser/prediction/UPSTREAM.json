@@ -166,10 +166,15 @@
         "source": "atn/ATNDeserializer.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNDeserializer.java",
         "sha256": "696e4b89613c6ad47ba5264c755ed77120897679bb1e4f961c3e3e799e38e7cf"
+      },
+      {
+        "source": "Recognizer.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/Recognizer.java",
+        "sha256": "125fe54ea24213ee9c6e04d85f18ff5668fbeb266e41a8135e383b3542dbd558"
       }
     ]
   },
-  "scope": "Prediction-context/configuration/mode values, private retained 372-decision DFA storage and complete private local/SLL start/closure/reach/cold precedence-filter/loop-entry-pruning kernels for the pinned grammar; no full-context or adaptive predictor, generated parser or production adapter.",
+  "scope": "Prediction-context/configuration/mode values, retained private372-decision DFA, complete Local/SLL and Full start/closure/reach kernels over one merge round, and bounded explicit-policy real-token/primary-invocation runtime control; adaptive prediction, generated schedules, host-policy capture, production cache mapping and capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -248,9 +253,47 @@
     "busy": "Incoming-first full-config equality with allocation-free LinkedFrames, stored native insertion hashes and boolean-only membership under the separate local producer stability proof.",
     "source_assertions": "Explicit Enabled/Disabled runtime profile; reached no-message AssertionError site facts for RuleStop Empty context and MIN_VALUE-before-pop/falloff, with disabled Java wrapping arithmetic.",
     "mandatory_successors": [
-      "Full-context producers over the real parser invocation/precedence/token owners on the same round",
+      "Actual host snapshot/assertion producer and production parser/cache ownership mapping; private Full producer is implemented separately on the same round.",
       "Adaptive prediction, metadata, diagnostics and generated 176-rule schedules",
       "Production capability preservation or reviewed migration under the open embedded-parser-error-capability gate"
+    ]
+  },
+  "runtime_profile_sources": {
+    "jdk": "Temurin25.0.1+8",
+    "sources": [
+      {
+        "source": "java/lang/Boolean.java",
+        "url": "https://raw.githubusercontent.com/openjdk/jdk25u/jdk-25.0.1%2B8/src/java.base/share/classes/java/lang/Boolean.java",
+        "sha256": "fe13c6057ffa9a8458613f9766cf06d498140b9468a241ca42ffbf2db9416abd"
+      },
+      {
+        "source": "java/lang/Class.java",
+        "url": "https://raw.githubusercontent.com/openjdk/jdk25u/jdk-25.0.1%2B8/src/java.base/share/classes/java/lang/Class.java",
+        "sha256": "c8bbfd60aa7c15f4121e2b8ea5aba2c145babfa972528306c1a765a74138bd94"
+      },
+      {
+        "source": "java/lang/ProcessEnvironment.java",
+        "url": "https://raw.githubusercontent.com/openjdk/jdk25u/jdk-25.0.1%2B8/src/java.base/unix/classes/java/lang/ProcessEnvironment.java",
+        "sha256": "cba847bedab165ef971de46fde14c419d7212ebc48714676cb4903bdf66cb72d"
+      }
+    ],
+    "capture": "OPEN: explicit CapturedClassPolicy consumer only; source class-initialization environment snapshot and assertion selection require the future admitted host adapter."
+  },
+  "private_runtime_full_domain": {
+    "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
+    "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",
+    "cleanup_limit": "Mandatory reopen before generated/tree/listener post-current entry effects; legal cached-token precursor theorem does not settle arbitrary JVM Parser cleanup.",
+    "full": "Complete private Full start/closure/reach over the same terminal Local-to-Full ClosureRound/MergeRound. Full context domain includes generic Array classes and terminal EmptyReturn. No Full set is interned in ordinary C3 maps.",
+    "memo": "Absent or Present retained exactly at handoff; first FullReach activates before intermediate admission; no nested/reset merge round after handoff.",
+    "busy": "Separate Full theorem: only immutable EOF successors357/370 enter Boolean-only Busy under allocation-free incoming-first shared LinkedFrames equality; no JVM identity hash/layout/resource parity.",
+    "errors": "Sealed actual RuntimeError SQL-borrowed Err through shared factories; outer restoration guard survives memo/facade/collector cleanup, disarms before real seek and releases after success.",
+    "assertions": "Explicit profile, including FullNoOuter reached at completed Full closure end; disabled source arithmetic unchanged.",
+    "mandatory_open": [
+      "Actual host snapshot/assertion producer",
+      "Production classloader/cache realm, budget and concurrent writer policy",
+      "embedded-parser-error-capability",
+      "Adaptive prediction and all176 generated/tree/listener/diagnostic/reset schedules",
+      "Phase2 and executed compiler/discovery/tests"
     ]
   }
 }

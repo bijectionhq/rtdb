@@ -368,6 +368,78 @@ Source assertions are selected explicitly rather than inferred from a Rust build
 Reached checks retain the RuleStop-Empty and MIN_VALUE-before-pop/falloff sites as owned inline no-message `AssertionError` facts for the future diagnostic owner.
 Disabled checks retain Java wrapping arithmetic without an artificial depth cap.
 No-reach `None` is a producer fact; later adaptive control constructs the actual no-viable exception at its source location.
-Full-context producers, real parser/token ownership, adaptive control, generated schedules and diagnostic adapters remain mandatory successors.
+The private runtime and Full producer described below extend this local kernel; adaptive control, generated schedules and diagnostic adapters remain mandatory successors.
 The OPEN `embedded-parser-error-capability` gate still blocks production adoption and compatibility closure; wire projection does not discharge the embedded cause/recognizer/config/DFA obligation.
 Compiler and runtime qualification remain unrun.
+
+== Private runtime and Full continuation
+
+`ParserEnvironment` is a passive retained region containing one transferred `PredictionStorage` and explicit immutable `CapturedClassPolicy`.
+Construction initializes the actual372 C3 decisions through existing admission and preserves any populated cache.
+Exclusive session borrowing retains that same region across predictions, failures and subsequent sessions.
+This private caller-selected native region is not a production classloader sharing or concurrency policy.
+The host snapshot/assertion producer and production cache realm, shared budget, concurrent writer and observable history mapping remain OPEN.
+Policy capture consumes explicit pruning/assertion facts without reading host environment, inferring build assertions or selecting defaults.
+
+`ParserSession` is a passive parse transient owning the real admitted `TokenStream`, primary invocation records, current recognizer state/context, witnessed signed precedence stack, matched-EOF fact and failure state.
+Its append-only parse-branded records are the actual context control identities for later generated/tree work.
+They remain through bounded control clearing and are destroyed before the work scope can drop.
+There is no parallel invocation graph, semantic stack, token provider, buffer replacement or per-transition collector.
+Ordinary construction rejects left-recursive rules; entry checks the Ordinary role, unentered start/stop and captured actual parent/state/call binding before effects.
+Ordinary exit requires an entered Ordinary current record and restores invoking state after its real stop demand.
+Source-null start/stop facts retain their partial failure prefixes.
+
+Recursive entry saves the original generated outer parent/invoking state immutably on its initial primary record.
+The existing precedence element contains its actual signed value and entry witness together, with full enlarged native capacity admitted before push.
+Entry sets rule-start state, admits/pushes precedence, selects current context and demands real `LT(1)` before returning active authority.
+An initial token error retains the Entering prefix and grants no invented finally capability.
+A fresh replacement is admitted with that entry's saved outer pair before push; current loop state and later live initial-parent mutations do not supply its origin.
+Push binds the same active entry/current head, then updates previous parent/invoking state before real `LT(-1)`, stop, current replacement and inherited start.
+Unroll reads actual current, pops the checked actual top once before real `LT(-1)`, writes stop/current saved parent/retctx parent and closes that entry.
+It does not restore Recognizer state.
+Closing and Closed reject repeated cleanup; stale, cross-entry and wrong-role capabilities reject before effects and latch failure.
+Eligible source finally and rewind remain callable after a body error; normal work remains sealed.
+
+The bounded cleanup theorem uses the existing stream's immutable buffered prefix: a successfully entered parent makes nested `LT(1)` and `LT(-1)` cached reads.
+Root initialization and constructor/precedence admission retain their real failure stages, including rule-start state before failed precedence growth.
+Entered ordinary children execute their source finally before recursive parents.
+Actual generated tree/listener/other post-current entry effects MUST reopen failed-child cleanup before generated or production adoption.
+This precursor does not replace that review with fabricated failed-child fixtures or an extra ordinary-scope stack.
+
+Prediction captures an actually initialized index, immutable current invocation view and real stack top.
+An uninitialized index remains absent and fails before mark, work or memo entry.
+`PredictionInput` exclusively borrows the stack-owned restoration guard outside the access and closure factories.
+That guard alone borrows the actual stream and failure state.
+Shared sealed generic factories propagate the original `RuntimeError` as `Err`, including its SQL-borrowed recognition fact, after comparison-link cleanup.
+Only inline PredictionError identity and RuntimeError wrapping implement the conversion boundary.
+Work, memo, facades and actual collector cleanup finish before origin restoration.
+Normal restoration disarms before its single real seek, releases only after success and lets a seek error override the original result.
+Unwind marks failure and restores after inner owners drop; the captured buffered origin remains seekable without new admission.
+No Drop retry, error clone, `Ok(Err)` channel or raw cache capability escape is provided.
+
+`ClosureRound` transitions terminally from Local to Full while retaining the same merge round and its exact Absent/Present history.
+Every Local owning method checks phase before shortcut, memo, cache binding or allocation.
+Full start is single-entry; first Full reach activates the existing memo before intermediate admission.
+Private `parts` and generic keys remain a closed-controller discipline boundary: later adaptive code must exclude nested/reset rounds, arbitrary cached alias mutation and Local publication after Full.
+Brands alone do not prove that call-graph condition.
+
+Local and Full policies select one iterative closure and epsilon kernel.
+Full start converts the actual current primary parent path through existing `from_invocations`, then creates fresh packed-zero Unpredicated configurations in source alternative order.
+Full stop handling visits normal live parents in order; terminal EmptyReturn copies the same stop with Empty, and an Empty stop adds its original identity without chasing global returns.
+The explicit source profile selects the completed `FullNoOuter` assertion.
+Full precedence uses actual origin/current seeks around the pinned stack predicate, then copies or eliminates the successor without accumulating semantic context.
+Full reach withholds all prior stops for every token, runs the source shortcut only without withheld stops and non-EOF input, and filters EOF results before longest-match stop reinsertion.
+Prior stops are reinserted only when no new stop was reached.
+Full sets retain fresh metadata and never enter ordinary C3 maps or acquire fabricated roots.
+
+Full Busy has its own source proof.
+Full stop handling makes the local falloff insertion unreachable; only EOF successors357/370 are inserted.
+They are epsilon-only and copied before any output-set mutation, preserving stored hashes and current configuration values.
+Incoming-first shared `LinkedFrames` equality returns only the complete-search insertion boolean with allocation-free link cleanup.
+This does not claim JVM Empty identity hashes, collision/tree layout or Java heap/stack failure parity.
+Existing collector traversal reaches actual C3 roots and their current configuration contexts; unrooted Full work is swept by the same guard.
+
+The embedded cause/recognizer/config/DFA capability gate remains OPEN and distinct from wire results.
+The actual adaptive controller, all176 generated schedules, tree/labels/listeners, full reset/error strategy, diagnostics and production adapters remain required.
+No declared operation substitutes a placeholder for those successors.
+Source review of this private precursor does not authorize Phase2, production adoption or compiler/runtime qualification.

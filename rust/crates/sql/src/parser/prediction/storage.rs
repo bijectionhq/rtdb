@@ -210,6 +210,7 @@ impl PredictionStorage {
     pub(crate) fn new(grammar: OwnedGrammar, memory: &Arc<MemoryBudget>) -> Self {
         Self { dfas: DfaStore::new(Retained::new(memory)), configs: ConfigurationStore::new(Retained::new(memory)), contexts: ContextStore::new(Retained::new(memory)), grammar, #[cfg(test)] roots: FixtureRoots::new() }
     }
+    pub(super) fn grammar_view(&self) -> crate::parser::grammar::Grammar<'_> { self.grammar.view() }
     pub(crate) fn with_contexts<R>(
         &mut self, work: &AllocationScope,
         use_contexts: impl for<'id, 'access> FnOnce(&mut PredictionContexts<'id, 'access, 'access, Retained>) -> Result<R>,
@@ -262,6 +263,13 @@ pub(crate) fn with_prediction_storage<R>(
     storage: &mut PredictionStorage, work: &AllocationScope,
     use_store: impl for<'id, 'cfg, 'access> FnOnce(&mut PredictionAccess<'cfg, 'id, 'access, 'access>) -> Result<R>,
 ) -> Result<R> {
+    with_prediction_storage_result(storage, work, use_store)
+}
+
+pub(super) fn with_prediction_storage_result<R, E: super::FactoryError>(
+    storage: &mut PredictionStorage, work: &AllocationScope,
+    use_store: impl for<'id, 'cfg, 'access> FnOnce(&mut PredictionAccess<'cfg, 'id, 'access, 'access>) -> std::result::Result<R, E>,
+) -> std::result::Result<R, E> {
     let session = BorrowSession { owner: storage };
     let grammar = session.owner.grammar.view();
     let contexts = PredictionContexts::borrowed(&grammar, work, &mut session.owner.contexts);

@@ -370,10 +370,14 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
     }
 
     pub(crate) fn with_merge_round<R>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope, M>) -> Result<R>) -> Result<R> {
-        self.ready()?;
+        self.with_merge_round_result(use_round)
+    }
+    pub(super) fn with_merge_round_result<R, E: super::FactoryError>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope, M>) -> std::result::Result<R, E>) -> std::result::Result<R, E> {
+        self.ready().map_err(E::from)?;
         self.memo.clear();
         let result = use_round(&mut MergeRound { owner: self });
-        self.finish(result)
+        if result.is_err() { self.aborted = true; }
+        result
     }
 
     fn candidate(&self, capacity: usize) -> Result<CandidateArray<'id>> { Ok(CandidateArray { edges: vector(self.allocation, capacity)? }) }
