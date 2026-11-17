@@ -60,13 +60,13 @@ mod tests {
     }
 
     #[test]
-    fn magnitude_overflow_and_uncovered_parameters_preserve_propagation() {
+    fn magnitude_overflow_preserves_propagation_and_specified_child_io_is_caught() {
         let error = integer_failure(integer::IntegerError::MagnitudeOverflow);
         assert!(matches!(&error, Failure::Propagate(_)));
         assert_eq!(error.into_anomaly(), malformed());
-        let error = super::super::fixed_service(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3], &[0x30, 0]).unwrap_err();
-        assert!(matches!(&error, Failure::Propagate(_)));
-        assert_eq!(error.into_anomaly(), super::super::unsupported());
+        let oid = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3];
+        let name = super::super::recursive::initialized_name(oid, &[0x30, 0]).unwrap();
+        assert!(matches!(name, super::super::DigestName::Oid(value) if value.as_slice() == oid));
     }
 
     #[test]

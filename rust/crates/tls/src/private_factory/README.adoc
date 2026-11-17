@@ -142,11 +142,31 @@ The skipped OID's contents are not validated or required to identify PBES2.
 The real parameter value still requires a SEQUENCE after its KDF is parsed.
 The historical wrapper's remaining tail is ignored.
 
+== SpecifiedSHA2 parameter names
+
+`SpecifiedSHA2withECDSA` derives its name by parsing its non-NULL parameter as one AlgorithmIdentifier, initializing that child's registered parameter service, removing hyphens from the child's name, and appending `withECDSA`.
+SHA-1, SHA-224, SHA-256, SHA-384, and SHA-512 produce registered signature names and corresponding OIDs.
+Other successful child names have no reverse OID in the pinned provider profile.
+For example, SHA3-224 produces `SHA3224withECDSA`, whose spelling differs from the registered `SHA3-224withECDSA` name.
+The complete KnownOIDs derivation, including its 280 input names and five matches, is recorded in link:parameters/specified/README.adoc[the source derivation].
+
+A Java IOException while parsing or initializing the child selects the ordinary `SpecifiedSHA2withECDSA` name and OID.
+Absent or NULL parameters also retain that ordinary name.
+The enclosing identifier's own framing, OID, NULL contents, and cardinality are checked before its catch boundary exists.
+A child SpecifiedSHA2 that catches an error becomes a successful child name for an enclosing SpecifiedSHA2, which appends another suffix and has no reverse OID.
+Unchecked failures and native resource failures do not select this fallback.
+
+`DigestName::Unmapped` is a passive value for a successful derived name without a reverse OID or default private-key factory target.
+The evaluator retains only that observation, a known OID, or a typed PBES2 name; it does not construct nested name strings.
+A CRT key retains the containing parameter bytes, while a non-CRT rebuild uses the known derived signature OID or ordinary fallback OID and rejects an unmapped name.
+SpecifiedSHA2 results never satisfy the MGF digest allowlists.
+Stored AlgorithmIdentifier parameters remain encoded even though Java's `getEncodedParams` accessor returns null for this OID.
+
 == Parameter failure boundaries
 
 Parameter admission returns a passive `Failure` value that distinguishes modeled Java IO failures from failures that propagate through parameter-name lookup.
 The `JavaIo` variant retains malformed DER, tags, OIDs, field cardinality, parameter values, and representable BigInteger values outside the signed 32-bit range.
-The `Propagate` variant retains uncovered parameter behavior and BigInteger magnitude overflow.
+The `Propagate` variant retains BigInteger magnitude overflow.
 `DerValue.getBigIntegerInternal` constructs BigInteger before checking the signed 32-bit range.
 BigInteger's supported-magnitude check throws ArithmeticException, which DSAParameters does not catch and the NumberFormatException handlers in DHParameters and PBEParameters do not catch.
 The integer decoder retains that distinction before parameter admission applies its policy.
@@ -155,7 +175,7 @@ The parameter-local DER adapters classify failures at their parser boundaries wi
 The existing private-key admission reservation precedes these parsers; reservation and allocation-bound failures remain outside their Java IO conversions.
 Failure values and integer parse results are call-local passive values, with no additional growing collection or retained buffer.
 The public private-key result preserves the original anomaly from either variant.
-The current parameter evaluator propagates both variants without suppression.
+Only a pending SpecifiedSHA2 child catch can consume `JavaIo`; every `Propagate` failure returns immediately without consuming a catch boundary.
 
 == Admission and remaining source work
 
@@ -164,17 +184,22 @@ The source estimate allocates `128 * input_bytes` to the existing normalized PKC
 On a 64-bit target, the converter's section payload is at most 40 bytes per section, with each section requiring at least two input bytes; old and replacement vector capacities can overlap during growth.
 RSA component collections have eight members, optional PKCS8 fields have at most two members, and only the outer PSS result retains its last resolved hash name, MGF digest, and salt values.
 
-Nested PSS and OAEP services use a passive iterative evaluator on the caller's task.
-Its `Frame` values are call-local transients: a field continuation owns only its compact undecoded sibling suffix and parsing position, while an MGF continuation owns an OID and its allowlist choice.
-A rejected wrapper continuation has no payload.
+Nested PSS, OAEP, and SpecifiedSHA2 use a passive iterative evaluator on the caller's task.
+The evaluator is a single-writer call-local transient owning one work stack, one completed-child name slot, and the outer PSS result under construction.
+Its `Frame` values hold a shallow identifier to initialize, a compact undecoded sibling suffix, a fixed-service completion, a root-digest assignment, an MGF allowlist choice, a deferred wrapper rejection, or a SpecifiedSHA2 catch boundary.
+MGF continuations consume the completed child name without retaining another OID.
+Fixed-service completion frames hold only a service discriminator, and rejected-wrapper and SpecifiedSHA2 frames have no payload.
 The shallow `Identifier` owns an OID and a single encoded parameter value, without a full duplicate AlgorithmIdentifier encoding.
 The enclosing parsing buffers drop before the next child frame is evaluated.
 Pending sibling regions and active child regions are disjoint; an ancestor does not retain its consumed subtree or vector capacity.
 No frame contains another frame, and dropping a pending traversal is iterative.
 
-Each live frame corresponds to at least two consumed input bytes.
+Each retained frame is attributed to a distinct input TLV header, apart from a fixed number of root and active-work frames.
+Field continuations use their service parameter's outer header, fixed-service completions use their AlgorithmIdentifier header, MGF checks use their MGF wrapper header, deferred rejections use their owning context header, and SpecifiedSHA2 catches use their own AlgorithmIdentifier header.
+An initialization frame is popped before adding those service continuations, and only the outer PSS result receives a root-digest assignment frame.
+An unresolved malformed child adds at most one active initialization beyond those attributions.
 A compile-time assertion bounds its payload to 64 bytes on the target.
-Allowing old and replacement vector capacities during growth, frame storage is bounded by `96 * input_bytes` in the source estimate.
+Allowing old and replacement vector capacities during growth, frame storage is bounded by `96 * input_bytes` plus fixed overhead in the source estimate.
 An additional `32 * input_bytes` covers simultaneous frontier, suffix-copy, OID, and shallow parameter-encoding buffers, including BER-normalized views.
 The remaining `128 * input_bytes` is margin for normalization expansion and overlap between those categories.
 PBES2 adds a bounded number of DER views and normalized temporary owners, without another growing collection or traversal stack.
@@ -186,12 +211,12 @@ Repeated suffix copying and BER conversion can take quadratic time for adversari
 The fixed allowance covers small owner/control allocations and bounded OID representations.
 The estimate is conservative source accounting rather than a measured allocator high-water bound.
 Temporary owners drop before the reservation shrinks to retained encoded capacity, owner size, and 128 bytes of reservation overhead.
-Malformed data, unsupported factories, unsupported nested parameters, and budget exhaustion release their reservations.
+Malformed data, unsupported factories, unmapped non-CRT names, and budget exhaustion release their reservations.
 
 Nested PSS hash identifiers can select arbitrary AlgorithmParameters services.
 This decoder validates nested PSS, OAEP, PBES2, DSA, DH, EC, AES, DESede, Blowfish, ChaCha20-Poly1305, and legacy PBE parameters for the six services above.
 It preserves parameters for identifiers without a registered service.
-The parameter-dependent `SpecifiedSHA2withECDSA` name remains unsupported in that nested position.
+It resolves parameter-dependent SpecifiedSHA2 names through those same services and preserves the source's IOException-only fallback.
 Successful factory admission does not establish native TLS import, signing, key/certificate consistency, or cryptographic validity.
 
 Regression sources cover PKCS8 fields and BER framing, provider aliases, RSA range and CRT fallback behavior, PSS defaults and errors, signed DSA/DH values and retained tails, all registered EC curves, nested EC public bits, XDH/EdDSA scalar lengths, named post-quantum acceptance, HSS rejection, and reservation lifetime.
@@ -200,3 +225,4 @@ Legacy PBE regressions cover all six services, arbitrary salt lengths, signed it
 Recursive parameter regressions cover defaults, outer and context tags, ordering, duplicate and tail handling, PSS preframing, MGF allowlists, pSource labels, child initialization order, fixed-service descendants, BER views, CRT retention, non-CRT name-only reconstruction, deep alternating nesting, and admission cleanup.
 PBES2 regressions cover all fourteen derived names, signed counts and key lengths, salt and IV shapes, PRF and cipher restrictions, selective tails, historical wrappers, BER retention, nested descendants, duplicate hash names, non-CRT reverse-name failure, initialization ordering, and reservation cleanup.
 Typed parameter regressions cover signed padding, signed 32-bit limits, the allocation-free BigInteger magnitude boundary, Java IO versus propagated failures, and preservation of outward diagnostics.
+SpecifiedSHA2 regressions cover all five known signature OIDs, unmapped and PBES2 names, absent and NULL parameters, caught malformed children, fatal outer identifiers, nested catch boundaries, propagated failures, fixed-service descendants, MGF rejection, duplicate hashes, BER retention, context tails, deep mixed nesting, and reservation cleanup.

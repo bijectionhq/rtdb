@@ -1,0 +1,9 @@
+{
+  "source": "java.base/sun/security/util/KnownOIDs.java",
+  "source_sha256": "2a269aa108db2826558b1d0394a4562b4e589a76113dacf198ba8bc458954122",
+  "enum_entries": 280,
+  "registry_keys": 589,
+  "derived_matches": 5,
+  "double_suffix_matches": 0,
+  "pbes2_matches": 0
+}

@@ -1,0 +1,22 @@
+= SpecifiedSHA2 name derivation
+
+The source is the pinned OpenJDK 25.0.1+8 `KnownOIDs.java`, whose SHA256 is `2a269aa108db2826558b1d0394a4562b4e589a76113dacf198ba8bc458954122`.
+Its hash and the AlgorithmId and default-provider sources are retained in link:../../sources.sha256[the private-factory manifest].
+Upstream notices and licenses are retained in link:../../COPYRIGHT[COPYRIGHT] and the neighboring license files.
+
+link:derive.py[The derivation] reads source text and reproduces KnownOIDs' ordinary OID, standard-name, and alias registry, including entries that register only their OIDs.
+It checks that every enum declaration was consumed and that 280 entries produce 589 unique lookup keys.
+For every ordinary standard name, it removes all hyphens and appends `withECDSA`, then looks up that exact case-insensitive spelling.
+link:known_names.tsv[The full input and reverse-name audit] records all 280 rows.
+link:names.tsv[The five matches] produce the byte table in link:names.rs[names.rs].
+link:provenance.json[The derivation summary] records the source hash and registry cardinalities.
+
+Only SHA-1 and SHA-224/256/384/512 have a registered name after that transformation.
+No registered name ends with two `withECDSA` suffixes.
+None of the fourteen initialized PBES2 names has a registered transformed name.
+Unknown numeric OID names also fail reverse lookup after the nonnumeric suffix is appended.
+These observations let the evaluator retain a known OID or an unmapped-name discriminator without constructing an input-sized name string.
+
+The derivation uses Python's standard library and only reads the supplied source archive.
+Its inputs are the pinned `src.zip` and an output directory.
+Native compiler, provider runtime, and differential execution results remain pending for Phase 2.

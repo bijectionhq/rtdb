@@ -143,7 +143,7 @@ fn recursive_parameter_initialization_precedes_mgf_and_psource_oid_rejection() {
     for field in [mgf(SPECIFIED_SHA2, &der(0x30, &[])), der(0xa1, &algorithm(SPECIFIED_SHA2, &der(0x30, &[]))),
         der(0xa2, &algorithm(SPECIFIED_SHA2, &der(0x30, &[])))] {
         let error = decode(&nested_key(OAEP, &pss(&[field]))).err().unwrap();
-        assert!(error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+        assert!(error.to_string().contains("Malformed Java private key"));
     }
 }
 
@@ -151,11 +151,16 @@ fn recursive_parameter_initialization_precedes_mgf_and_psource_oid_rejection() {
 fn pss_preframes_all_fields_but_oaep_initializes_each_field_before_reading_the_next() {
     let content = [hash(SPECIFIED_SHA2, &der(0x30, &[])), vec![0xff]].concat();
     let pss_error = decode(&nested_key(PSS, &der(0x30, &content))).err().unwrap();
-    assert!(!pss_error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+    assert!(pss_error.to_string().contains("Malformed certificate identifier"));
     let oaep_error = decode(&nested_key(OAEP, &der(0x30, &content))).err().unwrap();
-    assert!(oaep_error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+    assert!(oaep_error.to_string().contains("Malformed certificate identifier"));
     let nonexact = der(0xa0, &[algorithm(SPECIFIED_SHA2, &der(0x30, &[])), der(5, &[])].concat());
-    assert!(!decode(&nested_key(OAEP, &pss(&[nonexact]))).err().unwrap().to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+    assert!(decode(&nested_key(OAEP, &pss(&[nonexact]))).err().unwrap().to_string().contains("Malformed certificate identifier"));
+    let content = [hash(DSA, &der(4, &[])), vec![0xff]].concat();
+    let pss_error = decode(&nested_key(PSS, &der(0x30, &content))).err().unwrap();
+    assert!(pss_error.to_string().contains("Malformed certificate identifier"));
+    let oaep_error = decode(&nested_key(OAEP, &der(0x30, &content))).err().unwrap();
+    assert!(oaep_error.to_string().contains("Malformed Java private key"));
 }
 
 #[test]

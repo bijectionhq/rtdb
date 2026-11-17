@@ -196,16 +196,20 @@ fn pbes2_names_are_not_mgf_digests_and_duplicate_root_hashes_use_the_last_valid_
 }
 
 #[test]
-fn pbes2_noncrt_name_failure_waits_for_all_later_nested_parameter_validation() {
+fn pbes2_noncrt_name_can_be_replaced_by_a_later_initialized_specified_name() {
     let specified_sha2 = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3];
     let mut values = components(); values[3] = vec![0];
     let parameter = pss(&[hash(PBES2, &basic(7, 2)), hash(specified_sha2, &algorithm(SHA1, &[]))]);
-    let error = decode(&key(PSS, &parameter, &rsa_material(&values), &[0], &[])).err().unwrap();
-    assert!(error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+    let input = key(PSS, &parameter, &rsa_material(&values), &[0], &[]);
+    let mut expected_values = values.clone();
+    expected_values[0].insert(0, 0);
+    for index in [1, 3, 4, 5, 6, 7] { expected_values[index] = vec![0]; }
+    let signature = &[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 1];
+    assert_eq!(decoded(&input), key(PSS, &pss(&[hash(signature, &[])]), &rsa_material(&expected_values), &[0], &[]));
     let mgf = der(0xa1, &algorithm(MGF1, &algorithm(PBES2, &basic(7, 2))));
     let parameter = pss(&[mgf, hash(specified_sha2, &algorithm(SHA1, &[]))]);
     let error = decode(&key(PSS, &parameter, &rsa_material(&values), &[0], &[])).err().unwrap();
-    assert!(!error.to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+    assert!(error.to_string().contains("Malformed Java private key"));
 }
 
 #[test]

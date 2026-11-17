@@ -181,11 +181,11 @@ fn pss_noncrt_rebuild_canonicalizes_digest_aliases_and_nondefault_mask_and_salt(
 }
 
 #[test]
-fn pss_uncovered_nested_parameter_services_return_explicit_errors() {
+fn pss_specified_sha2_names_admit_parsed_and_caught_child_parameters() {
     for (oid, parameter) in [(&[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3][..], der(0x30, &[])),
         (&[0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3][..], algorithm(SHA1, &[]))] {
         let input = key(PSS, &pss(&[der(0xa0, &algorithm(oid, &parameter))]), &rsa_material(&components()), &[0], &[]);
-        assert!(decode(&input).err().unwrap().to_string().contains("Unsupported nested Java private-key AlgorithmParameters"));
+        assert_eq!(decoded(&input), input);
     }
 }
 
@@ -193,6 +193,7 @@ mod iv_parameters;
 mod legacy_pbe;
 mod recursive_parameters;
 mod pbes2_parameters;
+mod specified_sha2;
 
 #[test]
 fn dsa_accepts_signed_scalars_and_ignored_scalar_tails_with_optional_parameters() {
