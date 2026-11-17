@@ -1822,14 +1822,17 @@ impl Parser<'_> {
                     .collect::<Result<_, _>>()
             })?;
 
+        let aliases_in_lookup = self.name_policy.map_or(true, |policy| policy.record_field_lookup_uses_aliases());
         for field in &fields {
             if let Some(_old) = lookup.insert(field.name.clone(), field.position) {
                 return Err(Details::FieldNameDuplicate(field.name.clone()).into());
             }
 
-            if let Some(ref field_aliases) = field.aliases {
-                for alias in field_aliases {
-                    lookup.insert(alias.clone(), field.position);
+            if aliases_in_lookup {
+                if let Some(ref field_aliases) = field.aliases {
+                    for alias in field_aliases {
+                        lookup.insert(alias.clone(), field.position);
+                    }
                 }
             }
         }

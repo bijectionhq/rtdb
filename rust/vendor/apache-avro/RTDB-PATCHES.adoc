@@ -15,7 +15,7 @@ No dependency resolution or Cargo command was executed during the adaptation.
 == Scoped policy
 
 Schema::parse_str_with_list_with_name_policy adds a synchronous parser-local policy.
-The policy is a passive borrowed object for name construction, field and enum validation, and an optional second reference candidate.
+The policy is a passive borrowed object for name construction, field and enum validation, record-field lookup rules, and an optional second reference candidate.
 The Parser remains a passive single-writer call-local transient, owning its existing schema maps and parse order.
 Its new optional reference is borrowed only for the parse call and never escapes into returned schema values.
 Name, Alias, and Schema remain passive immutable values with their existing shapes.
@@ -32,6 +32,11 @@ As in the original parser, aliases of unparsed external definitions are not prei
 References to those forward aliases may therefore fail before their declaring input has been parsed.
 That retained limitation requires a separate production behavior decision before activating Java name policies.
 The existing unscoped constructors and parser routes retain their global hooks, panic/error boundaries, and diagnostics.
+A scoped policy can return false from record_field_lookup_uses_aliases to index only raw field names.
+The default is true, preserving ordinary and existing scoped alias lookup and duplicate-name behavior.
+Opting out allows a field alias to match another field's raw name without replacing that field's index or treating a later raw name as a duplicate.
+Aliases remain on RecordField for schema resolution; only the existing lookup index changes its membership.
+Kafka's JavaNames policy has not opted out in this prerequisite, and production parsing remains unchanged.
 A scoped policy must return a name whose namespace has already been resolved against its construction context.
 The parser normalizes a returned None namespace to Some("").
 This explicit empty namespace is retained by Name::fully_qualified_name and gives global definitions, aliases, and references the same Eq/Hash key.
@@ -60,6 +65,7 @@ A policy is responsible for its own allocations; the future Kafka Java policy an
 
 Thirteen new unit regressions and one isolated integration regression cover initialized global defaults, globals that reject every name, fields, enum symbols, fixed/record declarations, named and field alias distinctions, cyclic and external references, nested unions, explicit empty namespaces, hash/qualification identity, serialization/reparse, candidate precedence, nested policies, policy errors, wrapper identity and input order, normalized duplicate names, canonical alias resolution, and nested/external fixed logical types.
 Resolver and value-resolution assertions check returned canonical reference identities against actual definitions.
+Four additional regression sources compare raw-only lookup with ordinary and default scoped parsing for both alias/raw collision directions, shared aliases, retained alias metadata, duplicate raw names and reader-field alias compatibility.
 The isolated integration target owns its rejecting global validators without changing another target's globals.
 All original schema.rs test bodies and the complete original validator.rs remain byte-identical to the archive.
 Compilation, tests, formatters, and runtime discovery remain unexecuted under the Phase1 work order.

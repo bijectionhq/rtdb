@@ -1,11 +1,11 @@
 use super::*;
 
-/// Name construction and validation borrowed by one synchronous schema parse.
+/// Name construction, validation and field lookup controls borrowed by one synchronous schema parse.
 /// Returned names must already include their enclosing namespace, if applicable.
 /// A returned `None` namespace is normalized to `Some("")` for subsequent qualification and reference-key identity.
 /// Definitions retaining a `Name` serialize that namespace explicitly as an empty string.
 /// Fixed definitions converted to `Uuid` or `Duration` discard their original name and namespace.
-/// Name construction and validation results must be stable for the same inputs and namespace during the call.
+/// Policy results must be stable for the same inputs and namespace during the call.
 /// The library retains no policy reference in returned schemas and does not change global validators.
 /// A policy implementation may itself call global or scoped parsing APIs.
 pub trait SchemaNamePolicy {
@@ -15,6 +15,12 @@ pub trait SchemaNamePolicy {
 
     /// Validates a record field's name; field aliases are passed through unchanged.
     fn record_field(&self, name: &str) -> AvroResult<()>;
+
+    /// Indexes field aliases in `RecordSchema::lookup` by default.
+    /// Returning false keeps only raw names in lookup and duplicate-field checks; `RecordField::aliases` is unchanged.
+    fn record_field_lookup_uses_aliases(&self) -> bool {
+        true
+    }
 
     /// Validates one enum symbol before duplicate and default checks.
     fn enum_symbol(&self, symbol: &str) -> AvroResult<()>;

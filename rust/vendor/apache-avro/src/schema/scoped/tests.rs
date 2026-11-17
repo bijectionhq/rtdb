@@ -296,3 +296,63 @@ fn nested_and_external_fixed_logical_definitions_register_the_final_type_for_can
         ResolvedSchema::try_from(&schema).unwrap();
     }
 }
+
+struct RawFieldLookup;
+impl SchemaNamePolicy for RawFieldLookup {
+    fn name(&self, name: &str, namespace: &Namespace) -> AvroResult<Name> { OpenNames { fallback: false }.name(name, namespace) }
+    fn record_field(&self, name: &str) -> AvroResult<()> { OpenNames { fallback: false }.record_field(name) }
+    fn enum_symbol(&self, symbol: &str) -> AvroResult<()> { OpenNames { fallback: false }.enum_symbol(symbol) }
+    fn record_field_lookup_uses_aliases(&self) -> bool { false }
+}
+
+fn raw_fields(text: &str) -> RecordSchema {
+    let (schema, _) = Schema::parse_str_with_list_with_name_policy(text, Vec::<&str>::new(), &RawFieldLookup).unwrap();
+    let Schema::Record(record) = schema else { panic!("expected record") };
+    record
+}
+
+#[test]
+fn scoped_raw_field_lookup_accepts_an_alias_that_matches_a_later_raw_name() {
+    let text = r#"{"type":"record","name":"R","fields":[{"name":"a","aliases":["b"],"type":"int"},{"name":"b","type":"long"}]}"#;
+    assert!(Schema::parse_str(text).is_err());
+    assert!(Schema::parse_str_with_list_with_name_policy(text, Vec::<&str>::new(), &OpenNames { fallback: false }).is_err());
+    let record = raw_fields(text);
+    assert_eq!(record.lookup.get("a"), Some(&0));
+    assert_eq!(record.lookup.get("b"), Some(&1));
+    assert_eq!(record.fields[0].aliases.as_deref(), Some(["b".to_owned()].as_slice()));
+    assert_eq!(record.fields[1].schema, Schema::Long);
+}
+
+#[test]
+fn scoped_raw_field_lookup_preserves_a_raw_field_hidden_by_a_later_alias() {
+    let text = r#"{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"b","aliases":["a"],"type":"long"}]}"#;
+    let record = raw_fields(text);
+    assert_eq!(record.lookup.get("a"), Some(&0));
+    assert_eq!(record.lookup.get("b"), Some(&1));
+    let Schema::Record(ordinary) = Schema::parse_str(text).unwrap() else { panic!("expected record") };
+    assert_eq!(ordinary.lookup.get("a"), Some(&1));
+    let Schema::Record(scoped_default) = parse(text) else { panic!("expected record") };
+    assert_eq!(scoped_default.lookup.get("a"), Some(&1));
+    assert_eq!(record.fields[1].aliases.as_deref(), Some(["a".to_owned()].as_slice()));
+}
+
+#[test]
+fn scoped_raw_field_lookup_retains_shared_alias_metadata_without_indexing_it() {
+    let text = r#"{"type":"record","name":"R","fields":[{"name":"a","aliases":["shared"],"type":"int"},{"name":"b","aliases":["shared"],"type":"long"}]}"#;
+    let record = raw_fields(text);
+    assert_eq!(record.lookup.len(), 2);
+    assert!(!record.lookup.contains_key("shared"));
+    for field in &record.fields { assert_eq!(field.aliases.as_deref(), Some(["shared".to_owned()].as_slice())); }
+    let Schema::Record(ordinary) = Schema::parse_str(text).unwrap() else { panic!("expected record") };
+    assert_eq!(ordinary.lookup.get("shared"), Some(&1));
+    let duplicate = r#"{"type":"record","name":"R","fields":[{"name":"a","type":"int"},{"name":"a","type":"long"}]}"#;
+    assert!(Schema::parse_str_with_list_with_name_policy(duplicate, Vec::<&str>::new(), &RawFieldLookup).is_err());
+}
+
+#[test]
+fn scoped_raw_field_lookup_keeps_reader_field_alias_compatibility() {
+    let writer = raw_fields(r#"{"type":"record","name":"R","fields":[{"name":"original","type":"int"}]}"#);
+    let reader = raw_fields(r#"{"type":"record","name":"R","fields":[{"name":"renamed","aliases":["original"],"type":"int"}]}"#);
+    assert!(!reader.lookup.contains_key("original"));
+    assert!(crate::schema_compatibility::SchemaCompatibility::can_read(&Schema::Record(writer), &Schema::Record(reader)).is_ok());
+}
