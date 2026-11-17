@@ -1,10 +1,14 @@
 = Java 25 double-byte character mappings
 
-The String converter supports Java25's `Shift_JIS` and `windows-31j` charsets and all ten distinct case-insensitive registered names.
+The String converter supports 20 Java25 charsets that use `DoubleByte.Decoder`, with 100 distinct case-insensitive registered names.
+The families are Big5, GB2312, GBK, EUC-KR, Shift_JIS, Windows-31J, IBM1381/942/943/948/949/950, IBM942C/943C/949C, Johab, PCK, and Windows936/949/950.
+The manifest gives every canonical name and alias, including the `x-` prefix used by several Java canonical names.
 The Shift_JIS aliases are `sjis`, `shift_jis`, `shift-jis`, `ms_kanji`, `x-sjis`, and `csShiftJIS`.
 The Windows-31J aliases are `MS932`, `windows-932`, and `csWindows31J`.
 Name matching preserves punctuation and follows the standard provider's alias ownership.
-The separate IBM942C charset owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`; those names do not select Windows-31J.
+IBM942C owns `cp932`, `ibm932`, `ibm-932`, `932`, and `x-ibm932`.
+`cp936` resolves to GBK, while `ms936` resolves to `x-mswin-936`.
+`cp949` and `cp950` resolve to IBM charsets, while `windows-949` and `windows-950` resolve to their Microsoft variants.
 link:charsets.tsv[The charset manifest] records canonical names, classes, source hashes, ASCII flags, trail ranges, present lead rows, resource sizes, mapping digests, decoded probe digests, and provider aliases.
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
@@ -15,10 +19,15 @@ No runtime mapping cache or decoder allocation is required.
 
 == Decoding and replacement
 
-Both Java classes construct the same `DoubleByte.Decoder` with their own `DecodeHolder` tables and trail range 0x40 through 0xFC.
+All 20 Java classes construct the same `DoubleByte.Decoder` with their class's selected tables and trail range.
+Seventeen classes use their own `DecodeHolder` tables, and the three IBM C variants share their base class's double-byte rows with a separate patched single-byte table.
 `String` selects its `ArrayDecoder.decode` entry point and uses U+FFFD replacements.
-The ASCII fastpath has the same result as the tables, whose first 128 single-byte entries are identity mappings.
-Bytes 0xA1 through 0xDF decode to halfwidth katakana; other bytes above 0x7F require a double-byte mapping or replacement.
+The ASCII fastpath has the same result as the tables for the fourteen constructors that enable it.
+IBM942 and IBM943 map ASCII-range control bytes 0x1A, 0x1C, and 0x7F to U+001C, U+007F, and U+001A, and bytes 0x5C and 0x7E to yen and overline.
+IBM949 maps byte 0x5C to the won sign.
+The three IBM C variants restore ASCII identity mappings and retain the constructor's false ASCII-fastpath flag.
+The native decoder always reads the selected table, including ASCII-only input and the prefix before a multibyte sequence.
+The Shift_JIS and Windows-31J tables map bytes 0xA1 through 0xDF to halfwidth katakana; other bytes above 0x7F require a double-byte mapping or replacement.
 
 * When the first byte has a single-byte mapping, the decoder consumes it alone.
 * Otherwise, a mapped pair consumes two bytes.
@@ -34,6 +43,13 @@ Decoded UTF16 units cross the native UTF8 boundary by combining adjacent surroga
 The tables preserve Java's distinctions between these charsets.
 For example, 0x815C decodes to U+2014 in Shift_JIS and U+2015 in Windows-31J, while 0x8160 decodes to U+301C and U+FF5E respectively.
 Windows-31J also retains the NEC/IBM extension mappings and private-use range U+E000 through U+E757.
+GB2312 maps 0xA1A4 and 0xA1AA to U+30FB and U+2015, while GBK maps them to U+00B7 and U+2014.
+Windows936 maps byte 0x80 to the euro sign, and Windows949 includes Hangul extensions such as 0x8141 for U+AC02.
+IBM948 and IBM950 retain their own Chinese and private-use mappings, including distinct interpretations of 0xA440 and 0xF9D6.
+
+Big5 uses the mapping present before Java initializes `Big5_Solaris.Holder`.
+Big5-Solaris initialization shallow-copies Big5's row array and then mutates seven entries in the shared 0xF9 row, changing existing Big5 decoders too.
+Big5-Solaris and this process-wide initialization behavior remain unsupported.
 
 == Sources and representation
 
@@ -49,8 +65,11 @@ A lead-row index of 0xFFFF represents Java's shared `B2C_UNMAPPABLE` row; every 
 Unmapped character entries contain U+FFFD.
 `shift_jis.bin` contains 39 lead rows and 15768 bytes, with SHA-256 `315c3ae24f7fc41e8928dddec73ad8312a7f13e82216e16167aa936cb1a85d13`.
 `windows-31j.bin` contains 55 lead rows and 21816 bytes, with SHA-256 `f4a3961137be202c450776887c715e01cf44ca031d99493478991cca71e61f67`.
+All 20 mapping resources together contain 608956 bytes; the manifest pins each resource separately.
 `aliases.rs` maps sorted lowercase names to `tables.rs` entries.
-Neither decoder table is modified by its encoder's non-round-trip mapping setup.
+The decoder tables are independent of their encoder's non-round-trip mapping setup.
+IBM942C copies its base single-byte table and replaces five entries with their ASCII byte values.
+IBM943C and IBM949C fill the lower 128 entries with ASCII identity mappings and copy the upper entries from the base table.
 
 == Reproduction and regression sources
 
@@ -61,11 +80,14 @@ link:derive.py[The Python standard-library derivation] accepts the pinned archiv
 python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-double-byte
 ----
 
-It verifies the archive and source-member hashes, the decoder constructors, the table initialization, row dimensions, ASCII identity, surrogate exclusions, and exact provider alias ownership before emitting the resources.
+It verifies the archive and source-member hashes, the decoder constructors, the direct and patched table initialization, row dimensions, enabled ASCII-fastpath identity, surrogate exclusions, and exact provider alias ownership before emitting the resources.
 It reads Java source text and archive contents only and requires no JDK execution.
 The decoded single-byte digest concatenates the result of every byte decoded as a separate record.
 The pair-probe digest concatenates the result of every two-byte record in unsigned order, with a U+0000 separator after each record.
-The regression source decodes each row of byte pairs with embedded 0x00 separators, which cannot be consumed as an invalid trail because it has a single-byte mapping.
+Every selected table maps byte 0x00 to U+0000 and has a positive minimum trail byte, which the derivation and regression sources assert.
+The regression source decodes each row of byte pairs with embedded 0x00 separators, which cannot form a mapped pair or be consumed as an invalid trail because it has a single-byte mapping.
 These probes cover every input pair, including malformed recovery and table holes, for every registered name and uppercase spelling.
 
-Independent regression anchors cover Japanese text, controls, halfwidth katakana, differing symbols, Windows extensions, private-use values, replacement grouping, truncated records, key/value precedence, null values, alias punctuation, and memory admission.
+Independent regression anchors cover Japanese, Chinese and Korean text, controls, halfwidth katakana, differing symbols, Windows extensions, private-use values, replacement grouping, truncated records, key/value precedence, null values, alias punctuation, and memory admission.
+The IBM ASCII-range remappings are asserted with ASCII-only records and multibyte suffixes.
+The original Shift_JIS and Windows-31J mapping bytes, source hashes, probe digests, and alias lists remain separately pinned.

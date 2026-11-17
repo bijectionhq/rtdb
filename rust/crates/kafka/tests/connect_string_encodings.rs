@@ -451,16 +451,34 @@ async fn single_byte_decoders_admit_worst_case_storage_before_decoding() {
 const DOUBLE_BYTE_MANIFEST: &str = include_str!("../src/connect/converter/charset/double_byte/charsets.tsv");
 
 #[test]
-fn shift_jis_resources_retain_pinned_source_and_mapping_provenance() {
-    let mappings: [&[u8]; 2] = [
+fn double_byte_resources_retain_pinned_source_and_mapping_provenance() {
+    let mappings: [&[u8]; 20] = [
+        include_bytes!("../src/connect/converter/charset/double_byte/big5.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/euc-kr.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/gb2312.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/gbk.bin"),
         include_bytes!("../src/connect/converter/charset/double_byte/shift_jis.bin"),
         include_bytes!("../src/connect/converter/charset/double_byte/windows-31j.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm1381.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm942.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm942c.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm943.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm943c.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm948.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm949.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm949c.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-ibm950.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-johab.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-mswin-936.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-pck.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-windows-949.bin"),
+        include_bytes!("../src/connect/converter/charset/double_byte/x-windows-950.bin"),
     ];
-    assert_eq!(sha256_hex(DOUBLE_BYTE_MANIFEST.as_bytes()), "7a178b00038c0baa4de1bd3a099639a39f3b24a733527bd2fa9aedfc8a09595e");
-    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/aliases.rs")), "951d4ff7d361a2f8a1c7355fada705357f4566e3f5afe9a9db78cdb422e09e1c");
-    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/tables.rs")), "c69e5c8ebd2d2d64bfdf19364d12055ac4df8a90f0b50ea25abaa4b1635206fe");
+    assert_eq!(sha256_hex(DOUBLE_BYTE_MANIFEST.as_bytes()), "764aeaeda584221a3723d9ad51fed7b6ef023650261f9bd9fdd0bfb770c5e67d");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/aliases.rs")), "aecbe513193975e92ae16ff1be8e0b722117cbab990f081d892c7297c800a19b");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/tables.rs")), "2d65d771e3706002c5ca60f988cf75a9707033a446d1ed107c60af268fd983da");
     assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/sources.sha256")), "7e4ddd5ae3690e645ba3fb2827bea0723e3afef51f9eab350a736ac9b347ce54");
-    assert_eq!(DOUBLE_BYTE_MANIFEST.lines().skip(1).count(), 2);
+    assert_eq!(DOUBLE_BYTE_MANIFEST.lines().skip(1).count(), 20);
     for (line, mapping) in DOUBLE_BYTE_MANIFEST.lines().skip(1).zip(mappings) {
         let fields: Vec<_> = line.split('\t').collect();
         assert_eq!(fields.len(), 13);
@@ -473,13 +491,18 @@ fn shift_jis_resources_retain_pinned_source_and_mapping_provenance() {
         let unit = |offset: usize| u16::from_be_bytes([mapping[offset], mapping[offset + 1]]);
         let rows = fields[7].parse::<usize>().unwrap();
         let width = usize::from(mapping[1] - mapping[0]) + 1;
+        assert!(mapping[0] > 0);
+        assert_eq!(unit(2), 0);
         assert_eq!(mapping.len(), 1026 + rows * width * 2);
         assert_eq!((0..256).filter(|index| unit(514 + index * 2) != 0xffff).count(), rows);
         for index in 0..256 {
             let row = unit(514 + index * 2);
             assert!(row == 0xffff || usize::from(row) < rows);
             assert!(!(0xd800..=0xdfff).contains(&unit(2 + index * 2)));
-            if index < 128 { assert_eq!(unit(2 + index * 2), index as u16); }
+            if index < 128 {
+                assert_ne!(unit(2 + index * 2), 0xfffd);
+                if fields[4] == "true" { assert_eq!(unit(2 + index * 2), index as u16); }
+            }
         }
         for pair in mapping[1026..].chunks_exact(2) {
             assert!(!(0xd800..=0xdfff).contains(&u16::from_be_bytes([pair[0], pair[1]])));
@@ -487,8 +510,20 @@ fn shift_jis_resources_retain_pinned_source_and_mapping_provenance() {
     }
 }
 
+#[test]
+fn shift_jis_source_mapping_and_probe_hashes_remain_pinned() {
+    let mut manifest = format!("{}\n", DOUBLE_BYTE_MANIFEST.lines().next().unwrap());
+    for line in DOUBLE_BYTE_MANIFEST.lines().filter(|line| line.starts_with("Shift_JIS\t") || line.starts_with("windows-31j\t")) {
+        manifest.push_str(line);
+        manifest.push('\n');
+    }
+    assert_eq!(sha256_hex(manifest.as_bytes()), "7a178b00038c0baa4de1bd3a099639a39f3b24a733527bd2fa9aedfc8a09595e");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/shift_jis.bin")), "315c3ae24f7fc41e8928dddec73ad8312a7f13e82216e16167aa936cb1a85d13");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/windows-31j.bin")), "f4a3961137be202c450776887c715e01cf44ca031d99493478991cca71e61f67");
+}
+
 #[tokio::test]
-async fn shift_jis_canonical_names_and_every_provider_alias_decode_single_bytes_and_pairs() {
+async fn double_byte_canonical_names_and_every_provider_alias_decode_single_bytes_and_pairs() {
     let mut names = std::collections::BTreeSet::new();
     for line in DOUBLE_BYTE_MANIFEST.lines().skip(1) {
         let fields: Vec<_> = line.split('\t').collect();
@@ -508,7 +543,7 @@ async fn shift_jis_canonical_names_and_every_provider_alias_decode_single_bytes_
             }
         }
     }
-    assert_eq!(names.len(), 10);
+    assert_eq!(names.len(), 100);
 }
 
 #[tokio::test]
@@ -607,5 +642,113 @@ async fn shift_jis_decoders_admit_replacement_and_mapping_storage_before_decodin
             let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
             assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8(expected.repeat(bytes.len())));
         }
+    }
+}
+
+#[tokio::test]
+async fn double_byte_families_preserve_chinese_korean_and_vendor_mappings() {
+    for (encoding, bytes, expected) in [
+        ("Big5", &[0xa4, 0x40, 0xa4, 0xa4, 0xa4, 0xe5][..], "一中文"),
+        ("GB2312", &[0xd6, 0xd0, 0xce, 0xc4, 0xa1, 0xa4, 0xa1, 0xaa][..], "中文・―"),
+        ("GBK", &[0xd6, 0xd0, 0xce, 0xc4, 0xa1, 0xa4, 0xa1, 0xaa, 0x81, 0x40][..], "中文·—丂"),
+        ("EUC-KR", &[0xb0, 0xa1, 0xc7, 0xd1, 0xb1, 0xb9][..], "가한국"),
+        ("x-Johab", &[0x88, 0x61, 0xd0, 0x65, 0x8a, 0x82][..], "가한국"),
+        ("x-IBM1381", &[0x80, 0xb0, 0xa1, 0xd6, 0xd0, 0x8c, 0xe0][..], "£啊中ⅰ"),
+        ("x-IBM942", &[0x80, 0xff, 0x81, 0x5c, 0xfa, 0x40, 0xf0, 0x40][..], "¢~—ⅰ\u{e000}"),
+        ("x-IBM942C", &[0x80, 0xff, 0x81, 0x5c, 0xfa, 0x40, 0xf0, 0x40][..], "¢~—ⅰ\u{e000}"),
+        ("x-IBM943", &[0x81, 0x5c, 0xed, 0x40, 0xfa, 0x40, 0xf0, 0x40][..], "—纊ⅰ\u{e000}"),
+        ("x-IBM943C", &[0x81, 0x5c, 0xed, 0x40, 0xfa, 0x40, 0xf0, 0x40][..], "—纊ⅰ\u{e000}"),
+        ("x-IBM948", &[0x80, 0x8c, 0x40, 0xa4, 0x40, 0xfa, 0x40][..], "¢一氈\u{f6c4}"),
+        ("x-IBM949", &[0x80, 0xb0, 0xa1, 0xc7, 0xd1, 0xb1, 0xb9, 0x8f, 0xa1][..], "¢가한국\u{e0bc}"),
+        ("x-IBM949C", &[0x80, 0xb0, 0xa1, 0xc7, 0xd1, 0xb1, 0xb9, 0x8f, 0xa1][..], "¢가한국\u{e0bc}"),
+        ("x-IBM950", &[0xa4, 0x40, 0xa4, 0xa4, 0xa4, 0xe5, 0xf9, 0xd6, 0xfa, 0x40][..], "一中文\u{f813}\u{e000}"),
+        ("x-PCK", &[0x81, 0x5c, 0x81, 0x60, 0xed, 0x40, 0xfa, 0x40][..], "―〜纊ⅰ"),
+        ("x-mswin-936", &[0x80, 0xd6, 0xd0, 0xce, 0xc4, 0x81, 0x40][..], "€中文丂"),
+        ("x-windows-949", &[0xb0, 0xa1, 0xc7, 0xd1, 0xb1, 0xb9, 0x81, 0x41][..], "가한국갂"),
+        ("x-windows-950", &[0xa4, 0x40, 0xa4, 0xa4, 0xa4, 0xe5, 0xa3, 0xe1, 0xf9, 0xd6][..], "一中文€碁"),
+    ] { assert_eq!(decode(encoding, bytes).await, expected, "{encoding}"); }
+}
+
+#[tokio::test]
+async fn ibm_double_byte_decoders_preserve_ascii_range_remappings_before_multibyte_suffixes() {
+    let prefix = [0, 0x1a, 0x1c, 0x5c, 0x7e, 0x7f];
+    for (name, expected) in [
+        ("x-IBM942", "\0\u{1c}\u{7f}¥‾\u{1a}"),
+        ("x-IBM943", "\0\u{1c}\u{7f}¥‾\u{1a}"),
+        ("x-IBM942C", "\0\u{1a}\u{1c}\\~\u{7f}"),
+        ("x-IBM943C", "\0\u{1a}\u{1c}\\~\u{7f}"),
+    ] {
+        assert_eq!(decode(name, &prefix).await, expected, "{name}");
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&[0x82, 0xa0]);
+        assert_eq!(decode(name, &bytes).await, format!("{expected}あ"), "{name}");
+    }
+    for (name, expected) in [("x-IBM949", "\0\u{1a}\u{1c}₩~\u{7f}"), ("x-IBM949C", "\0\u{1a}\u{1c}\\~\u{7f}")] {
+        assert_eq!(decode(name, &prefix).await, expected, "{name}");
+        let mut bytes = prefix.to_vec();
+        bytes.extend_from_slice(&[0xb0, 0xa1]);
+        assert_eq!(decode(name, &bytes).await, format!("{expected}가"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn double_byte_aliases_keep_ibm_and_windows_code_pages_distinct() {
+    for name in ["cp932", "ibm932", "ibm-932", "932", "x-ibm932", "cp942C"] {
+        assert_eq!(decode(name, &[0x5c, 0x80, 0x81, 0x5c]).await, "\\¢—", "{name}");
+    }
+    assert_eq!(decode("windows-932", &[0x5c, 0x80, 0x81, 0x5c]).await, "\\\u{fffd}―");
+    assert_eq!(decode("cp936", &[0x80]).await, "\u{fffd}");
+    assert_eq!(decode("ms936", &[0x80]).await, "€");
+    assert_eq!(decode("cp949", &[0x5c, 0x81, 0x41]).await, "₩\u{fffd}A");
+    assert_eq!(decode("windows-949", &[0x5c, 0x81, 0x41]).await, "\\갂");
+    assert_eq!(decode("cp950", &[0xf9, 0xd6]).await, "\u{f813}");
+    assert_eq!(decode("windows-950", &[0xf9, 0xd6]).await, "碁");
+}
+
+#[tokio::test]
+async fn double_byte_family_errors_follow_registered_lead_rows_and_trail_ranges() {
+    for (name, bytes, expected) in [
+        ("Big5", &[0xa1, 0x7f][..], "\u{fffd}\u{7f}"),
+        ("Big5", &[0xa1, 0x80][..], "\u{fffd}"),
+        ("Big5", &[0xf9, 0xd6][..], "\u{fffd}\u{fffd}"),
+        ("EUC-KR", &[0xa1, b'A'][..], "\u{fffd}A"),
+        ("EUC-KR", &[0xa1, 0xa0][..], "\u{fffd}"),
+        ("EUC-KR", &[0x80, 0xa1, 0xa1][..], "\u{fffd}\u{3000}"),
+        ("GB2312", &[0x81, 0x40][..], "\u{fffd}@"),
+        ("GB2312", &[0x80, 0x80][..], "\u{fffd}\u{fffd}"),
+        ("GBK", &[0x81, 0x7f][..], "\u{fffd}\u{7f}"),
+        ("GBK", &[0x81, 0xff][..], "\u{fffd}"),
+        ("x-Johab", &[0x84, 0x31][..], "\u{fffd}1"),
+        ("x-Johab", &[0x84, 0xff][..], "\u{fffd}"),
+        ("x-IBM942", &[0x81, 0xff][..], "\u{fffd}~"),
+        ("x-IBM943", &[0x81, 0xff][..], "\u{fffd}"),
+        ("x-PCK", &[0xf0, 0x40][..], "\u{fffd}@"),
+    ] { assert_eq!(decode(name, bytes).await, expected, "{name} {bytes:?}"); }
+}
+
+#[tokio::test]
+async fn double_byte_decoders_preserve_zero_separators_and_null_records() {
+    for line in DOUBLE_BYTE_MANIFEST.lines().skip(1) {
+        let name = line.split('\t').next().unwrap();
+        let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", name)]), false).unwrap();
+        let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+        assert_eq!(converter.decode("events", Some(&[0]), &mut context).await.unwrap().value, Value::Utf8("\0".into()), "{name}");
+        assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null, "{name}");
+        for byte in 0u8..=255 {
+            let standalone = decode(name, &[byte]).await;
+            assert_eq!(decode(name, &[byte, 0]).await, format!("{standalone}\0"), "{name} {byte:02x}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn double_byte_legacy_symbols_obey_scalar_memory_admission() {
+    for (name, byte, expected) in [("Big5", 0xff, "\u{fffd}"), ("x-IBM942", 0x7e, "‾"), ("x-IBM949", 0x5c, "₩"), ("x-mswin-936", 0x80, "€")] {
+        let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", name)]), false).unwrap();
+        let bytes = [byte; 1024];
+        let mut rejected = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4 - 1));
+        assert!(converter.decode("events", Some(&bytes), &mut rejected).await.is_err());
+        let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
+        assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8(expected.repeat(bytes.len())));
     }
 }
