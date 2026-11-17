@@ -1,0 +1,14 @@
+= Native slice unsigned varints
+
+`rd_slice_read_uvarint` consumes one unsigned 64-bit base-128 value across borrowed buffer segments.
+It accepts nonminimal encodings up to ten bytes, with a tenth byte of zero or one.
+A successful read advances the slice and publishes the value together.
+Underflow, a continuing tenth byte or a tenth-byte payload above one returns zero without changing the slice or caller output.
+The signed zig-zag wrapper retains the same failure behavior.
+
+`unittest_rdbuf` includes every tenth-byte value, all split positions, truncated and nonminimal zero encodings, an eleven-byte continuation, and a value followed by a suffix.
+The Kafka crate's `native_varint` source fixture invokes this existing native unit entry point.
+These fixtures require the runtime verification gate; the implementation was prepared under the source-only gate.
+
+`sources.json` pins the published native source and consumers used for this contract.
+`COPYRIGHT` retains their complete leading upstream notices.

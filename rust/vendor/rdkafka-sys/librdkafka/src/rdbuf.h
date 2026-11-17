@@ -312,6 +312,11 @@ size_t rd_slice_read(rd_slice_t *slice, void *dst, size_t size);
 size_t
 rd_slice_peek(const rd_slice_t *slice, size_t offset, void *dst, size_t size);
 
+/**
+ * @returns 1..10 bytes consumed, or 0 for underflow or uint64 overflow.
+ *          Failure leaves the slice position and output unchanged.
+ *          Nonminimal encodings within ten bytes are accepted.
+ */
 size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump);
 
 /**
@@ -319,7 +324,8 @@ size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump);
  *        storing the decoded number in \p nump on success (return value > 0).
  *
  * @returns the number of bytes read on success or 0 in case of
- *          buffer underflow.
+ *          buffer underflow or an unrepresentable unsigned 64-bit encoding.
+ *          On failure, the slice position and output remain unchanged.
  */
 static RD_UNUSED RD_INLINE size_t rd_slice_read_varint(rd_slice_t *slice,
                                                        int64_t *nump) {

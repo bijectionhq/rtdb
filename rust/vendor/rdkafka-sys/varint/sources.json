@@ -1,0 +1,9 @@
+{
+  "native_baseline_commit": "e747c55a8f7705a1716cccaec4d2c3a97f7c4263",
+  "sources": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.c": "b13ad292b72394993717f127f7e5da15e1b003921a5765e69a120ff65c21e226",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdbuf.h": "315d1a9f8ff17708bb4d1db2980ab49b11d7b90aef14088af7a8a7b0b08a9d53",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdvarint.c": "48cba4d8a8f2bf2ada0cfc1641c5ddf5bc25f22d84fafde208a265e6f8e0a83c",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_buf.h": "d65cfb10262ee781999e7a4150dc3b06bbe6f9473fd499704f48b11b188b5046"
+  }
+}

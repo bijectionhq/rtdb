@@ -969,13 +969,6 @@ rd_slice_peek(const rd_slice_t *slice, size_t offset, void *dst, size_t size) {
 }
 
 
-/**
- * @brief Read a varint-encoded unsigned integer from \p slice,
- *        storing the decoded number in \p nump on success (return value > 0).
- *
- * @returns the number of bytes read on success or 0 in case of
- *          buffer underflow.
- */
 size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump) {
         uint64_t num = 0;
         int shift    = 0;
@@ -992,6 +985,10 @@ size_t rd_slice_read_uvarint(rd_slice_t *slice, uint64_t *nump) {
                                 return 0; /* Underflow */
 
                         oct = *(const unsigned char *)(seg->seg_p + rof);
+
+                        if (unlikely(shift >= 64 ||
+                                     (shift == 63 && oct > 1)))
+                                return 0;
 
                         num |= (uint64_t)(oct & 0x7f) << shift;
                         shift += 7;
@@ -1884,6 +1881,8 @@ static int do_unittest_erase(void) {
 }
 
 
+#include "rdbuf_varint_test.h"
+
 int unittest_rdbuf(void) {
         int fails = 0;
 
@@ -1892,6 +1891,7 @@ int unittest_rdbuf(void) {
         fails += do_unittest_write_read_payload_correctness();
         fails += do_unittest_write_iov();
         fails += do_unittest_erase();
+        fails += do_unittest_slice_uvarint_bounds();
 
         return fails;
 }
