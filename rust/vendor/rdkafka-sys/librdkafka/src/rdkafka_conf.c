@@ -924,6 +924,10 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
      "Borrowed TLS context callback state.", _UNSUPPORTED_SSL},
     {_RK_GLOBAL, "ssl.ctx.libctx", _RK_C_PTR, _RK(ssl.libctx),
      "Borrowed OpenSSL library context.", _UNSUPPORTED_SSL},
+    {_RK_GLOBAL | _RK_HIDDEN, "ssl.ctx.replaces.default.trust", _RK_C_BOOL,
+     _RK(ssl.ctx_replaces_default_trust),
+     "Skip automatic CA discovery for a replacing TLS context callback.",
+     0, 1, 0, _UNSUPPORTED_SSL},
 
     /* Point user in the right direction if they try to apply
      * Java client SSL / JAAS properties. */
@@ -2933,6 +2937,18 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb(
 #endif
 }
 
+
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_ctx_replaces_default_trust(
+    rd_kafka_conf_t *conf, int replace) {
+#if WITH_SSL
+        rd_kafka_anyconf_set_internal(_RK_GLOBAL, conf,
+                                      "ssl.ctx.replaces.default.trust",
+                                      replace ? "true" : "false");
+        return RD_KAFKA_CONF_OK;
+#else
+        return replace ? RD_KAFKA_CONF_INVALID : RD_KAFKA_CONF_OK;
+#endif
+}
 
 rd_kafka_conf_res_t rd_kafka_conf_set_ssl_ctx_libctx(rd_kafka_conf_t *conf,
                                                   void *libctx) {

@@ -90,6 +90,10 @@ pub struct NativeClientConfig {
 /// Configures the client's OpenSSL context before any connection is started.
 /// Implementations may install callbacks borrowing themselves until client destruction.
 pub trait SslContextConfigurer: Send + Sync {
+    /// Skips automatic platform and OpenSSL CA discovery when the callback supplies replacement trust.
+    /// Explicit CA, CRL and client identity settings are still loaded before the callback.
+    fn replaces_default_trust(&self) -> bool { false }
+
     /// Supplies an OpenSSL 3 library context for TLS construction, or null for the default context.
     ///
     /// # Safety
@@ -317,6 +321,9 @@ impl ClientConfig {
         }
         conf.ssl_context = self.ssl_context.clone();
         if let Some(configuration) = &conf.ssl_context {
+            let replaces_trust = configuration.0.replaces_default_trust();
+            let result = unsafe { rdsys::rd_kafka_conf_set_ssl_ctx_replaces_default_trust(conf.ptr(), i32::from(replaces_trust)) };
+            if result.is_error() { return Err(KafkaError::ClientCreation("TLS trust replacement requires SSL support".into())); }
             let context = unsafe { configuration.0.library_context() };
             let result = unsafe { rdsys::rd_kafka_conf_set_ssl_ctx_libctx(conf.ptr(), context) };
             if result.is_error() { return Err(KafkaError::ClientCreation("TLS library contexts require OpenSSL 3 support".into())); }
