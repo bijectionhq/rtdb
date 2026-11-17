@@ -5,6 +5,7 @@ use rtdb_columnar::MemoryBudget;
 pub(super) mod support;
 mod deferred;
 mod sun_jks;
+mod sun_pkcs12;
 
 fn options() -> BTreeMap<String, String> { BTreeMap::from([("security.protocol".into(), "SSL".into())]) }
 

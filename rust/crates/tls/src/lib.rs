@@ -16,6 +16,9 @@ mod sun_jks;
 pub use sun_jks::{SunX509JksIdentity, SunX509JksStore};
 mod java_der;
 mod secret_der;
+mod private_factory;
+mod sun_pkcs12;
+pub use sun_pkcs12::{SunX509Pkcs12Identity, SunX509Pkcs12Store};
 mod identifiers;
 pub use identifiers::{CertificateAlternativeNames, CertificateBasicConstraints, CertificateExtendedKeyUsage, CertificateIdentifiers, CertificateKeyUsage, CertificatePublicKeyEncoding};
 

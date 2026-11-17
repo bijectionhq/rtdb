@@ -1,0 +1,35 @@
+= Sun PKCS12 bag attributes
+
+The Sun loader reads bag attributes using OpenJDK `25.0.1+8` `PKCS12KeyStore.loadSafeContents`, `PKCS12Attribute.parse`, and `DerValue` semantics.
+`Attributes` is a passive metadata value containing the last friendly name, last local key identifier, and presence of a trusted-key-usage attribute.
+Its parser runs inside the loader's existing allocation reservation.
+All cursors and zeroizing DER normalization views belong to the parse call.
+The complete attribute set is checked for framing errors before individual attributes are interpreted, without retaining a second array of every attribute.
+
+Missing or malformed outer attribute sets supply no attributes.
+A well-framed set whose individual attribute has an invalid sequence, OID, value set, or recognized typed value fails loading.
+Each attribute has exactly two fields: an OID and a set of values.
+Friendly names and local key identifiers use the first value, while trusted-key-usage validates every OID and accepts an empty set.
+Subsequent friendly-name and local-key-ID attributes replace earlier values.
+Friendly names use Java UTF16BE replacement boundaries, including paired-surrogate preservation, malformed-pair consumption, and retained byte-order marks.
+Local key identifiers accept primitive and constructed OCTET STRING values.
+
+Unknown attributes follow `PKCS12Attribute` typed-value validation.
+Booleans require one byte and accept any nonzero value as true.
+Integers require a nonempty signed Java `BigInteger` encoding and enforce its magnitude limit after redundant sign bytes are removed.
+Object identifiers use the shared Java OID validator.
+String payloads use Java replacement decoding and cannot fail solely because of malformed character bytes.
+Other tags, including constructed OCTET STRING values, are opaque to this unknown-attribute path.
+The loader does not expose the rendered text of unknown attributes.
+
+UTC and GeneralizedTime values validate the actual `DerValue.getTimeInternal` grammar.
+Month and day bounds are 1 through 12 and 1 through 31; Java normalizes dates such as February 31 after these checks.
+Hours, minutes, seconds, and numeric offsets retain their Java bounds.
+UTC years contain two digits and generalized years contain four.
+Missing seconds are accepted with `Z`.
+Numeric offsets require encoded seconds because the source reads seconds whenever more than two suffix bytes remain.
+Generalized fractional seconds accept a dot or comma and any positive number of digits before the timezone suffix.
+UTC fractions, empty fractions, nondigits, incomplete suffixes, and trailing data fail.
+The parser validates these fields without constructing a calendar because the rendered unknown-attribute text is not an exposed loader result.
+
+Regression sources cover swallowed framing errors, semantic failures, duplicate attributes, first-value selection, empty trusted sets, malformed later values, constructed key identifiers, UTF16 replacement boundaries, typed unknown values, time grammar and limits, and allocation-free checks of the `BigInteger` magnitude boundary.

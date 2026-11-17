@@ -47,6 +47,16 @@ Shared DER conversion validates the framing before allocating its byte buffer; i
 Native transports admit their expanded per-alias imports separately before copying keys or certificates.
 Source regressions cover raw alias translation, duplicate and enumeration behavior, eager errors on empty chains, PKCS8 normalization and fallback, entry sharing, allocation release, strict generic identity matching, and deferred transport failure for mismatched values.
 
+`SunX509Pkcs12Store` is the separate passive immutable owner for eager SunX509 PKCS12 credentials.
+It loads provider aliases and issuer chains, then recovers each final private or secret entry before filtering secrets and empty private-key chains.
+Its single-writer construction transient retains all private bags for load-time chain assembly and shares source certificate owners.
+Private recovery calls the pinned Java private-factory admission layer; unknown factories fail without a generic-key fallback.
+Secret-key recovery preserves registered PBE factory rules and permits Java's nonempty opaque non-PBE SecretKeySpec values before discarding them.
+The Sun-only protection services implement the pinned PBE/MAC password, parameter and retry rules without changing generic or deferred recovery.
+Loading uses the JKS-compatible initial bound plus a separately admitted construction transient, section/recovery scratch, chain expansion and retained key owners.
+Both producer and registry adapters import these credentials independently of private-key/certificate consistency.
+The link:src/sun_pkcs12/README.adoc[Sun PKCS12 reference] records source provenance, provider services, admission bounds, native certificate/import limits and remaining deferred SecretBag handling work.
+
 `DistinguishedName` is a passive immutable Java principal value with an independent reservation covering decoding and its retained canonical spelling.
 It follows OpenJDK 25.0.1 `X500Name`, `RDN`, and `AVA` canonicalization: RDN order remains significant, assertions within an RDN are sorted, and repeated assertions are retained.
 Standard RFC2253 keywords decode UTF8String and PrintableString values, including Java's Latin-1 decoding of PrintableString bytes.
