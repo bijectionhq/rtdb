@@ -46,8 +46,12 @@ fn short(output: &mut Vec<u8>, value: &[u8]) { output.extend_from_slice(&u16::tr
 fn long(output: &mut Vec<u8>, value: &[u8]) { output.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes()); output.extend_from_slice(value); }
 
 pub fn jks(identities: &[(&str, &Credential)], store_password: &str, key_password: &str) -> Vec<u8> {
+    jks_with_passwords(&identities.iter().map(|(alias, identity)| (*alias, *identity, key_password)).collect::<Vec<_>>(), store_password)
+}
+
+pub fn jks_with_passwords(identities: &[(&str, &Credential, &str)], store_password: &str) -> Vec<u8> {
     let mut store = 0xfeedfeedu32.to_be_bytes().to_vec(); store.extend_from_slice(&2u32.to_be_bytes()); store.extend_from_slice(&(identities.len() as u32).to_be_bytes());
-    for (alias, identity) in identities {
+    for (alias, identity, key_password) in identities {
         let key = identity.key.private_key_to_pkcs8().unwrap();
         let key_password = password(key_password); let mut previous = vec![7; 20]; let mut protected = previous.clone();
         for block in key.chunks(20) { previous = sha1(&[key_password.as_slice(), &previous].concat()); protected.extend(block.iter().zip(&previous).map(|(byte, mask)| byte ^ mask)); }

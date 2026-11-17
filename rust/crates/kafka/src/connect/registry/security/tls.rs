@@ -16,6 +16,7 @@ pub(super) fn client(options: &BTreeMap<String, String>, context: &mut Conversio
     let _preflight = context.reserve(preflight)?;
     let normalized = super::normalized(options);
     let tls = options.iter().filter_map(|(name, value)| name.strip_prefix("schema.registry.ssl.").map(|name| (name, value.as_str()))).collect::<BTreeMap<_, _>>();
+    let algorithm = crate::tls::keys::Algorithm::parse(tls.get("keymanager.algorithm").copied().filter(|name| !name.is_empty())).unwrap_or(crate::tls::keys::Algorithm::SunX509);
     let trust = Material::parse(&tls, "truststore", StoreUse::Trust)?;
     let identity = Material::parse(&tls, "keystore", StoreUse::OptionalIdentity)?;
     let root_bound = if trust.is_none() { crate::tls::trust::allocation_bound()? } else { 0 };
@@ -23,12 +24,12 @@ pub(super) fn client(options: &BTreeMap<String, String>, context: &mut Conversio
     let mut bound = options.iter().try_fold(root_bound, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len().checked_mul(16)?)).ok_or_else(|| error("allocation-overflow", "Registry TLS configuration overflow")))?;
     let trust_length = trust.as_ref().map(Material::length).transpose()?;
     let identity_length = identity.as_ref().map(Material::length).transpose()?;
-    for length in trust_length.into_iter().chain(identity_length) {
-        bound = bound.checked_add(KeyStore::allocation_bound(length.checked_add(1).ok_or_else(|| error("allocation-overflow", "Registry TLS allocation overflow"))?)?).ok_or_else(|| error("allocation-overflow", "Registry TLS allocation overflow"))?;
+    for (material, length) in trust.as_ref().zip(trust_length).into_iter().chain(identity.as_ref().zip(identity_length)) {
+        bound = bound.checked_add(material.allocation_bound(length.checked_add(1).ok_or_else(|| error("allocation-overflow", "Registry TLS allocation overflow"))?, algorithm)?).ok_or_else(|| error("allocation-overflow", "Registry TLS allocation overflow"))?;
     }
     let charge = context.reserve(bound)?;
     let trust = trust.as_ref().zip(trust_length).map(|(material, length)| material.load(length, Arc::clone(&charge))).transpose()?;
-    let identity = identity.as_ref().zip(identity_length).map(|(material, length)| material.load(length, Arc::clone(&charge))).transpose()?;
+    let identity = identity.as_ref().zip(identity_length).map(|(material, length)| material.load_identity(length, algorithm, Arc::clone(&charge))).transpose()?;
     let owner = crate::tls::NativeTls::from_registry(&tls, trust.as_ref(), identity.as_ref(), Arc::clone(&charge)).map_err(tls_error)?;
     let tls_context = unsafe { owner.registry_context().map_err(tls_error)? };
     let client = Client::new(tls_context, owner, verifies_names(&tls, registry_hostname_policy), &normalized, Arc::clone(&charge))?;
@@ -156,6 +157,25 @@ mod tests {
         assert!(client(&BTreeMap::from([("schema.registry.ssl.keystore.key".into(), "secret".into())]), &mut context, true).is_err());
         assert!(client(&BTreeMap::from([("schema.registry.ssl.truststore.type".into(), "PEM".into()), ("schema.registry.ssl.truststore.certificates".into(), "invalid".into())]), &mut context, true).is_err());
         assert!(client(&BTreeMap::from([("schema.registry.ssl.provider".into(), "java-only".into())]), &mut context, true).is_err());
+    }
+
+    #[test]
+    fn registry_new_sunx509_defers_java_key_password_errors_after_loading_metadata() {
+        let path = format!("{}/../tls/tests/fixtures/distinct-passwords.jks", env!("CARGO_MANIFEST_DIR"));
+        let memory = rtdb_columnar::MemoryBudget::new(32 << 20);
+        for (algorithm, succeeds) in [("SunX509", false), ("NewSunX509", true), ("PKIX", true)] {
+            let options = BTreeMap::from([
+                ("schema.registry.ssl.keystore.location".into(), path.clone()),
+                ("schema.registry.ssl.keystore.password".into(), "store_password".into()),
+                ("schema.registry.ssl.key.password".into(), "incorrect-key-password".into()),
+                ("schema.registry.ssl.keymanager.algorithm".into(), algorithm.into()),
+            ]);
+            let mut context = ConversionContext::new(Arc::clone(&memory));
+            let loaded = client(&options, &mut context, true);
+            assert_eq!(loaded.is_ok(), succeeds);
+            drop(loaded); drop(context);
+            assert_eq!(memory.used_bytes(), 0);
+        }
     }
 }
 

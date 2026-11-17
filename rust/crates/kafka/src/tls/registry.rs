@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, ptr, sync::Arc};
 use foreign_types::ForeignType;
-use openssl::{ssl::{SslContext, SslContextBuilder, SslMode, SslVerifyMode}, stack::Stack, x509::X509};
+use openssl::{ssl::{SslContext, SslContextBuilder, SslMode, SslVerifyMode}, x509::X509};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::KeyStore;
 use rtdb_types::Result;
-use super::{Algorithm, ClientIdentity, KeyManager, KeyType, NativeTls, Policy, invalid, random, security, trust, validation};
+use super::{Algorithm, KeyManager, Material, NativeTls, Policy, invalid, random, trust, validation};
 
 impl NativeTls {
-    pub(crate) fn from_registry(options: &BTreeMap<&str, &str>, trust: Option<&KeyStore>, identities: Option<&KeyStore>, charge: Arc<MemoryReservation>) -> Result<Arc<Self>> {
+    pub(crate) fn from_registry(options: &BTreeMap<&str, &str>, trust: Option<&KeyStore>, identities: Option<&Material>, charge: Arc<MemoryReservation>) -> Result<Arc<Self>> {
         super::validate_provider(options.get("provider").copied().filter(|name| !name.is_empty()))?;
         let algorithm = Algorithm::parse(options.get("keymanager.algorithm").copied().filter(|name| !name.is_empty()))?;
         let trust_algorithm = validation::Algorithm::parse(options.get("trustmanager.algorithm").copied().filter(|name| !name.is_empty()))?;
@@ -18,24 +18,15 @@ impl NativeTls {
         let signature_random = random::Context::new(None, charge.budget())?;
         let mut bound = 65_536usize;
         for certificate in trust.into_iter().flat_map(KeyStore::trusted_certificates) { bound = native_bound(bound, certificate.len())?; }
-        for identity in identities.into_iter().flat_map(KeyStore::identities) {
-            bound = native_bound(bound, identity.private_key_pkcs8().len())?;
-            for certificate in identity.certificates() { bound = native_bound(bound, certificate.len())?; }
-        }
-        let reservations = vec![Arc::clone(&charge), charge.budget().reserve(bound)?];
+        let mut reservations = vec![Arc::clone(&charge), charge.budget().reserve(bound)?];
         let default_trust = if trust.is_none() { Some(trust::decode(Arc::clone(&charge))?) } else { None };
         let trust = trust.or(default_trust.as_ref()).expect("explicit or default Registry trust");
         let trust = trust.trusted_certificates().iter().map(|certificate| X509::from_der(certificate).map_err(invalid)).collect::<Result<Vec<_>>>()?;
-        let key_manager = KeyManager::new(algorithm, identities.map(KeyStore::identities).unwrap_or(&[]));
-        let identities = identities.into_iter().flat_map(KeyStore::identities).map(|identity| {
-            let certificate = X509::from_der(&identity.certificates()[0]).map_err(invalid)?;
-            let kind = KeyType::of(&certificate)?;
-            let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
-            let mut chain = Stack::new().map_err(invalid)?;
-            for certificate in &identity.certificates()[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-            let eligible = algorithm == Algorithm::SunX509 || security::verify_client_chain(&std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>()).is_ok();
-            Ok(ClientIdentity { certificate, key, chain, kind, eligible })
-        }).collect::<Result<Vec<_>>>()?;
+        let (key_manager, identities) = if let Some(material) = identities {
+            let (manager, identities, native_charge) = material.native(algorithm, &random, &charge)?;
+            reservations.push(native_charge);
+            (manager, identities)
+        } else { (KeyManager::new(algorithm, &[]), Vec::new()) };
         let simple_trust = if trust_algorithm == validation::Algorithm::SunX509 { Some(validation::SimpleTrust::new(trust.clone(), Arc::clone(&charge))?) } else { None };
         Ok(Arc::new(Self { identities, key_manager, trust: Some(trust), simple_trust, policy, reservations, random, signature_random }))
     }

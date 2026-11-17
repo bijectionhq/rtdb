@@ -32,7 +32,8 @@ The Registry hostname override disables name checks for an absent, empty or exac
 OAuth HTTPS retains its default hostname verification.
 The link:src/connect/registry/http/README.adoc[Registry HTTP connector] retains caller-driven connection ownership and Java redirect, timeout and response-header behavior.
 Explicit `ssl.ca.location` or `ssl.ca.pem` retains native CA loading; an explicit Java truststore, including an empty store, replaces the pinned anchors.
-A per-connection certificate callback checks the peer's certificate types, signature algorithms, curves and acceptable issuer names through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
+A per-connection certificate callback selects client identities using the configured Java key manager.
+The eager `SunX509` path additionally checks native usability through OpenSSL's https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
 `ssl.keymanager.algorithm` selects `SunX509` by default; `NewSunX509` and its `PKIX` alias select the alternative built-in manager.
 Registry HTTPS accepts the same names through `schema.registry.ssl.keymanager.algorithm`.
 Algorithm names are case-insensitive.
@@ -42,6 +43,12 @@ Kafka applies Java ConfigDef trimming to algorithm names; Registry HTTPS preserv
 It otherwise chooses the first valid certificate, then an expired certificate before one with incompatible client key usage or extended key usage.
 Fallback ties use requested key-type priority, then store enumeration.
 `NewSunX509` also applies the pinned Java algorithm constraints to every certificate in each candidate chain.
+Java JKS and PKCS12 stores under `NewSunX509` retain encrypted private keys and select using certificate metadata before recovering the chosen entry.
+An unavailable key password or malformed protected key on an unselected entry does not fail configuration.
+Ordinary recovery failure on the selected entry supplies no client certificate and does not select another alias; memory-admission failures fail the callback.
+The retained effective key password has its own admitted, zeroized buffer, with the store password used when no key password was supplied.
+Recovered native keys retain independent reservations and both random-provider contexts on their SSL connection until native key cleanup completes.
+PEM keys and `SunX509` Java keys remain eager.
 Both transports keep the peer's certificate signature preferences separate from its CertificateVerify schemes.
 TLS 1.3 uses `signature_algorithms_cert` when present, with the unfiltered `signature_algorithms` list as its fallback.
 Certificate preferences set key-type priority, while the signing list must permit a CertificateVerify signature and TLS 1.2 certificate types restrict eligible key families.
@@ -83,7 +90,7 @@ Certificate SHA-1 remains subject to the pinned path policy; SHA-1 handshake sig
 Trusted certificates follow Java HashSet bucket and tree ordering; ties between distinct certificates with the same hash use native object identity and are specific to the process.
 The native simple validator checks the connection's configured DNS name or IP address and retains its peer-chain reservation until the connection is destroyed.
 `SunX509` uses the pinned roots or Java-style trust material; native `ssl.ca.location` and `ssl.ca.pem` overrides remain available with `PKIX`.
-All parsed keys, chains, roots and their memory reservations belong to one immutable TLS value retained by the native client.
+Parsed store metadata, eager keys, chains, roots and their memory reservations belong to one immutable TLS value retained by the native client.
 Native client destruction joins librdkafka's activity and destroys its OpenSSL objects before releasing that value.
 Configuration duplication retains the same value, and creation failures release both the native configuration and its TLS ownership.
 The vendored callback contract is documented in link:../../vendor/rdkafka/XTDB.adoc[the rdkafka fork].
@@ -111,7 +118,8 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 == Open parity gaps
 
-`NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
+The eager `SunX509` store decoder still differs from Java provider alias lookup for raw mixed-case JKS aliases and some PKCS12 alias and issuer-chain cases.
+Its JKS path recovers a private key before discarding an empty chain, while PKCS12 currently skips keys without a matched certificate before recovery; Java `SunX509KeyManagerImpl` recovers those keys first.
 PKIX builder candidate preference, TreeSet traversal and subject/key/subject-alternative-name repetition rules still require the exact Java search-order implementation.
 Native name-constraint matching beyond Java self-issued exceptions and native algorithm availability still require qualification against Java's validator.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
