@@ -6,6 +6,10 @@ The upstream distributions and their license notices are retained.
 `SslContextConfigurer` is a passive, shared configuration capability.
 Its callback receives the linked OpenSSL `SSL_CTX` after native certificate and verification setup and before any connection starts.
 The callback may install per-connection callbacks that borrow its immutable state.
+The optional `replaces_default_trust` method suppresses automatic platform trust-store loading, CA path probing and OpenSSL default verify paths when the capability supplies replacement trust.
+Its default is false.
+Explicit native CA certificates, CRLs and client identities are still loaded before the callback.
+The native configuration stores the selected flag, including across configuration duplication.
 The optional `library_context` method supplies a borrowed OpenSSL 3 library context before native `SSL_CTX_new_ex` construction.
 Its omitted implementation selects OpenSSL's default context.
 The same retained capability owns that library context through the last native TLS object's destruction.
@@ -31,5 +35,5 @@ It does not inspect private C layouts or locate callback state through a global 
 The consuming Kafka crate pins `openssl` 0.10.81 and `openssl-sys` 0.9.117, shared with the native dependency's OpenSSL linkage.
 
 Primary references are https://github.com/fede1024/rust-rdkafka/tree/v0.38.0[rust-rdkafka 0.38.0], https://github.com/confluentinc/librdkafka/tree/v2.10.0[librdkafka 2.10.0], https://docs.openssl.org/3.0/man3/SSL_CTX_set_cert_cb/[SSL_CTX_set_cert_cb] and https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
-Native ownership and handshake regression sources live in `../../crates/kafka/tests/native_tls_ownership.rs` and `../../crates/kafka/tests/connect_registry_tls.rs`.
+Native ownership, default-trust replacement and handshake regression sources live in `../../crates/kafka/tests/native_tls_ownership.rs`, `../../crates/kafka/tests/native_tls_default_trust.rs` and `../../crates/kafka/tests/connect_registry_tls.rs`.
 The fork and regression sources remain uncompiled and unexecuted in the source-only phase.

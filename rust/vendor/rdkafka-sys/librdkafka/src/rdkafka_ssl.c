@@ -1256,7 +1256,7 @@ static int rd_kafka_ssl_set_certs(rd_kafka_t *rk,
                 }
         }
 
-        if (ca_probe) {
+        if (ca_probe && !rk->rk_conf.ssl.ctx_replaces_default_trust) {
 #ifdef _WIN32
                 /* Attempt to load CA root certificates from the
                  * configured Windows certificate stores. */

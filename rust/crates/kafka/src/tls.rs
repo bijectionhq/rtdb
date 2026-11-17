@@ -125,6 +125,7 @@ impl NativeTls {
 }
 
 impl rdkafka::config::SslContextConfigurer for NativeTls {
+    fn replaces_default_trust(&self) -> bool { self.trust.is_some() }
     unsafe fn library_context(&self) -> *mut c_void { self.random.as_ptr().cast() }
     unsafe fn configure(&self, context: *mut c_void) -> std::result::Result<(), String> {
         let context = context.cast::<openssl_sys::SSL_CTX>();

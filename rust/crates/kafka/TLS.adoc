@@ -20,6 +20,8 @@ An empty Java identity store supplies no client certificate.
 An empty explicit Java truststore replaces default roots with an empty trust set; certificate acceptance is decided during the handshake.
 Absent Java and native CA configuration uses the pinned Temurin 25.0.1+8 `cacerts` resource, retained with its provenance and license files in `src/tls/cacerts`.
 The native client receives a fresh trust store containing exactly those decoded anchors.
+Clients with retained Java or pinned trust material skip native platform-root discovery before installing that trust store.
+Explicit native CA, CRL and identity settings retain their own loading and validation.
 Registry HTTPS clients decode the same pinned resource into their Rustls root store, with the client retaining its admitted allocation.
 They retain an explicitly empty Java truststore as empty.
 Explicit `ssl.ca.location` or `ssl.ca.pem` retains native CA loading; an explicit Java truststore, including an empty store, replaces the pinned anchors.

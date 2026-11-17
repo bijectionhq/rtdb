@@ -155,3 +155,19 @@ fn producer_derivation_applies_defaults_without_changing_the_shared_base() {
     }
     assert!(configuration.config_map().is_empty());
 }
+
+#[test]
+fn prepared_tls_replaces_automatic_roots_only_when_it_owns_the_trust_material() {
+    let memory = MemoryBudget::new(64 << 20);
+    for (options, expected) in [
+        (BTreeMap::from([("security.protocol".into(), "SSL".into())]), "true"),
+        (ssl_options(), "true"),
+        (BTreeMap::from([("security.protocol".into(), "SSL".into()), ("ssl.ca.location".into(), "native-roots.pem".into())]), "false"),
+    ] {
+        let configuration = prepare(&options, &memory).unwrap();
+        let native = configuration.create_native_config().unwrap();
+        assert_eq!(native.get("ssl.ctx.replaces.default.trust").unwrap(), expected);
+        drop(configuration); drop(native);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

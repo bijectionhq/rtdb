@@ -2481,6 +2481,16 @@ rd_kafka_conf_res_t rd_kafka_conf_set_ssl_cert_verify_cb(
 
 
 /**
+ * @brief Skip automatic CA discovery when a TLS context callback supplies trust.
+ * A nonzero replace value skips platform certificate stores, CA path probing and OpenSSL default verify paths; explicit CA, CRL and identity loading remains enabled.
+ * The default is zero, and configuration copies retain the selected value.
+ * @returns RD_KAFKA_CONF_INVALID when nonzero replace requires unavailable SSL support.
+ */
+RD_EXPORT
+rd_kafka_conf_res_t rd_kafka_conf_set_ssl_ctx_replaces_default_trust(
+    rd_kafka_conf_t *conf, int replace);
+
+/**
  * @brief Supply the borrowed OpenSSL 3 library context used to create TLS contexts.
  * Configuration copies borrow the same pointer, which must outlive their clients.
  * A null pointer selects OpenSSL's default library context.
