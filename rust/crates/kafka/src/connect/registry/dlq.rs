@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc, time::{Duration, Instant}};
-use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, message::{Header, OwnedHeaders}, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext}};
+use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, message::{Header, OwnedHeaders}, native_byte_account::NativeByteAccount, producer::{BaseProducer, BaseRecord, DeliveryResult, Producer, ProducerContext}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use super::{ConversionContext, Original, error, rules::DlqRule};
@@ -75,7 +75,9 @@ impl DlqProducer {
         let configuration = options.iter().try_fold(65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len())).ok_or_else(overflow))?;
         let mut charges = vec![context.reserve(configuration.checked_mul(8).ok_or_else(overflow)?)?];
         let mut settings = config::Settings::parse(options)?;
-        charges.push(context.reserve(settings.allocation_bound()?)?);
+        let native_capacity = settings.native_byte_capacity()?;
+        let native_charge = context.reserve(native_capacity)?;
+        charges.push(Arc::clone(&native_charge));
         let tls = tls::configure(options, &mut settings.properties, context)?;
         let mut client = crate::client_config(&settings.properties);
         if let Some(tls) = tls {
@@ -83,6 +85,8 @@ impl DlqProducer {
             charges.extend(tls.reservations().cloned());
             client.set_ssl_context_configurer(tls);
         }
+        let account = NativeByteAccount::new(native_capacity, native_charge).map_err(|cause| error("dlq", cause))?;
+        client.set_native_byte_account(account);
         let producer = client.create_with_context(DeliveryContext).map_err(|cause| error("dlq", cause))?;
         Ok(Self { producer, settings, charges })
     }
@@ -123,6 +127,9 @@ fn varint_length(value: usize) -> Result<usize> {
     Ok((32 - (value << 1).leading_zeros()).max(1).div_ceil(7) as usize)
 }
 fn overflow() -> rtdb_types::Anomaly { error("allocation-overflow", "Dead-letter allocation exceeds addressable memory") }
+
+#[cfg(test)]
+mod native_account_tests;
 
 #[cfg(test)]
 mod tests {

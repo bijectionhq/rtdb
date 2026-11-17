@@ -175,6 +175,8 @@ Registry JSON retains BigDecimal precision and scale; generic JSON and Avro migr
 Value failures retain the Registry key frame, while key failures send a null value.
 The source uses headerless converter calls, so DLQ records carry the five generated rule headers.
 A missing DLQ topic fails before producer creation; producer failures leave the rule failure as the returned conversion error.
+DLQ producers attach their retained native byte account before native construction.
+link:src/connect/registry/dlq/NATIVE-ACCOUNT.adoc[DLQ byte-account ownership] records the selected request/response ceiling and the separate construction/background allocation requirements.
 The assignment owner awaits both converter drains after normal completion, errors, and cancellation.
 Native Kafka dead-letter producers support PLAIN/SCRAM credentials and JKS, PKCS12 or PEM client material, including multiple private-key entries selected during the TLS handshake.
 Java protocol and cipher-suite configuration uses the native OpenSSL client adapter; link:TLS.adoc[TLS configuration and open parity gaps] records its scope and pending qualification.

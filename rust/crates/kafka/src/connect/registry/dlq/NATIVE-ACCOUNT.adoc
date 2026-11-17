@@ -1,0 +1,23 @@
+= DLQ native byte account
+
+The actual DlqProducer constructor attaches a NativeByteAccount to its ClientConfig before creating the native producer.
+The existing checked capacity policy is three buffer.memory lengths plus 8MiB.
+The same capacity reservation is shared with the producer's charge region and the account guard; shared handles do not reserve that capacity twice.
+Native TLS configuration and captured material retain their existing earlier construction/error order.
+
+DlqProducer and Settings remain passive values with their existing stored shape.
+The account retains its existing Monitor Object role, with a re-evaluable drain condition over attached clients and charged native allocations.
+Configuration clones and native clients keep that account alive through their existing ownership rules.
+Completed ordered Metadata requests also retain it, including when they outlive both DlqProducer and its originating context.
+The final account release drains native owners before releasing its Rust capacity guard.
+
+The selected ceiling covers native receive-frame storage and the implemented accounted request, completion and queue-owner classes.
+It does not establish a complete producer allocation bound.
+Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
+The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
+Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
+
+Four new regression source functions exercise actual DlqProducer attachment, response ownership after producer/context destruction, failed native configuration cleanup, pre-construction capacity rejection and checked capacity arithmetic.
+The native account and ordered response primitives are the existing reviewed production implementations, and the integration source uses a real native mock cluster.
+Original DLQ/config/cancellation assertions remain unchanged.
+No compiler, formatter, runtime or regression execution occurred in Phase 1.

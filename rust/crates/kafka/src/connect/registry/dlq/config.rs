@@ -101,7 +101,7 @@ impl Settings {
         if !self.key_serializer.accepts(key) || !self.value_serializer.accepts(value) { return Err(error("dlq", "Configured producer serializer cannot accept the original byte array")); }
         Ok(())
     }
-    pub fn allocation_bound(&self) -> Result<usize> { self.buffer_bytes.checked_mul(3).and_then(|bytes| bytes.checked_add(8 << 20)).ok_or_else(overflow) }
+    pub fn native_byte_capacity(&self) -> Result<usize> { self.buffer_bytes.checked_mul(3).and_then(|bytes| bytes.checked_add(8 << 20)).ok_or_else(overflow) }
 }
 
 #[cfg(test)]
@@ -174,6 +174,23 @@ mod tests {
             options.insert("ssl.engine.factory.class".into(), factory.into());
             assert!(Settings::parse(&options).is_err());
         }
+    }
+
+    #[test]
+    fn native_byte_capacity_is_a_checked_ceiling_independent_of_the_record_size_limit() {
+        let mut options = BTreeMap::from([("bootstrap.servers".into(), "localhost:1".into())]);
+        options.insert("buffer.memory".into(), "0".into());
+        let settings = Settings::parse(&options).unwrap();
+        assert_eq!(settings.native_byte_capacity().unwrap(), 8 << 20);
+        assert_eq!(settings.maximum_record_bytes, 0);
+        options.insert("buffer.memory".into(), (1 << 20).to_string());
+        let settings = Settings::parse(&options).unwrap();
+        assert_eq!(settings.native_byte_capacity().unwrap(), 11 << 20);
+        assert_eq!(settings.maximum_record_bytes, 1 << 20);
+        options.insert("buffer.memory".into(), i64::MAX.to_string());
+        let settings = Settings::parse(&options);
+        if usize::BITS >= 64 { assert!(settings.unwrap().native_byte_capacity().is_err()); }
+        else { assert!(settings.is_err()); }
     }
 }
 
