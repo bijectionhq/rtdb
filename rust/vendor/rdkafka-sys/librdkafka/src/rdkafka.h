@@ -3118,6 +3118,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
 
 /**
  * Creates a fixed byte account for producer receive frames and explicitly accounted native requests.
+ * Parsed Metadata arenas retain their charges until rd_kafka_metadata_destroy().
  * The caller reserves capacity bytes before creating the account and keeps that reservation until account destruction returns.
  * Returns NULL on allocation or monitor failure.
  */
@@ -5271,6 +5272,8 @@ typedef struct rd_kafka_metadata {
  * @remark Consumer: If \p all_topics is non-zero the Metadata response
  *         information may trigger a re-join if any subscribed topics
  *         have changed partition count or existence state.
+ * @remark On an accounted producer, the returned allocation retains its byte charge independently of the client.
+ *         Release it before waiting for that account's destruction on the same caller.
  *
  * @returns RD_KAFKA_RESP_ERR_NO_ERROR on success (in which case *metadatap)
  *          will be set, else RD_KAFKA_RESP_ERR__TIMED_OUT on timeout or
@@ -5286,6 +5289,8 @@ rd_kafka_metadata(rd_kafka_t *rk,
 
 /**
  * @brief Release metadata memory.
+ * Returns the allocation's byte charge after freeing its storage.
+ * A NULL pointer is accepted.
  */
 RD_EXPORT
 void rd_kafka_metadata_destroy(const struct rd_kafka_metadata *metadata);

@@ -416,6 +416,7 @@ static int unittest_rdclock(void) {
 /**@}*/
 
 extern int unittest_string(void);
+extern int unittest_metadata_account(void);
 extern int unittest_cgrp(void);
 extern int unittest_mock_cluster(void);
 #if WITH_SASL_SCRAM
@@ -457,6 +458,7 @@ int rd_unittest(void) {
                 {"broker", unittest_broker},
                 {"byte_account", unittest_byte_account},
                 {"ordered_metadata", unittest_ordered_metadata},
+                {"metadata_account", unittest_metadata_account},
                 {"request", unittest_request},
 #if WITH_SASL_OAUTHBEARER
                 {"sasl_oauthbearer", unittest_sasl_oauthbearer},

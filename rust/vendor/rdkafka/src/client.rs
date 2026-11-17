@@ -484,6 +484,7 @@ impl<C: ClientContext> Client<C> {
 
     /// Returns the metadata information for the specified topic, or for all topics in the cluster
     /// if no topic is specified.
+    /// An accounted producer reports the native critical system resource error if parsed-arena admission or allocation fails.
     pub fn fetch_metadata<T: Into<Timeout>>(
         &self,
         topic: Option<&str>,
@@ -510,7 +511,7 @@ impl<C: ClientContext> Client<C> {
             return Err(KafkaError::MetadataFetch(ret.into()));
         }
 
-        Ok(unsafe { Metadata::from_ptr(metadata_ptr) })
+        Ok(unsafe { Metadata::from_ptr(metadata_ptr, self.native.byte_account().cloned()) })
     }
 
     /// Returns high and low watermark for the specified topic and partition.

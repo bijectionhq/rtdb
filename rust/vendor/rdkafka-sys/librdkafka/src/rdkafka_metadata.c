@@ -185,7 +185,64 @@ rd_kafka_metadata(rd_kafka_t *rk,
 
 
 void rd_kafka_metadata_destroy(const struct rd_kafka_metadata *metadata) {
+        rd_kafka_metadata_internal_t *mdi;
+        rd_kafka_byte_account_t *account;
+        size_t charge;
+        if (!metadata)
+                return;
+        mdi = rd_kafka_metadata_get_internal(metadata);
+        account = mdi->byte_account;
+        charge = mdi->byte_charge;
         rd_free((void *)metadata);
+        rd_kafka_byte_account_release(account, charge);
+}
+
+static rd_bool_t rd_kafka_metadata_arena_size(size_t name_bytes,
+                                              size_t wire_bytes,
+                                              rd_bool_t compute_racks,
+                                              size_t *size) {
+        /* The parser's arena estimate allows four wire lengths, plus one for rack mappings. */
+        const size_t factor = 4 + (compute_racks ? 1 : 0);
+        size_t parts[3], total = 0;
+        int i;
+        if (wire_bytes > SIZE_MAX / factor)
+                return rd_false;
+        parts[0] = sizeof(rd_kafka_metadata_internal_t);
+        parts[1] = name_bytes;
+        parts[2] = wire_bytes * factor;
+        for (i = 0; i < 3; i++) {
+                size_t aligned;
+                if (parts[i] > SIZE_MAX - 7)
+                        return rd_false;
+                aligned = RD_ROUNDUP(parts[i], 8);
+                if (aligned > SIZE_MAX - total)
+                        return rd_false;
+                total += aligned;
+        }
+        *size = total;
+        return rd_true;
+}
+
+static rd_kafka_metadata_internal_t *rd_kafka_metadata_arena_new(
+    rd_tmpabuf_t *tbuf, rd_kafka_byte_account_t *account, size_t size,
+    void *(*allocate)(size_t)) {
+        rd_kafka_metadata_internal_t *mdi;
+        char *allocation;
+        if (size < sizeof(*mdi) || size > SIZE_MAX - 7 || (size & 7) ||
+            !rd_kafka_byte_account_acquire(account, size))
+                return NULL;
+        allocation = allocate(size);
+        if (!allocation) {
+                rd_kafka_byte_account_release(account, size);
+                return NULL;
+        }
+        rd_tmpabuf_new(tbuf, size, rd_false);
+        tbuf->buf = allocation;
+        mdi = rd_tmpabuf_alloc(tbuf, sizeof(*mdi));
+        memset(mdi, 0, sizeof(*mdi));
+        mdi->byte_account = account;
+        mdi->byte_charge = account ? size : 0;
+        return mdi;
 }
 
 
@@ -207,7 +264,9 @@ static rd_kafka_metadata_internal_t *rd_kafka_metadata_copy_internal(
          * the pointer address. */
         rd_tmpabuf_new(&tbuf, size, rd_true /*assert on fail*/);
         rd_tmpabuf_finalize(&tbuf);
-        mdi = rd_tmpabuf_write(&tbuf, src, sizeof(*mdi));
+        mdi = rd_tmpabuf_write(&tbuf, src_internal, sizeof(*mdi));
+        mdi->byte_account = NULL;
+        mdi->byte_charge = 0;
         md  = &mdi->metadata;
 
         rd_tmpabuf_write_str(&tbuf, src->orig_broker_name);
@@ -551,10 +610,10 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                          const char *reason) {
         rd_kafka_t *rk = rkb->rkb_rk;
         int i, j, k;
-        rd_tmpabuf_t tbuf;
+        rd_tmpabuf_t tbuf = RD_ZERO_INIT;
         rd_kafka_metadata_internal_t *mdi = NULL;
         rd_kafka_metadata_t *md           = NULL;
-        size_t rkb_namelen;
+        size_t rkb_namelen, arena_size;
         const int log_decode_errors  = LOG_ERR;
         rd_list_t *missing_topics    = NULL;
         rd_list_t *missing_topic_ids = NULL;
@@ -579,6 +638,8 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                                     RD_KAFKAP_STR_LEN(rk->rk_conf.client_rack);
         rd_bool_t compute_racks = has_client_rack;
 
+        *mdip = NULL;
+
         if (request) {
                 requested_topics    = request->rkbuf_u.Metadata.topics;
                 requested_topic_ids = request->rkbuf_u.Metadata.topic_ids;
@@ -596,8 +657,7 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
 
         /* Ignore metadata updates when terminating */
         if (rd_kafka_terminating(rkb->rkb_rk)) {
-                err = RD_KAFKA_RESP_ERR__DESTROY;
-                goto done;
+                return RD_KAFKA_RESP_ERR__DESTROY;
         }
 
         rd_kafka_assert(NULL, thrd_is_current(rk->rk_thread));
@@ -611,24 +671,17 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                     rd_list_copy(requested_topic_ids, rd_list_Uuid_copy, NULL);
 
         rd_kafka_broker_lock(rkb);
-        rkb_namelen = strlen(rkb->rkb_name) + 1;
-        /* We assume that the marshalled representation is
-         * no more than 4 times larger than the wire representation.
-         * This is increased to 5 times in case if we want to compute partition
-         * to rack mapping. */
-        rd_tmpabuf_new(&tbuf, 0, rd_false /*dont assert on fail*/);
-        rd_tmpabuf_add_alloc(&tbuf, sizeof(*mdi));
-        rd_tmpabuf_add_alloc(&tbuf, rkb_namelen);
-        rd_tmpabuf_add_alloc(&tbuf, rkbuf->rkbuf_totlen *
-                                        (4 + (compute_racks ? 1 : 0)));
-
-        rd_tmpabuf_finalize(&tbuf);
-
-        if (!(mdi = rd_tmpabuf_alloc(&tbuf, sizeof(*mdi)))) {
+        rkb_namelen = strlen(rkb->rkb_name);
+        if (rkb_namelen == SIZE_MAX ||
+            !rd_kafka_metadata_arena_size(rkb_namelen + 1, rkbuf->rkbuf_totlen,
+                                           compute_racks, &arena_size) ||
+            !(mdi = rd_kafka_metadata_arena_new(
+                  &tbuf, rk->rk_byte_account, arena_size, malloc))) {
                 rd_kafka_broker_unlock(rkb);
                 err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
                 goto err;
         }
+        rkb_namelen++;
 
         md                 = &mdi->metadata;
         md->orig_broker_id = rkb->rkb_nodeid;
@@ -1114,7 +1167,6 @@ rd_kafka_parse_Metadata0(rd_kafka_broker_t *rkb,
                 rd_kafka_wrunlock(rkb->rkb_rk);
         }
 
-done:
         if (missing_topics)
                 rd_list_destroy(missing_topics);
         if (missing_topic_ids)
@@ -1153,7 +1205,8 @@ err:
                 rd_list_destroy(missing_topics);
         if (missing_topic_ids)
                 rd_list_destroy(missing_topic_ids);
-        rd_tmpabuf_destroy(&tbuf);
+        if (mdi)
+                rd_kafka_metadata_destroy(&mdi->metadata);
 
         return err;
 }
@@ -2196,3 +2249,5 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 
         return RD_KAFKA_OP_RES_HANDLED;
 }
+
+#include "rdkafka_metadata_account_test.h"

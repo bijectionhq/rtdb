@@ -94,6 +94,8 @@ typedef struct rd_kafka_metadata_internal_s {
         int32_t cluster_authorized_operations; /**< ACL operations allowed
                                                 * for cluster, -1 if not
                                                 * supported by broker */
+        rd_kafka_byte_account_t *byte_account;
+        size_t byte_charge;
 } rd_kafka_metadata_internal_t;
 
 /**

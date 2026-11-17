@@ -2632,7 +2632,7 @@ static void rd_kafka_handle_Metadata(rd_kafka_t *rk,
                 rko = NULL;
         } else {
                 if (mdi)
-                        rd_free(mdi);
+                        rd_kafka_metadata_destroy(&mdi->metadata);
         }
 
         goto done;

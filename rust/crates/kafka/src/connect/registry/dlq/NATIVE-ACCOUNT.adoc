@@ -19,7 +19,8 @@ Admission denial leaves an existing array intact and ends the current connection
 Initial and downgraded ApiVersions requests admit their contiguous frame and buffer owner before entering the broker's outbound queue.
 Their charge persists to final buffer release, including overlap with an earlier request during a downgrade.
 It does not establish a complete producer allocation bound.
-Client/broker construction, overlapping broker threads/stacks, automatic Metadata decoding and caches, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require their separate construction/background admission proof.
+Ordinary Metadata responses admit the contiguous parsed arena and keep its charge through the last native or Rust result owner.
+Client and broker construction, overlapping broker threads and stacks, Metadata cache entries, independent clones, rack scratch, admin output copies, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 

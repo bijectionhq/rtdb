@@ -93,7 +93,8 @@ Validation does not allocate an output collection or grow a buffer.
 The caller owns the topic-input array, any application result, and runtime timer/task allocation used by wait.
 
 The attached account also tracks ApiVersions handshake request buffers and the broker's decoded and fallback array payloads through their respective final release.
-Native client construction, bootstrap/discovered broker growth, broker threads and stacks, automatic Metadata decode/caches, ApiVersions sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
+The ordinary Metadata parser admits its contiguous response arena before allocation and keeps that charge with the arena after transfer.
+Native client construction, bootstrap and discovered broker growth, broker threads and stacks, Metadata cache entries, independent clones, rack scratch, admin output copies, ApiVersions sort storage, TLS/SASL, ordinary outbound requests, allocator overhead and the monitor require separate bounds.
 A whole-producer bound still requires a separately pre-admitted construction/background domain or admission interception for every reachable owner in that domain.
 Neither the completion cap nor borrowed validation establishes that bound.
 Java snapshot retention and partial/full merge, UUID/leader-epoch state, HashMap encounter order, metadata refresh/throttle scheduling, per-topic signed RoundRobin counters and once-per-send explicit partition binding remain separate integration work.

@@ -3,12 +3,14 @@
 use std::ffi::CStr;
 use std::fmt;
 use std::slice;
+use std::sync::Arc;
 
 use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
 use crate::error::IsError;
 use crate::util::{KafkaDrop, NativePtr};
+use crate::native_byte_account::NativeByteAccount;
 
 /// Broker metadata information.
 pub struct MetadataBroker(RDKafkaMetadataBroker);
@@ -145,7 +147,11 @@ impl fmt::Debug for MetadataTopic {
 ///
 /// This structure wraps the metadata pointer returned by rdkafka-sys, and
 /// deallocates all the native resources when dropped.
-pub struct Metadata(NativePtr<RDKafkaMetadata>);
+/// An accounted result retains its reservation independently of its originating client.
+pub struct Metadata {
+    native: NativePtr<RDKafkaMetadata>,
+    _byte_account: Option<Arc<NativeByteAccount>>,
+}
 
 unsafe impl KafkaDrop for RDKafkaMetadata {
     const TYPE: &'static str = "metadata";
@@ -157,20 +163,21 @@ unsafe extern "C" fn drop_metadata(ptr: *mut RDKafkaMetadata) {
 }
 
 impl Metadata {
-    /// Creates a new Metadata container given a pointer to the native rdkafka-sys metadata.
-    pub(crate) unsafe fn from_ptr(ptr: *const RDKafkaMetadata) -> Metadata {
-        Metadata(NativePtr::from_ptr(ptr as *mut _).unwrap())
+    /// # Safety
+    /// `ptr` must be exclusively owned native metadata and `account` must retain its attached byte account, if any.
+    pub(crate) unsafe fn from_ptr(ptr: *const RDKafkaMetadata, account: Option<Arc<NativeByteAccount>>) -> Metadata {
+        Metadata { native: NativePtr::from_ptr(ptr as *mut _).unwrap(), _byte_account: account }
     }
 
     /// Returns the ID of the broker originating this metadata.
     pub fn orig_broker_id(&self) -> i32 {
-        self.0.orig_broker_id
+        self.native.orig_broker_id
     }
 
     /// Returns the hostname of the broker originating this metadata.
     pub fn orig_broker_name(&self) -> &str {
         unsafe {
-            CStr::from_ptr(self.0.orig_broker_name)
+            CStr::from_ptr(self.native.orig_broker_name)
                 .to_str()
                 .expect("Broker name is not a valid UTF-8 string")
         }
@@ -180,8 +187,8 @@ impl Metadata {
     pub fn brokers(&self) -> &[MetadataBroker] {
         unsafe {
             slice::from_raw_parts(
-                self.0.brokers as *const MetadataBroker,
-                self.0.broker_cnt as usize,
+                self.native.brokers as *const MetadataBroker,
+                self.native.broker_cnt as usize,
             )
         }
     }
@@ -190,8 +197,8 @@ impl Metadata {
     pub fn topics(&self) -> &[MetadataTopic] {
         unsafe {
             slice::from_raw_parts(
-                self.0.topics as *const MetadataTopic,
-                self.0.topic_cnt as usize,
+                self.native.topics as *const MetadataTopic,
+                self.native.topic_cnt as usize,
             )
         }
     }

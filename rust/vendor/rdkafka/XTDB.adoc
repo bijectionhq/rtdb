@@ -93,8 +93,26 @@ The caller supplies a C completion that is valid on the submitting, serving, bro
 The account is a Monitor Object whose native release and client-detach operations signal the re-evaluable condition that both the live byte sum and attached-client count are zero.
 The last Rust owner waits for native release before dropping the supplied reservation.
 
+Ordinary Metadata responses admit their complete contiguous parsed arena before allocating it.
+Checked sizing includes the aligned internal root, originating-broker name and existing wire-size estimate, with the rack-mapping factor when required.
+Admission or native allocation denial returns `RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE` and parse failure releases the arena charge after freeing its storage.
+The root retains its account pointer and exact allocation charge through queue ownership and public C transfer.
+`rd_kafka_metadata_destroy` frees the root before returning that charge.
+Ordinary callback disposal, metadata-operation destruction and both admin projections use that final-release boundary.
+DescribeTopics retains an unpublished description through diagnostic formatting, then cleans it up with the parsed arena if validation fails.
+Both admin wrappers propagate the actual native parser/admission error even when it is separate from the response buffer's decode error.
+
+Rust `Metadata` retains an account `Arc` independently of its originating client and destroys its native pointer before that guard.
+Returned metadata can therefore outlive its producer without the producer's last account guard waiting on the caller's still-held result.
+Direct C and C++ users must dispose their returned metadata owners before waiting for account destruction on the same caller.
+Independent native metadata clones clear copied account ownership; their separate allocations remain unaccounted.
+Mock and leader-discovery roots remain uncharged and initialize their ownership fields to zero.
+The metadata cache, missing-topic lists, rack scratch, admin output copies, discovered brokers and other independent owners still require admission of their own.
+The additive arena and admin source fixtures live in `../rdkafka-sys/librdkafka/src/rdkafka_metadata_account_test.h` and `../rdkafka-sys/librdkafka/src/rdkafka_metadata_admin_account_test.h`.
+The Rust source fixtures include native regression dispatch and real MockCluster result lifetimes; neither has been executed in the source-only phase.
+
 The account measures the listed native allocation requests.
-The client, account monitor, existing queues, ordinary outbound requests, protocol decoding, TLS and SASL machinery, allocator overhead and application-side result storage have separate ownership and sizing.
+The client, account monitor, existing queues, ordinary outbound requests, other protocol decoding, TLS and SASL machinery, allocator overhead and application-side result storage have separate ownership and sizing.
 The additive link:src/ordered_metadata/TRANSPORT.adoc[ordered Metadata transport] retains bounded response storage on that account and exposes a validated borrowed visitor.
 The Connect DLQ metadata snapshot and round-robin partitioner still require their own integration.
 Regression sources live in `../../crates/kafka/tests/native_byte_account.rs` and `../rdkafka-sys/librdkafka/src/rdkafka_byte_account_test.h`.

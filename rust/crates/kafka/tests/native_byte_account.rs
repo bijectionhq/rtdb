@@ -91,3 +91,44 @@ fn native_byte_admission_follows_frames_requests_and_queue_nodes_through_final_r
 unsafe extern "C" {
     fn unittest_byte_account() -> std::ffi::c_int;
 }
+
+#[test]
+fn parsed_metadata_arena_admission_and_disposal_source_regressions() {
+    assert_eq!(unsafe { unittest_metadata_account() }, 0);
+}
+
+unsafe extern "C" {
+    fn unittest_metadata_account() -> std::ffi::c_int;
+}
+
+#[test]
+fn returned_metadata_keeps_the_account_until_its_last_native_arena_is_freed() {
+    use rdkafka::mocking::MockCluster;
+    use rdkafka::producer::{BaseProducer, Producer};
+    use std::time::Duration;
+
+    let cluster = MockCluster::new(1).unwrap();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let account = NativeByteAccount::new(8 << 20, Reservation(Arc::clone(&drops))).unwrap();
+    let weak = Arc::downgrade(&account);
+    let mut configuration = ClientConfig::new();
+    configuration.set("bootstrap.servers", cluster.bootstrap_servers());
+    configuration.set_native_byte_account(account);
+    let producer: BaseProducer = configuration.create().unwrap();
+    drop(configuration);
+    let first = producer.client().fetch_metadata(None, Duration::from_secs(10)).unwrap();
+    let second = producer.client().fetch_metadata(None, Duration::from_secs(10)).unwrap();
+    drop(producer);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    let two_arenas = weak.upgrade().unwrap().used();
+    assert!(two_arenas > 0);
+    assert_eq!(second.brokers().len(), 1);
+    assert!(!second.brokers()[0].host().is_empty());
+    drop(first);
+    let one_arena = weak.upgrade().unwrap().used();
+    assert!(one_arena > 0 && one_arena < two_arenas);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    drop(second);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
