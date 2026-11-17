@@ -24,6 +24,7 @@ fn write_string(text: &mut Text<'_>,value: &Object) -> Result<()> {
         Object::Time(value) => text.temporary(4096,||value.text()),
         Object::Path(value) => text.temporary(path_capacity(value)?,||Ok(value.text())),
         Object::TableRef(value) => { text.push("TableRef(schemaName=")?;text.push(&value.schema)?;text.push(", tableName=")?;text.push(&value.table)?;text.push(")") }
+        Object::VectorType(value) => value.write_string(text),
         Object::Throwable(value) => match value.as_ref() {
             Throwable::Anomaly { message,data,.. } => {
                 let Object::Keyword(category) = keyword_value(data,"cognitect.anomalies/category") else { return Err(invalid()); };
@@ -48,7 +49,7 @@ pub(super) fn printed(value: &Object,allocation: &EvaluationScope) -> Result<Str
     let mut text = Text::new(allocation);write_printed(&mut text,value)?;Ok(text.finish())
 }
 
-fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
+pub(super) fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
     match value {
         Object::Null => text.push("nil"),Object::Bool(value) => text.push(if *value { "true" } else { "false" }),
         Object::Number(value) => text.temporary(number_capacity(value)?,||Ok(value.printed())),
@@ -78,6 +79,7 @@ fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
         Object::TableRef(value) => {
             text.push("#xt/table ")?;if value.schema != "public" { text.push(&value.schema)?;text.push("/")?; }text.push(&value.table)
         }
+        Object::VectorType(value) => value.write_printed(text),
         Object::Throwable(value) => match value.as_ref() {
             Throwable::Anomaly { message,data,.. } => {
                 let Object::Keyword(category) = keyword_value(data,"cognitect.anomalies/category") else { return Err(invalid()); };

@@ -628,6 +628,26 @@ pub fn to_json_value(value: &TransitValue) -> Result<serde_json::Value> {
     to_json(value, 0)
 }
 
+/// Bounds storage allocated by `to_json_value`, including wrapper objects and temporary Base64 text.
+/// Reserve before conversion and retain the charge while the returned JSON value lives.
+/// Size overflow and nesting beyond the converter's depth limit return errors.
+pub fn json_value_allocation_bound(value: &TransitValue) -> Result<usize> {
+    fn bound(value: &TransitValue,depth: usize) -> Result<usize> {
+        if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
+        let add = |left: usize,right: usize|left.checked_add(right).ok_or_else(||invalid("Transit JSON allocation exceeds addressable memory"));
+        let text = |length: usize|length.checked_mul(8).ok_or_else(||invalid("Transit JSON allocation exceeds addressable memory"));
+        let payload = match value {
+            TransitValue::String(value) | TransitValue::Keyword(value) | TransitValue::Symbol(value) => text(value.len())?,
+            TransitValue::Bytes(value) => text(value.len())?,
+            TransitValue::Array(values) => values.iter().try_fold(0,|bytes,value|add(bytes,bound(value,depth + 1)?))?,
+            TransitValue::Map(entries) => entries.iter().try_fold(0,|bytes,(key,value)|add(add(add(bytes,512)?,bound(key,depth + 1)?)?,bound(value,depth + 1)?))?,
+            TransitValue::Tagged { tag,representation } => add(text(tag.len())?,bound(representation,depth + 1)?)?,
+            _ => 0,
+        };add(2048,payload)
+    }
+    bound(value,0)
+}
+
 fn to_json(value: &TransitValue, depth: usize) -> Result<serde_json::Value> {
     if depth > MAX_DEPTH { return Err(invalid("Transit nesting limit exceeded")); }
     Ok(match value {

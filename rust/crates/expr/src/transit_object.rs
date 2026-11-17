@@ -14,6 +14,7 @@ mod tagged_value;
 mod render;
 mod table;
 mod allocation;
+mod vector_type;
 use crate::EvaluationScope;
 use allocation::wire_charge;
 use collection::{Array,Map,Record,Entries};
@@ -22,12 +23,13 @@ use time::Time;
 use path::Path;
 use throwable::Throwable;
 use tagged_value::Tagged;
+use vector_type::Type;
 
 #[derive(Clone,Debug)]
 pub(crate) enum Object {
     Null,Bool(bool),Number(Arc<Number>),String(String),Keyword(String),Symbol(String),Character(u16),
     Bytes(Arc<Vec<u8>>),Vector(Vec<Self>),List(Vec<Self>),Set(Map),Map(Map),
-    Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(Arc<TableRef>),
+    Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(Arc<TableRef>),VectorType(Arc<Type>),
     TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),
 }
 
@@ -126,6 +128,7 @@ impl Object {
             "xtdb/tx-key" => Self::TxKey(Record::read(representation)?),
             "xtdb/path" => Self::Path(Path::read(representation.text()?)?),
             "xt/table" => Self::TableRef(Arc::new(table::read(representation,allocation)?)),
+            "xtdb/type" => Self::VectorType(Type::read(&representation,allocation)?),
             "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Self::Throwable(Arc::new(Throwable::read(&tag,&representation)?)),
             tag if Time::recognizes(tag) => Time::read(tag,&representation)?.map_or(Self::Null,Self::Time),
             _ => Self::Tagged(Arc::new(Tagged::new(tag,representation))),
@@ -196,6 +199,7 @@ impl Object {
             Self::Time(value) => value.wire()?,
             Self::Path(value) => value.wire(),
             Self::TableRef(value) => table::wire(value),
+            Self::VectorType(value) => value.wire(allocation)?,
             Self::Link(entries) => tagged("link",T::Map(wire_entries(entries.iter().map(|(key,value)|(key,value)),entries.len(),allocation)?)),
             Self::Throwable(value) => value.wire(allocation)?,
             Self::Tagged(value) => value.wire(allocation)?,
