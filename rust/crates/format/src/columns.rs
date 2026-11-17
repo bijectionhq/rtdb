@@ -153,9 +153,8 @@ fn scalar_to_proto(value: &ScalarType) -> Result<Type> {
         ScalarType::Duration(unit) => Type::Duration(encode_unit(*unit)),
         ScalarType::Interval(unit) => Type::Interval(Box::new(pb::Interval { unit: Some(match unit { IntervalUnit::YearMonth => 0, IntervalUnit::DayTime => 1, IntervalUnit::MonthDayNano => 2 }) })),
         ScalarType::IntervalMonthDayMicro => Type::Interval(Box::new(pb::Interval { unit: Some(3) })),
-        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 | ScalarType::F16 => {
-            return Err(Anomaly::unsupported("xtdb/col-meta-arrow-type", format!("Column metadata cannot record {value:?}")));
-        }
+        ScalarType::U8 | ScalarType::U16 | ScalarType::U32 | ScalarType::U64 => return Err(Anomaly::unsupported("xtdb/col-meta-unsigned-int", "unsigned ints")),
+        ScalarType::F16 => return Err(Anomaly::unsupported("xtdb/col-meta-float-precision", "float precision HALF")),
     })
 }
 
@@ -173,4 +172,22 @@ fn encode_unit(unit: TimeUnit) -> i32 {
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly {
     Anomaly::unsupported("xtdb/col-meta-type", message.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_scalar_metadata_preserves_the_reference_error_branch() {
+        for scalar in [ScalarType::U8, ScalarType::U16, ScalarType::U32, ScalarType::U64, ScalarType::F16] {
+            let (code, message) = if scalar == ScalarType::F16 { ("xtdb/col-meta-float-precision", "float precision HALF") } else { ("xtdb/col-meta-unsigned-int", "unsigned ints") };
+            for ty in [LogicalType::Scalar(scalar.clone()), LogicalType::list(LogicalType::Scalar(scalar.clone()))] {
+                let error = type_to_proto(&ty).unwrap_err();
+                assert_eq!(error.category, rtdb_types::AnomalyCategory::Unsupported);
+                assert_eq!(error.code, code);
+                assert_eq!(error.message.as_deref(), Some(message));
+            }
+        }
+    }
 }

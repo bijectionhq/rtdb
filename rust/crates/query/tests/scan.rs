@@ -28,7 +28,10 @@ async fn live_unsigned_cells_open_signed_while_native_metadata_rejects_unsigned_
     let physical = state.value().snapshot().column_types(&table())["v"].clone();
     let store = Arc::new(MemoryStore::default());
     let live = state.value().snapshot();
-    assert_eq!(rtdb_format::columns::type_to_proto(&physical).unwrap_err().code, "xtdb/col-meta-arrow-type");
+    let error = rtdb_format::columns::type_to_proto(&physical).unwrap_err();
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Unsupported);
+    assert_eq!(error.code, "xtdb/col-meta-unsigned-int");
+    assert_eq!(error.message.as_deref(), Some("unsigned ints"));
     {
         let context = query_context(live, Arc::clone(&store), false);
         let relation = scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None);

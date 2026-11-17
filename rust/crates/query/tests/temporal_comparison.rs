@@ -44,8 +44,14 @@ async fn spilled_sort_uses_session_order_and_extrema_reject_mixed_timestamp_vect
         argument: Some(column.clone()), distinct: false, filter: None, order_by: vec![],
     }).collect::<Vec<_>>();
     let schema = Schema::new(aggregates.iter().map(|aggregate| aggregate.field.clone()).collect()).unwrap();
+    let input_type = input.schema().fields()[0].data_type.clone();
     let aggregate = Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups: vec![], aggregates }).unwrap());
-    assert_eq!(collect(aggregate, &context).await.unwrap_err().code, "xtdb.group-by/incomparable-aggregate-types");
+    let error = collect(aggregate, &context).await.unwrap_err();
+    assert_eq!(error.category, rtdb_types::AnomalyCategory::Incorrect);
+    assert_eq!(error.code, "xtdb.group-by/incomparable-min-max-types");
+    let from_type = format!("#xt/type {}", input_type.to_edn().unwrap());
+    assert_eq!(error.message.as_deref(), Some(format!("Incomparable types in min/max aggregate: {from_type}").as_str()));
+    assert_eq!(error.context.get("from-type"), Some(&serde_json::Value::String(from_type)));
 }
 
 #[tokio::test]

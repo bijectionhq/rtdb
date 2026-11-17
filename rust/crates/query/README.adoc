@@ -435,3 +435,6 @@ Each emitted slice owns its evaluation charges until the slice is released, and 
 Integer-series descriptors remain constant-size even when LIMIT or OFFSET selects a small suffix of a large series.
 The PageOrdinality projection appends signed 64-bit positions starting at one for each semantic input page.
 These contracts follow `xtdb.operator.list/ListCursor` and `ProjectionSpec.LocalRowNumber`; full-input Unnest expansion retains its own page and signed 32-bit ordinal contract.
+
+MIN/MAX rejects incomparable declared input types with the `xtdb.group-by/incomparable-min-max-types` incorrect anomaly.
+Its message and `from-type` context retain the input's `#xt/type` representation.

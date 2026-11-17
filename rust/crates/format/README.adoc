@@ -46,6 +46,7 @@ Production block and compaction writers use those constructors; raw constructors
 Writers check every page's complete native schema, including nested full-width decimal annotations, before encoding it.
 Cross-process writer identity remains an unexecuted acceptance check, including FlatBuffer construction, schema ordering, and metadata encoding.
 The metadata codec retains column statistics and traverses IID and recency branches.
+Column type metadata preserves the reference unsigned-integer and half-precision-float rejection codes, `xtdb/col-meta-unsigned-int` and `xtdb/col-meta-float-precision`.
 Imported metadata retains its nested Arrow schema when written again.
 New leaf statistics include nested child references, counts, numeric bounds, presence flags, and byte-backed Bloom filters.
 Bloom filters use XXHash32 and MurmurHash3 x86 with the JVM's five hashes over 22 bits and portable Roaring serialization.
