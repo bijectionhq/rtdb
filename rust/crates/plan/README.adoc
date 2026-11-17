@@ -24,3 +24,14 @@ The sealed physical leaf view admits the other 34 variants; the private JSON ada
 The recipe encoder writes borrowed UTF8 through the existing JSON string kernel and passes proved physical leaves through that unchanged guard.
 The owned enums, their generic serialization traits and their programmatic constructors retain their existing contracts.
 The views add no text or node owner, retained lease, exact-unit producer or alternate representation.
+
+== Public raw-form contracts
+
+`RegexForm` remains a public enum with direct constructors such as `Literal(Value)`, `Character(char)`, `List(Vec<RegexForm>)` and `Tagged { tag, value }`, and `RegexReplacement` retains its five public fields.
+Both types retain their public `Clone`, `Debug`, `PartialEq`, `Serialize` and `Deserialize` traits.
+The raw-form fixtures pin generic serde calls as well as JSON bytes, including enum names and indices, scalar methods, collection and field order, float-bit payloads and legacy supplementary `Character(char)` values.
+They preserve the distinction between Rust's nil-filled recipe `Default` and serde's required recipe fields, duplicate-field errors, ignored unknown fields and literal nulls.
+Physical structs retain the last duplicate field and UTF8 key order, while raw and physical map/set vectors retain their entry order and duplicates.
+The fixtures also pin shallow normal and alternate Debug output, formatter options, NaN's nonreflexive structural equality and the different equality and wire behavior of signed zero.
+Generic serde retains its current format-dependent recursion and UTF8 input contracts, including rejection of isolated surrogate escapes by the generic JSON reader.
+Canonical ownership, fallible construction APIs and exact-unit producer/codec changes require their own reviewed migration; these contract fixtures add no production owner or behavior.
