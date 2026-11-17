@@ -95,7 +95,7 @@ fn native_files_are_validated_in_order_before_later_inline_overrides() {
     let root = support::Credential::new("root", false, None);
     let directory = tempfile::tempdir().unwrap(); let missing = directory.path().join("missing");
     let invalid = directory.path().join("invalid"); std::fs::write(&invalid, b"invalid PEM").unwrap();
-    let memory = MemoryBudget::new(32 << 20);
+    let memory = MemoryBudget::new(128 << 20);
     for (name, inline, value) in [
         ("ssl.ca.location", "ssl.ca.pem", root.certificate.to_pem().unwrap()),
         ("ssl.certificate.location", "ssl.certificate.pem", root.certificate.to_pem().unwrap()),
@@ -137,7 +137,7 @@ impl SslContextConfigurer for Inspect {
 #[test]
 fn native_ca_crl_certificate_and_key_snapshots_survive_configuration_copies() {
     let root = support::Credential::new("root", false, None); let credential = support::Credential::new("client", false, Some(&root));
-    let directory = tempfile::tempdir().unwrap(); let memory = MemoryBudget::new(32 << 20);
+    let directory = tempfile::tempdir().unwrap(); let memory = MemoryBudget::new(128 << 20);
     let mut properties = properties(&root);
     properties.insert("ssl.key.password".into(), "password".into());
     for (name, bytes) in [
@@ -156,15 +156,17 @@ fn native_ca_crl_certificate_and_key_snapshots_survive_configuration_copies() {
     drop(configuration);
     let retained = memory.used_bytes();
     let first = Client::new(&ClientConfig::new(), native, RDKafkaType::RD_KAFKA_PRODUCER, DefaultClientContext).unwrap();
+    let per_client = memory.used_bytes() - retained; assert!(per_client > 0);
     let second = Client::new(&ClientConfig::new(), duplicate, RDKafkaType::RD_KAFKA_PRODUCER, DefaultClientContext).unwrap();
-    drop(first); assert_eq!(memory.used_bytes(), retained);
+    assert_eq!(memory.used_bytes(), retained + 2 * per_client);
+    drop(first); assert_eq!(memory.used_bytes(), retained + per_client);
     drop(second); assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]
 fn native_pkcs12_snapshot_loads_after_unlinking_and_releases_after_failure() {
     let root = support::Credential::new("client", false, None);
-    let directory = tempfile::tempdir().unwrap(); let memory = MemoryBudget::new(32 << 20);
+    let directory = tempfile::tempdir().unwrap(); let memory = MemoryBudget::new(128 << 20);
     let mut builder = Pkcs12::builder(); builder.name("client").pkey(&root.key).cert(&root.certificate);
     let bytes = builder.build2("password").unwrap().to_der().unwrap();
     for password in ["password", "wrong"] {
@@ -256,3 +258,5 @@ fn empty_ca_snapshot_is_validated_before_a_later_inline_root() {
 }
 
 unsafe extern "C" { fn SSL_CTX_use_certificate_chain_bio(context: *mut openssl_sys::SSL_CTX, input: *mut openssl_sys::BIO) -> libc::c_int; }
+
+mod admission;

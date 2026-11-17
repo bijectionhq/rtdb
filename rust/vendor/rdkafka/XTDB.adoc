@@ -58,3 +58,12 @@ Location and inline settings remain separate ordered inputs.
 Native PKCS12 keeps its selected library context through decoding and password verification.
 The source owner remains alive through destruction of native clients and their loaded keys.
 The Rust adapter and qualification limits are documented in link:../../crates/kafka/src/client/material/README.adoc[native material ownership].
+
+`SslMaterialSource::admit_context` optionally acquires one `Send + Sync` lease before each `rd_kafka_new` call.
+Native configuration duplication does not share that lease: every resulting client requests its own admission.
+A failed admission prevents native construction.
+`SslMaterialLease::loaded` runs once after successful native creation and before the client is published, allowing temporary construction resources to be released.
+The native pointer is under RAII ownership before this callback can unwind.
+`NativeClient` destroys its pointer, including librdkafka's TLS context and provider cleanup, before dropping the retained lease.
+The default method supplies no admission, preserving callers that have no material accounting policy.
+This ownership seam does not itself bound OpenSSL allocations; the Kafka material source documents its explicit-file allowance and remaining qualification scope.

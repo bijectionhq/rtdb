@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, ffi::{CStr, c_void}, fs::File, io::{self, Read}, sync::Arc};
-use rdkafka::config::{SslContextConfigurer, SslMaterial, SslMaterialKind, SslMaterialSource};
+use rdkafka::config::{SslContextConfigurer, SslMaterial, SslMaterialKind, SslMaterialLease, SslMaterialSource};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
@@ -22,6 +22,20 @@ struct FileSnapshot { path: Box<str>, contents: Contents }
 enum Contents { Bytes(AdmittedBytes), Unavailable(i32), Unmanaged }
 struct AdmittedBytes { bytes: Zeroizing<Vec<u8>>, charge: Arc<MemoryReservation> }
 
+const DECODE_FIXED_BYTES: usize = 64 << 10;
+const DECODE_BYTES_PER_INPUT_BYTE: usize = 512;
+const PBE_SCRATCH_BYTES: usize = 33 << 20;
+
+enum DecodeAdmission {
+    Loading { retained: Arc<MemoryReservation>, _scratch: Arc<MemoryReservation> },
+    Retained { _charge: Arc<MemoryReservation> },
+}
+impl SslMaterialLease for DecodeAdmission {
+    fn loaded(&mut self) {
+        if let Self::Loading { retained, .. } = self { *self = Self::Retained { _charge: Arc::clone(retained) }; }
+    }
+}
+
 impl Configuration {
     pub(crate) fn capture(owner: Arc<NativeTls>, properties: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<Self>> {
         let size = MATERIALS.iter().try_fold(1024usize, |size, (_, name)| size.checked_add(properties.get(*name).map_or(0, String::len)).ok_or_else(overflow))?;
@@ -42,9 +56,31 @@ impl Configuration {
             Contents::Bytes(bytes) => Some(&bytes.charge), _ => None,
         }))
     }
+
+    fn admit_decoded(&self) -> Result<Option<Box<dyn SslMaterialLease>>> {
+        let mut bytes = 0usize;
+        let mut present = false;
+        let mut pbe = false;
+        for ((kind, _), file) in MATERIALS.iter().zip(&self.files) {
+            if let Some(FileSnapshot { contents: Contents::Bytes(input), .. }) = file {
+                present = true;
+                pbe |= matches!(kind, SslMaterialKind::PrivateKey | SslMaterialKind::KeyStore);
+                bytes = bytes.checked_add(input.bytes.len()).ok_or_else(overflow)?;
+            }
+        }
+        if !present { return Ok(None); }
+        let bytes = bytes.checked_mul(DECODE_BYTES_PER_INPUT_BYTE).and_then(|bytes| bytes.checked_add(DECODE_FIXED_BYTES)).ok_or_else(overflow)?;
+        let retained = self.charge.budget().reserve(bytes)?;
+        let admission = if pbe {
+            DecodeAdmission::Loading { retained, _scratch: self.charge.budget().reserve(PBE_SCRATCH_BYTES)? }
+        } else { DecodeAdmission::Retained { _charge: retained } };
+        Ok(Some(Box::new(admission)))
+    }
 }
 
 impl SslMaterialSource for Configuration {
+    fn admit_context(&self) -> std::result::Result<Option<Box<dyn SslMaterialLease>>, String> { self.admit_decoded().map_err(|error| error.to_string()) }
+
     fn material(&self, kind: SslMaterialKind, path: &CStr) -> SslMaterial<'_> {
         let index = MATERIALS.iter().position(|(candidate, _)| *candidate == kind).expect("complete native material kinds");
         match &self.files[index] {
