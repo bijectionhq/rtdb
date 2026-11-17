@@ -475,3 +475,73 @@ async fn host_absolute_value_preserves_category_scale_and_inline_metadata() {
         assert_eq!(project(&format!(r#"(regexp-replace "127" (str (byte (if true 127.9 {form}))) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
 }
+
+const CLASSIFICATIONS: [&str;11] = ["number?","integer?","int?","double?","float?","ratio?","decimal?","rational?","pos-int?","neg-int?","nat-int?"];
+
+#[tokio::test]
+async fn host_classifications_distinguish_numeric_categories_without_coercion() {
+    let cases: &[(&str,&[&str])] = &[
+        ("(byte 1)",&["number?","integer?","int?","rational?","pos-int?","nat-int?"]),
+        ("(short -1)",&["number?","integer?","int?","rational?","neg-int?"]),
+        ("(int 0)",&["number?","integer?","int?","rational?","nat-int?"]),
+        ("(long 1)",&["number?","integer?","int?","rational?","pos-int?","nat-int?"]),
+        ("-9223372036854775808",&["number?","integer?","int?","rational?","neg-int?"]),
+        ("9223372036854775807",&["number?","integer?","int?","rational?","pos-int?","nat-int?"]),
+        ("1N",&["number?","integer?","rational?"]),
+        ("'1N",&["number?","integer?","rational?"]),
+        ("0N",&["number?","integer?","rational?"]),
+        ("-1N",&["number?","integer?","rational?"]),
+        ("9223372036854775808",&["number?","integer?","rational?"]),
+        ("(float 1)",&["number?","float?"]),
+        ("(float ##NaN)",&["number?","float?"]),
+        ("1.0",&["number?","double?","float?"]),
+        ("-0.0",&["number?","double?","float?"]),
+        ("##NaN",&["number?","double?","float?"]),
+        ("##Inf",&["number?","double?","float?"]),
+        ("1.00M",&["number?","decimal?","rational?"]),
+        ("'1.00M",&["number?","decimal?","rational?"]),
+        ("1E-2147483647M",&["number?","decimal?","rational?"]),
+        ("(/ 7 2)",&["number?","ratio?","rational?"]),
+        ("(/ 1 3)",&["number?","ratio?","rational?"]),
+        ("(/ 4 2)",&["number?","integer?","int?","rational?","pos-int?","nat-int?"]),
+        ("(/ 4N 2)",&["number?","integer?","rational?"]),
+    ];
+    for (argument,accepted) in cases {
+        for predicate in CLASSIFICATIONS {
+            let expected = accepted.contains(&predicate);
+            assert_eq!(project(&format!(r#"(regexp-replace "{expected}" (str ({predicate} {argument})) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{predicate} {argument}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_classifications_return_false_for_nonnumbers_without_reading_quoted_children() {
+    for predicate in CLASSIFICATIONS {
+        for argument in ["nil","(if false 1)","false","true",r#""""#,r#""1""#,r#"(str "1")"#,r"\a",":a","'a","[]","{}","#{}","()","'()","'[1]","'{:a 1}","'#{1}","'(1)","str","(integer? 1)",r#"'[(subs "x" -1)]"#] {
+            assert_eq!(project(&format!(r#"(regexp-replace "false" (str ({predicate} {argument})) "x")"#)).await.unwrap(),Value::Utf8("x".into()),"{predicate} {argument}");
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({predicate} [(subs "x" -1)])) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+    }
+}
+
+#[tokio::test]
+async fn host_classifications_keep_ordinary_call_arity_and_boxed_result_metadata() {
+    for predicate in CLASSIFICATIONS {
+        for arguments in ["","1 2"] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (if true "a" ({predicate} {arguments})) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({predicate} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host form has the wrong number of arguments"));
+        }
+        for arguments in [r#"(subs "x" -1) 0"#,r#"0 (subs "x" -1)"#] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str ({predicate} {arguments})) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (let [f {predicate}] (str (f {arguments}))) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host substring indexes are out of range"));
+        }
+        for result in [format!("({predicate} 1)"),format!("(let [v ({predicate} 1)] v)"),format!("(let [f {predicate}] (f 1))")] {
+            assert_eq!(project(&format!(r#"(regexp-replace "a" (str (/ {result} ##NaN)) "x")"#)).await.unwrap_err().message.as_deref(),Some("Host value is not a Number"));
+        }
+        for call in [format!("(clojure.core/{predicate} nil)"),format!("(let [f {predicate}] (f nil))")] {
+            assert_eq!(project(&format!(r#"(regexp-replace "false" (str {call}) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+        }
+        assert_eq!(project(&format!(r#"(regexp-replace "a" (let [{predicate} str] ({predicate} "a")) "x")"#)).await.unwrap(),Value::Utf8("x".into()));
+    }
+    assert_eq!(project(r#"(regexp-replace "NaN" (str (/ (zero? 1) ##NaN)) "x")"#).await.unwrap(),Value::Utf8("x".into()));
+}
