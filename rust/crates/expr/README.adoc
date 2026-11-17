@@ -431,3 +431,8 @@ Decoded Transit anomalies retain their complete normalized exception data and ca
 Their object equality compares message, Clojure map equivalence and recursive cause equality; their hash follows the Java message/data/cause hash.
 Explicitly present null or false error-code entries remain distinct from an absent entry during object comparison.
 ExceptionInfo retains object identity, including when used as an anomaly cause.
+
+Unknown Transit tagged objects preserve their decoded identity through native object clones.
+An alias compares equal before its representation is inspected; separately decoded wrappers compare their representations with Java object equality.
+A null representation therefore fails equality between distinct wrappers with equal tags and always fails hashing.
+The tagged object's content hash and wire representation remain independent of its native address.

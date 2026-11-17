@@ -9,18 +9,20 @@ mod hash;
 mod time;
 mod path;
 mod throwable;
+mod tagged_value;
 use collection::{Array,Map,Record,Entries};
 use number::Number;
 use time::Time;
 use path::Path;
 use throwable::Throwable;
+use tagged_value::Tagged;
 
 #[derive(Clone,Debug)]
 pub(crate) enum Object {
     Null,Bool(bool),Number(Arc<Number>),String(String),Keyword(String),Symbol(String),Character(u16),
     Bytes(Arc<Vec<u8>>),Vector(Vec<Self>),List(Vec<Self>),Set(Map),Map(Map),
     Uri(String),Uuid([i64;2]),ByteBuffer(Vec<u8>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),
-    TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged { tag: String,representation: Box<Self> },
+    TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),
 }
 
 fn invalid() -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-transit-object", "Invalid stored Transit object representation") }
@@ -93,7 +95,7 @@ impl Object {
             "xtdb/path" => Self::Path(Path::read(representation.text()?)?),
             "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Self::Throwable(Arc::new(Throwable::read(&tag,&representation)?)),
             tag if Time::recognizes(tag) => Time::read(tag,&representation)?.map_or(Self::Null,Self::Time),
-            _ => Self::Tagged { tag,representation: Box::new(representation) },
+            _ => Self::Tagged(Arc::new(Tagged::new(tag,representation))),
         })
     }
     fn text(&self) -> Result<&str> { match self { Self::String(value) => Ok(value),_ => Err(invalid()) } }
@@ -144,7 +146,7 @@ impl Object {
             Self::Path(value) => value.wire(),
             Self::Link(entries) => tagged("link",T::Map(entries.iter().map(|(key,value)|Ok((key.wire()?,value.wire()?))).collect::<Result<_>>()?)),
             Self::Throwable(value) => value.wire()?,
-            Self::Tagged { tag,representation } => tagged(tag,representation.wire()?),
+            Self::Tagged(value) => value.wire()?,
         })
     }
 }
