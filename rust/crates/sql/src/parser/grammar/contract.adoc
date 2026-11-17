@@ -14,11 +14,20 @@ The upstream BSD 3-clause notice is retained in link:../../../LICENSE-ANTLR[`LIC
 
 == Ownership and admission
 
-`Grammar` is an immutable passive owner.
+`GrammarData` is a completed immutable passive value containing the graph and vocabulary.
 Its construction transient has one caller and cannot publish incomplete links.
-State, rule, decision and transition views borrow that owner; linked views retain the same owner.
+`Grammar::load` owns that data under the caller's allocation scope.
+`OwnedGrammar::load` takes a finite `MemoryBudget` and owns both the data and an independently constructed `AllocationScope`.
+Both constructors use the same private loader and admission schedule.
+The owned graph drops its data before its scope and releases all construction reservations when it is destroyed.
+
+`OwnedGrammar::view` returns a borrowing `Grammar` without allocating or copying graph storage.
+State, rule, decision and transition views borrow their grammar; linked views retain the same graph identity.
+Views from the same owned graph accept each other's invocation states, while separately loaded graphs remain distinct owners.
 Generated numeric coordinates can be resolved through checked lookups, while internal identifiers have no independent dereference interface.
 `Grammar` retains its allocation-scope borrow through destruction and provides no owned graph extraction or cloning operation.
+An owned graph can outlive the constructor's budget borrow; its reservations retain that finite budget.
+Borrowing views cannot outlive the owned graph.
 
 Construction admits each requested container before allocation.
 The decoded-word scratch contains 28,406 `i32` values.

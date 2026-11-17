@@ -1,5 +1,5 @@
 use rtdb_types::AllocationScope;
-use super::{DecisionData, DecisionId, ExpectedSymbol, Grammar, GrammarError, IssueKind, Result, RuleData, RuleId, StateData, StateId, StateKind, TokenSet, TokenType, Transition, bytes, issue, vector};
+use super::{DecisionData, DecisionId, ExpectedSymbol, Grammar, GrammarData, GrammarError, IssueKind, Result, RuleData, RuleId, StateData, StateId, StateKind, TokenSet, TokenType, Transition, bytes, issue, vector};
 use super::source::{Vocabulary, Words};
 use super::token::MAX_TOKEN;
 
@@ -127,6 +127,10 @@ struct GrammarBuilder<'a, 'scope> {
 }
 
 pub(super) fn load<'scope>(words: &[i32], layout: Layout, vocabulary: Vocabulary, allocation: &'scope AllocationScope) -> Result<Grammar<'scope>> {
+    Ok(Grammar::from_data(load_data(words, layout, vocabulary, allocation)?, allocation))
+}
+
+pub(super) fn load_data(words: &[i32], layout: Layout, vocabulary: Vocabulary, allocation: &AllocationScope) -> Result<GrammarData> {
     if vocabulary.rules.len() != layout.rules.count { return Err(issue(IssueKind::Rule, layout.rules.offset)); }
     let mut builder = GrammarBuilder::new(words, layout, allocation)?;
     builder.serialized_links()?;
@@ -409,9 +413,9 @@ impl<'a, 'scope> GrammarBuilder<'a, 'scope> {
         Ok(())
     }
 
-    fn finish(self, vocabulary: Vocabulary) -> Result<Grammar<'scope>> {
+    fn finish(self, vocabulary: Vocabulary) -> Result<GrammarData> {
         let mut states = vector(self.allocation, self.states.len())?;
         for (number, state) in self.states.into_iter().enumerate() { states.push(state.finish(number)?); }
-        Ok(Grammar { states, rules: self.rules, sets: self.sets, decisions: self.decisions, vocabulary, allocation: self.allocation })
+        Ok(GrammarData { states, rules: self.rules, sets: self.sets, decisions: self.decisions, vocabulary })
     }
 }

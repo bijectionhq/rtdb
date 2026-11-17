@@ -72,7 +72,7 @@ impl Drop for LookWorkspace<'_, '_, '_> {
 
 impl<'g, 'grammar, 'work> LookWorkspace<'g, 'grammar, 'work> {
     fn new(grammar: &'g Grammar<'grammar>, allocation: &'work AllocationScope) -> Result<Self> {
-        if grammar.rules.len() > RULE_COUNT { return Err(issue(IssueKind::Rule, grammar.rules.len())); }
+        if grammar.data().rules.len() > RULE_COUNT { return Err(issue(IssueKind::Rule, grammar.data().rules.len())); }
         Ok(Self {
             grammar, allocation, frames: Vec::new(), contexts: Vec::new(), visited: Vec::new(),
             visited_len: 0, invocations: Vec::new(), called_rules: [0; 3],
@@ -80,8 +80,8 @@ impl<'g, 'grammar, 'work> LookWorkspace<'g, 'grammar, 'work> {
     }
 
     fn follow(&self, invocation: State<'_, '_>) -> Result<StateId> {
-        if !std::ptr::eq(self.grammar, invocation.grammar) { return Err(GrammarError::ForeignOwner); }
-        match self.grammar.states[invocation.id.0 as usize].transitions.first() {
+        if !invocation.belongs_to(self.grammar) { return Err(GrammarError::ForeignOwner); }
+        match self.grammar.data().states[invocation.id.0 as usize].transitions.first() {
             Some(Transition::Rule { follow, .. }) => Ok(*follow),
             _ => Err(issue(IssueKind::Transition, invocation.id.0 as usize)),
         }
@@ -188,7 +188,7 @@ impl<'g, 'grammar, 'work> LookWorkspace<'g, 'grammar, 'work> {
             match frame {
                 Frame::Enter { state, context } => {
                     if !self.visit(state, context)? { continue; }
-                    let data = &self.grammar.states[state.0 as usize];
+                    let data = &self.grammar.data().states[state.0 as usize];
                     if matches!(data.kind, StateKind::RuleStop) {
                         match context {
                             ReturnContext::LocalEnd => result.insert(ExpectedSymbol::Epsilon),
@@ -205,7 +205,7 @@ impl<'g, 'grammar, 'work> LookWorkspace<'g, 'grammar, 'work> {
                     } else { self.push(Frame::Transitions { state, context, next: 0 })?; }
                 }
                 Frame::Transitions { state, context, next } => {
-                    let transitions = &self.grammar.states[state.0 as usize].transitions;
+                    let transitions = &self.grammar.data().states[state.0 as usize].transitions;
                     let Some(transition) = transitions.get(next).copied() else { continue; };
                     if next + 1 < transitions.len() { self.push(Frame::Transitions { state, context, next: next + 1 })?; }
                     match transition {
@@ -220,7 +220,7 @@ impl<'g, 'grammar, 'work> LookWorkspace<'g, 'grammar, 'work> {
                             self.push(Frame::Enter { state: target, context })?;
                         }
                         Transition::Atom { token, .. } => result.insert(ExpectedSymbol::Token(token)),
-                        Transition::Set { set, .. } => result.union(&self.grammar.sets[set]),
+                        Transition::Set { set, .. } => result.union(&self.grammar.data().sets[set]),
                     }
                 }
                 Frame::ClearCalledRule(rule) => self.set_called(rule, false),
