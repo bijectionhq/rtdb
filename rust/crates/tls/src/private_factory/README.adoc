@@ -86,26 +86,63 @@ They require absent or NULL AlgorithmIdentifier parameters and primitive inner k
 This factory stage imposes no cryptographic key-length check, including on empty key octets.
 HSS/LMS private-key generation always fails in the pinned provider.
 
+== Recursive PSS and OAEP parameters
+
+PSS hashes can name another PSS or OAEP service, and either service's main hash can nest again.
+The complete nested identifier is validated before its name is consumed.
+MGF and pSource identifiers likewise initialize any registered service before the wrapper's required OID is checked.
+Absent and NULL parameters skip service initialization.
+CRT keys retain the original containing parameter bytes; non-CRT PSS reconstruction retains only the outer hash service name, without its nested parameters.
+
+PSS requires a SEQUENCE and frames all of its context fields before evaluating any field.
+Repeated fields retain their last valid value, field order is unrestricted, and a context's unused inner tail is ignored.
+Every encountered value must be valid even if a later duplicate would replace it.
+OAEP reads ordered optional context fields zero, one, and two, each containing exactly one value.
+Duplicate, reordered, unknown, and trailing fields fail.
+Both primitive and constructed context tags are accepted.
+OAEP uses the outer value's content without checking its tag, unlike PSS's required SEQUENCE.
+
+Both services require MGF1 and admit SHA-1, SHA-224, SHA-256, SHA-384, SHA-512, SHA-512/224, and SHA-512/256 as its digest.
+PSS additionally admits SHA3-224, SHA3-256, SHA3-384, and SHA3-512; OAEP rejects those MGF names.
+Main hash names are not restricted to that allowlist.
+OAEP's pSource must be PSpecified with present non-NULL parameters containing primitive or constructed OCTET STRING data.
+An empty label is accepted.
+
 == Admission and remaining source work
 
-Decode reserves `128 * input_bytes + 65,536` before parsing, with checked arithmetic.
-The source estimate covers one shared Java BER converter's growing section vector, normalized frame and algorithm owners, a fixed number of provider parameter/key views, and the temporary encoded fragments plus final output.
+Decode reserves `384 * input_bytes + 65,536` before parsing, with checked arithmetic.
+The source estimate allocates `128 * input_bytes` to the existing normalized PKCS8 and algorithm owners, provider views, encoded fragments, final output, and one active Java BER conversion.
 On a 64-bit target, the converter's section payload is at most 40 bytes per section, with each section requiring at least two input bytes; old and replacement vector capacities can overlap during growth.
-The 128 multiplier leaves room for that overlap and the bounded simultaneously retained byte owners.
-RSA component collections have eight members, optional PKCS8 fields have at most two members, and PSS retains only its last digest, MGF digest, and salt values.
-Recursive nested PSS AlgorithmParameters are not traversed.
+RSA component collections have eight members, optional PKCS8 fields have at most two members, and only the outer PSS result retains its last digest, MGF digest, and salt values.
+
+Nested PSS and OAEP services use a passive iterative evaluator on the caller's task.
+Its `Frame` values are call-local transients: a field continuation owns only its compact undecoded sibling suffix and parsing position, while an MGF continuation owns an OID and its allowlist choice.
+A rejected wrapper continuation has no payload.
+The shallow `Identifier` owns an OID and a single encoded parameter value, without a full duplicate AlgorithmIdentifier encoding.
+The enclosing parsing buffers drop before the next child frame is evaluated.
+Pending sibling regions and active child regions are disjoint; an ancestor does not retain its consumed subtree or vector capacity.
+No frame contains another frame, and dropping a pending traversal is iterative.
+
+Each live frame corresponds to at least two consumed input bytes.
+A compile-time assertion bounds its payload to 64 bytes on the target.
+Allowing old and replacement vector capacities during growth, frame storage is bounded by `96 * input_bytes` in the source estimate.
+An additional `32 * input_bytes` covers simultaneous frontier, suffix-copy, OID, and shallow parameter-encoding buffers, including BER-normalized views.
+The remaining `128 * input_bytes` is margin for normalization expansion and overlap between those categories.
+There is no fixed nesting-depth limit.
+Repeated suffix copying and BER conversion can take quadratic time for adversarially nested inputs, while simultaneously owned byte storage remains linear.
 The fixed allowance covers small owner/control allocations and bounded OID representations.
 The estimate is conservative source accounting rather than a measured allocator high-water bound.
 Temporary owners drop before the reservation shrinks to retained encoded capacity, owner size, and 128 bytes of reservation overhead.
 Malformed data, unsupported factories, unsupported nested parameters, and budget exhaustion release their reservations.
 
 Nested PSS hash identifiers can select arbitrary AlgorithmParameters services.
-This decoder validates nested DSA, DH, EC, AES, DESede, Blowfish, ChaCha20-Poly1305, and legacy PBE parameters for the six services above.
+This decoder validates nested PSS, OAEP, DSA, DH, EC, AES, DESede, Blowfish, ChaCha20-Poly1305, and legacy PBE parameters for the six services above.
 It preserves parameters for identifiers without a registered service.
-Nested PSS, OAEP, and PBES2 parameter services currently return an explicit unsupported-parameters error.
+The PBES2 parameter service currently returns an explicit unsupported-parameters error.
 The parameter-dependent `SpecifiedSHA2withECDSA` name is also unsupported in that nested position.
 Successful factory admission does not establish native TLS import, signing, key/certificate consistency, or cryptographic validity.
 
 Regression sources cover PKCS8 fields and BER framing, provider aliases, RSA range and CRT fallback behavior, PSS defaults and errors, signed DSA/DH values and retained tails, all registered EC curves, nested EC public bits, XDH/EdDSA scalar lengths, named post-quantum acceptance, HSS rejection, and reservation lifetime.
 Nested IV regressions cover encoded-length boundaries, primitive versus constructed OCTET acceptance, BER forms, malformed components, absent and NULL parameters, CRT retention, non-CRT regeneration, cipher-specific OIDs, and admission release.
 Legacy PBE regressions cover all six services, arbitrary salt lengths, signed iteration boundaries and padding, primitive-only salt, complete sequence consumption, BER framing, absent and NULL parameters, CRT retention, non-CRT regeneration, unregistered nearby OIDs, and reservation release.
+Recursive parameter regressions cover defaults, outer and context tags, ordering, duplicate and tail handling, PSS preframing, MGF allowlists, pSource labels, child initialization order, fixed-service descendants, BER views, CRT retention, non-CRT name-only reconstruction, deep alternating nesting, and admission cleanup.

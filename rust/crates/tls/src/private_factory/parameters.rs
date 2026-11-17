@@ -36,51 +36,25 @@ fn curve(bytes: &[u8]) -> Result<()> {
     if curves::CURVES.iter().any(|(_, candidate)| *candidate == &*oid) { Ok(()) } else { Err(malformed()) }
 }
 
-fn pss(bytes: &[u8]) -> Result<Pss> {
-    let mut input = Der(bytes);
-    let sequence = expect(&mut input, 0x30)?;
-    let mut fields = Der(&sequence);
-    let mut result = Pss { digest: Zeroizing::new(SHA1.to_vec()), mgf_digest: Zeroizing::new(SHA1.to_vec()), salt: 20 };
-    while !fields.0.is_empty() {
-        let value = next(&mut fields)?;
-        let mut inner = Der(&value.content);
-        match value.tag & 0xdf {
-            0x80 => { result.digest = digest(&mut inner)?.oid; }
-            0x81 => {
-                let algorithm = secret_der::algorithm(&mut inner, malformed)?;
-                if algorithm.oid.as_slice() != MGF1 { return Err(malformed()); }
-                let mut encoded = Der(parameter(&algorithm)?.ok_or_else(malformed)?);
-                let digest = digest(&mut encoded)?;
-                encoded.end()?;
-                if !is_mgf_digest(&digest.oid) { return Err(malformed()); }
-                result.mgf_digest = digest.oid;
-            }
-            0x82 => { result.salt = integer::int(&mut inner)?; if result.salt < 0 { return Err(malformed()); } }
-            0x83 => { if integer::int(&mut inner)? != 1 { return Err(malformed()); } }
-            _ => return Err(malformed()),
-        }
-    }
-    Ok(result)
-}
+mod recursive;
 
-fn digest(input: &mut Der<'_>) -> Result<Algorithm> {
-    let algorithm = secret_der::algorithm(input, malformed)?;
-    if let Some(parameter) = parameter(&algorithm)? {
-        match algorithm.oid.as_slice() {
-            DSA | [0x2b, 0x0e, 3, 2, 12] => integers(parameter, 3, false)?,
-            DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => integers(parameter, 2, true)?,
-            EC => curve(parameter)?,
-            [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1] => primitive_iv(parameter, 16)?,
-            [0x2b, 0x0e, 3, 2, 17] | [0x2b, 6, 1, 4, 1, 0x97, 0x55, 1, 1, 2] => primitive_iv(parameter, 8)?,
-            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
-            [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3]
-                | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6] => legacy_pbe(parameter)?,
-            PSS | [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(unsupported()),
-            oid if registered_parameter_service(oid) => return Err(unsupported()),
-            _ => {},
-        }
+fn pss(bytes: &[u8]) -> Result<Pss> { recursive::pss(bytes) }
+
+fn fixed_service(oid: &[u8], parameter: &[u8]) -> Result<()> {
+    match oid {
+        DSA | [0x2b, 0x0e, 3, 2, 12] => integers(parameter, 3, false)?,
+        DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => integers(parameter, 2, true)?,
+        EC => curve(parameter)?,
+        [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1] => primitive_iv(parameter, 16)?,
+        [0x2b, 0x0e, 3, 2, 17] | [0x2b, 6, 1, 4, 1, 0x97, 0x55, 1, 1, 2] => primitive_iv(parameter, 8)?,
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
+        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3]
+            | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6] => legacy_pbe(parameter)?,
+        [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3]
+            | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13] => return Err(unsupported()),
+        _ => {},
     }
-    Ok(algorithm)
+    Ok(())
 }
 
 fn primitive_iv(bytes: &[u8], length: usize) -> Result<()> {
@@ -108,12 +82,6 @@ fn legacy_pbe(bytes: &[u8]) -> Result<()> {
 }
 
 fn is_mgf_digest(oid: &[u8]) -> bool { matches!(oid, SHA1 | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1..=10]) }
-
-fn registered_parameter_service(oid: &[u8]) -> bool {
-    matches!(oid,
-        [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7]
-        | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13])
-}
 
 impl Pss {
     pub(super) fn encode(&self) -> Result<Zeroizing<Vec<u8>>> {

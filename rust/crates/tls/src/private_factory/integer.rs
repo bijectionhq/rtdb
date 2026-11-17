@@ -23,7 +23,11 @@ fn unsigned_range(length: usize, first: u8) -> bool { length < 1 << 28 || length
 
 pub(super) fn int(input: &mut Der<'_>) -> Result<i32> {
     let value = expect(input, 2)?;
-    let value = signed(&value)?;
+    int_content(&value)
+}
+
+pub(super) fn int_content(bytes: &[u8]) -> Result<i32> {
+    let value = signed(bytes)?;
     if value.len() > 4 { return Err(malformed()); }
     let initial = if value[0] & 0x80 == 0 { 0i32 } else { -1i32 };
     Ok(value.iter().fold(initial, |result, byte| result.wrapping_shl(8) | i32::from(*byte)))

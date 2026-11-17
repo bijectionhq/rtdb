@@ -30,7 +30,7 @@ impl PrivateKey {
     pub(crate) fn encoded_pkcs8(&self) -> &[u8] { &self.encoded }
 }
 
-fn allocation_bound(bytes: usize) -> Result<usize> { bytes.checked_mul(128).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow) }
+fn allocation_bound(bytes: usize) -> Result<usize> { bytes.checked_mul(384).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow) }
 
 fn family(oid: &[u8]) -> Result<Family> {
     Ok(match oid {
