@@ -9,6 +9,13 @@ Enable native access with `--enable-native-access=ALL-UNNAMED` and Arrow's requi
 The native library remains loaded for the process lifetime so retained Arrow release callbacks remain callable.
 The binding requires a 64-bit process.
 
+The first ordinary `NativeDatabase.open` call captures `Boolean.getBoolean("java.util.Arrays.useLegacyMergeSort")` in a private initialization holder.
+Subsequent ordinary opens reuse that selection; the overload with a final `boolean legacyMergeSort` accepts an explicit caller-captured value for each runtime.
+Both enter the bounded native property transport and keep the selection immutable within the node and its query contexts.
+The reference `Arrays.LegacyMergeSort` holder has its own initialization time.
+If the host changed the system property after that holder initialized, the adapter's current-property capture cannot recover its earlier value; use the explicit overload with the retained reference initialization value.
+The adapter does not read or expose the vector-null-check property through this transport.
+
 [source,java]
 ----
 try (var allocator = new RootAllocator();

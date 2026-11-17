@@ -20,9 +20,12 @@ impl PageCursor for Input {
     }
 }
 fn execution(batch_rows: usize) -> Execution {
+    execution_with_options(QueryOptions { batch_rows,..Default::default() })
+}
+fn execution_with_options(options: QueryOptions) -> Execution {
     let database = DatabaseSnapshot { partitions: vec![],storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()),1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb",BTreeMap::from([("xtdb".into(),database)]),false).unwrap();
-    let context = QueryContext::new(catalog,MemoryBudget::new(1 << 27),Timestamp(0),"UTC",QueryOptions { batch_rows,..Default::default() },&CancellationToken::new()).unwrap();
+    let context = QueryContext::new(catalog,MemoryBudget::new(1 << 27),Timestamp(0),"UTC",options,&CancellationToken::new()).unwrap();
     Execution { parameters: Arc::new(BoundParameters::infer(vec![],&context.memory).unwrap()),outer: OuterRows::empty(&context.memory).unwrap(),context,bindings: None,analysis: None }
 }
 fn field(id: u32,ty: LogicalType) -> Field { Field { id: ColumnId(id),name: format!("c{id}"),qualifier: None,qualified_only: false,unnamed: false,data_type: ty } }
@@ -46,6 +49,69 @@ fn cursor(execution: &Execution,schema: Schema,pages: Vec<Vec<Vec<Value>>>,group
     (AggregateCursor::new(input,schema,groups,aggregates,runtime,execution.clone()).unwrap(),polls)
 }
 fn row(group: i64,value: i64) -> Vec<Value> { vec![Value::I64(group),Value::I64(value)] }
+
+struct PercentileInput { next: usize,count: usize,fail_after: bool,memory: Arc<MemoryBudget> }
+#[async_trait]
+impl RowCursor for PercentileInput {
+    async fn next(&mut self) -> Result<Option<OwnedRow>> {
+        if self.next == self.count {
+            return if self.fail_after { Err(Anomaly::fault("test/percentile-input","Failure after the complete group")) } else { Ok(None) };
+        }
+        let value = if self.fail_after {
+            Value::Timestamp { value: if self.next == 0 { i64::MAX } else { 0 },unit: if self.next == 0 { TimeUnit::Second } else { TimeUnit::Nanosecond },timezone: None }
+        } else { Value::I64((self.count - self.next - 1) as i64) };
+        self.next += 1;
+        OwnedRow::new(vec![value],&self.memory).map(Some)
+    }
+}
+
+#[tokio::test]
+async fn percentile_finishes_the_complete_group_before_comparing_above_order_by_block_size() {
+    for object_sort in [rtdb_types::ObjectSort::TimSort,rtdb_types::ObjectSort::LegacyMergeSort] {
+        let execution = execution_with_options(QueryOptions { batch_rows: 1,object_sort,sort_memory_bytes: usize::MAX,..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        let input = Box::new(PercentileInput { next: 0,count: 102_401,fail_after: true,memory: Arc::clone(&execution.context.memory) });
+        let scope = execution.scope().unwrap();
+        let error = percentile(input,PercentileKind::Discrete,0.5,false,&scope,&execution).await.unwrap_err();
+        assert_eq!(error.code,"test/percentile-input");drop(scope);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
+
+#[tokio::test]
+async fn complete_group_percentile_uses_both_algorithms_without_order_by_run_merges() {
+    for object_sort in [rtdb_types::ObjectSort::TimSort,rtdb_types::ObjectSort::LegacyMergeSort] {
+        let execution = execution_with_options(QueryOptions { batch_rows: 1,object_sort,sort_memory_bytes: usize::MAX,..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        for (kind,descending,expected) in [(PercentileKind::Continuous,false,Value::F64(25_600.0)),(PercentileKind::Discrete,true,Value::I64(76_800))] {
+            let input = Box::new(PercentileInput { next: 0,count: 102_401,fail_after: false,memory: Arc::clone(&execution.context.memory) });
+            let scope = execution.scope().unwrap();
+            let value = percentile(input,kind,0.25,descending,&scope,&execution).await.unwrap();
+            assert_eq!(value,expected);drop(value);drop(scope);
+            assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn percentile_descending_swaps_comparator_operands_before_failure() {
+    for (object_sort,descending,x_unit,y_unit) in [
+        (rtdb_types::ObjectSort::TimSort,false,"day-time","year-month"),
+        (rtdb_types::ObjectSort::TimSort,true,"year-month","day-time"),
+        (rtdb_types::ObjectSort::LegacyMergeSort,false,"year-month","day-time"),
+        (rtdb_types::ObjectSort::LegacyMergeSort,true,"day-time","year-month"),
+    ] {
+        let execution = execution_with_options(QueryOptions { object_sort,..Default::default() });
+        let baseline = execution.context.memory.used_bytes();
+        let input = Box::new(Input { pages: vec![vec![vec![Value::IntervalYearMonth(1)],vec![Value::IntervalDayTime { days: 1,milliseconds: 0 }]]].into(),fail_after: None,polls: Arc::new(AtomicUsize::new(0)),memory: Arc::clone(&execution.context.memory) });
+        let input = crate::pages::rows(input,Arc::clone(&execution.context));
+        let scope = execution.scope().unwrap();
+        let error = percentile(input,PercentileKind::Discrete,0.5,descending,&scope,&execution).await.unwrap_err();
+        assert_eq!(error.code,"xtdb.expression/cannot-compare-different-unit-intervals");
+        assert_eq!(error.context["x-unit"],serde_json::Value::from(x_unit));assert_eq!(error.context["y-unit"],serde_json::Value::from(y_unit));drop(scope);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
 
 #[tokio::test]
 async fn aggregate_columns_complete_their_page_masks_before_the_next_column() {

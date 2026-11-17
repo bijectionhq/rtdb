@@ -6,17 +6,21 @@ use zeroize::Zeroizing;
 
 use crate::config::{NodeConfiguration, ParsedConfiguration, ProcessEnvironment, PgwireSettings, FlightSettings};
 
-pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
+pub const HELP: &str = "RTDB\n\nUsage: rtdb --build-info\n       rtdb [node|ingest|playground|compactor] [-f FILE] [--memory-limit BYTES]\n       rtdb [export-snapshot|reset-compactor] DATABASE [-f FILE] [--dry-run] [--memory-limit BYTES]\n       rtdb hash-password [--argon2id|--bcrypt] [PASSWORD]\n\nNode defaults to xtdb.yaml, xtdb.yml or xtdb.edn in the working directory.\nIngest configuration uses YAML.\nPlayground accepts --port PORT and --flight-sql-port PORT.\nStartup accepts -Djava.util.Arrays.useLegacyMergeSort=true before or after the command.\nPasswords may be read from standard input.\nFile inspection: read-arrow-file, read-arrow-stream-file, read-hash-trie-file,\n                 read-table-block-file, read-block-file PATH [--memory-limit BYTES].\nInspection output is typed JSON.\nMemory defaults to RTDB_MEMORY_LIMIT_BYTES or 1073741824 bytes.\n";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeMode { Node, Ingest, Playground, Compactor }
 #[derive(Clone, Debug)]
-pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32 }
+pub struct StartOptions { pub mode: NodeMode, pub file: Option<PathBuf>, pub allocation_limit_bytes: usize, pub pgwire_port: i32, pub flight_sql_port: i32, pub object_sort: rtdb_types::ObjectSort }
 #[derive(Clone, Debug)]
 pub enum Command { Help, Version, BuildInfo, Start(StartOptions), Inspect { kind: crate::inspect::FileKind, path: PathBuf, allocation_limit_bytes: usize }, SnapshotExport { options: StartOptions, database: String, dry_run: bool }, CompactorReset { options: StartOptions, database: String, dry_run: bool }, HashPassword { bcrypt: bool, password: Option<Secret> } }
 
 pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(&str) -> Option<String>) -> Result<Command> {
     let mut arguments = arguments.into_iter().peekable();
+    let mut object_sort = rtdb_types::ObjectSort::default();
+    while arguments.peek().is_some_and(|argument|argument.starts_with("-D")) {
+        object_sort = crate::config::properties::command_property(&arguments.next().expect("peeked property"))?;
+    }
     if matches!(arguments.peek().map(String::as_str), Some("help" | "--help" | "-h")) { return Ok(Command::Help); }
     if matches!(arguments.peek().map(String::as_str), Some("--version" | "-V")) { return Ok(Command::Version); }
     if arguments.peek().is_some_and(|argument| argument == "--build-info") {
@@ -48,7 +52,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
     }
     if arguments.peek().is_some_and(|argument| matches!(argument.as_str(), "export-snapshot" | "reset-compactor")) {
         let command = arguments.next().expect("matched maintenance command");
-        let mut options = StartOptions { mode: NodeMode::Node, file: None, allocation_limit_bytes: environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024), pgwire_port: 5432, flight_sql_port: 3000 };
+        let mut options = StartOptions { mode: NodeMode::Node, file: None, allocation_limit_bytes: environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024), pgwire_port: 5432, flight_sql_port: 3000, object_sort };
         let mut database = None;
         let mut dry_run = false;
         while let Some(argument) = arguments.next() {
@@ -57,6 +61,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
                 "-f" | "--file" => options.file = Some(PathBuf::from(arguments.next().ok_or_else(|| invalid("--file requires a path"))?)),
                 "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
                 "--dry-run" => dry_run = true,
+                name if name.starts_with("-D") => options.object_sort = crate::config::properties::command_property(name)?,
                 name if !name.starts_with('-') && database.is_none() => database = Some(argument),
                 _ => return Err(invalid(format!("{command} accepts one database name, --file, --dry-run and --memory-limit"))),
             }
@@ -95,7 +100,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
         Some(_) => return Err(invalid("Unknown RTDB command")),
     };
     let allocation_limit_bytes = environment("RTDB_MEMORY_LIMIT_BYTES").map(|value| bytes(&value)).transpose()?.unwrap_or(1024 * 1024 * 1024);
-    let mut options = StartOptions { mode, file: None, allocation_limit_bytes, pgwire_port: 5432, flight_sql_port: 3000 };
+    let mut options = StartOptions { mode, file: None, allocation_limit_bytes, pgwire_port: 5432, flight_sql_port: 3000, object_sort };
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
@@ -103,6 +108,7 @@ pub fn parse(arguments: impl IntoIterator<Item = String>, environment: &impl Fn(
             "--memory-limit" => options.allocation_limit_bytes = bytes(&arguments.next().ok_or_else(|| invalid("--memory-limit requires bytes"))?)?,
             "-p" | "--port" if mode == NodeMode::Playground => options.pgwire_port = port(arguments.next())?,
             "--flight-sql-port" if mode == NodeMode::Playground => options.flight_sql_port = port(arguments.next())?,
+            name if name.starts_with("-D") => options.object_sort = crate::config::properties::command_property(name)?,
             _ => return Err(invalid(format!("Unknown option '{argument}'"))),
         }
     }
@@ -120,6 +126,7 @@ impl StartOptions {
             config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
             config.server = Some(PgwireSettings { host: "0.0.0.0".into(), port: self.pgwire_port, ..Default::default() });
             config.flight_sql = Some(FlightSettings { host: "0.0.0.0".into(), port: self.flight_sql_port, ..Default::default() });
+            config.object_sort = self.object_sort;
             return Ok(parsed);
         }
         let path = self.file.clone().or_else(|| ["xtdb.yaml", "xtdb.yml", "xtdb.edn"].into_iter().map(PathBuf::from).find(|path| path.is_file()));
@@ -133,7 +140,7 @@ impl StartOptions {
             _ => ParsedConfiguration::from_yaml(&text, &ProcessEnvironment, &memory, false)?,
         };
         for warning in parsed.warnings() { eprintln!("{warning}"); }
-        Ok(parsed)
+        Ok(parsed.with_object_sort(self.object_sort))
     }
 
     pub fn load(&self) -> Result<NodeConfiguration> {
@@ -143,12 +150,13 @@ impl StartOptions {
             config.auth = rtdb_auth::AuthConfig::SingleRootUser { password: None };
             config.server = Some(PgwireSettings { host: "0.0.0.0".into(), port: self.pgwire_port, ..Default::default() });
             config.flight_sql = Some(FlightSettings { host: "0.0.0.0".into(), port: self.flight_sql_port, ..Default::default() });
+            config.object_sort = self.object_sort;
             return Ok(config);
         }
         let path = self.file.clone().or_else(|| ["xtdb.yaml", "xtdb.yml", "xtdb.edn"].into_iter().map(PathBuf::from).find(|path| path.is_file()));
         if self.mode == NodeMode::Ingest && path.is_none() { return Err(invalid("ingest requires a YAML configuration file")); }
         let text = path.as_deref().map(read_configuration).transpose()?.unwrap_or_default();
-        match (self.mode, path.as_deref().and_then(Path::extension).and_then(|extension| extension.to_str())) {
+        let mut configuration = match (self.mode, path.as_deref().and_then(Path::extension).and_then(|extension| extension.to_str())) {
             (NodeMode::Ingest, Some("edn")) => Err(invalid("Ingest configuration uses YAML")),
             (NodeMode::Ingest, _) => NodeConfiguration::from_ingest_yaml(&text),
             (_, Some("edn")) => {
@@ -157,7 +165,9 @@ impl StartOptions {
                 Ok(configuration)
             }
             _ => NodeConfiguration::from_yaml(&text),
-        }
+        }?;
+        configuration.object_sort = self.object_sort;
+        Ok(configuration)
     }
 }
 

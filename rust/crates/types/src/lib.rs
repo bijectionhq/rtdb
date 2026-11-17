@@ -15,6 +15,7 @@ mod value;
 mod uri;
 mod utf8;
 mod version;
+mod object_sort;
 
 pub use error::{Anomaly, AnomalyCategory, Result};
 pub use calendar::{CalendarDate, CivilDate, CivilDateTime, DateUnit, parse_iso_local_time, MIN_CALENDAR_YEAR, MAX_CALENDAR_YEAR, MIN_EPOCH_DAY, MAX_EPOCH_DAY, NANOS_PER_DAY};
@@ -31,6 +32,7 @@ pub use value::{DecimalValue, Value};
 pub use uri::UriParts;
 pub use utf8::decode_java_utf8;
 pub use version::{BuildInfo, compiled_build_info, runtime_version, runtime_revision};
+pub use object_sort::ObjectSort;
 
 mod decimal_text;
 pub use decimal_text::{DecimalSpelling, decimal_digit, decimal_spelling, decimal_text_scale};

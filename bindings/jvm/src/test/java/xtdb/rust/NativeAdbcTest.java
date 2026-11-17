@@ -18,6 +18,19 @@ final class NativeAdbcTest {
     private static final String YAML = "server: null\nflightSql: null\nnodeId: jvm-binding-test\n";
     private static NativeDatabase open(RootAllocator allocator) throws Exception { return NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024); }
 
+    @Test void explicitObjectSorterSelectionOpensIndependentNativeRuntimes() throws Exception {
+        for (boolean legacy : new boolean[] {false, true}) {
+            try (var allocator = new RootAllocator(); var database = NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024, legacy); var connection = database.connect(); var statement = connection.createStatement("SELECT n FROM (VALUES (3), (1), (2), (1)) AS t(n) ORDER BY n")) {
+                try (var result = statement.executeQuery()) {
+                    assertTrue(result.getReader().loadNextBatch());
+                    var column = result.getReader().getVectorSchemaRoot().getVector(0);
+                    assertEquals(List.of(1, 1, 2, 3), java.util.stream.IntStream.range(0, 4).mapToObj(i -> ((Number) column.getObject(i)).intValue()).toList());
+                    assertFalse(result.getReader().loadNextBatch());
+                }
+            }
+        }
+    }
+
     @Test void adbcTestBasicQueryAndUpdate() throws Exception {
         try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect(); var statement = connection.createStatement()) {
             statement.setSqlQuery("INSERT INTO foo (_id, v) VALUES (1, 'native')");

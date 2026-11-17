@@ -240,7 +240,7 @@ impl AggregateColumn {
                     let scope = execution.scope()?;
                     let selected = CollectedRows { reader: ordered.reader(Arc::clone(&execution.context.memory))?,group,width: schema.len(),argument: argument_position(aggregate.argument.as_ref().ok_or_else(||invalid("aggregate-state","Collected aggregate argument is absent"))?,schema)?,execution: execution.clone() };
                     let value = if let AggregateFunction::Percentile { kind,fraction: PercentileFraction::Literal(fraction),descending } = &aggregate.function {
-                        percentile(Box::new(selected),aggregate,*kind,*fraction,*descending,&scope,execution).await?
+                        percentile(Box::new(selected),*kind,*fraction,*descending,&scope,execution).await?
                     } else {
                         let mut selected = selected;
                         let mut values = Vec::new();
@@ -420,37 +420,34 @@ impl ScalarAccumulator {
     }
 }
 
-async fn percentile(selected: BoxCursor, aggregate: &AggregateExpr, kind: PercentileKind, fraction: f64, descending: bool, output: &rtdb_expr::EvaluationScope, execution: &Execution) -> Result<Value> {
-    let argument = aggregate.argument.as_ref().ok_or_else(|| invalid("aggregate-state", "Percentile input is absent"))?;
-    let field = rtdb_plan::Field { id: rtdb_plan::ColumnId(0), name: "_percentile_input".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: argument.data_type() };
-    let order = vec![SortExpr { expr: field.expression(), descending, nulls_first: false }];
-    let input = Box::new(PercentileRows { input: selected, execution: execution.clone() });
-    let mut sorted = SortCursor::new(input, Schema::new(vec![field])?, order, execution.clone());
-    let mut values = execution.context.spill.create()?;
-    let mut count = 0i32;
-    while let Some(row) = sorted.next().await? {
+async fn percentile(selected: BoxCursor, kind: PercentileKind, fraction: f64, descending: bool, output: &rtdb_expr::EvaluationScope, execution: &Execution) -> Result<Value> {
+    let mut input = PercentileRows { input: selected, execution: execution.clone() };
+    let mut values = crate::sort::RecordBuffer::new(Arc::clone(&execution.context))?;
+    while let Some(row) = input.next().await? {
         execution.context.check_cancelled()?;
-        count = count.checked_add(1).ok_or_else(|| invalid("percentile-size", "Percentile input exceeds the reference vector row limit"))?;
-        values.write(&row.values, &execution.context.memory)?;
+        values.push(row)?;
     }
+    drop(input);
+    let values = values.finish()?;
+    let count = i32::try_from(values.len()).map_err(|_|invalid("percentile-size","Percentile input exceeds the reference vector row limit"))?;
     if count == 0 { return Ok(Value::Null); }
+    let indices = crate::sort::sort_records(&values,&execution.context,|left,right| {
+        let (left,right) = if descending { (right,left) } else { (left,right) };
+        rtdb_expr::ordered_compare_in_timezone(&left[0],&right[0],false,&execution.context.timezone)
+    })?;
     let (low, high, weight) = percentile_ranks(kind, fraction, count)?;
-    let mut reader = values.finish()?.reader(Arc::clone(&execution.context.memory))?;
-    let mut lower = None;
-    for index in 0..=high {
-        execution.context.check_cancelled()?;
-        let row = reader.next()?.ok_or_else(|| invalid("percentile-state", "Percentile rank is absent from sorted input"))?;
-        if index == high {
-            if kind == PercentileKind::Discrete {
-                output.reserve(row.values[0].retained_bytes()?.checked_mul(2).ok_or_else(|| invalid("aggregate-size", "Aggregate result exceeds addressable memory"))?)?;
-                return execution.evaluate(output, &rtdb_plan::Expr::Literal(row.values[0].clone()), &Schema::default(), &[]).await;
-            }
-            let upper = number(&row.values[0]).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?;
-            return Ok(Value::F64(match lower { Some(lower) => lower + weight * (upper - lower), None => upper }));
-        }
-        if index == low { lower = Some(number(&row.values[0]).ok_or_else(|| invalid("percentile-input", "Continuous percentile requires numeric values"))?); }
+    let mut access = values.access()?;
+    let low_row = access.get(indices.values[low as usize])?;
+    if kind == PercentileKind::Discrete {
+        let value = &low_row.values()[0];
+        output.reserve(value.retained_bytes()?.checked_mul(2).ok_or_else(|| invalid("aggregate-size", "Aggregate result exceeds addressable memory"))?)?;
+        return execution.evaluate(output, &rtdb_plan::Expr::Literal(value.clone()), &Schema::default(), &[]).await;
     }
-    Err(invalid("percentile-state", "Percentile rank was not visited"))
+    let lower = number(&low_row.values()[0]).ok_or_else(||invalid("percentile-input","Continuous percentile requires numeric values"))?;
+    if low == high { return Ok(Value::F64(lower)); }
+    let high_row = access.get(indices.values[high as usize])?;
+    let upper = number(&high_row.values()[0]).ok_or_else(||invalid("percentile-input","Continuous percentile requires numeric values"))?;
+    Ok(Value::F64(lower + weight * (upper - lower)))
 }
 fn percentile_ranks(kind: PercentileKind, fraction: f64, count: i32) -> Result<(i32, i32, f64)> {
     if count == 1 { return Ok((0, 0, 0.0)); }

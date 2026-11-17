@@ -79,6 +79,8 @@ impl ParsedConfiguration {
     }
 
     pub fn configuration(&self) -> &NodeConfiguration { &self.configuration }
+    /// Applies a caller-captured object-sort selection to this unopened runtime configuration.
+    pub fn with_object_sort(mut self,selection: rtdb_types::ObjectSort) -> Self { self.configuration.object_sort = selection;self }
     /// Returns the retained parser/configuration allocation bound in bytes, including environment expansions.
     pub fn allocation_bound(&self) -> usize { *self.charges.bytes.borrow() }
     pub fn warnings(&self) -> &[String] { &self.warnings }

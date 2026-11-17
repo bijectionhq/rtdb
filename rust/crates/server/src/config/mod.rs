@@ -3,6 +3,7 @@ mod remotes;
 mod node;
 mod edn;
 mod bounded;
+pub(crate) mod properties;
 
 use std::{collections::{BTreeMap, BTreeSet}, path::PathBuf, time::Duration};
 use rtdb_auth::{AuthConfig, Secret};
@@ -11,6 +12,7 @@ use rtdb_types::{Anomaly, Result, SourcePosition};
 
 pub use remotes::RemoteConfig;
 pub use bounded::{ConfigurationEnvironment, EnvironmentValue, ParsedConfiguration, ParsedYamlDocument, ProcessEnvironment};
+pub use properties::object_sort_properties;
 
 #[derive(Clone, Debug)]
 pub struct PgwireSettings { pub host: String, pub port: i32, pub read_only_port: i32, pub connections: usize, pub ssl: Option<KeyStoreSettings> }
@@ -69,6 +71,7 @@ pub struct NodeConfiguration {
     pub kafka_auto_create_topic: bool,
     pub join_build_rows: i64,
     pub generate_series_end_exclusive: bool,
+    pub object_sort: rtdb_types::ObjectSort,
 }
 impl std::fmt::Debug for NodeConfiguration {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,7 +121,7 @@ impl NodeConfiguration {
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
                 default_timezone: "UTC".into(), indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
-                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive }
+                tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
@@ -133,7 +136,7 @@ impl NodeConfiguration {
                 Some(values) => values.iter().map(|value| scalar_string(value, "skipDbs")).collect::<Result<_>>()?,
                 None => environment("XTDB_SKIP_DBS").into_iter().flat_map(|value| value.split(',').map(str::trim).filter(|value| !value.is_empty()).map(str::to_owned).collect::<Vec<_>>()).collect(),
             };
-            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive }
+            Self { playground: false, server, flight_sql, health, remotes, primary, fixed_databases: None, memory_cache, disk_cache, default_timezone, indexer, compactor, garbage, auth, tracing, modules, read_only_databases, skipped_databases, node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         };
         fields.finish()?;
         Ok(configuration)

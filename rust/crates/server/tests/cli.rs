@@ -4,6 +4,44 @@ use rtdb_server::cli::{self, Command, NodeMode};
 fn parse(arguments: &[&str]) -> Command { cli::parse(arguments.iter().map(|value| (*value).into()), &|_| None).unwrap() }
 
 #[test]
+fn object_sort_property_is_resolved_once_and_reaches_node_query_options() {
+    use rtdb_types::ObjectSort;
+    let Command::Start(options) = parse(&["-Djava.util.Arrays.useLegacyMergeSort=TrUe","playground"]) else { panic!("expected start") };
+    assert_eq!(options.object_sort,ObjectSort::LegacyMergeSort);
+    assert_eq!(options.load().unwrap().node_options(1 << 26).unwrap().query.object_sort,ObjectSort::LegacyMergeSort);
+    let parsed = options.load_reserved().unwrap();
+    assert_eq!(parsed.configuration().node_options(1 << 26).unwrap().query.object_sort,ObjectSort::LegacyMergeSort);
+    let Command::Start(default) = parse(&["playground"]) else { panic!("expected start") };
+    assert_eq!(default.object_sort,ObjectSort::TimSort);
+    assert_eq!(parsed.configuration().object_sort,ObjectSort::LegacyMergeSort);
+    for argument in ["-Djava.util.Arrays.useLegacyMergeSort","-Djava.util.Arrays.useLegacyMergeSort=false","-Djava.util.Arrays.useLegacyMergeSort= true","-Djava.util.Arrays.useLegacyMergeSort=yes"] {
+        let Command::Start(options) = parse(&["-Djava.util.Arrays.useLegacyMergeSort=true","node",argument]) else { panic!("expected start") };
+        assert_eq!(options.object_sort,ObjectSort::TimSort);
+    }
+    let Command::CompactorReset { options,.. } = parse(&["reset-compactor","xtdb","-Djava.util.Arrays.useLegacyMergeSort=true"]) else { panic!("expected reset") };
+    assert_eq!(options.object_sort,ObjectSort::LegacyMergeSort);
+    for argument in ["-Dxtdb.vector.null-checks=false","-Dunknown=true"] {
+        assert!(cli::parse([argument.to_owned(),"node".into()],&|_|None).is_err());
+        assert!(cli::parse(["node".into(),argument.to_owned()],&|_|None).is_err());
+    }
+    assert!(cli::parse([format!("-Djava.util.Arrays.useLegacyMergeSort={}","x".repeat(4096))],&|_|None).is_err());
+}
+
+#[test]
+fn captured_object_sort_survives_yaml_edn_and_ingest_configuration_loading() {
+    let directory = tempfile::tempdir().unwrap();
+    for (mode,file,text) in [("node","node.yaml","server: null\n"),("node","node.edn","{}"),("ingest","ingest.yaml","databases: {}\n")] {
+        let path = directory.path().join(file);std::fs::write(&path,text).unwrap();
+        let Command::Start(options) = parse(&[mode,"-f",path.to_str().unwrap(),"-Djava.util.Arrays.useLegacyMergeSort=true"]) else { panic!("expected start") };
+        assert_eq!(options.load().unwrap().node_options(1 << 26).unwrap().query.object_sort,rtdb_types::ObjectSort::LegacyMergeSort);
+        let parsed = options.load_reserved().unwrap();
+        let (configuration,_,lease) = parsed.into_execution(1 << 26).unwrap();
+        assert_eq!(configuration.node_options(1 << 26).unwrap().query.object_sort,rtdb_types::ObjectSort::LegacyMergeSort);
+        drop(configuration);drop(lease);
+    }
+}
+
+#[test]
 fn compiled_build_info_ignores_runtime_version_overrides() {
     assert!(matches!(parse(&["--build-info"]), Command::BuildInfo));
     assert!(cli::parse(["--build-info", "extra"].map(str::to_owned), &|_| None).is_err());

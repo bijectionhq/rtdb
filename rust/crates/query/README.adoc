@@ -88,7 +88,7 @@ Spill files are scoped temporary resources with a retained-byte quota.
 * Inner, outer, semi, and anti joins accumulate complete build pages and use in-memory hashing or shuffled spill partitions.
 * Cross joins retain left pages and publish each left/right page product in right-page, left-page order.
 * Distinct and set operations use exact equality checks against spill files, including occurrence tracking for INTERSECT ALL and EXCEPT ALL.
-* Sort preserves complete input-page accumulation, applies stable TimSort within each run, and merges four adjacent runs per pass.
+* Sort preserves complete input-page accumulation, applies the configured stable object sorter within each run, and merges four adjacent runs per pass.
 * Grouping assigns first-seen group IDs across complete input pages, then updates each aggregate column in specification order.
   Count, sum, average, min/max, boolean, variance, standard deviation, ordered array aggregates, and `vec-agg` share that page schedule.
 * Window execution assigns first-seen partition IDs, orders partitions through the shared sort path, and completes each ROW_NUMBER, LEAD, and LAG output column over the retained sorted relation.
@@ -216,12 +216,15 @@ No claim is made about cancellation latency.
 External table providers, transaction-result shaping, network output, query preparation caches, and the required production traces are outside this source checkpoint.
 The declared aggregate IR includes ordered-set continuous and discrete percentiles.
 Their immutable passive descriptors carry the fraction and sort direction; the passive aggregate cursor resolves fraction parameters when it opens, including for empty input.
-The caller-owned percentile input cursor excludes nulls, sorts through the existing spill merge, and selects one rank or interpolates two ranks without retaining the group in memory.
+The caller-owned percentile input cursor excludes nulls and retains the complete group in an indexed record store before sorting its indices.
+The configured memory threshold switches record backing to spill files without performing comparisons or splitting the group into sort runs.
+The selected object sorter runs once over the complete group, then the cursor selects one rank or interpolates two ranks.
+Descending percentile comparison swaps operands through the reference `Comparator.reversed()` contract; ordinary ORDER BY keeps its separate result-negation rule.
 Empty groups emit NULL and remain present in the result.
 Percentiles construct the ordered-vector comparator after consuming input, so unsupported list, struct, or mixed type legs fail even on empty input.
 Ordinary sorting constructs that comparator for each nonempty run and skips it for empty input.
 Numeric vector ordering preserves signed integer comparisons and otherwise uses Java Double.compare, including decimal values.
-Within-run ties retain input order; ties across runs follow the reference priority queue.
+Within-run and percentile ties retain input order; ordinary sort ties across runs follow the reference priority queue.
 Scalar predicates and MIN/MAX retain their separate comparison rules.
 `tests/percentiles.rs` maps `group_by_test.clj`'s trailing empty-group regression and adds spill, cancellation, quota, and plan-validation source assertions.
 The formulas, parameter coercion, and output types follow `operator/group_by.clj`'s percentile factories; numeric rank errors currently use a native anomaly code rather than the JVM exception diagnostic.
@@ -416,7 +419,9 @@ A row limit up to 51200 triggers a complete sort and top-k reduction at each cro
 Other executions finish all sorted runs before merging groups of four, with merged output pages of 102401 rows.
 Each completed merge releases its consumed input files before the next group begins.
 Comparator metadata is prepared at sort and merge boundaries, including every loaded run pair before queue insertion.
-Within-run sorting follows the default OpenJDK25 TimSort comparator schedule; merge ties and final-row reinsertion follow its priority queue.
-The optional JVM `java.util.Arrays.useLegacyMergeSort` algorithm selection remains required configuration work.
+`QueryOptions::object_sort` selects the default OpenJDK25 TimSort schedule or the legacy object merge-sort schedule.
+Both algorithms preserve comparator call order, stable ties and immediate failure propagation; the legacy path uses a complete auxiliary index array and does not perform TimSort's comparator-contract checks.
+The setting also reaches window sorting, ordered array aggregation and each complete percentile group through their shared sort owners.
+External merge ties and final-row reinsertion retain the priority-queue schedule under either selection.
 Physical record spilling and its indexed lookup preserve these comparison and page boundaries.
 The scheduling, backing-store and algorithm regression sources remain unexecuted.

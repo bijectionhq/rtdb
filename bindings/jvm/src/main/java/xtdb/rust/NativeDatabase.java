@@ -11,13 +11,30 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
     private final BufferAllocator allocator;
     private final java.util.concurrent.atomic.AtomicReference<String> awaitToken = new java.util.concurrent.atomic.AtomicReference<>();
     private NativeDatabase(NativeAbi abi, long handle, BufferAllocator allocator) { super(abi, handle); this.allocator = allocator; }
-    /** Honors native node YAML, including listeners; use server/flightSql null for a port-free embedded node. */
+    private static final class SortProperty {
+        static final boolean LEGACY = Boolean.getBoolean("java.util.Arrays.useLegacyMergeSort");
+    }
+    /** Opens native node YAML, including listeners; use server/flightSql null for a port-free node.
+     * The first call captures java.util.Arrays.useLegacyMergeSort; subsequent calls reuse that selection.
+     * This capture cannot recover an earlier value already cached by the JVM's Arrays sorter.
+     * The allocator remains caller-owned; invalid configuration and unavailable resources throw AdbcException.
+     * nativeMemoryBytes must be positive and bounds native runtime allocations in bytes.
+     */
     public static NativeDatabase open(BufferAllocator allocator, String yaml, long nativeMemoryBytes) throws AdbcException {
+        return open(allocator, yaml, nativeMemoryBytes, SortProperty.LEGACY);
+    }
+    /** Uses an explicitly captured object-sort selection for this native runtime.
+     * The allocator remains caller-owned; YAML and property bytes are copied before return.
+     * Invalid configuration or unavailable native resources throw AdbcException.
+     * nativeMemoryBytes must be positive and bounds native runtime allocations in bytes.
+     */
+    public static NativeDatabase open(BufferAllocator allocator, String yaml, long nativeMemoryBytes, boolean legacyMergeSort) throws AdbcException {
         if (nativeMemoryBytes <= 0) throw AdbcException.invalidArgument("Native memory limit must be positive");
         NativeAbi abi = NativeAbi.get();
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment text = NativeAbi.text(arena, yaml);
-            return new NativeDatabase(abi, abi.handle("database_open", text, text.byteSize(), nativeMemoryBytes), allocator);
+            MemorySegment properties = NativeAbi.text(arena, "{\"java.util.Arrays.useLegacyMergeSort\":\"" + legacyMergeSort + "\"}");
+            return new NativeDatabase(abi, abi.handle("database_open_with_properties", text, text.byteSize(), nativeMemoryBytes, properties, properties.byteSize()), allocator);
         }
     }
     @Override public NativeConnection connect() throws AdbcException { return connect("xtdb"); }

@@ -53,6 +53,15 @@ pub unsafe extern "C" fn rtdb_v1_database_open(yaml: *const u8, yaml_length: usi
     }) }
 }
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_open_with_properties(yaml: *const u8,yaml_length: usize,memory_bytes: usize,properties: *const u8,properties_length: usize,out: *mut u64,error: *mut u64) -> i32 {
+    unsafe { call(error,|| {
+        let out = output(out)?;*out = 0;
+        if properties_length > 4096 { return Err(invalid("Native system properties exceed 4096 bytes")); }
+        let region = region::EmbeddedRegion::open_with_properties(text(yaml,yaml_length)?,memory_bytes,text(properties,properties_length)?)?;
+        *out = handles::insert(Handle::Database(Arc::new(region::DatabaseHandle(region))))?;Ok(())
+    }) }
+}
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_retain(handle: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || { let out = output(out)?; *out = 0; *out = if handle == 1 { 1 } else { handles::insert(handles::get(handle)?)? }; Ok(()) }) }
 }
