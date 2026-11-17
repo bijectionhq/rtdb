@@ -98,7 +98,7 @@ pub(crate) fn expression_bound(expr: &Expr) -> Result<usize> {
         Expr::Field { expr, name, data_type } => { bytes = add(bytes, expression_bound(expr)?)?; bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(data_type.retained_bytes()?, 32)?)?)?; }
         Expr::Binary { left, right, .. } => { bytes = add(bytes, expression_bound(left)?)?; bytes = add(bytes, expression_bound(right)?)?; }
         Expr::Call { name, args, return_type } => { bytes = add(bytes, add(multiply(name.len(), 8)?, multiply(return_type.retained_bytes()?, 32)?)?)?; for arg in args { bytes = add(bytes, expression_bound(arg)?)?; } }
-        Expr::RegexReplace { source,recipe,return_type } => { bytes = add(bytes,add(multiply(recipe.retained_bytes()?,8)?,multiply(return_type.retained_bytes()?,32)?)?)?;bytes = add(bytes,expression_bound(source)?)?; }
+        Expr::RegexReplace { source,recipe,return_type } => { bytes = add(bytes,add(multiply(recipe.work_bound()?,8)?,multiply(return_type.retained_bytes()?,32)?)?)?;bytes = add(bytes,expression_bound(source)?)?; }
         Expr::Coalesce(args) | Expr::List(args) => for arg in args { bytes = add(bytes, expression_bound(arg)?)?; },
         Expr::Between { operand,low,high,.. } => { bytes = add(bytes,add(expression_bound(operand)?,add(expression_bound(low)?,expression_bound(high)?)?)?)?; }
         Expr::SimpleCase { operand, branches, otherwise } => { bytes = add(bytes, expression_bound(operand)?)?; for (candidate, value) in branches { bytes = add(bytes, add(expression_bound(candidate)?, expression_bound(value)?)?)?; } bytes = add(bytes, expression_bound(otherwise)?)?; }

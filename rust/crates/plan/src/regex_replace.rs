@@ -122,6 +122,11 @@ impl RegexReplacement {
         [&self.pattern,&self.replacement,&self.start,&self.occurrence,&self.flags].into_iter()
             .try_fold(std::mem::size_of::<Self>(),|bytes,value|bytes.checked_add(value.retained_bytes()?).ok_or_else(size_error))
     }
+
+    /// Returns the recipe byte estimate used by conservative plan work bounds.
+    /// Propagates retained-size overflow errors.
+    /// This measurement does not acquire a memory reservation.
+    pub fn work_bound(&self) -> Result<usize> { self.retained_bytes() }
 }
 
 fn metadata_error(message: &str) -> Anomaly { Anomaly::fault("xtdb.error/unknown",message) }

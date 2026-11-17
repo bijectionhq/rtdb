@@ -35,3 +35,10 @@ Physical structs retain the last duplicate field and UTF8 key order, while raw a
 The fixtures also pin shallow normal and alternate Debug output, formatter options, NaN's nonreflexive structural equality and the different equality and wire behavior of signed zero.
 Generic serde retains its current format-dependent recursion and UTF8 input contracts, including rejection of isolated surrogate escapes by the generic JSON reader.
 Canonical ownership, fallible construction APIs and exact-unit producer/codec changes require their own reviewed migration; these contract fixtures add no production owner or behavior.
+
+== Allocation measurements
+
+`RegexReplacement::retained_bytes` measures retained recipe storage.
+`RegexReplacement::work_bound` supplies the recipe contribution to RuntimeSchema's allocation-work estimates.
+The current work contribution uses the same size calculation as retained storage.
+A work-bound measurement does not acquire or release a memory reservation.
