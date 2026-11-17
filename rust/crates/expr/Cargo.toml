@@ -6,6 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+futures.workspace = true
+async-stream.workspace = true
 rtdb-types.workspace = true
 rtdb-plan.workspace = true
 rtdb-columnar.workspace = true

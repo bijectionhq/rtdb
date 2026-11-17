@@ -149,7 +149,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
                 for order in &aggregate.order_by { expression(&order.expr)?; }
             }
         }
-        RelationNode::Unnest { expr, .. } => expression(expr)?,
+        RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } => expression(expr)?,
         RelationNode::Join { condition, .. } => if let Some(condition) = condition { expression(condition)?; },
         RelationNode::Apply { arguments, .. } => for (_, expr) in arguments { expression(expr)?; },
         RelationNode::Mark { arguments, comparison, .. } => { for (_, expr) in arguments { expression(expr)?; } expression(comparison)?; },
@@ -161,7 +161,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
         }
         RelationNode::Limit { offset, fetch, .. } => for bound in [offset, fetch].into_iter().flatten() { expression(bound)?; },
         RelationNode::PatchGaps { from, to, .. } => { expression(from)?; expression(to)?; }
-        RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Set { .. } | RelationNode::Distinct { .. } => {}
+        RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Set { .. } | RelationNode::Distinct { .. } | RelationNode::PageOrdinality { .. } => {}
     }
     match relation.node() {
         RelationNode::Aggregate { aggregates, .. } => for aggregate in aggregates { bytes = add(bytes, multiply(aggregate.function.retained_bytes()?, 8)?)?; },
@@ -271,6 +271,17 @@ fn relation_types(relation: &Relation, catalog: &CatalogSnapshot, parameters: &B
             for expr in expressions { fields.push(field_type(&expr.field, expr.function.result_type(&input)?)); }
             Schema::new(fields)?
         }
+        RelationNode::List { expr, element } => {
+            let types = expression_type(expr, &Schema::default(), parameters, outer)?.legs().into_iter().map(|ty| match ty.unencoded() {
+                L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element,
+                _ => L::Null,
+            }).collect::<Vec<_>>();
+            Schema::new(vec![field_type(element, L::join_all(&types))])?
+        }
+        RelationNode::PageOrdinality { input, field } => {
+            let input = child(input)?;
+            Schema::new(input.fields().iter().cloned().chain([field.clone()]).collect())?
+        }
         RelationNode::Unnest { input, expr, element, ordinality, outer: nullable } => {
             let input = child(input)?;
             let types = expression_type(expr, &input, parameters, outer)?.legs().into_iter().map(|ty| match ty { L::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => *element, _ => L::Null }).collect::<Vec<_>>();
@@ -314,11 +325,11 @@ fn relation_types(relation: &Relation, catalog: &CatalogSnapshot, parameters: &B
         }
     };
     let node = match (relation.node(), children.as_slice()) {
-        (RelationNode::Values { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => RuntimeNode::Leaf,
+        (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => RuntimeNode::Leaf,
         (RelationNode::Aggregate { .. }, [input]) => RuntimeNode::Aggregate { input: Arc::clone(input), types: aggregates },
         (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => RuntimeNode::Binary(Arc::clone(left), Arc::clone(right)),
         (RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
-            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PatchGaps { .. }, [input]) => RuntimeNode::Unary(Arc::clone(input)),
+            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => RuntimeNode::Unary(Arc::clone(input)),
         _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
     };
     Ok(Arc::new(RuntimeRelation { schema, node, _reservation: Arc::clone(reservation) }))

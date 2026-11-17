@@ -147,11 +147,11 @@ fn belongs_to(expression: &Expr, schema: &Schema) -> bool {
 fn maximum_id(relation: &Relation) -> Option<u32> {
     let here = relation.schema().fields().iter().map(|field| field.id.0).max();
     let children = match relation.node() {
-        RelationNode::Values { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => None,
+        RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => None,
         RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
         | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
-        | RelationNode::Unnest { input, .. } | RelationNode::PatchGaps { input, .. } => maximum_id(input),
+        | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => maximum_id(input),
         RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => maximum_id(left).max(maximum_id(right)),
         RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => maximum_id(input).max(maximum_id(dependent)),
         RelationNode::Let { binding, body } => maximum_id(&binding.relation).max(maximum_id(body)),

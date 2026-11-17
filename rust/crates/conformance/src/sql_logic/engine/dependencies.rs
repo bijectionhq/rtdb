@@ -20,7 +20,7 @@ impl ResolvedTables {
 
 fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBinding>) -> Result<()> {
     match source.node() {
-        RelationNode::Values { .. } => {}
+        RelationNode::Values { .. } | RelationNode::List { .. } => {}
         RelationNode::Scan(scan) => bindings.push(catalog.table(&scan.table.name)?
             .ok_or_else(|| gap("Prepared table disappeared from its own snapshot"))?),
         RelationNode::Project { input, .. } | RelationNode::Rename { input, .. }
@@ -28,7 +28,7 @@ fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBin
         | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
         | RelationNode::Distinct { input } | RelationNode::Unnest { input, .. }
-        | RelationNode::PatchGaps { input, .. } => collect(input, catalog, bindings)?,
+        | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => collect(input, catalog, bindings)?,
         RelationNode::Let { binding, body } => { collect(&binding.relation, catalog, bindings)?; collect(body, catalog, bindings)?; }
         RelationNode::Reference { binding } => collect(&binding.relation, catalog, bindings)?,
         RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => {
@@ -64,14 +64,14 @@ impl Rebuilder {
         let schema = Schema::new(source.schema().fields().to_vec()).map_err(projection_error)?;
         let mut node = source.node().clone();
         match &mut node {
-            RelationNode::Values { .. } => {}
+            RelationNode::Values { .. } | RelationNode::List { .. } => {}
             RelationNode::Scan(scan) => scan.table = self.next_table()?,
             RelationNode::Project { input, .. } | RelationNode::Rename { input, .. }
             | RelationNode::Filter { input, .. } | RelationNode::Aggregate { input, .. }
             | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
             | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
             | RelationNode::Distinct { input } | RelationNode::Unnest { input, .. }
-            | RelationNode::PatchGaps { input, .. } => *input = self.relation(input)?,
+            | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => *input = self.relation(input)?,
             RelationNode::Let { binding, body } => { *binding = self.binding(binding)?; *body = self.relation(body)?; }
             RelationNode::Reference { binding } => *binding = self.binding(binding)?,
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => {
@@ -233,15 +233,17 @@ mod tests {
             ("Limit", relation(input.schema().clone(), RelationNode::Limit { input: Arc::clone(&input), offset: Some(Expr::Literal(V::I64(0))), fetch: Some(Expr::Literal(V::I64(2))) })),
             ("Distinct", relation(input.schema().clone(), RelationNode::Distinct { input: Arc::clone(&input) })),
             ("Set", relation(input.schema().clone(), RelationNode::Set { left: Arc::clone(&input), right, operator: SetOperator::Except, all: false })),
+            ("List", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone() })),
+            ("PageOrdinality", relation(input.schema().concat(&Schema::new(vec![ordinal.clone()]).unwrap()).unwrap(), RelationNode::PageOrdinality { input: Arc::clone(&input), field: ordinal.clone() })),
             ("Unnest", relation(input.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap(), RelationNode::Unnest { input, expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element, ordinality: Some(ordinal), outer: true })),
             ("PatchGaps", relation(Schema::new(patch_output).unwrap(), RelationNode::PatchGaps { input: patch, iid: ColumnId(0), valid_from: ColumnId(1), valid_to: ColumnId(2), document: ColumnId(3), from: Expr::Literal(V::Null), to: Expr::Literal(V::Null) })),
         ]
     }
 
     #[test]
-    fn all_nineteen_relation_variants_keep_their_typed_projection() {
+    fn all_relation_variants_keep_their_typed_projection() {
         let cases = variants();
-        assert_eq!(cases.len(), 19);
+        assert_eq!(cases.len(), 21);
         let mut names = BTreeSet::new();
         for (name, source) in cases {
             assert!(names.insert(name));
@@ -252,6 +254,8 @@ mod tests {
             assert_eq!(serde_json::to_value(&*restored).unwrap()["node"].as_object().unwrap().keys().next().map(String::as_str), Some(name));
             match restored.node() {
                 RelationNode::Values { rows } => assert_eq!(rows, &[vec![Expr::Literal(V::I64(7))]]),
+                RelationNode::List { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
+                RelationNode::PageOrdinality { field, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); }
                 RelationNode::Scan(scan) => { assert_eq!(scan.table, table("a")); assert_eq!(scan.columns[0].id, ColumnId(0)); }
                 RelationNode::Project { expressions, .. } => { assert_eq!(expressions[0].field.id, ColumnId(2)); assert_eq!(expressions[0].expr, Expr::column(ColumnId(0), L::Scalar(S::I64))); }
                 RelationNode::Rename { prefix, expressions, .. } => { assert_eq!(prefix, "prefix/"); assert_eq!(expressions[0].field.name, "out"); }

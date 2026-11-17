@@ -75,6 +75,32 @@ impl CompiledExpr {
     pub async fn evaluate_async(&self, row: &[Value], context: &EvalContext<'_>) -> Result<Value> { evaluate_async(&self.expr, &self.schema, row, context).await }
 }
 
+enum ListEvent {
+    Opened,
+    Batch(ListBatch),
+}
+
+/// A completed list slice retaining all cell evaluation charges until it is dropped.
+pub struct ListBatch { values: Vec<Value>, _scope: crate::EvaluationScope }
+impl ListBatch {
+    pub fn values(&self) -> &[Value] { &self.values }
+}
+
+/// Caller-polled list evaluation, with its descriptor selected once at opening.
+/// Each pull completes one semantic page.
+/// Dropping the reader releases its retained reader state; returned batches and caller-owned preparation charges keep their own lifetimes.
+pub struct ListExpression<'a> { events: futures::stream::BoxStream<'a, Result<ListEvent>> }
+impl ListExpression<'_> {
+    pub async fn next_batch(&mut self) -> Result<Option<ListBatch>> {
+        use futures::StreamExt;
+        match self.events.next().await.transpose()? {
+            Some(ListEvent::Batch(batch)) => Ok(Some(batch)),
+            Some(ListEvent::Opened) => Err(Anomaly::fault("rtdb.expr/list-state", "List descriptor opened twice")),
+            None => Ok(None),
+        }
+    }
+}
+
 enum ListStorage { Integer(crate::series::IntegerSeries), Bins { reader: crate::temporal_functions::RangeBins,length: usize }, Values(Vec<Value>) }
 
 /// Owned list cells or an immutable generated-list descriptor.

@@ -15,6 +15,9 @@ pub(crate) enum HiddenColumn { ExplicitOnly, Internal }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TablePurpose { Query, Mutation, Erase }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ListTableKind { Series, Unnest }
+
 pub(crate) struct Context<'a> {
     pub source: &'a str,
     pub catalog: &'a dyn Catalog,
@@ -522,7 +525,7 @@ impl Context<'_> {
                         _ => Err(error("Series arguments must be expressions")),
                     }).collect::<Result<Vec<_>>>())?;
                     let expression = self.series(&function, args)?;
-                    return self.list_table(expression, alias.as_ref(), *with_ordinality, "_genseries");
+                    return self.list_table(expression, alias.as_ref(), *with_ordinality, ListTableKind::Series);
                 }
                 if *with_ordinality { return Err(unsupported("WITH ORDINALITY requires a list table")); }
                 if let Some(inline) = self.inline_xtql.iter().find(|inline| inline.matches(name)).cloned() {
@@ -607,30 +610,35 @@ impl Context<'_> {
             ast::TableFactor::UNNEST { array_exprs, alias, with_ordinality, with_offset, .. } => {
                 if array_exprs.len() != 1 || *with_offset { return Err(unsupported("Multi-array UNNEST or OFFSET")); }
                 let expr = self.lateral_scope(lateral_start, |context| context.expr(&array_exprs[0], &Schema::default(), &BTreeMap::new()))?;
-                self.list_table(expr, alias.as_ref(), *with_ordinality, "_unnest")
+                self.list_table(expr, alias.as_ref(), *with_ordinality, ListTableKind::Unnest)
             }
             _ => Err(unsupported("Table source")),
         }
     }
 
-    fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, element_prefix: &str) -> Result<Arc<Relation>> {
+    fn list_table(&mut self, expr: Expr, alias: Option<&ast::TableAlias>, with_ordinality: bool, kind: ListTableKind) -> Result<Arc<Relation>> {
         let alias = alias.ok_or_else(|| error("List tables require an alias"))?;
         let elements = expr.data_type().legs().into_iter().map(|ty| match ty.unencoded() {
             LogicalType::Nothing | LogicalType::Null => Ok(LogicalType::Null),
             LogicalType::List { kind: rtdb_types::ListKind::List | rtdb_types::ListKind::Set | rtdb_types::ListKind::FixedSizeList(_), element } => Ok(*element),
             _ => Ok(LogicalType::Null),
         }).collect::<Result<Vec<_>>>()?;
-        let element_name = self.symbol(element_prefix)?;
+        let element_name = self.symbol(if kind == ListTableKind::Series { "_genseries" } else { "_unnest" })?;
         let mut element = self.binder.field(element_name, None, LogicalType::join_all(&elements))?;
         element.unnamed = true;
         let ordinality = if with_ordinality {
             let name = self.symbol("_ordinal")?;
-            let mut field = self.binder.field(name, None, LogicalType::Scalar(ScalarType::I32))?;
+            let mut field = self.binder.field(name, None, LogicalType::Scalar(if kind == ListTableKind::Series { ScalarType::I64 } else { ScalarType::I32 }))?;
             field.unnamed = true;
             Some(field)
         } else { None };
         let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
-        let relation = Arc::new(Relation::new(schema, RelationNode::Unnest { input: Arc::new(Relation::unit()), expr, element, ordinality, outer: false })?);
+        let relation = if kind == ListTableKind::Series {
+            let input = Arc::new(Relation::new(Schema::new(vec![element.clone()])?, RelationNode::List { expr, element })?);
+            if let Some(field) = ordinality { Arc::new(Relation::new(schema, RelationNode::PageOrdinality { input, field })?) } else { input }
+        } else {
+            Arc::new(Relation::new(schema, RelationNode::Unnest { input: Arc::new(Relation::unit()), expr, element, ordinality, outer: false })?)
+        };
         self.alias(relation, alias)
     }
 

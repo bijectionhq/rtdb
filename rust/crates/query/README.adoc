@@ -426,3 +426,12 @@ The setting also reaches window sorting, ordered array aggregation and each comp
 External merge ties and final-row reinsertion retain the priority-queue schedule under either selection.
 Physical record spilling and its indexed lookup preserve these comparison and page boundaries.
 The scheduling, backing-store and algorithm regression sources remain unexecuted.
+
+== List table pages
+
+The passive List cursor opens one expression reader and then demands elements in semantic pages of 1,024 rows by default.
+`QueryOptions::list_batch_rows` controls those pages independently of public client batches.
+Each emitted slice owns its evaluation charges until the slice is released, and dropping the cursor releases the retained reader and captured expression region.
+Integer-series descriptors remain constant-size even when LIMIT or OFFSET selects a small suffix of a large series.
+The PageOrdinality projection appends signed 64-bit positions starting at one for each semantic input page.
+These contracts follow `xtdb.operator.list/ListCursor` and `ProjectionSpec.LocalRowNumber`; full-input Unnest expansion retains its own page and signed 32-bit ordinal contract.

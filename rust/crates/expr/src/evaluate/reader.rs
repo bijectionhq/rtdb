@@ -203,6 +203,41 @@ async fn execute(expr: &Expr,schema: &Schema,row: &[Value],context: &EvalContext
     materialize(value,&frame)?.await
 }
 
+pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Value], context: &'a EvalContext<'a>, replacements: &'a super::invocation::Replacements<'a>, batch_rows: usize)
+    -> futures::stream::BoxStream<'a, Result<super::ListEvent>> {
+    Box::pin(async_stream::try_stream! {
+        if batch_rows == 0 { Err(Anomaly::incorrect("xtdb/invalid-batch-size", "List page size must be positive"))?; }
+        let allocation = context.allocation.ok_or_else(|| Anomaly::fault("rtdb.expr/allocation-scope", "List cursor requires an allocation scope"))?;
+        let frame = EvaluationFrame { schema, row, context, asynchronous: true, replacements: Some(replacements) };
+        let continuation = scalar::prepare(expr, &frame)?.await?;
+        let value = if continuation.is_list() { Some(continuation.demand().await?) } else { None };
+        yield super::ListEvent::Opened;
+        if let Some(value) = value {
+            let size = len(&value)?;
+            let mut position = 0usize;
+            while position < size {
+                let count = (size - position).min(batch_rows);
+                let scope = crate::EvaluationScope::new(allocation.memory_budget())?;
+                scope.reserve(count.checked_mul(std::mem::size_of::<Value>()).ok_or_else(overflow)?)?;
+                let mut values = Vec::with_capacity(count);
+                {
+                    let page_context = context.with_allocation(&scope);
+                    let page_frame = EvaluationFrame { schema, row, context: &page_context, asynchronous: true, replacements: Some(replacements) };
+                    for index in position..position + count {
+                        let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
+                        let mut cell = materialize(cell, &page_frame)?.await?;
+                        cell.admit_expression_dates()?;
+                        super::validate_projection_value(&cell)?;
+                        values.push(cell);
+                    }
+                }
+                position += count;
+                yield super::ListEvent::Batch(super::ListBatch { values, _scope: scope });
+            }
+        }
+    })
+}
+
 pub(super) async fn execute_list_async(expr: &Expr, schema: &Schema, row: &[Value], context: &EvalContext<'_>,replacements: Option<&super::invocation::Replacements<'_>>) -> Result<super::EvaluatedList> {
     let frame = EvaluationFrame { schema, row, context, asynchronous: true,replacements };
     let continuation = scalar::prepare(expr, &frame)?.await?;

@@ -83,6 +83,19 @@ impl<'expr> ExpressionInvocation<'expr> {
         reader::execute_list_async(self.expression,self.schema,row,context,Some(&self.replacements)).await
     }
 
+    /// Opens one list descriptor without demanding any element.
+    /// Requires `context.allocation` and a positive `batch_rows`; each pull emits at most that many cells, and non-list inputs yield no batches.
+    /// Descriptor errors occur while opening; element errors occur when their complete page is pulled.
+    /// Retain this invocation, its preparation scope, row and context while pulling the returned pages.
+    pub async fn open_list<'a>(&'a self, row: &'a [Value], context: &'a EvalContext<'a>, batch_rows: usize) -> Result<super::ListExpression<'a>> {
+        use futures::StreamExt;
+        let mut events = reader::list_events(self.expression, self.schema, row, context, &self.replacements, batch_rows);
+        match events.next().await.transpose()? {
+            Some(super::ListEvent::Opened) => Ok(super::ListExpression { events }),
+            _ => Err(Anomaly::fault("rtdb.expr/list-state", "List descriptor did not open")),
+        }
+    }
+
     fn validate(&self,value: &Value) -> Result<()> {
         if matches!(self.expression,Expr::Column {..} | Expr::RowCopy(_)) { Ok(()) } else { validate_projection_value(value) }
     }

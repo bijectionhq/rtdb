@@ -223,6 +223,8 @@ pub struct WindowExpr { pub field: Field, pub function: WindowFunction }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RelationNode {
     Values { rows: Vec<Vec<Expr>> },
+    List { expr: Expr, element: Field },
+    PageOrdinality { input: Arc<Relation>, field: Field },
     Scan(Scan),
     Project { input: Arc<Relation>, expressions: Vec<NamedExpr> },
     Rename { input: Arc<Relation>, prefix: String, expressions: Vec<NamedExpr> },
@@ -285,11 +287,11 @@ impl Relation {
 
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
-            RelationNode::Values { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
+            RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
             RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
-            | RelationNode::Unnest { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
+            | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => vec![left, right],
             RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => vec![input, dependent],
             RelationNode::Let { binding, body } => vec![&binding.relation, body],
@@ -312,9 +314,9 @@ impl Relation {
             RelationNode::SortLimit { order_by, offset, fetch, .. } => order_by.iter().map(|order| &order.expr).chain(offset.iter()).chain(fetch.iter()).collect(),
             RelationNode::Window { order_by, .. } => order_by.iter().map(|order| &order.expr).collect(),
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
-            RelationNode::Unnest { expr, .. } => vec![expr],
+            RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } => vec![expr],
             RelationNode::PatchGaps { from, to, .. } => vec![from, to],
-            RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } => vec![],
+            RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::PageOrdinality { .. } => vec![],
         }
     }
 
@@ -473,6 +475,13 @@ impl Relation {
                 for ((output, left), right) in self.schema.fields().iter().zip(left.schema.fields()).zip(right.schema.fields()) {
                     if output.data_type != left.data_type.join(&right.data_type) { return invalid("Set output type is not the join of its inputs"); }
                 }
+            }
+            RelationNode::List { element, .. } => {
+                if self.schema.fields() != [element.clone()] { return invalid("List schema differs from its element"); }
+            }
+            RelationNode::PageOrdinality { input, field } => {
+                if field.data_type != LogicalType::Scalar(ScalarType::I64) { return invalid("Page ordinality requires an I64 result"); }
+                if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([field])) { return invalid("Page ordinality schema differs from its input and result"); }
             }
             RelationNode::Unnest { input, element, ordinality, .. } => {
                 if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([element]).chain(ordinality.iter())) {

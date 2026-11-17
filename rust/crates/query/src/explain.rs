@@ -89,6 +89,11 @@ fn describe(relation: &Relation) -> Result<Descriptor> {
                 Value::List(vec![text(window.field.name.clone()), text(function)])
             }).collect())),
         ]),
+        RelationNode::List { expr, element } => map([("columns", text(format!("{{{} {}}}", element.name, expression(expr)?)))]),
+        RelationNode::PageOrdinality { field, .. } => map([
+            ("append?", Value::Bool(true)),
+            ("project", text(format!("[{{{} (local-row-number)}}]", field.name))),
+        ]),
         RelationNode::Unnest { expr, element, ordinality, .. } => {
             let mut fields = BTreeMap::from([("from".into(), text(expression(expr)?)), ("to".into(), text(element.name.clone()))]);
             if let Some(field) = ordinality { fields.insert("ordinality".into(), text(field.name.clone())); }

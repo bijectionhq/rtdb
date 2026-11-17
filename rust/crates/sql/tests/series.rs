@@ -79,7 +79,7 @@ async fn series_tables_bind_aliases_lateral_arguments_and_ordinality() {
     assert_eq!(query("SELECT * FROM GENERATE_SERIES(1,3) AS g", false).await.unwrap(), [vec![V::I64(1)],vec![V::I64(2)],vec![V::I64(3)]]);
     assert_eq!(query("SELECT * FROM GENERATE_SERIES(1,3) AS g", true).await.unwrap(), [vec![V::I64(1)],vec![V::I64(2)]]);
     assert_eq!(query("SELECT stop,v,n FROM (VALUES (2),(4)) AS limits(stop),custom.RANGE(1,limits.stop) WITH ORDINALITY AS g(v,n) ORDER BY stop,n", false).await.unwrap(),
-        [vec![V::I64(2),V::I64(1),V::I32(1)],vec![V::I64(4),V::I64(1),V::I32(1)],vec![V::I64(4),V::I64(2),V::I32(2)],vec![V::I64(4),V::I64(3),V::I32(3)]]);
+        [vec![V::I64(2),V::I64(1),V::I64(1)],vec![V::I64(4),V::I64(1),V::I64(1)],vec![V::I64(4),V::I64(2),V::I64(2)],vec![V::I64(4),V::I64(3),V::I64(3)]]);
     assert!(query("SELECT * FROM GENERATE_SERIES(NULL,3) WITH ORDINALITY AS g(v,n)", false).await.unwrap().is_empty());
     assert!(query("SELECT * FROM RANGE(3,1) AS g(v)", false).await.unwrap().is_empty());
     assert_eq!(query("SELECT * FROM GENERATE_SERIES(DATE '2024-01-31',DATE '2024-04-01',INTERVAL '1' MONTH) AS g(day)", false).await.unwrap(),
@@ -98,22 +98,25 @@ fn series_and_unnest_wildcards_assign_labels_within_each_wildcard() {
     assert_eq!(labels("SELECT GENERATE_SERIES(1,3),RANGE(1,3)"), ["_column_1","_column_2"]);
     let context = context();
     let Statement::Query(plan) = prepare("SELECT * FROM RANGE(1,3) WITH ORDINALITY AS g(value,position)", &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("query") };
-    assert_eq!(plan.schema().fields()[1].data_type, rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::I32));
+    assert_eq!(plan.schema().fields()[1].data_type, rtdb_types::LogicalType::Scalar(rtdb_types::ScalarType::I64));
     for source in ["SELECT _column_1 FROM RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3)", "SELECT * FROM RANGE(1,3) AS g(x,y)", "SELECT * FROM RANGE(1,3) WITH ORDINALITY AS g(x)", "SELECT * FROM unknown(1,3) AS g", r#"SELECT * FROM "range"(1,3) AS g"#, "SELECT * FROM a.b.RANGE(1,3) AS g", "SELECT * FROM RANGE(1,3,1,TRUE) AS g"] {
         assert!(prepare(source, &context.catalog, &PrepareOptions::default()).is_err(), "{source}");
     }
 }
 
 #[tokio::test]
-async fn series_table_limits_consume_complete_expansion_pages_under_the_budget() {
-    assert_eq!(query("SELECT value FROM RANGE(0,10) AS g(value) LIMIT 3", false).await.unwrap(), [vec![V::I64(0)],vec![V::I64(1)],vec![V::I64(2)]]);
-    let context = context();
-    let Statement::Query(relation) = prepare("SELECT value FROM RANGE(0,2147483647) AS g(value) LIMIT 3", &context.catalog, &PrepareOptions::default()).unwrap().statement else { panic!("query") };
-    let mut cursor = PreparedQuery::new(relation).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();
-    assert_eq!(cursor.next_batch().await.unwrap_err().code,"rtdb/memory-budget-exceeded");
-    drop(cursor);
-    assert_eq!(context.memory.used_bytes(),0);
-    assert_eq!(context.spill_bytes(),0);
+async fn series_table_limits_keep_large_readers_bounded() {
+    assert_eq!(query("SELECT value FROM RANGE(0,2147483647) AS g(value) LIMIT 3", false).await.unwrap(), [vec![V::I64(0)],vec![V::I64(1)],vec![V::I64(2)]]);
+    assert_eq!(query("SELECT system._id FROM GENERATE_SERIES(1,200000000) AS system(_id) LIMIT 5", false).await.unwrap(),
+        (1..=5).map(|value| vec![V::I64(value)]).collect::<Vec<_>>());
+    assert_eq!(query("SELECT system._id FROM GENERATE_SERIES(1,200000000) AS system(_id) OFFSET 100000000 LIMIT 5", false).await.unwrap(),
+        (100000001..=100000005).map(|value| vec![V::I64(value)]).collect::<Vec<_>>());
+}
+
+#[tokio::test]
+async fn series_ordinality_is_i64_and_restarts_at_semantic_page_boundaries() {
+    assert_eq!(query("SELECT value,position FROM RANGE(0,1026) WITH ORDINALITY AS g(value,position) OFFSET 1022 LIMIT 4", false).await.unwrap(),
+        [vec![V::I64(1022),V::I64(1023)],vec![V::I64(1023),V::I64(1024)],vec![V::I64(1024),V::I64(1)],vec![V::I64(1025),V::I64(2)]]);
 }
 
 #[tokio::test(start_paused = true)]

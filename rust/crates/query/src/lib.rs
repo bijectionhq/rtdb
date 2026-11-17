@@ -4,6 +4,9 @@ mod parameters;
 mod cursor;
 mod runtime_schema;
 mod operators;
+mod list;
+#[cfg(test)]
+mod list_tests;
 mod join;
 mod join_key;
 mod pushdown;

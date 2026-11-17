@@ -155,6 +155,17 @@ fn build_pages_constrained(relation: Arc<Relation>, runtime: Arc<RuntimeRelation
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
+        RelationNode::List { expr, .. } => {
+            let pages = Box::new(execution.open_list(expr.clone()).await?);
+            let pages = crate::pages::retain_page_state(pages, state_reservation);
+            return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+        }
+        RelationNode::PageOrdinality { input, .. } => {
+            let input = build_pages_constrained(Arc::clone(input), runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
+            let pages = Box::new(crate::list::PageOrdinality::new(input, Arc::clone(&execution.context)));
+            let pages = crate::pages::retain_page_state(pages, state_reservation);
+            return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+        }
         RelationNode::Unnest { input,expr,ordinality,outer,.. } => {
             let input_pages = build_pages_constrained(Arc::clone(input),runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),pushdowns).await?;
             let pages = Box::new(Unnest { input: input_pages,schema: runtime.child(0)?.schema().clone(),expr: expr.clone(),ordinality: ordinality.is_some(),outer: *outer,execution });

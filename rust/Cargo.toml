@@ -53,6 +53,7 @@ arrow-schema = { version = "=58.4.1", features = ["ffi", "serde"] }
 arrow-select = "=58.4.1"
 arrow-ipc = { version = "=58.4.1", features = ["lz4", "zstd"] }
 async-trait = "0.1"
+async-stream = "=0.3.6"
 http = "1"
 base64 = "0.22"
 bytes = { version = "1", features = ["serde"] }

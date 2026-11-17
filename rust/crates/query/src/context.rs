@@ -96,6 +96,7 @@ impl rtdb_expr::PgCatalogLookup for CatalogSnapshot {
 #[derive(Clone, Debug)]
 pub struct QueryOptions {
     pub batch_rows: usize,
+    pub list_batch_rows: usize,
     pub sort_memory_bytes: usize,
     /// Build-row threshold for join Bloom/IID filters; exceeding it disables the filters.
     pub join_build_rows: i64,
@@ -107,7 +108,7 @@ pub struct QueryOptions {
     pub object_sort: rtdb_types::ObjectSort,
 }
 impl Default for QueryOptions {
-    fn default() -> Self { Self { batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
+    fn default() -> Self { Self { batch_rows: 1024, list_batch_rows: 1024, sort_memory_bytes: 8 * 1024 * 1024, join_build_rows: 100_000, spill_limit_bytes: 1024 * 1024 * 1024, bypass_temporal_pruning: false, generate_series_end_exclusive: false, object_sort: rtdb_types::ObjectSort::default() } }
 }
 
 pub struct QueryContext {
@@ -131,7 +132,7 @@ impl QueryContext {
     }
     /// Both cancellation sources end active pulls; cancelling a cursor leaves either parent unchanged.
     pub fn with_owner(catalog: CatalogSnapshot, memory: Arc<MemoryBudget>, current_time: impl Into<rtdb_types::Instant>, timezone: impl Into<String>, options: QueryOptions, parent_cancellation: &CancellationToken, owner_cancellation: &CancellationToken) -> Result<Arc<Self>> {
-        if options.batch_rows == 0 || options.sort_memory_bytes == 0 {
+        if options.batch_rows == 0 || options.list_batch_rows == 0 || options.sort_memory_bytes == 0 {
             return Err(invalid("invalid-options", "Batch rows and sort bytes must be positive"));
         }
         let spill = Arc::new(SpillRegion::new(options.spill_limit_bytes)?);
@@ -238,6 +239,31 @@ impl Execution {
         let context = rtdb_expr::EvalContext { parameters: self.parameters.values(), parameter_types: Some(self.parameters.types()), current_time: self.context.current_time, timezone: &self.context.timezone, outer_rows: &outer_rows, snapshot_token: self.context.snapshot_token(), allocation: Some(scope), catalog: Some(&self.context.catalog) };
         self.context.owner_cancellation.run_until_cancelled(self.context.cancellation.run_until_cancelled(
             invocation.evaluate_projection_async(row,&context))).await.flatten().ok_or_else(cancelled)?
+    }
+    pub async fn open_list(&self, expression: rtdb_plan::Expr) -> Result<crate::list::ListCursor> {
+        let execution = self.clone();
+        let context = Arc::clone(&self.context);
+        let stream = async_stream::try_stream! {
+            let scope = execution.scope()?;
+            let schema = rtdb_plan::Schema::default();
+            scope.reserve(execution.outer.rows.len().checked_mul(std::mem::size_of::<rtdb_expr::OuterRow<'_>>()).ok_or_else(|| crate::invalid("outer-size", "Outer row bindings exceed addressable memory"))?)?;
+            let outer_rows: Vec<_> = execution.outer.rows.iter().map(|(schema, row)| rtdb_expr::OuterRow { schema, values: &row.values }).collect();
+            let eval = rtdb_expr::EvalContext { parameters: execution.parameters.values(), parameter_types: Some(execution.parameters.types()), current_time: execution.context.current_time,
+                timezone: &execution.context.timezone, outer_rows: &outer_rows, snapshot_token: execution.context.snapshot_token(), allocation: Some(&scope), catalog: Some(&execution.context.catalog) };
+            let invocation = rtdb_expr::ExpressionInvocation::prepare(&expression, &schema, &eval)?;
+            let mut list = invocation.open_list(&[], &eval, execution.context.options.list_batch_rows).await?;
+            yield crate::list::ListEvent::Opened;
+            while let Some(batch) = list.next_batch().await? {
+                execution.context.check_cancelled()?;
+                let mut page = crate::pages::PageBuilder::new(batch.values().len(), &execution.context.memory)?;
+                for value in batch.values() {
+                    execution.context.check_cancelled()?;
+                    page.push(crate::cursor::OwnedRow::copy_parts(&[std::slice::from_ref(value)], 0, 0, &execution.context.memory)?)?;
+                }
+                yield crate::list::ListEvent::Page(page.finish());
+            }
+        };
+        crate::list::ListCursor::open(Box::pin(stream), context).await
     }
     pub async fn evaluate_list(&self, scope: &rtdb_expr::EvaluationScope, expression: &rtdb_plan::Expr, schema: &rtdb_plan::Schema, row: &[Value]) -> Result<rtdb_expr::EvaluatedList> {
         let invocation = self.prepare_expression(expression,schema,scope)?;
