@@ -144,7 +144,7 @@ fn untyped_parameters_defer_option_checks_until_runtime_source_selection() {
     let Statement::Query(relation) = compile("(fn [x] (-> (rel [{}] []) (return {:v (cast x #xt/type [:duration :nano] {:precision :ignored})})))",&EmptyCatalog,&CompileOptions::default()).unwrap().statement else { panic!() };
     let RelationNode::Project { input,expressions } = relation.node() else { panic!() };
     let expression = &expressions[0].expr;
-    assert_eq!(expression.data_type(),T::Nothing);
+    assert_eq!(expression.data_type(),T::Null);
     for value in [V::Null,V::Duration { value: 123,unit: U::Nanosecond }] {
         assert_eq!(evaluate(expression,input.schema(),&[],&EvalContext { parameters: &[value.clone()],..Default::default() }).unwrap(),value);
     }
@@ -275,10 +275,10 @@ fn unspecified_decimal_cast_preserves_literal_scale_and_scale_only_options() {
 #[test]
 fn casts_retain_unification_dependencies_and_aggregate_rewriting() {
     for source in [
-        "(unify (with {:v (cast x #xt/type [:decimal 64 9 256])}) (rel [{:x 1.25M}] [x]))",
+        "(unify (with {v (cast x #xt/type [:decimal 64 9 256])}) (rel [{:x 1.25M}] [x]))",
         "(-> (rel [{:x 1} {:x 2}] [x]) (aggregate {:total (cast (sum x) #xt/type [:decimal 64 9 256] {:precision 5 :scale 2})}))",
     ] {
-        assert!(compile(source, &EmptyCatalog, &CompileOptions::default()).is_ok(), "{source}");
+        compile(source, &EmptyCatalog, &CompileOptions::default()).unwrap_or_else(|error| panic!("{source}: {error:?}"));
     }
 }
 

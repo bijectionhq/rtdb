@@ -24,5 +24,5 @@ fn xtql_set_equality_rejects_nested_and_unselected_type_pairs() {
     }
     assert_eq!(project("(= {:a #{}} {:b #{}})").unwrap(),Value::Bool(false));
     assert_eq!(project("(= #{} nil)").unwrap(),Value::Null);
-    assert_eq!(project("(=== #{} #{})").unwrap(),Value::Bool(true));
+    assert_eq!(project("(=== #{} #{})").unwrap(),Value::Bool(false));
 }

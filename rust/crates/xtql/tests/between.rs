@@ -24,7 +24,7 @@ async fn project(expression: &str) -> Result<(LogicalType, Value)> {
 #[tokio::test(start_paused = true)]
 async fn xtql_between_macros_retain_once_binding_and_symmetry() {
     let start = tokio::time::Instant::now();
-    assert_eq!(project("(between-symmetric (coalesce (nullif (sleep (cast 5 #xt/type [:duration :milli])) nil) 7) 10 5)").await.unwrap().1,Value::Bool(true));
+    assert_eq!(project("(between-symmetric (coalesce (nullif (sleep (cast \"PT0.005S\" #xt/type [:duration :milli])) nil) 7) 10 5)").await.unwrap().1,Value::Bool(true));
     assert_eq!(tokio::time::Instant::now()-start,std::time::Duration::from_millis(5));
     assert_eq!(project("(between 7 10 5)").await.unwrap().1,Value::Bool(false));
     assert_eq!(project("(between-symmetric 7 nil 5)").await.unwrap().1,Value::Null);
