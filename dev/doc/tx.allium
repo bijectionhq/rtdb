@@ -1238,6 +1238,9 @@ surface ConnectionLifecycle {
     provides:
         CloseConnection(frontend, conn)
 
+    @guarantee AdbcResultCancellation
+        -- Native ADBC result release cancels that result's execution while preserving its caller's operation token, connection and sibling results.
+
     @guarantee CloseDiscardsOpenTx
         -- Closing the connection discards any open transaction without submitting.
         -- Closing is not an implicit commit.

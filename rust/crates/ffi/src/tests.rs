@@ -141,6 +141,8 @@ fn statement_captures_creation_catalog_for_prepare_schema_and_reexecution() {
             assert_eq!(batch.batch().num_rows(), 1);
             assert_eq!(rtdb_columnar::read_value(batch.batch().schema().field(0), batch.batch().column(0).as_ref(), 0).unwrap(), rtdb_types::Value::Utf8("first".into()));
             assert!(cursor.next().unwrap().is_none());
+            drop(cursor);
+            assert!(!token.is_cancelled());
         }
     }
     deferred.replace_source("SELECT label FROM docs", false).unwrap();
@@ -342,6 +344,45 @@ fn cancelling_one_stream_preserves_the_session_and_sibling_stream() {
     ok(unsafe { rtdb_v1_cancel(first_operation, &mut error) }, error);
     assert!(handles::cursor(first).unwrap().next().is_err());
     assert_eq!(handles::cursor(second).unwrap().next().unwrap().unwrap().batch().num_rows(), 1);
+}
+
+#[test]
+fn cursor_cancel_and_close_interrupt_active_pulls_without_cancelling_the_operation() {
+    use std::{sync::{Barrier, mpsc}, thread, time::Duration};
+    let mut native = Native::open();
+    let operation = native.operation();
+    let session = handles::session(native.session).unwrap();
+    let token = handles::cancellation(operation, &session).unwrap();
+    for close in [false, true] {
+        let statement = native.statement("SELECT pg_sleep(10.0)");
+        let cursor = native.query(statement, operation);
+        let value = handles::cursor(cursor).unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let started = Arc::clone(&barrier);
+        let reader = Arc::clone(&value);
+        let (result, received) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            started.wait();
+            result.send(reader.next().map(|_| ())).unwrap();
+        });
+        barrier.wait();
+        thread::sleep(Duration::from_millis(50));
+        let (closed, joined) = mpsc::channel();
+        let closer = thread::spawn(move || {
+            if close { value.close(); } else {
+                let mut error = 0;
+                ok(unsafe { rtdb_v1_cancel(cursor, &mut error) }, error);
+            }
+            closed.send(()).unwrap();
+        });
+        joined.recv_timeout(Duration::from_secs(3)).unwrap();
+        let observed = received.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(matches!(&observed, Err(error) if error.category == rtdb_types::AnomalyCategory::Interrupted), "{observed:?}");
+        closer.join().unwrap(); worker.join().unwrap();
+        assert!(!token.is_cancelled());
+    }
+    let statement = native.statement("SELECT 1");
+    assert!(handles::statement(statement).unwrap().query(&token).unwrap().next().unwrap().is_some());
 }
 
 #[test]

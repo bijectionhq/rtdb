@@ -35,6 +35,7 @@ Shutdown cancels node and server lifetimes, waits for admitted calls, and joins 
 The handle registry, sessions, statements, operation tokens, cursors, diagnostics and byte results are passive objects.
 Session and statement state each have one mutex writer.
 Operation cancellation bypasses those locks, and each token descends from its session lifetime.
+Each result owns a child cancellation token, so releasing a result preserves its caller's operation token and sibling results.
 Releasing the last operation handle cancels its scope.
 Statements retain the default database captured at creation for preparation, schema inspection and queries.
 Changing the connection's current catalog affects subsequent statements and DML submission.

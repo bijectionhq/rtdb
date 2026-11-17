@@ -130,6 +130,9 @@ impl StatementHandle {
         })
     }
     pub fn query(&self, token: &CancellationToken) -> Result<Arc<CursorHandle>> {
+        let _token_storage = self.session.region.memory().reserve(4096)?;
+        let result_token = token.child_token();
+        let token = &result_token;
         let mut locked = self.state.lock();
         let state = locked.as_mut().ok_or_else(super::closed)?;
         let cursor = self.session.region.run(async {
@@ -159,7 +162,7 @@ impl StatementHandle {
                 Source::Bulk(_) => Err(Anomaly::incorrect("xtdb.adbc/bulk-ingest-no-query", "Bulk ingest does not support queries")),
             }
         })?;
-        CursorHandle::new(Arc::clone(&self.session.region), cursor, token.clone())
+        CursorHandle::new(Arc::clone(&self.session.region), cursor, result_token)
     }
     pub fn update(&self, token: &CancellationToken) -> Result<i64> {
         let mut locked = self.state.lock();
@@ -229,7 +232,7 @@ impl CursorHandle {
     pub fn from_batch(region: Arc<EmbeddedRegion>, batch: OwnedBatch, token: CancellationToken) -> Result<Arc<Self>> {
         let reservation = region.memory().reserve(crate::arrow::schema_bound(batch.batch().schema().as_ref())?)?;
         let schema = batch.batch().schema().as_ref().clone();
-        Ok(Arc::new(Self { region, token, schema, state: Mutex::new(Some(CursorInput::Batch(batch))), _reservation: reservation }))
+        Ok(Arc::new(Self { region, token: token.child_token(), schema, state: Mutex::new(Some(CursorInput::Batch(batch))), _reservation: reservation }))
     }
     pub fn next(&self) -> Result<Option<DeclaredBatch>> {
         let mut state = self.state.lock();
