@@ -1,4 +1,5 @@
 use super::*;
+use admission::{DecodeResult, Failure};
 
 const SHA1: &[u8] = &[0x2b, 0x0e, 3, 2, 26];
 const MGF1: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 8];
@@ -11,39 +12,40 @@ pub(super) fn validate(algorithm: &Algorithm, family: Family) -> Result<Option<P
     let parameter = parameter(algorithm)?;
     match family {
         Family::Pss => return parameter.map(pss).transpose(),
-        Family::Dsa => if let Some(parameter) = parameter { integers(parameter, 3, false)?; },
-        Family::Dh => integers(parameter.ok_or_else(malformed)?, 2, true)?,
-        Family::Ec => curve(parameter.ok_or_else(malformed)?)?,
+        Family::Dsa => if let Some(parameter) = parameter { integers(parameter, 3, false).map_err(Failure::into_anomaly)?; },
+        Family::Dh => integers(parameter.ok_or_else(malformed)?, 2, true).map_err(Failure::into_anomaly)?,
+        Family::Ec => curve(parameter.ok_or_else(malformed)?).map_err(Failure::into_anomaly)?,
         Family::Named if parameter.is_some() => return Err(malformed()),
         _ => {},
     }
     Ok(None)
 }
 
-fn integers(bytes: &[u8], required: usize, optional_int: bool) -> Result<()> {
+fn integers(bytes: &[u8], required: usize, optional_int: bool) -> DecodeResult<()> {
     let mut input = Der(bytes);
-    let sequence = expect(&mut input, 0x30)?;
-    input.end()?;
+    let sequence = admission::expect(&mut input, 0x30)?;
+    admission::end(input)?;
     let mut fields = Der(&sequence);
-    for _ in 0..required { integer::signed(&expect(&mut fields, 2)?)?; }
-    if optional_int && !fields.0.is_empty() { integer::int(&mut fields)?; }
-    fields.end()
+    for _ in 0..required { admission::signed(&admission::expect(&mut fields, 2)?)?; }
+    if optional_int && !fields.0.is_empty() { admission::int(&mut fields)?; }
+    admission::end(fields)
 }
 
-fn curve(bytes: &[u8]) -> Result<()> {
+fn curve(bytes: &[u8]) -> DecodeResult<()> {
     let mut input = Der(bytes);
-    let oid = expect(&mut input, 6)?;
-    crate::java_der::valid_oid(&oid)?;
-    input.end()?;
-    if curves::CURVES.iter().any(|(_, candidate)| *candidate == &*oid) { Ok(()) } else { Err(malformed()) }
+    let oid = admission::expect(&mut input, 6)?;
+    admission::valid_oid(&oid)?;
+    admission::end(input)?;
+    if curves::CURVES.iter().any(|(_, candidate)| *candidate == &*oid) { Ok(()) } else { Err(admission::malformed_parameter()) }
 }
 
+mod admission;
 mod pbes2;
 mod recursive;
 
-fn pss(bytes: &[u8]) -> Result<Pss> { recursive::pss(bytes) }
+fn pss(bytes: &[u8]) -> Result<Pss> { recursive::pss(bytes).map_err(Failure::into_anomaly) }
 
-fn fixed_service(oid: &[u8], parameter: &[u8]) -> Result<()> {
+fn fixed_service(oid: &[u8], parameter: &[u8]) -> DecodeResult<()> {
     match oid {
         DSA | [0x2b, 0x0e, 3, 2, 12] => integers(parameter, 3, false)?,
         DH | [0x2a, 0x86, 0x48, 0xce, 0x3e, 2, 1] => integers(parameter, 2, true)?,
@@ -53,34 +55,34 @@ fn fixed_service(oid: &[u8], parameter: &[u8]) -> Result<()> {
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, 16, 3, 18] => chacha_nonce(parameter)?,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 3]
             | [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 12, 1, 1 | 2 | 3 | 5 | 6] => legacy_pbe(parameter)?,
-        [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(unsupported()),
+        [0x2a, 0x86, 0x48, 0xce, 0x3d, 4, 3] => return Err(Failure::Propagate(unsupported())),
         _ => {},
     }
     Ok(())
 }
 
-fn primitive_iv(bytes: &[u8], length: usize) -> Result<()> {
+fn primitive_iv(bytes: &[u8], length: usize) -> DecodeResult<()> {
     let mut input = Der(bytes);
-    if expect(&mut input, 4)?.len() != length { return Err(malformed()); }
-    input.end()
+    if admission::expect(&mut input, 4)?.len() != length { return Err(admission::malformed_parameter()); }
+    admission::end(input)
 }
 
-fn chacha_nonce(bytes: &[u8]) -> Result<()> {
+fn chacha_nonce(bytes: &[u8]) -> DecodeResult<()> {
     let mut input = Der(bytes);
-    let nonce = next(&mut input)?;
-    input.end()?;
-    if secret_der::octets(nonce, malformed)?.len() != 12 { return Err(malformed()); }
+    let nonce = admission::next(&mut input)?;
+    admission::end(input)?;
+    if admission::octets(nonce)?.len() != 12 { return Err(admission::malformed_parameter()); }
     Ok(())
 }
 
-fn legacy_pbe(bytes: &[u8]) -> Result<()> {
+fn legacy_pbe(bytes: &[u8]) -> DecodeResult<()> {
     let mut input = Der(bytes);
-    let sequence = expect(&mut input, 0x30)?;
-    input.end()?;
+    let sequence = admission::expect(&mut input, 0x30)?;
+    admission::end(input)?;
     let mut fields = Der(&sequence);
-    expect(&mut fields, 4)?;
-    integer::int(&mut fields)?;
-    fields.end()
+    admission::expect(&mut fields, 4)?;
+    admission::int(&mut fields)?;
+    admission::end(fields)
 }
 
 fn is_mgf_digest(oid: &[u8]) -> bool { matches!(oid, SHA1 | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1..=10]) }

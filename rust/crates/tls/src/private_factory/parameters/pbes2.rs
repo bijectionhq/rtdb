@@ -1,4 +1,5 @@
 use super::*;
+use admission::{expect, next, malformed_parameter};
 
 pub(super) const OID: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 13];
 const PBKDF2: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 5, 12];
@@ -48,10 +49,10 @@ impl Name {
     }
 }
 
-pub(super) fn decode(bytes: &[u8]) -> Result<Name> {
+pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Name> {
     let mut input = Der(bytes);
     let outer = expect(&mut input, 0x30)?;
-    input.end()?;
+    admission::end(input)?;
     let mut fields = Der(&outer);
     let first = next(&mut fields)?;
     if first.tag == 6 {
@@ -62,9 +63,9 @@ pub(super) fn decode(bytes: &[u8]) -> Result<Name> {
     } else { named(0x30, first, &mut fields) }
 }
 
-fn named(tag: u8, kdf: secret_der::Value<'_>, fields: &mut Der<'_>) -> Result<Name> {
+fn named(tag: u8, kdf: secret_der::Value<'_>, fields: &mut Der<'_>) -> DecodeResult<Name> {
     let prf = parse_kdf(kdf)?;
-    if tag != 0x30 { return Err(malformed()); }
+    if tag != 0x30 { return Err(malformed_parameter()); }
     let aes = parse_encryption(next(fields)?)?;
     Ok(match (prf, aes) {
         (Prf::Sha1, Aes::Bits128) => Name::HmacSha1Aes128,
@@ -84,21 +85,21 @@ fn named(tag: u8, kdf: secret_der::Value<'_>, fields: &mut Der<'_>) -> Result<Na
     })
 }
 
-fn parse_kdf(kdf: secret_der::Value<'_>) -> Result<Prf> {
+fn parse_kdf(kdf: secret_der::Value<'_>) -> DecodeResult<Prf> {
     let mut fields = Der(&kdf.content);
     let oid = expect(&mut fields, 6)?;
-    crate::java_der::valid_oid(&oid)?;
-    if oid.as_ref() != PBKDF2 || kdf.tag != 0x30 { return Err(malformed()); }
+    admission::valid_oid(&oid)?;
+    if oid.as_ref() != PBKDF2 || kdf.tag != 0x30 { return Err(malformed_parameter()); }
     let parameters = expect(&mut fields, 0x30)?;
     let mut parameters = Der(&parameters);
     expect(&mut parameters, 4)?;
-    integer::int(&mut parameters)?;
-    if parameters.0.first() == Some(&2) { integer::int(&mut parameters)?; }
+    admission::int(&mut parameters)?;
+    if parameters.0.first() == Some(&2) { admission::int(&mut parameters)?; }
     if parameters.0.first() != Some(&0x30) { return Ok(Prf::Sha1); }
     let prf = expect(&mut parameters, 0x30)?;
     let mut prf = Der(&prf);
     let oid = expect(&mut prf, 6)?;
-    crate::java_der::valid_oid(&oid)?;
+    admission::valid_oid(&oid)?;
     let algorithm = match oid.as_ref() {
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 2, 7] => Prf::Sha1,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 2, 8] => Prf::Sha224,
@@ -107,21 +108,21 @@ fn parse_kdf(kdf: secret_der::Value<'_>) -> Result<Prf> {
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 2, 11] => Prf::Sha512,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 2, 12] => Prf::Sha512224,
         [0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 2, 13] => Prf::Sha512256,
-        _ => return Err(malformed()),
+        _ => return Err(malformed_parameter()),
     };
     if prf.0.first() == Some(&5) { next(&mut prf)?; }
-    prf.end()?;
+    admission::end(prf)?;
     Ok(algorithm)
 }
 
-fn parse_encryption(encryption: secret_der::Value<'_>) -> Result<Aes> {
+fn parse_encryption(encryption: secret_der::Value<'_>) -> DecodeResult<Aes> {
     let mut fields = Der(&encryption.content);
     let oid = expect(&mut fields, 6)?;
-    crate::java_der::valid_oid(&oid)?;
+    admission::valid_oid(&oid)?;
     let aes = match oid.as_ref() {
         [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1, 2] => Aes::Bits128,
         [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 1, 42] => Aes::Bits256,
-        _ => return Err(malformed()),
+        _ => return Err(malformed_parameter()),
     };
     expect(&mut fields, 4)?;
     Ok(aes)

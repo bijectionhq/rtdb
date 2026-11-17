@@ -1,9 +1,14 @@
 use super::*;
 
-pub(super) fn signed(mut bytes: &[u8]) -> Result<&[u8]> {
-    if bytes.is_empty() { return Err(malformed()); }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum IntegerError { Malformed, MagnitudeOverflow }
+
+pub(super) fn signed(bytes: &[u8]) -> Result<&[u8]> { signed_checked(bytes).map_err(|_| malformed()) }
+
+pub(super) fn signed_checked(mut bytes: &[u8]) -> std::result::Result<&[u8], IntegerError> {
+    if bytes.is_empty() { return Err(IntegerError::Malformed); }
     while bytes.len() > 1 && (bytes[0] == 0 && bytes[1] & 0x80 == 0 || bytes[0] == 0xff && bytes[1] & 0x80 != 0) { bytes = &bytes[1..]; }
-    if !signed_range(bytes.len(), bytes[0], || bytes[1..].iter().all(|byte| *byte == 0)) { return Err(malformed()); }
+    check_signed_range(bytes.len(), bytes[0], || bytes[1..].iter().all(|byte| *byte == 0))?;
     Ok(bytes)
 }
 
@@ -19,6 +24,10 @@ fn signed_range(length: usize, first: u8, zero_tail: impl FnOnce() -> bool) -> b
     length < MAX_BYTES || length == MAX_BYTES && (first != 0x80 || !zero_tail())
 }
 
+fn check_signed_range(length: usize, first: u8, zero_tail: impl FnOnce() -> bool) -> std::result::Result<(), IntegerError> {
+    if signed_range(length, first, zero_tail) { Ok(()) } else { Err(IntegerError::MagnitudeOverflow) }
+}
+
 fn unsigned_range(length: usize, first: u8) -> bool { length < 1 << 28 || length == 1 << 28 && first < 0x80 }
 
 pub(super) fn int(input: &mut Der<'_>) -> Result<i32> {
@@ -26,9 +35,11 @@ pub(super) fn int(input: &mut Der<'_>) -> Result<i32> {
     int_content(&value)
 }
 
-pub(super) fn int_content(bytes: &[u8]) -> Result<i32> {
-    let value = signed(bytes)?;
-    if value.len() > 4 { return Err(malformed()); }
+pub(super) fn int_content(bytes: &[u8]) -> Result<i32> { int_content_checked(bytes).map_err(|_| malformed()) }
+
+pub(super) fn int_content_checked(bytes: &[u8]) -> std::result::Result<i32, IntegerError> {
+    let value = signed_checked(bytes)?;
+    if value.len() > 4 { return Err(IntegerError::Malformed); }
     let initial = if value[0] & 0x80 == 0 { 0i32 } else { -1i32 };
     Ok(value.iter().fold(initial, |result, byte| result.wrapping_shl(8) | i32::from(*byte)))
 }
@@ -67,5 +78,32 @@ mod tests {
         assert_eq!(encode_unsigned(&[0]).unwrap().as_slice(), [2, 1, 0]);
         assert_eq!(encode_unsigned(&[0x7f]).unwrap().as_slice(), [2, 1, 0x7f]);
         assert_eq!(encode_unsigned(&[0x80]).unwrap().as_slice(), [2, 2, 0, 0x80]);
+    }
+
+    #[test]
+    fn typed_signed_integer_results_preserve_sign_padding_and_java_int_boundaries() {
+        for (bytes, expected) in [(&[0, 0, 1][..], &[1][..]), (&[0xff, 0xff, 0x80], &[0x80]), (&[0, 0x80], &[0, 0x80])] {
+            assert_eq!(signed_checked(bytes).unwrap(), expected);
+            assert_eq!(signed(bytes).unwrap(), expected);
+        }
+        for (bytes, expected) in [(&[0][..], 0), (&[0xff], -1), (&[0x80, 0, 0, 0], i32::MIN), (&[0x7f, 0xff, 0xff, 0xff], i32::MAX)] {
+            assert_eq!(int_content_checked(bytes).unwrap(), expected);
+            assert_eq!(int_content(bytes).unwrap(), expected);
+        }
+        for bytes in [&[][..], &[0, 0x80, 0, 0, 0], &[0xff, 0x7f, 0xff, 0xff, 0xff]] {
+            assert_eq!(int_content_checked(bytes), Err(IntegerError::Malformed));
+            assert!(int_content(bytes).is_err());
+        }
+        assert_eq!(signed_checked(&[]), Err(IntegerError::Malformed));
+    }
+
+    #[test]
+    fn typed_magnitude_overflow_is_distinct_from_java_int_range_failure() {
+        assert_eq!(check_signed_range((1 << 28) - 1, 0x80, || true), Ok(()));
+        assert_eq!(check_signed_range(1 << 28, 0x80, || true), Err(IntegerError::MagnitudeOverflow));
+        assert_eq!(check_signed_range(1 << 28, 0x80, || false), Ok(()));
+        assert_eq!(check_signed_range(1 << 28, 0x7f, || panic!("positive boundary has no tail check")), Ok(()));
+        assert_eq!(check_signed_range((1 << 28) + 1, 1, || false), Err(IntegerError::MagnitudeOverflow));
+        assert_eq!(int_content_checked(&[0, 0x80, 0, 0, 0]), Err(IntegerError::Malformed));
     }
 }

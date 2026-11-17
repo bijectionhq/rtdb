@@ -1,4 +1,5 @@
 use super::*;
+use admission::{expect, next, malformed_parameter as malformed};
 
 const OAEP: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 7];
 const P_SPECIFIED: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 1, 9];
@@ -16,7 +17,7 @@ const _: () = assert!(std::mem::size_of::<Frame>() <= 64);
 
 struct Identifier { oid: Zeroizing<Vec<u8>>, parameter: Option<Zeroizing<Vec<u8>>> }
 
-pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
+pub(super) fn pss(bytes: &[u8]) -> DecodeResult<Pss> {
     let mut result = Pss { digest: DigestName::Oid(Zeroizing::new(SHA1.to_vec())), mgf_digest: Zeroizing::new(SHA1.to_vec()), salt: 20 };
     let mut frames = vec![fields(bytes, Fields::Pss, true)?];
     while let Some(frame) = frames.pop() {
@@ -40,7 +41,7 @@ pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
                 frames.push(Frame::Fields { remaining: Zeroizing::new(input.0.to_vec()), fields: following, root });
                 let mut inner = Der(&context.content);
                 let value = next(&mut inner)?;
-                if exact { inner.end()?; }
+                if exact { admission::end(inner)?; }
                 match tag {
                     0x80 => {
                         let algorithm = identifier(value)?;
@@ -57,7 +58,7 @@ pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
                         let parameter = algorithm.parameter.ok_or_else(malformed)?;
                         let mut encoded = Der(&parameter);
                         let value = next(&mut encoded)?;
-                        encoded.end()?;
+                        admission::end(encoded)?;
                         let digest = identifier(value)?;
                         if root { result.mgf_digest = Zeroizing::new(digest.oid.to_vec()); }
                         frames.push(Frame::CheckMgf { oid: Zeroizing::new(digest.oid.to_vec()), sha3: matches!(format, Fields::Pss) });
@@ -73,17 +74,17 @@ pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
                         let parameter = algorithm.parameter.ok_or_else(malformed)?;
                         let mut encoded = Der(&parameter);
                         let value = next(&mut encoded)?;
-                        encoded.end()?;
-                        secret_der::octets(value, malformed)?;
+                        admission::end(encoded)?;
+                        admission::octets(value)?;
                     }
                     0x82 => {
                         if value.tag != 2 { return Err(malformed()); }
-                        let salt = integer::int_content(&value.content)?;
+                        let salt = admission::int_content(&value.content)?;
                         if salt < 0 { return Err(malformed()); }
                         if root { result.salt = salt; }
                     }
                     0x83 => {
-                        if value.tag != 2 || integer::int_content(&value.content)? != 1 { return Err(malformed()); }
+                        if value.tag != 2 || admission::int_content(&value.content)? != 1 { return Err(malformed()); }
                     }
                     _ => return Err(malformed()),
                 }
@@ -93,22 +94,22 @@ pub(super) fn pss(bytes: &[u8]) -> Result<Pss> {
     Ok(result)
 }
 
-fn fields(bytes: &[u8], format: Fields, root: bool) -> Result<Frame> {
+fn fields(bytes: &[u8], format: Fields, root: bool) -> DecodeResult<Frame> {
     let mut input = Der(bytes);
     let outer = next(&mut input)?;
     if matches!(format, Fields::Pss) {
         if outer.tag != 0x30 { return Err(malformed()); }
         let mut framing = Der(&outer.content);
         while !framing.0.is_empty() { next(&mut framing)?; }
-    } else { input.end()?; }
+    } else { admission::end(input)?; }
     Ok(Frame::Fields { remaining: outer.content.into_owned(), fields: format, root })
 }
 
-fn identifier(value: secret_der::Value<'_>) -> Result<Identifier> {
+fn identifier(value: secret_der::Value<'_>) -> DecodeResult<Identifier> {
     if value.tag != 0x30 { return Err(malformed()); }
     let mut fields = Der(&value.content);
     let oid = expect(&mut fields, 6)?.into_owned();
-    crate::java_der::valid_oid(&oid)?;
+    admission::valid_oid(&oid)?;
     let parameter = if fields.0.is_empty() { None } else {
         let value = next(&mut fields)?;
         if value.tag == 5 {
@@ -116,11 +117,11 @@ fn identifier(value: secret_der::Value<'_>) -> Result<Identifier> {
             None
         } else { Some(encode(value.tag, &value.content)) }
     };
-    fields.end()?;
+    admission::end(fields)?;
     Ok(Identifier { oid, parameter })
 }
 
-fn schedule(algorithm: Identifier, frames: &mut Vec<Frame>) -> Result<DigestName> {
+fn schedule(algorithm: Identifier, frames: &mut Vec<Frame>) -> DecodeResult<DigestName> {
     if let Some(parameter) = algorithm.parameter {
         match algorithm.oid.as_slice() {
             PSS => frames.push(fields(&parameter, Fields::Pss, false)?),

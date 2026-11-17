@@ -142,6 +142,21 @@ The skipped OID's contents are not validated or required to identify PBES2.
 The real parameter value still requires a SEQUENCE after its KDF is parsed.
 The historical wrapper's remaining tail is ignored.
 
+== Parameter failure boundaries
+
+Parameter admission returns a passive `Failure` value that distinguishes modeled Java IO failures from failures that propagate through parameter-name lookup.
+The `JavaIo` variant retains malformed DER, tags, OIDs, field cardinality, parameter values, and representable BigInteger values outside the signed 32-bit range.
+The `Propagate` variant retains uncovered parameter behavior and BigInteger magnitude overflow.
+`DerValue.getBigIntegerInternal` constructs BigInteger before checking the signed 32-bit range.
+BigInteger's supported-magnitude check throws ArithmeticException, which DSAParameters does not catch and the NumberFormatException handlers in DHParameters and PBEParameters do not catch.
+The integer decoder retains that distinction before parameter admission applies its policy.
+
+The parameter-local DER adapters classify failures at their parser boundaries without inspecting anomaly text or converting arbitrary anomalies to Java IO failures.
+The existing private-key admission reservation precedes these parsers; reservation and allocation-bound failures remain outside their Java IO conversions.
+Failure values and integer parse results are call-local passive values, with no additional growing collection or retained buffer.
+The public private-key result preserves the original anomaly from either variant.
+The current parameter evaluator propagates both variants without suppression.
+
 == Admission and remaining source work
 
 Decode reserves `384 * input_bytes + 65,536` before parsing, with checked arithmetic.
@@ -184,3 +199,4 @@ Nested IV regressions cover encoded-length boundaries, primitive versus construc
 Legacy PBE regressions cover all six services, arbitrary salt lengths, signed iteration boundaries and padding, primitive-only salt, complete sequence consumption, BER framing, absent and NULL parameters, CRT retention, non-CRT regeneration, unregistered nearby OIDs, and reservation release.
 Recursive parameter regressions cover defaults, outer and context tags, ordering, duplicate and tail handling, PSS preframing, MGF allowlists, pSource labels, child initialization order, fixed-service descendants, BER views, CRT retention, non-CRT name-only reconstruction, deep alternating nesting, and admission cleanup.
 PBES2 regressions cover all fourteen derived names, signed counts and key lengths, salt and IV shapes, PRF and cipher restrictions, selective tails, historical wrappers, BER retention, nested descendants, duplicate hash names, non-CRT reverse-name failure, initialization ordering, and reservation cleanup.
+Typed parameter regressions cover signed padding, signed 32-bit limits, the allocation-free BigInteger magnitude boundary, Java IO versus propagated failures, and preservation of outward diagnostics.
