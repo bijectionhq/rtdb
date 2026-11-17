@@ -48,8 +48,18 @@ impl ControlParser<'_> {
         Ok(identifier)
     }
     fn string(&mut self) -> Result<String> {
-        let Some(TokenWithSpan { token: Token::SingleQuotedString(value), .. }) = self.tokens.get(self.index) else { return Err(self.error("Expected a string literal")); };
-        let value = value.clone(); self.index += 1; Ok(value)
+        let Some(token) = self.tokens.get(self.index) else { return Err(self.error("Expected a string literal")); };
+        let value = match &token.token {
+            Token::SingleQuotedString(value) => value.clone(),
+            Token::DollarQuotedString(value) => value.value.clone(),
+            Token::EscapedStringLiteral(_) => {
+                let span = source_span(self.source, token.span);
+                let source = self.source.get(span.start..span.end).ok_or_else(|| self.error("Invalid string literal span"))?;
+                source.get(2..source.len().saturating_sub(1)).ok_or_else(|| self.error("Invalid escaped string literal"))?.to_owned()
+            }
+            _ => return Err(self.error("Expected a string literal")),
+        };
+        self.index += 1; Ok(value)
     }
     fn expression(&mut self) -> Result<Expr> {
         if self.eat("ON") { return Ok(Expr::Literal(Value::Bool(true))); }
@@ -215,15 +225,20 @@ impl ControlParser<'_> {
         while !self.token(Token::RParen) {
             if self.token(Token::Comma) { continue; }
             self.expect("FORMAT")?; self.token(Token::Eq);
-            format = Some(match self.string()?.to_ascii_lowercase().as_str() {
-                "transit-json" => CopyFormat::TransitJson, "transit-msgpack" => CopyFormat::TransitMsgpack,
-                "arrow-file" => CopyFormat::ArrowFile, "arrow-stream" => CopyFormat::ArrowStream,
-                other => return Err(self.error(format!("Unsupported COPY format: {other}"))),
-            });
+            if format.is_none() {
+                format = Some(match self.string()?.as_str() {
+                    "transit-json" => Some(CopyFormat::TransitJson), "transit-msgpack" => Some(CopyFormat::TransitMsgpack),
+                    "arrow-file" => Some(CopyFormat::ArrowFile), "arrow-stream" => Some(CopyFormat::ArrowStream),
+                    _ => None,
+                });
+            } else {
+                if !self.tokens.get(self.index).is_some_and(|token| matches!(&token.token, Token::SingleQuotedString(_) | Token::DollarQuotedString(_) | Token::EscapedStringLiteral(_))) { return Err(self.error("Expected a string literal")); }
+                self.index += 1;
+            }
             if self.token(Token::RParen) { break; }
             if !self.token(Token::Comma) { return Err(self.error("Expected comma between COPY options")); }
         }
-        Ok(ControlStatement::CopyIn { table, format })
+        Ok(ControlStatement::CopyIn { table, format: format.flatten() })
     }
 }
 

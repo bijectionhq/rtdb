@@ -259,6 +259,11 @@ Its immutable result lives in `rtdb-plan`; scalar option binding is independent 
 `split_statements` separates statements by tokenizer spans before classification, preserving semicolons inside strings and comments.
 Callers classify each span with `parse_control` before passing query or DML text to the relational binder.
 The frontend owns prepared statement registries and COPY wire state; `rtdb-node` owns session transitions and control effects.
+COPY formats and ATTACH configuration accept standard, dollar-quoted and escaped character strings.
+These control values retain escaped-string bodies verbatim, following the pinned control visitor; standard strings decode doubled quotes.
+COPY classification selects the first format case-sensitively and retains an absent or unknown format for the frontend's format diagnostic.
+Later COPY options are still parsed, including after an unrecognized first format.
+Generic tokenizer literal admission and query-literal decoding still require the broader lexical compatibility work.
 
 == Inline XTQL
 

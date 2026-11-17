@@ -49,6 +49,52 @@ fn sql_parser_copy_attach_and_show_are_shared_typed_controls() {
 }
 
 #[test]
+fn copy_and_attach_use_control_character_string_bodies() {
+    for literal in ["'arrow-stream'", "$$arrow-stream$$", "$fmt$arrow-stream$fmt$", "E'arrow-stream'", "e'arrow-stream'"] {
+        let ControlStatement::CopyIn { format, .. } = parse(&format!("COPY docs FROM STDIN WITH (FORMAT {literal})")) else { panic!() };
+        assert_eq!(format, Some(CopyFormat::ArrowStream));
+    }
+    for (literal, expected) in [
+        ("'it''s yaml'", "it's yaml"),
+        ("$$key: 'value'; -- body\nnext: x$$", "key: 'value'; -- body\nnext: x"),
+        ("$cfg$é: 値\n$other$$cfg$", "é: 値\n$other$"),
+        (r"E'key: \n\t\x41\u0042'", r"key: \n\t\x41\u0042"),
+        (r"e'it''s \'quoted\''", r"it''s \'quoted\'"),
+        ("E'é\nline'", "é\nline"),
+    ] {
+        let source = format!("/* é\n */ ATTACH DATABASE db WITH {literal}");
+        assert_eq!(parse(&source), ControlStatement::AttachDatabase { name: "db".into(), configuration_yaml: Some(expected.into()) });
+    }
+    let ControlStatement::CopyIn { format, .. } = parse(r"COPY docs FROM STDIN WITH (FORMAT E'arrow\x2dstream')") else { panic!() };
+    assert_eq!(format, None);
+}
+
+#[test]
+fn copy_classification_uses_the_first_case_sensitive_format_and_retains_missing_formats() {
+    for options in [" WITH ()", " WITH (,,,)", " WITH (FORMAT 'unknown')", " WITH (FORMAT 'ARROW-STREAM')", " WITH (FORMAT 'unknown', FORMAT 'arrow-stream')"] {
+        let ControlStatement::CopyIn { format, .. } = parse(&format!("COPY docs FROM STDIN{options}")) else { panic!() };
+        assert_eq!(format, None, "{options}");
+    }
+    for options in ["FORMAT 'arrow-file', FORMAT 'arrow-stream'", ", FORMAT 'arrow-file',, FORMAT 'unknown',", "FORMAT $fmt$arrow-file$fmt$, FORMAT E'ARROW-STREAM'"] {
+        let ControlStatement::CopyIn { format, .. } = parse(&format!("COPY docs FROM STDIN WITH ({options})")) else { panic!() };
+        assert_eq!(format, Some(CopyFormat::ArrowFile), "{options}");
+    }
+    for options in ["FORMAT 'arrow-stream', FORMAT 1", "FORMAT 'arrow-stream', UNKNOWN 'x'", "FORMAT 'arrow-stream' FORMAT 'arrow-file'"] {
+        assert!(parse_control(&format!("COPY docs FROM STDIN WITH ({options})"), &PrepareOptions::default()).is_err(), "{options}");
+    }
+    assert!(parse_control("COPY docs FROM STDIN", &PrepareOptions::default()).is_err());
+}
+
+#[test]
+fn later_copy_format_bodies_do_not_replace_or_redecode_the_first_option() {
+    for first in ["arrow-file", "unknown"] {
+        let source = format!("COPY docs FROM STDIN WITH (FORMAT '{first}'{})", r", FORMAT E'\x41'".repeat(16_384));
+        let ControlStatement::CopyIn { format, .. } = parse(&source) else { panic!() };
+        assert_eq!(format, if first == "arrow-file" { Some(CopyFormat::ArrowFile) } else { None });
+    }
+}
+
+#[test]
 fn sql_parser_session_literals_and_typed_control_parameters() {
     assert_eq!(parse("SET standard_conforming_strings TO ON"), ControlStatement::SetParameter { name: "standard_conforming_strings".into(), value: Expr::Literal(Value::Bool(true)) });
     assert!(parse_control("SET application_name = ?", &Default::default()).is_err());
