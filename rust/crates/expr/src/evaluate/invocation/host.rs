@@ -1,12 +1,12 @@
 use std::{borrow::Cow,collections::BTreeMap,sync::Arc};
 use rtdb_plan::{RegexForm as Form, RegexFormKind as FormKind, RegexFormView as FormView, RegexForms as Forms, RegexLiteralKind as LiteralKind};
-use rtdb_types::{Anomaly,Result,Value};
+use rtdb_types::{Anomaly,Result,Value,java_text::{JavaString,JavaText}};
 use crate::EvalContext;
 use crate::jvm_number::{Binary,Bit,Cast,Classification,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
-pub(super) enum PatternText<'a> { Borrowed(&'a str),Computed(Arc<str>) }
-impl AsRef<str> for PatternText<'_> { fn as_ref(&self) -> &str { match self { Self::Borrowed(value) => value,Self::Computed(value) => value } } }
+pub(super) enum PatternText<'a> { Borrowed(JavaText<'a>),Computed(JavaString) }
+impl PatternText<'_> { pub(super) fn view(&self) -> JavaText<'_> { match self { Self::Borrowed(value) => *value,Self::Computed(value) => value.view() } } }
 enum Expression<'a> {
     Constant(FormView<'a>),Number(Arc<Number>),Nil,Local { index: usize,emission: Emission },Function(Function),
     Cast { kind: Cast,resolution: Resolution<CastInput>,value: Box<Expression<'a>> },
@@ -30,7 +30,7 @@ enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmet
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
-enum HostValue<'a> { Constant(FormView<'a>),Number(Arc<Number>),Nil,Bool(bool),Text(Arc<str>),Function(Function),Vector(Arc<[HostValue<'a>]>) }
+enum HostValue<'a> { Constant(FormView<'a>),Number(Arc<Number>),Nil,Bool(bool),Text(JavaString),Function(Function),Vector(Arc<[HostValue<'a>]>) }
 struct Compiler<'a,'c,'context> { symbols: BTreeMap<&'a str,(usize,Emission)>,active: usize,slots: usize,nodes: usize,context: &'c EvalContext<'context> }
 #[derive(Clone,Copy,PartialEq,Eq)]
 enum Emission { Number(Cast),Boolean,Reference,Unknown }
@@ -81,7 +81,7 @@ impl<'a> Program<'a> {
         match self.expression.evaluate(&mut locals,context)? {
             HostValue::Text(value) => Ok(PatternText::Computed(value)),
             HostValue::Constant(form) => match form.kind() {
-                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(PatternText::Borrowed(value)), _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")) },
+                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(PatternText::Borrowed(JavaText::from_utf8(value))), _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")) },
                 _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")),
             },
             _ => Err(error("REGEXP_REPLACE host pattern did not produce a String")),
@@ -383,11 +383,11 @@ impl HostValue<'_> {
     fn truthy(&self) -> bool {
         match self { Self::Nil | Self::Bool(false) => false, Self::Constant(form) => !matches!(literal_leaf(*form), Some(Value::Null | Value::Bool(false))), _ => true }
     }
-    fn string(&self) -> Result<&str> {
+    fn string(&self) -> Result<JavaText<'_>> {
         match self {
-            Self::Text(value) => Ok(value),
+            Self::Text(value) => Ok(value.view()),
             Self::Constant(form) => match form.kind() {
-                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(value), _ => Err(error("Host value is not a String")) },
+                FormKind::Literal(value) => match value.kind() { LiteralKind::Text(value) => Ok(JavaText::from_utf8(value)), _ => Err(error("Host value is not a String")) },
                 _ => Err(error("Host value is not a String")),
             },
             _ => Err(error("Host value is not a String")),
@@ -428,14 +428,22 @@ impl Function {
     fn apply<'a>(self,args: Vec<HostValue<'a>>,context: &EvalContext<'_>) -> Result<HostValue<'a>> {
         Ok(match self {
             Self::Str => {
-                context.reserve(args.len().checked_mul(std::mem::size_of::<Arc<str>>()).ok_or_else(limit)?)?;
-                let mut strings = Vec::with_capacity(args.len());
+                context.reserve(args.len().checked_mul(std::mem::size_of::<JavaString>()).ok_or_else(limit)?)?;
+                let mut strings = Vec::new();
+                strings.try_reserve_exact(args.len()).map_err(|_|allocation_error())?;
                 let mut length = 0usize;
-                for value in &args { let value = str_value(value,context)?;length = length.checked_add(value.len()).ok_or_else(limit)?;strings.push(value); }
+                let mut units = 0usize;
+                for value in &args {
+                    let value = str_value(value,context)?;
+                    length = length.checked_add(text_bytes(value.view())?).ok_or_else(limit)?;
+                    units = units.checked_add(value.view().len_units()).ok_or_else(limit)?;
+                    strings.push(value);
+                }
                 reserve_text(length,context)?;
-                let mut output = String::with_capacity(length);
-                for value in strings { output.push_str(&value); }
-                HostValue::Text(output.into())
+                let mut output = Vec::new();
+                output.try_reserve_exact(units).map_err(|_|allocation_error())?;
+                for value in &strings { output.extend(value.view().units()); }
+                HostValue::Text(retain_units(&output,context)?)
             }
             Self::Identity => { arity(args.len(),1,1)?;args.into_iter().next().ok_or_else(||error("Missing host argument"))? }
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
@@ -488,25 +496,22 @@ impl Function {
                     None => return Err(error("Host namespace requires a symbol or keyword")),
                 };
                 let (prefix,name) = if name == "/" { (None,name) } else { name.split_once('/').map_or((None,name),|(prefix,name)|(Some(prefix),name)) };
-                match if namespace { prefix } else { Some(name) } { Some(value) => HostValue::Text(text(value,context)?),None => HostValue::Nil }
+                match if namespace { prefix } else { Some(name) } { Some(value) => HostValue::Text(text_utf8(value,context)?),None => HostValue::Nil }
             }
             Self::Subs => {
                 arity(args.len(),2,3)?;
                 let value = args[0].string()?;
                 let start = args[1].index(context)?;
-                let length = i32::try_from(value.encode_utf16().count()).map_err(|_|limit())?;
+                let length = i32::try_from(value.len_units()).map_err(|_|limit())?;
                 let end = if args.len() == 3 { args[2].index(context)? } else { length };
                 if start < 0 || end < start || end > length { return Err(error("Host substring indexes are out of range")); }
                 context.reserve((length as usize).checked_mul(2).ok_or_else(limit)?)?;
-                let mut units = Vec::with_capacity(length as usize);
-                units.extend(value.encode_utf16());
+                let mut units = Vec::new();
+                units.try_reserve_exact(length as usize).map_err(|_|allocation_error())?;
+                units.extend(value.units());
                 let capacity = ((end - start) as usize).checked_mul(3).ok_or_else(limit)?;
                 reserve_text(capacity,context)?;
-                let mut output = String::with_capacity(capacity);
-                for character in char::decode_utf16(units[start as usize..end as usize].iter().copied()) {
-                    output.push(character.map_err(|_|unsupported("Host substring requires the isolated-surrogate text carrier"))?);
-                }
-                HostValue::Text(output.into())
+                HostValue::Text(retain_units(&units[start as usize..end as usize],context)?)
             }
         })
     }
@@ -647,27 +652,27 @@ fn numeric_compare(operation: Comparison,dispatch: Dispatch,left: &HostValue<'_>
     reserve_numeric(left.comparison_bound(&right).map_err(|_|limit())?,context)?;
     left.compare_numeric(operation,&right,dispatch).map_err(numeric_error)
 }
-fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<Arc<str>> {
+fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaString> {
     match value {
-        HostValue::Text(value) => Ok(Arc::clone(value)),HostValue::Nil => text("",context),HostValue::Bool(value) => text(if *value { "true" } else { "false" },context),
+        HostValue::Text(value) => Ok(value.clone()),HostValue::Nil => text_utf8("",context),HostValue::Bool(value) => text_utf8(if *value { "true" } else { "false" },context),
         HostValue::Constant(form) => match form.kind() {
-            FormKind::Symbol(value) => text(value,context),
-            FormKind::Character(value) => { context.reserve(32)?;text(&value.to_string(),context) }
+            FormKind::Symbol(value) => text_utf8(value,context),
+            FormKind::Character(value) => { context.reserve(32)?;text_utf8(&value.to_string(),context) }
             FormKind::Literal(value) => match value.kind() {
-                LiteralKind::Text(value) => text(value,context),
-                LiteralKind::Keyword(value) => { reserve_text(value.len().checked_add(1).ok_or_else(limit)?,context)?;text(&format!(":{value}"),context) }
+                LiteralKind::Text(value) => text_utf8(value,context),
+                LiteralKind::Keyword(value) => { reserve_text(value.len().checked_add(1).ok_or_else(limit)?,context)?;text_utf8(&format!(":{value}"),context) }
                 LiteralKind::Leaf(leaf) => match leaf.value() {
-                    Value::Null => text("",context),
-                    Value::Bool(value) => text(if *value { "true" } else { "false" },context),
-                    Value::I64(value) => { context.reserve(32)?;text(&value.to_string(),context) }
-                    Value::F64(value) => { context.reserve(64)?;text(&rtdb_types::java_f64_text(*value),context) }
+                    Value::Null => text_utf8("",context),
+                    Value::Bool(value) => text_utf8(if *value { "true" } else { "false" },context),
+                    Value::I64(value) => { context.reserve(32)?;text_utf8(&value.to_string(),context) }
+                    Value::F64(value) => { context.reserve(64)?;text_utf8(&rtdb_types::java_f64_text(*value),context) }
                     _ => Err(unsupported("Host object string rendering is not implemented for this value")),
                 },
                 _ => Err(unsupported("Host object string rendering is not implemented for this value")),
             },
             _ => Err(unsupported("Host object string rendering is not implemented for this value")),
         },
-        HostValue::Number(value) => { reserve_text(value.text_capacity().map_err(|_|limit())?,context)?;text(&value.text(),context) }
+        HostValue::Number(value) => { reserve_text(value.text_capacity().map_err(|_|limit())?,context)?;text_utf8(&value.text(),context) }
         _ => Err(unsupported("Host object string rendering is not implemented for this value")),
     }
 }
@@ -705,7 +710,25 @@ fn numeric_cast<'a>(kind: Cast,value: HostValue<'a>,primitive: bool,context: &Ev
     let result = if primitive { Number::cast_primitive(kind,&source) } else { Number::cast(kind,&source) };
     Ok(HostValue::Number(Arc::new(result.map_err(|_|error("Host numeric cast is out of range"))?)))
 }
-fn text(value: &str,context: &EvalContext<'_>) -> Result<Arc<str>> { reserve_text(value.len(),context)?;Ok(Arc::from(value)) }
+fn text_bytes(value: JavaText<'_>) -> Result<usize> {
+    value.code_points().try_fold(0usize,|bytes,point|bytes.checked_add(match point { 0..=0x7f => 1,0x80..=0x7ff => 2,0x800..=0xffff => 3,_ => 4 }).ok_or_else(limit))
+}
+fn text(value: JavaText<'_>,context: &EvalContext<'_>) -> Result<JavaString> {
+    if let Some(value) = value.utf8_source() { return text_utf8(value,context); }
+    reserve_text(text_bytes(value)?,context)?;
+    let mut units = Vec::new();
+    units.try_reserve_exact(value.len_units()).map_err(|_|allocation_error())?;
+    units.extend(value.units());
+    retain_units(&units,context)
+}
+fn text_utf8(value: &str,context: &EvalContext<'_>) -> Result<JavaString> {
+    reserve_text(value.len(),context)?;
+    match context.allocation { Some(scope) => JavaString::copy_utf8(value,scope.memory_budget()),None => JavaString::copy_utf8_untracked(value) }
+}
+fn retain_units(units: &[u16],context: &EvalContext<'_>) -> Result<JavaString> {
+    match context.allocation { Some(scope) => JavaString::copy_utf16(units,scope.memory_budget()),None => JavaString::copy_utf16_untracked(units) }
+}
+fn allocation_error() -> Anomaly { Anomaly::incorrect("rtdb.expr/allocation-failed","Unable to allocate host pattern text") }
 fn reserve_text(length: usize,context: &EvalContext<'_>) -> Result<()> {
     if length > 16 * 1024 * 1024 { return Err(limit()); }
     context.reserve(length.checked_mul(2).and_then(|size|size.checked_add(64)).ok_or_else(limit)?)
@@ -831,7 +854,7 @@ mod tests {
     fn non_ifn_calls_fail_before_argument_budget_admission() {
         let raw = [raw_literal(Value::Bool(false)),raw_literal(Value::I64(1)),raw_literal(Value::Utf8("x".into())),raw_character('x'),raw_list(),raw_anonymous(raw_list())];
         let mut functions = raw.iter().map(|form|HostValue::Constant(form.view())).collect::<Vec<_>>();
-        functions.extend([HostValue::Bool(true),HostValue::Text(Arc::from("x")),HostValue::Number(Arc::new(Number::Long(1)))]);
+        functions.extend([HostValue::Bool(true),HostValue::Text(JavaString::copy_utf8_untracked("x").unwrap()),HostValue::Number(Arc::new(Number::Long(1)))]);
         let argument = raw_literal(Value::I64(1));
         for function in functions {
             let memory = MemoryBudget::new(4096);
@@ -867,5 +890,108 @@ mod tests {
             }
             assert_eq!(memory.used_bytes(),0);
         }
+    }
+
+    fn index(value: i64) -> HostValue<'static> { HostValue::Number(Arc::new(Number::Long(value))) }
+
+    #[test]
+    fn substring_keeps_each_half_and_the_complete_supplementary_pair() {
+        let source = raw_literal(Value::Utf8("😀".into()));
+        let context = EvalContext::default();
+        for (start,end,expected) in [(0,1,vec![0xd83d]),(1,2,vec![0xde00]),(0,2,vec![0xd83d,0xde00])] {
+            let result = Function::Subs.apply(vec![HostValue::Constant(source.view()),index(start),index(end)],&context).unwrap();
+            assert_eq!(result.string().unwrap().units().collect::<Vec<_>>(),expected);
+        }
+        let result = Function::Subs.apply(vec![HostValue::Constant(source.view()),index(1)],&context).unwrap();
+        assert_eq!(result.string().unwrap().units().collect::<Vec<_>>(),[0xde00]);
+    }
+
+    #[test]
+    fn str_and_name_preserve_unmatched_units_and_join_halves_before_compilation() {
+        let context = EvalContext::default();
+        let high = HostValue::Text(JavaString::copy_utf16_untracked(&[0xd83d]).unwrap());
+        let low = HostValue::Text(JavaString::copy_utf16_untracked(&[0xde00]).unwrap());
+        let result = Function::Str.apply(vec![high.clone(),low],&context).unwrap();
+        assert_eq!(result.string().unwrap().units().collect::<Vec<_>>(),[0xd83d,0xde00]);
+        let result = Function::Str.apply(vec![high.clone()],&context).unwrap();
+        assert_eq!(result.string().unwrap().units().collect::<Vec<_>>(),[0xd83d]);
+        let result = Function::Name.apply(vec![high],&context).unwrap();
+        assert_eq!(result.string().unwrap().units().collect::<Vec<_>>(),[0xd83d]);
+    }
+
+    #[test]
+    fn computed_pattern_retains_its_own_charge_after_the_creator_scope_and_program_drop() {
+        let source = raw_build(|builder| {
+            builder.begin_list()?; builder.symbol("subs")?; builder.literal(&Value::Utf8("😀".into()))?;
+            builder.literal(&Value::I64(0))?; builder.literal(&Value::I64(1))?; builder.end()
+        });
+        let memory = MemoryBudget::new(1 << 20);
+        let pattern = {
+            let scope = EvaluationScope::new(&memory).unwrap();
+            let context = EvalContext { allocation: Some(&scope),..Default::default() };
+            Program::compile(&source,&context).unwrap().pattern(&context).unwrap()
+        };
+        assert_eq!(pattern.view().units().collect::<Vec<_>>(),[0xd83d]);
+        let retained = JavaString::allocation_bound_utf16(&[0xd83d]).unwrap();
+        assert_eq!(memory.used_bytes(),retained);
+        let PatternText::Computed(value) = pattern else { panic!("computed pattern") };
+        let clone = value.clone();
+        drop(value);
+        assert_eq!(memory.used_bytes(),retained);
+        assert_eq!(clone.view().units().collect::<Vec<_>>(),[0xd83d]);
+        drop(clone);
+        assert_eq!(memory.used_bytes(),0);
+    }
+
+    #[test]
+    fn retained_unit_copy_is_admitted_while_the_temporary_scope_charge_is_still_held() {
+        let retained = JavaString::allocation_bound_utf16(&[0xd83d]).unwrap();
+        let work = 4096 + 2 * 3 + 64 + 256;
+        for available in [retained - 1,retained] {
+            let memory = MemoryBudget::new(work + available);
+            let output = {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext { allocation: Some(&scope),..Default::default() };
+                let result = text(JavaText::from_utf16(&[0xd83d]),&context);
+                if available < retained {
+                    assert_eq!(result.unwrap_err().code,"rtdb/memory-budget-exceeded");
+                    assert_eq!(memory.used_bytes(),work);
+                    None
+                } else {
+                    let output = result.unwrap();
+                    assert_eq!(memory.used_bytes(),work + retained);
+                    Some(output)
+                }
+            };
+            assert_eq!(memory.used_bytes(),if output.is_some() { retained } else { 0 });
+            drop(output);
+            assert_eq!(memory.used_bytes(),0);
+        }
+    }
+
+    #[test]
+    fn str_keeps_the_scalar_text_limit_and_finishes_argument_rendering_before_the_final_guard() {
+        let context = EvalContext::default();
+        assert_eq!(text_bytes(JavaText::from_utf8("aé😀")).unwrap(),7);
+        assert_eq!(text_bytes(JavaText::from_utf16(&[0xd83d])).unwrap(),3);
+        assert_eq!(text_bytes(JavaText::from_utf16(&[0xd83d,0xde00])).unwrap(),4);
+        assert!(reserve_text(16 * 1024 * 1024,&context).is_ok());
+        assert_eq!(reserve_text(16 * 1024 * 1024 + 1,&context).unwrap_err().code,"rtdb.expr/regex-host-limit");
+        let source = JavaString::copy_utf8_untracked(&"a".repeat(8 * 1024 * 1024 + 1)).unwrap();
+        let args = vec![HostValue::Text(source.clone()),HostValue::Text(source.clone()),HostValue::Function(Function::Identity)];
+        assert_eq!(Function::Str.apply(args,&context).err().unwrap().message.as_deref(),Some("Host object string rendering is not implemented for this value"));
+        assert_eq!(Function::Str.apply(vec![HostValue::Text(source.clone()),HostValue::Text(source)],&context).err().unwrap().code,"rtdb.expr/regex-host-limit");
+    }
+
+    #[test]
+    fn substring_string_and_index_checks_keep_their_order_and_character_domain() {
+        let context = EvalContext::default();
+        let source = raw_literal(Value::Utf8("x".into()));
+        assert_eq!(Function::Subs.apply(vec![HostValue::Bool(false),HostValue::Nil],&context).err().unwrap().message.as_deref(),Some("Host value is not a String"));
+        assert_eq!(Function::Subs.apply(vec![HostValue::Constant(source.view()),HostValue::Bool(false)],&context).err().unwrap().message.as_deref(),Some("Host value is not a Number"));
+        assert_eq!(Function::Subs.apply(vec![HostValue::Constant(source.view()),index(-1)],&context).err().unwrap().message.as_deref(),Some("Host substring indexes are out of range"));
+        assert_eq!(Function::Subs.apply(vec![HostValue::Constant(source.view()),index(0),HostValue::Bool(false)],&context).err().unwrap().message.as_deref(),Some("Host value is not a Number"));
+        let character = raw_character('😀');
+        assert_eq!(numeric_cast(Cast::Int,HostValue::Constant(character.view()),false,&context).err().unwrap().message.as_deref(),Some("Host Character requires a single UTF16 code unit"));
     }
 }

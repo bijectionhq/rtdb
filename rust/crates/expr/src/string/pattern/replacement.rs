@@ -30,6 +30,10 @@ pub(crate) fn compile_replacement(pattern: &str, replacement: &str, flags: &str,
     Ok(CompiledReplacement { pattern: super::compile(pattern, flags, context)?, replacement })
 }
 
+pub(crate) fn compile_replacement_pattern(pattern: JavaText<'_>, replacement: &str, flags: &str, context: &EvalContext<'_>) -> Result<CompiledReplacement> {
+    compile_replacement_text(pattern, JavaText::from_utf8(replacement), JavaText::from_utf8(flags), context).map_err(CompileFailure::legacy)
+}
+
 pub(crate) fn compile_replacement_text(pattern: JavaText<'_>, replacement: JavaText<'_>, flags: JavaText<'_>, context: &EvalContext<'_>) -> std::result::Result<CompiledReplacement, CompileFailure> {
     let replacement = postgres_backrefs(replacement, context).map_err(CompileFailure::Resource)?;
     Ok(CompiledReplacement { pattern: compile_text(pattern, flags, context)?, replacement })

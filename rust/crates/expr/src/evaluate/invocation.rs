@@ -1,6 +1,6 @@
 use super::{EvalContext,Schema,Expr,Value,Result,Anomaly,expression_type,reader,overflow,validate_projection_value};
 use rtdb_types::{LogicalType,ScalarType};
-use crate::string::pattern::{CompiledReplacement,compile_replacement};
+use crate::string::pattern::{CompiledReplacement,compile_replacement_pattern};
 mod host;
 
 struct Replacement<'a> { expression: &'a Expr,compiled: CompiledReplacement }
@@ -38,7 +38,7 @@ impl<'expr> ExpressionInvocation<'expr> {
         let mut replacements = Replacements { entries: Vec::with_capacity(pending.len()) };
         for PendingBinding { expression,recipe,program } in pending {
             let pattern = program.pattern(context)?;
-            let compiled = compile_replacement(pattern.as_ref(),recipe.replacement_text()?,&recipe.flag_text()?,context)?;
+            let compiled = compile_replacement_pattern(pattern.view(),recipe.replacement_text()?,&recipe.flag_text()?,context)?;
             replacements.entries.push(Replacement { expression,compiled });
         }
         replacements.entries.sort_unstable_by_key(|entry|entry.expression as *const Expr as usize);

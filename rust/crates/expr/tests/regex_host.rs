@@ -329,6 +329,55 @@ fn host_decimal_extrema_and_abs_keep_extreme_scales_without_expanding_coefficien
     }
 }
 
+#[test]
+fn host_substring_halves_recombine_before_pattern_compilation_without_changing_raw_wire() {
+    let pattern = call("str",vec![
+        call("subs",vec![string("😀"),raw_literal(V::I64(0)),raw_literal(V::I64(1))]),
+        call("subs",vec![string("😀"),raw_literal(V::I64(1)),raw_literal(V::I64(2))]),
+    ]);
+    let expression = Expr::regex_replace(Expr::Literal(V::Utf8("😀".into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
+    let wire = serde_json::to_string(&expression).unwrap();
+    let memory = MemoryBudget::new(128 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        let context = EvalContext { allocation: Some(&scope),..Default::default() };
+        let schema = Schema::default();
+        let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+        assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8("x".into()));
+        assert_eq!(serde_json::to_string(&expression).unwrap(),wire);
+    }
+    assert_eq!(memory.used_bytes(),0);
+}
+
+#[test]
+fn host_isolated_substrings_compile_without_becoming_question_or_replacement_characters() {
+    for (start,end) in [(0,1),(1,2)] {
+        for source in ["?","�"] {
+            let pattern = call("subs",vec![string("😀"),raw_literal(V::I64(start)),raw_literal(V::I64(end))]);
+            let expression = Expr::regex_replace(Expr::Literal(V::Utf8(source.into())),RegexReplacement { pattern,replacement: string("x"),..Default::default() });
+            let memory = MemoryBudget::new(128 << 20);
+            {
+                let scope = EvaluationScope::new(&memory).unwrap();
+                let context = EvalContext { allocation: Some(&scope),..Default::default() };
+                let schema = Schema::default();
+                let invocation = ExpressionInvocation::prepare(&expression,&schema,&context).unwrap();
+                assert_eq!(invocation.evaluate(&[],&context).unwrap(),V::Utf8(source.into()));
+            }
+            assert_eq!(memory.used_bytes(),0);
+        }
+    }
+}
+
+#[test]
+fn empty_batches_prepare_invalid_unit_patterns_and_release_their_retained_text() {
+    let expression = replace(call("str",vec![call("subs",vec![string("😀"),raw_literal(V::I64(0)),raw_literal(V::I64(1))]),string("[")]));
+    let compiled = CompiledExpr::compile(&expression,&Schema::default()).unwrap();
+    let batch = RecordBatch::new_empty(Arc::new(arrow_schema::Schema::empty()));
+    let memory = MemoryBudget::new(128 << 20);
+    assert_eq!(evaluate_batch(&compiled,&batch,&EvalContext::default(),&memory).err().unwrap().code,"xtdb.expression/illegal-argument-exception");
+    assert_eq!(memory.used_bytes(),0);
+}
+
 fn raw_build(emit: impl FnOnce(&mut rtdb_plan::RegexFormBuilder<'_>) -> rtdb_types::Result<()>) -> rtdb_plan::RegexForm {
     let mut builder = rtdb_plan::RegexFormBuilder::new_untracked();
     emit(&mut builder).unwrap();

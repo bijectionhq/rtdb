@@ -9,7 +9,7 @@ mod replacement;
 #[cfg(test)] mod tests;
 use source::{PatternInput, supplementary, work_bytes};
 use failure::{CompileFailure, Description, Syntax};
-pub(crate) use replacement::{CompiledReplacement, compile_replacement};
+pub(crate) use replacement::{CompiledReplacement, compile_replacement, compile_replacement_pattern};
 
 const PATTERN_BYTES: usize = 65_536;
 const STACK_BRANCHES: usize = 512;

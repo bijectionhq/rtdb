@@ -37,12 +37,16 @@ Line endings try CRLF before CR and retain the shorter endpoint when the followi
 Quantifier atom acceptance controls whether that shorter endpoint remains available.
 Replacement for these node programs assembles the complete UTF-16 result before encoding UTF-8, so adjacent surrogate halves can recombine and remaining unpaired surrogates become `?`, following Java `String.getBytes(UTF_8)`.
 
+Host-computed `REGEXP_REPLACE` pattern strings retain exact UTF-16 units in the shared text owner.
+`subs` selects UTF-16 ranges, including either half of a supplementary pair, and `str` joins their units before pattern compilation.
+These computed strings retain their own allocation leases; temporary unit buffers remain covered by the preparation scope while retained copies are made.
+The existing 16 MiB host temporary-text limit still applies to valid UTF-8 text.
+Canonical raw metadata and its generic serialization retain their current UTF-8 domain; this computed path adds no exact-unit SQL or XTQL metadata producer.
+
 == Remaining implementation work
 
 This source wave is not a declaration of Java Pattern parity.
-Patterns using the ordinary scalar matcher still need isolated-surrogate pattern semantics and replacement advancement after an empty match before a supplementary character.
-These known cases return explicit unsupported errors where detected.
-The Java node program retains UTF-16 lookbehind edge positions and capture intervals; the ordinary scalar matcher still needs that representation.
+The shared exact-unit matcher and replacement foundation do not complete raw metadata, SQL/XTQL literal-producer, serialization or diagnostic integration.
 Remaining parser edge cases and the interaction of repeated captures with backtracking require Phase 2 differential qualification.
 
 The behavioral references are the pinned `core/src/main/clojure/xtdb/expression.clj` implementation and the https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Pattern.html[Java Pattern] and https://docs.oracle.com/en/java/javase/25/docs/api/java.base/java/util/regex/Matcher.html[Matcher] contracts.
