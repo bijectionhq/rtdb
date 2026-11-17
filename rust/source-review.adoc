@@ -727,14 +727,14 @@ Descriptors derive from the actual retained children, while public ingestion con
 Direct Struct field lookup retains the child's count; indirect lookup retains the reader's selection.
 Snapshots preserve source capture order and terminal-offset demand, releasing partial copies without changing original readers.
 Independent source review covers all 14 private regression sources and the public rejection counterpart to the migrated Null-valued run fixture.
-The tests remain unexecuted; independent Struct lookup keys, signed source counts, mutable writer trees, promotion, copying and production adoption remain required.
+The tests remain unexecuted; mutable signed-count arithmetic, writer trees, promotion, copying and production adoption remain required.
 
 Pattern compilation and boolean matching accept exact borrowed Java text through a private adapter.
 Quotation preprocessing retains the original source separately from its grammar points; isolated units remain exact until a grammar operation consumes them.
 Raw failure source, descriptions and native diagnostic buffers retain independent allocation leases.
 Only source-proven first-error branches receive Java syntax descriptions and indices; other failures retain native facts and the original text.
 Independent source review covers all 18 added regression sources, which remain unexecuted.
-Full syntax-error mappings and message rendering, replacement text and SQL/XTQL/host consumers remain required.
+Full syntax-error mappings and message rendering, source metadata normalization timing and SQL/XTQL/host consumers remain required.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
 
 
@@ -748,4 +748,38 @@ The pinned grammar bounds alternatives and precedence values; prediction-mode wo
 Fallible operations check their collaborators before identity, empty and cached shortcuts, sealing further work after an abort.
 Independent source review covers all 38 added regression sources; the 25 prediction-context sources remain unchanged.
 All remain unexecuted; closure and DFA insertion hashes, adaptive prediction, persistent cache ownership, generated rules and production parsing remain required.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+
+== Struct keys, signed counts, replacement and grammar ownership source checkpoint
+
+Native Struct descriptors retain lookup keys separately from actual child field names.
+Logical lookup and object materialization use entry keys, while Arrow projection uses each child's retained descriptor name.
+Private capture inputs retain preadmitted child capacity and copied-key leases until independently admitted output storage is complete.
+Independent source review covers all five added regression sources and preservation of the 48 existing affected test functions.
+Mutable signed-count arithmetic, writer trees and promotion, copying and production adoption remain required implementation work.
+
+Immutable physical readers retain signed source counts independently of initialized payload spans and child counts.
+Metadata and aliases preserve negative counts; native length consumers explicitly admit a nonnegative extent.
+Signed scalar offset reads multiply before byte-span admission, and snapshots skip terminal reads only for a zero count.
+Run lookup retains signed comparisons and the existing hint update order; copied readers own fresh hints.
+Public Arrow ingestion retains its strict validation contract.
+Independent source review covers 13 added regression sources and preservation of all 161 existing affected test functions.
+Mutable count arithmetic, source signed slices, container writers and production adoption remain required.
+
+Regex replacement normalization and expansion retain exact UTF16 units until the complete result reaches Java UTF8 emission.
+Malformed replacement syntax is consumed only after a successful match, preserving first-error order and empty-match advancement.
+Raw Java failures retain exception class, message and normalized replacement text; missing numeric groups reach the outer Fault adapter while malformed syntax reaches the expression IllegalArgument adapter.
+Raw output and diagnostic storage retain independent leases across preparation and row-scope destruction.
+The compiled pattern engine retains its existing preparation-scope contract.
+Independent source review covers all 20 added regression sources, with existing test bodies unchanged.
+Full pattern diagnostics, earlier source metadata normalization, semantic literals, host text, serialized trees and raw diagnostic transport remain required.
+
+The private grammar graph can own its finite allocation scope independently of a parse call.
+Owned and scoped construction share one admitted loader; borrowing views allocate no graph storage and retain the same underlying graph identity.
+Views from distinct loaded graphs remain foreign even when their artifacts are equal.
+Graph storage is destroyed before its owned scope releases construction reservations.
+Independent source review covers six added ownership regression sources and preservation of the existing graph, LOOK and prediction assertions.
+Retained prediction storage, shared cache histories, closure and adaptive prediction, generated rules and production parsing remain required implementation work.
+All regression sources remain unexecuted.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.

@@ -224,7 +224,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including checked-index reader/compiler/host consumers, shared object identity, exact-unit replacement and complete pattern diagnostics, and semantic/host/codec consumers of the shared UTF16 carrier; reconcile dev/doc/rust-regex.adoc against the final implementation."
+      "requirement": "Complete the recorded regex host-form namespace, interop/effect, function/macro and generated-local semantics, including checked-index reader/compiler/host consumers, shared object identity, source metadata normalization timing and complete pattern diagnostics, and semantic/host/codec consumers of the shared UTF16 carrier and exact-unit replacement foundation; reconcile dev/doc/rust-regex.adoc against the final implementation."
     },
     {
       "id": "transit-registered-objects",
@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and the reviewed scalar, descriptor, metadata-demand, reader-identity and immutable native-container foundations' keyed Struct, signed-count, writer/copy, relation, full-object and transport successors; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and the mutable count arithmetic, source signed slices, writer/copy, relation, full-object and transport successors to the reviewed scalar, descriptor, metadata-demand, reader-identity, immutable native-container, keyed Struct and signed reader-count foundations; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, grammar graph, expected-token traversal, prediction-context operations and ordered configuration/mode foundations with adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, prediction-context operations and ordered configuration/mode foundations with adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, raw UTF16 literal consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
       "id": "planning-allocation",
