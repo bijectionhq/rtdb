@@ -55,6 +55,20 @@ impl<'a> Material<'a> {
     }
 
     pub(super) fn load(&self, length: usize, charge: Arc<MemoryReservation>) -> Result<KeyStore> {
+        let bytes = self.bytes(length)?;
+        KeyStore::decode(&bytes, self.format, self.usage, self.password, self.key_password, charge)
+    }
+
+    pub(super) fn allocation_bound(&self, length: usize, algorithm: crate::tls::keys::Algorithm) -> Result<usize> {
+        crate::tls::identities::Material::allocation_bound(length, self.format, self.usage, algorithm, self.password, self.key_password)
+    }
+
+    pub(super) fn load_identity(&self, length: usize, algorithm: crate::tls::keys::Algorithm, charge: Arc<MemoryReservation>) -> Result<crate::tls::identities::Material> {
+        let bytes = self.bytes(length)?;
+        crate::tls::identities::Material::decode(&bytes, self.format, self.usage, algorithm, self.password, self.key_password, charge)
+    }
+
+    fn bytes(&self, length: usize) -> Result<Zeroizing<Vec<u8>>> {
         let mut bytes = Zeroizing::new(Vec::with_capacity(length.checked_add(1).ok_or_else(|| error("allocation-overflow", "Registry store size overflow"))?));
         match self.source {
             Source::Inline { key, chain } => {
@@ -66,7 +80,7 @@ impl<'a> Material<'a> {
                 if bytes.len() != length { return Err(error("invalid-plugin-config", "Registry keystore file changed while opening")); }
             }
         }
-        KeyStore::decode(&bytes, self.format, self.usage, self.password, self.key_password, charge)
+        Ok(bytes)
     }
 }
 

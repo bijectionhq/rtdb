@@ -1,8 +1,8 @@
 use std::{collections::BTreeMap, ffi::c_void, io::Read, sync::Arc};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{asn1::Asn1Time, pkey::{PKey, Private}, ssl::{SslContextBuilder, SslOptions, SslRef, SslVersion}, stack::Stack, x509::{X509, store::X509StoreBuilder}};
+use openssl::{asn1::Asn1Time, ssl::{SslContextBuilder, SslOptions, SslRef, SslVersion}, x509::{X509, store::X509StoreBuilder}};
 use rtdb_columnar::MemoryReservation;
-use rtdb_tls::{KeyStore, StoreFormat, StoreUse};
+use rtdb_tls::{StoreFormat, StoreUse};
 use rtdb_types::{Anomaly, Result};
 use zeroize::Zeroizing;
 
@@ -10,6 +10,8 @@ mod policy;
 use policy::Policy;
 pub(crate) mod keys;
 use keys::{Algorithm, KeyManager, KeyType};
+pub(crate) mod identities;
+use identities::{ClientIdentity, Material};
 pub(crate) mod trust;
 pub(crate) mod validation;
 pub(crate) mod security;
@@ -29,7 +31,6 @@ pub(crate) struct NativeTls {
     policy: Policy,
     reservations: Vec<Arc<MemoryReservation>>,
 }
-struct ClientIdentity { certificate: X509, key: PKey<Private>, chain: Stack<X509>, kind: KeyType, eligible: bool }
 
 impl NativeTls {
     pub(crate) fn from_java(options: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Option<Arc<Self>>> {
@@ -46,31 +47,23 @@ impl NativeTls {
         let mut identities = Vec::new();
         let mut trust = None;
         for (store, usage) in [("truststore", StoreUse::Trust), ("keystore", StoreUse::OptionalIdentity)] {
-            let material = material(options, store, usage, reserve)?;
+            let material = material(options, store, usage, algorithm, reserve)?;
             let material = if usage == StoreUse::Trust && material.is_none() && !trust::native_override(options) {
-                Some(trust::defaults(reserve)?)
+                Some(Material::Eager(Arc::new(trust::defaults(reserve)?)))
             } else { material };
             if let Some(material) = material {
-                reservations.push(material.reservation());
                 match usage {
                     StoreUse::Trust => {
+                        let Material::Eager(material) = material else { unreachable!("trust material is eager"); };
+                        reservations.push(material.reservation());
                         let certificates = material.trusted_certificates().iter().map(|certificate| X509::from_der(certificate).map_err(invalid)).collect::<Result<Vec<_>>>()?;
                         trust = Some(certificates);
                     }
                     StoreUse::Identity | StoreUse::OptionalIdentity => {
-                        key_manager = KeyManager::new(algorithm, material.identities());
-                        for identity in material.identities() {
-                            let certificate = X509::from_der(&identity.certificates()[0]).map_err(invalid)?;
-                            let kind = KeyType::of(&certificate)?;
-                            let key = unsafe { random.private_key_from_pkcs8(identity.private_key_pkcs8())? };
-                            let mut chain = Stack::new().map_err(invalid)?;
-                            for certificate in &identity.certificates()[1..] { chain.push(X509::from_der(certificate).map_err(invalid)?).map_err(invalid)?; }
-                            let eligible = algorithm == Algorithm::SunX509 || {
-                                let certificates = std::iter::once(certificate.as_ref()).chain(chain.iter()).collect::<Vec<_>>();
-                                security::verify_client_chain(&certificates).is_ok()
-                            };
-                            identities.push(ClientIdentity { certificate, key, chain, kind, eligible });
-                        }
+                        let (manager, loaded, charge) = material.native(algorithm, &random, &reservations[0])?;
+                        key_manager = manager;
+                        identities = loaded;
+                        reservations.push(charge);
                     }
                 }
             }
@@ -123,13 +116,10 @@ impl NativeTls {
             let identity = &self.identities[index];
             identity.eligible && identity.kind == kind && issuer_matches[index]
                 && (!self.key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
-                && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
+                && (self.key_manager.constrains_certificates() || identity.eager_compatible(ssl, required))
         }, |index| keys::client_status(&self.identities[index].certificate, &now));
         if let Some(index) = selected {
-            let identity = &self.identities[index];
-            ssl.set_certificate(&identity.certificate).map_err(invalid)?;
-            ssl.set_private_key(&identity.key).map_err(invalid)?;
-            for certificate in &identity.chain { ssl.add_chain_cert(certificate.to_owned()).map_err(invalid)?; }
+            self.identities[index].install(ssl, &self.random, &self.signature_random)?;
         }
         Ok(())
     }
@@ -157,7 +147,7 @@ unsafe extern "C" fn select_identity(ssl: *mut openssl_sys::SSL, opaque: *mut c_
     }
 }
 
-fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Option<KeyStore>> {
+fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, algorithm: Algorithm, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Option<Material>> {
     let get = |suffix: &str| options.get(&format!("ssl.{store}.{suffix}")).map(String::as_str);
     let location = get("location");
     let inline = get(if usage == StoreUse::Trust { "certificates" } else { "key" });
@@ -181,7 +171,7 @@ fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, re
         None => inline.map_or(0, str::len).checked_add(chain.map_or(0, str::len)).and_then(|bytes| bytes.checked_add(1)).ok_or_else(overflow)?,
     };
     if length > 4 * 1024 * 1024 { return Err(invalid("Producer keystore exceeds its byte limit")); }
-    let bound = KeyStore::allocation_bound_with_passwords(length, password, key_password)?.checked_add(length.checked_mul(32).ok_or_else(overflow)?).ok_or_else(overflow)?;
+    let bound = Material::allocation_bound(length, format, usage, algorithm, password, key_password)?.checked_add(length.checked_mul(32).ok_or_else(overflow)?).ok_or_else(overflow)?;
     let charge = reserve(bound)?;
     let mut bytes = Zeroizing::new(Vec::with_capacity(length.checked_add(1).ok_or_else(overflow)?));
     if let Some(path) = location {
@@ -194,7 +184,7 @@ fn material(options: &BTreeMap<String, String>, store: &str, usage: StoreUse, re
             bytes.push(b'\n'); bytes.extend_from_slice(chain.as_bytes());
         }
     }
-    KeyStore::decode(&bytes, format, usage, password, key_password, charge).map(Some)
+    Material::decode(&bytes, format, usage, algorithm, password, key_password, charge).map(Some)
 }
 
 const CERT_PKEY_VALID: i32 = 0x1;

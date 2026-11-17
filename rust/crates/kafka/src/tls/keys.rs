@@ -28,9 +28,13 @@ impl KeyManager {
 
     pub(crate) fn new(algorithm: Algorithm, identities: &[Identity]) -> Self {
         let aliases = identities.iter().map(|identity| identity.alias().unwrap_or(&[])).collect::<Vec<_>>();
+        Self::from_aliases(algorithm, &aliases)
+    }
+
+    pub(crate) fn from_aliases(algorithm: Algorithm, aliases: &[&[u16]]) -> Self {
         let order = if algorithm == Algorithm::SunX509 {
             rtdb_types::java_hash_map_order(16, aliases.iter(), |alias| alias.iter().fold(0i32, |hash, unit| hash.wrapping_mul(31).wrapping_add(i32::from(*unit))), |left, right| left.cmp(right)).expect("constant Java map capacity")
-        } else { (0..identities.len()).collect() };
+        } else { (0..aliases.len()).collect() };
         Self { algorithm, order }
     }
 

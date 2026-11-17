@@ -86,10 +86,10 @@ fn registry_native_managers_select_java_alias_order_for_tls12_and_tls13() {
     let second = Credential::new("second", false, Some(&root));
     let bytes = support::jks(&[("a", &first), ("b", &second)], "store", "key");
     let memory = MemoryBudget::new(32 << 20); let charge = memory.reserve(1 << 20).unwrap();
-    let identities = KeyStore::decode(&bytes, StoreFormat::Java, StoreUse::Identity, Some("store"), Some("key"), Arc::clone(&charge)).unwrap();
     let trust = KeyStore::decode(&root.certificate.to_pem().unwrap(), StoreFormat::Pem, StoreUse::Trust, None, None, Arc::clone(&charge)).unwrap();
     for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
         for (algorithm, expected) in [("SunX509", &first), ("NewSunX509", &second), ("PKIX", &second)] {
+            let identities = Material::decode(&bytes, StoreFormat::Java, StoreUse::OptionalIdentity, Algorithm::parse(Some(algorithm)).unwrap(), Some("store"), Some("key"), Arc::clone(&charge)).unwrap();
             let (address, broker) = support::broker(&server, &root, version, Some("rsa_pss_rsae_sha256:rsa_pkcs1_sha256"));
             let owner = NativeTls::from_registry(&BTreeMap::from([("keymanager.algorithm", algorithm)]), Some(&trust), Some(&identities), Arc::clone(&charge)).unwrap();
             let context = unsafe { owner.registry_context().unwrap() };
@@ -102,7 +102,7 @@ fn registry_native_managers_select_java_alias_order_for_tls12_and_tls13() {
             drop(stream); drop(context); drop(owner);
         }
     }
-    drop(identities); drop(trust); drop(charge); assert_eq!(memory.used_bytes(), 0);
+    drop(trust); drop(charge); assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]
@@ -116,9 +116,9 @@ fn registry_native_selection_honors_peer_issuer_hints_and_ec_signatures() {
     let ec = Credential::new("ec client", true, Some(&root));
     let bytes = support::jks(&[("rsa", &rsa), ("ec", &ec)], "store", "key");
     let memory = MemoryBudget::new(32 << 20); let charge = memory.reserve(1 << 20).unwrap();
-    let identities = KeyStore::decode(&bytes, StoreFormat::Java, StoreUse::Identity, Some("store"), Some("key"), Arc::clone(&charge)).unwrap();
     let trust = KeyStore::decode(&root.certificate.to_pem().unwrap(), StoreFormat::Pem, StoreUse::Trust, None, None, Arc::clone(&charge)).unwrap();
     for algorithm in ["SunX509", "NewSunX509"] {
+        let identities = Material::decode(&bytes, StoreFormat::Java, StoreUse::OptionalIdentity, Algorithm::parse(Some(algorithm)).unwrap(), Some("store"), Some("key"), Arc::clone(&charge)).unwrap();
         for (issuer, accepted) in [(&root, true), (&other, false)] {
             let (address, broker) = support::broker(&server, issuer, SslVersion::TLS1_2, Some("ecdsa_secp256r1_sha256:rsa_pkcs1_sha256"));
             let owner = NativeTls::from_registry(&BTreeMap::from([("keymanager.algorithm", algorithm)]), Some(&trust), Some(&identities), Arc::clone(&charge)).unwrap();
@@ -131,5 +131,5 @@ fn registry_native_selection_honors_peer_issuer_hints_and_ec_signatures() {
             drop(stream); drop(context); drop(owner);
         }
     }
-    drop(identities); drop(trust); drop(charge); assert_eq!(memory.used_bytes(), 0);
+    drop(trust); drop(charge); assert_eq!(memory.used_bytes(), 0);
 }
