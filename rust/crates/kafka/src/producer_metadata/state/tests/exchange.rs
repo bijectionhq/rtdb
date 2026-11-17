@@ -22,10 +22,15 @@ fn native_exchange_keeps_the_built_scope_and_wire_selection_after_state_changes(
     let client: BaseProducer = ClientConfig::new()
         .set("bootstrap.servers", &endpoint)
         .set("enable.sparse.connections", "false")
+        .set("enable.ordered.metadata.bootstrap", "true")
         .set("allow.auto.create.topics", "true")
         .set_native_byte_account(Arc::clone(&account))
         .create()
         .unwrap();
+    assert_eq!(
+        client.client().fetch_metadata(None, Duration::from_secs(5)).unwrap().brokers().len(),
+        1,
+    );
     let memory = MemoryBudget::new(1 << 20);
     let mut producer = ProducerMetadata::new(
         Settings { refresh_backoff_ms: 10, refresh_backoff_max_ms: 10, metadata_expire_ms: 1000, metadata_idle_ms: 100 },

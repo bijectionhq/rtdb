@@ -45,6 +45,7 @@ impl ProducerMetadata {
     /// The client must be the accounted producer for this metadata state with auto topic creation enabled.
     /// Topics are passed in builder encounter order, and an empty list uses the broker-only request.
     /// Bootstrap uses [`Client::start_ordered_metadata_endpoint`] and learned brokers use [`Client::start_ordered_metadata_at`].
+    /// The producer configuration must enable `enable.ordered.metadata.bootstrap` before submitting to a bootstrap target.
     /// Their response capacity, timeout, readiness and retry contracts apply.
     /// Temporary descriptor admission failure ends mutation under the producer's existing failure policy.
     /// Native submission rejection releases the temporary inputs and leaves the metadata capability usable.

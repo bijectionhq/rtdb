@@ -604,6 +604,12 @@ static const struct rd_kafka_property rd_kafka_properties[] = {
      "it needs to communicate with. When disabled the client "
      "will maintain connections to all brokers in the cluster.",
      0, 1, 1},
+    {_RK_GLOBAL | _RK_PRODUCER | _RK_HIDDEN,
+     "enable.ordered.metadata.bootstrap", _RK_C_BOOL,
+     _RK(ordered_metadata_bootstrap),
+     "Retain configured bootstrap broker owners through broker discovery "
+     "for ordered Metadata requests addressed to a bootstrap endpoint.",
+     0, 1, 0},
     {_RK_GLOBAL | _RK_DEPRECATED, "reconnect.backoff.jitter.ms", _RK_C_INT,
      _RK(reconnect_jitter_ms),
      "No longer used. See `reconnect.backoff.ms` and "

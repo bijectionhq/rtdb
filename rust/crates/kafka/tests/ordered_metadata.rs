@@ -176,11 +176,13 @@ fn endpoint_metadata_uses_the_exact_configured_bootstrap_connection() {
     let producer: BaseProducer = ClientConfig::new()
         .set("bootstrap.servers", &endpoint)
         .set("enable.sparse.connections", "false")
+        .set("enable.ordered.metadata.bootstrap", "true")
         .set_native_byte_account(Arc::clone(&account))
         .create()
         .unwrap();
     let client = producer.client();
     let timeout = Duration::from_secs(5);
+    assert_eq!(client.fetch_metadata(None, timeout).unwrap().brokers().len(), 1);
     let deadline = Instant::now() + Duration::from_secs(10);
     let request = loop {
         match client.start_ordered_metadata_endpoint(host, port, &[], 65536, timeout) {
@@ -204,5 +206,20 @@ fn endpoint_metadata_uses_the_exact_configured_bootstrap_connection() {
     drop(producer);
     assert_eq!(request.poll_raw().unwrap().unwrap().summary().topics, 0);
     drop(request);
+    assert_eq!(account.used(), 0);
+}
+
+#[test]
+fn endpoint_metadata_requires_retained_bootstrap_ownership() {
+    let account = NativeByteAccount::new(4 * 1024 * 1024, ()).unwrap();
+    let producer: BaseProducer = ClientConfig::new()
+        .set_native_byte_account(Arc::clone(&account))
+        .create()
+        .unwrap();
+    assert!(matches!(
+        producer.client().start_ordered_metadata_endpoint("127.0.0.1", 9092, &[], 65536, Duration::from_secs(5)),
+        Err(OrderedMetadataError::Native(code)) if code == rdkafka::error::RDKafkaErrorCode::UnsupportedFeature as i32,
+    ));
+    drop(producer);
     assert_eq!(account.used(), 0);
 }

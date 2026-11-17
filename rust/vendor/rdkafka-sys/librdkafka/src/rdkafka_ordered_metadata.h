@@ -388,7 +388,8 @@ rd_kafka_resp_err_t rd_kafka_ordered_metadata_start_endpoint(
         *result = NULL;
         if (!rk || timeout_ms <= 0 || body_capacity > INT32_MAX)
                 return RD_KAFKA_RESP_ERR__INVALID_ARG;
-        if (rk->rk_type != RD_KAFKA_PRODUCER || !rk->rk_byte_account)
+        if (rk->rk_type != RD_KAFKA_PRODUCER || !rk->rk_byte_account ||
+            !rk->rk_conf.ordered_metadata_bootstrap)
                 return RD_KAFKA_RESP_ERR__UNSUPPORTED_FEATURE;
         if (!host_bytes || !host_length || host_length >= sizeof(host) ||
             memchr(host_bytes, '\0', host_length))

@@ -93,6 +93,7 @@ impl<C: ClientContext> Client<C> {
     }
 
     /// Starts ordered Metadata on the currently authenticated connection of a configured bootstrap endpoint.
+    /// Requires `enable.ordered.metadata.bootstrap` on the producer at creation; otherwise submission returns a native unsupported-feature error.
     /// Host must match the native configured hostname or address bytes, including any retained IPv6 brackets.
     /// An empty host, embedded NUL or formatted endpoint exceeding the native node-name capacity returns a native argument error.
     /// A missing or unavailable connection returns `BrokerNotReady` without starting a connection.

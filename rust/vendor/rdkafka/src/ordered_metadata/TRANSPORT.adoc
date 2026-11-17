@@ -21,6 +21,10 @@ The request uses the selected native broker owner through completion and retries
 The same owner can change its advertised endpoint and reconnect.
 
 `Client::start_ordered_metadata_endpoint` submits the same forms to an authenticated configured bootstrap broker matched by its exact native host bytes and unsigned port.
+Set `enable.ordered.metadata.bootstrap=true` when constructing the producer to keep configured broker owners available throughout its lifetime.
+Discovery can retain both a configured owner and a learned owner for the same address.
+The producer's normal connection scheduling and byte account govern both owners.
+Endpoint submissions require this mode.
 The caller supplies the bytes as configured in the broker inventory, including any retained IPv6 brackets.
 The broker lock captures the negotiated Metadata version and socket generation while the current configured endpoint matches the connected address epoch.
 The broker thread checks the socket generation before queueing and again before transmitting.
