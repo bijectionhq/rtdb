@@ -70,6 +70,19 @@ Native and Arrow run-end admission checks every retained end, including unused r
 Run ends must be positive, strictly increasing and within `i32::MAX`, with one value per run and final coverage at least the logical length.
 A shorter logical length, including zero, retains the complete covering run table and its value owners.
 Arrow admission also preserves the SDK's offset-plus-length coverage validation.
+Each run-end node retains a reader identity with an atomic signed run-index hint.
+Clones, selections and named/child views share that identity.
+Lookup checks the current run, then its successor, then binary-searches with source i32 arithmetic; it stores a successful lookup before reading the value.
+A failed lookup leaves the hint unchanged, while a later value-read failure retains the new hint.
+Long run ends narrow to i32 during reads; strict external admission still validates the original wide values.
+Nested encoded run ends use their own concrete Long getter and reader identity.
+Concurrent calls use relaxed atomic hint reads and writes without a cross-call ordering guarantee.
+The private reader-snapshot operation recursively creates fresh hints, retains existing backing allocations and descriptors, and keeps selections and named-leg masks.
+It admits bounded reader metadata before construction and retains that lease until the last copied reader drops.
+Snapshot construction follows child order and reads nonempty variable/list terminal offsets at their source constructor boundary; failures release the partial copy and leave original readers unchanged.
+Native variable snapshots recompute only the copied last-offset cursor, while zero-count snapshots require no terminal offset.
+Private fixtures exercise wrapped and partial run tables; public native and SDK ingress continue requiring complete validated layouts.
+Partial native container publication, writer trees, full host objects, physical transport and production reader adoption remain separate required work.
 Dense unions retain every negative discriminator byte as an absent leg.
 Named-leg selections retain raw signed offsets without checking the final child's bounds; nested selection checks only intermediate offset/index entries it actually reads.
 Consuming getters check retained payload bounds before access.

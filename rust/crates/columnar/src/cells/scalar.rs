@@ -9,7 +9,7 @@ impl RunGetter {
 }
 
 fn long_long_reader(node: &PhysicalNode) -> bool {
-    matches!(&node.storage, NodeLayout::RunEnd { .. })
+    matches!(&node.storage, NodeLayout::RunEnd(_))
         || matches!(node.descriptor.scalar_field().map(Field::data_type), Some(DataType::FixedSizeBinary(_))) && !node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY)
 }
 
@@ -53,10 +53,10 @@ impl<'a> CellRef<'a> {
         let mut row = self.vector.address.row(self.index)?;
         loop {
             match &node.storage {
-                NodeLayout::RunEnd { values, .. } => {
-                    if matches!(getter, RunGetter::LongLong) && !long_long_reader(values) { return Err(unsupported(getter.name())); }
-                    row = node.run_index(row)?;
-                    node = values;
+                NodeLayout::RunEnd(reader) => {
+                    if matches!(getter, RunGetter::LongLong) && !long_long_reader(reader.values()) { return Err(unsupported(getter.name())); }
+                    row = reader.index(row)?;
+                    node = reader.values();
                 },
                 NodeLayout::Union { .. } => return Err(unsupported(getter.name())),
                 _ => return Ok(ResolvedCell { node, row }),

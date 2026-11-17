@@ -136,11 +136,11 @@ fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Ar
         }
         DataType::RunEndEncoded(ends, field) => {
             let data = array.to_data();
-            NodeLayout::RunEnd {
+            NodeLayout::RunEnd(RunEndReader::new(RunStorage {
                 logical_offset: data.offset(),
                 ends: node(Arc::clone(ends), make_array(data.child_data()[0].clone()), owner)?,
                 values: node(Arc::clone(field), make_array(data.child_data()[1].clone()), owner)?,
-            }
+            }))
         }
         _ => {
             let data = array.to_data();
@@ -151,7 +151,7 @@ fn node(field: Arc<Field>, array: ArrayRef, owner: &Arc<NodeOwner>) -> Result<Ar
 }
 
 pub(super) fn finish_node(ingress: Arc<Field>, length: usize, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
-    if let (NodeLayout::RunEnd { ends, values, .. }, DataType::RunEndEncoded(_, _)) = (&storage, ingress.data_type()) { storage::check_runs(ends, values, length)?; }
+    if let (NodeLayout::RunEnd(reader), DataType::RunEndEncoded(_, _)) = (&storage, ingress.data_type()) { storage::check_runs(reader.ends(), reader.values(), length)?; }
     let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
     Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, length, storage, owner }))
 }

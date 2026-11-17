@@ -291,7 +291,7 @@ impl VectorDescriptor {
                 encoding: UnionEncoding::DeclaredIds(fields.iter().map(|(id, _)| id).collect()),
                 children: children.iter().map(|child| Arc::clone(&child.descriptor)).collect(),
             },
-            (NodeLayout::RunEnd { ends, values, .. }, DataType::RunEndEncoded(_, _)) => ContainerKind::RunEnd { ends: Arc::clone(&ends.descriptor), values: Arc::clone(&values.descriptor) },
+            (NodeLayout::RunEnd(reader), DataType::RunEndEncoded(_, _)) => ContainerKind::RunEnd { ends: Arc::clone(&reader.ends().descriptor), values: Arc::clone(&reader.values().descriptor) },
             _ => return Err(layout()),
         };
         let nullable = !matches!(&kind, ContainerKind::DenseUnion { .. } | ContainerKind::RunEnd { .. }) && ingress.is_nullable();

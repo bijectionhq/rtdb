@@ -5,6 +5,8 @@ mod native_scalar;
 mod write;
 mod open;
 mod scalar;
+mod run_reader;
+mod snapshot;
 mod storage;
 mod view;
 
@@ -14,6 +16,7 @@ use arrow_schema::{DataType, Field};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
 use crate::{MemoryReservation, OwnedColumn, Selection};
 use storage::NodeLayout;
+use run_reader::{RunEndReader, RunStorage};
 pub use storage::{PhysicalLayout, RetainedBuffer};
 pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
 use descriptor::Declaration;
@@ -42,8 +45,9 @@ impl std::error::Error for VectorReadError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { match self { Self::Anomaly(error) => Some(error), Self::AbsentPrimitiveReceiver => None } }
 }
 
-/// Immutable physical vector with shared buffer, schema and selection reservations.
-/// Clones and child views retain their owners; selection does not copy payload buffers.
+/// Physical reader with immutable buffers, schema and selection reservations.
+/// Clones and child views retain their owners and share run-end lookup hints; selection does not copy payload buffers.
+/// Run-end hints use relaxed atomic access; concurrent reads have no guaranteed cross-call ordering.
 /// Fixed-width primitive byte addresses use source i32 products after logical row admission.
 #[derive(Clone, Debug)]
 pub struct ExecutionVector { view: ReaderView, address: Address }
@@ -68,7 +72,7 @@ impl PhysicalNode {
 }
 #[derive(Debug)]
 struct NodeOwner { backing: BackingOwner, metadata: Arc<MemoryReservation> }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum BackingOwner { Arrow { _array: ArrayRef, reservation: Arc<MemoryReservation> }, Native }
 
 #[derive(Clone, Debug)]
@@ -163,7 +167,7 @@ impl ExecutionVector {
         fn name(node: &PhysicalNode, row: PhysicalIndex) -> Result<Option<&str>> {
             match &node.storage {
                 NodeLayout::Union { .. } => Ok(node.union_leg(row)?.map(|child| child.descriptor.name())),
-                NodeLayout::RunEnd { values, .. } => name(values, node.run_index(row)?),
+                NodeLayout::RunEnd(reader) => name(reader.values(), reader.index(row)?),
                 _ => Err(unsupported("getLeg")),
             }
         }
@@ -200,7 +204,7 @@ fn resolve_node(mut node: &PhysicalNode, mut row: PhysicalIndex) -> Result<Resol
                 Some((child, offset)) => { node = child; row = offset; }
                 None => return Ok(ResolvedAccess::AbsentUnion { type_id: node.union_id(row)?, row }),
             },
-            NodeLayout::RunEnd { values, .. } => { row = node.run_index(row)?; node = values; }
+            NodeLayout::RunEnd(reader) => { row = reader.index(row)?; node = reader.values(); }
             _ => return Ok(ResolvedAccess::Leaf(ResolvedCell { node, row })),
         }
     }
