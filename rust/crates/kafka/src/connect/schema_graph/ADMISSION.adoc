@@ -1,0 +1,79 @@
+= Admitted graph materialization
+
+GraphBuilder.finish_with_admission is an additive internal graph-finishing route.
+Existing finish_with callers retain their existing implementation.
+The admitted route borrows a synchronous metadata callback and one admission operation; neither escapes into the result.
+The caller admits existing builder input before constructing it and retains reservations for the returned graph's lifetime.
+The callback admits its scratch and returned metadata/default allocations before constructing them.
+The library admits its own finish storage and final graph/root/child materialization.
+
+GraphBuilder is a passive single-writer transient.
+During decoration, its local SchemaGraph is mutable and unpublished; callbacks receive passive borrowed SchemaViews and return owned Metadata values.
+The graph becomes an Arc owner only after decoration and final admission succeed.
+There is no additional retained lookup map, callback owner, reservation owner, or background state in SchemaGraph.
+Reservations remain with the caller's existing plan/region owner.
+
+== Finish storage and ordering
+
+Before growing finish collections, the route counts N nodes, E edges and each Struct's field count with checked arithmetic.
+Missing nodes and an absent root fail before finish storage allocation.
+The additional storage charge includes N Node slots, N visited flags, N order entries, and 2*N+E pending entries.
+The pending capacity covers every root push, first-visit expanded push and edge push in the complete traversal, so the frontier cannot grow past its reservation.
+Each duplicate-name set uses the same conservative tree-node accounting convention as native Value documents: 16 entry slots plus 256 bytes per entry.
+The charge includes every Struct set even though validation uses them sequentially.
+Existing builder input remains live under its prior reservation while the new node Vec is created.
+
+Edge, duplicate-field and alias-cycle validation completes before the first borrowed node callback.
+The new preallocated traversal preserves metadata_order's root order, reverse edge push order, cycle handling and child-before-expanded-node processing.
+Each callback result is normalized before replacing node metadata.
+The old node metadata remains live while the callback constructs its replacement; its existing lease is not credited against the new allocation.
+Checked size failures and admission failures propagate through Result.
+No invalid-default suppression occurs in this graph API.
+
+== Owned copies
+
+SchemaView.metadata_allocation_bound reads effective alias metadata without allocating it.
+It counts the Metadata header, selected name/doc payloads, the sorted unique parameter entries and their key/value payloads, and the selected default's full retained bytes.
+A parameter entry uses 16 native entry slots plus 256 bytes, matching the existing conservative tree model.
+metadata_owned calls admission before producing strings, parameter-map nodes or a default Value clone.
+The parameter map is filled directly, avoiding an intermediate collection or sorting buffer.
+Explicit empty metadata values retain their overriding effect, and null defaults normalize to absence.
+
+Final publication admits a SchemaGraph Arc header, a root ConnectSchema Arc header, root effective metadata, and its immediate kind materialization.
+An array creates one child schema, a map two, and a Struct its actual number of fields.
+Each child adds an Arc header and its effective metadata/default copy; Structs also add an exactly preallocated field Vec and raw field-name payloads.
+Recursive edges retain NodeIds in SchemaReference rather than recursively materializing descendants.
+The root and child headers include both Arc counters and alignment allowance.
+All these allocations coexist with the admitted graph metadata and any still-held source/default owners.
+
+The retained accounting follows the existing graph model using checked arithmetic.
+It includes initial metadata/field charges and decorated metadata charges instead of subtracting replaced storage while a shared caller lease may still retain it.
+The native container model is conservative logical allocation accounting, not a claim about allocator bookkeeping bytes.
+
+== Legacy views of admitted graphs
+
+Generic consumers can still call the existing SchemaReference.resolve and ConnectSchema.resolved APIs on an admitted graph.
+Those paths clone alias metadata and defaults through the original materializers.
+The new view_bytes calculation therefore uses a borrowed legacy-copy bound, separate from the smaller new owned-view demand.
+
+For an alias chain of D nodes, sum each node's retained metadata/default footprint and conservative parameter-tree footprint into S.
+The bound is (2*D+4)*S plus (3*D+4) NodeId slots.
+The two per-node metadata allowances cover the source metadata/default clone and its merge/replacement overlap; four final allowances cover the effective metadata, transient owner and capacity overlap.
+The separate three-slot allowance covers the alias-id Vec's simultaneous old and new capacities during geometric growth.
+For a view, add every immediate child Arc and legacy metadata bound, a conservative field Vec capacity of 2*field_count+4 slots and raw names, plus the additional effective root metadata copies.
+This counts the actual finite alias and child structure; it is unrelated to an input-size multiplier for conversion output.
+The per-graph maximum is computed without allocating metadata or temporary schema views.
+
+A concrete ConnectSchema may override its graph node's metadata after a view is returned.
+Its outer default/name/parameters can exceed the immutable graph's metadata.
+SchemaView.legacy_resolution_bound therefore adds that actual concrete outer metadata copy to the graph materialization bound and returns zero for a concrete nonreference whose resolved view is borrowed.
+Future admission callers using the legacy resolved route must use that checked outer-aware query; the unchanged legacy view_allocation_bound API does not acquire new callers in this prerequisite.
+Borrowed conversion can avoid those view/default copies entirely.
+
+== Regression scope
+
+Regression sources compare legacy and admitted metadata, concrete kinds, recursive edges and callback order without comparing private allocation counters.
+They cover all node kinds, alias precedence and large defaults, structural rejection, malformed nodes/edges/names/cycles before callbacks, default-copy rejection, final publication rejection, exact versus one-byte-below additional budgets, last caller-lease release, null normalization, legacy alias/default copy accounting, concrete outer overrides and arithmetic overflow.
+Original assertions and finish_with bodies are retained.
+No production caller selects the admitted route in this prerequisite, and no Java name policy or scrubbed conversion is activated.
+Rust/Java compilation and regression execution remain pending under the Phase 1 work order.

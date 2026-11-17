@@ -24,7 +24,7 @@ struct MetadataChain<'a> { source: Option<Source<'a>> }
 
 impl<'a> SchemaView<'a> {
     pub(crate) fn new(schema: &'a ConnectSchema) -> Self { Self { source: Source::Schema(schema) } }
-    fn node(graph: &'a SchemaGraph, node: NodeId) -> Self { Self { source: Source::Graph(graph, node) } }
+    pub(super) fn node(graph: &'a SchemaGraph, node: NodeId) -> Self { Self { source: Source::Graph(graph, node) } }
     fn metadata(self) -> MetadataChain<'a> { MetadataChain { source: Some(self.source) } }
     pub(crate) fn optional(self) -> bool { self.metadata().any(|metadata| metadata.optional) }
     pub(crate) fn name(self) -> Option<&'a str> { self.metadata().find_map(|metadata| metadata.name) }
@@ -33,6 +33,14 @@ impl<'a> SchemaView<'a> {
     pub(crate) fn default_value(self) -> Option<&'a Value> { self.metadata().find_map(|metadata| metadata.default) }
     pub(crate) fn parameter(self, name: &str) -> Option<&'a str> { self.metadata().find_map(|metadata| metadata.parameters.get(name).map(String::as_str)) }
     pub(crate) fn parameters(self) -> Parameters<'a> { Parameters { schema: self, previous: None } }
+    pub(crate) fn legacy_resolution_bound(self) -> Result<usize> {
+        let graph = match self.source {
+            Source::Schema(ConnectSchema { kind: SchemaKind::Reference(reference), .. }) => (&*reference.graph, reference.node),
+            Source::Schema(_) => return Ok(0),
+            Source::Graph(graph, node) => (graph, node),
+        };
+        super::admitted::resolution_bound(graph.0, graph.1, self.metadata_allocation_bound()?)
+    }
     pub(crate) fn identity(self) -> Option<(usize, usize)> {
         match self.source {
             Source::Schema(ConnectSchema { kind: SchemaKind::Reference(reference), .. }) => Some(reference.identity()),

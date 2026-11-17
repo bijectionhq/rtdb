@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_types::{Result, Value};
 use super::{ConnectField, ConnectSchema, SchemaKind, error};
 mod borrowed;
+mod admitted;
 pub(crate) use borrowed::{SchemaView, ViewKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
