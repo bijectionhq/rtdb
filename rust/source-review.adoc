@@ -659,3 +659,33 @@ Container promotion and copying, relation assembly, full object/ValueReader adap
 Stored-object text now shares a borrowed syntax kernel while retaining its original allocation owner and append order.
 Host collection construction/order, function identity, literal carriers and environment-dependent text remain required work.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+
+== Shared numeric and collection source checkpoint
+
+The numeric implementation now lives in `types::jvm_number`; expression evaluation retains its existing primitive and boxed dispatch paths.
+The moved implementation and all 20 existing numeric test bodies have source-text equivalence review.
+Decimal coefficient rendering and Murmur3 share the same implementations across their existing callers.
+Four additional regression sources cover the public numeric/helper boundary; all tests remain unexecuted.
+
+The checked Clojure collection index retains source-order duplicate detection, callback demand and HAMT traversal, including null keys and hash collisions.
+When supplied, the caller's allocation region is borrowed through destruction of the completed index or duplicate outcome; both retain the admitted input keys.
+Map construction preserves the eight-pair array-map threshold, while checked set construction uses the HAMT path at every size.
+Reader/compiler admission, host adapters, unchecked quoted sets, Java object identity and isolated UTF16 text remain required consumers.
+The index has independent source review and unexecuted regression sources; it does not complete the host collection implementation.
+
+== Native descriptor and grammar source checkpoint
+
+The scalar writer's publication gate owns its mutable scalar state; copying kernels can mutate that state only through the caller's admitted operation.
+Execution vectors retain native container descriptors independently of Arrow SDK field projection.
+Native union descriptors retain every child and its ordinal, including ordinals whose narrowed signed byte is negative.
+Checked SDK projection reports unrepresentable union declarations without discarding their native descriptors.
+Descriptor construction admits depth-weighted Struct-join allocations before cloning metadata, with retained-child and release regression sources.
+Logical-type failure demand, reader nullability, partial native container storage, run-reader hint identity, recursive writers/copies and production adoption remain required implementation work.
+
+The private SQL grammar graph retains the pinned serialized automaton, checked owner-bound links and its rule-return edges.
+Expected-token traversal implements local epsilon results, full-context EOF results and source-ordered invocation returns without recursive native traversal.
+Its visited configurations, invocation contexts and traversal frames retain their caller-owned allocation region through destruction.
+The graph and expected-token increments have independent source review and unexecuted regression sources.
+Adaptive prediction, generated rule control, diagnostic integration, raw UTF16 literal consumers and whole-batch production parsing remain incomplete.
+The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
