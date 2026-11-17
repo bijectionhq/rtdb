@@ -48,6 +48,9 @@ It saves the original next encounter cursor before the predicate, then selected 
 This iterator route does not call user hashCode, flatten small trees or move the balanced root to the encounter front.
 It returns whether a predicate selected removal, matching Collection.removeIf after its iterator.remove call.
 Removed slots enter the private free list; later insertions reuse their existing collection admission.
+`Map::clear` drops all mappings without key callbacks or admission and adds their slots to the free list.
+It retains the initialized table capacity, resize threshold and all collection leases, so subsequent empty lookups still hash their keys.
+Clearing an uninitialized map preserves its lazy initialization.
 
 A mutation error poisons this unpublished transient.
 Completed removal prefixes remain private, and later lookup, iteration, mutation or finish rejects the failed transient.
@@ -85,9 +88,10 @@ HashSet and IdentityHashMap were read for later adapters; this slice does not im
 
 HashMap.java intervals include hash/comparableClassFor333–375, getNode574–595, putVal632–675, resize684–758, treeifyBin762–783, remove804–859, HashIterator1582–1624, moveRootToFront1991–2010, find2018–2048, tieBreak2059–2068, treeify2072–2111, untreeify2118–2129, putTreeVal2134–2176, removeTreeNode2190–2286, split2298–2343, rotations2348–2382 and balancing2384–2530.
 Collection.removeIf576–586 supplies predicate/iterator ordering.
+HashMap.clear865–873 and HashSet.clear253–255 supply clear's table retention and lack of key callbacks.
 The pinned iterator uses removeNode(p.hash,p.key,null,false,false); public remove separately computes hash(key).
 
-Nineteen core and fourteen removal regression functions are present as source.
+Nineteen core and eighteen removal regression functions are present as source.
 They cover lazy capacities and callbacks, null/identity/hash guards, first-key replacement, comparable/noncomparable collision trees, signed spread ordering, identity ties, resize geometry, immutable lease ownership, failure boundaries, public removal geometry and iterator cursor behavior.
 The regression expectations were source-read or manually traced; none have run.
 No compiler, formatter, runtime discovery, dependency discovery or Java/native test execution was used.

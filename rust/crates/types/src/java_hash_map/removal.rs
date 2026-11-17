@@ -2,6 +2,30 @@ use super::*;
 use std::ops::Bound::{Excluded, Unbounded};
 
 impl<K, V, L> Map<K, V, L> {
+    /// Drops all mappings while retaining table capacity and collection leases.
+    /// An initialized table still hashes later lookups, even while empty.
+    /// Invokes neither key operations nor admission and rejects a failed transient.
+    /// A key or value destructor that unwinds leaves the transient poisoned.
+    pub fn clear(&mut self) -> Result<()> {
+        self.usable()?;
+        if self.len == 0 {
+            return Ok(());
+        }
+
+        self.failed = true;
+        self.buckets.clear();
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if matches!(slot, Slot::Occupied(_)) {
+                let entry = replace(slot, Slot::Vacant(self.free));
+                self.free = Some(index);
+                self.len -= 1;
+                drop(entry);
+            }
+        }
+        self.failed = false;
+        Ok(())
+    }
+
     /// Removes a mapping using Java key lookup and returns its stored key and value.
     /// A non-null key is hashed even before a table exists; null keys use zero.
     /// Fallible key operations precede link mutation, and their failure poisons this unpublished transient.

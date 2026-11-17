@@ -314,3 +314,96 @@ fn iterator_empty_rejected_and_sparse_bucket_passes_keep_the_source_cursor_and_c
     assert!(map.buckets.is_empty()); assert_eq!(map.len(), 0); assert_eq!(budget.requests, requests); assert_eq!(budget.live.load(AtomicOrdering::SeqCst), live); check(&map);
     drop(map); drop(empty); assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
 }
+
+#[test]
+fn clear_keeps_warm_lookup_demand_and_reuses_tree_slots_under_a_full_budget() {
+    let mut budget = Budget::new();
+    let mut ops = Ops::new();
+    let mut map = populated(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9], &mut budget, &mut ops);
+    map.remove(&key(9, 101), &mut ops, &mut budget).unwrap();
+    assert!(map.buckets[&0].root.is_some());
+    let geometry = (map.capacity, map.threshold, map.slots.len());
+    let requests = budget.requests;
+    let live = budget.live.load(AtomicOrdering::SeqCst);
+    budget.limit = live;
+    ops.calls.clear();
+
+    map.clear().unwrap();
+    map.clear().unwrap();
+    assert!(ops.calls.is_empty());
+    assert_eq!(map.try_iter().unwrap().len(), 0);
+    assert_eq!((map.capacity, map.threshold, map.slots.len()), geometry);
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), live);
+    check(&map);
+
+    ops.fail_hash = true;
+    assert!(map.contains_key(&key(1, 102), &mut ops, &mut budget).is_err());
+    assert_eq!(ops.calls, [Call::Hash(102)]);
+    ops.fail_hash = false;
+    for value in 0..9 {
+        map.put(key(value, value as usize + 20), value, &mut ops, &mut budget).unwrap();
+    }
+    assert_eq!(values(&map), [3, 0, 1, 2, 4, 5, 6, 7, 8]);
+    assert_eq!(budget.requests, requests);
+    check(&map);
+    drop(map);
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[test]
+fn clear_drops_values_while_their_collection_admission_stays_live() {
+    let mut budget = Budget::new();
+    let mut ops = Ops::new();
+    let mut map = Map::new(None).unwrap();
+    let value = Arc::new(42);
+    let retained = Arc::downgrade(&value);
+    map.put(key(1, 1), value, &mut ops, &mut budget).unwrap();
+    assert!(retained.upgrade().is_some());
+    let live = budget.live.load(AtomicOrdering::SeqCst);
+
+    map.clear().unwrap();
+
+    assert!(retained.upgrade().is_none());
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), live);
+    drop(map);
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
+}
+
+#[test]
+fn clear_preserves_lazy_initialization_and_rejects_poisoned_maps() {
+    let mut budget = Budget::new();
+    let mut ops = Ops::new();
+    let mut map: Map<Key, i32, Lease> = Map::new(Some(64)).unwrap();
+    map.clear().unwrap();
+    ops.fail_hash = true;
+    assert!(!map.contains_key(&key(1, 1), &mut ops, &mut budget).unwrap());
+    assert!(ops.calls.is_empty());
+    assert_eq!(budget.requests, 0);
+
+    assert!(map.put(key(1, 1), 42, &mut ops, &mut budget).is_err());
+    assert!(map.clear().is_err());
+    assert!(map.finish(&mut budget).is_err());
+}
+
+#[test]
+fn unwinding_during_clear_cannot_publish_partial_removal() {
+    struct Value(bool);
+    impl Drop for Value {
+        fn drop(&mut self) {
+            assert!(!self.0, "fixture destructor");
+        }
+    }
+
+    let mut budget = Budget::new();
+    let mut ops = Ops::new();
+    let mut map = Map::new(None).unwrap();
+    map.put(key(1, 1), Value(true), &mut ops, &mut budget).unwrap();
+    map.put(key(2, 2), Value(false), &mut ops, &mut budget).unwrap();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.clear()));
+
+    assert!(unwind.is_err());
+    assert!(map.try_iter().is_err());
+    assert!(map.clear().is_err());
+    assert!(map.finish(&mut budget).is_err());
+    assert_eq!(budget.live.load(AtomicOrdering::SeqCst), 0);
+}
