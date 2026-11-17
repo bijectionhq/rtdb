@@ -18,6 +18,7 @@ pub(super) enum Charset {
     EucJp(double_byte::euc_jp::EucJp),
     EucTw(double_byte::euc_tw::EucTw),
     IbmEuc(double_byte::ibm_euc::IbmEuc),
+    Iso2022CnKr(double_byte::iso2022cnkr::Iso2022CnKr),
     Iso2022Jp(double_byte::iso2022jp::Iso2022Jp),
     DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
@@ -70,6 +71,7 @@ impl Charset {
                 else if let Some(decoder) = double_byte::euc_jp::lookup(normalized) { Self::EucJp(decoder) }
                 else if let Some(decoder) = double_byte::euc_tw::lookup(normalized) { Self::EucTw(decoder) }
                 else if let Some(decoder) = double_byte::ibm_euc::lookup(normalized) { Self::IbmEuc(decoder) }
+                else if let Some(decoder) = double_byte::iso2022cnkr::lookup(normalized) { Self::Iso2022CnKr(decoder) }
                 else if let Some(decoder) = double_byte::iso2022jp::lookup(normalized) { Self::Iso2022Jp(decoder) }
                 else if let Some(table) = double_byte::lookup(normalized) { Self::DoubleByte(table) }
                 else { return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{name}'"))); }
@@ -91,6 +93,7 @@ impl Charset {
             Self::EucJp(decoder) => decoder.decode(bytes),
             Self::EucTw(decoder) => decoder.decode(bytes),
             Self::IbmEuc(decoder) => decoder.decode(bytes),
+            Self::Iso2022CnKr(decoder) => decoder.decode(bytes),
             Self::Iso2022Jp(decoder) => decoder.decode(bytes),
             Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
