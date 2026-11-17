@@ -25,9 +25,9 @@ fn bound(node: &PhysicalNode, row: PhysicalIndex) -> Result<usize> {
     if matches!(&node.storage, NodeLayout::Scalar(_)) { return super::native_scalar::value_bound(node, node.checked_position(row)?); }
     match node.container() {
         Some(ContainerStorageRef::Struct { children, .. }) => {
-            for child in children {
+            for (key, child) in children.iter() {
                 bytes = add(bytes, add(1024, mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?)?)?;
-                bytes = add(bytes, mul(child.descriptor.name().len(), 2)?)?;
+                bytes = add(bytes, mul(key.len(), 2)?)?;
                 if !child.descriptor.is_bottom_scalar() { bytes = add(bytes, bound(child, row)?)?; }
             }
         }
@@ -56,9 +56,9 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
     match node.container() {
         Some(ContainerStorageRef::Struct { children, .. }) => {
             let mut fields = BTreeMap::new();
-            for child in children {
+            for (key, child) in children.iter() {
                 let value = if child.descriptor.is_bottom_scalar() { Value::Undefined } else { read(child, row)? };
-                fields.insert(child.descriptor.name().to_owned(), value);
+                fields.insert(key.to_owned(), value);
             }
             Ok(Value::Struct(fields))
         }

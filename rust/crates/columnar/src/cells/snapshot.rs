@@ -24,7 +24,11 @@ fn node_bound(node: &PhysicalNode, depth: usize) -> Result<usize> {
     depth_limit(depth)?;
     let mut bytes = std::mem::size_of::<PhysicalNode>().checked_add(std::mem::size_of::<NodeOwner>()).and_then(|n| n.checked_add(256)).ok_or_else(allocation)?;
     match node.container() {
-        Some(ContainerStorageRef::Struct { children, .. } | ContainerStorageRef::Union { children, .. }) => {
+        Some(ContainerStorageRef::Struct { children, .. }) => {
+            bytes = add(bytes, children.len().checked_mul(std::mem::size_of::<Arc<PhysicalNode>>()).ok_or_else(allocation)?)?;
+            for (_, child) in children.iter() { bytes = add(bytes, node_bound(child, depth + 1)?)?; }
+        },
+        Some(ContainerStorageRef::Union { children, .. }) => {
             bytes = add(bytes, children.len().checked_mul(std::mem::size_of::<Arc<PhysicalNode>>()).ok_or_else(allocation)?)?;
             for child in children { bytes = add(bytes, node_bound(child, depth + 1)?)?; }
         },

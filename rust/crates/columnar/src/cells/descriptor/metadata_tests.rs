@@ -63,7 +63,8 @@ fn container_type_failures_follow_child_order_without_rewriting_inner_width() {
     let second = run("a-second", &ends64, &bottom, &memory);
     for children in [[Arc::clone(&first), Arc::clone(&second)], [Arc::clone(&second), Arc::clone(&first)]] {
         let expected = children[0].logical_type().unwrap_err();
-        for shape in [ContainerShapeRef::Struct(&children), ContainerShapeRef::OrdinalUnion(&children)] {
+        let fields = [StructFieldRef { key: children[0].name(), descriptor: &children[0] }, StructFieldRef { key: children[1].name(), descriptor: &children[1] }];
+        for shape in [ContainerShapeRef::Struct(&fields), ContainerShapeRef::OrdinalUnion(&children)] {
             let parent = VectorDescriptor::native_container("parent", false, shape, &memory).unwrap();
             assert_eq!(parent.logical_type(), Err(expected));
             assert!(parent.arrow_field().is_ok());
@@ -241,7 +242,8 @@ fn concrete_reads_and_structural_materialization_do_not_demand_failed_logical_me
     assert_eq!(error.code, "rtdb/unsupported-vector-reader");
     let child = runs.into_direct().unwrap();
     let children = [Arc::clone(&child.descriptor)];
-    let parent_descriptor = VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(&children), &memory).unwrap();
+    let fields = [StructFieldRef { key: children[0].name(), descriptor: &children[0] }];
+    let parent_descriptor = VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(&fields), &memory).unwrap();
     let parent = node(parent_descriptor, 1, NodeLayout::Struct { validity: None, children: vec![Arc::clone(&child)] });
     assert!(parent.logical_type().is_err());
     assert!(!parent.reader_nullable());
@@ -295,7 +297,8 @@ fn native_struct_reserves_cloned_child_names_before_logical_derivation() {
     let child = descriptor(&"x".repeat(128 * 1024), DataType::Int32, false, &child_memory);
     let before = child_memory.used_bytes();
     let owners = Arc::strong_count(&child);
-    assert!(VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(std::slice::from_ref(&child)), &parent_memory).is_err());
+    let fields = [StructFieldRef { key: child.name(), descriptor: &child }];
+    assert!(VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(&fields), &parent_memory).is_err());
     assert_eq!(parent_memory.used_bytes(), 0);
     assert_eq!(child_memory.used_bytes(), before);
     assert_eq!(Arc::strong_count(&child), owners);

@@ -20,7 +20,7 @@ use storage::NodeLayout;
 use native_container::{NativeContainerStorage, ContainerStorageRef};
 use run_reader::{RunEndReader, RunStorage};
 pub use storage::{PhysicalLayout, RetainedBuffer};
-pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
+pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, StructFieldDescriptor, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
 use descriptor::Declaration;
 
 /// Controls primitive validity checks for an individual physical read.
@@ -234,7 +234,7 @@ impl<'a> CellRef<'a> {
     pub fn raw_struct_field(&self, name: &str) -> Result<Option<OwnedCell>> {
         let cell = self.resolve()?;
         let Some(ContainerStorageRef::Struct { children, .. }) = cell.node.container() else { return Err(unsupported("raw_struct_field")); };
-        children.iter().find(|child| child.descriptor.name() == name).map(|child| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
+        children.iter().find(|(key, _)| *key == name).map(|(_, child)| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
     }
     /// Returns retained raw elements, including null-parent payload, after physical indirection.
     /// This is distinct from listElements admission on union/run-end readers.

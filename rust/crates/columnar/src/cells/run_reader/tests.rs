@@ -257,7 +257,11 @@ fn failed_recursive_snapshot_releases_captured_children_without_changing_source_
     let broken = variable(1, &[], 23, &memory);
     let children = vec![runs.clone().into_direct().unwrap(), broken.clone().into_direct().unwrap()];
     let descriptors = children.iter().map(|child| Arc::clone(&child.descriptor)).collect::<Vec<_>>();
-    let descriptor = VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(&descriptors), &memory).unwrap();
+    let fields = [
+        super::super::descriptor::StructFieldRef { key: descriptors[0].name(), descriptor: &descriptors[0] },
+        super::super::descriptor::StructFieldRef { key: descriptors[1].name(), descriptor: &descriptors[1] },
+    ];
+    let descriptor = VectorDescriptor::native_container("parent", false, ContainerShapeRef::Struct(&fields), &memory).unwrap();
     let parent = native(descriptor, 1, NodeLayout::Struct { validity: None, children }, &memory);
     let before = memory.used_bytes();
     assert_eq!(parent.snapshot_reader(&target).unwrap_err().code, "rtdb/row-index");
