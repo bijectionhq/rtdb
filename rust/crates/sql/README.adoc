@@ -264,6 +264,7 @@ These control values retain escaped-string bodies verbatim, following the pinned
 COPY classification selects the first format case-sensitively and retains an absent or unknown format for the frontend's format diagnostic.
 Later COPY options are still parsed, including after an unrecognized first format.
 Generic tokenizer literal admission and query-literal decoding still require the broader lexical compatibility work.
+Quoted identifiers preserve doubled interior quote or backtick delimiters in query and control names, matching the pinned identifier visitors.
 
 == Inline XTQL
 

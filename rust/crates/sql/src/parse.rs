@@ -80,7 +80,7 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
     let dialect = SqlDialect::default();
     let mut tokens = Vec::new();
     let mut invalid_token = None;
-    let result = Tokenizer::new(&dialect, source).tokenize_with_location_into_buf_with_mapper(&mut tokens, |token| {
+    let result = Tokenizer::new(&dialect, source).tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token| {
         if invalid_token.is_none() {
             let invalid = match &token.token {
                 Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),
@@ -89,6 +89,13 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
                 _ => None,
             };
             if let Some((message, span)) = invalid { invalid_token = Some(sql_error(message, source, span)); }
+        }
+        if let Token::Word(word) = &mut token.token {
+            match word.quote_style {
+                Some('"') if word.value.contains('"') => word.value = word.value.replace('"', "\"\""),
+                Some('`') if word.value.contains('`') => word.value = word.value.replace('`', "``"),
+                _ => {},
+            }
         }
         token
     });
