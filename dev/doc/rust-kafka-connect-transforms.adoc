@@ -18,6 +18,17 @@ The Kotlin loader passes the configured name directly to `Class.forName`, checks
 Bare names of the ten key/value families identify abstract classes and fail at construction on the JVM.
 The native dispatcher also rejects these bare names and reports `plugin-class-not-found`.
 
+== Assignment startup
+
+The assignment opens every referenced predicate before it opens any transform.
+It visits predicate aliases in the order transforms first refer to them, shares each predicate across its steps and skips unused predicates.
+It then opens the transforms in declaration order.
+A predicate class or configuration error therefore reaches the caller before any transform factory runs.
+
+The reference closes already-opened plugins in reverse opening order after a startup failure.
+On normal completion it closes transforms in step order, followed by predicates in first-use order.
+Native plugins release their resources through Rust destructors, and their relative destruction order remains a compatibility gap for custom factories.
+
 == Reference
 
 The Kotlin loader is in `modules/kafka/src/main/kotlin/xtdb/kafka/connectsrc/ConnectConfig.kt` at XTDB revision `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.

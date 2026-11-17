@@ -74,20 +74,21 @@ impl PluginRegistry {
         super::converter::open(spec, is_key)
     }
     /// Opens an assignment-owned, single-writer transform chain with explicit process date defaults.
+    /// It opens each referenced predicate once in first-use order, then opens the transforms in declaration order.
     /// Built-in date transforms retain the shared environment; custom factories retain their own configuration.
     /// Eager configuration and allocation failures return before publishing the chain.
     /// TimestampRouter constructs its formatter on the first timestamped record, so its pattern errors are returned by `apply`.
     pub fn chain_with_environment(&self, config: &ConnectConfig, environment: Arc<super::DateEnvironment>) -> Result<TransformChain> {
         let mut predicates = BTreeMap::new();
+        for alias in config.transforms.iter().filter_map(|spec| spec.predicate.as_ref()) {
+            if !predicates.contains_key(alias) {
+                let predicate = config.predicates.get(alias).ok_or_else(|| error("undeclared-predicate", alias))?;
+                let opened = match self.predicates.get(&predicate.class_name) { Some(factory) => factory.open(&predicate.options)?, None => super::transforms::predicate(predicate)? };
+                predicates.insert(alias.clone(), opened);
+            }
+        }
         let mut steps = Vec::new();
         for spec in &config.transforms {
-            if let Some(alias) = &spec.predicate {
-                if !predicates.contains_key(alias) {
-                    let predicate = config.predicates.get(alias).ok_or_else(|| error("undeclared-predicate", alias))?;
-                    let opened = match self.predicates.get(&predicate.class_name) { Some(factory) => factory.open(&predicate.options)?, None => super::transforms::predicate(predicate)? };
-                    predicates.insert(alias.clone(), opened);
-                }
-            }
             let transform = match self.transforms.get(&spec.plugin.class_name) { Some(factory) => factory.open(&spec.plugin.options)?, None => super::transforms::open(&spec.plugin, Arc::clone(&environment))? };
             let configuration_bytes = spec.plugin.options.iter().try_fold(4096usize, |size, (key, value)| size.checked_add(key.len()).and_then(|size| size.checked_add(value.len())).ok_or_else(|| error("allocation-overflow", "Transform configuration size overflow")))?;
             steps.push(Step { transform, predicate: spec.predicate.clone(), negate: spec.negate, configuration_bytes });
@@ -112,3 +113,6 @@ impl TransformChain {
         Ok(Some(record))
     }
 }
+
+#[cfg(test)]
+mod tests;
