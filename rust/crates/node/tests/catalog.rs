@@ -98,6 +98,7 @@ async fn metrics_tags_stream_as_arrow_and_declared_empty_catalogs_keep_their_sch
 #[tokio::test]
 async fn hidden_temporal_fields_bind_explicitly_and_stay_out_of_aliased_wildcards() {
     let context = context(false, Some(BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(2))])));
-    assert_eq!(query(&context, "SELECT d.* FROM docs AS d(identifier, value)").await, vec![vec![Value::I64(1), Value::I64(2)]]);
+    assert_eq!(query(&context, "SELECT d.* FROM docs AS d(_id, v)").await, vec![vec![Value::I64(1), Value::I64(2)]]);
+    assert_eq!(query(&context, "SELECT _system_from FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }]]);
     assert_eq!(query(&context, "SELECT _system_from, _valid_to FROM docs FOR ALL SYSTEM_TIME").await, vec![vec![Value::Timestamp { value: 1, unit: rtdb_types::TimeUnit::Microsecond, timezone: Some("UTC".into()) }, Value::Null]]);
 }

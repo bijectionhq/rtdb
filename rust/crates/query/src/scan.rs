@@ -278,7 +278,8 @@ impl PartitionScan {
             for row in resolver.resolve(&head.header,source)? {
                 let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(&row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
                 let reservation = self.execution.context.memory.reserve(bound)?;
-                let values = self.scan.columns.iter().map(|field|project(&row,&field.name)).collect::<Result<_>>()?;
+                let mut values = Vec::with_capacity(self.scan.columns.len());
+                for field in &self.scan.columns { values.push(project(&row,&field.name)?); }
                 groups[head.active].push_growing(OwnedRow::with_reservation(values,reservation)?,&self.execution.context.memory)?;
             }
         }
