@@ -1,0 +1,6 @@
+canonical	class	source	source_sha256	variant	aliases
+ISO-2022-JP	ISO2022_JP	jdk.charsets/sun/nio/cs/ext/ISO2022_JP.java	40ac29fdf68c0f7553fb59ecb18a47c83481b4839a650f546032c978bc9abb31	Standard	iso2022jp|jis|csISO2022JP|jis_encoding|csjisencoding
+ISO-2022-JP-2	ISO2022_JP_2	jdk.charsets/sun/nio/cs/ext/ISO2022_JP_2.java	60d5979c0147db805db2f40c631c6ce8dfd6709aedfef0aa34ee8519d57ee3d7	Jp2	csISO2022JP2|iso2022jp2
+x-windows-50220	MS50220	jdk.charsets/sun/nio/cs/ext/MS50220.java	05baa6b753f0613694e6da66fe43af38fefec7cbf3af6219fb1065be15d0058d	Ms5022x	ms50220|cp50220
+x-windows-50221	MS50221	jdk.charsets/sun/nio/cs/ext/MS50221.java	f810b9d3d36252cc5870a3dad99546febb0b9cf4f83c2daa121f46cfb69e5689	Ms5022x	ms50221|cp50221
+x-windows-iso2022jp	MSISO2022JP	jdk.charsets/sun/nio/cs/ext/MSISO2022JP.java	894432fc41796495172c84affc92eadd8435f4b215fab382cd63ab4061d6699d	MsIso	windows-iso2022jp
