@@ -783,3 +783,25 @@ Independent source review covers six added ownership regression sources and pres
 Retained prediction storage, shared cache histories, closure and adaptive prediction, generated rules and production parsing remain required implementation work.
 All regression sources remain unexecuted.
 The source-completeness gate remains false; compilation, runtime discovery and tests remain unrun.
+
+== Kafka charset and private-key parameter source checkpoint
+
+The pinned Temurin 25.0.1+8 Linux built-in charset registry contains 60 standard and 113 extended charsets, with 927 distinct case-normalized registered names and aliases.
+A source-only reconciliation now finds all 927 names in native lookup, with no additional registered spelling and 849 table alias bindings checked against their provider classes or decoder variants.
+The registry includes ISO-2022 families, ISCII91, default GB18030-2022, JIS0213, and JISAutoDetect.
+Extended-provider lookup also retains its four Unicode case equivalents through a separate static canonical-name inventory.
+Standard-provider lookup retains its ASCII-only case behavior.
+JISAutoDetect follows the pinned Linux Shift_JIS selection, strict probe priority, consumed-input comparison, Japanese-text heuristic, suffix replay, and record reset.
+Its probes use fixed call-local state, and the selected decoder appends into one admitted output String.
+Independent source reconstruction covers the mapping bytes, probe outcomes, replacement digests, provider declarations, and source provenance for these slices.
+Additional installed charset providers and alternate source platform or property profiles remain separate obligations.
+
+Private-key AlgorithmParameters admission now includes iterative nested PSS/OAEP validation, legacy PBE and fixed-IV services, PBES2's fourteen initialized names, and SpecifiedSHA2's parameter-dependent names.
+The complete pinned KnownOIDs source registry yields exactly five reverse OIDs after SpecifiedSHA2's name transformation.
+The evaluator distinguishes a caught Java IOException from a successful name without a reverse OID, while unchecked magnitude overflow and native resource failures propagate.
+CRT parameter retention and non-CRT name-based reconstruction retain their distinct source behavior under admitted ownership.
+Independent review covers the iterative frame bound, failure ordering, regression sources, unchanged prior inputs, and source-derived name tables.
+SunX509 JKS raw parsing, AlgorithmParameters initialization, and provider-specific KeyFactory fallback still require integration through their separate recovery boundary.
+Avro Java name policy, scrubbed field lookup, specific/reflection adapters, and shipped-classpath reconciliation remain open adapter work.
+The regression sources added by these slices remain unexecuted under the Phase 1 work order.
+This checkpoint does not close the source-completeness gate or establish runtime compatibility.
