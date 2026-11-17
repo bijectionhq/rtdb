@@ -1,11 +1,17 @@
-use std::{collections::BTreeMap, mem::size_of, sync::{Arc, atomic::{AtomicU64, Ordering}}};
+use std::{collections::BTreeMap, mem::size_of, sync::{Arc, OnceLock, atomic::{AtomicU64, Ordering}}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use super::{error, super::{ConversionContext, schema_graph::Scalar}};
 
 mod equality;
 mod binary;
+mod hashing;
+mod collections;
+mod evaluation;
+mod property_cache;
 pub(super) use binary::{ByteStorage, ByteBuffer, BufferBacking, BufferOrder};
+pub(super) use collections::{JavaKey, JavaMapBuilder, JavaMap, KeyIdentity, PreviousValue};
+pub(super) use evaluation::{Evaluation, IdentityWitness, MissingIdentityWitness, SchemaType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ObjectId { region: RegionId, index: usize }
@@ -19,10 +25,12 @@ fn take_region_id(counter: &AtomicU64) -> Result<RegionId> {
 pub(super) struct SchemaHandle { arena: Arc<SchemaObjects>, object: ObjectId }
 #[derive(Clone, Copy)]
 pub(super) struct ObjectView<'a> { arena: &'a SchemaObjects, object: ObjectId }
+#[derive(Clone, Copy)]
+pub(super) struct ValueOwner<'a> { arena: &'a SchemaObjects }
 
 pub(super) struct SchemaObjectsBuilder { arena: SchemaObjects }
 struct SchemaObjects { region: RegionId, objects: Vec<Object>, charges: Vec<Arc<MemoryReservation>> }
-enum Object { Builder { body: Body, state: BuilderState }, Built(ObjectId), Wrapper { target: ObjectId, optional: bool }, Imported(SchemaHandle) }
+enum Object { Builder { body: Body, state: BuilderState }, Built { builder: ObjectId, hash: OnceLock<i32> }, Wrapper { target: ObjectId, optional: bool }, Imported(SchemaHandle) }
 enum BuilderState { Building, Complete }
 struct Body { kind: Kind, metadata: Metadata }
 enum Kind { Scalar(Scalar), Array(ObjectId), Map(ObjectId, ObjectId), Struct(Vec<Field>) }
@@ -37,7 +45,7 @@ struct Metadata {
 pub(super) enum JavaValue {
     Null, Bool(bool), I8(i8), I16(i16), I32(i32), I64(i64), F32(f32), F64(f64),
     String(String), ByteArray(Arc<ByteStorage>), ByteBuffer(ByteBuffer), Date(i64), Decimal(BigDecimal),
-    Array(Vec<JavaValue>), Map(Vec<(JavaValue, JavaValue)>), Struct { schema: ObjectId, values: Vec<JavaValue> },
+    Array(Vec<JavaValue>), Map(JavaMap), Struct { schema: ObjectId, values: Vec<JavaValue> },
 }
 #[derive(Debug)]
 pub(super) struct BigDecimal { coefficient: Vec<u8>, scale: i32 }
@@ -92,6 +100,8 @@ impl SchemaObjectsBuilder {
         }
     }
     fn require(&self, id: ObjectId) -> Result<()> { self.arena.require(id) }
+    pub(super) fn view(&self, id: ObjectId) -> Result<ObjectView<'_>> { self.require(id)?; Ok(ObjectView { arena: &self.arena, object: id }) }
+    pub(super) fn owner(&self) -> ValueOwner<'_> { ValueOwner { arena: &self.arena } }
     fn builder(&mut self, kind: Kind, context: &mut ConversionContext) -> Result<ObjectId> { self.insert(Object::Builder { body: Body { kind, metadata: Metadata::default() }, state: BuilderState::Building }, context) }
     pub(super) fn scalar(&mut self, kind: Scalar, context: &mut ConversionContext) -> Result<ObjectId> { self.builder(Kind::Scalar(kind), context) }
     pub(super) fn record(&mut self, context: &mut ConversionContext) -> Result<ObjectId> { self.builder(Kind::Struct(Vec::new()), context) }
@@ -134,22 +144,27 @@ impl SchemaObjectsBuilder {
     }
     /// `bound` covers every allocation performed by `materialize`, including its typed container slots and payloads.
     pub(super) fn default_with(&mut self, builder: ObjectId, bound: usize, context: &mut ConversionContext, materialize: impl FnOnce() -> Result<JavaValue>) -> Result<super::default_input::DefaultAttempt<()>> {
-        self.building(builder)?; self.admit(bound, context)?;
-        let value = materialize()?;
-        let validation = equality::validate(&value, &self.arena, ObjectView { arena: &self.arena, object: builder }, context, 0)?;
+        self.default_typed_with(builder, bound, context, &mut MissingIdentityWitness, |_, _, _| materialize())
+    }
+    /// `bound` covers callback-owned value slots/payloads; returned typed owners retain their separately admitted storage leases.
+    pub(super) fn default_typed_with<W: IdentityWitness>(&mut self, builder: ObjectId, bound: usize, context: &mut ConversionContext, witness: &mut W, materialize: impl FnOnce(ValueOwner<'_>, Arc<MemoryReservation>, &mut Evaluation<'_, W>) -> Result<JavaValue>) -> Result<super::default_input::DefaultAttempt<()>> {
+        self.building(builder)?; let payload = self.admit(bound, context)?;
+        let mut evaluation = Evaluation { context, witness };
+        let value = materialize(ValueOwner { arena: &self.arena }, payload, &mut evaluation)?;
+        let validation = evaluation.validate(&value, &self.arena, ObjectView { arena: &self.arena, object: builder }, 0)?;
         if let super::default_input::DefaultAttempt::Invalid(cause) = validation { return Ok(super::default_input::DefaultAttempt::Invalid(cause)); }
         self.building(builder)?.metadata.default = if matches!(value, JavaValue::Null) { None } else { Some(value) }; Ok(super::default_input::DefaultAttempt::Value(()))
     }
     pub(super) fn wrapper(&mut self, target: ObjectId, optional: bool, context: &mut ConversionContext) -> Result<ObjectId> { self.require(target)?; self.insert(Object::Wrapper { target, optional }, context) }
     pub(super) fn build(&mut self, builder: ObjectId, context: &mut ConversionContext) -> Result<ObjectId> {
         self.building(builder)?;
-        let built = self.insert(Object::Built(builder), context)?;
+        let built = self.insert(Object::Built { builder, hash: OnceLock::new() }, context)?;
         match &mut self.arena.objects[builder.index] { Object::Builder { state, .. } => *state = BuilderState::Complete, _ => unreachable!() };
         Ok(built)
     }
     pub(super) fn import(&mut self, handle: &SchemaHandle, context: &mut ConversionContext) -> Result<ObjectId> {
         for (index, object) in self.arena.objects.iter().enumerate() {
-            if let Object::Imported(existing) = object { if existing.view().identity()? == handle.view().identity()? { return Ok(ObjectId { region: self.arena.region_id(), index }); } }
+            if let Object::Imported(existing) = object { if Arc::ptr_eq(&existing.arena, &handle.arena) && existing.view().identity()? == handle.view().identity()? { return Ok(ObjectId { region: self.arena.region_id(), index }); } }
         }
         handle.retain(context)?;
         self.insert(Object::Imported(handle.clone()), context)
@@ -167,23 +182,37 @@ impl SchemaObjects {
     fn require(&self, id: ObjectId) -> Result<()> {
         if id.region == self.region_id() && id.index < self.objects.len() { Ok(()) } else { Err(invalid("Schema object is outside its owning region")) }
     }
+    fn find_region(&self, region: RegionId, depth: usize) -> Result<&Self> {
+        fn find(arena: &SchemaObjects, region: RegionId, depth: usize) -> Result<Option<&SchemaObjects>> {
+            if depth > 128 { return Err(invalid("Imported typed-value owner depth exceeded")); }
+            if arena.region == region { return Ok(Some(arena)); }
+            for object in &arena.objects { if let Object::Imported(handle) = object { if let Some(owner) = find(&handle.arena, region, depth + 1)? { return Ok(Some(owner)); } } }
+            Ok(None)
+        }
+        find(self, region, depth)?.ok_or_else(|| invalid("Typed value's original schema owner is not retained by this region"))
+    }
+    fn value_schema(&self, object: ObjectId) -> Result<ObjectView<'_>> { Ok(ObjectView { arena: self.find_region(object.region, 0)?, object }) }
+}
+
+impl JavaValue {
+    fn retain(&self, context: &mut ConversionContext, depth: usize) -> Result<()> {
+        if depth > 128 { return Err(invalid("Typed value nesting depth exceeded")); }
+        match self {
+            JavaValue::ByteArray(storage) => storage.retain(context)?,
+            JavaValue::ByteBuffer(buffer) => buffer.retain(context)?,
+            JavaValue::Array(children) | JavaValue::Struct { values: children, .. } => for child in children { child.retain(context, depth + 1)?; },
+            JavaValue::Map(entries) => { entries.retain(context)?; for (key, child) in entries.iter() { key.retain(context, depth + 1)?; child.retain(context, depth + 1)?; } },
+            _ => (),
+        }
+        Ok(())
+    }
 }
 
 impl SchemaHandle {
+    pub(super) fn owner(&self) -> ValueOwner<'_> { ValueOwner { arena: &self.arena } }
     pub(super) fn view(&self) -> ObjectView<'_> { ObjectView { arena: &self.arena, object: self.object } }
     pub(super) fn at(&self, object: ObjectId) -> Result<ObjectView<'_>> { self.arena.require(object)?; Ok(ObjectView { arena: &self.arena, object }) }
     pub(super) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
-        fn values(value: &JavaValue, context: &mut ConversionContext, depth: usize) -> Result<()> {
-            if depth > 128 { return Err(invalid("Typed value nesting depth exceeded")); }
-            match value {
-                JavaValue::ByteArray(storage) => storage.retain(context)?,
-                JavaValue::ByteBuffer(buffer) => buffer.retain(context)?,
-                JavaValue::Array(children) | JavaValue::Struct { values: children, .. } => for child in children { values(child, context, depth + 1)?; },
-                JavaValue::Map(entries) => for (key, child) in entries { values(key, context, depth + 1)?; values(child, context, depth + 1)?; },
-                _ => (),
-            }
-            Ok(())
-        }
         fn walk(arena: &SchemaObjects, seen: &mut Vec<RegionId>, context: &mut ConversionContext, depth: usize) -> Result<()> {
             if depth > 128 { return Err(invalid("Imported schema-object depth exceeded")); }
             let owner = arena.region;
@@ -195,7 +224,7 @@ impl SchemaHandle {
             for object in &arena.objects {
                 match object {
                     Object::Imported(imported) => walk(&imported.arena, seen, context, depth + 1)?,
-                    Object::Builder { body, .. } => if let Some(value) = &body.metadata.default { values(value, context, 0)?; },
+                    Object::Builder { body, .. } => if let Some(value) = &body.metadata.default { value.retain(context, 0)?; },
                     _ => (),
                 }
             }
@@ -217,6 +246,7 @@ impl<'a> ObjectView<'a> {
         Err(invalid("Imported schema-object depth exceeded"))
     }
     fn identity(self) -> Result<(RegionId, usize)> { let actual = self.actual()?; Ok((actual.arena.region, actual.object.index)) }
+    pub(super) fn object_id(self) -> Result<ObjectId> { Ok(self.actual()?.object) }
     fn child(self, object: ObjectId) -> Self { Self { arena: self.arena, object } }
     fn body(self) -> Result<BodyView<'a>> {
         let mut current = self; let mut optional = None;
@@ -224,7 +254,7 @@ impl<'a> ObjectView<'a> {
             current = current.actual()?;
             match &current.arena.objects[current.object.index] {
                 Object::Wrapper { target, optional: outer } => { optional.get_or_insert(*outer); current = current.child(*target); }
-                Object::Built(builder) => current = current.child(*builder),
+                Object::Built { builder, .. } => current = current.child(*builder),
                 Object::Builder { body, .. } => return Ok(BodyView { arena: current.arena, body, optional: optional.unwrap_or(body.metadata.optional) }),
                 _ => return Err(invalid("Schema object body is not complete")),
             }

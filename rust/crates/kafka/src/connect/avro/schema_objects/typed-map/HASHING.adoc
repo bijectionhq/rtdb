@@ -1,0 +1,107 @@
+= Typed HashMap and source hash evaluation
+
+This registered internal implementation has no production caller.
+JavaValue::Map owns actual normalized Java hash-filtered mappings through the shared types/java_hash_map engine.
+Its construction, replacement, encounter order and later lookup preserve the source geometry rather than scanning an unchecked pair vector.
+Graph/default/union conversion, the Avro detected-cycle collection and the SMT/writer export owner remain separate integration work.
+
+== Roles and retained owners
+
+JavaMapBuilder is a passive single-writer transient; JavaMap is its passive immutable mapping/lease owner.
+JavaKey is a passive cloneable handle to one immutable Arc object, native identity token and creating region.
+Clones retain that same object without copying its typed value or changing its identity.
+The handle drops its Arc object before its retained payload/allocation leases.
+The materializer supplies an already-admitted payload lease; key-control allocation separately admits sizeof(KeyObject)+4096 before Arc publication.
+Map owners retain that payload lease and every shared-engine storage lease after the temporary ConversionContext drops.
+Replacement returns a passive PreviousValue owning the moved JavaValue before a trailing Arc of the map's payload lease.
+Its accessor borrows the value; no unchecked owned extraction is exposed, and the value drops before that lease.
+PreviousValue.retain counts that payload first and then the shared JavaValue traversal's nested binary/map owners against a fresh context's limit.
+Existing reservations are retained rather than reserved a second time; repeated retention in one context deduplicates their handles.
+Schema-dependent uses still require the retained source family in addition to this payload owner.
+Cached arena retention visits map storage, key payload/control reservations and nested binary owners against the fresh context's limit.
+
+ValueOwner is a passive borrowed view of the complete creating arena/import family.
+ObjectView continues to identify one source schema object.
+An imported root may normalize to its original ObjectView while its ValueOwner retains additional imported key/value schema owners in the outer family.
+A fresh data family can finish on a real imported schema root without constructing a dummy schema builder.
+Foreign key/Struct IDs resolve only through an explicitly retained original region in that family; the same numerical object index in another region cannot substitute for it.
+An import is deduplicated only when its retained outer arena and actual source root both match.
+Importing a larger family rooted at an already-retained schema consequently preserves its additional owners and charges.
+The eventual data owner must retain the finished family handle while any union/default/equality/SMT/writer operation can demand its provenance.
+
+Evaluation is a passive call-local borrower of ConversionContext and an explicit source identity-witness provider.
+It retains no authority, callback, task or monitor beyond the caller's operation.
+The provider supplies the actual source Schema.Type hashCode, SchemaBuilder Object hash, byte-array Object hash and demanded key/Pair identity-hash operations.
+Observations remain consistent for each retained source object/class and admit their own evaluation scratch.
+Native region/key nonces and allocation addresses do not establish Java hash observations.
+Missing demanded observations produce an outer unsupported anomaly before a mapping can be published with invented order.
+The regression witness values are explicit source-algorithm fixtures, not a discovered JVM profile.
+
+== Source callbacks, classes and memos
+
+Every incoming put/get/public-remove hash callback recomputes the typed source hash at the engine's callback point.
+The key does not cache an eagerly computed raw hash.
+The shared engine's stored insertion spread hash remains the separate iterator-removal mechanism.
+Ordinary Map equality uses each left key to look up the right map in source encounter order.
+A same-value reference returns through source self-identity before lookup or hashing, independently of which valid family retains it.
+A null left value performs get then containsKey; a non-null left value performs get then ordinary value equality.
+No global structural-key deduplication is added.
+Source-equal Struct keys can retain different source schema hashes and remain distinct Java mappings.
+
+Scalar hashing preserves Java wrapper classes, canonical NaNs, signed zeros and UTF16 String units.
+The current typed String/name/parameter carriers are Rust String and do not represent isolated Java UTF16 surrogates.
+Their coordinated carrier/parser expansion remains required before whole graph/default activation; this slice does not replace those units or establish that domain's parity.
+Byte arrays hash by their observed object identity; ByteBuffer hashes reversed signed bytes in its remaining range.
+Concrete heap/direct/read-only buffer classes do not pass HashMap's declared Comparable<C> screen merely because ByteBuffer's superclass implements Comparable<ByteBuffer>.
+List values use source ArrayList equality/hash behavior; built field lists use List.copyOf's immutable-list behavior.
+Struct equality compares its schema ordinarily then Arrays.deepEquals over value slots.
+Its hash evaluates the schema reference first and the Arrays.deepHashCode(values) argument second, before Objects.hash begins hashing those arguments and calls schema.hashCode.
+Deep mode applies directly to byte-array slots and stops at a nested List/Map's ordinary operation.
+
+Each Built object owns its ConnectSchema hash memo.
+The source Objects.hash argument order is type, optionality, ordinary default hash, fields, key schema, value schema, name, version, doc and parameters.
+The memo is published only after that expression succeeds; successful child memos survive a later parent failure.
+Imported schemas preserve their original memo owner.
+Wrappers hash optionality then their actual target; live or completed SchemaBuilder objects retain identity hashing.
+Pinned Enum.hashCode also has its own lazy nonzero identity-hash memo; the provider's type_hash operation includes that source class behavior rather than demanding a fresh identity observation on every invocation.
+
+BigDecimal hashing consumes arbitrary admitted signed coefficient width and scale without applying the writer's 64-digit limit.
+Numeric Comparable comparison preserves scale-insensitive numeric order while ordinary equality remains scale-sensitive.
+Equal-scale comparison needs no output allocation.
+Different-scale comparison admits two bounded base10 magnitude scratch vectors before their respective allocations, compares adjusted exponents, then aligned digits.
+Each scratch vector reserves sixteen times (coefficient magnitude bytes+1) u32 slots plus256, with checked arithmetic; its retained context reservation covers simultaneous buffers.
+This native arithmetic/scratch implementation does not claim JVM BigInteger allocation or OOME equivalence.
+
+== Property-comparison cache
+
+Evaluation.properties implements the actual AvroData Pair/HashMap cache path.
+The cache is a passive call-local shared Map<Pair,bool,Lease> transient.
+Pair holds two borrowed schema views and a native source-object token; it cannot outlive either arena.
+Pair hashes Objects.hash(left,right), compares left then right with ordinary schema equality, and uses explicit observed identity only if a noncomparable collision tree demands it.
+The identity fast path precedes Pair creation.
+Actual putIfAbsent(pair,true) precedes metadata/default/child comparisons, and a non-null hit returns immediately.
+A new provisional true entry guards recursive comparison, then final put reuses the same Pair identity and recomputes hashes.
+Map children compare value schema before key schema as AvroData.schemaEquals does.
+The cache owns its collection reservations during the call, and the conversion context retains those temporary charges through its scope.
+
+The older ObjectView.property_equals helper retains its identity-pair observation route for the published arena fixtures.
+It is not the new property-cache activation path and cannot establish Java cache/error-order parity.
+The coordinated graph caller must use Evaluation.properties with the actual source witness/profile.
+Avro Java Schema.equals/hashCode for ToConnectContext.detectedCycles remains a distinct relation requiring its own implementation.
+
+== Provenance and source fixtures
+
+link:sources.sha256[] pins thirty-two Temurin25.0.1+8 members, five Kafka Connect4.4.0 members, Confluent7.8.0 AvroData and the separately scoped Avro1.11.4 Schema reference.
+link:COPYRIGHT[] retains all thirty-nine full pre-package source prefixes.
+link:source-profile.json[] records exact archive/profile scope and the identity qualification.
+The existing link:../../names/LICENSE[GPLv2 with Classpath exception] and link:../../names/LICENSE-APACHE[Apache2 license] remain retained with this crate.
+The shared collection's independent source manifest is retained in types/src/java_hash_map/sources.sha256.
+
+Source intervals include ConnectSchema309–332, Field67–79, SchemaBuilder422–425, Struct238–251, AvroData2458–2548 and2625–2641.
+JDK operations include Enum182–193, Objects125–127, Arrays4569–4590 and4642–4669, AbstractMap450–475 and497–502, ArrayList599–650 and663–682, ImmutableCollections321–347, BigDecimal3081–3146 and3244–3252, BigInteger4076–4078, ByteBuffer1745–1756 and the concrete buffer class declarations.
+The borrowed signed-magnitude hash follows ArraysSupport183–189 and407–413; primitive wrapper and String helper bodies are individually pinned in the same manifest.
+
+Nineteen evaluation and two Pair-cache regression functions cover primitive/decimal/binary hashes, source hash order, memo failure boundaries, actual long/mixed/Struct keys, map null lookup order, repeated operator failure, key/map/replaced-value lease ownership, fresh parent/map/binary retention limits, retained larger import families, family-independent self-identity, equal-key/different-hash mappings, provisional pairs and ordinary-equal Pair collapse.
+The twenty-four published arena fixtures retain every assertion and value; their two Map-input constructors now use the admitted typed constructor.
+No fixture was executed, and no source fixture count is an executed denominator.
+The A09 NullNode conflict remains untouched and qualified in the earlier observation report.

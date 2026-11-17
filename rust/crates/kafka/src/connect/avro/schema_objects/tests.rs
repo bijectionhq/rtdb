@@ -1,4 +1,9 @@
 use super::*;
+fn typed_map<W: IdentityWitness>(entries: Vec<(JavaValue,JavaValue)>, owner: ValueOwner<'_>, payload: Arc<MemoryReservation>, evaluation: &mut Evaluation<'_,W>) -> Result<JavaValue> {
+    let mut map=JavaMapBuilder::new(None,owner,Arc::clone(&payload))?;
+    for (key,value) in entries {let key=JavaKey::new(key,owner,Arc::clone(&payload),evaluation.context)?;map.put(key,value,owner,evaluation)?;}
+    Ok(JavaValue::Map(map.finish(evaluation)?))
+}
 use super::super::default_input::DefaultAttempt;
 use rtdb_columnar::MemoryBudget;
 
@@ -139,7 +144,7 @@ fn map_validation_checks_each_key_before_an_unchecked_logical_value_cast_and_ski
     for empty in [true,false] {
         let mut builder=SchemaObjectsBuilder::new(&mut context).unwrap();let key=builder.scalar(Scalar::String,&mut context).unwrap();builder.name(key,Some("org.apache.kafka.connect.data.Date"),&mut context).unwrap();let key=builder.build(key,&mut context).unwrap();
         let element=builder.record(&mut context).unwrap();builder.name(element,Some("org.apache.kafka.connect.data.Date"),&mut context).unwrap();let element=builder.build(element,&mut context).unwrap();let map=builder.map(key,element,&mut context).unwrap();
-        let result=builder.default_with(map,16384,&mut context,|| Ok(JavaValue::Map(if empty {Vec::new()} else {vec![(JavaValue::String("key".into()),JavaValue::Date(0))]}))).unwrap();
+        let result=builder.default_typed_with(map,16384,&mut context,&mut MissingIdentityWitness,|owner,payload,evaluation| typed_map(if empty {Vec::new()} else {vec![(JavaValue::String("key".into()),JavaValue::Date(0))]},owner,payload,evaluation)).unwrap();
         assert_eq!(matches!(result,DefaultAttempt::Value(())),empty);let built=builder.build(map,&mut context).unwrap();assert!(builder.finish(built,&mut context).is_ok());
     }
 }
@@ -195,10 +200,10 @@ fn binary_default(buffer:bool,shape:BinaryShape,context:&mut ConversionContext)-
             let record=builder.record(context).unwrap();builder.field(record,"bytes",field,context).unwrap();let record=builder.build(record,context).unwrap();record_id=Some(record);builder.array(record,context).unwrap()
         }
     };
-    accepted(builder.default_with(root,16384,context,|| Ok(match shape {
+    accepted(builder.default_typed_with(root,16384,context,&mut MissingIdentityWitness,|owner,payload,evaluation| Ok(match shape {
         BinaryShape::Direct=>value,
         BinaryShape::List=>JavaValue::Array(vec![value]),
-        BinaryShape::Map=>JavaValue::Map(vec![(JavaValue::String("key".into()),value)]),
+        BinaryShape::Map=>typed_map(vec![(JavaValue::String("key".into()),value)],owner,payload,evaluation)?,
         BinaryShape::StructField|BinaryShape::StructListField=>{
             let value=if matches!(shape,BinaryShape::StructListField) {JavaValue::Array(vec![value])} else {value};
             JavaValue::Array(vec![JavaValue::Struct{schema:record_id.unwrap(),values:vec![value]}])

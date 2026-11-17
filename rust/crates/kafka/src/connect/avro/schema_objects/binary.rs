@@ -17,6 +17,12 @@ impl ByteStorage {
     pub(super) fn retain(&self, context: &mut ConversionContext) -> Result<()> { context.retain(Arc::clone(&self._charge)) }
 }
 impl ByteBuffer {
+    pub(super) fn class_name(&self) -> &'static str {
+        match self.backing {
+            BufferBacking::Heap { read_only: false, .. } => "java.nio.HeapByteBuffer", BufferBacking::Heap { read_only: true, .. } => "java.nio.HeapByteBufferR",
+            BufferBacking::Direct { read_only: false } => "java.nio.DirectByteBuffer", BufferBacking::Direct { read_only: true } => "java.nio.DirectByteBufferR",
+        }
+    }
     pub(in crate::connect::avro) fn whole(storage: Arc<ByteStorage>) -> Self {
         let capacity = storage.bytes.len(); Self { storage, backing: BufferBacking::Heap { offset: 0, read_only: false }, capacity, position: 0, limit: capacity, mark: None, order: BufferOrder::BigEndian }
     }

@@ -17,6 +17,7 @@ Foreign IDs are rejected before an edge or schema handle can use them.
 Recursive local references are IDs and create no Arc back edge.
 Imported handles point to completed immutable arenas and preserve their original object identity and reservation ownership.
 Imports therefore form an older-owner DAG.
+Import deduplication requires both the same retained outer arena and the same actual source root, preserving larger families rooted at an already-imported object.
 Stored Struct IDs remain in their actual owning arena, or become local forwarding imports that preserve that original schema identity.
 Copying a default into a new region cannot reinterpret an old object index as belonging to the new arena.
 
@@ -43,10 +44,16 @@ An imported cached object normalizes to its original identity before those opera
 
 The separate property comparison models AvroData.schemaEquals metadata/default/child traversal and uses an admitted temporary pair cache with provisional true entries for cycles.
 It is not Avro Java Schema.equals and cannot be substituted for ToConnectContext's detected-cycle relation.
-The current pair cache is indexed by object identity; concrete Java Pair/HashMap hashing, ordinary-equal key collapse, collision order and error/scratch timing remain an explicit activation implementation obligation.
-Typed Map equality currently performs ordinary key/value matching over retained entries; the complete Java key hashing/lookup/replacement order remains required with the arbitrary-key integration.
-The current private JavaValue::Map vector can represent duplicate Java keys or a different encounter order and is not a proof that its input is an actual normalized Java Map.
-Before activation, the concrete admitted HashMap constructor/insertion/collision/order capability must enforce unique visible keys and source iteration order before these values can be used.
+Evaluation supplies the concrete Java Pair/HashMap cache path, including ordinary-equal Pair collapse, source hash callbacks, provisional insertion and final put.
+The older ObjectView.property_equals observation helper retains its identity-pair scratch route and cannot establish that cache's error/order behavior.
+JavaValue::Map now owns a normalized shared HashMap capability with retained storage leases, actual source hash-filtered replacement and encounter/lookup geometry.
+Its keys are admitted cloneable handles retaining one typed object and source identity; no unchecked pair-vector constructor remains.
+Replacement returns PreviousValue, which owns the moved value before a trailing payload lease and exposes borrowed access only.
+Its fresh-context retention counts that payload and the same nested value-owner traversal used by cached schemas.
+That payload owner remains distinct from the retained schema family required by later schema-dependent operations.
+Evaluation performs ordinary Map equality through actual get/containsKey operations, while caller-supplied source identity observations remain explicitly qualified.
+The coordinated graph caller must use this Evaluation path and retain its complete ValueOwner import family through later schema-dependent consumers.
+link:typed-map/HASHING.adoc[The typed collection and hashing contract] records the exact source/cache/witness and admission boundaries.
 These qualifications are not source-parity or activation-closure claims.
 
 Default objects use Object.deepEquals at the default-object boundary.
