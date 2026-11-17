@@ -209,6 +209,21 @@
         "sha256": "c35534168fa008192936362530a877ed323f924228361df1395f81d9d5edf6e3",
         "prefix_bytes": 1214,
         "prefix_sha256": "b2954544393c73f8580d575dd08af4c78869150306e25b9f01c028bb3ba82a0c"
+      },
+      "java.base/java/util/Collections.java": {
+        "sha256": "df6478b21171697d14418a89daf3a2a1309ab210a5095fb58de2383528327006",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "0f56c6daa65499e0d68c4942623effbb3c9c258cc4a78b4ded8c552463ec403f"
+      },
+      "java.base/java/util/Random.java": {
+        "sha256": "254dd5b5b2d6901d70b33be3b3d410ede53c5ed041342a608919e15b966198ea",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "23639296d4d6c43fa163fdebd98ac19e0dc956d26688127d0ae2e6b55254f49d"
+      },
+      "java.base/java/net/InetSocketAddress.java": {
+        "sha256": "0e53690d19e66a600ad55aa6f5991bf58fe9af940dcee2b8442a1df1c3367a57",
+        "prefix_bytes": 1213,
+        "prefix_sha256": "fb1fa580c2d966238fd635a310892a4b15170c7241e00927b97ad1b035d14394"
       }
     }
   },
@@ -216,5 +231,12 @@
     "LICENSE": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726",
     "ASSEMBLY_EXCEPTION": "75292f03bf23d3db7c985aecc191029b93883200721ed23ed34a2e601463df33",
     "ADDITIONAL_LICENSE_INFO": "a69bce275ba7a3570af6579cb0f55682cd75fedfcd49e0e8e9022270c447c916"
+  },
+  "bootstrap_scope": {
+    "metadata": "Metadata.bootstrap/rebootstrap307-317; MetadataSnapshot.bootstrap234-244; Cluster.bootstrap215-222 and constructor node-copy/shuffle/index stages",
+    "shuffle": "Collections430-435 and482-488; Random310-329 and549-563; caller-observed default Random acquisition and complete nextInt operation, with no native substitute",
+    "resolved_endpoints": "InetSocketAddress.getHostString87-97 and371-372; getPort339-340 and checkPort151-155; actual DNS/config resolution remains caller-owned",
+    "ordinary_response_cluster_order": "Unobserved by this slice; only bootstrap Cluster.nodes retains the supplied source shuffle observations",
+    "source_only": true
   }
 }

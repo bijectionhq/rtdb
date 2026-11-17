@@ -381,3 +381,5 @@ fn active_topic_tree_entries_expire_through_successful_response_application() {
     assert_eq!(p.request(100).unwrap().topics().count(), 0);
     assert_eq!(p.snapshot().brokers().len(), 1);
 }
+
+mod bootstrap;

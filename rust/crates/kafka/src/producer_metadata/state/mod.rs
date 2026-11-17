@@ -9,11 +9,13 @@ mod response;
 mod snapshot;
 mod topics;
 mod merge;
+mod bootstrap;
 
 pub use keys::{IdentityWitness, NoIdentityWitness, TopicId, TopicPartitionKey};
 pub use owned::Text;
 pub use response::{Node, Partition};
 pub use snapshot::Snapshot;
+pub use bootstrap::{BootstrapAddresses, ResolvedEndpoint, JavaShuffleObservations, MissingShuffleObservations, ShuffleAdmission};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};
@@ -41,6 +43,8 @@ pub enum Failure {
     Closed,
     /// Selection consumed the topic counter but found no partition.
     EmptyTopic,
+    /// Rebootstrap was requested before any bootstrap addresses were installed.
+    MissingBootstrapAddresses,
     /// A previous native failure ended this mutable producer capability.
     CapabilityFailed,
 }
@@ -82,6 +86,7 @@ pub struct ProducerMetadata {
     new_topics: Names,
     epochs: Map<TopicPartitionKey, i32, Lease>,
     snapshot: Snapshot,
+    bootstrap_addresses: Option<BootstrapAddresses>,
     counters: Vector<Counter>,
     errors: Option<Table<Option<Text>, i16>>,
     invalid: Table<Option<Text>, ()>,
@@ -96,7 +101,7 @@ impl ProducerMetadata {
         let mut budget = Budget(budget);
         let refresh = RefreshState::new(settings.refresh_backoff_ms, settings.refresh_backoff_max_ms, settings.metadata_expire_ms, observations);
         Ok(Self {
-            snapshot: Snapshot::empty(&mut budget, identity)?, refresh, idle_ms: settings.metadata_idle_ms,
+            snapshot: Snapshot::empty(&mut budget, identity)?, bootstrap_addresses: None, refresh, idle_ms: settings.metadata_idle_ms,
             active: ActiveTopics::new(), new_topics: Map::new(None)?, epochs: Map::new(None)?,
             counters: Vector::new(), errors: None, invalid: Map::new(None)?.finish(&mut budget)?,
             unauthorized: Map::new(None)?.finish(&mut budget)?, budget, failed: false,

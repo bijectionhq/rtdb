@@ -1,7 +1,7 @@
 = Producer metadata state
 
 * D1: `ProducerMetadata` is a passive owner driven by one serialized caller.
-** It owns topic expiry, request membership, refresh state, last-seen epochs and producer-lifetime RoundRobin counters.
+** It owns topic expiry, request membership, refresh state, last-seen epochs, producer-lifetime RoundRobin counters and the last successful bootstrap address owner.
 ** `MetadataRequest` retains the chosen request version and topic sequence until its response arrives.
 ** `PreparedSend` retains one selected partition with the record and the immutable generation used for selection.
 Retries reuse that selected partition.
@@ -13,7 +13,8 @@ Retries reuse that selected partition.
 ** Broker duplicate rejection occurs in the response holder before topic wrappers are built.
 ** Partition availability requires a resolved leader node, including a node with an empty host or negative port.
 ** `brokers()` exposes holder-map encounter order.
-The shuffled `Cluster.nodes()` list used by a Java network client belongs to the network adapter.
+Ordinary response `Cluster.nodes()` shuffle remains a network-adapter observation.
+Bootstrap generations separately retain their qualified source-shuffled Cluster node list.
 
 * D3: Response application preserves source mutation stages.
 ** The holder and the network response error map precede the rebootstrap/empty-broker branches.
@@ -53,12 +54,44 @@ Native addresses, region IDs and allocation counters do not supply Java identity
 ** String comparisons use unsigned UTF16 units; UUID comparisons use signed 64-bit halves.
 Primitive integer and UUID lookup operations have no externally supplied callbacks.
 ** Java math/random operations remain supplied through the refresh observation provider.
-** The network adapter must own bootstrap/rebootstrap generations, broker selection, throttles, fatal errors and waiter notification.
+** The network adapter must resolve source bootstrap endpoints, supply the qualified Java shuffle authority, select brokers and own throttles, fatal errors and waiter notification.
 It must carry the captured request scope into `apply` after connection throttling and use `PreparedSend` for actual enqueue retries.
 ** Construction, broker/thread growth, automatic native metadata caches, ApiVersions, TLS/SASL, ordinary outbound owners and compression overlap need their own finite admitted domain.
 Receive-frame and ordered-request accounting do not bound those owners.
 ** The production module is awaiting its coordinated registration and DLQ adapter.
 The standalone integration fixture imports these production sources directly.
+
+== Bootstrap generations
+
+`prepare_bootstrap_addresses` creates an admitted immutable owner for an already resolved source address list before the source bootstrap call.
+Hosts are the caller's exact InetSocketAddress.getHostString values within the represented UTF8 domain, and ports use the source address's unsigned16-bit domain.
+It performs no DNS lookup, canonicalization, reverse lookup or re-resolution.
+Clones retain the original endpoint owners and budget domain; unrelated-budget input is rejected after the source refresh prefix.
+
+`bootstrap` first marks a full refresh and increments the signed update version with wrapping arithmetic.
+It builds MetadataSnapshot's default HashMap using source negative broker IDs beginning at -1, then independently constructs Cluster.bootstrap's source input node list.
+Only the Cluster list is shuffled.
+`brokers()` retains map encounter order, while `bootstrap_cluster_nodes()` borrows the qualified shuffled list and `is_bootstrap_configured()` exposes the source flag.
+Bootstrap has no controller even though its map contains broker -1.
+Ordinary response generations continue resolving their actual signed controller ID, including -1 when present.
+The closed cluster profile stores that distinction together with its applicable state.
+
+JavaShuffleObservations denotes the pinned Collections.shuffle default Random acquisition and complete Random.nextInt operations.
+`begin` is called even for empty or singleton lists; larger ArrayList profiles request bounds n down through two and swap from the end.
+The provider retains its own source generator state, including class-global Random acquisition/reuse and any seed/rejection history.
+It admits its native state and scratch through the supplied synchronous byte authority and retains those leases through actual final release.
+The producer and snapshots retain no provider or callback.
+Missing, exhausted or out-of-range observations fail explicitly; this implementation supplies no native random fallback or invented fixed order.
+Earlier source Cluster.empty acquisition remains part of the enclosing qualified profile, rather than an assumption of a newly seeded generator.
+
+A completed Snapshot is published before the already prepared address owner is installed.
+Construction failure keeps the previous snapshot and addresses while preserving the source full-refresh/version prefix.
+The existing native failure policy then ends mutation, with previously retained snapshots still readable.
+Missing-address rebootstrap instead preserves that prefix as a distinct source semantic failure and permits later bootstrap.
+`rebootstrap` reuses the retained resolved owner and preserves topic/epoch/counter/error/backoff state beyond the source prefix.
+It neither resolves addresses again nor adds a closed-metadata guard absent from the inspected source.
+Endpoint vectors/text, both Node collections, HashMap storage, shuffled list storage and immutable Snapshot owners are admitted before their actual allocations.
+Thirteen additive source cases cover those orders, lifetime/failure boundaries and state preservation; no runtime result is claimed.
 
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
