@@ -66,7 +66,7 @@ Scalar children retain either admitted Arrow or immutable native scalar storage.
 Public scalar ingress continues to use the validated Arrow opener.
 Each `RetainedBuffer` owns its buffer allocation reservation; child vectors retain their own owners, and native metadata is reserved before cloning or publishing it.
 Container admission checks declarations, complete direct children, row counts, validity spans and child offsets.
-Native and Arrow run-end admission checks every retained end, including unused runs behind sliced, empty and nested readers.
+Public `from_physical` and Arrow run-end admission check every retained end, including unused runs behind sliced, empty and nested readers.
 Run ends must be positive, strictly increasing and within `i32::MAX`, with one value per run and final coverage at least the logical length.
 A shorter logical length, including zero, retains the complete covering run table and its value owners.
 Arrow admission also preserves the SDK's offset-plus-length coverage validation.
@@ -82,7 +82,7 @@ It admits bounded reader metadata before construction and retains that lease unt
 Snapshot construction follows child order and reads nonempty variable/list terminal offsets at their source constructor boundary; failures release the partial copy and leave original readers unchanged.
 Native variable snapshots recompute only the copied last-offset cursor, while zero-count snapshots require no terminal offset.
 Private fixtures exercise wrapped and partial run tables; public native and SDK ingress continue requiring complete validated layouts.
-Partial native container publication, writer trees, full host objects, physical transport and production reader adoption remain separate required work.
+Writer trees, full host objects, physical transport and production reader adoption remain separate required work.
 Dense unions retain every negative discriminator byte as an absent leg.
 Named-leg selections retain raw signed offsets without checking the final child's bounds; nested selection checks only intermediate offset/index entries it actually reads.
 Consuming getters check retained payload bounds before access.
@@ -92,6 +92,21 @@ Null-vector nullness is constant true, and nonnullable scalar/container nullness
 Nullable validity, union discriminators/offsets, indirect indices, run ends and actual payload reads retain their own checked accesses.
 An absent leg is null for `is_null`, has no `leg_name`, and fails primitive/object reads; it remains distinct from an explicit Null leg and from a null nullable Duration leaf.
 No invalid Arrow union is constructed.
+
+The private `NativeContainerParts` publisher captures immutable native Struct, List/Map/Set, FixedList/range, Union and RunEnd states.
+It derives the authoritative descriptor from the actual child owners and moves those same children into storage.
+Publication admits metadata, signed-domain logical count, complete direct child views and byte-cursor coverage before retaining the new node.
+Native initialized buffer spans, byte/bit append cursors, list last-offset, parent count and child counts remain independent.
+Direct Struct field lookup returns the complete child with its own count; field lookup through an indirect reader retains that reader's selection.
+It does not pad missing validity, repair offsets, discard union children or impose complete external run coverage.
+Native list and union offsets use signed i32 byte-stride multiplication before checked access to initialized bytes.
+List count reads its end offset before its start and wraps subtraction; fixed-list count is its signed declared width and its start uses wrapped multiplication.
+Nullable native containers read their retained validity span; nonnullable containers report false without demanding a row payload.
+The existing outer `CellRef` gate and scalar logical-row gate remain in force.
+Raw list extraction and the logical `Value` bridge reject malformed or unavailable element ranges safely.
+The common `ContainerStorageRef` borrows native or admitted SDK storage without copying buffers or synthesizing an Arrow array.
+Native List snapshots reset the copied last-offset from the terminal offset after child and buffer capture; initial native publication retains the supplied last-offset unchanged.
+The empty Null-valued run reader fixture uses this private native path, while public ingestion continues rejecting that declaration.
 
 Forwarding primitive getters, `get_bytes` and concrete numeric wrappers return `VectorReadResult`.
 `VectorReadError::AbsentPrimitiveReceiver` retains the raw message-less NullPointerException producer separately from `VectorReadError::Anomaly`.
@@ -139,7 +154,8 @@ Raw access does not mask a child's payload with its parent's null bit and does n
 `tests/physical_layout.rs` adds native absent-leg containers, raw primitive failure routing, delayed inactive-offset admission, named-reader selection exceptions, canonical declarations, direct numeric/byte methods, shorter logical run lengths, malformed layout rejection and retained-owner failure cases.
 `cells/descriptor.rs` covers nested checked metadata projection, retained projection charges, allocation failure release, declared and ordinal discriminator identity, wrapped named-leg reads, custom child order, empty union types, descriptor depth admission and deep Struct joins under independent finite budgets.
 `cells/descriptor/metadata_tests.rs` covers independent field/type/nullability demand, typed failure ordering, delegated run-end admission, source-native fixed widths, structural reads and retained charges on failed metadata admission.
-Native partial container storage and writer construction remain separate from this descriptor prerequisite; public `from_physical` retains its strict SDK-declared input validation.
+`cells/native_container/tests.rs` covers partial native container counts, initialized spans and cursors, direct and selected child identity, wrapped offsets and ordinals, snapshot failure cleanup and retained leases.
+Writer construction remains separate from immutable native capture; public `from_physical` retains its strict SDK-declared input validation.
 These are unexecuted source regressions.
 Query frames, parameters, spill transport and expression consumers still require a coordinated physical-cell rollout before end-to-end null-check compatibility can be claimed.
 Container writers, physical page transport, hash/metadata factories and production consumers remain separate work.

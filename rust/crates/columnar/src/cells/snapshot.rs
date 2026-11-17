@@ -23,17 +23,16 @@ fn view_bound(vector: &ExecutionVector, depth: usize) -> Result<usize> {
 fn node_bound(node: &PhysicalNode, depth: usize) -> Result<usize> {
     depth_limit(depth)?;
     let mut bytes = std::mem::size_of::<PhysicalNode>().checked_add(std::mem::size_of::<NodeOwner>()).and_then(|n| n.checked_add(256)).ok_or_else(allocation)?;
-    match &node.storage {
-        NodeLayout::Struct { children, .. } | NodeLayout::Union { children, .. } => {
+    match node.container() {
+        Some(ContainerStorageRef::Struct { children, .. } | ContainerStorageRef::Union { children, .. }) => {
             bytes = add(bytes, children.len().checked_mul(std::mem::size_of::<Arc<PhysicalNode>>()).ok_or_else(allocation)?)?;
             for child in children { bytes = add(bytes, node_bound(child, depth + 1)?)?; }
         },
-        NodeLayout::List { elements, .. } | NodeLayout::FixedList { elements, .. } => { bytes = add(bytes, node_bound(elements, depth + 1)?)?; },
-        NodeLayout::RunEnd(reader) => {
+        Some(ContainerStorageRef::List { elements, .. } | ContainerStorageRef::FixedList { elements, .. }) => { bytes = add(bytes, node_bound(elements, depth + 1)?)?; },
+        None => if let NodeLayout::RunEnd(reader) = &node.storage {
             bytes = add(bytes, node_bound(reader.ends(), depth + 1)?)?;
             bytes = add(bytes, node_bound(reader.values(), depth + 1)?)?;
         },
-        NodeLayout::Leaf { .. } | NodeLayout::Scalar(_) => {},
     }
     Ok(bytes)
 }
@@ -52,6 +51,33 @@ fn snapshot_view(vector: &ExecutionVector, reservation: &Arc<MemoryReservation>)
 
 fn snapshot_node(node: &PhysicalNode, reservation: &Arc<MemoryReservation>) -> Result<Arc<PhysicalNode>> {
     let storage = match &node.storage {
+        NodeLayout::NativeContainer(storage) => NodeLayout::NativeContainer(match storage {
+            NativeContainerStorage::Struct { validity, children } => {
+                let validity = validity.clone();
+                let mut copied = Vec::with_capacity(children.len());
+                for child in children { copied.push(snapshot_node(child, reservation)?); }
+                NativeContainerStorage::Struct { validity, children: copied }
+            },
+            NativeContainerStorage::List { validity, offsets, elements, .. } => {
+                let elements = snapshot_node(elements, reservation)?;
+                let validity = validity.clone();
+                let offsets = offsets.clone();
+                let last_offset = if node.length == 0 { 0 } else { node.list_offset(PhysicalIndex::from_position(node.length)?, false)? };
+                NativeContainerStorage::List { validity, offsets, last_offset, elements }
+            },
+            NativeContainerStorage::FixedList { validity, elements } => {
+                let validity = validity.clone();
+                let elements = snapshot_node(elements, reservation)?;
+                NativeContainerStorage::FixedList { validity, elements }
+            },
+            NativeContainerStorage::Union { type_ids, offsets, children } => {
+                let mut copied = Vec::with_capacity(children.len());
+                for child in children { copied.push(snapshot_node(child, reservation)?); }
+                let type_ids = type_ids.clone();
+                let offsets = offsets.clone();
+                NativeContainerStorage::Union { type_ids, offsets, children: copied }
+            },
+        }),
         NodeLayout::Scalar(storage) => {
             let mut storage = storage.clone();
             if let NativeScalarData::Variable { offsets, last_offset, .. } = &mut storage.data {
