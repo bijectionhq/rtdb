@@ -455,14 +455,10 @@ int SSL_CTX_use_PrivateKey_ASN1(int type, SSL_CTX *ctx,
     return ret;
 }
 
-/*
- * Read a file that contains our certificate in "PEM" format, possibly
- * followed by a sequence of CA certificates that should be sent to the peer
- * in the Certificate message.
- */
-static int use_certificate_chain_file(SSL_CTX *ctx, SSL *ssl, const char *file)
+static int use_certificate_chain(SSL_CTX *ctx, SSL *ssl, const char *file,
+    BIO *in)
 {
-    BIO *in = NULL;
+    int borrowed = in != NULL;
     int ret = 0;
     X509 *x = NULL;
     pem_password_cb *passwd_callback;
@@ -488,20 +484,20 @@ static int use_certificate_chain_file(SSL_CTX *ctx, SSL *ssl, const char *file)
         passwd_callback_userdata = sc->default_passwd_callback_userdata;
     }
 
-    if (file == NULL) {
-        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
-        goto end;
-    }
-
-    in = BIO_new(BIO_s_file());
-    if (in == NULL) {
-        ERR_raise(ERR_LIB_SSL, ERR_R_BUF_LIB);
-        goto end;
-    }
-
-    if (BIO_read_filename(in, file) <= 0) {
-        ERR_raise(ERR_LIB_SSL, ERR_R_SYS_LIB);
-        goto end;
+    if (!borrowed) {
+        if (file == NULL) {
+            ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
+            goto end;
+        }
+        in = BIO_new(BIO_s_file());
+        if (in == NULL) {
+            ERR_raise(ERR_LIB_SSL, ERR_R_BUF_LIB);
+            goto end;
+        }
+        if (BIO_read_filename(in, file) <= 0) {
+            ERR_raise(ERR_LIB_SSL, ERR_R_SYS_LIB);
+            goto end;
+        }
     }
 
     x = X509_new_ex(real_ctx->libctx, real_ctx->propq);
@@ -582,18 +578,28 @@ static int use_certificate_chain_file(SSL_CTX *ctx, SSL *ssl, const char *file)
 
 end:
     X509_free(x);
-    BIO_free(in);
+    if (!borrowed)
+        BIO_free(in);
     return ret;
 }
 
 int SSL_CTX_use_certificate_chain_file(SSL_CTX *ctx, const char *file)
 {
-    return use_certificate_chain_file(ctx, NULL, file);
+    return use_certificate_chain(ctx, NULL, file, NULL);
 }
 
 int SSL_use_certificate_chain_file(SSL *ssl, const char *file)
 {
-    return use_certificate_chain_file(NULL, ssl, file);
+    return use_certificate_chain(NULL, ssl, file, NULL);
+}
+
+int SSL_CTX_use_certificate_chain_bio(SSL_CTX *ctx, BIO *in)
+{
+    if (in == NULL) {
+        ERR_raise(ERR_LIB_SSL, ERR_R_PASSED_NULL_PARAMETER);
+        return 0;
+    }
+    return use_certificate_chain(ctx, NULL, NULL, in);
 }
 
 static int serverinfo_find_extension(const unsigned char *serverinfo,

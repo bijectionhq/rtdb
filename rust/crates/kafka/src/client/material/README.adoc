@@ -1,0 +1,42 @@
+= Native Kafka material ownership
+
+`Configuration` is a passive retained wrapper around the Java TLS owner and immutable snapshots of explicit native regular files.
+Its construction runs on the caller before native client creation, after the Java adapter has consumed its own properties.
+It adds no task or background I/O.
+Each raw file buffer is admitted before allocation, zeroized on release and retained with its reservation through the last native configuration or client copy.
+The fixed collection of five file slots owns their filenames and contents; no process-global registry or path cache is used.
+The main Kafka log, Connect source consumers and Registry dead-letter producer use this wrapper.
+Plaintext configurations do not construct it.
+
+The native source distinguishes bytes, an unavailable file and an unmanaged filesystem input.
+Missing files and read failures are captured during preparation and reported when librdkafka reaches the corresponding load site.
+Allocation admission failures return immediately and roll back previously retained snapshots.
+A snapshot with zero bytes is an empty input, not permission to reread a file.
+A pathname changed on a prepared configuration is rejected at its native load site because it has no matching admitted snapshot.
+Regular files are read at their opened metadata length; a shorter read, additional byte or read error produces an unavailable snapshot.
+Concurrent content replacement is not an atomic filesystem snapshot.
+
+The native load sequence remains CA location, inline CA, CRL location, certificate memory/location/inline, key memory/location/inline, then native PKCS12.
+Every configured location is validated before a later inline override is applied.
+CA and CRL locations share OpenSSL's mixed certificate/CRL PEM parser.
+Certificate-chain locations preserve chain replacement, including an empty extra chain.
+Key locations preserve the password callback and selected OpenSSL library context.
+Native PKCS12 decoding uses the context-bearing object established by the provider adapter.
+The generic native capability supports PKCS12 filenames, while the main Java configuration surface consumes `ssl.keystore.location` as a Java store before this wrapper is constructed.
+
+Explicit native hashed CA directories keep OpenSSL's original lazy known-name lookup.
+Directory enumeration is not required, so execute-only directories remain usable when their hashed children are readable.
+New hash suffixes and CRL updates retain native visibility.
+Nonregular paths and the special CA value `probe` also keep native filesystem handling.
+Those paths are not covered by this regular-file raw snapshot admission increment.
+Java JKS, PKCS12 and PEM store snapshots have their own retained material owner; native hashed directories are a distinct configuration surface.
+
+This increment admits retained raw bytes and wrapper/path storage.
+OpenSSL certificate/key decoding runs for each native TLS context, so one shared raw-byte lease does not admit all per-client decoded allocations.
+That remaining qualification needs a per-context lease acquired before native material loading and retained until the context and its keys are destroyed.
+A future bounded directory loader also needs leases attached to retained X509/CRL objects, with duplicate temporary reads releasing their own charge.
+Charging only a temporary directory BIO would leave OpenSSL's growing certificate/CRL cache unaccounted for.
+
+The source trace is librdkafka 2.10.0 `rd_kafka_ssl_set_certs`, OpenSSL 3.6.3 `crypto/x509/by_file.c`, `crypto/x509/by_dir.c` and `ssl/ssl_rsa.c`.
+Regression sources cover immutable bytes after unlinking, native configuration copies, deferred file failures, admission rollback, native load order, mixed certificate/CRL inputs and PKCS12 password failures.
+The patch and test sources remain uncompiled and unexecuted in the source-only phase.

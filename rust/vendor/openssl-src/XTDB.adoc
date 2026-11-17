@@ -23,3 +23,11 @@ Keys loaded through native librdkafka options therefore use the signature overri
 The Rust TLS owner retains both library contexts beyond native context destruction.
 It does not rely on SSL context ex-data destruction, which occurs before native certificate keys are released.
 Regression sources in `../../crates/kafka/src/tls/random` exercise TLS 1.2 and TLS 1.3 client certificates with RSA-PSS and ECDSA and retain the owners through connection teardown.
+
+`X509_load_cert_crl_bio_ex` adds the existing PEM certificate/CRL file parser for a borrowed BIO.
+Its result is the imported object count, or zero on failure; the caller retains BIO ownership.
+The file entry point delegates to that parser after opening its original file BIO.
+`SSL_CTX_use_certificate_chain_bio` loads a certificate and replaces its chain from a borrowed BIO using the same parser and password callbacks as the file entry point.
+`OPENSSL_RTDB_MATERIAL_BIO` identifies these additive interfaces to the bundled librdkafka build.
+Native Kafka snapshot and loader-order regression sources live in `../../crates/kafka/src/client/material/tests.rs`.
+These changes do not alter the recorded upstream manifest and have not been compiled or executed during Phase 1.

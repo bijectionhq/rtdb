@@ -608,3 +608,4 @@ SSL_get_domain_flags                    608	3_5_0	EXIST::FUNCTION:
 SSL_CTX_set_new_pending_conn_cb         609	3_5_0	EXIST::FUNCTION:
 SSL_CTX_set_signature_libctx             610	3_6_3	EXIST::FUNCTION:
 SSL_CTX_get0_signature_libctx            611	3_6_3	EXIST::FUNCTION:
+SSL_CTX_use_certificate_chain_bio        612	3_6_3	EXIST::FUNCTION:

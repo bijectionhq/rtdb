@@ -79,7 +79,8 @@ impl DlqProducer {
         let tls = tls::configure(options, &mut settings.properties, context)?;
         let mut client = crate::client_config(&settings.properties);
         if let Some(tls) = tls {
-            charges.extend(tls.reservations().iter().cloned());
+            let tls = crate::client::material::Configuration::capture(tls, &settings.properties, &mut |bytes| context.reserve(bytes))?;
+            charges.extend(tls.reservations().cloned());
             client.set_ssl_context_configurer(tls);
         }
         let producer = client.create_with_context(DeliveryContext).map_err(|cause| error("dlq", cause))?;

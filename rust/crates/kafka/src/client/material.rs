@@ -1,0 +1,88 @@
+use std::{collections::BTreeMap, ffi::{CStr, c_void}, fs::File, io::{self, Read}, sync::Arc};
+use rdkafka::config::{SslContextConfigurer, SslMaterial, SslMaterialKind, SslMaterialSource};
+use rtdb_columnar::MemoryReservation;
+use rtdb_types::{Anomaly, Result};
+use zeroize::Zeroizing;
+use crate::tls::NativeTls;
+
+const MATERIALS: [(SslMaterialKind, &str); 5] = [
+    (SslMaterialKind::CertificateAuthorities, "ssl.ca.location"),
+    (SslMaterialKind::Revocations, "ssl.crl.location"),
+    (SslMaterialKind::CertificateChain, "ssl.certificate.location"),
+    (SslMaterialKind::PrivateKey, "ssl.key.location"),
+    (SslMaterialKind::KeyStore, "ssl.keystore.location"),
+];
+
+pub(crate) struct Configuration {
+    owner: Arc<NativeTls>,
+    files: [Option<FileSnapshot>; 5],
+    charge: Arc<MemoryReservation>,
+}
+struct FileSnapshot { path: Box<str>, contents: Contents }
+enum Contents { Bytes(AdmittedBytes), Unavailable(i32), Unmanaged }
+struct AdmittedBytes { bytes: Zeroizing<Vec<u8>>, charge: Arc<MemoryReservation> }
+
+impl Configuration {
+    pub(crate) fn capture(owner: Arc<NativeTls>, properties: &BTreeMap<String, String>, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Arc<Self>> {
+        let size = MATERIALS.iter().try_fold(1024usize, |size, (_, name)| size.checked_add(properties.get(*name).map_or(0, String::len)).ok_or_else(overflow))?;
+        let charge = reserve(size)?;
+        let mut files = std::array::from_fn(|_| None);
+        for (index, (kind, name)) in MATERIALS.iter().enumerate() {
+            if let Some(path) = properties.get(*name) {
+                let contents = if *kind == SslMaterialKind::CertificateAuthorities && path == "probe" { Contents::Unmanaged }
+                    else { snapshot(path, reserve)? };
+                files[index] = Some(FileSnapshot { path: path.clone().into_boxed_str(), contents });
+            }
+        }
+        Ok(Arc::new(Self { owner, files, charge }))
+    }
+
+    pub(crate) fn reservations(&self) -> impl Iterator<Item = &Arc<MemoryReservation>> {
+        self.owner.reservations().iter().chain(std::iter::once(&self.charge)).chain(self.files.iter().flatten().filter_map(|file| match &file.contents {
+            Contents::Bytes(bytes) => Some(&bytes.charge), _ => None,
+        }))
+    }
+}
+
+impl SslMaterialSource for Configuration {
+    fn material(&self, kind: SslMaterialKind, path: &CStr) -> SslMaterial<'_> {
+        let index = MATERIALS.iter().position(|(candidate, _)| *candidate == kind).expect("complete native material kinds");
+        match &self.files[index] {
+            Some(file) if file.path.as_bytes() == path.to_bytes() => match &file.contents {
+                Contents::Bytes(bytes) => SslMaterial::Bytes(&bytes.bytes),
+                Contents::Unavailable(error) => SslMaterial::Unavailable(*error),
+                Contents::Unmanaged => SslMaterial::Unmanaged,
+            },
+            _ => SslMaterial::Unavailable(libc::EINVAL),
+        }
+    }
+}
+
+impl SslContextConfigurer for Configuration {
+    fn material_source(&self) -> Option<&dyn SslMaterialSource> { Some(self) }
+    fn replaces_default_trust(&self) -> bool { self.owner.replaces_default_trust() }
+    unsafe fn library_context(&self) -> *mut c_void { unsafe { self.owner.library_context() } }
+    unsafe fn configure(&self, context: *mut c_void) -> std::result::Result<(), String> { unsafe { self.owner.configure(context) } }
+}
+
+fn snapshot(path: &str, reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<Contents> {
+    let metadata = match std::fs::metadata(path) { Ok(metadata) => metadata, Err(error) => return Ok(unavailable(error)) };
+    if !metadata.is_file() { return Ok(Contents::Unmanaged); }
+    let mut file = match File::open(path) { Ok(file) => file, Err(error) => return Ok(unavailable(error)) };
+    let metadata = match file.metadata() { Ok(metadata) => metadata, Err(error) => return Ok(unavailable(error)) };
+    let length = usize::try_from(metadata.len()).ok().filter(|length| *length <= i32::MAX as usize).ok_or_else(overflow)?;
+    let charge = reserve(length.checked_add(128).ok_or_else(overflow)?)?;
+    let mut bytes = Zeroizing::new(vec![0; length]);
+    if let Err(error) = file.read_exact(&mut bytes) { return Ok(unavailable(error)); }
+    match file.read(&mut [0]) {
+        Ok(0) => Ok(Contents::Bytes(AdmittedBytes { bytes, charge })),
+        Ok(_) => Ok(Contents::Unavailable(libc::EAGAIN)),
+        Err(error) => Ok(unavailable(error)),
+    }
+}
+
+fn unavailable(error: io::Error) -> Contents { Contents::Unavailable(error.raw_os_error().unwrap_or(libc::EIO)) }
+fn overflow() -> Anomaly { Anomaly::incorrect("rtdb/memory-budget-exceeded", "Native TLS snapshot exceeds its representable allocation bound") }
+
+#[cfg(test)]
+mod tests;

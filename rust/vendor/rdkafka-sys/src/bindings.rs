@@ -923,6 +923,11 @@ extern "C" {
     ) -> rd_kafka_conf_res_t;
 }
 extern "C" {
+    pub fn rd_kafka_conf_set_ssl_material_cb(
+        conf: *mut rd_kafka_conf_t,
+        callback: Option<unsafe extern "C" fn(kind: c_int, path: *const c_char, data: *mut *const c_void, size: *mut usize, os_error: *mut c_int, opaque: *mut c_void) -> c_int>,
+        opaque: *mut c_void,
+    ) -> rd_kafka_conf_res_t;
     pub fn rd_kafka_conf_set_ssl_ctx_replaces_default_trust(conf: *mut rd_kafka_conf_t, replace: c_int) -> rd_kafka_conf_res_t;
     pub fn rd_kafka_conf_set_ssl_ctx_libctx(conf: *mut rd_kafka_conf_t, context: *mut c_void) -> rd_kafka_conf_res_t;
     pub fn rd_kafka_conf_set_ssl_ctx_configure_cb(

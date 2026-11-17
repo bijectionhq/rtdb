@@ -23,7 +23,7 @@
 //! [librdkafka-config]: https://github.com/edenhill/librdkafka/blob/master/CONFIGURATION.md
 
 use std::collections::HashMap;
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::iter::FromIterator;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
@@ -87,9 +87,46 @@ pub struct NativeClientConfig {
     pub(crate) ssl_context: Option<Arc<SslContextConfig>>,
 }
 
+/// Native TLS file whose bytes can be supplied by a retained configuration owner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SslMaterialKind {
+    /// The `ssl.ca.location` file or hashed directory.
+    CertificateAuthorities,
+    /// The `ssl.crl.location` PEM file.
+    Revocations,
+    /// The `ssl.certificate.location` PEM certificate and chain.
+    CertificateChain,
+    /// The `ssl.key.location` PEM private key.
+    PrivateKey,
+    /// The native `ssl.keystore.location` PKCS12 file.
+    KeyStore,
+}
+
+/// A borrowed immutable native TLS file, an I/O failure, or the original filesystem loader.
+/// `Unavailable` carries an OS error number and prevents filesystem fallback.
+pub enum SslMaterial<'a> {
+    /// Uses the original filesystem loader.
+    Unmanaged,
+    /// Borrows immutable bytes from the retained source, including an empty input.
+    Bytes(&'a [u8]),
+    /// Fails this load with the supplied OS error number; filesystem loading is disabled.
+    Unavailable(i32),
+}
+
+/// Supplies immutable native TLS material at its original loading site.
+/// Calls can be concurrent across client copies; returned bytes must remain immutable while this source is retained.
+pub trait SslMaterialSource: Send + Sync {
+    /// `path` is the configured native filename, without normalization.
+    /// `Unmanaged` preserves filesystem loading, including hashed CA directory lookup.
+    fn material(&self, kind: SslMaterialKind, path: &CStr) -> SslMaterial<'_>;
+}
+
 /// Configures the client's OpenSSL context before any connection is started.
 /// Implementations may install callbacks borrowing themselves until client destruction.
 pub trait SslContextConfigurer: Send + Sync {
+    /// Supplies native file snapshots before `configure` runs, or preserves filesystem loading when absent.
+    fn material_source(&self) -> Option<&dyn SslMaterialSource> { None }
+
     /// Skips automatic platform and OpenSSL CA discovery when the callback supplies replacement trust.
     /// Explicit CA, CRL and client identity settings are still loaded before the callback.
     fn replaces_default_trust(&self) -> bool { false }
@@ -112,6 +149,27 @@ pub trait SslContextConfigurer: Send + Sync {
 pub(crate) struct SslContextConfig(Arc<dyn SslContextConfigurer>);
 impl std::fmt::Debug for SslContextConfig {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str("SslContextConfig") }
+}
+
+unsafe extern "C" fn ssl_material(kind: i32, path: *const c_char, bytes: *mut *const c_void, length: *mut usize, os_error: *mut i32, opaque: *mut c_void) -> i32 {
+    unsafe { *bytes = ptr::null(); *length = 0; *os_error = libc::EIO; }
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let kind = match kind {
+            0 => SslMaterialKind::CertificateAuthorities,
+            1 => SslMaterialKind::Revocations,
+            2 => SslMaterialKind::CertificateChain,
+            3 => SslMaterialKind::PrivateKey,
+            4 => SslMaterialKind::KeyStore,
+            _ => return -1,
+        };
+        let configuration = unsafe { &*opaque.cast::<SslContextConfig>() };
+        let Some(source) = configuration.0.material_source() else { return 0; };
+        match source.material(kind, unsafe { CStr::from_ptr(path) }) {
+            SslMaterial::Unmanaged => 0,
+            SslMaterial::Bytes(value) => { unsafe { *bytes = value.as_ptr().cast(); *length = value.len(); } 1 }
+            SslMaterial::Unavailable(error) => { unsafe { *os_error = error; } -1 }
+        }
+    })).unwrap_or(-1)
 }
 
 unsafe extern "C" fn configure_ssl_context(context: *mut c_void, opaque: *mut c_void, error: *mut c_char, capacity: usize) -> i32 {
@@ -321,6 +379,10 @@ impl ClientConfig {
         }
         conf.ssl_context = self.ssl_context.clone();
         if let Some(configuration) = &conf.ssl_context {
+            if configuration.0.material_source().is_some() {
+                let result = unsafe { rdsys::rd_kafka_conf_set_ssl_material_cb(conf.ptr(), Some(ssl_material), Arc::as_ptr(configuration) as *mut c_void) };
+                if result.is_error() { return Err(KafkaError::ClientCreation("TLS file snapshots require the bundled OpenSSL material API".into())); }
+            }
             let replaces_trust = configuration.0.replaces_default_trust();
             let result = unsafe { rdsys::rd_kafka_conf_set_ssl_ctx_replaces_default_trust(conf.ptr(), i32::from(replaces_trust)) };
             if result.is_error() { return Err(KafkaError::ClientCreation("TLS trust replacement requires SSL support".into())); }

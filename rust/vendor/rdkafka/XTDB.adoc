@@ -43,3 +43,18 @@ When enabled, the built-in SCRAM provider appends `tokenauth=true` to its client
 The retained message without its GS2 header includes the extension when computing client proof and verifying the server signature.
 This follows Kafka 4.4.0 `ScramLoginModule` and `ScramMessages.ClientFirstMessage`.
 Regression sources in `../../crates/kafka/tests/native_scram.rs` cover native configuration duplication and invoke the bundled SCRAM message unit cases.
+
+`SslContextConfigurer::material_source` optionally supplies a passive retained source of immutable native TLS file bytes.
+`rd_kafka_conf_set_ssl_material_cb` stores that callback and its owner across native configuration duplication.
+The callback distinguishes borrowed bytes, a deferred OS read failure, and the unchanged filesystem loader.
+An empty or unavailable snapshot never falls back to the filesystem.
+The Rust wrapper catches material callback unwinding at the C boundary.
+The bundled OpenSSL material API is required only when this optional source is supplied.
+
+CA files, CRL files, certificate chains, private keys and native PKCS12 stores are decoded at their original loading sites.
+CA and CRL files retain the common mixed-certificate/CRL PEM parser.
+File certificates replace their chain, and file private keys use the selected library context and configured password callback.
+Location and inline settings remain separate ordered inputs.
+Native PKCS12 keeps its selected library context through decoding and password verification.
+The source owner remains alive through destruction of native clients and their loaded keys.
+The Rust adapter and qualification limits are documented in link:../../crates/kafka/src/client/material/README.adoc[native material ownership].

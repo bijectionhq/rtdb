@@ -3,6 +3,7 @@ use rdkafka::ClientConfig;
 use rtdb_columnar::MemoryBudget;
 use rtdb_types::{Anomaly, Result};
 use crate::tls::NativeTls;
+pub(crate) mod material;
 
 pub(crate) fn prepare(options: &BTreeMap<String, String>, memory: &Arc<MemoryBudget>) -> Result<ClientConfig> {
     let mut properties = crate::native_properties(options)?;
@@ -32,7 +33,7 @@ pub(crate) fn prepare(options: &BTreeMap<String, String>, memory: &Arc<MemoryBud
     if java_identity { properties.remove("ssl.key.password"); }
     if let Some(value) = properties.get_mut("ssl.endpoint.identification.algorithm") { *value = if value.is_empty() { "none".into() } else { value.to_ascii_lowercase() }; }
     let mut configuration = crate::client_config(&properties);
-    if let Some(tls) = tls { configuration.set_ssl_context_configurer(tls); }
+    if let Some(tls) = tls { configuration.set_ssl_context_configurer(material::Configuration::capture(tls, &properties, &mut |bytes| memory.reserve(bytes))?); }
     Ok(configuration)
 }
 
