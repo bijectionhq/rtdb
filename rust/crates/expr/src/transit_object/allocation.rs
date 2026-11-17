@@ -4,6 +4,10 @@ use super::{Object,Path,number};
 
 pub(super) struct Text<'a> { value: String,allocation: &'a EvaluationScope }
 
+impl crate::semantic_text::Sink for Text<'_> {
+    fn push(&mut self,text: &str) -> Result<()> { Text::push(self,text) }
+}
+
 impl<'a> Text<'a> {
     pub(super) fn new(allocation: &'a EvaluationScope) -> Self { Self { value: String::new(),allocation } }
     pub(super) fn push(&mut self,text: &str) -> Result<()> {
@@ -44,4 +48,24 @@ pub(super) fn wire_charge(value: &Object,allocation: &EvaluationScope) -> Result
         _ => 0,
     };
     allocation.reserve(bytes.checked_mul(2).and_then(|bytes|bytes.checked_add(1024)).ok_or_else(overflow)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoted_text_rejects_growth_before_mutation_and_releases_its_scope() {
+        let memory = rtdb_columnar::MemoryBudget::new(4096 + 256 + 64);
+        {
+            let scope = EvaluationScope::new(&memory).unwrap();let mut text = Text::new(&scope);
+            text.push("x").unwrap();let capacity = text.value.capacity();
+            let value = "a".repeat(capacity);
+            assert!(crate::semantic_text::quoted(&mut text,&value).is_err());
+            assert_eq!(text.value.len(),capacity);assert_eq!(text.value.capacity(),capacity);
+            assert!(text.value.starts_with("x\""));assert!(text.value[2..].bytes().all(|byte|byte == b'a'));
+            assert_eq!(memory.used_bytes(),4096 + 256 + 64);
+        }
+        assert_eq!(memory.used_bytes(),0);
+    }
 }

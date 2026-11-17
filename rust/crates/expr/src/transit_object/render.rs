@@ -2,6 +2,7 @@ use rtdb_types::{Anomaly,Result};
 use super::{Map,Object,Throwable,Time,hash,invalid,keyword_value,number};
 use super::allocation::{Text,path_capacity};
 use crate::EvaluationScope;
+use crate::semantic_text::{self,Atom,Mode,SequenceKind,atom,quoted};
 
 pub(super) fn string(value: &Object,allocation: &EvaluationScope) -> Result<String> {
     let mut text = Text::new(allocation);write_string(&mut text,value)?;Ok(text.finish())
@@ -9,10 +10,11 @@ pub(super) fn string(value: &Object,allocation: &EvaluationScope) -> Result<Stri
 
 fn write_string(text: &mut Text<'_>,value: &Object) -> Result<()> {
     match value {
-        Object::Null => Ok(()),Object::Bool(value) => text.push(if *value { "true" } else { "false" }),
+        Object::Null => atom(text,Atom::Nil,Mode::Str),Object::Bool(value) => atom(text,Atom::Boolean(*value),Mode::Str),
         Object::Number(value) => text.temporary(number_capacity(value)?,||Ok(value.text())),
-        Object::String(value) | Object::Symbol(value) | Object::Uri(value) => text.push(value),
-        Object::Keyword(value) => { text.push(":")?;text.push(value) },Object::Character(value) => text.character(character(*value)),
+        Object::String(value) => atom(text,Atom::String(value),Mode::Str),Object::Symbol(value) => atom(text,Atom::Symbol(value),Mode::Str),
+        Object::Uri(value) => text.push(value),Object::Keyword(value) => atom(text,Atom::Keyword(value),Mode::Str),
+        Object::Character(value) => atom(text,Atom::Character(character(*value)),Mode::Str),
         Object::Bytes(value) => text.temporary(64,||Ok(format!("[B@{:x}",hash::identity(value) as u32))),
         Object::Vector(_) | Object::List(_) | Object::Set(_) | Object::Map(_) | Object::TxKey(_) => write_printed(text,value),
         Object::Uuid(value) => text.temporary(64,||Ok(uuid(value))),
@@ -51,19 +53,16 @@ pub(super) fn printed(value: &Object,allocation: &EvaluationScope) -> Result<Str
 
 pub(super) fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
     match value {
-        Object::Null => text.push("nil"),Object::Bool(value) => text.push(if *value { "true" } else { "false" }),
+        Object::Null => atom(text,Atom::Nil,Mode::Readable),Object::Bool(value) => atom(text,Atom::Boolean(*value),Mode::Readable),
         Object::Number(value) => text.temporary(number_capacity(value)?,||Ok(value.printed())),
-        Object::String(value) => quoted(text,value),Object::Symbol(value) => text.push(value),Object::Keyword(value) => { text.push(":")?;text.push(value) }
-        Object::Character(value) => {
-            let name = match *value { 10 => "newline",9 => "tab",32 => "space",8 => "backspace",12 => "formfeed",13 => "return",_ => "" };
-            text.push("\\")?;if name.is_empty() { text.character(character(*value)) } else { text.push(name) }
-        }
+        Object::String(value) => atom(text,Atom::String(value),Mode::Readable),Object::Symbol(value) => atom(text,Atom::Symbol(value),Mode::Readable),
+        Object::Keyword(value) => atom(text,Atom::Keyword(value),Mode::Readable),Object::Character(value) => atom(text,Atom::Character(character(*value)),Mode::Readable),
         Object::Bytes(value) => {
             text.push("#bytes \"")?;const HEX: &[u8] = b"0123456789abcdef";
             for byte in value.iter() { text.character(HEX[(byte >> 4) as usize] as char)?;text.character(HEX[(byte & 15) as usize] as char)?; }text.push("\"")
         }
-        Object::Vector(values) => sequence(text,"[",values.iter(),"]"),Object::List(values) => sequence(text,"(",values.iter(),")"),
-        Object::Set(values) => sequence(text,"#{",values.entries().map(|(key,_)|key),"}"),
+        Object::Vector(values) => sequence(text,SequenceKind::Vector,values.iter()),Object::List(values) => sequence(text,SequenceKind::List,values.iter()),
+        Object::Set(values) => sequence(text,SequenceKind::Set,values.entries().map(|(key,_)|key)),
         Object::Map(values) => map(text,values),
         Object::TxKey(value) => { text.push("#xt/tx-key ")?;map(text,&Map::from_entries(value.entries().map(|(key,value)|(key.clone(),value.clone())))?) }
         Object::Uri(value) => {
@@ -86,7 +85,7 @@ pub(super) fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
                 let category = Object::Keyword(category.rsplit('/').next().ok_or_else(invalid)?.into());
                 let code = keyword_value(data,"xtdb.error/code").clone();
                 let mut data = data.clone();data.strip_error_metadata()?;
-                text.push(" #xt/error ")?;sequence(text,"[",[category,code,message.clone(),data].iter(),"]")
+                text.push(" #xt/error ")?;sequence(text,SequenceKind::Vector,[category,code,message.clone(),data].iter())
             }
             Throwable::ExceptionInfo { .. } => Err(Anomaly::unsupported("xtdb.expression/transit-throwable-text", "Readable exception text requires its construction stack trace")),
         },
@@ -104,34 +103,24 @@ fn time(text: &mut Text<'_>,value: &Time) -> Result<()> {
         Time::Interval { .. } => "interval",
         Time::Range { from,to } => {
             let values = [from,to].map(|value|value.map_or(Object::Null,|value|Object::Time(Time::ZonedDateTime(value))));
-            text.push("#xt/tstz-range ")?;return sequence(text,"[",values.iter(),"]");
+            text.push("#xt/tstz-range ")?;return sequence(text,SequenceKind::Vector,values.iter());
         }
         Time::LegacyDate(_) => return Err(Anomaly::unsupported("xtdb.expression/transit-date-text", "Readable Date text requires its legacy calendar formatter")),
     };
     text.scope().reserve(4096)?;text.push("#xt/")?;text.push(tag)?;text.push(" ")?;quoted(text,&value.text()?)
 }
 
-fn sequence<'a>(text: &mut Text<'_>,start: &str,values: impl IntoIterator<Item=&'a Object>,end: &str) -> Result<()> {
-    text.push(start)?;let mut first = true;
-    for value in values { if !first { text.push(" ")?; }first = false;write_printed(text,value)?; }text.push(end)
+fn sequence<'a>(text: &mut Text<'_>,kind: SequenceKind,values: impl IntoIterator<Item=&'a Object>) -> Result<()> {
+    semantic_text::sequence(text,kind,values,write_printed)
 }
 
-fn map(text: &mut Text<'_>,value: &Map) -> Result<()> {
-    text.push("{")?;
-    for (index,(key,value)) in value.entries().enumerate() {
-        if index != 0 { text.push(", ")?; }write_printed(text,key)?;text.push(" ")?;write_printed(text,value)?;
-    }text.push("}")
-}
+fn map(text: &mut Text<'_>,value: &Map) -> Result<()> { semantic_text::map(text,value.entries(),write_printed) }
 
 fn default_object(text: &mut Text<'_>,class: &str,identity: i32,value: &Object) -> Result<()> {
     text.push("#object[")?;text.push(class)?;text.temporary(32,||Ok(format!(" 0x{:x} ",identity as u32)))?;
     let rendered = string(value,text.scope())?;quoted(text,&rendered)?;text.push("]")
 }
 fn character(value: u16) -> char { char::from_u32(u32::from(value)).unwrap_or('?') }
-fn quoted(text: &mut Text<'_>,value: &str) -> Result<()> {
-    text.push("\"")?;
-    for ch in value.chars() { match ch { '\n' => text.push("\\n"),'\t' => text.push("\\t"),'\r' => text.push("\\r"),'"' => text.push("\\\""),'\\' => text.push("\\\\"),'\u{c}' => text.push("\\f"),'\u{8}' => text.push("\\b"),_ => text.character(ch) }?; }text.push("\"")
-}
 fn number_capacity(value: &number::Number) -> Result<usize> { value.text_capacity().map_err(number::error)?.checked_mul(8).ok_or_else(crate::numeric::overflow) }
 fn uuid(value: &[i64;2]) -> String { uuid::Uuid::from_u128((u128::from(value[0] as u64) << 64) | u128::from(value[1] as u64)).to_string() }
 #[cfg(test)]
