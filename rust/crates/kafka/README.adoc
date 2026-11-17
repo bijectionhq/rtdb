@@ -104,6 +104,9 @@ Big5-HKSCS, Big5-HKSCS-2001, MS950-HKSCS, and MS950-HKSCS-XP add four charsets w
 Their overlays preserve BMP and supplementary mappings, XP private-use characters, and Big5 or MS950 fallback; each complete unmappable pair consumes both bytes, including an ASCII or zero trail.
 HKSCS decoding does not activate Big5-Solaris, and its existing seven overlay mappings remain unchanged by Solaris activation.
 The link:src/connect/converter/charset/double_byte/hkscs/README.adoc[HKSCS reference] records their source provenance, aliases, and replacement behavior.
+The DBCS-only JIS0208, JIS0212, IBM300, and IBM834 decoders map raw pairs with no ASCII or shift-mode bypass; each unmappable pair and unmatched final byte produces a replacement.
+The simple EUC IBM1383 and IBM970 decoders preserve ASCII and C1 controls, retry the byte after an unmappable SS2/SS3 prefix, and consume other unmappable pairs together.
+These six charsets have 36 registered names documented in the link:src/connect/converter/charset/double_byte/subclasses/README.adoc[DBCS-only and simple EUC reference].
 Other built-in multibyte and stateful charset families, including GB18030, ISO-2022, and ISCII, and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.

@@ -13,6 +13,8 @@ link:charsets.tsv[The charset manifest] records canonical names, classes, source
 link:big5-solaris.tsv[The Big5-Solaris manifest] records its canonical name, `Big5_Solaris` alias, seven shared-row updates, source hashes, and pair-probe digest after initialization.
 The four additional HKSCS variants use a separate decoder with BMP and supplementary overlays and shared Big5 or immutable MS950 fallback.
 Their 14 registered names, mappings, and two-byte replacement rules are described in link:hkscs/README.adoc[the HKSCS reference].
+JIS0208, JIS0212, IBM300, IBM834, IBM1383, and IBM970 use DBCS-only or simple EUC subclasses with 36 additional registered names.
+Their static mappings and subclass replacement rules are described in link:subclasses/README.adoc[the subclass reference].
 
 `Charset::DoubleByte` is a passive immutable configuration value borrowing one process-lifetime `Mapping`.
 `Mapping` owns immutable encoded table bytes and decodes on the caller's task.
