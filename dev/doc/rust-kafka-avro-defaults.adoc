@@ -11,3 +11,12 @@ Its full original source header and the Apache license accompany the borrowed de
 Regression sources cover positive and negative rounding boundaries through the production schema/metadata/default graph, including scalar, array, map and Connect JsonNode defaults.
 This bounded correction introduces no additional retained owner or allocation.
 The separate Java name/reference policy, default-origin materialization, graph admission, union-context and cache-lifetime work remains gated; Rust/Java regression execution is pending under the Phase 1 work order.
+
+Record default source members require exact raw field names.
+Apache Avro's JacksonUtils.toObject resolves every supplied member through Schema.getField before Connect's destination lookup or missing-field fallback.
+A field alias alone cannot supply that raw source member.
+For example, when `actual` has alias `alias` and default `fallback`, a parent default `{"alias":"ignored"}` is ignored; an empty parent default can still obtain `actual`'s declared fallback.
+The native check keeps its indexed fast path when the indexed field's raw name matches the member, then scans raw fields if an alias has overwritten that index entry.
+This preserves a real field even when another field's alias collides with its raw name.
+Regression sources cover raw, absent, alias-only and unknown source members, plus the native alias-index collision.
+The correction changes default source validation without changing ordinary reader alias resolution.

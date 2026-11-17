@@ -37,7 +37,7 @@ pub(super) fn field_default_class(value: &DefaultJson, schema: &apache_avro::Sch
         DefaultJson::Boolean(_) => Some(matches!(schema, Schema::Boolean)),
         DefaultJson::String(_) => if matches!(schema, Schema::String | Schema::Enum(_) | Schema::Bytes | Schema::Fixed(_)) { Some(true) } else { None },
         DefaultJson::Array(_) => if matches!(schema, Schema::Array(_)) { Some(true) } else { None },
-        DefaultJson::Object(fields) => match schema { Schema::Record(record) if fields.iter().any(|(key, _)| !record.lookup.contains_key(key)) => None, Schema::Map(_) | Schema::Record(_) => Some(true), _ => None },
+        DefaultJson::Object(fields) => match schema { Schema::Record(record) if fields.iter().any(|(key, _)| !record.lookup.get(key).and_then(|index| record.fields.get(*index)).is_some_and(|field| field.name == *key) && !record.fields.iter().any(|field| field.name == *key)) => None, Schema::Map(_) | Schema::Record(_) => Some(true), _ => None },
         DefaultJson::Null => Some(true),
     })
 }
@@ -104,3 +104,5 @@ pub(super) fn metadata_text(text: &str) -> Result<String> {
 }
 fn json<'a, T: serde::Deserialize<'a>>(text: &'a str) -> Result<T> { serde_json::from_str(text).map_err(|cause| error("avro-schema", cause)) }
 
+
+#[cfg(test)] mod tests;
