@@ -362,6 +362,24 @@ fn replacement_uses_java_group_number_name_escaping_and_empty_match_rules() {
 }
 
 #[test]
+fn replacement_errors_keep_java_messages_and_numeric_group_fault_category() {
+    for (replacement, category, code, message) in [
+        ("$", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "Illegal group reference: group index is missing"),
+        ("${1}", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "capturing group name {1} starts with digit character"),
+        ("${missing}", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "No group with name {missing}"),
+        ("$x$9", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "Illegal group reference"),
+        ("$9$", rtdb_types::AnomalyCategory::Fault, "xtdb.error/unknown", "No group 9"),
+        ("$10", rtdb_types::AnomalyCategory::Fault, "xtdb.error/unknown", "No group 1"),
+    ] {
+        let error = scalar_call("regexp_replace", &[text("xx"), text("x"), text(replacement)], &EvalContext::default()).unwrap_err();
+        assert_eq!(error.category, category);
+        assert_eq!(error.code, code);
+        assert_eq!(error.message.as_deref(), Some(message));
+        assert_eq!(replace("kept", "x", replacement), "kept");
+    }
+}
+
+#[test]
 fn unicode_case_backreferences_accept_different_utf8_widths_without_dynamic_compilation() {
     assert!(matches("kK", r"(?iu)(k)\1", ""));
     assert!(matches("Kk", r"(?iu)(K)\1", ""));

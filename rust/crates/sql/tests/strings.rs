@@ -62,6 +62,23 @@ async fn regexp_replace_literals_and_unsupported_start_are_admitted_before_rows(
 }
 
 #[tokio::test]
+async fn regexp_replace_reports_source_exception_category_only_after_a_match() {
+    for (replacement, category, code, message) in [
+        ("$", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "Illegal group reference: group index is missing"),
+        ("${1}", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "capturing group name {1} starts with digit character"),
+        ("$x$9", rtdb_types::AnomalyCategory::Incorrect, "xtdb.expression/illegal-argument-exception", "Illegal group reference"),
+        ("$9$", rtdb_types::AnomalyCategory::Fault, "xtdb.error/unknown", "No group 9"),
+    ] {
+        let error = query(&format!("SELECT REGEXP_REPLACE('xx','x','{replacement}')")).await.unwrap_err();
+        assert_eq!(error.category, category);
+        assert_eq!(error.code, code);
+        assert_eq!(error.message.as_deref(), Some(message));
+        assert_eq!(query(&format!("SELECT REGEXP_REPLACE('kept','x','{replacement}')")).await.unwrap(), [vec![text("kept")]]);
+        assert_eq!(query(&format!("SELECT REGEXP_REPLACE(NULL,'x','{replacement}')")).await.unwrap(), [vec![V::Null]]);
+    }
+}
+
+#[tokio::test]
 async fn regclass_and_regproc_text_casts_resolve_captured_catalog_and_search_path() {
     let oid = rtdb_types::pg_table_oid(None, &rtdb_types::TableRef::new("pg_catalog", "pg_class"));
     assert_eq!(query("SELECT CAST('pg_class' AS REGCLASS),CAST(CAST('pg_catalog.pg_class' AS REGCLASS) AS TEXT),STR(CAST('pg_class' AS REGCLASS))").await.unwrap(), [vec![V::RegClass(oid), text("pg_class"), text("pg_class")]]);

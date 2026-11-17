@@ -470,8 +470,17 @@ The private pattern adapter accepts borrowed `JavaText` and preprocesses exact c
 Quotation, comments, ranges and supplementary decisions retain unmatched units until their grammar operation consumes them; boolean search supplies exact UTF16 units to the existing matcher.
 Source admission counts the UTF8 width of scalar code points and three accounting bytes for each unmatched unit, preserving existing UTF8 limits without encoding the source.
 Raw compilation failures retain their source and dynamic diagnostic storage with independent leases; proven Java syntax mappings retain descriptions and post-quotation code-point indices separately from native/backend failures.
-The existing UTF8 entry points keep their current diagnostic adapter.
-Full Java failure-message rendering, the remaining syntax-error mappings, exact-unit replacement input and serialized SQL/XTQL/host text admission remain required boundaries.
+The existing UTF8 pattern-compilation entry points keep their current diagnostic adapter.
+Full Java failure-message rendering, the remaining syntax-error mappings and serialized SQL/XTQL/host text admission remain required boundaries.
+
+Compiled replacements retain normalized `JavaString` text independently of metadata temporaries.
+PostgreSQL backreference normalization preserves every UTF16 unit, and Java replacement syntax is interpreted only after a successful match.
+Raw replacement results and failures retain their own text charges; missing numeric groups retain `IndexOutOfBoundsException` facts separately from replacement syntax's `IllegalArgumentException` facts.
+The UTF8 expression adapter reports missing numeric groups as `xtdb.error/unknown` faults and syntax failures as `xtdb.expression/illegal-argument-exception` caller errors.
+Output fragments join in UTF16 before the ordinary adapter emits Java UTF8, allowing surrogate halves from different fragments to form a pair.
+Count/fill passes admit unit scratch, retained output and encoded bytes separately, including the owned copy of a no-match result.
+The compiled engine still requires its preparation scope, and ordinary returned values retain the row-scope contract.
+Raw throwable transport, source metadata normalization timing and serialized text admission remain required boundaries.
 
 Stored Transit Path values retain Unix byte identity separately from runtime-image path identity.
 URI validation precedes path construction; Unix slash normalization preserves dot segments, and the exact `file:///` spelling selects raw escaped octets.

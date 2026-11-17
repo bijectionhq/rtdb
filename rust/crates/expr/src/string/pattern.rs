@@ -2,12 +2,14 @@ use crate::{EvalContext, numeric::overflow};
 use fancy_regex::{Expr, Regex, RegexBuilder};
 use rtdb_types::{Anomaly, Result, Value};
 use rtdb_types::java_text::JavaText;
-use super::{add, illegal, java_unicode, text};
+use super::{illegal, java_unicode, text};
 mod source;
 mod failure;
+mod replacement;
 #[cfg(test)] mod tests;
 use source::{PatternInput, supplementary, work_bytes};
 use failure::{CompileFailure, Description, Syntax};
+pub(crate) use replacement::{CompiledReplacement, compile_replacement};
 
 const PATTERN_BYTES: usize = 65_536;
 const STACK_BRANCHES: usize = 512;
@@ -22,7 +24,6 @@ struct Translation { pattern: String, names: Vec<Option<String>>, supplementary:
 struct Translator<'a> { source: &'a PatternInput<'a>, position: usize, flags: Flags, scopes: Vec<Flags>, output: String, names: Vec<Option<String>>, literals: Vec<u32>, supplementary: bool, predicate_bmp: bool, syntax_prefix_verified: bool, syntax: Option<Syntax<'a>> }
 pub(crate) struct Pattern { regex: Regex, names: Vec<Option<String>> }
 pub(crate) struct LikePattern { pattern: Pattern, binary: bool }
-pub(crate) struct CompiledReplacement { pattern: Pattern,replacement: String }
 
 pub(crate) fn compile(pattern: &str, flags: &str, context: &EvalContext<'_>) -> Result<Pattern> {
     if pattern.len() > PATTERN_BYTES { return Err(limit("Pattern exceeds 64 KiB")); }
@@ -586,103 +587,6 @@ pub(crate) fn matches(args: &[Value], context: &EvalContext<'_>) -> Result<Value
 pub(crate) fn replace(args: &[Value], context: &EvalContext<'_>) -> Result<Value> {
     let source = text(&args[0])?;
     compile_replacement(text(&args[1])?,text(&args[2])?,args.get(3).map(text).transpose()?.unwrap_or(""),context)?.replace(source,context)
-}
-
-pub(crate) fn compile_replacement(pattern: &str,replacement: &str,flags: &str,context: &EvalContext<'_>) -> Result<CompiledReplacement> {
-    context.reserve(replacement.len().checked_mul(2).and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?)?;
-    let replacement = postgres_backrefs(replacement);
-    Ok(CompiledReplacement { pattern: compile(pattern,flags,context)?,replacement })
-}
-
-impl CompiledReplacement {
-    pub(crate) fn replace(&self,source: &str,context: &EvalContext<'_>) -> Result<Value> {
-        replace_utf16(source,&self.pattern,&self.replacement,context)
-    }
-}
-
-fn postgres_backrefs(value: &str) -> String {
-    let mut result = String::with_capacity(value.len());
-    let mut chars = value.chars().peekable();
-    while let Some(character) = chars.next() {
-        if character == '\\' {
-            if chars.peek() == Some(&'\\') { chars.next(); result.push_str("\\\\"); continue; }
-            if chars.peek().is_some_and(char::is_ascii_digit) { result.push('$'); while chars.peek().is_some_and(char::is_ascii_digit) { result.push(chars.next().expect("peeked digit")); } continue; }
-        }
-        result.push(character);
-    }
-    result
-}
-
-enum ReplacementPart<'a> { Text(&'a str), Group(usize) }
-
-fn replacement_tokens<'a>(value: &'a str, pattern: &Pattern, groups: usize, mut emit: impl FnMut(ReplacementPart<'a>) -> Result<()>) -> Result<()> {
-    let mut cursor = 0usize;
-    while cursor < value.len() {
-        let character = value[cursor..].chars().next().ok_or_else(overflow)?;
-        cursor += character.len_utf8();
-        match character {
-            '\\' => {
-                let character = value[cursor..].chars().next().ok_or_else(|| illegal("character to be escaped is missing"))?;
-                emit(ReplacementPart::Text(&value[cursor..cursor + character.len_utf8()]))?; cursor += character.len_utf8();
-            }
-            '$' if value.as_bytes().get(cursor) == Some(&b'{') => {
-                cursor += 1;
-                let start = cursor;
-                while value.as_bytes().get(cursor).is_some_and(u8::is_ascii_alphanumeric) { cursor += 1; }
-                if cursor == start { return Err(illegal("named capturing group has 0 length name")); }
-                if value.as_bytes().get(cursor) != Some(&b'}') { return Err(illegal("named capturing group is missing trailing '}'")); }
-                let name = &value[start..cursor]; cursor += 1;
-                if name.as_bytes()[0].is_ascii_digit() { return Err(illegal("capturing group name starts with digit character")); }
-                let group = pattern.names.iter().position(|candidate| candidate.as_deref() == Some(name)).ok_or_else(|| illegal(&format!("No group with name {{{name}}}")))? + 1;
-                emit(ReplacementPart::Group(group))?;
-            }
-            '$' => {
-                let digit = value.as_bytes().get(cursor).filter(|byte| byte.is_ascii_digit()).ok_or_else(|| illegal("Illegal group reference"))?;
-                let mut group = usize::from(*digit - b'0'); cursor += 1;
-                if group >= groups { return Err(illegal(&format!("No group {group}"))); }
-                while let Some(digit) = value.as_bytes().get(cursor).filter(|byte| byte.is_ascii_digit()) {
-                    let Some(next) = group.checked_mul(10).and_then(|group| group.checked_add(usize::from(*digit - b'0'))) else { break; };
-                    if next >= groups { break; } group = next; cursor += 1;
-                }
-                emit(ReplacementPart::Group(group))?;
-            }
-            _ => emit(ReplacementPart::Text(&value[cursor - character.len_utf8()..cursor]))?,
-        }
-    }
-    Ok(())
-}
-
-fn replace_utf16(source: &str, pattern: &Pattern, replacement: &str, context: &EvalContext<'_>) -> Result<Value> {
-    context.reserve(source.len().checked_mul(32).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(overflow)?)?;
-    let source: Vec<u16> = source.encode_utf16().collect();
-    let mut length = 0usize;
-    replacement_utf16_pass(&source, pattern, replacement, |part| { length = add(length, part.len())?; Ok(()) })?;
-    context.reserve(length.checked_mul(5).ok_or_else(overflow)?)?;
-    let mut units = Vec::with_capacity(length);
-    replacement_utf16_pass(&source, pattern, replacement, |part| { units.extend_from_slice(part); Ok(()) })?;
-    let mut output = String::with_capacity(length.checked_mul(3).ok_or_else(overflow)?);
-    for character in char::decode_utf16(units) { output.push(character.unwrap_or('?')); }
-    Ok(Value::Utf8(output))
-}
-
-fn replacement_utf16_pass(source: &[u16], pattern: &Pattern, replacement: &str, mut emit: impl FnMut(&[u16]) -> Result<()>) -> Result<()> {
-    let mut end = 0usize; let mut position = 0usize;
-    while position <= source.len() {
-        let Some(captures) = pattern.regex.captures_utf16(source, position, end).map_err(regex_error)? else { break; };
-        let start = captures[0]; let matched_end = captures[1];
-        emit(&source[end..start])?;
-        replacement_tokens(replacement, pattern, captures.len() / 2, |part| {
-            match part {
-                ReplacementPart::Group(group) if captures[group * 2] != usize::MAX => emit(&source[captures[group * 2]..captures[group * 2 + 1]])?,
-                ReplacementPart::Group(_) => {},
-                ReplacementPart::Text(text) => for character in text.chars() { let mut units = [0; 2]; emit(character.encode_utf16(&mut units))?; },
-            }
-            Ok(())
-        })?;
-        end = matched_end;
-        position = if start == end { end + 1 } else { end };
-    }
-    emit(&source[end..])
 }
 
 fn limit(message: &str) -> Anomaly { Anomaly::incorrect("rtdb.expr/regex-limit", message) }
