@@ -11,6 +11,7 @@ mod topics;
 mod merge;
 mod bootstrap;
 mod random;
+mod exchange;
 
 pub use keys::{IdentityWitness, NoIdentityWitness, TopicId, TopicPartitionKey};
 pub use owned::Text;
@@ -18,6 +19,7 @@ pub use response::{Node, Partition};
 pub use snapshot::Snapshot;
 pub use bootstrap::{BootstrapAddresses, ResolvedEndpoint, JavaShuffleObservations, MissingShuffleObservations, ShuffleAdmission};
 pub use random::{JavaRandom, JavaRandomSeeds, JavaShuffleRandom};
+pub use exchange::{MetadataExchange, MetadataTarget, SubmissionFailure};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};

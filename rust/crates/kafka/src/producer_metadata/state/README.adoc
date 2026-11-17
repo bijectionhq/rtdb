@@ -116,6 +116,15 @@ The caller supplies the slot, seed history and clock and owns admission for any 
 Concurrent replacement of the Collections slot during first acquisition requires a separate observation.
 The existing observer interface remains available for other qualified histories.
 
+== Ordered request exchange
+
+`ProducerMetadata::start_exchange` captures the producer request's scope and delegates the admitted topic list to the selected native bootstrap endpoint or learned broker.
+The native producer must match the metadata owner and enable automatic topic creation.
+The temporary descriptor array is admitted through the metadata budget and borrows the request names until native submission copies them.
+Polling the native exchange returns the original scope with the borrowed response, even after the metadata owner has requested a later generation.
+The transport retains the response and its account through producer shutdown.
+The network owner still needs to qualify the target, manage the request lifecycle, process throttles and apply each response once.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
