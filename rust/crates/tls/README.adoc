@@ -25,6 +25,28 @@ Recovery checks Java `PrivateKeyEntry` algorithm equality, leaving proof of poss
 The existing eager `KeyStore` API retains its public-key equality assertion and existing alias and chain behavior.
 In particular, eager JKS identities use stored entries directly, and eager PKCS12 retains its previous Rust lowercase, encoded-name comparisons, issuer fallback order, and retained-chain expansion bound.
 The protected API supplies the Java metadata and recovery semantics without changing those existing callers.
+`SunX509JksStore` is a separate passive immutable owner for eager SunX509 JKS credentials.
+It enumerates raw aliases, resolves each through locale-English lowercase, recovers the resolved key, then discards an empty certificate chain.
+Every resolved key lookup performs recovery, including aliases that resolve to an already recovered entry.
+Raw alias bindings share one recovered entry's zeroized PKCS8 and nonempty certificate chain.
+The decode-local alias table owns a pending-or-recovered entry state and is discarded before publication.
+This owner accepts mismatched private-key and certificate algorithms or public values; transport import and handshake qualification remain separate operations.
+Its Sun-only protection-envelope parser follows `EncryptedPrivateKeyInfo` and `KeyProtector`, including BER framing, constructed octets, opaque protection parameters, and the unchecked outer tag.
+Recovered PKCS8 follows `PKCS8Key` versions zero and one, optional attributes, optional version-one public bits, and generic-key fallback without native key acceptance.
+Its private-key field requires a primitive OCTET STRING, including when the entry has no certificate chain.
+Version-zero attributes are discarded during normalization; version-one attributes and normalized public bits are retained.
+AlgorithmParameters validation, provider-specific KeyFactory re-encoding and native support for Java's raw private-key fallback remain open.
+Generic and deferred key recovery retain their existing parsers and assertions.
+
+SunX509 JKS input, alias metadata and password encoding use initial admission of 64 times the input length plus password allowance and 65,536 bytes.
+Each recovery separately admits 512 times the protected-key length, 16 times any newly retained certificate bytes, and 65,536 bytes before allocating scratch.
+The surviving entry charge shrinks to its retained buffer capacities and owner overhead; repeated aliases release their recovery scratch without copying retained entries.
+The Sun parser wraps owned DER results before checking their tags, and its constructed-octet work queue, algorithm encodings and private-key output use zeroizing owners on success and error paths.
+Secret byte buffers receive their complete capacity before content is appended, avoiding unzeroized copies from buffer growth.
+Shared DER conversion validates the framing before allocating its byte buffer; its copy pass reuses that validated framing and returns ownership directly to the Sun wrapper.
+Native transports admit their expanded per-alias imports separately before copying keys or certificates.
+Source regressions cover raw alias translation, duplicate and enumeration behavior, eager errors on empty chains, PKCS8 normalization and fallback, entry sharing, allocation release, strict generic identity matching, and deferred transport failure for mismatched values.
+
 `DistinguishedName` is a passive immutable Java principal value with an independent reservation covering decoding and its retained canonical spelling.
 It follows OpenJDK 25.0.1 `X500Name`, `RDN`, and `AVA` canonicalization: RDN order remains significant, assertions within an RDN are sorted, and repeated assertions are retained.
 Standard RFC2253 keywords decode UTF8String and PrintableString values, including Java's Latin-1 decoding of PrintableString bytes.

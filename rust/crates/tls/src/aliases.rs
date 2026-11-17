@@ -33,6 +33,19 @@ impl<T> JksEntries<T> {
     pub(super) fn into_enumeration(self) -> impl Iterator<Item = (Vec<u16>, T)> {
         self.buckets.into_iter().rev().flatten()
     }
+
+    pub(super) fn aliases(&self) -> impl Iterator<Item = &[u16]> {
+        self.buckets.iter().rev().flatten().map(|(alias, _)| alias.as_slice())
+    }
+
+    pub(super) fn get_mut(&mut self, alias: &[u16]) -> Option<&mut T> {
+        let index = bucket(alias, self.buckets.len());
+        self.buckets[index].iter_mut().find(|(key, _)| key.as_slice() == alias).map(|(_, value)| value)
+    }
+
+    pub(super) fn map<U>(self, mut value: impl FnMut(T) -> U) -> JksEntries<U> {
+        JksEntries { buckets: self.buckets.into_iter().map(|entries| entries.into_iter().map(|(alias, entry)| (alias, value(entry))).collect()).collect(), count: self.count }
+    }
 }
 
 fn bucket(alias: &[u16], capacity: usize) -> usize {

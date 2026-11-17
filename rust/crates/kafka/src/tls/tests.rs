@@ -4,6 +4,7 @@ use rtdb_columnar::MemoryBudget;
 #[path = "../../tests/support/kafka_tls.rs"]
 pub(super) mod support;
 mod deferred;
+mod sun_jks;
 
 fn options() -> BTreeMap<String, String> { BTreeMap::from([("security.protocol".into(), "SSL".into())]) }
 

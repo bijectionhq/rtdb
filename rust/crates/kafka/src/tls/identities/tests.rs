@@ -9,6 +9,51 @@ fn material(bytes: &[u8], password: Option<&str>, algorithm: Algorithm, memory: 
 }
 
 #[test]
+fn sun_jks_mismatched_values_reach_installation_and_new_sun_keeps_algorithm_checks() {
+    let leaf = Credential::new("leaf", false, None);
+    let other = Credential::new("other key", false, None);
+    let mismatch = Credential { key: other.key, certificate: leaf.certificate.clone(), chain: vec![] };
+    let bytes = support::jks(&[("client", &mismatch)], "store", "key");
+    let memory = MemoryBudget::new(32 << 20);
+    let eager = material(&bytes, Some("key"), Algorithm::SunX509, &memory);
+    assert!(matches!(eager, Material::SunJks(_)));
+    let charge = memory.reserve(65_536).unwrap();
+    let random = random::Context::new(None, &memory).unwrap(); let signatures = random::Context::new(None, &memory).unwrap();
+    let native = eager.native(Algorithm::SunX509, &random, &charge).unwrap();
+    let native_charge = native.reservation();
+    assert!(eager.native(Algorithm::NewSunX509, &random, &charge).is_err());
+    assert_eq!(native.entries()[0].kind, KeyType::Rsa);
+    let context = SslContextBuilder::new(SslMethod::tls_client()).unwrap().build(); let mut ssl = Ssl::new(&context).unwrap();
+    assert!(native.entries()[0].install(&mut ssl, &random, &signatures).is_err());
+    drop(ssl); drop(context); drop(native); drop(native_charge); drop(eager);
+    let other = Credential::new("EC key", true, None);
+    let mismatch = Credential { key: other.key, certificate: leaf.certificate.clone(), chain: vec![] };
+    let bytes = support::jks(&[("client", &mismatch)], "store", "key");
+    let deferred = material(&bytes, Some("key"), Algorithm::NewSunX509, &memory);
+    let Material::Deferred(owner) = deferred else { panic!("expected deferred key"); };
+    assert!(owner.store.identities()[0].recover(Some("key"), &memory).is_err());
+    drop(owner); drop(charge); drop(random); drop(signatures); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn sun_jks_native_expansion_is_admitted_before_import_and_key_password_falls_back() {
+    let identity = Credential::new("client", false, None);
+    let bytes = support::jks(&[("CLIENT", &identity), ("Client", &identity), ("client", &identity)], "store", "store");
+    let memory = MemoryBudget::new(32 << 20);
+    let material = material(&bytes, None, Algorithm::SunX509, &memory);
+    let Material::SunJks(store) = &material else { panic!("expected Sun JKS material"); };
+    assert_eq!(store.identities().len(), 3);
+    let charge = memory.reserve(65_536).unwrap(); let random = random::Context::new(None, &memory).unwrap();
+    let remaining = memory.reserve((32 << 20) - memory.used_bytes()).unwrap();
+    assert_eq!(material.native(Algorithm::SunX509, &random, &charge).err().unwrap().code, "rtdb/memory-budget-exceeded");
+    drop(remaining);
+    let native = material.native(Algorithm::SunX509, &random, &charge).unwrap(); let native_charge = native.reservation();
+    assert_eq!(native.entries().len(), 3);
+    drop(material); assert_eq!(native.entries()[0].certificate.to_der().unwrap(), identity.certificate.to_der().unwrap());
+    drop(native); drop(native_charge); drop(charge); drop(random); assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn deferred_keys_preserve_selected_alias_failure_without_trying_another_entry() {
     let first = Credential::new("first", false, None);
     let second = Credential::new("second", false, None);
