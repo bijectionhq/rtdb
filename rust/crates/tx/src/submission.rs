@@ -111,7 +111,7 @@ fn infer_document_decimals(value: &mut Value) -> Result<()> {
 fn materialize(input: &Relation, context: &EvalContext<'_>) -> Result<Vec<Vec<Value>>> {
     match input.node() {
         RelationNode::Values { rows } => rows.iter().map(|row| row.iter().map(|expr| evaluate(expr, &Schema::default(), &[], context)).collect()).collect(),
-        RelationNode::Project { input, expressions } => materialize(input, context)?.iter().map(|row| expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), row, context)).collect()).collect(),
+        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => materialize(input, context)?.iter().map(|row| expressions.iter().map(|expr| evaluate(&expr.expr, input.schema(), row, context)).collect()).collect(),
         _ => Err(Anomaly::fault("rtdb.tx/static-plan", "Static SQL source contains a data-dependent operator")),
     }
 }

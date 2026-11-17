@@ -58,7 +58,7 @@ pub fn prepare_static(sql: &str, catalog: &dyn Catalog, options: &crate::Prepare
         }
     }
     fn relation(input: &Relation) -> bool {
-        matches!(input.node(), RelationNode::Values { .. } | RelationNode::Project { .. }) && input.expressions().into_iter().all(expression) && input.children().into_iter().all(|child| relation(child))
+        matches!(input.node(), RelationNode::Values { .. } | RelationNode::Project { .. } | RelationNode::Rename { .. }) && input.expressions().into_iter().all(expression) && input.children().into_iter().all(|child| relation(child))
     }
     Ok((relation(&output.input) && output.valid_time.expressions().into_iter().all(expression)).then_some(output))
 }

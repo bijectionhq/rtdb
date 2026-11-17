@@ -216,3 +216,11 @@ fn minmax_rejects_incomparable_and_unsupported_argument_types_340() {
         assert!(prepare("SELECT min($1) FROM docs", &Fixture, &options).is_err());
     }
 }
+
+#[test]
+fn static_insert_values_keep_declared_column_renames() {
+    let plan = rtdb_sql::prepare_static("INSERT INTO foo (_id, v) VALUES (1, 7)", &Fixture, &PrepareOptions::default()).unwrap().unwrap();
+    assert!(matches!(plan.input.node(), RelationNode::Rename { .. }));
+    assert_eq!(plan.input.schema().fields().iter().map(|field|field.name.as_str()).collect::<Vec<_>>(), ["_id", "v"]);
+    assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, v) SELECT _id, v FROM foo", &Fixture, &PrepareOptions::default()).unwrap().is_none());
+}
