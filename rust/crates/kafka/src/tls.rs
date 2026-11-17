@@ -26,6 +26,7 @@ impl NativeTls {
         if !options.get("security.protocol").is_some_and(|protocol| protocol.eq_ignore_ascii_case("SSL") || protocol.eq_ignore_ascii_case("SASL_SSL")) { return Ok(None); }
         let bytes = options.iter().try_fold(65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len())).ok_or_else(overflow))?;
         let mut reservations = vec![reserve(bytes.checked_mul(16).ok_or_else(overflow)?)?];
+        validate_provider(options.get("ssl.provider").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let policy = Policy::from_java(options)?;
         let algorithm = Algorithm::parse(options.get("ssl.keymanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let mut key_manager = KeyManager::new(algorithm, &[]);
@@ -185,6 +186,13 @@ unsafe extern "C" {
 }
 fn invalid(cause: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-tls-config", cause.to_string()) }
 fn overflow() -> Anomaly { invalid("Kafka TLS material exceeds allocation range") }
+
+pub(crate) fn validate_provider(name: Option<&str>) -> Result<()> {
+    match name {
+        None | Some("SunJSSE") => Ok(()),
+        _ => Err(invalid("TLS provider requires a native context adapter")),
+    }
+}
 
 #[cfg(test)]
 mod tests;

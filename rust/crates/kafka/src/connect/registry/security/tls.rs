@@ -10,7 +10,8 @@ const MAXIMUM_STORE_FILE: usize = 4 * 1024 * 1024;
 pub(super) fn client(options: &BTreeMap<String, String>, context: &mut ConversionContext, registry_hostname_policy: bool) -> Result<(Client, Arc<MemoryReservation>)> {
     let normalized = super::normalized(options);
     let tls = options.iter().filter_map(|(name, value)| name.strip_prefix("schema.registry.ssl.").map(|name| (name, value.as_str()))).collect::<BTreeMap<_, _>>();
-    for name in ["provider", "trustmanager.algorithm", "secure.random.implementation", "cipher.suites"] {
+    crate::tls::validate_provider(tls.get("provider").copied().filter(|name| !name.is_empty())).map_err(|cause| error("invalid-plugin-config", cause))?;
+    for name in ["trustmanager.algorithm", "secure.random.implementation", "cipher.suites"] {
         if tls.get(name).is_some_and(|value| !value.is_empty()) { return Err(error("invalid-plugin-config", format!("Registry TLS option '{name}' requires a native provider adapter"))); }
     }
     let mut files = BTreeMap::new();
@@ -77,6 +78,22 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_sunjsse_provider_and_empty_default_preserve_raw_provider_names() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 26);
+        for provider in ["SunJSSE", ""] {
+            let mut context = ConversionContext::new(Arc::clone(&memory));
+            let options = BTreeMap::from([("schema.registry.ssl.provider".into(), provider.into())]);
+            let (client, charge) = client(&options, &mut context, true).unwrap();
+            drop(client); drop(charge); drop(context); assert_eq!(memory.used_bytes(), 0);
+        }
+        for provider in ["sunjsse", " SunJSSE ", "\u{a0}SunJSSE\u{a0}", "SUN", "custom.Provider"] {
+            let mut context = ConversionContext::new(Arc::clone(&memory));
+            let options = BTreeMap::from([("schema.registry.ssl.provider".into(), provider.into())]);
+            assert_eq!(client(&options, &mut context, true).err().unwrap().code, "xtdb.kafka-connect-source/invalid-plugin-config");
+            drop(context); assert_eq!(memory.used_bytes(), 0);
+        }
+    }
     #[test]
     fn registry_default_roots_remain_charged_until_the_client_closes() {
         let memory = rtdb_columnar::MemoryBudget::new(1 << 26);

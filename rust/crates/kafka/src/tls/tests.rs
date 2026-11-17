@@ -6,6 +6,22 @@ mod support;
 fn options() -> BTreeMap<String, String> { BTreeMap::from([("security.protocol".into(), "SSL".into())]) }
 
 #[test]
+fn producer_sunjsse_provider_uses_java_string_trim_and_exact_provider_case() {
+    let memory = MemoryBudget::new(1 << 25);
+    for provider in ["SunJSSE", "\u{1} SunJSSE \u{20}"] {
+        let mut options = options(); options.insert("ssl.provider".into(), provider.into());
+        let material = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
+        assert_eq!(material.trust.as_ref().unwrap().len(), 146);
+        drop(material); assert_eq!(memory.used_bytes(), 0);
+    }
+    for provider in ["", "sunjsse", "\u{a0}SunJSSE\u{a0}", "SUN", "custom.Provider"] {
+        let mut options = options(); options.insert("ssl.provider".into(), provider.into());
+        assert!(NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).is_err());
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn java_tls_material_is_admitted_before_opening_files_and_ignores_plaintext_paths() {
     let memory = MemoryBudget::new(0); let mut options = options();
     options.insert("ssl.keystore.location".into(), "/missing/keystore".into());
