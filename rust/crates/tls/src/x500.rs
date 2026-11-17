@@ -9,7 +9,8 @@ pub(crate) use case::{equals_ignore_case_utf16, lowercase_utf16};
 
 /// Immutable Java X500Principal canonical name decoded from an ASN.1 name.
 /// Its allocation reservation covers parsing scratch and remains owned until this value drops.
-pub struct DistinguishedName { canonical: String, _reservation: Arc<MemoryReservation> }
+pub struct DistinguishedName { canonical: String, rdns: Vec<CanonicalRdn>, _reservation: Arc<MemoryReservation> }
+struct CanonicalRdn { range: std::ops::Range<usize>, assertions: usize, geographical: bool }
 
 impl DistinguishedName {
     /// Decodes the name under an independent reservation; the borrowed input has its own owner.
@@ -28,23 +29,45 @@ impl DistinguishedName {
             let rdn = rdns.expect(0x31)?;
             let mut assertions = Der(&rdn.content);
             let mut values = Vec::new();
+            let mut geographical = false;
             while !assertions.0.is_empty() {
                 let sequence = assertions.expect(0x30)?;
                 let mut assertion = Der(&sequence.content);
                 let oid = assertion.expect(6)?.content;
+                geographical |= matches!(oid.as_ref(), [0x55, 4, 6 | 7 | 8 | 9]);
                 let value = assertion.next()?;
                 assertion.end()?;
                 values.push(canonical_assertion(&oid, value)?);
             }
             values.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.encode_utf16().cmp(right.1.encode_utf16())));
-            canonical.push(values.into_iter().map(|(_, value)| value).collect::<Vec<_>>().join("+"));
+            let count = values.len();
+            canonical.push((values.into_iter().map(|(_, value)| value).collect::<Vec<_>>().join("+"), count, geographical));
         }
-        canonical.reverse();
-        Ok(Self { canonical: canonical.join(","), _reservation: reservation })
+        let mut text = String::new();
+        let mut rdns = Vec::with_capacity(canonical.len());
+        for (value, assertions, geographical) in canonical.into_iter().rev() {
+            if !rdns.is_empty() { text.push(','); }
+            let start = text.len();
+            text.push_str(&value);
+            rdns.push(CanonicalRdn { range: start..text.len(), assertions, geographical });
+        }
+        rdns.reverse();
+        Ok(Self { canonical: text, rdns, _reservation: reservation })
     }
 
     /// Borrows the RFC2253 canonical spelling used for Java principal equality and hashing.
     pub fn canonical(&self) -> &str { &self.canonical }
+
+    /// Returns the issuer's RDN distance from its closest common ancestor with this name.
+    /// Returns `None` when there is no common RDN or the last common RDN contains country, state, locality or street-address attributes.
+    /// Uses OpenJDK 25.0.1 ForwardBuilder's structural RDN comparison; canonical-string delimiters do not define RDN boundaries.
+    pub fn distance_to_common_non_geographical_ancestor(&self, issuer: &Self) -> Option<usize> {
+        let common = self.rdns.iter().zip(&issuer.rdns).take_while(|(left, right)| {
+            left.assertions == right.assertions && self.canonical[left.range.clone()] == issuer.canonical[right.range.clone()]
+        }).count();
+        if common == 0 || self.rdns[common - 1].geographical { None }
+        else { Some(issuer.rdns.len() - common) }
+    }
 }
 
 impl PartialEq for DistinguishedName { fn eq(&self, other: &Self) -> bool { self.canonical == other.canonical } }

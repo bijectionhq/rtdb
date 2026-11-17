@@ -33,6 +33,12 @@ Escaping, ASCII space collapse and Java trimming precede pinned locale-US case c
 Peer issuer hints and certificate issuer or subject names can therefore compare through the same canonical representation.
 Malformed UTF-8 uses the shared Java replacement decoder.
 The source regressions cover Unicode equivalence, encoding distinctions, RDN order, arbitrary-size OID arcs, BER framing and allocation ownership.
+`DistinguishedName::distance_to_common_non_geographical_ancestor` follows OpenJDK 25.0.1 `ForwardBuilder.distanceToCommonAncestor`.
+It compares RDNs from the root of the name and returns the issuer's remaining RDN count.
+Country, state, locality or street-address attributes in the last common RDN suppress that preference.
+RDN boundaries, assertion counts and geographical attributes come from the original ASN.1 structure, including every AVA of a multivalued RDN.
+Canonical-string punctuation does not define structural RDN boundaries.
+The structural view shares the name's existing reservation and is released with it.
 
 The codec reads JKS and PKCS12 stores, PEM trust certificates, and plain or encrypted PKCS8 PEM identities.
 JKS store integrity and private-key protection use independent passwords.

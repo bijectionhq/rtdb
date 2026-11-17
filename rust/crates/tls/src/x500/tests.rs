@@ -138,3 +138,65 @@ fn name_reservations_are_admitted_before_parsing_and_released_with_each_value() 
     drop(second); assert_eq!(memory.used_bytes(), 0);
     assert_eq!(DistinguishedName::decode(&[0xff], &MemoryBudget::new(0)).err().unwrap().code, "rtdb/memory-budget-exceeded");
 }
+
+#[test]
+fn common_ancestor_distance_uses_highest_first_structural_rdns() {
+    let country = assertion(&[0x55, 4, 6], 19, b"FR");
+    let organization = assertion(&[0x55, 4, 10], 12, b"Example");
+    let anchor = decode(&name(vec![vec![country.clone()], vec![organization.clone()], vec![cn(12, b"root")]]));
+    let sibling = decode(&name(vec![vec![country.clone()], vec![organization.clone()], vec![cn(12, b"issuer")]]));
+    let ancestor = decode(&name(vec![vec![country.clone()], vec![organization.clone()]]));
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&sibling), Some(1));
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&ancestor), Some(0));
+    assert_eq!(ancestor.distance_to_common_non_geographical_ancestor(&anchor), Some(1));
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&anchor), Some(0));
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&decode(&name(vec![vec![country], vec![cn(12, b"other")]]))), None);
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&decode(&[])), None);
+}
+
+#[test]
+fn geography_uses_every_original_oid_in_the_last_common_rdn() {
+    for oid in [6, 7, 8, 9] {
+        let rdn = vec![assertion(&[0x55, 4, oid], 12, b"place"), assertion(&[0x55, 4, 10], 12, b"Example")];
+        let anchor = decode(&name(vec![rdn.clone()]));
+        let issuer = decode(&name(vec![rdn, vec![cn(12, b"issuer")]]));
+        assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&issuer), None);
+    }
+    let geographical_parent = vec![assertion(&[0x55, 4, 6], 19, b"FR")];
+    let organization = vec![assertion(&[0x55, 4, 10], 12, b"Example")];
+    let anchor = decode(&name(vec![geographical_parent.clone(), organization.clone()]));
+    let issuer = decode(&name(vec![geographical_parent, organization, vec![cn(12, b"issuer")]]));
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&issuer), Some(1));
+}
+
+#[test]
+fn compatibility_delimiters_do_not_create_rdns_or_geographical_attributes() {
+    for value in ["Org，cn=child", "Org＋c=FR", "Org,cn=child", "Org+c=FR"] {
+        let rdn = vec![assertion(&[0x55, 4, 10], 12, value.as_bytes())];
+        let anchor = decode(&name(vec![rdn.clone()]));
+        let issuer = decode(&name(vec![rdn, vec![cn(12, b"issuer")]]));
+        assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&issuer), Some(1), "{value}");
+        assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&anchor), Some(0), "{value}");
+    }
+}
+
+#[test]
+fn ancestor_comparison_preserves_rdn_equality_and_name_reservations() {
+    let memory = MemoryBudget::new(2 << 20);
+    let left = name(vec![vec![assertion(&[0x55, 4, 10], 12, "ÉCOLE".as_bytes()), cn(12, b"CA")]]);
+    let right = name(vec![vec![cn(19, b"ca"), assertion(&[0x55, 4, 10], 12, "e\u{301}cole".as_bytes())], vec![cn(12, b"issuer")]]);
+    let anchor = DistinguishedName::decode(&left, &memory).unwrap();
+    let issuer = DistinguishedName::decode(&right, &memory).unwrap();
+    assert_eq!(anchor.distance_to_common_non_geographical_ancestor(&issuer), Some(1));
+    assert!(memory.used_bytes() > 0);
+    drop(anchor); drop(issuer); assert_eq!(memory.used_bytes(), 0);
+    assert!(DistinguishedName::decode(&left, &MemoryBudget::new(1)).is_err());
+}
+
+#[test]
+fn common_ancestor_does_not_merge_distinct_ava_counts_after_nfkd() {
+    let single = decode(&name(vec![vec![assertion(&[0x55, 4, 10], 12, "Org＋ou=Team".as_bytes())]]));
+    let multiple = decode(&name(vec![vec![assertion(&[0x55, 4, 10], 12, b"Org"), assertion(&[0x55, 4, 11], 12, b"Team")]]));
+    assert_eq!(single.canonical(), multiple.canonical());
+    assert_eq!(single.distance_to_common_non_geographical_ancestor(&multiple), None);
+}
