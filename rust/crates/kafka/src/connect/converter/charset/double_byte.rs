@@ -8,6 +8,7 @@ pub(super) mod hkscs;
 pub(super) mod ibm_euc;
 pub(super) mod iso2022cnkr;
 pub(super) mod iso2022jp;
+pub(super) mod jis0213;
 pub(super) mod subclasses;
 mod tables;
 

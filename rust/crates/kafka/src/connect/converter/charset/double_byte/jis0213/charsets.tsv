@@ -1,0 +1,3 @@
+canonical	class	source	source_sha256	variant	aliases
+x-SJIS_0213	SJIS_0213	jdk.charsets/sun/nio/cs/ext/SJIS_0213.java	4a56c3883792ae9f71c75a84248b866424edaddd8fddca0e68824bb0a13c6cc5	Standard	sjis-0213|sjis_0213|sjis:2004|sjis_0213:2004|shift_jis_0213:2004|shift_jis:2004
+x-MS932_0213	MS932_0213	jdk.charsets/sun/nio/cs/ext/MS932_0213.java	c09551eea602b4e953cc5d532b4105ee7894c22f23d3ffdb4a0f2d97d0b927d5	Windows	MS932-0213|MS932_0213|MS932:2004|windows-932-0213|windows-932:2004

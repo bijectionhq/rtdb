@@ -1,0 +1,129 @@
+{
+  "archive_sha256": "8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d",
+  "source_zip_member": "jdk-25.0.1+8/lib/src.zip",
+  "source_zip_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "image_member": "jdk-25.0.1+8/lib/modules",
+  "image_bytes": 145853395,
+  "image_sha256": "eaa087fdeba16f966a62466ad9c80b75fc630ed5909863edaf86e0709c58dd81",
+  "image_byte_order": "little",
+  "image_version": "1.0",
+  "image_flags": 0,
+  "image_resource_count": 30324,
+  "image_table_length": 30324,
+  "image_locations_bytes": 625793,
+  "image_strings_bytes": 678193,
+  "image_index_bytes": 1546606,
+  "resource_path": "/jdk.charsets/sun/nio/cs/ext/sjis0213.dat",
+  "resource_offset_table_slot": 1162,
+  "resource_location_offset": 23971,
+  "resource_attributes": [
+    0,
+    362,
+    432108,
+    436150,
+    48183,
+    103042317,
+    0,
+    26566
+  ],
+  "resource_content_offset": 103042317,
+  "resource_image_offset": 104588923,
+  "resource_compressed_bytes": 0,
+  "resource_bytes": 26566,
+  "resource_sha256": "9a103ec5e953cb5f8dd205c928abde3b333086a1e784825c940a6acc2e1c0020",
+  "resource_decompression": "none; compressed-size attribute is zero",
+  "mapping_shape": {
+    "payload_bytes": 26562,
+    "bytes_consumed": 26566,
+    "block_order": [
+      8,
+      1,
+      2,
+      3,
+      5,
+      6,
+      7
+    ],
+    "blocks": [
+      {
+        "tag": 8,
+        "file_offset": 4,
+        "bytes": 516,
+        "u16_count": 256,
+        "sha256": "4f2374d8d4468271a86d13b8f7fce7129e6c313d0b730f8be42b13fcbc5b8228"
+      },
+      {
+        "tag": 1,
+        "file_offset": 520,
+        "bytes": 516,
+        "u16_count": 256,
+        "sha256": "113b3a34e93c3b27b6929d4659587a5df9a8aa8f79fe2228629c5e3dce846155",
+        "mapped_bmp_units": 191
+      },
+      {
+        "tag": 2,
+        "file_offset": 1036,
+        "bytes": 11854,
+        "u16_count": 5921,
+        "sha256": "1c2cc02faf82963ad9ba2ecda69f4c247f7454b04cb1d5c09d5cc5fa56cb22aa",
+        "bounds_b1_min_max_b2_min_max": [
+          129,
+          159,
+          64,
+          254
+        ],
+        "mapped_bmp_units": 5756
+      },
+      {
+        "tag": 3,
+        "file_offset": 12890,
+        "bytes": 11090,
+        "u16_count": 5539,
+        "sha256": "13055949b980a59aed90b77918115d1dd7fac7d2b92ea5fdb180a2000b2ba28b",
+        "bounds_b1_min_max_b2_min_max": [
+          224,
+          252,
+          64,
+          254
+        ],
+        "mapped_bmp_units": 5149
+      },
+      {
+        "tag": 5,
+        "file_offset": 23980,
+        "bytes": 1216,
+        "u16_count": 606,
+        "sha256": "bc2c6c40b09aedd0e3fc612129611405ae545f02ee53ac5b7c11714535f5a138",
+        "pairs": 303
+      },
+      {
+        "tag": 6,
+        "file_offset": 25196,
+        "bytes": 1216,
+        "u16_count": 606,
+        "sha256": "f7d8fc0c0d276a99815aa46f1cf151c1c41a70388bca0061e54f61ece1747f2a",
+        "pairs": 303
+      },
+      {
+        "tag": 7,
+        "file_offset": 26412,
+        "bytes": 154,
+        "u16_count": 75,
+        "sha256": "6bc1b8d1ac7815adcc5db9af5930cf7d295d242399fec8a70dcb960921b826d4",
+        "triples": 25
+      }
+    ],
+    "examples": {
+      "single_5c": 92,
+      "supplementary_first": [
+        34720,
+        131083
+      ],
+      "composite_first": [
+        33525,
+        12363,
+        12442
+      ]
+    }
+  }
+}

@@ -1,0 +1,130 @@
+= Java 25 JIS0213 character mappings
+
+The String converter supports `x-SJIS_0213` and `x-MS932_0213` through all 13 case-insensitive names registered by the pinned Java extended provider.
+The standard aliases are `sjis-0213`, `sjis_0213`, `sjis:2004`, `sjis_0213:2004`, `shift_jis_0213:2004`, and `shift_jis:2004`.
+The Windows aliases are `MS932-0213`, `MS932_0213`, `MS932:2004`, `windows-932-0213`, and `windows-932:2004`.
+link:charsets.tsv[The charset manifest] records both canonical names, provider classes, source hashes, configurations, and aliases.
+
+`Charset::Jis0213` holds a passive immutable `Jis0213` configuration.
+The passive `JisMapping` and existing `Mapping` values borrow 48,382 bytes of immutable resources with process lifetime.
+Passive `Pair` values contain a scalar or two BMP units for a composite mapping.
+The cursor, current result, and output are transients owned by one decode call.
+No mapping initialization, decoded lookup collection, or mutable decoder state survives a record.
+The existing String scalar admission checks and reserves `4 * input_bytes + 16384` before decoding.
+The output reserves at most three UTF8 bytes per input byte: a single-byte character or replacement uses at most three bytes, a supplementary pair uses four, and a composite pair uses at most six.
+
+== Lookup order and replacement boundaries
+
+Both configurations first use the JIS0213 single-byte table.
+ASCII backslash and tilde remain U+005C and U+007E, and bytes 0xA1 through 0xDF map to halfwidth Kana.
+An unmapped first byte starts a two-byte lookup.
+The Windows configuration first tries the MS932 BMP mapping with inclusive trail bounds 0x40 through 0xFC.
+Both configurations then try the JIS0213 BMP mapping, supplementary mapping, and composite mapping, in that order.
+The Windows override changes only BMP double-byte lookup.
+
+The JIS0213 BMP table has lead ranges 0x81 through 0x9F and 0xE0 through 0xFC, with 191 entries per row.
+Its stored trail bounds are 0x40 and 0xFE, but `CharsetMapping.decodeDouble` tests `b2 < b2Max`, excluding 0xFE.
+Supplementary and composite lookups use the complete two-byte key independently of those BMP bounds.
+The supplementary values gain 0x20000 before conversion to a scalar.
+Composite values remain two separate Unicode scalars, preserving combining marks.
+
+The standard mapping decodes 0x8160 as U+301C and 0x8161 as U+2016; Windows decodes them as U+FF5E and U+2225.
+The standard mapping decodes 0xF040 as U+20089, while the Windows BMP mapping takes priority and produces U+E000.
+Both configurations decode 0x8280 as U+2127, 0x87A0 as U+2000B, and 0x82F5 as U+304B U+309A.
+
+OpenJDK25 `String(byte[], Charset)` uses `CharsetDecoder` with replacement enabled and `endOfInput` true for both classes.
+Their decoder does not implement `ArrayDecoder`.
+If every pair lookup fails, the decoder consumes two bytes when the second byte is also unmapped in the single-byte table.
+Otherwise it consumes only the first byte and decodes the second byte again.
+This rule applies even when the first byte has no lead row, or the second byte could start a valid pair.
+A final unmapped single byte produces one replacement.
+Every replacement is U+FFFD, and partial input never carries across records.
+
+== Source provenance and module-image extraction
+
+The resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+Its SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d`.
+Archive member `jdk-25.0.1+8/lib/src.zip` has SHA256 `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+Archive member `jdk-25.0.1+8/lib/modules` has 145,853,395 bytes and SHA256 `eaa087fdeba16f966a62466ad9c80b75fc630ed5909863edaf86e0709c58dd81`.
+link:sources.sha256[The source manifest] pins 18 source files covering the image format, mapping loader, decoder classes, provider registration, and String replacement path.
+link:COPYRIGHT[Copyright notices] retain their upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information] from the pinned archive.
+
+`SJIS_0213.Holder` loads `sjis0213.dat` through its class resource stream.
+The exact image resource is `/jdk.charsets/sun/nio/cs/ext/sjis0213.dat`.
+It contains 26,566 bytes with SHA256 `9a103ec5e953cb5f8dd205c928abde3b333086a1e784825c940a6acc2e1c0020`.
+link:provenance.json[The extraction provenance] records the image index, location attributes, resource offset, mapping block boundaries, and block hashes.
+
+`ImageHeader` defines a seven-u32 header containing magic, version, flags, resource count, table length, location-byte count, and string-byte count.
+The pinned image uses little-endian integers, magic 0xCAFEDADA, version 0x00010000, and flags zero.
+The 28-byte header is followed by two table-length arrays of four-byte integers, then location bytes and string bytes.
+The first array is the hash redirect table; the second is the location-offset table.
+The derivation enumerates the location-offset table to find the unique resource.
+The index occupies 1,546,606 bytes.
+
+`ImageLocation.decompress` treats attribute bytes at or below seven as terminators.
+Other attribute bytes encode the attribute kind in the upper five bits and a one-through-eight-byte value length in the lower three bits.
+Attribute values use big-endian order.
+Kinds 1 through 4 identify module, parent, base name, and extension through NUL-terminated image strings.
+The target's four string components are ASCII.
+Kinds 5, 6, and 7 are content offset, compressed size, and uncompressed size.
+The resource occupies offset-table slot 1162 and location-table byte offset 23971.
+Its content offset is 103,042,317, added to the index size by `BasicImageReader.getResourceBuffer`, giving absolute image offset 104,588,923.
+
+The compressed-size attribute is zero, so the resource is read directly.
+Unexpected nonzero compressed sizes fail explicitly in the derivation.
+The pinned decompressor source describes an alternative 29-byte 0xCAFEFAFA header and layered decompression path; this resource requires neither.
+Python's standard `tarfile` implementation decompresses the containing gzip archive.
+
+== Resource formats
+
+`sjis0213.dat` is retained byte-for-byte, including its encoding-only blocks.
+`CharsetMapping.load` reads a four-byte big-endian payload length followed by tagged blocks.
+The payload length is 26,562, exactly the resource size minus four.
+Each block begins with a two-byte big-endian tag.
+Double-byte blocks then contain four two-byte bounds.
+Every block ends with a two-byte character count and that many two-byte units.
+
+[cols="1,1,1,1,3",options="header"]
+|===
+|Tag |Offset |Bytes |Units |Meaning
+|8 |4 |516 |256 |Character-to-byte index
+|1 |520 |516 |256 |Single-byte table, 191 mapped BMP units
+|2 |1036 |11854 |5921 |First BMP block, 5756 mapped units
+|3 |12890 |11090 |5539 |Second BMP block, 5149 mapped units
+|5 |23980 |1216 |606 |303 byte-to-supplementary mappings
+|6 |25196 |1216 |606 |303 reverse supplementary mappings
+|7 |26412 |154 |75 |25 byte/base/combining triples
+|===
+
+Supplementary tables store sorted keys in their first half and corresponding values in their second half.
+Composite entries are triples sorted by byte key.
+The derivation verifies dimensions, key ordering, exact input consumption, and nonsurrogate BMP and composite units.
+Generated constants in `tables.rs` locate the arrays directly; decoding does not parse or copy the resource.
+
+`windows-31j.bin` derives from `MS932.DecodeHolder` and contains 21,816 bytes.
+It begins with inclusive trail bounds 0x40 and 0xFC, then 256 single-byte units, 256 row indices, and 55 present rows of 189 units.
+All units and indices use big-endian order.
+An absent row has index 0xFFFF and an unmapped value is U+FFFD.
+The table is byte-identical to the existing generic Windows-31J resource.
+link:mappings.tsv[The mapping manifest] records both resource hashes, sizes, and their input resource or source hashes.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads only archive members, source text, and image bytes:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-jis0213
+----
+
+The derivation pins archive, source ZIP, and raw mapping hashes, and checks provider ownership and decoder source assumptions.
+It never loads a JDK library or executes Java, jimage, extracted binaries, or the Rust implementation.
+It generates both resources, aliases, offsets, manifests, source hashes, copyright headers, and licenses.
+link:probes.tsv[The probe manifest] records independent single-byte, pair, and recovery digests for each configuration.
+The single-byte digest concatenates the decoded results of 256 independent records.
+The pair digest covers all 65,536 byte pairs in unsigned order, appending U+0000 after each decoded result.
+The recovery digest appends bytes `41 82 F5 87 A0` to each input pair before decoding and then appends U+0000 to the result.
+The separator is outside the input, so malformed input cannot consume it.
+
+Regression sources cover every registered name and uppercase spelling, the complete pair and recovery spaces, all supplementary and composite entries, Windows precedence, invalid pair consumption, record boundaries, null and empty values, configuration precedence, and memory admission.
+The regression sources have not been executed during Phase 1 source work.
