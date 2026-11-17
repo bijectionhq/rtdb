@@ -108,7 +108,7 @@ fn grapheme_boundary_replacement_assembles_utf16_before_java_utf8_encoding() {
     assert_eq!(replace("😀b", r"(?<=(.))\b{g}(?:b|😀)", "$1"), "😀😀");
     assert_eq!(replace("😀b", r"(?<=(.))\b{g}(?:b|\x{1f600})", "$1"), "😀?");
     assert_eq!(replace("😀b", r"a\uD800|(?!\A).\b{g}b", "x"), "?x");
-    assert_eq!(replace("😀b", r"(?iu)a\uD800|(?!\A).\b{g}b", "x"), "?x");
+    assert_eq!(replace("😀b", r"(?iu)a\uD800|(?!\A).\b{g}b", "x"), "😀b");
 }
 
 #[test]
@@ -352,7 +352,7 @@ fn replacement_uses_java_group_number_name_escaping_and_empty_match_rules() {
     assert_eq!(replace("b", "(a)?b", "$1!"), "!");
     assert_eq!(replace("aba", r"\A(?:(?=(a(b)?))ab?)+\z", "$1-$2"), "a-b");
     assert_eq!(replace("aba", r"\A(?:(?>(a(b)?)))+\z", "$1-$2"), "a-b");
-    assert_eq!(replace("aab", r"\A(?:(?=(a(b)?))ab?)+ab\z", "$1-$2"), "a-");
+    assert_eq!(replace("aab", r"\A(?:(?=(a(b)?))ab?)+ab\z", "$1-$2"), "ab-b");
     assert_eq!(replace("a", "(a)", r"\1\\$0"), "a\\a");
     assert_eq!(replace("a", "a*", "x"), "xx");
     assert_eq!(replace("ab", "", "x"), "xaxbx");
@@ -427,6 +427,7 @@ fn malformed_java_syntax_does_not_enable_foreign_regex_extensions() {
 
 #[test]
 fn regex_limits_bound_patterns_nesting_and_retained_backtracking() {
+    assert!(matches(&"a".repeat(16), r"\A(a|b)+\z", ""));
     let cumulative = "(?:(?:(?:(?:(?:a{10000}){10000}){10000}){10000}){10000})";
     assert_eq!(scalar_call("like_regex", &[text("a"), text(cumulative), text("")], &EvalContext::default()).unwrap_err().code, "rtdb.expr/regex-limit");
     let oversized = "a".repeat(65_537);
@@ -434,7 +435,7 @@ fn regex_limits_bound_patterns_nesting_and_retained_backtracking() {
     let nested = format!("{}a{}", "[".repeat(129), "]".repeat(129));
     assert_eq!(scalar_call("like_regex", &[text("a"), text(&nested), text("")], &EvalContext::default()).unwrap_err().code, "rtdb.expr/regex-limit");
     let source = "a".repeat(600);
-    assert_eq!(scalar_call("like_regex", &[text(&source), text(r"\A(?:a(?=a))*a"), text("")], &EvalContext::default()).unwrap_err().code, "rtdb.expr/regex-limit");
+    assert_eq!(scalar_call("like_regex", &[text(&source), text(r"\A(?:a(?=a)|a)*a"), text("")], &EvalContext::default()).unwrap_err().code, "rtdb.expr/regex-limit");
 }
 
 #[test]

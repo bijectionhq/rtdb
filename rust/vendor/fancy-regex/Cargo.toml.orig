@@ -18,7 +18,11 @@ default = ["unicode", "perf", "std"]
 track_caller = []
 perf = ["regex-automata/perf"]
 unicode = ["regex-automata/unicode", "regex-syntax/unicode"]
-std = ["regex-automata/std", "regex-syntax/std", "bit-set/std"]
+std = ["regex-automata/std", "regex-syntax/std", "bit-set/std", "dep:stacker"]
+
+[dependencies.stacker]
+version = "0.1.25"
+optional = true
 
 [dependencies.regex-automata]
 version = "0.4"

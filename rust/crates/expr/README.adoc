@@ -464,6 +464,7 @@ Replacement advances one UTF16 unit after an empty match and assembles the compl
 The native vendor's ordinary defaults remain unchanged; its explicit `java_utf16` builder method enables Java matching and the graph.
 Disabling Java matching clears that selection, and borrowed UTF8 capture APIs continue to reject intervals that split a surrogate pair.
 Graph compile, delegate and retained matching state are reserved before construction; per-input UTF16 scratch and completed output use the caller's allocation scope.
+Java graph recursion uses bounded stack growth with its storage admitted before compilation, and reaching the configured recursion limit returns a resource error.
 The shared analyzer's checked cumulative-width admission and existing finite pattern, nesting, repetition, step and stack limits remain in force.
 `tests/java_pattern.rs` and vendor `tests/java_utf16.rs` retain the unexecuted matcher and ownership regressions.
 The ordinary matcher dispatch gaps covered here are separate from the wider UTF16 text-carrier and raw host-form evaluator work.

@@ -12,6 +12,15 @@ fn translation(pattern: JavaText<'_>) -> Translation {
     Translator { source: &source, position: 0, flags: Flags::default(), scopes: Vec::new(), output: String::new(), names: Vec::new(), literals: Vec::new(), supplementary: source.points.iter().copied().any(supplementary), predicate_bmp: true, syntax_prefix_verified: true, syntax: None }.translate(&context).unwrap()
 }
 
+#[test]
+fn escaped_surrogate_slice_keeps_bmp_search_starts() {
+    let source = r"a\uD800|(?!\A).\b{g}b";
+    let translated = translation(JavaText::from_utf8(source));
+    assert!(!translated.supplementary, "{}", translated.pattern);
+    let pattern = compile(source, "", &EvalContext::default()).unwrap();
+    assert!(pattern.search("😀b", &EvalContext::default()).unwrap(), "{:?} {:?}", pattern.regex, Expr::parse_java_tree(&translated.pattern));
+}
+
 fn failure(pattern: &[u16], context: &EvalContext<'_>) -> failure::PatternFailure {
     match compile_text(JavaText::from_utf16(pattern), JavaText::from_utf8(""), context).err().unwrap() {
         CompileFailure::Pattern(failure) => failure,

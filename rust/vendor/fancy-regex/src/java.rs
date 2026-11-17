@@ -8,6 +8,13 @@ use class::CharacterClass;
 
 const MAX_CALL_DEPTH: usize = 512;
 
+fn on_stack<T>(work: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "std")]
+    { stacker::maybe_grow(64 * 1024, 1024 * 1024, work) }
+    #[cfg(not(feature = "std"))]
+    { work() }
+}
+
 pub(crate) fn requires_java_nodes(expr: &Expr) -> bool {
     match expr {
         Expr::GraphemeBoundary | Expr::LineEnding => true,
@@ -346,7 +353,7 @@ impl Matcher<'_> {
     fn matches(&mut self, node: usize, position: usize) -> Result<bool> {
         if self.depth >= self.options.backtrack_stack_limit.min(MAX_CALL_DEPTH) { return Err(Error::RuntimeError(RuntimeError::StackOverflow)); }
         self.depth += 1;
-        let result = self.execute(node, position);
+        let result = on_stack(|| self.execute(node, position));
         self.depth -= 1;
         result
     }
@@ -511,7 +518,7 @@ impl Matcher<'_> {
     fn curly(&mut self, body: usize, position: usize, count: usize, max: usize, order: Order, next: usize) -> Result<bool> {
         if self.depth >= self.options.backtrack_stack_limit.min(MAX_CALL_DEPTH) { return Err(Error::RuntimeError(RuntimeError::StackOverflow)); }
         self.depth += 1;
-        let result = self.curly_inner(body, position, count, max, order, next);
+        let result = on_stack(|| self.curly_inner(body, position, count, max, order, next));
         self.depth -= 1;
         result
     }
@@ -557,7 +564,7 @@ impl Matcher<'_> {
     fn group_curly(&mut self, body: usize, position: usize, count: usize, max: usize, order: Order, group: Option<usize>, next: usize) -> Result<bool> {
         if self.depth >= self.options.backtrack_stack_limit.min(MAX_CALL_DEPTH) { return Err(Error::RuntimeError(RuntimeError::StackOverflow)); }
         self.depth += 1;
-        let result = self.group_curly_inner(body, position, count, max, order, group, next);
+        let result = on_stack(|| self.group_curly_inner(body, position, count, max, order, group, next));
         self.depth -= 1;
         result
     }

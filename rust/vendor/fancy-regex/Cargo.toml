@@ -44,6 +44,7 @@ default = [
 ]
 perf = ["regex-automata/perf"]
 std = [
+    "dep:stacker",
     "regex-automata/std",
     "regex-syntax/std",
     "bit-set/std",
@@ -122,6 +123,10 @@ default-features = false
 [dependencies.unicode-normalization]
 version = "=0.1.24"
 default-features = false
+
+[dependencies.stacker]
+version = "0.1.25"
+optional = true
 
 [dev-dependencies.criterion]
 version = "0.5"

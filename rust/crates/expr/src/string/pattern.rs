@@ -55,7 +55,7 @@ fn compile_admitted(pattern: JavaText<'_>, flags: JavaText<'_>, bytes: usize, co
     let slots = metrics.nodes.checked_mul(4).and_then(|slots| slots.checked_add(64)).ok_or_else(overflow).map_err(&retain)?;
     let matching = (STACK_BRANCHES + 1).checked_mul(slots.checked_mul(32).and_then(|bytes| bytes.checked_add(64)).ok_or_else(overflow).map_err(&retain)?).ok_or_else(overflow).map_err(&retain)?;
     context.reserve(compilation.checked_add(matching).ok_or_else(overflow).map_err(&retain)?).map_err(&retain)?;
-    context.reserve(BACKTRACKS * 64 + STACK_BRANCHES * 1024).map_err(&retain)?;
+    context.reserve(BACKTRACKS * 64 + STACK_BRANCHES * (32 * 1024)).map_err(&retain)?;
     let regex = RegexBuilder::new(&translation.pattern).java_utf16(true).java_supplementary(translation.supplementary).backtrack_limit(BACKTRACKS).backtrack_stack_limit(STACK_BRANCHES)
         .delegate_size_limit(DELEGATE_BYTES).delegate_dfa_size_limit(DFA_BYTES).build().map_err(regex_error).map_err(&retain)?;
     Ok(Pattern { regex, names: translation.names })
