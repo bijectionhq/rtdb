@@ -10,11 +10,11 @@ use super::*;
 use crate::MemoryBudget;
 use buffer::{MutableBits, MutableBytes};
 use native_scalar::{NativeScalarData, NativeScalarStorage, ScalarOffsets, ScalarStorageRef, StoredBits, StoredBytes};
-pub(crate) use owner::{ScalarReader, ScalarWriter};
+pub(crate) use owner::{ScalarReader, ScalarWriter, VectorWriter};
 pub(crate) use copy::{ScalarCopier, ScalarSource};
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ReferenceFailure { Unsupported(&'static str), InvalidCopySource, CheckFailed, RequireFailed, Bounds, NegativeArraySize(i32) }
+pub(crate) enum ReferenceFailure { Unsupported(&'static str), InvalidCopySource, CheckFailed, RequireFailed, Bounds, NegativeArraySize(i32), CannotPromoteUnionLeg, RunEndReceiverClass, CannotSetUnionNullable }
 #[derive(Debug)]
 pub(crate) enum WriteError { Reference(ReferenceFailure), Native(Anomaly) }
 pub(crate) type WriteResult<T> = std::result::Result<T, WriteError>;

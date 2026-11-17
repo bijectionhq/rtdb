@@ -242,4 +242,33 @@ That native admission preserves prior mutations and applies the existing abort-u
 Zero-width zero fills skip payload admission, while empty array and raw-buffer copies still check their signed destination span.
 Native scalar finish preserves captured negative counts and cursors without normalizing or padding payloads.
 `cells/write/count_tests.rs` adds source regressions for wrapped counts, raw copy demands, cursor failure order, native admission and retained ownership.
-Container count arithmetic, source signed reader slices, recursive copier factories, relations, full objects, transport and production adoption remain required follow-on work.
+Complete source constructor and child/getter behavior, source signed reader slices, recursive copier factories, relations, full objects, transport and production adoption remain required follow-on work.
+
+== Private vector tree construction and common writes
+
+The crate-private `VectorWriter::from_descriptor` constructs a fresh empty native tree from an admitted retained `VectorDescriptor`.
+It selects the concrete direct Struct, List, FixedList, Map, Set, timestamp-range, DenseUnion and RunEnd constructors, with existing scalar states as private leaves.
+Struct lookup keys remain independent of child names, and dense-union construction uses complete ordered children with ordinal byte discriminators.
+Negative fixed-list widths, zero-width fixed binary and failed run-end logical metadata retain their concrete native identities during construction.
+The current scalar descriptor domain excludes source-legal negative fixed-binary widths; their source-native scalar construction and metadata boundary remain required work.
+
+One passive transient owns the complete tree, its attached metadata and buffer leases, and one `Ready`/`NativeAborted` publication gate.
+Its working root methods cover signed count/name/nullability inspection, common null/undefined and primitive/byte writes, `end_struct`, `end_list`, `clear` and consuming `finish`.
+Scalar bodies and ordinary scalar reader admission remain shared with the standalone scalar foundation.
+Run-end singleton writes complete the values operation before checking counts and writing the concrete end receiver.
+Nested run-end values use their actual counts without requesting logical metadata or payload equality.
+Union null writes use the explicit Null leg, while a union-valued run-end nullable setter retains its separate source failure before any row prefix.
+Map delegates list end; Set and timestamp-range retain their source unsupported end methods.
+
+Native depth admission follows the physical descriptor tree through failed logical metadata and bounds construction, recursive operations and teardown at 128 levels.
+Names, scalar ingress copies, keyed slots, child arrays and capture inputs are admitted before allocation under leases retained with their owners.
+An absent Union Null child completes construction before slot growth; installed growth and completed source prefixes share the root mutation recorder.
+Reference failures preserve the completed state and keep the owner usable; native failure after mutation requires whole-root `clear` before further writes or publication.
+Clear preserves established kinds, names, nullability, child slots and charged capacity while zeroing buffers and resetting counts/cursors.
+Consuming finish retains independent parent/child counts, initialized spans and list last-offset, and derives immutable metadata from the actual captured children.
+Immutable reader snapshots retain their existing terminal-offset and reader-identity behavior.
+
+`cells/write/owner/tree_tests.rs` covers concrete construction and writes, keyed names, wrapper methods, wrapped counts/ordinals, failure prefixes, finite admission, capture cleanup, aliases and depth-bound teardown.
+Full Field/type factory construction, borrowed source getter/hint and LongLong kernels, routed child handles, promotion, recursive copying, relations, host objects/hash, physical transport and production adoption remain required increments.
+The independent source signed-Slice error, allocation and mutable-alias contract also remains open.
+The Phase 1 source gate remains in force; this private foundation has not been compiled or executed.

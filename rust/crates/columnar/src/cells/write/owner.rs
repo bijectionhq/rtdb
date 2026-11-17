@@ -2,6 +2,11 @@ use super::*;
 use rtdb_types::{IntervalUnit, ScalarType};
 use super::super::getters::Getter;
 
+mod tree;
+mod containers;
+#[cfg(test)]
+mod tree_tests;
+
 pub(super) enum MutableScalarData {
     Null,
     Bits(MutableBits),
@@ -296,5 +301,42 @@ impl ScalarReader<'_> {
     pub(crate) fn get_bytes(&self, row: i32) -> VectorReadResult<&[u8]> {
         if !matches!(self.scalar.field().data_type(), DataType::Utf8 | DataType::Binary | DataType::FixedSizeBinary(_)) { return Err(unsupported("getBytes").into()); }
         Ok(self.storage().bytes(self.row(row)?, self.scalar.field().data_type())?)
+    }
+}
+
+pub(crate) struct VectorWriter { root: tree::WriterNode, state: PublicationState }
+impl VectorWriter {
+    pub(crate) fn from_descriptor(descriptor: &VectorDescriptor, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        tree::WriterNode::admit(descriptor, 1)?;
+        Ok(Self { root: tree::WriterNode::build(descriptor, &memory)?, state: PublicationState::Ready })
+    }
+    pub(crate) fn name(&self) -> &str { self.root.name() }
+    pub(crate) fn nullable(&self) -> bool { self.root.nullable() }
+    pub(crate) fn value_count(&self) -> i32 { self.root.count().get() }
+    pub(crate) fn checked_len(&self) -> Result<usize> { self.root.count().checked_len() }
+    fn operation<T>(&mut self, action: impl FnOnce(&mut tree::WriterNode, &mut Mutation) -> WriteResult<T>) -> WriteResult<T> {
+        if self.state == PublicationState::NativeAborted { return Err(WriteError::Native(aborted())); }
+        let mut mutation = Mutation::default();
+        let result = action(&mut self.root, &mut mutation);
+        if matches!(&result, Err(WriteError::Native(_))) && mutation.changed { self.state = PublicationState::NativeAborted; }
+        result
+    }
+    pub(crate) fn write_undefined(&mut self) -> WriteResult<()> { self.operation(|node, mutation| node.undefined(1, mutation)) }
+    pub(crate) fn write_null(&mut self) -> WriteResult<()> { self.operation(|node, mutation| node.write_null(1, mutation)) }
+    pub(crate) fn write_boolean(&mut self, value: bool) -> WriteResult<()> { self.operation(|node, mutation| node.boolean(value, 1, mutation)) }
+    fn primitive(&mut self, method: &'static str, bytes: &[u8]) -> WriteResult<()> { self.operation(|node, mutation| node.primitive(method, bytes, 1, mutation)) }
+    pub(crate) fn write_byte(&mut self, value: i8) -> WriteResult<()> { self.primitive("writeByte", &value.to_le_bytes()) }
+    pub(crate) fn write_short(&mut self, value: i16) -> WriteResult<()> { self.primitive("writeShort", &value.to_le_bytes()) }
+    pub(crate) fn write_int(&mut self, value: i32) -> WriteResult<()> { self.primitive("writeInt", &value.to_le_bytes()) }
+    pub(crate) fn write_long(&mut self, value: i64) -> WriteResult<()> { self.primitive("writeLong", &value.to_le_bytes()) }
+    pub(crate) fn write_float(&mut self, value: f32) -> WriteResult<()> { self.primitive("writeFloat", &value.to_le_bytes()) }
+    pub(crate) fn write_double(&mut self, value: f64) -> WriteResult<()> { self.primitive("writeDouble", &value.to_le_bytes()) }
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> WriteResult<()> { self.operation(|node, mutation| node.bytes(bytes, 1, mutation)) }
+    pub(crate) fn end_struct(&mut self) -> WriteResult<()> { self.operation(|node, mutation| node.end_struct(1, mutation)) }
+    pub(crate) fn end_list(&mut self) -> WriteResult<()> { self.operation(|node, mutation| node.end_list(1, mutation)) }
+    pub(crate) fn clear(&mut self) { self.root.clear(); self.state = PublicationState::Ready; }
+    pub(crate) fn finish(self) -> Result<ExecutionVector> {
+        if self.state == PublicationState::NativeAborted { return Err(aborted()); }
+        self.root.finish()
     }
 }
