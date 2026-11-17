@@ -223,9 +223,12 @@ pub(super) fn list_events<'a>(expr: &'a Expr, schema: &'a Schema, row: &'a [Valu
                 {
                     let page_context = context.with_allocation(&scope);
                     let page_frame = EvaluationFrame { schema, row, context: &page_context, asynchronous: true, replacements: Some(replacements) };
+                    let integers = match &value { EvalValue::List(_, reader) => match reader.as_ref() { ListReader::IntegerSeries(series) => Some(*series), _ => None }, _ => None };
                     for index in position..position + count {
-                        let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
-                        let mut cell = materialize(cell, &page_frame)?.await?;
+                        let mut cell = if let Some(series) = integers { series.nth(index) } else {
+                            let cell = nth(clone_value(&value, &page_frame)?, index, &page_frame)?.await?;
+                            materialize(cell, &page_frame)?.await?
+                        };
                         cell.admit_expression_dates()?;
                         super::validate_projection_value(&cell)?;
                         values.push(cell);
