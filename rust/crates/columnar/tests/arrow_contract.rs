@@ -12,6 +12,7 @@ fn round_trip(ty: LogicalType, values: Vec<Value>) {
     let field = to_field("value", &ty).unwrap();
     assert_eq!(from_field(&field).unwrap(), ty);
     let array = build_array(&ty, &values).unwrap();
+    array.to_data().validate_full().unwrap();
     assert_eq!(array.data_type(), field.data_type());
     assert_eq!(array.len(), values.len());
     for (row, value) in values.iter().enumerate() { assert_eq!(&read_value(&field, array.as_ref(), row).unwrap(), value); }
@@ -51,6 +52,7 @@ fn absent_struct_children_read_as_null_without_losing_bottom_fields() {
     let values = vec![Value::Struct(BTreeMap::from([("declared".into(), Value::Undefined), ("maybe".into(), Value::I64(1))])), Value::Struct(BTreeMap::from([("declared".into(), Value::Undefined)]))];
     let array = build_array(&ty, &values).unwrap();
     let field = to_field("x", &ty).unwrap();
+    array.to_data().validate_full().unwrap();
     assert_eq!(read_value(&field, array.as_ref(), 0).unwrap(), Value::Struct(BTreeMap::from([
         ("declared".into(), Value::Undefined), ("maybe".into(), Value::I64(1)),
     ])));

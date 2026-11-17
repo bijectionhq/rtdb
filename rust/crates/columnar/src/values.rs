@@ -64,7 +64,9 @@ fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Resu
                 }).collect::<Vec<_>>();
                 build(child_type, &child_values, check_precision)
             }).collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(StructArray::try_new_with_length(fields.clone(), arrays, validity(values), values.len()).map_err(super::arrow_error)?))
+            let data = arrow_data::ArrayData::builder(DataType::Struct(fields.clone())).len(values.len()).nulls(validity(values))
+                .child_data(arrays.iter().map(|array| array.to_data()).collect()).build().map_err(super::arrow_error)?;
+            Ok(make_array(data))
         }
         LogicalType::List { kind, element } => build_list(logical, kind, element, values, check_precision),
         LogicalType::Union(_) => build_union(logical, values, check_precision),
@@ -249,8 +251,16 @@ fn build_list(logical: &LogicalType, kind: &ListKind, element: &LogicalType, val
     }
     let array = build(element, &flat, check_precision)?;
     match field.data_type() {
-        DataType::List(child) => Ok(Arc::new(ListArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), array, validity(values)).map_err(super::arrow_error)?)),
-        DataType::FixedSizeList(child, size) => Ok(Arc::new(FixedSizeListArray::try_new_with_length(Arc::clone(child), *size, array, validity(values), values.len()).map_err(super::arrow_error)?)),
+        DataType::List(_) => {
+            let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(values.len()).nulls(validity(values))
+                .add_buffer(ScalarBuffer::from(offsets).into_inner()).add_child_data(array.to_data()).build().map_err(super::arrow_error)?;
+            Ok(make_array(data))
+        }
+        DataType::FixedSizeList(_, _) => {
+            let data = arrow_data::ArrayData::builder(field.data_type().clone()).len(values.len()).nulls(validity(values))
+                .add_child_data(array.to_data()).build().map_err(super::arrow_error)?;
+            Ok(make_array(data))
+        }
         DataType::Map(child, sorted) => {
             let entries = array.as_any().downcast_ref::<StructArray>().ok_or_else(layout_error)?.clone();
             Ok(Arc::new(MapArray::try_new(Arc::clone(child), OffsetBuffer::new(ScalarBuffer::from(offsets)), entries, validity(values), *sorted).map_err(super::arrow_error)?))

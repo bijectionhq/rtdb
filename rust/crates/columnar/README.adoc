@@ -4,6 +4,7 @@ Columnar builders and readers are passive call-owned transforms.
 `OwnedBatch`, `OwnedColumn`, and cloned Arrow arrays retain their allocation reservations independently of the query cursor.
 `MemoryBudget` and `MemoryReservation` re-export the shared byte-admission types from `rtdb-types`.
 Schema codecs preserve native logical types and the full signed decimal precision and scale at external boundaries.
+Struct and list builders validate physical child validity through checked `ArrayData`, preserving bottom fields and explicit union NULL legs.
 
 Execution admission uses `execution_type`, `execution_field_type`, `admit_execution_value`, and `read_execution_value`.
 Unsigned integer storage is read as the signed integer of the same width, including nested cells, matching the pinned Arrow vector opener.
