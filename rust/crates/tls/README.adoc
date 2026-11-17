@@ -13,6 +13,10 @@ JKS store integrity and private-key protection use independent passwords.
 A missing JKS store password skips the integrity check while retaining bounded framing checks.
 Trust loading does not require decrypting JKS private keys.
 JKS loading retains the last entry for each stored alias, comparing modified UTF-8 aliases as exact UTF-16 code-unit sequences.
+Private-key identities retain their stored aliases and Java store enumeration order for transport-owned key-manager selection.
+JKS enumeration follows `Hashtable` bucket traversal, collision insertion and resize order.
+PKCS12 enumeration follows `LinkedHashMap` insertion order; replacing an existing alias retains its original position.
+PEM identities carry no stored alias.
 Certificates are validated while loading, and private keys are decrypted after duplicate entries have been replaced.
 PKCS12 decoding preserves separate integrity and key passwords, multiple private-key bags, local-key identifiers, certificate chains, and Java trusted-certificate attributes.
 BER constructed octets and indefinite lengths are bounded by the encoded input and a nesting limit.
