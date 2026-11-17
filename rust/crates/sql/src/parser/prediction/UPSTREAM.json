@@ -106,10 +106,15 @@
         "source": "atn/ATNState.java",
         "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNState.java",
         "sha256": "825c020effdac6ecb0ab5f64fef810478b60020ebd215482863b59276b2f0600"
+      },
+      {
+        "source": "dfa/DFA.java",
+        "url": "https://raw.githubusercontent.com/antlr/antlr4/4.13.2/runtime/Java/src/org/antlr/v4/runtime/dfa/DFA.java",
+        "sha256": "6f119a06edf323f67fb0b4de10dd9b178ef38eb2bac2aea486447b97f1584621"
       }
     ]
   },
-  "scope": "Prediction-context values, cached and uncached merging, SLL cached-context publication, live ordered configuration identities, pinned semantic algebra and prediction-mode facts; no token prediction or production parser adapter.",
+  "scope": "Prediction-context/configuration/mode values and private retained 372-decision DFA storage, source publication phases and actual roots; no token prediction or production parser adapter.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -156,5 +161,28 @@
       66,
       67
     ]
+  },
+  "native_container_policy_sources": {
+    "provider": "Eclipse Temurin25.0.1+8-LTS; SOURCE=.:git:61d6a2c1b35e",
+    "archive": "https://github.com/adoptium/temurin25-binaries/releases/tag/jdk-25.0.1%2B8",
+    "source_archive_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+    "sources": [
+      {
+        "source": "java.base/java/util/HashMap.java",
+        "url": "https://raw.githubusercontent.com/openjdk/jdk25u/jdk-25.0.1%2B8/src/java.base/share/classes/java/util/HashMap.java",
+        "sha256": "f3f1d144fdd482730280697ebd94971cfff0480e6016dd5c7e46c47f4b9e3d44"
+      },
+      {
+        "source": "java.base/java/util/HashSet.java",
+        "url": "https://raw.githubusercontent.com/openjdk/jdk25u/jdk-25.0.1%2B8/src/java.base/share/classes/java/util/HashSet.java",
+        "sha256": "ba15878b13e4fc41b45ac53b9e5ebd32e9c58a2cf2559540ccdffbf47e2b481c"
+      }
+    ],
+    "policy": "Private native 32-slot half-full map with stored native insertion hashes and allocation-free comparisons under the nonescaping stable-producer premise; no JVM Object identity hash, bucket/tree layout or allocator/stack failure equivalence."
+  },
+  "production_gate": {
+    "finding": "embedded-parser-error-capability",
+    "status": "open",
+    "required": "Preserve supported embedded cause/recognizer/config/DFA behavior or deliver a specific reviewed-design-compatible migration with source/native assertions before production cache adoption or compatibility closure."
   }
 }

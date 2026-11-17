@@ -1,6 +1,6 @@
 = Prediction values
 
-This private parser component implements prediction-context values, ordered configuration identities and prediction-mode facts from ANTLR 4.13.2.
+This private parser component implements prediction-context values, ordered configuration identities, prediction-mode facts and private retained DFA storage from ANTLR 4.13.2.
 `UPSTREAM.json` pins the primary sources; link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
 It does not perform token prediction, recognize SQL rules or change a production parser entry point.
 
@@ -15,7 +15,8 @@ Invocation input excludes the root sentinel and runs innermost to outermost; con
 
 The owner retains flat immutable node slots with owned array payloads, mutable round-local memo membership, canonical-context membership and traversal scratch.
 A candidate array remains private and mutable until operand reuse and common-parent normalization finish.
-Published nodes and their edges do not change.
+Published context values and their parent edges do not change.
+Each Array also carries admitted comparison work metadata, exclusively owned and cleared by its active private equality session.
 The derived local-domain bit records whether a node can be traversed by the SLL cached-context operation without following a null parent.
 The owner has an explicit `Drop` lifetime witness, so its allocation scope must outlive storage destruction.
 It exposes no storage extraction, cloning or mutable graph view.
@@ -101,9 +102,9 @@ Completed canonical publications survive later failures, including failure to re
 An unpublished array payload is dropped if admitting its node slot fails.
 The failed access remains sealed, but a subsequent access has fresh work and abort state under the same retained budget.
 Canonical entries are strong roots and are not evicted or reset to recover memory.
-Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its configuration and context blocks before its owned grammar.
+Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its DFA, configuration and context blocks before its owned grammar.
 The region exposes neither raw stores nor graph replacement, and takes no ambient budget or cache.
-DFA root integration and parser-environment sharing remain separate required work.
+Production parser-environment sharing and adoption of the private DFA constituent remain separate required work.
 
 == Configuration objects and ordered sets
 
@@ -140,7 +141,8 @@ Hashing folds the ordered list with Java's wrapping 31-fold.
 A read-only set retains a computed non-`-1` hash even if an alias subsequently changes a configuration.
 The value `-1` remains the source cache sentinel and is recomputed on the next request.
 Clearing a mutable set clears membership but retains semantic, outer-context, unique-alternative and conflict metadata.
-Later closure and DFA containers must separately preserve their insertion-time hashes when aliased keys change.
+The private DFA map stores its native insertion-time hashes separately; a later closure container still requires its own reviewed implementation.
+The DFA substitution proof requires its closed internal producer and nonescaping-capability premise, and does not deep-freeze arbitrary configuration aliases.
 
 == Semantic values and mode facts
 
@@ -218,10 +220,70 @@ Unrooted variable payloads release their leases, while reusable pool capacities 
 A failed access retains completed rooted updates and releases unrooted work; a later access has fresh abort flags and scratch.
 Neither callback errors nor memory exhaustion reset canonical membership or read-only cached hashes.
 
-This component has no production DFA root constituent yet, so configuration values without actual persistent roots are collected at access end.
-The private test-only fixture supplies two fixed key/value set pairs at the future cache traversal boundary.
+The private DFA constituent now directly traces actual map keys and values, ordinary and synthetic starts, prefilter configurations and completed edge references before configuration collection.
+Completed predicate pairs own inline semantic values and checked alternatives, with no outgoing configuration or context IDs in this domain.
+The private test-only fixture still supplies two fixed key/value set pairs for the generic configuration regressions.
 It is absent from production and does not model DFA insertion, equality or hash behavior.
-The real DFA constituent must trace its actual keys, values, starts, synthetic precedence configurations and completed edge/predicate references through this same owner boundary.
+The production parser does not adopt this cache in this slice.
+
+== Private DFA storage and phases
+
+The retained region owns all 372 decision descriptors under the same finite budget and grammar identity.
+Explicit initialization constructs one admitted candidate descriptor block and publishes it only when complete.
+Five precedence decisions own separate synthetic starts; these starts do not enter ordinary state membership.
+Context-only and configuration-only access do not initialize the DFA cache.
+
+A state is either Synthetic, with its prefilter set and precedence edges, or Ordinary, with its set, completed acceptance and publication phase.
+Ordinary phases distinguish an unnumbered draft, a numbered unpublished draft and an interned state with ordinary edges.
+A map get hit returns the stored value before numbering or optimization of its incoming draft.
+On a miss, numbering precedes ordered optimization, read-only conversion and map publication.
+Failure retains that number and every completed configuration or canonical prefix.
+The nonfallible map/phase publication follows all admission, probing and checked lookup work.
+A blocked ordinary edge allocation leaves its already interned target published.
+
+Draft and interned handles have distinct types and retain the access's invariant configuration brand.
+Returning a draft, interned target or borrowed DFA view as the joint callback's independent result is excluded by that brand or borrow; returning copied phase, number or acceptance facts is permitted.
+These lifetime contracts remain source-only until compiler qualification.
+Backing generation, kind, phase and decision checks also reject copied draft aliases after interning.
+Acceptance is one nonaccept, plain or predicated value and can be completed only on an unnumbered draft.
+Every stored real start, edge target, map key and map value belongs to that decision and has interned ordinary backing.
+Missing targets and the inline Error sentinel remain distinct.
+Precedence edges grow only at their reached nonnegative index; ordinary edge storage admits 370 entries on its first legal publication.
+
+The map retains distinct key and value identities and stored native insertion hashes.
+Its private native layout begins with 32 slots on the first missed put and stays at most half full.
+A missing table does not demand a get hash; put hashing precedes table admission.
+Lookup compares the incoming ordered full configuration set against the stored key, including conflict-object identity and live configuration equality.
+Native capacity replacement covers both full buffers while they overlap.
+This policy does not recover Java Object identity hashes, collision bins, tree shape, heap exhaustion or stack limits.
+
+Private DFA probes select linked continuations through the same context equality loop used by ordinary fallible comparisons.
+A single left-parent path is acyclic, so an Array owns at most one active continuation; a shared node can be revisited after that continuation is removed.
+The exclusive session borrow prevents nested probes, mutation and collection while links remain active.
+Its destructor drains links on true, false, error and unwind before releasing the borrow.
+The ordinary scoped policy retains its frame layout, clear-on-entry, push-before-descent admission and residual-frame behavior.
+Comparison introduces no allocation, token access, application predicate, diagnostic, cancellation poll or external callback in the private probe policy.
+All new slot metadata is covered by concrete node capacity admission.
+
+Under the internal stable-producer and nonescaping-capability premise, complete allocation-free collision comparisons preserve the unique returned representative independently of the native layout.
+Actual internal ordinary successors are fresh except for unchanged skipped stop identities, and cold precedence filtering runs before ordinary publication.
+The actual SLL context producers exclude escaping one-entry Arrays and traversable null parents, so optimization preserves their class-sensitive equality and hash.
+The generic one-entry Array reconstruction, mutable alias, stale hash and conflict-identity regressions remain valid and unchanged.
+This premise does not authorize a generic mutable JVM cache surface or implement closure and adaptive prediction.
+
+== Embedded parser cause capability gate
+
+The production gate `embedded-parser-error-capability` remains open.
+Public source embedded prepare, statement and ADBC calls can retain `Incorrect.cause`, whose recognition exception exposes a recognizer, configurations and shared mutable DFA state.
+No-op report listeners and an in-project consumer census do not remove that capability.
+The current native diagnostic projection's null Java cause is a compatibility gap.
+Pgwire and remote Flight project serialized diagnostics; direct in-process exceptions can retain their cause objects.
+
+This private foundation exports no DFA facade, cache put, cached set/config key or raw ID beyond the prediction boundary.
+Before production adoption or compatibility closure, an owning adapter plan must preserve the required embedded observations and shared-history effects, or deliver a specific reviewed-design-compatible migration for each incompatible extension.
+Ordinary results, errors, first-error timing and SLL/Bail-to-LL cache histories remain required under either resolution.
+Source assertions and Phase 2 receipts must cover cause nullability, recognizer and dead-end configuration access, post-error shared-cache behavior, the native projection and separate wire results.
+No public cause behavior is removed or waived by this slice.
 
 == Remaining parser work
 

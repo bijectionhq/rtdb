@@ -3,6 +3,7 @@ use rtdb_types::{AllocationScope, MemoryBudget, MemoryReservation};
 use crate::parser::grammar::OwnedGrammar;
 use super::{PredictionContexts, PredictionError, Result, capacity_error};
 use super::context::ContextStore;
+use super::dfa::{DfaStore, PredictionDfas};
 use super::config::{Configurations, ConfigurationStore};
 #[cfg(test)]
 use super::config::{ConfigSetKey, SetId};
@@ -198,6 +199,7 @@ impl<T> DerefMut for StoreRef<'_, T> {
 }
 
 pub(crate) struct PredictionStorage {
+    dfas: DfaStore<Retained>,
     configs: ConfigurationStore<Retained>,
     contexts: ContextStore<Retained>,
     grammar: OwnedGrammar,
@@ -206,7 +208,7 @@ pub(crate) struct PredictionStorage {
 }
 impl PredictionStorage {
     pub(crate) fn new(grammar: OwnedGrammar, memory: &Arc<MemoryBudget>) -> Self {
-        Self { configs: ConfigurationStore::new(Retained::new(memory)), contexts: ContextStore::new(Retained::new(memory)), grammar, #[cfg(test)] roots: FixtureRoots::new() }
+        Self { dfas: DfaStore::new(Retained::new(memory)), configs: ConfigurationStore::new(Retained::new(memory)), contexts: ContextStore::new(Retained::new(memory)), grammar, #[cfg(test)] roots: FixtureRoots::new() }
     }
     pub(crate) fn with_contexts<R>(
         &mut self, work: &AllocationScope,
@@ -223,18 +225,23 @@ impl Drop for BorrowSession<'_> {
     fn drop(&mut self) {
         #[cfg(test)]
         self.owner.roots.mark(&mut self.owner.configs);
+        self.owner.dfas.collect(&mut self.owner.configs);
         self.owner.configs.collect(&mut self.owner.contexts);
         self.owner.contexts.collect();
     }
 }
 
 pub(crate) struct PredictionAccess<'cfg, 'id, 'g, 'scope> {
+    dfas: PredictionDfas<'cfg, 'g, 'scope>,
     configs: Configurations<'cfg, 'id, 'g, 'scope, Retained>,
     contexts: PredictionContexts<'id, 'g, 'scope, Retained>,
     #[cfg(test)]
     roots: &'g mut FixtureRoots,
 }
 impl<'cfg, 'id, 'g, 'scope> PredictionAccess<'cfg, 'id, 'g, 'scope> {
+    pub(super) fn dfa_parts(&mut self) -> (&mut PredictionDfas<'cfg, 'g, 'scope>, &mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
+        (&mut self.dfas, &mut self.configs, &mut self.contexts)
+    }
     pub(crate) fn parts(&mut self) -> (&mut Configurations<'cfg, 'id, 'g, 'scope, Retained>, &mut PredictionContexts<'id, 'g, 'scope, Retained>) {
         (&mut self.configs, &mut self.contexts)
     }
@@ -259,7 +266,8 @@ pub(crate) fn with_prediction_storage<R>(
     let grammar = session.owner.grammar.view();
     let contexts = PredictionContexts::borrowed(&grammar, work, &mut session.owner.contexts);
     let configs = Configurations::borrowed(&grammar, work, &mut session.owner.configs);
-    let mut access = PredictionAccess { configs, contexts, #[cfg(test)] roots: &mut session.owner.roots };
+    let dfas = PredictionDfas::borrowed(&grammar, work, &mut session.owner.dfas);
+    let mut access = PredictionAccess { dfas, configs, contexts, #[cfg(test)] roots: &mut session.owner.roots };
     use_store(&mut access)
 }
 

@@ -3,6 +3,7 @@ mod config;
 mod semantic;
 mod mode;
 mod storage;
+mod dfa;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};
@@ -23,7 +24,7 @@ pub(crate) enum PredictionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Problem { Capacity, Context, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, Grammar(ArtifactIssue) }
+pub(crate) enum Problem { Capacity, Context, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, DfaDecision, DfaPhase, Grammar(ArtifactIssue) }
 
 impl From<GrammarError> for PredictionError {
     fn from(error: GrammarError) -> Self {

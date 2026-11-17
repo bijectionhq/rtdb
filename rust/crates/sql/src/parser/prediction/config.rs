@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 use rtdb_types::AllocationScope;
 use crate::parser::grammar::{Decision, Grammar, State, StateKindView};
 use super::{ContextKey, MergeMode, MergeRound, PredictionContexts, PredictionError, Problem, Result, Semantic};
-use super::context::{ContextId, ContextStore, finish_hash, update_hash};
+use super::context::{ContextId, ContextStore, EqualityPolicy, finish_hash, update_hash};
 use super::storage::{Block, Pool, Retained, Scoped, SlotId, StoreMemory, StoreRef};
 #[cfg(test)]
 #[path = "config_tests.rs"]
@@ -57,6 +57,7 @@ impl ConfigKey<'_> {
     pub(super) fn identity(self) -> ConfigId { self.id }
 }
 impl ConfigSetKey<'_> {
+    pub(super) fn stored(self) -> SetId { self.id }
     fn at(id: SetId) -> Self { Self { id, brand: PhantomData } }
     #[cfg(test)]
     pub(super) fn identity(self) -> SetId { self.id }
@@ -397,18 +398,27 @@ impl<'cfg, 'id, 'g, 'scope, M: StoreMemory> Configurations<'cfg, 'id, 'g, 'scope
         self.finish(result)
     }
     fn equal_config(&self, left: ConfigKey<'cfg>, right: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
+        self.equal_config_using(left, right, contexts, EqualityPolicy::ScopedFrames)
+    }
+    fn equal_config_using(&self, left: ConfigKey<'cfg>, right: ConfigKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>, policy: EqualityPolicy) -> Result<bool> {
         if left == right { return Ok(true); }
         let (a, b) = (self.data(left), self.data(right));
-        Ok(a.state == b.state && a.alt == b.alt && contexts.equivalent(ContextKey::from_stored(a.context), ContextKey::from_stored(b.context))? && a.semantic == b.semantic && a.suppressed() == b.suppressed())
+        Ok(a.state == b.state && a.alt == b.alt && contexts.equivalent_using(ContextKey::from_stored(a.context), ContextKey::from_stored(b.context), policy)? && a.semantic == b.semantic && a.suppressed() == b.suppressed())
     }
     pub(crate) fn equivalent_set(&mut self, left: ConfigSetKey<'cfg>, right: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
+        self.equivalent_set_using(left, right, contexts, EqualityPolicy::ScopedFrames)
+    }
+    pub(super) fn equivalent_set_for_probe(&mut self, left: ConfigSetKey<'cfg>, right: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>) -> Result<bool> {
+        self.equivalent_set_using(left, right, contexts, EqualityPolicy::LinkedFrames)
+    }
+    fn equivalent_set_using(&mut self, left: ConfigSetKey<'cfg>, right: ConfigSetKey<'cfg>, contexts: &mut PredictionContexts<'id, 'g, 'scope, M>, policy: EqualityPolicy) -> Result<bool> {
         self.check_context(contexts)?;
         let result = (|| {
             if left == right { return Ok(true); }
             let (a, b) = (self.set(left), self.set(right));
             if a.ordered.len() != b.ordered.len() { return Ok(false); }
             for (left, right) in a.ordered.iter().zip(b.ordered.iter()) {
-                if !self.equal_config(ConfigKey::at(*left), ConfigKey::at(*right), contexts)? { return Ok(false); }
+                if !self.equal_config_using(ConfigKey::at(*left), ConfigKey::at(*right), contexts, policy)? { return Ok(false); }
             }
             let (a, b) = (a.facts, b.facts);
             Ok(a.mode == b.mode && a.unique == b.unique && a.conflicting == b.conflicting && a.semantic == b.semantic && a.outer == b.outer)

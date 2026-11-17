@@ -6,6 +6,9 @@ use super::storage::{Block, Pool, Retained, Scoped, SlotId, StoreMemory, StoreRe
 #[cfg(test)]
 #[path = "context_tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "probe_tests.rs"]
+mod probe_tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextKey<'id> { id: ContextId, brand: PhantomData<fn(&'id mut ()) -> &'id mut ()> }
@@ -46,11 +49,12 @@ impl Edge<'_> {
 impl StoredEdge {
     fn branded<'id>(self) -> Edge<'id> { Edge { parent: self.parent.map(ContextKey::at), address: self.address } }
 }
-enum Shape<M: StoreMemory> { Singleton(StoredEdge), Array(Block<StoredEdge, M>) }
+struct EqualityLink { right: ContextId, next: usize, previous: Option<ContextId> }
+enum Shape<M: StoreMemory> { Singleton(StoredEdge), Array { edges: Block<StoredEdge, M>, continuation: Option<EqualityLink> } }
 struct Node<M: StoreMemory> { shape: Shape<M>, hash: i32, local: bool }
 impl<M: StoreMemory> Node<M> {
-    fn len(&self) -> usize { match &self.shape { Shape::Singleton(_) => 1, Shape::Array(edges) => edges.len() } }
-    fn edge(&self, index: usize) -> StoredEdge { match &self.shape { Shape::Singleton(edge) => *edge, Shape::Array(edges) => edges[index] } }
+    fn len(&self) -> usize { match &self.shape { Shape::Singleton(_) => 1, Shape::Array { edges, .. } => edges.len() } }
+    fn edge(&self, index: usize) -> StoredEdge { match &self.shape { Shape::Singleton(edge) => *edge, Shape::Array { edges, .. } => edges[index] } }
 }
 
 #[derive(Clone, Copy)]
@@ -115,7 +119,7 @@ impl<M: StoreMemory> ContextStore<M> {
     pub(super) fn canonical_len(&self) -> usize { self.canonical.len }
     #[cfg(test)]
     pub(super) fn array_edges(&self) -> usize {
-        self.nodes.values().map(|node| match &node.shape { Shape::Array(edges) => edges.len(), _ => 0 }).sum()
+        self.nodes.values().map(|node| match &node.shape { Shape::Array { edges, .. } => edges.len(), _ => 0 }).sum()
     }
     #[cfg(test)]
     pub(super) fn array_bytes(length: usize) -> usize { 256 + length * std::mem::size_of::<StoredEdge>() }
@@ -237,7 +241,7 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
 
     fn shape(&self, key: ContextKey<'id>) -> ContextShape {
         if key == self.empty() { return ContextShape::Empty; }
-        match &self.store.node(key.id).shape { Shape::Singleton(_) => ContextShape::Singleton, Shape::Array(_) => ContextShape::Array }
+        match &self.store.node(key.id).shape { Shape::Singleton(_) => ContextShape::Singleton, Shape::Array { .. } => ContextShape::Array }
     }
     fn len(&self, key: ContextKey<'id>) -> usize {
         if key == self.empty() { 1 } else { self.store.node(key.id).len() }
@@ -282,7 +286,7 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
         let mut edges = Block::with_capacity(&self.store.memory, candidate.edges.len())?;
         for edge in &candidate.edges { edges.push(edge.stored()); }
         let node = Node {
-            shape: Shape::Array(edges), hash: self.array_hash(&candidate.edges),
+            shape: Shape::Array { edges, continuation: None }, hash: self.array_hash(&candidate.edges),
             local: candidate.edges.iter().all(|edge| self.edge_local(*edge)),
         };
         self.append(node)
@@ -321,51 +325,15 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
         self.finish(result)
     }
     fn equal(&mut self, left: ContextKey<'id>, right: ContextKey<'id>) -> Result<bool> {
-        self.equality.clear();
-        let mut frame = EqualityFrame::Pair(left, right);
-        loop {
-            match frame {
-                EqualityFrame::Pair(left, right) => {
-                    if left != right {
-                        if self.shape(left) != self.shape(right) || self.hash(left) != self.hash(right) { return Ok(false); }
-                        match self.shape(left) {
-                            ContextShape::Empty => return Ok(false),
-                            ContextShape::Singleton => {
-                                let (left, right) = (self.edge(left, 0), self.edge(right, 0));
-                                if left.address != right.address { return Ok(false); }
-                                let (Some(left), Some(right)) = (left.parent, right.parent) else { return Ok(false); };
-                                frame = EqualityFrame::Pair(left, right);
-                                continue;
-                            }
-                            ContextShape::Array => {
-                                if self.len(left) != self.len(right) { return Ok(false); }
-                                for index in 0..self.len(left) {
-                                    if self.edge(left, index).address != self.edge(right, index).address { return Ok(false); }
-                                }
-                                frame = EqualityFrame::Parents { left, right, next: 0 };
-                                continue;
-                            }
-                        }
-                    }
-                }
-                EqualityFrame::Parents { left, right, next } => {
-                    if next < self.len(left) {
-                        let (a, b) = (self.edge(left, next).parent, self.edge(right, next).parent);
-                        match (a, b) {
-                            (None, None) => { frame = EqualityFrame::Parents { left, right, next: next + 1 }; continue; }
-                            (Some(a), Some(b)) => {
-                                push(&mut self.equality, EqualityFrame::Parents { left, right, next: next + 1 }, self.allocation)?;
-                                frame = EqualityFrame::Pair(a, b);
-                                continue;
-                            }
-                            _ => return Ok(false),
-                        }
-                    }
-                }
-            }
-            let Some(next) = self.equality.pop() else { return Ok(true); };
-            frame = next;
-        }
+        self.equal_using(left, right, EqualityPolicy::ScopedFrames)
+    }
+    pub(super) fn equivalent_using(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, policy: EqualityPolicy) -> Result<bool> {
+        self.ready()?;
+        let result = self.equal_using(left, right, policy);
+        self.finish(result)
+    }
+    fn equal_using(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, policy: EqualityPolicy) -> Result<bool> {
+        EqualitySession::new(self, policy).run(left, right)
     }
 
     fn memo_slot(&mut self, left: ContextKey<'id>, right: ContextKey<'id>) -> Result<Option<usize>> {
@@ -649,6 +617,99 @@ impl<'id, 'g, 'scope, M: StoreMemory> PredictionContexts<'id, 'g, 'scope, M> {
             let Some(next) = self.canonicalizing.pop() else { return Ok(result); };
             frame = next;
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum EqualityPolicy { ScopedFrames, LinkedFrames }
+struct EqualitySession<'a, 'id, 'g, 'scope, M: StoreMemory> {
+    owner: &'a mut PredictionContexts<'id, 'g, 'scope, M>,
+    policy: EqualityPolicy,
+    head: Option<ContextId>,
+}
+impl<'a, 'id, 'g, 'scope, M: StoreMemory> EqualitySession<'a, 'id, 'g, 'scope, M> {
+    fn new(owner: &'a mut PredictionContexts<'id, 'g, 'scope, M>, policy: EqualityPolicy) -> Self {
+        if matches!(policy, EqualityPolicy::ScopedFrames) { owner.equality.clear(); }
+        Self { owner, policy, head: None }
+    }
+    fn save(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, next: usize) -> Result<()> {
+        match self.policy {
+            EqualityPolicy::ScopedFrames => push(&mut self.owner.equality, EqualityFrame::Parents { left, right, next }, self.owner.allocation),
+            EqualityPolicy::LinkedFrames => {
+                let ContextId::Node(id) = left.id else { unreachable!() };
+                let node = self.owner.store.nodes.get_mut(id).expect("comparison retains its left node");
+                let Shape::Array { continuation, .. } = &mut node.shape else { unreachable!() };
+                assert!(continuation.is_none());
+                *continuation = Some(EqualityLink { right: right.id, next, previous: self.head });
+                self.head = Some(left.id);
+                Ok(())
+            }
+        }
+    }
+    fn pop(&mut self) -> Option<EqualityFrame<'id>> {
+        match self.policy {
+            EqualityPolicy::ScopedFrames => self.owner.equality.pop(),
+            EqualityPolicy::LinkedFrames => {
+                let left = self.head?;
+                let ContextId::Node(id) = left else { unreachable!() };
+                let node = self.owner.store.nodes.get_mut(id).expect("comparison retains its continuation");
+                let Shape::Array { continuation, .. } = &mut node.shape else { unreachable!() };
+                let link = continuation.take().expect("active array owns its continuation");
+                self.head = link.previous;
+                Some(EqualityFrame::Parents { left: ContextKey::at(left), right: ContextKey::at(link.right), next: link.next })
+            }
+        }
+    }
+    fn run(&mut self, left: ContextKey<'id>, right: ContextKey<'id>) -> Result<bool> {
+        let mut frame = EqualityFrame::Pair(left, right);
+        loop {
+            match frame {
+                EqualityFrame::Pair(left, right) => {
+                    if left != right {
+                        if self.owner.shape(left) != self.owner.shape(right) || self.owner.hash(left) != self.owner.hash(right) { return Ok(false); }
+                        match self.owner.shape(left) {
+                            ContextShape::Empty => return Ok(false),
+                            ContextShape::Singleton => {
+                                let (left, right) = (self.owner.edge(left, 0), self.owner.edge(right, 0));
+                                if left.address != right.address { return Ok(false); }
+                                let (Some(left), Some(right)) = (left.parent, right.parent) else { return Ok(false); };
+                                frame = EqualityFrame::Pair(left, right);
+                                continue;
+                            }
+                            ContextShape::Array => {
+                                if self.owner.len(left) != self.owner.len(right) { return Ok(false); }
+                                for index in 0..self.owner.len(left) {
+                                    if self.owner.edge(left, index).address != self.owner.edge(right, index).address { return Ok(false); }
+                                }
+                                frame = EqualityFrame::Parents { left, right, next: 0 };
+                                continue;
+                            }
+                        }
+                    }
+                }
+                EqualityFrame::Parents { left, right, next } => {
+                    if next < self.owner.len(left) {
+                        let (a, b) = (self.owner.edge(left, next).parent, self.owner.edge(right, next).parent);
+                        match (a, b) {
+                            (None, None) => { frame = EqualityFrame::Parents { left, right, next: next + 1 }; continue; }
+                            (Some(a), Some(b)) => {
+                                self.save(left, right, next + 1)?;
+                                frame = EqualityFrame::Pair(a, b);
+                                continue;
+                            }
+                            _ => return Ok(false),
+                        }
+                    }
+                }
+            }
+            let Some(next) = self.pop() else { return Ok(true); };
+            frame = next;
+        }
+    }
+}
+impl<M: StoreMemory> Drop for EqualitySession<'_, '_, '_, '_, M> {
+    fn drop(&mut self) {
+        if matches!(self.policy, EqualityPolicy::LinkedFrames) { while self.pop().is_some() {} }
     }
 }
 
