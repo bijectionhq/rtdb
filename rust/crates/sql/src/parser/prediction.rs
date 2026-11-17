@@ -1,8 +1,14 @@
 mod context;
+mod config;
+mod semantic;
+mod mode;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};
 pub(crate) use context::{ContextKey, ContextShape, ContextView, MergeMode, MergeRound, PredictionContexts};
+pub(crate) use config::{Alternative, AlternativeSet, ConfigChange, ConfigKey, ConfigSetKey, ConfigView, ConfigSetView, Configurations, ConflictKey, SetMode};
+pub(crate) use semantic::Semantic;
+pub(crate) use mode::{AlternativeChoice, ModeWorkspace, PredictionMode, SubsetsView};
 
 type Result<T> = std::result::Result<T, PredictionError>;
 
@@ -15,7 +21,7 @@ pub(crate) enum PredictionError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Problem { Capacity, Context, Invocation(u32), CanonicalDomain, Grammar(ArtifactIssue) }
+pub(crate) enum Problem { Capacity, Context, Invocation(u32), CanonicalDomain, Alternative, Precedence, Readonly, EmptySubsets, Grammar(ArtifactIssue) }
 
 impl From<GrammarError> for PredictionError {
     fn from(error: GrammarError) -> Self {
@@ -32,6 +38,16 @@ pub(crate) fn with_prediction_contexts<'g, 'scope, R>(
     use_contexts: impl for<'id> FnOnce(&mut PredictionContexts<'id, 'g, 'scope>) -> Result<R>,
 ) -> Result<R> {
     use_contexts(&mut PredictionContexts::new(grammar, allocation))
+}
+
+pub(crate) fn with_configurations<'id, 'g, 'scope, R>(
+    contexts: &mut PredictionContexts<'id, 'g, 'scope>,
+    use_configs: impl for<'cfg> FnOnce(&mut Configurations<'cfg, 'id, 'g, 'scope>, &mut PredictionContexts<'id, 'g, 'scope>) -> Result<R>,
+) -> Result<R> {
+    contexts.ready()?;
+    let mut configs = Configurations::new(contexts.grammar(), contexts.allocation());
+    let result = use_configs(&mut configs, contexts);
+    contexts.finish(result)
 }
 
 fn capacity_error() -> PredictionError { PredictionError::Artifact(Problem::Capacity) }

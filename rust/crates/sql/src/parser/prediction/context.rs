@@ -16,6 +16,8 @@ impl ContextKey<'_> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MergeMode { LocalWildcard, FullExact }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MemoUse { Round, Absent }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ContextShape { Empty, Singleton, Array }
 
@@ -115,12 +117,13 @@ impl<'id, 'g, 'scope> ContextView<'_, 'id, 'g, 'scope> {
 
 pub(crate) struct MergeRound<'round, 'id, 'g, 'scope> { owner: &'round mut PredictionContexts<'id, 'g, 'scope> }
 impl Drop for MergeRound<'_, '_, '_, '_> { fn drop(&mut self) { self.owner.memo.clear(); } }
-impl<'id> MergeRound<'_, 'id, '_, '_> {
+impl<'id, 'g, 'scope> MergeRound<'_, 'id, 'g, 'scope> {
     pub(crate) fn merge(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, mode: MergeMode) -> Result<ContextKey<'id>> {
         self.owner.ready()?;
-        let result = self.owner.merge(left, right, mode);
+        let result = self.owner.merge(left, right, mode, MemoUse::Round);
         self.owner.finish(result)
     }
+    pub(super) fn contexts(&mut self) -> &mut PredictionContexts<'id, 'g, 'scope> { self.owner }
 }
 
 impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
@@ -132,10 +135,20 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         }
     }
 
-    fn ready(&self) -> Result<()> { if self.aborted { Err(PredictionError::Aborted) } else { Ok(()) } }
-    fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
+    pub(super) fn ready(&self) -> Result<()> { if self.aborted { Err(PredictionError::Aborted) } else { Ok(()) } }
+    pub(super) fn finish<T>(&mut self, result: Result<T>) -> Result<T> {
         if result.is_err() { self.aborted = true; }
         result
+    }
+    pub(super) fn grammar(&self) -> &'g Grammar<'scope> { self.grammar }
+    pub(super) fn allocation(&self) -> &'scope AllocationScope { self.allocation }
+    #[cfg(test)]
+    pub(super) fn null_parent_fixture(&mut self, follow: State<'g, 'scope>) -> Result<ContextKey<'id>> {
+        self.ready()?;
+        let result = if follow.belongs_to(self.grammar) {
+            self.singleton_edge(Edge { parent: None, address: ReturnAddress::Follow(follow.number()) })
+        } else { Err(PredictionError::ForeignOwner) };
+        self.finish(result)
     }
     pub(crate) fn empty(&self) -> ContextKey<'id> { ContextKey::empty() }
     pub(crate) fn view(&self, key: ContextKey<'id>) -> ContextView<'_, 'id, 'g, 'scope> { ContextView { owner: self, key } }
@@ -299,6 +312,18 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         Ok(())
     }
 
+    fn merged_lookup(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, memo: MemoUse) -> Result<Option<ContextKey<'id>>> {
+        if memo == MemoUse::Round { self.memo_get(left, right) } else { Ok(None) }
+    }
+    fn merged_record(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, value: ContextKey<'id>, memo: MemoUse) -> Result<()> {
+        if memo == MemoUse::Round { self.memo_put(left, right, value) } else { Ok(()) }
+    }
+    pub(crate) fn merge_uncached(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, mode: MergeMode) -> Result<ContextKey<'id>> {
+        self.ready()?;
+        let result = self.merge(left, right, mode, MemoUse::Absent);
+        self.finish(result)
+    }
+
     pub(crate) fn with_merge_round<R>(&mut self, use_round: impl for<'round> FnOnce(&mut MergeRound<'round, 'id, 'g, 'scope>) -> Result<R>) -> Result<R> {
         self.ready()?;
         self.memo.clear();
@@ -318,7 +343,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         candidate.edges.push(self.edge(key, 0));
         self.array(&candidate)
     }
-    fn merge(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, mode: MergeMode) -> Result<ContextKey<'id>> {
+    fn merge(&mut self, left: ContextKey<'id>, right: ContextKey<'id>, mode: MergeMode, memo: MemoUse) -> Result<ContextKey<'id>> {
         self.merges.clear();
         push(&mut self.merges, MergeFrame::Visit(left, right), self.allocation)?;
         let mut result = self.empty();
@@ -327,14 +352,14 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
                 MergeFrame::Visit(left, right) => {
                     if self.equal(left, right)? { result = left; continue; }
                     if self.shape(left) != ContextShape::Array && self.shape(right) != ContextShape::Array {
-                        if let Some(cached) = self.memo_get(left, right)? { result = cached; continue; }
+                        if let Some(cached) = self.merged_lookup(left, right, memo)? { result = cached; continue; }
                         let (a, b) = (self.edge(left, 0), self.edge(right, 0));
                         if left == self.empty() || right == self.empty() {
                             result = match mode {
                                 MergeMode::LocalWildcard => self.empty(),
                                 MergeMode::FullExact => self.pair_array(a, b)?,
                             };
-                            self.memo_put(left, right, result)?;
+                            self.merged_record(left, right, result, memo)?;
                         } else if a.address == b.address {
                             let (Some(a), Some(b)) = (a.parent, b.parent) else { return Err(PredictionError::Artifact(Problem::Context)); };
                             push(&mut self.merges, MergeFrame::SingletonParents { left, right }, self.allocation)?;
@@ -347,13 +372,13 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
                             result = if let Some(parent) = parent {
                                 self.pair_array(Edge { parent: Some(parent), address: a.address }, Edge { parent: Some(parent), address: b.address })?
                             } else { self.pair_array(a, b)? };
-                            self.memo_put(left, right, result)?;
+                            self.merged_record(left, right, result, memo)?;
                         }
                     } else {
                         if mode == MergeMode::LocalWildcard && (left == self.empty() || right == self.empty()) { result = self.empty(); continue; }
                         let left = self.as_array(left)?;
                         let right = self.as_array(right)?;
-                        if let Some(cached) = self.memo_get(left, right)? { result = cached; continue; }
+                        if let Some(cached) = self.merged_lookup(left, right, memo)? { result = cached; continue; }
                         let capacity = self.len(left).checked_add(self.len(right)).ok_or_else(capacity_error)?;
                         let candidate = self.candidate(capacity)?;
                         push(&mut self.merges, MergeFrame::Array(ArrayMerge { left, right, i: 0, j: 0, candidate }), self.allocation)?;
@@ -365,7 +390,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
                     else if b.parent == Some(result) { result = right; }
                     else {
                         result = self.singleton_edge(Edge { parent: Some(result), address: a.address })?;
-                        self.memo_put(left, right, result)?;
+                        self.merged_record(left, right, result, memo)?;
                     }
                 }
                 MergeFrame::Array(mut merge) => {
@@ -392,7 +417,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
                     } else {
                         while merge.i < left_len { merge.candidate.edges.push(self.edge(merge.left, merge.i)); merge.i += 1; }
                         while merge.j < right_len { merge.candidate.edges.push(self.edge(merge.right, merge.j)); merge.j += 1; }
-                        result = self.finish_array_merge(merge)?;
+                        result = self.finish_array_merge(merge, memo)?;
                     }
                 }
                 MergeFrame::ArrayParent { mut merge, address } => {
@@ -445,7 +470,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
         }
         Ok(())
     }
-    fn finish_array_merge(&mut self, mut merge: ArrayMerge<'id>) -> Result<ContextKey<'id>> {
+    fn finish_array_merge(&mut self, mut merge: ArrayMerge<'id>, memo: MemoUse) -> Result<ContextKey<'id>> {
         let key = if merge.candidate.edges.len() == 1 {
             self.singleton_edge(merge.candidate.edges[0])?
         } else {
@@ -454,7 +479,7 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
             else if self.candidate_equal(&merge.candidate, merge.right, hash)? { merge.right }
             else { self.normalize_parents(&mut merge.candidate)?; self.array(&merge.candidate)? }
         };
-        self.memo_put(merge.left, merge.right, key)?;
+        self.merged_record(merge.left, merge.right, key, memo)?;
         Ok(key)
     }
 
@@ -548,11 +573,11 @@ impl<'id, 'g, 'scope> PredictionContexts<'id, 'g, 'scope> {
     }
 }
 
-fn update_hash(hash: i32, value: i32) -> i32 {
+pub(super) fn update_hash(hash: i32, value: i32) -> i32 {
     let value = (value as u32).wrapping_mul(0xcc9e2d51).rotate_left(15).wrapping_mul(0x1b873593);
     ((hash as u32 ^ value).rotate_left(13).wrapping_mul(5).wrapping_add(0xe6546b64)) as i32
 }
-fn finish_hash(hash: i32, words: u32) -> i32 {
+pub(super) fn finish_hash(hash: i32, words: u32) -> i32 {
     let mut hash = hash as u32 ^ words.wrapping_mul(4);
     hash ^= hash >> 16; hash = hash.wrapping_mul(0x85ebca6b);
     hash ^= hash >> 13; hash = hash.wrapping_mul(0xc2b2ae35);

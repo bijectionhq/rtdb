@@ -1,6 +1,6 @@
-= Prediction contexts
+= Prediction values
 
-This private parser component implements the prediction-context value, merge and cached-context schedules from ANTLR 4.13.2.
+This private parser component implements prediction-context values, ordered configuration identities and prediction-mode facts from ANTLR 4.13.2.
 `UPSTREAM.json` pins the primary sources; link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
 It does not perform token prediction, recognize SQL rules or change a production parser entry point.
 
@@ -50,6 +50,8 @@ Ending a round clears membership while retaining its already admitted capacity.
 The graph and canonical cache survive the round.
 Local-wildcard Empty absorbs a root; full-exact merging retains an explicit EmptyReturn edge.
 Operand and parent identity reuse follows the source branches, and common-parent normalization retains the first equal parent only after operand-reuse checks.
+An uncached merge uses the same traversal with every memo read and write disabled, without clearing or replacing an existing round memo.
+This includes recursive array-parent merges and models source calls whose merge-cache argument is null.
 
 Cached-context traversal first preserves any entire empty context, then checks identity-visited and canonical membership before visiting parents in index order.
 Unchanged parents retain the original node.
@@ -76,9 +78,90 @@ Completed views remain available for nonallocating inspection.
 No partially constructed key is returned on failure; private storage completed before a later cache-publication failure remains inaccessible through the failed operation.
 Failures do not create source-derived diagnostic strings in this component.
 
+== Configuration objects and ordered sets
+
+`with_configurations` opens a passive single-writer region using the exact grammar, allocation scope and context brand of its supplied prediction-context owner.
+Its additional invariant configuration-key lifetime prevents config, set and conflict-object handles from escaping the callback or crossing independently opened configuration regions.
+The context owner remains a separate collaborator; cached additions borrow its existing merge round, while uncached additions use its memo-free operation.
+Configuration storage, set membership and completed conflict objects are flat owned values with an explicit allocation-scope destruction witness.
+Views borrow their actual region and read the current configuration object.
+
+A configuration constructor copies fields into a fresh object identity.
+Set entries retain object identities, so a merge or canonicalization through one set changes the configuration observed through its other aliases.
+Membership compares state, alternative and semantic value; it excludes the syntactic context and packed outer-depth word.
+A distinct membership match merges into the first object without changing ordered membership.
+Adding the same identity again appends another ordered occurrence, including when that identity is already in the membership index.
+Set copies retain configuration and conflict-object identities, copy metadata, and start with mutable membership.
+
+Addition updates incoming semantic and outer-depth flags before membership lookup.
+On a distinct match, context merging completes before a replacement configuration value is published.
+The replacement uses signed maximum of the packed outer words followed by the incoming suppression bit, not maximum of unpacked depths.
+The word's increment wraps as a Java integer; depth masks only bit `0x40000000` and keeps the sign bit.
+A failed merge leaves the aliased object unchanged while retaining the source's earlier set-flag updates.
+Canonicalization updates objects in list order; failure after an earlier completed update seals further work without rolling that update back.
+
+Full configuration equality includes context and suppression but excludes raw outer depth.
+Its hash uses the source Murmur3 framing over state, alternative, context and semantic value; suppression and depth are omitted.
+The unpredicated singleton uses a native hash discriminator because the Java object's process identity hash is not derivable from the source archive.
+This discriminator is private lookup data, not an exposed JVM hash result.
+Set equality compares the ordered full configurations, full-context mode, unique alternative, conflict-object identity, semantic flag and outer-context flag.
+Equal conflict bit contents published as distinct objects do not satisfy the identity comparison.
+
+Read-only membership drops its lookup index and rejects addition, clearing and canonicalization through that set.
+Its referenced objects remain live, and metadata is independent of the membership state.
+Hashing folds the ordered list with Java's wrapping 31-fold.
+A read-only set retains a computed non-`-1` hash even if an alias subsequently changes a configuration.
+The value `-1` remains the source cache sentinel and is recomputed on the next request.
+Clearing a mutable set clears membership but retains semantic, outer-context, unique-alternative and conflict metadata.
+Later closure and DFA containers must separately preserve their insertion-time hashes when aliased keys change.
+
+== Semantic values and mode facts
+
+The pinned graph has 372 decisions, with at most 87 outgoing alternatives; decision 65 at state 848 attains that bound.
+Alternatives are checked against the actual decision, and the complete alternative set fits two inline 64-bit words.
+The graph's 42 semantic transitions are precedence predicates with positive values no greater than 67.
+Precedence construction checks a real owner-bound state and reads its indexed transition; a caller-supplied transition payload cannot establish this invariant.
+Within this domain, semantic AND reduces precedence values to their minimum and OR to their maximum, after the source null and unpredicated sentinel branches.
+The domain bound makes ordinary ordering equivalent to the source comparator's wrapping subtraction.
+Unpredicated direct evaluation returns false; precedence simplification preserves the unpredicated sentinel, and later simulator call sites must retain their explicit sentinel checks.
+
+Mode work is a passive transient retaining charged grouping and state-map scratch.
+Its completed subset view borrows that workspace and cannot survive its reuse.
+An all-rule-stop set terminates before allocating stripping or grouping storage, including an empty set.
+SLL with semantic predicates creates fresh unpredicated configuration objects and adds them to a full-context set without a merge cache.
+LL retains the original configurations.
+Grouping traverses the whole ordered list before conflict reduction, and a state-to-alternatives map is requested only after the conflict predicate succeeds.
+Groups use state and structural syntactic context, ignoring alternative, semantics and suppression.
+Viable results distinguish empty input from conflicting minima, preserving the source's `-1` versus `0` distinction.
+The all-subsets-equal operation rejects an empty outer collection explicitly.
+
+Native grouping retains first representatives and insertion order within equal-hash collision chains.
+Its final subset reductions are allocation-free bitset operations and do not depend on the source hash map's bucket enumeration.
+During immutable grouping, a repeated get/put or reinsert comparison has already completed with the same context pair and retained equality-frame capacity.
+Omitting that repeated traversal introduces no new allocation or effect; this argument does not apply to later mutable-key closure and DFA containers.
+Neither grouping nor mode facts pull tokens, evaluate application predicates or select parser rules.
+
+Configuration, set and conflict slot vectors begin with admitted capacity 16 and use checked full replacement growth.
+A new set admits seven ordered entries and 32 native lookup slots before publication.
+Lookup tables remain at most half full; group and state vectors admit only encountered entries.
+Every old and replacement buffer remains covered while both are live.
+Duplicate-identity append reserves list growth only when reached, and a distinct merge does not reserve an unused list slot.
+SLL stripping reserves each new object in list order, after admitting its new set.
+Mode and configuration failures seal their reached work, and mode failures also seal the context collaborator.
+An operation accepting a context owner or merge round checks that collaborator before flags, membership, identity, empty-set or cached-hash shortcuts.
+An aborted collaborator seals the configuration owner on entry; mode entry propagates a failed participant check to every supplied owner before returning.
+Completed nonallocating views remain available; no owned error string or cloned anomaly is cached.
+Native reservations remain with the scope until its destruction, including discarded scratch and copied set storage.
+
+The factory and view signatures also carry the lifetime tests as source contracts.
+Returning a `ConfigKey`, `ConfigSetKey`, `ConflictKey` or a workspace carrying that brand as the factory's independent result is not permitted by the invariant callback lifetime.
+A key from an enclosing configuration factory cannot be passed into another factory, and context keys retain their separate owner brand.
+A view cannot outlive the region borrow; the region's `Drop` requires its allocation scope through destruction.
+These lifetime contracts and all regression sources remain unexecuted.
+
 == Remaining parser work
 
-Ordered configuration sets, precedence filtering, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+Precedence filtering, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
