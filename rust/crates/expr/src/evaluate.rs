@@ -13,7 +13,7 @@ mod invocation;
 pub use invocation::ExpressionInvocation;
 
 /// Derives all emitted type alternatives from the complete input and outer schemas and bound parameters.
-/// Performs expression admission without reading row payloads; metadata allocations use the caller's evaluation scope.
+/// Performs expression admission without reading row payloads; temporary metadata uses a call-local scope and the returned type is charged to the caller's scope.
 pub fn expression_type(expr: &Expr,schema: &Schema,context: &EvalContext<'_>) -> Result<LogicalType> {
     let Some(allocation) = context.allocation else { return reader::expression_type(expr,schema,context); };
     let scratch = crate::EvaluationScope::new(allocation.memory_budget())?;

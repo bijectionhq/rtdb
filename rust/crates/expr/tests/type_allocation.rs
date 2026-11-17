@@ -4,6 +4,20 @@ use rtdb_plan::{Expr, Schema};
 use rtdb_types::{LogicalType, ScalarType, Value};
 
 #[test]
+fn repeated_typing_releases_scratch_while_the_caller_scope_remains_alive() {
+    let expression = Expr::Call { name: "character_length".into(), args: vec![Expr::Literal(Value::Utf8("x".into()))], return_type: LogicalType::Scalar(ScalarType::I32) };
+    let memory = MemoryBudget::new(64 << 10);
+    let scope = EvaluationScope::new(&memory).unwrap();
+    let context = EvalContext { allocation: Some(&scope), ..Default::default() };
+    for _ in 0..128 {
+        assert_eq!(expression_type(&expression, &Schema::default(), &context).unwrap(), LogicalType::Scalar(ScalarType::I32));
+    }
+    assert!(memory.used_bytes() < 48 << 10);
+    drop(scope);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn ordinary_function_typing_borrows_large_literal_payloads() {
     let expression = Expr::Call { name: "character_length".into(), args: vec![Expr::Literal(Value::Utf8("x".repeat(1 << 20)))], return_type: LogicalType::Scalar(ScalarType::I32) };
     let memory = MemoryBudget::new(64 << 10);
