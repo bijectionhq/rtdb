@@ -1,0 +1,51 @@
+= Pinned SQL grammar graph
+
+`Grammar::load` constructs the parser graph from the included `Sql.interp` source artifact under a caller-supplied finite `AllocationScope`.
+The graph contains 3,017 states, 176 rules, 43 token sets and 372 decisions.
+Its 3,515 serialized transitions produce 556 distinct rule-stop return edges, for 4,071 retained transitions.
+The five Action transitions retain their rule/action identity and take part in epsilon traversal.
+The graph also retains the 42 precedence transitions, 142 marked return edges and five precedence decisions.
+
+The constructor adapts ANTLR 4.13.2's https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNDeserializer.java[`ATNDeserializer`] and https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/atn/ATNState.java[`ATNState`].
+Link completion and graph verification precede publication.
+Transition insertion preserves source order; equal labels or epsilon transitions sharing a target retain the first transition.
+The published archive, grammar, generated-source and runtime hashes are in link:UPSTREAM.json[`UPSTREAM.json`].
+The upstream BSD 3-clause notice is retained in link:../../../LICENSE-ANTLR[`LICENSE-ANTLR`].
+
+== Ownership and admission
+
+`Grammar` is an immutable passive owner.
+Its construction transient has one caller and cannot publish incomplete links.
+State, rule, decision and transition views borrow that owner; linked views retain the same owner.
+Generated numeric coordinates can be resolved through checked lookups, while internal identifiers have no independent dereference interface.
+`Grammar` retains its allocation-scope borrow through destruction and provides no owned graph extraction or cloning operation.
+
+Construction admits each requested container before allocation.
+The decoded-word scratch contains 28,406 `i32` values.
+Transition capacity includes every serialized edge and every serialized call's return candidate: 4,117 slots, with 46 slots unused after deduplication.
+Vocabulary arrays contain borrowed static strings.
+Builder state, rule-stop scratch, completed rule pairs, token sets, decisions and final state storage have separate reservations based on their actual element sizes and counts.
+The final state array is admitted while the builder array remains live; transition backing stores move into the final states.
+Reservations, including temporary and unused capacity, remain with the allocation scope until it is dropped.
+These admission points define the native resource contract; they do not assert JVM heap-allocation equivalence.
+
+Allocation failure returns the original admission anomaly and drops the unfinished graph.
+Malformed artifact failures contain an inline issue kind and source coordinate, without an allocated diagnostic string.
+The production constructor accepts only the included parser artifact.
+
+== Tokens and display
+
+Raw lexer kinds map to the pinned token numbers without decoding a literal or requesting another lexeme.
+EOF is distinct from the expected-set epsilon symbol.
+The fixed token-set value contains epsilon, EOF and token numbers 1 through 368; it owns no heap storage.
+Its union, membership, epsilon removal and iteration operate on that fixed universe.
+Iteration follows numeric token order.
+
+Vocabulary display borrows the literal name when present and otherwise the symbolic name.
+EOF's vocabulary name is `EOF`; expected-set formatting uses `<EOF>` and `<EPSILON>` as specified by https://github.com/antlr/antlr4/blob/4.13.2/runtime/Java/src/org/antlr/v4/runtime/misc/IntervalSet.java[`IntervalSet`].
+`display_len` counts the exact output bytes without allocation.
+`write_display` writes to caller-provided storage whose capacity and lifetime the caller has already admitted.
+Neither operation returns an owned string.
+
+The graph is private and is not connected to production SQL entry points.
+Context-sensitive expected-token traversal, all generated rule schedules, prediction, SLL/Bail-to-LL retry and diagnostic orchestration remain required parser work.
