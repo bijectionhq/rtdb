@@ -23,7 +23,7 @@ fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBin
         RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
         RelationNode::Scan(scan) => bindings.push(catalog.table(&scan.table.name)?
             .ok_or_else(|| gap("Prepared table disappeared from its own snapshot"))?),
-        RelationNode::Project { input, .. } | RelationNode::Rename { input, .. }
+        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
         | RelationNode::Filter { input, .. } | RelationNode::Aggregate { input, .. }
         | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
@@ -66,7 +66,7 @@ impl Rebuilder {
         match &mut node {
             RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => {}
             RelationNode::Scan(scan) => scan.table = self.next_table()?,
-            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. }
+            RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. }
             | RelationNode::Filter { input, .. } | RelationNode::Aggregate { input, .. }
             | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
             | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
@@ -219,6 +219,7 @@ mod tests {
             ("Values", values(Expr::Literal(V::I64(7)), 0)),
             ("Scan", Arc::clone(&input)),
             ("Project", relation(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Project { input: Arc::clone(&input), expressions: vec![named.clone()] })),
+            ("Extend", Arc::new(Arc::clone(&input).extend(vec![named.clone()]).unwrap())),
             ("Rename", relation(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Rename { input: Arc::clone(&input), prefix: "prefix/".into(), expressions: vec![named] })),
             ("Let", let_relation(Arc::clone(&definition), reference(&definition))),
             ("Reference", reference(&definition)),
@@ -244,7 +245,7 @@ mod tests {
     #[test]
     fn all_relation_variants_keep_their_typed_projection() {
         let cases = variants();
-        assert_eq!(cases.len(), 22);
+        assert_eq!(cases.len(), 23);
         let mut names = BTreeSet::new();
         for (name, source) in cases {
             assert!(names.insert(name));
@@ -258,7 +259,7 @@ mod tests {
                 RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
                 RelationNode::PageOrdinality { field, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); }
                 RelationNode::Scan(scan) => { assert_eq!(scan.table, table("a")); assert_eq!(scan.columns[0].id, ColumnId(0)); }
-                RelationNode::Project { expressions, .. } => { assert_eq!(expressions[0].field.id, ColumnId(2)); assert_eq!(expressions[0].expr, Expr::column(ColumnId(0), L::Scalar(S::I64))); }
+                RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } => { assert_eq!(expressions[0].field.id, ColumnId(2)); assert_eq!(expressions[0].expr, Expr::column(ColumnId(0), L::Scalar(S::I64))); }
                 RelationNode::Rename { prefix, expressions, .. } => { assert_eq!(prefix, "prefix/"); assert_eq!(expressions[0].field.name, "out"); }
                 RelationNode::Let { binding, body } => { assert_eq!(binding.name, "cte"); assert!(matches!(body.node(), RelationNode::Reference { .. })); }
                 RelationNode::Reference { binding } => assert_eq!(binding.name, "cte"),

@@ -45,8 +45,8 @@ fn describe(relation: &Relation) -> Result<Descriptor> {
     let strings = |values: Vec<String>| Value::List(values.into_iter().map(Value::Utf8).collect());
     let mut op = crate::analysis::operator(relation);
     let explanation = match relation.node() {
-        RelationNode::Project { expressions, .. } => map([
-            ("append?", Value::Bool(false)),
+        RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } => map([
+            ("append?", Value::Bool(matches!(relation.node(), RelationNode::Extend { .. }))),
             ("project", text(format!("[{}]", expressions.iter().map(|named| Ok(format!("{{{} {}}}", named.field.name, expression(&named.expr)?))).collect::<Result<Vec<_>>>()?.join(" ")))),
         ]),
         RelationNode::Rename { prefix, expressions, .. } => {

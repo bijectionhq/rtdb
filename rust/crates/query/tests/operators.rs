@@ -513,3 +513,65 @@ fn catalog_bindings_reserve_before_enumeration_and_clones_retain_the_charge() {
     let retained = tables.clone(); drop(tables); assert_eq!(memory.used_bytes(), used); drop(retained); assert_eq!(memory.used_bytes(), 0);
     let exhausted = MemoryBudget::new(1); assert!(context.catalog.tables_reserved("xtdb", &exhausted).is_err()); assert_eq!(exhausted.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn extension_retains_input_fields_and_resolves_appended_fields_in_input_scope() {
+    let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+    let baseline = context.memory.used_bytes();
+    let input_field = field(0, "v", scalar(ScalarType::U64));
+    let input = Arc::new(Relation::new(
+        Schema::new(vec![input_field.clone()]).unwrap(),
+        RelationNode::Values { rows: vec![vec![Expr::Parameter { index: 0, data_type: input_field.data_type.clone() }]] },
+    ).unwrap());
+    let copy = field(1, "copy", input_field.data_type.clone());
+    let computed = field(2, "increment", scalar(ScalarType::I64));
+    let extension = Arc::new(input.extend(vec![
+        NamedExpr { field: copy.clone(), expr: input_field.expression() },
+        NamedExpr { field: computed.clone(), expr: Expr::binary(BinaryOp::Add, input_field.expression(), Expr::Literal(Value::I64(1))) },
+    ]).unwrap());
+    assert_eq!(extension.schema().fields(), &[input_field, copy, computed]);
+
+    let mut cursor = PreparedQuery::new(extension).unwrap().execute(Arc::clone(&context), vec![Value::U64(u64::MAX)]).await.unwrap();
+    assert_eq!(cursor.runtime_schema().fields().iter().map(|field| (&*field.name, field.data_type.clone())).collect::<Vec<_>>(), [
+        ("v", scalar(ScalarType::I64)), ("copy", scalar(ScalarType::I64)), ("increment", scalar(ScalarType::I64)),
+    ]);
+    let result = cursor.next_batch().await.unwrap().unwrap();
+    let row = result.batch().schema().fields().iter().zip(result.batch().columns())
+        .map(|(field, column)| read_value(field, column.as_ref(), 0).unwrap()).collect::<Vec<_>>();
+    assert_eq!(row, [Value::I64(-1), Value::I64(-1), Value::I64(0)]);
+    assert!(cursor.next_batch().await.unwrap().is_none());
+    drop(result);
+    drop(cursor);
+    assert_eq!(context.memory.used_bytes(), baseline);
+}
+
+#[tokio::test]
+async fn extension_materializes_a_full_input_page_before_limit_can_consume_a_row() {
+    let context = query_context(QueryOptions { batch_rows: 1, ..Default::default() });
+    let baseline = context.memory.used_bytes();
+    let input = numbers(0, "v", &[1, 0]);
+    let extended = Arc::new(Arc::clone(&input).extend(vec![NamedExpr {
+        field: field(1, "reduced", scalar(ScalarType::I64)),
+        expr: Expr::binary(BinaryOp::Divide, Expr::Literal(Value::I64(1)), input.schema().fields()[0].expression()),
+    }]).unwrap());
+    let limited = Arc::new(extended.limit(None, Some(Expr::Literal(Value::I64(1)))).unwrap());
+    let mut cursor = PreparedQuery::new(limited).unwrap().execute(Arc::clone(&context), vec![]).await.unwrap();
+    let error = match cursor.next_batch().await { Err(error) => error, Ok(_) => panic!("extension published a partial input page") };
+    assert_eq!(error.code, "xtdb.expression/division-by-zero");
+    drop(cursor);
+    assert_eq!(context.memory.used_bytes(), baseline);
+}
+
+#[test]
+fn extension_rejects_reused_columns_and_appended_sibling_references() {
+    let input = numbers(0, "v", &[1]);
+    let existing = input.schema().fields()[0].clone();
+    let reused = Arc::clone(&input).extend(vec![NamedExpr { field: existing.clone(), expr: existing.expression() }]);
+    assert!(reused.is_err());
+    let appended = field(1, "appended", scalar(ScalarType::I64));
+    let sibling = input.extend(vec![
+        NamedExpr { field: appended.clone(), expr: existing.expression() },
+        NamedExpr { field: field(2, "sibling", scalar(ScalarType::I64)), expr: appended.expression() },
+    ]).unwrap_err();
+    assert_eq!(sibling.code, "rtdb.plan/unbound-column");
+}

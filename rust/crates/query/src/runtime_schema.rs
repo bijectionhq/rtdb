@@ -143,7 +143,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
             for (name, ty) in &scan.table.columns { bytes = add(bytes, add(add(1024, multiply(name.len(), 8)?)?, multiply(ty.retained_bytes()?, 32)?)?)?; }
             if let Some(iids) = &scan.iids { bytes = add(bytes, multiply(iids.len(), 64)?)?; }
         }
-        RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => for named in expressions { expression(&named.expr)?; },
+        RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } | RelationNode::Rename { expressions, .. } => for named in expressions { expression(&named.expr)?; },
         RelationNode::Aggregate { groups, aggregates, .. } => {
             for group in groups { expression(&group.expr)?; }
             for aggregate in aggregates {
@@ -213,12 +213,15 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
             for predicate in &scan.predicates { expression_type(predicate, &schema, parameters, outer)?; }
             schema
         }
-        RelationNode::Project { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
+        RelationNode::Project { input, expressions } | RelationNode::Extend { input, expressions } | RelationNode::Rename { input, expressions, .. } => {
             let input = child(input)?;
-            Schema::new(expressions.iter().map(|expr| {
+            let fields = expressions.iter().map(|expr| {
                 let ty = expression_type(&expr.expr, &input, parameters, outer)?;
                 Ok(if ty == expr.expr.data_type() { expr.field.clone() } else { field_type(&expr.field, ty) })
-            }).collect::<Result<_>>()?)?
+            }).collect::<Result<Vec<_>>>()?;
+            if matches!(relation.node(), RelationNode::Extend { .. }) {
+                Schema::new(input.fields().iter().cloned().chain(fields).collect())?
+            } else { Schema::new(fields)? }
         }
         RelationNode::Let { binding, body } => { child(&binding.relation)?; child(body)? }
         RelationNode::Reference { binding } => relation_types(&binding.relation, catalog, parameters, outer, reservation)?.schema().clone(),
@@ -331,7 +334,7 @@ fn relation_types(relation: &Arc<Relation>, catalog: &CatalogSnapshot, parameter
         (RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. }, []) => EmittedNode::Leaf,
         (RelationNode::Aggregate { .. }, [input]) => EmittedNode::Aggregate { input: Arc::clone(input), types: aggregates },
         (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => EmittedNode::Binary(Arc::clone(left), Arc::clone(right)),
-        (RelationNode::Project { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
+        (RelationNode::Project { .. } | RelationNode::Extend { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
             | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => EmittedNode::Unary(Arc::clone(input)),
         _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
     };

@@ -199,7 +199,7 @@ fn row_count(relation: &Relation,execution: &Execution) -> Result<i64> {
             }
             Ok(rows)
         }
-        RelationNode::Project { input,.. } | RelationNode::Rename { input,.. } | RelationNode::Filter { input,.. } => row_count(input,execution),
+        RelationNode::Project { input,.. } | RelationNode::Extend { input,.. } | RelationNode::Rename { input,.. } | RelationNode::Filter { input,.. } => row_count(input,execution),
         RelationNode::Reference { binding } => row_count(&binding.relation,execution),
         RelationNode::Let { body,.. } => row_count(body,execution),
         _ => Ok(i64::MAX),

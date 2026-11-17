@@ -148,7 +148,7 @@ fn maximum_id(relation: &Relation) -> Option<u32> {
     let here = relation.schema().fields().iter().map(|field| field.id.0).max();
     let children = match relation.node() {
         RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => None,
-        RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
+        RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
         | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
         | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => maximum_id(input),

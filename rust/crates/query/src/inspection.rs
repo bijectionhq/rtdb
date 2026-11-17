@@ -35,6 +35,14 @@ impl Constraints {
         constraints.used = Some(used);
         constraints
     }
+    pub fn through_extension(mut self, expressions: &[NamedExpr]) -> Self {
+        for named in expressions {
+            self.bounds.remove(&named.field.id);
+            if let Some(used) = &mut self.used { used.remove(&named.field.id); }
+            self.require(&named.expr);
+        }
+        self
+    }
     async fn values(&self, scan: &Scan, name: &str, execution: &Execution, scope: &rtdb_expr::EvaluationScope) -> Result<Vec<(BinaryOp, Value)>> {
         let Some(column) = scan.columns.iter().find(|field| field.name == name) else { return Ok(Vec::new()); };
         let mut values = Vec::new();

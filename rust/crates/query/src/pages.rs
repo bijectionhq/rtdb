@@ -44,7 +44,23 @@ impl PageBuilder {
 pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: impl ExactSizeIterator<Item=&'a Expr> + Send,execution: &crate::context::Execution) -> Result<OwnedPage> {
     let mut output = PageBuilder::new(page.len(),&execution.context.memory)?;
     for _ in 0..page.len() { output.push(OwnedRow::copy_parts(&[],0,expressions.len(),&execution.context.memory)?)?; }
-    for (column,expression) in expressions.enumerate() {
+    evaluate_columns(page, &mut output, 0, schema, expressions, execution).await?;
+    Ok(output.finish())
+}
+
+pub(crate) async fn extend<'a>(page: &OwnedPage, schema: &Schema, expressions: impl ExactSizeIterator<Item = &'a Expr> + Send, execution: &crate::context::Execution) -> Result<OwnedPage> {
+    let memory = &execution.context.memory;
+    let mut output = PageBuilder::new(page.len(), memory)?;
+    for row in page.rows() {
+        execution.context.check_cancelled()?;
+        output.push(OwnedRow::copy_parts(&[&row.values], 0, expressions.len(), memory)?)?;
+    }
+    evaluate_columns(page, &mut output, schema.len(), schema, expressions, execution).await?;
+    Ok(output.finish())
+}
+
+async fn evaluate_columns<'a>(page: &OwnedPage, output: &mut PageBuilder, first: usize, schema: &Schema, expressions: impl Iterator<Item = &'a Expr> + Send, execution: &crate::context::Execution) -> Result<()> {
+    for (column,expression) in (first..).zip(expressions) {
         let metadata_scope = execution.scope()?;
         let invocation = execution.prepare_expression(expression,schema,&metadata_scope)?;
         for (input,row) in page.rows().iter().zip(output.rows_mut()) {
@@ -53,7 +69,7 @@ pub(crate) async fn project<'a>(page: &OwnedPage,schema: &Schema,expressions: im
             row.replace_value(column,value,&execution.context.memory)?;
         }
     }
-    Ok(output.finish())
+    Ok(())
 }
 
 pub(crate) fn coalesce(input: BoxPageCursor, context: Arc<QueryContext>) -> BoxPageCursor { Box::new(CoalescingPages { input,context,seen: 0 }) }

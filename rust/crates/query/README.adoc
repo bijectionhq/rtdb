@@ -429,6 +429,14 @@ External merge ties and final-row reinsertion retain the priority-queue schedule
 Physical record spilling and its indexed lookup preserve these comparison and page boundaries.
 The scheduling, backing-store and algorithm regression sources remain unexecuted.
 
+== Column extension
+
+`Extend` appends computed fields after the original fields in the input schema.
+Each expression reads the original input fields.
+The cursor copies the input cells without evaluating them again and calculates the appended columns for the full input page before publishing it.
+An expression failure releases the unpublished page.
+The operator uses the source `:map` emission shape, a project with `append?` set to true.
+
 == Column-table and List pages
 
 The passive ColumnTable cursor completes expression materialization during opening and publishes one semantic page, including an empty page.

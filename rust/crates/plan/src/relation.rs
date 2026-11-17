@@ -230,6 +230,9 @@ pub enum RelationNode {
     PageOrdinality { input: Arc<Relation>, field: Field },
     Scan(Scan),
     Project { input: Arc<Relation>, expressions: Vec<NamedExpr> },
+    /// Appends new fields to the input schema in expression order.
+    /// Each expression reads the original input fields.
+    Extend { input: Arc<Relation>, expressions: Vec<NamedExpr> },
     Rename { input: Arc<Relation>, prefix: String, expressions: Vec<NamedExpr> },
     Let { binding: Arc<MaterializedBinding>, body: Arc<Relation> },
     Reference { binding: Arc<MaterializedBinding> },
@@ -278,6 +281,10 @@ impl Relation {
     pub fn project(self: Arc<Self>, expressions: Vec<NamedExpr>) -> Result<Self> {
         Self::new(Schema::new(expressions.iter().map(|expr| expr.field.clone()).collect())?, RelationNode::Project { input: self, expressions })
     }
+    pub fn extend(self: Arc<Self>, expressions: Vec<NamedExpr>) -> Result<Self> {
+        let schema = Schema::new(self.schema.fields().iter().cloned().chain(expressions.iter().map(|expr| expr.field.clone())).collect())?;
+        Self::new(schema, RelationNode::Extend { input: self, expressions })
+    }
     pub fn filter(self: Arc<Self>, predicate: Expr) -> Result<Self> {
         Self::new(self.schema.clone(), RelationNode::Filter { input: self, predicate })
     }
@@ -291,7 +298,7 @@ impl Relation {
     pub fn children(&self) -> Vec<&Arc<Self>> {
         match &self.node {
             RelationNode::Values { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } | RelationNode::Scan(_) | RelationNode::Reference { .. } => vec![],
-            RelationNode::Project { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
+            RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
             | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
@@ -305,7 +312,7 @@ impl Relation {
         match &self.node {
             RelationNode::Values { rows } => rows.iter().flatten().collect(),
             RelationNode::Scan(scan) => scan.valid_time.expressions().into_iter().chain(scan.system_time.expressions()).chain(scan.predicates.iter()).collect(),
-            RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
+            RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } | RelationNode::Rename { expressions, .. } => expressions.iter().map(|expr| &expr.expr).collect(),
             RelationNode::Filter { predicate, .. } => vec![predicate],
             RelationNode::Join { condition, .. } => condition.iter().collect(),
             RelationNode::Apply { arguments, .. } => arguments.iter().map(|(_, expr)| expr).collect(),
@@ -380,6 +387,10 @@ impl Relation {
             }
             RelationNode::Project { expressions, .. } | RelationNode::Rename { expressions, .. } => {
                 if !self.schema.fields().iter().eq(expressions.iter().map(|expr| &expr.field)) { return invalid("Projection fields differ from output schema"); }
+            }
+            RelationNode::Extend { input, expressions } => {
+                let expected = input.schema().fields().iter().chain(expressions.iter().map(|expr| &expr.field));
+                if !self.schema.fields().iter().eq(expected) { return invalid("Extension schema differs from its input and appended fields"); }
             }
             RelationNode::Let { binding, body } => {
                 if binding.name.is_empty() { return invalid("Materialized binding name is empty"); }

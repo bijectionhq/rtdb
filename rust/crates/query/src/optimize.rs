@@ -17,6 +17,12 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let node = match relation.node() { RelationNode::Rename { prefix, .. } => RelationNode::Rename { input, prefix: prefix.clone(), expressions }, _ => RelationNode::Project { input, expressions } };
             Ok(Arc::new(Relation::new(schema, node)?))
         }
+        RelationNode::Extend { input, expressions } => {
+            let mut columns = input.schema().ids();
+            columns.extend(expressions.iter().flat_map(|named| named.expr.referenced_columns()));
+            let input = prune(Arc::clone(input), &columns)?;
+            Ok(Arc::new(input.extend(expressions.clone())?))
+        }
         RelationNode::Filter { input, predicate } => {
             let mut columns = required.clone(); columns.extend(predicate.referenced_columns());
             let input = prune(Arc::clone(input), &columns)?;

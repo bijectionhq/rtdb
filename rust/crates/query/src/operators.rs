@@ -103,6 +103,14 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
+        RelationNode::Extend { expressions, .. } => {
+            let child = runtime.child(0)?;
+            let schema = child.schema().clone();
+            let pages = build_pages_constrained(child, execution.child(0), constraints.through_extension(expressions), pushdowns).await?;
+            let pages = Box::new(PageExtend { input: pages, schema, expressions: expressions.clone(), execution });
+            let pages = crate::pages::retain_page_state(pages, state_reservation);
+            return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
+        }
         RelationNode::Filter { predicate,.. } => {
             let mut constraints = constraints;constraints.add(predicate);
             let pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
@@ -257,6 +265,15 @@ impl PageCursor for PageProject {
         self.execution.context.check_cancelled()?;
         let Some(page) = self.input.next_page().await? else { return Ok(None); };
         crate::pages::project(&page,&self.schema,self.expressions.iter().map(|expression|&expression.expr),&self.execution).await.map(Some)
+    }
+}
+struct PageExtend { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
+#[async_trait]
+impl PageCursor for PageExtend {
+    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
+        self.execution.context.check_cancelled()?;
+        let Some(page) = self.input.next_page().await? else { return Ok(None); };
+        crate::pages::extend(&page, &self.schema, self.expressions.iter().map(|named| &named.expr), &self.execution).await.map(Some)
     }
 }
 struct PageFilter { input: BoxPageCursor, schema: Schema, predicate: Expr, execution: Execution }
