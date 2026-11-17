@@ -150,12 +150,18 @@ fn each_native_configuration_copy_admits_its_own_decoded_material() {
 }
 
 #[test]
-fn omitted_and_nonregular_material_do_not_claim_decode_admission() {
+fn omitted_material_has_no_lease_and_directories_release_the_constructor_lease() {
     let directory = tempfile::tempdir().unwrap();
     for properties in [BTreeMap::new(), BTreeMap::from([("ssl.ca.location".into(), directory.path().to_str().unwrap().into())])] {
         let memory = MemoryBudget::new(128 << 20);
         let snapshot = Configuration::capture(owner(&memory), &properties, &mut |bytes| memory.reserve(bytes)).unwrap();
-        assert!(snapshot.admit_context().unwrap().is_none());
+        let baseline = memory.used_bytes();
+        let lease = snapshot.admit_context().unwrap();
+        if properties.is_empty() { assert!(lease.is_none()); }
+        else {
+            let mut lease = lease.unwrap(); assert!(memory.used_bytes() > baseline);
+            lease.loaded(); assert_eq!(memory.used_bytes(), baseline);
+        }
         drop(snapshot); assert_eq!(memory.used_bytes(), 0);
     }
 }

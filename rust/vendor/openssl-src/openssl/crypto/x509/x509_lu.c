@@ -442,6 +442,52 @@ static int x509_store_add(X509_STORE *store, void *x, int crl)
     return ret;
 }
 
+int ossl_x509_store_add_admitted(X509_STORE *store, void *x, int crl,
+    const X509_HASH_DIR_SOURCE *source, int *denied)
+{
+    X509_OBJECT candidate = { 0 }, *obj = NULL;
+    void *grant = NULL;
+    int added = 0, ret = 0;
+
+    if (x == NULL)
+        return 0;
+    candidate.type = crl ? X509_LU_CRL : X509_LU_X509;
+    if (crl)
+        candidate.data.crl = x;
+    else
+        candidate.data.x509 = x;
+    if (!X509_STORE_lock(store))
+        return 0;
+    if (X509_OBJECT_retrieve_match(store->objs, &candidate)) {
+        ret = 1;
+        goto end;
+    }
+    grant = source->reserve(source->arg, sizeof(*obj) + 4 * sizeof(void *));
+    if (grant == NULL) {
+        *denied = 1;
+        goto end;
+    }
+    obj = X509_OBJECT_new();
+    if (obj == NULL)
+        goto end;
+    *obj = candidate;
+    if (!X509_OBJECT_up_ref_count(obj)) {
+        obj->type = X509_LU_NONE;
+        goto end;
+    }
+    added = sk_X509_OBJECT_push(store->objs, obj);
+    ret = added != 0;
+end:
+    if (added == 0)
+        X509_OBJECT_free(obj);
+    if (grant != NULL)
+        source->settle(source->arg, grant, added != 0);
+    X509_STORE_unlock(store);
+    if (!ret && !*denied)
+        ERR_raise(ERR_LIB_X509, ERR_R_X509_LIB);
+    return ret;
+}
+
 int X509_STORE_add_cert(X509_STORE *xs, X509 *x)
 {
     if (!x509_store_add(xs, x, 0)) {

@@ -21,6 +21,8 @@
 #include <stdio.h>
 #include <time.h>
 #include <errno.h>
+#include <limits.h>
+#include <stdint.h>
 #include <sys/types.h>
 
 #ifndef OPENSSL_NO_POSIX_IO
@@ -46,6 +48,7 @@ typedef struct lookup_dir_st {
     BUF_MEM *buffer;
     STACK_OF(BY_DIR_ENTRY) *dirs;
     CRYPTO_RWLOCK *lock;
+    X509_HASH_DIR_SOURCE source;
 } BY_DIR;
 
 static int dir_ctrl(X509_LOOKUP *ctx, int cmd, const char *argp, long argl,
@@ -79,6 +82,34 @@ X509_LOOKUP_METHOD *X509_LOOKUP_hash_dir(void)
     return &x509_dir_lookup;
 }
 
+int X509_STORE_set0_hash_dir_source(X509_STORE *store,
+    const X509_HASH_DIR_SOURCE *source)
+{
+    int i;
+
+    if (store == NULL || source == NULL || source->open == NULL
+        || source->close == NULL || source->retain == NULL
+        || source->reserve == NULL || source->settle == NULL
+        || source->free_source == NULL
+        || store->retained_owner.free_func != NULL)
+        return -1;
+    for (i = 0; i < sk_X509_LOOKUP_num(store->get_cert_methods); i++) {
+        X509_LOOKUP *lookup = sk_X509_LOOKUP_value(store->get_cert_methods, i);
+        BY_DIR *dir;
+
+        if (lookup->method != &x509_dir_lookup)
+            continue;
+        dir = lookup->method_data;
+        if (dir->source.open != NULL)
+            return -1;
+        if (!X509_STORE_set0_retained_owner(store, source->arg, source->free_source))
+            return -1;
+        dir->source = *source;
+        return 1;
+    }
+    return 0;
+}
+
 static int dir_ctrl(X509_LOOKUP *ctx, int cmd, const char *argp, long argl,
     char **retp)
 {
@@ -87,6 +118,10 @@ static int dir_ctrl(X509_LOOKUP *ctx, int cmd, const char *argp, long argl,
 
     switch (cmd) {
     case X509_L_ADD_DIR:
+        if (ld->source.open != NULL) {
+            ERR_raise(ERR_LIB_X509, X509_R_INVALID_DIRECTORY);
+            return 0;
+        }
         if (argl == X509_FILETYPE_DEFAULT) {
             const char *dir = ossl_safe_getenv(X509_get_default_cert_dir_env());
 
@@ -117,6 +152,7 @@ static int new_dir(X509_LOOKUP *lu)
         goto err;
     }
     a->dirs = NULL;
+    memset(&a->source, 0, sizeof(a->source));
     a->lock = CRYPTO_THREAD_lock_new();
     if (a->lock == NULL) {
         BUF_MEM_free(a->buffer);
@@ -219,11 +255,53 @@ static int add_cert_dir(BY_DIR *ctx, const char *dir, int type)
     return 1;
 }
 
+static int load_admitted_file(X509_LOOKUP *lookup, const char *path,
+    int filetype, X509_LOOKUP_TYPE type, OSSL_LIB_CTX *libctx,
+    const char *propq, const X509_HASH_DIR_SOURCE *source, int *denied)
+{
+    const unsigned char *bytes = NULL;
+    size_t length = 0;
+    void *read = NULL;
+    BIO *in = NULL;
+    int count = 0, os_error = EIO;
+    int opened = source->open(source->arg, path, &bytes, &length, &read, &os_error);
+
+    if (opened != 1) {
+        if (opened < 0)
+            *denied = 1;
+        else {
+            ERR_raise(ERR_LIB_SYS, os_error);
+            ERR_raise(ERR_LIB_X509, ERR_R_BIO_LIB);
+        }
+        return 0;
+    }
+    if (bytes == NULL || length > INT_MAX) {
+        *denied = 1;
+        goto end;
+    }
+    in = BIO_new_mem_buf(bytes, (int)length);
+    if (in == NULL) {
+        ERR_raise(ERR_LIB_X509, ERR_R_BIO_LIB);
+        goto end;
+    }
+    if (type == X509_LU_X509)
+        count = ossl_x509_load_cert_bio_ex(lookup, in, filetype, libctx,
+            propq, source, read, denied);
+    else
+        count = ossl_x509_load_crl_bio(lookup, in, filetype, source, read, denied);
+end:
+    BIO_free(in);
+    source->close(read);
+    return count;
+}
+
 static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
     const X509_NAME *name, X509_OBJECT *ret,
     OSSL_LIB_CTX *libctx, const char *propq)
 {
-    BY_DIR *ctx;
+    BY_DIR *ctx = (BY_DIR *)xl->method_data;
+    const X509_HASH_DIR_SOURCE *source = ctx->source.open == NULL ? NULL : &ctx->source;
+    void *path_grant = NULL;
     union {
         X509 st_x509;
         X509_CRL crl;
@@ -251,12 +329,26 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
         goto finish;
     }
 
+    if (source != NULL) {
+        size_t longest = 0;
+
+        for (i = 0; i < sk_BY_DIR_ENTRY_num(ctx->dirs); i++) {
+            size_t length = strlen(sk_BY_DIR_ENTRY_value(ctx->dirs, i)->dir);
+
+            if (length > longest)
+                longest = length;
+        }
+        if (longest > INT_MAX - 32 || longest > (SIZE_MAX - 4096) / 4)
+            goto finish;
+        path_grant = source->reserve(source->arg, longest * 4 + 4096);
+        if (path_grant == NULL)
+            goto finish;
+    }
     if ((b = BUF_MEM_new()) == NULL) {
         ERR_raise(ERR_LIB_X509, ERR_R_BUF_LIB);
         goto finish;
     }
 
-    ctx = (BY_DIR *)xl->method_data;
     h = X509_NAME_hash_ex(name, libctx, propq, &i);
     if (i == 0)
         goto finish;
@@ -328,8 +420,16 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
                     break;
             }
 #endif
-            /* found one. */
-            if (type == X509_LU_X509) {
+            if (source != NULL) {
+                int denied = 0;
+                int count = load_admitted_file(xl, b->data, ent->dir_type,
+                    type, libctx, propq, source, &denied);
+
+                if (denied)
+                    goto finish;
+                if (count == 0)
+                    break;
+            } else if (type == X509_LU_X509) {
                 if ((X509_load_cert_file_ex(xl, b->data, ent->dir_type, libctx,
                         propq))
                     == 0)
@@ -376,8 +476,19 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
                 hent = sk_BY_DIR_HASH_value(ent->hashes, idx);
             }
             if (hent == NULL) {
+                void *grant = NULL;
+
+                if (source != NULL) {
+                    grant = source->reserve(source->arg, sizeof(*hent) + 4 * sizeof(void *));
+                    if (grant == NULL) {
+                        CRYPTO_THREAD_unlock(ctx->lock);
+                        goto finish;
+                    }
+                }
                 hent = OPENSSL_malloc(sizeof(*hent));
                 if (hent == NULL) {
+                    if (grant != NULL)
+                        source->settle(source->arg, grant, 0);
                     CRYPTO_THREAD_unlock(ctx->lock);
                     ok = 0;
                     goto finish;
@@ -387,6 +498,8 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
                 if (!sk_BY_DIR_HASH_push(ent->hashes, hent)) {
                     CRYPTO_THREAD_unlock(ctx->lock);
                     OPENSSL_free(hent);
+                    if (grant != NULL)
+                        source->settle(source->arg, grant, 0);
                     ERR_raise(ERR_LIB_X509, ERR_R_CRYPTO_LIB);
                     ok = 0;
                     goto finish;
@@ -397,6 +510,8 @@ static int get_cert_by_subject_ex(X509_LOOKUP *xl, X509_LOOKUP_TYPE type,
                  * will not mutate the stack and therefore require a write lock.
                  */
                 sk_BY_DIR_HASH_sort(ent->hashes);
+                if (grant != NULL)
+                    source->settle(source->arg, grant, 1);
             } else if (hent->suffix < k) {
                 hent->suffix = k;
             }
@@ -428,6 +543,8 @@ finish:
     }
 
     BUF_MEM_free(b);
+    if (path_grant != NULL)
+        source->settle(source->arg, path_grant, 0);
     return ok;
 }
 

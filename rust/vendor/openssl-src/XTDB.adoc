@@ -66,7 +66,27 @@ Custom CRL methods retain their existing cleanup behavior.
 If a custom destruction callback aborts before cached payload cleanup, the retained owner is also left unreleased, keeping its admission while the skipped native allocations remain live.
 The pinned built-in CRL method has no destruction callback and follows the complete payload cleanup path.
 Native default/probe stores, inline inputs, nonregular files, arbitrary providers, and later handshake/session allocations remain independent admission qualifications.
-The lazy native hashed-directory loader has not yet been connected to these hooks.
+
+`X509_STORE_set0_hash_dir_source` installs admitted lazy input on an existing hashed-directory lookup.
+
+* The setter transfers one source owner only on success and closes further directory registration.
+  It does not add a lookup, enumerate a directory or open a child path.
+* The original subject-hash and numeric-suffix probes select each certificate or CRL file.
+  A source callback supplies immutable admitted bytes to the certificate-only or CRL-only parser.
+  The original file entry points use these same borrowed-BIO parser bodies without source callbacks.
+* A decoded file owner attaches to each parsed object before cache insertion.
+  Duplicate candidates release their temporary owners; objects imported before a later parse failure retain theirs.
+* Metadata grants precede cache-object, pointer-capacity and CRL-suffix allocation.
+  Grants commit only after publication or roll back after allocation cleanup.
+  Each lookup also holds a temporary path-buffer grant until that buffer is freed.
+* Admission denial returns zero from this lookup before cached-result selection and error clearing.
+  Other lookup methods and already-cached store results retain their existing behavior.
+  A distinct public budget error is not guaranteed when another result satisfies the lookup.
+* The source owner is released through the store's final-cleanup hook.
+  Independently retained certificates and CRLs keep their own decoded-file owners.
+
+The Kafka binding and its regression sources live in `../../crates/kafka/src/client/material/directory`.
+That binding documents its bounded-read behavior, conservative native decode allowance and remaining allocation qualifications.
 
 `openssl/test/retained_owner_test.c` is a standalone native regression program.
 Its process-local allocator hooks check that object, property, cached-extension, lookup and pointer-stack storage is freed before owner callbacks.

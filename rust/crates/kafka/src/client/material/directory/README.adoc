@@ -1,0 +1,71 @@
+= Native Kafka hashed-directory admission
+
+Explicit non-`probe` `ssl.ca.location` inputs captured as unmanaged material can install admitted lazy directory reads on the native TLS store.
+
+* Native loading determines whether the configured path names a directory.
+  `Configuration::configure` runs after those loaders and Java TLS configuration, before any connection.
+  Installation finds an existing hash lookup; a replaced store or a non-directory load receives no new lookup.
+* Each native client holds a constructor allowance of `64 KiB + 128 * configured_path_bytes` before `rd_kafka_new`.
+  Successful configuration attaches a separate store allowance, and `loaded()` releases the constructor allowance.
+  Failed construction releases its allowance after native cleanup.
+** Native registration splits the configured string at the platform path-list separator, even when that separator belongs to an existing directory's name.
+   Every distinct nonempty segment allocates an entry, an empty hash stack and a copied name.
+** On the pinned LP64 layout, each segment requires 24 entry bytes, 40 stack bytes, one name terminator and up to four pointer widths of directory-stack capacity.
+   The allowance reserves 128 bytes per input byte plus the fixed region allowance.
+   Native allocator overhead remains outside this source-derived estimate.
+* Directory registration ends at source installation.
+  Default paths, automatic probes and omitted CA locations do not install this source.
+
+== Lookup inputs
+
+The native hash-directory algorithm selects `hash.N` certificate files and `hash.rN` CRL files.
+
+* Reads use the selected names without directory enumeration.
+  Execute-only directory access remains sufficient, and newly created files or CRL suffixes remain discoverable by later probes.
+* The requesting thread opens each file, reads its metadata and admits raw bytes plus a decoded-material allowance before allocating the read buffer.
+  A regular file must fit `i32::MAX` bytes and the finite memory budget.
+* Reads consume exactly the observed size and then check for another byte.
+  Shrinkage or growth during that read fails the file load.
+  Same-size mutation is not detected and does not establish a filesystem snapshot.
+* Nonregular children fail the admitted read.
+  Unix opens include `O_NONBLOCK` to avoid waiting for a FIFO that replaced a selected path.
+  This bounded regular-file behavior differs from the unrestricted native file BIO for changing or nonregular inputs.
+* The certificate-only and CRL-only native parser bodies retain their existing partial-import and error-count rules.
+  They do not use the mixed certificate/CRL PEM reader.
+
+== Retained resources
+
+`DirectorySource` is a passive store owner containing the native TLS configuration and a synchronized metadata reservation.
+
+* `DirectoryRead` owns the immutable raw buffer until the borrowed native BIO is destroyed.
+  Its shared `DecodedFile` contains the decode reservation and native library-context owner.
+* Every decoded certificate or CRL receives a reference to `DecodedFile` before cache publication.
+  The final native object cleanup releases that reference after its fields and heap storage.
+  Surviving objects can retain a decoded file after store destruction.
+* The metadata reservation grows exclusively under its mutex.
+  Each grant owns its admitted byte count until settlement.
+  Rollback releases only that grant; a concurrent successful insertion keeps its own bytes.
+* Cache objects and CRL-suffix entries retain their metadata grants through final store destruction.
+  Pointer-capacity allowance is four pointer widths per entry, covering the pinned stack's minimum and growth capacities.
+  Temporary path grants and grant bookkeeping are released after their native allocations.
+
+The decoded allowance is `64 KiB + 512 * input_bytes`.
+It is conservative admission, not a proved upper bound for every native provider allocation.
+
+* Defaults, automatic probes, inline material, arbitrary providers and later handshake/session allocations require separate qualification.
+* A path captured as unmanaged that becomes a regular file before native path classification uses the original initial file loader.
+  Its constructor/path allowance does not establish admission for that unexpected decode.
+* Admission denial stops this hash lookup before it returns a cached match or clears errors.
+  The enclosing store may still satisfy a request from another lookup or a previously cached object.
+  The API does not promise a distinct public budget error in that case.
+
+== Regression sources
+
+`tests.rs` exercises the native lookup through its actual cache and the production PKIX entry point.
+
+* Lazy discovery covers late certificate creation, execute-only directories and new CRL suffixes.
+* Lifetime cases cover duplicate decodes, partially imported PEM files, independently retained native objects and rejected duplicate source installation.
+* Admission cases cover raw/decode denial, cache metadata denial, CRL-suffix metadata denial after duplicate import, and denied lookups with an existing cached match.
+* Concurrent cases cover duplicate publication and rollback beside a committed metadata grant.
+* Construction cases cover absent lookup methods, the closed directory-registration boundary and colon-rich directory names with many distinct native registrations.
+  Boundary cases cover allowance overflow and exact constructor-lease release.
