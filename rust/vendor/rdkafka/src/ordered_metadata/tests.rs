@@ -139,8 +139,8 @@ fn unknown_root_tags_retain_duplicate_and_decreasing_ids_in_received_order() {
 
 #[test]
 fn borrowed_topic_ffi_layout_matches_native_name_and_length_fields() {
-    assert_eq!(std::mem::size_of::<MetadataTopic<'_>>(),std::mem::size_of::<sys::rd_kafka_metadata_topic_t>());
-    assert_eq!(std::mem::align_of::<MetadataTopic<'_>>(),std::mem::align_of::<sys::rd_kafka_metadata_topic_t>());
+    assert_eq!(std::mem::size_of::<MetadataTopic<'_>>(),std::mem::size_of::<sys::rd_kafka_ordered_metadata_topic_t>());
+    assert_eq!(std::mem::align_of::<MetadataTopic<'_>>(),std::mem::align_of::<sys::rd_kafka_ordered_metadata_topic_t>());
     let text = "topic"; let topic = MetadataTopic::new(text);
     assert_eq!(topic.raw.name,text.as_ptr().cast()); assert_eq!(topic.raw.length,text.len());
 }

@@ -3153,10 +3153,10 @@ rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
                                             char *errstr, size_t errstr_size);
 
 typedef struct rd_kafka_ordered_metadata_s rd_kafka_ordered_metadata_t;
-typedef struct rd_kafka_metadata_topic_s {
+typedef struct rd_kafka_ordered_metadata_topic_s {
         const void *name;
         size_t length;
-} rd_kafka_metadata_topic_t;
+} rd_kafka_ordered_metadata_topic_t;
 
 /**
  * Starts a named-topic Metadata request on an accounted producer without waiting for a broker.
@@ -3171,7 +3171,7 @@ typedef struct rd_kafka_metadata_topic_s {
  */
 RD_EXPORT
 rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
-    rd_kafka_t *rk, const rd_kafka_metadata_topic_t *topics, size_t count,
+    rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
     size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result);
 
 /**

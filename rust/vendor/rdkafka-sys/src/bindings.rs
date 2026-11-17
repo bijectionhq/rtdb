@@ -92,13 +92,13 @@ pub struct rd_kafka_ordered_metadata_s {
 pub type rd_kafka_ordered_metadata_t = rd_kafka_ordered_metadata_s;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct rd_kafka_metadata_topic_t {
+pub struct rd_kafka_ordered_metadata_topic_t {
     pub name: *const c_void,
     pub length: usize,
 }
 extern "C" {
     pub fn rd_kafka_ordered_metadata_start(rk: *mut rd_kafka_t,
-        topics: *const rd_kafka_metadata_topic_t, count: usize,
+        topics: *const rd_kafka_ordered_metadata_topic_t, count: usize,
         body_capacity: usize, timeout_ms: c_int,
         result: *mut *mut rd_kafka_ordered_metadata_t) -> rd_kafka_resp_err_t;
     pub fn rd_kafka_ordered_metadata_poll(result: *mut rd_kafka_ordered_metadata_t,

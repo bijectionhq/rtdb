@@ -12,13 +12,13 @@ pub use wire::{Broker, Event, Int32Array, MetadataView, Partition, ProtocolError
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
 pub struct MetadataTopic<'a> {
-    raw: sys::rd_kafka_metadata_topic_t,
+    raw: sys::rd_kafka_ordered_metadata_topic_t,
     borrowed: PhantomData<&'a str>,
 }
 impl<'a> MetadataTopic<'a> {
     /// Borrows the UTF8 bytes without validating broker topic-name rules.
     pub fn new(name: &'a str) -> Self {
-        Self { raw: sys::rd_kafka_metadata_topic_t { name: name.as_ptr().cast(), length: name.len() }, borrowed: PhantomData }
+        Self { raw: sys::rd_kafka_ordered_metadata_topic_t { name: name.as_ptr().cast(), length: name.len() }, borrowed: PhantomData }
     }
 }
 

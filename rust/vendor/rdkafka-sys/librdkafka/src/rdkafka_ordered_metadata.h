@@ -127,7 +127,7 @@ static unsigned char *rd_kafka_ordered_varint(unsigned char *out, uint32_t value
 }
 
 static rd_kafka_resp_err_t rd_kafka_ordered_body_size(
-    const rd_kafka_metadata_topic_t *topics, size_t count, int16_t version,
+    const rd_kafka_ordered_metadata_topic_t *topics, size_t count, int16_t version,
     size_t *size) {
         size_t i;
         size_t total;
@@ -152,7 +152,7 @@ static rd_kafka_resp_err_t rd_kafka_ordered_body_size(
 }
 
 static void rd_kafka_ordered_body_write(unsigned char *out,
-                                         const rd_kafka_metadata_topic_t *topics,
+                                         const rd_kafka_ordered_metadata_topic_t *topics,
                                          size_t count, int16_t version,
                                          rd_bool_t auto_create) {
         size_t i;
@@ -191,7 +191,7 @@ static void rd_kafka_ordered_body_write(unsigned char *out,
 }
 
 static rd_kafka_resp_err_t rd_kafka_ordered_metadata_submit(
-    rd_kafka_broker_t *rkb, const rd_kafka_metadata_topic_t *topics, size_t count,
+    rd_kafka_broker_t *rkb, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
     int16_t version, size_t body_capacity, int timeout_ms,
     rd_kafka_ordered_metadata_t **output) {
         rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
@@ -238,7 +238,7 @@ release:
 }
 
 rd_kafka_resp_err_t rd_kafka_ordered_metadata_start(
-    rd_kafka_t *rk, const rd_kafka_metadata_topic_t *topics, size_t count,
+    rd_kafka_t *rk, const rd_kafka_ordered_metadata_topic_t *topics, size_t count,
     size_t body_capacity, int timeout_ms, rd_kafka_ordered_metadata_t **result) {
         rd_kafka_broker_t *rkb;
         rd_kafka_resp_err_t error;

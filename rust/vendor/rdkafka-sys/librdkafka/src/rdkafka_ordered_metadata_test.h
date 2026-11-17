@@ -1,4 +1,4 @@
-static const rd_kafka_metadata_topic_t ut_ordered_topic = {"z", 1};
+static const rd_kafka_ordered_metadata_topic_t ut_ordered_topic = {"z", 1};
 static const unsigned char ut_ordered_v13_body[] = {
         2, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, 2,'z',0,1,0
 };
