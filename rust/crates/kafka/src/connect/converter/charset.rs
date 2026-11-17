@@ -5,6 +5,7 @@ use super::error;
 #[derive(Clone, Copy)]
 pub(super) enum Charset {
     Utf8,
+    Cesu8,
     Latin1,
     Ascii,
     Utf16(Utf16Order),
@@ -32,6 +33,7 @@ impl Charset {
     fn parse(name: &str) -> Result<Self> {
         Ok(match name.to_ascii_lowercase().as_str() {
             "utf-8" | "utf8" | "unicode-1-1-utf-8" => Self::Utf8,
+            "cesu-8" | "cesu8" | "cscesu-8" => Self::Cesu8,
             "iso-8859-1" | "iso-ir-100" | "iso_8859-1" | "latin1" | "l1" | "ibm819"
             | "cp819" | "csisolatin1" | "819" | "ibm-819" | "iso8859_1" | "iso_8859-1:1987"
             | "iso_8859_1" | "8859_1" | "iso8859-1" => Self::Latin1,
@@ -52,12 +54,37 @@ impl Charset {
     pub(super) fn decode(self, bytes: &[u8]) -> String {
         match self {
             Self::Utf8 => rtdb_types::decode_java_utf8(bytes),
+            Self::Cesu8 => decode_cesu8(bytes),
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
             Self::Utf16(order) => decode_utf16(bytes, order),
             Self::Utf32(order) => decode_utf32(bytes, order),
         }
     }
+}
+
+fn decode_cesu8(mut bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 3);
+    let units = std::iter::from_fn(|| {
+        let (&first, tail) = bytes.split_first()?;
+        bytes = tail;
+        if first < 0x80 { return Some(u16::from(first)); }
+        if !(0xc2..=0xef).contains(&first) { return Some(0xfffd); }
+        let Some(&second) = bytes.first() else { return Some(0xfffd); };
+        if second & 0xc0 != 0x80 || (first == 0xe0 && second < 0xa0) {
+            return Some(0xfffd);
+        }
+        bytes = &bytes[1..];
+        if first < 0xe0 {
+            return Some((u16::from(first & 0x1f) << 6) | u16::from(second & 0x3f));
+        }
+        let Some(&third) = bytes.first() else { return Some(0xfffd); };
+        if third & 0xc0 != 0x80 { return Some(0xfffd); }
+        bytes = &bytes[1..];
+        Some((u16::from(first & 0x0f) << 12) | (u16::from(second & 0x3f) << 6) | u16::from(third & 0x3f))
+    });
+    output.extend(char::decode_utf16(units).map(|unit| unit.unwrap_or('\u{fffd}')));
+    output
 }
 
 fn decode_utf16(mut bytes: &[u8], order: Utf16Order) -> String {

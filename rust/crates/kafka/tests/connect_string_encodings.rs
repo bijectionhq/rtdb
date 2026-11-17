@@ -228,3 +228,86 @@ async fn utf32_decoder_byte_order_resets_for_each_record() {
     }
     assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null);
 }
+
+#[tokio::test]
+async fn cesu8_aliases_decode_bmp_boundaries_and_preserve_marks() {
+    let bytes = [0, 0x7f, 0xc2, 0x80, 0xdf, 0xbf, 0xe0, 0xa0, 0x80, 0xed, 0x9f, 0xbf, 0xee, 0x80, 0x80, 0xef, 0xbf, 0xbf];
+    for alias in ["CESU-8", "CESU8", "csCESU-8", "cScEsU-8"] {
+        assert_eq!(decode(alias, &bytes).await, "\0\u{7f}\u{80}\u{7ff}\u{800}\u{d7ff}\u{e000}\u{ffff}");
+        assert_eq!(decode(alias, &[0xef, 0xbb, 0xbf, b'a', 0xef, 0xbb, 0xbf]).await, "\u{feff}a\u{feff}");
+        assert_eq!(decode(alias, &[]).await, "");
+    }
+    for alias in ["CESU_8", "CESU", "csCESU8"] {
+        assert!(PluginRegistry::default().converter(&spec(&[("converter.encoding", alias)]), false).is_err());
+    }
+}
+
+#[tokio::test]
+async fn cesu8_replacement_groups_follow_java_array_decoder_boundaries() {
+    for (bytes, expected) in [
+        (&[0xc0, 0x80, 0xc1, 0xbf][..], "\u{fffd}\u{fffd}\u{fffd}\u{fffd}"),
+        (&[0xc2][..], "\u{fffd}"),
+        (&[0xc2, b'a'][..], "\u{fffd}a"),
+        (&[0xe0][..], "\u{fffd}"),
+        (&[0xe0, 0x9f][..], "\u{fffd}\u{fffd}"),
+        (&[0xe0, 0x9f, 0x80][..], "\u{fffd}\u{fffd}\u{fffd}"),
+        (&[0xe0, 0xa0][..], "\u{fffd}"),
+        (&[0xe0, 0xa0, b'a'][..], "\u{fffd}a"),
+        (&[0xe1, b'a', 0x80][..], "\u{fffd}a\u{fffd}"),
+        (&[0xe1, 0x80, b'a'][..], "\u{fffd}a"),
+        (&[0xed, 0xa0][..], "\u{fffd}"),
+        (&[0xed, 0xa0, b'a'][..], "\u{fffd}a"),
+        (&[0xef, 0xbf][..], "\u{fffd}"),
+        (&[0xe1, 0xc2, 0x80][..], "\u{fffd}\u{80}"),
+    ] {
+        assert_eq!(decode("CESU-8", bytes).await, expected, "{bytes:?}");
+    }
+}
+
+#[tokio::test]
+async fn cesu8_rejects_four_byte_utf8_sequences_one_byte_at_a_time() {
+    for bytes in [
+        &[0xf0, 0x90, 0x80, 0x80][..],
+        &[0xf0, 0x9f, 0x98, 0x80][..],
+        &[0xf4, 0x8f, 0xbf, 0xbf][..],
+        &[0xf5, 0x80, 0x80, 0x80][..],
+    ] {
+        assert_eq!(decode("CESU-8", bytes).await, "\u{fffd}\u{fffd}\u{fffd}\u{fffd}");
+    }
+    assert_eq!(decode("CESU-8", &[0xf0, 0x90]).await, "\u{fffd}\u{fffd}");
+    assert_eq!(decode("CESU-8", &[0xff, b'a', 0xfe]).await, "\u{fffd}a\u{fffd}");
+}
+
+#[tokio::test]
+async fn cesu8_surrogate_units_pair_only_when_adjacent() {
+    for (bytes, expected) in [
+        (&[0xed, 0xa0, 0xbd, 0xed, 0xb8, 0x80][..], "😀"),
+        (&[0xed, 0xa0, 0x80, 0xed, 0xa0, 0x81, 0xed, 0xb0, 0x80][..], "\u{fffd}\u{10400}"),
+        (&[0xed, 0xa0, 0x80, b'a', 0xed, 0xb0, 0x80][..], "\u{fffd}a\u{fffd}"),
+        (&[0xed, 0xa0, 0x80, 0xff, 0xed, 0xb0, 0x80][..], "\u{fffd}\u{fffd}\u{fffd}"),
+        (&[0xed, 0xb0, 0x80, 0xed, 0xa0, 0x80][..], "\u{fffd}\u{fffd}"),
+        (&[0xed, 0xa0, 0x80, 0xe1, 0x80][..], "\u{fffd}\u{fffd}"),
+    ] {
+        assert_eq!(decode("CESU-8", bytes).await, expected, "{bytes:?}");
+    }
+}
+
+#[tokio::test]
+async fn cesu8_decoder_resets_surrogates_and_partial_sequences_per_record() {
+    let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", "CESU-8")]), false).unwrap();
+    let mut context = ConversionContext::new(MemoryBudget::new(1 << 20));
+    for bytes in [&[0xed, 0xa0, 0xbd][..], &[0xed, 0xb8, 0x80][..], &[0xe1, 0x80][..], &[0x80][..]] {
+        assert_eq!(converter.decode("events", Some(bytes), &mut context).await.unwrap().value, Value::Utf8("\u{fffd}".into()));
+    }
+    assert_eq!(converter.decode("events", None, &mut context).await.unwrap().value, Value::Null);
+}
+
+#[tokio::test]
+async fn cesu8_decoder_admits_replacement_storage_before_decoding() {
+    let mut converter = PluginRegistry::default().converter(&spec(&[("converter.encoding", "CESU-8")]), false).unwrap();
+    let bytes = [0xff; 1024];
+    let mut rejected = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4 - 1));
+    assert!(converter.decode("events", Some(&bytes), &mut rejected).await.is_err());
+    let mut admitted = ConversionContext::new(MemoryBudget::new(16_384 + bytes.len() * 4));
+    assert_eq!(converter.decode("events", Some(&bytes), &mut admitted).await.unwrap().value, Value::Utf8("\u{fffd}".repeat(bytes.len())));
+}

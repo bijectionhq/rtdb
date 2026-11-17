@@ -84,6 +84,8 @@ The String converter selects the key or value deserializer encoding before decod
 Selected serializer encodings are validated during opening even for ingestion.
 All nine Java25 standard charsets and their aliases are supported: UTF8, ASCII, ISO-8859-1, UTF16, UTF16BE, UTF16LE, UTF32, UTF32BE, and UTF32LE.
 BOM-sensitive little-endian UTF16 and both BOM-suffixed UTF32 variants are also supported.
+CESU-8 supports the `CESU8` and `csCESU-8` aliases, retains byte-order marks as text, and replaces each byte of a four-byte UTF8 sequence separately.
+Its two- and three-byte malformed groups follow Java's replacement boundaries; decoded surrogate pairs combine into Unicode scalars, while isolated surrogate units become replacements in native UTF8 values.
 UTF8 and UTF16 replacement consumes malformed byte groups at the Java decoder boundary; fixed-endian UTF16 preserves its initial byte-order mark as text.
 UTF32 consumes a matching initial byte-order mark, including in fixed-endian modes, and defaults to big-endian order when no order is specified.
 Its malformed four-byte words and final one-to-three-byte fragment each produce one replacement; adjacent surrogate units emitted by Java's decoder combine into one Unicode scalar, while isolated units become replacements in native UTF8 values.
