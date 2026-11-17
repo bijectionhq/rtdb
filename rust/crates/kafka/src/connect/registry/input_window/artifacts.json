@@ -1,0 +1,151 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "archives": {
+    "jackson-core-2.16.0-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.16.0/jackson-core-2.16.0-sources.jar",
+      "sha256": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864"
+    },
+    "jackson-databind-2.16.0-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.16.0/jackson-databind-2.16.0-sources.jar",
+      "sha256": "9967c9d76cd6cabdce763149d643bc0b66e580208d635684b1bda5e09da44b30"
+    },
+    "jackson-core-2.21.7-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.21.7/jackson-core-2.21.7-sources.jar",
+      "sha256": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c"
+    },
+    "jackson-databind-2.21.7-sources.jar": {
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.21.7/jackson-databind-2.21.7-sources.jar",
+      "sha256": "9d0088f4990df572c2e3aa1c14d4c03fd8200283d801836c8044d01b9ccb7e73"
+    },
+    "kafka-schema-registry-client-7.8.0-sources.jar": {
+      "url": "https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0-sources.jar",
+      "sha256": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf"
+    }
+  },
+  "source_prefixes": {
+    "confluent-7.8.0/io/confluent/kafka/schemaregistry/client/rest/RestService.java": {
+      "bytes": 595,
+      "sha256": "1a213df5f633cee7547228673a81db1aa052a73bd9bd16c13f76472ccbc7c053"
+    },
+    "confluent-7.8.0/io/confluent/kafka/schemaregistry/utils/JacksonMapper.java": {
+      "bytes": 595,
+      "sha256": "df7f93c6193a1c126519694f137319c154d1450268a11a9295025ea68b94d0e1"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/JsonFactory.java": {
+      "bytes": 95,
+      "sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/JsonParser.java": {
+      "bytes": 96,
+      "sha256": "1cbc2a395007c3ca9f43e6e35d34b1016c851a670da869a3f9e6450bfc9a78af"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/StreamReadConstraints.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/base/ParserBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/io/IOContext.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/io/MergedStream.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/io/UTF32Reader.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/json/ByteSourceJsonBootstrapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/util/BufferRecycler.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/JsonFactory.java": {
+      "bytes": 95,
+      "sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/JsonParser.java": {
+      "bytes": 96,
+      "sha256": "1cbc2a395007c3ca9f43e6e35d34b1016c851a670da869a3f9e6450bfc9a78af"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/StreamReadConstraints.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/base/ParserBase.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/io/IOContext.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/io/MergedStream.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/io/UTF32Reader.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/json/ByteSourceJsonBootstrapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/json/UTF8StreamJsonParser.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/util/BufferRecycler.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.16.0/com/fasterxml/jackson/databind/ObjectMapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-databind-2.21.7/com/fasterxml/jackson/databind/ObjectMapper.java": {
+      "bytes": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  },
+  "legal_members": {
+    "confluent-7.8.0/LICENSE-APACHE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-core-2.16.0/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-core-2.16.0/META-INF/jackson-core-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-core-2.16.0/META-INF/jackson-core-NOTICE": "0a0042db627fe915c6a1d9ef74927af5081446063e8888494be6718d692dd2b8",
+    "jackson-core-2.21.7/META-INF/FastDoubleParser-LICENSE": "59067508e44346bf93dc9c5e4d673a67ecd77988c2020bb5e0f8667eb199f396",
+    "jackson-core-2.21.7/META-INF/FastDoubleParser-ThirdParty-LICENSE": "dbc36f9422a40d58d1a214080583667cfd37d61c2fae1657d981edda2a60727f",
+    "jackson-core-2.21.7/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-core-2.21.7/META-INF/Schubfach-LICENSE": "12d39a6615219d73202300715e365bec2b958f858d1e837c8f2dace57f905969",
+    "jackson-core-2.21.7/META-INF/jackson-core-LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-core-2.21.7/META-INF/jackson-core-NOTICE": "e6aef1c0f4cf5b0f802c16b31fce309b3c3737450b93c40d6291bf6540aae3d1",
+    "jackson-databind-2.16.0/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-databind-2.16.0/META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+    "jackson-databind-2.21.7/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+    "jackson-databind-2.21.7/META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201"
+  },
+  "reused_legal": {
+    "confluent-7.8.0/LICENSE-APACHE": "../references/LICENSE-APACHE, already pinned full Apache2 license for these source headers"
+  }
+}

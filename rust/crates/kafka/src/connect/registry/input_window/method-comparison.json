@@ -1,0 +1,177 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "methods": [
+    {
+      "source": "io/UTF32Reader.java",
+      "signature": "public UTF32Reader(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "d5384b2a48b14c1ea5e8cd779fd2c4e82d48bfd432904f367fc92e142dadd77d",
+        "2.21.7": "d5384b2a48b14c1ea5e8cd779fd2c4e82d48bfd432904f367fc92e142dadd77d"
+      }
+    },
+    {
+      "source": "io/UTF32Reader.java",
+      "signature": "public int read(char[] cbuf",
+      "identical_without_comments_or_whitespace": false,
+      "body_sha256": {
+        "2.16.0": "2ad1f1de03e9221d3cb470d914e3fa7b286302d7c865657638bc8c53f7788ab0",
+        "2.21.7": "2620677e4f8e4658f10d7a947b5dee60b001a7bfa72e5a20a4bb691ac81cfe97"
+      }
+    },
+    {
+      "source": "io/UTF32Reader.java",
+      "signature": "private boolean loadMore(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "27534d2bc7559284385201d2f53b3616ffe6740442c12f64b51b192720b979c4",
+        "2.21.7": "27534d2bc7559284385201d2f53b3616ffe6740442c12f64b51b192720b979c4"
+      }
+    },
+    {
+      "source": "io/UTF32Reader.java",
+      "signature": "public void close()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "f8604e59f0ba990cc758cf8969a4ce06d70ba5acc6509ff9266ebcb909ddd53b",
+        "2.21.7": "f8604e59f0ba990cc758cf8969a4ce06d70ba5acc6509ff9266ebcb909ddd53b"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "public JsonEncoding detectEncoding()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "277e3eb1fa2715115ca1242e26141fb046480aab6e1e3239eae5144433f6b7b6",
+        "2.21.7": "277e3eb1fa2715115ca1242e26141fb046480aab6e1e3239eae5144433f6b7b6"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "protected boolean ensureLoaded(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "fd54ba3d85f5f6e4304a99fc01f4d5b82aa2566e96e0dfea2164915ae5660ff6",
+        "2.21.7": "fd54ba3d85f5f6e4304a99fc01f4d5b82aa2566e96e0dfea2164915ae5660ff6"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "private boolean checkUTF32(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "4b3aacda6964263ee7835fb4a747a093a6076de6b78796edf3e384f4ad1ebb01",
+        "2.21.7": "4b3aacda6964263ee7835fb4a747a093a6076de6b78796edf3e384f4ad1ebb01"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "private boolean checkUTF16(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "488493eb8d02b9bb930ef1f5122f1111461b2080a6106cdab0674ac40982f467",
+        "2.21.7": "488493eb8d02b9bb930ef1f5122f1111461b2080a6106cdab0674ac40982f467"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "private boolean handleBOM(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "fb833256f79c83106a9e7e4333fca9338d0f9d4481c5c89cb21c7c89145973d9",
+        "2.21.7": "fb833256f79c83106a9e7e4333fca9338d0f9d4481c5c89cb21c7c89145973d9"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "public Reader constructReader()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "bc81daeba75d4c3a8b369276594a109051a3aec742b5d6c560637b3f06b1c0e5",
+        "2.21.7": "bc81daeba75d4c3a8b369276594a109051a3aec742b5d6c560637b3f06b1c0e5"
+      }
+    },
+    {
+      "source": "json/ByteSourceJsonBootstrapper.java",
+      "signature": "public JsonParser constructParser(",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "1ad0c1b261604b184ce7df8cf75fbbff428a1b9a38a642ad030f7d10f4159038",
+        "2.21.7": "1ad0c1b261604b184ce7df8cf75fbbff428a1b9a38a642ad030f7d10f4159038"
+      }
+    },
+    {
+      "source": "json/UTF8StreamJsonParser.java",
+      "signature": "protected final boolean _loadMore()",
+      "identical_without_comments_or_whitespace": false,
+      "body_sha256": {
+        "2.16.0": "6d5d1a850916a634a4b8e875b5152d5424d02388a6220f986aa3a073e70b76be",
+        "2.21.7": "8b53689f517bfa019206b62952c7bd130a50a23c493570fba457d70cf59cc5b0"
+      }
+    },
+    {
+      "source": "json/UTF8StreamJsonParser.java",
+      "signature": "protected void _closeInput()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "9b2b9191a18d56c03427f5ea5ab5d18ad3c85198c3069d060de2de495f50787f",
+        "2.21.7": "9b2b9191a18d56c03427f5ea5ab5d18ad3c85198c3069d060de2de495f50787f"
+      }
+    },
+    {
+      "source": "json/ReaderBasedJsonParser.java",
+      "signature": "protected boolean _loadMore()",
+      "identical_without_comments_or_whitespace": false,
+      "body_sha256": {
+        "2.16.0": "d1a6207d774b40a656f8a60621b15739266f6ed1dddd558357da5a774fa5bc17",
+        "2.21.7": "b0631c1eba80ed01ae06b13ff07819e09ba13c63b2dc490aca7e64b2662145d7"
+      }
+    },
+    {
+      "source": "json/ReaderBasedJsonParser.java",
+      "signature": "protected void _closeInput()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "8d7734079bbbe587052ca253259da42dd5480efb6a8b694e9f9be78af3f1902d",
+        "2.21.7": "8d7734079bbbe587052ca253259da42dd5480efb6a8b694e9f9be78af3f1902d"
+      }
+    },
+    {
+      "source": "base/ParserBase.java",
+      "signature": "public void close()",
+      "identical_without_comments_or_whitespace": false,
+      "body_sha256": {
+        "2.16.0": "ff02a8498b1d75e9912176a9949036e84ee89b2a0f2c227f2b83050d00954dd1",
+        "2.21.7": "3414bacadf7dcd3159dc6dada31b23ec5930338905cb802ac9cd43472448ea78"
+      }
+    },
+    {
+      "source": "io/MergedStream.java",
+      "signature": "public int read(byte[] b, int off, int len)",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "2134669e99a389a4b5fc14077402c0485bc7897c900b379b8362d7a5e5055363",
+        "2.21.7": "2134669e99a389a4b5fc14077402c0485bc7897c900b379b8362d7a5e5055363"
+      }
+    },
+    {
+      "source": "io/MergedStream.java",
+      "signature": "public int available()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "0e91903729c5c3e814138a9c4fb848e3cd348c114ac569c74be00e4e59b8a169",
+        "2.21.7": "0e91903729c5c3e814138a9c4fb848e3cd348c114ac569c74be00e4e59b8a169"
+      }
+    },
+    {
+      "source": "io/MergedStream.java",
+      "signature": "public void close()",
+      "identical_without_comments_or_whitespace": true,
+      "body_sha256": {
+        "2.16.0": "8842c00d34c0ab09d7846caac25635a267fd1ac55211e4e994b7902fbeee0361",
+        "2.21.7": "8842c00d34c0ab09d7846caac25635a267fd1ac55211e4e994b7902fbeee0361"
+      }
+    }
+  ]
+}

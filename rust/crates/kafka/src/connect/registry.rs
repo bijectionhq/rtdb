@@ -16,6 +16,8 @@ mod json_admission;
 use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
+#[cfg(test)]
+mod input_window;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RegistryFormat { Avro, Json }

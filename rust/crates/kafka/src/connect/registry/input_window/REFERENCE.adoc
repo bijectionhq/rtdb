@@ -1,0 +1,113 @@
+= Observed Registry input windows
+
+The input-window source models ByteSourceJsonBootstrapper, direct UTF8 refill windows, UTF32Reader and ReaderBasedJsonParser refill windows for the two pinned Jackson profiles.
+The caller supplies actual Java InputStream call observations and actual byte/character buffer capacities.
+The model invokes no network I/O and infers no HTTP segmentation or effective runtime profile.
+The Registry test build includes 19 regression source fixtures, with execution pending Phase 2.
+Production routing still uses the existing Registry response decoder.
+The Phase2, source-completeness and whole-native memory gates remain open.
+
+== Observations and source order
+
+ReadTape borrows an ordered sequence of ReadRequest/Returned observations.
+Each observation describes the direct call made by the inspected Jackson class, rather than recursively recording calls inside an InputStream implementation.
+A read records the source overload, requested offset and requested length, followed by bytes, zero, EOF or an observed I/O failure.
+Close is a distinct call/result.
+Only the demanded observation is inspected; an invalid future observation cannot fail bootstrap or a completed earlier read.
+The caller retains ownership of observed byte slices and I/O message text for the model's lifetime.
+Empty/oversized byte results and mismatched/missing calls are model-input errors rather than source encoding errors.
+Native admission/allocation/overflow anomalies remain Failure::Native.
+Source I/O failures, zero-read failures, unsupported byte orders and UTF32 decoding failures remain separately typed.
+
+Bootstrap allocates its observed byte capacity before the first stream call.
+ensureLoaded4 requests the entire remaining buffer capacity, so it can retain more than four bytes while decoding none of the extra characters.
+A zero/EOF result returns false without installing an EOF latch.
+The following ensureLoaded2 can therefore issue another source read when fewer than two bytes remain.
+BOMs, zero-byte heuristics and unsupported2143/3412 UCS4 orders follow both pinned source methods.
+UTF8 BOM bytes advance the initial pointer while the initial parser processed count remains zero for the InputStream path.
+
+Utf8Window returns already buffered bytes before demanding a refill.
+A refill advances the Java long processed count before the source read and requests a slice at offset0 with the observed buffer length.
+EOF/zero clear the pointer/end and call source close before returning EOF or throwing for zero.
+A source close failure therefore precedes that zero-read diagnostic.
+The source-open field is cleared only after successful close, matching UTF8StreamJsonParser._closeInput.
+Explicit parser close sets its closed state first and releases its byte payload even if source close fails.
+
+UTF32Reader requests an entire byte buffer when no partial word remains, then slice reads only while fewer than four bytes are available.
+A returned valid character prefix does not cause another source read merely to fill the caller's output array.
+One to three trailing bytes remain buffered until the next demanded read compacts and refills them.
+Clean/partial EOF releases the managed byte payload before returning/reporting source EOF positions.
+A zero result fails immediately in UTF32 loadMore and does not itself close the source.
+The explicit UTF32 close path clears source-open state and releases the byte payload before calling source close.
+This differs from the UTF8 parser's close-field mutation order.
+
+UTF32 read_into mutates the caller's output as source characters are decoded.
+A later invalid word can leave a valid prefix in that output even though the read throws and charCount is not advanced.
+The reported invalid value is the source's normalized codePoint-minus0x10000 value, and byte/char diagnostics use Java int wrapping arithmetic.
+BMP surrogate values pass through as UTF16 units.
+Jackson216 retains the normalized low16 bits when a pair crosses output capacity; Jackson221 retains the proper low surrogate.
+For codePoint0x10000 the older retained value is zero, which is also its no-pending sentinel, so that low unit is lost.
+A nonzero pending unit is returned before any refill and can postpone observation of EOF or an I/O failure.
+
+ReaderWindow allocates its observed character capacity before the first reader call.
+Its next method publishes no character until the complete demanded UTF32 read succeeds.
+An invalid suffix within that same reader window therefore fails before a completed earlier root could be observed.
+A split source read can let that root complete without ever reading the suffix before close.
+The parser's processed count advances before the reader call, including a call that subsequently fails.
+Reader EOF closes the reader before returning EOF.
+Explicit parser close sets the closed state before closing and releases its character payload in the source finally order.
+
+== Capacities and role boundaries
+
+ByteInput is a passive single-writer byte-window value owning one admitted byte Buffer, its borrowed ReadTape and ptr/end/source-open state.
+Utf8Window owns only the UTF8 parser-window state around that input.
+Utf32Reader owns the byte input, profile/endian, pending unit and Java byte/char counters.
+ReaderWindow owns the decoder, admitted character Buffer and parser ptr/end/processed/close state.
+Profile, ReadMethod, ReadRequest, Call, Returned, Observation, Stage, DetectedInput and failure variants are passive source values.
+No owner starts a task, retains a callback or makes a choice among independent events.
+
+Buffer checks Java signed-array length, Rust layout, multiplication and native margin before context.reserve and try_reserve_exact.
+Payload initialization occurs after admission.
+Byte and character payloads coexist under separate reservations, including failure of the later character allocation.
+Their payload fields precede their reservation fields.
+The existing ConversionContext retains every accepted charge until context drop even after a payload has been released.
+A retained buffer keeps its own lease after that context is dropped.
+No parallel memory pool or exposed budget authority is added.
+The helper performs no fallible source I/O during Rust Drop.
+
+The standard BufferRecycler lengths in both source profiles are8000 read bytes and4000 token characters.
+They are source facts rather than hardcoded choices in the model.
+Observed recycled/custom capacities remain explicit inputs; the caller must establish how they arose.
+Small-capacity source controls exercise the same class methods without claiming those capacities are the stock fresh Registry factory's defaults.
+The4000-unit pending-boundary fixture uses an explicitly observed larger byte buffer.
+With a fresh8000-byte input buffer, at most4000 UTF16 units are decoded from that buffer in one UTF32 read, so that larger-buffer fixture does not claim the pending bug occurs on every fresh stock response.
+
+== Future cursor boundary
+
+The future cursor must run bootstrap before demanding its first token.
+It must consume successful ReaderWindow output only after that window's full read has completed.
+Lexical peeks must cache/reuse already demanded units rather than clone a window and consume the read tape twice.
+A raw-span rescan must not replay source reads or reconstruct a corrected surrogate where the actual observed UTF32 window returned the older pending-unit value.
+Field names crossing a reader window need their actual decoded units retained under admission before later field/value prefetch can overwrite that window.
+Reload-sensitive UTF8 literal suffix handling must use the exposed processed/pointer state and preserve source rewind/failure order.
+This helper does not itself tokenize JSON, intern names or alter the frozen response cursor.
+
+Detected UTF16 is an explicit branch retaining its byte input and endian observation.
+JDK StreamDecoder/MergedStream Reader behavior remains required before that branch can feed the cursor.
+JSON token state is owned by the future lexical integration: core2.21 clears the current token before source close by default, while this window helper owns no token.
+The future ObjectMapper try-with-resources boundary must call explicit close on successful/failed bean parsing and preserve a primary failure with a close failure suppressed.
+Bootstrap creation failure occurs before that parser owner exists; no implicit source close is added here.
+Persistent symbol tables, actual HTTP observation capture, canonical POST behavior, timing/cache changes and effective shaded profile qualification remain separate integration work.
+
+== Provenance
+
+link:artifacts.json[artifacts.json] pins five source archives, complete pre-package prefix lengths/digests and legal members.
+link:sources.sha256[sources.sha256] pins26 Java sources plus14 legal members.
+link:COPYRIGHT[COPYRIGHT] and link:LICENSES[LICENSES] retain the exact labeled full prefixes/licenses/notices, including empty source prefixes.
+The Confluent Apache license is reused byte-for-byte from the already pinned references/LICENSE-APACHE.
+link:method-comparison.json[method-comparison.json] records source-only normalized-body hashes for19 selected methods in both core profiles.
+Bootstrap methods and UTF32 constructor/loadMore/close are identical after removing whitespace/comments.
+UTF32 read contains the pending-unit fix and a bounds-check rewrite for Java calls outside the valid Rust output-slice domain.
+The two parser loadMore methods differ only in their constraints accessor within the modeled default unlimited-document profile.
+ParserBase.close additionally owns the newer current-token clearing branch, which stays with future lexical integration.
+No Java, Rust, Cargo, Gradle, formatter, project helper or dependency-resolution execution produced these records.
