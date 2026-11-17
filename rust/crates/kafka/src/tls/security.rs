@@ -8,7 +8,7 @@ mod parameters;
 mod peer;
 pub(crate) use peer::permits_client_certificate;
 mod pkix;
-pub(crate) use pkix::verify_pkix_server_chain;
+pub(crate) use pkix::verify_pkix_anchor;
 mod native;
 pub(crate) use native::configure as configure_native;
 
@@ -63,8 +63,17 @@ pub(crate) fn verify_public_key(certificate: &X509Ref) -> Result<()> {
     Key::of(&certificate.public_key().map_err(invalid)?).check()
 }
 
+pub(crate) fn verify_untrusted_certificate(certificate: &X509Ref) -> Result<()> {
+    blocked(Fingerprint::of(certificate)?)
+}
+
 // OpenJDK 25.0.1 SimpleValidator/AlgorithmChecker and EndEntityChecker security policy.
 pub(crate) fn verify_server_chain(chain: &[&X509Ref]) -> Result<()> {
+    verify_server_path(chain)?;
+    verify_server_distrust(chain)
+}
+
+pub(crate) fn verify_server_path(chain: &[&X509Ref]) -> Result<()> {
     let anchor = *chain.last().ok_or_else(|| invalid("TLS security policy requires a nonempty chain"))?;
     let anchor_fingerprint = Fingerprint::of(anchor)?;
     blocked(anchor_fingerprint)?;
@@ -80,8 +89,14 @@ pub(crate) fn verify_server_chain(chain: &[&X509Ref]) -> Result<()> {
         key.check()?;
         issuer = key.inherit(Some(issuer))?;
     }
+    Ok(())
+}
+
+pub(crate) fn verify_server_distrust(chain: &[&X509Ref]) -> Result<()> {
+    if chain.len() < 2 { return Ok(()); }
+    let anchor = Fingerprint::of(chain[chain.len() - 1])?;
     let sub_ca = if chain.len() > 2 { Some(Fingerprint::of(chain[chain.len() - 2])?) } else { None };
-    if let Some(cutoff) = distrust_cutoff(anchor_fingerprint, sub_ca) { issued_before(chain[0], cutoff)?; }
+    if let Some(cutoff) = distrust_cutoff(anchor, sub_ca) { issued_before(chain[0], cutoff)?; }
     Ok(())
 }
 

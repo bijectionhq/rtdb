@@ -66,9 +66,23 @@ Simple validation and client authority hints compare distinguished names using J
 Intermediate extended key usage does not constrain the simple validator.
 A directly trusted leaf bypasses certificate validity and usage checks while retaining explicit certificate distrust checks.
 `PKIX` follows Java's ordered-chain validation shortcut and otherwise builds a path from the supplied certificates.
-The builder retries candidates rejected by certificate policy and limits paths to five non-self-issued intermediate certificates; ordered validation has no builder depth limit.
-Search state and candidate validation are admitted against the connection's memory budget, and admission failures stop the search.
-An exactly trusted leaf takes Java's PKIX early return; other paths require a version-3 anchor to assert CA basic constraints and, when present, certificate-signing key usage.
+
+* *Candidate search follows Java preference and branch rules.*
+  Candidate preference follows AKI/SKID, trusted-issuer and common non-geographical ancestor rules through HashSet and TreeMap insertion and traversal.
+** Repeated DER or repeated subject/public-key/parsed-SAN values are excluded.
+   Successive self-issued candidates stop a search branch after anchor completion has been considered.
+** The builder retries candidates rejected by path signatures, algorithms, constraints or certificate policy and limits paths to five non-self-issued intermediate certificates.
+   Ordered validation has no builder depth limit.
+
+* *Search allocations are admitted against the connection's memory budget.*
+  Admission failures stop the search.
+  Failed attempts and backtracked candidate frames release their reservations before later work.
+
+* *Post-selection policy failures do not retry another anchor.*
+  An exactly trusted leaf takes Java's PKIX early return.
+  Other paths require a version-3 anchor to assert CA basic constraints and, when present, certificate-signing key usage.
+** Anchor CA/key-usage checks and TLS end-entity/distrust policy run after path selection.
+
 The native verifier accepts the exact selected chain and call-local Java self-issued classifications, with issuer names compared through Java X500Principal canonicalization.
 Original certificates supply every signature check, callback certificate and returned chain; original anchors supply Java's anchor policy checks.
 Anchor path lengths, name constraints, critical extensions, dates and self-signatures remain outside native path validation.
@@ -120,8 +134,10 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 The eager `SunX509` store decoder still differs from Java provider alias lookup for raw mixed-case JKS aliases and some PKCS12 alias and issuer-chain cases.
 Its JKS path recovers a private key before discarding an empty chain, while PKCS12 currently skips keys without a matched certificate before recovery; Java `SunX509KeyManagerImpl` recovers those keys first.
-PKIX builder candidate preference, TreeSet traversal and subject/key/subject-alternative-name repetition rules still require the exact Java search-order implementation.
+PKIX trust-anchor identity hashes and non-Comparable collision ties use native process identity; they do not reproduce a particular JVM run's `System.identityHashCode` inputs.
+Public-key equality normalizes absent and BER-encoded empty NULL parameters; non-NULL BER parameter canonicalization, OID validation, unaligned BIT STRING handling and additional provider acceptance remain open.
 Native name-constraint matching beyond Java self-issued exceptions and native algorithm availability still require qualification against Java's validator.
+The builder's Java BasicConstraints/KeyUsage selectors accept parsed extensions alongside malformed noncritical copies, but native path metadata still needs the same parsing boundary to admit those complete paths.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 These are open standard-configuration gaps.
 Additional Java providers and credential extensions require native implementations.

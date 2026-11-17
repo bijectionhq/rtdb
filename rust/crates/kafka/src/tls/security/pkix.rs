@@ -1,26 +1,24 @@
-use std::ptr;
-use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{asn1::Asn1BitString, nid::Nid, x509::X509Ref};
+use std::{ptr, sync::Arc};
+use foreign_types::ForeignTypeRef;
+use openssl::x509::X509Ref;
+use rtdb_columnar::MemoryBudget;
+use rtdb_tls::{CertificateBasicConstraints, CertificateKeyUsage};
 use rtdb_types::Result;
 use super::super::invalid;
 
-// A one-certificate chain is admitted here only after exact certificate membership in the trust store.
-pub(crate) fn verify_pkix_server_chain(chain: &[&X509Ref]) -> Result<()> {
-    let anchor = chain.last().ok_or_else(|| invalid("TLS PKIX policy requires a nonempty chain"))?;
-    if chain.len() == 1 { return Ok(()); }
-    super::verify_server_chain(chain)?;
+pub(crate) fn verify_pkix_anchor(anchor: &X509Ref, memory: &Arc<MemoryBudget>) -> Result<()> {
     if anchor.version() < 2 { return Ok(()); }
-    let flags = unsafe { openssl_sys::X509_get_extension_flags(anchor.as_ptr()) };
-    if flags & (openssl_sys::EXFLAG_BCONS | openssl_sys::EXFLAG_CA) != (openssl_sys::EXFLAG_BCONS | openssl_sys::EXFLAG_CA) {
+    let length = unsafe { openssl_sys::i2d_X509(anchor.as_ptr(), ptr::null_mut()) };
+    let bound = usize::try_from(length).ok().and_then(|length| length.checked_add(64))
+        .ok_or_else(|| invalid("TLS anchor encoding exceeds allocation range"))?;
+    let _encoding = memory.reserve(bound)?;
+    let encoded = anchor.to_der().map_err(invalid)?;
+    let material_error = |error: rtdb_types::Anomaly| if error.code == "rtdb.tls/invalid-keystore" { invalid(error) } else { error };
+    if CertificateBasicConstraints::decode(&encoded, memory).map_err(material_error)?.path_length() == -1 {
         return Err(invalid("TLS PKIX trust anchor is not a certificate authority"));
     }
-    let mut critical = -1;
-    let usage = unsafe { openssl_sys::X509_get_ext_d2i(anchor.as_ptr(), Nid::KEY_USAGE.as_raw(), &mut critical, ptr::null_mut()) };
-    if usage.is_null() {
-        if critical != -1 { return Err(invalid("TLS PKIX trust anchor has invalid key usage")); }
-    } else {
-        let usage = unsafe { Asn1BitString::from_ptr(usage.cast()) };
-        if usage.as_slice().first().is_none_or(|bits| bits & 0x04 == 0) { return Err(invalid("TLS PKIX trust anchor excludes certificate signing")); }
+    if !CertificateKeyUsage::decode(&encoded, memory).map_err(material_error)?.permits_certificate_signing() {
+        return Err(invalid("TLS PKIX trust anchor excludes certificate signing"));
     }
     Ok(())
 }
@@ -29,6 +27,13 @@ pub(crate) fn verify_pkix_server_chain(chain: &[&X509Ref]) -> Result<()> {
 mod tests {
     use super::*;
     use openssl::{asn1::Asn1Time, bn::BigNum, hash::MessageDigest, pkey::PKey, rsa::Rsa, x509::{X509, X509NameBuilder, extension::{BasicConstraints, KeyUsage}}};
+
+    fn verify_pkix_server_chain(chain: &[&X509Ref]) -> Result<()> {
+        let anchor = chain.last().ok_or_else(|| invalid("TLS PKIX policy requires a nonempty chain"))?;
+        if chain.len() == 1 { return Ok(()); }
+        super::super::verify_server_chain(chain)?;
+        verify_pkix_anchor(anchor, &MemoryBudget::new(16 << 20))
+    }
 
     fn anchor(version: i32, ca: bool, sign: Option<bool>) -> X509 {
         let key = PKey::from_rsa(Rsa::generate(1024).unwrap()).unwrap();

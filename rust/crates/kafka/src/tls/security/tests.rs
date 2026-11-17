@@ -158,3 +158,10 @@ fn pss_parameters_check_both_digests_and_default_sha1_independently() {
         assert!(parameters::pss(&malformed).is_err());
     }
 }
+
+#[test]
+fn builder_blocklist_screening_leaves_algorithm_constraints_to_path_validation() {
+    let weak = certificate(512, MessageDigest::md5(), 1_700_000_000, None);
+    assert!(verify_untrusted_certificate(&weak).is_ok());
+    assert!(verify_client_chain(&[&weak]).is_err());
+}
