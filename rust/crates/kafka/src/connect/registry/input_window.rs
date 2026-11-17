@@ -2,6 +2,9 @@ use std::{alloc::Layout, mem::size_of, sync::Arc};
 use rtdb_types::{Anomaly, MemoryReservation};
 use super::{ConversionContext, error};
 
+mod utf16;
+pub(super) use utf16::{Utf16Reader, Utf16Window};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Profile { Jackson216, Jackson221 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9,13 +12,13 @@ pub(super) enum ReadMethod { Slice, WholeBuffer }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ReadRequest { pub(super) method: ReadMethod, pub(super) offset: usize, pub(super) length: usize }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Call { Read(ReadRequest), Close }
+pub(super) enum Call { Read(ReadRequest), Available, Close }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Returned<'a> { Bytes(&'a [u8]), Zero, Eof, Io(&'a str), Closed }
+pub(super) enum Returned<'a> { Bytes(&'a [u8]), Zero, Eof, Available(i32), Io(&'a str), Closed }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Observation<'a> { pub(super) call: Call, pub(super) returned: Returned<'a> }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Stage { Bootstrap, Utf8Refill, Utf32Refill, SourceClose }
+pub(super) enum Stage { Bootstrap, Utf8Refill, Utf32Refill, Utf16Read, Utf16Available, SourceClose }
 #[derive(Debug)]
 pub(super) enum Failure<'a> {
     Native(Anomaly),
@@ -38,16 +41,19 @@ impl<'a> ReadTape<'a> {
         let observed = self.observations.get(index).ok_or(Failure::Observation { index, expected: call, detail: "Missing source call observation" })?;
         self.next += 1;
         if observed.call != call { return Err(Failure::Observation { index, expected: call, detail: "Source call differs from its observation" }); }
-        match observed.returned {
-            Returned::Io(detail) => Err(Failure::Io { stage, detail }),
-            Returned::Closed if call != Call::Close => Err(Failure::Observation { index, expected: call, detail: "Close result used for a read" }),
-            returned if call == Call::Close && returned != Returned::Closed => Err(Failure::Observation { index, expected: call, detail: "Read result used for close" }),
-            Returned::Bytes(bytes) => {
-                let Call::Read(request) = call else { unreachable!() };
+        match (call, observed.returned) {
+            (_, Returned::Io(detail)) => Err(Failure::Io { stage, detail }),
+            (Call::Close, Returned::Closed) => Ok(Returned::Closed),
+            (Call::Close, _) => Err(Failure::Observation { index, expected: call, detail: "Read result used for close" }),
+            (Call::Available, returned @ Returned::Available(_)) => Ok(returned),
+            (Call::Available, _) => Err(Failure::Observation { index, expected: call, detail: "Non-availability result used for available" }),
+            (Call::Read(request), Returned::Bytes(bytes)) => {
                 if bytes.is_empty() || bytes.len() > request.length { return Err(Failure::Observation { index, expected: call, detail: "Observed byte count is outside the requested capacity" }); }
                 Ok(Returned::Bytes(bytes))
             }
-            returned => Ok(returned),
+            (Call::Read(_), returned @ (Returned::Zero | Returned::Eof)) => Ok(returned),
+            (Call::Read(_), Returned::Closed) => Err(Failure::Observation { index, expected: call, detail: "Close result used for a read" }),
+            (Call::Read(_), Returned::Available(_)) => Err(Failure::Observation { index, expected: call, detail: "Availability result used for a read" }),
         }
     }
 }

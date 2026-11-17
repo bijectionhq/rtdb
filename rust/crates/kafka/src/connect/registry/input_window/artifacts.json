@@ -21,6 +21,10 @@
     "kafka-schema-registry-client-7.8.0-sources.jar": {
       "url": "https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0-sources.jar",
       "sha256": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf"
+    },
+    "temurin-25.0.1+8/src.zip": {
+      "source": "Temurin25.0.1+8 cached JDK src.zip, same exact source artifact pinned by ../../avro/names/README.adoc",
+      "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482"
     }
   },
   "source_prefixes": {
@@ -127,6 +131,90 @@
     "jackson-databind-2.21.7/com/fasterxml/jackson/databind/ObjectMapper.java": {
       "bytes": 0,
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/JsonEncoding.java": {
+      "bytes": 96,
+      "sha256": "1cbc2a395007c3ca9f43e6e35d34b1016c851a670da869a3f9e6450bfc9a78af"
+    },
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/JsonEncoding.java": {
+      "bytes": 96,
+      "sha256": "1cbc2a395007c3ca9f43e6e35d34b1016c851a670da869a3f9e6450bfc9a78af"
+    },
+    "temurin-25.0.1+8/java.base/java/io/InputStreamReader.java": {
+      "bytes": 1214,
+      "sha256": "55349bc302b8c53ed118e6efdab9fe54833d93386ac1f99816bf575696526e8a"
+    },
+    "temurin-25.0.1+8/java.base/java/io/Reader.java": {
+      "bytes": 1214,
+      "sha256": "55349bc302b8c53ed118e6efdab9fe54833d93386ac1f99816bf575696526e8a"
+    },
+    "temurin-25.0.1+8/java.base/java/lang/Character.java": {
+      "bytes": 1214,
+      "sha256": "570d5e597a5131923d783b1f7531e704377aeb71aafd1101875c47ab5df3b5ad"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/Buffer.java": {
+      "bytes": 1214,
+      "sha256": "eac888b811586a9a022e35075518b266580d73dd3dd845d4749889c052c885dd"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/ByteBuffer.java": {
+      "bytes": 1278,
+      "sha256": "41c27f721aca482ae5f244b43c1df6594728d71491cded433e635fa3a73fa9dc"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/CharBuffer.java": {
+      "bytes": 1278,
+      "sha256": "41c27f721aca482ae5f244b43c1df6594728d71491cded433e635fa3a73fa9dc"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/HeapByteBuffer.java": {
+      "bytes": 1278,
+      "sha256": "0bf121d8d7896783335368346d49ed3f5444898c83872fa416b100e42d4ff248"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/HeapCharBuffer.java": {
+      "bytes": 1278,
+      "sha256": "0bf121d8d7896783335368346d49ed3f5444898c83872fa416b100e42d4ff248"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/charset/Charset.java": {
+      "bytes": 1214,
+      "sha256": "53d5498ba9045a071811504b80de643aaf96220aba896f6b42079ea11a0843f9"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/charset/CharsetDecoder.java": {
+      "bytes": 1278,
+      "sha256": "0bf121d8d7896783335368346d49ed3f5444898c83872fa416b100e42d4ff248"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/charset/CoderResult.java": {
+      "bytes": 1214,
+      "sha256": "6962864d53e03bc35cce9ff90bd4058dc8e14d7a45f5353baeae2dad63431aa7"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/charset/CodingErrorAction.java": {
+      "bytes": 1214,
+      "sha256": "6962864d53e03bc35cce9ff90bd4058dc8e14d7a45f5353baeae2dad63431aa7"
+    },
+    "temurin-25.0.1+8/java.base/java/nio/charset/StandardCharsets.java": {
+      "bytes": 1213,
+      "sha256": "eb4f9a6fb23ba9e4a7084d725638e2c4d8b1abb274b3367d9ca5507baa810bfe"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/StandardCharsets.java": {
+      "bytes": 1284,
+      "sha256": "110b0100129f8a6aac91de706d20d5403afb4ecb5b45bad3cb9afe4891018f4d"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/StreamDecoder.java": {
+      "bytes": 1222,
+      "sha256": "01e36a83752d15311c061198b73448e95bc175077c89fab3aeb35d04ea73f808"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UTF_16BE.java": {
+      "bytes": 1214,
+      "sha256": "e58a1af4586b440638722142c6223ddf57edd5abf75828262b6b8d9efce6c2a2"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UTF_16LE.java": {
+      "bytes": 1214,
+      "sha256": "e58a1af4586b440638722142c6223ddf57edd5abf75828262b6b8d9efce6c2a2"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/Unicode.java": {
+      "bytes": 1214,
+      "sha256": "99bcfd6b3228f1d7a8d41f22ec2453ba136c8f3a99d8804784dcc030c6f17f0c"
+    },
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UnicodeDecoder.java": {
+      "bytes": 1214,
+      "sha256": "f27521e961e44969c45c86e4d443f82eda606bd7726252aab24fa7efd6dbefed"
     }
   },
   "legal_members": {
@@ -143,7 +231,10 @@
     "jackson-databind-2.16.0/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "jackson-databind-2.16.0/META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
     "jackson-databind-2.21.7/META-INF/LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
-    "jackson-databind-2.21.7/META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201"
+    "jackson-databind-2.21.7/META-INF/NOTICE": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+    "temurin-25.0.1+8/legal/java.base/LICENSE": "4b9abebc4338048a7c2dc184e9f800deb349366bdf28eb23c2677a77b4c87726",
+    "temurin-25.0.1+8/legal/java.base/ASSEMBLY_EXCEPTION": "75292f03bf23d3db7c985aecc191029b93883200721ed23ed34a2e601463df33",
+    "temurin-25.0.1+8/legal/java.base/ADDITIONAL_LICENSE_INFO": "a69bce275ba7a3570af6579cb0f55682cd75fedfcd49e0e8e9022270c447c916"
   },
   "reused_legal": {
     "confluent-7.8.0/LICENSE-APACHE": "../references/LICENSE-APACHE, already pinned full Apache2 license for these source headers"

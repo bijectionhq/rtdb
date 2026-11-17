@@ -1,0 +1,50 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "jdk": "Temurin25.0.1+8",
+  "jdk_source_archive_sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
+  "shared_by_jackson_profiles": [
+    "2.16.0",
+    "2.21.7"
+  ],
+  "route": [
+    "ByteSourceJsonBootstrapper.constructReader",
+    "new MergedStream when buffered prefix remains",
+    "new InputStreamReader(in, enc.getJavaName())",
+    "StreamDecoder.forInputStreamReader",
+    "standardProvider UTF-16BE/UTF-16LE",
+    "new UnicodeDecoder with fixed BIG/LITTLE order and REPLACE actions"
+  ],
+  "decoder_byte_capacity": 8192,
+  "decoder_byte_capacity_kind": "fixed constructor constant, not an observed recycler or HTTP read size",
+  "malformed_replacement_utf16": [
+    65533
+  ],
+  "unmappable_action": "REPLACE",
+  "availability": "Merged prefix or decoder bytes short-circuit; actual underlying InputStream.available observations only at the source call; IOException suppressed into false by inReady",
+  "eof": "implRead-local, decoder reset; no persistent stream EOF latch",
+  "scope": "InputStream/heap ByteBuffer/fixed-endian standard decoder/valid output slices; Channel/custom CharsetDecoder/report-ignore actions/actual HTTP capture remain separate",
+  "source_sha256": {
+    "jackson-core-2.16.0/com/fasterxml/jackson/core/JsonEncoding.java": "5e45b25a3ef462bddea01c02d9f0344bd49d40d3e3016e2c7c4255dd9963b3a6",
+    "jackson-core-2.21.7/com/fasterxml/jackson/core/JsonEncoding.java": "5e45b25a3ef462bddea01c02d9f0344bd49d40d3e3016e2c7c4255dd9963b3a6",
+    "temurin-25.0.1+8/java.base/java/io/InputStreamReader.java": "a3e5fefeb3eb2fd5aa462d12c72fcfddc2690ff67cf5fcf5657c3e5799aff142",
+    "temurin-25.0.1+8/java.base/java/io/Reader.java": "cc82de4006f9bb38a4485fa5f1a29ef59186e69124f91e6f5b1e89aee80248d3",
+    "temurin-25.0.1+8/java.base/java/lang/Character.java": "bd864040a42498f6c15cfc61786570924e75072c61e576847c57434ded10ac52",
+    "temurin-25.0.1+8/java.base/java/nio/Buffer.java": "5c85050fb8db34bc928b4393c535e5828710d51a6050ce94849d0a1cd5da40bc",
+    "temurin-25.0.1+8/java.base/java/nio/ByteBuffer.java": "a3e0edb39439b54ff3376231eaac8ba82fc34c92360ef8700740e90eca871f4b",
+    "temurin-25.0.1+8/java.base/java/nio/CharBuffer.java": "74e9d1331ecdb0d8ef771bdf5afe1b4df8c707c547b0990118956d17b2f129e8",
+    "temurin-25.0.1+8/java.base/java/nio/HeapByteBuffer.java": "c1e71077b449f36e217cd518a44a11775ca86ef4b62a9380f473c6da13847048",
+    "temurin-25.0.1+8/java.base/java/nio/HeapCharBuffer.java": "1840787652df0faa8b1cb7db0669a299ccb11aa5c3cb66b173b7cb36d4a73c26",
+    "temurin-25.0.1+8/java.base/java/nio/charset/Charset.java": "0fe6c1d9b013caed44dcab551feca13421bc38460be5b0af9f34034a2273dbd3",
+    "temurin-25.0.1+8/java.base/java/nio/charset/CharsetDecoder.java": "f19b3054b9bbcf43414728180dbe6f66fe68e105a1c45d336bc95a7dbb6f29ef",
+    "temurin-25.0.1+8/java.base/java/nio/charset/CoderResult.java": "90b0342b377d07c1cad52df770d5bf8998cc56cd37610b37228c708ef0791283",
+    "temurin-25.0.1+8/java.base/java/nio/charset/CodingErrorAction.java": "46b357ccafc738fcbafd2bf01d156fd6cbddc70e22841b787f1e9e7123c766d6",
+    "temurin-25.0.1+8/java.base/java/nio/charset/StandardCharsets.java": "e81bb7f9d16c73a892998cc4025119f6e9bc3518d4c46cab97482f67e0ced13a",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/StandardCharsets.java": "6e27f9982eb5746810d96efc9bee34165ea7485eb66f5a266e0cbf4f88258356",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/StreamDecoder.java": "06a95070ebf087c10269141d685e3f483028c020211f2ad53dd1bcdbebef173a",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UTF_16BE.java": "a8acf5c715c81c1d4f667992912e1d3f899188b7b68c6822c7a87ecf85f720a3",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UTF_16LE.java": "c4cc990ee3ae33ff50c975090e12538cc666b391f5f6473964b143412d603318",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/Unicode.java": "101d2453e9e665b1e26a48acabfe633a62255dcbc2703b77f2e66244d150c2ee",
+    "temurin-25.0.1+8/java.base/sun/nio/cs/UnicodeDecoder.java": "ec91349f6de068de5ee2316f62b225f6d7d7c37a6ccad60a283454327c395c1d"
+  }
+}

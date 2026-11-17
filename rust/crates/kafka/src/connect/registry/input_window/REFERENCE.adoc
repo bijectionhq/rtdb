@@ -1,18 +1,19 @@
 = Observed Registry input windows
 
-The input-window source models ByteSourceJsonBootstrapper, direct UTF8 refill windows, UTF32Reader and ReaderBasedJsonParser refill windows for the two pinned Jackson profiles.
+The input-window source models ByteSourceJsonBootstrapper, direct UTF8 refill windows, UTF32Reader, the pinned JDK UTF16 InputStreamReader path and ReaderBasedJsonParser refill windows for the two Jackson profiles.
 The caller supplies actual Java InputStream call observations and actual byte/character buffer capacities.
 The model invokes no network I/O and infers no HTTP segmentation or effective runtime profile.
-The Registry test build includes 19 regression source fixtures, with execution pending Phase 2.
+The Registry test build includes36 regression source fixtures, with execution pending Phase2.
 Production routing still uses the existing Registry response decoder.
 The Phase2, source-completeness and whole-native memory gates remain open.
 
 == Observations and source order
 
 ReadTape borrows an ordered sequence of ReadRequest/Returned observations.
-Each observation describes the direct call made by the inspected Jackson class, rather than recursively recording calls inside an InputStream implementation.
+Each observation describes the underlying InputStream call demanded by the inspected Jackson/JDK wrappers, rather than recursively recording calls inside an InputStream implementation.
 A read records the source overload, requested offset and requested length, followed by bytes, zero, EOF or an observed I/O failure.
-Close is a distinct call/result.
+Available and close are distinct calls/results.
+Available results retain the Java signed int return value; only values greater than zero mean ready.
 Only the demanded observation is inspected; an invalid future observation cannot fail bootstrap or a completed earlier read.
 The caller retains ownership of observed byte slices and I/O message text for the model's lifetime.
 Empty/oversized byte results and mismatched/missing calls are model-input errors rather than source encoding errors.
@@ -62,7 +63,11 @@ Explicit parser close sets the closed state before closing and releases its char
 ByteInput is a passive single-writer byte-window value owning one admitted byte Buffer, its borrowed ReadTape and ptr/end/source-open state.
 Utf8Window owns only the UTF8 parser-window state around that input.
 Utf32Reader owns the byte input, profile/endian, pending unit and Java byte/char counters.
-ReaderWindow owns the decoder, admitted character Buffer and parser ptr/end/processed/close state.
+ReaderWindow owns the UTF32 decoder, admitted character Buffer and parser ptr/end/processed/close state.
+MergedInput owns the UTF16 branch's byte input and returns its retained prefix before delegating to the source.
+Utf16Reader owns MergedInput, its separately admitted fixed decoder buffer, fixed endian, position/limit, optional leftover unit and closed state.
+Utf16Window owns that decoder, its admitted parser character buffer and parser ptr/end/processed/attached/closed state.
+DecodeStatus is a passive underflow/overflow value for the fixed REPLACE decoder.
 Profile, ReadMethod, ReadRequest, Call, Returned, Observation, Stage, DetectedInput and failure variants are passive source values.
 No owner starts a task, retains a callback or makes a choice among independent events.
 
@@ -92,19 +97,67 @@ Field names crossing a reader window need their actual decoded units retained un
 Reload-sensitive UTF8 literal suffix handling must use the exposed processed/pointer state and preserve source rewind/failure order.
 This helper does not itself tokenize JSON, intern names or alter the frozen response cursor.
 
-Detected UTF16 is an explicit branch retaining its byte input and endian observation.
-JDK StreamDecoder/MergedStream Reader behavior remains required before that branch can feed the cursor.
+Detected UTF16 retains its byte input and endian observation for Utf16Reader::new.
+Utf16Window supplies its completed reader windows to the future cursor under the same demand-before-publication rule.
+The existing response cursor has not been changed to consume those windows.
 JSON token state is owned by the future lexical integration: core2.21 clears the current token before source close by default, while this window helper owns no token.
 The future ObjectMapper try-with-resources boundary must call explicit close on successful/failed bean parsing and preserve a primary failure with a close failure suppressed.
 Bootstrap creation failure occurs before that parser owner exists; no implicit source close is added here.
 Persistent symbol tables, actual HTTP observation capture, canonical POST behavior, timing/cache changes and effective shaded profile qualification remain separate integration work.
 
+== UTF16 InputStreamReader demand
+
+Both Jackson profiles pass the detected UTF-16BE/UTF-16LE charset name to InputStreamReader.
+The pinned JDK standard provider resolves those names before extension providers, and each creates the fixed-endian UnicodeDecoder.
+StreamDecoder configures malformed/unmappable actions to REPLACE and allocates an8192-byte heap ByteBuffer.
+This8192-byte capacity is the constructor's fixed value, independent of observed bootstrap/parser recycler capacities.
+link:utf16/source-profile.json[source-profile.json] pins that source path and its qualifications.
+
+MergedInput returns only available prefix bytes for a read and releases that prefix when exhausted.
+Its available method returns prefix length without calling the underlying source.
+The next underlying read uses the decoder byte buffer's actual compacted position and remaining8192-byte capacity.
+Zero reads fail; the compacted buffer is flipped on zero/EOF/I/O failure as in readBytes' finally block.
+A buffered odd byte or incomplete high surrogate remains available to implReady even though it cannot yet produce a character.
+
+UnicodeDecoder's malformed high plus nonlow pair becomes one replacement consuming four bytes.
+An isolated low surrogate becomes a replacement consuming two bytes.
+An incomplete remaining one/two/three-byte group is replaced only after source EOF is observed.
+Valid surrogate pairs require two output slots and remain buffered when only one slot is left.
+Later BOM units remain literal for these fixed-endian decoders.
+EOF is local to one implRead call; the source reset restores the same fixed endian, and a later read may demand EOF again.
+
+After producing a prefix, implRead asks inReady before another blocking byte read.
+Available IOException is suppressed into false; a tape mismatch or native failure remains an error.
+No source available call is made when merged-prefix bytes or buffered decoder bytes already satisfy the relevant readiness check.
+An actual available result can therefore determine whether a later read error precedes publication of a completed root window.
+The source fixtures distinguish available0 from available1 followed by read failure.
+
+read_one requests two units through a fixed native stack temporary and retains the second as an optional leftover.
+That optional value preserves an actual zero unit.
+Bulk reads copy a leftover before their subsequent readiness demand and preserve the source single-slot recursion order.
+Bulk read and ready check the decoder closed flag before proceeding.
+The source scalar read can return a retained leftover after close before its next bulk read checks closed; the model retains that distinction.
+
+StreamDecoder close marks its closed flag in finally even if underlying close fails.
+A parser may still have an attached reader field after that failure; its next bulk read then throws Stream closed without another underlying source call.
+Explicit Utf16Window close releases its parser character payload even when reader close fails.
+The decoder's final byte-buffer field remains owned until the native reader owner is dropped.
+Byte input, decoder bytes and parser characters are separately admitted before their respective allocations, including construction failures before any read or available demand.
+The existing conservative context retention and each payload's own lease continue to cover their actual native lifetime.
+
+This capability covers the Registry InputStream route, heap decoder buffer, valid Java output-array slices, standard fixed-endian UTF16 and REPLACE actions.
+The Channel/FileChannel factories, custom CharsetDecoder/error actions and arbitrary unchecked exceptions from custom InputStream implementations require separate qualified observations.
+Returned::Io represents source IOException and is the only source error suppressed by inReady.
+Actual HTTP observation capture, custom document-limit validation and lexical/token/primary-close-failure composition remain open.
+
 == Provenance
 
-link:artifacts.json[artifacts.json] pins five source archives, complete pre-package prefix lengths/digests and legal members.
-link:sources.sha256[sources.sha256] pins26 Java sources plus14 legal members.
+link:artifacts.json[artifacts.json] pins six source archives, complete pre-package prefix lengths/digests and legal members.
+link:sources.sha256[sources.sha256] pins47 Java sources plus17 legal members.
 link:COPYRIGHT[COPYRIGHT] and link:LICENSES[LICENSES] retain the exact labeled full prefixes/licenses/notices, including empty source prefixes.
 The Confluent Apache license is reused byte-for-byte from the already pinned references/LICENSE-APACHE.
+Temurin25.0.1+8 source and complete java.base legal files use the same exact distribution inputs already pinned by the Avro names source model.
+All prior notice/pin bytes remain retained, with the new JDK/JsonEncoding entries appended.
 link:method-comparison.json[method-comparison.json] records source-only normalized-body hashes for19 selected methods in both core profiles.
 Bootstrap methods and UTF32 constructor/loadMore/close are identical after removing whitespace/comments.
 UTF32 read contains the pending-unit fix and a bounds-check rewrite for Java calls outside the valid Rust output-slice domain.
