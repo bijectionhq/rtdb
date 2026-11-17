@@ -80,12 +80,65 @@ fn protected_pkcs12_friendly_name_matching_uses_java_simple_case() {
 fn protected_pkcs12_secret_entries_can_replace_a_private_key_alias() {
     let (key, certificate) = fixture();
     let encrypted = key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), b"key-password").unwrap();
-    let secret = safe_bag(4, sequence(&[der(6, PBES2), der(0xa0, &der(4, b"protected secret"))]), 2, Some("SHARED"));
+    let secret = safe_bag(5, sequence(&[der(6, PBES2), der(0xa0, &der(4, b"protected secret"))]), 2, Some("SHARED"));
     let bytes = pfx(&[safe_bag(2, encrypted.clone(), 1, Some("shared")), secret.clone(), certificate_bag(&certificate, 1, None)]);
     let memory = MemoryBudget::new(32 << 20);
     assert!(load_protected(&bytes, None, &memory).unwrap().identities().is_empty());
     let bytes = pfx(&[secret, safe_bag(2, encrypted, 1, Some("shared")), certificate_bag(&certificate, 1, None)]);
     assert_eq!(load_protected(&bytes, None, &memory).unwrap().identities().len(), 1);
+}
+
+#[test]
+fn protected_pkcs12_ignores_crl_payloads_and_aliases_but_validates_bag_envelopes() {
+    let (key, certificate) = fixture(); let memory = MemoryBudget::new(32 << 20);
+    let encrypted = key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), b"key-password").unwrap();
+    for payload in [der(5, &[]), der(4, b"opaque CRL payload")] {
+        let bytes = pfx(&[safe_bag(2, encrypted.clone(), 1, Some("shared")), safe_bag(4, payload, 2, Some("SHARED")), certificate_bag(&certificate, 1, None)]);
+        let loaded = load_protected(&bytes, None, &memory).unwrap();
+        assert_eq!(loaded.identities().len(), 1); assert_eq!(loaded.identities()[0].alias(), "shared".encode_utf16().collect::<Vec<_>>());
+        assert!(loaded.identities()[0].recover(Some("key-password"), &memory).is_ok());
+        assert_eq!(decode(&bytes, None, Some("key-password"), true).unwrap().identities.len(), 1);
+    }
+    let oid = [BAG_PREFIX, &[4]].concat();
+    for malformed in [sequence(&[der(6, &oid), der(4, &[])]), sequence(&[der(6, &oid), der(0xa0, &der(5, &[])), der(0x31, &der(5, &[]))])] {
+        assert!(load_protected(&pfx(&[malformed]), None, &memory).is_err());
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn protected_pkcs12_validates_secret_bag_envelopes_while_generic_loading_ignores_them() {
+    let memory = MemoryBudget::new(32 << 20);
+    for payload in [der(5, &[]), sequence(&[der(6, PBES2)]), sequence(&[der(6, PBES2), der(0xa0, &der(5, &[]))]),
+        sequence(&[der(6, PBES2), der(0xa0, &[der(4, b"first"), der(4, b"second")].concat())])] {
+        let bytes = pfx(&[safe_bag(5, payload, 1, Some("secret"))]);
+        assert!(load_protected(&bytes, None, &memory).is_err());
+        assert!(decode(&bytes, None, None, true).unwrap().identities.is_empty());
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn protected_pkcs12_secret_entries_generate_aliases_and_keep_replacement_positions() {
+    let (key, certificate) = fixture(); let memory = MemoryBudget::new(32 << 20);
+    let encrypted = key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), b"key-password").unwrap();
+    let secret = sequence(&[der(6, PBES2), der(0xa0, &der(4, b"not recovered"))]);
+    for (kind, expected) in [(4, "1"), (5, "2")] {
+        let bytes = pfx(&[safe_bag(kind, secret.clone(), 2, None), safe_bag(2, encrypted.clone(), 1, None), certificate_bag(&certificate, 1, None)]);
+        let loaded = load_protected(&bytes, None, &memory).unwrap();
+        assert_eq!(loaded.identities().len(), 1); assert_eq!(loaded.identities()[0].alias(), expected.encode_utf16().collect::<Vec<_>>());
+        assert!(loaded.identities()[0].recover(Some("key-password"), &memory).is_ok());
+        let generic = decode(&bytes, None, Some("key-password"), true).unwrap();
+        assert_eq!(generic.identities[0].alias(), Some("1".encode_utf16().collect::<Vec<_>>().as_slice()));
+    }
+    let bytes = pfx(&[safe_bag(5, secret, 1, Some("FIRST")), safe_bag(2, encrypted.clone(), 2, Some("second")), safe_bag(2, encrypted, 3, Some("first")),
+        certificate_bag(&certificate, 2, None), certificate_bag(&certificate, 3, None)]);
+    let loaded = load_protected(&bytes, None, &memory).unwrap();
+    assert_eq!(loaded.identities().iter().map(|identity| String::from_utf16(identity.alias()).unwrap()).collect::<Vec<_>>(), ["first", "second"]);
+    for identity in loaded.identities() { assert!(identity.recover(Some("key-password"), &memory).is_ok()); }
+    let generic = decode(&bytes, None, Some("key-password"), true).unwrap();
+    assert_eq!(generic.identities.iter().map(|identity| String::from_utf16(identity.alias().unwrap()).unwrap()).collect::<Vec<_>>(), ["second", "first"]);
+    drop(generic); drop(loaded); assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

@@ -108,3 +108,28 @@ fn sun_pkcs12_client_authentication_accepts_matching_keys_and_rejects_mismatched
     }
     drop(trust); drop(charge); assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn new_sun_pkcs12_secret_alias_positions_reach_native_selection_and_crls_stay_ignored() {
+    let first = Credential::new("first", false, None); let second = Credential::new("second", false, None);
+    let first_key = first.key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), b"key").unwrap();
+    let second_key = second.key.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), b"key").unwrap();
+    let certificate_bag = |identity: &Credential, id| {
+        bag(3, &seq(&[der(6, b"\x2a\x86\x48\x86\xf7\x0d\x01\x09\x16\x01"), der(0xa0, &der(4, &identity.certificate.to_der().unwrap()))]), id, None)
+    };
+    let secret = seq(&[der(6, &[0x2a, 3]), der(0xa0, &der(4, b"not recovered"))]);
+    for (kind, expected) in [(4, ["second", "first"]), (5, ["first", "second"])] {
+        let bytes = pfx(&[bag(kind, &secret, 1, Some("FIRST")), bag(2, &second_key, 2, Some("second")), bag(2, &first_key, 3, Some("first")),
+            certificate_bag(&second, 2), certificate_bag(&first, 3)]);
+        let memory = MemoryBudget::new(32 << 20);
+        let initial = memory.reserve(Material::allocation_bound(bytes.len(), StoreFormat::Java, StoreUse::OptionalIdentity, Algorithm::NewSunX509, None, Some("key")).unwrap()).unwrap();
+        let material = Material::decode(&bytes, StoreFormat::Java, StoreUse::OptionalIdentity, Algorithm::NewSunX509, None, Some("key"), initial).unwrap();
+        assert!(matches!(material, Material::Deferred(_)));
+        let charge = memory.reserve(65_536).unwrap(); let random = random::Context::new(None, &memory).unwrap();
+        let native = material.native(Algorithm::NewSunX509, &random, &charge).unwrap();
+        assert_eq!(native.manager().choose(&[KeyType::Rsa], |_, _| true, |_| crate::tls::keys::Status::Valid), Some(0));
+        let expected = expected.map(|alias| if alias == "first" { first.certificate.to_der().unwrap() } else { second.certificate.to_der().unwrap() });
+        assert_eq!(native.entries().iter().map(|identity| identity.certificate.to_der().unwrap()).collect::<Vec<_>>(), expected);
+        drop(material); drop(native); drop(random); drop(charge); assert_eq!(memory.used_bytes(), 0);
+    }
+}
