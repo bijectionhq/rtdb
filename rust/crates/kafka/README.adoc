@@ -28,6 +28,10 @@ The documented PLAIN JAAS configuration and SCRAM username/password configuratio
 JAAS lexical rules follow the pinned Java tokenizer: slash comments, Java control whitespace, quoted octal escapes and word/number boundaries.
 Quote numeric values and credentials containing punctuation outside Java word characters.
 Both modules accept `required`, `requisite`, `sufficient`, and `optional` with Java's locale-independent uppercase matching; later duplicate options replace earlier values.
+PLAIN ignores additional login options.
+SCRAM ignores additional options except `tokenauth`, whose case-insensitive `true` value selects delegation-token authentication.
+The adapter maps that option to `sasl.scram.tokenauth` and includes `tokenauth=true` in the client-first message and authenticated transcript.
+Explicit native and JAAS token-authentication settings must agree.
 Other login modules and Java client extensions require an explicit native adapter and return an error.
 Kafka log clients and Connect source consumers accept Java TLS properties through the shared native TLS adapter.
 Each log prepares one retained client configuration for its topic administrator, producer, watermark readers, ranges, and tails.

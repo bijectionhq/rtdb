@@ -1,4 +1,4 @@
-= XTDB native TLS callback fork
+= XTDB native Kafka adapter fork
 
 This directory contains rust-rdkafka 0.38.0, paired with `../rdkafka-sys` 4.9.0+2.10.0 and its bundled librdkafka 2.10.0.
 The upstream distributions and their license notices are retained.
@@ -37,3 +37,9 @@ The consuming Kafka crate pins `openssl` 0.10.81 and `openssl-sys` 0.9.117, shar
 Primary references are https://github.com/fede1024/rust-rdkafka/tree/v0.38.0[rust-rdkafka 0.38.0], https://github.com/confluentinc/librdkafka/tree/v2.10.0[librdkafka 2.10.0], https://docs.openssl.org/3.0/man3/SSL_CTX_set_cert_cb/[SSL_CTX_set_cert_cb] and https://docs.openssl.org/3.0/man3/SSL_check_chain/[SSL_check_chain].
 Native ownership, default-trust replacement and handshake regression sources live in `../../crates/kafka/tests/native_tls_ownership.rs`, `../../crates/kafka/tests/native_tls_default_trust.rs` and `../../crates/kafka/tests/connect_registry_tls.rs`.
 The fork and regression sources remain uncompiled and unexecuted in the source-only phase.
+
+The native `sasl.scram.tokenauth` boolean defaults to false and is copied with the SASL configuration.
+When enabled, the built-in SCRAM provider appends `tokenauth=true` to its client-first message.
+The retained message without its GS2 header includes the extension when computing client proof and verifying the server signature.
+This follows Kafka 4.4.0 `ScramLoginModule` and `ScramMessages.ClientFirstMessage`.
+Regression sources in `../../crates/kafka/tests/native_scram.rs` cover native configuration duplication and invoke the bundled SCRAM message unit cases.

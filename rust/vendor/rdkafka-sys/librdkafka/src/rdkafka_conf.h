@@ -305,6 +305,7 @@ struct rd_kafka_conf_s {
                 mtx_t lock;
                 char *username;
                 char *password;
+                int scram_tokenauth;
 #if WITH_SASL_SCRAM
                 /* SCRAM EVP-wrapped hash function
                  * (return value from EVP_shaX()) */

@@ -53,7 +53,15 @@ pub fn native_properties(properties: &BTreeMap<String, String>) -> Result<BTreeM
                     if properties.get(native).is_some_and(|configured| configured != &value) { return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", format!("JAAS and native {native} disagree"))); }
                     properties.insert(native.into(), value);
                 }
-                if !options.is_empty() { return Err(jaas_error()); }
+                if module == "org.apache.kafka.common.security.scram.ScramLoginModule" {
+                    let enabled = options.get("tokenauth").is_some_and(|value| value.eq_ignore_ascii_case("true"));
+                    if let Some(configured) = properties.get("sasl.scram.tokenauth") {
+                        let configured = if ["true", "t", "1"].iter().any(|value| configured.eq_ignore_ascii_case(value)) { Some(true) }
+                            else if ["false", "f", "0"].iter().any(|value| configured.eq_ignore_ascii_case(value)) { Some(false) } else { None };
+                        if configured != Some(enabled) { return Err(Anomaly::incorrect("xtdb.kafka/conflicting-config", "JAAS and native sasl.scram.tokenauth disagree")); }
+                    }
+                    properties.insert("sasl.scram.tokenauth".into(), enabled.to_string());
+                }
             }
             _ => return Err(Anomaly::unsupported("xtdb.kafka/jaas-login-module", "Kafka login module requires a native credential adapter")),
         }
