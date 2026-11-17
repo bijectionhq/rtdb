@@ -3,7 +3,7 @@ use rtdb_types::Result;
 use super::{Object,invalid};
 
 impl Object {
-    pub(super) fn equivalent(&self,other: &Self) -> Result<bool> { self.object_equal(other,false) }
+    pub(crate) fn equivalent(&self,other: &Self) -> Result<bool> { self.object_equal(other,false) }
     pub(super) fn java_equal(&self,other: &Self) -> Result<bool> { self.object_equal(other,true) }
     fn object_equal(&self,other: &Self,java: bool) -> Result<bool> {
         Ok(match (self,other) {
