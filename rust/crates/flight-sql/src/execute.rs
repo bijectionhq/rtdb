@@ -62,7 +62,7 @@ impl Service {
         if !query {
             let arguments = params.as_ref().map(|params| wire::parameter_batch(params, self.memory()).and_then(|batch| wire::arguments(batch.batch(), self.memory()))).transpose()?;
             self.execute_update_in(&mut native, source, arguments).await?;
-            return Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty.encode(self.memory())?, self.memory())?));
+            return Ok((wire::OwnedSchema::empty(self.memory())?, query_ticket(Ticket::Empty {}.encode(self.memory())?, self.memory())?));
         }
         let basis = if control.is_some() { native.state_mut().unchecked_read_basis().await } else { native.state_mut().read_basis().await }.map_err(status)?;
         let schema = if let Some(control) = control {

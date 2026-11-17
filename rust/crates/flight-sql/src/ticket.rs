@@ -14,7 +14,7 @@ pub(crate) enum Ticket {
     #[serde(rename = "run")]
     Run { #[serde(rename = "dbName")] database: String, sql: String, #[serde(deserialize_with = "required_nullable")] params: Option<String>, basis: Basis },
     #[serde(rename = "empty")]
-    Empty,
+    Empty {},
 }
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -27,7 +27,7 @@ impl Basis {
 impl Ticket {
     pub fn run(database: String, sql: String, params: Option<&Bytes>, basis: &QueryBasis) -> Result<Self, Status> { Ok(Self::Run { database, sql, params: params.map(|bytes| STANDARD.encode(bytes)), basis: Basis::capture(basis)? }) }
     pub fn encode(&self, memory: &Arc<MemoryBudget>) -> Result<Bytes, Status> {
-        let size = match self { Self::Empty => 128, Self::Run { database, sql, params, basis } => wire::add(1024, wire::add(database.len(), wire::add(sql.len(), wire::add(params.as_ref().map_or(0, String::len), wire::add(basis.snapshot_token.len(), basis.default_tz.len())?)?)?)?)? };
+        let size = match self { Self::Empty {} => 128, Self::Run { database, sql, params, basis } => wire::add(1024, wire::add(database.len(), wire::add(sql.len(), wire::add(params.as_ref().map_or(0, String::len), wire::add(basis.snapshot_token.len(), basis.default_tz.len())?)?)?)?)? };
         let charge = memory.reserve(wire::mul(size, 6)?).map_err(status)?;
         Ok(wire::retain(serde_json::to_vec(self).map_err(arrow)?, charge))
     }
@@ -65,7 +65,7 @@ mod tests {
     }
     #[test]
     fn empty_ticket_and_unknown_fields_match_kotlin_json_configuration() {
-        let memory = MemoryBudget::new(4096); assert_eq!(Ticket::Empty.encode(&memory).unwrap().as_ref(), br#"{"type":"empty"}"#);
+        let memory = MemoryBudget::new(4096); assert_eq!(Ticket::Empty {}.encode(&memory).unwrap().as_ref(), br#"{"type":"empty"}"#);
         assert!(Ticket::decode(br#"{"type":"empty","unknown":1}"#).is_err()); assert!(Ticket::decode(b"not-json").is_err());
     }
     #[test]
