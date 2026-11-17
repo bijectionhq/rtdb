@@ -86,7 +86,7 @@ impl Parser<'_> {
             .map(absolute)
     }
 
-    fn parse_name(&self, complex: &Map<String, Value>, enclosing: &Namespace) -> AvroResult<Name> {
+    pub(super) fn parse_name(&self, complex: &Map<String, Value>, enclosing: &Namespace) -> AvroResult<Name> {
         if self.name_policy.is_none() {
             return Name::parse(complex, enclosing);
         }
@@ -106,7 +106,7 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_aliases(&self, aliases: Option<Vec<String>>, namespace: &Namespace) -> AvroResult<Aliases> {
+    pub(super) fn parse_aliases(&self, aliases: Option<Vec<String>>, namespace: &Namespace) -> AvroResult<Aliases> {
         if self.name_policy.is_none() {
             return Ok(fix_aliases_namespace(aliases, namespace));
         }
@@ -115,21 +115,21 @@ impl Parser<'_> {
         }).transpose()
     }
 
-    fn validate_field_name(&self, name: &str) -> AvroResult<()> {
+    pub(super) fn validate_field_name(&self, name: &str) -> AvroResult<()> {
         match self.name_policy {
             Some(policy) => policy.record_field(name),
             None => validate_record_field_name(name),
         }
     }
 
-    fn validate_enum_symbol(&self, symbol: &str) -> AvroResult<()> {
+    pub(super) fn validate_enum_symbol(&self, symbol: &str) -> AvroResult<()> {
         match self.name_policy {
             Some(policy) => policy.enum_symbol(symbol),
             None => validate_enum_symbol_name(symbol),
         }
     }
 
-    fn already_seen_schema(&self, complex: &Map<String, Value>, namespace: &Namespace) -> AvroResult<Option<&Schema>> {
+    pub(super) fn already_seen_schema(&self, complex: &Map<String, Value>, namespace: &Namespace) -> AvroResult<Option<&Schema>> {
         if self.name_policy.is_none() {
             return Ok(self.get_already_seen_schema(complex, namespace));
         }
@@ -142,7 +142,7 @@ impl Parser<'_> {
         }
     }
 
-    fn schema_type_name(&self, name: Name, value: Value, parsed: &Schema) -> AvroResult<Name> {
+    pub(super) fn schema_type_name(&self, name: Name, value: Value, parsed: &Schema) -> AvroResult<Name> {
         if self.name_policy.is_none() {
             return Ok(get_schema_type_name(name, value));
         }
@@ -157,7 +157,7 @@ impl Parser<'_> {
         Ok(name)
     }
 
-    fn finish_scoped_schema(&mut self, complex: &Map<String, Value>, namespace: &Namespace, parsed: &Schema) -> AvroResult<()> {
+    pub(super) fn finish_scoped_schema(&mut self, complex: &Map<String, Value>, namespace: &Namespace, parsed: &Schema) -> AvroResult<()> {
         let (name, aliases) = match parsed {
             Schema::Decimal(decimal) => match decimal.inner.as_ref() {
                 Schema::Fixed(fixed) => (fixed.name.clone(), fixed.aliases.clone()),
@@ -175,7 +175,7 @@ impl Parser<'_> {
         Ok(())
     }
 
-    fn fetch_scoped_ref(&mut self, text: &str, namespace: &Namespace) -> AvroResult<Schema> {
+    pub(super) fn fetch_scoped_ref(&mut self, text: &str, namespace: &Namespace) -> AvroResult<Schema> {
         let primary = self.policy_name(text, namespace)?;
         if let Some(found) = self.scoped_candidate(&primary)? {
             return Ok(found);
