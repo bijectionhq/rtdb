@@ -42,10 +42,26 @@
 #define CRL_SCORE_AKID 0x004 /* CRL issuer matches CRL AKID */
 #define CRL_SCORE_TIME_DELTA 0x002 /* Have a delta CRL with valid times */
 
+typedef enum { SELECTED_NATIVE_EXTENSIONS, SELECTED_JAVA_EXTENSIONS } SELECTED_POLICY;
 typedef struct {
     STACK_OF(X509) *metadata;
-    const unsigned char *self_issued;
+    SELECTED_POLICY policy;
+    union {
+        const unsigned char *self_issued;
+        const X509_JAVA_CERTIFICATE_FACTS *facts;
+    } values;
 } SELECTED_CHAIN;
+
+static int selected_java(const SELECTED_CHAIN *selected)
+{
+    return selected != NULL && selected->policy == SELECTED_JAVA_EXTENSIONS;
+}
+
+static unsigned char selected_self_issued(const SELECTED_CHAIN *selected, int i)
+{
+    return selected_java(selected) ? selected->values.facts[i].self_issued
+                                   : selected->values.self_issued[i];
+}
 
 static int x509_verify_x509(X509_STORE_CTX *ctx);
 static int x509_verify_rpk(X509_STORE_CTX *ctx);
@@ -296,7 +312,7 @@ static int verify_chain(X509_STORE_CTX *ctx)
 }
 
 /* Metadata copies never supply certificate signatures or callback certificate values. */
-static STACK_OF(X509) *selected_metadata(const STACK_OF(X509) *chain)
+static STACK_OF(X509) *selected_metadata(const STACK_OF(X509) *chain, int java_extensions)
 {
     STACK_OF(X509) *metadata = sk_X509_new_null();
     int i, j;
@@ -316,9 +332,11 @@ static STACK_OF(X509) *selected_metadata(const STACK_OF(X509) *chain)
             X509_EXTENSION *extension = X509_get_ext(copy, j);
             int nid = OBJ_obj2nid(X509_EXTENSION_get_object(extension));
 
-            if (!X509_EXTENSION_get_critical(extension)
-                && (nid == NID_subject_key_identifier
-                    || nid == NID_authority_key_identifier))
+            if ((!X509_EXTENSION_get_critical(extension)
+                    && (nid == NID_subject_key_identifier
+                        || nid == NID_authority_key_identifier))
+                || (java_extensions && (nid == NID_basic_constraints
+                        || nid == NID_key_usage || nid == NID_ext_key_usage)))
                 X509_EXTENSION_free(X509_delete_ext(copy, j));
         }
         ERR_set_mark();
@@ -331,10 +349,36 @@ static STACK_OF(X509) *selected_metadata(const STACK_OF(X509) *chain)
     return NULL;
 }
 
-int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
-    STACK_OF(X509) *chain, const unsigned char *self_issued, size_t count)
+/* OpenJDK 25.0.1 ConstraintsChecker walks from the anchor toward the leaf with a signed path-length limit. */
+static int check_java_constraints(X509_STORE_CTX *ctx, const SELECTED_CHAIN *selected)
 {
-    SELECTED_CHAIN selected;
+    int count = sk_X509_num(ctx->chain) - 1;
+    int i;
+    int32_t maximum = count;
+
+    for (i = count - 1; i > 0; i--) {
+        X509 *original = sk_X509_value(ctx->chain, i);
+        const X509_JAVA_CERTIFICATE_FACTS *facts = &selected->values.facts[i];
+        int32_t constraint = facts->basic_constraints;
+
+        CB_FAIL_IF((facts->key_usage & 0x04) == 0, ctx, original, i,
+            X509_V_ERR_KEYUSAGE_NO_CERTSIGN);
+        if (X509_get_version(original) < X509_VERSION_3)
+            constraint = i == count - 1 && facts->self_issued != 0 ? INT32_MAX : -1;
+        CB_FAIL_IF(constraint == -1, ctx, original, i, X509_V_ERR_INVALID_CA);
+        if (facts->self_issued == 0) {
+            CB_FAIL_IF(maximum <= 0, ctx, original, i, X509_V_ERR_PATH_LENGTH_EXCEEDED);
+            maximum = maximum == INT32_MIN ? INT32_MAX : maximum - 1;
+        }
+        if (constraint < maximum)
+            maximum = constraint;
+    }
+    return 1;
+}
+
+static int verify_selected_chain(X509_STORE_CTX *ctx,
+    STACK_OF(X509) *chain, size_t count, SELECTED_CHAIN *selected)
+{
     int i, ok = -1;
     unsigned long permitted = X509_V_FLAG_USE_CHECK_TIME | X509_V_FLAG_NO_CHECK_TIME
         | X509_V_FLAG_PARTIAL_CHAIN | X509_V_FLAG_TRUSTED_FIRST;
@@ -343,7 +387,9 @@ int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
         ERR_raise(ERR_LIB_X509, ERR_R_PASSED_NULL_PARAMETER);
         return -1;
     }
-    if (chain == NULL || self_issued == NULL || count < 2
+    if (chain == NULL || (selected_java(selected) ? selected->values.facts == NULL
+                                                    : selected->values.self_issued == NULL)
+        || count < 2
         || count > INT_MAX || sk_X509_num(chain) != (int)count
         || ctx->cert != sk_X509_value(chain, 0) || ctx->chain != NULL
         || ctx->rpk != NULL || ctx->parent != NULL || ctx->bare_ta_signed
@@ -356,7 +402,9 @@ int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
         return -1;
     }
     for (i = 0; i < (int)count; i++) {
-        if (sk_X509_value(chain, i) == NULL || self_issued[i] > 1) {
+        if (sk_X509_value(chain, i) == NULL
+            || ((i + 1 < (int)count || !selected_java(selected))
+                && selected_self_issued(selected, i) > 1)) {
             ctx->error = X509_V_ERR_INVALID_CALL;
             return -1;
         }
@@ -367,21 +415,41 @@ int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
         return -1;
     }
     ctx->num_untrusted = (int)count - 1;
-    selected.self_issued = self_issued;
-    selected.metadata = selected_metadata(chain);
-    if (selected.metadata == NULL) {
+    selected->metadata = selected_metadata(chain, selected_java(selected));
+    if (selected->metadata == NULL) {
         ctx->error = X509_V_ERR_OUT_OF_MEM;
         return -1;
     }
-    if ((ok = check_extensions(ctx, &selected)) > 0
+    if ((ok = selected_java(selected) ? check_java_constraints(ctx, selected) : 1) > 0
+        && (ok = check_extensions(ctx, selected)) > 0
         && (ok = check_id(ctx)) > 0
         && (ok = X509_get_pubkey_parameters(NULL, ctx->chain) ? 1 : -1) > 0
-        && (ok = internal_verify_selected(ctx, &selected)) > 0)
-        ok = check_name_constraints(ctx, &selected);
-    sk_X509_pop_free(selected.metadata, X509_free);
+        && (ok = internal_verify_selected(ctx, selected)) > 0)
+        ok = check_name_constraints(ctx, selected);
+    sk_X509_pop_free(selected->metadata, X509_free);
     if (ok <= 0 && ctx->error == X509_V_OK)
         ctx->error = X509_V_ERR_UNSPECIFIED;
     return ok;
+}
+
+int X509_STORE_CTX_verify_selected_chain(X509_STORE_CTX *ctx,
+    STACK_OF(X509) *chain, const unsigned char *self_issued, size_t count)
+{
+    SELECTED_CHAIN selected;
+
+    selected.policy = SELECTED_NATIVE_EXTENSIONS;
+    selected.values.self_issued = self_issued;
+    return verify_selected_chain(ctx, chain, count, &selected);
+}
+
+int X509_STORE_CTX_verify_selected_java_chain(X509_STORE_CTX *ctx,
+    STACK_OF(X509) *chain, const X509_JAVA_CERTIFICATE_FACTS *facts, size_t count)
+{
+    SELECTED_CHAIN selected;
+
+    selected.policy = SELECTED_JAVA_EXTENSIONS;
+    selected.values.facts = facts;
+    return verify_selected_chain(ctx, chain, count < INT_MAX ? count + 1 : 0, &selected);
 }
 
 int X509_STORE_CTX_verify(X509_STORE_CTX *ctx)
@@ -723,9 +791,9 @@ static int check_extensions(X509_STORE_CTX *ctx, const SELECTED_CHAIN *selected)
         ret = X509_check_ca(x);
         if (selected != NULL && must_be_ca == 1) {
             int legacy_rollover = X509_get_version(x) < X509_VERSION_3
-                && i + 1 == num && selected->self_issued[i] != 0;
+                && i + 1 == num && selected_self_issued(selected, i) != 0;
 
-            CB_FAIL_IF(!legacy_rollover
+            CB_FAIL_IF(!selected_java(selected) && !legacy_rollover
                     && (X509_get_version(x) < X509_VERSION_3 || ret != 1),
                 ctx, original, i, X509_V_ERR_INVALID_CA);
         } else switch (must_be_ca) {
@@ -830,12 +898,12 @@ static int check_extensions(X509_STORE_CTX *ctx, const SELECTED_CHAIN *selected)
         if (purpose >= X509_PURPOSE_MIN && !check_purpose(ctx, x, original, purpose, i, must_be_ca))
             return 0;
         /* Check path length */
-        CB_FAIL_IF(i > 1 && x->ex_pathlen != -1
+        CB_FAIL_IF(!selected_java(selected) && i > 1 && x->ex_pathlen != -1
                 && plen > x->ex_pathlen + proxy_path_length,
             ctx, original, i, X509_V_ERR_PATH_LENGTH_EXCEEDED);
         /* Increment path length if not a self-issued intermediate CA */
         if (i > 0 && (selected == NULL ? (x->ex_flags & EXFLAG_SI) == 0
-                                     : selected->self_issued[i] == 0))
+                                     : selected_self_issued(selected, i) == 0))
             plen++;
         /*
          * If this certificate is a proxy certificate, the next certificate
@@ -908,7 +976,7 @@ static int check_name_constraints(X509_STORE_CTX *ctx, const SELECTED_CHAIN *sel
 
         /* Ignore self-issued certs unless last in chain */
         if (i != 0 && (selected == NULL ? (x->ex_flags & EXFLAG_SI) != 0
-                                      : selected->self_issued[i] != 0))
+                                      : selected_self_issued(selected, i) != 0))
             continue;
 
         /*
@@ -2282,7 +2350,7 @@ static int internal_verify_selected(X509_STORE_CTX *ctx, const SELECTED_CHAIN *s
             int ret;
 
             if (selected != NULL) {
-                ret = n + 1 == sk_X509_num(ctx->chain) - 1 ? X509_V_OK
+                ret = selected_java(selected) || n + 1 == sk_X509_num(ctx->chain) - 1 ? X509_V_OK
                     : ossl_x509_signing_allowed(sk_X509_value(selected->metadata, n + 1),
                         sk_X509_value(selected->metadata, n));
             } else {

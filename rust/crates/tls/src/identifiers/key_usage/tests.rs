@@ -86,6 +86,7 @@ fn java_usage_decisions_mask_every_bit_beyond_the_declared_length() {
     for byte in 0..=255u8 {
         for padding in 0..=7u8 {
             let usage = decode(&[extension(true, &encoded(3, &[padding, byte]))]);
+            assert_eq!(usage.permitted_bits(), byte & (0xff << padding));
             assert_eq!(usage.permits_digital_signatures(), byte & 0x80 != 0);
             assert_eq!(usage.permits_certificate_signing(), padding <= 2 && byte & 4 != 0);
             let primitive = (0..7u8).any(|bit| bit < 8 - padding && byte & (0x80 >> bit) != 0);
@@ -151,4 +152,11 @@ fn standalone_key_usage_array_capacity_uses_java_signed_wrapping() {
     assert!(declared_bit_length(1, 536_870_912).is_err());
     assert!(declared_bit_length(8, 1).is_err());
     assert!(declared_bit_length(0, i32::MAX as usize + 1).is_err());
+}
+
+#[test]
+fn permitted_bits_distinguish_absent_usage_from_an_empty_parsed_value() {
+    assert_eq!(decode(&[]).permitted_bits(), 0xff);
+    assert_eq!(decode(&[extension(false, &[5, 0])]).permitted_bits(), 0xff);
+    assert_eq!(decode(&[extension(false, &encoded(3, &[0]))]).permitted_bits(), 0);
 }

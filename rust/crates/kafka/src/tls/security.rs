@@ -8,7 +8,7 @@ mod parameters;
 mod peer;
 pub(crate) use peer::permits_client_certificate;
 mod pkix;
-pub(crate) use pkix::verify_pkix_anchor;
+pub(crate) use pkix::{JavaCertificateFacts, PathMetadata, verify_pkix_anchor, verify_pkix_server_usage};
 mod native;
 pub(crate) use native::configure as configure_native;
 
@@ -74,15 +74,19 @@ pub(crate) fn verify_server_chain(chain: &[&X509Ref]) -> Result<()> {
 }
 
 pub(crate) fn verify_server_path(chain: &[&X509Ref]) -> Result<()> {
+    verify_server_path_with_usage(chain, |_, certificate| key_usage(certificate))
+}
+
+fn verify_server_path_with_usage(chain: &[&X509Ref], usage: impl Fn(usize, &X509Ref) -> Result<()>) -> Result<()> {
     let anchor = *chain.last().ok_or_else(|| invalid("TLS security policy requires a nonempty chain"))?;
     let anchor_fingerprint = Fingerprint::of(anchor)?;
     blocked(anchor_fingerprint)?;
     if chain.len() == 1 { return Ok(()); }
     let jdk_ca = anchor_fingerprint.listed(JDK_ANCHORS);
     let mut issuer = Key::of(&anchor.public_key().map_err(invalid)?);
-    for certificate in chain[..chain.len() - 1].iter().rev() {
+    for (index, certificate) in chain[..chain.len() - 1].iter().enumerate().rev() {
         blocked(Fingerprint::of(certificate)?)?;
-        key_usage(certificate)?;
+        usage(index, certificate)?;
         issuer.check()?;
         let key = Key::of(&certificate.public_key().map_err(invalid)?);
         signature(certificate, jdk_ca, true)?;

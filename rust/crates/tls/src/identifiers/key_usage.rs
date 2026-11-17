@@ -32,6 +32,10 @@ impl CertificateKeyUsage {
         Ok(Self { permissions: permits.unwrap_or(0xff), _reservation: reservation })
     }
 
+    /// Returns permissions for usage bits zero through seven in high-bit-first order.
+    /// Missing or malformed noncritical usage returns 0xff; parsed bits outside the declared length are zero.
+    pub fn permitted_bits(&self) -> u8 { self.permissions }
+
     /// Accepts absence or a parsed keyCertSign bit; missing bits in a parsed value are false.
     pub fn permits_certificate_signing(&self) -> bool { self.permissions & 4 != 0 }
 

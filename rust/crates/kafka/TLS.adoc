@@ -83,16 +83,22 @@ A directly trusted leaf bypasses certificate validity and usage checks while ret
   Other paths require a version-3 anchor to assert CA basic constraints and, when present, certificate-signing key usage.
 ** Anchor CA/key-usage checks and TLS end-entity/distrust policy run after path selection.
 
-The native verifier accepts the exact selected chain and call-local Java self-issued classifications, with issuer names compared through Java X500Principal canonicalization.
+The native verifier accepts the exact selected chain and call-local Java facts for self-issuance, signed BasicConstraints and KeyUsage, with issuer names compared through Java X500Principal canonicalization.
 Original certificates supply every signature check, callback certificate and returned chain; original anchors supply Java's anchor policy checks.
 Anchor path lengths, name constraints, critical extensions, dates and self-signatures remain outside native path validation.
-Temporary non-anchor metadata copies exclude noncritical AKI and SKID only after the shared Java identifier parser accepts their criticality, duplicate and malformed-extension rules.
+Temporary non-anchor metadata copies exclude noncritical AKI and SKID after the shared Java identifier parser accepts their criticality, duplicate and malformed-extension rules.
+The copies also exclude BasicConstraints, KeyUsage and ExtendedKeyUsage after the shared Java extension parsers accept their states.
+Malformed noncritical BC/KU values are absent, parsed copies survive malformed noncritical copies, and duplicate parsed or malformed critical values fail.
+Malformed-only noncritical EKU remains usable on an intermediate but fails the leaf's server-authentication query.
+The reverse path walk requires intermediate keyCertSign before applying the signed Java path-length rule; exactly `-1` rejects CA status, while other negative limits fail only when a later non-self-issued intermediate consumes the limit.
+The SSLAlgorithmConstraints checker rejects a parsed KeyUsage without any primitive in bits zero through six; the standalone DisabledAlgorithmConstraints checker has no such gate.
 These copies supply extension checks and are never used for signature verification or transmitted.
 Ordered validation screens candidate anchors using canonical AKI key identifiers against original SKID extension bytes and signed serial numbers; absent SKID and pre-version-3 anchor serials follow Java's compatibility rules.
 Builder anchor screening uses its distinct legacy-certificate validity-period rule.
 Java self-issued intermediates retain the path-length and name-constraint exceptions, including version-1/version-2 key rollover immediately below an anchor in ordered validation.
 Certificate validity is checked on every non-anchor member, while intermediate extended key usage does not restrict the path.
-Leaf usage checks follow the Java TLS-server rules after path validation has consumed critical extensions.
+Leaf KU/EKU checks use the shared Java parsers after path selection and do not retry another anchor.
+An exactly trusted single certificate skips path facts and leaf usage checks.
 Critical ordinary-policy qualifiers are rejected while Java's policy tree remains live; an absent or exhausted policy tree leaves later qualifiers unchecked, and anyPolicy qualifiers do not trigger rejection.
 Policy processing starts with Java's default anyPolicy set and enforces explicit-policy, mapping and anyPolicy-inhibition counters, including the self-issued and final-certificate rules.
 The four policy extensions use Java's BER parsing and duplicate handling: malformed noncritical extensions are absent, malformed critical extensions fail, and two successfully parsed copies of one extension fail.
@@ -139,7 +145,8 @@ Public-key comparisons normalize encoded `X509Key` framing, including BER parame
 Both known DH OIDs use SunJCE signed numeric `y`/`p`/`g` equality after validating the DH fields; optional private-value length does not affect equality.
 Other AlgorithmParameters/KeyFactory acceptance and custom provider equality remain open.
 Native name-constraint matching beyond Java self-issued exceptions and native algorithm availability still require qualification against Java's validator.
-The builder's Java BasicConstraints/KeyUsage selectors accept parsed extensions alongside malformed noncritical copies, but native path metadata still needs the same parsing boundary to admit those complete paths.
+Netscape certificate-type checks and other native extension caches, including name constraints and SAN, retain their native parsing boundaries.
+The BC/KU/EKU integration does not establish complete Java extension-parsing or checker-error ordering parity.
 JVM truststore system-property overrides and a separately provisioned `jssecacerts` file require an explicit native or Java-style truststore configuration.
 These are open standard-configuration gaps.
 Additional Java providers and credential extensions require native implementations.

@@ -5953,3 +5953,4 @@ X509_set0_retained_owner                6080	3_6_3	EXIST::FUNCTION:
 X509_CRL_set0_retained_owner            6081	3_6_3	EXIST::FUNCTION:
 X509_STORE_set0_retained_owner          6082	3_6_3	EXIST::FUNCTION:
 X509_STORE_set0_hash_dir_source         6083	3_6_3	EXIST::FUNCTION:
+X509_STORE_CTX_verify_selected_java_chain 6084	3_6_3	EXIST::FUNCTION:
