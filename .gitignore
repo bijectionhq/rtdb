@@ -57,3 +57,5 @@ src/test/resources/data/
 
 # local experiments (not for commit)
 /scratch/
+
+__pycache__/

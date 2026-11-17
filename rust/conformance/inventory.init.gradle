@@ -1,14 +1,23 @@
 import groovy.json.JsonOutput
 import org.gradle.api.tasks.SourceSetContainer
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
 import org.gradle.api.tasks.JavaExec
 import org.gradle.api.tasks.compile.JavaCompile
 import org.gradle.api.tasks.testing.Test
 
 gradle.projectsEvaluated {
+    if (gradle.parent != null) return
     def root = gradle.rootProject
     def adapter = root.file(root.providers.gradleProperty("rtdb.adapterRoot").get())
     def evidence = root.file(root.providers.gradleProperty("rtdb.inventoryOutput").get())
     def compiled = root.layout.buildDirectory.dir("rtdb-conformance/recorder")
+    def recorderLibraries = root.configurations.named("testRuntimeClasspath").get().incoming.artifactView {
+        componentFilter { id ->
+            id instanceof ModuleComponentIdentifier && id.group in [
+                "org.junit.platform", "org.junit.jupiter", "org.opentest4j", "org.apiguardian", "com.fasterxml.jackson.core"
+            ]
+        }
+    }.files
     gradle.taskGraph.whenReady { graph ->
         evidence.mkdirs()
         def target = new File(evidence, "requested-lanes.json")
@@ -21,7 +30,7 @@ gradle.projectsEvaluated {
     def compile = root.tasks.register("compileRtdbInventoryRecorder", JavaCompile) {
         dependsOn root.tasks.named("testClasses")
         source = root.fileTree(new File(adapter, "jvm-java")) { include "**/*.java" }
-        classpath = root.extensions.getByType(SourceSetContainer).getByName("test").runtimeClasspath
+        classpath = recorderLibraries
         destinationDirectory = compiled
         javaCompiler = root.tasks.named("compileTestJava", JavaCompile).flatMap { it.javaCompiler }
     }
@@ -30,10 +39,11 @@ gradle.projectsEvaluated {
             project.tasks.register("rtdbDiscoverTests", JavaExec) {
                 dependsOn compile, project.tasks.named("testClasses")
                 def baseline = project.tasks.named("test", Test)
-                classpath = baseline.get().classpath + root.files(compiled, new File(adapter, "jvm-services"))
+                classpath = baseline.get().classpath + recorderLibraries + root.files(compiled, new File(adapter, "jvm-services"))
                 javaLauncher = baseline.get().javaLauncher
                 mainClass = "rtdb.conformance.DiscoveryRecorder"
                 jvmArgs baseline.get().jvmArgs
+                systemProperties baseline.get().systemProperties
                 systemProperty "rtdb.inventory.project", project.path
                 args([new File(evidence, project.path.replace(':', '_') + "-discovery.json").absolutePath] +
                     baseline.get().testClassesDirs.files.collect { it.absolutePath })
@@ -42,7 +52,7 @@ gradle.projectsEvaluated {
         }
         project.tasks.withType(Test).configureEach { task ->
             dependsOn compile
-            classpath += root.files(compiled, new File(adapter, "jvm-services"))
+            classpath += recorderLibraries + root.files(compiled, new File(adapter, "jvm-services"))
             systemProperty "rtdb.inventory.output", new File(evidence, task.path.replace(':', '_')).absolutePath
             systemProperty "rtdb.inventory.project", project.path
             systemProperty "rtdb.inventory.task", task.path

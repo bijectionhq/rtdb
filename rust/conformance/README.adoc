@@ -58,6 +58,9 @@ Linux runs enable descendant reaping; the runner treats an undrained group or un
 `controls_verified` establishes the control harness only; the incomplete inventory still blocks `complete_parity`.
 No runner or test in this directory has executed during Phase 1.
 `inventory.init.gradle` adds a passive, callback-driven JUnit recorder without changing the reference test sources.
+Only the requested root build owns its evidence directory; nested buildSrc and included builds do not publish lane manifests.
+The recorder uses the JUnit and Jackson library artifacts selected by that root's test runtime, including for empty packaging modules, while each module retains its own application and test classes.
+`test_inventory_init.py` exercises a real Gradle fixture with buildSrc, an empty module, dynamic invocations and a module lacking the recorder's runtime libraries.
 The recorder serializes each worker's plan, dynamic registrations, skips, outcomes, and report entries into its own event stream.
 A recording error omits the terminal event, so reconciliation rejects the stream even when JUnit logs and suppresses a listener exception.
 The unfiltered discovery command retains templates omitted by normal task tags; concrete parameterized invocations come from execution.
