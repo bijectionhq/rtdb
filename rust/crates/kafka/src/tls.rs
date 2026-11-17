@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 mod policy;
 use policy::Policy;
-mod trust;
+pub(crate) mod trust;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,

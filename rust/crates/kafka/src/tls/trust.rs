@@ -11,20 +11,29 @@ pub(super) fn native_override(options: &BTreeMap<String, String>) -> bool {
 }
 
 pub(super) fn defaults(reserve: &mut impl FnMut(usize) -> Result<Arc<MemoryReservation>>) -> Result<KeyStore> {
-    let bound = KeyStore::allocation_bound_with_passwords(CACERTS.len(), Some("changeit"), None)?
-        .checked_add(CACERTS.len().checked_mul(32).ok_or_else(overflow)?).ok_or_else(overflow)?;
-    KeyStore::decode(CACERTS, StoreFormat::Java, StoreUse::Trust, Some("changeit"), None, reserve(bound)?)
+    decode(reserve(allocation_bound()?)?)
+}
+
+pub(crate) fn allocation_bound() -> Result<usize> {
+    KeyStore::allocation_bound_with_passwords(CACERTS.len(), Some("changeit"), None)?
+        .checked_add(CACERTS.len().checked_mul(32).ok_or_else(overflow)?).ok_or_else(overflow)
+}
+
+pub(crate) fn decode(reservation: Arc<MemoryReservation>) -> Result<KeyStore> {
+    if reservation.bytes() < allocation_bound()? { return Err(super::invalid("Default trust store reservation is too small")); }
+    KeyStore::decode(CACERTS, StoreFormat::Java, StoreUse::Trust, Some("changeit"), None, reservation)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use rtdb_columnar::MemoryBudget;
-    use sha2::{Digest, Sha256};
+    use openssl::hash::{MessageDigest, hash};
 
     #[test]
     fn pinned_default_roots_are_decoded_under_the_retained_reservation() {
-        assert_eq!(format!("{:x}", Sha256::digest(CACERTS)), "7a33aaf51d8460f3e57956e90a8fe179188e9c82578555020881f5cd48c4274b");
+        let digest = hash(MessageDigest::sha256(), CACERTS).unwrap().iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        assert_eq!(digest, "7a33aaf51d8460f3e57956e90a8fe179188e9c82578555020881f5cd48c4274b");
         let memory = MemoryBudget::new(32 << 20);
         let roots = defaults(&mut |bytes| memory.reserve(bytes)).unwrap();
         assert!(roots.identities().is_empty());

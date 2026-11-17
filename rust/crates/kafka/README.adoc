@@ -105,7 +105,7 @@ Java protocol and cipher-suite configuration uses the native OpenSSL client adap
 Additional Java producer extensions, custom credential/provider classes, and several nondefault converter settings remain unfinished source work.
 Client certificate selection retains all keystore identities and matches signature schemes and acceptable issuer names.
 PKCS12 store and private-key passwords are independent.
-System trust roots retain an 8 MiB reservation; configured trust material retains its keystore decode reservation.
+Registry default trust uses the pinned Temurin 25.0.1+8 certificate store under a retained decode reservation; configured trust retains its keystore reservation.
 The native trust-store allocation bound requires runtime qualification.
 Date patterns use native hybrid Gregorian, Buddhist and five-era Japanese calendars with the pinned CLDR locale data, week fields, localized names/numbers, named zones and construction-time two-digit-year pivots.
 link:LEGACY-DATES.adoc[Connect date conversion] records the raw-millisecond boundary, process environment, resource ownership and remaining provider qualifications.
