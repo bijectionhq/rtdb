@@ -12,6 +12,7 @@ use super::{Algorithm, KeyManager, KeyType, invalid, overflow, random, security}
 /// Deferred entries retain their protected store and zeroized effective password through the last owner.
 pub(crate) enum Material { Eager(Arc<KeyStore>), Deferred(Arc<ProtectedKeys>) }
 pub(crate) struct ProtectedKeys { store: Arc<ProtectedKeyStore>, password: Option<Zeroizing<String>>, _password_charge: Arc<MemoryReservation> }
+pub(super) struct NativeIdentities { entries: Vec<ClientIdentity>, manager: KeyManager, charge: Arc<MemoryReservation> }
 pub(super) struct ClientIdentity { pub certificate: X509, pub chain: Stack<X509>, pub kind: KeyType, pub eligible: bool, key: Key }
 enum Key { Eager { key: PKey<Private>, _random: Arc<random::Context> }, Deferred { owner: Arc<ProtectedKeys>, index: usize } }
 struct SelectedKey { key: PKey<Private>, _charge: Arc<MemoryReservation>, _random: Arc<random::Context>, _signature_random: Arc<random::Context> }
@@ -35,9 +36,9 @@ impl Material {
         } else { KeyStore::decode(bytes, format, usage, password, key_password, charge).map(|store| Self::Eager(Arc::new(store))) }
     }
 
-    /// The caller retains the returned charge until the native identities and certificate copies are destroyed.
+    /// The returned owner's reservation must outlive SSL connections retaining its certificates.
     /// Deferred material requires NewSunX509; loading metadata does not attempt private-key recovery.
-    pub(super) fn native(&self, algorithm: Algorithm, random: &Arc<random::Context>, charge: &Arc<MemoryReservation>) -> Result<(KeyManager, Vec<ClientIdentity>, Arc<MemoryReservation>)> {
+    pub(super) fn native(&self, algorithm: Algorithm, random: &Arc<random::Context>, charge: &Arc<MemoryReservation>) -> Result<NativeIdentities> {
         if matches!(self, Self::Deferred(_)) && algorithm != Algorithm::NewSunX509 { return Err(invalid("Deferred private keys require NewSunX509")); }
         let mut bound = 65_536usize;
         match self {
@@ -68,8 +69,14 @@ impl Material {
                 (manager, identities)
             }
         };
-        Ok((manager, identities, charge))
+        Ok(NativeIdentities { entries: identities, manager, charge })
     }
+}
+
+impl NativeIdentities {
+    pub(super) fn entries(&self) -> &[ClientIdentity] { &self.entries }
+    pub(super) fn manager(&self) -> &KeyManager { &self.manager }
+    pub(super) fn reservation(&self) -> Arc<MemoryReservation> { Arc::clone(&self.charge) }
 }
 
 impl ClientIdentity {

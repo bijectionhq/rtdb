@@ -45,7 +45,8 @@ fn new_sunx509_rejects_weak_keys_in_the_complete_client_chain() {
         options.insert("ssl.ca.pem".into(), "native-owned".into());
         let memory = MemoryBudget::new(1 << 24);
         let material = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
-        assert_eq!(material.identities.len(), 1); assert_eq!(material.identities[0].eligible, eligible);
+        let identities = material.identities.as_ref().unwrap().entries();
+        assert_eq!(identities.len(), 1); assert_eq!(identities[0].eligible, eligible);
         drop(material); assert_eq!(memory.used_bytes(), 0);
     }
 }
@@ -66,7 +67,7 @@ fn jks_distinct_store_and_key_passwords_keep_material_charged_until_the_last_own
     options.insert("ssl.keystore.location".into(), format!("{}/../tls/tests/fixtures/distinct-passwords.jks", env!("CARGO_MANIFEST_DIR")));
     options.insert("ssl.keystore.password".into(), "store_password".into()); options.insert("ssl.key.password".into(), "private_password".into());
     let material = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
-    assert_eq!(material.identities.len(), 1); assert!(memory.used_bytes() > 0);
+    assert_eq!(material.identities.as_ref().unwrap().entries().len(), 1); assert!(memory.used_bytes() > 0);
     let copy = Arc::clone(&material); drop(material); assert!(memory.used_bytes() > 0); drop(copy); assert_eq!(memory.used_bytes(), 0);
     options.insert("ssl.key.password".into(), "wrong".into());
     assert!(NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).is_err()); assert_eq!(memory.used_bytes(), 0);
@@ -91,7 +92,7 @@ fn empty_java_client_stores_survive_native_client_creation_and_release_on_close(
         options.insert(format!("ssl.{store}.password"), "12345678".into());
     }
     let material = NativeTls::from_java(&options, &mut |bytes| memory.reserve(bytes)).unwrap().unwrap();
-    assert!(material.identities.is_empty());
+    assert!(material.identities.as_ref().unwrap().entries().is_empty());
     assert!(material.trust.as_ref().is_some_and(Vec::is_empty));
     let mut configuration = rdkafka::ClientConfig::new();
     configuration.set("security.protocol", "SSL").set_ssl_context_configurer(material);

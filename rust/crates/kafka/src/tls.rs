@@ -11,7 +11,7 @@ use policy::Policy;
 pub(crate) mod keys;
 use keys::{Algorithm, KeyManager, KeyType};
 pub(crate) mod identities;
-use identities::{ClientIdentity, Material};
+use identities::{Material, NativeIdentities};
 pub(crate) mod trust;
 pub(crate) mod validation;
 pub(crate) mod security;
@@ -22,10 +22,9 @@ pub(crate) mod random;
 mod registry;
 
 pub(crate) struct NativeTls {
-    identities: Vec<ClientIdentity>,
+    identities: Option<NativeIdentities>,
     random: Arc<random::Context>,
     signature_random: Arc<random::Context>,
-    key_manager: KeyManager,
     trust: Option<Vec<X509>>,
     simple_trust: Option<validation::SimpleTrust>,
     policy: Policy,
@@ -43,8 +42,7 @@ impl NativeTls {
         let trust_algorithm = validation::Algorithm::parse(options.get("ssl.trustmanager.algorithm").map(|name| name.trim_matches(|character| character <= '\u{20}')))?;
         let random = random::Context::new(options.get("ssl.secure.random.implementation").map(|name| name.trim_matches(|character| character <= '\u{20}')), reservations[0].budget())?;
         let signature_random = random::Context::new(None, reservations[0].budget())?;
-        let mut key_manager = KeyManager::new(algorithm, &[]);
-        let mut identities = Vec::new();
+        let mut identities = None;
         let mut trust = None;
         for (store, usage) in [("truststore", StoreUse::Trust), ("keystore", StoreUse::OptionalIdentity)] {
             let material = material(options, store, usage, algorithm, reserve)?;
@@ -60,10 +58,9 @@ impl NativeTls {
                         trust = Some(certificates);
                     }
                     StoreUse::Identity | StoreUse::OptionalIdentity => {
-                        let (manager, loaded, charge) = material.native(algorithm, &random, &reservations[0])?;
-                        key_manager = manager;
-                        identities = loaded;
-                        reservations.push(charge);
+                        let loaded = material.native(algorithm, &random, &reservations[0])?;
+                        reservations.push(loaded.reservation());
+                        identities = Some(loaded);
                     }
                 }
             }
@@ -72,7 +69,7 @@ impl NativeTls {
             let anchors = trust.as_ref().ok_or_else(|| invalid("SunX509 trust management requires Java-style trust material"))?.clone();
             Some(validation::SimpleTrust::new(anchors, Arc::clone(&reservations[0]))?)
         } else { None };
-        Ok(Some(Arc::new(Self { identities, random, signature_random, key_manager, trust, simple_trust, policy, reservations })))
+        Ok(Some(Arc::new(Self { identities, random, signature_random, trust, simple_trust, policy, reservations })))
     }
 
     pub(crate) fn reservations(&self) -> &[Arc<MemoryReservation>] { &self.reservations }
@@ -90,7 +87,7 @@ impl NativeTls {
             for certificate in certificates { store.add_cert(certificate.clone()).map_err(invalid)?; }
             context.set_cert_store(store.build());
         }
-        if !self.identities.is_empty() {
+        if self.identities.as_ref().is_some_and(|identities| !identities.entries().is_empty()) {
             unsafe { request::configure(context, &self.reservations[0])?; }
             unsafe { SSL_CTX_set_cert_cb(context.as_ptr(), Some(select_identity), (self as *const Self).cast_mut().cast()); }
         }
@@ -101,25 +98,28 @@ impl NativeTls {
 
     fn select(&self, ssl: &mut SslRef) -> Result<()> {
         unsafe { SSL_certs_clear(ssl.as_ptr()); }
+        let Some(material) = &self.identities else { return Ok(()); };
+        let identities = material.entries();
+        let key_manager = material.manager();
         let request = request::Request::of(ssl)?;
         let types = request.requested_types(ssl);
         let now = Asn1Time::days_from_now(0).map_err(invalid)?;
         let memory = self.reservations[0].budget();
         let authorities = names::peer_authorities(ssl, memory)?;
-        let _matches_charge = memory.reserve(self.identities.len().checked_add(64).ok_or_else(overflow)?)?;
-        let mut issuer_matches = Vec::with_capacity(self.identities.len());
-        for identity in &self.identities {
+        let _matches_charge = memory.reserve(identities.len().checked_add(64).ok_or_else(overflow)?)?;
+        let mut issuer_matches = Vec::with_capacity(identities.len());
+        for identity in identities {
             issuer_matches.push(names::matches_issuer(std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()), &authorities, memory)?);
         }
         let required = CERT_PKEY_VALID | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
-        let selected = self.key_manager.choose(&types, |index, kind| {
-            let identity = &self.identities[index];
+        let selected = key_manager.choose(&types, |index, kind| {
+            let identity = &identities[index];
             identity.eligible && identity.kind == kind && issuer_matches[index]
-                && (!self.key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
-                && (self.key_manager.constrains_certificates() || identity.eager_compatible(ssl, required))
-        }, |index| keys::client_status(&self.identities[index].certificate, &now));
+                && (!key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
+                && (key_manager.constrains_certificates() || identity.eager_compatible(ssl, required))
+        }, |index| keys::client_status(&identities[index].certificate, &now));
         if let Some(index) = selected {
-            self.identities[index].install(ssl, &self.random, &self.signature_random)?;
+            identities[index].install(ssl, &self.random, &self.signature_random)?;
         }
         Ok(())
     }
