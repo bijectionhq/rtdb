@@ -187,8 +187,17 @@ fn collect_names(schema: &Schema, names: &mut BTreeMap<String, Schema>) {
     }
 }
 fn resolve<'a>(schema: &'a Schema, names: &'a BTreeMap<String, Schema>) -> Result<&'a Schema> {
-    match schema { Schema::Ref { name } => names.get(&name.fullname(None)).ok_or_else(|| error("avro-schema", format!("Unknown schema reference '{}'", name.fullname(None)))), _ => Ok(schema) }
+    let Schema::Ref { name } = schema else { return Ok(schema); };
+    names.iter().find(|(fullname, _)| {
+        if !name.name.contains('.') {
+            if let Some(namespace) = name.namespace.as_deref().filter(|namespace| !namespace.is_empty()) {
+                return namespace.bytes().chain(std::iter::once(b'.')).chain(name.name.bytes()).eq(fullname.bytes());
+            }
+        }
+        fullname.as_str() == name.name.as_str()
+    }).map(|(_, schema)| schema).ok_or_else(|| error("avro-schema", format!("Unknown schema reference '{}'", name.fullname(None))))
 }
+#[cfg(test)] mod resolve_tests;
 fn member_name(schema: &Schema) -> String {
     match schema {
         Schema::Record(value) => return value.name.name.clone(), Schema::Enum(value) => return value.name.name.clone(), Schema::Fixed(value) => return value.name.name.clone(),
