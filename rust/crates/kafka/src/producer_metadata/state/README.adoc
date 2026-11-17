@@ -104,8 +104,17 @@ A native shuffle failure preserves the previous generation after the source refr
 `Snapshot::cluster_nodes()` borrows the node order from the retained ordinary or bootstrap generation.
 The unqualified `new` and `apply` entry points preserve the fixtures that inspect response state without a shuffle observation.
 They yield an unqualified snapshot instead of a node-order substitute.
-Transport scheduling and the actual shared Random provider remain separate obligations.
+Transport scheduling and production qualification of Java class and clock histories remain separate obligations.
 Five additive source cases cover initial, full and partial observation demand, shared Node identity, failure order and retained ownership.
+
+== Bounded Random and serialized shuffle acquisition
+
+`JavaRandom` implements stock Random's 48-bit seed and bounded int draws, including rejection draws and the signed overflow test.
+`JavaRandomSeeds` owns a class's default-constructor seed uniquifier and advances it before requesting the constructor's signed nanosecond observation.
+`JavaShuffleRandom` borrows the caller's Collections slot for serialized acquisition and reuses its generator on later shuffles.
+The caller supplies the slot, seed history and clock and owns admission for any enclosing heap allocation.
+Concurrent replacement of the Collections slot during first acquisition requires a separate observation.
+The existing observer interface remains available for other qualified histories.
 
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
