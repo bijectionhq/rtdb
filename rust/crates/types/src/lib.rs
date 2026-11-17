@@ -20,6 +20,7 @@ mod memory;
 mod allocation;
 mod clojure_index;
 pub mod jvm_number;
+pub mod java_text;
 mod murmur3;
 
 pub use error::{Anomaly, AnomalyCategory, Result};

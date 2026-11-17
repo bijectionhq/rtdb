@@ -120,3 +120,18 @@ Collection equivalence, Java wrapper equality and cross-category numeric compari
 `murmur3_32` supplies the shared borrowed-byte hash; columnar vector hashing and XXHash32 retain their columnar owner.
 The numeric unit tests and `tests/jvm_number.rs` preserve regression sources for category behavior, primitive and boxed casts, decimal scale edges and hash vectors; they remain unexecuted.
 Frontend semantic admission, shared UTF16, reader singleton identity and host collection/text adapters remain required work.
+
+== Shared Java text
+
+`java_text::JavaString` retains exact UTF16 units in shared immutable UTF8 or UTF16 backing.
+Charged constructors admit the boxed backing, shared owner and bookkeeping before allocation; their leases survive until the final clone is destroyed.
+Explicitly named untracked constructors serve programmatic contexts with the same native size checks.
+Owned strings admit at most `i32::MAX` units, while borrowed `JavaText` views require no allocation.
+Equality compares units across representations; shared backing does not establish Java object identity.
+
+`JavaText` counts and slices in UTF16 units, including ranges that split a supplementary pair.
+Unit and code-point iterators preserve unmatched surrogates; `java_utf8_bytes` explicitly applies Java String encoding and replaces each unmatched unit with byte `?`.
+The borrowed UTF8 accessor succeeds only for scalar-aligned ranges on UTF8 backing.
+The carrier has no serde, display, wire-format or implicit lossy conversion.
+`tests/java_text.rs` contains unexecuted regression sources for exact units, slice boundaries, explicit encoding and retained allocation lifetimes.
+Regex, SQL and EDN literals, host text and collections, object identity, serialized plan trees and raw diagnostics still require their consumer adapters.
