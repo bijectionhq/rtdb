@@ -45,11 +45,12 @@ fn equal_cells<'a>(left: EvalValue<'a>,right: EvalValue<'a>,strict: bool,frame: 
                 }
                 Ok(if unknown { None } else { Some(true) })
             }
+            (EvalValue::List(Kind::Set,a),EvalValue::List(Kind::Set,b)) if strict => Ok(Some(Arc::ptr_eq(a,b))),
             (EvalValue::List(Kind::Set,_),EvalValue::List(Kind::Set,_)) => {
                 let a = materialize(left,frame)?.await?;
                 let b = materialize(right,frame)?.await?;
                 frame.context.reserve(crate::equality_allocation_bound(&a,&b)?)?;
-                if strict { crate::strict_eq(&a,&b).map(Some) } else { crate::compare::sql_eq_value(&a,&b,frame.context.timezone) }
+                crate::compare::sql_eq_value(&a,&b,frame.context.timezone)
             }
             _ => Ok(Some(false)),
         }
@@ -76,4 +77,19 @@ pub(super) fn order<'a>(left: EvalValue<'a>,right: EvalValue<'a>,frame: &'a Eval
             _ => Err(invalid("compare")),
         }
     },frame)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_set_reader_aliases_compare_by_identity_without_reading_children() {
+        let schema = Schema::default();
+        let context = EvalContext::default();
+        let frame = EvaluationFrame { schema: &schema, row: &[], context: &context, asynchronous: false, replacements: None };
+        let set = make_list(Kind::Set, ListReader::Values(vec![Value::Transit(vec![0xff])]), &frame).unwrap();
+        let alias = clone_value(&set, &frame).unwrap();
+        assert_eq!(poll_sync(equal(set, alias, true, &frame).unwrap()).unwrap(), Some(true));
+    }
 }

@@ -341,6 +341,9 @@ LIKE and ILIKE also compile the selected pattern before consuming the input, and
 A null left argument contributes no payload, while Struct construction and polymorphic argument boxing retain their evaluation effects.
 Merged fields retain their existing nested list readers until a field consumer reads them.
 
+Strict equality between native set expressions compares their reader identities without consuming their elements.
+A cloned reader retains its identity, while separate set constructions produce separate readers.
+
 Stored Transit field access constructs semantic objects through the wire decoder's read cache.
 Repeated cached byte-array and NaN keys retain object identity during record construction, including NaN returned unchanged by ratio division.
 The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.

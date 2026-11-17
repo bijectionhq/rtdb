@@ -39,3 +39,21 @@ async fn declared_set_pairs_reject_empty_lists_and_unselected_branches() {
     let expression = Expr::binary(B::Eq,Expr::Parameter { index: 0,data_type: union.clone() },Expr::Parameter { index: 0,data_type: union });
     assert!(evaluate(&expression,&Schema::default(),&[],&EvalContext { parameters: &[V::I64(1)],..Default::default() }).is_err());
 }
+
+#[tokio::test]
+async fn strict_set_expressions_compare_reader_identity_without_demanding_elements() {
+    fn constructed_set() -> Expr {
+        let divide = Expr::binary(B::Divide, Expr::Literal(V::I64(1)), Expr::Literal(V::I64(0)));
+        Expr::Call { name: "set".into(), args: vec![divide], return_type: set_type() }
+    }
+    for (left, right) in [
+        (constructed_set(), constructed_set()),
+        (Expr::Literal(set()), Expr::Literal(set())),
+        (Expr::List(vec![constructed_set()]), Expr::List(vec![constructed_set()])),
+        (Expr::Struct(BTreeMap::from([("field".into(), constructed_set())])), Expr::Struct(BTreeMap::from([("field".into(), constructed_set())]))),
+    ] {
+        let expression = Expr::Call { name: "===".into(), args: vec![left, right], return_type: L::Scalar(S::Bool) };
+        assert_eq!(evaluate(&expression, &Schema::default(), &[], &EvalContext::default()).unwrap(), V::Bool(false));
+        assert_eq!(evaluate_async(&expression, &Schema::default(), &[], &EvalContext::default()).await.unwrap(), V::Bool(false));
+    }
+}
