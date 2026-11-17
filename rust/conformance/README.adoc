@@ -17,6 +17,8 @@ Typed multiset observations contain a `schema` array and a `rows` array whose ro
 Reference and Rust run receipts must record artifact and fixture digests, observation values, comparator version, and exact failure location.
 A missing receipt remains unverified even when a corresponding native test exists.
 Compilation and execution are pending under the Phase 1 work order.
+link:source-completeness.adoc[The source completeness record] separates missing implementation and unfinished source review from Phase 2 qualification.
+Every execution runner validates that record and its reviewed implementation revision before starting project code.
 
 The initial `assertion-ledger.json` maps the two mandatory comparison controls.
 It is an incomplete ledger: the source inventory remains the record of unmapped files and candidate cases.

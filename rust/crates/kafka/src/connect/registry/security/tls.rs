@@ -14,7 +14,10 @@ pub(super) fn client(options: &BTreeMap<String, String>, context: &mut Conversio
         if tls.get(name).is_some_and(|value| !value.is_empty()) { return Err(error("invalid-plugin-config", format!("Registry TLS option '{name}' requires a native provider adapter"))); }
     }
     let mut files = BTreeMap::new();
-    let mut bound = options.iter().try_fold(transport::ROOT_RESERVATION + 65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len().checked_mul(16)?)).ok_or_else(|| error("allocation-overflow", "Registry TLS configuration overflow")))?;
+    let default_roots = !tls.contains_key("truststore.location") && !tls.contains_key("truststore.certificates");
+    let root_bound = if default_roots { crate::tls::trust::allocation_bound()? } else { 0 };
+    let root_bound = root_bound.checked_add(65_536).ok_or_else(|| error("allocation-overflow", "Registry TLS configuration overflow"))?;
+    let mut bound = options.iter().try_fold(root_bound, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len().checked_mul(16)?)).ok_or_else(|| error("allocation-overflow", "Registry TLS configuration overflow")))?;
     for name in ["truststore.location", "keystore.location"] {
         if let Some(path) = tls.get(name) {
             let length = usize::try_from(std::fs::metadata(path).map_err(|cause| error("invalid-plugin-config", cause))?.len()).map_err(|_| error("invalid-plugin-config", "Registry keystore file is too large"))?;
@@ -74,6 +77,30 @@ fn material(tls: &BTreeMap<&str, &str>, files: &BTreeMap<&str, usize>, store: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn registry_default_roots_remain_charged_until_the_client_closes() {
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 26);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let (client, charge) = client(&BTreeMap::new(), &mut context, true).unwrap();
+        drop(context); drop(charge);
+        assert!(memory.used_bytes() >= crate::tls::trust::allocation_bound().unwrap());
+        drop(client);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    #[test]
+    fn explicit_registry_trust_does_not_reserve_the_default_bundle() {
+        let path = format!("{}/../tls/tests/fixtures/empty.jks", env!("CARGO_MANIFEST_DIR"));
+        let options = BTreeMap::from([
+            ("schema.registry.ssl.truststore.location".into(), path),
+            ("schema.registry.ssl.truststore.password".into(), "12345678".into()),
+        ]);
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 20);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let (client, charge) = client(&options, &mut context, true).unwrap();
+        assert!(charge.bytes() < crate::tls::trust::allocation_bound().unwrap());
+        drop(context); drop(charge); drop(client);
+        assert_eq!(memory.used_bytes(), 0);
+    }
     #[test]
     fn empty_java_registry_stores_are_retained_until_the_client_closes() {
         let path = format!("{}/../tls/tests/fixtures/empty.jks", env!("CARGO_MANIFEST_DIR"));
