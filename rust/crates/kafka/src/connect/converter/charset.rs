@@ -16,6 +16,7 @@ pub(super) enum Charset {
     DoubleByteSubclass(double_byte::subclasses::Decoder),
     Ebcdic(&'static double_byte::Mapping),
     EucJp(double_byte::euc_jp::EucJp),
+    IbmEuc(double_byte::ibm_euc::IbmEuc),
     DoubleByte(&'static double_byte::Mapping),
     SingleByte(&'static [u8; 512]),
     Utf16(Utf16Order),
@@ -65,6 +66,7 @@ impl Charset {
                 else if let Some(decoder) = double_byte::subclasses::lookup(normalized) { Self::DoubleByteSubclass(decoder) }
                 else if let Some(table) = double_byte::ebcdic::lookup(normalized) { Self::Ebcdic(table) }
                 else if let Some(decoder) = double_byte::euc_jp::lookup(normalized) { Self::EucJp(decoder) }
+                else if let Some(decoder) = double_byte::ibm_euc::lookup(normalized) { Self::IbmEuc(decoder) }
                 else if let Some(table) = double_byte::lookup(normalized) { Self::DoubleByte(table) }
                 else { return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{name}'"))); }
             },
@@ -83,6 +85,7 @@ impl Charset {
             Self::DoubleByteSubclass(decoder) => decoder.decode(bytes),
             Self::Ebcdic(table) => double_byte::ebcdic::decode(table, bytes),
             Self::EucJp(decoder) => decoder.decode(bytes),
+            Self::IbmEuc(decoder) => decoder.decode(bytes),
             Self::DoubleByte(table) => table.decode(bytes),
             Self::SingleByte(table) => single_byte::decode(table, bytes),
             Self::Utf16(order) => decode_utf16(bytes, order),
