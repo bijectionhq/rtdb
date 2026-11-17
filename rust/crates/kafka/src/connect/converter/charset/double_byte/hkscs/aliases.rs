@@ -1,0 +1,16 @@
+pub(super) const ALIASES: &[(&str, usize)] = &[
+    ("big5-hkscs", 0),
+    ("big5-hkscs-2001", 1),
+    ("big5-hkscs:unicode3.0", 1),
+    ("big5_hkscs", 0),
+    ("big5_hkscs_2001", 1),
+    ("big5hk", 0),
+    ("big5hk-2001", 1),
+    ("big5hkscs", 0),
+    ("big5hkscs-2001", 1),
+    ("ms950_hkscs", 2),
+    ("ms950_hkscs_xp", 3),
+    ("x-big5-hkscs-2001", 1),
+    ("x-ms950-hkscs", 2),
+    ("x-ms950-hkscs-xp", 3),
+];

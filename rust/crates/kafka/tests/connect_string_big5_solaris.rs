@@ -42,6 +42,8 @@ fn solaris_patch_and_provider_sources_retain_pinned_provenance() {
 #[tokio::test]
 async fn first_nonempty_solaris_record_patches_existing_and_future_big5_converters_process_wide() {
     let mut existing = open("Big5");
+    let hkscs_names = ["Big5-HKSCS", "x-Big5-HKSCS-2001", "x-MS950-HKSCS", "x-MS950-HKSCS-XP"];
+    let mut hkscs: Vec<_> = hkscs_names.iter().map(|name| open(name)).collect();
     let mut alias = open("csBig5");
     let mut solaris = open("x-Big5-Solaris");
     let mut solaris_alias = open("bIg5_sOlArIs");
@@ -49,6 +51,14 @@ async fn first_nonempty_solaris_record_patches_existing_and_future_big5_converte
         ("converter.encoding", "Big5"),
         ("value.serializer.encoding", "Big5_Solaris"),
     ]), false).unwrap();
+    for converter in &mut hkscs {
+        assert_eq!(decode(converter.as_mut(), None).await, Value::Null);
+        assert_eq!(decode(converter.as_mut(), Some(&[])).await, Value::Utf8(String::new()));
+        assert_eq!(decode(converter.as_mut(), Some(b"a")).await, Value::Utf8("a".into()));
+        for (second, scalar) in (0xd6..=0xdc).zip("碁銹裏墻恒粧嫺".chars()) {
+            assert_eq!(decode(converter.as_mut(), Some(&[0xf9, second])).await, Value::Utf8(scalar.to_string()));
+        }
+    }
     for second in 0xd6..=0xdc {
         assert_eq!(decode(existing.as_mut(), Some(&[0xf9, second])).await, Value::Utf8("\u{fffd}\u{fffd}".into()));
         assert_eq!(decode(serializer_only.as_mut(), Some(&[0xf9, second])).await, Value::Utf8("\u{fffd}\u{fffd}".into()));
@@ -60,6 +70,15 @@ async fn first_nonempty_solaris_record_patches_existing_and_future_big5_converte
     assert!(solaris.decode("events", Some(b"a"), &mut rejected).await.is_err());
     assert_eq!(decode(existing.as_mut(), Some(&[0xf9, 0xd6])).await, Value::Utf8("\u{fffd}\u{fffd}".into()));
     assert_eq!(decode(solaris.as_mut(), Some(b"a")).await, Value::Utf8("a".into()));
+    for (name, converter) in hkscs_names.into_iter().zip(&mut hkscs) {
+        let mut future = open(name);
+        for current in [converter, &mut future] {
+            for (second, scalar) in (0xd6..=0xdc).zip("碁銹裏墻恒粧嫺".chars()) {
+                assert_eq!(decode(current.as_mut(), Some(&[0xf9, second])).await, Value::Utf8(scalar.to_string()));
+            }
+            assert_eq!(decode(current.as_mut(), Some(&[0xa4, 0xa4])).await, Value::Utf8("中".into()));
+        }
+    }
     for converter in [&mut existing, &mut alias, &mut serializer_only, &mut solaris, &mut solaris_alias] {
         for (second, scalar) in (0xd6..=0xdc).zip("碁銹裏墻恒粧嫺".chars()) {
             assert_eq!(decode(converter.as_mut(), Some(&[0xf9, second])).await, Value::Utf8(scalar.to_string()));

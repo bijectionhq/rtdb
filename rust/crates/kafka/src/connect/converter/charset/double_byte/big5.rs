@@ -30,6 +30,8 @@ impl Big5Family {
         } else { self.base.pair(first, second) }
     }
 
+    pub(super) fn single(&self, byte: u8) -> u16 { self.base.single(byte) }
+
     pub(in super::super) fn decode_big5(&self, bytes: &[u8]) -> String {
         self.base.decode_with_pairs(bytes, |first, second| self.pair(first, second))
     }
@@ -75,6 +77,17 @@ mod tests {
         assert_eq!(family.decode_big5(&[0xf9, 0xd6, 0, 0xf9, 0xd7]), "碁\0\u{fffd}\u{fffd}");
         family.entries[1].store(patches::SOLARIS_UNITS[1], Ordering::Relaxed);
         assert_eq!(family.decode_big5(&[0xf9, 0xd6, 0, 0xf9, 0xd7]), "碁\0銹");
+    }
+
+    #[test]
+    fn hkscs_fallback_reads_each_current_big5_mapping() {
+        let family = family();
+        let fallback = super::super::hkscs::Base::Big5(&family);
+        assert_eq!(fallback.pair(0xf9, 0xd6), 0xfffd);
+        family.entries[0].store(patches::SOLARIS_UNITS[0], Ordering::Relaxed);
+        assert_eq!(fallback.pair(0xf9, 0xd6), 0x7881);
+        assert_eq!(fallback.pair(0xf9, 0xd7), 0xfffd);
+        assert!(!family.initialized.is_completed());
     }
 
     #[test]

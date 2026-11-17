@@ -1,5 +1,6 @@
 mod aliases;
 pub(super) mod big5;
+pub(super) mod hkscs;
 mod tables;
 
 pub(in super::super) struct Mapping(&'static [u8]);
