@@ -349,6 +349,7 @@ Repeated cached byte-array and NaN keys retain object identity during record con
 The cache and constructed objects remain owned by one evaluation; `tests/transit_objects.rs` records the MessagePack and JSON cases as unexecuted regression source.
 Equality between two stored Transit values constructs each registered object graph before comparing it.
 Comparisons with native scalar operands retain their emitted JVM representation: numeric categories stay distinct, and UTF8, keyword, UUID and binary scalars supply byte buffers.
+Millisecond date scalars supply signed64 days by truncating their stored milliseconds toward zero.
 Interval scalars compare their months, days and nanoseconds.
 Strict equality reads a Transit object even against native NULL; a decoded Transit null equals native NULL, while ordinary SQL equality keeps outer NULL propagation.
 Collection equality follows decoded values and identity-bearing objects retain their separate read identities, including when the serialized bytes match.
