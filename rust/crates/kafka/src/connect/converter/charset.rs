@@ -8,10 +8,14 @@ pub(super) enum Charset {
     Latin1,
     Ascii,
     Utf16(Utf16Order),
+    Utf32(Utf32Order),
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Utf16Order { Big, Little, BomBig, BomLittle }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Utf32Order { Detect, Big, Little }
 
 impl Charset {
     pub(super) fn configured(options: &BTreeMap<String, String>, is_key: bool) -> Result<Self> {
@@ -38,6 +42,9 @@ impl Charset {
             "utf-16be" | "utf_16be" | "iso-10646-ucs-2" | "x-utf-16be" | "unicodebigunmarked" => Self::Utf16(Utf16Order::Big),
             "utf-16le" | "utf_16le" | "x-utf-16le" | "unicodelittleunmarked" => Self::Utf16(Utf16Order::Little),
             "x-utf-16le-bom" | "unicodelittle" => Self::Utf16(Utf16Order::BomLittle),
+            "utf-32" | "utf_32" | "utf32" => Self::Utf32(Utf32Order::Detect),
+            "utf-32be" | "utf_32be" | "x-utf-32be" | "x-utf-32be-bom" | "utf_32be_bom" | "utf-32be-bom" => Self::Utf32(Utf32Order::Big),
+            "utf-32le" | "utf_32le" | "x-utf-32le" | "x-utf-32le-bom" | "utf_32le_bom" | "utf-32le-bom" => Self::Utf32(Utf32Order::Little),
             _ => return Err(error("invalid-plugin-config", format!("Unsupported string encoding '{name}'"))),
         })
     }
@@ -48,6 +55,7 @@ impl Charset {
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
             Self::Utf16(order) => decode_utf16(bytes, order),
+            Self::Utf32(order) => decode_utf32(bytes, order),
         }
     }
 }
@@ -81,4 +89,25 @@ fn decode_utf16(mut bytes: &[u8], order: Utf16Order) -> String {
     }
     if !bytes.is_empty() { output.push('\u{fffd}'); }
     output
+}
+
+fn decode_utf32(mut bytes: &[u8], order: Utf32Order) -> String {
+    let little = if bytes.starts_with(&[0, 0, 0xfe, 0xff]) && order != Utf32Order::Little {
+        bytes = &bytes[4..]; false
+    } else if bytes.starts_with(&[0xff, 0xfe, 0, 0]) && order != Utf32Order::Big {
+        bytes = &bytes[4..]; true
+    } else { order == Utf32Order::Little };
+    let words = bytes.chunks_exact(4);
+    let tail = (!words.remainder().is_empty()).then_some(0xfffdu16);
+    let units = words.flat_map(|word| {
+        let word = [word[0], word[1], word[2], word[3]];
+        let point = if little { u32::from_le_bytes(word) } else { u32::from_be_bytes(word) };
+        // OpenJDK25 UTF_32Coder.Decoder emits BMP surrogate values as UTF16 units.
+        if point <= 0xffff { [Some(point as u16), None] }
+        else if point <= 0x10ffff {
+            let point = point - 0x10000;
+            [Some(0xd800 | (point >> 10) as u16), Some(0xdc00 | (point & 0x3ff) as u16)]
+        } else { [Some(0xfffd), None] }
+    }).flatten().chain(tail);
+    char::decode_utf16(units).map(|unit| unit.unwrap_or('\u{fffd}')).collect()
 }
