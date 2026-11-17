@@ -13,7 +13,7 @@ fn context() -> Arc<QueryContext> {
     let database = DatabaseSnapshot { partitions: vec![], storage: Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20)) };
     let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
     QueryContext::new(catalog, MemoryBudget::new(1 << 24), Timestamp(0), "+02:00",
-        QueryOptions { batch_rows: 1, sort_memory_bytes: 1, merge_fan_in: 2, ..Default::default() }, &CancellationToken::new()).unwrap()
+        QueryOptions { batch_rows: 1, sort_memory_bytes: 1, ..Default::default() }, &CancellationToken::new()).unwrap()
 }
 fn values(rows: Vec<Value>) -> Arc<Relation> {
     let data_type = LogicalType::join_all(&rows.iter().map(Value::logical_type).collect::<Vec<_>>());
