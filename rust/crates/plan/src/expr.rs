@@ -391,8 +391,8 @@ impl Expr {
                     if let Err(error) = function_type(name, &[left.data_type(), right.data_type()]) { failure = Some(error); }
                 }
                 for left in left.data_type().legs() { for right in right.data_type().legs() {
-                    if let (LogicalType::Scalar(ScalarType::Decimal { scale: left, .. }), LogicalType::Scalar(ScalarType::Decimal { scale: right, .. })) = (left, right) {
-                        if let Err(error) = decimal_arithmetic_scale(*op, left, right) { failure = Some(error); }
+                    if let (LogicalType::Scalar(ScalarType::Decimal { scale: left, .. }), LogicalType::Scalar(ScalarType::Decimal { scale: right, .. })) = (&left, &right) {
+                        if let Err(error) = decimal_arithmetic_scale(*op, *left, *right) { failure = Some(error); }
                     }
                 } }
             }

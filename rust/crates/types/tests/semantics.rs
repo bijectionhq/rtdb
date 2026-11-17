@@ -95,6 +95,19 @@ fn missing_struct_children_contribute_null_and_nested_structs_stay_nested() {
 }
 
 #[test]
+fn recursive_struct_joins_preserve_nested_nullability() {
+    let mut left = structure(&[("a", scalar(S::I64))]);
+    let mut right = structure(&[("b", scalar(S::Utf8))]);
+    let mut expected = structure(&[("a", scalar(S::I64).maybe()), ("b", scalar(S::Utf8).maybe())]);
+    for _ in 0..16 {
+        left = structure(&[("nested", T::list(left))]);
+        right = structure(&[("nested", T::list(right))]);
+        expected = structure(&[("nested", T::list(expected))]);
+    }
+    assert_eq!(T::join_all([&left, &right].into_iter()), expected);
+}
+
+#[test]
 fn joining_encoded_and_plain_values_removes_physical_encoding_recursively() {
     let encoded = scalar(S::I64).run_end_encoded(RunEndWidth::I32).unwrap();
     assert_ne!(encoded, scalar(S::I64));

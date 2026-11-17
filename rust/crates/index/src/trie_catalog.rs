@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use rtdb_types::calendar::CivilDate;
+use rtdb_types::CivilDate;
 use rtdb_format::{block::proto as block_pb, catalog::TableBlock, keys::TrieKey, log::proto as log_pb};
 use rtdb_types::{Anomaly, BlockIndex, Result, TableRef, Timestamp};
 

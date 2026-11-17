@@ -47,7 +47,8 @@ impl Running {
 struct Client { client: FlightServiceClient<Channel>, headers: MetadataMap }
 impl Client {
     async fn connect(server: &ServerHandle, basic: Option<&str>) -> Self {
-        let client = FlightServiceClient::connect(format!("http://{}", server.address())).await.unwrap(); let mut this = Self { client, headers: MetadataMap::new() };
+        let channel = Channel::from_shared(format!("http://{}", server.address())).unwrap().connect().await.unwrap();
+        let client = FlightServiceClient::new(channel); let mut this = Self { client, headers: MetadataMap::new() };
         if let Some(basic) = basic { use base64::Engine; this.headers.insert("authorization", format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(basic)).parse().unwrap()); }
         let request = this.request(futures::stream::iter(vec![arrow_flight::HandshakeRequest::default()]));
         let response = this.client.handshake(request).await.unwrap();

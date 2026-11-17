@@ -108,7 +108,7 @@ fn gallop(key: usize,values: &[usize],hint: usize,upper: bool,compare: &mut impl
     Ok(right)
 }
 
-impl<C: FnMut(usize,usize) -> Result<Ordering)> TimSort<'_,C> {
+impl<C: FnMut(usize,usize) -> Result<Ordering>> TimSort<'_,C> {
     fn collapse(&mut self,force: bool) -> Result<()> {
         while self.run_count > 1 {
             let mut at = self.run_count - 2;
@@ -268,11 +268,11 @@ mod tests {
     fn gallop_bounds_use_the_pinned_hint_and_binary_comparison_order() {
         let values = [0,2,2,4,4,6,8];
         let mut trace = Vec::new();
-        let mut compare = |left,right| { trace.push((left,right));Ok(left.cmp(&right)) };
+        let mut compare = |left: usize,right: usize| { trace.push((left,right));Ok(left.cmp(&right)) };
         assert_eq!(gallop(4,&values,0,false,&mut compare).unwrap(),3);
         assert_eq!(trace,[(4,0),(4,2),(4,4),(4,2)]);
         trace.clear();
-        let mut compare = |left,right| { trace.push((left,right));Ok(left.cmp(&right)) };
+        let mut compare = |left: usize,right: usize| { trace.push((left,right));Ok(left.cmp(&right)) };
         assert_eq!(gallop(4,&values,6,true,&mut compare).unwrap(),5);
         assert_eq!(trace,[(4,8),(4,6),(4,4),(4,4)]);
     }
@@ -295,7 +295,7 @@ mod tests {
     fn reverse_merge_gallops_from_the_high_hint_without_negative_cursors() {
         let mut indices: Vec<_> = (16..64).chain(0..16).collect();
         let mut trace = Vec::new();
-        let mut compare = |left,right| { trace.push((left,right));Ok(left.cmp(&right)) };
+        let mut compare = |left: usize,right: usize| { trace.push((left,right));Ok(left.cmp(&right)) };
         let mut state = TimSort { indices: &mut indices,compare: &mut compare,temporary: vec![0;32],runs: [Run::default();49],run_count: 0,min_gallop: 7 };
         state.merge_high(Run { base: 0,len: 48 },Run { base: 48,len: 16 }).unwrap();
         let mut expected: Vec<_> = (56..63).rev().map(|value|(15,value)).collect();

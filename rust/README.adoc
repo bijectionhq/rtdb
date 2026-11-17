@@ -4,10 +4,24 @@ This workspace is being implemented against XTDB commit `c84f9334eb060ceb92d28ec
 The reviewed design is repository commit `c995e6b35b6812aa423c8a158c4e201e27532320`.
 The JVM source, tests, fixtures, and external language clients remain the compatibility reference.
 
-The implementation is in Phase 1.
-Compilation, dependency resolution, executable test discovery, tests, benchmarks, and server execution are deferred until every required production path has been implemented and reviewed from source.
-No build, compatibility, durability, or performance result is asserted by the presence of source or tests.
-Workspace editor settings disable Rust checks, build scripts, and procedural macro execution while this phase is active.
+Source review and native build verification are separate requirements.
+A successful build does not establish compatibility, durability, or performance parity with XTDB.
+Workspace editor settings disable automatic Rust checks, build scripts, and procedural macro execution.
+
+== Building
+
+Install Rust 1.94.1 or later, a C/C++ toolchain, CMake, pkg-config, Perl, and the platform's SASL development libraries.
+Run these commands from the repository root:
+
+[source,shell]
+----
+cargo build --manifest-path rust/Cargo.toml --workspace --locked
+cargo test --manifest-path rust/Cargo.toml --workspace --locked
+----
+
+The server executable is `rust/target/debug/rtdb`.
+For a server-only build, use `cargo build --manifest-path rust/Cargo.toml -p rtdb-server --bin rtdb --locked`.
+The server's default feature set uses local storage; optional backends are selected through the features in `crates/server/Cargo.toml`.
 
 See link:../dev/doc/rtdb-crates-and-test-parity.md[crate contracts] and link:../dev/doc/xtdb-rust-rewrite.md[migration and rollback contracts].
 Implementation status and evidence are tracked in link:implementation-status.json[the status manifest].
@@ -28,8 +42,8 @@ Readers own their log cursor, and only a successful read at the durable tip may 
 == Verification gate
 
 The Phase 1 source review must trace a client read, a data-dependent write, replica recovery, compaction retry, CDC restart, and database shutdown through concrete production implementations.
-Every design surface requires an implementation path before Phase 2 begins.
+Every design surface requires an implementation path before compatibility qualification.
 The presence of a package, an interface, or an unexecuted assertion is not completion of that surface.
 
-Phase 2 follows the repository's `xtdb-testing` workflow for Gradle runs and preserves separate reference, native, and comparison receipts.
+Verification follows the repository's `xtdb-testing` workflow for Gradle runs and preserves separate reference, native, and comparison receipts.
 The historical results recorded in the design are reference results, not a Rust baseline.

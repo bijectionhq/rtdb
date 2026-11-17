@@ -156,7 +156,7 @@ impl Engine {
         for row in &values.rows {
             if row.len() == 1 && columns.len() != 1 { return Err(Anomaly::incorrect("rtdb.conformance/slt-assertion", "Single-expression insert requires exactly one synthetic column")); }
             let mut document = BTreeMap::from([("_id".into(), Value::Uuid(*uuid::Uuid::new_v4().as_bytes()))]);
-            for (column, expression) in columns.iter().zip(row) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
+            for (column, expression) in columns.iter().zip(row.iter()) { document.insert(Identifier::unquoted(column).normalized(), literal(expression)?); }
             documents.push(document);
         }
         self.submit(TxOp::PutDocs { table: TableRef::new("public", name), documents: Documents::new(documents, self.node.memory())?, valid_from: None, valid_to: None }).await?;

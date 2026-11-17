@@ -10,7 +10,7 @@ pub(super) fn indices<'a>(initial: usize, keys: impl IntoIterator<Item = &'a Map
         (MapKey::String(left), MapKey::String(right)) => left.encode_utf16().cmp(right.encode_utf16()),
         (MapKey::Utf8(left), MapKey::Utf8(right)) => left.cmp(right),
         _ => unreachable!("one Java key class per map"),
-    }).ok_or_else(super::super::super::resolution::overflow)
+    }).ok_or_else(super::super::resolution::overflow)
 }
 
 #[cfg(test)]

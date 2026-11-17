@@ -45,7 +45,7 @@ fn trie_keys_and_recorded_slugs_retain_existing_object_paths() {
 
 #[test]
 fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
-    use rtdb_types::calendar::CivilDate;
+    use rtdb_types::CivilDate;
     for (date, text) in [
         (CivilDate::from_ymd(0, 1, 1).unwrap(), "l01-r00000101-b00"),
         (CivilDate::from_ymd(280_000, 2, 29).unwrap(), "l01-r2800000229-b00"),
@@ -64,7 +64,7 @@ fn trie_recency_keys_preserve_the_nonnegative_java_calendar_range() {
 
 #[test]
 fn trie_recency_parser_keeps_lenient_year_width_and_smart_month_ends() {
-    use rtdb_types::calendar::CivilDate;
+    use rtdb_types::CivilDate;
     for (encoded, year) in [("0", 0), ("1", 1), ("01", 1), ("001", 1), ("0001", 1), ("00001", 1), ("280000", 280_000), ("999999999", 999_999_999)] {
         for sign in ["", "+"] {
             let key: TrieKey = format!("l01-r{sign}{encoded}0101-b00").parse().unwrap();

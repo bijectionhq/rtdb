@@ -352,7 +352,7 @@ fn path_range(path: &[u8]) -> Result<(Iid, Iid)> {
     }
     Ok((Iid(lower), Iid(upper)))
 }
-fn recency(date: Option<rtdb_types::calendar::CivilDate>) -> Result<Timestamp> {
+fn recency(date: Option<rtdb_types::CivilDate>) -> Result<Timestamp> {
     date.map(|date| date.epoch_day().checked_mul(86_400_000_000).map(Timestamp).ok_or_else(|| invalid("recency", "Trie recency exceeds microsecond range"))).unwrap_or(Ok(Timestamp::MAX))
 }
 fn summarize_rows(rows: impl IntoIterator<Item = Result<RowSource>>) -> Result<Option<TemporalSummary>> {

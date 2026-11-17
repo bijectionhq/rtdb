@@ -116,8 +116,8 @@ async fn cancelled_acknowledgement_does_not_cancel_an_accepted_append() {
 async fn local_durability_survives_lost_acknowledgement_and_reopen() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("LOG");
-    let options = LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 };
-    let (inner, driver) = LocalLog::open(&path, options.clone()).unwrap();
+    let options = || LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 };
+    let (inner, driver) = LocalLog::open(&path, options()).unwrap();
     let cancellation = CancellationToken::new();
     let owner = tokio::spawn(driver.run(cancellation.clone()));
     let schedule = FaultSchedule::new(vec![rule(Operation::DurableReceipt, Phase::After, Action::Fail("acknowledgement connection lost".into()))], 64).unwrap();
@@ -126,7 +126,7 @@ async fn local_durability_survives_lost_acknowledgement_and_reopen() {
     schedule.assert_exhausted().unwrap();
     cancellation.cancel(); owner.await.unwrap().unwrap();
     inner.close_and_wait().await; drop(log); drop(inner);
-    let (reopened, driver) = LocalLog::open(&path, options).unwrap();
+    let (reopened, driver) = LocalLog::open(&path, options()).unwrap();
     let records = reopened.read_range(LogOffset(0), LogOffset(i64::MAX)).await.unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].payload.as_ref(), b"survives");

@@ -138,8 +138,8 @@ fn extension(certificate: &X509Ref, index: i32) -> Result<(bool, &[u8])> {
     let critical = unsafe { openssl_sys::X509_EXTENSION_get_critical(extension) } != 0;
     let data = unsafe { openssl_sys::X509_EXTENSION_get_data(extension) };
     if data.is_null() { return Err(malformed()); }
-    let length = usize::try_from(unsafe { openssl_sys::ASN1_STRING_length(data) }).map_err(|_| malformed())?;
-    let bytes = unsafe { openssl_sys::ASN1_STRING_get0_data(data) };
+    let length = usize::try_from(unsafe { openssl_sys::ASN1_STRING_length(data.cast()) }).map_err(|_| malformed())?;
+    let bytes = unsafe { openssl_sys::ASN1_STRING_get0_data(data.cast()) };
     let bytes = if length == 0 { &[] } else {
         if bytes.is_null() { return Err(malformed()); }
         unsafe { std::slice::from_raw_parts(bytes, length) }

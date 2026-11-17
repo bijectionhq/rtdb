@@ -40,7 +40,7 @@ rtdb-pg-source = { path = "crates/pg-source" }
 rtdb-auth = { path = "crates/auth" }
 rtdb-pg-codec = { path = "crates/pg-codec" }
 rtdb-pgwire = { path = "crates/pgwire" }
-rtdb-server = { path = "crates/server" }
+rtdb-server = { path = "crates/server", default-features = false }
 rtdb-metrics = { path = "crates/metrics" }
 rtdb-flight-sql = { path = "crates/flight-sql" }
 rtdb-ffi = { path = "crates/ffi" }

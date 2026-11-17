@@ -201,7 +201,8 @@ fn derive(digest: MessageDigest, password: &[u8], salt: &[u8], count: usize, pur
     while output.len() < length {
         let mut value = hash(digest, &[&diversifier, &input])?;
         for _ in 1..count { value = hash(digest, &[&value])?; }
-        output.extend_from_slice(&value[..(length - output.len()).min(value.len())]);
+        let remaining = (length - output.len()).min(value.len());
+        output.extend_from_slice(&value[..remaining]);
         for chunk in input.chunks_exact_mut(block) {
             let mut carry = 1u16;
             for (index, byte) in chunk.iter_mut().enumerate().rev() {

@@ -44,20 +44,23 @@ impl PasswordCredential {
             }
         } else { None };
         let endpoint = self.authority.token_endpoint().await?;
-        let mut form = url::form_urlencoded::Serializer::new(String::new());
-        form.append_pair("client_id", &self.client_id)
-            .append_pair("scope", GRANTED_SCOPES)
-            .append_pair("client_info", "1");
-        match refresh_token {
-            Some(refresh_token) => { form.append_pair("grant_type", "refresh_token").append_pair("refresh_token", refresh_token.secret()); }
-            None => {
-                form.append_pair("grant_type", assertion.as_ref().map_or("password", |assertion| assertion.grant_type))
-                    .append_pair("username", self.username.secret()).append_pair("password", self.password.secret());
-                if let Some(assertion) = assertion { form.append_pair("assertion", &assertion.encoded); }
+        let body = {
+            let mut form = url::form_urlencoded::Serializer::new(String::new());
+            form.append_pair("client_id", &self.client_id)
+                .append_pair("scope", GRANTED_SCOPES)
+                .append_pair("client_info", "1");
+            match refresh_token {
+                Some(refresh_token) => { form.append_pair("grant_type", "refresh_token").append_pair("refresh_token", refresh_token.secret()); }
+                None => {
+                    form.append_pair("grant_type", assertion.as_ref().map_or("password", |assertion| assertion.grant_type))
+                        .append_pair("username", self.username.secret()).append_pair("password", self.password.secret());
+                    if let Some(assertion) = assertion { form.append_pair("assertion", &assertion.encoded); }
+                }
             }
-        }
+            form.finish()
+        };
         let response = self.client.post(endpoint.clone()).header(reqwest::header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(form.finish()).send().await.map_err(|_| invalid("Azure username/password token endpoint could not be reached"))?;
+            .body(body).send().await.map_err(|_| invalid("Azure username/password token endpoint could not be reached"))?;
         if response.status() != reqwest::StatusCode::OK { return Err(ExchangeFailure::Service(invalid("Azure username/password token exchange failed"))); }
         parse_token(&federation::read_body(response).await?, endpoint.path().starts_with("/adfs/"), OffsetDateTime::now_utc()).map_err(ExchangeFailure::Other)
     }

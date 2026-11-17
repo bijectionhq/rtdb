@@ -1,8 +1,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use rtdb_types::calendar::CivilDate;
-use rtdb_types::{Anomaly, BlockIndex, Result, StorageEpoch, StorageVersion, TableRef};
+use rtdb_types::{Anomaly, BlockIndex, CivilDate, Result, StorageEpoch, StorageVersion, TableRef};
 use serde::Serialize;
 
 pub const CURRENT_STORAGE_VERSION: StorageVersion = StorageVersion(6);

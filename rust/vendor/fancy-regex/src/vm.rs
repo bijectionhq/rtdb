@@ -207,9 +207,23 @@ pub enum Insn {
     FailNegativeLookAround,
     /// Set IX back by the specified number of characters
     GoBack(usize),
+    /// Fail the current execution path.
     Fail,
-    LookBehindBounds { min: usize, max: usize, lower: usize },
-    TryLookBehind { lower: usize },
+    /// Save the earliest permitted byte index and select the first look-behind start.
+    LookBehindBounds {
+        /// Minimum look-behind length in Unicode code points.
+        min: usize,
+        /// Maximum look-behind length in Unicode code points.
+        max: usize,
+        /// Save slot for the earliest candidate byte index.
+        lower: usize,
+    },
+    /// Retry look-behind from the preceding Unicode code point.
+    TryLookBehind {
+        /// Save slot for the earliest candidate byte index.
+        lower: usize,
+    },
+    /// Require the current byte index to equal the index in the save slot.
     CheckPosition(usize),
     /// Back reference to a group number to check
     Backref {
@@ -217,6 +231,7 @@ pub enum Insn {
         slot: usize,
         /// Whether the backref should be matched case insensitively
         casei: bool,
+        /// Restrict case-insensitive comparison to ASCII letters.
         ascii: bool,
     },
     /// Begin of atomic group
@@ -543,7 +558,7 @@ pub(crate) fn run_with_previous_end(
                 Insn::CanonicalClass(ref class) => {
                     let candidates = crate::canonical::candidates(s, ix, |character| {
                         let mut bytes = [0; 4];
-                        class.is_match(character.encode_utf8(&mut bytes))
+                        class.is_match(&*character.encode_utf8(&mut bytes))
                     });
                     let Some(first) = candidates[0] else { break 'fail; };
                     for candidate in candidates[1..].iter().rev().flatten() { state.push(pc + 1, *candidate)?; }

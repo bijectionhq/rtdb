@@ -15,7 +15,7 @@ fn reserve(size: usize, live: &Arc<AtomicUsize>) -> ReadReservation {
 async fn local_range_reports_disappearance_of_an_observed_durable_file() {
     let directory = tempfile::tempdir().unwrap(); let path = directory.path().join("LOG");
     let cancel = CancellationToken::new();
-    let (log, driver) = LocalLog::open(&path, LocalLogOptions::default()).unwrap();
+    let (log, driver) = LocalLog::open(&path, LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 }).unwrap();
     let task = tokio::spawn(driver.run(cancel.clone()));
     log.enqueue(Bytes::from_static(b"payload"), Timestamp(0)).await.unwrap().durable().await.unwrap();
     std::fs::remove_file(&path).unwrap();

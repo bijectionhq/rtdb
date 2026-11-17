@@ -223,7 +223,7 @@ impl Bags {
                 remaining = remaining.checked_sub(certificate.der.len()).ok_or_else(|| invalid("PKCS12 certificate chains exceed the reserved material bound"))?;
                 chain.push(certificate.der.clone());
                 let issuer = certificate.certificate.issuer_name().to_der().map_err(invalid)?;
-                if issuer == certificate.certificate.subject_name().to_der().map_err(invalid)? && certificate.certificate.verify(&certificate.certificate.public_key().map_err(invalid)?).map_err(invalid)? { break; }
+                if issuer == certificate.certificate.subject_name().to_der().map_err(invalid)? && certificate.certificate.verify(certificate.certificate.public_key().map_err(invalid)?.as_ref()).map_err(invalid)? { break; }
                 let authority = certificate.certificate.authority_key_id().map(|id| id.as_slice());
                 let mut fallback = None; next = None;
                 for candidate in &self.certificates {
@@ -387,7 +387,8 @@ fn derive(hash: MessageDigest, password: &str, salt: &[u8], iterations: usize, p
             let mut state = Hasher::new(hash).map_err(invalid)?; state.update(&digest).map_err(invalid)?;
             digest[..].zeroize(); digest = state.finish().map_err(invalid)?;
         }
-        output.extend_from_slice(&digest[..(length - output.len()).min(digest.len())]);
+        let remaining = (length - output.len()).min(digest.len());
+        output.extend_from_slice(&digest[..remaining]);
         for chunk in input.chunks_exact_mut(block) {
             let mut carry = 1u16;
             for (index, byte) in chunk.iter_mut().enumerate().rev() {

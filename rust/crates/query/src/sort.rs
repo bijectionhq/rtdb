@@ -197,7 +197,7 @@ impl KeyTypes {
         let mut bound = crate::runtime_schema::schema_bound(&plan.schema)?;
         for order in &plan.order { bound = bound.checked_add(crate::runtime_schema::expression_bound(&order.expr)?).ok_or_else(size_error)?; }
         for ty in plan.execution.parameters.types() { bound = bound.checked_add(ty.retained_bytes()?).ok_or_else(size_error)?; }
-        for (schema, _) in &plan.execution.outer.rows { bound = bound.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(size_error)?; }
+        for schema in plan.execution.outer.schemas() { bound = bound.checked_add(crate::runtime_schema::schema_bound(schema)?).ok_or_else(size_error)?; }
         let scope = plan.execution.scope()?;
         scope.reserve(bound.checked_mul(16).and_then(|n| n.checked_add(4096)).ok_or_else(size_error)?)?;
         let values = plan.order.iter().map(|order| plan.execution.expression_type(&scope, &order.expr, &plan.schema)).collect::<Result<Vec<_>>>()?;

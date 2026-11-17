@@ -58,7 +58,7 @@ fn lookup_observes_certificates_created_after_context_configuration() {
     let root = Credential::new("late root", false, None);
     let (context, lookup) = configured(directory.path(), &memory);
     assert!(unsafe { find(lookup, 1, root.certificate.subject_name()) }.is_none());
-    assert!(context.cert_store().objects().is_empty());
+    assert!(context.cert_store().all_certificates().is_empty());
     std::fs::write(certificate_path(directory.path(), &root, 0), root.certificate.to_pem().unwrap()).unwrap();
     let found = unsafe { find(lookup, 1, root.certificate.subject_name()) }.unwrap();
     assert_eq!(found.x509().unwrap().to_der().unwrap(), root.certificate.to_der().unwrap());
@@ -237,7 +237,8 @@ fn absent_hash_lookup_does_not_retain_a_source_or_create_a_lookup() {
     let context = SslContextBuilder::new(SslMethod::tls_client()).unwrap();
     unsafe { install(context.as_ptr(), Arc::clone(&owner), &memory, 32).unwrap(); }
     assert_eq!(memory.used_bytes(), baseline);
-    assert!(context.cert_store().objects().is_empty());
+    let context = context.build();
+    assert!(context.cert_store().all_certificates().is_empty());
     drop(context); drop(owner); assert_eq!(memory.used_bytes(), 0);
 }
 

@@ -124,7 +124,7 @@ async fn field_access_discards_scalar_payloads_but_forces_controls_struct_constr
     assert_eq!(evaluate_async(&expression,&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).await.unwrap(),V::Null);
     let controlled = Expr::Case { branches: vec![(Expr::binary(B::Eq,divide.clone(),Expr::Literal(V::I64(0))),Expr::Literal(V::I64(1)))],otherwise: Box::new(Expr::Literal(V::I64(2))) };
     let boxed = Expr::Case { branches: vec![(Expr::Literal(V::Bool(true)),divide.clone())],otherwise: Box::new(Expr::Literal(V::Null)) };
-    for source in [controlled,boxed,Expr::Struct(BTreeMap::from([("present".into(),divide)]))] {
+    for source in [controlled,boxed,Expr::Struct(vec![("present".into(),divide)])] {
         assert_eq!(evaluate_async(&field(source,"absent"),&Schema::default(),&[],&EvalContext { allocation: Some(&default_allocation),..Default::default() }).await.unwrap_err().code,"xtdb.expression/division-by-zero");
     }
 }

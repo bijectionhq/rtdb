@@ -85,7 +85,7 @@ fn partition_roundtrip_preserves_states_watermarks_and_omits_table_name() {
 
 #[test]
 fn wide_recency_partitions_roundtrip_and_reject_microsecond_overflow() {
-    use rtdb_types::calendar::CivilDate;
+    use rtdb_types::CivilDate;
     let catalog = apply(&[("l02-r2800000103-b00", 10)]);
     let mut partitions = catalog.partitions(&table()).unwrap();
     let midnight = CivilDate::from_ymd(280_000, 1, 3).unwrap().epoch_day() * 86_400_000_000;
