@@ -170,7 +170,14 @@ impl RegistryConverter {
         self.request_query(path, &[], body, context).await
     }
     async fn request_query(&mut self, path: &[String], query: &[(String, String)], body: Option<&Json>, context: &mut ConversionContext) -> Result<Json> {
-        context.reserve(self.maximum_schema_bytes.checked_mul(4).ok_or_else(|| error("allocation-overflow", "Schema response bound overflow"))?)?;
+        let response = self.request_raw(path, query, body, context).await?;
+        match response.bytes() {
+            Some(bytes) => json_admission::parse(bytes, context),
+            None => Ok(Json::Null),
+        }
+    }
+    async fn request_raw(&mut self, path: &[String], query: &[(String, String)], body: Option<&Json>, context: &mut ConversionContext) -> Result<http::RawResponse> {
+        let response_charge = context.reserve(self.maximum_schema_bytes.checked_mul(4).ok_or_else(|| error("allocation-overflow", "Schema response bound overflow"))?)?;
         if self.client.is_none() { self.client = Some(security::client(&self.options, context)?); }
         let (client, charge) = self.client.as_ref().expect("registry client initialized");
         context.retain(Arc::clone(charge))?;
@@ -191,7 +198,7 @@ impl RegistryConverter {
                 None => (::http::Method::GET, Vec::new()),
             };
             let response = match client.request(method, url, headers, body).await { Ok(response) => response, Err(cause) => { failure = Some(error("schema-registry", cause.without_url())); continue; } };
-            if response.status() == ::http::StatusCode::NO_CONTENT { return Ok(Json::Null); }
+            if response.status() == ::http::StatusCode::NO_CONTENT { return Ok(http::RawResponse::NoContent); }
             if response.status() != ::http::StatusCode::OK {
                 let cause = error("schema-registry", format!("Schema Registry returned HTTP {}", response.status()));
                 if response.status().is_server_error() { failure = Some(cause); continue; } return Err(cause);
@@ -203,7 +210,7 @@ impl RegistryConverter {
                 if bytes.len().checked_add(chunk.len()).is_none_or(|size| size > self.maximum_schema_bytes) { return Err(error("schema-registry", "Schema response exceeds its byte limit")); }
                 bytes.extend_from_slice(&chunk);
             }
-            return json_admission::parse(&bytes, context);
+            return Ok(http::RawResponse::body(bytes, response_charge));
         }
         Err(failure.unwrap_or_else(|| error("schema-registry", "No Schema Registry endpoint is configured")))
     }

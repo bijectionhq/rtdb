@@ -46,7 +46,8 @@ SchemaEntity computes normalizedPath at construction; later reflected entityPath
 
 == Owners and admission
 
-RawResponse and RawBody are passive byte envelopes for the later transport seam.
+The Registry transport returns a passive RawResponse whose RawBody retains the admitted byte vector through decoding or final release.
+The existing generic response path parses these borrowed bytes through the admitted JSON materializer.
 Cursor and Input are passive call-local borrowed lexical state; Name retains an Input snapshot rather than a decoded-name allocation.
 Token, Frame, Profile, Utf8Demand and the failure variants are passive value tags.
 TextBufferObservation is a passive caller-owned observation of the actual source text-segment capacity in UTF16 units at a demanded value's opening-quote byte offset.

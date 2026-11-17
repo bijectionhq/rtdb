@@ -1,5 +1,5 @@
-use std::{fmt, sync::Arc};
-use rtdb_types::{Anomaly, MemoryReservation};
+use std::fmt;
+use rtdb_types::Anomaly;
 use super::{ConversionContext, error};
 
 mod owned;
@@ -43,13 +43,6 @@ impl fmt::Display for Failure {
     }
 }
 pub(super) type Result<T> = std::result::Result<T, Failure>;
-
-pub(super) enum RawResponse { NoContent, Body(RawBody) }
-pub(super) struct RawBody { bytes: Vec<u8>, _charge: Arc<MemoryReservation> }
-impl RawResponse {
-    pub(super) fn body(bytes: Vec<u8>, charge: Arc<MemoryReservation>) -> Self { Self::Body(RawBody { bytes, _charge: charge }) }
-    pub(super) fn bytes(&self) -> Option<&[u8]> { match self { Self::NoContent => None, Self::Body(body) => Some(&body.bytes) } }
-}
 
 fn overflow() -> Anomaly { error("allocation-overflow", "Registry response allocation exceeds addressable memory") }
 fn allocation_failed() -> Anomaly { error("allocation-failed", "Registry response allocation failed") }

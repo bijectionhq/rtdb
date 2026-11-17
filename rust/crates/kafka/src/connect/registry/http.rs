@@ -14,6 +14,18 @@ use url::{Host, Position, Url};
 const HEADER_LIMIT: usize = 384 * 1024;
 mod resolve;
 
+pub(super) enum RawResponse { NoContent, Body(RawBody) }
+pub(super) struct RawBody { bytes: Vec<u8>, _charge: Arc<MemoryReservation> }
+impl RawResponse {
+    /// The supplied charge must cover the byte vector's retained capacity through its final release.
+    pub(super) fn body(bytes: Vec<u8>, charge: Arc<MemoryReservation>) -> Self {
+        Self::Body(RawBody { bytes, _charge: charge })
+    }
+    pub(super) fn bytes(&self) -> Option<&[u8]> {
+        match self { Self::NoContent => None, Self::Body(body) => Some(&body.bytes) }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Client(Arc<Configuration>);
 
