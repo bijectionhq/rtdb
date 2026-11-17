@@ -5,8 +5,11 @@ struct Entry<'a, K> { key: &'a K, source: usize, hash: i32, previous: Option<usi
 struct Bucket { head: Option<usize>, tail: Option<usize>, len: usize, root: Option<usize> }
 struct Replay<'a, K, C> { entries: Vec<Entry<'a, K>>, compare_keys: C, buckets: BTreeMap<usize, Bucket>, capacity: usize, threshold: usize }
 
-// OpenJDK HashMap insertion and iteration order, including collision trees (java.util.HashMap).
-pub(crate) fn indices<'a, K: Eq + 'a>(initial: usize, keys: impl IntoIterator<Item = &'a K>, hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Option<Vec<usize>> {
+/// Returns OpenJDK HashMap iteration indices after insertion, replacement and collision-tree ordering.
+/// Keys share one Java comparable class: `hash` returns its raw `hashCode`, and `compare_keys` uses its `Comparable` ordering.
+/// Duplicate keys return the last input index at their retained Java iteration position.
+/// The caller owns keys and allocation admission; an overflowing initial capacity returns `None`.
+pub fn indices<'a, K: Eq + 'a>(initial: usize, keys: impl IntoIterator<Item = &'a K>, hash: impl Fn(&K) -> i32, compare_keys: impl Fn(&K, &K) -> Ordering) -> Option<Vec<usize>> {
     let capacity = initial.max(1).checked_next_power_of_two()?.min(1 << 30);
     let mut replay = Replay { entries: Vec::new(), compare_keys, buckets: BTreeMap::new(), capacity, threshold: capacity * 3 / 4 };
     for (source, key) in keys.into_iter().enumerate() { replay.insert(key, source, hash(key)); }
