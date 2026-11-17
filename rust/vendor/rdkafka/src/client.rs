@@ -30,6 +30,7 @@ use crate::groups::GroupList;
 use crate::log::{debug, error, info, trace, warn};
 use crate::metadata::Metadata;
 use crate::mocking::MockCluster;
+use crate::native_byte_account::NativeByteAccount;
 use crate::statistics::Statistics;
 use crate::util::{self, ErrBuf, KafkaDrop, NativePtr, Timeout};
 
@@ -157,6 +158,7 @@ impl ClientContext for DefaultClientContext {}
 // TODO(benesch): this should be `pub(crate)`.
 pub struct NativeClient {
     ptr: NativePtr<RDKafka>,
+    _byte_account: Option<Arc<NativeByteAccount>>,
     _ssl_context: Option<Arc<SslContextConfig>>,
     material_lease: Option<Box<dyn SslMaterialLease>>,
 }
@@ -173,9 +175,15 @@ unsafe impl Send for NativeClient {}
 impl NativeClient {
     /// # Safety
     /// `ptr` must be a live, exclusively owned native client whose callbacks remain valid through destruction.
-    pub(crate) unsafe fn from_ptr(ptr: *mut RDKafka, ssl_context: Option<Arc<SslContextConfig>>, material_lease: Option<Box<dyn SslMaterialLease>>) -> NativeClient {
+    pub(crate) unsafe fn from_ptr(
+        ptr: *mut RDKafka,
+        ssl_context: Option<Arc<SslContextConfig>>,
+        material_lease: Option<Box<dyn SslMaterialLease>>,
+        byte_account: Option<Arc<NativeByteAccount>>,
+    ) -> NativeClient {
         NativeClient {
             ptr: NativePtr::from_ptr(ptr).unwrap(),
+            _byte_account: byte_account,
             _ssl_context: ssl_context,
             material_lease,
         }
@@ -251,6 +259,9 @@ impl<C: ClientContext> Client<C> {
         rd_kafka_type: RDKafkaType,
         context: Arc<C>,
     ) -> KafkaResult<Client<C>> {
+        if native_config.byte_account.is_some() && rd_kafka_type != RDKafkaType::RD_KAFKA_PRODUCER {
+            return Err(KafkaError::ClientCreation("Native byte accounts require a producer".into()));
+        }
         let mut err_buf = ErrBuf::new();
         unsafe {
             rdsys::rd_kafka_conf_set_opaque(
@@ -265,20 +276,39 @@ impl<C: ClientContext> Client<C> {
             None => None,
         };
         let ssl_context = native_config.ssl_context.take();
-        let client_ptr = unsafe {
-            rdsys::rd_kafka_new(
-                rd_kafka_type,
-                native_config.ptr(),
-                err_buf.as_mut_ptr(),
-                err_buf.capacity(),
-            )
+        let byte_account = native_config.byte_account.take();
+        let mut configuration = native_config.ptr();
+        let client_ptr = match &byte_account {
+            Some(account) => unsafe {
+                rdsys::rd_kafka_new_accounted_producer(
+                    &mut configuration,
+                    account.ptr(),
+                    err_buf.as_mut_ptr(),
+                    err_buf.capacity(),
+                )
+            },
+            None => unsafe {
+                rdsys::rd_kafka_new(
+                    rd_kafka_type,
+                    configuration,
+                    err_buf.as_mut_ptr(),
+                    err_buf.capacity(),
+                )
+            },
         };
         if client_ptr.is_null() {
-            native_config.ssl_context = ssl_context;
+            if configuration.is_null() {
+                std::mem::forget(native_config);
+            } else {
+                native_config.ssl_context = ssl_context;
+                native_config.byte_account = byte_account;
+            }
             return Err(KafkaError::ClientCreation(err_buf.to_string()));
         }
         std::mem::forget(native_config);
-        let mut native = unsafe { NativeClient::from_ptr(client_ptr, ssl_context, material_lease) };
+        let mut native = unsafe {
+            NativeClient::from_ptr(client_ptr, ssl_context, material_lease, byte_account)
+        };
         if let Some(lease) = &mut native.material_lease { lease.loaded(); }
         trace!("Create new librdkafka client {:p}", client_ptr);
 

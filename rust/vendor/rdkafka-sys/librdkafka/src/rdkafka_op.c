@@ -202,7 +202,9 @@ void rd_kafka_op_print(FILE *fp, const char *prefix, rd_kafka_op_t *rko) {
 }
 
 
-rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
+rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
+                                         rd_kafka_op_type_t type,
+                                         rd_kafka_byte_account_t *account) {
         rd_kafka_op_t *rko;
 #define _RD_KAFKA_OP_EMPTY                                                     \
         1234567 /* Special value to be able to assert                          \
@@ -294,7 +296,12 @@ rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
         if (tsize == _RD_KAFKA_OP_EMPTY)
                 tsize = 0;
 
-        rko           = rd_calloc(1, sizeof(*rko) - sizeof(rko->rko_u) + tsize);
+        tsize += sizeof(*rko) - sizeof(rko->rko_u);
+        if (!rd_kafka_byte_account_acquire(account, tsize))
+                return NULL;
+        rko = rd_calloc(1, tsize);
+        rko->rko_byte_account = account;
+        rko->rko_byte_charge = account ? tsize : 0;
         rko->rko_type = type;
 
 #if ENABLE_DEVEL
@@ -305,7 +312,13 @@ rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
 }
 
 
+rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type) {
+        return rd_kafka_op_new_accounted(source, type, NULL);
+}
+
 void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
+        rd_kafka_byte_account_t *account = rko->rko_byte_account;
+        size_t charge = rko->rko_byte_charge;
 
         /* Call ops callback with ERR__DESTROY to let it
          * clean up its resources. */
@@ -523,6 +536,7 @@ void rd_kafka_op_destroy(rd_kafka_op_t *rko) {
 #endif
 
         rd_free(rko);
+        rd_kafka_byte_account_release(account, charge);
 }
 
 

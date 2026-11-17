@@ -167,6 +167,19 @@ rd_buf_alloc_segment(rd_buf_t *rbuf, size_t min_size, size_t max_size) {
 }
 
 
+size_t rd_buf_contig_extra_bytes(rd_buf_t *rbuf, size_t size) {
+        void *p;
+        size_t offset = RD_ROUNDUP(rbuf->rbuf_extra_len, 8);
+        size_t spare = offset <= rbuf->rbuf_extra_size ?
+                           rbuf->rbuf_extra_size - offset : 0;
+        if (rbuf->rbuf_wpos &&
+            rd_segment_write_remains(rbuf->rbuf_wpos, &p) >= size)
+                return 0;
+        if (spare >= sizeof(rd_segment_t))
+                return size <= spare - sizeof(rd_segment_t) ? 0 : size;
+        return size + sizeof(rd_segment_t);
+}
+
 /**
  * @brief Ensures that \p size bytes will be available
  *        for writing and the position will be updated to point to the

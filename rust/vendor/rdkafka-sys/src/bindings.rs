@@ -80,6 +80,20 @@ pub struct rd_kafka_s {
 pub type rd_kafka_t = rd_kafka_s;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
+pub struct rd_kafka_byte_account_s {
+    _unused: [u8; 0],
+}
+pub type rd_kafka_byte_account_t = rd_kafka_byte_account_s;
+extern "C" {
+    pub fn rd_kafka_byte_account_new(capacity: usize) -> *mut rd_kafka_byte_account_t;
+    pub fn rd_kafka_byte_account_used(account: *mut rd_kafka_byte_account_t) -> usize;
+    pub fn rd_kafka_byte_account_destroy(account: *mut rd_kafka_byte_account_t);
+    pub fn rd_kafka_new_accounted_producer(conf: *mut *mut rd_kafka_conf_t,
+        account: *mut rd_kafka_byte_account_t, errstr: *mut c_char,
+        errstr_size: usize) -> *mut rd_kafka_t;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct rd_kafka_topic_s {
     _unused: [u8; 0],
 }

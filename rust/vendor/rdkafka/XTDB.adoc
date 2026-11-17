@@ -67,3 +67,38 @@ The native pointer is under RAII ownership before this callback can unwind.
 `NativeClient` destroys its pointer, including librdkafka's TLS context and provider cleanup, before dropping the retained lease.
 The default method supplies no admission, preserving callers that have no material accounting policy.
 This ownership seam does not itself bound OpenSSL allocations; the Kafka material source documents its explicit-file allowance and remaining qualification scope.
+
+== Producer native byte account
+
+A caller reserves capacity before creating a `NativeByteAccount` and passes the reservation to `NativeByteAccount::new`.
+`ClientConfig::set_native_byte_account` shares that capacity among producers created from the configuration or its native duplicates.
+Admin clients also use the native producer constructor.
+A consumer configuration carrying an account fails at client creation.
+The last safe owner blocks until all attached native clients and charged allocations have completed destruction, then releases the reservation on its Rust caller.
+The producer's native main queue and the admin polling queue release their references before their owning client is destroyed.
+
+The byte ceiling covers allocator-requested storage for incoming Kafka response frames on every broker connection and for requests submitted through the internal accounted Metadata entry point.
+Each frame acquires its header and segment arena before reading the correlation ID.
+After reading the declared size, it acquires additional storage before allocating the body, including any segment descriptor outside the original arena.
+A late response, a partially read frame and overlapping responses keep their charges until their final native buffer references are released.
+An admission failure during reception closes the connection and fails its outstanding requests with `RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE` through the normal broker error path.
+Callers should allow capacity for simultaneous responses, including connection setup.
+
+The internal Metadata sender charges one contiguous request including its headers, client ID, encoded body and flexible tags.
+It validates the client ID against the Kafka signed-short string length range before calculating the complete request size.
+An invalid or oversized submission or an initial refusal returns a typed error before the C completion is installed.
+Each transmission, retry and reply queue node has a separate charge until its own final free.
+A node admission failure delivers its terminal error inline, including when another native owner releases capacity during error delivery.
+The caller supplies a C completion that is valid on the submitting, serving, broker and teardown threads.
+The account is a Monitor Object whose native release and client-detach operations signal the re-evaluable condition that both the live byte sum and attached-client count are zero.
+The last Rust owner waits for native release before dropping the supplied reservation.
+
+The account measures the listed native allocation requests.
+The client, account monitor, existing queues, ordinary outbound requests, protocol decoding, TLS and SASL machinery, allocator overhead and application-side result storage have separate ownership and sizing.
+Ordered Metadata response decoding and the Connect DLQ round-robin partitioner still require their own integration.
+Regression sources live in `../../crates/kafka/tests/native_byte_account.rs` and `../rdkafka-sys/librdkafka/src/rdkafka_byte_account_test.h`.
+
+
+`UPSTREAM.json` and `../rdkafka-sys/UPSTREAM.json` retain the original file hashes and registry archive identities.
+The source archive SHA-256 values are `5f1856d72dbbbea0d2a5b2eaf6af7fb3847ef2746e883b11781446a51dbc85c0` for rust-rdkafka and `5230dca48bc354d718269f3e4353280e188b610f7af7e2fcf54b7a79d5802872` for rdkafka-sys.
+The accounting changes retain each modified librdkafka file's upstream license header.

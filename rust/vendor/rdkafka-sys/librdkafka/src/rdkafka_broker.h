@@ -606,6 +606,13 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
                                     rd_kafka_resp_cb_t *resp_cb,
                                     void *opaque);
 
+/* Copies the encoded Metadata body, excluding flexible root tags.
+ * The C completion may run inline or on a broker, serving or teardown thread.
+ * Queue admission failure delivers a terminal CRIT_SYS_RESOURCE error.
+ * An immediate error returns ownership to the caller without invoking completion. */
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque);
 void rd_kafka_broker_buf_retry(rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf);
 
 
@@ -711,5 +718,6 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
                                   rd_list_t *wait_thrds);
 
 int unittest_broker(void);
+int unittest_byte_account(void);
 
 #endif /* _RDKAFKA_BROKER_H_ */

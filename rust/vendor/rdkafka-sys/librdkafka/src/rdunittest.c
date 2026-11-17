@@ -455,6 +455,7 @@ int rd_unittest(void) {
 #endif
                 {"conf", unittest_conf},
                 {"broker", unittest_broker},
+                {"byte_account", unittest_byte_account},
                 {"request", unittest_request},
 #if WITH_SASL_OAUTHBEARER
                 {"sasl_oauthbearer", unittest_sasl_oauthbearer},

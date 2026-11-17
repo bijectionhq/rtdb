@@ -279,6 +279,11 @@ static RD_UNUSED const char *rd_kafka_type2str(rd_kafka_type_t type) {
         return types[type];
 }
 
+rd_bool_t rd_kafka_byte_account_acquire(rd_kafka_byte_account_t *account,
+                                         size_t bytes);
+void rd_kafka_byte_account_release(rd_kafka_byte_account_t *account,
+                                   size_t bytes);
+
 /**
  * Kafka handle, internal representation of the application's rd_kafka_t.
  */
@@ -286,6 +291,7 @@ static RD_UNUSED const char *rd_kafka_type2str(rd_kafka_type_t type) {
 struct rd_kafka_s {
         rd_kafka_q_t *rk_rep; /* kafka -> application reply queue */
         rd_kafka_q_t *rk_ops; /* any -> rdkafka main thread ops */
+        rd_kafka_byte_account_t *rk_byte_account;
 
         TAILQ_HEAD(, rd_kafka_broker_s) rk_brokers;
         rd_list_t rk_broker_by_id; /* Fast id lookups. */

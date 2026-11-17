@@ -37,8 +37,8 @@ use crate::TopicPartitionList;
 /// `AdminClient` provides programmatic access to managing a Kafka cluster,
 /// notably manipulating topics, partitions, and configuration paramaters.
 pub struct AdminClient<C: ClientContext> {
-    client: Client<C>,
     queue: Arc<NativeQueue>,
+    client: Client<C>,
     should_stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }

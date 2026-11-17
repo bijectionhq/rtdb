@@ -242,6 +242,8 @@ typedef rd_kafka_resp_err_t(rd_kafka_make_req_cb_t)(rd_kafka_broker_t *rkb,
  */
 struct rd_kafka_buf_s { /* rd_kafka_buf_t */
         TAILQ_ENTRY(rd_kafka_buf_s) rkbuf_link;
+        rd_kafka_byte_account_t *rkbuf_byte_account;
+        size_t rkbuf_byte_charge;
 
         int32_t rkbuf_corrid;
 
@@ -999,6 +1001,9 @@ void rd_kafka_buf_push0(rd_kafka_buf_t *rkbuf,
         rd_kafka_buf_push0(rkbuf, buf, len, 1 /*allow_crc*/, free_cb)
 rd_kafka_buf_t *rd_kafka_buf_new0(int segcnt, size_t size, int flags);
 #define rd_kafka_buf_new(segcnt, size) rd_kafka_buf_new0(segcnt, size, 0)
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_buf_t **result);
 rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
                                           int16_t ApiKey,
                                           int segcnt,

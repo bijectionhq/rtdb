@@ -35,6 +35,7 @@ use rdkafka_sys::types::*;
 use crate::client::ClientContext;
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::log::{log_enabled, DEBUG, INFO, WARN};
+use crate::native_byte_account::NativeByteAccount;
 use crate::util::{ErrBuf, KafkaDrop, NativePtr};
 
 /// The log levels supported by librdkafka.
@@ -85,6 +86,7 @@ impl RDKafkaLogLevel {
 pub struct NativeClientConfig {
     ptr: NativePtr<RDKafkaConf>,
     pub(crate) ssl_context: Option<Arc<SslContextConfig>>,
+    pub(crate) byte_account: Option<Arc<NativeByteAccount>>,
 }
 
 /// Native TLS file whose bytes can be supplied by a retained configuration owner.
@@ -216,6 +218,7 @@ impl Clone for NativeClientConfig {
         Self {
             ptr: unsafe { NativePtr::from_ptr(rdsys::rd_kafka_conf_dup(self.ptr())).unwrap() },
             ssl_context: self.ssl_context.clone(),
+            byte_account: self.byte_account.clone(),
         }
     }
 }
@@ -226,6 +229,7 @@ impl NativeClientConfig {
         NativeClientConfig {
             ptr: NativePtr::from_ptr(ptr).unwrap(),
             ssl_context: None,
+            byte_account: None,
         }
     }
 
@@ -314,6 +318,7 @@ impl NativeClientConfig {
 /// Client configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
+    byte_account: Option<Arc<NativeByteAccount>>,
     conf_map: HashMap<String, String>,
     ssl_context: Option<Arc<SslContextConfig>>,
     /// The librdkafka logging level. Refer to [`RDKafkaLogLevel`] for the list
@@ -331,10 +336,18 @@ impl ClientConfig {
     /// Creates a new empty configuration.
     pub fn new() -> ClientConfig {
         ClientConfig {
+            byte_account: None,
             conf_map: HashMap::new(),
             ssl_context: None,
             log_level: log_level_from_global_config(),
         }
+    }
+
+    /// Shares an admitted byte account among producers created from this configuration.
+    /// Consumer creation with an account returns a client creation error.
+    pub fn set_native_byte_account(&mut self, account: Arc<NativeByteAccount>) -> &mut Self {
+        self.byte_account = Some(account);
+        self
     }
 
     /// Gets a reference to the underlying config map
@@ -394,6 +407,7 @@ impl ClientConfig {
         for (key, value) in &self.conf_map {
             conf.set(key, value)?;
         }
+        conf.byte_account = self.byte_account.clone();
         conf.ssl_context = self.ssl_context.clone();
         if let Some(configuration) = &conf.ssl_context {
             if configuration.0.material_source().is_some() {

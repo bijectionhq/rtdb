@@ -284,6 +284,8 @@ struct rd_kafka_admin_fanout_worker_cbs;
 
 struct rd_kafka_op_s {
         TAILQ_ENTRY(rd_kafka_op_s) rko_link;
+        rd_kafka_byte_account_t *rko_byte_account;
+        size_t rko_byte_charge;
 
         rd_kafka_op_type_t rko_type; /* Internal op type */
         rd_kafka_event_type_t rko_evtype;
@@ -732,14 +734,17 @@ TAILQ_HEAD(rd_kafka_op_head_s, rd_kafka_op_s);
 const char *rd_kafka_op2str(rd_kafka_op_type_t type);
 void rd_kafka_op_destroy(rd_kafka_op_t *rko);
 rd_kafka_op_t *rd_kafka_op_new0(const char *source, rd_kafka_op_type_t type);
+rd_kafka_op_t *rd_kafka_op_new_accounted(const char *source,
+                                         rd_kafka_op_type_t type,
+                                         rd_kafka_byte_account_t *account);
 #if ENABLE_DEVEL
 #define _STRINGIFYX(A) #A
 #define _STRINGIFY(A)  _STRINGIFYX(A)
-#define rd_kafka_op_new(type)                                                  \
-        rd_kafka_op_new0(__FILE__ ":" _STRINGIFY(__LINE__), type)
+#define RD_KAFKA_OP_SOURCE __FILE__ ":" _STRINGIFY(__LINE__)
 #else
-#define rd_kafka_op_new(type) rd_kafka_op_new0(NULL, type)
+#define RD_KAFKA_OP_SOURCE NULL
 #endif
+#define rd_kafka_op_new(type) rd_kafka_op_new0(RD_KAFKA_OP_SOURCE, type)
 rd_kafka_op_t *rd_kafka_op_new_reply(rd_kafka_op_t *rko_orig,
                                      rd_kafka_resp_err_t err);
 rd_kafka_op_t *rd_kafka_op_new_cb(rd_kafka_t *rk,

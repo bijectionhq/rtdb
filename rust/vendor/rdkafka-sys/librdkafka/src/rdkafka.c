@@ -956,12 +956,105 @@ void rd_kafka_decommissioned_broker_thread_join(rd_kafka_t *rk,
         }
 }
 
+struct rd_kafka_byte_account_s {
+        mtx_t lock;
+        cnd_t idle;
+        size_t capacity;
+        size_t used;
+        size_t clients;
+};
+
+rd_kafka_byte_account_t *rd_kafka_byte_account_new(size_t capacity) {
+        rd_kafka_byte_account_t *account = calloc(1, sizeof(*account));
+        if (!account)
+                return NULL;
+        if (mtx_init(&account->lock, mtx_plain) != thrd_success)
+                goto fail;
+        if (cnd_init(&account->idle) != thrd_success) {
+                mtx_destroy(&account->lock);
+                goto fail;
+        }
+        account->capacity = capacity;
+        return account;
+fail:
+        free(account);
+        return NULL;
+}
+
+static rd_bool_t rd_kafka_byte_account_attach(rd_kafka_byte_account_t *account) {
+        rd_bool_t admitted;
+        if (!account)
+                return rd_true;
+        mtx_lock(&account->lock);
+        admitted = account->clients < SIZE_MAX;
+        if (admitted)
+                account->clients++;
+        mtx_unlock(&account->lock);
+        return admitted;
+}
+
+static void rd_kafka_byte_account_detach(rd_kafka_byte_account_t *account) {
+        if (!account)
+                return;
+        mtx_lock(&account->lock);
+        rd_assert(account->clients > 0);
+        if (--account->clients == 0 && account->used == 0)
+                cnd_broadcast(&account->idle);
+        mtx_unlock(&account->lock);
+}
+
+rd_bool_t rd_kafka_byte_account_acquire(rd_kafka_byte_account_t *account,
+                                        size_t bytes) {
+        rd_bool_t admitted;
+        if (!account)
+                return rd_true;
+        mtx_lock(&account->lock);
+        admitted = bytes <= account->capacity - account->used;
+        if (admitted)
+                account->used += bytes;
+        mtx_unlock(&account->lock);
+        return admitted;
+}
+
+void rd_kafka_byte_account_release(rd_kafka_byte_account_t *account,
+                                   size_t bytes) {
+        if (!account)
+                return;
+        mtx_lock(&account->lock);
+        rd_assert(bytes <= account->used);
+        account->used -= bytes;
+        if (account->used == 0 && account->clients == 0)
+                cnd_broadcast(&account->idle);
+        mtx_unlock(&account->lock);
+}
+
+size_t rd_kafka_byte_account_used(rd_kafka_byte_account_t *account) {
+        size_t used;
+        mtx_lock(&account->lock);
+        used = account->used;
+        mtx_unlock(&account->lock);
+        return used;
+}
+
+void rd_kafka_byte_account_destroy(rd_kafka_byte_account_t *account) {
+        if (!account)
+                return;
+        mtx_lock(&account->lock);
+        while (account->used || account->clients)
+                cnd_wait(&account->idle, &account->lock);
+        mtx_unlock(&account->lock);
+        cnd_destroy(&account->idle);
+        mtx_destroy(&account->lock);
+        free(account);
+}
+
 /**
  * @brief Final destructor for rd_kafka_t, must only be called with refcnt 0.
  *
  * @locality application thread
  */
 void rd_kafka_destroy_final(rd_kafka_t *rk) {
+        rd_kafka_byte_account_t *byte_account = rk->rk_byte_account;
 
         rd_kafka_assert(rk, rd_kafka_terminating(rk));
 
@@ -1057,6 +1150,7 @@ void rd_kafka_destroy_final(rd_kafka_t *rk) {
         rwlock_destroy(&rk->rk_lock);
 
         rd_free(rk);
+        rd_kafka_byte_account_detach(byte_account);
         rd_kafka_global_cnt_decr();
 }
 
@@ -2277,10 +2371,10 @@ void rd_kafka_term_sig_handler(int sig) {
 }
 
 
-rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
-                         rd_kafka_conf_t *app_conf,
-                         char *errstr,
-                         size_t errstr_size) {
+static rd_kafka_t *rd_kafka_new0(rd_kafka_type_t type, rd_kafka_conf_t *app_conf,
+                                 char *errstr, size_t errstr_size,
+                                 rd_kafka_byte_account_t *account,
+                                 rd_kafka_conf_t **accounted_confp) {
         rd_kafka_t *rk;
         static rd_atomic32_t rkid;
         rd_kafka_conf_t *conf;
@@ -2322,6 +2416,15 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
         }
 
 
+        if (!rd_kafka_byte_account_attach(account)) {
+                if (errstr)
+                        rd_snprintf(errstr, errstr_size, "Too many native byte account clients");
+                if (!app_conf)
+                        rd_kafka_conf_destroy(conf);
+                rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE, ENOMEM);
+                return NULL;
+        }
+
         rd_kafka_global_cnt_incr();
 
         /*
@@ -2329,6 +2432,7 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
          */
         rk = rd_calloc(1, sizeof(*rk));
 
+        rk->rk_byte_account = account;
         rk->rk_type       = type;
         rk->rk_ts_created = rd_clock();
 
@@ -2710,6 +2814,12 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
                                     rk->rk_init_wait_cnt);
                 mtx_unlock(&rk->rk_init_lock);
 
+                if (account) {
+                        if (app_conf)
+                                rd_free(app_conf);
+                        *accounted_confp = NULL;
+                        rd_kafka_destroy(rk);
+                }
                 rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE,
                                         EDEADLK);
                 return NULL;
@@ -2745,6 +2855,8 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
          * will have been copied in its entirety above. */
         if (app_conf)
                 rd_free(app_conf);
+        if (accounted_confp)
+                *accounted_confp = NULL;
         rd_kafka_set_last_error(0, 0);
 
         return rk;
@@ -2797,6 +2909,25 @@ fail:
 
         return NULL;
 }
+
+rd_kafka_t *rd_kafka_new(rd_kafka_type_t type, rd_kafka_conf_t *conf,
+                         char *errstr, size_t errstr_size) {
+        return rd_kafka_new0(type, conf, errstr, errstr_size, NULL, NULL);
+}
+
+rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
+                                            rd_kafka_byte_account_t *account,
+                                            char *errstr, size_t errstr_size) {
+        if (!confp || !account) {
+                if (errstr)
+                        rd_snprintf(errstr, errstr_size, "Missing native byte account or configuration pointer");
+                rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__INVALID_ARG, EINVAL);
+                return NULL;
+        }
+        return rd_kafka_new0(RD_KAFKA_PRODUCER, *confp, errstr, errstr_size,
+                             account, confp);
+}
+
 
 /**
  * Schedules a rebootstrap of the cluster immediately.

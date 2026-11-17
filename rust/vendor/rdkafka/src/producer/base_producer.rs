@@ -335,8 +335,8 @@ where
     Part: Partitioner,
     C: ProducerContext<Part>,
 {
-    client: Client<C>,
     queue: NativeQueue,
+    client: Client<C>,
     _partitioner: PhantomData<Part>,
 }
 

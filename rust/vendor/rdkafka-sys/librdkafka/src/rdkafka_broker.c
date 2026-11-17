@@ -1250,12 +1250,38 @@ void rd_kafka_broker_buf_enq_replyq(rd_kafka_broker_t *rkb,
                 rd_kafka_broker_buf_enq2(rkb, rkbuf);
 
         } else {
-                rd_kafka_op_t *rko    = rd_kafka_op_new(RD_KAFKA_OP_XMIT_BUF);
+                rd_kafka_op_t *rko = rd_kafka_op_new_accounted(
+                    RD_KAFKA_OP_SOURCE, RD_KAFKA_OP_XMIT_BUF, rkbuf->rkbuf_byte_account);
+                if (!rko) {
+                        rd_kafka_replyq_destroy(&rkbuf->rkbuf_replyq);
+                        rd_kafka_buf_callback(rkb->rkb_rk, rkb,
+                                              RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE,
+                                              NULL, rkbuf);
+                        return;
+                }
                 rko->rko_u.xbuf.rkbuf = rkbuf;
                 rd_kafka_q_enq(rkb->rkb_ops, rko);
         }
 }
 
+
+
+rd_kafka_resp_err_t rd_kafka_broker_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_q_t *queue, rd_kafka_resp_cb_t *completion, void *opaque) {
+        rd_kafka_replyq_t replyq = RD_ZERO_INIT;
+        rd_kafka_buf_t *request;
+        rd_kafka_resp_err_t err;
+        if (!completion)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        err = rd_kafka_buf_accounted_metadata(rkb, version, body, length, &request);
+        if (err)
+                return err;
+        if (queue)
+                replyq.q = rd_kafka_q_keep(queue);
+        rd_kafka_broker_buf_enq_replyq(rkb, request, replyq, completion, opaque);
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
 
 
 /**
@@ -1997,6 +2023,33 @@ err_parse:
 
 
 
+static rd_kafka_buf_t *
+rd_kafka_recv_buf_new(rd_kafka_byte_account_t *account) {
+        size_t charge = sizeof(rd_kafka_buf_t) +
+                        2 * RD_ROUNDUP(sizeof(rd_segment_t), 8) +
+                        RD_KAFKAP_RESHDR_SIZE;
+        rd_kafka_buf_t *frame;
+        if (!rd_kafka_byte_account_acquire(account, charge))
+                return NULL;
+        frame = rd_kafka_buf_new(2, RD_KAFKAP_RESHDR_SIZE);
+        frame->rkbuf_byte_account = account;
+        frame->rkbuf_byte_charge = account ? charge : 0;
+        rd_buf_write_ensure(&frame->rkbuf_buf, RD_KAFKAP_RESHDR_SIZE,
+                            RD_KAFKAP_RESHDR_SIZE);
+        return frame;
+}
+
+static rd_bool_t rd_kafka_recv_buf_grow(rd_kafka_buf_t *frame, size_t size) {
+        if (frame->rkbuf_byte_account) {
+                size_t extra = rd_buf_contig_extra_bytes(&frame->rkbuf_buf, size);
+                if (!rd_kafka_byte_account_acquire(frame->rkbuf_byte_account, extra))
+                        return rd_false;
+                frame->rkbuf_byte_charge += extra;
+        }
+        rd_buf_write_ensure_contig(&frame->rkbuf_buf, size);
+        return rd_true;
+}
+
 int rd_kafka_recv(rd_kafka_broker_t *rkb) {
         rd_kafka_buf_t *rkbuf;
         ssize_t r;
@@ -2016,13 +2069,10 @@ int rd_kafka_recv(rd_kafka_broker_t *rkb) {
         if (!(rkbuf = rkb->rkb_recv_buf)) {
                 /* No receive in progress: create new buffer */
 
-                rkbuf = rd_kafka_buf_new(2, RD_KAFKAP_RESHDR_SIZE);
-
+                rkbuf = rd_kafka_recv_buf_new(rkb->rkb_rk->rk_byte_account);
+                if (!rkbuf)
+                        goto budget_denied;
                 rkb->rkb_recv_buf = rkbuf;
-
-                /* Set up buffer reader for the response header. */
-                rd_buf_write_ensure(&rkbuf->rkbuf_buf, RD_KAFKAP_RESHDR_SIZE,
-                                    RD_KAFKAP_RESHDR_SIZE);
         }
 
         rd_dassert(rd_buf_write_remains(&rkbuf->rkbuf_buf) > 0);
@@ -2091,8 +2141,8 @@ int rd_kafka_recv(rd_kafka_broker_t *rkb) {
                          * the common response header). We want all
                          * data to be in contigious memory. */
 
-                        rd_buf_write_ensure_contig(&rkbuf->rkbuf_buf,
-                                                   rkbuf->rkbuf_totlen);
+                        if (!rd_kafka_recv_buf_grow(rkbuf, rkbuf->rkbuf_totlen))
+                                goto budget_denied;
                 }
         }
 
@@ -2107,6 +2157,11 @@ int rd_kafka_recv(rd_kafka_broker_t *rkb) {
         }
 
         return 1;
+
+budget_denied:
+        rd_snprintf(errstr, sizeof(errstr), "Native byte account exhausted");
+        err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+        goto err;
 
 err_parse:
         err = rkbuf->rkbuf_err;
@@ -2937,7 +2992,15 @@ void rd_kafka_broker_buf_retry(rd_kafka_broker_t *rkb, rd_kafka_buf_t *rkbuf) {
         /* If called from another thread than rkb's broker thread
          * enqueue the buffer on the broker's op queue. */
         if (!thrd_is_current(rkb->rkb_thread)) {
-                rd_kafka_op_t *rko    = rd_kafka_op_new(RD_KAFKA_OP_XMIT_RETRY);
+                rd_kafka_op_t *rko = rd_kafka_op_new_accounted(
+                    RD_KAFKA_OP_SOURCE, RD_KAFKA_OP_XMIT_RETRY, rkbuf->rkbuf_byte_account);
+                if (!rko) {
+                        rd_kafka_replyq_destroy(&rkbuf->rkbuf_replyq);
+                        rd_kafka_buf_callback(rkb->rkb_rk, rkb,
+                                              RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE,
+                                              NULL, rkbuf);
+                        return;
+                }
                 rko->rko_u.xbuf.rkbuf = rkbuf;
                 rd_kafka_q_enq(rkb->rkb_ops, rko);
                 return;
@@ -6196,6 +6259,8 @@ void rd_kafka_broker_decommission(rd_kafka_t *rk,
 
         rd_kafka_wrlock(rk);
 }
+
+#include "rdkafka_byte_account_test.h"
 
 /**
  * @name Unit tests

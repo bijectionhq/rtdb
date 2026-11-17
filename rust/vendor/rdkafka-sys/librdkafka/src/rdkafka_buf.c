@@ -33,6 +33,8 @@
 #include "rdkafka_interceptor.h"
 
 void rd_kafka_buf_destroy_final(rd_kafka_buf_t *rkbuf) {
+        rd_kafka_byte_account_t *account = rkbuf->rkbuf_byte_account;
+        size_t charge = rkbuf->rkbuf_byte_charge;
 
         switch (rkbuf->rkbuf_reqhdr.ApiKey) {
         case RD_KAFKAP_Metadata:
@@ -77,6 +79,7 @@ void rd_kafka_buf_destroy_final(rd_kafka_buf_t *rkbuf) {
         rd_refcnt_destroy(&rkbuf->rkbuf_refcnt);
 
         rd_free(rkbuf);
+        rd_kafka_byte_account_release(account, charge);
 }
 
 
@@ -137,11 +140,11 @@ void rd_kafka_buf_upgrade_flexver_request(rd_kafka_buf_t *rkbuf) {
  * @brief Create new request buffer with the request-header written (will
  *        need to be updated with Length, etc, later)
  */
-rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
+static rd_kafka_buf_t *rd_kafka_buf_new_request1(rd_kafka_broker_t *rkb,
                                           int16_t ApiKey,
                                           int segcnt,
                                           size_t size,
-                                          rd_bool_t is_flexver) {
+                                          rd_bool_t is_flexver, rd_bool_t contiguous) {
         rd_kafka_buf_t *rkbuf;
 
         /* Make room for common protocol request headers */
@@ -154,6 +157,8 @@ rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
         segcnt += 1; /* headers */
 
         rkbuf = rd_kafka_buf_new0(segcnt, size, 0);
+        if (contiguous)
+                rd_buf_write_ensure_contig(&rkbuf->rkbuf_buf, size);
 
         rkbuf->rkbuf_rkb = rkb;
         rd_kafka_broker_keep(rkb);
@@ -182,6 +187,53 @@ rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
 
         return rkbuf;
 }
+
+rd_kafka_buf_t *rd_kafka_buf_new_request0(rd_kafka_broker_t *rkb,
+                                          int16_t ApiKey,
+                                          int segcnt,
+                                          size_t size,
+                                          rd_bool_t is_flexver) {
+        return rd_kafka_buf_new_request1(rkb, ApiKey, segcnt, size, is_flexver,
+                                         rd_false);
+}
+
+rd_kafka_resp_err_t rd_kafka_buf_accounted_metadata(
+    rd_kafka_broker_t *rkb, int16_t version, const void *body, size_t length,
+    rd_kafka_buf_t **result) {
+        rd_kafka_byte_account_t *account = rkb->rkb_rk->rk_byte_account;
+        const rd_kafkap_str_t *client_id = rkb->rkb_rk->rk_client_id;
+        rd_bool_t flexible = version >= 9;
+        size_t header;
+        size_t fixed = sizeof(rd_kafka_buf_t) +
+                       2 * RD_ROUNDUP(sizeof(rd_segment_t), 8);
+        size_t charge;
+        rd_kafka_buf_t *request;
+        *result = NULL;
+        if (!account || version < 0 || version > 13 || (!body && length))
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        if (client_id->len < RD_KAFKAP_STR_LEN_NULL)
+                return RD_KAFKA_RESP_ERR__INVALID_ARG;
+        if (client_id->len > INT16_MAX)
+                return RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
+        header = (size_t)RD_KAFKAP_REQHDR_SIZE + 2 +
+                 (size_t)RD_KAFKAP_STR_LEN(client_id) + (flexible ? 2 : 0);
+        if (length > (size_t)INT32_MAX - header ||
+            length + header > SIZE_MAX - fixed)
+                return RD_KAFKA_RESP_ERR_MSG_SIZE_TOO_LARGE;
+        charge = fixed + header + length;
+        if (!rd_kafka_byte_account_acquire(account, charge))
+                return RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+        request = rd_kafka_buf_new_request1(rkb, RD_KAFKAP_Metadata, 1, length,
+                                            flexible, rd_true);
+        request->rkbuf_byte_account = account;
+        request->rkbuf_byte_charge = charge;
+        rd_kafka_buf_ApiVersion_set(request, version, 0);
+        if (length)
+                rd_kafka_buf_write(request, body, length);
+        *result = request;
+        return RD_KAFKA_RESP_ERR_NO_ERROR;
+}
+
 
 
 
@@ -478,7 +530,13 @@ void rd_kafka_buf_callback(rd_kafka_t *rk,
             response ? response->rkbuf_ts_sent : -1, err);
 
         if (err != RD_KAFKA_RESP_ERR__DESTROY && request->rkbuf_replyq.q) {
-                rd_kafka_op_t *rko = rd_kafka_op_new(RD_KAFKA_OP_RECV_BUF);
+                rd_kafka_op_t *rko = rd_kafka_op_new_accounted(
+                    RD_KAFKA_OP_SOURCE, RD_KAFKA_OP_RECV_BUF, request->rkbuf_byte_account);
+                if (!rko) {
+                        if (!err)
+                                err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                        goto direct;
+                }
 
                 rd_kafka_assert(NULL, !request->rkbuf_response);
                 request->rkbuf_response = response;
@@ -502,6 +560,7 @@ void rd_kafka_buf_callback(rd_kafka_t *rk,
                 return;
         }
 
+direct:
         if (request->rkbuf_cb)
                 request->rkbuf_cb(rk, rkb, err, response, request,
                                   request->rkbuf_opaque);

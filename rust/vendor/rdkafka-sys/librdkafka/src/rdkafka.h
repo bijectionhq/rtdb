@@ -250,6 +250,7 @@ const char *rd_kafka_get_debug_contexts(void);
 /* @cond NO_DOC */
 /* Private types to provide ABI compatibility */
 typedef struct rd_kafka_s rd_kafka_t;
+typedef struct rd_kafka_byte_account_s rd_kafka_byte_account_t;
 typedef struct rd_kafka_topic_s rd_kafka_topic_t;
 typedef struct rd_kafka_conf_s rd_kafka_conf_t;
 typedef struct rd_kafka_topic_conf_s rd_kafka_topic_conf_t;
@@ -3114,6 +3115,43 @@ rd_kafka_t *rd_kafka_new(rd_kafka_type_t type,
                          rd_kafka_conf_t *conf,
                          char *errstr,
                          size_t errstr_size);
+
+/**
+ * Creates a fixed byte account for producer receive frames and explicitly accounted native requests.
+ * The caller reserves capacity bytes before creating the account and keeps that reservation until account destruction returns.
+ * Returns NULL on allocation or monitor failure.
+ */
+RD_EXPORT
+rd_kafka_byte_account_t *rd_kafka_byte_account_new(size_t capacity);
+
+/**
+ * Returns the current live byte charge for a non-NULL account.
+ * Concurrent queries and client activity are supported while the account is alive.
+ */
+RD_EXPORT
+size_t rd_kafka_byte_account_used(rd_kafka_byte_account_t *account);
+
+/**
+ * Waits for attached clients and charged allocations to be released and destroys the account.
+ * The caller must prevent new clients and queries from starting and release any objects it owns before waiting.
+ * Independently retained allocations may be released by their own threads during this wait.
+ * A NULL account is accepted.
+ */
+RD_EXPORT
+void rd_kafka_byte_account_destroy(rd_kafka_byte_account_t *account);
+
+/**
+ * Creates a producer attached to a non-NULL account before its network threads start.
+ * A NULL *confp selects the default configuration.
+ * Sets *confp to NULL when the configuration is consumed, including a failed creation that joins started threads.
+ * On failure, returns NULL, sets the last error and writes errstr.
+ * A remaining non-NULL configuration belongs to the caller.
+ */
+RD_EXPORT
+rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
+                                            rd_kafka_byte_account_t *account,
+                                            char *errstr, size_t errstr_size);
+
 
 
 /**
