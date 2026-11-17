@@ -1,4 +1,5 @@
 use super::*;
+use crate::java_der::bit_layout;
 mod comparison;
 
 /// Immutable `X509Key` encoded-key normalization with independent allocation ownership.
@@ -97,17 +98,6 @@ fn emits_null(oid: &[u8]) -> bool {
         | [0x2b, 0x0e, 3, 2, 0x1a]
         | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2, 1..=10]
         | [0x60, 0x86, 0x48, 1, 0x65, 3, 4, 3, 13..=16])
-}
-
-// OpenJDK 25.0.1 DerValue.checkPaddedBits and BitArray(int, byte[], int) use signed wrapping arithmetic and the backing array's remaining length.
-fn bit_layout(padding: u8, bytes: usize, backing: usize) -> Result<(usize, u8)> {
-    if padding > 7 { return Err(malformed()); }
-    let bits = (bytes as i32).wrapping_mul(8).wrapping_sub(i32::from(padding));
-    if bits < 0 || (backing as i32).wrapping_mul(8) < bits { return Err(malformed()); }
-    let length = usize::try_from(bits.wrapping_add(7) / 8).map_err(|_| malformed())?;
-    if length > bytes { return Err(malformed()); }
-    let padding = ((length as i32).wrapping_mul(8) - bits) as u8;
-    Ok((length, padding))
 }
 
 #[cfg(test)]
