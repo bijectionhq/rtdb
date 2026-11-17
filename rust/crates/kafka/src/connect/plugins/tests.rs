@@ -197,3 +197,41 @@ fn predicate_open_failure_drops_preceding_predicates_in_reverse_opening_order() 
     assert!(error.message.as_deref().is_some_and(|message| message.contains("com.example.MissingPredicate")));
     assert_eq!(observed(&events), ["open a", "open z", "drop z", "drop a"]);
 }
+
+#[test]
+fn remaining_allocation_counts_new_and_retained_charges_without_counting_the_same_owner_twice() {
+    let memory = rtdb_columnar::MemoryBudget::new(64);
+    let mut context = super::ConversionContext::with_limit(Arc::clone(&memory), 32);
+    assert_eq!(context.allocation_remaining(), 32);
+    let owned = context.reserve(8).unwrap();
+    assert_eq!(context.allocation_remaining(), 24);
+    context.retain(Arc::clone(&owned)).unwrap();
+    assert_eq!(context.allocation_remaining(), 24);
+    let retained = memory.reserve(4).unwrap();
+    context.retain(Arc::clone(&retained)).unwrap();
+    assert_eq!(context.allocation_remaining(), 20);
+    assert!(context.reserve(21).is_err());
+    assert_eq!(context.allocation_remaining(), 20);
+    drop(context);
+    assert_eq!(memory.used_bytes(), 12);
+    drop(owned);
+    drop(retained);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn a_remaining_record_ceiling_does_not_authorize_an_exhausted_shared_budget() {
+    let memory = rtdb_columnar::MemoryBudget::new(16);
+    let held = memory.reserve(14).unwrap();
+    let mut context = super::ConversionContext::with_limit(Arc::clone(&memory), 32);
+    assert_eq!(context.allocation_remaining(), 32);
+    assert!(context.reserve(3).is_err());
+    assert_eq!(context.allocation_remaining(), 32);
+    let admitted = context.reserve(2).unwrap();
+    assert_eq!(context.allocation_remaining(), 30);
+    assert_eq!(memory.used_bytes(), 16);
+    drop(context);
+    drop(admitted);
+    drop(held);
+    assert_eq!(memory.used_bytes(), 0);
+}

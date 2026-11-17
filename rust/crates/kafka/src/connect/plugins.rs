@@ -19,6 +19,7 @@ impl ConversionContext {
     pub fn new(memory: Arc<MemoryBudget>) -> Self { let limit = memory.limit_bytes(); Self { memory, charges: Vec::new(), limit, reserved: 0, registry_key: None } }
     pub fn with_limit(memory: Arc<MemoryBudget>, limit: usize) -> Self { Self { memory, charges: Vec::new(), limit, reserved: 0, registry_key: None } }
     pub fn allocation_limit(&self) -> usize { self.limit }
+    pub(crate) fn allocation_remaining(&self) -> usize { self.limit - self.reserved }
     pub fn reserve(&mut self, bytes: usize) -> Result<Arc<MemoryReservation>> {
         let reserved = self.reserved.checked_add(bytes).filter(|bytes| *bytes <= self.limit).ok_or_else(|| error("batch-too-large", "Converter allocation exceeds its per-record limit"))?;
         let charge = self.memory.reserve(bytes)?; self.charges.push(Arc::clone(&charge)); self.reserved = reserved; Ok(charge)
