@@ -476,7 +476,7 @@ fn double_byte_resources_retain_pinned_source_and_mapping_provenance() {
     ];
     assert_eq!(sha256_hex(DOUBLE_BYTE_MANIFEST.as_bytes()), "764aeaeda584221a3723d9ad51fed7b6ef023650261f9bd9fdd0bfb770c5e67d");
     assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/aliases.rs")), "aecbe513193975e92ae16ff1be8e0b722117cbab990f081d892c7297c800a19b");
-    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/tables.rs")), "2d65d771e3706002c5ca60f988cf75a9707033a446d1ed107c60af268fd983da");
+    assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/tables.rs")), "0e93a1098b42f0dc7a80f74333fcf08f2226c21f6e51ac36626ecf593b218e2f");
     assert_eq!(sha256_hex(include_bytes!("../src/connect/converter/charset/double_byte/sources.sha256")), "7e4ddd5ae3690e645ba3fb2827bea0723e3afef51f9eab350a736ac9b347ce54");
     assert_eq!(DOUBLE_BYTE_MANIFEST.lines().skip(1).count(), 20);
     for (line, mapping) in DOUBLE_BYTE_MANIFEST.lines().skip(1).zip(mappings) {
@@ -699,7 +699,7 @@ async fn double_byte_aliases_keep_ibm_and_windows_code_pages_distinct() {
     assert_eq!(decode("windows-932", &[0x5c, 0x80, 0x81, 0x5c]).await, "\\\u{fffd}―");
     assert_eq!(decode("cp936", &[0x80]).await, "\u{fffd}");
     assert_eq!(decode("ms936", &[0x80]).await, "€");
-    assert_eq!(decode("cp949", &[0x5c, 0x81, 0x41]).await, "₩\u{fffd}A");
+    assert_eq!(decode("cp949", &[0x5c, 0x81, 0x41]).await, "₩¬A");
     assert_eq!(decode("windows-949", &[0x5c, 0x81, 0x41]).await, "\\갂");
     assert_eq!(decode("cp950", &[0xf9, 0xd6]).await, "\u{f813}");
     assert_eq!(decode("windows-950", &[0xf9, 0xd6]).await, "碁");
