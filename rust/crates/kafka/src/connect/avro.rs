@@ -11,6 +11,7 @@ mod datum;
 mod output;
 mod default_json;
 mod reader;
+mod names;
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;

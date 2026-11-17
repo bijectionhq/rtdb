@@ -1,0 +1,41 @@
+= Java names and borrowed record lookup
+
+link:../names.rs[The internal helpers] provide a call-local Java name policy, borrowed canonical name parts, a streaming scrub comparator, and borrowed record selection.
+They are prerequisites for the converter's ordered reference checks and allocation admission.
+The production parser and conversion routes do not select these helpers yet.
+The policy neither registers nor reads a process-global validator.
+
+Name validation uses the pinned link:README.adoc[UTF16 category data and source proof].
+Apache Avro 1.11.4 Schema.Name splits at the final dot, validates only the suffix, and uses the prefix in preference to a supplied namespace.
+Empty namespace suppresses inheritance; namespace text is otherwise preserved.
+The native scoped policy returns an explicit empty namespace for global names so subsequent qualification retains that identity.
+Borrowed name parts expose checked owned-text and fullname payload lengths; container headers, repeated namespace copies, and other conversion allocations remain the caller's admission responsibility.
+This policy alone does not impose Java's ordered canonical-reference grammar or primitive declaration-name restrictions.
+
+Confluent 7.8.0 AvroData.doScrubName first preserves an already valid ASCII identifier.
+Otherwise it invokes Java URLEncoder with UTF8, prefixes x when the encoded first character is a digit, and replaces each non-ASCII-word encoded character with underscore.
+For valid Rust strings, the internal iterator emits the same composition without a heap buffer: letters, digits and underscore pass through; URL-safe punctuation and space become underscore; other UTF8 bytes become underscore plus two uppercase hex digits.
+For example, é becomes _C3_A9, plus becomes _2B, and a leading digit gains x.
+An empty input remains empty, and a disabled scrub flag preserves every input byte.
+
+AvroData.toConnectData's IndexedRecord branch iterates destination Connect fields, scrubs each lookup name, obtains the exact raw source field, and reads its position.
+Selection keeps that source child's physical schema with its borrowed value.
+Several destinations may therefore select the same source child.
+Output field names remain the destination names.
+The native selector scans record.fields directly because the native record.lookup index also contains field aliases; Java's raw field lookup does not substitute those aliases.
+The actual-schema/value labels and lengths are checked before positional selection.
+
+== Sources and retained notices
+
+link:selector-sources.sha256[The selector manifest] pins the complete inspected Confluent AvroData and Java URLEncoder source bytes.
+The Confluent source is the 7.8.0 https://packages.confluent.io/maven/io/confluent/kafka-connect-avro-data/7.8.0/kafka-connect-avro-data-7.8.0-sources.jar[source artifact]; relevant methods are doScrubName and toConnectData's Map/IndexedRecord cases.
+The JDK source is java.base/java/net/URLEncoder.java from the same digest-pinned src.zip as the category artifact; its ASCII safe set, UTF8 encoder and uppercase hex emission determine the comparator spelling.
+link:SELECTOR-COPYRIGHT[The original source headers] retain their exact bytes.
+The existing link:LICENSE-APACHE[Apache license] covers the Confluent source, and the existing link:LICENSE[JDK license], link:ASSEMBLY_EXCEPTION[assembly exception] and link:ADDITIONAL_LICENSE_INFO[additional license information] accompany URLEncoder.
+
+The category link:sources.sha256[manifest] already pins Apache Avro 1.11.4 Schema.java and the Character/CharacterData implementations consulted for simple names, namespace construction and reference candidates.
+The native RecordSchema, field alias index and scoped policy interface are preserved under link:../../../../../../vendor/apache-avro/UPSTREAM.json[the vendored Apache Avro source manifest] and its link:../../../../../../vendor/apache-avro/RTDB-PATCHES.adoc[local scoped API reference].
+These source dependencies are separate from the generated category-output manifest; adding selector provenance does not regenerate or change that artifact.
+
+Regression sources compare all 65,536 name units with independent Unicode expectations and cover namespace rules, global isolation, raw field aliases, URL-encoding spellings, duplicate selected-child identity, physical source type and missing raw fields.
+No Java/Rust execution or runtime behavior claim follows from this source-only prerequisite.
