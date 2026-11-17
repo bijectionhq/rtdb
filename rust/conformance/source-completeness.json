@@ -258,6 +258,28 @@
       "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context and configuration storage, ordered configuration/mode, exact-unit literal-decoder and private tree-JSON foundations with actual DFA roots, adaptive prediction, closure/DFA insertion semantics, shared-cache ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
     },
     {
+      "id": "source-signed-binary-width",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "types_columnar_durable_formats",
+        "sql_xtql_execution",
+        "client_read"
+      ],
+      "requirement": "Preserve source-native FixedSizeBinary signed constructor parameters independently of checked SDK schema admission: negative widths retain successful type/field metadata and byte-write prefixes; implement signed write/copy/read demands and distinguish the negative MemorySegment reinterpretation size failure from Arrow bounds failures, including exact retained owner and span lifetimes."
+    },
+    {
+      "id": "embedded-parser-error-capability",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "sql_xtql_execution",
+        "client_operational_surfaces",
+        "client_read"
+      ],
+      "requirement": "Reconcile supported embedded SQL errors whose RecognitionException cause exposes the recognizer and shared mutable DFA/configuration objects with the native exception projection: preserve required observable behavior/capability or a concrete migration consistent with the reviewed binding design, retain source assertion cases, and enforce any private native-cache no-escape premise separately before production parsing or compatibility closure. Trace in-process causes separately from serialized pgwire/Flight diagnostics."
+    },
+    {
       "id": "planning-allocation",
       "kind": "implementation",
       "status": "open",

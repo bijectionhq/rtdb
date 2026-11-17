@@ -862,3 +862,30 @@ Public serialization, canonical exact-text tree ownership, semantic producers, h
 
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+== Borrowed raw forms and source-domain findings
+
+Raw-form metadata, SQL classification, host compilation, explain rendering and private recipe JSON share immutable borrowed views of the existing owners.
+Child and iterator borrows retain the original source lifetime without copying a subtree or collecting intermediate views.
+Raw syntax collections remain distinct from physical literal collections at host admission and rendering boundaries.
+The sealed physical leaf view excludes strings, keywords and recursive containers; its private JSON adapter uses the existing independently closed serializer guard.
+Independent source review covers 14 added regression sources and preservation of existing host identity, metadata and JSON assertions.
+The owned constructors and serialization traits retain their existing contracts.
+Canonical exact-unit ownership, semantic producers, external codecs and production exposure remain required.
+The mutable scalar state module moved while preserving its implementation and the existing test assertions.
+Container writers and their complete source constructor, getter, promotion and copy dependencies remain required.
+
+The pinned direct FixedSizeBinary constructor accepts negative signed widths and retains them in type and field metadata.
+A width of -1 permits an actual byte append before the count advances; a later byte getter fails at Java25 MemorySegment reinterpretation with a negative size.
+The current native scalar constructor rejects that identity at strict schema admission.
+A separate source-native declaration, signed-width kernels and exact reader failure boundary are required while checked SDK admission retains its contract.
+
+Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
+That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
+The current native exception projection carries no such cause capability.
+Before production parser integration or compatibility closure, preserve the required observable behavior or record a concrete migration consistent with the reviewed embedded-binding design.
+A private native cache may rely on its separately enforced nonescaping configuration boundary; that premise does not settle the embedded compatibility requirement.
+Serialized wire diagnostics and in-process exception capabilities require separate source assertions.
+
+All regression sources remain unexecuted by this workflow.
+The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
