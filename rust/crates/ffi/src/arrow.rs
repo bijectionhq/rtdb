@@ -179,7 +179,8 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
         } else { Ok(field) }
     })?;
     if decimals.next().is_some() { return Err(super::invalid("Unused decimal C schema parameters")); }
-    let imported = unsafe { from_ffi(array, &carrier) }.map_err(arrow_error)?;
+    let native_schema = FFI_ArrowSchema::try_from(&fields).map_err(arrow_error)?;
+    let imported = unsafe { from_ffi(array, &native_schema) }.map_err(arrow_error)?;
     imported.validate_full().map_err(arrow_error)?;
     if !matches!(imported.data_type(), DataType::Struct(_)) { return Err(super::invalid("Arrow bind requires a record-batch struct")); }
     let array = StructArray::from(imported);
