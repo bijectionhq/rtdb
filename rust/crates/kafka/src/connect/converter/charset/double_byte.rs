@@ -1,6 +1,7 @@
 mod aliases;
 pub(super) mod big5;
 pub(super) mod ebcdic;
+pub(super) mod euc_jp;
 pub(super) mod hkscs;
 pub(super) mod subclasses;
 mod tables;

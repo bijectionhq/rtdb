@@ -1,0 +1,66 @@
+= Java 25 EUC-JP character mappings
+
+The String converter supports `EUC-JP`, `x-euc-jp-linux`, and `x-eucJP-Open`, with 14 distinct case-insensitive registered names.
+link:charsets.tsv[The charset manifest] records each canonical name, class, source hash, decoder variant, aliases, and decoded probe digests.
+link:mappings.tsv[The mapping manifest] records the five source tables, their hashes, resource sizes, row counts, and mapping digests.
+
+`Charset::EucJp` contains a passive immutable `EucJp` variant.
+The input cursor and UTF8 output belong to one decode call, with no state retained across records or converters.
+The variant borrows process-lifetime immutable mapping resources occupying 47,104 bytes.
+JIS0201, JIS0208, and JIS0212 retain the bytes already used by the corresponding standalone decoders in separate resources.
+The existing String scalar memory admission precedes decoding, and the output reserves at most three UTF8 bytes per input byte.
+Java's decoder holders initialize immutable tables and have no process-wide mapping updates.
+
+== Prefixes, mapping selection, and replacement boundaries
+
+OpenJDK25 `String(byte[], Charset)` uses the `CharsetDecoder` replacement path for this family.
+`EUC_JP.Decoder` implements `DelegatableDecoder` and does not implement `ArrayDecoder`.
+String invokes decoding with `endOfInput` true and enables replacement for both malformed and unmappable input.
+
+ASCII bytes pass through unchanged, including backslash, tilde, controls, and escape.
+SS2 (0x8E) consumes two bytes and maps the second through JIS0201 when it is at least 0x80.
+This preserves halfwidth U+FF61 through U+FF9F for trails 0xA1 through 0xDF.
+SS3 (0x8F) consumes three bytes and maps the last two through JIS0212 after subtracting 0x80 from each.
+Other bytes with the high bit set consume a pair through JIS0208 with the same 0x80 subtraction.
+
+`x-euc-jp-linux` replaces every complete SS3 triple because its decoder has no JIS0212 mapping.
+`x-eucJP-Open` uses the full Solaris JIS0212 table for SS3 and tries the Solaris JIS0208 additions only when the ordinary pair decoder returns unmappable.
+The Solaris JIS0208 table adds 457 mappings, including 0xADA1 to U+2460, and shares one equal mapped entry with the base table.
+The Solaris JIS0212 table retains 6,067 base mappings and adds 106 entries, including 0x8FF3F3 to U+2170.
+Loading the Solaris variant does not mutate the ordinary or Linux mappings.
+
+A complete unmappable pair produces one replacement and consumes both bytes, even when the second byte is ASCII, NUL, or another prefix.
+A complete unmappable SS3 triple produces one replacement and consumes all three bytes.
+Terminal underflow produces one replacement for the entire remaining prefix and its available trail, so `[0x8F, 0x41]` is one replacement rather than a replacement followed by `A`.
+Every record starts independently; a prefix at one record's end cannot combine with bytes in a later record.
+
+== Source provenance and resource format
+
+Resources derive from the Eclipse Temurin OpenJDK `25.0.1+8` Linux x64 JDK archive.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The supporting source manifest] pins provider ownership, the three decoder constructors, shared decoding helpers, and the String/CharsetDecoder replacement path.
+link:COPYRIGHT[Copyright notices] retain the upstream headers byte-for-byte, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception], and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+The four pair resources use the immutable `Mapping` format described in link:../README.adoc[the double-byte reference]: two trail-bound bytes, 256 single-byte units, 256 row indices, then compact pair rows.
+Their trail range is 0x21 through 0x7E and all single-byte entries are U+FFFD.
+The JIS0201 resource contains 256 big-endian UTF16 units in unsigned byte order.
+All source character units are BMP values without surrogate units.
+The row-index marker 0xFFFF occupies a separate field from the unmapped character marker U+FFFD.
+
+== Reproduction and regression sources
+
+link:derive.py[The Python standard-library derivation] reads archive members and Java source text only:
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-euc-jp
+----
+
+It verifies archive hashes, decoder constructors and helper calls, mapping-holder initialization, table dimensions, surrogate exclusions, and exact provider alias ownership.
+The single-byte digest concatenates all 256 bytes decoded as independent records.
+The raw-pair digest concatenates all 65,536 two-byte records in unsigned order, appending U+0000 to each decoded result.
+The two triple digests cover those same pairs with an initial SS2 or SS3 byte in each independent record.
+Regression sources append separators to decoded results because an input zero may be consumed inside a pair or triple.
+
+Regression sources cover every canonical name and alias in original and uppercase spelling, all single bytes, pairs and prefix triples, Japanese text, halfwidth and distinct JIS symbols, Solaris additions, Linux JIS0212 rejection, malformed groups, terminal truncations, record independence, null values, configuration, and memory admission.
+They also retain equality assertions against the existing standalone JIS0201, JIS0208, and JIS0212 mapping resources.
