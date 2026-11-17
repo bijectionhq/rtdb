@@ -51,7 +51,7 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance and CDC have recorded source traces; Azure credentials and Kafka configuration paths still have implementation gaps.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations; Kafka ConfigProvider substitution, shipped client adapters, and Avro naming/conversion admission still require implementation and final source reconciliation.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",

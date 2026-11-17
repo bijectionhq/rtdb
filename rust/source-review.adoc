@@ -394,7 +394,8 @@ No Rust compiler, formatter, build script, test runner, server, benchmark, Gradl
 The native Azure managed-identity adapter covers App Service, Service Fabric, Cloud Shell, Arc, and IMDS endpoint protocols with bounded responses and retries.
 The default bridge distinguishes unavailable credentials from authentication failure, including unsupported client selectors and the pinned JSON error-envelope classification.
 Arc challenge reads belong to the database I/O region; Unix nonblocking open and regular-file validation reject FIFOs before reading.
-Independent source review of those repairs is clear; desktop-cache credentials and runtime qualification remain pending.
+Independent source review of those repairs is clear; subsequent desktop-cache and environment-password sources are in `crates/azure/src/desktop.rs` and its cache, password and federation modules.
+Their regression sources and runtime qualification remain unexecuted by this workflow.
 
 SQL CONCAT now stringifies arguments and replaces null with empty text, while the strict scalar concat and concatenation operator retain their own semantics.
 Unused and overwritten SETTING forms preserve syntactic validation and lexical parameter requirements without premature scalar typing.
@@ -801,7 +802,7 @@ The complete pinned KnownOIDs source registry yields exactly five reverse OIDs a
 The evaluator distinguishes a caught Java IOException from a successful name without a reverse OID, while unchecked magnitude overflow and native resource failures propagate.
 CRT parameter retention and non-CRT name-based reconstruction retain their distinct source behavior under admitted ownership.
 Independent review covers the iterative frame bound, failure ordering, regression sources, unchanged prior inputs, and source-derived name tables.
-SunX509 JKS raw parsing, AlgorithmParameters initialization, and provider-specific KeyFactory fallback still require integration through their separate recovery boundary.
+The later key-recovery integration and its remaining native-provider qualification are recorded in the Kafka registry, Avro admission and key-recovery checkpoint below.
 Avro Java name policy, scrubbed field lookup, specific/reflection adapters, and shipped-classpath reconciliation remain open adapter work.
 The regression sources added by these slices remain unexecuted under the Phase 1 work order.
 This checkpoint does not close the source-completeness gate or establish runtime compatibility.
@@ -889,3 +890,43 @@ Serialized wire diagnostics and in-process exception capabilities require separa
 
 All regression sources remain unexecuted by this workflow.
 The source-completeness gate remains false; compilation, runtime discovery and Phase 2 qualification remain unrun.
+
+== Kafka registry, Avro admission and key-recovery source checkpoint
+
+SunX509 JKS recovery parses and initializes the raw PKCS8 key before selecting an available key factory.
+Only typed NoSuchAlgorithm and InvalidKeySpec outcomes permit raw fallback; unchecked parameter failures and native admission failures propagate.
+Raw and provider scratch reservations overlap their actual input owners, and cached entries retain the resulting key and certificate charges independently.
+Strict PKCS12 preparation instead completes its original outer framing and OID-only factory selection before provider validation, with no raw fallback.
+Independent source review covers the raw-first and strict-order regression sources, failure categories, repeated alias recovery, retained owners and all 59 pinned private-key source hashes and notice prefixes.
+Native TLS import and provider execution remain unqualified.
+
+Registry reference traversal follows list-order depth-first insertion, including version lookup and latest-version replacement before a repeated-name check.
+Reference subjects use the fetched parent subject for context qualification; initial provider roots retain their null parent origin.
+Missing and null HTTP reference lists become empty lists, while null members remain ordered positions and fail only when traversal demands them.
+Typed list storage is admitted before deserialization, and retained document accounting includes reference-slot and string capacities that serialization can omit.
+The immutable reference owner supplies both indexed lookup and dependency-ordered text iteration.
+Full parse and datum failure timing before subject-version lookup, canonical lookup bodies, persistent version caches and remaining response coercions still require implementation.
+
+Java Avro naming prerequisites now include the pinned BMP category artifact, borrowed canonical name parts and raw-field selectors with streaming Confluent scrub comparison.
+The category fixture covers all 65,536 Java char units; selectors retain the selected child's actual schema/value and can read the same physical child more than once.
+These primitives remain inactive in the production parser and conversion route.
+An additive graph finisher borrows metadata views and admits traversal storage, metadata/default copies and final graph/root/child publication before construction.
+The caller must retain every reservation through the published graph's lifetime, including cached plans that survive a conversion context.
+The existing production graph route remains unchanged until exact default and conversion demand are integrated.
+An inactive ordered canonical-name gate validates dependency-first declarations, self references, alias exclusion and the distinct textual/object namespace fallback rules.
+Its regression sources include duplicate-field checks after all field schemas have been walked.
+Java policy activation and branch-specific default lookup still require complete conversion/default admission.
+
+Static inspection identifies 26 concrete stock transform classes, three predicates and the node's three stock row-converter classes in the declared Kafka/Confluent dependency artifacts.
+The dispatcher rejects the twelve nonexistent Key/Value suffixes on whole-record transforms before validating their options; explicit native factory overrides retain precedence.
+Assignment startup opens distinct referenced predicates in first-use order before opening transforms in declaration order.
+Failed startup releases successful opens in reverse order, while a published chain releases transforms in step order and distinct predicates in first-use order.
+The chain owns stable predicate slots, and a private opening guard moves its two buffers into the completed owner without retaining an alias index.
+These orders apply to normally returning Rust destructors; original cleanup-count and new event-trace assertions have native regression sources.
+This inventory establishes candidate class declarations and packaging routes, while effective shaded-image classpaths and dependency linkage require Phase 2.
+ConfigProvider substitution, the common-name logging SSL factory, DLQ round-robin partitioning, broker login/callback mechanisms and Java regex behavior in the reached plugins remain concrete adapter work.
+Specific/reflection Avro adapters, broader parser/Java-string behavior and operator-provided extensions remain separate compatibility obligations.
+
+Independent reviews cover the bounded source changes and preservation of the existing assertions.
+This workflow has executed none of the new regression sources or the Phase 2 qualification matrix.
+The implementation revision remains unset and the source-completeness gate remains false.
