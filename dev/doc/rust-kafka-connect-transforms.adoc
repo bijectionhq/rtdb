@@ -1,0 +1,25 @@
+= Kafka Connect transform class names
+
+Each `transforms.<alias>.type` value names a concrete transform by its fully qualified, case-sensitive Java binary name.
+The assignment uses the native factory registered for that exact name when one exists.
+Otherwise it looks up the name among the built-in Kafka transforms.
+
+The built-in classes use the package `org.apache.kafka.connect.transforms`.
+These ten transform families require `$Key` or `$Value` after the class name to select the part of the record to transform.
+
+* `Cast`, `ExtractField`, `Flatten`, `HeaderFrom`, `HoistField`
+* `InsertField`, `MaskField`, `ReplaceField`, `SetSchemaMetadata`, `TimestampConverter`
+
+For example, `org.apache.kafka.connect.transforms.ExtractField$Value` extracts a field from the record value.
+The six whole-record classes are `DropHeaders`, `Filter`, `InsertHeader`, `RegexRouter`, `TimestampRouter` and `ValueToKey`.
+Adding `$Key` or `$Value` to one of these names fails built-in lookup with `xtdb.kafka-connect-source/plugin-class-not-found` before the transform validates its options.
+
+The Kotlin loader passes the configured name directly to `Class.forName`, checks that it implements `Transformation` and calls its no-argument constructor.
+Bare names of the ten key/value families identify abstract classes and fail at construction on the JVM.
+The native dispatcher also rejects these bare names and reports `plugin-class-not-found`.
+
+== Reference
+
+The Kotlin loader is in `modules/kafka/src/main/kotlin/xtdb/kafka/connectsrc/ConnectConfig.kt` at XTDB revision `c84f9334eb060ceb92d28ecdd4a06e6b625932fd`.
+The 26 concrete names come from `META-INF/services/org.apache.kafka.connect.transforms.Transformation` in `org.apache.kafka:connect-transforms:4.4.0`.
+The descriptor has SHA-256 `fb6190fa07666a3afcadbed2534c4f7cbd08e726db638868423defa0e8d67eb1`.

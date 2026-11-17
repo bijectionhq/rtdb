@@ -29,6 +29,9 @@ fn list(options: &BTreeMap<String, String>, key: &str) -> Vec<String> { options.
 pub(super) fn open(spec: &PluginSpec, environment: Arc<super::DateEnvironment>) -> Result<Box<dyn Transform>> {
     let class = spec.class_name.strip_prefix("org.apache.kafka.connect.transforms.").ok_or_else(|| error("plugin-class-not-found", &spec.class_name))?;
     let (name, key) = class.strip_suffix("$Key").map(|name| (name, true)).or_else(|| class.strip_suffix("$Value").map(|name| (name, false))).unwrap_or((class, false));
+    if name != class && matches!(name, "DropHeaders" | "Filter" | "InsertHeader" | "RegexRouter" | "TimestampRouter" | "ValueToKey") {
+        return Err(error("plugin-class-not-found", &spec.class_name));
+    }
     if matches!(name, "ExtractField" | "HoistField" | "ReplaceField" | "SetSchemaMetadata" | "HeaderFrom" | "InsertField" | "Cast" | "Flatten" | "MaskField" | "TimestampConverter") && name == class { return Err(error("plugin-class-not-found", "Transform requires its concrete Key or Value class")); }
     let options = &spec.options;
     if name == "Cast" { return cast::open(options, key, environment); }

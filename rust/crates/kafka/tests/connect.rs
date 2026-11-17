@@ -15,6 +15,93 @@ fn properties() -> BTreeMap<String, String> { BTreeMap::from([
     ("value.converter".into(), "org.apache.kafka.connect.json.JsonConverter".into()),
     ("value.converter.schemas.enable".into(), "false".into()),
 ]) }
+
+fn transform_config(class: &str, options: &[(&str, &str)]) -> ConnectConfig {
+    let mut properties = properties();
+    properties.insert("transforms".into(), "step".into());
+    properties.insert("transforms.step.type".into(), class.into());
+    for &(key, value) in options {
+        properties.insert(format!("transforms.step.{key}"), value.into());
+    }
+    ConnectConfig::parse(&properties).unwrap()
+}
+
+const STOCK_TRANSFORMS: &[(&[&str], &[(&str, &str)])] = &[
+    (&["Cast$Key", "Cast$Value"], &[("spec", "int32")]),
+    (&["DropHeaders"], &[("headers", "id")]),
+    (&["ExtractField$Key", "ExtractField$Value"], &[("field", "id")]),
+    (&["Filter"], &[]),
+    (&["Flatten$Key", "Flatten$Value"], &[]),
+    (&["HeaderFrom$Key", "HeaderFrom$Value"], &[("fields", "id"), ("headers", "id"), ("operation", "copy")]),
+    (&["HoistField$Key", "HoistField$Value"], &[("field", "id")]),
+    (&["InsertField$Key", "InsertField$Value"], &[("topic.field", "source")]),
+    (&["InsertHeader"], &[("header", "id"), ("value.literal", "1")]),
+    (&["MaskField$Key", "MaskField$Value"], &[("fields", "id")]),
+    (&["RegexRouter"], &[("regex", "events"), ("replacement", "records")]),
+    (&["ReplaceField$Key", "ReplaceField$Value"], &[]),
+    (&["SetSchemaMetadata$Key", "SetSchemaMetadata$Value"], &[("schema.name", "Event")]),
+    (&["TimestampConverter$Key", "TimestampConverter$Value"], &[("target.type", "unix")]),
+    (&["TimestampRouter"], &[]),
+    (&["ValueToKey"], &[("fields", "id")]),
+];
+
+#[test]
+fn all_concrete_kafka_transformation_classes_open_by_their_binary_names() {
+    let registry = PluginRegistry::default();
+    let environment = environment();
+    for &(names, options) in STOCK_TRANSFORMS {
+        for name in names {
+            let class = format!("org.apache.kafka.connect.transforms.{name}");
+            registry.chain_with_environment(&transform_config(&class, options), environment.clone())
+                .unwrap_or_else(|error| panic!("{class}: {error}"));
+        }
+    }
+}
+
+#[test]
+fn whole_record_transform_suffixes_fail_class_lookup_before_option_validation() {
+    let registry = PluginRegistry::default();
+    let environment = environment();
+    for name in ["DropHeaders", "Filter", "InsertHeader", "RegexRouter", "TimestampRouter", "ValueToKey"] {
+        for suffix in ["$Key", "$Value"] {
+            let class = format!("org.apache.kafka.connect.transforms.{name}{suffix}");
+            let error = registry.chain_with_environment(&transform_config(&class, &[]), environment.clone())
+                .err().unwrap_or_else(|| panic!("{class} opened"));
+            assert_eq!(error.code, "xtdb.kafka-connect-source/plugin-class-not-found", "{class}");
+            assert!(error.message.as_deref().is_some_and(|message| message.contains(class.as_str())), "{class}: {error}");
+        }
+    }
+}
+
+#[test]
+fn abstract_transform_classes_require_a_concrete_key_or_value_class() {
+    let registry = PluginRegistry::default();
+    let environment = environment();
+    for &(names, options) in STOCK_TRANSFORMS {
+        if let Some(name) = names[0].strip_suffix("$Key") {
+            let class = format!("org.apache.kafka.connect.transforms.{name}");
+            assert!(registry.chain_with_environment(&transform_config(&class, options), environment.clone()).is_err(), "{class}");
+        }
+    }
+}
+
+#[test]
+fn an_explicit_transform_factory_is_selected_before_stock_class_lookup() {
+    use rtdb_kafka::connect::{Transform, TransformFactory};
+
+    struct Factory;
+    impl TransformFactory for Factory {
+        fn open(&self, _: &BTreeMap<String, String>) -> rtdb_types::Result<Box<dyn Transform>> {
+            Err(rtdb_types::Anomaly::incorrect("test/factory-option-error", "Factory requires options"))
+        }
+    }
+
+    let class = "org.apache.kafka.connect.transforms.Filter$Key";
+    let registry = PluginRegistry::default().with_transform(class.into(), std::sync::Arc::new(Factory)).unwrap();
+    let error = registry.chain_with_environment(&transform_config(class, &[]), environment()).err().unwrap();
+    assert_eq!(error.code, "test/factory-option-error");
+}
+
 #[test]
 fn closed_config_namespace_preserves_plugin_options_and_validates_aliases() {
     let mut values = properties();
