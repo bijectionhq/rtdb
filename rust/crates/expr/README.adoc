@@ -488,6 +488,8 @@ Stored Transit TableRef values construct unrestricted schema and table strings t
 Null schema defaults to `public`, null table becomes empty text, and flat list destructuring preserves array-map duplicate handling without hash promotion.
 The complete schema/table pair owns equality, Java hashing and canonical Transit output.
 Scalar names use Java object text; collection names use readable Clojure forms, including numeric suffixes and registered print methods.
+The passive semantic-text kernel writes borrowed scalar views and collection punctuation through a fallible sink; the stored-object buffer retains its caller's required allocation scope and reserves before growth.
+Host text still uses its separate optional-scope admission and 16MiB limit; host collection and function rendering remain required work.
 ByteBuffer aliases retain the identity used by default readable printing while content equality and wire output remain byte-based.
 The pure text adapter assumes the default Clojure print bindings and enabled Java time literals.
 Legacy Date text still requires a caller-owned process default-zone/calendar provider, and readable ExceptionInfo output still requires construction-stack semantics; those valid name inputs currently report explicit unsupported errors.

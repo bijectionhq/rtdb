@@ -87,6 +87,21 @@ fn table_text_distinguishes_scalar_to_string_from_readable_collection_elements()
 }
 
 #[test]
+fn table_text_preserves_escapes_named_characters_and_nested_collection_order() {
+    for json in [false,true] {
+        let raw = "\n\t\r\"\\\u{c}\u{8}é😀";
+        let characters = ['\n','\t',' ','\u{8}','\u{c}','\r','é'].into_iter().map(|value|tag("c",text(&value.to_string()))).collect();
+        let value = T::Array(vec![
+            text(raw),T::Array(characters),
+            tag("list",T::Array(vec![T::Map(vec![(keyword("b"),T::Bool(false)),(keyword("a"),T::Null)])])),
+            tag("set",T::Array(vec![T::Null])),T::Symbol("ns/x".into()),
+        ]);
+        let expected = r#"["\n\t\r\"\\\f\bé😀" [\newline \tab \space \backspace \formfeed \return \é] ({:b false, :a nil}) #{nil} ns/x]"#;
+        assert_eq!(selected(table(text(raw),value),json).unwrap(),table(text(raw),text(expected)));
+    }
+}
+
+#[test]
 fn table_names_use_registered_objects_custom_string_and_print_methods() {
     for json in [false,true] {
         for (value,scalar,readable) in [
