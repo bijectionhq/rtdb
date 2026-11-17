@@ -5,8 +5,8 @@ use rtdb_columnar::{MemoryReservation, estimate_read_value_bytes, read_value};
 use rtdb_format::database::proto::DatabaseConfig;
 use rtdb_maintenance::CollectionObserver;
 use rtdb_node::{AutonomousTxOptions, DatabaseAccess, LogAccess, NativeResources, NativeSession, Node, NodeOptions, NodeServices, ResourceFactory, SessionIdentity};
-use rtdb_plan::{Catalog, CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers, Identifier, QualifiedTable, Relation, Statement, TableBinding};
-use rtdb_query::{PreparedQuery, QueryContext};
+use rtdb_plan::{Catalog, CatalogMetric, CatalogMetrics, CatalogRows, CatalogUser, CatalogUsers, Identifier, QualifiedTable, Statement, TableBinding};
+use rtdb_query::PreparedQuery;
 use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail};
 use rtdb_tx::{Documents, TransactionAuthorization, TxOp};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit, Timestamp, Value};
@@ -16,6 +16,8 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::{Arc, atomic::{AtomicI64, Ord
 use tokio_util::sync::CancellationToken;
 
 use super::{Error, Options, Record, format};
+
+mod dependencies;
 
 struct Identity;
 impl TransactionAuthorization for Identity { fn check_role_membership(&self, _: &str, _: Option<&str>) -> Result<()> { Ok(()) } }
@@ -174,7 +176,7 @@ impl Engine {
         let catalog = HiddenIdCatalog { delegate: &context.catalog, hide: !options.direct_sql };
         let mut prepared = rtdb_sql::prepare(sql, &catalog, &rtdb_sql::PrepareOptions { default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..rtdb_sql::PrepareOptions::default() })?;
         let Statement::Query(relation) = prepared.statement else { return Err(Anomaly::incorrect("xtdb/not-a-query", "Statement is not a query")); };
-        let relation = if options.direct_sql { relation } else { restore_dependencies(&relation, &context)? };
+        let relation = if options.direct_sql { relation } else { dependencies::restore_dependencies(&relation, &context.catalog)? };
         prepared.statement = Statement::Query(relation);
         let mut cursor = PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context.clone(), vec![]).await?;
         let mut bytes = cursor.schema().fields().iter().try_fold(8192usize, |bytes, field| {
@@ -227,19 +229,6 @@ impl Catalog for HiddenIdCatalog<'_> {
     fn tables(&self, database: &str) -> Result<Vec<TableBinding>> { Ok(self.delegate.tables(database)?.into_iter().map(|binding| self.filter(binding)).collect()) }
 }
 
-fn restore_dependencies(relation: &Relation, context: &QueryContext) -> Result<Arc<Relation>> {
-    fn visit(value: &mut Json, catalog: &dyn Catalog) -> Result<()> {
-        if let Some(table) = value.get_mut("node").and_then(|node| node.get_mut("Scan")).and_then(|scan| scan.get_mut("table")) {
-            let binding: TableBinding = serde_json::from_value(table.clone()).map_err(|error| gap(&error.to_string()))?;
-            *table = serde_json::to_value(catalog.table(&binding.name)?.ok_or_else(|| gap("Prepared table disappeared from its own snapshot"))?).map_err(|error| gap(&error.to_string()))?;
-        }
-        match value { Json::Object(fields) => { for child in fields.values_mut() { visit(child, catalog)?; } }, Json::Array(values) => { for child in values { visit(child, catalog)?; } }, _ => {} }
-        Ok(())
-    }
-    let mut value = serde_json::to_value(relation).map_err(|error| gap(&error.to_string()))?;
-    visit(&mut value, &context.catalog)?;
-    Ok(Arc::new(serde_json::from_value(value).map_err(|error| gap(&error.to_string()))?))
-}
 fn object_name(name: &ast::ObjectName) -> Result<String> {
     let parts = name.0.iter().map(|part| part.as_ident().map(|identifier| Identifier { text: identifier.value.clone(), quoted: identifier.quote_style.is_some() }.normalized()).ok_or_else(|| gap("Non-identifier object name"))).collect::<Result<Vec<_>>>()?;
     Ok(parts.join("."))
