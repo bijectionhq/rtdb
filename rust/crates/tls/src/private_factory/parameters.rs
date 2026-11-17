@@ -8,14 +8,14 @@ enum DigestName { Oid(Zeroizing<Vec<u8>>), Pbes2(pbes2::Name), Unmapped }
 
 pub(super) struct Pss { digest: DigestName, mgf_digest: Zeroizing<Vec<u8>>, salt: i32 }
 
-pub(super) fn validate(algorithm: &Algorithm, family: Family) -> Result<Option<Pss>> {
-    let parameter = parameter(algorithm)?;
+pub(super) fn validate(algorithm: &Algorithm, family: Family) -> FactoryResult<Option<Pss>> {
+    let parameter = parameter(algorithm).map_err(FactoryFailure::InvalidKeySpec)?;
     match family {
         Family::Pss => return parameter.map(pss).transpose(),
-        Family::Dsa => if let Some(parameter) = parameter { integers(parameter, 3, false).map_err(Failure::into_anomaly)?; },
-        Family::Dh => integers(parameter.ok_or_else(malformed)?, 2, true).map_err(Failure::into_anomaly)?,
-        Family::Ec => curve(parameter.ok_or_else(malformed)?).map_err(Failure::into_anomaly)?,
-        Family::Named if parameter.is_some() => return Err(malformed()),
+        Family::Dsa => if let Some(parameter) = parameter { integers(parameter, 3, false).map_err(factory_failure)?; },
+        Family::Dh => integers(parameter.ok_or_else(failure::malformed)?, 2, true).map_err(factory_failure)?,
+        Family::Ec => curve(parameter.ok_or_else(failure::malformed)?).map_err(factory_failure)?,
+        Family::Named if parameter.is_some() => return Err(failure::malformed()),
         _ => {},
     }
     Ok(None)
@@ -44,7 +44,14 @@ mod pbes2;
 mod recursive;
 mod specified;
 
-fn pss(bytes: &[u8]) -> Result<Pss> { recursive::pss(bytes).map_err(Failure::into_anomaly) }
+fn pss(bytes: &[u8]) -> FactoryResult<Pss> { recursive::pss(bytes).map_err(factory_failure) }
+
+fn factory_failure(error: Failure) -> FactoryFailure {
+    match error {
+        value @ Failure::JavaIo(_) => FactoryFailure::InvalidKeySpec(value.into_anomaly()),
+        value @ Failure::Propagate(_) => FactoryFailure::Fatal(value.into_anomaly()),
+    }
+}
 
 fn fixed_service(oid: &[u8], parameter: &[u8]) -> DecodeResult<()> {
     match oid {
@@ -118,4 +125,21 @@ fn canonical_oid(oid: &[u8]) -> Result<&[u8]> {
         [0x2b, 6, 1, 5, 5, 7, 3, 8] | [0x2b, 6, 1, 5, 5, 7, 48, 3] => return Err(malformed()),
         _ => oid,
     })
+}
+
+#[cfg(test)]
+mod factory_tests {
+    use super::*;
+
+    #[test]
+    fn factory_parameter_boundary_rejects_java_io_and_preserves_propagation() {
+        let expected = crate::java_der::malformed();
+        let error = factory_failure(Failure::JavaIo(expected.clone()));
+        assert!(matches!(&error, FactoryFailure::InvalidKeySpec(_)));
+        assert_eq!(error.into_anomaly(), expected);
+        let expected = malformed();
+        let error = factory_failure(Failure::Propagate(expected.clone()));
+        assert!(matches!(&error, FactoryFailure::Fatal(_)));
+        assert_eq!(error.into_anomaly(), expected);
+    }
 }

@@ -12,10 +12,13 @@ pub(super) fn signed_checked(mut bytes: &[u8]) -> std::result::Result<&[u8], Int
     Ok(bytes)
 }
 
-pub(super) fn unsigned(mut bytes: &[u8]) -> Result<&[u8]> {
-    if bytes.is_empty() { return Err(malformed()); }
+#[cfg(test)]
+pub(super) fn unsigned(bytes: &[u8]) -> Result<&[u8]> { unsigned_checked(bytes).map_err(|_| malformed()) }
+
+pub(super) fn unsigned_checked(mut bytes: &[u8]) -> std::result::Result<&[u8], IntegerError> {
+    if bytes.is_empty() { return Err(IntegerError::Malformed); }
     while bytes.len() > 1 && bytes[0] == 0 { bytes = &bytes[1..]; }
-    if !unsigned_range(bytes.len(), bytes[0]) { return Err(malformed()); }
+    check_unsigned_range(bytes.len(), bytes[0])?;
     Ok(bytes)
 }
 
@@ -30,11 +33,17 @@ fn check_signed_range(length: usize, first: u8, zero_tail: impl FnOnce() -> bool
 
 fn unsigned_range(length: usize, first: u8) -> bool { length < 1 << 28 || length == 1 << 28 && first < 0x80 }
 
+fn check_unsigned_range(length: usize, first: u8) -> std::result::Result<(), IntegerError> {
+    if unsigned_range(length, first) { Ok(()) } else { Err(IntegerError::MagnitudeOverflow) }
+}
+
+#[cfg(test)]
 pub(super) fn int(input: &mut Der<'_>) -> Result<i32> {
     let value = expect(input, 2)?;
     int_content(&value)
 }
 
+#[cfg(test)]
 pub(super) fn int_content(bytes: &[u8]) -> Result<i32> { int_content_checked(bytes).map_err(|_| malformed()) }
 
 pub(super) fn int_content_checked(bytes: &[u8]) -> std::result::Result<i32, IntegerError> {
@@ -105,5 +114,24 @@ mod tests {
         assert_eq!(check_signed_range(1 << 28, 0x7f, || panic!("positive boundary has no tail check")), Ok(()));
         assert_eq!(check_signed_range((1 << 28) + 1, 1, || false), Err(IntegerError::MagnitudeOverflow));
         assert_eq!(int_content_checked(&[0, 0x80, 0, 0, 0]), Err(IntegerError::Malformed));
+    }
+
+    #[test]
+    fn typed_unsigned_integers_keep_positive_interpretation_and_empty_rejection() {
+        for (bytes, expected) in [(&[0, 0, 0x80][..], &[0x80][..]), (&[0xff], &[0xff]), (&[0, 0], &[0])] {
+            assert_eq!(unsigned_checked(bytes).unwrap(), expected);
+            assert_eq!(unsigned(bytes).unwrap(), expected);
+        }
+        assert_eq!(unsigned_checked(&[]), Err(IntegerError::Malformed));
+        assert!(unsigned(&[]).is_err());
+        assert_eq!(int(&mut Der(&[2, 1, 1])).unwrap(), 1);
+    }
+
+    #[test]
+    fn typed_unsigned_magnitude_boundaries_are_unchecked_big_integer_failures() {
+        assert_eq!(check_unsigned_range((1 << 28) - 1, 0xff), Ok(()));
+        assert_eq!(check_unsigned_range(1 << 28, 0x7f), Ok(()));
+        assert_eq!(check_unsigned_range(1 << 28, 0x80), Err(IntegerError::MagnitudeOverflow));
+        assert_eq!(check_unsigned_range((1 << 28) + 1, 1), Err(IntegerError::MagnitudeOverflow));
     }
 }

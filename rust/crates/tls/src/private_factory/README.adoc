@@ -177,6 +177,34 @@ Failure values and integer parse results are call-local passive values, with no 
 The public private-key result preserves the original anomaly from either variant.
 Only a pending SpecifiedSHA2 child catch can consume `JavaIo`; every `Propagate` failure returns immediately without consuming a catch boundary.
 
+== Factory failure boundaries
+
+The private typed factory attempt returns encoded bytes or a passive `FactoryFailure` value: `NoSuchAlgorithm`, `InvalidKeySpec`, or `Fatal`, each retaining its original anomaly.
+The strict `PrivateKey::decode` entrypoint returns every failure with that original diagnostic and does not apply raw-key fallback.
+Missing default factories produce `NoSuchAlgorithm`, while the registered HSS/LMS factory's private-key rejection produces `InvalidKeySpec`.
+Provider PKCS8 framing, parameter requirements, material checks, and Java IO failures produce `InvalidKeySpec` through their checked factory exception paths.
+The provider-specific parameter validator maps its service evaluator's `JavaIo` to `InvalidKeySpec` and `Propagate` to `Fatal` with an exhaustive match.
+It enforces factory requirements independently of the general nested AlgorithmIdentifier initializer.
+
+Signed and unsigned BigInteger magnitude overflow remains fatal through provider construction.
+Malformed integers and representable BigInteger values outside the Java int range are checked key-specification failures.
+The unsigned helper preserves the provider's positive interpretation of RSA components before its supported-magnitude check.
+`bit_layout_checked` retains the distinction between DerValue padding checks that throw IOException and BitArray backing/representation checks that throw unchecked exceptions.
+The existing `bit_layout` wrapper keeps its accepted layouts and diagnostics for other consumers.
+Factory public-bit parsing maps only the former class to `InvalidKeySpec`.
+
+Non-CRT PSS parameter encoding failures are fatal.
+`PSSParameters.getEncoded` wraps a failed reverse-name lookup in IOException, and `AlgorithmId(ObjectIdentifier, AlgorithmParameters)` wraps that encoding failure in IllegalStateException.
+`RSAPrivateKeyImpl` catches ProviderException, so this IllegalStateException reaches KeyFactory's runtime-exception path.
+The explicitly caught RSAUtil ProviderException paths have different factory rejection behavior.
+
+Native admission, retained-size and reservation-shrink failures stay outside factory rejection classification.
+Checked native fragment-size and bit-length failures retain their original diagnostic in `Fatal`.
+The factory's AlgorithmIdentifier adapter wraps only admitted source parsing and normalization.
+For an admitted input of at most Java's signed array length, normalization retains at most twice the input bytes and three framing/OID fragments add fixed header overhead; their native size sum is below the checked `384 * input_bytes + 65,536` admission bound.
+The adapter cannot convert an admitted native size overflow into a key-specification rejection.
+No general anomaly conversion or message-based classification is used.
+
 == Admission and remaining source work
 
 Decode reserves `384 * input_bytes + 65,536` before parsing, with checked arithmetic.
@@ -226,3 +254,4 @@ Recursive parameter regressions cover defaults, outer and context tags, ordering
 PBES2 regressions cover all fourteen derived names, signed counts and key lengths, salt and IV shapes, PRF and cipher restrictions, selective tails, historical wrappers, BER retention, nested descendants, duplicate hash names, non-CRT reverse-name failure, initialization ordering, and reservation cleanup.
 Typed parameter regressions cover signed padding, signed 32-bit limits, the allocation-free BigInteger magnitude boundary, Java IO versus propagated failures, and preservation of outward diagnostics.
 SpecifiedSHA2 regressions cover all five known signature OIDs, unmapped and PBES2 names, absent and NULL parameters, caught malformed children, fatal outer identifiers, nested catch boundaries, propagated failures, fixed-service descendants, MGF rejection, duplicate hashes, BER retention, context tails, deep mixed nesting, and reservation cleanup.
+Typed factory regressions cover missing versus rejecting factories, strict parse ordering, provider material and parameter rejection, fatal non-CRT PSS encoding, signed and unsigned integer classes, parameter-failure propagation, and allocation-free BIT STRING backing boundaries.

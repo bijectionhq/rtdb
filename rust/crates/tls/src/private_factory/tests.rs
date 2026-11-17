@@ -194,6 +194,7 @@ mod legacy_pbe;
 mod recursive_parameters;
 mod pbes2_parameters;
 mod specified_sha2;
+mod factory_failures;
 
 #[test]
 fn dsa_accepts_signed_scalars_and_ignored_scalar_tails_with_optional_parameters() {

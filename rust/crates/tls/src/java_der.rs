@@ -144,13 +144,21 @@ fn write_length(bytes: &mut Vec<u8>, length: usize) {
 
 pub(crate) fn malformed() -> Anomaly { invalid("Malformed certificate identifier") }
 
-// OpenJDK 25.0.1 DerValue.checkPaddedBits and BitArray(int, byte[], int) use signed wrapping arithmetic and the backing array's remaining length.
 pub(crate) fn bit_layout(padding: u8, bytes: usize, backing: usize) -> Result<(usize, u8)> {
-    if padding > 7 { return Err(malformed()); }
+    bit_layout_checked(padding, bytes, backing).map_err(|_| malformed())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BitLayoutError { JavaIo, Unchecked }
+
+// OpenJDK 25.0.1 DerValue.checkPaddedBits and BitArray(int, byte[], int) use signed wrapping arithmetic and the backing array's remaining length.
+pub(crate) fn bit_layout_checked(padding: u8, bytes: usize, backing: usize) -> std::result::Result<(usize, u8), BitLayoutError> {
+    if padding > 7 { return Err(BitLayoutError::JavaIo); }
     let bits = (bytes as i32).wrapping_mul(8).wrapping_sub(i32::from(padding));
-    if bits < 0 || (backing as i32).wrapping_mul(8) < bits { return Err(malformed()); }
-    let length = usize::try_from(bits.wrapping_add(7) / 8).map_err(|_| malformed())?;
-    if length > bytes { return Err(malformed()); }
+    if bits < 0 { return Err(BitLayoutError::JavaIo); }
+    if (backing as i32).wrapping_mul(8) < bits { return Err(BitLayoutError::Unchecked); }
+    let length = usize::try_from(bits.wrapping_add(7) / 8).map_err(|_| BitLayoutError::Unchecked)?;
+    if length > bytes { return Err(BitLayoutError::Unchecked); }
     let padding = ((length as i32).wrapping_mul(8) - bits) as u8;
     Ok((length, padding))
 }
