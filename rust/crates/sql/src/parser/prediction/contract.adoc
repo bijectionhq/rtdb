@@ -287,7 +287,8 @@ No public cause behavior is removed or waived by this slice.
 
 == Remaining parser work
 
-Full-context production, real adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
+The private Full producer and runtime are described below.
+Adaptive prediction, all 176 generated rule schedules and the SLL/Bail-to-LL/error orchestration remain required.
 Shared DFA/cache history and the captured ANTLR initialization option still require their production owner and demand review.
 Diagnostics, raw UTF16 literal consumers, typed semantic adapters and whole-batch production parsing remain incomplete.
 All regression sources and lifetime contracts remain unexecuted.
@@ -331,7 +332,7 @@ This sequential caller condition is not enforced by the brands.
 Memo presence begins Absent, so cold start and filtering use the existing uncached addition path.
 The first reach changes it to Present before intermediate-set admission; all later additions share the same existing round memo.
 Clearing Busy membership, continuations, captured contexts or skipped stops does not clear that memo.
-A mandatory full-context successor must extend this same round and preserve the source terminal local-to-full handoff before adaptive prediction can be adopted.
+The Full continuation extends this round through the terminal handoff described below.
 
 `ClosureWork` owns passive scope-local continuation, Busy, skipped-stop and captured-alt1 constituents.
 Continuations retain live configuration handles; resumed parent/context/packed reads observe alias updates at the source read points.

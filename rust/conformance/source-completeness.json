@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration/private actual-root DFA, ordered configuration/mode, exact-unit literal-decoder, private tree-JSON and local/SLL start/closure/reach/cold-precedence foundations with full-context producers over the same round, adaptive prediction and cache insertion, shared parser ownership, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects; retain every frontend through admitted parsed ownership."
+      "requirement": "Integrate the isolated native scanner, token stream, owned grammar graph, expected-token traversal, retained canonical-context/configuration/private actual-root DFA, ordered configuration/mode, exact-unit literal decoder, private tree JSON, parser runtime and Local/Full producers over one merge round through adaptive prediction and cache insertion, generated rule control and diagnostic demand, canonical text/codec consumers, and whole-batch syntax validation before simple-query effects. Complete host policy capture, production parser and cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",

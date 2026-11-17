@@ -1054,3 +1054,15 @@ The preserved explicit-null Connect-default assertion conflicts with the pinned 
 Independent source reviews cover the bounded published changes and their regression sources.
 This workflow has executed no compiler, formatter, runtime discovery, regression suite or Phase 2 qualification.
 The implementation revision remains unset, every area conclusion remains pending and the source-completeness gate remains false.
+
+== Private parser runtime and Full prediction checkpoint
+
+The retained parser environment supplies one prediction store to exclusive sessions.
+Each session owns the real token stream, primary invocation records and precedence stack.
+Recursive replacements use the original outer call link, and unroll pops the current entry before its stop token demand.
+The prediction round carries its merge history from Local to Full and restores the input origin after prediction work and collection finish.
+Full producers have source regressions for start context, precedence, stop ordering and EOF, alongside session and failure regressions.
+
+Host policy capture, production cache ownership, adaptive control, generated rule schedules, diagnostics and embedded cause capability remain open.
+Generated tree and listener effects require a new review of failed rule entry cleanup.
+The 64 new regression cases remain unexecuted, and Phase 2 remains gated on source completeness.
