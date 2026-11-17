@@ -15,9 +15,10 @@ fn signed_precision_never_sizes_decimal_rescaling_or_arithmetic_work() {
         assert!(decimal_rescale(&decimal(i128::MAX, precision, 0), precision, 1, 128).is_err());
         assert_eq!(decimal_rescale(&decimal(0, precision, i32::MIN), precision, i32::MAX, 128).unwrap(), decimal(0, precision, i32::MAX));
         assert_eq!(decimal_text(&decimal(1, precision, i32::MAX)), "1E-2147483647");
-        let Value::Decimal(remainder) = arithmetic(BinaryOp::Modulo, &Value::Decimal(decimal(1, precision, i32::MIN)), &Value::Decimal(decimal(-3, precision, i32::MAX))).unwrap() else { panic!("Expected decimal") };
-        assert_eq!((remainder.precision, remainder.scale, remainder.bit_width), (precision, i32::MAX, 256));
-        assert_eq!(decimal_text(&remainder), "-2E-2147483647");
+        assert!(arithmetic(BinaryOp::Modulo, &Value::Decimal(decimal(1, precision, i32::MIN)), &Value::Decimal(decimal(-3, precision, i32::MAX))).is_err());
+        let Value::Decimal(remainder) = arithmetic(BinaryOp::Modulo, &Value::Decimal(decimal(10, precision, 1)), &Value::Decimal(decimal(-3, precision, 1))).unwrap() else { panic!("Expected decimal") };
+        assert_eq!((remainder.precision, remainder.scale, remainder.bit_width), (precision, 1, 256));
+        assert_eq!(decimal_text(&remainder), "-0.2");
     }
     for precision in [i32::MIN, -1, 0] {
         assert!(decimal_rescale(&decimal(0, 32, 0), precision, 0, 128).is_err());

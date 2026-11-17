@@ -231,14 +231,16 @@ fn list_text_outputs_keep_vector_capacity_charged_until_scope_transfer() {
 }
 
 #[test]
-fn scalar_argument_capacity_is_reserved_before_evaluation_or_null_short_circuit() {
+fn invocation_admission_precedes_argument_evaluation_and_null_short_circuit() {
     for name in ["concat", "str"] {
         let memory = MemoryBudget::new(8192);
         let scope = EvaluationScope::new(&memory).unwrap();
         let context = EvalContext { allocation: Some(&scope), ..Default::default() };
-        let expression = Expr::Call { name: name.into(), args: vec![Expr::Literal(V::Null); 1024], return_type: L::Scalar(S::Utf8) };
+        let mut args = vec![Expr::Literal(V::Null); 1024];
+        args[1] = Expr::Parameter { index: 0, data_type: L::Scalar(S::Utf8) };
+        let expression = Expr::Call { name: name.into(), args, return_type: L::Scalar(S::Utf8) };
         assert_eq!(evaluate(&expression, &Schema::default(), &[], &context).unwrap_err().code, "rtdb/memory-budget-exceeded");
-        assert_eq!(memory.peak_bytes(), 4096);
+        assert_eq!(memory.peak_bytes(), 8192);
         drop(scope);
         assert_eq!(memory.used_bytes(), 0);
     }
