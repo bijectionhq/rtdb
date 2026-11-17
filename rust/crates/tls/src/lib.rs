@@ -13,7 +13,7 @@ pub use x500::DistinguishedName;
 mod protected;
 pub use protected::{ProtectedIdentity, ProtectedKeyStore, RecoveredKey};
 mod identifiers;
-pub use identifiers::CertificateIdentifiers;
+pub use identifiers::{CertificateAlternativeNames, CertificateIdentifiers};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreFormat { Java, Pem }

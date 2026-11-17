@@ -3,6 +3,9 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result, UriParts};
 use crate::{DistinguishedName, invalid};
 
+mod alternative_names;
+pub use alternative_names::CertificateAlternativeNames;
+
 /// Immutable Java certificate identifiers, independently charged through their last borrowed use.
 /// Serial numbers use minimal signed two's-complement bytes, including a sign byte when required.
 #[derive(Debug)]
@@ -25,60 +28,31 @@ impl CertificateIdentifiers {
         let bound = certificate_der.len().checked_mul(512).and_then(|bytes| bytes.checked_add(65_536))
             .ok_or_else(|| invalid("Certificate identifiers exceed allocation range"))?;
         let reservation = memory.reserve(bound)?;
-        let certificate = single(certificate_der, 0x30)?;
-        let mut certificate = Der(&certificate);
-        let tbs = certificate.expect(0x30)?;
-        certificate.expect(0x30)?;
-        certificate.expect(3)?;
-        certificate.end()?;
-        let mut tbs = Der(&tbs);
-        if tbs.0.first().is_some_and(|tag| tag & 0xdf == 0x80) { tbs.next()?; }
-        let serial = signed(&tbs.expect(2)?)?;
-        for _ in 0..5 { tbs.expect(0x30)?; }
         let mut subject = None;
         let mut unparseable_subject = None;
         let mut authority = None;
-        for tag in [1, 2] {
-            if tbs.0.first().is_some_and(|value| value & 0xdf == (0x80 | tag)) { tbs.next()?; }
-        }
-        if !tbs.0.is_empty() {
-            let (tag, extensions) = tbs.next()?;
-            if tag == 0xa3 {
-                let extensions = Der(&extensions).expect(0x30)?;
-                let mut extensions = Der(&extensions);
-                while !extensions.0.is_empty() {
-                    let extension = extensions.next()?;
-                    if !matches!(extension.0, 0x30 | 0x31) { return Err(malformed()); }
-                    let mut extension = Der(&extension.1);
-                    let oid = extension.expect(6)?;
-                    valid_oid(&oid)?;
-                    let (tag, content) = extension.next()?;
-                    let (critical, value) = if tag == 1 {
-                        if content.len() != 1 { return Err(malformed()); }
-                        (content[0] != 0, octets(extension.next()?)?)
-                    } else { (false, octets((tag, content))?) };
-                    match oid.as_ref() {
-                        [0x55, 0x1d, 0x0e] => match subject_identifier(&value) {
-                            Ok(()) => {
-                                if subject.is_some() { return Err(duplicate()); }
-                                subject = Some(value);
-                            }
-                            Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => unparseable_subject = Some(value),
-                            Err(error) => return Err(error),
-                        },
-                        [0x55, 0x1d, 0x23] => match authority_identifier(&value, memory) {
-                            Ok(value) => {
-                                if authority.is_some() { return Err(duplicate()); }
-                                authority = Some(value);
-                            }
-                            Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
-                            Err(error) => return Err(error),
-                        },
-                        _ => {},
+        let serial = scan_certificate(certificate_der, |oid, critical, value| {
+            match oid {
+                [0x55, 0x1d, 0x0e] => match subject_identifier(&value) {
+                    Ok(()) => {
+                        if subject.is_some() { return Err(duplicate()); }
+                        subject = Some(value);
                     }
-                }
+                    Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => unparseable_subject = Some(value),
+                    Err(error) => return Err(error),
+                },
+                [0x55, 0x1d, 0x23] => match authority_identifier(&value, memory) {
+                    Ok(value) => {
+                        if authority.is_some() { return Err(duplicate()); }
+                        authority = Some(value);
+                    }
+                    Err(error) if !critical && error.code == "rtdb.tls/invalid-keystore" => {},
+                    Err(error) => return Err(error),
+                },
+                _ => {},
             }
-        }
+            Ok(())
+        })?;
         Ok(Self { subject: subject.or(unparseable_subject), authority, serial, _reservation: reservation })
     }
 
@@ -90,6 +64,43 @@ impl CertificateIdentifiers {
     /// Signed AKI serial from the same completely parsed extension as `authority_key_identifier`.
     pub fn authority_serial_number(&self) -> Option<&[u8]> { self.authority.as_ref().and_then(|authority| authority.serial.as_deref()) }
     pub fn serial_number(&self) -> &[u8] { &self.serial }
+}
+
+fn scan_certificate(certificate_der: &[u8], mut visit: impl FnMut(&[u8], bool, Vec<u8>) -> Result<()>) -> Result<Vec<u8>> {
+    let certificate = single(certificate_der, 0x30)?;
+    let mut certificate = Der(&certificate);
+    let tbs = certificate.expect(0x30)?;
+    certificate.expect(0x30)?;
+    certificate.expect(3)?;
+    certificate.end()?;
+    let mut tbs = Der(&tbs);
+    if tbs.0.first().is_some_and(|tag| tag & 0xdf == 0x80) { tbs.next()?; }
+    let serial = signed(&tbs.expect(2)?)?;
+    for _ in 0..5 { tbs.expect(0x30)?; }
+    for tag in [1, 2] {
+        if tbs.0.first().is_some_and(|value| value & 0xdf == (0x80 | tag)) { tbs.next()?; }
+    }
+    if !tbs.0.is_empty() {
+        let (tag, extensions) = tbs.next()?;
+        if tag == 0xa3 {
+            let extensions = Der(&extensions).expect(0x30)?;
+            let mut extensions = Der(&extensions);
+            while !extensions.0.is_empty() {
+                let extension = extensions.next()?;
+                if !matches!(extension.0, 0x30 | 0x31) { return Err(malformed()); }
+                let mut extension = Der(&extension.1);
+                let oid = extension.expect(6)?;
+                valid_oid(&oid)?;
+                let (tag, content) = extension.next()?;
+                let (critical, value) = if tag == 1 {
+                    if content.len() != 1 { return Err(malformed()); }
+                    (content[0] != 0, octets(extension.next()?)?)
+                } else { (false, octets((tag, content))?) };
+                visit(&oid, critical, value)?;
+            }
+        }
+    }
+    Ok(serial)
 }
 
 fn signed(mut bytes: &[u8]) -> Result<Vec<u8>> {
