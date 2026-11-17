@@ -48,7 +48,7 @@ final class NativeAdbcTest {
         try (var allocator = new RootAllocator(); var database = open(allocator); var connection = database.connect(); var statement = connection.createStatement("SELECT ? AS a, ? AS b")) {
             statement.prepare();
             assertEquals(List.of("", ""), statement.getParameterSchema().getFields().stream().map(Field::getName).toList());
-            try (var external = new RootAllocator(); var first = new BigIntVector("", external); var second = new BigIntVector("", external)) {
+            try (var external = new RootAllocator(); var other = new RootAllocator(); var first = new BigIntVector("", external); var second = new BigIntVector("", other)) {
                 first.allocateNew(1); first.setSafe(0, 3); first.setValueCount(1);
                 second.allocateNew(1); second.setSafe(0, 7); second.setValueCount(1);
                 try (var root = new VectorSchemaRoot(List.of(first, second))) { root.setRowCount(1); statement.bind(root); }

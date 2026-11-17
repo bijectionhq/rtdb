@@ -27,9 +27,18 @@ public final class NativeStatement extends NativeResource implements AdbcStateme
         }
     }
     @Override public void bind(VectorSchemaRoot root) throws AdbcException {
-        try (ArrowArray array = ArrowArray.allocateNew(connection.allocator); ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator)) {
+        try (VectorSchemaRoot copy = VectorSchemaRoot.create(root.getSchema(), connection.allocator);
+             ArrowArray array = ArrowArray.allocateNew(connection.allocator); ArrowSchema schema = ArrowSchema.allocateNew(connection.allocator)) {
+            copy.allocateNew();
+            for (int column = 0; column < root.getFieldVectors().size(); column++) {
+                var source = root.getVector(column);
+                var target = copy.getVector(column);
+                for (int row = 0; row < root.getRowCount(); row++) target.copyFromSafe(row, row, source);
+                target.setValueCount(root.getRowCount());
+            }
+            copy.setRowCount(root.getRowCount());
             try {
-                Data.exportVectorSchemaRoot(connection.allocator, root, null, array, schema);
+                Data.exportVectorSchemaRoot(connection.allocator, copy, null, array, schema);
                 abi.call("statement_bind", handle(), NativeAbi.address(array.memoryAddress()), NativeAbi.address(schema.memoryAddress()));
             } finally { if (array.snapshot().release != 0) array.release(); if (schema.snapshot().release != 0) schema.release(); }
         }
