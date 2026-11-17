@@ -27,7 +27,7 @@ impl RetainedBuffer {
     pub(super) fn arrow(buffer: Buffer, reservation: &Arc<MemoryReservation>) -> Self {
         Self { buffer, _reservation: Arc::clone(reservation) }
     }
-    fn i32(&self, index: usize) -> Result<i32> {
+    pub(super) fn i32(&self, index: usize) -> Result<i32> {
         let start = index.checked_mul(4).ok_or_else(allocation)?;
         let bytes = self.as_slice().get(start..start.checked_add(4).ok_or_else(allocation)?).ok_or_else(index_error)?;
         Ok(i32::from_le_bytes(bytes.try_into().map_err(|_| layout())?))
@@ -49,6 +49,7 @@ pub enum PhysicalLayout {
 #[derive(Debug)]
 pub(super) enum NodeLayout {
     Scalar(super::native_scalar::NativeScalarStorage),
+    NativeContainer(NativeContainerStorage),
     Leaf { array: ArrayRef, payload: Option<Buffer>, payload_offset: usize },
     Struct { validity: Option<NullBuffer>, children: Vec<Arc<PhysicalNode>> },
     List { validity: Option<NullBuffer>, offsets: RetainedBuffer, elements: Arc<PhysicalNode> },
@@ -62,6 +63,12 @@ impl PhysicalNode {
         match &self.storage { NodeLayout::Leaf { array, .. } => Ok(array.as_ref()), _ => Err(layout()) }
     }
     pub(super) fn null(&self, row: PhysicalIndex) -> Result<bool> {
+        if let Some(container) = self.container() {
+            return match container {
+                ContainerStorageRef::Struct { validity, .. } | ContainerStorageRef::List { validity, .. } | ContainerStorageRef::FixedList { validity, .. } => validity.is_null(row),
+                ContainerStorageRef::Union { .. } => match self.union_child(row)? { Some((child, offset)) => child.null(offset), None => Ok(true) },
+            };
+        }
         Ok(match &self.storage {
             NodeLayout::Scalar(storage) => {
                 if self.scalar_field()?.data_type() == &DataType::Null { true }
@@ -70,55 +77,52 @@ impl PhysicalNode {
             },
             NodeLayout::Leaf { .. } if self.descriptor.scalar_field().is_some_and(|field| field.data_type() == &DataType::Null) => true,
             NodeLayout::Leaf { array, .. } => self.descriptor.is_nullable() && array.is_null(self.checked_position(row)?),
-            NodeLayout::Struct { validity, .. } | NodeLayout::List { validity, .. } | NodeLayout::FixedList { validity, .. } => {
-                if !self.descriptor.is_nullable() { false } else {
-                    let row = self.checked_position(row)?;
-                    validity.as_ref().is_some_and(|bits| bits.is_null(row))
-                }
-            },
-            NodeLayout::Union { .. } => match self.union_child(row)? { Some((child, offset)) => child.null(offset)?, None => true },
             NodeLayout::RunEnd(reader) => reader.values().null(reader.index(row)?)?,
+            _ => return Err(layout()),
         })
     }
     pub(super) fn check(&self, row: usize) -> Result<()> { if row < self.length { Ok(()) } else { Err(index_error()) } }
     pub(super) fn checked_position(&self, row: PhysicalIndex) -> Result<usize> { let row = row.position()?; self.check(row)?; Ok(row) }
     pub(super) fn union_id(&self, row: PhysicalIndex) -> Result<i8> {
-        let NodeLayout::Union { type_ids, .. } = &self.storage else { return Err(unsupported("getTypeId")); };
-        Ok(*type_ids.as_slice().get(row.position()?).ok_or_else(index_error)? as i8)
+        let Some(ContainerStorageRef::Union { type_ids, .. }) = self.container() else { return Err(unsupported("getTypeId")); };
+        Ok(*type_ids.get(row.position()?).ok_or_else(index_error)? as i8)
     }
     pub(super) fn union_offset_index(&self, row: PhysicalIndex) -> Result<PhysicalIndex> {
-        let NodeLayout::Union { offsets, .. } = &self.storage else { return Err(layout()); };
-        Ok(PhysicalIndex(offsets.i32(row.position()?)?))
+        let Some(ContainerStorageRef::Union { offsets, .. }) = self.container() else { return Err(layout()); };
+        Ok(PhysicalIndex(offsets.get(row)?))
     }
     pub(super) fn union_leg(&self, row: PhysicalIndex) -> Result<Option<&Arc<Self>>> {
         let id = self.union_id(row)?;
         if id < 0 { return Ok(None); }
-        let NodeLayout::Union { children, .. } = &self.storage else { return Err(layout()); };
+        let Some(ContainerStorageRef::Union { children, .. }) = self.container() else { return Err(layout()); };
         let index = self.descriptor.union_index(id)?;
-        Ok(Some(&children[index]))
+        Ok(Some(children.get(index).ok_or_else(index_error)?))
     }
     pub(super) fn union_child(&self, row: PhysicalIndex) -> Result<Option<(&Arc<Self>, PhysicalIndex)>> {
         self.union_leg(row)?.map(|child| Ok((child, self.union_offset_index(row)?))).transpose()
     }
     pub(super) fn list_offset(&self, row: PhysicalIndex, count: bool) -> Result<i32> {
-        match &self.storage {
-            NodeLayout::FixedList { size, .. } => Ok(if count { *size as i32 } else { row.0.wrapping_mul(*size as i32) }),
-            NodeLayout::List { offsets, .. } => {
+        match self.container() {
+            Some(ContainerStorageRef::FixedList { size, .. }) => Ok(if count { size } else { row.0.wrapping_mul(size) }),
+            Some(ContainerStorageRef::List { offsets, .. }) => {
                 if count {
-                    let end = offsets.i32(PhysicalIndex(row.0.wrapping_add(1)).position()?)?;
-                    Ok(end.wrapping_sub(offsets.i32(row.position()?)?))
-                } else { offsets.i32(row.position()?) }
+                    let end = offsets.get(PhysicalIndex(row.0.wrapping_add(1)))?;
+                    Ok(end.wrapping_sub(offsets.get(row)?))
+                } else { offsets.get(row) }
             },
             _ => Err(unsupported(if count { "getListCount" } else { "getListStartIndex" })),
         }
     }
     pub(super) fn elements(&self, row: usize) -> Result<(&Arc<Self>, usize, usize)> {
         self.check(row)?;
-        let (child, start, end) = match &self.storage {
-            NodeLayout::List { offsets, elements, .. } => (elements, usize::try_from(offsets.i32(row)?).map_err(|_| layout())?, usize::try_from(offsets.i32(row + 1)?).map_err(|_| layout())?),
-            NodeLayout::FixedList { size, elements, .. } => {
-                let start = row.checked_mul(*size).ok_or_else(allocation)?;
-                (elements, start, start.checked_add(*size).ok_or_else(allocation)?)
+        let row = PhysicalIndex::from_position(row)?;
+        let (child, start, end) = match self.container() {
+            Some(ContainerStorageRef::List { offsets, elements, .. }) => (elements, usize::try_from(offsets.get(row)?).map_err(|_| layout())?, usize::try_from(offsets.get(PhysicalIndex(row.0.wrapping_add(1)))?).map_err(|_| layout())?),
+            Some(ContainerStorageRef::FixedList { size, elements, .. }) => {
+                let start = usize::try_from(row.0.wrapping_mul(size)).map_err(|_| layout())?;
+                let end = usize::try_from(row.0.wrapping_add(1).wrapping_mul(size)).map_err(|_| layout())?;
+                if size < 0 { return Err(layout()); }
+                (elements, start, end)
             }
             _ => return Err(unsupported("getListStartIndex")),
         };

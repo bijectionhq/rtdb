@@ -22,16 +22,16 @@ fn bound(node: &PhysicalNode, row: PhysicalIndex) -> Result<usize> {
     let mut bytes = add(1024, mul(std::mem::size_of::<Value>(), 4)?)?;
     if node.null(row)? { return Ok(bytes); }
     if let NodeLayout::Leaf { array, .. } = &node.storage { return crate::estimate_read_value_bytes(node.ingress_arrow()?, array.as_ref(), node.checked_position(row)?); }
-    match &node.storage {
-        NodeLayout::Scalar(_) => return super::native_scalar::value_bound(node, node.checked_position(row)?),
-        NodeLayout::Struct { children, .. } => {
+    if matches!(&node.storage, NodeLayout::Scalar(_)) { return super::native_scalar::value_bound(node, node.checked_position(row)?); }
+    match node.container() {
+        Some(ContainerStorageRef::Struct { children, .. }) => {
             for child in children {
                 bytes = add(bytes, add(1024, mul(add(std::mem::size_of::<Value>(), std::mem::size_of::<String>())?, 16)?)?)?;
                 bytes = add(bytes, mul(child.descriptor.name().len(), 2)?)?;
                 if !child.descriptor.is_bottom_scalar() { bytes = add(bytes, bound(child, row)?)?; }
             }
         }
-        NodeLayout::List { .. } | NodeLayout::FixedList { .. } => {
+        Some(ContainerStorageRef::List { .. } | ContainerStorageRef::FixedList { .. }) => {
             let (child, start, end) = node.elements(node.checked_position(row)?)?;
             bytes = add(bytes, mul(end - start, mul(std::mem::size_of::<Value>(), 6)?)?)?;
             for row in start..end { bytes = add(bytes, bound(child, PhysicalIndex::from_position(row)?)?)?; }
@@ -52,9 +52,9 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
         }
         return Ok(value);
     }
-    match &node.storage {
-        NodeLayout::Scalar(_) => super::native_scalar::value(node, node.checked_position(row)?),
-        NodeLayout::Struct { children, .. } => {
+    if matches!(&node.storage, NodeLayout::Scalar(_)) { return super::native_scalar::value(node, node.checked_position(row)?); }
+    match node.container() {
+        Some(ContainerStorageRef::Struct { children, .. }) => {
             let mut fields = BTreeMap::new();
             for child in children {
                 let value = if child.descriptor.is_bottom_scalar() { Value::Undefined } else { read(child, row)? };
@@ -62,7 +62,7 @@ fn read(node: &PhysicalNode, row: PhysicalIndex) -> Result<Value> {
             }
             Ok(Value::Struct(fields))
         }
-        NodeLayout::List { .. } | NodeLayout::FixedList { .. } => {
+        Some(ContainerStorageRef::List { .. } | ContainerStorageRef::FixedList { .. }) => {
             let (child, start, end) = node.elements(node.checked_position(row)?)?;
             let mut values = Vec::with_capacity(end - start);
             for row in start..end { values.push(read(child, PhysicalIndex::from_position(row)?)?); }

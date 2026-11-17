@@ -2,6 +2,7 @@ mod getters;
 mod descriptor;
 mod materialize;
 mod native_scalar;
+mod native_container;
 mod write;
 mod open;
 mod scalar;
@@ -16,6 +17,7 @@ use arrow_schema::{DataType, Field};
 use rtdb_types::{Anomaly, LogicalType, Result, Value};
 use crate::{MemoryReservation, OwnedColumn, Selection};
 use storage::NodeLayout;
+use native_container::{NativeContainerStorage, ContainerStorageRef};
 use run_reader::{RunEndReader, RunStorage};
 pub use storage::{PhysicalLayout, RetainedBuffer};
 pub use descriptor::{ContainerKind, DeclarationRef, RetainedArrowField, UnencodedBottom, UnionEncoding, VectorDescriptor, VectorTypeFailure, VectorTypeResult};
@@ -165,8 +167,8 @@ impl ExecutionVector {
     }
     fn leg_name(&self, index: PhysicalIndex) -> Result<Option<&str>> {
         fn name(node: &PhysicalNode, row: PhysicalIndex) -> Result<Option<&str>> {
+            if matches!(node.container(), Some(ContainerStorageRef::Union { .. })) { return Ok(node.union_leg(row)?.map(|child| child.descriptor.name())); }
             match &node.storage {
-                NodeLayout::Union { .. } => Ok(node.union_leg(row)?.map(|child| child.descriptor.name())),
                 NodeLayout::RunEnd(reader) => name(reader.values(), reader.index(row)?),
                 _ => Err(unsupported("getLeg")),
             }
@@ -199,11 +201,13 @@ impl<'a> ResolvedCell<'a> {
 enum ResolvedAccess<'a> { Leaf(ResolvedCell<'a>), AbsentUnion { type_id: i8, row: PhysicalIndex } }
 fn resolve_node(mut node: &PhysicalNode, mut row: PhysicalIndex) -> Result<ResolvedAccess<'_>> {
     loop {
-        match &node.storage {
-            NodeLayout::Union { .. } => match node.union_child(row)? {
-                Some((child, offset)) => { node = child; row = offset; }
+        if matches!(node.container(), Some(ContainerStorageRef::Union { .. })) {
+            match node.union_child(row)? {
+                Some((child, offset)) => { node = child; row = offset; continue; }
                 None => return Ok(ResolvedAccess::AbsentUnion { type_id: node.union_id(row)?, row }),
-            },
+            }
+        }
+        match &node.storage {
             NodeLayout::RunEnd(reader) => { row = reader.index(row)?; node = reader.values(); }
             _ => return Ok(ResolvedAccess::Leaf(ResolvedCell { node, row })),
         }
@@ -229,14 +233,14 @@ impl<'a> CellRef<'a> {
     /// Raw access does not grant the wrapper's reference vectorFor method.
     pub fn raw_struct_field(&self, name: &str) -> Result<Option<OwnedCell>> {
         let cell = self.resolve()?;
-        let NodeLayout::Struct { children, .. } = &cell.node.storage else { return Err(unsupported("raw_struct_field")); };
+        let Some(ContainerStorageRef::Struct { children, .. }) = cell.node.container() else { return Err(unsupported("raw_struct_field")); };
         children.iter().find(|child| child.descriptor.name() == name).map(|child| ExecutionVector::direct(Arc::clone(child)).owned_cell(cell.node.checked_position(cell.row)?)).transpose()
     }
     /// Returns retained raw elements, including null-parent payload, after physical indirection.
     /// This is distinct from listElements admission on union/run-end readers.
     pub fn raw_list_elements(&self) -> Result<ExecutionVector> {
         let cell = self.resolve()?;
-        if !matches!(&cell.node.storage, NodeLayout::List { .. } | NodeLayout::FixedList { .. }) { return Err(unsupported("raw_list_elements")); }
+        if !matches!(cell.node.container(), Some(ContainerStorageRef::List { .. } | ContainerStorageRef::FixedList { .. })) { return Err(unsupported("raw_list_elements")); }
         let (child, start, end) = cell.node.elements(cell.node.checked_position(cell.row)?)?;
         ExecutionVector::direct(Arc::clone(child)).select(&Selection::Range { offset: start, length: end - start })
     }

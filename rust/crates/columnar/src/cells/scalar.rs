@@ -52,13 +52,13 @@ impl<'a> CellRef<'a> {
         let mut node = node.as_ref();
         let mut row = self.vector.address.row(self.index)?;
         loop {
+            if matches!(node.container(), Some(ContainerStorageRef::Union { .. })) { return Err(unsupported(getter.name())); }
             match &node.storage {
                 NodeLayout::RunEnd(reader) => {
                     if matches!(getter, RunGetter::LongLong) && !long_long_reader(reader.values()) { return Err(unsupported(getter.name())); }
                     row = reader.index(row)?;
                     node = reader.values();
                 },
-                NodeLayout::Union { .. } => return Err(unsupported(getter.name())),
                 _ => return Ok(ResolvedCell { node, row }),
             }
         }

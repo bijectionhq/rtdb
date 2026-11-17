@@ -172,21 +172,14 @@ fn run_end_forwarding_keeps_storage_free_leaf_methods_and_signed_search_position
 }
 
 #[test]
-fn empty_run_end_null_values_keep_constant_nullness_after_named_selection() {
+fn external_empty_run_end_null_values_remain_rejected() {
     let memory = MemoryBudget::new(16 * 1024 * 1024);
     let ends = open(Field::new("run_ends", DataType::Int32, false), Arc::new(Int32Array::from(Vec::<i32>::new())), &memory);
     let values = open(Field::new("values", DataType::Null, true), Arc::new(NullArray::new(0)), &memory);
     let field = Arc::new(Field::new("runs", DataType::RunEndEncoded(Arc::new(ends.ingress_field().arrow().unwrap().clone()), Arc::new(values.ingress_field().arrow().unwrap().clone())), false));
-    let runs = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 0, run_ends: ends, values }, &memory).unwrap();
-    let parent = absent_parent(runs, &[0, -1, i32::MAX], &memory);
-    let selected = parent.vector_for("runs").unwrap().unwrap().select(&Selection::All).unwrap();
-    for row in 0..3 {
-        let cell = selected.cell(row).unwrap();
-        assert!(cell.is_null().unwrap());
-        assert_eq!(cell.object().unwrap().value(), &Value::Null);
-        assert_eq!(anomaly(cell.get_long(NullChecks::Enabled).unwrap_err()).code, "rtdb/unsupported-vector-reader");
-        assert_eq!(cell.byte_span().unwrap_err().code, "rtdb/unsupported-vector-reader");
-    }
+    let error = ExecutionVector::from_physical(field, PhysicalLayout::RunEndEncoded { length: 0, run_ends: ends, values }, &memory).unwrap_err();
+    assert_eq!(error.code, "rtdb/run-end-type");
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[test]

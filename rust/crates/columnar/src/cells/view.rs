@@ -50,13 +50,17 @@ impl ExecutionVector {
     }
 
     /// Implements Struct child and DenseUnion named-leg lookup while retaining the reader's selection.
+    /// A direct Struct returns the complete child with its own row count.
     /// Missing names return None; other classes, including run-end encoding, reject vectorFor.
     /// A union leg masks is_null only; its getters still delegate through the stored offset.
     pub fn vector_for(&self, name: &str) -> Result<Option<Self>> {
         match &self.view {
-            ReaderView::Direct(node) => match &node.storage {
-                NodeLayout::Struct { children, .. } => Ok(children.iter().find(|child| child.descriptor.name() == name).map(|child| Self { view: ReaderView::Direct(Arc::clone(child)), address: self.address.clone() })),
-                NodeLayout::Union { children, .. } => {
+            ReaderView::Direct(node) => match node.container() {
+                Some(ContainerStorageRef::Struct { children, .. }) => Ok(children.iter().find(|child| child.descriptor.name() == name).map(|child| match &self.address {
+                    Address::Identity { .. } => Self::direct(Arc::clone(child)),
+                    address => Self { view: ReaderView::Direct(Arc::clone(child)), address: address.clone() },
+                })),
+                Some(ContainerStorageRef::Union { children, .. }) => {
                     let Some(index) = children.iter().position(|child| child.descriptor.name() == name) else { return Ok(None); };
                     let id = node.descriptor.union_type_id(index)?;
                     self.leg(node, id, Self::direct(Arc::clone(&children[index]))).map(Some)
@@ -84,8 +88,8 @@ impl ExecutionVector {
     pub fn list_elements(&self) -> Result<Self> {
         match &self.view {
             ReaderView::UnionLeg { inner, .. } => inner.list_elements(),
-            ReaderView::Direct(node) => match &node.storage {
-                NodeLayout::List { elements, .. } | NodeLayout::FixedList { elements, .. } => Ok(Self::direct(Arc::clone(elements))),
+            ReaderView::Direct(node) => match node.container() {
+                Some(ContainerStorageRef::List { elements, .. } | ContainerStorageRef::FixedList { elements, .. }) => Ok(Self::direct(Arc::clone(elements))),
                 _ => Err(unsupported("listElements")),
             },
         }
@@ -115,12 +119,12 @@ impl ExecutionVector {
     fn map_column(&self, last: bool) -> Result<Self> {
         match &self.view {
             ReaderView::UnionLeg { inner, .. } => inner.map_column(last),
-            ReaderView::Direct(node) => match &node.storage {
-                NodeLayout::Struct { children, .. } => {
+            ReaderView::Direct(node) => match node.container() {
+                Some(ContainerStorageRef::Struct { children, .. }) => {
                     let child = if last { children.last() } else { children.first() }.ok_or_else(|| unsupported("empty Struct map reader"))?;
                     Ok(Self::direct(Arc::clone(child)))
                 }
-                NodeLayout::List { elements, .. } if matches!(node.descriptor.container(), Some(ContainerKind::Map { .. })) => Self::direct(Arc::clone(elements)).map_column(last),
+                Some(ContainerStorageRef::List { elements, .. }) if matches!(node.descriptor.container(), Some(ContainerKind::Map { .. })) => Self::direct(Arc::clone(elements)).map_column(last),
                 _ => Err(unsupported(if last { "mapValues" } else { "mapKeys" })),
             },
         }
