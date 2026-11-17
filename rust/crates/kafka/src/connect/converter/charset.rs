@@ -12,6 +12,7 @@ pub(super) enum Charset {
     Latin1,
     Ascii,
     Iscii91,
+    Gb18030,
     Big5(&'static double_byte::big5::Big5Family),
     Big5Solaris(&'static double_byte::big5::Big5Family),
     Hkscs(&'static double_byte::hkscs::Hkscs),
@@ -65,6 +66,7 @@ impl Charset {
             "utf-32le" | "utf_32le" | "x-utf-32le" | "x-utf-32le-bom" | "utf_32le_bom" | "utf-32le-bom" => Self::Utf32(Utf32Order::Little),
             "big5" | "csbig5" => Self::Big5(&double_byte::big5::FAMILY),
             "x-big5-solaris" | "big5_solaris" => Self::Big5Solaris(&double_byte::big5::FAMILY),
+            "gb18030" | "gb18030-2022" => Self::Gb18030,
             normalized => {
                 if iscii91::supports(normalized) { Self::Iscii91 }
                 else if let Some(table) = single_byte::lookup(normalized) { Self::SingleByte(table) }
@@ -89,6 +91,7 @@ impl Charset {
             Self::Latin1 => bytes.iter().map(|byte| char::from(*byte)).collect(),
             Self::Ascii => bytes.iter().map(|byte| if *byte < 128 { char::from(*byte) } else { '\u{fffd}' }).collect(),
             Self::Iscii91 => iscii91::decode(bytes),
+            Self::Gb18030 => double_byte::gb18030::decode(bytes),
             Self::Big5(family) => family.decode_big5(bytes),
             Self::Big5Solaris(family) => family.decode_solaris(bytes),
             Self::Hkscs(table) => table.decode(bytes),

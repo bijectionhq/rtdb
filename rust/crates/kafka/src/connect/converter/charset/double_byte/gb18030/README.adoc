@@ -1,0 +1,71 @@
+= Java 25 GB18030 String decoding
+
+The String converter accepts `GB18030` and `gb18030-2022`, case-insensitively, using the pinned Java 25 default 2022 mappings.
+The Java system property `jdk.charset.GB18030=2000` selects different mappings and the `gb18030-2000` alias.
+That property override is outside this default-provider implementation; `gb18030-2000` is rejected.
+link:charsets.tsv[The charset manifest] records the selected class, provider, standard and alias.
+
+`Charset::Gb18030` is a passive immutable configuration value.
+Its decoder borrows two process-lifetime byte tables containing 126,972 bytes.
+The input cursor and UTF8 output are transients owned by one decode call.
+There is no decoder state shared between records.
+The caller's checked String scalar admission of `4 * input_bytes + 16,384` precedes the decoder's `3 * input_bytes` output reservation.
+A BMP result uses at most three UTF8 bytes; a supplementary result uses four bytes for four input bytes.
+Each malformed input event consumes at least one byte and emits one replacement.
+
+== Byte interpretation and replacement
+
+Bytes 0x00 through 0x7F emit ASCII.
+Bytes 0x80 and 0xFF consume one byte and emit U+FFFD.
+Leads 0x81 through 0xFE require a second byte.
+A second byte below 0x30 replaces only the lead, so the second byte is processed again.
+Second bytes 0x3A through 0x3F, 0x7F and 0xFF consume both bytes and emit U+FFFD.
+Second bytes 0x40 through 0xFE, excluding 0x7F, select the two-byte mapping.
+
+Second bytes 0x30 through 0x39 select four-byte decoding.
+The decoder requires all four bytes before inspecting the third byte.
+An invalid third byte consumes three bytes; an invalid fourth byte consumes four bytes.
+A valid third byte is in 0x81 through 0xFE, and a valid fourth byte is in 0x30 through 0x39.
+The offset is `(((first - 0x81) * 10 + second - 0x30) * 126 + third - 0x81) * 10 + fourth - 0x30`.
+
+Offsets 0 through 0x99FB produce the pinned BMP mapping, including literal U+FFFF at the upper boundary.
+Offsets 0x2E248 through 0x12E247 produce scalar values U+10000 through U+10FFFF by subtracting 0x1E248.
+Other structurally valid four-byte sequences consume all four bytes and produce U+FFFD.
+The BMP table incorporates Java's table lookups, arithmetic ranges, and the eight relocated 2022 offsets 0x4A71 through 0x4A78.
+The two-byte table includes 2022 mappings such as A6D9 to U+FE10, A8BC to U+1E3F, and FE59 to U+9FB4.
+
+Terminal underflow replaces the complete remaining prefix once.
+For example, `81 30 41` produces one replacement because four-byte availability is checked first.
+With an additional `42`, the invalid third byte consumes the first three bytes and the final byte produces `B`.
+Null, empty and subsequent records retain no partial prefix.
+
+== Source provenance and resources
+
+The resources derive from Eclipse Temurin OpenJDK `25.0.1+8` for Linux x64.
+The archive SHA256 is `8daf77d1aacffe38c9889689bc224a13557de77559d9a5bb91991e6a298baa0d` and its `lib/src.zip` SHA256 is `3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482`.
+link:sources.sha256[The source manifest] pins the GB18030 decoder, standard provider, String constructor, Charset and CharsetDecoder sources.
+link:COPYRIGHT[Copyright notices] retain their original headers, with link:LICENSE[GPLv2 with Classpath Exception], link:ASSEMBLY_EXCEPTION[assembly exception] and link:ADDITIONAL_LICENSE_INFO[additional license information].
+
+link:mappings.tsv[The resource manifest] records each size, hash and shape.
+`pairs.bin` contains 126 lead rows from 0x81 through 0xFE and 191 trail columns from 0x40 through 0xFE, as big-endian unsigned 16-bit units.
+The decoder excludes the 0x7F trail before table lookup.
+`bmp.bin` contains 39,420 big-endian unsigned 16-bit units in four-byte offset order.
+Neither table contains surrogate units.
+
+link:derive.py[The standard-library derivation] reads archive members and Java source literals only.
+It parses concatenated String literals and `IS_2000` conditional expressions with the default false value, then applies the pinned index arrays and BMP range formulas.
+It does not use host charset codecs, Java execution, or Rust execution.
+
+[source,bash]
+----
+python3 derive.py /path/to/OpenJDK25U-jdk_x64_linux_hotspot_25.0.1_8.tar.gz /tmp/java25-gb18030
+----
+
+== Regression sources
+
+link:probes.tsv[The probe manifest] records source-derived UTF8 result digests with a U+0000 separator after each decoded record.
+It covers all 256 single bytes, all 65,536 byte pairs, and all 1,587,600 structurally valid four-byte sequences.
+Additional probes cover all third/fourth-byte combinations after ten representative lead/digit prefixes, plus all second/third-byte combinations after two representative leads.
+Their 655,360 and 131,072 records include malformed widths, prefix truncation, and suffix reprocessing.
+Focused regression sources cover BMP range boundaries, 2022 relocations, supplementary endpoints, aliases, configuration precedence, record reset, and memory admission.
+All executable validation remains pending until the complete implementation passes its Phase 1 source gate.

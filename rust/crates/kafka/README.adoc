@@ -123,7 +123,9 @@ ISO-2022-CN, its CNS/GB variants, and ISO-2022-KR support all 12 registered name
 Their GB2312/KSC5601 and CNS mappings, high-byte interpretation, BMP-only CNS single shifts, and distinct escape-error lengths are documented in the link:src/connect/converter/charset/double_byte/iso2022cnkr/README.adoc[ISO-2022-CN/KR reference].
 ISCII91 supports all six registered names with delayed Nukta compositions, Halant joiners, and record-local pending-character state.
 Its signed-byte indexing, attribute handling, retained error context, and terminal flush behavior are documented in the link:src/connect/converter/charset/iscii91/README.adoc[ISCII91 reference].
-Other built-in multibyte and stateful charset families, including GB18030, JIS0213, and JISAutoDetect, and additional installed charset providers remain source-completeness work.
+GB18030 and its `gb18030-2022` alias use the pinned default Java 25 mappings, including supplementary scalars and the provider's four-byte replacement boundaries.
+The conditional `gb18030-2000` alias is outside the default-provider configuration, as described in the link:src/connect/converter/charset/double_byte/gb18030/README.adoc[GB18030 reference].
+The built-in JIS0213 and JISAutoDetect families and additional installed charset providers remain source-completeness work.
 Registry lookup uses bounded HTTP responses, a retained schema cache, reference resolution, subject-name strategies, and subject-version lookup; Avro datum preflight bounds decoded allocation before the native decoder runs.
 Avro conversion retains narrow integer annotations, field defaults, Connect metadata, enum/fixed metadata, and non-string map entry records.
 `scrub.invalid.names=true` is accepted for Avro ingestion and preserves Connect schema names, including `connect.name` annotations.
