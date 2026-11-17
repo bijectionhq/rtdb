@@ -37,7 +37,7 @@ impl CatalogRuntime for NodeCatalogRuntime {
         let Ok(database) = self.node.catalog().database("xtdb") else { return empty(); };
         let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
         let snapshot = database.partition.open_snapshot(head);
-        if !snapshot.tables().contains(&TableRef::new("xt", "role_membership")) { return empty(); }
+        if !snapshot.contains_table(&TableRef::new("xt", "role_membership")) { return empty(); }
         let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&database.storage) })]), false)?;
         let context = QueryContext::with_owner(catalog, Arc::clone(self.node.memory()), self.node.now(), "UTC", QueryOptions::default(), &self.cancellation, self.node.cancellation())?;
         let prepared = rtdb_sql::prepare("SELECT \"user\", \"role\" FROM xt.role_membership", &context.catalog, &Default::default())?;

@@ -68,6 +68,8 @@ fn uncommitted_rows_are_visible_only_to_transaction_snapshot() {
     tx.put(table(), document(0, 42), Interval::ALL).unwrap();
     assert_eq!(rows(&state.open_snapshot(None)), 0);
     assert_eq!(rows(&tx.snapshot().unwrap()), 1);
+    assert!(!state.open_snapshot(None).contains_table(&table()));
+    assert!(tx.snapshot().unwrap().contains_table(&table()));
     assert_eq!(state.value().live().block_row_count(), 0);
     drop(tx);
     assert_eq!(rows(&state.open_snapshot(None)), 0);
@@ -128,6 +130,8 @@ fn published_l0_hides_live_rows_but_keeps_types_and_pinned_catalogs() {
     let after = state.open_snapshot(None);
     assert_eq!(rows(&after), 0);
     assert_eq!(rows(&held), 1);
+    assert!(after.contains_table(&table()));
+    assert!(held.contains_table(&table()));
     assert_eq!(after.column_types(&table())["v"], LogicalType::Scalar(ScalarType::I64));
     assert_eq!(after.trie_entries(&table()).len(), 1);
     assert!(held.trie_entries(&table()).is_empty());
@@ -157,6 +161,7 @@ fn block_adoption_publishes_catalogs_and_rollover_together() {
     reader.join().unwrap();
     assert_eq!(rows(&held), 1);
     assert_eq!(rows(&state.open_snapshot(None)), 0);
+    assert!(state.open_snapshot(None).contains_table(&table()));
     assert_eq!(state.value().table_catalog().metadata(&table()).unwrap().row_count, 1);
     assert_eq!(state.value().live().block_row_count(), 0);
 }
@@ -186,11 +191,30 @@ fn empty_declared_table_is_visible_to_later_staged_transactions() {
     let staged = Arc::new(creator.stage().unwrap());
     let snapshot = state.resolving_snapshot(&[Arc::clone(&staged)]).unwrap();
     assert!(snapshot.tables().contains(&table()));
+    assert!(snapshot.contains_table(&table()));
     assert_eq!(snapshot.column_types(&table())["v"], LogicalType::Nothing);
     assert_eq!(rows(&snapshot), 0);
     assert!(!state.open_snapshot(None).tables().contains(&table()));
+    assert!(!state.open_snapshot(None).contains_table(&table()));
     state.apply(&staged).unwrap();
     assert!(state.open_snapshot(Some(key(0).system_time)).tables().contains(&table()));
+    assert!(state.open_snapshot(Some(key(0).system_time)).contains_table(&table()));
+}
+
+#[test]
+fn table_membership_includes_seeded_empty_catalogs_and_keeps_its_captured_generation() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let before = state.open_snapshot(None);
+    for name in [TableRef::new("xt", "txs"), TableRef::new("xt", "role_membership")] {
+        assert!(before.contains_table(&name));
+        assert!(before.segments(&name).is_empty());
+    }
+    assert!(!before.contains_table(&table()));
+    let budget = MemoryBudget::new(1 << 24);
+    state.apply(&stage(&state, &budget, 0)).unwrap();
+    assert!(!before.contains_table(&table()));
+    assert!(state.open_snapshot(Some(key(0).system_time)).contains_table(&table()));
+    assert!(!state.open_snapshot(Some(key(0).system_time)).contains_table(&TableRef::new("missing", "docs")));
 }
 
 #[test]

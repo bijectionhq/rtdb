@@ -52,11 +52,11 @@ impl CatalogSnapshot {
     fn binding(&self, database: &str, table: &TableRef) -> Result<Option<TableBinding>> {
         let snapshots = &self.database(database)?.partitions;
         if let Some(definition) = crate::system_schema::definition(table) { return Ok(Some(definition.binding(database))); }
-        if !snapshots.iter().any(|snapshot| snapshot.tables().contains(table)) { return Ok(None); }
+        if !snapshots.iter().any(|snapshot| snapshot.contains_table(table)) { return Ok(None); }
         let mut columns: Option<BTreeMap<String, LogicalType>> = None;
         let mut oid = None;
         for snapshot in snapshots {
-            if !snapshot.tables().contains(table) { continue; }
+            if !snapshot.contains_table(table) { continue; }
             if let Some(entry) = snapshot.table_entry(table) {
                 let next = entry.oid as i32;
                 if oid.is_some_and(|previous| previous != next) { return Err(Anomaly::fault("rtdb.query/partition-table-oid", "Partition catalogs disagree on table OID")); }
