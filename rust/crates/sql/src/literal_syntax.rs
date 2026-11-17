@@ -59,13 +59,33 @@ impl Context<'_> {
                 if let Some(predicate) = &select.selection { self.admit_expression_literals(predicate)?; }
                 if let Some(having) = &select.having { self.admit_expression_literals(having)?; }
                 for item in &select.projection {
-                    match item {
-                        ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } => self.admit_expression_literals(expression)?,
-                        _ => (),
-                    }
+                    self.admit_projection_literal(item)?;
                 }
                 if let ast::GroupByExpr::Expressions(expressions, _) = &select.group_by {
                     for expression in expressions { self.admit_expression_literals(expression)?; }
+                }
+            }
+            ast::SetExpr::FromPipeline(pipeline) => {
+                for table in &pipeline.from {
+                    self.admit_joined_table_literals(table)?;
+                }
+                for tail in &pipeline.tails {
+                    match tail {
+                        ast::FromPipelineTail::Where(predicate) => self.admit_expression_literals(predicate)?,
+                        ast::FromPipelineTail::Select(select) => {
+                            if let Some(having) = &select.having {
+                                self.admit_expression_literals(having)?;
+                            }
+                            for item in &select.projection {
+                                self.admit_projection_literal(item)?;
+                            }
+                            if let Some(ast::GroupByExpr::Expressions(expressions, _)) = &select.group_by {
+                                for expression in expressions {
+                                    self.admit_expression_literals(expression)?;
+                                }
+                            }
+                        }
+                    }
                 }
             }
             ast::SetExpr::Query(query) => self.admit_query_literals(query)?,
@@ -74,6 +94,14 @@ impl Context<'_> {
             _ => (),
         }
         Ok(())
+    }
+
+    fn admit_projection_literal(&mut self, item: &ast::SelectItem) -> Result<()> {
+        match item {
+            ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } =>
+                self.admit_expression_literals(expression),
+            _ => Ok(()),
+        }
     }
 
     fn admit_joined_table_literals(&mut self, table: &ast::TableWithJoins) -> Result<()> {

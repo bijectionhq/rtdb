@@ -47,6 +47,10 @@ impl Dialect for SqlDialect {
     fn is_identifier_start(&self, ch: char) -> bool { ch.is_ascii_alphabetic() || ch == '_' }
     fn is_identifier_part(&self, ch: char) -> bool { ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$') }
     fn is_delimited_identifier_start(&self, ch: char) -> bool { GenericDialect {}.is_delimited_identifier_start(ch) }
+    fn supports_from_pipeline(&self) -> bool { true }
+    fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
+        *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
+    }
 
     generic_flags!(
         supports_unicode_string_literal,

@@ -697,6 +697,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Whether FROM-first queries accept a sequence of WHERE and SELECT clauses.
+    fn supports_from_pipeline(&self) -> bool {
+        false
+    }
+
     /// Return true if the dialect supports "FROM-first" inserts.
     ///
     /// Example:

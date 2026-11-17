@@ -59,6 +59,13 @@ pub(crate) struct Context<'a> {
 #[derive(Clone)]
 enum Cte { Inline(Arc<Relation>), Materialized(Arc<MaterializedBinding>) }
 
+struct SelectProjection<'a> {
+    items: &'a [ast::SelectItem],
+    group_by: Option<&'a ast::GroupByExpr>,
+    having: Option<&'a ast::Expr>,
+    distinct: bool,
+}
+
 pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: &PrepareOptions, forms: FormAllocation<'_>) -> Result<Expr> {
     struct ScalarCatalog;
     impl Catalog for ScalarCatalog {
@@ -241,9 +248,10 @@ impl Context<'_> {
                 self.ctes.insert(name, cte);
             }
         }
-        let integrated_order = matches!(query.body.as_ref(), ast::SetExpr::Select(_));
+        let integrated_order = matches!(query.body.as_ref(), ast::SetExpr::Select(_) | ast::SetExpr::FromPipeline(_));
         let mut input = match query.body.as_ref() {
             ast::SetExpr::Select(select) => self.select(select, query.order_by.as_ref())?,
+            ast::SetExpr::FromPipeline(pipeline) => self.from_pipeline(pipeline, query.order_by.as_ref())?,
             body => self.set_expr(body)?,
         };
         if let Some(order) = query.order_by.as_ref().filter(|_| !integrated_order) {
@@ -315,6 +323,7 @@ impl Context<'_> {
     fn set_expr(&mut self, set: &ast::SetExpr) -> Result<Arc<Relation>> {
         match set {
             ast::SetExpr::Select(select) => self.select(select, None),
+            ast::SetExpr::FromPipeline(pipeline) => self.from_pipeline(pipeline, None),
             ast::SetExpr::Query(query) => self.query(query),
             ast::SetExpr::Values(values) => self.values(&values.rows),
             ast::SetExpr::SetOperation { left, op, set_quantifier, right } => {
@@ -331,12 +340,62 @@ impl Context<'_> {
     }
 
     fn select(&mut self, select: &ast::Select, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
-        let wildcard = [ast::SelectItem::Wildcard(Default::default())];
-        let from_first = matches!(&select.select_token.0.token, sqlparser::tokenizer::Token::Word(word) if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("FROM"));
-        let projection = if from_first && select.projection.is_empty() { &wildcard[..] } else { &select.projection };
         if select.top.is_some() || select.into.is_some() || select.qualify.is_some() || !select.lateral_views.is_empty() || select.prewhere.is_some() || !select.cluster_by.is_empty() || !select.distribute_by.is_empty() || !select.sort_by.is_empty() || !select.connect_by.is_empty() { return Err(unsupported("SELECT extension")); }
+        let mut input = self.table_input(&select.from)?;
+        if let Some(predicate) = &select.selection {
+            input = self.bind_filter(input, predicate)?;
+        }
+        let distinct = match &select.distinct {
+            None => false,
+            Some(ast::Distinct::Distinct) => true,
+            Some(_) => return Err(unsupported("DISTINCT ON")),
+        };
+        self.select_projection(input, SelectProjection {
+            items: &select.projection,
+            group_by: Some(&select.group_by),
+            having: select.having.as_ref(),
+            distinct,
+        }, order_by)
+    }
+
+    fn from_pipeline(&mut self, pipeline: &ast::FromPipeline, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
+        let input = self.table_input(&pipeline.from)?;
+        let first_projection = pipeline.tails.iter().position(|tail| matches!(tail, ast::FromPipelineTail::Select(_)));
+        if let Some(boundary) = first_projection.map(|index| index + 1).filter(|index| *index < pipeline.tails.len()) {
+            let (initial, remaining) = pipeline.tails.split_at(boundary);
+            let projected = self.bind_from_tails(input, initial, None)?;
+            return self.with_projection_scope(|context| context.bind_from_tails(projected, remaining, order_by));
+        }
+        self.bind_from_tails(input, &pipeline.tails, order_by)
+    }
+
+    fn bind_from_tails(&mut self, mut input: Arc<Relation>, tails: &[ast::FromPipelineTail], order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
+        for (index, tail) in tails.iter().enumerate() {
+            match tail {
+                ast::FromPipelineTail::Where(predicate) => input = self.bind_filter(input, predicate)?,
+                ast::FromPipelineTail::Select(select) => {
+                    let last = index + 1 == tails.len();
+                    input = self.select_projection(input, SelectProjection {
+                        items: &select.projection,
+                        group_by: select.group_by.as_ref(),
+                        having: select.having.as_ref(),
+                        distinct: select.distinct,
+                    }, if last { order_by } else { None })?;
+                    if last {
+                        return Ok(input);
+                    }
+                }
+            }
+        }
+        let wildcard = [ast::SelectItem::Wildcard(Default::default())];
+        self.select_projection(input, SelectProjection {
+            items: &wildcard, group_by: None, having: None, distinct: false,
+        }, order_by)
+    }
+
+    fn table_input(&mut self, tables: &[ast::TableWithJoins]) -> Result<Arc<Relation>> {
         let mut input = Arc::new(Relation::unit());
-        for (index, table) in select.from.iter().enumerate() {
+        for (index, table) in tables.iter().enumerate() {
             let (right, arguments) = if index == 0 { (self.joined_table(table, self.outer_scopes.len())?, Vec::new()) }
                 else { self.from_scope(input.schema().clone(), |context, start| context.joined_table(table, start))? };
             input = if arguments.is_empty() && input.schema().is_empty() && matches!(input.node(), RelationNode::Values { rows } if rows == &vec![vec![]]) {
@@ -345,13 +404,26 @@ impl Context<'_> {
                 self.cross_join_from(input, right, arguments)?
             };
         }
-        if let Some(predicate) = &select.selection { let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?; input = Arc::new(input.filter(predicate)?); }
-        let groups = match &select.group_by { ast::GroupByExpr::Expressions(expressions, modifiers) if modifiers.is_empty() => expressions, _ => return Err(unsupported("GROUP BY ALL or grouping sets")) };
+        Ok(input)
+    }
+
+    fn bind_filter(&mut self, mut input: Arc<Relation>, predicate: &ast::Expr) -> Result<Arc<Relation>> {
+        let predicate = self.relational_expr(predicate, &mut input, &BTreeMap::new())?;
+        Ok(Arc::new(input.filter(predicate)?))
+    }
+
+    fn select_projection(&mut self, mut input: Arc<Relation>, select: SelectProjection<'_>, order_by: Option<&ast::OrderBy>) -> Result<Arc<Relation>> {
+        let projection = select.items;
+        let groups = match select.group_by {
+            None => &[][..],
+            Some(ast::GroupByExpr::Expressions(expressions, modifiers)) if modifiers.is_empty() => expressions,
+            _ => return Err(unsupported("GROUP BY ALL or grouping sets")),
+        };
         let mut aggregate_calls = Vec::new();
         for item in projection {
             if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; crate::expression::aggregate_notices(expr, &mut self.notices); }
         }
-        if let Some(having) = &select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
+        if let Some(having) = select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
         let mut replacements = BTreeMap::new();
         if !groups.is_empty() || !aggregate_calls.is_empty() {
             let mut named_groups = Vec::new();
@@ -373,7 +445,7 @@ impl Context<'_> {
             let schema = Schema::new(named_groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|agg| agg.field.clone())).collect())?;
             input = Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups: named_groups, aggregates })?);
         }
-        if let Some(having) = &select.having { let predicate = self.relational_expr(having, &mut input, &replacements)?; input = Arc::new(input.filter(predicate)?); }
+        if let Some(having) = select.having { let predicate = self.relational_expr(having, &mut input, &replacements)?; input = Arc::new(input.filter(predicate)?); }
         let mut windows = Vec::new();
         for item in projection {
             if let ast::SelectItem::UnnamedExpr(expression) | ast::SelectItem::ExprWithAlias { expr: expression, .. } = item { crate::expression::window_calls(expression, &mut windows); }
@@ -441,8 +513,7 @@ impl Context<'_> {
             input = Arc::new(input.sort(order)?);
             input = Arc::new(input.project(fields.into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect())?);
         } else { input = Arc::new(input.project(projected)?); }
-        if let Some(distinct) = &select.distinct {
-            if !matches!(distinct, ast::Distinct::Distinct) { return Err(unsupported("DISTINCT ON")); }
+        if select.distinct {
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
         }
         Ok(input)

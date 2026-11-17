@@ -366,6 +366,10 @@ Their arguments bind against the preceding FROM scope, permitting correlated ser
 Unnamed table fields retain internal binding identities; wildcard projections assign `_column_1`, `_column_2` and subsequent labels within that wildcard expansion.
 UNNEST uses the same table-column naming contract.
 FROM-first queries with an omitted projection expand the visible wildcard; an explicit empty SELECT projection retains zero-column rows.
+Each FROM-first WHERE or SELECT tail uses the columns produced by the preceding tail.
+After a SELECT tail, later tails resolve only the projected names and columns local to their own subqueries.
+GROUP BY and HAVING belong to the SELECT tail that follows them.
+ORDER BY can reference the final SELECT's input as well as its output names.
 Series table forms use a List cursor with semantic pages of 1,024 rows and retain a constant-size integer-series descriptor.
 LIMIT and OFFSET consume those pages without materializing the complete series.
 Series WITH ORDINALITY uses signed 64-bit local row numbers, restarting at each semantic page.

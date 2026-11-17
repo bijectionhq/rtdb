@@ -150,6 +150,8 @@ impl fmt::Display for ProjectionSelect {
 pub enum SetExpr {
     /// Restricted SELECT .. FROM .. HAVING (no ORDER BY or set operations)
     Select(Box<Select>),
+    /// FROM followed by an ordered sequence of filters and projections.
+    FromPipeline(Box<FromPipeline>),
     /// Parenthesized SELECT subquery, which may include more set operations
     /// in its body and an optional ORDER BY / LIMIT.
     Query(Box<Query>),
@@ -194,6 +196,7 @@ impl fmt::Display for SetExpr {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             SetExpr::Select(s) => s.fmt(f),
+            SetExpr::FromPipeline(pipeline) => pipeline.fmt(f),
             SetExpr::Query(q) => {
                 f.write_str("(")?;
                 q.fmt(f)?;
@@ -230,6 +233,79 @@ impl fmt::Display for SetExpr {
                 Ok(())
             }
         }
+    }
+}
+
+/// A FROM-first query specification with its clauses in evaluation order.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct FromPipeline {
+    /// The FROM keyword.
+    pub from_token: AttachedToken,
+    /// The input tables and their joins.
+    pub from: Vec<TableWithJoins>,
+    /// Clauses applied in source order.
+    pub tails: Vec<FromPipelineTail>,
+    /// Window definitions following the last tail.
+    pub named_window: Vec<NamedWindowDefinition>,
+}
+
+/// One relational operation in a FROM-first query specification.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum FromPipelineTail {
+    /// A filter over the preceding relation.
+    Where(Expr),
+    /// A projection with optional grouping over the preceding relation.
+    Select(Box<FromPipelineSelect>),
+}
+
+/// A GROUP BY / HAVING / SELECT tail in a FROM-first query.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub struct FromPipelineSelect {
+    /// Optional grouping.
+    pub group_by: Option<GroupByExpr>,
+    /// Optional filter after grouping.
+    pub having: Option<Expr>,
+    /// The SELECT keyword.
+    pub select_token: AttachedToken,
+    /// Whether SELECT removes duplicate rows.
+    pub distinct: bool,
+    /// The explicit projection, which may be empty.
+    pub projection: Vec<SelectItem>,
+}
+
+impl fmt::Display for FromPipeline {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "FROM {}", display_comma_separated(&self.from))?;
+        for tail in &self.tails {
+            match tail {
+                FromPipelineTail::Where(predicate) => write!(f, " WHERE {predicate}")?,
+                FromPipelineTail::Select(select) => {
+                    if let Some(group_by) = &select.group_by {
+                        write!(f, " {group_by}")?;
+                    }
+                    if let Some(having) = &select.having {
+                        write!(f, " HAVING {having}")?;
+                    }
+                    f.write_str(" SELECT")?;
+                    if select.distinct {
+                        f.write_str(" DISTINCT")?;
+                    }
+                    if !select.projection.is_empty() {
+                        write!(f, " {}", display_comma_separated(&select.projection))?;
+                    }
+                }
+            }
+        }
+        if !self.named_window.is_empty() {
+            write!(f, " WINDOW {}", display_comma_separated(&self.named_window))?;
+        }
+        Ok(())
     }
 }
 

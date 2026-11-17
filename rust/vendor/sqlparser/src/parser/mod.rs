@@ -15084,7 +15084,9 @@ impl<'a> Parser<'a> {
     pub fn parse_query_body(&mut self, precedence: u8) -> Result<Box<SetExpr>, ParserError> {
         // We parse the expression using a Pratt parser, as in `parse_expr()`.
         // Start by parsing a restricted SELECT or a `(subquery)`:
-        let expr = if self.peek_keyword(Keyword::SELECT)
+        let expr = if self.dialect.supports_from_pipeline() && self.peek_keyword(Keyword::FROM) {
+            SetExpr::FromPipeline(Box::new(self.parse_from_pipeline()?))
+        } else if self.peek_keyword(Keyword::SELECT)
             || (self.peek_keyword(Keyword::FROM) && self.dialect.supports_from_first_select())
         {
             SetExpr::Select(self.parse_select().map(Box::new)?)
@@ -15109,6 +15111,76 @@ impl<'a> Parser<'a> {
         };
 
         self.parse_remaining_set_exprs(expr, precedence)
+    }
+
+    fn parse_from_pipeline(&mut self) -> Result<FromPipeline, ParserError> {
+        let from_token = self.expect_keyword(Keyword::FROM)?.into();
+        let from = self.parse_table_with_joins()?;
+        let mut tails = Vec::new();
+        loop {
+            if self.parse_keyword(Keyword::WHERE) {
+                tails.push(FromPipelineTail::Where(self.parse_expr()?));
+            } else if self.peek_one_of_keywords(&[Keyword::GROUP, Keyword::HAVING, Keyword::SELECT]).is_some() {
+                let group_by = self.parse_optional_group_by()?;
+                let having = if self.parse_keyword(Keyword::HAVING) {
+                    Some(self.parse_expr()?)
+                } else {
+                    None
+                };
+                let select_token = self.expect_keyword(Keyword::SELECT)?.into();
+                let distinct = self.parse_keyword(Keyword::DISTINCT);
+                if !distinct {
+                    let _ = self.parse_keyword(Keyword::ALL);
+                }
+                let mut projection = Vec::new();
+                loop {
+                    if self.peek_keyword(Keyword::SELECT) {
+                        let Some(item) = self.maybe_parse(|p| {
+                            let item = p.parse_select_item()?;
+                            if p.at_from_pipeline_projection_end() || p.peek_token_ref().token == Token::Comma {
+                                Ok(item)
+                            } else {
+                                p.expected_ref("end of projection item", p.peek_token_ref())
+                            }
+                        })? else {
+                            break;
+                        };
+                        projection.push(item);
+                    } else if self.at_from_pipeline_projection_end() {
+                        break;
+                    } else if self.peek_token_ref().token != Token::Comma {
+                        projection.push(self.parse_select_item()?);
+                    }
+                    if !self.consume_token(&Token::Comma) {
+                        break;
+                    }
+                }
+                tails.push(FromPipelineTail::Select(Box::new(FromPipelineSelect {
+                    group_by, having, select_token, distinct, projection,
+                })));
+            } else {
+                break;
+            }
+        }
+        let named_window = if self.parse_keyword(Keyword::WINDOW) {
+            self.parse_comma_separated(Parser::parse_named_window)?
+        } else {
+            Vec::new()
+        };
+        Ok(FromPipeline { from_token, from, tails, named_window })
+    }
+
+    fn at_from_pipeline_projection_end(&mut self) -> bool {
+        match &self.peek_token_ref().token {
+            Token::EOF | Token::RParen | Token::SemiColon => true,
+            Token::Word(word) => matches!(
+                word.keyword,
+                Keyword::WHERE | Keyword::GROUP | Keyword::HAVING | Keyword::SELECT |
+                Keyword::WINDOW | Keyword::ORDER | Keyword::OFFSET | Keyword::FETCH |
+                Keyword::LIMIT | Keyword::UNION | Keyword::EXCEPT | Keyword::INTERSECT
+            ),
+            _ => false,
+        }
     }
 
     /// Parse any extra set expressions that may be present in a query body
@@ -18665,7 +18737,8 @@ impl<'a> Parser<'a> {
         loop {
             match &self.peek_nth_token_ref(i).token {
                 Token::LParen => i += 1,
-                Token::Word(w) if w.keyword == Keyword::SELECT => return i > 0,
+                Token::Word(w) if w.keyword == Keyword::SELECT
+                    || (w.keyword == Keyword::FROM && self.dialect.supports_from_pipeline()) => return i > 0,
                 _ => return false,
             }
         }
@@ -18675,22 +18748,11 @@ impl<'a> Parser<'a> {
     /// beginning of a subquery possibly preceded by CTEs;
     /// i.e. `(WITH ...` or `(SELECT ...`.
     fn peek_subquery_or_cte_start(&mut self) -> bool {
-        matches!(
-            self.peek_tokens_ref(),
-            [
-                TokenWithSpan {
-                    token: Token::LParen,
-                    ..
-                },
-                TokenWithSpan {
-                    token: Token::Word(Word {
-                        keyword: Keyword::SELECT | Keyword::WITH,
-                        ..
-                    }),
-                    ..
-                },
-            ]
-        )
+        self.peek_token_ref().token == Token::LParen
+            && match &self.peek_nth_token_ref(1).token {
+                Token::Word(w) => self.is_subquery_keyword(w.keyword),
+                _ => false,
+            }
     }
 
     fn parse_conflict_clause(&mut self) -> Option<SqliteOnConflict> {
@@ -20969,10 +21031,16 @@ impl<'a> Parser<'a> {
         self.tokens
     }
 
-    /// Returns true if the next keyword indicates a sub query, i.e. SELECT or WITH
     fn peek_sub_query(&mut self) -> bool {
-        self.peek_one_of_keywords(&[Keyword::SELECT, Keyword::WITH])
-            .is_some()
+        match &self.peek_token_ref().token {
+            Token::Word(w) => self.is_subquery_keyword(w.keyword),
+            _ => false,
+        }
+    }
+
+    fn is_subquery_keyword(&self, keyword: Keyword) -> bool {
+        matches!(keyword, Keyword::SELECT | Keyword::WITH)
+            || (keyword == Keyword::FROM && self.dialect.supports_from_pipeline())
     }
 
     pub(crate) fn parse_show_stmt_options(&mut self) -> Result<ShowStatementOptions, ParserError> {

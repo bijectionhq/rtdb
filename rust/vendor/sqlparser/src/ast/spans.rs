@@ -35,7 +35,8 @@ use super::{
     ConflictTarget, ConnectByKind, ConstraintCharacteristics, CopySource, CreateIndex, CreateTable,
     CreateTableOptions, Cte, Delete, DoUpdate, ExceptSelectItem, ExcludeConstraintElement,
     ExcludeSelectItem, Expr, ExprWithAlias, Fetch, ForValues, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList, FunctionArguments, GroupByExpr,
+    FromPipeline, FromPipelineTail, FunctionArgExpr, FunctionArgumentClause, FunctionArgumentList,
+    FunctionArguments, GroupByExpr,
     HavingBound, IfStatement, IlikeSelectItem, IndexColumn, Insert, Interpolate, InterpolateExpr,
     Join, JoinConstraint, JoinOperator, JsonPath, JsonPathElem, LateralView, LimitClause,
     MatchRecognizePattern, Measure, Merge, MergeAction, MergeClause, MergeInsertExpr,
@@ -220,6 +221,7 @@ impl Spanned for SetExpr {
     fn span(&self) -> Span {
         match self {
             SetExpr::Select(select) => select.span(),
+            SetExpr::FromPipeline(pipeline) => pipeline.span(),
             SetExpr::Query(query) => query.span(),
             SetExpr::SetOperation {
                 op: _,
@@ -234,6 +236,25 @@ impl Spanned for SetExpr {
             SetExpr::Delete(statement) => statement.span(),
             SetExpr::Merge(statement) => statement.span(),
         }
+    }
+}
+
+impl Spanned for FromPipeline {
+    fn span(&self) -> Span {
+        Span::union_iter(
+            iter::once(self.from_token.0.span)
+                .chain(self.from.iter().map(Spanned::span))
+                .chain(self.tails.iter().map(|tail| match tail {
+                    FromPipelineTail::Where(predicate) => predicate.span(),
+                    FromPipelineTail::Select(select) => Span::union_iter(
+                        iter::once(select.select_token.0.span)
+                            .chain(select.group_by.iter().map(Spanned::span))
+                            .chain(select.having.iter().map(Spanned::span))
+                            .chain(select.projection.iter().map(Spanned::span)),
+                    ),
+                }))
+                .chain(self.named_window.iter().map(Spanned::span)),
+        )
     }
 }
 

@@ -290,3 +290,60 @@ fn multiple_unnests_unnest_distinct_columns() {
     staged_ids(&relation, &mut ids);
     assert_eq!(ids.len(), 2);
 }
+
+#[tokio::test]
+async fn from_first_filters_and_projections_bind_in_source_order() {
+    let sql = "FROM (VALUES (?),(?)) AS t(k) WHERE k > ? SELECT k + ? AS k WHERE k < ? SELECT k * ? AS result";
+    let args = [0, 3, 1, 4, 8, 2].into_iter().map(Value::I64).collect();
+    assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 6);
+    assert_eq!(query(sql, args).await.unwrap(), vec![vec![Value::I64(14)]]);
+    assert_eq!(
+        query("FROM (VALUES (1),(2)) AS t(k) WHERE k = 1", vec![]).await.unwrap(),
+        vec![vec![Value::I64(1)]],
+    );
+    assert_eq!(
+        query("FROM (VALUES (1),(2)) AS t(k) SELECT WHERE TRUE", vec![]).await.unwrap(),
+        vec![vec![], vec![]],
+    );
+    assert!(query("FROM (VALUES (1)) AS t(k) SELECT k AS x WHERE t.k = 1", vec![]).await.is_err());
+}
+
+#[tokio::test]
+async fn from_first_specifications_are_query_operands_in_nested_contexts() {
+    let sql = "WITH MATERIALIZED c AS (FROM (VALUES (1),(2)) AS t(k) WHERE k = 2 SELECT k) \
+               FROM (FROM c SELECT k) AS d WHERE k = (FROM c SELECT k) SELECT k \
+               UNION ALL FROM c WHERE k > 1 SELECT k ORDER BY k";
+    assert_eq!(query(sql, vec![]).await.unwrap(), vec![vec![Value::I64(2)], vec![Value::I64(2)]]);
+    assert_eq!(
+        query("FROM (VALUES (1),(2),(2)) AS t(k) GROUP BY k HAVING COUNT(*) > 1 SELECT k, COUNT(*) AS n", vec![]).await.unwrap(),
+        vec![vec![Value::I64(2), Value::I64(2)]],
+    );
+}
+
+#[tokio::test]
+async fn from_first_projection_exposes_only_its_outputs_to_later_tails() {
+    let prefix = "FROM (VALUES (2)) AS o(k), LATERAL (FROM (VALUES (1)) AS t(v)";
+    assert_eq!(
+        query(&format!("{prefix} SELECT o.k AS v) AS d SELECT d.v"), vec![]).await.unwrap(),
+        vec![vec![Value::I64(2)]],
+    );
+    for later in ["WHERE o.k = 2", "SELECT o.k AS v", "WHERE TRUE ORDER BY o.k"] {
+        let error = query(&format!("{prefix} SELECT v {later}) AS d SELECT d.v"), vec![]).await.unwrap_err();
+        assert_eq!(error.code, "xtdb/column-not-found", "{later}");
+    }
+    assert_eq!(
+        query(&format!("{prefix} SELECT v WHERE (SELECT v) = 1) AS d SELECT d.v"), vec![]).await.unwrap(),
+        vec![vec![Value::I64(1)]],
+    );
+}
+
+#[tokio::test]
+async fn from_first_select_keyword_can_also_name_a_projected_column() {
+    for (sql, value) in [
+        ("FROM (VALUES (2)) AS t(select) SELECT select", 2),
+        ("FROM (VALUES (2,3)) AS t(select, v) SELECT SELECT v", 2),
+        ("FROM (VALUES (2)) AS t(v) SELECT SELECT 1 AS n", 1),
+    ] {
+        assert_eq!(query(sql, vec![]).await.unwrap(), vec![vec![Value::I64(value)]], "{sql}");
+    }
+}

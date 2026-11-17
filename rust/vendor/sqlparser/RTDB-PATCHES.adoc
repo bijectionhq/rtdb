@@ -1,0 +1,9 @@
+= sqlparser changes for RTDB
+
+This is sqlparser 0.63.0 from crates.io, under the Apache License 2.0 in LICENSE.TXT.
+The published archive has SHA-256 `3679862809bd1f92e563cf6fd820e28f39135303668001c10331d5027183e8b4`.
+
+RTDB's dialect enables the FROM-first query specification from the XTDB grammar.
+The parser records each WHERE and SELECT tail in source order, including GROUP BY and HAVING before the SELECT they belong to.
+The syntax tree retains the usual expression nodes and their spans, and the existing set-operation parser consumes each FROM-first specification as one operand.
+The flag defaults to false, preserving the upstream dialects' FROM-first syntax.

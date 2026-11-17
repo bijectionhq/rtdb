@@ -102,6 +102,14 @@ impl Context<'_> {
 
     pub(crate) fn lateral_scope<T>(&mut self, start: usize, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         if start == self.outer_scopes.len() { return bind(self); }
+        self.with_visible_outer_scopes(start, bind)
+    }
+
+    pub(crate) fn with_projection_scope<T>(&mut self, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.with_visible_outer_scopes(self.outer_scopes.len(), bind)
+    }
+
+    fn with_visible_outer_scopes<T>(&mut self, start: usize, bind: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
         let previous = self.outer_scopes.iter().map(|scope| scope.visible).collect::<Vec<_>>();
         for (index, scope) in self.outer_scopes.iter_mut().enumerate() { scope.visible = index >= start; }
         let result = bind(self);
