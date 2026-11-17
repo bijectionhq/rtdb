@@ -1081,3 +1081,33 @@ Exact-unit producers, dependent host semantics and whole-plan allocation remain 
 The read, write, recovery and shutdown paths retain their existing session, log and lifecycle ordering.
 The source updates carry the current budget into preparation and resolution, including the existing staged snapshot and static submission paths.
 Compilation and regression execution remain pending under the Phase 1 gate.
+
+== Kafka typed-map and broker scheduling source checkpoint
+
+Typed Connect maps now use the shared Java HashMap geometry for key lookup, replacement and encounter order.
+Their keys retain the typed values.
+Hash and equality callbacks borrow the schema owner family when an operation requires schema provenance.
+Replaced values retain their payload independently, and a fresh conversion accounts for that payload and any nested retained owners.
+Property comparisons use an admitted HashMap with source Pair hashing and provisional entries that terminate recursive comparisons.
+Canonical schema construction, qualified identity observations, exact Java text through parser and graph consumers, writer and SMT ownership, and production activation remain open.
+The explicit NullNode default conflict remains recorded with its original assertion.
+
+Ordered Metadata can send an explicit empty topic list and address an existing learned native broker by ID.
+Broker-only requests use version 1 or later, with version 4 as the minimum when auto-creation is disabled.
+The request remains bound to the selected native broker owner through retries and reconnects.
+Exact bootstrap endpoint and connection-incarnation targeting, actual native connection observations and the network/DLQ owner remain open.
+
+The passive producer metadata can retain an admitted resolved bootstrap address list, publish bootstrap and rebootstrap snapshots, and retain qualified Cluster node order for initial, full and partial response generations.
+The initial Cluster acquisition precedes backoff math.
+The ordinary shuffled list shares the response broker Node owners, and bootstrap retains its independent source Node list.
+The least-loaded selector observes connection readiness independently of send capacity before rebootstrap decisions.
+Production bootstrap DNS, Java math and random history, throttling, fatal errors, waiters and selected-partition enqueue remain required.
+
+The native byte account now covers ApiVersions handshake requests and negotiated and fallback array payloads through overlap, rollback and final release.
+Native construction and broker threads, automatic Metadata caches, sort internals, security and remaining outbound/compression storage still require finite bounds.
+
+The Registry HTTP transport now hands admitted response bytes to the existing JSON materializer through an owned raw body.
+Nineteen source fixtures cover observed input windows through byte bootstrap, UTF8 refills and both pinned UTF32 reader profiles.
+Thirty source fixtures cover ordered typed REST beans.
+Live typed parsing, actual HTTP stream observations, symbol tables, nullable UTF16 carrier consumers, version lookup and cache timing remain open.
+New source fixtures are unexecuted, and the source-completeness gate remains false.
