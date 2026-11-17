@@ -422,6 +422,11 @@ Shift and bit-index counts use the low six bits of a signed long, including nega
 Direct `bit-and`, `bit-or`, `bit-xor` and `bit-and-not` execute left-nested operations before later arguments; indirect calls evaluate every argument before folding.
 Fixed inline `bit-not` and shift calls check arity during compilation, while bit-index calls remain ordinary strict functions.
 Primitive floating and Boolean arguments preserve unresolved bit-call metadata; boxed references retain the resolved Object-overload metadata.
+Host `min` and `max` preserve selected Object identity and numeric category; selected primitive parameters widen to long or double before boxing.
+Homogeneous primitive extrema use JDK signed-zero rules, while mixed and boxed ties select the right argument; NaN selection precedes conversion of the other evaluated argument.
+Direct n-ary extrema execute left-nested selections and derive overload metadata at each node; indirect calls evaluate all arguments before folding.
+A one-argument extremum returns its argument unchanged, and wrong arities of extrema or `abs` remain ordinary invocation errors.
+Host `abs` preserves fixed-long wrapping, widens Float to Double, retains BigInt and ratio categories, and preserves Decimal scale and nonnegative object identity under the root nil MathContext.
 Compiled numeric calls distinguish primitive booleans from boxed Boolean literals and preserve unresolved static-call metadata through locals and control forms.
 Substring indexes require Number objects before boxed integer conversion; Character indexes require an explicit numeric cast.
 Programs retain no runtime context or global namespace; their lexical values and computed strings use the invocation preparation scope.
