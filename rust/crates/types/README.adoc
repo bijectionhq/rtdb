@@ -63,3 +63,12 @@ Existing `ZoneId` lookup and local resolution remain independent of the legacy v
 `decode_java_utf8` applies Java replacement grouping to byte sequences, including encoded surrogate triples.
 URI percent decoding and stored Unix Path rendering share that decoder without copying URI percent-byte runs.
 `tests/utf8.rs` records malformed-prefix, surrogate and supplementary decoding as unexecuted regression source.
+
+== Finite memory admission
+
+`MemoryBudget` owns a finite byte limit with atomic retained and peak counters.
+Child scopes charge the same ancestor limits while retaining their own counters.
+A `MemoryReservation` keeps its budget chain alive until the final shared lease drops.
+Exclusive `shrink_to` releases excess bytes from that chain without lowering peaks; attempts to grow the lease fail before changing counters.
+Columnar allocation owners re-export these same types and retain their leases through Arrow slices and clones.
+Frontend planning admission still requires reservations before parsing and catalog-dependent binding; shared budget availability alone does not provide those reservations.

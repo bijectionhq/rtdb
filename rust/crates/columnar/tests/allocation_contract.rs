@@ -117,3 +117,20 @@ fn selected_list_bound_uses_its_offsets_and_rejects_unknown_extensions() {
     let field = field.with_metadata(std::collections::HashMap::from([(rtdb_columnar::EXTENSION_NAME_KEY.into(), "unknown/extension".into())]));
     assert_eq!(estimate_read_value_bytes(&field, array.as_ref(), 0).unwrap_err().code, "rtdb/unknown-arrow-extension");
 }
+
+#[test]
+fn columnar_and_foundation_budgets_share_the_same_lease_type_and_charge() {
+    let budget: Arc<rtdb_types::MemoryBudget> = MemoryBudget::new(1 << 20);
+    let array = std::sync::Arc::new(arrow_array::Int64Array::from(vec![1, 2]));
+    let schema = Arc::new(Schema::new(vec![arrow_schema::Field::new("v", arrow_schema::DataType::Int64, false)]));
+    let raw = RecordBatch::try_new(schema, vec![array]).unwrap();
+    let bytes = raw.get_array_memory_size();
+    let reservation: Arc<rtdb_types::MemoryReservation> = budget.reserve(bytes).unwrap();
+    let batch = OwnedBatch::with_reservation(raw, reservation).unwrap();
+    assert!(Arc::ptr_eq(batch.reservation().budget(), &budget));
+    let retained = batch.batch().clone();
+    drop(batch);
+    assert_eq!(budget.used_bytes(), bytes);
+    drop(retained);
+    assert_eq!(budget.used_bytes(), 0);
+}
