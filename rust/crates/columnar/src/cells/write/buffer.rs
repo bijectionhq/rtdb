@@ -2,6 +2,14 @@ use super::*;
 use arrow_buffer::Buffer;
 use std::ops::Range;
 
+pub(super) fn arrow19_default_capacity(request: u64) -> Result<usize> {
+    let capacity = if request == 0 { 0 } else if request < 16 * 1024 * 1024 { request.next_power_of_two().max(2) } else { request };
+    let capacity = i64::try_from(capacity).map_err(|_| allocation())?;
+    let capacity = usize::try_from(capacity).map_err(|_| allocation())?;
+    std::alloc::Layout::array::<u8>(capacity).map_err(|_| allocation())?;
+    Ok(capacity)
+}
+
 struct Allocation { bytes: Box<[u8]>, reservation: Arc<MemoryReservation> }
 pub(super) struct MutableBytes {
     allocation: Option<Allocation>,
@@ -10,6 +18,15 @@ pub(super) struct MutableBytes {
 }
 impl MutableBytes {
     pub fn new(memory: &Arc<MemoryBudget>) -> Self { Self { allocation: None, append: 0, memory: Arc::clone(memory) } }
+    pub fn initial_arrow19_default_zeroed(request: u64, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let extent = arrow19_default_capacity(request)?;
+        if extent == 0 { return Ok(Self::new(memory)); }
+        let reservation = memory.reserve(extent.checked_add(128).ok_or_else(allocation)?)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(extent).map_err(|_| allocation())?;
+        bytes.resize(extent, 0);
+        Ok(Self { allocation: Some(Allocation { bytes: bytes.into_boxed_slice(), reservation }), append: 0, memory: Arc::clone(memory) })
+    }
     pub fn bytes(&self) -> &[u8] { self.allocation.as_ref().map_or(&[], |allocation| allocation.bytes.as_ref()) }
     fn capacity(&self) -> i64 { self.bytes().len() as i64 }
     fn reallocate(&mut self, requested: i64, mutation: &mut Mutation) -> WriteResult<()> {
@@ -122,6 +139,10 @@ impl MutableBytes {
 pub(super) struct MutableBits { bytes: MutableBytes, pub append: i32 }
 impl MutableBits {
     pub fn new(memory: &Arc<MemoryBudget>) -> Self { Self { bytes: MutableBytes::new(memory), append: 0 } }
+    pub fn initial_arrow19_default_zeroed(initial_count: u32, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let request = u64::from(initial_count.wrapping_add(7) >> 3);
+        Ok(Self { bytes: MutableBytes::initial_arrow19_default_zeroed(request, memory)?, append: 0 })
+    }
     pub fn bytes(&self) -> &[u8] { self.bytes.bytes() }
     pub fn byte_append(&self) -> i64 { self.bytes.append }
     pub fn ensure_capacity_signed(&mut self, count: i32, mutation: &mut Mutation) -> WriteResult<()> {

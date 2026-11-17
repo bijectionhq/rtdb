@@ -75,17 +75,22 @@ pub enum ContainerKind {
 enum DescriptorShape {
     Scalar { field: Field, logical: LogicalType },
     NativeScalar(SourceScalarMetadata),
+    CountScalar(CountScalarMetadata),
     Container { name: String, nullable: bool, metadata: HashMap<String, String>, kind: ContainerKind, logical: LogicalMetadata },
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct ScalarDescriptorRef<'a> { field: &'a Field, logical: &'a LogicalType, source: Option<&'a SourceScalarMetadata> }
+enum ScalarOrigin<'a> { Sdk, Parameterized(&'a SourceScalarMetadata), Counted(&'a CountScalarMetadata) }
+#[derive(Clone, Copy)]
+pub(super) struct ScalarDescriptorRef<'a> { field: &'a Field, logical: &'a LogicalType, origin: ScalarOrigin<'a> }
 impl<'a> ScalarDescriptorRef<'a> {
     pub fn field(self) -> &'a Field { self.field }
     pub fn logical_type(self) -> &'a LogicalType { self.logical }
     pub fn value_type(self) -> &'a LogicalType { match self.logical { LogicalType::Maybe(inner) => inner, logical => logical } }
-    pub(super) fn source_metadata(self) -> Option<&'a SourceScalarMetadata> { self.source }
-    pub(super) fn source_declaration(self) -> Option<SourceScalarDeclaration> { self.source.map(SourceScalarMetadata::declaration) }
+    pub(super) fn source_metadata(self) -> Option<&'a SourceScalarMetadata> { match self.origin { ScalarOrigin::Parameterized(metadata) => Some(metadata), _ => None } }
+    pub(super) fn source_declaration(self) -> Option<SourceScalarDeclaration> { self.source_metadata().map(SourceScalarMetadata::declaration) }
+    pub(super) fn count_metadata(self) -> Option<&'a CountScalarMetadata> { match self.origin { ScalarOrigin::Counted(metadata) => Some(metadata), _ => None } }
+    pub(super) fn count_class(self) -> Option<CountScalarClass> { self.count_metadata().map(CountScalarMetadata::class) }
     pub(super) fn fixed_width(self) -> Result<Option<i32>> {
         if let Some(declaration) = self.source_declaration() { return Ok(Some(declaration.fixed_width())); }
         super::scalar::fixed_width(self.field.data_type()).map(|width| i32::try_from(width).map_err(|_| layout())).transpose()
@@ -226,28 +231,33 @@ impl VectorDescriptor {
         let reservation = Arc::clone(metadata.reservation());
         Arc::new(Self { shape: DescriptorShape::NativeScalar(metadata), reservation })
     }
-    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar { field, .. } => field.name(), DescriptorShape::NativeScalar(metadata) => metadata.field().name(), DescriptorShape::Container { name, .. } => name } }
+    pub(super) fn captured_count_scalar(metadata: CountScalarMetadata) -> Arc<Self> {
+        let reservation = Arc::clone(metadata.reservation());
+        Arc::new(Self { shape: DescriptorShape::CountScalar(metadata), reservation })
+    }
+    pub fn name(&self) -> &str { match &self.shape { DescriptorShape::Scalar { field, .. } => field.name(), DescriptorShape::NativeScalar(metadata) => metadata.field().name(), DescriptorShape::CountScalar(metadata) => metadata.field().name(), DescriptorShape::Container { name, .. } => name } }
     /// Physical Field nullability; run-end fields are nonnullable even when their value reader admits nulls.
-    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar { field, .. } => field.is_nullable(), DescriptorShape::NativeScalar(metadata) => metadata.field().is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
+    pub fn is_nullable(&self) -> bool { match &self.shape { DescriptorShape::Scalar { field, .. } => field.is_nullable(), DescriptorShape::NativeScalar(metadata) => metadata.field().is_nullable(), DescriptorShape::CountScalar(metadata) => metadata.field().is_nullable(), DescriptorShape::Container { nullable, .. } => *nullable } }
     /// Concrete reader nullability without demanding its logical type.
     /// Run-end readers delegate to values; dense unions report false independently of their legs.
     pub fn reader_nullable(&self) -> bool {
         match self.container() { Some(ContainerKind::RunEnd { values, .. }) => values.reader_nullable(), Some(ContainerKind::DenseUnion { .. }) => false, _ => self.is_nullable() }
     }
-    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar { field, .. } => field.metadata(), DescriptorShape::NativeScalar(metadata) => metadata.field().metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
+    pub fn metadata(&self) -> &HashMap<String, String> { match &self.shape { DescriptorShape::Scalar { field, .. } => field.metadata(), DescriptorShape::NativeScalar(metadata) => metadata.field().metadata(), DescriptorShape::CountScalar(metadata) => metadata.field().metadata(), DescriptorShape::Container { metadata, .. } => metadata } }
     /// Borrows cached logical metadata without allocation or payload access.
     /// Native run-end types over Null/Nothing return their source Unsupported outcome, including through enclosing types.
     /// Physical field projection and reader nullability remain independently available.
     pub fn logical_type(&self) -> VectorTypeResult<&LogicalType> {
-        match &self.shape { DescriptorShape::Scalar { logical, .. } => Ok(logical), DescriptorShape::NativeScalar(metadata) => Ok(metadata.logical()), DescriptorShape::Container { logical, .. } => logical.borrow() }
+        match &self.shape { DescriptorShape::Scalar { logical, .. } => Ok(logical), DescriptorShape::NativeScalar(metadata) => Ok(metadata.logical()), DescriptorShape::CountScalar(metadata) => Ok(metadata.logical()), DescriptorShape::Container { logical, .. } => logical.borrow() }
     }
     /// Borrows declared scalar metadata; source UUID physical width remains in its native descriptor.
     /// Containers return None and require a retained field projection.
     pub fn scalar_field(&self) -> Option<&Field> { self.scalar().map(ScalarDescriptorRef::field) }
     pub(super) fn scalar(&self) -> Option<ScalarDescriptorRef<'_>> {
         match &self.shape {
-            DescriptorShape::Scalar { field, logical } => Some(ScalarDescriptorRef { field, logical, source: None }),
-            DescriptorShape::NativeScalar(metadata) => Some(ScalarDescriptorRef { field: metadata.field(), logical: metadata.logical(), source: Some(metadata) }),
+            DescriptorShape::Scalar { field, logical } => Some(ScalarDescriptorRef { field, logical, origin: ScalarOrigin::Sdk }),
+            DescriptorShape::NativeScalar(metadata) => Some(ScalarDescriptorRef { field: metadata.field(), logical: metadata.logical(), origin: ScalarOrigin::Parameterized(metadata) }),
+            DescriptorShape::CountScalar(metadata) => Some(ScalarDescriptorRef { field: metadata.field(), logical: metadata.logical(), origin: ScalarOrigin::Counted(metadata) }),
             _ => None,
         }
     }

@@ -169,6 +169,24 @@ pub(super) fn finish_source_fixed(metadata: SourceScalarMetadata, count: SourceC
     Ok(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count, storage, owner }))
 }
 
+pub(super) enum CountScalarPayload {
+    Null,
+    Int { validity: Option<super::native_scalar::StoredBits>, bytes: super::native_scalar::StoredBytes },
+}
+
+pub(super) fn finish_count_scalar(metadata: CountScalarMetadata, count: SourceCount, payload: CountScalarPayload) -> Result<Arc<PhysicalNode>> {
+    let (validity, data) = match (metadata.class(), payload) {
+        (CountScalarClass::Null, CountScalarPayload::Null) => (None, super::native_scalar::NativeScalarData::Null),
+        (CountScalarClass::IntArrow19Default, CountScalarPayload::Int { validity, bytes }) if metadata.field().is_nullable() == validity.is_some() => (validity, super::native_scalar::NativeScalarData::Fixed(bytes)),
+        _ => return Err(layout()),
+    };
+    let reservation = Arc::clone(metadata.reservation());
+    let descriptor = VectorDescriptor::captured_count_scalar(metadata);
+    let storage = NodeLayout::Scalar(super::native_scalar::NativeScalarStorage { validity, data });
+    let owner = Arc::new(NodeOwner { backing: BackingOwner::Native, metadata: reservation });
+    Ok(Arc::new(PhysicalNode { declaration: Declaration::Native, descriptor, count, storage, owner }))
+}
+
 fn finish_counted_node(ingress: Arc<Field>, count: SourceCount, storage: NodeLayout, owner: Arc<NodeOwner>) -> Result<Arc<PhysicalNode>> {
     let descriptor = VectorDescriptor::opened(&ingress, &storage, Arc::clone(&owner.metadata))?;
     Ok(Arc::new(PhysicalNode { declaration: Declaration::Arrow(ingress), descriptor, count, storage, owner }))

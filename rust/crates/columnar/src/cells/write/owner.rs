@@ -16,12 +16,14 @@ pub(super) enum MutableScalarData {
 enum ScalarDescriptor {
     Sdk { ingress: Arc<Field>, field: Arc<Field>, logical: LogicalType, reservation: Arc<MemoryReservation> },
     Source(SourceScalarMetadata),
+    Counted(CountScalarMetadata),
 }
 impl ScalarDescriptor {
-    fn field(&self) -> &Field { match self { Self::Sdk { field, .. } => field, Self::Source(metadata) => metadata.field() } }
-    fn logical(&self) -> &LogicalType { match self { Self::Sdk { logical, .. } => logical, Self::Source(metadata) => metadata.logical() } }
-    fn reservation(&self) -> &Arc<MemoryReservation> { match self { Self::Sdk { reservation, .. } => reservation, Self::Source(metadata) => metadata.reservation() } }
-    fn source_metadata(&self) -> Option<&SourceScalarMetadata> { match self { Self::Source(metadata) => Some(metadata), Self::Sdk { .. } => None } }
+    fn field(&self) -> &Field { match self { Self::Sdk { field, .. } => field, Self::Source(metadata) => metadata.field(), Self::Counted(metadata) => metadata.field() } }
+    fn logical(&self) -> &LogicalType { match self { Self::Sdk { logical, .. } => logical, Self::Source(metadata) => metadata.logical(), Self::Counted(metadata) => metadata.logical() } }
+    fn reservation(&self) -> &Arc<MemoryReservation> { match self { Self::Sdk { reservation, .. } => reservation, Self::Source(metadata) => metadata.reservation(), Self::Counted(metadata) => metadata.reservation() } }
+    fn source_metadata(&self) -> Option<&SourceScalarMetadata> { match self { Self::Source(metadata) => Some(metadata), _ => None } }
+    fn count_class(&self) -> Option<CountScalarClass> { match self { Self::Counted(metadata) => Some(metadata.class()), _ => None } }
 }
 pub(super) struct ScalarState {
     pub(super) count: SourceCount,
@@ -45,8 +47,29 @@ impl ScalarState {
         let validity = (field.is_nullable() && field.data_type() != &DataType::Null).then(|| MutableBits::new(&memory));
         Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Sdk { ingress, field, logical, reservation: metadata } })
     }
+    fn source_null(name: &str, nullable: bool, initial_count: i32, memory: &Arc<MemoryBudget>) -> Result<Self> {
+        let metadata = CountScalarMetadata::new(name, nullable, CountScalarClass::Null, memory)?;
+        Ok(Self { count: SourceCount::new(initial_count), validity: None, data: MutableScalarData::Null, descriptor: ScalarDescriptor::Counted(metadata) })
+    }
+    fn source_int_arrow19_default(name: &str, nullable: bool, initial_count: i32, memory: &Arc<MemoryBudget>) -> WriteResult<Self> {
+        let request = i64::from(initial_count) * 4;
+        if request < 0 { return Err(WriteError::Reference(ReferenceFailure::NegativeAllocationSize(request))); }
+        let metadata = CountScalarMetadata::new(name, nullable, CountScalarClass::IntArrow19Default, memory)?;
+        let data = MutableBytes::initial_arrow19_default_zeroed(request as u64, memory)?;
+        let validity = if nullable { Some(MutableBits::initial_arrow19_default_zeroed(initial_count as u32, memory)?) } else { None };
+        Ok(Self { count: SourceCount::new(initial_count), validity, data: MutableScalarData::Fixed { width: 4, data }, descriptor: ScalarDescriptor::Counted(metadata) })
+    }
     fn from_descriptor(descriptor: &VectorDescriptor, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let scalar = descriptor.scalar().ok_or_else(|| unsupported("ScalarWriter"))?;
+        if let Some(metadata) = scalar.count_metadata() {
+            let metadata = metadata.rebuilt(memory)?;
+            let data = match metadata.class() {
+                CountScalarClass::Null => MutableScalarData::Null,
+                CountScalarClass::IntArrow19Default => MutableScalarData::Fixed { width: 4, data: MutableBytes::new(memory) },
+            };
+            let validity = (metadata.class() == CountScalarClass::IntArrow19Default && metadata.field().is_nullable()).then(|| MutableBits::new(memory));
+            return Ok(Self { count: SourceCount::new(0), validity, data, descriptor: ScalarDescriptor::Counted(metadata) });
+        }
         if let Some(metadata) = scalar.source_metadata() {
             let metadata = metadata.rebuilt(memory)?;
             let data = MutableScalarData::Fixed { width: metadata.declaration().fixed_width(), data: MutableBytes::new(memory) };
@@ -76,6 +99,7 @@ impl ScalarState {
                 ScalarDescriptor::Sdk { ingress, field, logical, reservation: Arc::clone(reservation) }
             },
             ScalarDescriptor::Source(metadata) => ScalarDescriptor::Source(metadata.with_nullable(true)?),
+            ScalarDescriptor::Counted(metadata) => ScalarDescriptor::Counted(metadata.with_nullable(true)?),
         };
         mutation.mark();
         if !matches!(&self.data, MutableScalarData::Null) {
@@ -249,6 +273,14 @@ impl ScalarState {
                 let NativeScalarData::Fixed(bytes) = data else { return Err(layout()); };
                 super::super::open::finish_source_fixed(metadata, self.count, validity, bytes)?
             },
+            ScalarDescriptor::Counted(metadata) => {
+                let payload = match data {
+                    NativeScalarData::Null if validity.is_none() => super::super::open::CountScalarPayload::Null,
+                    NativeScalarData::Fixed(bytes) => super::super::open::CountScalarPayload::Int { validity, bytes },
+                    _ => return Err(layout()),
+                };
+                super::super::open::finish_count_scalar(metadata, self.count, payload)?
+            },
         };
         Ok(ExecutionVector::direct(node))
     }
@@ -259,6 +291,12 @@ pub(crate) struct ScalarWriter {
     state: PublicationState,
 }
 impl ScalarWriter {
+    pub(crate) fn source_null(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { scalar: ScalarState::source_null(name, nullable, initial_count, &memory)?, state: PublicationState::Ready })
+    }
+    pub(crate) fn source_int_arrow19_default(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { scalar: ScalarState::source_int_arrow19_default(name, nullable, initial_count, &memory)?, state: PublicationState::Ready })
+    }
     pub(crate) fn new(ingress: Arc<Field>, memory: Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { scalar: ScalarState::new(ingress, memory)?, state: PublicationState::Ready })
     }
@@ -269,6 +307,11 @@ impl ScalarWriter {
         let Some(metadata) = self.scalar.descriptor.source_metadata() else { return Ok(None); };
         let MutableScalarData::Fixed { data, .. } = &self.scalar.data else { return Err(layout()); };
         Ok(Some(SourceScalarReader::fixed(metadata.declaration(), data.bytes())))
+    }
+    pub(crate) fn source_int_pointer(&self, row: i32) -> Result<Option<SourceBytePointer<'_>>> {
+        if self.scalar.descriptor.count_class() != Some(CountScalarClass::IntArrow19Default) { return Ok(None); }
+        let MutableScalarData::Fixed { width: 4, data } = &self.scalar.data else { return Err(layout()); };
+        Ok(Some(SourceBytePointer::int(data.bytes(), row)))
     }
     pub(crate) fn value_count(&self) -> i32 { self.scalar.value_count() }
     pub(crate) fn checked_len(&self) -> Result<usize> { self.scalar.count.checked_len() }
@@ -353,6 +396,12 @@ impl ScalarReader<'_> {
 
 pub(crate) struct VectorWriter { root: tree::WriterNode, state: PublicationState }
 impl VectorWriter {
+    pub(crate) fn source_null(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { root: tree::WriterNode::Scalar(ScalarState::source_null(name, nullable, initial_count, &memory)?), state: PublicationState::Ready })
+    }
+    pub(crate) fn source_int_arrow19_default(name: &str, nullable: bool, initial_count: i32, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
+        Ok(Self { root: tree::WriterNode::Scalar(ScalarState::source_int_arrow19_default(name, nullable, initial_count, &memory)?), state: PublicationState::Ready })
+    }
     pub(crate) fn from_descriptor(descriptor: &VectorDescriptor, memory: Arc<MemoryBudget>) -> WriteResult<Self> {
         tree::WriterNode::admit(descriptor, 1)?;
         Ok(Self { root: tree::WriterNode::build(descriptor, &memory)?, state: PublicationState::Ready })

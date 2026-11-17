@@ -39,6 +39,14 @@ impl<'a> SourceScalarReader<'a> {
 
 pub(crate) struct SourceBytePointer<'a> { backing: &'a [u8], offset: i64, length: i64 }
 impl<'a> SourceBytePointer<'a> {
+    pub(crate) fn from_int_arrow19_default(vector: &'a ExecutionVector, row: i32) -> Result<Option<Self>> {
+        let (ReaderView::Direct(node), Address::Identity { .. }) = (&vector.view, &vector.address) else { return Ok(None); };
+        if node.descriptor.scalar().and_then(|scalar| scalar.count_class()) != Some(CountScalarClass::IntArrow19Default) { return Ok(None); }
+        let NodeLayout::Scalar(storage) = &node.storage else { return Err(layout()); };
+        let native_scalar::NativeScalarData::Fixed(bytes) = &storage.data else { return Err(layout()); };
+        Ok(Some(Self::int(bytes.bytes.as_slice(), row)))
+    }
+    pub(super) fn int(backing: &'a [u8], row: i32) -> Self { Self { backing, offset: i64::from(row.wrapping_mul(4)), length: 4 } }
     pub(crate) fn offset(&self) -> i64 { self.offset }
     pub(crate) fn length(&self) -> i64 { self.length }
     pub(crate) fn demand_native(&self) -> SourceScalarReadResult<&'a [u8]> {
