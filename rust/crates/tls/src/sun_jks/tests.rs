@@ -58,6 +58,8 @@ fn unknown_key(version: &[u8], optional: &[u8]) -> Vec<u8> {
     encoded(0x30, &[encoded(2, version), encoded(0x30, &encoded(6, &[0x2a, 3, 4, 100])), encoded(4, &[1, 2, 3]), optional.to_vec()].concat())
 }
 
+mod factory;
+
 #[test]
 fn raw_jks_aliases_resolve_before_eager_recovery_and_share_the_lowercase_entry() {
     let (protected, chain) = fixture(); let memory = MemoryBudget::new(32 << 20);
@@ -197,8 +199,8 @@ fn eager_entry_sharing_retains_one_key_and_chain_and_rejects_unadmitted_work() {
     assert_eq!(loaded.identities().len(), 3);
     let entry = Arc::clone(&loaded.identities[0].entry);
     for identity in loaded.identities() { assert!(Arc::ptr_eq(&entry, &identity.entry)); }
-    drop(loaded); assert_eq!(memory.used_bytes(), entry._reservation.bytes());
-    assert!(!entry.private_key.is_empty()); assert_eq!(entry.certificates, chain);
+    drop(loaded); assert_eq!(memory.used_bytes(), entry._reservation.bytes() + entry.private_key.retained_bytes());
+    assert!(!entry.private_key.encoded_pkcs8().is_empty()); assert_eq!(entry.certificates, chain);
     drop(entry); assert_eq!(memory.used_bytes(), 0);
     assert!(SunX509JksStore::decode(&bytes, Some("store"), Some("12345678"), memory.reserve(0).unwrap()).is_err());
     let bound = SunX509JksStore::allocation_bound(bytes.len(), Some("store"), Some("12345678")).unwrap();

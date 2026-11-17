@@ -205,6 +205,43 @@ For an admitted input of at most Java's signed array length, normalization retai
 The adapter cannot convert an admitted native size overflow into a key-specification rejection.
 No general anomaly conversion or message-based classification is used.
 
+== JKS raw-first recovery
+
+`PrivateKey::parse_jks` implements the separate `PKCS8Key.parseKey` path used after SunX509 JKS protection recovery.
+It constructs an admitted passive `RawPrivateKey` before applying factory fallback policy.
+Raw construction validates the complete PKCS8 frame, signed version zero or one, AlgorithmIdentifier and its registered parameters, primitive private OCTET STRING, optional attributes and public bits, and complete field consumption.
+It normalizes the version and AlgorithmIdentifier, drops version-zero attributes, and retains version-one attributes and normalized public bits.
+AlgorithmIdentifier initialization completes before private material or optional fields are accepted, including for algorithms with no private-key factory.
+Missing EC/DH parameters therefore pass raw initialization and can fall back after their factories reject them; malformed present parameters fail raw construction.
+Named-family non-NULL parameters remain a provider requirement and can select fallback after valid raw construction.
+
+The raw owner holds zeroizing normalized bytes, its complete default factory target, and its admission lease.
+The target is `Available`, `NoSuchAlgorithm`, or the known HSS/LMS `InvalidKeySpec` rejection.
+Available targets have ordinary OID-backed names accepted by the existing family lookup; the typed attempt selects the same immutable default family from the normalized encoding.
+Initialized PBES2 names and SpecifiedSHA2 derived or fallback names have no default private-key factory and retain the raw key.
+The existing iterative evaluator supplies those name observations; raw construction does not use the family-specific provider requirement validator.
+Stored SpecifiedSHA2 parameter bytes remain in raw output.
+
+For an available factory, only typed `NoSuchAlgorithm` and `InvalidKeySpec` failures promote the raw owner.
+Every `Fatal` result returns its original diagnostic, including non-CRT PSS reverse-name encoding and unchecked integer/BitArray failures.
+Factory success returns the provider's encoding.
+The factory receives normalized raw bytes, so a DH success retains that normalized input; strict PKCS12 continues to supply its original input to the same DH factory.
+`PrivateKey::decode` and the strict PKCS12 caller keep their separate entrypoint and ordering.
+
+Raw construction reserves `384 * plaintext_bytes + 65,536` before parsing and keeps that full lease until the factory decision.
+An available factory separately reserves `384 * normalized_bytes + 65,536` against the actual normalized length.
+No budget failure can select raw fallback.
+On success, the raw bytes and lease drop before the factory output lease shrinks.
+On checked rejection, factory scratch drops before the raw bytes and lease are promoted together and shrunk to the final private-key charge.
+All parser and parameter temporaries have dropped before either shrink.
+No uncharged key buffer escapes its owner.
+
+SunX509 JKS retains its separate `512 * protected_bytes + 65,536` protection admission and certificate allowance.
+Decryption and `parse_jks` share a lexical block whose plaintext owner drops before certificate/entry retention is charged.
+The completed entry owns its private key inline and keeps a separate certificate/entry lease; its entry charge subtracts the inline key size already included by `PrivateKey`.
+Repeated aliases and empty chains perform fresh raw/factory handling before reuse or filtering, then drop unused temporary key owners.
+The key and entry leases remain held until their last owners drop.
+
 == Admission and remaining source work
 
 Decode reserves `384 * input_bytes + 65,536` before parsing, with checked arithmetic.
@@ -255,3 +292,4 @@ PBES2 regressions cover all fourteen derived names, signed counts and key length
 Typed parameter regressions cover signed padding, signed 32-bit limits, the allocation-free BigInteger magnitude boundary, Java IO versus propagated failures, and preservation of outward diagnostics.
 SpecifiedSHA2 regressions cover all five known signature OIDs, unmapped and PBES2 names, absent and NULL parameters, caught malformed children, fatal outer identifiers, nested catch boundaries, propagated failures, fixed-service descendants, MGF rejection, duplicate hashes, BER retention, context tails, deep mixed nesting, and reservation cleanup.
 Typed factory regressions cover missing versus rejecting factories, strict parse ordering, provider material and parameter rejection, fatal non-CRT PSS encoding, signed and unsigned integer classes, parameter-failure propagation, and allocation-free BIT STRING backing boundaries.
+JKS regressions cover raw normalization, unknown and HSS fallback, absent versus malformed registered parameters, top-level derived names, checked material rejection, successful RSA/EC re-encoding, DH input distinctions, fatal PSS encoding, deep initialization, separate raw/factory admission, repeated-alias validation, entry sharing, empty-chain ordering, and once-only retained charges.

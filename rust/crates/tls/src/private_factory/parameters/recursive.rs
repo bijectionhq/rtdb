@@ -31,6 +31,17 @@ pub(super) fn pss(bytes: &[u8]) -> DecodeResult<Pss> {
     Ok(evaluator.result)
 }
 
+pub(super) fn initialize(algorithm: &Algorithm) -> DecodeResult<DigestName> {
+    let parameter = parameter(algorithm).map_err(Failure::JavaIo)?.map(|bytes| Zeroizing::new(bytes.to_vec()));
+    initialize_name(Identifier { oid: Zeroizing::new(algorithm.oid.to_vec()), parameter })
+}
+
+fn initialize_name(algorithm: Identifier) -> DecodeResult<DigestName> {
+    let mut evaluator = Evaluator::new(vec![Frame::Initialize(algorithm)]);
+    evaluator.run()?;
+    Ok(evaluator.completed_name())
+}
+
 impl Evaluator {
     fn new(frames: Vec<Frame>) -> Self {
         let result = Pss { digest: DigestName::Oid(Zeroizing::new(SHA1.to_vec())), mgf_digest: Zeroizing::new(SHA1.to_vec()), salt: 20 };
@@ -208,9 +219,7 @@ fn identifier(value: secret_der::Value<'_>) -> DecodeResult<Identifier> {
 #[cfg(test)]
 pub(super) fn initialized_name(oid: &[u8], parameter: &[u8]) -> DecodeResult<DigestName> {
     let algorithm = Identifier { oid: Zeroizing::new(oid.to_vec()), parameter: Some(Zeroizing::new(parameter.to_vec())) };
-    let mut evaluator = Evaluator::new(vec![Frame::Initialize(algorithm)]);
-    evaluator.run()?;
-    Ok(evaluator.completed_name())
+    initialize_name(algorithm)
 }
 
 #[cfg(test)]

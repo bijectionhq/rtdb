@@ -37,17 +37,27 @@ Its Sun-only protection-envelope parser follows `EncryptedPrivateKeyInfo` and `K
 Recovered PKCS8 follows `PKCS8Key` versions zero and one, optional attributes, optional version-one public bits, and generic-key fallback without native key acceptance.
 Its private-key field requires a primitive OCTET STRING, including when the entry has no certificate chain.
 Version-zero attributes are discarded during normalization; version-one attributes and normalized public bits are retained.
-AlgorithmParameters validation, provider-specific KeyFactory re-encoding and native support for Java's raw private-key fallback remain open.
+Raw AlgorithmIdentifier parsing initializes registered parameters before the private material and optional fields are read.
+The resulting name selects the pinned default factory: a successful provider key supplies its encoding, while checked missing-factory or invalid-key-specification failures retain the normalized raw key.
+Malformed raw data, unchecked provider failures, and native admission failures abort recovery.
+Non-CRT PSS reverse-name encoding failures follow Java's unchecked IllegalStateException path and cannot select raw fallback.
+Native import of the resulting raw or provider key remains a transport operation.
 Generic and deferred key recovery retain their existing parsers and assertions.
 
 SunX509 JKS input, alias metadata and password encoding use initial admission of 64 times the input length plus password allowance and 65,536 bytes.
 Each recovery separately admits 512 times the protected-key length, 16 times any newly retained certificate bytes, and 65,536 bytes before allocating scratch.
-The surviving entry charge shrinks to its retained buffer capacities and owner overhead; repeated aliases release their recovery scratch without copying retained entries.
+Raw normalization additionally admits `384 * plaintext_bytes + 65,536` while the protection scratch remains held.
+An available factory separately admits `384 * normalized_bytes + 65,536`, using the actual normalized input length while the raw owner remains leased.
+Known missing or rejecting factories need no provider parsing scratch.
+Raw and factory temporaries drop before the selected key lease shrinks to its encoded capacity and owner overhead.
+Decrypted plaintext drops before the protection lease shrinks to certificate and entry retention.
+The entry charge excludes the inline private-key size already charged by that key's separate lease.
+Repeated aliases perform fresh raw and factory handling before sharing the retained entry and release the temporary recovery owners.
 The Sun parser wraps owned DER results before checking their tags, and its constructed-octet work queue, algorithm encodings and private-key output use zeroizing owners on success and error paths.
 Secret byte buffers receive their complete capacity before content is appended, avoiding unzeroized copies from buffer growth.
 Shared DER conversion validates the framing before allocating its byte buffer; its copy pass reuses that validated framing and returns ownership directly to the Sun wrapper.
 Native transports admit their expanded per-alias imports separately before copying keys or certificates.
-Source regressions cover raw alias translation, duplicate and enumeration behavior, eager errors on empty chains, PKCS8 normalization and fallback, entry sharing, allocation release, strict generic identity matching, and deferred transport failure for mismatched values.
+Source regressions cover raw alias translation, duplicate and enumeration behavior, eager errors on empty chains, PKCS8 normalization and factory fallback, parameter initialization, provider re-encoding, unchecked encoding failures, entry sharing, allocation release, strict generic identity matching, and deferred transport failure for mismatched values.
 
 `SunX509Pkcs12Store` is the separate passive immutable owner for eager SunX509 PKCS12 credentials.
 It loads provider aliases and issuer chains, then recovers each final private or secret entry before filtering secrets and empty private-key chains.
@@ -99,6 +109,7 @@ A missing PKCS12 store password skips encrypted certificate sections and the int
 Raw private-key and non-TLS bags are skipped; public-key-protected stores and unrecognized cryptographic algorithms fail explicitly.
 
 The JKS source mapping is OpenJDK `JavaKeyStore` and `KeyProtector` at `jdk-21+35`.
+Eager SunX509 JKS raw-first key recovery uses the pinned Temurin 25.0.1+8 `KeyProtector`, `PKCS8Key`, `AlgorithmId`, and default factory sources retained in link:src/private_factory/sources.sha256[the factory source manifest].
 The protected API was additionally traced against the pinned Temurin 25.0.1+8 `JavaKeyStore`, `PKCS12KeyStore`, `KeyStoreSpi`, `KeyStore.PrivateKeyEntry`, and `X509KeyManagerImpl` sources.
 Registry configuration semantics are mapped to Confluent 7.8.0 `SslFactory`.
 The server retains the existing `ServerConfig` keystore surface and pinned PostgreSQL TLS fixtures.

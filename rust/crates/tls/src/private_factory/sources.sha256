@@ -56,3 +56,4 @@ c8460734ad375657f3c3dfd51313181f21e28899e586e15e5950accd0cee1589  java.base/com/
 bba99fbb05575c801189f2864d9d55182d01847a78cb2101b8a7f7e5b8602ae3  java.base/java/security/spec/MGF1ParameterSpec.java
 94b379b91781f03a89128a7b66bdd70c4b5e1b4dcbbe6cf17894fe834781d9c5  java.base/com/sun/crypto/provider/PBES2Parameters.java
 c44876ddd8b78d04d299af4052d471e98af7546c112decc750de48ec9e6615b1  java.base/javax/crypto/spec/IvParameterSpec.java
+346c099d8d4a636c8ea4fd7b647466464827ae6427b01d2e36e722c07d037f34  java.base/sun/security/provider/KeyProtector.java

@@ -8,6 +8,7 @@ mod curves;
 mod failure;
 mod integer;
 mod parameters;
+mod raw;
 
 pub(crate) struct PrivateKey { encoded: Zeroizing<Vec<u8>>, _reservation: Arc<MemoryReservation> }
 
@@ -30,6 +31,17 @@ impl PrivateKey {
     }
 
     pub(crate) fn encoded_pkcs8(&self) -> &[u8] { &self.encoded }
+
+    pub(crate) fn parse_jks(encoded: &[u8], memory: &Arc<MemoryBudget>) -> Result<Self> { raw::parse_key(encoded, memory) }
+
+    fn from_admitted(encoded: Zeroizing<Vec<u8>>, mut reservation: Arc<MemoryReservation>) -> Result<Self> {
+        let retained = encoded.capacity().checked_add(std::mem::size_of::<Self>()).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?;
+        Arc::get_mut(&mut reservation).expect("unpublished JKS private key reservation").shrink_to(retained)?;
+        Ok(Self { encoded, _reservation: reservation })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_bytes(&self) -> usize { self._reservation.bytes() }
 }
 
 fn allocation_bound(bytes: usize) -> Result<usize> { bytes.checked_mul(384).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(overflow) }
