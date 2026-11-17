@@ -75,8 +75,13 @@ enum InvocationRole<'parse> {
     RecursiveEntry { saved: SavedOuterLink<'parse>, phase: RecursionPhase<'parse> },
     RecursionReplacement { entry: InvocationKey<'parse>, previous: InvocationKey<'parse>, state: ReplacementUse },
 }
+pub(super) enum InvocationCause<'sql> {
+    NoViableAlternative(NoViableAlternative<'sql>),
+    InputMismatch { offending: IndexedLexeme<'sql>, state: ParserState },
+}
+
 enum InvocationException<'parse, 'sql> {
-    Owned(NoViableAlternative<'sql>),
+    Owned(InvocationCause<'sql>),
     Shared(InvocationKey<'parse>),
 }
 
@@ -98,12 +103,14 @@ struct PendingNoViableReport<'parse, 'sql> {
     mode: PredictionMode,
 }
 
+enum BailRecovery { Clear, Entered }
+
 enum ParserControl<'parse, 'sql> {
     Ready,
     Failed,
     PendingNoViable(PendingNoViableReport<'parse, 'sql>),
     InErrorRecovery,
-    BailCancelled(InvocationKey<'parse>),
+    BailCancelled { exception: InvocationKey<'parse>, recovery: BailRecovery },
 }
 
 impl ParserControl<'_, '_> {
@@ -111,7 +118,7 @@ impl ParserControl<'_, '_> {
 
     fn abort(&mut self) {
         *self = match self {
-            Self::InErrorRecovery | Self::BailCancelled(_) => Self::InErrorRecovery,
+            Self::InErrorRecovery | Self::BailCancelled { recovery: BailRecovery::Entered, .. } => Self::InErrorRecovery,
             _ => Self::Failed,
         };
     }
@@ -260,7 +267,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     pub(super) fn advance_input(&mut self) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.input.consume().map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn seek_input(&mut self, index: usize) -> RuntimeResult<'sql, ()> { let result = self.ready().and_then(|()| self.input.seek(index).map_err(RuntimeError::Input)); self.finish(result) }
     pub(super) fn rewind_input(&mut self) -> RuntimeResult<'sql, ()> {
-        if matches!(self.control, ParserControl::BailCancelled(_)) {
+        if matches!(self.control, ParserControl::BailCancelled { .. }) {
             return self.finish(Err(RuntimeError::Control(RuntimeProblem::Aborted)));
         }
         let result = self.input.seek(0).map_err(RuntimeError::Input);
@@ -273,7 +280,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     pub(super) fn precedence(&self) -> i32 { self.precedence.last().copied().expect("base precedence").value() }
     pub(super) fn invocation_view(&self) -> InvocationView<'_, 'parse, 'sql> { InvocationView { records: &self.records, current: self.current } }
     pub(super) fn clear_rule_control(&mut self) -> RuntimeResult<'sql, ()> {
-        if matches!(self.control, ParserControl::BailCancelled(_)) {
+        if matches!(self.control, ParserControl::BailCancelled { .. }) {
             return self.finish(Err(RuntimeError::Control(RuntimeProblem::Aborted)));
         }
         let result = if self.precedence.len() != 1 { Err(RuntimeError::Control(RuntimeProblem::Recursion)) } else { self.current = None; self.matched_eof = false; self.precedence.clear(); self.precedence.push(PrecedenceFrame::Base0); Ok(()) }; self.finish(result)
@@ -338,7 +345,7 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
 #[derive(Clone, Copy)]
 pub(super) struct InvocationView<'a, 'parse, 'sql> { records: &'a [InvocationRecord<'parse, 'sql>], current: Option<InvocationKey<'parse>> }
 impl<'a, 'parse, 'sql> InvocationView<'a, 'parse, 'sql> {
-    pub(super) fn exception(&self, invocation: InvocationKey<'parse>) -> Option<&NoViableAlternative<'sql>> {
+    pub(super) fn exception(&self, invocation: InvocationKey<'parse>) -> Option<&InvocationCause<'sql>> {
         let exception = self.records.get(invocation.index)?.exception.as_ref()?;
         let owner = match exception {
             InvocationException::Owned(cause) => return Some(cause),

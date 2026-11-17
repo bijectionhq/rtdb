@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use rtdb_types::{MemoryBudget, MemoryReservation};
 use crate::lexer::{ScanError, StreamError};
-use crate::parser::grammar::OwnedGrammar;
+use crate::parser::grammar::{OwnedGrammar, TransitionView};
 use super::*;
 use super::super::{CapturedClassPolicy, ParserState};
 use super::super::super::PredictionStorage;
@@ -84,9 +84,10 @@ fn assert_shared_exception<'parse>(
     let [root, parent, local] = frames;
     let view = session.invocation_view();
     let original = view.exception(local).unwrap();
-    assert_eq!(original.state, ParserState::State(3014));
-    assert_eq!((original.start.index(), original.offending.index()), (2, 3));
-    assert_eq!((original.start.lexeme().raw(), original.offending.lexeme().raw()), ("READ", "read"));
+    let InvocationCause::NoViableAlternative(cause) = original else { panic!("expected no-viable cause"); };
+    assert_eq!(cause.state, ParserState::State(3014));
+    assert_eq!((cause.start.index(), cause.offending.index()), (2, 3));
+    assert_eq!((cause.start.lexeme().raw(), cause.offending.lexeme().raw()), ("READ", "read"));
     assert!(std::ptr::eq(original, view.exception(parent).unwrap()));
     assert!(std::ptr::eq(original, view.exception(root).unwrap()));
 }
@@ -144,7 +145,7 @@ fn bail_stamps_one_exception_across_real_parents_and_retries_the_same_action_on_
         } else {
             assert!(matches!(&pass, Err(PassError::Runtime(RuntimeError::ReportedNoViableAlternative(_)))));
             let view = session.invocation_view();
-            let caught = view.exception(local).unwrap();
+            let Some(InvocationCause::NoViableAlternative(caught)) = view.exception(local) else { panic!("expected no-viable cause"); };
             assert_eq!(caught.offending.index(), 3);
             assert!(view.exception(parent).is_none());
             assert!(view.exception(root).is_none());
@@ -182,7 +183,8 @@ fn report_admission_failure_preserves_the_catch_assignment_and_prevents_bail() {
         assert!(matches!(session.control, ParserControl::InErrorRecovery));
         assert_eq!(session.syntax_errors, 0);
         let view = session.invocation_view();
-        assert_eq!(view.exception(local).unwrap().offending.index(), 3);
+        let Some(InvocationCause::NoViableAlternative(cause)) = view.exception(local) else { panic!("expected no-viable cause"); };
+        assert_eq!(cause.offending.index(), 3);
         assert!(view.exception(parent).is_none());
         assert!(view.exception(root).is_none());
         exit_isolation(session)?;
@@ -328,4 +330,218 @@ fn a_successful_sll_action_returns_without_reset_or_ll() {
     assert_eq!(result.unwrap().number(), 2);
     assert_eq!(calls, 1);
     assert_eq!(memory.used_bytes(), 0);
+}
+
+fn match_at_state<'parse, 'sql>(
+    session: &mut ParserSession<'parse, 'sql, '_, '_>,
+    state: u32,
+) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
+    session.set_state(state)?;
+    let token = {
+        let grammar = session.environment.storage.grammar_view();
+        let state = grammar.state(state).map_err(RuntimeError::from)?;
+        let Some(TransitionView::Atom { token, .. }) = state.transitions().next() else { panic!("generated token match"); };
+        token
+    };
+    session.match_bail(token)
+}
+
+#[test]
+fn repeatable_predicts_before_demanding_the_token_that_bails_inline() {
+    for (source, spelling) in [
+        ("ISOLATION LEVEL RePeAtAbLe wrong @", Some("wrong")),
+        ("ISOLATION LEVEL RePeAtAbLe", None),
+    ] {
+        let mut calls = 0;
+        let (result, memory) = fixture(source, |session, mode, _, _| {
+            calls += 1;
+            if mode == PredictionMode::Ll {
+                assert_eq!(session.input_index(), Some(0));
+                assert!(session.current().is_none());
+                assert!(session.control.is_ready());
+                assert!(session.profile == ParserProfile::LlDefault);
+                assert_eq!(session.syntax_errors, 0);
+                assert!(session.buffered_token(3).is_some());
+                assert!(session.buffered_token(4).is_none());
+                return Ok(());
+            }
+
+            let [root, parent, local] = enter_isolation(session)?;
+            assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+            assert_eq!(session.input_index(), Some(2));
+            assert!(session.buffered_token(3).is_none());
+            let matched = match_at_state(session, 3011)?;
+            assert_eq!((matched.index(), matched.lexeme().raw()), (2, "RePeAtAbLe"));
+            let pass = match_at_state(session, 3012);
+            let Err(PassError::Cancelled(cancellation)) = &pass else { panic!("expected inline Bail cancellation"); };
+            assert_eq!(cancellation.exception, local);
+            assert!(matches!(&session.control, ParserControl::BailCancelled { exception, recovery: BailRecovery::Clear } if *exception == local));
+            assert_eq!(session.syntax_errors, 0);
+            assert!(!session.matched_eof);
+            assert!(session.pending_no_viable_report().is_none());
+            assert_eq!(session.input_index(), Some(3));
+            assert_eq!(session.current(), Some(local));
+            assert!(session.buffered_token(4).is_none());
+
+            assert!(matches!(&session.records[local.index].exception, Some(InvocationException::Owned(InvocationCause::InputMismatch { .. }))));
+            let view = session.invocation_view();
+            let cause = view.exception(local).unwrap();
+            let InvocationCause::InputMismatch { state, offending } = cause else { panic!("expected inline mismatch cause"); };
+            assert_eq!(*state, ParserState::State(3012));
+            assert_eq!(offending.index(), 3);
+            match spelling {
+                Some(spelling) => assert_eq!(offending.lexeme().raw(), spelling),
+                None => assert_eq!(offending.lexeme().kind(), Kind::Eof),
+            }
+            assert!(std::ptr::eq(cause, view.exception(parent).unwrap()));
+            assert!(std::ptr::eq(cause, view.exception(root).unwrap()));
+            exit_isolation(session)?;
+            assert_eq!(session.records[local.index].stop.unwrap().index(), 2);
+            pass.map(|_| ())
+        });
+        result.unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn successful_bail_matches_return_actual_occurrences_without_retry() {
+    let mut calls = 0;
+    let (result, memory) = fixture("ISOLATION LEVEL RePeAtAbLe ReAd", |session, mode, _, _| {
+        calls += 1;
+        let [_, _, local] = enter_isolation(session)?;
+        assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+        let first = match_at_state(session, 3011)?;
+        let second = match_at_state(session, 3012)?;
+        assert_eq!((first.index(), first.lexeme().raw()), (2, "RePeAtAbLe"));
+        assert_eq!((second.index(), second.lexeme().raw()), (3, "ReAd"));
+        assert_eq!(session.input_index(), Some(4));
+        assert_eq!(session.buffered_token(4).unwrap().lexeme().kind(), Kind::Eof);
+        assert!(!session.matched_eof);
+        assert!(session.invocation_view().exception(local).is_none());
+        exit_isolation(session)?;
+        assert_eq!(session.records[local.index].stop.unwrap().index(), 3);
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn generated_eof_match_keeps_the_buffered_occurrence_for_finally() {
+    let mut calls = 0;
+    let (result, memory) = fixture("SELECT 1", |session, _, _, _| {
+        calls += 1;
+        let local = session.new_invocation(0)?;
+        session.enter_rule(local)?;
+        session.advance_input()?;
+        session.advance_input()?;
+        let matched = match_at_state(session, 356)?;
+        assert_eq!((matched.index(), matched.lexeme().kind()), (2, Kind::Eof));
+        assert!(session.matched_eof);
+        assert_eq!(session.input_index(), Some(2));
+        assert!(session.buffered_token(3).is_none());
+        session.exit_rule()?;
+        assert_eq!(session.records[local.index].stop.unwrap().index(), 2);
+        Ok(())
+    });
+    result.unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn lexer_failure_during_successful_match_consume_cannot_bail_inline() {
+    let mut calls = 0;
+    let (result, memory) = fixture("ISOLATION LEVEL REPEATABLE @", |session, mode, _, _| {
+        calls += 1;
+        let frames = enter_isolation(session)?;
+        assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+        assert!(session.buffered_token(3).is_none());
+        let pass = match_at_state(session, 3011);
+        assert!(matches!(pass, Err(PassError::Runtime(RuntimeError::Input(
+            StreamError::Scan(ScanError::Recognition(_)),
+        )))));
+        assert_eq!(session.state(), ParserState::State(3011));
+        assert_eq!(session.input_index(), Some(2));
+        assert!(session.buffered_token(3).is_none());
+        assert!(matches!(session.control, ParserControl::Failed));
+        assert_eq!(session.syntax_errors, 0);
+        assert!(frames.into_iter().all(|frame| session.invocation_view().exception(frame).is_none()));
+        exit_isolation(session)?;
+        pass.map(|_| ())
+    });
+    assert!(matches!(result, Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(_))))));
+    assert_eq!(calls, 1);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn token_buffer_admission_failure_during_match_consume_cannot_bail_inline() {
+    let source = format!("{}REPEATABLE READ", "before ".repeat(99));
+    let mut calls = 0;
+    let (result, memory) = fixture(&source, |session, mode, memory, _| {
+        calls += 1;
+        let local = session.new_invocation(175)?;
+        session.enter_rule(local)?;
+        for _ in 0..99 {
+            session.advance_input()?;
+        }
+        session.set_state(3014)?;
+        assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+        assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+        assert_eq!(session.input_index(), Some(99));
+        assert!(session.buffered_token(100).is_none());
+        let _blocker = exhaust(memory);
+        let pass = match_at_state(session, 3011);
+        assert!(matches!(&pass, Err(PassError::Runtime(RuntimeError::Input(
+            StreamError::Scan(ScanError::Admission(error)),
+        ))) if error.code == "rtdb/memory-budget-exceeded"));
+        assert_eq!(session.state(), ParserState::State(3011));
+        assert_eq!(session.input_index(), Some(99));
+        assert!(session.buffered_token(100).is_none());
+        assert!(matches!(session.control, ParserControl::Failed));
+        assert_eq!(session.syntax_errors, 0);
+        assert!(session.invocation_view().exception(local).is_none());
+        session.exit_rule()?;
+        pass.map(|_| ())
+    });
+    assert!(matches!(result, Err(RuntimeError::Input(StreamError::Scan(ScanError::Admission(_))))));
+    assert_eq!(calls, 1);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn denied_normal_use_preserves_the_recovery_state_of_each_cancelled_path() {
+    for (source, inline) in [
+        ("ISOLATION LEVEL REPEATABLE wrong", true),
+        (MALFORMED_LEVEL, false),
+    ] {
+        let mut calls = 0;
+        let (result, memory) = fixture(source, |session, mode, memory, _| {
+            calls += 1;
+            let [_, _, local] = enter_isolation(session)?;
+            let pass = if inline {
+                assert_eq!(session.adaptive_predict(DECISION, mode)?.number(), 3);
+                match_at_state(session, 3011)?;
+                match_at_state(session, 3012).map(|_| ())
+            } else {
+                catch_failed_prediction(session, local, mode)
+            };
+            assert!(matches!(pass, Err(PassError::Cancelled(_))));
+            let used = memory.used_bytes();
+            assert!(matches!(session.lookahead(1), Err(RuntimeError::Control(RuntimeProblem::Aborted))));
+            assert!(if inline { matches!(session.control, ParserControl::Failed) }
+                else { matches!(session.control, ParserControl::InErrorRecovery) });
+            assert_eq!(session.syntax_errors, if inline { 0 } else { 1 });
+            assert_eq!(memory.used_bytes(), used);
+            exit_isolation(session)?;
+            pass
+        });
+        assert!(matches!(result, Err(RuntimeError::Control(RuntimeProblem::Aborted))));
+        assert_eq!(calls, 1);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 }

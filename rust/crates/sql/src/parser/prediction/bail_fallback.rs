@@ -1,6 +1,8 @@
 use rtdb_types::AllocationScope;
+use crate::lexer::{IndexedLexeme, Kind};
+use crate::parser::grammar::TokenType;
 use super::{
-    InvocationException, InvocationKey, ParserControl, ParserEnvironment, ParserProfile, ParserSession,
+    BailRecovery, InvocationCause, InvocationException, InvocationKey, ParserControl, ParserEnvironment, ParserProfile, ParserSession,
     PrecedenceFrame, RuntimeError, RuntimeProblem, RuntimeResult, with_parser_session,
 };
 use super::super::PredictionMode;
@@ -52,6 +54,42 @@ pub(in crate::parser::prediction) fn with_bail_fallback<'sql, 'env, 'work, T>(
 }
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
+    pub(in crate::parser::prediction) fn match_bail(
+        &mut self,
+        expected: TokenType,
+    ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
+        let current = self.ready().and_then(|()| {
+            if self.profile != ParserProfile::SllBail {
+                return Err(RuntimeError::Control(RuntimeProblem::Aborted));
+            }
+            let current = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
+            if self.record(current)?.start.is_none() {
+                return Err(RuntimeError::Control(RuntimeProblem::Invocation));
+            }
+            Ok(current)
+        });
+        let current = self.finish(current)?;
+        let matched = self.lookahead(1)?.expect("positive lookahead");
+        let actual = self.environment.storage.grammar_view().token_type(matched.lexeme().kind())
+            .map_err(RuntimeError::from);
+        if self.finish(actual)? != expected {
+            let state = self.state;
+            let offending = self.lookahead(1)?.expect("positive lookahead");
+            let cause = InvocationCause::InputMismatch { offending, state };
+            self.records[current.index].exception = Some(InvocationException::Owned(cause));
+            return self.cancel_bail(current, BailRecovery::Clear);
+        }
+
+        if expected == TokenType::EOF {
+            self.matched_eof = true;
+        }
+        let consumed = self.lookahead(1)?.expect("positive lookahead");
+        if consumed.lexeme().kind() != Kind::Eof {
+            self.advance_input()?;
+        }
+        Ok(matched)
+    }
+
     pub(in crate::parser::prediction) fn catch_no_viable_alternative<T>(
         &mut self,
         local: InvocationKey<'parse>,
@@ -62,22 +100,25 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             self.control.abort();
             return Err(RuntimeError::Control(RuntimeProblem::Aborted).into());
         };
-        let cause = report.cause;
+        let cause = InvocationCause::NoViableAlternative(report.cause);
         self.records[local.index].exception = Some(InvocationException::Owned(cause));
         self.report_no_viable_alternative()?;
+        self.cancel_bail(local, BailRecovery::Entered)
+    }
 
+    fn cancel_bail<T>(&mut self, local: InvocationKey<'parse>, recovery: BailRecovery) -> PassResult<'parse, 'sql, T> {
         let mut ancestor = self.records[local.index].parent;
         while let Some(key) = ancestor {
             let record = &mut self.records[key.index];
             record.exception = Some(InvocationException::Shared(local));
             ancestor = record.parent;
         }
-        self.control = ParserControl::BailCancelled(local);
+        self.control = ParserControl::BailCancelled { exception: local, recovery };
         Err(PassError::Cancelled(BailCancellation { exception: local }))
     }
 
     fn reset_after_bail(&mut self, cancellation: BailCancellation<'parse>) -> RuntimeResult<'sql, ()> {
-        if !matches!(&self.control, ParserControl::BailCancelled(exception) if *exception == cancellation.exception)
+        if !matches!(&self.control, ParserControl::BailCancelled { exception, .. } if *exception == cancellation.exception)
             || self.profile != ParserProfile::SllBail
             || self.current.is_some()
             || !matches!(self.precedence.as_slice(), [PrecedenceFrame::Base0])
@@ -85,7 +126,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             return self.finish(Err(RuntimeError::Control(RuntimeProblem::Aborted)));
         }
 
-        self.control = ParserControl::InErrorRecovery;
+        self.control.abort();
         self.input.seek(0)?;
         self.input.seek(0)?;
 

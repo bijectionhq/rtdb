@@ -565,7 +565,28 @@ This profile has no trace listener and the pinned interpreter's reset has no sta
 Recognizer state, previous invocation records, buffered tokens and retained DFA history persist.
 The wrapper then selects the LL strategy, listener and prediction profile, and calls the same action once more.
 This private adapter covers the caught adaptive no-viable path.
-Generated rule bodies, other recognition variants, inline recovery and production adoption remain required.
+Generated rule bodies, other recognition variants, the remaining inline recovery paths and production adoption remain required.
+
+== SLL Bail token matches
+
+The private SLL match operates on the current primary invocation and reads the actual `LT(1)` token.
+It compares the token type through the pinned grammar's vocabulary.
+A successful match marks EOF when applicable and observes the consume operation's own `LT(1)`.
+For a non-EOF token, the stream synchronizes the following occurrence before advancing.
+A matched EOF stays current so rule finally can record its actual occurrence.
+The match returns its first observed token.
+
+A mismatch constructs an input-mismatch cause at the actual current recognizer state and invocation.
+The constructor's own `LT(1)` supplies the offending occurrence.
+Bail anchors the cause in that primary record, links its actual parent chain to the same cause and returns the existing branded cancellation.
+The inline prefix leaves recovery clear, leaves the syntax-error count and cursor unchanged and bypasses the generated recognition catch.
+The existing wrapper can use that cancellation after rule finally.
+Invalidating a cancellation preserves its originating recovery condition.
+A runtime fault during token demand propagates before any inline exception assignment or cancellation.
+
+A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
+Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
+Generated context and terminal attachment, LL inline recovery, expected-token capabilities and production adoption remain open.
 
 == Finishing-alternative selection
 
