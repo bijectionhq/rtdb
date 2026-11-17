@@ -13,6 +13,7 @@ use keys::{Algorithm, KeyManager, KeyType};
 pub(crate) mod trust;
 pub(crate) mod validation;
 pub(crate) mod security;
+pub(crate) mod request;
 
 pub(crate) struct NativeTls {
     identities: Vec<ClientIdentity>,
@@ -87,6 +88,7 @@ impl NativeTls {
             context.set_cert_store(store.build());
         }
         if !self.identities.is_empty() {
+            unsafe { request::configure(context, &self.reservations[0])?; }
             unsafe { SSL_CTX_set_cert_cb(context.as_ptr(), Some(select_identity), (self as *const Self).cast_mut().cast()); }
         }
         if let Some(trust) = &self.simple_trust { unsafe { trust.configure_native(context)?; } }
@@ -95,12 +97,15 @@ impl NativeTls {
 
     fn select(&self, ssl: &mut SslRef) -> Result<()> {
         unsafe { SSL_certs_clear(ssl.as_ptr()); }
-        let types = requested_types(ssl);
+        let request = request::Request::of(ssl)?;
+        let types = request.requested_types(ssl);
         let now = Asn1Time::days_from_now(0).map_err(invalid)?;
         let required = CERT_PKEY_VALID | CERT_PKEY_ISSUER_NAME | if ssl.version2() == Some(SslVersion::TLS1_2) { CERT_PKEY_CERT_TYPE } else { 0 };
         let selected = self.key_manager.choose(&types, |index, kind| {
             let identity = &self.identities[index];
-            identity.eligible && identity.kind == kind && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
+            identity.eligible && identity.kind == kind
+                && (!self.key_manager.constrains_certificates() || std::iter::once(identity.certificate.as_ref()).chain(identity.chain.iter()).all(|certificate| request.permits(certificate)))
+                && unsafe { SSL_check_chain(ssl.as_ptr(), identity.certificate.as_ptr(), identity.key.as_ptr(), identity.chain.as_ptr()) } & required == required
         }, |index| keys::client_status(&self.identities[index].certificate, &now));
         if let Some(index) = selected {
             let identity = &self.identities[index];
@@ -176,26 +181,10 @@ const CERT_PKEY_VALID: i32 = 0x1;
 const CERT_PKEY_ISSUER_NAME: i32 = 0x200;
 const CERT_PKEY_CERT_TYPE: i32 = 0x400;
 
-fn requested_types(ssl: &SslRef) -> Vec<KeyType> {
-    let count = unsafe { SSL_get_sigalgs(ssl.as_ptr(), -1, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()) };
-    let mut types = keys::requested_types((0..count).map(|index| {
-        let (mut signature, mut hash) = (0, 0);
-        unsafe { SSL_get_sigalgs(ssl.as_ptr(), index, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut signature, &mut hash); }
-        u16::from_be_bytes([hash, signature])
-    }));
-    if ssl.version2() == Some(SslVersion::TLS1_2) {
-        let mut types_pointer: *const u8 = std::ptr::null();
-        let length = unsafe { openssl_sys::SSL_ctrl(ssl.as_ptr(), 103, 0, (&mut types_pointer as *mut *const u8).cast()) };
-        let offered = if length > 0 && !types_pointer.is_null() { unsafe { std::slice::from_raw_parts(types_pointer, length as usize) } } else { &[] };
-        types.retain(|kind| offered.contains(&match kind { KeyType::Rsa | KeyType::RsaPss => 1, KeyType::Dsa => 2, KeyType::Ec | KeyType::EdDsa => 64, KeyType::Other => 0 }));
-    }
-    types
-}
 unsafe extern "C" {
     fn SSL_CTX_set_cert_cb(context: *mut openssl_sys::SSL_CTX, callback: Option<unsafe extern "C" fn(*mut openssl_sys::SSL, *mut c_void) -> i32>, opaque: *mut c_void);
     fn SSL_check_chain(ssl: *mut openssl_sys::SSL, certificate: *mut openssl_sys::X509, key: *mut openssl_sys::EVP_PKEY, chain: *mut openssl_sys::stack_st_X509) -> i32;
     fn SSL_certs_clear(ssl: *mut openssl_sys::SSL);
-    fn SSL_get_sigalgs(ssl: *mut openssl_sys::SSL, index: i32, signature: *mut i32, hash: *mut i32, signature_hash: *mut i32, raw_signature: *mut u8, raw_hash: *mut u8) -> i32;
 }
 fn invalid(cause: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("xtdb.kafka/invalid-tls-config", cause.to_string()) }
 fn overflow() -> Anomaly { invalid("Kafka TLS material exceeds allocation range") }

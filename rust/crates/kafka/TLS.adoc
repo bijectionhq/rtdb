@@ -33,6 +33,13 @@ Kafka applies Java ConfigDef trimming to algorithm names; Registry HTTPS preserv
 It otherwise chooses the first valid certificate, then an expired certificate before one with incompatible client key usage or extended key usage.
 Fallback ties use requested key-type priority, then store enumeration.
 `NewSunX509` also applies the pinned Java algorithm constraints to every certificate in each candidate chain.
+Both transports keep the peer's certificate signature preferences separate from its CertificateVerify schemes.
+TLS 1.3 uses `signature_algorithms_cert` when present, with the unfiltered `signature_algorithms` list as its fallback.
+Certificate preferences set key-type priority, while the signing list must permit a CertificateVerify signature and TLS 1.2 certificate types restrict eligible key families.
+`NewSunX509` checks every candidate certificate's signature algorithm against those certificate preferences, including the final supplied certificate.
+Its peer check follows Java's JCA algorithm names, so the RSA-PSS wire schemes share one algorithm name even when their digest identifiers differ.
+The native message callback retains the admitted certificate-request allocation on its SSL connection until replacement or connection destruction.
+Registry uses the additive request view documented in link:../../vendor/rustls/XTDB.adoc[the Rustls fork].
 The selected entry supplies its key and certificate chain.
 A request with no compatible entry sends no client certificate.
 `ssl.trustmanager.algorithm` and `schema.registry.ssl.trustmanager.algorithm` default to `PKIX`, with the aliases `SunPKIX`, `X509` and `X.509`.
@@ -64,7 +71,6 @@ A list containing only disabled suites or protocols produces no usable handshake
 
 == Open parity gaps
 
-Separate `signature_algorithms_cert` preferences require transport integration beyond the exposed peer signing-scheme list.
 `NewSunX509` currently recovers every private key at configuration time; Java can defer recovery until an alias is selected.
 OpenSSL's certificate validation, key-size limits, signature restrictions and algorithm availability are not yet qualified against Java's complete security constraints.
 Distinguished-name matching still uses OpenSSL canonicalization; Java's Unicode case folding and NFKD normalization need a shared native adapter.

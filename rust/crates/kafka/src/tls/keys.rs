@@ -24,6 +24,8 @@ impl Algorithm {
 }
 
 impl KeyManager {
+    pub(crate) fn constrains_certificates(&self) -> bool { self.algorithm == Algorithm::NewSunX509 }
+
     pub(crate) fn new(algorithm: Algorithm, identities: &[Identity]) -> Self {
         let aliases = identities.iter().map(|identity| identity.alias().unwrap_or(&[])).collect::<Vec<_>>();
         let order = if algorithm == Algorithm::SunX509 {

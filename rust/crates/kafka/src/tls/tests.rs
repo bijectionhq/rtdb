@@ -130,7 +130,7 @@ fn native_builtin_managers_select_java_alias_order_and_verify_trust_for_both_pro
     std::fs::write(&file, support::jks(&[("a", &first), ("b", &second)], "store-password", "key-password")).unwrap();
     for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
         for (algorithm, expected) in [("SunX509", &first), ("NewSunX509", &second), ("PKIX", &second)] {
-            let (address, broker) = support::broker(&server, &root, version, Some("rsa_pss_rsae_sha256"));
+            let (address, broker) = support::broker(&server, &root, version, Some("rsa_pss_rsae_sha256:rsa_pkcs1_sha256"));
             let mut options = options();
             options.insert("ssl.keymanager.algorithm".into(), algorithm.into());
             options.insert("ssl.trustmanager.algorithm".into(), if algorithm == "PKIX" { "SunX509" } else { "PKIX" }.into());
