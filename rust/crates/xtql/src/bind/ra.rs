@@ -56,7 +56,7 @@ impl Importer<'_, '_, '_> {
             }
             ("project" | "π" | "pi" | "map" | "ⲭ" | "chi", [input]) => self.project(options, input, matches!(op, "map" | "ⲭ" | "chi"))?,
             ("rename" | "ρ" | "rho", [input]) => self.rename(options, input)?,
-            ("sort", [input]) => self.sort(options, input)?,
+            ("sort", [input]) => return self.sort(options, input),
             ("group-by" | "γ" | "gamma", [input]) => self.group_by(options, input)?,
             ("union-all" | "∪", [left, right]) => self.set(SetOperator::Union, left, right)?,
             ("intersect" | "∩", [left, right]) => self.set(SetOperator::Intersect, left, right)?,
@@ -323,18 +323,32 @@ impl Importer<'_, '_, '_> {
         input.project(expressions)
     }
 
-    fn sort(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
+    fn sort(&mut self, options: &Edn, input: &Edn) -> Result<Arc<Relation>> {
         let input = self.lower(input)?;
-        let mut bound = bind_input(&input);
-        let order_by = Self::sort_specs(options, &bound)?;
-        let mut read_limit = |key| options.option(key).filter(|form| !matches!(form.kind, EdnKind::Nil)).map(|form| self.scalar(form, &mut bound)).transpose();
-        let offset = read_limit("skip")?;
-        let fetch = read_limit("limit")?;
-        if order_by.is_empty() { return input.limit(offset, fetch); }
-        Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })
+        let bound = bind_input(&input);
+        let order_by = Self::sort_specs(options, |column| {
+            let name = column_name(column)?;
+            Ok(bound.variables.get(name).map_or(PExpr::Literal(Value::Null), Field::expression))
+        })?;
+        let offset = self.row_limit(options.option("skip"))?;
+        let fetch = self.row_limit(options.option("limit"))?;
+        if order_by.is_empty() && offset.is_none() && fetch.is_none() { return Ok(input); }
+        let relation = if order_by.is_empty() { input.limit(offset, fetch)? }
+            else { Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })? };
+        Ok(Arc::new(relation))
     }
 
-    fn sort_specs(options: &Edn, bound: &Bound) -> Result<Vec<SortExpr>> {
+    fn row_limit(&mut self, form: Option<&Edn>) -> Result<Option<PExpr>> {
+        let Some(form) = form.filter(|form| !matches!(form.kind, EdnKind::Nil)) else { return Ok(None); };
+        if let Some(name) = form.symbol().filter(|name| name.starts_with('?')) {
+            let parameter = self.parameters.get(&self.compiler.symbols.parameter(name)).cloned()
+                .ok_or_else(|| error("xtdb/expected-number", "Expected: number, got: null").with_context("param", name.into()))?;
+            return Ok(Some(parameter));
+        }
+        self.scalar(form, &mut Bound::unit()).map(Some)
+    }
+
+    fn sort_specs(options: &Edn, mut expression: impl FnMut(&Edn) -> Result<PExpr>) -> Result<Vec<SortExpr>> {
         let mut order_by = Vec::new();
         for spec in options.option("order-specs").map(sequence).transpose()?.unwrap_or_default() {
             let (column, order) = match spec.vector().ok_or_else(|| invalid("Sort specification must be a vector"))? {
@@ -354,8 +368,7 @@ impl Importer<'_, '_, '_> {
                 None | Some(Some("nulls-last")) => false,
                 _ => return Err(invalid("Expected :nulls-first or :nulls-last")),
             };
-            let name = column_name(column)?;
-            let expr = bound.variables.get(name).ok_or_else(|| invalid(format!("Unknown sort column: {name}")))?.expression();
+            let expr = expression(column)?;
             order_by.push(SortExpr { expr, descending, nulls_first });
         }
         Ok(order_by)
@@ -402,7 +415,8 @@ impl Importer<'_, '_, '_> {
         let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
         let field = self.compiler.binder.field(name, None, aggregate_type(&function, input_type, grouped)?)?;
         let filter = options.and_then(|options| options.option("filter")).map(|predicate| self.scalar(predicate, bound)).transpose()?;
-        let order_by = options.map(|options| Self::sort_specs(options, bound)).transpose()?.unwrap_or_default();
+        let order_by = options.map(|options| Self::sort_specs(options, |column| Ok(self.column_or_null(column, bound)?.expression())))
+            .transpose()?.unwrap_or_default();
         Ok(AggregateExpr { field, function, argument, distinct, filter, order_by })
     }
 

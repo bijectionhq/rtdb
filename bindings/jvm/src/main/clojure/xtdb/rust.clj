@@ -123,6 +123,11 @@
   (.connect node
             (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb")))
 
+(defn- logical-arguments [args]
+  (if (sequential? args)
+    (into {} (map-indexed (fn [index value] [(str "?_" index) value])) args)
+    (or args {})))
+
 (defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types?] :as options
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
@@ -131,7 +136,7 @@
         (set-await-token! connection token))
       (with-read-settings connection options
         (fn []
-          (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
+          (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (logical-arguments args)))]
             (let [key-fn (serde/read-key-fn key-fn)
                   rows (loop [rows (transient [])]
                          (if-let [bytes (.next result)]

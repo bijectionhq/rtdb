@@ -7,11 +7,13 @@
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.operator.distinct-test :as original-distinct]
             [xtdb.operator.join-test :as original-join]
+            [xtdb.operator.order-by-test :as original-order-by]
             [xtdb.operator.project-test :as original-project]
             [xtdb.operator.rename-test :as original-rename]
             [xtdb.operator.select-test :as original-select]
             [xtdb.operator.set-test :as original-set]
             [xtdb.operator.table-test :as original-table]
+            [xtdb.operator.top-test :as original-top]
             [xtdb.sql.expr-test :as original-expr]
             [xtdb.sql.correlated-subquery-nulls-test :as original-correlated]
             [xtdb.sql.exists-decorrelation-test :as original-exists]
@@ -156,6 +158,14 @@
 (deftest-original-api original-rename/test-rename)
 
 (deftest-original-api original-distinct/test-distinct)
+
+(deftest-original-api original-order-by/test-order-by)
+
+(deftest-original-api original-order-by/test-order-by-with-nulls)
+
+(deftest-original-api original-top/test-top)
+
+(deftest-original-api original-top/test-param-3699)
 
 (deftest-original-api original-set/test-union-all)
 

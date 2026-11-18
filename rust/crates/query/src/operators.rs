@@ -240,8 +240,16 @@ async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<
     let Some(expr) = expr else { return Ok(None); };
     let scope = execution.scope()?;
     let value = execution.evaluate(&scope, expr, &Schema::default(), &[]).await?;
-    integer(&value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)).map(|value|Some(value as u64))
-        .ok_or_else(|| rtdb_types::Anomaly::incorrect("xtdb/expected-number","LIMIT and OFFSET require a non-negative signed integer"))
+    if let Some(value) = integer(&value).filter(|value| (0..=i128::from(i64::MAX)).contains(value)) { return Ok(Some(value as u64)); }
+    let description = match value {
+        Value::Null | Value::Undefined => "null".to_owned(),
+        Value::Utf8(value) => value,
+        Value::Bool(value) => value.to_string(),
+        other => integer(&other).map(|value|value.to_string())
+            .or_else(||rtdb_expr::number(&other).map(|value|value.to_string()))
+            .unwrap_or_else(||format!("{:?}",other.logical_type())),
+    };
+    Err(rtdb_types::Anomaly::incorrect("xtdb/expected-number", format!("Expected: number, got: {description}")))
 }
 
 async fn materialize_rows(rows: &[Vec<Expr>], execution: &Execution) -> Result<Option<OwnedPage>> {
