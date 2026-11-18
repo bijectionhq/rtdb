@@ -64,8 +64,19 @@ fn wire_text_object(tag: &str, representation: &T) -> Result<Option<Object>> {
     Ok(None)
 }
 
-pub(crate) fn print_registered_scalar(tag: &str, representation: &T, admission: Admission<'_>) -> Result<Option<String>> {
-    wire_text_object(tag, representation)?.map(|value| render::printed(&value, admission)).transpose()
+fn read_object(bytes: &[u8],admission: Admission<'_>) -> Result<Object> { decode_with(bytes,&mut ObjectReadBuilder { admission }) }
+
+/// `(pr-str v)` of the value serde reads from `bytes`.
+pub(crate) fn printed_text(bytes: &[u8],admission: Admission<'_>) -> Result<String> { render::printed(&read_object(bytes,admission)?,admission) }
+
+/// The `[:transit :utf8]` cast: a string is returned as itself, anything else as `(pr-str v)`.
+pub(crate) fn cast_text(bytes: &[u8],admission: Admission<'_>) -> Result<String> {
+    match read_object(bytes,admission)? { Object::String(value) => Ok(value),value => render::printed(&value,admission) }
+}
+
+/// `(str v)`, with `nil` kept distinct so that callers can pass it through as SQL NULL.
+pub(crate) fn str_text(bytes: &[u8],admission: Admission<'_>) -> Result<Option<String>> {
+    match read_object(bytes,admission)? { Object::Null => Ok(None),value => render::string(&value,admission).map(Some) }
 }
 
 pub(crate) struct Decoded<'a> { value: Object,allocation: &'a EvaluationScope }

@@ -85,16 +85,19 @@ fn format_keeps_first_argument_checks_and_resolves_unused_arguments_before_direc
 }
 
 #[test]
-fn unselected_registered_shapes_keep_successful_raw_format_rendering() {
+fn unselected_registered_shapes_format_with_str_or_refuse_stack_trace_text() {
     let date = tag("m",T::String("0".into()));
     let nested = info(T::String("nested".into()),T::Map(vec![]));
-    for value in [date,info(T::Null,T::Map(vec![(T::String("nested".into()),nested)]))] {
+    for (value,printable) in [(date,true),(info(T::Null,T::Map(vec![(T::String("nested".into()),nested)])),false)] {
         let args = [text("%s"),stored(&value)];
         let memory = MemoryBudget::new(8 << 20);
         {
             let scope = EvaluationScope::new(&memory).unwrap();
             for context in [EvalContext::default(),EvalContext { allocation: Some(&scope),..Default::default() }] {
-                assert!(matches!(scalar_call("format",&args,&context).unwrap(),V::Utf8(_)));
+                match scalar_call("format",&args,&context) {
+                    Ok(value) => assert!(printable && matches!(value,V::Utf8(_))),
+                    Err(error) => assert!(!printable && error.code == "xtdb.expression/transit-throwable-text","{error:?}"),
+                }
             }
         }
         assert_eq!(memory.used_bytes(),0);

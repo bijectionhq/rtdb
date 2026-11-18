@@ -119,7 +119,7 @@ fn resolve(value: &Value, context: &EvalContext<'_>) -> Result<Option<String>> {
                 FormatArgument::Semantic(value) => value,
                 FormatArgument::Wire(rtdb_format::transit::TransitValue::Null) => return Ok(None),
                 FormatArgument::Wire(rtdb_format::transit::TransitValue::String(value)) => value,
-                FormatArgument::Wire(value) => super::render::transit(&value, 0)?,
+                FormatArgument::Wire(_) => match crate::transit_object::str_text(bytes, Admission::for_context(context.allocation))? { Some(value) => value, None => return Ok(None) },
             }
         }
         Value::Uuid(value) => String::from_utf8_lossy(value).into_owned(),

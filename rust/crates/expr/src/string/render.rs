@@ -1,6 +1,5 @@
-use rtdb_format::transit::TransitValue;
 use rtdb_types::{Anomaly, Result, TimeUnit, Value};
-use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts, transit_object::legacy_date_text};
+use crate::{admission::Admission, numeric::overflow, temporal::IntervalParts};
 
 /// Bounds scratch and output retained while casting a value to text, including Transit cache expansion.
 /// Acquire this charge before calling `cast` directly and retain it until the returned text acquires its own owner.
@@ -36,10 +35,7 @@ pub(crate) fn text(value: &Value) -> Result<String> {
         Value::Timestamp { value, unit, timezone } => timestamp(nanos(*value, *unit), timezone.as_deref())?,
         Value::Duration { value, unit } => crate::temporal_text::duration_text(i128::from(i64::try_from(nanos(*value, *unit)).map_err(|_| overflow())?)),
         value if IntervalParts::of(value).is_some() => crate::temporal_text::interval_text(IntervalParts::of(value).ok_or_else(overflow)?),
-        Value::Transit(bytes) => {
-            let value = rtdb_format::transit::decode_msgpack(bytes)?;
-            if let TransitValue::String(value) = value { value } else { transit(&value, 0)? }
-        }
+        Value::Transit(bytes) => crate::transit_object::cast_text(bytes, Admission::Standalone)?,
         value => reader(value, 0)?,
     })
 }
@@ -69,7 +65,7 @@ fn reader(value: &Value, depth: usize) -> Result<String> {
         Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => format!("[{}]", values.iter().map(|value| reader(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
         Value::Struct(fields) => format!("{{{}}}", fields.iter().map(|(name, value)| Ok(format!("{} {}", quoted(name), reader(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
         Value::Map { entries, .. } => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", object(key, depth + 1)?, object(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
-        Value::Transit(bytes) => transit(&rtdb_format::transit::decode_msgpack(bytes)?, depth + 1)?,
+        Value::Transit(bytes) => crate::transit_object::printed_text(bytes, Admission::Standalone)?,
         _ => return Err(crate::numeric::inapplicable("text", &[value])),
     })
 }
@@ -84,41 +80,6 @@ fn object(value: &Value, depth: usize) -> Result<String> {
     })
 }
 
-pub(super) fn transit(value: &TransitValue, depth: usize) -> Result<String> {
-    if depth > 128 { return Err(Anomaly::incorrect("xtdb.expression/value-depth", "Printable Transit value exceeds the nesting limit")); }
-    Ok(match value {
-        TransitValue::Null => "nil".into(), TransitValue::Bool(value) => value.to_string(), TransitValue::Integer(value) => value.to_string(),
-        TransitValue::Float(value) => printed_float(*value, None), TransitValue::String(value) => quoted(value), TransitValue::Keyword(value) => format!(":{value}"), TransitValue::Symbol(value) => value.clone(),
-        TransitValue::Float32(value) => printed_float(f64::from(*value),Some(*value)),
-        TransitValue::Bytes(value) => tagged("bytes", &hex(value)),
-        TransitValue::Array(values) => format!("[{}]", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-        TransitValue::Map(entries) => format!("{{{}}}", entries.iter().map(|(key, value)| Ok(format!("{} {}", transit(key, depth + 1)?, transit(value, depth + 1)?))).collect::<Result<Vec<_>>>()?.join(", ")),
-        TransitValue::Tagged { tag, representation } => {
-            if let Some(printed) = crate::transit_object::print_registered_scalar(tag, representation, Admission::Standalone)? {
-                return Ok(printed);
-            }
-            match (tag.as_str(), representation.as_ref()) {
-                ("i8" | "i16" | "i32" | "i64", TransitValue::Integer(value)) => value.to_string(),
-                ("f32", TransitValue::Float(value)) => printed_float(*value, Some(*value as f32)),
-                ("f64", TransitValue::Float(value)) => printed_float(*value, None),
-                (tag @ ("m" | "t"), representation) if legacy_date_text::HOST_CAPTURE => {
-                    let millis = legacy_date_text::wire_millis(tag, representation)?;
-                    legacy_date_text::readable(millis, Admission::Standalone)?
-                }
-                ("m", TransitValue::String(value)) => instant(value.parse().map_err(|_| Anomaly::incorrect("xtdb.expression/invalid-transit-date", "Invalid millisecond date representation"))?)?,
-                ("n", TransitValue::String(value)) => format!("{value}N"), ("f", TransitValue::String(value)) => format!("{value}M"),
-                ("u", TransitValue::String(value)) => tagged("uuid", value), ("r", TransitValue::String(value)) => tagged("xt/uri", &rtdb_types::UriParts::parse(value)?.to_ascii_string()),
-                ("r", _) => return Err(Anomaly::incorrect("xtdb.expression/invalid-transit-uri", "URI Transit representation must be text")),
-                ("set", TransitValue::Array(values)) => format!("#{{{}}}", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-                ("list", TransitValue::Array(values)) => format!("({})", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
-                ("xtdb/period-duration", _) => format!("#xt/period-duration {}", transit(representation, depth + 1)?),
-                ("xtdb/tx-key", _) => format!("#xt/tx-key {}", transit(representation, depth + 1)?),
-                _ => format!("#{tag} {}", transit(representation, depth + 1)?),
-            }
-        }
-    })
-}
-
 fn quoted(value: &str) -> String {
     let mut output = String::with_capacity(value.len() + 2);
     output.push('"');
@@ -129,10 +90,6 @@ fn tagged(tag: &str, value: &str) -> String { format!("#{tag} {}", quoted(value)
 fn printed_float(value: f64, single: Option<f32>) -> String { if value.is_nan() { "##NaN".into() } else if value == f64::INFINITY { "##Inf".into() } else if value == f64::NEG_INFINITY { "##-Inf".into() } else { super::float_text(value, single) } }
 fn hex(value: &[u8]) -> String { const HEX: &[u8] = b"0123456789abcdef"; let mut text = String::with_capacity(value.len() * 2); for byte in value { text.push(HEX[(byte >> 4) as usize] as char); text.push(HEX[(byte & 15) as usize] as char); } text }
 fn nanos(value: i64, unit: TimeUnit) -> i128 { i128::from(value) * (1_000_000_000 / i128::from(unit.units_per_second())) }
-fn instant(millis: i64) -> Result<String> {
-    let seconds = millis.div_euclid(1000).rem_euclid(86_400);
-    Ok(tagged("inst", &format!("{}T{:02}:{:02}:{:02}.{:03}-00:00", date(millis.div_euclid(86_400_000))?, seconds / 3600, seconds / 60 % 60, seconds % 60, millis.rem_euclid(1000))))
-}
 
 fn timestamp(nanos: i128, zone: Option<&str>) -> Result<String> {
     let (offset, suffix) = if let Some(zone) = zone {
