@@ -1,0 +1,76 @@
+= Qualified reusable Avro parser environment
+
+AvroSchemaRuntime owns the supplied Avro SchemaStringFactory, captured InputBuffers authority and effective InternAuthority across schema parse groups.
+It returns an admitted datum by value for the actual converter owner to wrap and cache.
+The root-owned Registry integration can select this parser when that qualified environment is supplied and retain the existing route when it is absent.
+This cohort keeps the runtime and Reader facade behind their existing test gate while that installation is coordinated.
+
+== Owners and source profile
+
+The runtime is a passive single-writer environment owner.
+Its factory handle shares the supplied actual Avro classloader/factory root; it creates no replacement factory, recycler or intern cache per parse.
+Factory clones preserve that root while each parse group has fresh Schema.Parser names state.
+The captured input authority and intern authority keep their distinct source scopes rather than becoming factory-local maps.
+They own and admit their nested heap payloads and retain demanded cached storage through their operations.
+The runtime introduces no active task, monitor or new schema/value tree.
+
+The constructor reserves a checked16*(sizeof(runtime)+sizeof(buffer authority)+sizeof(intern authority))+4096 before boxing either authority.
+The captured control lease drops after the factory and authority payloads and is retained in each new parse context before demand.
+Any outer Arc or Mutex wrapping this inline runtime belongs to its caller's admission and source scope.
+The returned datum already owns its canonical/native parse reservations; the converter admits any extra outer plan wrapper where it constructs it.
+
+The pinned reference uses Avro1.11.4, Confluent7.8.0 and Jackson core/databind2.21.7.
+link:../../registry/response/DEFAULT-PROFILE.adoc[The classpath evidence] distinguishes the retained C84 worker profile from cache presence and packaged runtime qualification.
+The runtime does not infer a factory seed, interner contents or recycler identity from those classpath records.
+The fixture seed37 is an explicit deterministic source-algorithm input, not a JVM identity observation.
+
+Avro's plain Schema.FACTORY enables ALLOW_COMMENTS, while Confluent's separate JacksonMapper enables ALLOW_NON_NUMERIC_NUMBERS.
+Their mapper features and factory roots remain distinct.
+Avro's tree retains the default Int/Long/BigInteger/Double node classes described by the link:../java_schema/producer/string_reader/READER.adoc[String Reader profile].
+The runtime uses the published unregistered LogicalTypes profile, with its existing custom-factory and fixed-decimal source-Math qualifications.
+
+SourcePolicy remains a per-group argument.
+AvroSchema.getParser,224–227, sets validateDefaults from that AvroSchema's isNew value; it is not persistent factory state.
+The caller likewise supplies the effective Fixed bytes limit in that policy.
+
+== Nullable root and retained input
+
+parse accepts an optional borrowed JavaText root and ordered borrowed JavaText references.
+The caller retains their charged stable document owners for the synchronous operation.
+None represents Java null; an empty String remains an actual input String.
+
+Confluent AvroSchema,110–120, parses references before checking whether the root schema String is null.
+The runtime therefore source-parses all references, including semantic validation, buffered trailing checks and finally-close behavior, even when the root is None.
+That branch returns None without native transport projection because no native root datum is demanded.
+A valid reference containing native-unrepresentable metadata can succeed there, while an invalid reference still fails.
+An actual empty String reaches the Reader and fails through its absent-tree schema branch.
+
+A non-null root uses the existing complete-source-group Reader and ParsedPair route.
+All reference/root source stages and canonical finalization complete before backend transport starts.
+The returned datum retains its independently admitted canonical and native owners after runtime, input documents and creation context drop.
+The converter's later Connect plan/decode stages continue through their existing consumers.
+No production graph/default/union behavior is activated by this owner alone.
+
+== Captured recycler boundary
+
+InputBuffers currently supplies an already captured effective recycler slot.
+A complete process-pool integration must acquire the effective recycler for every reference/root parser before either direct buffer copying or fallback child creation.
+The earliest common boundary is with_tree immediately before Session::open.
+The matching IOContext/pool close follows symbol release and token-buffer return inside the existing closed-once lifecycle; an earlier release failure skips that later close.
+This cohort adds no acquisition hook and makes no full process-pool claim.
+The supplied captured authority profile must remain valid over the calls that reuse it.
+
+== Source and regression scope
+
+link:sources.sha256[] pins the consulted source/profile/native dependency snapshots.
+link:COPYRIGHT[] retains the complete primary Java pre-package prefixes, including empty prefixes.
+link:source-profile.json[] records the concrete owner/API, native profile and pending registration boundary.
+The retained link:../java_schema/producer/NOTICE-JACKSON[], link:../names/LICENSE-APACHE[], link:../names/LICENSE[] and link:../names/ADDITIONAL_LICENSE_INFO[] supply the existing notices and licenses.
+
+Six additive source regression functions cover persistent factory/recycler/interner use, fresh parser identities, reference-first null handling, empty String distinction, per-group default validation, admission before authority use, fresh-context retention and exact UTF16 datum/decode lifetime.
+The tests preserve every published StringReader22 body and all earlier Avro assertions, including A09.
+They have not been executed in Phase1.
+
+Native document/token/depth limits and unmatched/nonfinite transport exclusions remain explicit in the String Reader profile.
+The A09 explicit-null default expectation/source conflict remains unresolved.
+Full typed graph/default/generalized-union/arbitrary-key conversion and source provenance through SMT/writer consumers remain integration work.

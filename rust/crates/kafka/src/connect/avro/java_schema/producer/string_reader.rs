@@ -53,6 +53,17 @@ impl SchemaStringFactory {
         let (root, _) = self.read_schema(&mut producer, text, buffers, intern, context)?;
         producer.builder.finish(root, context)
     }
+    pub(in crate::connect::avro) fn parse_without_root(
+        &self, references: &[JavaText<'_>], buffers: &mut dyn InputBuffers,
+        intern: &mut dyn InternAuthority, policy: SourcePolicy, context: &mut ConversionContext,
+    ) -> Result<()> {
+        let mut logical = logical::Unregistered;
+        let mut producer = Producer { builder: SchemasBuilder::new(context)?, policy, native: NativeFootprint::new(), logical: &mut logical };
+        for reference in references {
+            self.read_schema(&mut producer, *reference, buffers, intern, context)?;
+        }
+        Ok(())
+    }
     fn read_schema(
         &self, producer: &mut Producer<'_>, text: JavaText<'_>, buffers: &mut dyn InputBuffers,
         intern: &mut dyn InternAuthority, context: &mut ConversionContext,

@@ -1,0 +1,36 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "source_snapshot": "/tmp/rtdb-avro-runtime-sources",
+  "primary_java_source_count": 9,
+  "pinned_file_count": 16,
+  "existing_reader_baseline": "ee12bcf3f",
+  "registration": "Avro runtime and shared Reader remain under existing cfg(test); root owns coordinated visibility and actual optional Registry injection",
+  "runtime_role": "passive single-writer retained source environment owner; factory and captured buffer/intern authorities have distinct actual scopes",
+  "constructor_admission": "checked16*(sizeof(runtime)+sizeof(B)+sizeof(I))+4096 before boxing B/I; nested authority heap already admitted by its owner",
+  "drop_order": "factory,buffer box,intern box,control lease; no input borrow escapes",
+  "parse_return": "Option<AvroDatumPlan> by value; caller admits/retains extra outer wrapper",
+  "nullable_root": "Java null parses ordered references first and returns None without backend transport; actual empty String remains a parse input",
+  "source_policy": "per-group validateDefaults from isNew and effective Fixed bytes limit; not factory lifetime state",
+  "logical_profile": "published Unregistered environment, fixed-decimal source Math/custom factory qualification unchanged",
+  "reference_default": {
+    "avro": "1.11.4",
+    "confluent": "7.8.0",
+    "jackson_core_databind": "2.21.7",
+    "basis": "durable C84 worker classpath record; not jar-cache presence or packaged classloader proof"
+  },
+  "mapper_difference": "Avro plain Schema.FACTORY ALLOW_COMMENTS; Confluent JacksonMapper ALLOW_NON_NUMERIC_NUMBERS; distinct roots and mapper number/features",
+  "symbol_seed": "supplied effective seed; 221 uses System.identityHashCode(owner) directly, no odd-bit normalization; no native nonce substitution",
+  "captured_recycler_boundary": "current InputBuffers is already captured; future effective-pool acquisition must precede Session::open per reference/root; IOContext pool close follows symbols and token give",
+  "regression_function_count": 6,
+  "fixture_seed": 37,
+  "fixture_seed_is_jvm_observation": false,
+  "published_assertions_preserved": true,
+  "remaining": [
+    "root-owned real Registry consumer and shared/Avro un-gating",
+    "actual per-parser process pool/intern/entropy ownership, supported effective profile and packaging qualification",
+    "full typed graph/default/generalized-union/arbitrary-key/SMT/writer integration",
+    "native unmatched/nonfinite projection exclusions and native profile limits",
+    "A09 explicit-null default assertion/source conflict"
+  ]
+}
