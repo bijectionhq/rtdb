@@ -366,6 +366,10 @@ impl<'a> Cursor<'a> {
     pub(super) fn observed(input: super::window::WindowInput<'a>, profile: Profile, observations: super::window::LexicalObservations<'a>) -> Self {
         Self::Observed(observed::ObservedCursor::new(input, profile, observations))
     }
+    pub(super) fn reader(input: super::window::WindowInput<'a>, child: super::symbols::ChildSymbols,
+        authority: &'a mut dyn super::symbols::InternAuthority) -> Self {
+        Self::Observed(observed::ObservedCursor::reader(input, child, authority))
+    }
     pub(super) fn start(&mut self) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.start() } }
     pub(super) fn offset(&self) -> usize { match self { Self::Slice(cursor) => cursor.offset(), Self::Observed(cursor) => cursor.offset() } }
     pub(super) fn profile(&self) -> Profile { match self { Self::Slice(cursor) => cursor.profile(), Self::Observed(cursor) => cursor.profile() } }
@@ -401,6 +405,6 @@ impl<'a> Cursor<'a> {
     }
     pub(super) fn coercion(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Coercion, self.offset(), detail) }
     pub(super) fn constructor(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Constructor, self.offset(), detail) }
-    pub(super) fn close(&mut self) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.close() } }
+    pub(super) fn close(&mut self, context: &mut ConversionContext) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.close(context) } }
     pub(super) fn observations_consumed(&self) -> usize { match self { Self::Slice(_) => 0, Self::Observed(cursor) => cursor.observations_consumed() } }
 }

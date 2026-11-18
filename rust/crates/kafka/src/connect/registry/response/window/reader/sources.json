@@ -1,0 +1,211 @@
+{
+  "source_only": true,
+  "runtime_execution": false,
+  "effective_profile": null,
+  "archives": [
+    {
+      "artifact": "jackson-core-2.16.0-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.16.0/jackson-core-2.16.0-sources.jar",
+      "sha256": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864"
+    },
+    {
+      "artifact": "jackson-databind-2.16.0-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.16.0/jackson-databind-2.16.0-sources.jar",
+      "sha256": "9967c9d76cd6cabdce763149d643bc0b66e580208d635684b1bda5e09da44b30"
+    },
+    {
+      "artifact": "jackson-core-2.21.7-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-core/2.21.7/jackson-core-2.21.7-sources.jar",
+      "sha256": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c"
+    },
+    {
+      "artifact": "jackson-databind-2.21.7-sources.jar",
+      "url": "https://repo.maven.apache.org/maven2/com/fasterxml/jackson/core/jackson-databind/2.21.7/jackson-databind-2.21.7-sources.jar",
+      "sha256": "9d0088f4990df572c2e3aa1c14d4c03fd8200283d801836c8044d01b9ccb7e73"
+    },
+    {
+      "artifact": "kafka-schema-registry-client-7.8.0-sources.jar",
+      "url": "https://packages.confluent.io/maven/io/confluent/kafka-schema-registry-client/7.8.0/kafka-schema-registry-client-7.8.0-sources.jar",
+      "sha256": "0bede2ed51df1c97cc1a86c49e5dc1bdebca570d791e81183b39cd3b5004feaf"
+    }
+  ],
+  "sources": [
+    {
+      "source": "jackson-core-2.16.0/com/fasterxml/jackson/core/JsonFactory.java",
+      "sha256": "c0cf7e68abb53f4801ecfaf1781fce0e0cbffcd4b12f9acb5e6c745c9bf6c2ff",
+      "prefix_bytes": 95,
+      "prefix_sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e"
+    },
+    {
+      "source": "jackson-core-2.16.0/com/fasterxml/jackson/core/json/ByteSourceJsonBootstrapper.java",
+      "sha256": "207a142f58a2f54da0506e07c080a2f9955e3896bc1a9d0422f026293d56ff95",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.16.0/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java",
+      "sha256": "1eafd3b149b38dbed916b1aa75bf4a5937ecba4bd888a896171cd92cd2870b7b",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.16.0/com/fasterxml/jackson/core/base/ParserBase.java",
+      "sha256": "993684a563d0caf8483b31c726714b43f2350e64bb128752fef2f8deaae1f80d",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.16.0/com/fasterxml/jackson/core/sym/CharsToNameCanonicalizer.java",
+      "sha256": "a114c4e3f908e8e9eb4610e4bc58dd9ee5e1e655143add3f1b9fad109428af79",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-databind-2.16.0/com/fasterxml/jackson/databind/ObjectMapper.java",
+      "sha256": "4d8b7aa7e85a7883b3f5e8d92b2ae515a0a6e9b71c940dc0baf676c11fc84baf",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.21.7/com/fasterxml/jackson/core/JsonFactory.java",
+      "sha256": "974906459e29d3141eb96e7db9506112e1059ac03e45c11fde84495bf8b5dad1",
+      "prefix_bytes": 95,
+      "prefix_sha256": "334d59e865e73128ab8cca5e1e1448fa7b076c29e0ecac418279c48aa5740f6e"
+    },
+    {
+      "source": "jackson-core-2.21.7/com/fasterxml/jackson/core/json/ByteSourceJsonBootstrapper.java",
+      "sha256": "8cd034e2e19a3db3f24a5ef9783a6d20689803c48db3ce8044de0391812faa6d",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.21.7/com/fasterxml/jackson/core/json/ReaderBasedJsonParser.java",
+      "sha256": "1d7962d7929125a71a76300eff59480eebbb3a5e6b5e925310a4b11d758c1d36",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.21.7/com/fasterxml/jackson/core/base/ParserBase.java",
+      "sha256": "8cc65c2102f74d26897c19d08713ed331c807c8e7df656b8265df75e373758ba",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-core-2.21.7/com/fasterxml/jackson/core/sym/CharsToNameCanonicalizer.java",
+      "sha256": "ce482c911eb7c98326a01532e9e04c38d9188e93bf6a4d7bf55fe4904398794c",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "jackson-databind-2.21.7/com/fasterxml/jackson/databind/ObjectMapper.java",
+      "sha256": "88ba55a51dc03b287f6c22bb759b7ff3f740dd78e6bae6f07d3dc573645860fe",
+      "prefix_bytes": 0,
+      "prefix_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "source": "confluent-7.8.0/io/confluent/kafka/schemaregistry/client/rest/RestService.java",
+      "sha256": "5d6577be0db47b4addd3385074a81a737f210619c2918f5bcfbc14daedcf8cdf",
+      "prefix_bytes": 595,
+      "prefix_sha256": "1a213df5f633cee7547228673a81db1aa052a73bd9bd16c13f76472ccbc7c053"
+    },
+    {
+      "source": "confluent-7.8.0/io/confluent/kafka/schemaregistry/utils/JacksonMapper.java",
+      "sha256": "d370dce0c7217902e42af91dbc4c3474e9afb8665919e88fe87aff6308dee5ae",
+      "prefix_bytes": 595,
+      "prefix_sha256": "df7f93c6193a1c126519694f137319c154d1450268a11a9295025ea68b94d0e1"
+    }
+  ],
+  "complete_prefix_reuse": "../../artifacts.json and ../../COPYRIGHT; zero-byte pre-package prefixes recorded explicitly",
+  "legal_members": [
+    {
+      "source": "jackson-core-2.16.0/META-INF/jackson-core-LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.16.0/META-INF/jackson-core-NOTICE",
+      "sha256": "0a0042db627fe915c6a1d9ef74927af5081446063e8888494be6718d692dd2b8",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.16.0/META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-databind-2.16.0/META-INF/NOTICE",
+      "sha256": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-databind-2.16.0/META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/FastDoubleParser-LICENSE",
+      "sha256": "59067508e44346bf93dc9c5e4d673a67ecd77988c2020bb5e0f8667eb199f396",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/FastDoubleParser-ThirdParty-LICENSE",
+      "sha256": "dbc36f9422a40d58d1a214080583667cfd37d61c2fae1657d981edda2a60727f",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/Schubfach-LICENSE",
+      "sha256": "12d39a6615219d73202300715e365bec2b958f858d1e837c8f2dace57f905969",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/jackson-core-LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/jackson-core-NOTICE",
+      "sha256": "e6aef1c0f4cf5b0f802c16b31fce309b3c3737450b93c40d6291bf6540aae3d1",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-core-2.21.7/META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-databind-2.21.7/META-INF/NOTICE",
+      "sha256": "612b14bc77c944ce229cbba0d14919162cfea8ed802cbf06a8e865e032d03201",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "jackson-databind-2.21.7/META-INF/LICENSE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../LICENSES"
+    },
+    {
+      "source": "confluent-7.8.0/LICENSE-APACHE",
+      "sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "reused_in": "../../../references/LICENSE-APACHE"
+    }
+  ],
+  "published_dependencies": {
+    "rust/crates/kafka/src/connect/registry/response/artifacts.json": "707627115ba6541c3830b8fd503878b55ac320b873045529c642e1c559281475",
+    "rust/crates/kafka/src/connect/registry/response/sources.sha256": "ea40eb56a84d964721de81972ede327971251a24175bf4c97fc1e6285db229e2",
+    "rust/crates/kafka/src/connect/registry/response/COPYRIGHT": "a15466c6a61ae66c86deec4c58789620eec28c7567fd3c088b3f5a5623f1f8c7",
+    "rust/crates/kafka/src/connect/registry/response/LICENSES": "94221d4fcede4db86b4594656a98a84c2e68c17062e942fcebf24d024208ad7e",
+    "rust/crates/kafka/src/connect/registry/response/symbols/sources.json": "cf23f88ff9671b91e89aaddc6e637d14899be7a3f60ae63d2857e06960b73b28",
+    "rust/crates/kafka/src/connect/registry/response/symbols/COPYRIGHT": "a0fe91c712f57fea96ec0583d6fa8098d4e5602df2105fcc234c5f8cfbaa0008",
+    "rust/crates/kafka/src/connect/registry/response/symbols/LICENSES": "7063a45f38e10a7eb0112bbb1a33a5bb1ca734993d069c2243110b903e056d10",
+    "rust/crates/kafka/src/connect/registry/response/symbols/profiles.json": "f479bee84252ebb7e81f7d353dd117bdacad818256e3e5007ea60be1de810784",
+    "rust/crates/kafka/src/connect/registry/response/window/provenance.json": "d12012bab5ab4886602a988b7525c829ab13c4cd7584d65ee029619f975a1b40",
+    "rust/crates/kafka/src/connect/registry/response/window/sources.sha256": "e2f5cfbf4308084e44c9f8d111b89efab3065466f26f45b8e3e709a544d65941"
+  },
+  "source_order": {
+    "ByteSourceJsonBootstrapper.constructParser": "constructReader then rootCharSymbols.makeChild then ReaderBasedJsonParser token-buffer allocation",
+    "ReaderBasedJsonParser._releaseBuffers": "super buffers then symbol release then recyclable input buffer",
+    "ParserBase.close": "close input then release buffers in ordinary finally",
+    "ObjectMapper._readMapAndClose": "parser already constructed before try-with-resources; mapper primary keeps suppressed close",
+    "RestService.sendHttpRequest": "explicit input close only after readValue success; HTTP disconnect in finally"
+  },
+  "scope": "Actual borrowed interning capability and observed fresh Reader input; no accepted-name observations, no effective profile or native HTTP read-tape inference"
+}

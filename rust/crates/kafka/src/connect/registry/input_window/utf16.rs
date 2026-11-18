@@ -175,10 +175,14 @@ impl<'a> Utf16Window<'a> {
         Ok(false)
     }
     fn close_input(&mut self) -> Result<'a, ()> { if self.attached { self.reader.close()?; self.attached = false; } Ok(()) }
-    pub(in crate::connect::registry) fn close(&mut self) -> Result<'a, ()> {
+    pub(in crate::connect::registry) fn close_input_stage(&mut self) -> Result<'a, ()> {
         if self.closed { return Ok(()); }
         self.ptr = self.ptr.max(self.end); self.closed = true;
-        let result = self.close_input(); self.buffer = None; result
+        self.close_input()
+    }
+    pub(in crate::connect::registry) fn release_parser_buffer(&mut self) { self.buffer = None; }
+    pub(in crate::connect::registry) fn close(&mut self) -> Result<'a, ()> {
+        let result = self.close_input_stage(); self.release_parser_buffer(); result
     }
 }
 

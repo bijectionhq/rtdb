@@ -1,6 +1,7 @@
 use std::{alloc::Layout, mem::size_of, sync::{Arc, Mutex, atomic::AtomicUsize}};
 use rtdb_types::{Anomaly, MemoryReservation, java_text::JavaString};
-use super::{ConversionContext, Profile};
+use super::ConversionContext;
+pub(in crate::connect) use super::Profile;
 
 mod storage;
 use storage::{Bucket, OverflowBits, Table};
@@ -12,10 +13,10 @@ const COLLISION_LIMIT: usize = 150;
 const NAME_LIMIT: usize = 50_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::connect::registry) struct FactoryProfile { pub profile: Profile, pub identity_hash_seed: i32 }
+pub(in crate::connect) struct FactoryProfile { pub profile: Profile, pub identity_hash_seed: i32 }
 
 #[derive(Debug)]
-pub(in crate::connect::registry) enum Failure {
+pub(in crate::connect) enum Failure {
     Native(Anomaly),
     NameLength(usize),
     CollisionOverflow { count: usize },
@@ -23,9 +24,9 @@ pub(in crate::connect::registry) enum Failure {
     Poisoned,
 }
 impl From<Anomaly> for Failure { fn from(cause: Anomaly) -> Self { Self::Native(cause) } }
-pub(in crate::connect::registry) type Result<T> = std::result::Result<T, Failure>;
+pub(in crate::connect) type Result<T> = std::result::Result<T, Failure>;
 
-pub(in crate::connect::registry) struct SymbolName { text: JavaString, charge: Arc<MemoryReservation> }
+pub(in crate::connect) struct SymbolName { text: JavaString, charge: Arc<MemoryReservation> }
 impl SymbolName {
     fn copy(units: &[u16], context: &mut ConversionContext) -> Result<Arc<Self>> {
         let bytes = JavaString::allocation_bound_utf16(units)?.checked_add(shared_bound::<Self>()?).ok_or_else(overflow)?;
@@ -33,25 +34,26 @@ impl SymbolName {
         let text = JavaString::copy_utf16_with_admission(units, |_| Ok(Arc::clone(&charge)))?;
         Ok(Arc::new(Self { text, charge }))
     }
-    pub(in crate::connect::registry) fn text(&self) -> &JavaString { &self.text }
-    pub(in crate::connect::registry) fn retain(&self, context: &mut ConversionContext) -> rtdb_types::Result<()> { context.retain(Arc::clone(&self.charge)) }
+    pub(in crate::connect) fn text(&self) -> &JavaString { &self.text }
+    pub(in crate::connect) fn retain(&self, context: &mut ConversionContext) -> rtdb_types::Result<()> { context.retain(Arc::clone(&self.charge)) }
 }
 
-pub(in crate::connect::registry) trait InternAuthority {
+pub(in crate::connect) trait InternAuthority {
     fn intern(&mut self, candidate: Arc<SymbolName>, context: &mut ConversionContext) -> rtdb_types::Result<Arc<SymbolName>>;
 }
 
-pub(in crate::connect::registry) struct ReaderSymbols {
+pub(in crate::connect) struct ReaderSymbols {
     factory: FactoryProfile, state: Mutex<Arc<Table>>, empty: Arc<SymbolName>, charge: Arc<MemoryReservation>,
 }
 impl ReaderSymbols {
-    pub(in crate::connect::registry) fn new(factory: FactoryProfile, context: &mut ConversionContext) -> Result<Arc<Self>> {
+    pub(in crate::connect) fn factory(&self) -> FactoryProfile { self.factory }
+    pub(in crate::connect) fn new(factory: FactoryProfile, context: &mut ConversionContext) -> Result<Arc<Self>> {
         let charge = context.reserve(shared_bound::<Self>()?)?;
         let state = Table::new(INITIAL_SIZE, context)?;
         let empty = SymbolName::copy(&[], context)?;
         Ok(Arc::new(Self { factory, state: Mutex::new(Arc::new(state)), empty, charge }))
     }
-    pub(in crate::connect::registry) fn child(self: &Arc<Self>, context: &mut ConversionContext) -> Result<ChildSymbols> {
+    pub(in crate::connect) fn child(self: &Arc<Self>, context: &mut ConversionContext) -> Result<ChildSymbols> {
         context.retain(Arc::clone(&self.charge))?;
         self.empty.retain(context)?;
         let table = self.state.lock().map_err(|_| poisoned_lock())?;
@@ -73,20 +75,20 @@ impl Storage { fn table(&self) -> &Table { match self { Self::Shared(table) => t
 struct Active { storage: Storage, canonicalize: bool, overflows: Option<OverflowBits> }
 enum ChildState { Active(Active), Poisoned }
 /// Use the creation ConversionContext for every lookup and release of this parser child.
-pub(in crate::connect::registry) struct ChildSymbols { state: ChildState, root: Arc<ReaderSymbols> }
+pub(in crate::connect) struct ChildSymbols { state: ChildState, root: Arc<ReaderSymbols> }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::connect::registry) enum Release { Unchanged, Published, Reset, LostPublication, Disabled, Poisoned }
+pub(in crate::connect) enum Release { Unchanged, Published, Reset, LostPublication, Disabled, Poisoned }
 
 impl ChildSymbols {
-    pub(in crate::connect::registry) fn factory(&self) -> FactoryProfile { self.root.factory }
-    pub(in crate::connect::registry) fn find(&mut self, units: &[u16], authority: &mut impl InternAuthority,
+    pub(in crate::connect) fn factory(&self) -> FactoryProfile { self.root.factory }
+    pub(in crate::connect) fn find(&mut self, units: &[u16], authority: &mut (impl InternAuthority + ?Sized),
         context: &mut ConversionContext) -> Result<JavaString> {
         let result = self.find_inner(units, authority, context);
         if matches!(&result, Err(Failure::Native(_) | Failure::Poisoned)) { self.state = ChildState::Poisoned; }
         result
     }
-    fn find_inner(&mut self, units: &[u16], authority: &mut impl InternAuthority,
+    fn find_inner(&mut self, units: &[u16], authority: &mut (impl InternAuthority + ?Sized),
         context: &mut ConversionContext) -> Result<JavaString> {
         let ChildState::Active(active) = &mut self.state else { return Err(Failure::Poisoned); };
         if units.is_empty() { return Ok(self.root.empty.text.clone()); }
@@ -145,7 +147,7 @@ impl ChildSymbols {
         Ok(name.text.clone())
     }
 
-    pub(in crate::connect::registry) fn release(self, context: &mut ConversionContext) -> Result<Release> {
+    pub(in crate::connect) fn release(self, context: &mut ConversionContext) -> Result<Release> {
         let ChildState::Active(active) = self.state else { return Ok(Release::Poisoned); };
         if !active.canonicalize { return Ok(Release::Disabled); }
         let Storage::Private(table) = active.storage else { return Ok(Release::Unchanged); };

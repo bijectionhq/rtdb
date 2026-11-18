@@ -3,6 +3,7 @@
 `ReaderSymbols` implements the field-name table used by the pinned Jackson `ReaderBasedJsonParser` profiles.
 It is a registered, inactive capability under the Registry response decoder's existing test gate.
 The installed HTTP/JSON route and all existing observation-driven entry points remain unchanged.
+The connect-local `crate::connect::registry::reader_symbols` facade exposes the same capability to sibling Connect modules while retaining the response test gate.
 The table decides its own lookup, insertion, collision and overflow outcomes from completed UTF16 names.
 It does not accept an observation that merely declares a field name successful.
 
@@ -35,7 +36,7 @@ Sharing native JavaString storage confers no Java object identity.
 It owns no worker, callback or condition wait.
 `ChildSymbols` is a passive, parser-local single-writer transient with Shared/Private table state or a poisoned state.
 Its lookup and release calls use the same ConversionContext that created the child.
-The future parser entry point must supply that call region consistently; moving a child between contexts is outside this private contract.
+The Reader-symbol parser entry points supply that call region consistently; moving a child between contexts is outside this private contract.
 
 `SymbolName` is an immutable exact JavaString and its original full reservation.
 That reservation includes text backing and native shared-name owner storage and survives through the final returned JavaString clone.
@@ -98,7 +99,7 @@ Sixteen new unexecuted source fixture functions cover ordinary persistent hits, 
 All115 existing rule, bean, cursor and input-window fixture bodies remain unchanged.
 No compiler, formatter, test/runtime, Cargo/Gradle or project script was executed.
 
-The next bounded slice will compose this Reader authority at the observed cursor's actual name demand before immutable text publication.
+The link:../window/reader/REFERENCE.adoc[Reader-symbol entry points] compose this authority at actual Reader name demand before immutable text publication, derive the lexical profile from the factory child, and release symbols in parser-close order.
 UTF8 ByteQuads, remaining lexical branches, physical read/recycler authority, the effective mapper/intern profile, nullable DTO/reference/rule activation and version/cache timing remain open.
 Native HTTP frames do not supply Java refill tapes or accepted-name observations.
 Avro's exact JavaText schema input remains coordinated with its owner.

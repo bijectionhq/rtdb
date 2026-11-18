@@ -1,4 +1,4 @@
-use super::{ConversionContext, Failure, Profile, Result, TextBufferObservation, beans, cursor::Cursor, decode};
+use super::{ConversionContext, Failure, FailureKind, Profile, Result, TextBufferObservation, beans, cursor::Cursor, decode, symbols};
 use super::super::{error, input_window};
 
 pub(in crate::connect::registry) enum WindowInput<'a> {
@@ -41,6 +41,16 @@ impl WindowInput<'_> {
             Self::Utf32(window) => window.close().map_err(source_failure),
         }
     }
+    pub(super) fn close_input_stage(&mut self) -> Result<()> {
+        match self {
+            Self::Utf8(window) => window.close().map_err(source_failure),
+            Self::Utf16(window) => window.close_input_stage().map_err(source_failure),
+            Self::Utf32(window) => window.close_input_stage().map_err(source_failure),
+        }
+    }
+    pub(super) fn release_parser_buffer(&mut self) {
+        match self { Self::Utf8(_) => (), Self::Utf16(window) => window.release_parser_buffer(), Self::Utf32(window) => window.release_parser_buffer() }
+    }
     pub(super) fn observations_consumed(&self) -> usize {
         match self {
             Self::Utf8(window) => window.observations_consumed(),
@@ -79,13 +89,24 @@ fn decode_window<'a, T>(input: WindowInput<'a>, profile: Profile, observations: 
     context: &mut ConversionContext, decode: impl FnOnce(&mut Cursor<'a>, &mut ConversionContext) -> Result<T>) -> ObservedDecode<T> {
     let mut cursor = Cursor::observed(input, profile, observations);
     let result = cursor.start().and_then(|()| decode(&mut cursor, context));
-    let close = cursor.close();
+    let close = cursor.close(context);
     let observations_consumed = cursor.observations_consumed();
     match (result, close) {
         (Ok(value), Ok(())) => ObservedDecode { result: Ok(value), suppressed_close: None, observations_consumed },
         (Ok(_), Err(cause)) => ObservedDecode { result: Err(cause), suppressed_close: None, observations_consumed },
         (Err(cause), close) => ObservedDecode { result: Err(cause), suppressed_close: close.err(), observations_consumed },
     }
+}
+
+pub(super) fn symbol_failure(cause: symbols::Failure, offset: usize) -> Failure {
+    let (kind, detail) = match cause {
+        symbols::Failure::Native(cause) => return Failure::Native(cause),
+        symbols::Failure::NameLength(_) => (FailureKind::Constraint, "Reader field name length exceeds 50000"),
+        symbols::Failure::CollisionOverflow { .. } => (FailureKind::Constraint, "Reader symbol collision chain exceeds 150"),
+        symbols::Failure::RehashCount { .. } => (FailureKind::Unchecked, "Reader symbol count differs during rehash"),
+        symbols::Failure::Poisoned => return rtdb_types::Anomaly::fault("xtdb.kafka-connect-source/registry-symbol-poisoned", "A failed symbol child cannot continue parsing").into(),
+    };
+    Failure::at(kind, offset, detail)
 }
 
 pub(super) fn unavailable(detail: &'static str) -> Failure {
@@ -106,3 +127,6 @@ fn source_failure(cause: input_window::Failure<'_>) -> Failure {
 
 #[cfg(test)]
 mod tests;
+
+mod reader;
+pub(in crate::connect::registry) use reader::{ReaderInput, schema_from_reader, schema_string_from_reader};

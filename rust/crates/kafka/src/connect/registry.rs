@@ -19,6 +19,8 @@ mod http_tests;
 mod input_window;
 #[cfg(test)]
 mod response;
+#[cfg(test)]
+pub(super) use response::symbols as reader_symbols;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RegistryFormat { Avro, Json }

@@ -1,7 +1,7 @@
 use rtdb_types::java_text::JavaString;
-use super::{ConversionContext, Failure, FailureKind, Frame, Kind, Profile, Result, Token, Usage,
+use super::{ConversionContext, Failure, FailureKind, Frame, Kind, Profile, Result, TextBufferObservation, Token, Usage,
     copy_string, input::{Encoding, Input, Utf8Demand}, scan_name, text_buffer::TextBufferDemand, utf8_unit_bytes};
-use super::super::{owned::Values, window::{LexicalObservations, WindowInput, unavailable}};
+use super::super::{owned::Values, symbols::{ChildSymbols, InternAuthority}, window::{LexicalObservations, NameObservation, WindowInput, symbol_failure, unavailable}};
 
 struct Lookahead { value: Option<u16>, before: usize, after: usize }
 struct WindowCursor<'a> { source: WindowInput<'a>, lookahead: Option<Lookahead>, at: usize }
@@ -55,16 +55,32 @@ impl Spelling {
     fn push(&mut self, unit: u16) { if self.len < self.units.len() { self.units[self.len] = unit; self.len += 1; } }
 }
 
+enum NameAuthority<'a> {
+    Observed { names: &'a [NameObservation<'a>], next: usize },
+    Reader { child: ChildSymbols, intern: &'a mut dyn InternAuthority },
+    Closed,
+}
+
 pub(in crate::connect::registry::response) struct ObservedCursor<'a> {
     input: WindowCursor<'a>, profile: Profile, frames: Values<Frame>, token: Option<Token>,
-    spelling: Spelling, observations: LexicalObservations<'a>, next_name: usize,
+    spelling: Spelling, names: NameAuthority<'a>, text_buffers: &'a [TextBufferObservation],
 }
 impl<'a> ObservedCursor<'a> {
     pub(super) fn new(input: WindowInput<'a>, profile: Profile, observations: LexicalObservations<'a>) -> Self {
         Self { input: WindowCursor::new(input), profile, frames: Values::new(), token: None,
-            spelling: Spelling::new(), observations, next_name: 0 }
+            spelling: Spelling::new(), names: NameAuthority::Observed { names: observations.names, next: 0 }, text_buffers: observations.text_buffers }
     }
-    pub(super) fn start(&mut self) -> Result<()> { self.input.source.validate_profile(self.profile)?; self.input.initialize()?; self.token = Some(self.lex(true)?); Ok(()) }
+    pub(super) fn reader(input: WindowInput<'a>, child: ChildSymbols, authority: &'a mut dyn InternAuthority) -> Self {
+        let profile = child.factory().profile;
+        Self { input: WindowCursor::new(input), profile, frames: Values::new(), token: None,
+            spelling: Spelling::new(), names: NameAuthority::Reader { child, intern: authority }, text_buffers: &[] }
+    }
+    pub(super) fn start(&mut self) -> Result<()> {
+        if matches!(&self.names, NameAuthority::Reader { .. }) && self.input.source.is_utf8() {
+            return Err(unavailable("Reader symbols cannot qualify a UTF8 byte parser"));
+        }
+        self.input.source.validate_profile(self.profile)?; self.input.initialize()?; self.token = Some(self.lex(true)?); Ok(())
+    }
     pub(super) fn offset(&self) -> usize { self.token.map_or(self.input.at, |token| token.start) }
     pub(super) fn profile(&self) -> Profile { self.profile }
     pub(super) fn kind(&mut self, context: &mut ConversionContext) -> Result<Kind> {
@@ -100,12 +116,13 @@ impl<'a> ObservedCursor<'a> {
             return Err(self.syntax("Expected a quoted object field name"));
         }
         let name = self.name(context)?;
-        let observed = self.observations.names.get(self.next_name)
-            .ok_or_else(|| unavailable("Field name requires an observed successful canonicalizer result"))?;
-        if observed.start != start || !name.view().units().eq(observed.units.iter().copied()) {
-            return Err(unavailable("Observed canonicalizer position or UTF16 result differs from the consumed field name"));
+        if let NameAuthority::Observed { names, next } = &mut self.names {
+            let observed = names.get(*next).ok_or_else(|| unavailable("Field name requires an observed successful canonicalizer result"))?;
+            if observed.start != start || !name.view().units().eq(observed.units.iter().copied()) {
+                return Err(unavailable("Observed canonicalizer position or UTF16 result differs from the consumed field name"));
+            }
+            *next += 1;
         }
-        self.next_name += 1;
         self.space()?;
         self.expect(0x3a, "Expected a colon after the field name")?;
         self.frames.as_mut_slice().last_mut().unwrap().first = false;
@@ -129,7 +146,7 @@ impl<'a> ObservedCursor<'a> {
         if self.kind(context)? != Kind::String { return Err(self.coercion("Expected a string token")); }
         let start = self.token.unwrap().start;
         let capacity = if self.input.source.is_utf8() {
-            self.observations.text_buffers.iter().find(|observation| observation.value_start == start).map(|observation| observation.capacity_units)
+            self.text_buffers.iter().find(|observation| observation.value_start == start).map(|observation| observation.capacity_units)
         } else { None };
         let mut units = Values::new();
         self.string_units(Usage::Value, capacity, Some((&mut units, context)))?;
@@ -169,7 +186,12 @@ impl<'a> ObservedCursor<'a> {
         if !self.input.source.is_utf8() {
             let mut units = Values::new();
             self.string_units(Usage::Name, None, Some((&mut units, context)))?;
-            return Ok(JavaString::copy_utf16_with_admission(units.as_slice(), |bytes| context.reserve(bytes))?);
+            let offset = self.input.at;
+            return match &mut self.names {
+                NameAuthority::Observed { .. } => Ok(JavaString::copy_utf16_with_admission(units.as_slice(), |bytes| context.reserve(bytes))?),
+                NameAuthority::Reader { child, intern } => child.find(units.as_slice(), &mut **intern, context).map_err(|cause| symbol_failure(cause, offset)),
+                NameAuthority::Closed => Err(unavailable("Reader name authority has already been closed")),
+            };
         }
         let mut raw = Values::new();
         let mut length = 0usize;
@@ -354,7 +376,15 @@ impl<'a> ObservedCursor<'a> {
     }
     fn syntax(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Syntax, self.input.at, detail) }
     fn coercion(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Coercion, self.offset(), detail) }
-    pub(super) fn close(&mut self) -> Result<()> { self.input.source.close() }
+    pub(super) fn close(&mut self, context: &mut ConversionContext) -> Result<()> {
+        if matches!(&self.names, NameAuthority::Closed) { return Ok(()); }
+        if matches!(&self.names, NameAuthority::Observed { .. }) { return self.input.source.close(); }
+        let input_close = self.input.source.close_input_stage();
+        let NameAuthority::Reader { child, .. } = std::mem::replace(&mut self.names, NameAuthority::Closed) else { unreachable!() };
+        let symbol_close = child.release(context).map(|_| ()).map_err(|cause| symbol_failure(cause, self.input.at));
+        if symbol_close.is_ok() { self.input.source.release_parser_buffer(); }
+        symbol_close.and(input_close)
+    }
     pub(super) fn observations_consumed(&self) -> usize { self.input.source.observations_consumed() }
 }
 

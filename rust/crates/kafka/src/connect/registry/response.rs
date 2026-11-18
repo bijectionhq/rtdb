@@ -9,13 +9,14 @@ mod scalars;
 mod collections;
 mod decode;
 mod window;
-pub(super) mod symbols;
+pub(in crate::connect) mod symbols;
 
 pub(super) use beans::{Metadata, Properties, Rule, RuleKind, RuleMode, RuleSet};
 pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
+pub(super) use window::{ReaderInput, schema_from_reader, schema_string_from_reader};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Profile { Jackson216, Jackson221 }
+pub(in crate::connect) enum Profile { Jackson216, Jackson221 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TextBufferObservation {
@@ -24,7 +25,7 @@ pub(super) struct TextBufferObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FailureKind { Syntax, Coercion, Constructor, MissingSetter, Constraint }
+pub(super) enum FailureKind { Syntax, Coercion, Constructor, MissingSetter, Constraint, Unchecked }
 
 #[derive(Debug)]
 pub(super) enum Failure {
