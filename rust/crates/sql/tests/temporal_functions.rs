@@ -49,6 +49,20 @@ async fn range_bins_fields_allow_underscore_names_on_parenthesized_values() {
 }
 
 #[tokio::test]
+async fn timestamp_type_qualifiers_accept_both_time_zone_spellings() {
+    for form in [
+        "TIMESTAMP WITH TIMEZONE '2021-10-21T12:34:00+01:00'",
+        "TIMESTAMP WITHOUT TIMEZONE '2021-10-21T12:34:00+01:00'",
+        "CAST('2021-10-21T12:34:00+01:00' AS TIMESTAMP(3) WITH TIMEZONE)",
+        "CAST('2021-10-21T12:34:00+01:00' AS TIMESTAMP(3) WITHOUT TIMEZONE)",
+    ] {
+        let query_single = format!("SELECT {form}");
+        let query_multiple = query_single.replace("TIMEZONE", "TIME ZONE");
+        assert_eq!(query(&query_single, "UTC").await.unwrap(), query(&query_multiple, "UTC").await.unwrap());
+    }
+}
+
+#[tokio::test]
 async fn now_uses_the_query_clock_in_each_form() {
     let rows = query("SELECT NOW, now(), Now(3), CURRENT_TIMESTAMP(3), t.\"now\" FROM (VALUES (1)) t(\"now\")", "UTC").await.unwrap();
     let timestamp = |unit| V::Timestamp { value: 0, unit, timezone: Some("UTC".into()) };

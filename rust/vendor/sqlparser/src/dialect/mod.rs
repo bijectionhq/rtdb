@@ -508,6 +508,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Does the dialect accept `TIMEZONE` as one word in a type qualifier?
+    fn supports_single_word_time_zone(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialects supports specifying null treatment
     /// as part of a window function's parameter list as opposed
     /// to after the parameter list.

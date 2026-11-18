@@ -462,6 +462,7 @@ Current and local clock forms support their unsigned integer precision argument;
 The shared temporal syntax validator applies the same field, timezone-literal and precision grammar to query expressions and query settings.
 `CURRENT_DATE` and `CURRENT_TIME` retain the reference UTC semantics, while the `LOCAL_` forms use the session zone.
 Each query preparation binds `CURRENT_TIMESTAMP` output metadata to its command's timezone, and retained controls defer that zone to execution.
+Timestamp literals and datetime cast targets accept both `TIME ZONE` and `TIMEZONE` in their WITH and WITHOUT qualifiers.
 `tests/temporal_functions.rs` covers planning and execution for fields, units, bins, clocks, aliases and rejected forms.
 
 Field access uses `(expression).field` for Struct members and Transit map fields, including stored error data and transaction-key records.

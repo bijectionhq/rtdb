@@ -12788,6 +12788,21 @@ impl<'a> Parser<'a> {
         Ok(ty)
     }
 
+    fn parse_time_zone_qualifier(&mut self) -> Result<TimezoneInfo, ParserError> {
+        let qualifier = if self.parse_keyword(Keyword::WITH) {
+            TimezoneInfo::WithTimeZone
+        } else if self.parse_keyword(Keyword::WITHOUT) {
+            TimezoneInfo::WithoutTimeZone
+        } else {
+            return Ok(TimezoneInfo::None);
+        };
+        if self.dialect.supports_single_word_time_zone() && self.parse_keyword(Keyword::TIMEZONE) {
+            return Ok(qualifier);
+        }
+        self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
+        Ok(qualifier)
+    }
+
     #[cfg_attr(feature = "recursive-protection", recursive::recursive)]
     fn parse_data_type_helper(
         &mut self,
@@ -13005,15 +13020,7 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::TIMESTAMP => {
                     let precision = self.parse_optional_precision()?;
-                    let tz = if self.parse_keyword(Keyword::WITH) {
-                        self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
-                        TimezoneInfo::WithTimeZone
-                    } else if self.parse_keyword(Keyword::WITHOUT) {
-                        self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
-                        TimezoneInfo::WithoutTimeZone
-                    } else {
-                        TimezoneInfo::None
-                    };
+                    let tz = self.parse_time_zone_qualifier()?;
                     Ok(DataType::Timestamp(precision, tz))
                 }
                 Keyword::TIMESTAMPTZ => Ok(DataType::Timestamp(
@@ -13025,15 +13032,7 @@ impl<'a> Parser<'a> {
                 }
                 Keyword::TIME => {
                     let precision = self.parse_optional_precision()?;
-                    let tz = if self.parse_keyword(Keyword::WITH) {
-                        self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
-                        TimezoneInfo::WithTimeZone
-                    } else if self.parse_keyword(Keyword::WITHOUT) {
-                        self.expect_keywords(&[Keyword::TIME, Keyword::ZONE])?;
-                        TimezoneInfo::WithoutTimeZone
-                    } else {
-                        TimezoneInfo::None
-                    };
+                    let tz = self.parse_time_zone_qualifier()?;
                     Ok(DataType::Time(precision, tz))
                 }
                 Keyword::TIMETZ => Ok(DataType::Time(
