@@ -11,6 +11,7 @@ use arrow_schema::{Schema, SchemaRef};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, Result};
 
+mod decoded_schema;
 mod nulls;
 
 pub struct ArrowFile {
@@ -73,8 +74,9 @@ impl ArrowFile {
         let ipc_schema = footer.schema().ok_or_else(|| invalid("Arrow footer has no schema"))?;
         if !ipc_schema.endianness().equals_to_target_endianness() { return Err(invalid("Arrow file endianness differs from the host")); }
         let full_schema = Arc::new(crate::ipc_decimal::decode(ipc_schema)?);
-        let schema = if let Some(projection) = &projection { Arc::new(full_schema.project(projection).map_err(invalid)?) } else { Arc::clone(&full_schema) };
-        let mut decoder = FileDecoder::new(Arc::clone(&full_schema), footer.version());
+        let decoded = decoded_schema::adapt(&full_schema)?;
+        let schema = if let Some(projection) = &projection { Arc::new(decoded.project(projection).map_err(invalid)?) } else { Arc::clone(&decoded) };
+        let mut decoder = FileDecoder::new(decoded, footer.version());
         if let Some(projection) = projection { decoder = decoder.with_projection(projection); }
         if let Some(dictionaries) = footer.dictionaries() {
             for block in dictionaries { let buffer = read_block(reader.as_mut(), block, &full_schema)?; decoder.read_dictionary(block, &buffer).map_err(invalid)?; }
@@ -217,7 +219,7 @@ impl<R: Read> ArrowStream<R> {
     pub fn from_reader(mut reader: R, projection: Option<Vec<usize>>) -> Result<Self> {
         let (metadata, body) = read_message(&mut reader)?.ok_or_else(|| invalid("Arrow stream has no schema"))?;
         if !body.is_empty() { return Err(invalid("Arrow schema has a body")); }
-        let schema = Arc::new(read_schema_header(&metadata)?);
+        let schema = decoded_schema::adapt(&Arc::new(read_schema_header(&metadata)?))?;
         let projected = if let Some(projection) = &projection { Arc::new(schema.project(projection).map_err(invalid)?) } else { Arc::clone(&schema) };
         Ok(Self { reader, schema, projected, projection, dictionaries: HashMap::new(), finished: false })
     }

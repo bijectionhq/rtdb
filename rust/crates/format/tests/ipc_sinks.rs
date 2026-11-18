@@ -10,6 +10,40 @@ fn page() -> RecordBatch {
 }
 
 #[test]
+fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
+    use std::collections::BTreeMap;
+    use rtdb_format::{data::{EventBatch, StoredEvent, StoredOperation, build_event_batch}, ipc::{ArrowFile, ArrowStream}};
+    use rtdb_types::{EntityId, Interval, LogicalType, ScalarType, Timestamp, Value};
+
+    let events = [Value::Null, Value::I64(7), Value::Utf8("mixed".into())].into_iter().enumerate()
+        .map(|(index, value)| StoredEvent {
+            iid: EntityId::Integer(index as i64).iid(),
+            system_from: Timestamp(100),
+            valid_time: Interval::ALL,
+            operation: StoredOperation::Put(BTreeMap::from([("v".into(), value)])),
+            recency: None,
+        }).collect::<Vec<_>>();
+    let field_type = LogicalType::from_legs([LogicalType::Null, LogicalType::Scalar(ScalarType::I64), LogicalType::Scalar(ScalarType::Utf8)]);
+    let fields = BTreeMap::from([("v".into(), field_type)]);
+    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let schema = batch.schema();
+    let DataType::Union(operations, _) = schema.field_with_name("op").unwrap().data_type() else { panic!("event operations") };
+    let put = operations.iter().find(|(_, field)| field.name() == "put").unwrap().1;
+    let DataType::Struct(fields) = put.data_type() else { panic!("event document") };
+    assert!(!fields.find("v").unwrap().1.is_nullable());
+
+    let mut file = ArrowFile::open(Arc::from(write_file(&schema, std::slice::from_ref(&batch)).unwrap()), None).unwrap();
+    let mut stream = ArrowStream::open(Arc::from(write_stream(&schema, &[batch]).unwrap()), None).unwrap();
+    for (decoded, admitted_schema) in [(file.read_page(0).unwrap(), file.schema()), (stream.next().unwrap().unwrap(), stream.schema())] {
+        assert_eq!(decoded.schema(), admitted_schema);
+        let decoded = EventBatch::new(decoded).unwrap();
+        for (index, expected) in events.iter().enumerate() {
+            assert_eq!(&decoded.read_event(index).unwrap(), expected);
+        }
+    }
+}
+
+#[test]
 fn incremental_sinks_match_buffered_jvm_end_markers() {
     let batch = page();
     let expected = write_file(&batch.schema(), std::slice::from_ref(&batch)).unwrap();
