@@ -37,6 +37,10 @@ pub struct SelectedPartition(i32);
 impl SelectedPartition {
     /// Returns the selected signed partition ID or the no-leader fallback index.
     pub fn id(self) -> i32 { self.0 }
+
+    pub(super) fn explicit(id: i32) -> Option<Self> {
+        (id >= 0).then_some(Self(id))
+    }
 }
 
 /// Java RoundRobinPartitioner's remainder-by-zero failure for an empty topic list.

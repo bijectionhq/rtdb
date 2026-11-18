@@ -55,6 +55,12 @@ pub enum Failure {
     Closed,
     /// Selection consumed the topic counter but found no partition.
     EmptyTopic,
+    /// The source producer rejects a negative partition.
+    InvalidPartition(i32),
+    /// The native record has a different topic or requested partition from the successful wait.
+    RecordMetadataMismatch,
+    /// The topic contains a zero byte and cannot enter the native producer's C-string API.
+    InvalidNativeRecordTopic,
     /// Rebootstrap was requested before any bootstrap addresses were installed.
     MissingBootstrapAddresses,
     /// A previous native failure ended this mutable producer capability.
@@ -342,6 +348,11 @@ impl ProducerMetadata {
     /// The caller supplies an already admitted record owner; keys do not affect this stock RoundRobin policy.
     /// An empty topic still consumes its counter, while native admission failure ends this mutable capability.
     pub fn select_send<T>(&mut self, topic: &str, record: T) -> Outcome<PreparedSend<T>> {
+        let snapshot = self.snapshot();
+        self.select_send_in(snapshot, topic, record)
+    }
+
+    fn select_send_in<T>(&mut self, snapshot: Snapshot, topic: &str, record: T) -> Outcome<PreparedSend<T>> {
         self.usable()?;
         let result = (|| {
             let index = match self.counters.as_slice().iter().position(|counter| counter.topic.as_str() == topic) {
@@ -353,9 +364,9 @@ impl ProducerMetadata {
                     index
                 }
             };
-            let choices = PartitionChoices::new(self.snapshot.partitions(topic)).map_err(|_| Anomaly::unsupported("rtdb/kafka-partition-list-size", "Java partition lists require a signed int length"))?;
+            let choices = PartitionChoices::new(snapshot.partitions(topic)).map_err(|_| Anomaly::unsupported("rtdb/kafka-partition-list-size", "Java partition lists require a signed int length"))?;
             let partition = self.counters.as_mut_slice()[index].value.select(choices).map_err(|_| Failure::EmptyTopic)?;
-            Ok(PreparedSend { record, partition, snapshot: self.snapshot.clone() })
+            Ok(PreparedSend { record, partition, snapshot })
         })();
         self.completed(result)
     }

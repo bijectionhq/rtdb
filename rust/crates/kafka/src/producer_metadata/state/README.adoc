@@ -177,6 +177,19 @@ Following the exception constructors from `Errors.java` to `RetriableException`,
 Its input is the archive paths in lexical order, each followed by an ASCII space, lowercase SHA-256 of the entire member and LF.
 The production caller still supplies the qualified clock, actual sender wake operation and metrics sink.
 
+== Preparing a RoundRobin send
+
+`TopicMetadata` ties the completed wait to its originating producer and request.
+It derives the accumulator time and remaining queue budget from the original start and observed elapsed time.
+The caller provides its serialized, admitted record using the same topic and requested partition.
+A source explicit partition bypasses the counter.
+The RoundRobin counter selects from the waited generation even if a newer one was published during serialization.
+A negative selected partition fails after the draw and before native enqueue.
+The resulting native `BaseRecord` carries the selected partition, and a returned queue-full record can be sent again with that assignment.
+The prepared send retains its generation independently of the producer monitor.
+The DLQ activation still requires its production network owner and use of the returned queue budget and append time.
+That integration must account for the native timestamp zero sentinel.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.

@@ -1,7 +1,11 @@
+use rdkafka::{message::ToBytes, producer::BaseRecord, util::IntoOpaque};
 use rtdb_types::{Anomaly, Result};
 
 use super::{MetadataMonitor, WaitCompletion};
-use super::super::{Failure, IdentityWitness, MetadataTopicError, MetadataWait, Outcome, ProducerMetadata, Snapshot, WaitFailure};
+use super::super::{
+    Failure, IdentityWitness, MetadataTopicError, MetadataWait, Outcome, PreparedSend, ProducerMetadata,
+    SelectedPartition, Snapshot, WaitFailure,
+};
 
 /// One producer call's topic, requested partition and original wait budget.
 pub struct TopicWaitRequest<'a> {
@@ -24,13 +28,15 @@ pub trait MetadataClock {
 }
 
 /// The retained generation and source timing of a resolved topic.
-pub struct TopicMetadata {
+pub struct TopicMetadata<'call> {
+    monitor: &'call MetadataMonitor,
+    request: TopicWaitRequest<'call>,
     snapshot: Snapshot,
     elapsed_ms: i64,
     elapsed_ns: Option<i64>,
 }
 
-impl TopicMetadata {
+impl TopicMetadata<'_> {
     /// Borrows the retained generation whose partition count satisfied the producer call.
     pub fn snapshot(&self) -> &Snapshot { &self.snapshot }
 
@@ -39,6 +45,46 @@ impl TopicMetadata {
 
     /// Returns the measured source nanoseconds for metrics, absent for cached success.
     pub fn elapsed_ns(&self) -> Option<i64> { self.elapsed_ns }
+
+    /// Returns the signed source wall time used for the accumulator append after waiting.
+    /// Addition uses Java long wrapping arithmetic.
+    pub fn append_time_ms(&self) -> i64 { self.request.started_ms.wrapping_add(self.elapsed_ms) }
+
+    /// Returns the source milliseconds left for queue admission after metadata.
+    /// The Java long subtraction wraps, then the result is clamped at zero.
+    pub fn queue_wait_ms(&self) -> i64 { self.request.maximum_wait_ms.wrapping_sub(self.elapsed_ms).max(0) }
+
+    /// Fixes the native record's partition using the generation and producer from this wait.
+    /// The caller supplies the already admitted, serialized record with the original topic and explicit partition, if any.
+    /// Mismatched records and zero bytes in the topic fail before a counter draw.
+    /// A source explicit partition bypasses the counter.
+    /// RoundRobin consumes its counter before rejecting a negative result.
+    /// An admission failure ends the mutable capability and wakes waiters, as in [`ProducerMetadata::select_send`] and [`MetadataMonitor::wait_for_topic`].
+    /// When enqueue returns the record for retry, reuse it with the selected partition and existing payload owner.
+    pub fn prepare_round_robin<'record, K: ToBytes + ?Sized, P: ToBytes + ?Sized, D: IntoOpaque>(
+        self, record: BaseRecord<'record, K, P, D>,
+    ) -> Outcome<PreparedSend<BaseRecord<'record, K, P, D>>> {
+        let Self { monitor, request, snapshot, .. } = self;
+        if record.topic != request.topic || record.partition != request.partition {
+            return Err(Failure::RecordMetadataMismatch);
+        }
+        if record.topic.as_bytes().contains(&0) {
+            return Err(Failure::InvalidNativeRecordTopic);
+        }
+        let mut prepared = if let Some(id) = request.partition {
+            monitor.lock()?.usable()?;
+            let partition = SelectedPartition::explicit(id).ok_or(Failure::InvalidPartition(id))?;
+            PreparedSend { record, partition, snapshot }
+        } else {
+            monitor.apply_topic_change(|metadata| metadata.select_send_in(snapshot, request.topic, record))?
+        };
+        let partition = prepared.partition_id();
+        if partition < 0 {
+            return Err(Failure::InvalidPartition(partition));
+        }
+        prepared.record = prepared.record.partition(partition);
+        Ok(prepared)
+    }
 }
 
 /// The first failure in the producer's topic metadata wait.
@@ -100,13 +146,13 @@ impl MetadataMonitor {
     /// After an update within budget, the topic check can clear both recoverable sets as in [`ProducerMetadata::take_error_for_topic`].
     /// The clock and identity callbacks must not reenter the monitor.
     /// Cancellation leaves completed topic and request mutations and issued sender wakeups in effect.
-    pub async fn wait_for_topic(
-        &self,
-        request: TopicWaitRequest<'_>,
+    pub async fn wait_for_topic<'call>(
+        &'call self,
+        request: TopicWaitRequest<'call>,
         clock: &mut impl MetadataClock,
         identity: &mut impl IdentityWitness,
         mut wake_sender: impl FnMut() -> Result<()>,
-    ) -> std::result::Result<TopicMetadata, TopicWaitFailure> {
+    ) -> std::result::Result<TopicMetadata<'call>, TopicWaitFailure> {
         let TopicWaitRequest { topic, partition, started_ms, maximum_wait_ms } = request;
         let mut snapshot = self.snapshot()?;
         if snapshot.invalid_topics().any(|name| name == Some(topic)) {
@@ -116,7 +162,7 @@ impl MetadataMonitor {
         let mut known_partitions = partition_count(&snapshot, topic).map_err(TopicWaitFailure::Observation)?;
         let has_partition = |count: Option<i32>| count.is_some_and(|count| partition.is_none_or(|id| id < count));
         if has_partition(known_partitions) {
-            return Ok(TopicMetadata { snapshot, elapsed_ms: 0, elapsed_ns: None });
+            return Ok(TopicMetadata { monitor: self, request, snapshot, elapsed_ms: 0, elapsed_ns: None });
         }
 
         let started_ns = clock.nanoseconds().map_err(TopicWaitFailure::Observation)?;
@@ -151,7 +197,7 @@ impl MetadataMonitor {
             known_partitions = partition_count(&snapshot, topic).map_err(TopicWaitFailure::Observation)?;
             if has_partition(known_partitions) {
                 let elapsed_ns = clock.nanoseconds().map_err(TopicWaitFailure::Observation)?.wrapping_sub(started_ns);
-                return Ok(TopicMetadata { snapshot, elapsed_ms, elapsed_ns: Some(elapsed_ns) });
+                return Ok(TopicMetadata { monitor: self, request, snapshot, elapsed_ms, elapsed_ns: Some(elapsed_ns) });
             }
         }
     }
