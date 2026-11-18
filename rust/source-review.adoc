@@ -892,7 +892,10 @@ Container writers and their complete source constructor, getter, promotion and c
 The pinned direct FixedSizeBinary constructor accepts negative signed widths and retains them in type and field metadata.
 A width of -1 permits an actual byte append before the count advances; a later byte getter fails at Java25 MemorySegment reinterpretation with a negative size.
 A separate source-native declaration now retains that identity through signed write/copy kernels and borrowed byte facts while checked SDK admission retains its contract.
-Existing-inner adoption, complete raw object and ByteBuffer behavior, selected readers and production transport remain required.
+A first explicit selection borrows signed row indices independently of the source byte region.
+Byte and pointer getters forward the stored signed index after the selector lookup, and the resulting view can outlive the selector.
+LongLong checks the inner receiver class before lookup and reads its eight-byte backing span immediately.
+Existing-inner adoption, complete raw object and ByteBuffer behavior, remaining indirect-reader operations and production transport remain required.
 
 Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
 That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
@@ -901,7 +904,10 @@ The embedded Java and Clojure migration documents the diagnostic APIs and the ch
 `NativeAdbcTest.embeddedSqlErrorsExposeDiagnosticsAndKeepTheConnectionUsable` covers the same inputs through native Java preparation and the Clojure query path.
 The native fixtures check the existing diagnostic projection, including the Java null cause and the Clojure anomaly values, and leave source-to-native message parity open.
 Keep the live recognizer observation as an explicit migration difference in conformance.
-Production parser adoption still requires separately enforced native-cache ownership and nonescape.
+The private native parser environment can retain its cache across direct-control invocations under an explicit budget.
+The owned control result and error facts outlive the parse session, and the listener reservation stays with the returned diagnostic.
+The enclosing parser can inspect the copied offending state and distinguish an input mismatch from a cause-free token report.
+Production grammar adoption and the complete parser owner contract remain open.
 Serialized pgwire and Flight diagnostics require their own assertions.
 
 All regression sources remain unexecuted by this workflow.
@@ -1436,6 +1442,7 @@ It charges selection worklists and copied file indexes before allocation.
 The worklists end before metadata reads, and the selected indexes remain charged through traversal.
 Scan setup traverses borrowed live segments and their leaves in the existing order.
 A live segment whose IID paths all miss still contributes to the priority offset of persisted pages.
+A live append validates its contiguous row range in order and passes the range directly to bulk trie insertion.
 The shared live-index allocations, including sorted live-leaf storage, still require admission work.
 Block production can copy selected leaf rows directly when every live batch matches the captured Arrow layout.
 The fallback rebuilds the page from the captured table schema.
@@ -1454,7 +1461,11 @@ After reopening, the fixture synchronizes both manually configured nodes before 
 The native pgwire fixture captures the ordered IID rows before either PATCH.
 The Flight SQL fixture captures signed IID bytes and its declared and per-batch fields after both PATCH operations.
 The runner compares those observations with the original JVM case after both native node owners have joined and binds the verdict to the validated receipt bytes.
-Portable transfer of the first closed layout and paired execution remain pending.
+The JVM recorder copies each closed store’s local logs and `objects/v06` tree after the original run-end rewrite assertion and before either node reopens.
+The replay mode checks the original receipt, local logs, block catalogs and every copied compacted rewrite.
+Before submitting tick 40, the reopened native nodes verify the archived source boundary, the replica watermark and the recovered tick-39 transaction.
+Those same nodes run the original continuation and the internal and wire observations.
+Paired execution and native-to-JVM checkpoint handoff remain pending.
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.

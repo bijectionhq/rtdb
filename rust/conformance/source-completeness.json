@@ -11,6 +11,7 @@
         "rust/crates/types/src/lib.rs",
         "rust/crates/columnar/src/lib.rs",
         "rust/crates/columnar/src/cells.rs",
+        "rust/crates/columnar/src/cells/source_scalar.rs",
         "rust/crates/format/src/lib.rs",
         "rust/crates/temporal/src/lib.rs",
         "rust/crates/trie/src/lib.rs"
@@ -18,7 +19,7 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Live appends pass contiguous row indexes through the bulk trie insertion path as a range. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/storage/src/cache.rs",
@@ -33,10 +34,11 @@
     },
     "sql_xtql_execution": {
       "status": "pending",
-      "conclusion": "Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and frontend allocation still require source completion.",
+      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and frontend allocation still require source completion.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/sql/src/lexer.rs",
+        "rust/crates/sql/src/parser/prediction/direct_control.rs",
         "rust/crates/xtql/src/lib.rs",
         "rust/crates/plan/src/lib.rs",
         "rust/crates/expr/src/evaluate.rs",
@@ -92,7 +94,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. Full simulation scheduling and assertions, portable mixed IID checkpoint transfer, additional paired adapters and full assertion bindings need source completion.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. A dedicated mixed IID mode copies the original JVM checkpoint, checks native recovery at tick 39 and runs the continuation and wire observers. Full simulation scheduling and assertions, additional paired adapters and full assertion bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -110,7 +112,9 @@
         "rust/crates/conformance/src/simulation/mod.rs",
         "rust/conformance/run_mixed_iid_reference.py",
         "rust/conformance/run_mixed_iid_native.py",
+        "rust/conformance/mixed_iid_checkpoint.py",
         "rust/crates/conformance/src/history/mixed_iid.rs",
+        "rust/crates/conformance/src/history/mixed_iid/checkpoint.rs",
         "rust/crates/conformance/src/history/mixed_iid/wire.rs",
         "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj",
         "rust/crates/conformance/src/faults.rs"
@@ -321,7 +325,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, selected readers, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand and FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
