@@ -2,7 +2,8 @@
 
 SchemaStringFactory reads borrowed JavaText through a distinct retained Avro Schema.FACTORY symbol root, then constructs the canonical schema and its native datum from that same Reader tree.
 ParsedPair::parse_java_text_with_reader and AvroDatumPlan::parse_admitted_java_text_with_reader exercise the complete admitted pairing route.
-These entry points and their module remain test-gated with the shared Reader facade; Registry and the normal converter continue using their existing routes.
+These entry points and their module are registered in the normal Connect scope with the shared Reader facade.
+The stock Registry writer/selected-reader construction uses the shared factory environment and per-converter runtime owners described in link:../../../runtime/RUNTIME.adoc[].
 The supplied source document owners remain alive and charged for the synchronous parse.
 No input borrow, parser cursor or callback escapes into the returned datum.
 
@@ -15,7 +16,7 @@ The constructor selects the pinned default mapper and stream constraints, ALLOW_
 It does not discover a JVM identity, select a global recycler pool or infer environment overrides.
 
 InternAuthority is a separate borrowed synchronous effective-source operator.
-InputBuffers is the borrowed authority for the actual captured token-buffer recycler slot0.
+InputBuffers is the borrowed authority for acquiring and retaining the actual token-buffer recycler slot0 for each parser.
 TokenRecycler is a passive single-writer captured slot, and TokenBuffer is its exclusive UTF16 storage value with a trailing captured lease.
 Jackson2.16.0 returns a buffer by replacing that slot; Jackson2.21.7 keeps an already larger or equal buffer.
 A reused buffer keeps its actual length, so its buffered trailing content can differ from that of a fresh4000-unit buffer.
@@ -36,6 +37,7 @@ Confluent AvroSchema.java110–123 parses references in encounter order using th
 
 For at most0x8000 source units, JsonFactory admits/copies the token buffer before taking the child-symbol snapshot.
 For a longer String, the StringReader branch takes the child snapshot before its parser constructor allocates the token buffer.
+Both branches acquire the effective recycler before that branch-specific ordering begins.
 The native adapter preserves those two orders and uses the actual shared child.find/intern/release operations.
 Both Jackson2.16.0 and2.21.7 have this split.
 
@@ -54,7 +56,9 @@ An empty readTree result is absent and closes the parser at EOF before the callb
 
 Close sets the source closed flag before releasing anything, so a failed close is not repeated by finally.
 The shared symbol child is released before the token buffer is returned.
+The IOContext/pool close hook follows that token return and is skipped if an earlier release fails.
 A close failure overrides an earlier schema failure, and failed symbol release skips the later token return.
+Native wrapper abandonment detaches an unfinished capture after construction/release failure without replaying source give/close or returning a failed buffer.
 Native decoder scratch is owned by the context rather than pretending to be Jackson's complete TextBuffer/recycler-pool implementation.
 
 == Backend projection and admitted ownership
@@ -99,8 +103,8 @@ No temporary projection tree or text owner is retained after native assembly.
 
 The adapter has explicit native limits of256Ki UTF16 document units,1000 numeric token units and traversal depth128.
 These limits, scratch admission and diagnostics do not establish complete Jackson stream-constraint, TextBuffer segmentation, global recycler selection or JVM allocation-failure timing parity.
-The caller still needs the actual effective factory/recycler/intern scope before normal parser activation.
-The Reader facade and this Avro module must be registered together by their owners.
+The stock parser environment supplies a distinct shared Avro factory, a Jackson-domain default thread-token pool and the shared effective intern authority.
+The native thread/strong-retention and factory-seed qualifications are recorded by those owners and are not JVM observation claims.
 
 The native projection boundary remains narrower than the canonical source domain.
 Complete unmatched-unit and source-valid class/value handling through public schema/value, SMT and writer consumers remains integration work.
@@ -112,7 +116,7 @@ link:COPYRIGHT[] retains the complete pre-package prefix of every primary source
 link:source-profile.json[] records archive hashes, source intervals, native limits and the shared facade baseline.
 The retained link:../NOTICE-JACKSON[], link:../../../names/LICENSE-APACHE[], link:../../../names/LICENSE[] and link:../../../names/ADDITIONAL_LICENSE_INFO[] supply the existing Jackson, Apache and JDK notices/licenses.
 
-Twenty-two new source regression functions cover creation/snapshot order, buffered versus unread tails, semantic/close failure order, exact units, actual persistent symbols, retained tree storage, native normalization, recursive pairing, complete source-group precedence over transport and datum/decode use after construction-owner drop.
+Twenty-four source regression functions cover creation/snapshot/acquisition order, buffered versus unread tails, semantic/close failure order, exact units, actual persistent symbols, retained tree storage, native normalization, recursive pairing, complete source-group precedence over transport and datum/decode use after construction-owner drop.
 All previously published fixture bodies and assertions remain unchanged.
 No compiler, formatter, runtime, test or project helper was executed for this Phase1 slice.
 

@@ -21,12 +21,9 @@ mod to_connect_context;
 mod schema_objects;
 mod java_schema;
 pub(super) use java_schema::{FixedBytesLimit, SourcePolicy};
-#[cfg(test)]
 pub(super) use java_schema::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
-#[cfg(test)]
 mod runtime;
-#[cfg(test)]
-pub(super) use runtime::AvroSchemaRuntime;
+pub(super) use runtime::{AvroSchemaRuntime, ThreadTokenPool};
 pub(super) use datum::AvroDatum;
 use datum::{PhysicalValue as Avro, AvroMap, MapKey};
 pub(super) use resolution::AvroResolution;

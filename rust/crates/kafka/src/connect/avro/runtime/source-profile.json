@@ -5,7 +5,7 @@
   "primary_java_source_count": 9,
   "pinned_file_count": 16,
   "existing_reader_baseline": "ee12bcf3f",
-  "registration": "Avro runtime and shared Reader remain under existing cfg(test); root owns coordinated visibility and actual optional Registry injection",
+  "registration": "Avro runtime/Reader registered normally with root-owned shared facade and stock factory/Registry consumer cohort",
   "runtime_role": "passive single-writer retained source environment owner; factory and captured buffer/intern authorities have distinct actual scopes",
   "constructor_admission": "checked16*(sizeof(runtime)+sizeof(B)+sizeof(I))+4096 before boxing B/I; nested authority heap already admitted by its owner",
   "drop_order": "factory,buffer box,intern box,control lease; no input borrow escapes",
@@ -21,16 +21,16 @@
   },
   "mapper_difference": "Avro plain Schema.FACTORY ALLOW_COMMENTS; Confluent JacksonMapper ALLOW_NON_NUMERIC_NUMBERS; distinct roots and mapper number/features",
   "symbol_seed": "supplied effective seed; 221 uses System.identityHashCode(owner) directly, no odd-bit normalization; no native nonce substitution",
-  "captured_recycler_boundary": "current InputBuffers is already captured; future effective-pool acquisition must precede Session::open per reference/root; IOContext pool close follows symbols and token give",
-  "regression_function_count": 6,
+  "captured_recycler_boundary": "InputBuffers acquire per document before Session direct/fallback branch; close after symbols and token give; ThreadTokenPool default native worker adapter, documented strong-retention/thread qualification",
+  "regression_function_count": 7,
   "fixture_seed": 37,
   "fixture_seed_is_jvm_observation": false,
   "published_assertions_preserved": true,
   "remaining": [
-    "root-owned real Registry consumer and shared/Avro un-gating",
-    "actual per-parser process pool/intern/entropy ownership, supported effective profile and packaging qualification",
+    "source entropy/interner qualification, Java thread/SoftReference/custom pools and packaged profile confirmation",
     "full typed graph/default/generalized-union/arbitrary-key/SMT/writer integration",
     "native unmatched/nonfinite projection exclusions and native profile limits",
     "A09 explicit-null default assertion/source conflict"
-  ]
+  ],
+  "native_detach": "InputBuffers::abandon resets only local capture after constructor/release failure; no source give/close replay or failed buffer publication, same-runtime fresh-context retry"
 }

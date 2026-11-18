@@ -59,7 +59,6 @@ impl ParsedPair {
         let super::java_text::ParsedInput { canonical, inputs } = super::java_text::parse(text, references, policy, logical, context)?;
         Self::assemble(canonical, inputs.root(), inputs.references(), options, context)
     }
-    #[cfg(test)]
     pub(in crate::connect::avro) fn parse_java_text_with_reader(
         text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy,
         factory: &SchemaStringFactory, buffers: &mut dyn InputBuffers, intern: &mut dyn crate::connect::registry::reader_symbols::InternAuthority,
@@ -107,7 +106,6 @@ impl AdmittedSource {
     }
 }
 impl AvroDatumPlan {
-    #[cfg(test)]
     pub fn parse_admitted_java_text_with_reader(
         text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy,
         factory: &SchemaStringFactory, buffers: &mut dyn crate::connect::avro::InputBuffers, intern: &mut dyn crate::connect::registry::reader_symbols::InternAuthority,

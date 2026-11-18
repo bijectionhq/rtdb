@@ -2,8 +2,8 @@
 
 AvroSchemaRuntime owns the supplied Avro SchemaStringFactory, captured InputBuffers authority and effective InternAuthority across schema parse groups.
 It returns an admitted datum by value for the actual converter owner to wrap and cache.
-The root-owned Registry integration can select this parser when that qualified environment is supplied and retain the existing route when it is absent.
-This cohort keeps the runtime and Reader facade behind their existing test gate while that installation is coordinated.
+The stock Registry converter's writer and selected-reader plans use the root-owned ParserFactories environment to construct this parser.
+The runtime and Reader entry points are registered in the normal Connect scope; their regression modules remain test-only.
 
 == Owners and source profile
 
@@ -53,12 +53,13 @@ No production graph/default/union behavior is activated by this owner alone.
 
 == Captured recycler boundary
 
-InputBuffers currently supplies an already captured effective recycler slot.
-A complete process-pool integration must acquire the effective recycler for every reference/root parser before either direct buffer copying or fallback child creation.
-The earliest common boundary is with_tree immediately before Session::open.
+InputBuffers acquires its effective recycler for each reference/root parser before either direct buffer copying or fallback child creation.
+Its default successful acquire/close hooks preserve already captured authority implementations.
+The common acquisition boundary is Session::open before its direct/fallback branch.
 The matching IOContext/pool close follows symbol release and token-buffer return inside the existing closed-once lifecycle; an earlier release failure skips that later close.
-This cohort adds no acquisition hook and makes no full process-pool claim.
-The supplied captured authority profile must remain valid over the calls that reuse it.
+Native constructor/release failures detach the local capture through abandon without replaying source give/close or publishing a failed buffer, allowing a fresh-context retry on the same runtime.
+link:pool/POOL.adoc[ThreadTokenPool] supplies the shared domain/thread adapter used by the stock factory environment.
+The supplied source profile remains explicit, including native thread identity and strong-retention qualifications.
 
 == Source and regression scope
 
@@ -67,7 +68,7 @@ link:COPYRIGHT[] retains the complete primary Java pre-package prefixes, includi
 link:source-profile.json[] records the concrete owner/API, native profile and pending registration boundary.
 The retained link:../java_schema/producer/NOTICE-JACKSON[], link:../names/LICENSE-APACHE[], link:../names/LICENSE[] and link:../names/ADDITIONAL_LICENSE_INFO[] supply the existing notices and licenses.
 
-Six additive source regression functions cover persistent factory/recycler/interner use, fresh parser identities, reference-first null handling, empty String distinction, per-group default validation, admission before authority use, fresh-context retention and exact UTF16 datum/decode lifetime.
+Seven source regression functions cover persistent factory/recycler/interner use, fresh parser identities, reference-first null handling, empty String distinction, per-group default validation, admission before authority use, fresh-context retention, native detach/retry and exact UTF16 datum/decode lifetime.
 The tests preserve every published StringReader22 body and all earlier Avro assertions, including A09.
 They have not been executed in Phase1.
 

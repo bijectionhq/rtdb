@@ -1,0 +1,98 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "source_snapshot": "/tmp/rtdb-avro-token-pool-sources",
+  "baseline": "53c69240e including original5ed5b1a4e first-token corrections",
+  "primary_java_sources": 18,
+  "pinned_files": 27,
+  "source_archives": {
+    "jackson-core-2.16.0-sources.jar": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864",
+    "jackson-core-2.21.7-sources.jar": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c"
+  },
+  "source_intervals": {
+    "JsonFactory221": [
+      "2189-2209",
+      "2221-2245"
+    ],
+    "JsonRecyclerPools221": [
+      "20-41",
+      "125-147"
+    ],
+    "RecyclerPool221": [
+      "139-181"
+    ],
+    "BufferRecyclers221": [
+      "35-90"
+    ],
+    "BufferRecycler221": [
+      "190-211",
+      "239-273"
+    ],
+    "IOContext221": [
+      "494-503"
+    ],
+    "ReaderBasedJsonParser221": [
+      "108-149",
+      "216-229"
+    ],
+    "ParserBase221": [
+      "401-417"
+    ],
+    "JsonRecyclerPools216": [
+      "20-42",
+      "117-132"
+    ],
+    "RecyclerPool216": [
+      "105-138"
+    ]
+  },
+  "owner_roles": {
+    "ThreadTokenPool": "passive shared Jackson-domain owner, no whole-group lock",
+    "Entries": "native thread index/backing lease owner, short mutex publication",
+    "Slot": "shared passive char-token0 replica and trailing Arc/control reservation",
+    "ThreadInputBuffers": "passive converter-local Idle/Active capture adapter"
+  },
+  "api": [
+    "ThreadTokenPool::new(Profile,context)->Result<Arc<Self>>",
+    "pool.buffers()->ThreadInputBuffers",
+    "InputBuffers::acquire(context),close(context) default no-op for already-captured authorities",
+    "InputBuffers::abandon() native-only default no-op; pooled adapter drops local capture"
+  ],
+  "lifecycle": [
+    "per-document acquire before Session direct/fallback branch",
+    "direct buffer/copy before child OR fallback child before token buffer",
+    "readTree and source schema assembly",
+    "buffered trailing-content check",
+    "closed flag before symbols release",
+    "token give",
+    "IOContext/pool close; omitted on earlier release failure"
+  ],
+  "default_source_pool": "ThreadLocalPoolBase acquire does not withPool-link; releasePooled no-op and releaseToPool has no linked target",
+  "native_qualification": {
+    "thread": "Rust native ThreadId captured once per synchronous parser, not Java logical/virtual-thread identity",
+    "retention": "strong domain entries and idle arrays until domain drop; no SoftReference GC/manager or dead-thread TLS cleanup parity",
+    "slots": "char-token0 only; Registry Reader matching-domain consumers must share this slot; other source BufferRecycler arrays remain separate work",
+    "recovery": "constructor/release failure invokes native detach to Idle without source cleanup replay or failed buffer publication; fresh admitted context may retry same runtime",
+    "concurrency": "same-thread overlapping captures share cell; stock parser does not escape/transfer active context across threads"
+  },
+  "admission": {
+    "domain_slot": "checked shared Arc layout*16+4096 before Arc allocation; payload before trailing charge",
+    "index": "16*capacity*sizeof(Entry)+4096 before allocation/reallocation; initial capacity4",
+    "token": "existing leased TokenBuffer bound/reuse unchanged",
+    "fresh_context": "retain existing domain/index/slot/token charges, no second physical reservation"
+  },
+  "activation": "Avro-only runtime/Reader module/export gates and two Reader entry-method gates removed; root-owned stock factory/Registry consumer co-published",
+  "regression_functions": {
+    "new_pool": 4,
+    "additive_reader": 2,
+    "published_runtime_preserved": 6,
+    "published_corrected_reader_prefix_preserved": 22,
+    "additive_runtime": 1
+  },
+  "remaining": [
+    "Java thread/SoftReference/platform and entropy qualification",
+    "broader Registry input-window pull/nullable DTO activation and char-slot sharing",
+    "typed graph/default/generalized-union/arbitrary-key/cache/SMT/writer integration",
+    "native unmatched/nonfinite representations and A09 assertion/source conflict"
+  ]
+}

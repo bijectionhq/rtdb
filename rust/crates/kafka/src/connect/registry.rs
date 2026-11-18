@@ -1,7 +1,7 @@
 use std::{collections::{BTreeMap, VecDeque}, sync::Arc, time::Instant};
 use async_trait::async_trait;
 use rtdb_columnar::MemoryReservation;
-use rtdb_types::Result;
+use rtdb_types::{Result, java_text::JavaText};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use super::{ConnectData, ConversionContext, Converter, PluginSpec, error};
@@ -13,13 +13,14 @@ mod http;
 mod references;
 mod json_admission;
 mod schema_id;
+mod factory;
+pub(super) use factory::ParserFactories;
 use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod input_window;
 mod response;
-#[cfg(test)]
 pub(super) use response::symbols as reader_symbols;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -29,6 +30,8 @@ pub(super) struct RegistryConverter {
     urls: Vec<reqwest::Url>,
     security: security::Security,
     format: RegistryFormat,
+    parsers: ParserFactories,
+    avro: Option<super::avro::AvroSchemaRuntime>,
     is_key: bool,
     options: BTreeMap<String, String>,
     schemas: BTreeMap<(String, u32), WriterEntry>,
@@ -141,7 +144,11 @@ struct Reference {
     version: Option<i32>,
 }
 impl RegistryConverter {
+    #[cfg(test)]
     pub fn open(spec: &PluginSpec, format: RegistryFormat, is_key: bool) -> Result<Self> {
+        Self::with_parsers(spec, format, is_key, ParserFactories::default())
+    }
+    pub(super) fn with_parsers(spec: &PluginSpec, format: RegistryFormat, is_key: bool, parsers: ParserFactories) -> Result<Self> {
         let options = &spec.options;
         let urls = options.get("schema.registry.url").ok_or_else(|| error("invalid-plugin-config", "schema.registry.url is required"))?.split(',').map(|value| {
             let url = reqwest::Url::parse(value.trim()).map_err(|cause| error("invalid-plugin-config", cause))?;
@@ -160,7 +167,7 @@ impl RegistryConverter {
         for key in ["specific.avro.reader", "schema.reflection"] {
             super::converter::option_bool(options, key, false)?;
         }
-        Ok(Self { client: None, urls, security, format, is_key, options: options.clone(), schemas: BTreeMap::new(), order: VecDeque::new(), capacity, maximum_schema_bytes: 256 * 1024, next_avro_union: 0, reader_selection, latest, bindings: BTreeMap::new(), binding_order: VecDeque::new(), dlq: BTreeMap::new() })
+        Ok(Self { client: None, urls, security, format, parsers, avro: None, is_key, options: options.clone(), schemas: BTreeMap::new(), order: VecDeque::new(), capacity, maximum_schema_bytes: 256 * 1024, next_avro_union: 0, reader_selection, latest, bindings: BTreeMap::new(), binding_order: VecDeque::new(), dlq: BTreeMap::new() })
     }
     async fn fetch_schema_id(&mut self, id: u32, context: &mut ConversionContext) -> Result<RegistrySchema> {
         let response = self.request_raw(&["schemas".into(), "ids".into(), id.to_string()], &[], None, context).await?;
@@ -280,8 +287,19 @@ impl RegistryConverter {
         let rule_bound = rules::ReadRules::allocation_bound(document.root.rule_set.as_ref(), &self.options)?;
         context.reserve(document.bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(rule_bound)).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| error("allocation-overflow", "Schema graph allocation overflow"))?)
     }
-    fn avro_plan(&self, document: &SchemaDocument) -> Result<Arc<super::avro::AvroDatumPlan>> {
-        super::avro::AvroDatumPlan::parse(&document.root.schema, &document.references.texts().map(str::to_owned).collect::<Vec<_>>(), &self.options).map(Arc::new)
+    fn avro_plan(&mut self, document: &SchemaDocument, context: &mut ConversionContext) -> Result<Arc<super::avro::AvroDatumPlan>> {
+        let count = document.references.by_name().len();
+        let slots = count.checked_mul(std::mem::size_of::<JavaText<'_>>()).and_then(|bytes| bytes.checked_add(256))
+            .ok_or_else(|| error("allocation-overflow", "Avro reference slots exceed addressable memory"))?;
+        context.reserve(slots)?;
+        let mut references = Vec::new();
+        references.try_reserve_exact(count).map_err(|cause| error("allocation-failed", cause))?;
+        references.extend(document.references.texts().map(JavaText::from_utf8));
+        if self.avro.is_none() { self.avro = Some(self.parsers.avro(context)?); }
+        let runtime = self.avro.as_mut().expect("Avro runtime initialized");
+        let policy = super::avro::SourcePolicy { validate_defaults: false, fixed_bytes: super::avro::FixedBytesLimit::DEFAULT };
+        let plan = runtime.parse(Some(JavaText::from_utf8(&document.root.schema)), &references, &self.options, policy, context)?;
+        Ok(Arc::new(plan.expect("non-null Avro schema produced a datum plan")))
     }
     async fn reader_document(&mut self, writer: &SchemaDocument, id: u32, context: &mut ConversionContext) -> Result<Option<Arc<SchemaDocument>>> {
         context.reserve(self.reader_selection.request_bound(&writer.subject)?)?;
@@ -313,7 +331,7 @@ impl RegistryConverter {
             let document = self.document(root, writer.subject.clone(), returned, context).await?;
             self.plan_charge(&document, context)?;
             match self.format {
-                RegistryFormat::Avro => { self.avro_plan(&document)?; }
+                RegistryFormat::Avro => { self.avro_plan(&document, context)?; }
                 RegistryFormat::Json => { serde_json::from_str::<Json>(&document.root.schema).map_err(|cause| error("json-schema", cause))?; }
             }
             versions.push(document);
@@ -350,9 +368,9 @@ impl RegistryConverter {
             RegistryFormat::Json => ReaderPlan::Json(JsonOutput::Unprepared),
             RegistryFormat::Avro => {
                 charges.push(self.plan_charge(&writer, context)?);
-                let writer = self.avro_plan(&writer)?;
+                let writer = self.avro_plan(&writer, context)?;
                 let selection = if let Some(selected) = &selected {
-                    let reader = self.avro_plan(selected)?;
+                    let reader = self.avro_plan(selected, context)?;
                     if migrations.is_empty() { writer.validate_reader(Some(&reader))?; }
                     let decode = if !migrations.is_empty() { AvroRead::Migration }
                         else if writer.raw_bytes() { AvroRead::RawBytes }

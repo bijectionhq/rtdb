@@ -453,3 +453,105 @@ fn all_source_schemas_and_closes_precede_transport_of_an_earlier_unrepresentable
     assert!(failure.code.ends_with("close-fixture"));
     assert_eq!(closes.get(), 2);
 }
+
+#[derive(Clone)]
+struct Trace { events: Rc<RefCell<Vec<&'static str>>>, charge: Arc<MemoryReservation> }
+impl Trace {
+    fn new(context: &mut ConversionContext) -> Self {
+        let charge = context.reserve(4096).unwrap();
+        let mut events = Vec::new();
+        events.try_reserve_exact(8).unwrap();
+        Self { events: Rc::new(RefCell::new(events)), charge }
+    }
+    fn push(&self, event: &'static str) {
+        let mut events = self.events.borrow_mut();
+        assert!(events.len() < events.capacity());
+        events.push(event);
+    }
+}
+struct AcquireInject { pool: TokenRecycler, root: Arc<ReaderSymbols>, intern: Intern, trace: Trace }
+impl InputBuffers for AcquireInject {
+    fn profile(&self) -> Profile { self.pool.profile() }
+    fn acquire(&mut self, context: &mut ConversionContext) -> Result<()> {
+        self.trace.push("acquire");
+        let mut child = self.root.child(context).map_err(symbol_error)?;
+        child.find(&[119, 97, 114, 109], &mut self.intern, context).map_err(symbol_error)?;
+        child.release(context).map_err(symbol_error)?;
+        Ok(())
+    }
+    fn take(&mut self, minimum: usize, context: &mut ConversionContext) -> Result<TokenBuffer> {
+        self.trace.push("take");
+        self.pool.take(minimum, context)
+    }
+    fn give(&mut self, buffer: TokenBuffer, context: &mut ConversionContext) -> Result<()> {
+        self.trace.push("give");
+        self.pool.give(buffer, context)
+    }
+    fn close(&mut self, _: &mut ConversionContext) -> Result<()> { self.trace.push("close"); Ok(()) }
+}
+
+#[test]
+fn source_recycler_acquisition_precedes_both_child_snapshot_paths() {
+    for selected in [Profile::Jackson216, Profile::Jackson221] {
+        for fallback in [false, true] {
+            let mut context = support::context();
+            let factory = SchemaStringFactory::new_default(profile(selected), &mut context).unwrap();
+            let mut intern = Intern::new(&mut context);
+            let trace = Trace::new(&mut context);
+            let mut buffers = AcquireInject { pool: TokenRecycler::empty(selected), root: Arc::clone(&factory.symbols), intern: intern.clone(), trace: trace.clone() };
+            context.reserve(70_000).unwrap();
+            let mut input = r#"{"warm":1}"#.to_owned();
+            if fallback { input.extend(std::iter::repeat_n(' ', DIRECT_STRING_LIMIT + 1 - input.len())); }
+            factory.with_tree(JavaText::from_utf8(&input), &mut buffers, &mut intern, &mut context, |tree, _| {
+                trace.push("schema");
+                assert!(matches!(tree.unwrap().get("warm").unwrap().value(), JsonValue::I32(1)));
+                Ok(())
+            }).unwrap();
+            assert_eq!(intern.calls(), 1);
+            assert_eq!(&*trace.events.borrow(), &["acquire", "take", "schema", "give", "close"]);
+        }
+    }
+}
+
+struct CloseHooks { pool: TokenRecycler, trace: Trace, fail_acquire: bool, fail_give: bool, fail_close: bool }
+impl InputBuffers for CloseHooks {
+    fn profile(&self) -> Profile { self.pool.profile() }
+    fn acquire(&mut self, _: &mut ConversionContext) -> Result<()> {
+        self.trace.push("acquire");
+        if self.fail_acquire { Err(error("acquire-fixture", "Source acquire failure")) } else { Ok(()) }
+    }
+    fn take(&mut self, minimum: usize, context: &mut ConversionContext) -> Result<TokenBuffer> {
+        self.trace.push("take");
+        self.pool.take(minimum, context)
+    }
+    fn give(&mut self, buffer: TokenBuffer, context: &mut ConversionContext) -> Result<()> {
+        self.trace.push("give");
+        if self.fail_give { Err(error("give-fixture", "Source token return failure")) } else { self.pool.give(buffer, context) }
+    }
+    fn close(&mut self, _: &mut ConversionContext) -> Result<()> {
+        self.trace.push("close");
+        if self.fail_close { Err(error("pool-close-fixture", "Source IOContext close failure")) } else { Ok(()) }
+    }
+}
+
+#[test]
+fn io_context_close_follows_token_return_is_skipped_on_failure_and_runs_once_at_empty_eof() {
+    for (input, acquire, give, close, expected, events) in [
+        ("\"int\"", true, false, false, "acquire-fixture", &["acquire"][..]),
+        ("\"int\"", false, true, false, "give-fixture", &["acquire", "take", "schema", "give"][..]),
+        ("\"int\"", false, false, true, "pool-close-fixture", &["acquire", "take", "schema", "give", "close"][..]),
+        ("", false, false, true, "pool-close-fixture", &["acquire", "take", "give", "close"][..]),
+    ] {
+        let mut context = support::context();
+        let factory = SchemaStringFactory::new_default(profile(Profile::Jackson221), &mut context).unwrap();
+        let mut intern = Intern::new(&mut context);
+        let trace = Trace::new(&mut context);
+        let mut buffers = CloseHooks { pool: TokenRecycler::empty(Profile::Jackson221), trace: trace.clone(), fail_acquire: acquire, fail_give: give, fail_close: close };
+        let failure = factory.with_tree(JavaText::from_utf8(input), &mut buffers, &mut intern, &mut context, |_, _| {
+            trace.push("schema");
+            Err::<(), _>(error("semantic", "Schema failure"))
+        }).unwrap_err();
+        assert!(failure.code.ends_with(expected));
+        assert_eq!(&*trace.events.borrow(), events);
+    }
+}

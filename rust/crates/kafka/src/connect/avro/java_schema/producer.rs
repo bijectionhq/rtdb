@@ -4,9 +4,7 @@ mod input;
 mod native_bound;
 mod pair;
 mod java_text;
-#[cfg(test)]
 mod string_reader;
-#[cfg(test)]
 pub(in crate::connect) use string_reader::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
 use native_bound::NativeFootprint;
 pub(in crate::connect::avro) use pair::{AdmittedSource, ParsedPair, PairSelection};

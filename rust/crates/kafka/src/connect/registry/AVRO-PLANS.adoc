@@ -1,0 +1,17 @@
+= Registry Avro plan construction
+
+The stock Connect Avro converter constructs datum plans through the Avro String Reader.
+It admits borrowed source text for ordered references and passes the same source parse into the native datum plan.
+Avro schema comments are handled by the Avro factory before native transport.
+Fetched Registry schemas use the nonvalidating default policy and the default Avro Fixed bytes limit.
+
+Clones of the native plugin registry share an admitted Jackson intern cache, a token recycler pool and the distinct Avro symbol root.
+Each converter keeps its own mutable parser environment.
+The factory root is initialized on demand with a stable native identity seed.
+The token pool follows the synchronous native calling thread.
+Packaged JVM seed values, SoftReference clearing and foreign classloader state remain runtime qualifications.
+
+The Registry document and plan binding retain the text and resulting schema state through both success and retry.
+The converter currently receives Registry schema strings projected to UTF8 by its HTTP consumers.
+Direct nullable UTF16 transport, typed logical consumers beyond the native datum boundary and Jackson input above the current native traversal limits remain open.
+The link:../avro/runtime/RUNTIME.adoc[Avro runtime reference] records its parser and buffer contracts.

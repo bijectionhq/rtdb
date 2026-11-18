@@ -33,6 +33,46 @@ async fn registry_requests_accept_only_ok_or_no_content_as_success() {
 }
 
 #[tokio::test]
+async fn stock_avro_converter_parses_fetched_schema_strings_with_avros_comment_policy() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let schema = r#"/* registry schema */ {"type":"record","name":"R","fields":[{"name":"id","type":"long"}]}"#;
+        for (request, body) in [
+            ("GET /schemas/ids/17 HTTP/1.1", serde_json::json!({"schema": schema})),
+            ("POST /subjects/events-value?normalize=false&deleted=true HTTP/1.1", serde_json::json!({"id": 17, "version": 3})),
+        ] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = request_head(&mut socket).await;
+            assert_eq!(head.lines().next(), Some(request));
+            if let Some(length) = head.lines().filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim().parse::<usize>().unwrap()) {
+                assert!(length < 8192);
+                let mut bytes = vec![0; length];
+                socket.read_exact(&mut bytes).await.unwrap();
+            }
+            let body = body.to_string();
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([
+        ("schema.registry.url".into(), format!("http://{address}")),
+    ]) };
+    let plugins = crate::connect::PluginRegistry::default();
+    let mut converter = plugins.converter(&spec, false).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 27);
+    let mut context = ConversionContext::new(Arc::clone(&memory));
+    let data = tokio::time::timeout(std::time::Duration::from_secs(5), converter.decode("events", Some(&[0, 0, 0, 0, 17, 14]), &mut context))
+        .await.unwrap().unwrap();
+    assert_eq!(data.value, rtdb_types::Value::Struct(BTreeMap::from([("id".into(), rtdb_types::Value::I64(7))])));
+    assert_eq!(data.schema.as_ref().unwrap().version, Some(3));
+    converter.close().await.unwrap();
+    server.await.unwrap();
+    drop((data, converter, plugins, context));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn writer_schema_id_projects_eligible_envelopes_and_uses_legacy_for_other_fields() {
     for (body, expected_type) in [
         (r#"{"schema":"\"string\"","references":[ ]}"#, None),

@@ -15,11 +15,14 @@ impl TokenBuffer {
     fn retain(&self, context: &mut ConversionContext) -> Result<()> { context.retain(Arc::clone(&self.charge)) }
 }
 
-/// Supplies the actual captured source recycler slot; returned storage stays charged through its final use.
+/// A parser's capture lasts through close or native abandonment; storage stays charged through final use.
 pub(in crate::connect) trait InputBuffers {
     fn profile(&self) -> Profile;
+    fn acquire(&mut self, _: &mut ConversionContext) -> Result<()> { Ok(()) }
     fn take(&mut self, minimum: usize, context: &mut ConversionContext) -> Result<TokenBuffer>;
     fn give(&mut self, buffer: TokenBuffer, context: &mut ConversionContext) -> Result<()>;
+    fn close(&mut self, _: &mut ConversionContext) -> Result<()> { Ok(()) }
+    fn abandon(&mut self) {}
 }
 
 pub(in crate::connect) struct TokenRecycler { profile: Profile, idle: Option<TokenBuffer> }

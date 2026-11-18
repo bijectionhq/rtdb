@@ -1,0 +1,77 @@
+= Default Avro thread-token pool
+
+ThreadTokenPool is the passive shared owner of char-token slot0 in one supplied Jackson classloader/profile domain.
+The stock parser environment shares that pool and the distinct Avro SchemaStringFactory across converter-local AvroSchemaRuntime owners.
+It does not put a lock around a complete parse group, so source child snapshots and root publication can interleave across converters.
+
+== Source capture and close
+
+JsonFactory creates an IOContext and acquires its effective recycler before either String parser branch constructs its child symbols.
+Session::open therefore calls InputBuffers.acquire before direct token-buffer allocation/copy or fallback child creation.
+Every reference and non-null root creates a separate capture.
+A null root with zero references creates none.
+
+Session::close sets its closed flag before release, then releases symbols, returns the token buffer and invokes InputBuffers.close.
+An earlier release failure skips the later hook, and a failed close is not replayed by finally.
+Default successful hooks preserve the published already captured authority implementations.
+The new lifecycle fixtures use real shared symbol operations to witness acquisition before both snapshot paths and exact close/failure prefixes.
+
+Jackson2.16.0 and2.21.7 defaultPool select the globally shared ThreadLocalPool.
+Its acquirePooled delegates to BufferRecyclers.getBufferRecycler, which consults a static ThreadLocal containing a SoftReference.
+ThreadLocalPoolBase deliberately omits withPool linkage in acquireAndLinkPooled and does no work in releasePooled.
+IOContext.close calls BufferRecycler.releaseToPool, which has no linked pool to return to in this default profile.
+Native close therefore releases its local capture without removing the shared thread slot or enqueueing a recycler.
+
+== Native owners and admission
+
+The domain owns an admitted Mutex-protected vector of native ThreadId and Arc<Slot> associations.
+Entries owns its backing reservation; growth admits the replacement backing before reallocation, while the old backing is still charged.
+A Slot is a passive shared owner of Mutex<TokenRecycler> and its trailing control reservation.
+The TokenRecycler keeps the published version-specific array take/return semantics and each TokenBuffer keeps its captured storage reservation.
+No slot lock spans name interning, schema construction or a whole parse group.
+
+ThreadInputBuffers is a passive converter-local adapter with an Idle or Active capture.
+Acquisition selects the current native thread once, retains the domain/index/slot reservations and captures that shared slot.
+Take and give operate on the captured cell rather than reselecting a thread or moving the entire recycler out of the pool.
+Overlapping same-thread contexts can therefore use separate checked-out arrays and return them to the same slot.
+The2.16 return replaces an existing slot value;2.21 keeps an already larger or equal buffer.
+
+The pool's Arc owner and initial four-entry index backing are admitted before allocation.
+Every shared owner uses its checked Arc layout plus a sixteenfold envelope and4096 bytes; index storage uses16*capacity*sizeof(entry)+4096.
+Slot creation and index growth are admitted independently before allocation.
+Fresh contexts retain the existing physical reservations rather than allocating a second physical charge for cached buffers.
+Domain entries and slot/token payloads drop before their captured reservation owners.
+
+The adapter rejects an operation requiring a missing capture and re-acquisition of an unclosed capture.
+When construction or a release stage fails, the native abandon operation drops only the local capture and restores Idle.
+It invokes no source give/close operation and publishes no failed buffer state.
+Ordinary source schema/dangling errors run close normally; a fresh admitted context can retry the same runtime after a native denial.
+The stock synchronous parse does not escape or transfer an active parser between native threads.
+
+== Thread and reference qualification
+
+This native index uses Rust native ThreadId and strongly retains entries and idle buffers until the supplied domain drops.
+It does not reproduce Java logical/virtual-thread identity, SoftReference GC timing, reference-manager tracking/property effects, dead-thread ThreadLocal cleanup or custom recycler pools.
+A source recycler can remain strongly reachable through a retained parser/IOContext even after close; no native weak reference or fabricated GC event substitutes for that source lifetime.
+The admitted cache models default synchronous native worker reuse within this stated profile.
+It makes no source heap or JVM OOME timing claim.
+
+BufferRecyclers belongs to the Jackson classloader rather than an Avro factory.
+Registry Reader char-token users must share this same domain slot when their source classloader scope matches, despite distinct mapper features and symbol roots.
+Other BufferRecycler array slots and the pending Registry input-window integration remain their owners' separate work.
+
+== Source and regression evidence
+
+link:sources.sha256[] pins both default-pool source implementations and the relevant factory/context/parser lifecycle sources.
+link:COPYRIGHT[] preserves every full primary pre-package prefix, including empty prefixes.
+link:source-profile.json[] records the source intervals, native owner/admission profile and activation boundary.
+Existing link:../../names/LICENSE-APACHE[], link:../../names/LICENSE[] and link:../../names/ADDITIONAL_LICENSE_INFO[] remain retained.
+
+Four new pool regression sources cover overlapping captures and replacement, domain/native-thread isolation, retained lease accounting after context drop, and rejected thread-index growth before mutation.
+Two additive Reader regression sources cover real acquisition/snapshot interleaving and IOContext-close failure order.
+An additive Runtime source induces real context denial during parser creation and token return, verifies skipped source cleanup and successful fresh-context retry, and checks final reservation release.
+Every previously published Runtime6, corrected StringReader22 and older Avro assertion body remains unchanged.
+No new regression was executed in Phase1.
+
+Normal writer/selected-reader parser construction is installed with the root-owned stock factory cohort.
+Full typed graph/default/generalized-union/arbitrary-key behavior, source-valid native-unrepresentable values through SMT/writer consumers, and the A09 explicit-null default assertion/source conflict remain open.

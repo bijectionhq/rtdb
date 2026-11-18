@@ -3,6 +3,8 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Result, java_text::JavaText};
 use super::{AvroDatumPlan, ConversionContext, InputBuffers, SchemaStringFactory, SourcePolicy, error};
 use crate::connect::registry::reader_symbols::InternAuthority;
+mod pool;
+pub(in crate::connect) use pool::ThreadTokenPool;
 
 pub(in crate::connect) struct AvroSchemaRuntime {
     factory: SchemaStringFactory,
@@ -12,7 +14,7 @@ pub(in crate::connect) struct AvroSchemaRuntime {
 }
 
 impl AvroSchemaRuntime {
-    /// Supply the retained actual Avro factory, captured recycler and effective intern authority.
+    /// Supply the retained Avro factory, reusable recycler authority and effective intern authority.
     /// Authorities own admitted nested payloads and retain demanded cached storage in each call's context.
     pub(in crate::connect) fn new<B, I>(
         factory: SchemaStringFactory,

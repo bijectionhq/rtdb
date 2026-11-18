@@ -205,3 +205,78 @@ fn exact_utf16_datum_survives_runtime_input_and_construction_context_drop() {
     drop(next);
     assert_eq!(budget.used_bytes(), 0);
 }
+
+#[test]
+fn native_open_and_token_return_denials_detach_without_source_cleanup_and_allow_fresh_context_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct FailureState {
+        stage: AtomicUsize,
+        acquires: AtomicUsize,
+        gives: AtomicUsize,
+        closes: AtomicUsize,
+        abandons: AtomicUsize,
+        charge: Arc<MemoryReservation>,
+    }
+    struct FailOnce { inner: pool::ThreadInputBuffers, state: Arc<FailureState> }
+    impl InputBuffers for FailOnce {
+        fn profile(&self) -> Profile { self.inner.profile() }
+        fn acquire(&mut self, context: &mut ConversionContext) -> Result<()> {
+            context.retain(Arc::clone(&self.state.charge))?;
+            self.inner.acquire(context)?;
+            self.state.acquires.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+        fn take(&mut self, minimum: usize, context: &mut ConversionContext) -> Result<TokenBuffer> {
+            if self.state.stage.compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                let denied = context.allocation_remaining().checked_add(1).unwrap();
+                context.reserve(denied)?;
+            }
+            self.inner.take(minimum, context)
+        }
+        fn give(&mut self, buffer: TokenBuffer, context: &mut ConversionContext) -> Result<()> {
+            self.state.gives.fetch_add(1, Ordering::Relaxed);
+            if self.state.stage.compare_exchange(2, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                let denied = context.allocation_remaining().checked_add(1).unwrap();
+                context.reserve(denied)?;
+            }
+            self.inner.give(buffer, context)
+        }
+        fn close(&mut self, context: &mut ConversionContext) -> Result<()> {
+            self.state.closes.fetch_add(1, Ordering::Relaxed);
+            self.inner.close(context)
+        }
+        fn abandon(&mut self) {
+            self.state.abandons.fetch_add(1, Ordering::Relaxed);
+            self.inner.abandon();
+        }
+    }
+    for stage in [1, 2] {
+        let budget = MemoryBudget::new(usize::MAX);
+        let mut context = ConversionContext::new(Arc::clone(&budget));
+        let charge = context.reserve(4096).unwrap();
+        let state = Arc::new(FailureState { stage: AtomicUsize::new(stage), acquires: AtomicUsize::new(0), gives: AtomicUsize::new(0), closes: AtomicUsize::new(0), abandons: AtomicUsize::new(0), charge });
+        let pool = pool::ThreadTokenPool::new(Profile::Jackson221, &mut context).unwrap();
+        let intern = Intern::new(&mut context);
+        let buffers = FailOnce { inner: pool.buffers(), state: Arc::clone(&state) };
+        let mut runtime = AvroSchemaRuntime::new(factory(&mut context), buffers, intern.clone(), &mut context).unwrap();
+        let failure = runtime.parse(Some(JavaText::from_utf8("\"int\"")), &[], &BTreeMap::new(), policy(), &mut context).err().unwrap();
+        assert!(failure.code.ends_with("batch-too-large"));
+        assert_eq!(state.acquires.load(Ordering::Relaxed), 1);
+        assert_eq!(state.gives.load(Ordering::Relaxed), usize::from(stage == 2));
+        assert_eq!(state.closes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.abandons.load(Ordering::Relaxed), 1);
+        drop(context);
+        let mut next = ConversionContext::new(Arc::clone(&budget));
+        let datum = runtime.parse(Some(JavaText::from_utf8("\"int\"")), &[], &BTreeMap::new(), policy(), &mut next).unwrap().unwrap();
+        assert_eq!(state.acquires.load(Ordering::Relaxed), 2);
+        assert_eq!(state.closes.load(Ordering::Relaxed), 1);
+        assert_eq!(state.abandons.load(Ordering::Relaxed), 1);
+        drop(datum);
+        drop(runtime);
+        drop(intern);
+        drop(pool);
+        drop(state);
+        drop(next);
+        assert_eq!(budget.used_bytes(), 0);
+    }
+}

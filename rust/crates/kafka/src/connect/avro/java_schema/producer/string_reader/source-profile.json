@@ -91,11 +91,13 @@
   },
   "source_order": [
     "native document-handle slot/control admission",
-    "direct buffer copy before child OR fallback child before buffer for each ordered reference/root",
-    "readTree with actual name-symbol demand and semantic schema construction",
-    "each source currently-buffered release/Java trim check and finally close once",
-    "canonical arena finalization after all source schemas/close operations succeed",
-    "ProjectedInputs control admission then ordered native backend JSON projection",
+    "per-document recycler acquisition before Session direct/fallback branch",
+    "direct buffer copy before child OR fallback child before buffer",
+    "readTree with actual name-symbol demand and source schema construction",
+    "each source currently buffered release/Java trim check",
+    "closed flag before symbols release, token give and IOContext/pool close; native detach on construction/release failure",
+    "canonical arena finalization after all source operations succeed",
+    "ProjectedInputs control admission and ordered backend transport projection",
     "complete native footprint bound and same-owner native parse/pair validation",
     "datum publication with retained canonical/native ownership"
   ],
@@ -116,14 +118,14 @@
     "native_pair": "published NativeFootprint bound and ParsedPair validation unchanged",
     "source_documents": "16*(reference_count+1)*sizeof(JsonNode)+4096 before call-local Vec allocation; existing node payload leases retained, vector dropped before local lease"
   },
-  "regression_function_count": 22,
+  "regression_function_count": 24,
   "fixture_seed": {
     "value": 37,
     "scope": "explicit deterministic source-algorithm test profile; not discovered JVM identity"
   },
   "existing_published_tests_edited": false,
   "remaining": [
-    "normal coordinated shared Reader export/registration and actual effective factory/recycler/intern owners",
+    "default stock parser owners registered with explicit native entropy/thread/strong-retention qualification; broader Registry pull/nullable DTO/char-slot integration pending",
     "full source TextBuffer segmentation/recycler-pool selection, constraint overrides/diagnostics and JVM allocation-failure timing",
     "unmatched/nonfinite source values across native backend and public schema/value/SMT/writer consumers",
     "complete typed graph/default/generalized-union/arbitrary-key conversion and source cache consumers",

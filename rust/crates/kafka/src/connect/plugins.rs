@@ -75,6 +75,7 @@ pub struct PluginRegistry {
     converters: BTreeMap<String, Arc<dyn ConverterFactory>>,
     transforms: BTreeMap<String, Arc<dyn TransformFactory>>,
     predicates: BTreeMap<String, Arc<dyn PredicateFactory>>,
+    parser_factories: super::registry::ParserFactories,
 }
 impl PluginRegistry {
     /// Additional bytes for cloned registry maps and class names; factory objects remain shared.
@@ -94,7 +95,7 @@ impl PluginRegistry {
     }
     pub fn converter(&self, spec: &PluginSpec, is_key: bool) -> Result<Box<dyn Converter>> {
         if let Some(factory) = self.converters.get(&spec.class_name) { return factory.open(&spec.options, is_key); }
-        super::converter::open(spec, is_key)
+        super::converter::open(spec, is_key, &self.parser_factories)
     }
     /// Opens an assignment-owned, single-writer transform chain with explicit process date defaults.
     /// It opens each referenced predicate once in first-use order, then opens the transforms in declaration order.

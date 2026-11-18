@@ -10,7 +10,6 @@ mod collections;
 mod decode;
 #[cfg(test)]
 mod window;
-#[cfg(test)]
 pub(in crate::connect) mod symbols;
 
 #[cfg(test)]

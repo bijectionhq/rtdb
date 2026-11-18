@@ -31,7 +31,10 @@ impl SchemaStringFactory {
         if self.symbols.factory().profile != buffers.profile() {
             return Err(Anomaly::unsupported("rtdb/avro-reader-buffer-profile", "Factory and captured recycler source profiles differ"));
         }
-        let mut session = Session::open(&self.symbols, text, buffers, context)?;
+        let mut session = match Session::open(&self.symbols, text, buffers, context) {
+            Ok(session) => session,
+            Err(cause) => { buffers.abandon(); return Err(cause); }
+        };
         let result = (|| {
             let tree = syntax::tree(&mut session, intern, context)?;
             if tree.is_none() { session.close(buffers, context)?; }
@@ -108,6 +111,7 @@ impl SchemaStringFactory {
 struct Session<'a> { input: Option<StringInput<'a>>, child: Option<ChildSymbols>, closed: bool }
 impl<'a> Session<'a> {
     fn open(symbols: &Arc<ReaderSymbols>, text: JavaText<'a>, buffers: &mut dyn InputBuffers, context: &mut ConversionContext) -> Result<Self> {
+        buffers.acquire(context)?;
         if text.len_units() <= DIRECT_STRING_LIMIT {
             let buffer = buffers.take(text.len_units(), context)?;
             let input = StringInput::direct(text, buffer)?;
@@ -128,9 +132,13 @@ impl<'a> Session<'a> {
     fn close(&mut self, buffers: &mut dyn InputBuffers, context: &mut ConversionContext) -> Result<()> {
         if self.closed { return Ok(()); }
         self.closed = true;
-        if let Some(child) = self.child.take() { child.release(context).map_err(symbol_error)?; }
-        if let Some(input) = self.input.take() { buffers.give(input.into_buffer(), context)?; }
-        Ok(())
+        let result = (|| {
+            if let Some(child) = self.child.take() { child.release(context).map_err(symbol_error)?; }
+            if let Some(input) = self.input.take() { buffers.give(input.into_buffer(), context)?; }
+            buffers.close(context)
+        })();
+        if result.is_err() { buffers.abandon(); }
+        result
     }
 }
 fn symbol_error(cause: Failure) -> Anomaly {
