@@ -1,4 +1,4 @@
-use std::{ops::Range, sync::Arc};
+use std::sync::Arc;
 use rtdb_plan::{ControlCommitMode, ControlStatement, DiscardTarget};
 use rtdb_types::{AllocationScope, Anomaly, MemoryReservation};
 use crate::lexer::{IndexedLexeme, Kind, ScanError, Span, StreamError};
@@ -7,13 +7,13 @@ use super::{
     ParserState, PredictionError, RuntimeError, RuntimeProblem, RuntimeResult, with_bail_fallback,
 };
 use super::no_viable_report::ListenerDiagnostic;
-use crate::parser::initial_statement::InitialRoot;
+use crate::parser::statement_syntax::StatementRoot;
 
-/// An initial statement syntax report holding its listener allocation until drop.
+/// A statement syntax report from the original grammar's listener, holding its allocation until drop.
 #[derive(Debug)]
-pub struct InitialStatementDiagnostic(ListenerDiagnostic);
+pub struct StatementSyntaxDiagnostic(ListenerDiagnostic);
 
-impl InitialStatementDiagnostic {
+impl StatementSyntaxDiagnostic {
     /// Borrows the incorrect `xtdb/sql-error` anomaly with the listener’s text and empty context.
     pub fn anomaly(&self) -> &Anomaly { &self.0.anomaly }
 
@@ -154,20 +154,19 @@ impl DirectControlError {
 }
 
 impl ParserEnvironment {
-    pub(in crate::parser) fn initial_statement_diagnostic(
-        &mut self, source: &str, span: &Range<usize>, root: InitialRoot, work: &AllocationScope,
-    ) -> rtdb_types::Result<Option<InitialStatementDiagnostic>> {
+    pub(in crate::parser) fn statement_syntax_diagnostic(
+        &mut self, source: &str, root: StatementRoot, work: &AllocationScope,
+    ) -> rtdb_types::Result<Option<StatementSyntaxDiagnostic>> {
         let result = with_bail_fallback(self, source, work, |session, _| {
             match root {
-                InitialRoot::Direct => session.direct_sql_statement()?,
-                InitialRoot::Batch => session.multi_sql_statement()?,
+                StatementRoot::Direct => session.direct_sql_statement()?,
+                StatementRoot::Batch => session.multi_sql_statement()?,
             };
             Ok(())
         });
         match result {
-            Err(RuntimeError::ReportedTokenSyntax(report)) if report.is_initial_statement(span) => {
-                Ok(Some(InitialStatementDiagnostic(report.into_listener())))
-            }
+            Err(RuntimeError::ReportedTokenSyntax(report)) => Ok(Some(StatementSyntaxDiagnostic(report.into_listener()))),
+            Err(RuntimeError::ReportedNoViableAlternative(report)) => Ok(Some(StatementSyntaxDiagnostic(report.into_listener()))),
             Err(RuntimeError::Prediction(PredictionError::Admission(error))
                 | RuntimeError::Input(StreamError::Scan(ScanError::Admission(error)))) => Err(error),
             _ => Ok(None),

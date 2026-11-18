@@ -75,6 +75,18 @@ impl Client {
 }
 fn cstring(text: &str) -> Vec<u8> { let mut bytes = text.as_bytes().to_vec(); bytes.push(0); bytes }
 fn tags(frames: &[(u8, Vec<u8>)]) -> Vec<u8> { frames.iter().map(|frame| frame.0).collect() }
+
+fn initial_statement_mismatch(line: usize, column: usize) -> String {
+    format!(
+        "Errors parsing SQL statement:\n  - line {line}:{column} mismatched input 'SELEC' expecting {{'(', 'ASSERT', 'ATTACH', 'BEGIN', 'COMMIT', 'COPY', 'CREATE', 'DELETE', 'DETACH', 'DISCARD', 'ERASE', 'EXECUTE', 'EXPLAIN', 'FROM', 'GRANT', 'INSERT', 'PATCH', 'PREPARE', 'RECORDS', 'REVOKE', 'ROLLBACK', 'SELECT', 'SET', 'SETTING', 'SHOW', 'START', 'UPDATE', 'VALUES', 'WITH', 'XTQL'}}"
+    )
+}
+
+fn error_fields(body: &[u8]) -> (String, String, serde_json::Value) {
+    let field = |tag: u8| body.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(&[tag])).unwrap();
+    let text = |tag: u8| String::from_utf8(field(tag).to_vec()).unwrap();
+    (text(b'C'), text(b'M'), serde_json::from_slice(field(b'D')).unwrap())
+}
 fn rows(frames: &[(u8, Vec<u8>)]) -> Vec<Vec<Option<Vec<u8>>>> {
     frames.iter().filter(|frame| frame.0 == b'D').map(|(_, bytes)| {
         let count = u16::from_be_bytes(bytes[..2].try_into().unwrap()); let mut offset = 2;
@@ -811,17 +823,14 @@ async fn simple_batch_grammar_errors_preserve_transactions_and_reached_errors_fa
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
     let source = "-- début\r\nSELEC 42 /* tail */ ;  ";
-    let normalized = source.strip_suffix(";  ").unwrap();
-    let syntax = rtdb_sql::parse_statement_batch(normalized, &MemoryBudget::new(1 << 20)).unwrap_err();
-    assert_eq!(syntax.context["position"], serde_json::json!(12));
-    assert_eq!(syntax.context["span"], serde_json::json!({"start": 11, "end": 16}));
-    let expected = rtdb_pg_codec::encode_error(&syntax, rtdb_types::PgType::Json).unwrap();
 
     let idle = client.query(source).await;
     assert_eq!(tags(&idle), b"EZ");
     assert_eq!(idle[1].1, b"I");
-    let detail = idle[0].1.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
-    assert_eq!(detail, expected);
+    let (state, message, detail) = error_fields(&idle[0].1);
+    assert_eq!(state, "08P01");
+    assert_eq!(message, initial_statement_mismatch(2, 0));
+    assert_eq!(detail, serde_json::json!({"category": "incorrect", "code": "xtdb/sql-error", "message": message, "data": {"sql": source}}));
 
     let begun = client.query("BEGIN").await;
     assert_eq!(tags(&begun), b"CZ");
@@ -882,20 +891,19 @@ async fn single_range_grammar_error_keeps_an_extended_transaction_open_until_syn
 async fn simple_batch_reports_the_first_statement_grammar_error_after_lexing() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
-    for (source, message, start, end) in [
-        ("SELEC 7; SELECT 1 LIMIT ALL", "SELEC", 0, 5),
-        ("SELECT 1 LIMIT ALL; SELEC 7", "LIMIT requires an unsigned integer or parameter", 15, 18),
-        ("SELEC 7; SELECT @", "Invalid character in SQL source", 16, 17),
+    let limit_all = "Errors parsing SQL statement:\n  - line 1:15 mismatched input 'ALL' expecting {UNSIGNED_INTEGER, POSTGRES_PARAMETER_SPECIFICATION, '?'}".to_owned();
+    for (source, expected) in [
+        ("SELEC 7; SELECT 1 LIMIT ALL", initial_statement_mismatch(1, 0)),
+        ("SELECT 1 LIMIT ALL; SELEC 7", limit_all),
+        ("SELEC 7; SELECT @", initial_statement_mismatch(1, 0)),
     ] {
         let frames = client.query(source).await;
         assert_eq!(tags(&frames), b"EZ");
         assert_eq!(frames[1].1, b"I");
-        let detail = frames[0].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
-        let anomaly: serde_json::Value = serde_json::from_slice(detail).unwrap();
-        assert_eq!(anomaly["code"], "xtdb/sql-error");
-        assert!(anomaly["message"].as_str().unwrap().contains(message));
-        assert_eq!(anomaly["data"]["position"], serde_json::json!(start + 1));
-        assert_eq!(anomaly["data"]["span"], serde_json::json!({"start": start, "end": end}));
+        let (state, message, detail) = error_fields(&frames[0].1);
+        assert_eq!(state, "08P01");
+        assert_eq!(message, expected);
+        assert_eq!(detail, serde_json::json!({"category": "incorrect", "code": "xtdb/sql-error", "message": expected, "data": {"sql": source}}));
     }
     drop(client);
     running.stop().await;

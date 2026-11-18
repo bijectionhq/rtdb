@@ -15,7 +15,7 @@ pub(super) use bail_fallback::{PassError, PassResult, with_bail_fallback};
 
 #[path = "direct_control.rs"]
 mod direct_control;
-pub use direct_control::{ContextualStatementDiagnostic, InitialStatementDiagnostic};
+pub use direct_control::{ContextualStatementDiagnostic, StatementSyntaxDiagnostic};
 pub(in crate::parser) use direct_control::{DirectControlError, DirectControlRecognition};
 
 #[path = "inline_match.rs"]
@@ -44,6 +44,9 @@ mod generated_expr;
 #[path = "generated_names.rs"]
 mod generated_names;
 pub(in crate::parser) use generated_names::is_identifier_token;
+
+#[path = "generated_offset.rs"]
+mod generated_offset;
 
 #[path = "generated_select.rs"]
 mod generated_select;
@@ -171,6 +174,7 @@ pub(super) enum ContextClass {
     BinaryStringLiteral, DateTimeLiteral0, DateLiteral, TimestampLiteral, WithTimeZone, WithoutTimeZone,
     IntervalLiteral0, MultiFieldInterval, SingleFieldInterval,
     CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
+    DynamicParameter, PostgresParameter,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
@@ -189,6 +193,7 @@ impl ContextClass {
             Self::CommonValueExpr0 => 33,
             Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,
             Self::RegularIdentifier | Self::DelimitedIdentifier => 22,
+            Self::DynamicParameter | Self::PostgresParameter => 39,
             Self::IsolationLevelTxMode => 164,
             Self::ReadUncommittedIsolation | Self::ReadCommittedIsolation | Self::RepeatableReadIsolation | Self::SerializableIsolation => 175,
         }

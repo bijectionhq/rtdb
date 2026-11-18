@@ -317,19 +317,17 @@ async fn uploaded_statement_errors_keep_direct_diagnostics_and_allow_the_next_up
 }
 
 #[tokio::test]
-async fn get_schema_keeps_the_existing_later_statement_error_and_span() {
+async fn get_schema_reports_a_later_statement_under_the_direct_grammar() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
     let command = CommandStatementQuery { query: "SELECT 1; SELEC 1".into(), transaction_id: None };
     let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
     let error = client.client.get_schema(request).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
-    assert!(error.message().starts_with("sql parser error: Expected: an SQL statement, found: SELEC "));
+    assert_eq!(error.message(), "Errors parsing SQL statement:\n  - line 1:10 mismatched input 'SELEC' expecting <EOF>");
     let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
     let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
-    assert_eq!(detail["category"], "incorrect");
-    assert_eq!(detail["code"], "xtdb/sql-error");
-    assert_eq!(detail["data"]["span"], serde_json::json!({"start": 10, "end": 15}));
+    assert_eq!(detail, serde_json::json!({"category": "incorrect", "code": "xtdb/sql-error", "message": error.message()}));
     running.stop().await;
 }
 

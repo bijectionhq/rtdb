@@ -14,7 +14,7 @@ impl std::io::Write for MetadataBytes {
 pub(crate) fn status(error: Anomaly) -> Status { status_ref(&error) }
 
 pub(crate) fn initial_prepare_status(source: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Status {
-    match rtdb_sql::initial_statement_diagnostic(source, &error, memory) {
+    match rtdb_sql::statement_syntax_diagnostic(source, &error, memory) {
         Ok(Some(diagnostic)) => status_ref(diagnostic.anomaly()),
         Ok(None) => status(error),
         Err(admission) => status(admission),

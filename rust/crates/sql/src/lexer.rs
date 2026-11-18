@@ -4,7 +4,7 @@ mod vocabulary;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt::{self, Write}, ops::Range, sync::Arc};
+use std::{fmt::{self, Write}, sync::Arc};
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result};
 pub(crate) use vocabulary::{Keyword, Punctuation, keyword};
 pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream, TokenText};
@@ -376,28 +376,6 @@ fn word_or_literal(start: Cursor<'_>, first: char) -> (Kind, Cursor<'_>) {
         if let Some(end) = binary(start) { accepted = (Kind::BinaryString, end); }
     }
     accepted
-}
-
-pub(crate) fn is_first_identifier(source: &str, span: &Range<usize>, memory: &Arc<MemoryBudget>) -> bool {
-    let mut start = Cursor { source: Source(source), position: Position::START };
-    while start.position.byte < span.start {
-        let Some(first) = start.peek() else { return false; };
-        if let Some(end) = simple_trivia_end(start, first) {
-            start = end;
-        } else if start.remaining().starts_with("/*") {
-            // The native comment recognizer owns the grammar's overlapping and nested cases.
-            let Ok(work) = AllocationScope::new(memory) else { return false; };
-            let Ok(token) = Lexer::new(source, &work).next() else { return false; };
-            let actual = token.span();
-            return token.kind() == Kind::Identifier && (actual.start.byte..actual.end.byte) == *span;
-        } else {
-            return false;
-        }
-    }
-    if start.position.byte != span.start { return false; }
-    let Some(first) = start.peek().filter(|&first| identifier_start(first)) else { return false; };
-    let (kind, end) = word_or_literal(start, first);
-    kind == Kind::Identifier && end.position.byte == span.end
 }
 
 fn whitespace(value: char) -> bool { matches!(value, ' ' | '\n' | '\r' | '\t') }

@@ -151,7 +151,8 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 return session.decline_select_call(ORDER_CALL);
             }
             if matches!(session.lookahead_action(MAY_OFFSET)?.number(), 140 | 194 | 228) {
-                return session.decline_select_call(OFFSET_CALL);
+                session.generated_call(OFFSET_CALL)?;
+                session.offset_and_limit()?;
             }
             Ok(())
         })

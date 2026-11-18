@@ -8,7 +8,7 @@ mod closure;
 mod runtime;
 mod adaptive;
 pub(super) use runtime::is_identifier_token;
-pub use runtime::{ContextualStatementDiagnostic, InitialStatementDiagnostic};
+pub use runtime::{ContextualStatementDiagnostic, StatementSyntaxDiagnostic};
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, GrammarError};

@@ -536,7 +536,7 @@ impl From<Anomaly> for SimpleQueryFailure {
 
 impl SimpleQueryFailure {
     fn from_batch(legacy: Anomaly, source: &str, original: &str, memory: &Arc<MemoryBudget>) -> Self {
-        let diagnostic = rtdb_sql::initial_batch_diagnostic(source, &legacy, memory)
+        let diagnostic = rtdb_sql::batch_syntax_diagnostic(source, &legacy, memory)
             .and_then(|report| report.map(|report| report.with_sql_context(original)).transpose());
         match diagnostic {
             Ok(Some(report)) => Self::Statement(report),
