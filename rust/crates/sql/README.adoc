@@ -151,6 +151,11 @@ These are source-grounded assertions; execution and exact diagnostic equivalence
 These sources check binding invariants and do not replace the upstream execution assertions or plan golden comparisons.
 No Rust test, parser invocation, or build has run during Phase 1.
 
+== Character casts
+
+CHAR, VARCHAR, TEXT, BPCHAR and NAME cast to Arrow's variable-length UTF-8 type.
+A parenthesized length after any of these type names is a syntax error.
+
 == Decimal casts
 
 `DECIMAL`, `NUMERIC`, and `DEC` retain existing decimal precision and scale when no precision is supplied.

@@ -13,6 +13,28 @@ impl Catalog for EmptyCatalog {
 }
 
 #[test]
+fn character_type_names_use_variable_length_utf8_and_reject_width_syntax() {
+    let options = PrepareOptions::default();
+    for name in ["CHAR", "VARCHAR", "TEXT", "BPCHAR", "NAME"] {
+        let source = format!("SELECT CAST('a' AS {name}) AS v, 'b'::{name} AS w");
+        assert!(prepare(&source, &EmptyCatalog, &options).is_ok(), "{source}");
+        for source in [
+            format!("SELECT\n 'é'::{name}(10) AS v"),
+            format!("SELECT CAST('é' AS {name}(10)) AS v"),
+            format!("SELECT CAST('é' AS {name}(10) ARRAY) AS v"),
+        ] {
+            let error = parse(&source).unwrap_err();
+            let position = source.find("(10)").unwrap();
+            assert_eq!(error.code, "xtdb/sql-error", "{source}: {error}");
+            assert!(error.message.as_deref().is_some_and(|message| message.contains("mismatched input '('")), "{source}: {error}");
+            assert_eq!(error.context["span"], serde_json::json!({"start": position, "end": position + 1}), "{source}");
+        }
+    }
+    assert!(parse("SELECT CHAR_LENGTH('abc')").is_ok());
+    assert!(sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::GenericDialect {}, "SELECT CAST('é' AS CHAR(10))").is_ok());
+}
+
+#[test]
 fn select_column_labels_follow_expression_provenance_and_sublist_positions() {
     for (source, labels) in [
         (

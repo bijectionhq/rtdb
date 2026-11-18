@@ -50,7 +50,7 @@ impl ReturningClause<'_> {
             if token.token == Token::EOF { break; }
             if parser.consume_token(&Token::Comma) { at_start = false; continue; }
             if ["ALL", "DISTINCT"].iter().any(|keyword| word(Some(&token), keyword)) { return Err(sql_error("RETURNING accepts a select list without a set quantifier", source, token.span)); }
-            let mut item = dialect.checked(parser.parse_select_item()).map_err(|error| sql_error(error.to_string(), source, token.span))?;
+            let mut item = dialect.checked(parser.parse_select_item()).map_err(|error| crate::parse::parser_error(error, source, token.span))?;
             materialized.apply(&mut item)?;
             let wildcard = match &item {
                 ast::SelectItem::Wildcard(options) => {

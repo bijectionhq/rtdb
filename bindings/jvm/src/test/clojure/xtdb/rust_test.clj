@@ -100,6 +100,8 @@
 
 (deftest-original-api original-sql/disallow-slashes-in-delimited-identifiers-3799)
 
+(deftest-original-api original-sql/test-char-type)
+
 (deftest-original-api original-with/disallow-period-specs-on-ctes-3440)
 
 (deftest-original-api original-expr/duration-literal-query)

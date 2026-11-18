@@ -132,11 +132,11 @@ pub use self::teradata::TeradataDialect;
 #[cfg(feature = "derive-dialect")]
 pub use sqlparser_derive::derive_dialect;
 
-use crate::ast::{ColumnOption, Expr, GranteesType, Ident, ObjectNamePart, Statement};
+use crate::ast::{ColumnOption, DataType, Expr, GranteesType, Ident, ObjectNamePart, Statement};
 pub use crate::keywords;
 use crate::keywords::Keyword;
 use crate::parser::{Parser, ParserError};
-use crate::tokenizer::Token;
+use crate::tokenizer::{Token, Word};
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;
@@ -601,6 +601,11 @@ pub trait Dialect: Debug + Any {
     /// e.g. `"""abc"""`
     fn supports_triple_quoted_string(&self) -> bool {
         false
+    }
+
+    /// Resolves type names whose grammar accepts no parenthesized modifiers.
+    fn unparameterized_data_type(&self, _word: &Word) -> Option<DataType> {
+        None
     }
 
     /// Dialect-specific prefix parser override

@@ -58,6 +58,8 @@ pub enum ParserError {
     TokenizerError(String),
     /// Generic parser error with a message.
     ParserError(String),
+    /// Opening parenthesis of modifiers on a type that accepts no modifiers.
+    TypeModifierNotAllowed(Span),
     /// Raised when a recursion depth limit is exceeded.
     RecursionLimitExceeded,
 }
@@ -177,15 +179,12 @@ impl From<TokenizerError> for ParserError {
 
 impl fmt::Display for ParserError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(
-            f,
-            "sql parser error: {}",
-            match self {
-                ParserError::TokenizerError(s) => s,
-                ParserError::ParserError(s) => s,
-                ParserError::RecursionLimitExceeded => "recursion limit exceeded",
-            }
-        )
+        f.write_str("sql parser error: ")?;
+        match self {
+            ParserError::TokenizerError(s) | ParserError::ParserError(s) => f.write_str(s),
+            ParserError::TypeModifierNotAllowed(span) => write!(f, "mismatched input '('{}", span.start),
+            ParserError::RecursionLimitExceeded => f.write_str("recursion limit exceeded"),
+        }
     }
 }
 
@@ -367,6 +366,7 @@ pub struct Parser<'a> {
 /// memoization, so the caches hold no strings.
 #[derive(Debug, Clone, Copy)]
 enum ExprPrefixError {
+    TypeModifierNotAllowed(Span),
     RecursionLimitExceeded,
     Err,
 }
@@ -374,6 +374,7 @@ enum ExprPrefixError {
 impl From<&ParserError> for ExprPrefixError {
     fn from(e: &ParserError) -> Self {
         match e {
+            ParserError::TypeModifierNotAllowed(span) => Self::TypeModifierNotAllowed(*span),
             ParserError::RecursionLimitExceeded => Self::RecursionLimitExceeded,
             _ => Self::Err,
         }
@@ -1774,6 +1775,7 @@ impl<'a> Parser<'a> {
         found: &TokenWithSpan,
     ) -> Result<T, ParserError> {
         match cached {
+            ExprPrefixError::TypeModifierNotAllowed(span) => Err(ParserError::TypeModifierNotAllowed(span)),
             ExprPrefixError::RecursionLimitExceeded => Err(ParserError::RecursionLimitExceeded),
             ExprPrefixError::Err => self.expected_ref("an expression", found),
         }
@@ -12838,8 +12840,18 @@ impl<'a> Parser<'a> {
         let next_token_index = self.get_current_index();
 
         let mut trailing_bracket: MatchedTrailingBracket = false.into();
-        let mut data = match &next_token.token {
-            Token::Word(w) => match w.keyword {
+        let simple_type = match &next_token.token {
+            Token::Word(word) => dialect.unparameterized_data_type(word),
+            _ => None,
+        };
+        let mut data = match (simple_type, &next_token.token) {
+            (Some(data_type), _) => {
+                if self.peek_token_ref().token == Token::LParen {
+                    return Err(ParserError::TypeModifierNotAllowed(self.peek_token_ref().span));
+                }
+                Ok(data_type)
+            }
+            (None, Token::Word(w)) => match w.keyword {
                 Keyword::BOOLEAN => Ok(DataType::Boolean),
                 Keyword::BOOL => Ok(DataType::Bool),
                 Keyword::FLOAT => {
@@ -13248,7 +13260,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             },
-            _ => self.expected_at("a data type name", next_token_index),
+            (None, _) => self.expected_at("a data type name", next_token_index),
         }?;
 
         if self.dialect.supports_array_typedef_with_brackets() {

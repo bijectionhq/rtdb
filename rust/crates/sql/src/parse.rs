@@ -2,7 +2,7 @@ use rtdb_plan::{Identifier, SourceSpan};
 use rtdb_types::{Anomaly, MemoryBudget, Result};
 use std::{ops::ControlFlow, sync::Arc};
 use sqlparser::ast::VisitMut;
-use sqlparser::{ast as ast, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
+use sqlparser::{ast as ast, parser::{Parser, ParserError}, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
 use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
@@ -389,7 +389,7 @@ pub(super) fn parse_statement_syntax<'input>(
         let patch = word(tokens.first(), "PATCH");
         let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
-        let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if patch {
             let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
             if temporal.iter().any(|clause| Some(clause.owner_end) == end && matches!(clause.extent, TemporalExtent::All)) {
@@ -397,19 +397,19 @@ pub(super) fn parse_statement_syntax<'input>(
             }
         }
         if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
-        let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| parser_error(error, sql, slice[0].span))?;
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
         Syntax::Records { patch, table, records }
     } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
         let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
-        let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let table = parser.parse_object_name(false).map_err(|error| parser_error(error, sql, slice[0].span))?;
         let mut columns = Vec::new();
         if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
             loop {
                 columns.push(identifier_token(&parser.next_token())?);
                 if parser.consume_token(&Token::RParen) { break; }
-                parser.expect_token(&Token::Comma).map_err(|error| sql_error(error.to_string(), sql, parser.peek_token().span))?;
+                parser.expect_token(&Token::Comma).map_err(|error| parser_error(error, sql, parser.peek_token().span))?;
             }
         }
         if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
@@ -426,7 +426,7 @@ pub(super) fn parse_statement_syntax<'input>(
         Syntax::Erase(delete)
     } else if word(tokens.first(), "ASSERT") {
         let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[1..].to_vec());
-        let expression = dialect.checked(parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let expression = dialect.checked(parser.parse_expr()).map_err(|error| parser_error(error, sql, slice[0].span))?;
         let message = if parser.consume_token(&Token::Comma) {
             match parser.next_token().token { Token::SingleQuotedString(message) => Some(message), _ => return Err(sql_error("ASSERT message must be a string", sql, slice[0].span)) }
         } else { None };
@@ -457,7 +457,7 @@ pub(super) fn parse_statement_syntax<'input>(
 fn standard(tokens: Vec<TokenWithSpan>, source: &str) -> Result<ast::Statement> {
     let at = tokens.first().map(|token| token.span).unwrap_or_else(Span::empty);
     let dialect = SqlDialect::default();
-    let mut statements = dialect.checked(Parser::new(&dialect).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| sql_error(error.to_string(), source, at))?;
+    let mut statements = dialect.checked(Parser::new(&dialect).with_tokens_with_locations(tokens).parse_statements()).map_err(|error| parser_error(error, source, at))?;
     if statements.len() != 1 { return Err(sql_error("Expected one SQL statement", source, at)); }
     Ok(statements.remove(0))
 }
@@ -512,7 +512,7 @@ pub(crate) fn extract_temporal(tokens: Vec<TokenWithSpan>, source: &str) -> Resu
 pub(crate) fn expression(tokens: &[TokenWithSpan], source: &str, precedence: u8) -> Result<(ast::Expr, usize)> {
     let dialect = SqlDialect::default();
     let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens.to_vec());
-    let expression = dialect.checked(parser.parse_subexpr(precedence)).map_err(|error| sql_error(error.to_string(), source, parser.peek_token().span))?;
+    let expression = dialect.checked(parser.parse_subexpr(precedence)).map_err(|error| parser_error(error, source, parser.peek_token().span))?;
     Ok((expression, parser.index()))
 }
 
@@ -534,6 +534,15 @@ pub(crate) fn source_span(source: &str, span: Span) -> SourceSpan {
         start + source[start.min(source.len())..].chars().take(location.column.saturating_sub(1) as usize).map(char::len_utf8).sum::<usize>()
     };
     SourceSpan { start: offset(span.start), end: offset(span.end) }
+}
+
+pub(crate) fn parser_error(error: ParserError, source: &str, at: Span) -> Anomaly {
+    match error {
+        ParserError::TypeModifierNotAllowed(span) =>
+            sql_error(format!("Errors parsing SQL statement:\n  - line {}:{} mismatched input '('",
+                span.start.line, span.start.column.saturating_sub(1)), source, span),
+        error => sql_error(error.to_string(), source, at),
+    }
 }
 
 pub(crate) fn sql_error(message: impl Into<String>, source: &str, span: Span) -> Anomaly {

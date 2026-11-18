@@ -100,6 +100,17 @@ impl Dialect for SqlDialect {
     fn supports_optional_projection_items(&self) -> bool { true }
     fn supports_single_word_time_zone(&self) -> bool { true }
     fn supports_interval_field_ranges(&self) -> bool { true }
+    fn unparameterized_data_type(&self, word: &Word) -> Option<ast::DataType> {
+        if word.quote_style.is_some() { return None; }
+        match word.keyword {
+            Keyword::CHAR => Some(ast::DataType::Char(None)),
+            Keyword::VARCHAR => Some(ast::DataType::Varchar(None)),
+            Keyword::TEXT | Keyword::NAME => Some(ast::DataType::Text),
+            _ if word.value.eq_ignore_ascii_case("BPCHAR") => Some(ast::DataType::Text),
+            _ => None,
+        }
+    }
+
     fn supports_interval_identifier(&self) -> bool { true }
     fn supports_table_function_syntax(&self) -> bool { false }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {

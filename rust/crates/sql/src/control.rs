@@ -193,8 +193,11 @@ pub(super) fn parse_control_tokens<'input>(
 struct ControlParser<'a> { source: &'a str, tokens: Vec<TokenWithSpan>, index: usize }
 
 impl ControlParser<'_> {
+    fn current_span(&self) -> Span {
+        self.tokens.get(self.index).or_else(|| self.tokens.last()).map_or_else(Span::empty, |token| token.span)
+    }
     fn error(&self, message: impl Into<String>) -> rtdb_types::Anomaly {
-        sql_error(message, self.source, self.tokens.get(self.index).or_else(|| self.tokens.last()).map_or_else(Span::empty, |token| token.span))
+        sql_error(message, self.source, self.current_span())
     }
     fn eat(&mut self, expected: &str) -> bool {
         if word(self.tokens.get(self.index), expected) { self.index += 1; true } else { false }
@@ -237,7 +240,8 @@ impl ControlParser<'_> {
         let dialect = crate::dialect::SqlDialect::default();
         let mut parser = Parser::new(&dialect).with_recursion_limit(CONTROL_EXPRESSION_RECURSION_LIMIT)
             .with_tokens_with_locations(self.tokens[self.index..].to_vec());
-        let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
+        let expression = dialect.checked(parser.parse_expr())
+            .map_err(|error| crate::parse::parser_error(error, self.source, self.current_span()))?;
         self.index += parser.index();
         Ok(expression)
     }
