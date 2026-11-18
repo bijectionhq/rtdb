@@ -1,6 +1,7 @@
 mod store;
 mod support;
 pub(crate) mod as_of_erase;
+pub mod mixed_iid;
 #[cfg(test)] mod noncanonical_iid;
 pub mod recovery;
 

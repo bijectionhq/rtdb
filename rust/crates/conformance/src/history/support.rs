@@ -37,6 +37,9 @@ impl RunningNode {
         Self::open_with_resources(directory, clock, reads, resources, false).await
     }
     pub async fn open_with_resources(directory: &Path, clock: Arc<FixtureClock>, reads: Arc<Reads>, resources: Arc<dyn ResourceFactory>, read_only: bool) -> std::result::Result<Self, Error> {
+        Self::open_configured(directory, clock, reads, resources, read_only, |_| {}).await
+    }
+    pub(super) async fn open_configured(directory: &Path, clock: Arc<FixtureClock>, reads: Arc<Reads>, resources: Arc<dyn ResourceFactory>, read_only: bool, configure: impl FnOnce(&mut NodeOptions)) -> std::result::Result<Self, Error> {
         let mut options = NodeOptions::default();
         options.read_only = read_only;
         options.replication.may_lead = !read_only;
@@ -49,6 +52,7 @@ impl RunningNode {
         options.replication.assertion_interval = Duration::from_millis(10);
         options.replication.flush_timeout = Duration::from_secs(24 * 60 * 60);
         options.replication.election_seed = 42;
+        configure(&mut options);
         let resources = Arc::new(CountingResources { inner: resources, reads });
         let observer = Arc::new(Observer::default());
         let services = NodeServices { resources, clock,
