@@ -235,7 +235,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers, including generic STR, cast and FORMAT with source Date locale and time-zone policy and ExceptionInfo construction state, plus required Path provider environments."
+      "requirement": "Complete the remaining registered object families and their semantic equality, rendering and inspection consumers. Complete semantic STR and cast rendering and the remaining FORMAT shapes, including source Date locale and time-zone policy and the ExceptionInfo construction state used by readable text. Complete required Path provider environments."
     },
     {
       "id": "physical-expression-schedules",
@@ -245,7 +245,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete remaining expression invocation boundaries and source constructor/allocator/bounds environments, existing-inner aliases, Field factories, mutable getter/hint/LongLong, remaining signed Slice operations and mutable-selection aliasing, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree, source scalar declaration/signed write-copy/borrowed-byte foundations and typed Null/stock-Arrow19-enabled-bounds Int initial-count constructors; preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
+      "requirement": "Complete remaining expression invocation boundaries and source constructor/allocator/bounds environments, existing-inner aliases, Field factories, remaining mutable getters and hints, signed Slice operations and mutable-selection aliasing, routed child writer/promotion, recursive copier/relation/full-object/hash and transport integration beyond the reviewed common vector tree and source scalar declaration, signed write-copy and borrowed-byte foundations. Extend signed FixedBinary LongLong beyond the direct and first Slice paths reviewed with Arrow 19 bounds checks. Extend initial-count construction beyond the reviewed typed Null and stock Arrow 19 Int cases. Preserve physical vector null payloads, selected union legs and getter indexes through production execution views, copies and native spilling."
     },
     {
       "id": "sql-grammar-and-literals",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete generated rule and tree schedules beyond the two-profile statement roots, control statements and constant SELECT with numeric expressions, fixed-token scalar literals and aliases, the complete identifier family, isolation and empty-details window paths, and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before Simple Query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
+      "requirement": "Complete generated rule and tree schedules beyond the two-profile statement roots, control statements and constant SELECT with numeric expressions, Boolean and NULL literals, character strings and aliases, the complete identifier family, isolation and empty-details window paths, and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before Simple Query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
@@ -266,7 +266,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer reuse, general ByteBuffer operations, selected readers, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer reuse, general ByteBuffer operations, selected readers, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand and FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
