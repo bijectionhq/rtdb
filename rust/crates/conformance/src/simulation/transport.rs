@@ -6,6 +6,7 @@ use rtdb_format::{envelope::{ReplicaBody, ReplicaEnvelope}, log::proto::NoOp};
 use rtdb_storage::{Error, Result, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, MemoryLog, ReplayHead}, object_store::ReadReservation};
 use rtdb_types::{Term, TermSequence, Timestamp};
 use tokio::sync::{oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 type Durable = oneshot::Sender<Result<LogMetadata>>;
 
@@ -25,11 +26,12 @@ struct BootState {
 pub(super) struct BootTransport {
     replica: Arc<MemoryLog>,
     state: watch::Sender<BootState>,
+    cancellation: CancellationToken,
 }
 
 impl BootTransport {
-    pub fn new(replica: Arc<MemoryLog>) -> Arc<Self> {
-        Arc::new(Self { replica, state: watch::channel(BootState::default()).0 })
+    pub fn new(replica: Arc<MemoryLog>, cancellation: CancellationToken) -> Arc<Self> {
+        Arc::new(Self { replica, state: watch::channel(BootState::default()).0, cancellation })
     }
 
     pub fn actor(self: &Arc<Self>, actor: usize) -> Arc<dyn Log> {
@@ -37,7 +39,10 @@ impl BootTransport {
     }
 
     async fn wait(&self, ready: impl Fn(&BootState) -> bool) -> Result<()> {
-        self.state.subscribe().wait_for(ready).await.map(|_| ()).map_err(|_| invalid("boot monitor closed"))
+        let mut state = self.state.subscribe();
+        self.cancellation.run_until_cancelled(state.wait_for(ready)).await
+            .ok_or_else(|| Error::Closed("Processor simulation stopped".into()))?
+            .map(|_| ()).map_err(|_| invalid("boot monitor closed"))
     }
 
     pub async fn open(&self, actor: usize) -> Result<()> {
@@ -169,7 +174,7 @@ mod tests {
     #[tokio::test]
     async fn accepted_claim_uses_the_provider_only_at_commit_and_refusal_assigns_no_position() {
         let provider = Arc::new(MemoryLog::new(4096));
-        let transport = BootTransport::new(Arc::clone(&provider));
+        let transport = BootTransport::new(Arc::clone(&provider), CancellationToken::new());
         let rejected = transport.actor(1);
         let (attempt, grant) = tokio::join!(rejected.enqueue(claim(), Timestamp(4)), transport.attempt(1));
         assert!(grant.is_ok());

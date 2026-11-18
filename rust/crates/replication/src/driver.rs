@@ -316,8 +316,11 @@ impl ReplicationDriver {
             self.cancellation.cancelled().await;
             return Ok(());
         }
-        let tail = self.logs.replica_tail(self.read_position).await?;
         let cancellation = self.cancellation.clone();
+        if cancellation.is_cancelled() { return Ok(()); }
+        let tail = self.logs.replica_tail(self.read_position).await;
+        if cancellation.is_cancelled() { return Ok(()); }
+        let tail = tail?;
         let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
         self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }

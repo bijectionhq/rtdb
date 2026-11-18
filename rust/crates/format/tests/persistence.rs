@@ -89,6 +89,7 @@ fn old_source_headers_and_empty_flush_requests_remain_ignored() {
     let mut bytes = vec![3];
     bytes.extend(empty_flush.encode_to_vec());
     assert_eq!(SourceMessage::decode(&bytes).unwrap(), None);
+    assert_eq!(SourceMessage::decode_wire(&bytes).unwrap(), empty_flush.message.map(SourceMessage::Protobuf));
     let legacy = vec![0xff, 0xff, 0xff, 0xff, 1, 2, 3];
     assert_eq!(SourceMessage::decode(&legacy).unwrap().unwrap().encode().unwrap(), legacy);
     assert!(SourceMessage::decode(&[]).is_err());

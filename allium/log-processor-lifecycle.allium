@@ -53,6 +53,7 @@ external entity LeaderTerm {
 external entity ReplicaLog {
     -- The database's replica log: the durable, totally-ordered sequence of records a follower replays to build local state, and a leader writes and reads back.
     -- It is also where leadership is settled, and it takes no part in settling it: who leads is a function of its contents, which every reader computes alike.
+    -- A cancelled processor stops after its pending replica-tail open resolves without publishing startup progress.
 }
 
 ------------------------------------------------------------

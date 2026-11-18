@@ -42,16 +42,19 @@ impl SourceMessage {
 
     /// Legacy transaction bytes include their 0xff header.
     pub fn decode(bytes: &[u8]) -> Result<Option<Self>> {
+        Ok(Self::decode_wire(bytes)?.filter(|message| !matches!(message,
+            Self::Protobuf(SourceBody::FlushBlock(block)) if block.expected_block_idx.is_none())))
+    }
+
+    /// Decodes the stored message before applying the source log reader's processing rules.
+    pub fn decode_wire(bytes: &[u8]) -> Result<Option<Self>> {
         let (&header, payload) = bytes.split_first().ok_or_else(|| invalid("Empty source message"))?;
         match header {
             LEGACY_TX_HEADER => Ok(Some(Self::LegacyTransaction(bytes.to_vec()))),
             LEGACY_FLUSH_HEADER => Ok(None),
             PROTOBUF_LOG_HEADER => {
                 let decoded = SourceLogMessage::decode(payload).map_err(|error| invalid(error.to_string()))?;
-                match decoded.message {
-                    Some(SourceBody::FlushBlock(ref block)) if block.expected_block_idx.is_none() => Ok(None),
-                    body => Ok(body.map(Self::Protobuf)),
-                }
+                Ok(decoded.message.map(Self::Protobuf))
             }
             _ => Err(invalid(format!("Unknown source message header: {header}"))),
         }

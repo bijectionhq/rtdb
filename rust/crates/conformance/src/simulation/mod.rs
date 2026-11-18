@@ -99,8 +99,8 @@ impl Trial {
         let source = Arc::new(MemoryLog::new(4 * 1024 * 1024));
         let replica = Arc::new(MemoryLog::new(4 * 1024 * 1024));
         let store = Arc::new(MemoryStore::default());
-        let transport = BootTransport::new(Arc::clone(&replica));
         let cancellation = CancellationToken::new();
+        let transport = BootTransport::new(Arc::clone(&replica), cancellation.clone());
         let initial = Timestamp(tape.claim_time());
         let clock: ReplicationClock = Arc::new(move || initial);
         let mut actors = Vec::new();
@@ -236,7 +236,7 @@ async fn scenario(
                 let actual = range.next(ReadReservation::new(bytes, memory.reserve(bytes)?)).await?
                     .ok_or("native source receipt did not identify a durable record")?;
                 if actual.metadata.offset.0 != position.0 || actual.metadata.timestamp.0 != micros(*time).unwrap()
-                    || !matches!(SourceMessage::decode(&actual.payload)?,
+                    || !matches!(SourceMessage::decode_wire(&actual.payload)?,
                         Some(SourceMessage::Protobuf(SourceBody::FlushBlock(FlushBlock { expected_block_idx: None }))))
                 {
                     return Err("a native source record differs from its recorded absent-expectation flush".into());
@@ -424,8 +424,9 @@ mod tests {
         let mut observed = Vec::new();
         let mut current = None;
         let result = trial.run(&tape, &mut observed, &mut current).await;
-        assert!(trial.shutdown().await.is_empty());
-        let summary = result.unwrap();
+        let failures = trial.shutdown().await;
+        let summary = result.unwrap_or_else(|error| panic!("Replay at sequence {current:?} failed: {error}; shutdown: {failures:?}"));
+        assert!(failures.is_empty(), "{failures:?}");
         assert_eq!(observed[1]["reference_sequence"], 1);
         assert_eq!(observed[1]["observation"]["kind"], "source_flush_durable");
         assert_eq!(observed[4]["observation"]["kind"], "claim_refused");
@@ -452,9 +453,18 @@ mod tests {
         let mut trial = Trial::open(&tape).await.unwrap();
         let mut observed = Vec::new();
         let mut current = None;
-        assert!(trial.run(&tape, &mut observed, &mut current).await.is_err());
-        assert_eq!(current, Some(12));
-        assert!(trial.shutdown().await.is_empty());
+        let error = trial.run(&tape, &mut observed, &mut current).await.unwrap_err();
+        let failures = trial.shutdown().await;
+        assert_eq!(current, Some(12), "Replay failed: {error}; shutdown: {failures:?}");
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_processors_waiting_for_their_first_tail() {
+        let trial = Trial::open(&fixture()).await.unwrap();
+        tokio::task::yield_now().await;
+        let failures = trial.shutdown().await;
+        assert!(failures.is_empty(), "{failures:?}");
     }
 
     #[test]
