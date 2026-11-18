@@ -915,6 +915,8 @@ impl<'a> Tokenizer<'a> {
     ///
     /// When true (default) the tokenizer unescapes literal values
     /// (for example, `""` in SQL is unescaped to the literal `"`).
+    /// Dialects can preserve doubled quoted identifier delimiters through
+    /// [`Dialect::preserves_doubled_identifier_delimiters`].
     ///
     /// When false, the tokenizer provides the raw strings as provided
     /// in the query.  This can be helpful for programs that wish to
@@ -2433,8 +2435,7 @@ impl<'a> Tokenizer<'a> {
                 if chars.peek() == Some(&quote_end) {
                     chars.next();
                     s.push(ch);
-                    if !self.unescape {
-                        // In no-escape mode, the given query has to be saved completely
+                    if !self.unescape || self.dialect.preserves_doubled_identifier_delimiters() {
                         s.push(ch);
                     }
                 } else {

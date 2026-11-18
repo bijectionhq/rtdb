@@ -22,3 +22,6 @@ Each ordinary line or block comment occupies one token with its original locatio
 Block comments retain their dialect-specific nesting and end-of-input diagnostics.
 Full SQL tokenization retains original comment text.
 Dialect-enabled optimizer hints still expand, preserving text in any comment tokens they emit.
+
+RTDB preserves doubled double-quote and backtick delimiters when the tokenizer reads a quoted identifier.
+String literals use the dialect's existing unescape rules.

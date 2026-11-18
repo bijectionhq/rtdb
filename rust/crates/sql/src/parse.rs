@@ -293,7 +293,7 @@ fn tokenize_into(
     mut append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
 ) -> Result<()> {
     let mut invalid_token = None;
-    let result = tokenizer.try_tokenize_with_location_into_buf(tokens, |tokens, mut token| {
+    let result = tokenizer.try_tokenize_with_location_into_buf(tokens, |tokens, token| {
         if invalid_token.is_none() {
             let invalid = match &token.token {
                 Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),
@@ -302,13 +302,6 @@ fn tokenize_into(
                 _ => None,
             };
             if let Some((message, span)) = invalid { invalid_token = Some(sql_error(message, source, span)); }
-        }
-        if let Token::Word(word) = &mut token.token {
-            match word.quote_style {
-                Some('"') if word.value.contains('"') => word.value = word.value.replace('"', "\"\""),
-                Some('`') if word.value.contains('`') => word.value = word.value.replace('`', "``"),
-                _ => {},
-            }
         }
         append(tokens, token)
     });
@@ -532,4 +525,39 @@ pub(crate) fn source_span(source: &str, span: Span) -> SourceSpan {
 pub(crate) fn sql_error(message: impl Into<String>, source: &str, span: Span) -> Anomaly {
     let span = source_span(source, span);
     Anomaly::incorrect("xtdb/sql-error", message).with_context("position", serde_json::json!(span.start + 1)).with_context("span", serde_json::json!({"start":span.start,"end":span.end}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::GenericDialect;
+
+    #[test]
+    fn both_tokenizer_paths_keep_quoted_identifier_spelling_and_literal_unescaping() {
+        let source = r#""é""😀", `a````b`, 'x''y'"#;
+        let full = tokenize(source).unwrap();
+        let mut boundary = Vec::new();
+        tokenize_boundaries_into(source, &mut boundary, |tokens, token| {
+            tokens.push(token);
+            Ok(())
+        }).unwrap();
+        assert_eq!(full, boundary);
+        let identifier = |index: usize, text: &str, delimiter: char| {
+            let TokenWithSpan { token: Token::Word(word), span } = &full[index] else { panic!("quoted identifier") };
+            assert_eq!(word.value, text);
+            assert_eq!(word.quote_style, Some(delimiter));
+            let span = source_span(source, *span);
+            assert_eq!(&source[span.start + 1..span.end - 1], text);
+        };
+        identifier(0, "é\"\"😀", '"');
+        identifier(3, "a````b", '`');
+        assert!(matches!(&full[6].token, Token::SingleQuotedString(text) if text == "x'y"));
+
+        let dialect = GenericDialect {};
+        let vendor_default = Tokenizer::new(&dialect, source).tokenize_with_location().unwrap();
+        assert_eq!(vendor_default[0].span, full[0].span);
+        assert!(matches!(&vendor_default[0].token, Token::Word(word) if word.value == "é\"😀"));
+        assert!(matches!(&vendor_default[3].token, Token::Word(word) if word.value == "a``b"));
+        assert_eq!(vendor_default[6], full[6]);
+    }
 }

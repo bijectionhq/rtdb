@@ -219,6 +219,12 @@ pub trait Dialect: Debug + Any {
         ch == '"' || ch == '`'
     }
 
+    /// Keeps both characters of a doubled identifier delimiter in the token value, including in unescape mode.
+    /// The default is `false`.
+    fn preserves_doubled_identifier_delimiters(&self) -> bool {
+        false
+    }
+
     /// Determine if a character starts a potential nested quoted identifier.
     /// Example: RedShift supports the following quote styles to all mean the same thing:
     /// ```sql
