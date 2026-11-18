@@ -120,8 +120,9 @@
         (serde/->TxKey (get result "tx_id") (time/->instant (get result "system_time")))))))
 
 (defn- connect ^NativeConnection [^NativeDatabase node {:keys [database]}]
-  (.connect node
-            (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb")))
+  (err/wrap-anomaly {}
+    (.connect node
+              (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb"))))
 
 (defn- logical-arguments [args]
   (if (sequential? args)

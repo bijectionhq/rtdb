@@ -147,6 +147,7 @@
   (with-redefs [rust/plan (observing :native @#'rust/plan)
                 rust/transact (observing :native @#'rust/transact)
                 rust/execute-set! (observing :native @#'rust/execute-set!)
+                rust/connect (observing :native @#'rust/connect)
                 tu/with-node native-with-node
                 xtn/start-node (observing :native-node native-start-node)]
     (binding [tu/*query-ra-executor* (observing :native native-query-ra)

@@ -74,6 +74,14 @@
     (is (= [{:xt/id 1}] (xt/q connection "SELECT _id FROM docs")))
     (is (thrown? xtdb.api.error.Incorrect (xt/q connection "SELECT 1" {:database :other})))))
 
+(deftest api-adbc-test-node-rejects-an-unknown-database-as-incorrect
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (anomalous? [:incorrect nil "Unknown database: no_such_db"]
+                    (xt/execute-tx node [[:put-docs :docs {:xt/id 1}]] {:database :no-such-db})))
+    (is (anomalous? [:incorrect nil "Unknown database: no_such_db"]
+                    (xt/q node "SELECT 1" {:database :no-such-db})))))
+
 (deftest api-adbc-test-preserves-nil-vs-present-empty-sql-batch
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]
