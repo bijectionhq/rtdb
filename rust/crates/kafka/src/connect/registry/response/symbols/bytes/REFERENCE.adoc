@@ -93,6 +93,9 @@ link:sources.json[The source manifest] pins the inspected table, factory, UTF8 p
 Both pinned table implementations were read in full.
 The long-hash literals and collision family are source-expression fixture data, not executed native or Java output.
 The family [0,0,0,index,1000-index] has an equal long hash for index 0 through 1000 because its final two nonnegative folded terms have the same sum.
+Running the seed-7 family against Jackson 2.16.0 and 2.21.7 with default factory flags produces the same transitions.
+The insertion at index 21 first grows the table to 128 buckets and leaves the long-quad cursor at 1134.
+The insertion at index 529 fails with 529 completed entries, 2048 buckets and the spill cursor advanced to 16384.
 
 Twenty additive unexecuted source fixture functions cover empty/short/long names, actual padded UTF8 spellings, unmatched units, all four hash shapes, each collision area, copy-on-write, current/stale publication, threshold bypass, repeated interning and its failure, full-spill source prefix, long storage and signed bounds, max-size clearing, the source consistency guard, reuse limits, copy/long-growth admission and authority poison, and retained lease survival.
 The consistency-guard fixture injects the corrupt count needed to reach that defensive source branch.

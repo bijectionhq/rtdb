@@ -209,11 +209,11 @@ fn spill_resize_interns_the_incoming_name_before_existing_names_in_slot_order() 
         let root = ByteSymbols::new(factory(profile), context).unwrap();
         let mut child = root.child(context).unwrap();
         let mut intern = Intern::default();
-        for index in 0..14 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
+        for index in 0..22 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
         assert_eq!(private(&child).size, 128);
-        let expected: Vec<_> = (0..14).chain(0..13).map(|index| format!("c{index}").encode_utf16().collect::<Vec<_>>()).collect();
+        let expected: Vec<_> = (0..22).chain(0..21).map(|index| format!("c{index}").encode_utf16().collect::<Vec<_>>()).collect();
         assert_eq!(intern.names, expected);
-        for index in 0..14 { is(&child.find(&colliding(index)).unwrap().unwrap(), &format!("c{index}")); }
+        for index in 0..22 { is(&child.find(&colliding(index)).unwrap().unwrap(), &format!("c{index}")); }
     });
 }
 
@@ -222,14 +222,14 @@ fn failure_during_rehash_interning_poison_drops_the_unpublished_prefix() {
     run(|profile, context| {
         let root = ByteSymbols::new(factory(profile), context).unwrap();
         let mut child = root.child(context).unwrap();
-        let mut intern = Intern { fail_at: Some(15), ..Intern::default() };
-        for index in 0..13 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
-        let candidate = name("c13", context);
-        match child.add(Quads::new(&colliding(13)).unwrap(), candidate, &mut intern, context) {
+        let mut intern = Intern { fail_at: Some(23), ..Intern::default() };
+        for index in 0..21 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
+        let candidate = name("c21", context);
+        match child.add(Quads::new(&colliding(21)).unwrap(), candidate, &mut intern, context) {
             Err(Failure::Native(cause)) => assert_eq!(cause.code, "fixture/byte-intern"), _ => panic!("expected exact interning failure"),
         }
-        assert_eq!(intern.names[13], "c13".encode_utf16().collect::<Vec<_>>());
-        assert_eq!(intern.names[14], "c0".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(intern.names[21], "c21".encode_utf16().collect::<Vec<_>>());
+        assert_eq!(intern.names[22], "c0".encode_utf16().collect::<Vec<_>>());
         assert!(matches!(child.find(&colliding(0)), Err(Failure::Poisoned)));
         assert_eq!(child.release(context).unwrap(), Release::Poisoned);
         assert!(root.child(context).unwrap().find(&colliding(0)).unwrap().is_none());
@@ -242,19 +242,19 @@ fn large_spill_overflow_preserves_its_mutated_cursor_and_releasable_source_prefi
         let root = ByteSymbols::new(factory(profile), context).unwrap();
         let mut child = root.child(context).unwrap();
         let mut intern = Intern::default();
-        for index in 0..273 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
-        let candidate = name("c273", context);
-        match child.add(Quads::new(&colliding(273)).unwrap(), candidate, &mut intern, context) {
-            Err(Failure::CollisionOverflow { count, size }) => { assert_eq!(count, 273); assert_eq!(size, 2048); }
+        for index in 0..529 { add(&mut child, &colliding(index), &format!("c{index}"), &mut intern, context); }
+        let candidate = name("c529", context);
+        match child.add(Quads::new(&colliding(529)).unwrap(), candidate, &mut intern, context) {
+            Err(Failure::CollisionOverflow { count, size }) => { assert_eq!(count, 529); assert_eq!(size, 2048); }
             _ => panic!("expected source collision failure"),
         }
         assert_eq!(private(&child).spill_end, 2048 * 8);
-        assert_eq!(intern.names.len(), 559);
-        assert!(child.find(&colliding(273)).unwrap().is_none());
+        assert_eq!(intern.names.len(), 1063);
+        assert!(child.find(&colliding(529)).unwrap().is_none());
         assert_eq!(child.release(context).unwrap(), Release::Published);
         let later = root.child(context).unwrap();
-        is(&later.find(&colliding(272)).unwrap().unwrap(), "c272");
-        assert!(later.find(&colliding(273)).unwrap().is_none());
+        is(&later.find(&colliding(528)).unwrap().unwrap(), "c528");
+        assert!(later.find(&colliding(529)).unwrap().is_none());
     });
 }
 
@@ -263,11 +263,11 @@ fn long_quad_growth_keeps_prior_offsets_and_rehash_copies_all_quads() {
     run(|profile, context| {
         let mut table = Table::new(64, 512, 128, context).unwrap();
         let mut intern = Intern::default();
-        for index in 0..14 { super::add(&mut table, &colliding(index), name(&format!("l{index}"), context), factory(profile), &mut intern, context).unwrap(); }
+        for index in 0..22 { super::add(&mut table, &colliding(index), name(&format!("l{index}"), context), factory(profile), &mut intern, context).unwrap(); }
         assert_eq!(table.size, 128);
         assert!(table.area.values.len() > table.size * 8);
-        for index in 0..14 { is(&table.find(&colliding(index), hash(7, &colliding(index))).unwrap().text, &format!("l{index}")); }
-        assert_eq!(table.long_end, table.size * 8 + 14 * 5);
+        for index in 0..22 { is(&table.find(&colliding(index), hash(7, &colliding(index))).unwrap().text, &format!("l{index}")); }
+        assert_eq!(table.long_end, table.size * 8 + 22 * 5);
     });
 }
 
