@@ -187,7 +187,8 @@ fn exact_utf16_datum_survives_runtime_input_and_construction_context_drop() {
     let wrapper = context.reserve(size_of::<AvroDatumPlan>().checked_mul(16).unwrap() + 4096).unwrap();
     let datum = Arc::new(datum);
     let connect = datum.connect_plan(None, None, &mut 0, &mut context).unwrap();
-    assert_eq!(connect.connect.resolved().doc.as_deref(), Some("😀"));
+    assert_eq!(connect.connect.resolved().doc, None);
+    assert_eq!(connect.connect.resolved().parameters.get("io.confluent.connect.avro.record.doc").map(String::as_str), Some("😀"));
     drop(root);
     drop(reference);
     drop(runtime);

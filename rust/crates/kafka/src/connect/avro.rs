@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use apache_avro::Schema;
-use rtdb_types::{DecimalValue, Result, Value};
+use rtdb_types::{Anomaly, DecimalValue, Result, Value};
 use super::{ConnectData, ConnectSchema, ConversionContext, SchemaKind, error};
 mod metadata;
 mod graph;
@@ -75,6 +75,28 @@ impl AvroPlan {
         self.convert(self.datum.decode_datum(bytes, context)?, &mut 0, context)
     }
 }
+/// Java's `Schema.Parser` accepts any reference text, but only named declarations enter the shared name table.
+/// The native list parser requires an object per reference, so texts that declare no names are dropped here.
+fn naming_references(references: Vec<String>) -> Result<Vec<String>> {
+    fn declares_names(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(_) => true,
+            serde_json::Value::Array(items) => items.iter().any(declares_names),
+            _ => false,
+        }
+    }
+    let mut named = Vec::with_capacity(references.len());
+    for text in references {
+        let value: serde_json::Value = serde_json::from_str(&text).map_err(|cause| error("avro-schema", cause))?;
+        match value {
+            serde_json::Value::Object(_) => named.push(text),
+            serde_json::Value::Array(ref items) if items.iter().any(declares_names) =>
+                return Err(Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-reference", "Union references with inline named declarations are not supported")),
+            _ => {}
+        }
+    }
+    Ok(named)
+}
 impl AvroDatumPlan {
     /// Admits and retains the bounded same-input source/native assembly; Connect graph/default conversion remains a separate stage.
     /// Uses the unregistered LogicalTypes profile; threshold-dependent Fixed Decimal precision reports a required source-math observation.
@@ -129,6 +151,7 @@ impl AvroDatumPlan {
         let references = metadata_references.iter().map(|text| physical_logical_types(text)).collect::<Result<Vec<_>>>()?;
         let text = without_field_defaults(&text)?;
         let references = references.iter().map(|text| without_field_defaults(text)).collect::<Result<Vec<_>>>()?;
+        let references = naming_references(references)?;
         let (mut root, mut references) = match policy {
             None => Schema::parse_str_with_list(&text, &references),
             Some(policy) => Schema::parse_str_with_list_with_name_policy(&text, &references, policy),
@@ -486,6 +509,16 @@ fn decimal_value_at_scale(bytes: Vec<u8>, scale: i32) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn references_that_declare_no_names_parse_like_java_and_inline_union_declarations_are_rejected() {
+        let root = r#"{"type":"record","name":"Event","fields":[{"name":"child","type":"Child"}]}"#;
+        let child = r#"{"type":"record","name":"Child","fields":[{"name":"value","type":"long"}]}"#.to_string();
+        let plan = AvroDatumPlan::parse(root, &["\"long\"".into(), r#"["null","string"]"#.into(), child], &BTreeMap::new()).unwrap();
+        assert!(plan.names.contains_key("Child"));
+        let inline = r#"["null",{"type":"record","name":"Child","fields":[]}]"#.to_string();
+        let Err(failure) = AvroDatumPlan::parse(r#""long""#, &[inline], &BTreeMap::new()) else { panic!("inline union reference parsed") };
+        assert_eq!(failure.code, "xtdb.kafka-connect-source/unsupported-avro-reference");
+    }
     #[test]
     fn scrub_invalid_names_preserves_ingested_connect_names_and_ascii_fields() {
         let schema = r#"{"type":"record","name":"wire.Event","connect.name":"connect.name-with spaces","fields":[{"name":"field_1","type":"long"},{"name":"nested","type":{"type":"record","name":"Child","connect.name":"1 child","fields":[{"name":"_value","type":"string"}]}}]}"#;

@@ -217,7 +217,7 @@ fn retained_document_keeps_empty_reference_slots_and_metadata_capacity_after_con
     assert!(8 * serialized_size(&root).unwrap() < reference_slots);
     let converter = converter("http://registry.invalid".into());
     let memory = MemoryBudget::new(1 << 24); let mut context = ConversionContext::new(Arc::clone(&memory));
-    let document = converter.finish_document(ResolvedSchema { root, references: ResolvedReferences::default() }, "events-value".into(), 1, &mut context).unwrap();
+    let document = converter.finish_document(ResolvedSchema { root, references: ResolvedReferences::default() }, crate::connect::registry::DocumentPlan::Json, "events-value".into(), 1, &mut context).unwrap();
     drop(converter); drop(context);
     assert_eq!(memory.used_bytes(), document.charge.bytes());
     assert!(document.charge.bytes() >= reference_slots + metadata_slots);

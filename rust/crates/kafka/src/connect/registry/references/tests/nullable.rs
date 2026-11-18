@@ -136,7 +136,7 @@ fn retained_document_charges_null_slots_and_spare_capacity_even_when_empty_lists
         else { assert_eq!(value["references"], json!([null])); }
         let converter = converter("http://registry.invalid".into());
         let memory = MemoryBudget::new(1 << 24); let mut context = ConversionContext::new(Arc::clone(&memory));
-        let document = converter.finish_document(ResolvedSchema { root, references: ResolvedReferences::default() }, "events-value".into(), 1, &mut context).unwrap();
+        let document = converter.finish_document(ResolvedSchema { root, references: ResolvedReferences::default() }, crate::connect::registry::DocumentPlan::Json, "events-value".into(), 1, &mut context).unwrap();
         drop(converter); drop(context);
         assert_eq!(memory.used_bytes(), document.charge.bytes());
         assert!(document.charge.bytes() >= slots);
