@@ -6,7 +6,7 @@
   "areas": {
     "types_columnar_durable_formats": {
       "status": "pending",
-      "conclusion": "The final source review must reconcile type, Arrow, durable-codec and registered-object coverage with the reviewed design.",
+      "conclusion": "A captured direct FixedBinary vector supplies retained buffers and signed layout to a UUID reader. The final source review must reconcile type, Arrow, durable-codec and registered-object coverage with the reviewed design.",
       "implementation_paths": [
         "rust/crates/types/src/lib.rs",
         "rust/crates/columnar/src/lib.rs",
@@ -19,7 +19,7 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Live appends pass contiguous row indexes through the bulk trie insertion path as a range. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Live appends pass contiguous row indexes through the bulk trie insertion path as a range. System catalog sizing borrows live segments and counts trie entries in place. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/storage/src/cache.rs",
@@ -28,6 +28,7 @@
         "rust/crates/trie/src/memory.rs",
         "rust/crates/query/src/scan.rs",
         "rust/crates/query/src/scan_tasks.rs",
+        "rust/crates/query/src/system.rs",
         "rust/crates/temporal/src/lib.rs",
         "rust/crates/maintenance/src/merge.rs"
       ]
@@ -78,12 +79,14 @@
     },
     "client_operational_surfaces": {
       "status": "pending",
-      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present; the final public-entry and configuration review is pending.",
+      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. The final public-entry and configuration review is pending.",
       "implementation_paths": [
         "rust/crates/node/src/runtime.rs",
         "rust/crates/pgwire/src/lib.rs",
         "rust/crates/pg-codec/src/lib.rs",
         "rust/crates/flight-sql/src/lib.rs",
+        "rust/crates/flight-sql/src/execute.rs",
+        "rust/crates/flight-sql/src/wire.rs",
         "rust/crates/ffi/src/lib.rs",
         "rust/crates/auth/src/lib.rs",
         "rust/crates/server/src/main.rs",
@@ -94,7 +97,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. A dedicated mixed IID mode copies the original JVM checkpoint, checks native recovery at tick 39 and runs the continuation and wire observers. Full simulation scheduling and assertions, additional paired adapters and full assertion bindings need source completion.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. Version 2 adds the post-join live-index equality with actual operands from all three actors. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. The mixed IID transfer modes verify the closed JVM and native checkpoints, recover the tick-39 basis on the other engine and run the continuation. Separate observers record serialized PostgreSQL and Flight SQL parser failures and same-session follow-up results. Full simulation scheduling and assertions, additional paired adapters and full assertion bindings need source completion.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -110,11 +113,18 @@
         "rust/conformance/replay_log_processor_sim.py",
         "rust/conformance/simulation/LogProcessorTrace.kt",
         "rust/crates/conformance/src/simulation/mod.rs",
+        "rust/crates/conformance/src/simulation/tape.rs",
+        "rust/conformance/run_parser_wire.py",
+        "rust/conformance/jvm/rtdb/conformance/parser_wire.clj",
+        "rust/crates/conformance/src/history/parser_wire.rs",
         "rust/conformance/run_mixed_iid_reference.py",
         "rust/conformance/run_mixed_iid_native.py",
+        "rust/conformance/run_mixed_iid_jvm_replay.py",
+        "rust/conformance/jvm/rtdb/conformance/mixed_iid_replay.clj",
         "rust/conformance/mixed_iid_checkpoint.py",
         "rust/crates/conformance/src/history/mixed_iid.rs",
         "rust/crates/conformance/src/history/mixed_iid/checkpoint.rs",
+        "rust/crates/conformance/src/history/mixed_iid/export.rs",
         "rust/crates/conformance/src/history/mixed_iid/wire.rs",
         "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj",
         "rust/crates/conformance/src/faults.rs"
@@ -268,7 +278,7 @@
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/ffi/src/lib.rs": "297959eca4306d004a509791ac80d52525359582be94cfd236961366d89c7c7c",
-        "rust/crates/node/src/node.rs": "e2637a95f5df22f11e3cf5ad6d305f5cefed7f9f45d891c1a7eec609fecc5f41",
+        "rust/crates/node/src/node.rs": "2a1a0fa99702b83f2f33ded57f540161395e6565e52ef1c6019ac42680abe89d",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
@@ -329,7 +339,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "Complete mutable FixedSizeBinary existing-inner aliases and cross-allocator transfers, pointer use beyond the reviewed borrowed retargeting, ordering and default equality paths, general ByteBuffer operations, remaining indirect-reader operations, transport and production consumers. Preserve signed construction and write-copy behavior, immutable captured FixedBinary adoption into UUID readers, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand, signed explicit selection lookup and receiver-class order, FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
@@ -340,7 +350,7 @@
         "client_operational_surfaces",
         "client_read"
       ],
-      "requirement": "Qualify actual receipts from the paired reference and native embedded observers through the declared-migration comparator. Enforce private native-cache nonescape before production parsing. Qualify exact diagnostic parity and serialized pgwire and Flight results independently of the embedded migration."
+      "requirement": "Qualify actual receipts from the paired reference and native embedded observers through the declared-migration comparator. Enforce private native-cache nonescape before production parsing. Run the serialized pgwire and Flight comparison independently of the embedded migration and reconcile any diagnostic differences it reports."
     },
     {
       "id": "planning-allocation",

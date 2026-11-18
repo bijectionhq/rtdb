@@ -895,7 +895,9 @@ A separate source-native declaration now retains that identity through signed wr
 A first explicit selection borrows signed row indices independently of the source byte region.
 Byte and pointer getters forward the stored signed index after the selector lookup, and the resulting view can outlive the selector.
 LongLong checks the inner receiver class before lookup and reads its eight-byte backing span immediately.
-Existing-inner adoption, complete raw object and ByteBuffer behavior, remaining indirect-reader operations and production transport remain required.
+A UUID reader can adopt the immutable buffers and original append cursors of a direct source FixedBinary capture after admitting its own metadata.
+The retained owners share their buffer leases, and the original remains usable after an admission error.
+Mutable existing-inner aliases, cross-allocator ownership, complete raw object and ByteBuffer behavior, remaining indirect-reader operations and production transport remain required.
 
 Supported embedded SQL preparation can expose a parser through an Incorrect exception's RecognitionException cause.
 That recognizer reaches shared mutable DFA configurations, so listener restrictions alone do not establish that cached keys never change after publication.
@@ -1443,6 +1445,7 @@ The worklists end before metadata reads, and the selected indexes remain charged
 Scan setup traverses borrowed live segments and their leaves in the existing order.
 A live segment whose IID paths all miss still contributes to the priority offset of persisted pages.
 A live append validates its contiguous row range in order and passes the range directly to bulk trie insertion.
+The system cursor borrows its live segments and counts trie catalog entries in place when computing its allocation bound.
 The shared live-index allocations, including sorted live-leaf storage, still require admission work.
 Block production can copy selected leaf rows directly when every live batch matches the captured Arrow layout.
 The fallback rebuilds the page from the captured table schema.
@@ -1454,6 +1457,9 @@ Native control receipts identify the same production executable as the compariso
 The optional historical erase mapping preserves the two original SQL statements and checks each engine's live and later adopted L0 layout at its applied erase transaction.
 Its paired and comparator inputs are present in source.
 The original Gradle invocation, the paired execution and the mismatch result are pending.
+The refused-claim simulator's version 2 tape records the original post-join equality operands for each of the three JVM actors.
+The native trial joins its drivers, derives the expected maximum admitted transaction from durable replica records and reads each retained partition's completed live-index key.
+Version 1 captures retain the boot and authored-input replay scope.
 The mixed-IID JVM recorder selects its original Jovial invocation and keeps each of its 14 assertion observations and corroborating physical file evidence.
 The native fixture runs the same two ingest ranges and rewrites the IID column after closing its first mixed store.
 The comparison source checks serving plain and run-end files plus ordered SQL history, direct IID join and intersection, and PATCH read-back.
@@ -1465,7 +1471,10 @@ The JVM recorder copies each closed store’s local logs and `objects/v06` tree 
 The replay mode checks the original receipt, local logs, block catalogs and every copied compacted rewrite.
 Before submitting tick 40, the reopened native nodes verify the archived source boundary, the replica watermark and the recovered tick-39 transaction.
 Those same nodes run the original continuation and the internal and wire observations.
-Paired execution and native-to-JVM checkpoint handoff remain pending.
+Native capture joins both owners at the same boundary and records the closed file inventories, framed log tips and rewritten Arrow digests.
+The reverse runner verifies both copies and checks each JVM's recovered tick-39 transaction before invoking the original continuation helpers.
+It compares the continuation's typed observations with the independent C84 JUnit receipt.
+Both transfer directions await paired execution.
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
@@ -1481,6 +1490,10 @@ The SQL-logic archive producer copies the observed process records, original inp
 Its archive can retain a completed run with a failed aggregate result.
 Flight SQL GetFlightInfo retains the classified update through argument decoding while the shared session owns execution and transaction buffering.
 Flight SQL reserves memory before classifying the full SQL input and retains a control's estimated parsing and binding allowance through schema preparation or execution.
+Bound parameter fields are converted under a schema allowance that outlives the temporary IPC batch through result schema binding.
+Zero-row arguments retain their field types, and unbound result schema binding borrows the prepared types.
+The wire comparator records both real parser failures and the typed follow-up on each PostgreSQL and Flight SQL session.
+Exact serialized diagnostic and schema comparison remains pending.
 The embedded statement owns an admitted control or reserves its retained SQL text and bulk names before copying them.
 Its old source, plan and arguments survive a failed replacement.
 Pgwire Extended Parse retains an admitted direct control through its prepared statement owner, including a bound portal that outlives registration replacement.
@@ -1510,7 +1523,8 @@ An admission failure reaches ordinary and admin response callers as a resource e
 Earlier cache updates retain their entries, observer notifications and expiry schedules.
 Eligible queries retain their destination when suppression hint admission fails.
 The native topic-info copy path admits its allocation when the client has a byte account.
-Public account construction currently supports producers.
+The SDK's original setter attaches the account to producers.
+An explicit opt-in also attaches the account to consumers, whose receive frames and implemented Metadata owners draw from it.
 Live-topic allocations, other independent clones and admin output need separate admission.
 
 Live Registry HTTP collection borrows bounded windows from the current native response frame and retains the admitted raw body through its final consumer.
