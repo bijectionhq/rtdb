@@ -61,12 +61,11 @@ The node's PostgreSQL TLS configuration does not apply to this endpoint.
 
 GetFlightInfo captures a query's SQL, database, optional parameter IPC, and explicit read basis into the Kotlin-compatible JSON ticket inside `TicketStatementQuery`.
 It keeps the connection borrowed through statement classification, basis capture, and schema preparation against that basis.
-When initial preparation rejects a first unquoted ASCII identifier outside both parser vocabularies, GetFlightInfo can use a matching Direct parser diagnostic.
-GetFlightInfo compares the offending byte range and accepts an extraneous-input or statement-head mismatch report for that first token.
+GetFlightInfo, GetSchema and CreatePreparedStatement use the same selected Direct parser diagnostics for initial preparation.
+When the vendor parser rejects a first unquoted ASCII identifier outside both vocabularies, the frontend compares the byte range and accepts a matching extraneous-input or statement-head mismatch report.
 The gRPC description carries the report’s line, column and message.
 Anomaly metadata includes the message, category `incorrect` and code `xtdb/sql-error` when its encoding fits the 4 KiB limit.
 A Direct parser admission failure after eligibility returns its resource error, and other Direct outcomes retain the original preparation error.
-GetSchema continues to report its vendor parser diagnostic.
 Paired Flight SQL diagnostic execution remains pending.
 DoGet revalidates the redeeming session, waits its visibility barrier, then opens the captured basis through `NativeSession::query_context_at`.
 A ticket remains usable by a different authorized caller.

@@ -237,6 +237,19 @@ async fn bearer_cookie_disagreement_and_replayed_different_basic_header_are_reje
     assert_eq!(integer(&first.query("SELECT 42::bigint AS n").await[0], 0, 0), 42); running.stop().await;
 }
 
+fn assert_initial_sql_diagnostic(error: &Status, diagnostic: &str) {
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let prefix = format!("Errors parsing SQL statement:\n  - line 1:0 {diagnostic} expecting ");
+    assert!(error.message().starts_with(&prefix), "{}", error.message());
+    let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(detail["category"], "incorrect");
+    assert_eq!(detail["code"], "xtdb/sql-error");
+    assert_eq!(detail["message"], error.message());
+    assert!(detail.get("cause").is_none());
+    assert!(detail.get("data").is_none());
+}
+
 #[tokio::test]
 async fn initial_statement_reports_use_direct_parser_anomaly_metadata_on_remote_flight() {
     let running = Running::start(None, FlightConfig::default()).await;
@@ -249,26 +262,45 @@ async fn initial_statement_reports_use_direct_parser_anomaly_metadata_on_remote_
         let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
         let request = client.request(descriptor);
         let error = client.client.get_flight_info(request).await.unwrap_err();
-        assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        let prefix = format!("Errors parsing SQL statement:\n  - line 1:0 {diagnostic} expecting ");
-        assert!(error.message().starts_with(&prefix), "{}", error.message());
-        let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
-        let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
-        assert_eq!(detail["category"], "incorrect");
-        assert_eq!(detail["code"], "xtdb/sql-error");
-        assert_eq!(detail["message"], error.message());
-        assert!(detail.get("cause").is_none());
-        assert!(detail.get("data").is_none());
+        assert_initial_sql_diagnostic(&error, diagnostic);
     }
     assert_eq!(integer(&client.query("SELECT 42::bigint AS answer").await[0], 0, 0), 42);
     running.stop().await;
 }
 
 #[tokio::test]
-async fn get_schema_keeps_the_existing_statement_error_and_span() {
+async fn schema_and_prepare_report_direct_parser_errors_and_keep_the_flight_session() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
-    let command = CommandStatementQuery { query: "SELEC 1".into(), transaction_id: None };
+    for (sql, diagnostic) in [
+        ("SELEC 1", "mismatched input 'SELEC'"),
+        ("extra SELECT 1", "extraneous input 'extra'"),
+    ] {
+        let command = CommandStatementQuery { query: sql.into(), transaction_id: None };
+        let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+        let error = client.client.get_schema(request).await.unwrap_err();
+        assert_initial_sql_diagnostic(&error, diagnostic);
+
+        let request = ActionCreatePreparedStatementRequest { query: sql.into(), transaction_id: None };
+        let error = client.action("CreatePreparedStatement", request.as_any().encode_to_vec().into()).await.unwrap_err();
+        assert_initial_sql_diagnostic(&error, diagnostic);
+    }
+
+    let sql = "SELECT 42::bigint AS answer";
+    let command = CommandStatementQuery { query: sql.into(), transaction_id: None };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let schema = Schema::try_from(client.client.get_schema(request).await.unwrap().into_inner()).unwrap();
+    assert_eq!(schema.fields()[0].name(), "answer");
+    assert_eq!(schema.fields()[0].data_type(), &DataType::Int64);
+    assert!(!client.prepare(sql, None).await.prepared_statement_handle.is_empty());
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn get_schema_keeps_the_existing_later_statement_error_and_span() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let command = CommandStatementQuery { query: "SELECT 1; SELEC 1".into(), transaction_id: None };
     let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
     let error = client.client.get_schema(request).await.unwrap_err();
     assert_eq!(error.code(), tonic::Code::InvalidArgument);
@@ -277,7 +309,7 @@ async fn get_schema_keeps_the_existing_statement_error_and_span() {
     let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
     assert_eq!(detail["category"], "incorrect");
     assert_eq!(detail["code"], "xtdb/sql-error");
-    assert_eq!(detail["data"]["span"], serde_json::json!({"start": 0, "end": 5}));
+    assert_eq!(detail["data"]["span"], serde_json::json!({"start": 10, "end": 15}));
     running.stop().await;
 }
 

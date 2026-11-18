@@ -1,5 +1,6 @@
 use rtdb_format::diagnostics::JsonAnomaly;
-use rtdb_types::{Anomaly, AnomalyCategory};
+use rtdb_types::{Anomaly, AnomalyCategory, MemoryBudget};
+use std::sync::Arc;
 use tonic::{Code, Status};
 struct MetadataBytes(Vec<u8>);
 impl std::io::Write for MetadataBytes {
@@ -12,7 +13,15 @@ impl std::io::Write for MetadataBytes {
 
 pub(crate) fn status(error: Anomaly) -> Status { status_ref(&error) }
 
-pub(crate) fn status_ref(error: &Anomaly) -> Status {
+pub(crate) fn initial_prepare_status(source: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Status {
+    match rtdb_sql::initial_statement_diagnostic(source, &error, memory) {
+        Ok(Some(diagnostic)) => status_ref(diagnostic.anomaly()),
+        Ok(None) => status(error),
+        Err(admission) => status(admission),
+    }
+}
+
+fn status_ref(error: &Anomaly) -> Status {
     let code = match error.category {
         AnomalyCategory::Incorrect => Code::InvalidArgument,
         AnomalyCategory::Forbidden => Code::Unauthenticated,

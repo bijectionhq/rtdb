@@ -9,7 +9,7 @@ use rtdb_query::QueryContext;
 use rtdb_tx::SqlArguments;
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
-use crate::{error::{cancelled, invalid, status, status_ref}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
+use crate::{error::{cancelled, initial_prepare_status, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize }
 impl Service {
@@ -22,7 +22,8 @@ impl Service {
             return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
-        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
+        let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic)
+            .map_err(|error| initial_prepare_status(source, error, &context.memory))?;
         let schema = if prepared.is_dml() { None } else {
             Some(self.parameterized_schema(&prepared, &context, params)?)
         };
@@ -84,13 +85,8 @@ impl Service {
         } else {
             let prepared = {
                 let context = native.prepare_context(&token).await.map_err(status)?;
-                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(|error| {
-                    match rtdb_sql::initial_statement_diagnostic(source, &error, &context.memory) {
-                        Ok(Some(diagnostic)) => status_ref(diagnostic.anomaly()),
-                        Ok(None) => status(error),
-                        Err(admission) => status(admission),
-                    }
-                })?
+                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic)
+                    .map_err(|error| initial_prepare_status(source, error, &context.memory))?
             };
             if prepared.is_dml() {
                 let arguments = decode_arguments()?;
