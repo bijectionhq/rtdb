@@ -221,6 +221,7 @@
 (deftest-original-api original-sql/test-boolean-cast)
 (deftest-original-api original-sql/test-keyword)
 (deftest-original-api original-sql/test-str)
+(deftest-original-api original-sql/select-with-lots-of-commas)
 (deftest-original-api original-sql/null-valid-time-insertion-behaves-as-if-non-specified)
 (deftest-original-api original-sql/forbid-invalid-columns-update)
 (deftest-original-api original-sql/joins-across-polymorphic-data-4061+4078)

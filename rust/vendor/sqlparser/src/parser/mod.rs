@@ -292,6 +292,12 @@ enum ParserState {
     ColumnDefinition,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProjectionPosition {
+    Select,
+    FromPipeline,
+}
+
 /// A SQL Parser
 ///
 /// This struct is the main entry point for parsing SQL queries.
@@ -15133,29 +15139,7 @@ impl<'a> Parser<'a> {
                 if !distinct {
                     let _ = self.parse_keyword(Keyword::ALL);
                 }
-                let mut projection = Vec::new();
-                loop {
-                    if self.peek_keyword(Keyword::SELECT) {
-                        let Some(item) = self.maybe_parse(|p| {
-                            let item = p.parse_select_item()?;
-                            if p.at_from_pipeline_projection_end() || p.peek_token_ref().token == Token::Comma {
-                                Ok(item)
-                            } else {
-                                p.expected_ref("end of projection item", p.peek_token_ref())
-                            }
-                        })? else {
-                            break;
-                        };
-                        projection.push(item);
-                    } else if self.at_from_pipeline_projection_end() {
-                        break;
-                    } else if self.peek_token_ref().token != Token::Comma {
-                        projection.push(self.parse_select_item()?);
-                    }
-                    if !self.consume_token(&Token::Comma) {
-                        break;
-                    }
-                }
+                let projection = self.parse_projection_with_optional_items(ProjectionPosition::FromPipeline)?;
                 tails.push(FromPipelineTail::Select(Box::new(FromPipelineSelect {
                     group_by, having, select_token, distinct, projection,
                 })));
@@ -15171,12 +15155,52 @@ impl<'a> Parser<'a> {
         Ok(FromPipeline { from_token, from, tails, named_window })
     }
 
-    fn at_from_pipeline_projection_end(&mut self) -> bool {
+    fn parse_projection_with_optional_items(&mut self, position: ProjectionPosition) -> Result<Vec<SelectItem>, ParserError> {
+        let leading_wildcard = self.peek_token_ref().token == Token::Mul;
+        let first = if leading_wildcard { Some(self.parse_select_item()?) }
+            else { self.parse_optional_projection_item(position)? };
+        let mut projection: Vec<_> = first.into_iter().collect();
+        while self.consume_token(&Token::Comma) {
+            if self.peek_token_ref().token == Token::Mul {
+                if leading_wildcard {
+                    return self.expected_ref("projection item after leading wildcard", self.peek_token_ref());
+                }
+                projection.push(self.parse_select_item()?);
+                break;
+            }
+            if let Some(item) = self.parse_optional_projection_item(position)? {
+                projection.push(item);
+            }
+        }
+        Ok(projection)
+    }
+
+    fn parse_optional_projection_item(&mut self, position: ProjectionPosition) -> Result<Option<SelectItem>, ParserError> {
+        if position == ProjectionPosition::FromPipeline && self.peek_keyword(Keyword::SELECT) {
+            return self.maybe_parse(|parser| {
+                let item = parser.parse_select_item()?;
+                if parser.at_projection_end(position) || parser.peek_token_ref().token == Token::Comma {
+                    Ok(item)
+                } else {
+                    parser.expected_ref("end of projection item", parser.peek_token_ref())
+                }
+            });
+        }
+        if self.at_projection_end(position) || self.peek_token_ref().token == Token::Comma {
+            Ok(None)
+        } else {
+            self.parse_select_item().map(Some)
+        }
+    }
+
+    fn at_projection_end(&mut self, position: ProjectionPosition) -> bool {
         match &self.peek_token_ref().token {
             Token::EOF | Token::RParen | Token::SemiColon => true,
+            Token::Word(word) if matches!(word.keyword, Keyword::FROM | Keyword::INTO) => position == ProjectionPosition::Select,
+            Token::Word(word) if word.keyword == Keyword::SELECT => position == ProjectionPosition::FromPipeline,
             Token::Word(word) => matches!(
                 word.keyword,
-                Keyword::WHERE | Keyword::GROUP | Keyword::HAVING | Keyword::SELECT |
+                Keyword::WHERE | Keyword::GROUP | Keyword::HAVING |
                 Keyword::WINDOW | Keyword::ORDER | Keyword::OFFSET | Keyword::FETCH |
                 Keyword::LIMIT | Keyword::UNION | Keyword::EXCEPT | Keyword::INTERSECT
             ),
@@ -15328,7 +15352,9 @@ impl<'a> Parser<'a> {
         }
 
         let projection =
-            if self.dialect.supports_empty_projections() && self.peek_keyword(Keyword::FROM) {
+            if self.dialect.supports_optional_projection_items() {
+                self.parse_projection_with_optional_items(ProjectionPosition::Select)?
+            } else if self.dialect.supports_empty_projections() && self.peek_keyword(Keyword::FROM) {
                 vec![]
             } else {
                 self.parse_projection()?

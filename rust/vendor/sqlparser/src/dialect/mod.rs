@@ -638,6 +638,11 @@ pub trait Dialect: Debug + Any {
         self.supports_trailing_commas()
     }
 
+    /// Does the dialect allow empty items in a SELECT projection list?
+    fn supports_optional_projection_items(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports trailing commas in the `FROM` clause of a `SELECT` statement.
     /// Example: `SELECT 1 FROM T, U, LIMIT 1`
     fn supports_from_trailing_commas(&self) -> bool {

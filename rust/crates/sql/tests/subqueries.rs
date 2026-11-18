@@ -80,6 +80,31 @@ async fn array_query_collects_one_column_with_order_duplicates_and_nulls() {
 }
 
 #[tokio::test]
+async fn optional_select_items_preserve_rows_columns_and_wildcard_positions() {
+    assert_eq!(query("SELECT", vec![]).await.unwrap(), [vec![]]);
+    assert!(query("SELECT ,, WHERE FALSE", vec![]).await.unwrap().is_empty());
+    assert_eq!(query("SELECT ,, FROM (VALUES (1)) t(a)", vec![]).await.unwrap(), [vec![]]);
+    for sql in [
+        "SELECT ,,a,,b, FROM (VALUES (1,2)) t(a,b)",
+        "SELECT *,, FROM (VALUES (1,2)) t(a,b)",
+        "SELECT ,* FROM (VALUES (1,2)) t(a,b)",
+        "SELECT ,t.*, FROM (VALUES (1,2)) t(a,b)",
+        "FROM (VALUES (1,2)) t(a,b) SELECT ,,a,,b,",
+    ] {
+        assert_eq!(query(sql, vec![]).await.unwrap(), [vec![Value::I64(1), Value::I64(2)]], "{sql}");
+    }
+    for sql in [
+        "SELECT a,*,b FROM (VALUES (1,2)) t(a,b)",
+        "SELECT ,*, FROM (VALUES (1)) t(a)",
+        "SELECT *,* FROM (VALUES (1)) t(a)",
+        "FROM (VALUES (1)) t(a) SELECT *,*",
+        "SELECT 1 WHERE 1 IN (,1)",
+    ] {
+        assert_eq!(query(sql, vec![]).await.unwrap_err().code, "xtdb/sql-error", "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn array_query_uses_lexical_correlations_and_join_condition_scope() {
     let source = "SELECT v.x, ARRAY(SELECT n FROM (VALUES (2),(1)) t(n) WHERE t.n = v.x) FROM (VALUES (1),(2),(3)) v(x)";
     assert_eq!(query(source, vec![]).await.unwrap(), [

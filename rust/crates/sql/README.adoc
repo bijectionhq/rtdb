@@ -410,6 +410,8 @@ An unparenthesized series call followed by an alias expands to one row per eleme
 A series call without an alias and a parenthesized series call each return one row containing the list.
 Their arguments bind against the preceding FROM scope, permitting correlated series for each preceding row.
 Unnamed table fields retain internal binding identities; wildcard projections assign `_column_1`, `_column_2` and subsequent labels within that wildcard expansion.
+SELECT projection lists may have empty entries, including leading and trailing entries.
+An unqualified wildcard may start the list or end it, and a qualified wildcard follows the ordinary item rules.
 UNNEST uses the same table-column naming contract.
 FROM-first queries with an omitted projection expand the visible wildcard; an explicit empty SELECT projection retains zero-column rows.
 Each FROM-first WHERE or SELECT tail uses the columns produced by the preceding tail.
