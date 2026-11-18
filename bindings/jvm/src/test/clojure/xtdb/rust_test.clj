@@ -70,6 +70,63 @@
 (deftest test-bare-user-keyword
   (run-original-api-case #'original-expr/test-bare-user-keyword))
 
+(deftest test-like-regex-query-case-insensitive
+  (run-original-api-case #'original-expr/test-like-regex-query-case-insensitive))
+
+(deftest test-ilike-query
+  (run-original-api-case #'original-expr/test-ilike-query))
+
+(deftest test-postgres-regex-query
+  (run-original-api-case #'original-expr/test-postgres-regex-query))
+
+(deftest test-reverse-query
+  (run-original-api-case #'original-expr/test-reverse-query))
+
+(deftest test-concat-function-query
+  (run-original-api-case #'original-expr/test-concat-function-query))
+
+(deftest test-position-with-substring
+  (run-original-api-case #'original-expr/test-position-with-substring))
+
+(deftest test-substring-for-length-on-nested-substring
+  (run-original-api-case #'original-expr/test-substring-for-length-on-nested-substring))
+
+(deftest test-length-query
+  (run-original-api-case #'original-expr/test-length-query))
+
+(deftest test-replace
+  (run-original-api-case #'original-expr/test-replace))
+
+(deftest interval-literal-query
+  (run-original-api-case #'original-expr/interval-literal-query))
+
+(deftest test-postgres-session-information-functions
+  (run-original-api-case #'original-expr/test-postgres-session-information-functions))
+
+(deftest test-string-to-array
+  (run-original-api-case #'original-expr/test-string-to-array))
+
+(deftest test-array-upper
+  (run-original-api-case #'original-expr/test-array-upper))
+
+(deftest test-array-lower
+  (run-original-api-case #'original-expr/test-array-lower))
+
+(deftest test-array-length
+  (run-original-api-case #'original-expr/test-array-length))
+
+(deftest test-uri-fns
+  (run-original-api-case #'original-expr/test-uri-fns))
+
+(deftest period-nulls-4315
+  (run-original-api-case #'original-expr/period-nulls-4315))
+
+(deftest test-lateral-with-unnest-4009
+  (run-original-api-case #'original-sql/test-lateral-with-unnest-4009))
+
+(deftest interval-read-write-bug-4066
+  (run-original-api-case #'original-sql/interval-read-write-bug-4066))
+
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]
