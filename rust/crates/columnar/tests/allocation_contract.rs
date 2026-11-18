@@ -156,3 +156,14 @@ fn columnar_and_foundation_budgets_share_the_same_lease_type_and_charge() {
     drop(retained);
     assert_eq!(budget.used_bytes(), 0);
 }
+
+#[test]
+fn wide_sparse_nested_documents_estimate_their_builders_once_per_type_node() {
+    let scalar = |seed: usize| match seed % 3 { 0 => Value::I64(seed as i64), 1 => Value::Utf8(format!("v{seed}")), _ => Value::Bool(seed % 2 == 0) };
+    let nested = |seed: usize, depth: usize| (0..depth).fold(scalar(seed), |value, level| Value::Struct(BTreeMap::from([(format!("n{}_{level}", seed % 7), value)])));
+    let values: Vec<_> = (0..40).map(|doc| Value::Struct((0..12).map(|field| (format!("f{}", (doc * 7 + field) % 60), nested(doc + field, 1 + (doc + field) % 5))).collect())).collect();
+    let logical = LogicalType::join_all(&values.iter().map(Value::logical_type).collect::<Vec<_>>());
+    let bound = estimate_builder_bytes(&logical, &values).unwrap();
+    assert!(bound < 128 << 20, "{bound} bytes estimated for 40 sparse documents");
+    retains_within_bound(logical, values);
+}

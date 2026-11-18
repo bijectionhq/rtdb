@@ -11,20 +11,20 @@ pub fn estimate_builder_bytes(logical: &LogicalType, values: &[Value]) -> Result
 pub fn estimate_builder_bytes_refs<'a>(logical: &LogicalType, values: impl IntoIterator<Item = &'a Value>) -> Result<usize> {
     logical.validate()?;
     let (schema, depth) = schema_cost(logical)?;
-    let mut bytes = multiply(schema, depth)?;
+    let mut bytes = schema;
     let admission = super::values::Admission::new(logical);
     for value in values {
         if !admission.accepts(value) {
             return Err(Anomaly::incorrect("rtdb/column-type-mismatch", "Allocation estimate requires values belonging to the declared logical type"));
         }
         bytes = add(bytes, cell_cost(logical, value)?)?;
-        bytes = add(bytes, multiply(clone_cost(value)?, depth)?)?;
+        bytes = add(bytes, multiply(clone_cost(value)?, value_depth(value).min(depth))?)?;
     }
     multiply(bytes, 4)
 }
 
 fn schema_cost(logical: &LogicalType) -> Result<(usize, usize)> {
-    let mut bytes = 8192;
+    let mut bytes = 1024;
     let mut depth = 1;
     let mut child = |logical: &LogicalType| -> Result<()> {
         let (child_bytes, child_depth) = schema_cost(logical)?;
@@ -47,6 +47,7 @@ fn schema_cost(logical: &LogicalType) -> Result<(usize, usize)> {
 }
 
 fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
+    if matches!(value, Value::Undefined | Value::Null) { return absent_cost(logical); }
     let mut bytes = add(multiply(std::mem::size_of::<Value>(), 2)?, 128)?;
     match logical {
         LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => bytes = add(bytes, cell_cost(inner, value)?)?,
@@ -95,6 +96,32 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
         },
     }
     Ok(bytes)
+}
+
+/// An absent or null cell occupies one null slot in every descendant array and clones no value.
+fn absent_cost(logical: &LogicalType) -> Result<usize> {
+    Ok(match logical {
+        LogicalType::Maybe(inner) | LogicalType::RunEndEncoded { value: inner, .. } => add(16, absent_cost(inner)?)?,
+        LogicalType::Nothing | LogicalType::Null => 16,
+        LogicalType::Scalar(ScalarType::FixedSizeBinary(width)) => add(16, *width as usize)?,
+        LogicalType::Scalar(_) => 48,
+        LogicalType::Struct(fields) => fields.values().try_fold(16, |bytes, field| add(bytes, absent_cost(field)?))?,
+        LogicalType::Union(legs) => add(16, legs.first().map(absent_cost).transpose()?.unwrap_or(0))?,
+        LogicalType::List { kind, element } => {
+            let count = match kind { ListKind::FixedSizeList(width) => *width as usize, ListKind::TimestampTzRange => 2, _ => 0 };
+            add(16, multiply(absent_cost(element)?, count)?)?
+        }
+    })
+}
+
+/// Copies clone a value once per nesting level it occupies.
+fn value_depth(value: &Value) -> usize {
+    1 + match value {
+        Value::Struct(fields) => fields.values().map(value_depth).max().unwrap_or(0),
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().map(value_depth).max().unwrap_or(0),
+        Value::Map { entries, .. } => entries.iter().map(|(key, value)| value_depth(key).max(value_depth(value))).max().unwrap_or(0) + 1,
+        _ => 0,
+    }
 }
 
 fn clone_cost(value: &Value) -> Result<usize> {
