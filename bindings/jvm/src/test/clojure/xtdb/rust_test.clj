@@ -257,6 +257,7 @@
 (deftest-original-api original-expr/test-date-trunc-with-timezone-query)
 (deftest-original-api original-expr/test-date-trunc-with-interval-query)
 (deftest-original-api original-expr/test-date-bin)
+(deftest-original-api original-expr/test-extract-query)
 (deftest-original-api original-expr/test-age-function)
 (deftest-original-api original-expr/test-lower-upper-period-fns-3660)
 (deftest-original-api original-expr/test-quote-ident)

@@ -28,7 +28,7 @@ pub(crate) fn call(name: &str,args: &[Value],context: &EvalContext<'_>) -> Optio
                 let Value::Utf8(field) = &args[0] else { return Err(inapplicable(name,&[])); };
                 let field = F::parse(field)?;
                 let L::Scalar(source) = args[1].logical_type() else { return Err(inapplicable(name,&[])); };
-                if !field.supports(name,&source) { return Err(rtdb_types::Anomaly::unsupported("xtdb.expression/extract-not-supported",format!("{field:?} is not supported for {source:?}"))); }
+                field.validate_for(name, &source)?;
                 if name == "extract" { extract(field,&args[1]) }
                 else {
                     let zone = args.get(2).map(|value| match value { Value::Utf8(zone) => rtdb_plan::truncation_zone(zone), _ => Err(inapplicable(name,&[])) }).transpose()?;

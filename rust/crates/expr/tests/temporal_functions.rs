@@ -157,6 +157,27 @@ fn date_trunc_reports_the_same_invalid_timezone_in_planning_and_evaluation() {
 }
 
 #[test]
+fn extract_rejections_preserve_field_and_source_type_data() {
+    use rtdb_format::transit::{TransitValue as T, decode_anomaly, encode_anomaly, from_json_value};
+
+    for (field, value, description, source, field_data) in [
+        ("TIMEZONE_HOUR", ts(0, U::Microsecond, None), "timestamp without timezone", "timestamp-local", T::Keyword("timezone-hour".into())),
+        ("TIMEZONE_HOUR", V::DateDay(0), "date", "date", T::String("TIMEZONE_HOUR".into())),
+        ("YEAR", V::Time { value: 0, unit: U::Nanosecond, bit_width: 64 }, "time without timezone", "time-local", T::String("YEAR".into())),
+        ("WEEK", interval(0, 3, 0), "interval", "interval", T::String("WEEK".into())),
+    ] {
+        let planned = function_type_with_args("extract", &[text(field), lit(value.clone())]).unwrap_err();
+        let evaluated = scalar_call("extract", &[V::Utf8(field.into()), value], &EvalContext::default()).unwrap_err();
+        assert_eq!(planned, evaluated);
+        let error = decode_anomaly(&encode_anomaly(&planned).unwrap()).unwrap();
+        assert_eq!(error.code, "xtdb.expression/extract-not-supported");
+        assert_eq!(error.message.as_deref(), Some(format!("Extract \"{field}\" not supported for type {description}").as_str()));
+        assert_eq!(from_json_value(&error.context["field"]).unwrap(), field_data);
+        assert_eq!(from_json_value(&error.context["source-type"]).unwrap(), T::Keyword(source.into()));
+    }
+}
+
+#[test]
 fn direct_temporal_calls_validate_fields_and_map_delegated_checked_overflow() {
     for field in ["DOW","ISODOW","DOY","EPOCH","TIMEZONE_HOUR","TIMEZONE_MINUTE"] {
         assert_eq!(scalar_call("date_trunc",&[V::Utf8(field.into()),V::DateDay(0)],&EvalContext::default()).unwrap_err().code,"xtdb.expression/extract-not-supported");

@@ -52,6 +52,10 @@ impl Anomaly {
         self
     }
 
+    pub fn with_transit_context(self, key: impl Into<String>, value: &crate::transit_value::TransitValue) -> Result<Self> {
+        Ok(self.with_context(key, crate::transit_value::to_json_value(value)?))
+    }
+
     pub fn is_caller_error(&self) -> bool {
         matches!(self.category, AnomalyCategory::Incorrect | AnomalyCategory::Unsupported
             | AnomalyCategory::NotFound | AnomalyCategory::Forbidden | AnomalyCategory::Conflict)

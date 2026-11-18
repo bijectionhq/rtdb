@@ -1,5 +1,6 @@
 use crate::{BinaryOp, Expr};
 use rtdb_types::{Anomaly, IntervalUnit, LogicalType as L, Result, ScalarType as S, TimeUnit, Value, ZoneId};
+use rtdb_types::transit_value::TransitValue as T;
 
 /// A parsed EXTRACT or DATE_TRUNC field; applicability also depends on the function and source type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,6 +30,43 @@ impl TemporalField {
             S::Time { .. } => clock,
             S::Interval(_) | S::IntervalMonthDayMicro => matches!(self,Year | Month | Day | Hour | Minute | Second),
             _ => false,
+        }
+    }
+
+    pub fn validate_for(self, name: &str, source: &S) -> Result<()> {
+        if self.supports(name, source) { return Ok(()); }
+        if name == "extract" {
+            let source_name = match source {
+                S::DateDay | S::DateMilli => Some(("date", "date")),
+                S::Timestamp { timezone: None, .. } => Some(("timestamp without timezone", "timestamp-local")),
+                S::Time { .. } => Some(("time without timezone", "time-local")),
+                S::Interval(_) | S::IntervalMonthDayMicro => Some(("interval", "interval")),
+                _ => None,
+            };
+            if let Some((description, keyword)) = source_name {
+                let field = self.sql_name();
+                let field_data = match (source, self) {
+                    (S::Timestamp { timezone: None, .. }, Self::TimezoneHour) => T::Keyword("timezone-hour".into()),
+                    (S::Timestamp { timezone: None, .. }, Self::TimezoneMinute) => T::Keyword("timezone-minute".into()),
+                    (S::Timestamp { timezone: None, .. }, Self::Epoch) => T::Keyword("epoch".into()),
+                    _ => T::String(field.into()),
+                };
+                return Err(Anomaly::unsupported("xtdb.expression/extract-not-supported", format!("Extract \"{field}\" not supported for type {description}"))
+                    .with_transit_context("field", &field_data)?
+                    .with_transit_context("source-type", &T::Keyword(keyword.into()))?);
+            }
+        }
+        Err(Anomaly::unsupported("xtdb.expression/extract-not-supported", format!("{self:?} is not supported for {source:?}")))
+    }
+
+    fn sql_name(self) -> &'static str {
+        match self {
+            Self::Millennium => "MILLENNIUM", Self::Century => "CENTURY", Self::Decade => "DECADE",
+            Self::Year => "YEAR", Self::Quarter => "QUARTER", Self::Month => "MONTH", Self::Week => "WEEK",
+            Self::Day => "DAY", Self::Hour => "HOUR", Self::Minute => "MINUTE", Self::Second => "SECOND",
+            Self::Millisecond => "MILLISECOND", Self::Microsecond => "MICROSECOND",
+            Self::Dow => "DOW", Self::IsoDow => "ISODOW", Self::Doy => "DOY",
+            Self::TimezoneHour => "TIMEZONE_HOUR", Self::TimezoneMinute => "TIMEZONE_MINUTE", Self::Epoch => "EPOCH",
         }
     }
 }
@@ -151,7 +189,7 @@ pub(crate) fn with_args(name: &str,args: &[Expr],base: L) -> Result<L> {
         let Expr::Literal(Value::Utf8(field)) = &args[0] else { return Err(Anomaly::unsupported("xtdb.expression/non-literal-temporal-field","Temporal field must be a literal string")); };
         let field = TemporalField::parse(field)?;
         for leg in args[1].data_type().legs() {
-            if let L::Scalar(source) = leg { if !field.supports(name,&source) { return Err(Anomaly::unsupported("xtdb.expression/extract-not-supported",format!("{field:?} is not supported for {source:?}"))); } }
+            if let L::Scalar(source) = leg { field.validate_for(name, &source)?; }
         }
         if let Some(timezone) = args.get(2) {
             let Expr::Literal(Value::Utf8(timezone)) = timezone else { return Err(Anomaly::unsupported("xtdb.expression/non-literal-timezone","Truncation timezone must be a literal string")); };
