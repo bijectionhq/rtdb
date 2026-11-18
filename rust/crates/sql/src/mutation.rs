@@ -39,7 +39,8 @@ fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::Prepar
     let statement = parsed.remove(0);
     let eligible = match &statement.tree.statement {
         crate::parse::Syntax::Records { .. } => true,
-        crate::parse::Syntax::Standard(sqlparser::ast::Statement::Insert(insert)) => insert.source.as_ref().is_some_and(|query| matches!(query.body.as_ref(), sqlparser::ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()),
+        crate::parse::Syntax::Standard(sqlparser::ast::Statement::Insert(insert)) => !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
+            matches!(query.body.as_ref(), sqlparser::ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()),
         _ => false,
     };
     if !eligible { return Ok(None); }

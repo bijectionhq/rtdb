@@ -393,6 +393,9 @@ Without an explicit column list, the result columns use `_column_1`, `_column_2`
 Table-period expressions use a scope without local or outer columns.
 They admit parameters and scalar expressions that resolve without a column.
 
+An INSERT with a VALUES source requires a column list that includes `_id`.
+Planning reports the missing column list and the mandatory `_id` diagnostic together when the list is absent.
+
 == Series expression lowering
 
 SQL GENERATE_SERIES and RANGE accept two or three arguments and one optional schema qualifier.

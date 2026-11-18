@@ -1,6 +1,7 @@
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Result, Value};
 use sqlparser::tokenizer::Span;
 use crate::interval_literal::IntervalLiteralError;
+use crate::planning_diagnostic::PlanningDiagnostic;
 
 struct AdmittedInterval { occurrence: Span, input: String, parsed: std::result::Result<Value, IntervalLiteralError> }
 
@@ -18,16 +19,15 @@ impl LiteralAdmission {
     }
 
     pub fn check(&self) -> Result<()> {
-        if self.intervals.iter().all(|entry| entry.parsed.is_ok()) { return Ok(()); }
-        let mut message = String::from("Errors planning SQL statement:");
-        let mut errors = Vec::new();
-        for entry in &self.intervals {
-            if let Err(cause) = &entry.parsed {
-                let input = &entry.input;
-                message.push_str(&format!("\n  - Cannot parse interval: {input} - failed with message {}", cause.message().unwrap_or("null")));
-                errors.push(serde_json::json!({"i-str": input, "msg": cause.message()}));
-            }
+        let mut errors = self.intervals.iter().filter_map(|entry| {
+            let cause = entry.parsed.as_ref().err()?;
+            let input = &entry.input;
+            Some(PlanningDiagnostic::new(format!("Cannot parse interval: {input} - failed with message {}", cause.message().unwrap_or("null")))
+                .with_detail("i-str", input.clone()).with_detail("msg", serde_json::json!(cause.message())))
+        });
+        match errors.next() {
+            Some(first) => Err(first.into_anomaly(errors)),
+            None => Ok(()),
         }
-        Err(Anomaly::incorrect("xtdb/sql-error", message).with_context("errors", errors.into()))
     }
 }

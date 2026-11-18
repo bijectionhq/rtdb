@@ -275,7 +275,8 @@ impl<'a> OpenTransaction<'a> {
             None => arguments.unwrap_or_default().iter().enumerate().map(|(index, value)| (index, rtdb_columnar::execution_type(&value.logical_type()))).collect(),
         };
         let options = rtdb_sql::PrepareOptions { parameter_types, default_timezone: context.timezone.clone(), generate_series_end_exclusive: context.options.generate_series_end_exclusive, ..Default::default() };
-        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory)?;
+        let mutation = rtdb_sql::prepare_tx_in(sql, &context.catalog, &options, &context.memory)
+            .map_err(|error| error.with_context("sql", sql.into()))?;
         self.execute_mutation(mutation, context, arguments).await.map_err(|error| error.with_context("sql", sql.into()))
     }
 

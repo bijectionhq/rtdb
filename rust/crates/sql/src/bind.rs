@@ -196,6 +196,10 @@ impl Context<'_> {
                 let ast::TableObject::TableName(name) = &insert.table else { return Err(unsupported("Dynamic INSERT target")); };
                 let target = self.target(name)?;
                 let source = insert.source.as_ref().ok_or_else(|| unsupported("INSERT DEFAULT VALUES"))?;
+                let missing_id = || crate::planning_diagnostic::PlanningDiagnostic::new("INSERT does not contain mandatory _id column");
+                if insert.columns.is_empty() && matches!(source.body.as_ref(), ast::SetExpr::Values(_)) {
+                    return Err(crate::planning_diagnostic::PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([missing_id()]));
+                }
                 let mut input = self.query(source)?;
                 if !insert.columns.is_empty() {
                     if insert.columns.len() != input.schema().len() { return Err(error("INSERT column count differs from source")); }
@@ -203,7 +207,7 @@ impl Context<'_> {
                     if names.iter().collect::<BTreeSet<_>>().len() != names.len() { return Err(error("INSERT repeats a column")); }
                     input = self.rename(input, None, Some(names))?;
                 }
-                if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(error("INSERT requires an _id column")); }
+                if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(missing_id().into_anomaly([])); }
                 if input.schema().fields().iter().any(|field| field.name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&field.name.as_str())) { return Err(error("INSERT cannot write internal identity or system-time columns")); }
                 Statement::Dml(Dml::Insert { table: target, input })
             }

@@ -178,6 +178,7 @@
 (deftest-original-api original-sql/ignore-returning-keys-3668)
 (deftest-original-api original-sql/read-write-promotion-conflict-in-live-rel-3709)
 
+(deftest-original-api original-sql/test-no-column-name-list-insert-with-values-3752)
 (deftest-original-api original-sql/test-date-id-caught-3446)
 (deftest-original-api original-sql/test-tx-ops-sql-params)
 

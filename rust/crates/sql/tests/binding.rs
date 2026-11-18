@@ -22,6 +22,19 @@ fn table_periods_have_no_local_or_outer_column_scope() {
 }
 
 #[test]
+fn insert_values_without_a_projection_reports_both_planning_diagnostics() {
+    let sql = "INSERT INTO foo VALUES (1, unresolved_function())";
+    let error = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert_eq!(error.message.as_deref(), Some("Errors planning SQL statement:\n  - INSERT with VALUES needs column name list\n  - INSERT does not contain mandatory _id column"));
+    assert_eq!(error.context["errors"], serde_json::json!([{}, {}]));
+    assert!(rtdb_sql::prepare_static(sql, &Fixture, &PrepareOptions::default()).unwrap().is_none());
+    let select = prepare("INSERT INTO foo SELECT 1 AS v", &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(select.context["errors"], serde_json::json!([{}]));
+    assert_eq!(select.message.as_deref(), Some("Errors planning SQL statement:\n  - INSERT does not contain mandatory _id column"));
+}
+
+#[test]
 fn invalid_interval_default_reports_its_source_occurrence_once() {
     let error = prepare("SETTING DEFAULT VALID_TIME AS OF INTERVAL 'bad' SELECT * FROM foo",&Fixture,&PrepareOptions::default()).unwrap_err();
     assert_eq!(error.message.as_deref(),Some("Errors planning SQL statement:\n  - Cannot parse interval: bad - failed with message null"));

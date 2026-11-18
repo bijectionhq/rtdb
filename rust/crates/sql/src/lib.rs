@@ -14,6 +14,7 @@ mod settings;
 mod temporal_syntax;
 mod interval_literal;
 mod literal_admission;
+mod planning_diagnostic;
 mod literal_syntax;
 mod json_access;
 mod materialized;
