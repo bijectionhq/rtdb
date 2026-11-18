@@ -3,6 +3,7 @@
             [xtdb.api :as xt]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.sql.expr-test :as original-expr]
+            [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
             [xtdb.sql-test :as original-sql]
             [xtdb.test-util :as tu]
@@ -106,6 +107,10 @@
 (deftest-original-api original-sql/test-select-without-from)
 
 (deftest-original-api original-sql/test-generated-column-names)
+
+(deftest-original-api original-identifiers/keyword-led-constructs-still-open-their-own-constructs)
+(deftest-original-api original-identifiers/keyword-column-names-round-trip-through-dml)
+(deftest-original-api original-identifiers/as-default-names-the-column-default)
 
 (deftest-original-api original-sql/mismatched-columns-in-table-projection-stops-ingestion-4069)
 

@@ -100,9 +100,13 @@ impl Dialect for SqlDialect {
     fn supports_optional_projection_items(&self) -> bool { true }
     fn supports_single_word_time_zone(&self) -> bool { true }
     fn supports_interval_field_ranges(&self) -> bool { true }
+    fn supports_interval_identifier(&self) -> bool { true }
     fn supports_table_function_syntax(&self) -> bool { false }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
+    }
+    fn is_select_item_alias(&self, explicit: bool, keyword: &Keyword, parser: &mut Parser) -> bool {
+        explicit || (*keyword != Keyword::DEFAULT && self.is_column_alias(keyword, parser))
     }
 
     generic_flags!(
@@ -187,6 +191,14 @@ impl Dialect for SqlDialect {
         }
         let Token::Word(word) = &token.token else { return None; };
         if let Some(expr) = current_catalog(parser, word, token.span) { return Some(Ok(expr)); }
+        if word.quote_style.is_none()
+            && (word.value.eq_ignore_ascii_case("RECORD") || word.value.eq_ignore_ascii_case("OBJECT"))
+            && parser.peek_nth_token_ref(1).token == Token::LParen
+        {
+            parser.next_token();
+            parser.next_token();
+            return Some(parser.parse_dictionary_fields(Token::RParen));
+        }
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("NOW") {
             parser.next_token();
             return Some(parser.parse_time_functions(ast::ObjectName::from(vec![word.to_ident(token.span)])));

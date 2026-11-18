@@ -69,6 +69,25 @@ fn select_column_labels_follow_expression_provenance_and_sublist_positions() {
 }
 
 #[test]
+fn identifier_keywords_distinguish_columns_constructors_and_explicit_aliases() {
+    for sql in [
+        "SELECT 1 AS default",
+        "SELECT 1 \"default\"",
+        "SELECT interval, q.interval AS qualified, interval + 1 FROM (VALUES (2)) q(interval)",
+        "SELECT record, object FROM (VALUES (2, 3)) q(record, object)",
+        "SELECT INTERVAL '3' DAY",
+    ] {
+        prepare(sql, &EmptyCatalog, &PrepareOptions::default()).unwrap_or_else(|error| panic!("{sql}: {error}"));
+    }
+    assert!(prepare("SELECT 1 default", &EmptyCatalog, &PrepareOptions::default()).is_err());
+    let sql = "SELECT RECORD() AS r, OBJECT(a: 1, b: RECORD(c: 2)) AS o";
+    let rtdb_plan::Statement::Query(relation) = prepare(sql, &EmptyCatalog, &PrepareOptions::default()).unwrap().statement else { panic!() };
+    assert_eq!(relation.schema().fields()[0].data_type, rtdb_types::LogicalType::Struct(Default::default()));
+    let rtdb_types::LogicalType::Struct(fields) = &relation.schema().fields()[1].data_type else { panic!() };
+    assert_eq!(fields.keys().collect::<Vec<_>>(), ["a", "b"]);
+}
+
+#[test]
 fn implicit_and_explicit_labels_share_duplicate_checks() {
     for source in [
         "SELECT (v), v FROM (VALUES (1)) t(v)",

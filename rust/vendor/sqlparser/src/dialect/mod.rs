@@ -1596,6 +1596,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Allows INTERVAL as an identifier when it does not introduce a string literal.
+    fn supports_interval_identifier(&self) -> bool {
+        false
+    }
+
     /// Returns true if the dialect supports specifying which table to copy
     /// the schema from inside parenthesis.
     ///

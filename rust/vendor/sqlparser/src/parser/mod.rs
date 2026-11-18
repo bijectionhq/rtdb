@@ -1603,7 +1603,12 @@ impl<'a> Parser<'a> {
             }
             Keyword::OVERLAY => Ok(Some(self.parse_overlay_expr()?)),
             Keyword::TRIM => Ok(Some(self.parse_trim_expr()?)),
-            Keyword::INTERVAL => Ok(Some(self.parse_interval()?)),
+            Keyword::INTERVAL
+                if !self.dialect.supports_interval_identifier()
+                    || self.starts_interval_literal() =>
+            {
+                Ok(Some(self.parse_interval()?))
+            }
             // Treat ARRAY[1,2,3] as an array [1,2,3], otherwise try as subquery or a function call
             Keyword::ARRAY if *self.peek_token_ref() == Token::LBracket => {
                 self.expect_token(&Token::LBracket)?;
@@ -1794,7 +1799,15 @@ impl<'a> Parser<'a> {
         let loc = self.peek_token_ref().span.start;
         let opt_expr = self.maybe_parse(|parser| {
             match parser.parse_data_type()? {
-                DataType::Interval { .. } => parser.parse_interval(),
+                DataType::Interval { .. } => {
+                    if parser.dialect.supports_interval_identifier()
+                        && !parser.starts_interval_literal()
+                    {
+                        parser.expected_ref("an interval string literal", parser.peek_token_ref())
+                    } else {
+                        parser.parse_interval()
+                    }
+                }
                 // PostgreSQL allows almost any identifier to be used as custom data type name,
                 // and we support that in `parse_data_type()`. But unlike Postgres we don't
                 // have a list of globally reserved keywords (since they vary across dialects),
@@ -3369,6 +3382,14 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn starts_interval_literal(&self) -> bool {
+        let sign = matches!(self.peek_token_ref().token, Token::Plus | Token::Minus);
+        matches!(
+            self.peek_nth_token_ref(usize::from(sign)).token,
+            Token::SingleQuotedString(_) | Token::EscapedStringLiteral(_) | Token::DollarQuotedString(_)
+        )
+    }
+
     /// Parse an `INTERVAL` expression.
     ///
     /// Some syntactically valid intervals:
@@ -3702,11 +3723,13 @@ impl<'a> Parser<'a> {
     /// [map]: https://clickhouse.com/docs/operations/settings/settings#additional_table_filters
     fn parse_dictionary(&mut self) -> Result<Expr, ParserError> {
         self.expect_token(&Token::LBrace)?;
+        self.parse_dictionary_fields(Token::RBrace)
+    }
 
-        let fields = self.parse_comma_separated0(Self::parse_dictionary_field, Token::RBrace)?;
-
-        self.expect_token(&Token::RBrace)?;
-
+    /// Parses a dictionary's fields after its opening delimiter.
+    pub fn parse_dictionary_fields(&mut self, end: Token) -> Result<Expr, ParserError> {
+        let fields = self.parse_comma_separated0(Self::parse_dictionary_field, end.clone())?;
+        self.expect_token(&end)?;
         Ok(Expr::Dictionary(fields))
     }
 

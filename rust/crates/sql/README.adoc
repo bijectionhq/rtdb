@@ -251,6 +251,8 @@ Unqualified and table-qualified wildcards accept EXCLUDE followed by RENAME, wit
 EXCLUDE matches original unqualified column names.
 An unqualified wildcard's RENAME can resolve a qualified column chain; a table-qualified wildcard's RENAME accepts unqualified names.
 Quoted identifiers preserve case and literal dots, and AS is optional except before an unquoted DEFAULT alias.
+INTERVAL introduces a literal when it precedes a character string and can also name a column.
+RECORD and OBJECT followed by parentheses construct the same struct values as brace syntax.
 Renames resolve original column identities, so renaming `x` to `y` does not change the source of a later `y` rename.
 Repeated renames of one source use the last alias, missing rename sources are ignored, and excluded sources are not restored by a rename.
 Unqualified renames resolve before exclusions; a table-qualified wildcard must retain at least one column after exclusions before its renames resolve.
