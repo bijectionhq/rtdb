@@ -6,7 +6,7 @@ use std::sync::Arc;
 use arrow_array::{Array, StructArray, UnionArray};
 use arrow_schema::DataType;
 use async_trait::async_trait;
-use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{IndexBatch, LiveTable, RowSource, Snapshot};
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
@@ -22,6 +22,31 @@ struct DataFile { storage: Arc<BufferPool>, key: ObjectKey, state: DataState }
 
 enum PageSource { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File { file: usize, page: usize } }
 struct Page { lower: Iid, upper: Iid, priority: usize, source: PageSource, summary: PageSummary, content_matches: bool }
+
+#[derive(Default)]
+struct PageDescriptors {
+    entries: Vec<Page>,
+    capacity: usize,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl PageDescriptors {
+    fn push(&mut self, page: Page, memory: &Arc<MemoryBudget>) -> Result<()> {
+        if self.entries.len() == self.capacity {
+            let size_error = || invalid("scan-page-size", "Scan page descriptor capacity exceeds addressable memory");
+            let capacity = self.capacity.checked_mul(2).ok_or_else(size_error)?.max(1);
+            let bytes = capacity.checked_mul(std::mem::size_of::<Page>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(size_error)?;
+            let reservation = memory.reserve(bytes)?;
+            self.entries.try_reserve_exact(capacity - self.entries.len()).map_err(|error| invalid("scan-page-size", error))?;
+            self.capacity = capacity;
+            self._reservation = Some(reservation);
+        }
+        self.entries.push(page);
+        Ok(())
+    }
+}
+
 enum ActiveRows { Live { table: Arc<LiveTable>, rows: Arc<[u32]> }, File(Arc<IndexBatch>) }
 struct LoadedPage { rows: ActiveRows, _reservation: Arc<MemoryReservation> }
 impl ActiveRows {
@@ -49,7 +74,7 @@ struct PartitionScan {
     bounds: TemporalBounds,
     initialized: bool,
     files: Vec<DataFile>,
-    pages: Vec<Page>,
+    pages: PageDescriptors,
     tasks: Option<ScanTaskPlan>,
     loaded: BTreeMap<usize, LoadedPage>,
     output: VecDeque<OwnedPage>,
@@ -78,7 +103,7 @@ impl ScanCursor {
         for snapshot in &database.partitions {
             let bounds = bounds(&scan, snapshot, &execution).await?;
             partitions.push_back(PartitionScan { snapshot: snapshot.clone(), storage: Arc::clone(&database.storage), scan: scan.clone(), execution: execution.clone(), bounds,
-                initialized: false, files: Vec::new(), pages: Vec::new(), tasks: None, loaded: BTreeMap::new(),
+                initialized: false, files: Vec::new(), pages: PageDescriptors::default(), tasks: None, loaded: BTreeMap::new(),
                 output: VecDeque::new(), output_reservation: None, counts: ScanCounts::default(), pushdowns: pushdowns.clone(), canonical_entity_iids });
         }
         Ok(Self { partitions, completed: ScanCounts::default(), database: name, source, _reservation: reservation })
@@ -137,7 +162,7 @@ impl PartitionScan {
                 recency: Some(recency(trie.key.recency())?), iid_range: Some(path_range(trie.key.part())?) })
         }).collect::<Result<_>>()?;
         let slug = self.snapshot.table_entry(table).map(|entry| entry.slug.clone());
-        let mut pages = Vec::new();
+        let mut pages = PageDescriptors::default();
         let live = self.snapshot.segments(table);
         for (priority, segment) in live.iter().enumerate() {
             for leaf in segment.trie().leaves() {
@@ -146,11 +171,11 @@ impl PartitionScan {
                 let rows = leaf.sorted_rows(segment.as_ref())?;
                 let temporal = summarize_rows(rows.iter().map(|row| segment.row(*row)))?;
                 pages.push(Page { lower, upper, priority, source: PageSource::Live { table: Arc::clone(segment), rows }, content_matches: true,
-                    summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } });
+                    summary: PageSummary { page_index: 0, temporal, recency: Some(Timestamp::MAX), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?;
             }
         }
         let mut combined = summaries;
-        for (index, page) in pages.iter().enumerate() {
+        for (index, page) in pages.entries.iter().enumerate() {
             let mut summary = page.summary.clone();
             summary.page_index = u32::try_from(tries.len().checked_add(index).ok_or_else(|| invalid("page-count", "Candidate count overflow"))?).map_err(|error| invalid("page-count", error))?;
             combined.push(summary);
@@ -187,12 +212,12 @@ impl PartitionScan {
                         content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
                             && may_satisfy_not_null(&self.scan, columns),
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
-                            recency: Some(recency), iid_range: Some((lower, upper)) } }),
+                            recency: Some(recency), iid_range: Some((lower, upper)) } }, &self.execution.context.memory)?,
                 }
             }
         }
-        for (index, page) in pages.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
-        self.tasks = Some(ScanTaskPlan::new(pages.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
+        for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
+        self.tasks = Some(ScanTaskPlan::new(pages.entries.iter().map(|page|PageRange { lower: page.lower,upper: page.upper }),&self.execution.context.memory)?);
         self.pages = pages;
         self.initialized = true;
         Ok(())
@@ -201,7 +226,7 @@ impl PartitionScan {
         self.execution.context.check_cancelled()?;
         if self.loaded.contains_key(&index) { return Ok(()); }
         let reservation = self.execution.context.memory.reserve(std::mem::size_of::<LoadedPage>() + 256)?;
-        let page = &self.pages[index];
+        let page = &self.pages.entries[index];
         let rows = match &page.source {
             PageSource::Live { table, rows } => ActiveRows::Live { table: Arc::clone(table),rows: Arc::clone(rows) },
             PageSource::File { file, page: page_index } => {
@@ -250,11 +275,11 @@ impl PartitionScan {
     async fn buffer_task(&mut self,task: ScanTask) -> Result<()> {
         let bound = task.pages.len().checked_mul(std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>() + std::mem::size_of::<OwnedPage>() + 256).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(||invalid("scan-task-size","Scan task scratch exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bound)?;
-        let summaries: Vec<_> = task.pages.iter().map(|index|self.pages[*index].summary.clone()).collect();
-        let mut selected: Vec<_> = select_pages(&summaries,self.pruning(),|summary|self.pages[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
+        let summaries: Vec<_> = task.pages.iter().map(|index|self.pages.entries[*index].summary.clone()).collect();
+        let mut selected: Vec<_> = select_pages(&summaries,self.pruning(),|summary|self.pages.entries[summary.page_index as usize].content_matches).into_iter().map(|summary|summary.page_index as usize).collect();
         self.counts.pages_pruned = self.counts.pages_pruned.saturating_add((task.pages.len() - selected.len()) as u64);
         self.counts.pages_used = self.counts.pages_used.saturating_add(selected.len() as u64);
-        selected.sort_by_key(|index| (matches!(self.pages[*index].source,PageSource::Live { .. }),self.pages[*index].priority,*index));
+        selected.sort_by_key(|index| (matches!(self.pages.entries[*index].source,PageSource::Live { .. }),self.pages.entries[*index].priority,*index));
         let mut groups = Vec::with_capacity(selected.len());
         let mut heads = BinaryHeap::with_capacity(selected.len());
         for (group,index) in selected.iter().copied().enumerate() {
@@ -265,7 +290,7 @@ impl PartitionScan {
             for ordinal in 0..rows.len() {
                 let header = rows.row(ordinal)?.header()?;
                 if header.iid > task.range.upper { break; }
-                if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages[index].priority,ordinal });break; }
+                if header.iid >= task.range.lower { heads.push(Head { header,active: group,priority: self.pages.entries[index].priority,ordinal });break; }
             }
         }
         let mut resolver = HistoryResolver::new(self.bounds,self.scan.clamp_valid_time);
@@ -288,7 +313,7 @@ impl PartitionScan {
                 groups[head.active].push_growing(OwnedRow::with_reservation(values,reservation)?,&self.execution.context.memory)?;
             }
         }
-        self.loaded.retain(|index,_| self.pages[*index].upper > task.range.upper);
+        self.loaded.retain(|index,_| self.pages.entries[*index].upper > task.range.upper);
         self.output = groups.into_iter().filter(|page|page.len() > 0).map(PageBuilder::finish).collect();
         self.output_reservation = Some(reservation);
         Ok(())
@@ -412,4 +437,151 @@ fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
     };
     Some(TemporalSummary { min_valid_from: bound("_valid_from", "min", true)?, max_valid_to: bound("_valid_to", "max", false)?,
         min_system_from: bound("_system_from", "min", true)?, max_system_from: bound("_system_from", "max", false)? })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions, context::OuterRows, parameters::BoundParameters};
+    use rtdb_format::{data::{StoredEvent, StoredOperation, build_event_batch}, ipc::write_file, keys::TrieKey, metadata::MetadataBuilder};
+    use rtdb_index::{CatalogTrie, PartitionState, TransactionBuffer};
+    use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
+    use rtdb_storage::{MemoryStore, ObjectStore};
+    use rtdb_trie::TrieConfig;
+    use rtdb_types::{TableRef, TransactionKey, TxId};
+    use tokio_util::sync::CancellationToken;
+
+    fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
+        let state = PartitionState::empty(TrieConfig::new(1, 1).unwrap()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let key = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+        let memory = MemoryBudget::new(1 << 20);
+        let mut write = TransactionBuffer::new(state.value().snapshot(), key, memory).unwrap();
+        let events = [0x00, 0x40, 0x80].into_iter().enumerate().map(|(index, prefix)| {
+            let value = Value::I64(index as i64 + 1);
+            StoredEvent {
+                iid: Iid([prefix; 16]),
+                system_from: key.system_time,
+                valid_time: Interval::ALL,
+                operation: StoredOperation::Put(BTreeMap::from([("_id".into(), value.clone()), ("v".into(), value)])),
+                recency: None,
+            }
+        }).collect::<Vec<_>>();
+        for event in &events {
+            write.append(table.clone(), event.clone()).unwrap();
+        }
+        state.apply(&write.stage().unwrap()).unwrap();
+        (state, table, events)
+    }
+
+    async fn assert_descriptor_lifetime(snapshot: Snapshot, table: TableRef, store: MemoryStore, persisted: Option<(usize, usize)>) {
+        let (metadata_size, metadata_charge) = persisted.unwrap_or_default();
+        let files_used = usize::from(persisted.is_some());
+        let storage = Arc::new(BufferPool::new(Arc::new(store), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage: Arc::clone(&storage) };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let binding = catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+        let field = Field { id: ColumnId(0), name: "v".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["v"].clone() };
+        let scan = Scan {
+            table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+        };
+        let memory = MemoryBudget::new(1 << 24);
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(100), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
+        };
+        let before_cursor = memory.used_bytes();
+        let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+        let cursor_open = memory.used_bytes();
+        let old_extent = 2 * std::mem::size_of::<Page>() + 256;
+        let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
+        let headroom = metadata_charge + old_extent + replacement_extent - 1;
+        let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
+        let retained_at_growth = cursor_open + pressure.bytes() + metadata_charge + old_extent;
+        let error = cursor.next_page().await.err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+        let partition = cursor.partitions.front().unwrap();
+        assert!(partition.pages.entries.is_empty());
+        assert!(partition.pages._reservation.is_none());
+        assert!(partition.tasks.is_none());
+        assert!(partition.loaded.is_empty());
+        assert_eq!(partition.files.len(), files_used);
+        assert!(partition.files.iter().all(|file| matches!(&file.state, DataState::Unopened)));
+        assert_eq!(storage.retained_bytes(), metadata_size);
+        assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
+        drop((cursor, pressure));
+        assert_eq!(memory.used_bytes(), before_cursor);
+
+        let mut cursor = ScanCursor::new(scan, execution.clone(), None).await.unwrap();
+        assert_eq!(memory.used_bytes(), cursor_open);
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            let descriptors = &cursor.partitions.front().unwrap().pages;
+            assert_eq!(descriptors.entries.len(), 3);
+            assert_eq!(descriptors._reservation.as_ref().unwrap().bytes(), replacement_extent);
+            rows.extend(page.rows().iter().map(|row| row.values[0].clone()));
+        }
+        assert_eq!(rows, [Value::I64(1), Value::I64(2), Value::I64(3)]);
+        let counts = cursor.scan_counts().unwrap();
+        assert_eq!(counts.files_used, files_used as u64);
+        assert_eq!((counts.pages_used, counts.rows_read), (3, 3));
+        assert!(cursor.partitions.is_empty());
+        assert_eq!(memory.used_bytes(), cursor_open);
+        drop(cursor);
+        assert_eq!(memory.used_bytes(), before_cursor);
+        drop(execution);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn live_page_descriptors_admit_growth_and_release_on_partition_close() {
+        let (state, table, _) = live_table();
+        let snapshot = state.value().snapshot();
+        let segments = snapshot.segments(&table);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].trie().leaves().len(), 3);
+        assert!(snapshot.trie_entries(&table).is_empty());
+        assert_descriptor_lifetime(snapshot, table, MemoryStore::default(), None).await;
+    }
+
+    #[tokio::test]
+    async fn persisted_page_descriptors_admit_growth_before_opening_the_data_file() {
+        let (state, table, events) = live_table();
+        let captured = state.value();
+        let table_entry = captured.table_catalog().entry(&table).unwrap();
+        let trie = TrieKey::l0(captured.live().block_index()).unwrap();
+        let put_fields = captured.live().tables()[&table].column_types().clone();
+        let mut builder = MetadataBuilder::new(false, false);
+        let mut children = [None; 4];
+        let mut pages = Vec::new();
+        for (slot, event) in children.iter_mut().zip(&events) {
+            let page = build_event_batch(std::slice::from_ref(event), Some(put_fields.clone()), None).unwrap();
+            *slot = Some(builder.write_leaf(&page).unwrap());
+            pages.push(page);
+        }
+        builder.write_iid_branch(children).unwrap();
+        let (metadata, statistics) = builder.finish().unwrap();
+        let meta = metadata.write().unwrap();
+        let data = write_file(pages[0].schema().as_ref(), &pages).unwrap();
+        let metadata_size = meta.len();
+        let probe = MemoryBudget::new(1 << 24);
+        let layout = inspect_file_reserved(&mut Cursor::new(meta.as_slice()), |bytes| probe.reserve(bytes)).unwrap();
+        let metadata_charge = layout.full_allocation_bound().unwrap();
+        assert!(probe.peak_bytes() <= metadata_charge);
+        assert_eq!(probe.used_bytes(), 0);
+
+        let store = MemoryStore::default();
+        let addition = CatalogTrie::notification(trie.clone(), data.len() as i64, Some(statistics)).unwrap();
+        store.put(&ObjectKey::new(table_entry.slug.metadata_key(&trie)).unwrap(), meta.into()).await.unwrap();
+        store.put(&ObjectKey::new(table_entry.slug.data_key(&trie)).unwrap(), data.into()).await.unwrap();
+        state.add_tries(&BTreeMap::from([(table.clone(), vec![addition])]), Timestamp(200)).unwrap();
+        let snapshot = state.value().snapshot();
+        assert_eq!(snapshot.trie_entries(&table).len(), 1);
+        assert!(snapshot.segments(&table).is_empty());
+        assert_descriptor_lifetime(snapshot, table, store, Some((metadata_size, metadata_charge))).await;
+    }
 }

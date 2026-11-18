@@ -207,6 +207,7 @@ A single large output row, aggregate array, or set of overlapping active pages c
 
 The scan accepts uncompressed, LZ4 and Zstandard Arrow trie data and metadata.
 It reserves inspected dictionary, row-descriptor and decoded-buffer bounds before opening the corresponding data.
+Live and persisted scan page descriptors reserve capacity from the query budget before growth, and the reservation stays with the scan partition.
 
 Memory reservations cover retained rows, output Arrow buffers, staged parameter values, decoded page bounds, and scoped spill work.
 Several bounds are conservative estimates rather than proven physical-allocation limits.
