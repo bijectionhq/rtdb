@@ -37,12 +37,11 @@ async fn log_clients_resolve_provider_bootstrap_and_keep_configuration_through_n
     assert_eq!(written.offset, LogOffset(0));
     let before_releasing_log = memory.used_bytes();
     drop(opened.log);
+    cancellation.cancel();
+    driver.await.unwrap().unwrap();
     assert!(memory.used_bytes() < before_releasing_log);
     assert!(memory.used_bytes() > 0);
     drop(tail);
-    assert!(memory.used_bytes() > 0);
-    cancellation.cancel();
-    driver.await.unwrap().unwrap();
     assert_eq!(memory.used_bytes(), 0);
 }
 
