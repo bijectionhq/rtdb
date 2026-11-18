@@ -91,7 +91,42 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
 }
 
 pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
-    let prepared_source = parsed.source();
+    let source = parsed.source();
+    bind_using(parsed, catalog, options, |context, statement, settings| {
+        let statement = context.statement(statement);
+        Ok(PreparedStatement {
+            statement: context.check_bound(statement)?,
+            parameter_types: context.binder.parameter_types().clone(),
+            source: source.to_owned(),
+            notices: std::mem::take(&mut context.notices),
+            settings,
+        })
+    })
+}
+
+pub(crate) fn bind_static_values(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<Option<InsertRows>> {
+    bind_using(parsed, catalog, options, |context, statement, _settings| {
+        let Syntax::Standard(ast::Statement::Insert(insert)) = statement else {
+            return Err(Anomaly::fault("rtdb.sql/static-insert", "Expected a static INSERT with VALUES"));
+        };
+        match context.insert_rows(insert) {
+            Ok(rows) => {
+                let valid = context.validate_insert_columns(&rows.input);
+                context.check_bound(valid)?;
+                Ok(Some(rows))
+            }
+            Err(InsertRowsError::Projection { .. }) => Ok(None),
+            Err(InsertRowsError::Other(error)) => context.check_bound(Err(error)),
+        }
+    })
+}
+
+fn bind_using<T>(
+    parsed: ParsedStatement<'_>,
+    catalog: &dyn Catalog,
+    options: &PrepareOptions,
+    bind: impl FnOnce(&mut Context<'_>, &Syntax, QuerySettings) -> Result<T>,
+) -> Result<T> {
     let next_parameter = parsed.parameter_count();
     let forms = parsed.forms;
     let crate::parse::StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
@@ -102,11 +137,25 @@ pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: 
     context.default_valid = valid;
     context.default_system = system;
     context.admit_statement_literals(&statement)?;
-    let statement = context.statement(&statement);
-    context.check_diagnostics(statement.as_ref().err())?;
-    let statement = statement?;
-    context.literals.check()?;
-    Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: prepared_source.to_owned(), notices: context.notices, settings })
+    bind(&mut context, &statement, settings)
+}
+
+pub(crate) struct InsertRows {
+    pub(crate) table: QualifiedTable,
+    pub(crate) input: Arc<Relation>,
+}
+
+enum InsertRowsError {
+    Projection { expected: usize, given: Vec<usize>, declares_id: bool },
+    Other(Anomaly),
+}
+
+impl From<Anomaly> for InsertRowsError {
+    fn from(error: Anomaly) -> Self { Self::Other(error) }
+}
+
+fn insert_missing_id() -> PlanningDiagnostic {
+    PlanningDiagnostic::new("INSERT does not contain mandatory _id column")
 }
 
 struct TransactionCatalog<'a>(&'a dyn Catalog);
@@ -126,6 +175,13 @@ impl Catalog for TransactionCatalog<'_> {
 }
 
 impl Context<'_> {
+    fn check_bound<T>(&mut self, result: Result<T>) -> Result<T> {
+        self.check_diagnostics(result.as_ref().err())?;
+        let value = result?;
+        self.literals.check()?;
+        Ok(value)
+    }
+
     fn check_diagnostics(&mut self, terminal: Option<&Anomaly>) -> Result<()> {
         if terminal.is_some_and(|error| !error.is_caller_error() || error.code.starts_with("rtdb/")) {
             return Ok(());
@@ -230,37 +286,71 @@ impl Context<'_> {
         }
     }
 
+    fn insert_rows(&mut self, insert: &ast::Insert) -> std::result::Result<InsertRows, InsertRowsError> {
+        if insert.returning.is_some() || insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some() {
+            return Err(unsupported("INSERT modifiers and RETURNING").into());
+        }
+        let ast::TableObject::TableName(name) = &insert.table else { return Err(unsupported("Dynamic INSERT target").into()); };
+        let table = self.target(name)?;
+        let source = insert.source.as_ref().ok_or_else(|| unsupported("INSERT DEFAULT VALUES"))?;
+        let expected = insert.columns.len();
+        if let ast::SetExpr::Values(values) = source.body.as_ref() {
+            if expected == 0 {
+                return Err(PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([insert_missing_id()]).into());
+            }
+            let given = values.rows.iter().map(|row| row.expressions().len())
+                .filter(|width| *width != expected).collect::<Vec<_>>();
+            if !given.is_empty() {
+                let declares_id = insert.columns.iter().any(|name| {
+                    matches!(name.0.as_slice(), [part] if part.as_ident().is_some_and(|name| identifier(name).normalized() == "_id"))
+                });
+                return Err(InsertRowsError::Projection { expected, given, declares_id });
+            }
+        }
+        let mut input = self.query(source)?;
+        if expected != 0 {
+            if expected != input.schema().len() {
+                return Err(InsertRowsError::Projection { expected, given: vec![input.schema().len()], declares_id: false });
+            }
+            let names = insert.columns.iter().map(|name| {
+                let names = identifiers(name)?;
+                if names.len() != 1 { return Err(error("INSERT columns must be unqualified")); }
+                Ok(names[0].normalized())
+            }).collect::<Result<Vec<_>>>()?;
+            if names.iter().collect::<BTreeSet<_>>().len() != names.len() { return Err(error("INSERT repeats a column").into()); }
+            input = self.rename(input, None, Some(names))?;
+        }
+        Ok(InsertRows { table, input })
+    }
+
+    fn validate_insert_columns(&mut self, input: &Relation) -> Result<()> {
+        if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(self.planning_failure(insert_missing_id())); }
+        if input.schema().fields().iter().any(|field| field.name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&field.name.as_str())) {
+            return Err(error("INSERT cannot write internal identity or system-time columns"));
+        }
+        Ok(())
+    }
+
     fn standard(&mut self, statement: &ast::Statement) -> Result<Statement> {
         Ok(match statement {
             ast::Statement::Query(query) => Statement::Query(self.query(query)?),
             ast::Statement::Insert(insert) => {
-                if insert.returning.is_some() || insert.on.is_some() || insert.overwrite || insert.ignore || insert.replace_into || insert.or.is_some() || !insert.assignments.is_empty() || insert.output.is_some() { return Err(unsupported("INSERT modifiers and RETURNING")); }
-                let ast::TableObject::TableName(name) = &insert.table else { return Err(unsupported("Dynamic INSERT target")); };
-                let target = self.target(name)?;
-                let source = insert.source.as_ref().ok_or_else(|| unsupported("INSERT DEFAULT VALUES"))?;
-                let missing_id = || PlanningDiagnostic::new("INSERT does not contain mandatory _id column");
-                if insert.columns.is_empty() && matches!(source.body.as_ref(), ast::SetExpr::Values(_)) {
-                    return Err(PlanningDiagnostic::new("INSERT with VALUES needs column name list").into_anomaly([missing_id()]));
-                }
-                let mut input = self.query(source)?;
-                if !insert.columns.is_empty() {
-                    if insert.columns.len() != input.schema().len() {
-                        let mismatch = PlanningDiagnostic::column_count(insert.columns.len(), input.schema().len());
-                        let declares_id = matches!(source.body.as_ref(), ast::SetExpr::Values(_))
-                            && insert.columns.iter().any(|name| {
-                                matches!(name.0.as_slice(), [part] if part.as_ident().is_some_and(|name| identifier(name).normalized() == "_id"))
-                            });
-                        if declares_id { return Err(self.planning_failure(mismatch)); }
-                        self.diagnostics.push(mismatch);
-                        return Err(self.planning_failure(missing_id()));
+                let InsertRows { table, input } = match self.insert_rows(insert) {
+                    Ok(rows) => rows,
+                    Err(InsertRowsError::Other(error)) => return Err(error),
+                    Err(InsertRowsError::Projection { expected, given, declares_id }) => {
+                        let mut mismatches = given.into_iter().map(|given| PlanningDiagnostic::column_count(expected, given));
+                        let last = if declares_id {
+                            mismatches.next_back().expect("projection rejected with a row width mismatch")
+                        } else {
+                            insert_missing_id()
+                        };
+                        self.diagnostics.extend(mismatches);
+                        return Err(self.planning_failure(last));
                     }
-                    let names = insert.columns.iter().map(|name| { let names = identifiers(name)?; if names.len() != 1 { return Err(error("INSERT columns must be unqualified")); } Ok(names[0].normalized()) }).collect::<Result<Vec<_>>>()?;
-                    if names.iter().collect::<BTreeSet<_>>().len() != names.len() { return Err(error("INSERT repeats a column")); }
-                    input = self.rename(input, None, Some(names))?;
-                }
-                if !input.schema().fields().iter().any(|field| field.name == "_id") { return Err(self.planning_failure(missing_id())); }
-                if input.schema().fields().iter().any(|field| field.name.starts_with('_') && !["_id", "_fn", "_valid_from", "_valid_to"].contains(&field.name.as_str())) { return Err(error("INSERT cannot write internal identity or system-time columns")); }
-                Statement::Dml(Dml::Insert { table: target, input })
+                };
+                self.validate_insert_columns(&input)?;
+                Statement::Dml(Dml::Insert { table, input })
             }
             ast::Statement::Update(update) => {
                 if update.from.is_some() || update.returning.is_some() || update.output.is_some() || !update.order_by.is_empty() || update.limit.is_some() || !update.table.joins.is_empty() { return Err(unsupported("UPDATE FROM, joined targets, ordering, or RETURNING")); }

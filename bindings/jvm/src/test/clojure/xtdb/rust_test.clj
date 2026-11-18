@@ -44,6 +44,21 @@
     (protocols/-execute-tx node [{:op :sql, :sql "INSERT INTO docs (_id) VALUES (3)", :arg-rows []}] {})
     (is (= [{:xt/id 1} {:xt/id 2}] (xt/q node "SELECT _id FROM docs ORDER BY _id")))))
 
+(deftest invalid-values-projection-aborts-the-logged-transaction
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (xt/execute-tx node ["INSERT INTO docs (_id, v) VALUES (0, 'prior')"])
+    (doseq [sql ["INSERT INTO docs (_id, v) VALUES (1)"
+                 "INSERT INTO docs (_id, v) VALUES (unbound_name)"
+                 "INSERT INTO docs (_id, v) VALUES (2, 'uncommitted'), (3)"]]
+      (let [{:keys [tx-id]} (xt/submit-tx node [sql])
+            [{:keys [committed error]}] (xt/q node ["SELECT committed, error FROM xt.txs WHERE _id = ?" tx-id])]
+        (is (false? committed))
+        (is (= "Errors planning SQL statement:\n  - Column count mismatch: expected 2, given 1"
+               (ex-message error)))
+        (is (= tx-id (-> error ex-data :tx-key :tx-id)))))
+    (is (= [{:xt/id 0 :v "prior"}] (xt/q node "SELECT * FROM docs")))))
+
 (deftest transit-java-dates-work-as-documents-and-sql-arguments
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

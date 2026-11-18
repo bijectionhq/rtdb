@@ -35,6 +35,25 @@ fn insert_values_without_a_projection_reports_both_planning_diagnostics() {
 }
 
 #[test]
+fn invalid_values_projection_remains_available_for_resolution() {
+    for source in [
+        "INSERT INTO foo (_id, v) VALUES (1)",
+        "INSERT INTO foo (_id, v) VALUES (unbound_name)",
+        "INSERT INTO foo (_id, v) VALUES (1, 2), (3)",
+    ] {
+        assert!(rtdb_sql::prepare_static(source, &Fixture, &PrepareOptions::default()).unwrap().is_none());
+        let error = prepare(source, &Fixture, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.context["errors"], serde_json::json!([{"expected": 2, "given": 1}]), "{source}");
+    }
+    let source = "INSERT INTO foo (_id, v) VALUES (1), (2,3,4), (5,6)";
+    let error = prepare(source, &Fixture, &PrepareOptions::default()).unwrap_err();
+    assert_eq!(error.context["errors"], serde_json::json!([
+        {"expected": 2, "given": 1},
+        {"expected": 2, "given": 3},
+    ]));
+}
+
+#[test]
 fn table_projection_failures_report_dependent_columns_in_order() {
     let sql = "INSERT INTO foo (_id) SELECT _id FROM UNNEST([1,2,3]) x (_id, foo)";
     let error = prepare(sql, &Fixture, &PrepareOptions::default()).unwrap_err();

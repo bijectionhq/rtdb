@@ -401,6 +401,7 @@ They admit parameters and scalar expressions that resolve without a column.
 An INSERT with a VALUES source requires a column list that includes `_id`.
 Planning reports the missing column list and the mandatory `_id` diagnostic together when the list is absent.
 An invalid table projection reports its diagnostic before the dependent column and INSERT schema diagnostics.
+A VALUES insert with the wrong source width retains its SQL for logged transaction resolution.
 
 == Series expression lowering
 

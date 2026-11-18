@@ -37,17 +37,19 @@ fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::Prepar
     let mut parsed = crate::parse::parse_with(sql, forms)?;
     if parsed.len() != 1 { return Err(invalid("A transaction operation must contain one statement")); }
     let statement = parsed.remove(0);
-    let eligible = match &statement.tree.statement {
-        crate::parse::Syntax::Records { .. } => true,
-        crate::parse::Syntax::Standard(sqlparser::ast::Statement::Insert(insert)) => !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
-            matches!(query.body.as_ref(), sqlparser::ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()),
-        _ => false,
-    };
-    if !eligible { return Ok(None); }
-    let prepared = statement.bind(catalog, options)?;
-    let output = match prepared.statement {
-        Statement::Dml(Dml::Insert { table, input }) => StaticMutation { table, input, patch: false, valid_time: TemporalFilter::Default },
-        Statement::Dml(Dml::Patch { table, input, valid_time }) => StaticMutation { table, input, patch: true, valid_time },
+    let output = match &statement.tree.statement {
+        crate::parse::Syntax::Records { .. } => match statement.bind(catalog, options)?.statement {
+            Statement::Dml(Dml::Insert { table, input }) => StaticMutation { table, input, patch: false, valid_time: TemporalFilter::Default },
+            Statement::Dml(Dml::Patch { table, input, valid_time }) => StaticMutation { table, input, patch: true, valid_time },
+            _ => return Ok(None),
+        },
+        crate::parse::Syntax::Standard(sqlparser::ast::Statement::Insert(insert))
+            if !insert.columns.is_empty() && insert.source.as_ref().is_some_and(|query|
+                matches!(query.body.as_ref(), sqlparser::ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()) =>
+        {
+            let Some(crate::bind::InsertRows { table, input }) = crate::bind::bind_static_values(statement, catalog, options)? else { return Ok(None); };
+            StaticMutation { table, input, patch: false, valid_time: TemporalFilter::Default }
+        }
         _ => return Ok(None),
     };
     fn decimal_target(target: &CastTarget) -> bool {
