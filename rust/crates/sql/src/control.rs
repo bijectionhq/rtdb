@@ -137,7 +137,7 @@ pub fn parse_control_syntax_in<'input>(source: &'input str, memory: &'input std:
 }
 
 fn parse_control_syntax<'input>(source: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Option<ParsedControl<'input>>> {
-    let mut tokens = crate::parse::tokenize(source)?;
+    let mut tokens = crate::parse::tokenize(source, forms.memory())?;
     if !probe_control(source, &mut tokens)? { return Ok(None); }
     parse_control_tokens(StatementSource::full(source), &tokens, forms)
 }

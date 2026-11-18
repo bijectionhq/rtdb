@@ -43,7 +43,7 @@ impl<I: Iterator> Iterator for SpanBoundaryCursor<I> where I::Item: Borrow<Token
 }
 
 pub fn split_statements(source: &str) -> Result<Vec<SourceSpan>> {
-    let tokens = crate::parse::tokenize(source)?;
+    let tokens = crate::parse::tokenize(source, None)?;
     Ok(SpanBoundaryCursor::new(tokens.into_iter()).map(|span| crate::parse::source_span(source, span)).collect())
 }
 
@@ -56,7 +56,7 @@ impl SplitTokens {
     pub(super) fn tokenize_in(source: &str, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut tokens = Self { values: Vec::new(), reservation: None };
         let reservation = &mut tokens.reservation;
-        crate::parse::tokenize_boundaries_into(source, &mut tokens.values, |values, token| {
+        crate::parse::tokenize_boundaries_into(source, Some(memory), &mut tokens.values, |values, token| {
             if values.len() == values.capacity() {
                 let capacity = values.capacity().checked_mul(2).ok_or_else(token_array_size)?.max(4);
                 let layout = Layout::array::<TokenWithSpan>(capacity).map_err(|_| token_array_size())?;
@@ -115,7 +115,7 @@ mod tests {
     use rtdb_types::{MemoryBudget, Result};
 
     fn split_ranges_fixture(source: &str, memory: &Arc<MemoryBudget>) -> Result<super::SplitStatements> {
-        let mut tokens = crate::parse::tokenize(source)?;
+        let mut tokens = crate::parse::tokenize(source, None)?;
         super::collect_split_ranges(source, &mut tokens, memory)
     }
 
@@ -351,7 +351,7 @@ mod boundary_line_comment_tests {
         assert_eq!(boundary.values[3].span, Span::new(end, Location::new(2, 1)));
         assert_eq!(boundary.values[4].span, Span::new(Location::new(2, 1), Location::new(2, 2)));
 
-        let full = crate::parse::tokenize(&source).unwrap();
+        let full = crate::parse::tokenize(&source, None).unwrap();
         assert_eq!((&boundary.values[..2], &boundary.values[3..]), (&full[..2], &full[3..]));
         assert_eq!(token.span, full[2].span);
         assert!(matches!(&full[2].token, Token::Whitespace(Whitespace::SingleLineComment { prefix, comment })
@@ -477,7 +477,7 @@ mod boundary_block_comment_tests {
         assert_eq!(boundary.values[3].span, Span::new(Location::new(2, 4), Location::new(2, 5)));
         assert_eq!(boundary.values[4].span, Span::new(Location::new(2, 5), Location::new(2, 6)));
 
-        let full = crate::parse::tokenize(&source).unwrap();
+        let full = crate::parse::tokenize(&source, None).unwrap();
         assert_eq!((&boundary.values[..2], &boundary.values[3..]), (&full[..2], &full[3..]));
         assert_eq!(token.span, full[2].span);
         assert!(matches!(&full[2].token, Token::Whitespace(Whitespace::MultiLineComment(text))

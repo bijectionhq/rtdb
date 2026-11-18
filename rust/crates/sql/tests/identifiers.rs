@@ -158,6 +158,31 @@ fn first_invalid_identifier_precedes_a_later_tokenizer_error() {
 }
 
 #[test]
+fn delimited_identifier_recognition_uses_the_failing_source_token() {
+    use rtdb_sql::split_statements_in;
+    use rtdb_types::MemoryBudget;
+
+    for (source, line, column, bad) in [
+        ("SELECT 1 AS \"zip/code\"", 1, 12, "\"zip/"),
+        ("SELECT 'é';\n  SELECT `zip/code`", 2, 9, "`zip/"),
+        ("SELECT 'é', \"a\"\"bé/c\"", 1, 15, "\"bé/"),
+        ("SELECT \"zip/code", 1, 7, "\"zip/"),
+    ] {
+        let memory = MemoryBudget::new(64 << 10);
+        let errors = [parse(source).unwrap_err(), split_statements(source).unwrap_err(),
+            split_statements_in(source, &memory).err().expect("invalid SQL")];
+        let start = source.find(bad).unwrap();
+        for error in errors {
+            assert_eq!(error.code, "xtdb/sql-error");
+            assert_eq!(error.message, Some(format!("Errors parsing SQL statement:\n  - line {line}:{column} token recognition error at: '{bad}'")));
+            assert_eq!(error.context["position"], serde_json::json!(start + 1));
+            assert_eq!(error.context["span"], serde_json::json!({"start": start, "end": start + bad.len()}));
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
 fn invalid_combined_operator_reports_its_first_invalid_character_before_a_later_lexical_error() {
     for (source, first) in [("SELECT a <@ b, 'unterminated", '@'), ("SELECT a ^@ b, 'unterminated", '^')] {
         let errors = [parse(source).unwrap_err(), parse_control(source, &PrepareOptions::default()).unwrap_err(), split_statements(source).unwrap_err()];

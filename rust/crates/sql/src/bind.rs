@@ -22,7 +22,10 @@ enum ListTableKind { Series, Unnest }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum FormAllocation<'a> { Tracked(&'a Arc<MemoryBudget>), Untracked }
-impl FormAllocation<'_> {
+impl<'a> FormAllocation<'a> {
+    pub(crate) fn memory(self) -> Option<&'a Arc<MemoryBudget>> {
+        match self { Self::Tracked(memory) => Some(memory), Self::Untracked => None }
+    }
     pub(crate) fn literal(self, value: &Value) -> Result<RegexForm> {
         let mut builder = match self { Self::Tracked(memory) => RegexFormBuilder::new_in(memory), Self::Untracked => RegexFormBuilder::new_untracked() };
         builder.literal(value)?;

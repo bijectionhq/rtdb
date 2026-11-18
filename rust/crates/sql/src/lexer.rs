@@ -4,8 +4,8 @@ mod vocabulary;
 #[cfg(test)]
 mod tests;
 
-use std::fmt::{self, Write};
-use rtdb_types::{AllocationScope, Anomaly, Result};
+use std::{fmt::{self, Write}, sync::Arc};
+use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result};
 pub(crate) use vocabulary::{Keyword, Punctuation, keyword};
 pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream, TokenText};
 
@@ -150,7 +150,49 @@ impl Drop for RenderedDiagnostic<'_> {
 
 impl RecognitionError<'_> {
     pub(crate) fn span(self) -> Span { self.span }
+    pub(crate) fn for_delimited_identifier(source: &str, start: usize, end: usize) -> Option<RecognitionError<'_>> {
+        if !source[start..].starts_with(['"', '`']) { return None; }
+        let prefix = &source[..start];
+        let line_prefix = prefix.rsplit_once('\n').map_or(prefix, |(_, line)| line);
+        let position = Position {
+            byte: start,
+            code_point: prefix.chars().count(),
+            line: prefix.bytes().filter(|byte| *byte == b'\n').count() + 1,
+            column: line_prefix.chars().count(),
+        };
+        let mut cursor = Cursor { source: Source(source), position };
+        while cursor.position.byte < end {
+            let delimiter = match cursor.peek()? {
+                '"' => Delimiter::DoubleQuote,
+                '`' => Delimiter::Backtick,
+                _ => return None,
+            };
+            let candidate = quoted(cursor, QuotedRule::Identifier(delimiter));
+            let Some(accepted) = candidate.accepted else { return Some(cursor.error(candidate.failure)); };
+            cursor = accepted;
+        }
+        None
+    }
+
     pub(crate) fn render<'scope>(self, allocation: &'scope AllocationScope) -> Result<RenderedDiagnostic<'scope>> {
+        let anomaly = self.render_anomaly(|bytes| allocation.reserve(bytes))?;
+        Ok(RenderedDiagnostic { anomaly, _allocation: allocation })
+    }
+
+    pub(crate) fn compatibility_anomaly(self, memory: Option<&Arc<MemoryBudget>>) -> Anomaly {
+        let span = self.span;
+        let render = self.render_anomaly(|bytes| {
+            let bytes = bytes.checked_add(256).ok_or_else(size_error)?;
+            memory.map(|memory| memory.reserve(bytes)).transpose()
+        });
+        match render {
+            Ok(anomaly) => anomaly.with_context("position", serde_json::json!(span.start.byte + 1))
+                .with_context("span", serde_json::json!({"start": span.start.byte, "end": span.end.byte})),
+            Err(error) => error,
+        }
+    }
+
+    fn render_anomaly<T>(self, admit: impl FnOnce(usize) -> Result<T>) -> Result<Anomaly> {
         const CODE: &str = "xtdb/sql-error";
         const PREFIX: &str = "Errors parsing SQL statement:\n  - line ";
         const RECOGNITION: &str = " token recognition error at: '";
@@ -164,7 +206,7 @@ impl RecognitionError<'_> {
             .and_then(|size| size.checked_add(RECOGNITION.len()))
             .and_then(|size| size.checked_add(escaped))
             .and_then(|size| size.checked_add(1)).ok_or_else(size_error)?;
-        allocation.reserve(capacity.checked_add(CODE.len()).ok_or_else(size_error)?)?;
+        let _reservation = admit(capacity.checked_add(CODE.len()).ok_or_else(size_error)?)?;
         let mut message = String::with_capacity(capacity);
         write!(&mut message, "{PREFIX}{}:{}{RECOGNITION}", self.span.start.line, self.span.start.column).expect("String writing is infallible");
         for value in text.chars() {
@@ -176,7 +218,7 @@ impl RecognitionError<'_> {
             }
         }
         message.push('\'');
-        Ok(RenderedDiagnostic { anomaly: Anomaly::incorrect(CODE, message), _allocation: allocation })
+        Ok(Anomaly::incorrect(CODE, message))
     }
 }
 

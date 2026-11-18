@@ -266,10 +266,10 @@ impl VisitMut for TemporalExtent {
     }
 }
 
-pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
+pub(crate) fn tokenize(source: &str, memory: Option<&Arc<MemoryBudget>>) -> Result<Vec<TokenWithSpan>> {
     let dialect = SqlDialect::default();
     let mut tokens = Vec::new();
-    tokenize_into(source, Tokenizer::new(&dialect, source), &mut tokens, |tokens, token| {
+    tokenize_into(source, memory, Tokenizer::new(&dialect, source), &mut tokens, |tokens, token| {
         tokens.push(token);
         Ok(())
     })?;
@@ -278,36 +278,50 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
 
 pub(super) fn tokenize_boundaries_into(
     source: &str,
+    memory: Option<&Arc<MemoryBudget>>,
     tokens: &mut Vec<TokenWithSpan>,
     append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
 ) -> Result<()> {
     let dialect = SqlDialect::default();
     let tokenizer = Tokenizer::new(&dialect, source).without_comment_text();
-    tokenize_into(source, tokenizer, tokens, append)
+    tokenize_into(source, memory, tokenizer, tokens, append)
 }
 
 fn tokenize_into(
     source: &str,
+    memory: Option<&Arc<MemoryBudget>>,
     mut tokenizer: Tokenizer<'_>,
     tokens: &mut Vec<TokenWithSpan>,
     mut append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
 ) -> Result<()> {
+    let quoted_error = |span: Span| {
+        let bytes = source_span(source, span);
+        crate::lexer::RecognitionError::for_delimited_identifier(source, bytes.start, bytes.end)
+            .map(|error| error.compatibility_anomaly(memory))
+    };
     let mut invalid_token = None;
     let result = tokenizer.try_tokenize_with_location_into_buf(tokens, |tokens, token| {
         if invalid_token.is_none() {
-            let invalid = match &token.token {
-                Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),
-                Token::ArrowAt => Some(("Invalid character in SQL source", Span::new(Location::new(token.span.start.line, token.span.start.column + 1), token.span.end))),
-                Token::Char(_) | Token::AtSign | Token::AtAt | Token::AtArrow | Token::AtQuestion | Token::CaretAt => Some(("Invalid character in SQL source", token.span)),
+            invalid_token = match &token.token {
+                Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => quoted_error(token.span),
+                Token::ArrowAt => Some(sql_error("Invalid character in SQL source", source,
+                    Span::new(Location::new(token.span.start.line, token.span.start.column + 1), token.span.end))),
+                Token::Char(_) | Token::AtSign | Token::AtAt | Token::AtArrow | Token::AtQuestion | Token::CaretAt =>
+                    Some(sql_error("Invalid character in SQL source", source, token.span)),
                 _ => None,
             };
-            if let Some((message, span)) = invalid { invalid_token = Some(sql_error(message, source, span)); }
         }
         append(tokens, token)
     });
     if let Some(error) = invalid_token { return Err(error); }
     result.map_err(|error| match error {
-        TokenizeBufferError::Lexer(error) => sql_error(error.to_string(), source, Span::new(error.location, error.location)),
+        TokenizeBufferError::Lexer(error) => {
+            let at = Span::new(error.location, error.location);
+            let start = source_span(source, at).start;
+            crate::lexer::RecognitionError::for_delimited_identifier(source, start, source.len())
+                .map(|error| error.compatibility_anomaly(memory))
+                .unwrap_or_else(|| sql_error(error.to_string(), source, at))
+        }
         TokenizeBufferError::Append(error) => error,
     })
 }
@@ -333,7 +347,7 @@ pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input Arc<MemoryBudge
 }
 
 fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<StatementSyntaxBatch<'input>> {
-    let tokens = tokenize(sql)?;
+    let tokens = tokenize(sql, forms.memory())?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     validate_common_syntax(&tokens, sql)?;
     let source = StatementSource::full(sql);
@@ -551,9 +565,9 @@ mod tests {
     #[test]
     fn both_tokenizer_paths_keep_quoted_identifier_spelling_and_literal_unescaping() {
         let source = r#""é""😀", `a````b`, 'x''y'"#;
-        let full = tokenize(source).unwrap();
+        let full = tokenize(source, None).unwrap();
         let mut boundary = Vec::new();
-        tokenize_boundaries_into(source, &mut boundary, |tokens, token| {
+        tokenize_boundaries_into(source, None, &mut boundary, |tokens, token| {
             tokens.push(token);
             Ok(())
         }).unwrap();

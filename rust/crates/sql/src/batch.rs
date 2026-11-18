@@ -249,7 +249,7 @@ impl SqlPrepareSyntax {
 /// An ordinary range borrows the input for the caller's own parsing policy.
 pub fn parse_extended_statement<'input>(source: &'input str, memory: &Arc<MemoryBudget>) -> Result<ExtendedParse<'input>> {
     let allocation = memory.reserve(command_size(source.len())?)?;
-    let mut tokens = crate::parse::tokenize(source)?;
+    let mut tokens = crate::parse::tokenize(source, Some(memory))?;
     tokens.retain(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
     let mut ranges = tokens.split(|token| token.token == Token::SemiColon).filter(|range| !range.is_empty());
     let statement = match (ranges.next(), ranges.next()) {
