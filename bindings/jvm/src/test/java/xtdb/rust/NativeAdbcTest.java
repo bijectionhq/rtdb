@@ -3,7 +3,10 @@ package xtdb.rust;
 import static org.junit.jupiter.api.Assertions.*;
 import clojure.java.api.Clojure;
 import java.io.IOException;
+import java.time.Instant;
+import java.time.ZonedDateTime;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.arrow.adbc.core.AdbcConnection.GetObjectsDepth;
 import org.apache.arrow.adbc.core.AdbcStatusCode;
 import org.apache.arrow.adbc.core.BulkIngestMode;
@@ -32,6 +35,38 @@ final class NativeAdbcTest {
                 }
             }
         }
+    }
+
+    @Test void inMemoryLogClockRejectsFailedReadsAndAllowsTheNextAppend() throws Exception {
+        var reads = new AtomicInteger();
+        try (var allocator = new RootAllocator();
+             var database = NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024, () -> {
+                 return switch (reads.getAndIncrement()) {
+                     case 0 -> throw new IllegalStateException("clock unavailable");
+                     case 1 -> Instant.MAX;
+                     default -> Instant.parse("2020-01-02T03:04:05.123456789Z");
+                 };
+             });
+             var connection = database.connect();
+             var insert = connection.createStatement("INSERT INTO docs (_id) VALUES (1)")) {
+            assertEquals(0, reads.get());
+            var failed = assertThrows(NativeException.class, insert::executeUpdate);
+            assertTrue(failed.getMessage().contains("The host in-memory log clock failed"));
+            var outOfRange = assertThrows(NativeException.class, insert::executeUpdate);
+            assertTrue(outOfRange.getMessage().contains("Instant exceeds microsecond timestamp range"));
+            insert.executeUpdate();
+            try (var statement = connection.createStatement("SELECT CAST(_valid_from AS TEXT) FROM docs");
+                 var result = statement.executeQuery()) {
+                assertTrue(result.getReader().loadNextBatch());
+                var batch = result.getReader().getVectorSchemaRoot();
+                assertEquals(1, batch.getRowCount());
+                var validFrom = ZonedDateTime.parse(batch.getVector(0).getObject(0).toString()).toInstant();
+                assertEquals(Instant.parse("2020-01-02T03:04:05.123456Z"), validFrom);
+                assertFalse(result.getReader().loadNextBatch());
+            }
+            assertEquals(3, reads.get());
+        }
+        assertEquals(3, reads.get());
     }
 
     @Test void adbcTestBasicQueryAndUpdate() throws Exception {

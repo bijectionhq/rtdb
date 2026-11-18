@@ -1,4 +1,4 @@
-use super::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, await_tip};
+use super::{AppendReceipt, AppendTimestampSource, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, SuppliedTimestamp, await_tip};
 use crate::{Error, IoRegion, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -21,16 +21,6 @@ pub struct LocalLogOptions {
     pub queue_capacity: usize,
 }
 
-pub trait LocalTimestampSource: Send + Sync {
-    /// Called once per record in the ordered writer before publication.
-    /// Errors roll back the current write batch and fail its outstanding receipts.
-    fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> Result<Timestamp>;
-}
-struct SuppliedTimestamp;
-impl LocalTimestampSource for SuppliedTimestamp {
-    fn timestamp(&self, _: &[u8], supplied: Timestamp) -> Result<Timestamp> { Ok(supplied) }
-}
-
 struct Queued { payload: Bytes, timestamp: Timestamp, durable: oneshot::Sender<Result<LogMetadata>> }
 
 pub struct LocalLog {
@@ -47,7 +37,7 @@ pub struct LocalLogDriver {
     progress: Arc<Progress>,
 }
 
-struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn LocalTimestampSource> }
+struct Writer { file: File, path: Arc<PathBuf>, timestamps: Arc<dyn AppendTimestampSource> }
 
 pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Error {
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
@@ -97,12 +87,12 @@ impl LocalLog {
 
     /// Uses `timestamps` in the writer; enqueued timestamps remain available to that policy.
     /// The returned driver has the same run/cancel/join obligation as `open`.
-    pub fn open_with_timestamp_source(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn LocalTimestampSource>) -> Result<(Arc<Self>, LocalLogDriver)> {
+    pub fn open_with_timestamp_source(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>) -> Result<(Arc<Self>, LocalLogDriver)> {
         Self::open_with_timestamp_source_in(path, options, timestamps, IoRegion::new())
     }
 
     /// Uses a caller-owned reader I/O region; the caller closes that region after consumers and the writer join.
-    pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn LocalTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
+    pub fn open_with_timestamp_source_in(path: impl AsRef<Path>, options: LocalLogOptions, timestamps: Arc<dyn AppendTimestampSource>, reads: Arc<IoRegion>) -> Result<(Arc<Self>, LocalLogDriver)> {
         let _operation = reads.admit()?;
         let path = path.as_ref();
         if options.queue_capacity == 0 || options.maximum_message_bytes > i32::MAX as usize {

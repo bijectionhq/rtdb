@@ -348,6 +348,8 @@ variant Detach : DbOp {
 
 entity SourceMessage {
     msg_id: MessageId
+    -- An in-memory source log with a configured clock samples it for each transaction in append order.
+    -- A failed clock sample rejects the append before assigning a position or publishing a record.
     log_timestamp: Timestamp
     kind: TxMessage | LegacyTxMessage | FlushBlockMessage | TriesAddedMessage
          | AttachDbMessage | DetachDbMessage

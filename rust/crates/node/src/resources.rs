@@ -6,12 +6,13 @@ use async_trait::async_trait;
 use futures::{FutureExt, future::BoxFuture};
 use prost_types::Any;
 use rtdb_format::{database::proto::{DatabaseConfig, database_config}, keys::{CURRENT_STORAGE_VERSION, storage_root}};
-use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_storage::{IoRegion, LocalStore, MemoryStore, ObjectKey, ObjectStore, log::{AppendTimestampSource, LocalLog, LocalLogOptions, Log, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
 use rtdb_storage::disk_cache::DiskCache;
-use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion};
+use rtdb_types::{Anomaly, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 pub type ResourceDriver = BoxFuture<'static, Result<()>>;
+pub type TransactionClock = dyn Fn() -> Result<Timestamp> + Send + Sync;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogAccess { ReadOnly, SourceWriter, ReadWrite }
@@ -93,6 +94,7 @@ pub struct NativeResources {
     storage_factories: BTreeMap<String, Arc<dyn RemoteStorageFactory>>,
     disk_cache: Option<Arc<DiskCache>>,
     io: Arc<IoRegion>,
+    memory_transaction_clock: Option<Arc<TransactionClock>>,
     local_log_clock: Arc<dyn crate::Clock>,
     local_log_uses_clock_for_non_transactions: bool,
 }
@@ -101,12 +103,18 @@ impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
             log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, io: IoRegion::new(),
-            local_log_clock: Arc::new(crate::SystemClock), local_log_uses_clock_for_non_transactions: false }
+            memory_transaction_clock: None, local_log_clock: Arc::new(crate::SystemClock), local_log_uses_clock_for_non_transactions: false }
     }
 }
 
 impl NativeResources {
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
+    /// Samples this clock for each transaction appended to an in-memory source log.
+    /// Calls into a shared clock can originate from different databases concurrently.
+    pub fn with_in_memory_log_clock(mut self, clock: Arc<TransactionClock>) -> Self {
+        self.memory_transaction_clock = Some(clock);
+        self
+    }
     pub fn with_local_log_clock(mut self, clock: Arc<dyn crate::Clock>, use_for_non_transactions: bool) -> Self {
         self.local_log_clock = clock;
         self.local_log_uses_clock_for_non_transactions = use_for_non_transactions;
@@ -131,12 +139,28 @@ impl NativeResources {
 }
 
 struct NativeLogTimestamps { clock: Arc<dyn crate::Clock>, source: bool, use_for_non_transactions: bool }
-impl rtdb_storage::log::LocalTimestampSource for NativeLogTimestamps {
+impl AppendTimestampSource for NativeLogTimestamps {
     fn timestamp(&self, payload: &[u8], _: rtdb_types::Timestamp) -> rtdb_storage::Result<rtdb_types::Timestamp> {
         use crate::Clock;
-        let transaction = self.source && rtdb_format::envelope::SourceMessage::is_transaction_encoded(payload).map_err(|error| rtdb_storage::Error::Task(error.to_string()))?;
+        let transaction = self.source && is_source_transaction(payload)?;
         Ok(if transaction || self.use_for_non_transactions { self.clock.now() } else { crate::SystemClock.now() })
     }
+}
+
+struct MemoryLogTransactionTimestamps(Arc<TransactionClock>);
+impl AppendTimestampSource for MemoryLogTransactionTimestamps {
+    fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> rtdb_storage::Result<Timestamp> {
+        if is_source_transaction(payload)? {
+            (self.0)().map_err(|error| rtdb_storage::Error::Task(error.to_string()))
+        } else {
+            Ok(supplied)
+        }
+    }
+}
+
+fn is_source_transaction(payload: &[u8]) -> rtdb_storage::Result<bool> {
+    rtdb_format::envelope::SourceMessage::is_transaction_encoded(payload)
+        .map_err(|error| rtdb_storage::Error::Task(error.to_string()))
 }
 
 fn type_name(configuration: &Any) -> Result<&str> {
@@ -220,7 +244,11 @@ impl ResourceFactory for NativeResources {
         match &configuration.log {
             None | Some(database_config::Log::InMemoryLog(_)) => {
                 let epoch = match &configuration.log { Some(database_config::Log::InMemoryLog(log)) => log.epoch.unwrap_or(0), _ => 0 };
-                Ok(OpenedLogs { source: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
+                let source = match &self.memory_transaction_clock {
+                    Some(clock) => MemoryLog::with_timestamp_source(self.maximum_log_message_bytes, Arc::new(MemoryLogTransactionTimestamps(Arc::clone(clock)))),
+                    None => MemoryLog::new(self.maximum_log_message_bytes),
+                };
+                Ok(OpenedLogs { source: Arc::new(source), replica: Arc::new(MemoryLog::new(self.maximum_log_message_bytes)),
                     source_epoch: StorageEpoch(epoch), replica_epoch: StorageEpoch(epoch), drivers: Vec::new() })
             }
             Some(database_config::Log::LocalLog(log)) => {

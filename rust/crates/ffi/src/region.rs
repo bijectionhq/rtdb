@@ -1,6 +1,7 @@
 use std::{future::Future, sync::{Arc, atomic::{AtomicBool, Ordering}}};
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
+use rtdb_node::TransactionClock;
 use rtdb_server::{ServerDriver, ServerHandle, config::{ParsedConfiguration, ProcessEnvironment}};
 use rtdb_types::{Anomaly, Result};
 use tokio::{runtime::Runtime, task::JoinHandle};
@@ -17,10 +18,7 @@ pub(crate) struct EmbeddedRegion {
 }
 
 impl EmbeddedRegion {
-    pub fn open(yaml: &str, memory_bytes: usize) -> Result<Arc<Self>> {
-        Self::open_with_properties(yaml,memory_bytes,"{}")
-    }
-    pub fn open_with_properties(yaml: &str,memory_bytes: usize,properties: &str) -> Result<Arc<Self>> {
+    pub fn open(yaml: &str, memory_bytes: usize, properties: &str, transaction_clock: Option<Arc<TransactionClock>>) -> Result<Arc<Self>> {
         blocking_caller()?;
         if memory_bytes == 0 { return Err(super::invalid("A positive allocation limit is required")); }
         let bootstrap = MemoryBudget::new(memory_bytes);
@@ -29,7 +27,12 @@ impl EmbeddedRegion {
         let (configuration, memory, configuration_charge) = parsed.into_execution(memory_bytes)?;
         drop(bootstrap);
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;
-        let (server, driver) = runtime.block_on(ServerDriver::open_with_memory(configuration, memory_bytes, memory))?;
+        let (server, driver) = runtime.block_on(async {
+            match transaction_clock {
+                Some(clock) => ServerDriver::open_with_in_memory_log_clock(configuration, memory_bytes, memory, clock).await,
+                None => ServerDriver::open_with_memory(configuration, memory_bytes, memory).await,
+            }
+        })?;
         let reservation = match server.node().memory().reserve(std::mem::size_of::<Self>() + 8192) {
             Ok(reservation) => reservation,
             Err(error) => { server.shutdown(); let _ = runtime.block_on(driver.run()); return Err(error); }

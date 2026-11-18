@@ -56,7 +56,7 @@ Ordinary database-opening failure, node/server startup failure, unstarted closur
 The disk-cache directory lock excludes concurrent owners and precedes abandoned temporary-file cleanup.
 Cache identity retains the pinned database/partition layout from `RemoteBufferPool.kt`; provider or epoch replacement under the same cache root requires explicit qualification in both engines.
 Such a replacement must use a fresh cache root or remove the previous cache while its owner is stopped; retained cache bytes do not establish storage identity.
-`Writer` and `LocalTimestampSource` are passive; the local log driver chooses work, and the writer samples each record's clock before append.
+`Writer` and `AppendTimestampSource` are passive; the local log driver chooses work, and the writer samples each record's clock before append.
 The local log driver requires cancellation followed by joining its run task; forcibly aborting that task can leave an in-progress blocking append with an unknown result.
 Several scalar and row-building paths still allocate transient values before charging their retained size.
 These paths require further work before claiming bounded peak query memory.

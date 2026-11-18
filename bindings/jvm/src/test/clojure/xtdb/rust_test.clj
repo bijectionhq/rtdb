@@ -1,5 +1,5 @@
 (ns xtdb.rust-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :as t :refer [deftest is]]
             [xtdb.api :as xt]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.sql.expr-test :as original-expr]
@@ -7,11 +7,16 @@
             [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
             [xtdb.rust])
-  (:import [org.apache.arrow.memory RootAllocator]
+  (:import [java.time InstantSource]
+           [org.apache.arrow.memory RootAllocator]
            [xtdb.rust NativeDatabase]))
 
-(defn- open-node ^NativeDatabase [allocator]
-  (NativeDatabase/open allocator "server: null\nflightSql: null\nnodeId: clojure-binding-test\n" (* 512 1024 1024)))
+(def ^:private node-config "server: null\nflightSql: null\nnodeId: clojure-binding-test\n")
+
+(defn- open-node ^NativeDatabase
+  ([allocator] (NativeDatabase/open allocator node-config (* 512 1024 1024)))
+  ([allocator ^InstantSource clock]
+   (NativeDatabase/open allocator node-config (* 512 1024 1024) clock)))
 
 (deftest api-adbc-test-query-and-native-transactions
   (with-open [allocator (RootAllocator.)
@@ -39,12 +44,26 @@
     (protocols/-execute-tx node [{:op :sql, :sql "INSERT INTO docs (_id) VALUES (3)", :arg-rows []}] {})
     (is (= [{:xt/id 1} {:xt/id 2}] (xt/q node "SELECT _id FROM docs ORDER BY _id")))))
 
+(defn- with-native-node [f]
+  (let [[log-type {:keys [instant-src]}] (:log tu/*node-opts*)]
+    (with-open [node (case log-type
+                      nil (open-node tu/*allocator*)
+                      :in-memory (open-node tu/*allocator* instant-src)
+                      (throw (ex-info "Unsupported native log fixture" {:log-type log-type})))]
+      (binding [tu/*node* node]
+        (f)))))
+
 (defn- run-original-api-case [original]
-  (with-open [allocator (RootAllocator.)
-              node (open-node allocator)]
-    (binding [tu/*allocator* allocator
-              tu/*node* node]
-      ((:test (meta original))))))
+  (let [fixtures (-> original meta :ns meta ::t/each-fixtures)
+        native-fixtures (mapv {tu/with-node with-native-node
+                              tu/with-allocator tu/with-allocator
+                              tu/with-mock-clock tu/with-mock-clock}
+                             fixtures)
+        native-fixtures (cond->> native-fixtures
+                          (not-any? #{tu/with-allocator} fixtures) (into [tu/with-allocator]))]
+    (when (some nil? native-fixtures)
+      (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
+    ((t/join-fixtures native-fixtures) (:test (meta original)))))
 
 (deftest multiple-query-tails
   (run-original-api-case #'original-sql/multiple-query-tails))
@@ -72,6 +91,9 @@
 
 (deftest test-generate-series-3212
   (run-original-api-case #'original-sql/test-generate-series-3212))
+
+(deftest test-order-nulls-first-last
+  (run-original-api-case #'original-sql/test-order-nulls-first-last))
 
 (deftest test-xt-version
   (run-original-api-case #'original-sql/test-xt-version))

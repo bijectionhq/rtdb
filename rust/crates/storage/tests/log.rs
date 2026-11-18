@@ -36,7 +36,7 @@ fn cancelled_local_log_reader_offloads_are_joined_after_writer_shutdown() {
 async fn timestamp_source_is_sampled_in_the_writer_after_enqueue() {
     use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
     struct Clock(AtomicI64);
-    impl rtdb_storage::log::LocalTimestampSource for Clock {
+    impl rtdb_storage::log::AppendTimestampSource for Clock {
         fn timestamp(&self, _: &[u8], _: Timestamp) -> rtdb_storage::Result<Timestamp> { Ok(Timestamp(self.0.fetch_add(1, Ordering::SeqCst))) }
     }
     let directory = tempfile::tempdir().unwrap();
@@ -57,7 +57,7 @@ async fn timestamp_source_is_sampled_in_the_writer_after_enqueue() {
 async fn timestamp_failure_rolls_back_every_record_in_the_write_batch() {
     use std::sync::Arc;
     struct FailSecond;
-    impl rtdb_storage::log::LocalTimestampSource for FailSecond {
+    impl rtdb_storage::log::AppendTimestampSource for FailSecond {
         fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> rtdb_storage::Result<Timestamp> {
             if payload == b"fail" { Err(Error::Task("clock failed".into())) } else { Ok(supplied) }
         }
@@ -71,6 +71,35 @@ async fn timestamp_failure_rolls_back_every_record_in_the_write_batch() {
     assert!(first.durable().await.is_err());
     assert!(second.durable().await.is_err());
     assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn memory_log_samples_before_publication_and_reuses_a_failed_position() {
+    use std::sync::{Arc, atomic::{AtomicI64, Ordering}};
+
+    struct Clock(AtomicI64);
+    impl rtdb_storage::log::AppendTimestampSource for Clock {
+        fn timestamp(&self, payload: &[u8], _: Timestamp) -> rtdb_storage::Result<Timestamp> {
+            if payload == b"fail" { return Err(Error::Task("clock failed".into())); }
+            Ok(Timestamp(self.0.fetch_add(1, Ordering::SeqCst)))
+        }
+    }
+
+    let clock = Arc::new(Clock(AtomicI64::new(30)));
+    let log = MemoryLog::with_timestamp_source(1024, clock.clone());
+    let first = log.enqueue(Bytes::from_static(b"first"), Timestamp(1)).await.unwrap().durable().await.unwrap();
+    assert_eq!(first.offset, LogOffset(0));
+    assert_eq!(first.timestamp, Timestamp(30));
+    assert!(matches!(log.enqueue(Bytes::from_static(b"fail"), Timestamp(2)).await, Err(Error::Task(_))));
+    assert_eq!(log.latest().unwrap(), LogOffset(0));
+    let next = log.enqueue(Bytes::from_static(b"next"), Timestamp(3)).await.unwrap().durable().await.unwrap();
+    assert_eq!(next.offset, LogOffset(1));
+    assert_eq!(next.timestamp, Timestamp(31));
+    let records = log.read_range(LogOffset(0), LogOffset(2)).await.unwrap();
+    assert_eq!(records.iter().map(|record| record.metadata).collect::<Vec<_>>(), [first, next]);
+    log.close();
+    assert!(log.enqueue(Bytes::from_static(b"closed"), Timestamp(4)).await.is_err());
+    assert_eq!(clock.0.load(Ordering::SeqCst), 32);
 }
 
 #[tokio::test]

@@ -30,6 +30,9 @@ final class NativeAbi {
         register(library, linker, "abi_version");
         register(library, linker, "database_open", PTR, I64, I64, PTR, PTR);
         register(library, linker, "database_open_with_properties", PTR, I64, I64, PTR, I64, PTR, PTR);
+        String clockOpen = "database_open_with_in_memory_log_clock";
+        library.find("rtdb_v1_" + clockOpen).ifPresent(symbol -> functions.put(clockOpen,
+            linker.downcallHandle(symbol, FunctionDescriptor.of(I32, PTR, I64, I64, PTR, I64, PTR, I64, PTR, PTR))));
         register(library, linker, "retain", I64, PTR, PTR);
         register(library, linker, "release", I64, PTR);
         register(library, linker, "close", I64, PTR);
@@ -65,7 +68,9 @@ final class NativeAbi {
         functions.put(name, linker.downcallHandle(library.find("rtdb_v1_" + name).orElseThrow(), FunctionDescriptor.of(I32, arguments)));
     }
     private int invoke(String name, Object... arguments) throws AdbcException {
-        try { return (int) functions.get(name).invokeWithArguments(arguments); }
+        MethodHandle function = functions.get(name);
+        if (function == null) throw AdbcException.invalidState("Native ABI entry point is unavailable: " + name);
+        try { return (int) function.invokeWithArguments(arguments); }
         catch (Throwable error) { throw AdbcException.internal("Native ABI invocation failed: " + name).withCause(error); }
     }
     void call(String name, Object... arguments) throws AdbcException {

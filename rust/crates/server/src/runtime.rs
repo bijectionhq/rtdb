@@ -4,7 +4,7 @@ use std::io::Write;
 use rtdb_auth::{Authenticator, NativeHttp};
 use rtdb_columnar::MemoryBudget;
 use rtdb_metrics::Registry;
-use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock};
+use rtdb_node::{Node, NodeDriver, NodeServices, SystemClock, TransactionClock};
 use rtdb_types::{Anomaly, AnomalyCategory, Result};
 use tokio::task::{JoinError, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -45,13 +45,18 @@ impl ServerDriver {
     /// Run exactly once; request shutdown through the handle and join this run before releasing dependencies.
     pub async fn open(config: NodeConfiguration, allocation_limit_bytes: usize) -> Result<(ServerHandle, Self)> {
         let memory = MemoryBudget::new(config.node_options(allocation_limit_bytes)?.execution_memory_bytes);
-        Self::open_mode(config, allocation_limit_bytes, memory, false).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
     }
 
     /// The supplied execution budget must match the cache/execution split of the process allocation ceiling.
     /// Startup allocations retained by the caller may already hold reservations from this budget.
     pub async fn open_with_memory(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>) -> Result<(ServerHandle, Self)> {
-        Self::open_mode(config, allocation_limit_bytes, memory, false).await
+        Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
+    }
+
+    /// Uses a host clock for transactions appended to in-memory source logs.
+    pub async fn open_with_in_memory_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
+        Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock)).await
     }
 
     /// Runs compaction while following the replica log, with no transaction listeners or leader election.
@@ -67,10 +72,10 @@ impl ServerDriver {
         config.flight_sql = None;
         config.indexer.enabled = true;
         config.garbage.enabled = false;
-        Self::open_mode(config, allocation_limit_bytes, memory, true).await
+        Self::open_mode(config, allocation_limit_bytes, memory, true, None).await
     }
 
-    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool) -> Result<(ServerHandle, Self)> {
+    async fn open_mode(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, compactor_only: bool, transaction_clock: Option<Arc<TransactionClock>>) -> Result<(ServerHandle, Self)> {
         let mut options = config.node_options(allocation_limit_bytes)?;
         if memory.limit_bytes() != options.execution_memory_bytes { return Err(Anomaly::incorrect("rtdb.server/invalid-memory-budget", "Supplied execution budget differs from the configured allocation split")); }
         if compactor_only { options.replication.may_lead = false; }
@@ -83,6 +88,10 @@ impl ServerDriver {
         let http = Arc::new(NativeHttp::new(Arc::clone(&memory), Duration::from_secs(30), 4 * 1024 * 1024)?);
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
+        let resources = match transaction_clock {
+            Some(clock) => resources.with_in_memory_log_clock(clock),
+            None => resources,
+        };
         let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,
             ..NodeServices::local(auth.clone(), metrics.clone(), auth.clone(), metrics.clone()) };
         let (node, driver) = Node::open_with_memory(options, services, memory).await?;

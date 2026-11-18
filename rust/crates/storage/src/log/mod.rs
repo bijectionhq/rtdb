@@ -2,7 +2,7 @@ mod local;
 mod memory;
 mod read_only;
 
-pub use local::{LocalLog, LocalLogDriver, LocalLogOptions, LocalTimestampSource};
+pub use local::{LocalLog, LocalLogDriver, LocalLogOptions};
 pub use memory::MemoryLog;
 pub use read_only::{ReadOnlyLocalLog, ReadOnlyLocalLogOptions};
 
@@ -13,6 +13,17 @@ use rtdb_types::Timestamp;
 use std::{sync::Arc, time::Duration};
 use std::{future::Future, pin::Pin};
 use tokio::sync::{oneshot, watch};
+
+pub trait AppendTimestampSource: Send + Sync {
+    /// Samples a record's timestamp in append order before publication.
+    /// An error fails the append without advancing the durable tip.
+    fn timestamp(&self, payload: &[u8], supplied: Timestamp) -> Result<Timestamp>;
+}
+
+struct SuppliedTimestamp;
+impl AppendTimestampSource for SuppliedTimestamp {
+    fn timestamp(&self, _: &[u8], supplied: Timestamp) -> Result<Timestamp> { Ok(supplied) }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct LogOffset(pub i64);

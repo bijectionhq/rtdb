@@ -68,6 +68,12 @@ JVM module, authenticator, storage and log factory objects do not cross the C AB
 The binding rejects the `xtdb.config` factory-object option explicitly.
 Existing remote JDBC, PostgreSQL, Python Flight SQL and Rust clients retain their protocol interfaces.
 
+`NativeDatabase.open(allocator, yaml, nativeMemoryBytes, instantSource)` uses a host `InstantSource` to timestamp transaction appends on in-memory source logs.
+The log records the instant at microsecond precision, sampling in append order within each log.
+The callback must be safe to call concurrently across logs and finish without reentering the database.
+If the source throws or supplies an instant outside the microsecond range, the append fails before it publishes a record.
+The database releases the callback when close finishes.
+
 The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
 The binding tests load a separately built native library from `xtdb.native.library`.
 The Clojure suite invokes the original query-tail, duration literal, null-or-missing UNNEST, and declared-column extrema test bodies with a fresh `NativeDatabase`.

@@ -1,4 +1,4 @@
-use super::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, await_tip};
+use super::{AppendReceipt, AppendTimestampSource, Log, LogMetadata, LogOffset, LogRecord, LogTail, Progress, SuppliedTimestamp, await_tip};
 use crate::{Error, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,15 +13,24 @@ struct Records {
     values: VecDeque<LogRecord>,
 }
 
-struct Shared { records: Mutex<Records>, progress: Progress, maximum_message_bytes: usize }
+struct Shared {
+    records: Mutex<Records>,
+    progress: Progress,
+    maximum_message_bytes: usize,
+    timestamps: Arc<dyn AppendTimestampSource>,
+}
 
 pub struct MemoryLog { shared: Arc<Shared> }
 
 impl MemoryLog {
     pub fn new(maximum_message_bytes: usize) -> Self {
+        Self::with_timestamp_source(maximum_message_bytes, Arc::new(SuppliedTimestamp))
+    }
+
+    pub fn with_timestamp_source(maximum_message_bytes: usize, timestamps: Arc<dyn AppendTimestampSource>) -> Self {
         Self { shared: Arc::new(Shared {
             records: Mutex::new(Records { first: 0, next: 0, values: VecDeque::new() }),
-            progress: Progress::new(LogOffset(-1)), maximum_message_bytes,
+            progress: Progress::new(LogOffset(-1)), maximum_message_bytes, timestamps,
         }) }
     }
 
@@ -59,8 +68,10 @@ impl Log for MemoryLog {
         }
         let mut records = self.shared.records.lock();
         self.shared.progress.latest()?;
+        let next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        let timestamp = self.shared.timestamps.timestamp(&payload, timestamp)?;
         let metadata = LogMetadata { offset: LogOffset(records.next), timestamp };
-        records.next = records.next.checked_add(1).ok_or_else(|| Error::Closed("log positions exhausted".into()))?;
+        records.next = next;
         records.values.push_back(LogRecord { metadata, payload });
         self.shared.progress.advance(metadata.offset);
         let (sender, durable) = oneshot::channel();

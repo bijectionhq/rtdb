@@ -6,7 +6,8 @@ import org.apache.arrow.adbc.core.AdbcException;
 abstract class NativeResource implements AutoCloseable {
     final NativeAbi abi;
     private final AtomicLong handle;
-    NativeResource(NativeAbi abi, long handle) { this.abi = abi; this.handle = new AtomicLong(handle); }
+    NativeResource(NativeAbi abi, long handle) { this(abi, new AtomicLong(handle)); }
+    NativeResource(NativeAbi abi, AtomicLong ownership) { this.abi = abi; this.handle = ownership; }
     final long handle() throws AdbcException {
         long value = handle.get();
         if (value == 0) throw AdbcException.invalidState("Native resource is closed");
