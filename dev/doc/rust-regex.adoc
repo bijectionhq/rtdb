@@ -46,6 +46,34 @@ These computed strings retain their own allocation leases; temporary unit buffer
 The existing 16 MiB host temporary-text limit still applies to valid UTF-8 text.
 Canonical raw metadata and its generic serialization retain their current UTF-8 domain; this computed path adds no exact-unit SQL or XTQL metadata producer.
 
+=== Host pattern forms
+
+Only XTQL computes a pattern from a host form; SQL `REGEXP_REPLACE` accepts only a literal pattern.
+The reference splices the form into generated code that it evaluates at query time, where `clojure.core` is referred but no other namespace alias or class import is in scope.
+
+The host evaluator accepts:
+
+* the special forms `quote`, `if`, `do`, `let`/`let*`, `when`, `when-not`, `if-let`, `when-let`, `and` and `or`;
+* the `clojure.core` functions `str`, `identity`, `name`, `namespace`, `subs`, `not`, `boolean`, `apply`, `format`, the numeric casts, arithmetic, comparisons, predicates, classifications, `quot`/`rem`/`mod`, `min`/`max`/`abs` and the bit operations, bare or `clojure.core/`-qualified;
+* `java.util.regex.Pattern/quote`, fully qualified;
+* `clojure.string/join`, `upper-case`, `lower-case`, `replace` and `trim`, fully qualified.
+
+`str` prints vectors and quoted lists and vectors in their readable form, as `pr-str` does.
+`format` admits only `%s`, `%d` and `%%`, with no argument index, flags, width or precision, because those are the conversions whose output does not depend on the JVM's default locale.
+`clojure.string/upper-case` and `lower-case` apply locale-independent Unicode case mapping.
+`clojure.string/replace` admits String and Character matches.
+
+The evaluator rejects, with `rtdb.expr/regex-host-form`:
+
+* side-effecting or environment-reading interop, such as `System/getProperty` or `slurp`, by design;
+* `Pattern/quote` and other unqualified class names, and namespace aliases such as `str/join`, which do not resolve in the reference's evaluation namespace;
+* every other Java interop form and every other `clojure.core` or `clojure.string` function;
+* `format` conversions other than `%s`, `%d` and `%%`, and specifiers carrying an index, flags, width or precision;
+* sequences over String characters for `apply` and `clojure.string/join`;
+* map and set literals with entries, whose printed and sequence order follows Clojure's hash order;
+* Pattern matches for `clojure.string/replace`, since the form syntax carries no regex literal;
+* tagged literals and anonymous function syntax.
+
 == Remaining implementation work
 
 This source wave is not a declaration of Java Pattern parity.

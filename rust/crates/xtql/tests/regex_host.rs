@@ -636,3 +636,23 @@ async fn host_null_and_ifn_values_evaluate_arguments_before_invocation() {
         assert_eq!(project(&format!(r#"(regexp-replace "a" {body} "x")"#)).await.unwrap(),Value::Utf8("x".into()));
     }
 }
+
+#[tokio::test]
+async fn host_string_library_forms_compute_patterns() {
+    for (source,pattern,expected) in [
+        ("a.b.c",r#"(java.util.regex.Pattern/quote ".")"#,"axbxc"),
+        ("a1b",r#"(format "%s%d" "a" 1)"#,"xb"),
+        ("abc",r#"(apply str ["a" "b"])"#,"xc"),
+        ("a|b",r#"(java.util.regex.Pattern/quote (clojure.string/join "|" ["a" "b"]))"#,"x"),
+        ("AB",r#"(clojure.string/upper-case "ab")"#,"x"),
+        ("ab",r#"(clojure.string/lower-case "AB")"#,"x"),
+        ("a.b",r#"(clojure.string/replace "a-b" "-" "\\.")"#,"x"),
+        ("ab",r#"(clojure.string/trim " ab ")"#,"x"),
+        (r#"[1 "a"]"#,r#"(java.util.regex.Pattern/quote (str [1 "a"]))"#,"x"),
+    ] {
+        assert_eq!(project(&format!(r#"(regexp-replace {source:?} {pattern} "x")"#)).await.unwrap(),Value::Utf8(expected.into()),"{pattern}");
+    }
+    for pattern in [r#"(Pattern/quote ".")"#,r#"(System/getProperty "user.dir")"#,r#"(str/join ["a"])"#] {
+        assert_eq!(project(&format!(r#"(regexp-replace "a" {pattern} "x")"#)).await.unwrap_err().code,"rtdb.expr/regex-host-form","{pattern}");
+    }
+}

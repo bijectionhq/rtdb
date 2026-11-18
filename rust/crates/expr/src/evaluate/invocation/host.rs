@@ -4,6 +4,8 @@ use rtdb_types::{Anomaly,Result,Value,java_text::{JavaString,JavaText}};
 use crate::EvalContext;
 use crate::jvm_number::{Binary,Bit,Cast,Classification,Comparison,Dispatch,Error as NumberError,Extremum,ExtremumCall,Integral,Number,Predicate,Selected,Unary,bit_not,bit_test};
 
+mod text;
+
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(JavaText<'a>),Computed(JavaString) }
 /// Host forms nest up to the depth limit, and an unoptimised frame of either recursion exceeds 30 KiB.
@@ -30,7 +32,7 @@ enum Expression<'a> {
     Vector(Vec<Expression<'a>>),Call { function: Box<Expression<'a>>,arguments: Vec<Expression<'a>> },
 }
 #[derive(Clone,Copy)]
-enum Function { Str,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Classification(Classification),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest,Absolute,Extremum(Extremum) }
+enum Function { Str,PatternQuote,Format,Apply,Join,UpperCase,LowerCase,Replace,Trim,Identity,Name,Namespace,Subs,Not,Boolean,Cast(Cast),Arithmetic(Arithmetic),Comparison(Comparison),Predicate(Predicate),Classification(Classification),Integral(Integral),Modulo,BitNot,Bit(Bit),BitTest,Absolute,Extremum(Extremum) }
 #[derive(Clone,Copy)]
 enum Arithmetic { Add(bool),Subtract(bool),Multiply(bool),Divide,Increment(bool),Decrement(bool) }
 #[derive(Clone)]
@@ -502,6 +504,7 @@ impl Function {
                 for value in &strings { output.extend(value.view().units()); }
                 HostValue::Text(retain_units(&output,context)?)
             }
+            Self::PatternQuote | Self::Format | Self::Apply | Self::Join | Self::UpperCase | Self::LowerCase | Self::Replace | Self::Trim => self.apply_text(args,context)?,
             Self::Identity => { arity(args.len(),1,1)?;args.into_iter().next().ok_or_else(||error("Missing host argument"))? }
             Self::Cast(kind) => { arity(args.len(),1,1)?;numeric_cast(kind,args.into_iter().next().ok_or_else(||error("Missing host argument"))?,false,context)? }
             Self::Arithmetic(operation) => operation.apply(args,context)?,
@@ -574,8 +577,14 @@ impl Function {
     }
 }
 fn function(name: &str) -> Option<Function> {
+    match name {
+        "java.util.regex.Pattern/quote" => return Some(Function::PatternQuote),
+        "clojure.string/join" => return Some(Function::Join),"clojure.string/upper-case" => return Some(Function::UpperCase),"clojure.string/lower-case" => return Some(Function::LowerCase),
+        "clojure.string/replace" => return Some(Function::Replace),"clojure.string/trim" => return Some(Function::Trim),
+        _ => {}
+    }
     let name = name.strip_prefix("clojure.core/").unwrap_or(name);
-    Some(match name { "str" => Function::Str,"identity" => Function::Identity,"name" => Function::Name,"namespace" => Function::Namespace,"subs" => Function::Subs,"not" => Function::Not,"boolean" => Function::Boolean,
+    Some(match name { "str" => Function::Str,"format" => Function::Format,"apply" => Function::Apply,"identity" => Function::Identity,"name" => Function::Name,"namespace" => Function::Namespace,"subs" => Function::Subs,"not" => Function::Not,"boolean" => Function::Boolean,
         "byte" => Function::Cast(Cast::Byte),"short" => Function::Cast(Cast::Short),"int" => Function::Cast(Cast::Int),"long" => Function::Cast(Cast::Long),"float" => Function::Cast(Cast::Float),"double" => Function::Cast(Cast::Double),
         "+" => Function::Arithmetic(Arithmetic::Add(false)),"+'" => Function::Arithmetic(Arithmetic::Add(true)),"-" => Function::Arithmetic(Arithmetic::Subtract(false)),"-'" => Function::Arithmetic(Arithmetic::Subtract(true)),
         "*" => Function::Arithmetic(Arithmetic::Multiply(false)),"*'" => Function::Arithmetic(Arithmetic::Multiply(true)),"/" => Function::Arithmetic(Arithmetic::Divide),
@@ -712,7 +721,9 @@ fn numeric_compare(operation: Comparison,dispatch: Dispatch,left: &HostValue<'_>
 fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaString> {
     match value {
         HostValue::Text(value) => Ok(value.clone()),HostValue::Nil => text_utf8("",context),HostValue::Bool(value) => text_utf8(if *value { "true" } else { "false" },context),
+        HostValue::Vector(_) => printed_text(value,context),
         HostValue::Constant(form) => match form.kind() {
+            FormKind::List(_) | FormKind::Vector(_) | FormKind::Map(_) | FormKind::Set(_) => printed_text(value,context),
             FormKind::Symbol(value) => text_utf8(value,context),
             FormKind::Character(value) => { context.reserve(32)?;text_utf8(&value.to_string(),context) }
             FormKind::Literal(value) => match value.kind() {
@@ -732,6 +743,9 @@ fn str_value(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaStri
         HostValue::Number(value) => { reserve_text(value.text_capacity().map_err(|_|limit())?,context)?;text_utf8(&value.text(),context) }
         _ => Err(unsupported("Host object string rendering is not implemented for this value")),
     }
+}
+fn printed_text(value: &HostValue<'_>,context: &EvalContext<'_>) -> Result<JavaString> {
+    match text::printed(value,context)? { HostValue::Text(value) => Ok(value),_ => unreachable!() }
 }
 fn literal_leaf<'a>(form: FormView<'a>) -> Option<&'a Value> {
     match form.kind() { FormKind::Literal(value) => match value.kind() { LiteralKind::Leaf(leaf) => Some(leaf.value()), _ => None }, _ => None }
@@ -1084,5 +1098,87 @@ mod tests {
         assert_eq!(Function::Subs.apply(vec![HostValue::Constant(source.view()),index(0),HostValue::Bool(false)],&context).err().unwrap().message.as_deref(),Some("Host value is not a Number"));
         let character = raw_character('😀');
         assert_eq!(numeric_cast(Cast::Int,HostValue::Constant(character.view()),false,&context).err().unwrap().message.as_deref(),Some("Host Character requires a single UTF16 code unit"));
+    }
+
+    enum S { Text(&'static str),Symbol(&'static str),Character(char),Int(i64),Float(f64),Nil,Keyword(&'static str),Big(&'static str),List(Vec<S>),Vector(Vec<S>),Map(Vec<S>) }
+    fn emit(builder: &mut RegexFormBuilder,form: &S) -> Result<()> {
+        match form {
+            S::Text(value) => builder.literal(&Value::Utf8((*value).into())),S::Symbol(value) => builder.symbol(value),S::Character(value) => builder.character(*value),
+            S::Int(value) => builder.literal(&Value::I64(*value)),S::Float(value) => builder.literal(&Value::F64(*value)),S::Nil => builder.literal(&Value::Null),
+            S::Keyword(value) => builder.literal(&Value::Keyword(rtdb_types::Keyword::from_name(*value))),S::Big(value) => builder.big_integer(value),
+            S::List(forms) | S::Vector(forms) | S::Map(forms) => {
+                match form { S::List(_) => builder.begin_list()?,S::Vector(_) => builder.begin_vector()?,_ => builder.begin_map()? }
+                for form in forms { emit(builder,form)?; }
+                builder.end()
+            }
+        }
+    }
+    fn call(name: &'static str,args: Vec<S>) -> S { S::List(std::iter::once(S::Symbol(name)).chain(args).collect()) }
+    fn quoted(form: S) -> S { call("quote",vec![form]) }
+    fn host_pattern(form: S) -> Result<String> {
+        let form = raw_build(|builder| emit(builder,&form));
+        let context = EvalContext::default();
+        let pattern = Program::compile(&form,&context)?.pattern(&context)?;
+        Ok(String::from_utf16_lossy(&pattern.view().units().collect::<Vec<_>>()))
+    }
+    fn host_failure(form: S) -> Anomaly { host_pattern(form).unwrap_err() }
+
+    #[test]
+    fn pattern_quote_requires_the_qualified_class_and_reopens_quotes_around_end_markers() {
+        assert_eq!(host_pattern(call("java.util.regex.Pattern/quote",vec![S::Text("a.b")])).unwrap(),r"\Qa.b\E");
+        assert_eq!(host_pattern(call("java.util.regex.Pattern/quote",vec![S::Text(r"a\Eb\E")])).unwrap(),r"\Qa\E\\E\Qb\E\\E\Q\E");
+        assert_eq!(host_failure(call("Pattern/quote",vec![S::Text("a")])).code,"rtdb.expr/regex-host-form");
+        assert_eq!(host_failure(call("java.util.regex.Pattern/quote",vec![S::Nil])).message.as_deref(),Some("Host value is not a String"));
+    }
+
+    #[test]
+    fn format_admits_only_locale_independent_string_and_integer_conversions() {
+        assert_eq!(host_pattern(call("format",vec![S::Text("%s-%d%%"),S::Text("a"),S::Int(-5)])).unwrap(),"a--5%");
+        assert_eq!(host_pattern(call("clojure.core/format",vec![S::Text("%s|%d|%s"),S::Nil,S::Nil,S::Vector(vec![S::Int(1),S::Text("x")])])).unwrap(),r#"null|null|[1 "x"]"#);
+        assert_eq!(host_pattern(call("format",vec![S::Text("%s"),S::Big("12")])).unwrap(),"12");
+        for (format,argument) in [("%5s",S::Text("a")),("%1$s",S::Text("a")),("%x",S::Int(1)),("%n",S::Nil)] {
+            assert_eq!(host_failure(call("format",vec![S::Text(format),argument])).code,"rtdb.expr/regex-host-form","{format}");
+        }
+        assert_eq!(host_failure(call("format",vec![S::Text("%d"),S::Float(1.5)])).code,"xtdb.error/unknown");
+        assert_eq!(host_failure(call("format",vec![S::Text("%d"),S::Big("1")])).code,"xtdb.error/unknown");
+        assert_eq!(host_failure(call("format",vec![S::Text("%s")])).message.as_deref(),Some("Host format is missing an argument"));
+        assert_eq!(host_failure(call("format",vec![S::Text("a%")])).message.as_deref(),Some("Host format specifier is incomplete"));
+    }
+
+    #[test]
+    fn apply_spreads_vectors_quoted_lists_and_nil_into_host_functions() {
+        assert_eq!(host_pattern(call("apply",vec![S::Symbol("str"),S::Text("a"),S::Vector(vec![S::Text("b"),S::Int(1),S::Nil])])).unwrap(),"ab1");
+        assert_eq!(host_pattern(call("apply",vec![S::Symbol("str"),quoted(S::List(vec![S::Big("1"),S::Float(2.0)]))])).unwrap(),"12.0");
+        assert_eq!(host_pattern(call("apply",vec![S::Symbol("str"),S::Text("a"),S::Nil])).unwrap(),"a");
+        assert_eq!(host_failure(call("apply",vec![S::Symbol("str"),S::Text("abc")])).code,"rtdb.expr/regex-host-form");
+        assert_eq!(host_failure(call("apply",vec![S::Symbol("str"),S::Int(1)])).message.as_deref(),Some("Host value is not a sequence"));
+    }
+
+    #[test]
+    fn clojure_string_functions_follow_the_java_string_operations_they_delegate_to() {
+        assert_eq!(host_pattern(call("clojure.string/join",vec![S::Text(","),S::Vector(vec![S::Text("a"),S::Int(1),S::Nil,S::Text("b")])])).unwrap(),"a,1,,b");
+        assert_eq!(host_pattern(call("clojure.string/join",vec![S::Vector(vec![S::Text("a"),S::Keyword("k")])])).unwrap(),"a:k");
+        assert_eq!(host_pattern(call("clojure.string/upper-case",vec![S::Text("straße")])).unwrap(),"STRASSE");
+        assert_eq!(host_pattern(call("clojure.string/lower-case",vec![S::Text("ΟΔΟΣ İ")])).unwrap(),"οδος i\u{307}");
+        assert_eq!(host_pattern(call("clojure.string/replace",vec![S::Text("a.b.c"),S::Text("."),S::Text(r"\.")])).unwrap(),r"a\.b\.c");
+        assert_eq!(host_pattern(call("clojure.string/replace",vec![S::Text("aaa"),S::Text("aa"),S::Text("b")])).unwrap(),"ba");
+        assert_eq!(host_pattern(call("clojure.string/replace",vec![S::Text("ab"),S::Text(""),S::Text("-")])).unwrap(),"-a-b-");
+        assert_eq!(host_pattern(call("clojure.string/replace",vec![S::Text("a.b"),S::Character('.'),S::Character('|')])).unwrap(),"a|b");
+        assert_eq!(host_failure(call("clojure.string/replace",vec![S::Text("a"),S::Int(1),S::Text("b")])).message.as_deref(),Some("Invalid match arg"));
+        assert_eq!(host_failure(call("clojure.string/replace",vec![S::Text("a"),S::Character('a'),S::Text("b")])).message.as_deref(),Some("Host replacement is not a Character"));
+        assert_eq!(host_pattern(call("clojure.string/trim",vec![S::Text(" \u{2007}a b\t\u{3000}\u{1f}")])).unwrap(),"\u{2007}a b");
+        assert_eq!(host_pattern(call("clojure.string/trim",vec![S::Text(" \n ")])).unwrap(),"");
+        assert_eq!(host_failure(call("clojure.string/upper-case",vec![S::Int(1)])).message.as_deref(),Some("Host value is not a String"));
+        assert_eq!(host_failure(call("str/join",vec![S::Vector(vec![])])).code,"rtdb.expr/regex-host-form");
+    }
+
+    #[test]
+    fn str_of_collections_uses_their_readable_print_form() {
+        assert_eq!(host_pattern(call("str",vec![S::Vector(vec![S::Int(1),S::Text("x\n\"")])])).unwrap(),r#"[1 "x\n\""]"#);
+        let form = S::Vector(vec![S::Symbol("a"),S::Text("b"),S::Character('c'),S::Character(' '),S::Big("1"),S::Float(f64::NAN),S::Nil,S::Keyword("k"),S::List(vec![]),S::Vector(vec![S::Int(2)])]);
+        assert_eq!(host_pattern(call("str",vec![quoted(form)])).unwrap(),r#"[a "b" \c \space 1N ##NaN nil :k () [2]]"#);
+        assert_eq!(host_pattern(call("str",vec![S::Map(vec![]),S::Text("-"),quoted(S::List(vec![S::Int(1),S::Int(2)]))])).unwrap(),"{}-(1 2)");
+        assert_eq!(host_failure(call("str",vec![quoted(S::Map(vec![S::Keyword("a"),S::Int(1)]))])).code,"rtdb.expr/regex-host-form");
+        assert_eq!(host_failure(call("str",vec![S::Vector(vec![S::Symbol("str")])])).code,"rtdb.expr/regex-host-form");
     }
 }
