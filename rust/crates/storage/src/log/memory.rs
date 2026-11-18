@@ -7,10 +7,23 @@ use rtdb_types::Timestamp;
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 use tokio::sync::oneshot;
 
+const MAXIMUM_POLL_RECORDS: usize = 1024;
+const DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
+
 struct Records {
     first: i64,
     next: i64,
     values: VecDeque<LogRecord>,
+}
+
+impl Records {
+    fn range(&self, from: i64, to: i64) -> Result<impl Iterator<Item = &LogRecord> + '_> {
+        if from < self.first || from > self.next {
+            return Err(Error::UnavailableLogRange { requested: from, first_retained: self.first });
+        }
+        Ok(self.values.iter().skip((from - self.first) as usize)
+            .take_while(move |record| record.metadata.offset.0 < to))
+    }
 }
 
 struct Shared {
@@ -53,11 +66,8 @@ impl MemoryLog {
 fn read(shared: &Shared, from: i64, to: i64) -> Result<Vec<LogRecord>> {
     if to < from { return Err(Error::Task("log range end precedes its start".into())); }
     let records = shared.records.lock();
-    if from < records.first || from > records.next {
-        return Err(Error::UnavailableLogRange { requested: from, first_retained: records.first });
-    }
-    Ok(records.values.iter().skip((from - records.first) as usize)
-        .take_while(|record| record.metadata.offset.0 < to).cloned().collect())
+    let result = records.range(from, to)?.cloned().collect();
+    Ok(result)
 }
 
 #[async_trait]
@@ -116,14 +126,51 @@ impl super::LogRange for MemoryRange {
 
 struct MemoryTail { shared: Arc<Shared>, after: LogOffset }
 
+impl MemoryTail {
+    async fn poll_with_payload_limit(&mut self, timeout: Duration, payload_limit: usize) -> Result<Vec<LogRecord>> {
+        let tip = await_tip(&self.shared.progress, self.after, timeout).await?;
+        if tip <= self.after { return Ok(Vec::new()); }
+        let payload_limit = payload_limit.max(self.shared.maximum_message_bytes);
+        let from = self.after.0 + 1;
+        let records = self.shared.records.lock();
+        let mut batch = Vec::new();
+        let mut payload_bytes = 0usize;
+        for record in records.range(from, tip.0 + 1)?.take(MAXIMUM_POLL_RECORDS) {
+            let Some(next_bytes) = payload_bytes.checked_add(record.payload.len()).filter(|bytes| *bytes <= payload_limit) else { break; };
+            batch.push(record.clone());
+            payload_bytes = next_bytes;
+        }
+        let last = batch.last().ok_or(Error::UnavailableLogRange { requested: from, first_retained: tip.0 })?;
+        self.after = last.metadata.offset;
+        Ok(batch)
+    }
+}
+
 #[async_trait]
 impl LogTail for MemoryTail {
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
-        let tip = await_tip(&self.shared.progress, self.after, timeout).await?;
-        if tip <= self.after { return Ok(Vec::new()); }
-        let records = read(&self.shared, self.after.0 + 1, tip.0 + 1)?;
-        if let Some(last) = records.last() { self.after = last.metadata.offset; }
-        else { return Err(Error::UnavailableLogRange { requested: self.after.0 + 1, first_retained: tip.0 }); }
-        Ok(records)
+        self.poll_with_payload_limit(timeout, DEFAULT_MAXIMUM_POLL_PAYLOAD_BYTES).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tail_payload_limit_preserves_the_prefix_and_admits_a_maximum_size_record() {
+        let log = MemoryLog::new(6);
+        let payloads: [&'static [u8]; 5] = [b"abc", b"defg", b"x", b"uvwxyz", b"y"];
+        for (offset, &payload) in payloads.iter().enumerate() {
+            log.enqueue(Bytes::from_static(payload), Timestamp(offset as i64)).await.unwrap().durable().await.unwrap();
+        }
+        let mut tail = MemoryTail { shared: Arc::clone(&log.shared), after: LogOffset(-1) };
+        for (limit, from, to) in [(7, 0, 2), (5, 2, 3), (5, 3, 4), (5, 4, 5)] {
+            let batch = tail.poll_with_payload_limit(Duration::ZERO, limit).await.unwrap();
+            let observed: Vec<_> = batch.iter().map(|record| record.payload.as_ref()).collect();
+            assert_eq!(observed.as_slice(), &payloads[from..to]);
+            assert!(batch.iter().zip(from..to).all(|(record, offset)| record.metadata.offset == LogOffset(offset as i64)));
+        }
+        assert!(tail.poll_with_payload_limit(Duration::ZERO, 5).await.unwrap().is_empty());
     }
 }

@@ -179,6 +179,35 @@ async fn a_tail_between_polls_keeps_its_exact_position() {
 }
 
 #[tokio::test]
+async fn memory_tail_drains_a_capped_prefix_and_detects_truncation_before_its_next_poll() {
+    let log = MemoryLog::new(64);
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let mut truncated = log.tail(LogOffset(-1)).await.unwrap();
+    for position in 0..1025 {
+        log.enqueue(Bytes::new(), Timestamp(position)).await.unwrap().durable().await.unwrap();
+    }
+
+    let batch = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(batch.len(), 1024);
+    assert!(batch.iter().zip(0..1024).all(|(record, position)| {
+        record.metadata.offset == LogOffset(position) && record.metadata.timestamp == Timestamp(position) && record.payload.is_empty()
+    }));
+    assert_eq!(truncated.poll(Duration::ZERO).await.unwrap().len(), 1024);
+    let remainder = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(remainder.len(), 1);
+    assert_eq!(remainder[0].metadata.offset, LogOffset(1024));
+    assert!(tail.poll(Duration::ZERO).await.unwrap().is_empty());
+    assert_eq!(log.read_range(LogOffset(0), LogOffset(1025)).await.unwrap().len(), 1025);
+
+    log.truncate_before(LogOffset(1025)).unwrap();
+    assert!(matches!(truncated.poll(Duration::ZERO).await,
+        Err(Error::UnavailableLogRange { requested: 1024, first_retained: 1025 })));
+    log.enqueue(Bytes::new(), Timestamp(1025)).await.unwrap().durable().await.unwrap();
+    log.close();
+    assert!(matches!(tail.poll(Duration::ZERO).await, Err(Error::Closed(_))));
+}
+
+#[tokio::test]
 async fn missing_retained_records_are_errors_instead_of_empty_polls() {
     let log = MemoryLog::new(64);
     let mut tail = log.tail(LogOffset(-1)).await.unwrap();
