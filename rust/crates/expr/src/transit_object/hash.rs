@@ -39,6 +39,7 @@ impl Object {
             Self::Path(value) => value.java_hash(),
             Self::TableRef(value) => string(&value.schema).wrapping_mul(31).wrapping_add(string(&value.table)),
             Self::VectorType(value) => value.java_hash(),
+            Self::Reg(value) => value.oid,
             Self::Vector(values) | Self::List(values) => {
                 let hash = values.iter().try_fold(1i32,|hash,value|Ok::<_,rtdb_types::Anomaly>(hash.wrapping_mul(31).wrapping_add(value.object_hash(equivalent)?)))?;
                 if equivalent { collection(hash,values.len()) } else { hash }

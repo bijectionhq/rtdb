@@ -36,7 +36,17 @@ pub(crate) enum Object {
     Null,Bool(bool),Number(Arc<Number>),String(String),Keyword(String),Symbol(String),Character(u16),
     Bytes(Arc<Vec<u8>>),Vector(Vec<Self>),List(Vec<Self>),Set(Map),Map(Map),
     Uri(String),Uuid([i64;2]),ByteBuffer(Arc<Vec<u8>>),KeyFn(String),ClojureForm(Box<Self>),Time(Time),Path(Path),TableRef(Arc<TableRef>),VectorType(Arc<Type>),
-    TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),
+    TxKey(Record),Throwable(Arc<Throwable>),Link(Arc<Vec<(Self,Self)>>),Tagged(Arc<Tagged>),Reg(Arc<Reg>),
+}
+
+#[derive(Clone,Copy,Debug,PartialEq,Eq)]
+pub(crate) enum RegKind { Oid,RegClass,RegProc }
+#[derive(Debug,PartialEq,Eq)]
+pub(crate) struct Reg { kind: RegKind,oid: i32 }
+
+impl RegKind {
+    fn tag(self) -> &'static str { match self { Self::Oid => "xt/oid",Self::RegClass => "xt/regclass",Self::RegProc => "xt/regproc" } }
+    fn class(self) -> &'static str { match self { Self::Oid => "Oid",Self::RegClass => "RegClass",Self::RegProc => "RegProc" } }
 }
 
 fn invalid() -> Anomaly { Anomaly::incorrect("xtdb.expression/invalid-transit-object", "Invalid stored Transit object representation") }
@@ -149,6 +159,11 @@ impl Object {
             "link" => match representation { Self::Map(map) => Self::Link(Arc::new(map.into_entries())),Self::TxKey(record) => Self::Link(Arc::new(record.into_entries())),_ => return Err(invalid()) },
             "xtdb/tx-key" => Self::TxKey(Record::read(representation)?),
             "xtdb/path" => Self::Path(Path::read(representation.text()?)?),
+            "xt/oid" | "xt/regclass" | "xt/regproc" => {
+                let kind = match tag.as_str() { "xt/oid" => RegKind::Oid,"xt/regclass" => RegKind::RegClass,_ => RegKind::RegProc };
+                let Number::Int(oid) = number::cast("i32",&representation)? else { return Err(invalid()); };
+                Self::Reg(Arc::new(Reg { kind,oid }))
+            }
             "xt/table" => Self::TableRef(Arc::new(table::read(representation,allocation)?)),
             "xtdb/type" => Self::VectorType(Type::read(&representation,allocation)?),
             "xt/error" | "xtdb/illegal-arg" | "xtdb/runtime-err" | "xtdb/exception-info" => Self::Throwable(Arc::new(Throwable::read(&tag,&representation)?)),
@@ -228,6 +243,7 @@ impl Object {
             Self::Link(entries) => tagged("link",T::Map(wire_entries(entries.iter().map(|(key,value)|(key,value)),entries.len(),allocation)?)),
             Self::Throwable(value) => value.wire(allocation)?,
             Self::Tagged(value) => value.wire(allocation)?,
+            Self::Reg(value) => tagged(value.kind.tag(),T::Integer(i64::from(value.oid))),
         })
     }
 }
@@ -264,4 +280,31 @@ fn byte_buffer(text: &str) -> Result<Vec<u8>> {
         let digit = |value|char::from_u32(u32::from(value)).and_then(rtdb_types::hexadecimal_digit).ok_or_else(invalid);
         Ok(digit(pair[0])? * 16 + digit(pair[1])?)
     }).collect()
+}
+
+#[cfg(test)]
+mod reg_tests {
+    use super::*;
+    use rtdb_format::transit::encode_msgpack;
+    use rtdb_types::Value;
+
+    #[test]
+    fn pg_oid_tags_read_as_int_checked_values_equal_to_emitted_oids() {
+        let allocation = EvaluationScope::new(&rtdb_columnar::MemoryBudget::new(1 << 20)).unwrap();
+        let read = |tag: &str,representation: T| Decoded::read(&encode_msgpack(&tagged(tag,representation)).unwrap(),&allocation);
+        for (tag,emitted,printed) in [("xt/oid",Value::Oid(12345),"Oid(oid=12345)"),("xt/regclass",Value::RegClass(12345),"RegClass(oid=12345)"),("xt/regproc",Value::RegProc(12345),"RegProc(oid=12345)")] {
+            let value = read(tag,T::Integer(12345)).unwrap();
+            assert!(value.equivalent_emitted(&emitted).unwrap());
+            assert!(!value.equivalent_emitted(&Value::I32(12345)).unwrap());
+            assert!(value.equivalent(&read(tag,T::Integer(12345)).unwrap()).unwrap());
+            assert!(!value.equivalent(&read(tag,T::Integer(1)).unwrap()).unwrap());
+            assert_eq!(value.value.hasheq().unwrap(),12345);
+            assert_eq!(render::string(&value.value,Admission::Standalone).unwrap(),printed);
+            assert_eq!(value.encode().unwrap(),encode_msgpack(&tagged(tag,T::Integer(12345))).unwrap());
+            assert!(read(tag,T::Integer(i64::from(i32::MAX) + 1)).is_err());
+            assert!(read(tag,T::String("1".into())).is_err());
+        }
+        assert!(!read("xt/oid",T::Integer(1)).unwrap().equivalent(&read("xt/regclass",T::Integer(1)).unwrap()).unwrap());
+        assert!(read("xt/regclass",T::Float(1.9)).unwrap().equivalent_emitted(&Value::RegClass(1)).unwrap());
+    }
 }

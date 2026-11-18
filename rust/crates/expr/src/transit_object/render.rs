@@ -1,5 +1,5 @@
 use rtdb_types::{Anomaly,Result};
-use super::{Map,Object,Throwable,Time,hash,invalid,keyword_value,number};
+use super::{Map,Object,Reg,Throwable,Time,hash,invalid,keyword_value,number};
 use super::allocation::{Text,path_capacity};
 use crate::admission::Admission;
 use crate::semantic_text::{self,Atom,Mode,SequenceKind,atom,quoted};
@@ -45,6 +45,7 @@ fn write_string(text: &mut Text<'_>,value: &Object) -> Result<()> {
         },
         Object::Link(value) => text.temporary(128,||Ok(format!("com.cognitect.transit.impl.LinkImpl@{:x}",hash::identity(value) as u32))),
         Object::Tagged(value) => text.temporary(128,||Ok(format!("com.cognitect.transit.impl.TaggedValueImpl@{:x}",value.hash_code()? as u32))),
+        Object::Reg(value) => text.temporary(64,||Ok(reg(value))),
     }
 }
 
@@ -94,6 +95,7 @@ pub(super) fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
         },
         Object::Link(link) => default_object(text,"com.cognitect.transit.impl.LinkImpl",hash::identity(link),value),
         Object::Tagged(tagged) => default_object(text,"com.cognitect.transit.impl.TaggedValueImpl",hash::identity(tagged),value),
+        Object::Reg(reg) => default_object(text,&format!("xtdb.types.{}",reg.kind.class()),hash::identity(reg),value),
     }
 }
 
@@ -126,6 +128,7 @@ fn default_object(text: &mut Text<'_>,class: &str,identity: i32,value: &Object) 
     text.push("#object[")?;text.push(class)?;text.temporary(32,||Ok(format!(" 0x{:x} ",identity as u32)))?;
     let rendered = string(value,text.admission())?;quoted(text,&rendered)?;text.push("]")
 }
+fn reg(value: &Reg) -> String { format!("{}(oid={})",value.kind.class(),value.oid) }
 fn character(value: u16) -> char { char::from_u32(u32::from(value)).unwrap_or('?') }
 fn number_capacity(value: &number::Number) -> Result<usize> { value.text_capacity().map_err(number::error)?.checked_mul(8).ok_or_else(crate::numeric::overflow) }
 fn uuid(value: &[i64;2]) -> String { uuid::Uuid::from_u128((u128::from(value[0] as u64) << 64) | u128::from(value[1] as u64)).to_string() }
