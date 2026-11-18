@@ -2,7 +2,7 @@ use super::*;
 use super::arrow::{Extension,Unit};
 
 impl Type {
-    pub(super) fn representation(&self,scope: &EvaluationScope) -> Result<Object> {
+    pub(super) fn representation(&self,scope: Admission<'_>) -> Result<Object> {
         let value = match self {
             Self::Null => keyword("null",scope)?,Self::Nothing => keyword("nothing",scope)?,
             Self::Mono(mono) => mono.representation(scope)?,
@@ -26,7 +26,7 @@ impl Type {
     }
     pub(in crate::transit_object) fn write_string(&self,text: &mut Text<'_>) -> Result<()> { self.write_mode(text,false) }
     pub(in crate::transit_object) fn write_printed(&self,text: &mut Text<'_>) -> Result<()> {
-        text.push("#xt/type ")?;let representation = self.representation(text.scope())?;super::super::render::write_printed(text,&representation)
+        text.push("#xt/type ")?;let representation = self.representation(text.admission())?;super::super::render::write_printed(text,&representation)
     }
     fn write_mode(&self,text: &mut Text<'_>,plain: bool) -> Result<()> {
         match self {
@@ -50,7 +50,7 @@ impl Type {
     }
 }
 impl Mono {
-    fn representation(&self,scope: &EvaluationScope) -> Result<Object> {
+    fn representation(&self,scope: Admission<'_>) -> Result<Object> {
         match self {
             Self::Scalar { arrow,.. } => arrow.representation(scope),
             Self::Listy { arrow,element,.. } => {

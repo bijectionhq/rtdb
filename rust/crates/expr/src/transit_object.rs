@@ -16,6 +16,9 @@ mod table;
 mod allocation;
 mod vector_type;
 use crate::EvaluationScope;
+use crate::admission::Admission;
+#[cfg(test)]
+mod admission_tests;
 use allocation::wire_charge;
 use collection::{Array,Map,Record,Entries};
 use number::Number;
@@ -47,7 +50,7 @@ impl<'a> Decoded<'a> {
         let count = bytes.len();
         let bytes_required = count.checked_mul(count).and_then(|bytes|bytes.checked_mul(16)).and_then(|bytes|count.checked_mul(64).and_then(|raw|bytes.checked_add(raw))).and_then(|bytes|bytes.checked_add(4096)).ok_or_else(crate::numeric::overflow)?;
         allocation.reserve(bytes_required)?;
-        let value = decode_with(bytes,&mut ObjectReadBuilder { allocation })?;
+        let value = decode_with(bytes,&mut ObjectReadBuilder { admission: Admission::Tracked(allocation) })?;
         Ok(Self { value,allocation })
     }
     pub(crate) fn field(self,name: Option<&str>) -> Result<Option<Self>> {
@@ -63,7 +66,7 @@ impl<'a> Decoded<'a> {
     pub(crate) fn equivalent_emitted(&self,other: &rtdb_types::Value) -> Result<bool> { self.value.equivalent_emitted(other,self.allocation) }
 }
 
-struct ObjectReadBuilder<'a> { allocation: &'a EvaluationScope }
+struct ObjectReadBuilder<'a> { admission: Admission<'a> }
 impl TransitReadBuilder for ObjectReadBuilder<'_> {
     type Value = Object;
     type Array = Array;
@@ -84,12 +87,12 @@ impl TransitReadBuilder for ObjectReadBuilder<'_> {
     fn start_map(&mut self,_size: usize) -> Result<Map> { Ok(Map::new()) }
     fn map_entry(&mut self,map: &mut Map,key: Object,value: Object) -> Result<()> { map.assoc(key,value) }
     fn finish_map(&mut self,map: Map) -> Result<Object> { Ok(Object::Map(map)) }
-    fn tagged(&mut self,tag: String,representation: Object) -> Result<Object> { Object::registered(tag,representation,self.allocation) }
+    fn tagged(&mut self,tag: String,representation: Object) -> Result<Object> { Object::registered(tag,representation,self.admission) }
 }
 
 impl Object {
     fn number(value: Number) -> Self { Self::Number(Arc::new(value)) }
-    fn registered(tag: String,representation: Self,allocation: &EvaluationScope) -> Result<Self> {
+    fn registered(tag: String,representation: Self,allocation: Admission<'_>) -> Result<Self> {
         Ok(match tag.as_str() {
             "'" => representation,
             "cmap" => Self::Null,
@@ -183,6 +186,9 @@ impl Object {
         })
     }
     fn wire(&self,allocation: &EvaluationScope) -> Result<T> {
+        self.wire_with(Admission::Tracked(allocation))
+    }
+    fn wire_with(&self,allocation: Admission<'_>) -> Result<T> {
         wire_charge(self,allocation)?;
         Ok(match self {
             Self::Null => T::Null,Self::Bool(value) => T::Bool(*value),Self::Number(value) => number::wire(value),Self::String(value) => T::String(value.clone()),Self::Keyword(value) => T::Keyword(value.clone()),Self::Symbol(value) => T::Symbol(value.clone()),
@@ -195,7 +201,7 @@ impl Object {
             Self::TxKey(record) => tagged("xtdb/tx-key",map_wire(&Map::from_entries(record.entries().map(|(key,value)|(key.clone(),value.clone())))?,allocation)?),
             Self::Uri(value) => tagged("r",T::String(value.clone())),Self::Uuid(values) => tagged("u",T::Array(values.iter().map(|value|T::Integer(*value)).collect())),
             Self::ByteBuffer(value) => { let mut text = String::with_capacity(value.len().checked_mul(2).and_then(|bytes|bytes.checked_add(2)).ok_or_else(crate::numeric::overflow)?);text.push_str("0x");const HEX: &[u8] = b"0123456789abcdef";for byte in value.iter() { text.push(HEX[(byte >> 4) as usize] as char);text.push(HEX[(byte & 15) as usize] as char); }tagged("xtdb/byte-array",T::String(text)) }
-            Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire(allocation)?),
+            Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire_with(allocation)?),
             Self::Time(value) => value.wire()?,
             Self::Path(value) => value.wire(),
             Self::TableRef(value) => table::wire(value),
@@ -207,15 +213,15 @@ impl Object {
     }
 }
 
-fn wire_values<'a>(values: impl Iterator<Item=&'a Object>,count: usize,allocation: &EvaluationScope) -> Result<Vec<T>> {
+fn wire_values<'a>(values: impl Iterator<Item=&'a Object>,count: usize,allocation: Admission<'_>) -> Result<Vec<T>> {
     let mut output = Vec::with_capacity(count);
-    for value in values { output.push(value.wire(allocation)?); }Ok(output)
+    for value in values { output.push(value.wire_with(allocation)?); }Ok(output)
 }
-fn wire_entries<'a>(values: impl Iterator<Item=(&'a Object,&'a Object)>,count: usize,allocation: &EvaluationScope) -> Result<Vec<(T,T)>> {
+fn wire_entries<'a>(values: impl Iterator<Item=(&'a Object,&'a Object)>,count: usize,allocation: Admission<'_>) -> Result<Vec<(T,T)>> {
     let mut output = Vec::with_capacity(count);
-    for (key,value) in values { output.push((key.wire(allocation)?,value.wire(allocation)?)); }Ok(output)
+    for (key,value) in values { output.push((key.wire_with(allocation)?,value.wire_with(allocation)?)); }Ok(output)
 }
-fn map_wire(map: &Map,allocation: &EvaluationScope) -> Result<T> { Ok(T::Map(wire_entries(map.entries(),map.len(),allocation)?)) }
+fn map_wire(map: &Map,allocation: Admission<'_>) -> Result<T> { Ok(T::Map(wire_entries(map.entries(),map.len(),allocation)?)) }
 fn keyword_value<'a>(object: &'a Object,name: &str) -> &'a Object { object.entries().and_then(|mut entries|entries.find(|(key,_)|matches!(key,Object::Keyword(key) if key == name))).map_or(&Object::Null,|(_,value)|value) }
 fn uuid(value: &Object) -> Result<[i64;2]> {
     if let Object::String(value) = value {

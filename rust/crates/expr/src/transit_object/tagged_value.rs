@@ -18,7 +18,7 @@ impl Tagged {
         if matches!(&self.representation, Object::Null) { return Err(invalid()); }
         Ok(17i32.wrapping_mul(31).wrapping_mul(hash::string(&self.tag)).wrapping_mul(31).wrapping_mul(self.representation.java_hash_code()?))
     }
-    pub(super) fn wire(&self,allocation: &crate::EvaluationScope) -> Result<T> { Ok(tagged(&self.tag, self.representation.wire(allocation)?)) }
+    pub(super) fn wire(&self,allocation: super::Admission<'_>) -> Result<T> { Ok(tagged(&self.tag, self.representation.wire_with(allocation)?)) }
 }
 
 #[cfg(test)]

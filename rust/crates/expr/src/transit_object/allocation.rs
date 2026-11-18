@@ -1,15 +1,17 @@
 use rtdb_types::Result;
-use crate::{EvaluationScope,numeric::overflow};
+use crate::{admission::Admission,numeric::overflow};
+#[cfg(test)]
+use crate::EvaluationScope;
 use super::{Object,Path,number};
 
-pub(super) struct Text<'a> { value: String,allocation: &'a EvaluationScope }
+pub(super) struct Text<'a> { value: String,allocation: Admission<'a> }
 
 impl crate::semantic_text::Sink for Text<'_> {
     fn push(&mut self,text: &str) -> Result<()> { Text::push(self,text) }
 }
 
 impl<'a> Text<'a> {
-    pub(super) fn new(allocation: &'a EvaluationScope) -> Self { Self { value: String::new(),allocation } }
+    pub(super) fn new(allocation: impl Into<Admission<'a>>) -> Self { Self { value: String::new(),allocation: allocation.into() } }
     pub(super) fn push(&mut self,text: &str) -> Result<()> {
         let required = self.value.len().checked_add(text.len()).ok_or_else(overflow)?;
         if required > self.value.capacity() {
@@ -24,7 +26,7 @@ impl<'a> Text<'a> {
         self.allocation.reserve(bytes)?;
         self.push(&render()?)
     }
-    pub(super) fn scope(&self) -> &'a EvaluationScope { self.allocation }
+    pub(super) fn admission(&self) -> Admission<'a> { self.allocation }
     pub(super) fn finish(self) -> String { self.value }
 }
 
@@ -32,7 +34,7 @@ pub(super) fn path_capacity(value: &Path) -> Result<usize> {
     match value { Path::Unix(value) => value.len().checked_mul(8).and_then(|bytes|bytes.checked_add(64)),Path::Jrt(value) => Some(value.len()) }.ok_or_else(overflow)
 }
 
-pub(super) fn wire_charge(value: &Object,allocation: &EvaluationScope) -> Result<()> {
+pub(super) fn wire_charge(value: &Object,allocation: Admission<'_>) -> Result<()> {
     let bytes = match value {
         Object::String(value) | Object::Keyword(value) | Object::Symbol(value) | Object::Uri(value) | Object::KeyFn(value) => value.len(),
         Object::Bytes(value) => value.len(),Object::ByteBuffer(value) => value.len().checked_mul(2).ok_or_else(overflow)?,

@@ -320,6 +320,9 @@ The pinned `xtdb/period-duration` registry entry is a plain function rather than
 The time, type, path, table, legacy Date, metadata and link handler families, collection hash/equality behavior, and reuse by comparison and text consumers remain required source work before the Phase 1 gate can close.
 `tests/transit_objects.rs` and the public SQL/XTQL field-access tests record these scalar conversion, nested failure and allocation contracts as unexecuted regression sources.
 
+Expression evaluation and registered-object construction share a borrowed tracked or standalone admission policy.
+Generic STR, cast and FORMAT still require registered-object rendering integration, including the process-dependent Date and ExceptionInfo cases.
+
 Simple CASE uses an explicit operand binding.
 It evaluates that operand once, including a null payload, before testing equality alternatives in order.
 A null operand skips the WHEN payloads; later alternatives and selected result boxes retain normal type admission and continuation rules.

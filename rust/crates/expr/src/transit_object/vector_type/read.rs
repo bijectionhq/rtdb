@@ -1,7 +1,7 @@
 use super::*;
 use super::arrow::{ArrowKind,Extension,Unit};
 
-pub(super) fn read(spec: &Object,scope: &EvaluationScope) -> Result<Arc<Type>> {
+pub(super) fn read(spec: &Object,scope: Admission<'_>) -> Result<Arc<Type>> {
     match spec {
         Object::VectorType(value) => Ok(Arc::clone(value)),
         Object::Keyword(name) => match name.as_str() {
@@ -10,24 +10,24 @@ pub(super) fn read(spec: &Object,scope: &EvaluationScope) -> Result<Arc<Type>> {
         },
         Object::Set(values) => from_set(values,scope),Object::Vector(values) => read_vector(values,scope),
         _ => {
-            let wire = spec.wire(scope)?;
+            let wire = spec.wire_with(scope)?;
             scope.reserve(rtdb_format::transit::json_value_allocation_bound(&wire)?.checked_add(1024).ok_or_else(overflow)?)?;
             Err(Anomaly::incorrect("invalid-type", "Invalid type").with_context("type-spec",rtdb_format::transit::to_json_value(&wire)?))
         }
     }
 }
-fn scalar(arrow: ArrowKind,scope: &EvaluationScope) -> Result<Arc<Type>> { retained(Type::Mono(retained(Mono::Scalar { arrow: retained(arrow,scope)?,encoding: Encoding::Plain },scope)?),scope) }
-fn range(scope: &EvaluationScope) -> Result<Arc<Type>> {
+fn scalar(arrow: ArrowKind,scope: Admission<'_>) -> Result<Arc<Type>> { retained(Type::Mono(retained(Mono::Scalar { arrow: retained(arrow,scope)?,encoding: Encoding::Plain },scope)?),scope) }
+fn range(scope: Admission<'_>) -> Result<Arc<Type>> {
     let instant = scalar(ArrowKind::Timestamp { unit: Unit::Micro,timezone: Some(text_arc("UTC",scope)?) },scope)?;
     retained(Type::Mono(retained(Mono::Listy { arrow: retained(ArrowKind::Extension(Extension::TsTzRange),scope)?,element: instant,encoding: Encoding::Plain },scope)?),scope)
 }
-fn read_vector(values: &[Object],scope: &EvaluationScope) -> Result<Arc<Type>> {
+fn read_vector(values: &[Object],scope: Admission<'_>) -> Result<Arc<Type>> {
     let nullable = values.iter().take_while(|value|matches!(value,Object::Keyword(name) if name == "?")).count();
     let mut value = read_vector_base(&values[nullable..],scope)?;
     for _ in 0..nullable { value = Type::maybe(&value,scope)?; }
     Ok(value)
 }
-fn read_vector_base(values: &[Object],scope: &EvaluationScope) -> Result<Arc<Type>> {
+fn read_vector_base(values: &[Object],scope: Admission<'_>) -> Result<Arc<Type>> {
     let head = values.first().unwrap_or(&Object::Null);let tail = values.get(1..).unwrap_or(&[]);
     let Object::Keyword(name) = head else { return Err(invalid()); };
     match name.as_str() {
@@ -52,7 +52,7 @@ fn read_vector_base(values: &[Object],scope: &EvaluationScope) -> Result<Arc<Typ
         _ => scalar(ArrowKind::sequence(values,scope)?,scope),
     }
 }
-fn from_set(source: &Map,scope: &EvaluationScope) -> Result<Arc<Type>> {
+fn from_set(source: &Map,scope: Admission<'_>) -> Result<Arc<Type>> {
     let mut converted = Map::set();
     for (spec,_) in source.entries() { let value = read(spec,scope)?;assoc(&mut converted,Object::VectorType(value),Object::Null,scope)?; }
     let mut legs = Legs::new();
@@ -68,7 +68,7 @@ fn from_set(source: &Map,scope: &EvaluationScope) -> Result<Arc<Type>> {
     }
     retained(Type::Poly { legs: retained(legs,scope)?,encoding: Encoding::Plain },scope)
 }
-fn fields(source: &Object,scope: &EvaluationScope) -> Result<Arc<Type>> {
+fn fields(source: &Object,scope: Admission<'_>) -> Result<Arc<Type>> {
     let mut fields = Map::new();
     let mut add = |key: &Object,value: &Object| -> Result<()> {
         let name = super::super::render::string(key,scope)?;
@@ -93,7 +93,7 @@ fn fields(source: &Object,scope: &EvaluationScope) -> Result<Arc<Type>> {
     let fields = retained(Fields { ordered: Arc::from(ordered),values },scope)?;
     retained(Type::Mono(retained(Mono::Struct { fields,encoding: Encoding::Plain },scope)?),scope)
 }
-fn pair(value: &Object,scope: &EvaluationScope,mut add: impl FnMut(&Object,&Object)->Result<()>) -> Result<()> {
+fn pair(value: &Object,scope: Admission<'_>,mut add: impl FnMut(&Object,&Object)->Result<()>) -> Result<()> {
     match value {
         Object::Null => add(&Object::Null,&Object::Null),
         Object::Vector(values) | Object::List(values) => add(values.first().unwrap_or(&Object::Null),values.get(1).unwrap_or(&Object::Null)),

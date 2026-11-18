@@ -1,10 +1,12 @@
 use rtdb_types::{Anomaly,Result};
 use super::{Map,Object,Throwable,Time,hash,invalid,keyword_value,number};
 use super::allocation::{Text,path_capacity};
+use crate::admission::Admission;
+#[cfg(test)]
 use crate::EvaluationScope;
 use crate::semantic_text::{self,Atom,Mode,SequenceKind,atom,quoted};
 
-pub(super) fn string(value: &Object,allocation: &EvaluationScope) -> Result<String> {
+pub(super) fn string(value: &Object,allocation: Admission<'_>) -> Result<String> {
     let mut text = Text::new(allocation);write_string(&mut text,value)?;Ok(text.finish())
 }
 
@@ -66,15 +68,15 @@ pub(super) fn write_printed(text: &mut Text<'_>,value: &Object) -> Result<()> {
         Object::Map(values) => map(text,values),
         Object::TxKey(value) => { text.push("#xt/tx-key ")?;map(text,&Map::from_entries(value.entries().map(|(key,value)|(key.clone(),value.clone())))?) }
         Object::Uri(value) => {
-            let uri = rtdb_types::UriParts::parse(value)?;text.scope().reserve(uri.ascii_allocation_bound()?)?;
+            let uri = rtdb_types::UriParts::parse(value)?;text.admission().reserve(uri.ascii_allocation_bound()?)?;
             text.push("#xt/uri ")?;quoted(text,&uri.to_ascii_string())
         }
-        Object::Uuid(value) => { text.scope().reserve(64)?;text.push("#uuid ")?;quoted(text,&uuid(value)) }
+        Object::Uuid(value) => { text.admission().reserve(64)?;text.push("#uuid ")?;quoted(text,&uuid(value)) }
         Object::ByteBuffer(bytes) => default_object(text,"java.nio.HeapByteBuffer",hash::identity(bytes),value),
         Object::KeyFn(value) => { text.push("#xt/key-fn :")?;text.push(value) }
         Object::ClojureForm(value) => { text.push("#xt/clj-form ")?;write_printed(text,value) }
         Object::Time(value) => time(text,value),
-        Object::Path(value) => { text.scope().reserve(path_capacity(value)?)?;text.push("#xt/path ")?;quoted(text,&value.text()) }
+        Object::Path(value) => { text.admission().reserve(path_capacity(value)?)?;text.push("#xt/path ")?;quoted(text,&value.text()) }
         Object::TableRef(value) => {
             text.push("#xt/table ")?;if value.schema != "public" { text.push(&value.schema)?;text.push("/")?; }text.push(&value.table)
         }
@@ -107,7 +109,7 @@ fn time(text: &mut Text<'_>,value: &Time) -> Result<()> {
         }
         Time::LegacyDate(_) => return Err(Anomaly::unsupported("xtdb.expression/transit-date-text", "Readable Date text requires its legacy calendar formatter")),
     };
-    text.scope().reserve(4096)?;text.push("#xt/")?;text.push(tag)?;text.push(" ")?;quoted(text,&value.text()?)
+    text.admission().reserve(4096)?;text.push("#xt/")?;text.push(tag)?;text.push(" ")?;quoted(text,&value.text()?)
 }
 
 fn sequence<'a>(text: &mut Text<'_>,kind: SequenceKind,values: impl IntoIterator<Item=&'a Object>) -> Result<()> {
@@ -118,7 +120,7 @@ fn map(text: &mut Text<'_>,value: &Map) -> Result<()> { semantic_text::map(text,
 
 fn default_object(text: &mut Text<'_>,class: &str,identity: i32,value: &Object) -> Result<()> {
     text.push("#object[")?;text.push(class)?;text.temporary(32,||Ok(format!(" 0x{:x} ",identity as u32)))?;
-    let rendered = string(value,text.scope())?;quoted(text,&rendered)?;text.push("]")
+    let rendered = string(value,text.admission())?;quoted(text,&rendered)?;text.push("]")
 }
 fn character(value: u16) -> char { char::from_u32(u32::from(value)).unwrap_or('?') }
 fn number_capacity(value: &number::Number) -> Result<usize> { value.text_capacity().map_err(number::error)?.checked_mul(8).ok_or_else(crate::numeric::overflow) }

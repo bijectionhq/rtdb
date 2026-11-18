@@ -20,6 +20,7 @@ mod collection;
 mod bitwise;
 mod series;
 mod volatile;
+mod admission;
 
 pub use rtdb_types::AllocationScope as EvaluationScope;
 pub use pg_catalog::{PgCatalogLookup, requires_pg_catalog};

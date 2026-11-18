@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap,sync::Arc};
 use rtdb_types::{Anomaly,Result};
-use crate::{EvaluationScope,numeric::overflow};
+use crate::{admission::Admission,numeric::overflow};
 use super::{Map,Object,allocation::Text,hash,invalid};
 mod arrow;
 mod read;
@@ -28,25 +28,25 @@ pub(crate) struct Fields { ordered: Arc<[Arc<str>]>,values: BTreeMap<Arc<str>,Ar
 #[derive(Debug)]
 pub(crate) struct Legs { ordered: Vec<Leg>,buckets: BTreeMap<i32,Vec<usize>> }
 
-fn retained<T>(value: T,scope: &EvaluationScope) -> Result<Arc<T>> {
+fn retained<T>(value: T,scope: Admission<'_>) -> Result<Arc<T>> {
     scope.reserve(std::mem::size_of::<T>().checked_add(32).ok_or_else(overflow)?)?;Ok(Arc::new(value))
 }
-fn text_arc(value: &str,scope: &EvaluationScope) -> Result<Arc<str>> { scope.reserve(value.len().checked_add(32).ok_or_else(overflow)?)?;Ok(Arc::from(value)) }
-fn slots(count: usize,scope: &EvaluationScope) -> Result<()> {
+fn text_arc(value: &str,scope: Admission<'_>) -> Result<Arc<str>> { scope.reserve(value.len().checked_add(32).ok_or_else(overflow)?)?;Ok(Arc::from(value)) }
+fn slots(count: usize,scope: Admission<'_>) -> Result<()> {
     let slot = std::mem::size_of::<(Object,Object)>().checked_mul(4).and_then(|bytes|bytes.checked_add(256)).ok_or_else(overflow)?;
     scope.reserve(count.checked_mul(slot).and_then(|bytes|bytes.checked_add(1024)).ok_or_else(overflow)?)
 }
-fn assoc(map: &mut Map,key: Object,value: Object,scope: &EvaluationScope) -> Result<()> { slots(map.len().checked_add(1).ok_or_else(overflow)?,scope)?;map.assoc(key,value) }
-fn keyword(value: &str,scope: &EvaluationScope) -> Result<Object> { scope.reserve(value.len())?;Ok(Object::Keyword(value.into())) }
-fn integer(value: i32,scope: &EvaluationScope) -> Result<Object> { Ok(Object::Number(retained(super::Number::Long(i64::from(value)),scope)?)) }
-fn vector<const N: usize>(values: [Object;N],scope: &EvaluationScope) -> Result<Object> { slots(N,scope)?;Ok(Object::Vector(Vec::from(values))) }
+fn assoc(map: &mut Map,key: Object,value: Object,scope: Admission<'_>) -> Result<()> { slots(map.len().checked_add(1).ok_or_else(overflow)?,scope)?;map.assoc(key,value) }
+fn keyword(value: &str,scope: Admission<'_>) -> Result<Object> { scope.reserve(value.len())?;Ok(Object::Keyword(value.into())) }
+fn integer(value: i32,scope: Admission<'_>) -> Result<Object> { Ok(Object::Number(retained(super::Number::Long(i64::from(value)),scope)?)) }
+fn vector<const N: usize>(values: [Object;N],scope: Admission<'_>) -> Result<Object> { slots(N,scope)?;Ok(Object::Vector(Vec::from(values))) }
 fn combine(left: i32,right: i32) -> i32 { left.wrapping_mul(31).wrapping_add(right) }
 fn enum_hash(class: &str,name: &str) -> i32 { class.encode_utf16().chain([u16::from(b'.')]).chain(name.encode_utf16()).fold(0i32,|hash,ch|combine(hash,i32::from(ch))) }
 
 impl Type {
-    pub(super) fn read(spec: &Object,scope: &EvaluationScope) -> Result<Arc<Self>> { read::read(spec,scope) }
+    pub(super) fn read(spec: &Object,scope: Admission<'_>) -> Result<Arc<Self>> { read::read(spec,scope) }
     fn encoding(&self) -> Encoding { match self { Self::Null | Self::Nothing => Encoding::Plain,Self::Mono(mono) | Self::Maybe(mono) => mono.encoding(),Self::Poly { encoding,.. } => *encoding } }
-    fn with_encoding(value: &Arc<Self>,encoding: Encoding,scope: &EvaluationScope) -> Result<Arc<Self>> {
+    fn with_encoding(value: &Arc<Self>,encoding: Encoding,scope: Admission<'_>) -> Result<Arc<Self>> {
         retained(match value.as_ref() {
             Self::Null | Self::Nothing => {
                 if let Encoding::RunEnd(width) = encoding {
@@ -59,7 +59,7 @@ impl Type {
             Self::Poly { legs,.. } => Self::Poly { legs: Arc::clone(legs),encoding },
         },scope)
     }
-    fn unencoded(value: &Arc<Self>,scope: &EvaluationScope) -> Result<Arc<Self>> {
+    fn unencoded(value: &Arc<Self>,scope: Admission<'_>) -> Result<Arc<Self>> {
         let result = match value.as_ref() {
             Self::Null | Self::Nothing => return Ok(Arc::clone(value)),
             Self::Mono(mono) | Self::Maybe(mono) => {
@@ -73,7 +73,7 @@ impl Type {
             }
         };retained(result,scope)
     }
-    fn maybe(value: &Arc<Self>,scope: &EvaluationScope) -> Result<Arc<Self>> {
+    fn maybe(value: &Arc<Self>,scope: Admission<'_>) -> Result<Arc<Self>> {
         retained(match value.as_ref() {
             Self::Null | Self::Maybe(_) => return Ok(Arc::clone(value)),Self::Nothing => Self::Null,Self::Mono(mono) => Self::Maybe(Arc::clone(mono)),
             Self::Poly { legs,encoding } => {
@@ -96,18 +96,18 @@ impl Type {
             Self::Mono(mono) | Self::Maybe(mono) => mono.java_hash(),Self::Poly { legs,encoding } => combine(legs.java_hash(),encoding.java_hash()),
         }
     }
-    pub(super) fn wire(&self,scope: &EvaluationScope) -> Result<super::T> { Ok(super::tagged("xtdb/type",self.representation(scope)?.wire(scope)?)) }
+    pub(super) fn wire(&self,scope: Admission<'_>) -> Result<super::T> { Ok(super::tagged("xtdb/type",self.representation(scope)?.wire_with(scope)?)) }
 }
 impl Mono {
     fn encoding(&self) -> Encoding { match self { Self::Scalar { encoding,.. } | Self::Listy { encoding,.. } | Self::Struct { encoding,.. } => *encoding } }
-    fn with_encoding(&self,encoding: Encoding,scope: &EvaluationScope) -> Result<Arc<Self>> {
+    fn with_encoding(&self,encoding: Encoding,scope: Admission<'_>) -> Result<Arc<Self>> {
         retained(match self {
             Self::Scalar { arrow,.. } => Self::Scalar { arrow: Arc::clone(arrow),encoding },
             Self::Listy { arrow,element,.. } => Self::Listy { arrow: Arc::clone(arrow),element: Arc::clone(element),encoding },
             Self::Struct { fields,.. } => Self::Struct { fields: Arc::clone(fields),encoding },
         },scope)
     }
-    fn unencoded(value: &Arc<Self>,scope: &EvaluationScope) -> Result<Arc<Self>> {
+    fn unencoded(value: &Arc<Self>,scope: Admission<'_>) -> Result<Arc<Self>> {
         match value.as_ref() {
             Self::Scalar { encoding,.. } if *encoding == Encoding::Plain => Ok(Arc::clone(value)),
             Self::Scalar { .. } => value.with_encoding(Encoding::Plain,scope),
@@ -157,7 +157,7 @@ impl Leg {
 }
 impl Legs {
     fn new() -> Self { Self { ordered: Vec::new(),buckets: BTreeMap::new() } }
-    fn insert(&mut self,leg: Leg,scope: &EvaluationScope) -> Result<()> {
+    fn insert(&mut self,leg: Leg,scope: Admission<'_>) -> Result<()> {
         let hash = leg.java_hash();
         if self.buckets.get(&hash).is_some_and(|indices|indices.iter().any(|index|leg.equivalent(&self.ordered[*index]))) { return Ok(()); }
         slots(self.ordered.len().checked_add(1).ok_or_else(overflow)?,scope)?;

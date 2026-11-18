@@ -1,8 +1,9 @@
 use rtdb_format::transit::TransitValue as T;
 use rtdb_types::{Result,TableRef};
 use super::{Object,render,tagged};
+use crate::admission::Admission;
 
-pub(super) fn read(representation: Object,allocation: &crate::EvaluationScope) -> Result<TableRef> {
+pub(super) fn read(representation: Object,allocation: Admission<'_>) -> Result<TableRef> {
     let representation = representation.destructure_map()?;
     let schema = representation.lookup_keyword("schema-name")?;
     let table = representation.lookup_keyword("table-name")?;

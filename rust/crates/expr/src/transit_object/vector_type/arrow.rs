@@ -14,13 +14,13 @@ pub(crate) enum Interval { YearMonth,DayTime,MonthDayNano }
 pub(crate) enum Extension { Keyword,Transit,Set,TsTzRange,IntervalMDM,Uuid,Uri,Oid,RegClass,RegProc }
 
 impl ArrowKind {
-    pub(super) fn read(spec: &Object,scope: &EvaluationScope) -> Result<Self> {
+    pub(super) fn read(spec: &Object,scope: Admission<'_>) -> Result<Self> {
         match spec { Object::Keyword(name) => Self::parse(name,None,scope),Object::Vector(values) | Object::List(values) => Self::sequence(values,scope),_ => Err(invalid()) }
     }
-    pub(super) fn sequence(values: &[Object],scope: &EvaluationScope) -> Result<Self> {
+    pub(super) fn sequence(values: &[Object],scope: Admission<'_>) -> Result<Self> {
         let Some(Object::Keyword(name)) = values.first() else { return Err(invalid()); };Self::parse(name,Some(&values[1..]),scope)
     }
-    fn parse(name: &str,tail: Option<&[Object]>,scope: &EvaluationScope) -> Result<Self> {
+    fn parse(name: &str,tail: Option<&[Object]>,scope: Admission<'_>) -> Result<Self> {
         let args = ||tail.ok_or_else(invalid);
         Ok(match name {
             "bool" => Self::Bool,"i8" => Self::Int { width: 8,signed: true },"i16" => Self::Int { width: 16,signed: true },"i32" => Self::Int { width: 32,signed: true },"i64" => Self::Int { width: 64,signed: true },
@@ -49,12 +49,12 @@ impl ArrowKind {
             "map" => Self::map(arg(args()?,0),scope)?,_ => return Err(invalid()),
         })
     }
-    pub(super) fn map(options: &Object,scope: &EvaluationScope) -> Result<Self> {
+    pub(super) fn map(options: &Object,scope: Admission<'_>) -> Result<Self> {
         charge_clone(options,scope)?;let options = options.clone().destructure_map()?;
         charge_clone(&options,scope)?;let sorted = options.lookup_keyword("sorted?")?;
         Ok(Self::Map(sorted.truthy()))
     }
-    pub(super) fn representation(&self,scope: &EvaluationScope) -> Result<Object> {
+    pub(super) fn representation(&self,scope: Admission<'_>) -> Result<Object> {
         let kw = |name|keyword(name,scope);let int = |value|integer(value,scope);
         match self {
             Self::Bool => kw("bool"),Self::Int { width,signed: true } => kw(match width { 8 => "i8",16 => "i16",32 => "i32",64 => "i64",_ => return Err(invalid()) }),Self::Int { signed: false,.. } => Err(invalid()),
@@ -122,12 +122,12 @@ impl Extension {
 }
 fn key(value: &Object) -> Result<&str> { match value { Object::Keyword(value) => Ok(value),_ => Err(invalid()) } }
 fn arg(args: &[Object],index: usize) -> &Object { args.get(index).unwrap_or(&Object::Null) }
-fn int(value: &Object,character: bool,scope: &EvaluationScope) -> Result<i32> {
+fn int(value: &Object,character: bool,scope: Admission<'_>) -> Result<i32> {
     if !character && !matches!(value,Object::Number(_)) { return Err(invalid()); }
     if let Object::Number(value) = value { scope.reserve(value.text_capacity().map_err(super::super::number::error)?.checked_mul(16).ok_or_else(overflow)?)?; }
     match super::super::number::cast("i32",value)? { super::super::Number::Int(value) => Ok(value),_ => unreachable!() }
 }
-fn charge_clone(value: &Object,scope: &EvaluationScope) -> Result<()> {
+fn charge_clone(value: &Object,scope: Admission<'_>) -> Result<()> {
     match value {
         Object::String(value) | Object::Keyword(value) | Object::Symbol(value) | Object::Uri(value) | Object::KeyFn(value) => scope.reserve(value.len().checked_mul(3).ok_or_else(overflow)?),
         Object::Vector(values) | Object::List(values) => { slots(values.len(),scope)?;for value in values { charge_clone(value,scope)?; }Ok(()) }

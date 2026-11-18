@@ -51,7 +51,7 @@ impl EvalContext<'_> {
         EvalContext { parameters: self.parameters, parameter_types: self.parameter_types, current_time: self.current_time, timezone: self.timezone,
             outer_rows: self.outer_rows, snapshot_token: self.snapshot_token, allocation: Some(allocation), catalog: self.catalog }
     }
-    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { match self.allocation { Some(scope) => scope.reserve(bytes), None => Ok(()) } }
+    pub(crate) fn reserve(&self, bytes: usize) -> Result<()> { crate::admission::Admission::for_context(self.allocation).reserve(bytes) }
 }
 
 #[derive(Clone)]
