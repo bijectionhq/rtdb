@@ -1,5 +1,7 @@
-use rtdb_temporal::{Ceiling, HistoryResolver, Polygon, PolygonCalculator};
-use rtdb_types::{EventHeader, EventOp, Iid, Interval, TemporalBounds, Timestamp};
+use std::cell::Cell;
+
+use rtdb_temporal::{Ceiling, HistoryResolver, Polygon, PolygonCalculator, ResolvedRow};
+use rtdb_types::{EventHeader, EventOp, Iid, Interval, MemoryBudget, TemporalBounds, Timestamp};
 
 fn times(values: &[i64]) -> Vec<Timestamp> { values.iter().copied().map(Timestamp).collect() }
 fn interval(lower: i64, upper: i64) -> Interval { Interval::from_micros(lower, upper).unwrap() }
@@ -145,4 +147,67 @@ fn resolver_rejects_out_of_order_input_before_corrupting_visibility() {
     calc.calculate(&event(2, 3, 0, 100, EventOp::Put)).unwrap();
     assert!(calc.calculate(&event(1, 2, 0, 100, EventOp::Put)).is_err());
     assert!(calc.calculate(&event(2, 4, 0, 100, EventOp::Put)).is_err());
+}
+
+#[test]
+fn history_growth_keeps_the_previous_charge_and_reserves_before_cloning() {
+    struct CountedSource<'a>(&'a Cell<usize>);
+    impl Clone for CountedSource<'_> {
+        fn clone(&self) -> Self {
+            self.0.set(self.0.get() + 1);
+            Self(self.0)
+        }
+    }
+
+    let slot = std::mem::size_of::<ResolvedRow<CountedSource<'_>>>();
+    let previous = 2 * slot + 256;
+    let replacement = 4 * slot + 256;
+    let delete = event(1, 200, 10, 20, EventOp::Delete);
+    let put = event(1, 100, 0, 30, EventOp::Put);
+    for fits in [false, true] {
+        let limit = previous + replacement - usize::from(!fits);
+        let root = MemoryBudget::new(limit);
+        let budget = root.scope();
+        let clones = Cell::new(0);
+        let mut resolver = HistoryResolver::new(TemporalBounds::default(), false);
+        assert!(resolver.resolve_in(&delete, CountedSource(&clones), &budget).unwrap().as_slice().is_empty());
+        assert_eq!(root.peak_bytes(), 0);
+
+        let result = resolver.resolve_in(&put, CountedSource(&clones), &budget);
+        if fits {
+            let history = result.unwrap();
+            let ranges: Vec<_> = history.as_slice().iter().map(|row| (row.valid_time, row.system_time)).collect();
+            assert_eq!(ranges, [
+                (interval(0, 10), interval(100, i64::MAX)),
+                (interval(10, 20), interval(100, 200)),
+                (interval(20, 30), interval(100, i64::MAX)),
+            ]);
+            assert_eq!(clones.get(), 3);
+            assert_eq!(budget.used_bytes(), replacement);
+            assert_eq!(root.used_bytes(), replacement);
+            assert_eq!(root.peak_bytes(), limit);
+            drop(history);
+        } else {
+            let error = result.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            let expected = format!("Cannot reserve {replacement} bytes from budget {limit} with {previous} retained");
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            assert_eq!(clones.get(), 2);
+        }
+        assert_eq!(budget.used_bytes(), 0);
+        assert_eq!(root.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn history_filters_events_before_reserving_and_still_reports_unsorted_input() {
+    let budget = MemoryBudget::new(0);
+    let bounds = TemporalBounds { valid_time: interval(40, 50), system_time: interval(0, 200) };
+    let mut resolver = HistoryResolver::new(bounds, false);
+    for header in [event(1, 200, 40, 50, EventOp::Put), event(1, 100, 0, 30, EventOp::Put)] {
+        assert!(resolver.resolve_in(&header, 1, &budget).unwrap().as_slice().is_empty());
+    }
+    let error = resolver.resolve_in(&event(1, 101, 40, 50, EventOp::Put), 1, &budget).err().unwrap();
+    assert_eq!(error.code, "xtdb/unsorted-events");
+    assert_eq!(budget.peak_bytes(), 0);
 }

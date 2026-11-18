@@ -1,4 +1,6 @@
-use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, Result, TemporalBounds, Timestamp};
+use std::sync::Arc;
+
+use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, MemoryBudget, MemoryReservation, Result, TemporalBounds, Timestamp};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -154,6 +156,34 @@ pub struct ResolvedRow<R> {
     pub system_time: Interval,
 }
 
+/// Resolved fragments of one event with their row storage reservation.
+pub struct ResolvedRows<R> {
+    rows: Vec<ResolvedRow<R>>,
+    capacity: usize,
+    _reservation: Option<Arc<MemoryReservation>>,
+}
+
+impl<R> ResolvedRows<R> {
+    /// Borrows the rows while their capacity remains reserved.
+    pub fn as_slice(&self) -> &[ResolvedRow<R>] { &self.rows }
+
+    fn push(&mut self, memory: &Arc<MemoryBudget>, row: impl FnOnce() -> ResolvedRow<R>) -> Result<()> {
+        if self.rows.len() == self.capacity {
+            let overflow = || Anomaly::incorrect("rtdb.temporal/history-row-size", "Resolved history capacity exceeds addressable memory");
+            let capacity = self.capacity.checked_mul(2).ok_or_else(overflow)?.max(1);
+            let bytes = capacity.checked_mul(std::mem::size_of::<ResolvedRow<R>>())
+                .and_then(|bytes| bytes.checked_add(256)).ok_or_else(overflow)?;
+            let reservation = memory.reserve(bytes)?;
+            self.rows.try_reserve_exact(capacity - self.rows.len())
+                .map_err(|error| Anomaly::incorrect("rtdb/allocation-failed", error.to_string()))?;
+            self.capacity = capacity;
+            self._reservation = Some(reservation);
+        }
+        self.rows.push(row());
+        Ok(())
+    }
+}
+
 pub struct HistoryResolver {
     calculator: PolygonCalculator,
     bounds: TemporalBounds,
@@ -166,9 +196,29 @@ impl HistoryResolver {
     }
 
     pub fn resolve<R: Clone>(&mut self, header: &EventHeader, source: R) -> Result<Vec<ResolvedRow<R>>> {
-        let Some(polygon) = self.calculator.calculate(header)? else { return Ok(Vec::new()); };
-        if header.op != EventOp::Put { return Ok(Vec::new()); }
         let mut result = Vec::new();
+        self.resolve_fragments(header, |valid_time, system_time| {
+            result.push(ResolvedRow { source: source.clone(), valid_time, system_time });
+            Ok(())
+        })?;
+        Ok(result)
+    }
+
+    /// Reserves inline row storage on `memory` before cloning the source for each emitted fragment.
+    /// The returned rows retain the reservation.
+    /// Uses the event order defined by [`PolygonCalculator::calculate`] and returns `xtdb/unsorted-events` for out-of-order input.
+    /// The calculator has consumed the event if result admission fails.
+    pub fn resolve_in<R: Clone>(&mut self, header: &EventHeader, source: R, memory: &Arc<MemoryBudget>) -> Result<ResolvedRows<R>> {
+        let mut result = ResolvedRows { rows: Vec::new(), capacity: 0, _reservation: None };
+        self.resolve_fragments(header, |valid_time, system_time| {
+            result.push(memory, || ResolvedRow { source: source.clone(), valid_time, system_time })
+        })?;
+        Ok(result)
+    }
+
+    fn resolve_fragments(&mut self, header: &EventHeader, mut emit: impl FnMut(Interval, Interval) -> Result<()>) -> Result<()> {
+        let Some(polygon) = self.calculator.calculate(header)? else { return Ok(()); };
+        if header.op != EventOp::Put { return Ok(()); }
         for idx in 0..polygon.range_count() {
             let valid_time = Interval::new(polygon.valid_times[idx], polygon.valid_times[idx + 1])?;
             let system_to = polygon.system_time_ceilings[idx];
@@ -178,9 +228,9 @@ impl HistoryResolver {
             let valid_time = if self.clamp_valid_time {
                 match valid_time.intersection(self.bounds.valid_time) { Some(interval) => interval, None => continue }
             } else { valid_time };
-            result.push(ResolvedRow { source: source.clone(), valid_time, system_time });
+            emit(valid_time, system_time)?;
         }
-        Ok(result)
+        Ok(())
     }
 }
 

@@ -305,11 +305,12 @@ impl PartitionScan {
             }
             if self.scan.iids.as_ref().is_some_and(|iids| !iids.contains(&head.header.iid)) { continue; }
             if self.scan.iids.is_none() && self.pushdowns.as_ref().is_some_and(|filters| !filters.iid_matches(&self.scan.columns,head.header.iid,self.canonical_entity_iids)) { continue; }
-            for row in resolver.resolve(&head.header,source)? {
-                let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(&row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
+            let history = resolver.resolve_in(&head.header, source, &self.execution.context.memory)?;
+            for row in history.as_slice() {
+                let bound = self.scan.columns.iter().try_fold(256usize,|bound,field|bound.checked_add(project_bound(row,&field.name)?).ok_or_else(||invalid("scan-row-size","Scan row allocation exceeds addressable memory")))?;
                 let reservation = self.execution.context.memory.reserve(bound)?;
                 let mut values = Vec::with_capacity(self.scan.columns.len());
-                for field in &self.scan.columns { values.push(project(&row,&field.name)?); }
+                for field in &self.scan.columns { values.push(project(row,&field.name)?); }
                 groups[head.active].push_growing(OwnedRow::with_reservation(values,reservation)?,&self.execution.context.memory)?;
             }
         }
@@ -448,7 +449,7 @@ mod tests {
     use rtdb_plan::{Catalog, ColumnId, Field, QualifiedTable};
     use rtdb_storage::{MemoryStore, ObjectStore};
     use rtdb_trie::TrieConfig;
-    use rtdb_types::{TableRef, TransactionKey, TxId};
+    use rtdb_types::{EntityId, LogicalType, ScalarType, TableRef, TransactionKey, TxId};
     use tokio_util::sync::CancellationToken;
 
     fn live_table() -> (PartitionState, TableRef, Vec<StoredEvent>) {
@@ -583,5 +584,90 @@ mod tests {
         assert_eq!(snapshot.trie_entries(&table).len(), 1);
         assert!(snapshot.segments(&table).is_empty());
         assert_descriptor_lifetime(snapshot, table, store, Some((metadata_size, metadata_charge))).await;
+    }
+
+    #[tokio::test]
+    async fn live_scan_admits_resolved_history_before_projecting_fragments() {
+        let state = PartitionState::empty(TrieConfig::default()).unwrap();
+        let table = TableRef::new("public", "docs");
+        let write_memory = MemoryBudget::new(1 << 20);
+        let put = TransactionKey { tx_id: TxId(0), system_time: Timestamp(100) };
+        let mut write = TransactionBuffer::new(state.value().snapshot(), put, Arc::clone(&write_memory)).unwrap();
+        write.put(table.clone(), BTreeMap::from([("_id".into(), Value::I64(1)), ("v".into(), Value::I64(9))]), Interval::from_micros(0, 30).unwrap()).unwrap();
+        state.apply(&write.stage().unwrap()).unwrap();
+        let delete = TransactionKey { tx_id: TxId(1), system_time: Timestamp(200) };
+        let mut write = TransactionBuffer::new(state.value().snapshot(), delete, write_memory).unwrap();
+        write.delete(table.clone(), &EntityId::Integer(1), Interval::from_micros(10, 20).unwrap()).unwrap();
+        state.apply(&write.stage().unwrap()).unwrap();
+
+        let snapshot = state.value().snapshot();
+        assert_eq!(snapshot.system_time_cap(), Some(delete.system_time));
+        let segments = snapshot.segments(&table);
+        assert_eq!(segments.len(), 1);
+        let leaves = segments[0].trie().leaves();
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].path().as_slice().is_empty());
+        let storage = Arc::new(BufferPool::new(Arc::new(MemoryStore::default()), 1 << 20));
+        let database = DatabaseSnapshot { partitions: vec![snapshot], storage };
+        let catalog = CatalogSnapshot::new("xtdb", BTreeMap::from([("xtdb".into(), database)]), false).unwrap();
+        let binding = catalog.table(&QualifiedTable { database: "xtdb".into(), table }).unwrap().unwrap();
+        let time = LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        let columns = [
+            ("v", binding.columns["v"].clone()), ("_valid_from", time.clone()), ("_valid_to", time.clone()),
+            ("_system_from", time.clone()), ("_system_to", time.maybe()),
+        ].into_iter().enumerate().map(|(index, (name, data_type))| Field {
+            id: ColumnId(index as u32), name: name.into(), qualifier: None, qualified_only: false, unnamed: false, data_type,
+        }).collect();
+        let scan = Scan {
+            table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+        };
+        let root = MemoryBudget::new(1 << 24);
+        let memory = root.scope();
+        let context = QueryContext::new(catalog, Arc::clone(&memory), Timestamp(200), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
+        let execution = Execution {
+            parameters: Arc::new(BoundParameters::infer(Vec::new(), &memory).unwrap()),
+            outer: OuterRows::empty(&memory).unwrap(), context, bindings: None, analysis: None,
+        };
+        let baseline = root.used_bytes();
+        let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
+        let partition = cursor.partitions.front_mut().unwrap();
+        partition.initialize().await.unwrap();
+        assert_eq!(partition.pages.entries.len(), 1);
+        partition.load(0).await.unwrap();
+        let scratch = std::mem::size_of::<PageSummary>() + std::mem::size_of::<Head>() + std::mem::size_of::<PageBuilder>()
+            + std::mem::size_of::<OwnedPage>() + 256 + 4096 + 256;
+        let slot = std::mem::size_of::<ResolvedRow<RowSource>>();
+        let previous = 2 * slot + 256;
+        let replacement = 4 * slot + 256;
+        let limit = root.limit_bytes();
+        let pressure = root.reserve(limit - root.used_bytes() - scratch - previous - replacement + 1).unwrap();
+        let retained = root.used_bytes() + scratch + previous;
+        let error = cursor.next_page().await.err().unwrap();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        let expected = format!("Cannot reserve {replacement} bytes from budget {limit} with {retained} retained");
+        assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+        assert!(cursor.partitions.front().unwrap().output.is_empty());
+        drop((cursor, pressure));
+        assert_eq!(root.used_bytes(), baseline);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let mut cursor = ScanCursor::new(scan, execution.clone(), None).await.unwrap();
+        let cursor_open = root.used_bytes();
+        let mut rows = Vec::new();
+        while let Some(page) = cursor.next_page().await.unwrap() {
+            rows.extend(page.rows().iter().map(|row| row.values.clone()));
+        }
+        let timestamp = |value| Value::Timestamp { value, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) };
+        assert_eq!(rows, [
+            vec![Value::I64(9), timestamp(0), timestamp(10), timestamp(100), Value::Null],
+            vec![Value::I64(9), timestamp(10), timestamp(20), timestamp(100), timestamp(200)],
+            vec![Value::I64(9), timestamp(20), timestamp(30), timestamp(100), Value::Null],
+        ]);
+        assert!(cursor.partitions.is_empty());
+        assert_eq!(root.used_bytes(), cursor_open);
+        drop((cursor, execution));
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(root.used_bytes(), 0);
     }
 }
