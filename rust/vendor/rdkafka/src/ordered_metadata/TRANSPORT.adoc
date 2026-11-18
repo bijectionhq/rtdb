@@ -215,7 +215,8 @@ Live topics copy timestamps, errors, states, UUIDs and leader/epoch integers, al
 The error path purges requested hints, wakes observers and schedules expiry for any earlier accepted cache writes, then releases the parsed arena.
 It skips later successful-response freshness, controller, cluster and group stages.
 The ordinary response handler reports the original permanent resource error to its requesting op, and both admin parsers return it before output projection.
-Independent admin/assignor/topic-info clones and live-topic growth still need their own admission.
+Independent admin/assignor copies and live-topic growth still need their own admission.
+Topic-info projection has the separate account and activation contract below.
 
 Hint storage is optional suppression state.
 A denied eligible topic still enters a nonnull query destination, and the returned hint count includes only installed arenas.
@@ -233,7 +234,7 @@ Cache scratch, independent clones and other native owners require separate admis
 The lightweight topic conversion acquires the client write lock before looking up or creating a proper topic.
 The constructor holds it through local topic publication, cache lookup and initialization from the cached entry.
 A source fixture observes that lock through the immediate constructor diagnostic on the native main actor and checks that the new topic inherits cached metadata after the parsed response has been freed.
-Native request/cache scratch, topic-info/assignor/admin clones, allocator overhead and all runtime/Phase2 qualification remain separate obligations.
+Native request and cache scratch, assignor and admin clones, allocator overhead and runtime effects require separate qualification.
 
 The Fetch and Produce leader tag handler holds the client write lock from cache lookup through leader and local topic updates.
 When a tag changes cached leader metadata, the handler reacquires the client write lock after processing the topics to notify cache observers and schedule expiry.
@@ -242,3 +243,32 @@ A source fixture on the actual native main actor checks the lock on a missing-br
 When the consumer-group Metadata refresh finds no usable broker, it holds the client write lock while replacing request-in-progress hints with retry hints for the next refresh.
 A native main-actor fixture checks the lock at both hint insertion diagnostics.
 It verifies that the retry hint's recorded expiry is one socket timeout after insertion and that the expiry timer stays unarmed.
+
+== Independent topic-info projections
+
+Metadata's literal and wildcard projection loops copy each selected topic into an independent topic-info arena while their client read lock protects the source cache.
+The accounted constructor measures its root, copied topic name, present rack arrays and strings, and the internal partition array required when any rack list is present.
+Checked products, individual eight-byte rounding and aggregate sums precede account acquisition and fallible allocation.
+For a non-NULL account, the copied owner retains the actual client's complete arena charge through candidate-list comparison, effective-list retention and common final destruction.
+It frees the arena before returning its charge.
+Equal candidates are destroyed after comparison, and changed candidates are admitted while the previous effective list is still live.
+Source cache replacement or purge cannot invalidate the copied name or rack values.
+
+Both Metadata projection functions return a typed native error, with CRIT_SYS_RESOURCE on a denied topic-info arena.
+The caller owns any partial info and error lists produced before that failure.
+Both classic consumer-group callers discard those transient lists and publish the existing asynchronous consumer resource error before effective-topic comparison, topic-error normalization, revocation or join.
+They retain the last complete effective/error lists and assignments.
+The cooperative subscription path has already installed its new subscription intent and incremented the version before projection.
+Its successful return transfers that adopted input away from the requesting SUBSCRIBE op, even when effective projection failed asynchronously.
+The new intent remains beside the previous effective list until a later complete projection replaces it.
+The shared Metadata parser retains its existing void consumer-group notification contract, so native Metadata can finish successfully while this later effective projection reports its separate asynchronous failure.
+
+The retained list is owned by the serialized consumer-group actor and is cleared or replaced before final group destruction.
+The built-in range, roundrobin and sticky member-metadata callbacks synchronously copy topic names into their own encoded storage.
+Those encoded outputs, candidate-list and topic-error scratch, consumer error ops/strings, full Metadata copies, rack scratch and other assignor/admin owners still require separate admission.
+
+Public accounted construction currently supports producers only.
+The actual topic-info projection callers belong to classic consumers, whose supported public construction still uses NULL accounts.
+The deterministic consumer fixtures exercise the internal fallible copy boundary with an internal account and caller-thread group state.
+An accounted public consumer profile requires separate activation.
+They cover exact and short admission, malloc rollback, rack geometry and lifetime, old/new overlap, partial projection prefixes, complete projections, both consumer failure paths, adopted input ownership, equal/changed effective lists, built-in member-metadata lifetime and final group destruction.

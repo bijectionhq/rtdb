@@ -24,7 +24,9 @@ The final native or Rust result owner retains all of these allocations.
 Retained ordinary Metadata cache arenas admit their complete root, copied payloads, padding and reliable-merge slack on that same account before allocation.
 Replacement admits the new arena while the old one remains charged, and common final destruction frees each arena before releasing its charge.
 A denied cache replacement preserves its old entry and propagates the native resource error after any broker and live-topic updates already completed.
-Client and broker construction, overlapping broker threads and stacks, live-topic storage, independent clones, rack scratch, admin output copies, ApiVersions sort internals, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
+Independent topic-info projection arenas have an internal fallible admission path retaining the actual client account through their final free.
+Their production callers are classic consumers, and supported public account construction remains producer-only, so this does not activate charged consumer copies.
+Client and broker construction, overlapping broker threads and stacks, live-topic storage, other independent clones, rack scratch, admin and member-metadata output copies, ApiVersions sort internals, consumer error owners, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.
 

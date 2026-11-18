@@ -126,12 +126,12 @@ rd_kafka_metadata_internal_t *
 rd_kafka_metadata_copy_add_racks(const rd_kafka_metadata_internal_t *mdi,
                                  size_t size);
 
-size_t
+rd_kafka_resp_err_t
 rd_kafka_metadata_topic_match(rd_kafka_t *rk,
                               rd_list_t *tinfos,
                               const rd_kafka_topic_partition_list_t *match,
                               rd_kafka_topic_partition_list_t *errored);
-size_t
+rd_kafka_resp_err_t
 rd_kafka_metadata_topic_filter(rd_kafka_t *rk,
                                rd_list_t *tinfos,
                                const rd_kafka_topic_partition_list_t *match,

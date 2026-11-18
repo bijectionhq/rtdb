@@ -5407,6 +5407,7 @@ rd_kafka_cgrp_modify_subscription(rd_kafka_cgrp_t *rkcg,
         rd_kafka_topic_partition_list_t *revoking;
         rd_list_t *tinfos;
         rd_kafka_topic_partition_list_t *errored;
+        rd_kafka_resp_err_t error;
         int metadata_age;
         int old_cnt = rkcg->rkcg_subscription->cnt;
         int32_t cgrp_subscription_version;
@@ -5473,11 +5474,23 @@ rd_kafka_cgrp_modify_subscription(rd_kafka_cgrp_t *rkcg,
         errored = rd_kafka_topic_partition_list_new(0);
 
         if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WILDCARD_SUBSCRIPTION)
-                rd_kafka_metadata_topic_match(rkcg->rkcg_rk, tinfos,
-                                              rkcg->rkcg_subscription, errored);
-        else
-                rd_kafka_metadata_topic_filter(
+                error = rd_kafka_metadata_topic_match(
                     rkcg->rkcg_rk, tinfos, rkcg->rkcg_subscription, errored);
+        else
+                error = rd_kafka_metadata_topic_filter(
+                    rkcg->rkcg_rk, tinfos, rkcg->rkcg_subscription, errored);
+        if (error) {
+                rd_list_destroy(tinfos);
+                rd_kafka_topic_partition_list_destroy(errored);
+                rd_kafka_consumer_err(
+                    rkcg->rkcg_q, RD_KAFKA_NODEID_UA, error, 0, NULL, NULL,
+                    RD_KAFKA_OFFSET_INVALID,
+                    "Metadata subscription projection failed: %s",
+                    rd_kafka_err2str(error));
+                RD_IF_FREE(revoking, rd_kafka_topic_partition_list_destroy);
+                /* The SUBSCRIBE op relinquishes its adopted input only on success. */
+                return RD_KAFKA_RESP_ERR_NO_ERROR;
+        }
 
         /* Propagate consumer errors for any non-existent or errored topics.
          * The function takes ownership of errored. */
@@ -6886,6 +6899,7 @@ void rd_kafka_cgrp_metadata_update_check(rd_kafka_cgrp_t *rkcg,
                                          rd_bool_t do_join) {
         rd_list_t *tinfos;
         rd_kafka_topic_partition_list_t *errored;
+        rd_kafka_resp_err_t error;
         rd_bool_t changed;
 
         rd_kafka_assert(NULL, thrd_is_current(rkcg->rkcg_rk->rk_thread));
@@ -6908,11 +6922,21 @@ void rd_kafka_cgrp_metadata_update_check(rd_kafka_cgrp_t *rkcg,
                              (void *)rd_kafka_topic_info_destroy);
 
         if (rkcg->rkcg_flags & RD_KAFKA_CGRP_F_WILDCARD_SUBSCRIPTION)
-                rd_kafka_metadata_topic_match(rkcg->rkcg_rk, tinfos,
-                                              rkcg->rkcg_subscription, errored);
-        else
-                rd_kafka_metadata_topic_filter(
+                error = rd_kafka_metadata_topic_match(
                     rkcg->rkcg_rk, tinfos, rkcg->rkcg_subscription, errored);
+        else
+                error = rd_kafka_metadata_topic_filter(
+                    rkcg->rkcg_rk, tinfos, rkcg->rkcg_subscription, errored);
+        if (error) {
+                rd_list_destroy(tinfos);
+                rd_kafka_topic_partition_list_destroy(errored);
+                rd_kafka_consumer_err(
+                    rkcg->rkcg_q, RD_KAFKA_NODEID_UA, error, 0, NULL, NULL,
+                    RD_KAFKA_OFFSET_INVALID,
+                    "Metadata subscription projection failed: %s",
+                    rd_kafka_err2str(error));
+                return;
+        }
 
 
         /*
@@ -7569,3 +7593,5 @@ int unittest_cgrp(void) {
 
         return fails;
 }
+
+#include "rdkafka_topic_info_cgrp_admission_test.h"

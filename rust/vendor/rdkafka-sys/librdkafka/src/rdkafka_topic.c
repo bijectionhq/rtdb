@@ -1941,57 +1941,103 @@ rd_kafka_topic_info_t *rd_kafka_topic_info_new(const char *topic,
         rd_kafka_topic_info_t *ti;
         size_t tlen = strlen(topic) + 1;
 
-        /* Allocate space for the topic along with the struct */
         ti        = rd_malloc(sizeof(*ti) + tlen);
         ti->topic = (char *)(ti + 1);
         memcpy((char *)ti->topic, topic, tlen);
         ti->partition_cnt       = partition_cnt;
         ti->partitions_internal = NULL;
+        ti->byte_account        = NULL;
+        ti->byte_charge         = 0;
 
         return ti;
 }
 
-/**
- * Allocate new topic_info, including rack information.
- * \p topic is copied.
- */
-rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack(
+static rd_bool_t rd_kafka_topic_info_size_add(size_t *total,
+                                               size_t width,
+                                               size_t count) {
+        size_t bytes, aligned;
+        if (width && count > SIZE_MAX / width)
+                return rd_false;
+        bytes = width * count;
+        if (bytes > SIZE_MAX - 7)
+                return rd_false;
+        aligned = RD_ROUNDUP(bytes, 8);
+        if (*total > SIZE_MAX - aligned)
+                return rd_false;
+        *total += aligned;
+        return rd_true;
+}
+
+static rd_bool_t rd_kafka_topic_info_string_size_add(size_t *total,
+                                                      const char *value) {
+        size_t length = strlen(value);
+        return length != SIZE_MAX &&
+               rd_kafka_topic_info_size_add(total, 1, length + 1);
+}
+
+static rd_bool_t rd_kafka_topic_info_rack_size(
     const char *topic,
     int partition_cnt,
-    const rd_kafka_metadata_partition_internal_t *mdpi) {
-        rd_kafka_topic_info_t *ti;
-        rd_tmpabuf_t tbuf;
+    const rd_kafka_metadata_partition_internal_t *mdpi,
+    size_t *size,
+    rd_bool_t *has_racks) {
+        size_t total = 0;
+        rd_bool_t present = rd_false;
         int i;
-        rd_bool_t has_racks = rd_false;
-
-        rd_tmpabuf_new(&tbuf, 0, rd_true /* assert on fail */);
-
-        rd_tmpabuf_add_alloc(&tbuf, sizeof(*ti));
-        rd_tmpabuf_add_alloc(&tbuf, strlen(topic) + 1);
+        if (!topic || partition_cnt < 0 || (partition_cnt && !mdpi) ||
+            !rd_kafka_topic_info_size_add(&total, sizeof(rd_kafka_topic_info_t), 1) ||
+            !rd_kafka_topic_info_string_size_add(&total, topic))
+                return rd_false;
         for (i = 0; i < partition_cnt; i++) {
                 size_t j;
-                if (!mdpi[i].racks)
+                if (!mdpi[i].racks) {
+                        if (mdpi[i].racks_cnt)
+                                return rd_false;
                         continue;
-
-                if (unlikely(!has_racks))
-                        has_racks = rd_true;
-
-                for (j = 0; j < mdpi[i].racks_cnt; j++) {
-                        rd_tmpabuf_add_alloc(&tbuf,
-                                             strlen(mdpi[i].racks[j]) + 1);
                 }
-                rd_tmpabuf_add_alloc(&tbuf, sizeof(char *) * mdpi[i].racks_cnt);
+                present = rd_true;
+                if (!rd_kafka_topic_info_size_add(&total, sizeof(*mdpi[i].racks),
+                                                   mdpi[i].racks_cnt))
+                        return rd_false;
+                for (j = 0; j < mdpi[i].racks_cnt; j++)
+                        if (!rd_kafka_topic_info_string_size_add(&total, mdpi[i].racks[j]))
+                                return rd_false;
         }
+        if (present && !rd_kafka_topic_info_size_add(
+                           &total, sizeof(*mdpi), partition_cnt))
+                return rd_false;
+        *size = total;
+        *has_racks = present;
+        return rd_true;
+}
 
-        if (has_racks) {
-                rd_tmpabuf_add_alloc(
-                    &tbuf, sizeof(rd_kafka_metadata_partition_internal_t) *
-                               partition_cnt);
+static rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack0(
+    rd_kafka_byte_account_t *account,
+    const char *topic,
+    int partition_cnt,
+    const rd_kafka_metadata_partition_internal_t *mdpi,
+    void *(*allocate)(size_t)) {
+        rd_kafka_topic_info_t *ti;
+        rd_tmpabuf_t tbuf;
+        size_t size;
+        int i;
+        rd_bool_t has_racks;
+        if (!rd_kafka_topic_info_rack_size(topic, partition_cnt, mdpi,
+                                            &size, &has_racks))
+                return NULL;
+        rd_tmpabuf_new(&tbuf, 0, rd_true);
+        tbuf.size = size;
+        if (!rd_kafka_byte_account_acquire(account, size))
+                return NULL;
+        tbuf.buf = account ? allocate(size) : rd_malloc(size);
+        if (!tbuf.buf) {
+                rd_kafka_byte_account_release(account, size);
+                return NULL;
         }
-
-        rd_tmpabuf_finalize(&tbuf);
 
         ti                      = rd_tmpabuf_alloc(&tbuf, sizeof(*ti));
+        ti->byte_account        = account;
+        ti->byte_charge         = account ? size : 0;
         ti->topic               = rd_tmpabuf_write_str(&tbuf, topic);
         ti->partition_cnt       = partition_cnt;
         ti->partitions_internal = NULL;
@@ -2026,10 +2072,47 @@ rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack(
 }
 
 /**
- * Destroy/free topic_info
+ * Copies the topic and rack data into one independently owned arena.
+ * Returns NULL on checked-size/admission failure or accounted allocation failure.
+ * A NULL account keeps the legacy assert-on-allocation policy.
+ * The nonnegative partition count requires that many stable mdpi entries.
+ * The account must remain alive until rd_kafka_topic_info_destroy().
+ * Input storage must stay stable for this call; no input pointer is retained.
+ */
+rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack_accounted(
+    rd_kafka_byte_account_t *account,
+    const char *topic,
+    int partition_cnt,
+    const rd_kafka_metadata_partition_internal_t *mdpi) {
+        return rd_kafka_topic_info_new_with_rack0(account, topic, partition_cnt,
+                                                  mdpi, malloc);
+}
+
+/**
+ * Allocate new topic_info, including rack information.
+ * \p topic is copied.
+ */
+rd_kafka_topic_info_t *rd_kafka_topic_info_new_with_rack(
+    const char *topic,
+    int partition_cnt,
+    const rd_kafka_metadata_partition_internal_t *mdpi) {
+        return rd_kafka_topic_info_new_with_rack_accounted(NULL, topic,
+                                                           partition_cnt, mdpi);
+}
+
+/**
+ * Frees an independent topic-info arena and returns its account charge.
+ * Accepts NULL.
  */
 void rd_kafka_topic_info_destroy(rd_kafka_topic_info_t *ti) {
+        rd_kafka_byte_account_t *account;
+        size_t charge;
+        if (!ti)
+                return;
+        account = ti->byte_account;
+        charge = ti->byte_charge;
         rd_free(ti);
+        rd_kafka_byte_account_release(account, charge);
 }
 
 
@@ -2144,3 +2227,5 @@ void rd_ut_kafka_topic_set_topic_exists(rd_kafka_topic_t *rkt,
 }
 
 #include "rdkafka_metadata_cache_topic_borrow_test.h"
+
+#include "rdkafka_topic_info_admission_test.h"

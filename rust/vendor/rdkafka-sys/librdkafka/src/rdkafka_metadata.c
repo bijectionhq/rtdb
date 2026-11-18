@@ -1341,18 +1341,20 @@ rd_kafka_parse_Metadata_admin(rd_kafka_broker_t *rkb,
  *                an available topic will be added to this list with
  *                the appropriate error set.
  *
- * @returns the number of topics matched and added to \p list
+ * @returns NO_ERROR, or CRIT_SYS_RESOURCE if a topic-info arena is denied.
+ *          Appended topic-info and error entries remain owned by the caller,
+ *          including a partial prefix on failure.
  *
  * @locks none
  * @locality any
  */
-size_t
+rd_kafka_resp_err_t
 rd_kafka_metadata_topic_match(rd_kafka_t *rk,
                               rd_list_t *tinfos,
                               const rd_kafka_topic_partition_list_t *match,
                               rd_kafka_topic_partition_list_t *errored) {
         int ti, i;
-        size_t cnt = 0;
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
         rd_kafka_topic_partition_list_t *unmatched;
         rd_list_t cached_topics;
         const char *topic;
@@ -1385,6 +1387,7 @@ rd_kafka_metadata_topic_match(rd_kafka_t *rk,
 
                 /* Scan for matches */
                 for (i = 0; i < match->cnt; i++) {
+                        rd_kafka_topic_info_t *tinfo;
                         if (!rd_kafka_topic_match(rk, match->elems[i].topic,
                                                   topic))
                                 continue;
@@ -1401,18 +1404,22 @@ rd_kafka_metadata_topic_match(rd_kafka_t *rk,
                                 continue; /* Skip errored topics */
                         }
 
-                        rd_list_add(tinfos, rd_kafka_topic_info_new_with_rack(
-                                                topic, mdt->partition_cnt,
-                                                mdti->partitions));
-
-                        cnt++;
+                        tinfo = rd_kafka_topic_info_new_with_rack_accounted(
+                            rk->rk_byte_account, topic, mdt->partition_cnt,
+                            mdti->partitions);
+                        if (!tinfo) {
+                                err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                                goto done;
+                        }
+                        rd_list_add(tinfos, tinfo);
                 }
         }
+done:
         rd_kafka_rdunlock(rk);
 
         /* Any topics/patterns still in unmatched did not match any
          * existing topics, add them to `errored`. */
-        for (i = 0; i < unmatched->cnt; i++) {
+        for (i = 0; !err && i < unmatched->cnt; i++) {
                 rd_kafka_topic_partition_t *elem = &unmatched->elems[i];
 
                 rd_kafka_topic_partition_list_add(errored, elem->topic,
@@ -1423,7 +1430,7 @@ rd_kafka_metadata_topic_match(rd_kafka_t *rk,
         rd_kafka_topic_partition_list_destroy(unmatched);
         rd_list_destroy(&cached_topics);
 
-        return cnt;
+        return err;
 }
 
 
@@ -1435,16 +1442,18 @@ rd_kafka_metadata_topic_match(rd_kafka_t *rk,
  * @param errored Non-existent and unauthorized topics are added to this
  *                list with the appropriate error code.
  *
- * @returns the number of topics matched and added to \p tinfos
+ * @returns NO_ERROR, or CRIT_SYS_RESOURCE if a topic-info arena is denied.
+ *          Appended topic-info and error entries remain owned by the caller,
+ *          including a partial prefix on failure.
  * @locks none
  */
-size_t
+rd_kafka_resp_err_t
 rd_kafka_metadata_topic_filter(rd_kafka_t *rk,
                                rd_list_t *tinfos,
                                const rd_kafka_topic_partition_list_t *match,
                                rd_kafka_topic_partition_list_t *errored) {
         int i;
-        size_t cnt = 0;
+        rd_kafka_resp_err_t err = RD_KAFKA_RESP_ERR_NO_ERROR;
 
         rd_kafka_rdlock(rk);
         /* For each topic in match, look up the topic in the cache. */
@@ -1471,18 +1480,21 @@ rd_kafka_metadata_topic_filter(rd_kafka_t *rk,
                                                           RD_KAFKA_PARTITION_UA)
                             ->err = mtopic->err;
                 else {
-                        rd_list_add(tinfos,
-                                    rd_kafka_topic_info_new_with_rack(
-                                        topic, mtopic->partition_cnt,
-                                        rkmce->rkmce_metadata_internal_topic
-                                            .partitions));
-
-                        cnt++;
+                        rd_kafka_topic_info_t *tinfo =
+                            rd_kafka_topic_info_new_with_rack_accounted(
+                                rk->rk_byte_account, topic,
+                                mtopic->partition_cnt,
+                                rkmce->rkmce_metadata_internal_topic.partitions);
+                        if (!tinfo) {
+                                err = RD_KAFKA_RESP_ERR__CRIT_SYS_RESOURCE;
+                                break;
+                        }
+                        rd_list_add(tinfos, tinfo);
                 }
         }
         rd_kafka_rdunlock(rk);
 
-        return cnt;
+        return err;
 }
 
 
@@ -2331,3 +2343,5 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 #include "rdkafka_metadata_account_test.h"
 #include "rdkafka_metadata_cache_parser_test.h"
 #include "rdkafka_metadata_tag_update_lock_test.h"
+
+#include "rdkafka_topic_info_metadata_admission_test.h"
