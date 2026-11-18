@@ -179,3 +179,58 @@ fn committed_jvm_data_files_are_read_through_the_event_schema() {
     assert_eq!(page.num_columns(), 1);
     page.column(0).to_data().validate_full().unwrap();
 }
+
+fn uuid_fields(field: &arrow_schema::Field) -> Vec<arrow_schema::Field> {
+    use arrow_schema::DataType;
+    let children: Vec<_> = match field.data_type() {
+        DataType::Struct(fields) => fields.iter().cloned().collect(),
+        DataType::Union(fields, _) => fields.iter().map(|(_, field)| Arc::clone(field)).collect(),
+        DataType::List(field) | DataType::Map(field, _) => vec![Arc::clone(field)],
+        _ => vec![],
+    };
+    let own = (field.metadata().get(rtdb_columnar::EXTENSION_NAME_KEY).map(String::as_str) == Some("uuid")).then(|| field.clone());
+    own.into_iter().chain(children.iter().flat_map(|child| uuid_fields(child))).collect()
+}
+
+fn assert_jvm_uuid_field(field: &arrow_schema::Field) {
+    assert_eq!(field.data_type(), &arrow_schema::DataType::FixedSizeBinary(16));
+    assert_eq!(field.metadata().get(rtdb_columnar::EXTENSION_METADATA_KEY).map(String::as_str), Some(""));
+}
+
+#[test]
+fn uuid_columns_round_trip_through_arrow_file_and_stream() {
+    let logical = LogicalType::Scalar(ScalarType::Uuid).maybe();
+    let cells = vec![Value::Uuid([0; 16]), Value::Null, Value::Uuid([0xff; 16]), Value::Uuid(std::array::from_fn(|index| index as u8))];
+    let field = rtdb_columnar::to_field("id", &logical).unwrap();
+    assert_jvm_uuid_field(&field);
+    let schema = arrow_schema::Schema::new(vec![field]);
+    let page = arrow_array::RecordBatch::try_new(Arc::new(schema.clone()), vec![rtdb_columnar::build_array(&logical, &cells).unwrap()]).unwrap();
+    let read_back = |page: &arrow_array::RecordBatch| {
+        assert_eq!(uuid_fields(page.schema().field(0)).len(), 1);
+        assert_jvm_uuid_field(page.schema().field(0));
+        assert_eq!(rtdb_columnar::from_field(page.schema().field(0)).unwrap(), logical);
+        (0..page.num_rows()).map(|row| rtdb_columnar::read_value(page.schema().field(0), page.column(0).as_ref(), row).unwrap()).collect::<Vec<_>>()
+    };
+    let mut file = ipc::ArrowFile::open(ipc::write_file(&schema, &[page.clone()]).unwrap().into(), None).unwrap();
+    assert_eq!(read_back(&file.read_page(0).unwrap()), cells);
+    let (stream_schema, pages) = ipc::read_stream(Arc::from(ipc::write_stream(&schema, &[page]).unwrap())).unwrap();
+    assert_jvm_uuid_field(stream_schema.field(0));
+    assert_eq!(pages.len(), 1);
+    assert_eq!(read_back(&pages[0]), cells);
+}
+
+#[test]
+fn uuid_put_documents_are_read_back_through_the_event_schema() {
+    let uuid = Value::Uuid(std::array::from_fn(|index| 0xa0 | index as u8));
+    let put = |iid: u8, id: Value| StoredEvent { iid: Iid([iid; 16]), system_from: Timestamp(1), valid_time: Interval::ALL, operation: StoredOperation::Put(BTreeMap::from([("ref".into(), id)])), recency: None };
+    let events = vec![put(1, uuid), put(2, Value::Null), put(3, Value::Uuid([0; 16]))];
+    let fields = BTreeMap::from([("ref".into(), LogicalType::Scalar(ScalarType::Uuid).maybe())]);
+    let batch = build_event_batch(&events, Some(fields), None).unwrap();
+    let bytes = ipc::write_file(batch.schema().as_ref(), &[batch]).unwrap();
+    let mut file = ipc::ArrowFile::open(bytes.into(), None).unwrap();
+    let uuids: Vec<_> = file.schema().fields().iter().flat_map(|field| uuid_fields(field)).collect();
+    assert_eq!(uuids.len(), 1);
+    assert_jvm_uuid_field(&uuids[0]);
+    let decoded = EventBatch::new(file.read_page(0).unwrap()).unwrap();
+    for (row, event) in events.iter().enumerate() { assert_eq!(&decoded.read_event(row).unwrap(), event); }
+}
