@@ -32,6 +32,29 @@ An expected-error assertion only passes when the original statement required an 
 Matching unexpected failures, query mismatches, skips, suppression, parse failures and query limits remain unverified.
 They cannot contribute passing coverage.
 
+== Scoped original SQL assertion receipt
+
+`python3 rust/conformance/emit_sql_logic_case.py --external EXTERNAL.json --run RUN --output CASE` extracts one observation from a retained SQL-logic run using link:configurations/sql-logic-scalar-case.json[the pinned case configuration].
+Use an output directory outside the external evidence archive.
+Keep the original absolute Linux invocation paths in the archive manifest and use its relocations to locate retained bytes.
+The reader checks the complete retained streams, original source, selected local production executable, and the two JVM invocations and native invocation.
+It checks the recorded Cargo workspace command, the compiler's source manifest and entry point, and the copied executable's position in the production build.
+Each execution must record the configured `UTC` timezone and the specified query clock mode.
+The three recorded storage versions must agree.
+The selected literal expression reads no table or time value, so its context records `applied_basis`, `valid_time` and `system_time` as JSON `null`.
+The pinned `sqlite-test/xtdb.test` record 4 expects T-formatted `NULL` followed by LF.
+Engine-specific schema, clock readings and snapshot tokens remain in the original archived evidence.
+
+The command emits a scoped ledger, the paired `CaseReceipt` arrays and their input lineage.
+Use `--verify CASE` in place of `--output CASE` to derive the expected bytes from the archive and check the existing receipt files.
+The lineage records the original JVM repeat as well as both compared executions.
+All retained streams must be structurally complete.
+The selected assertion must pass in all three executions.
+The scoped ledger records both `inventory_complete` and `runtime_reconciled` as `false`.
+The comparator produces its report from that ledger and the paired receipts.
+
+== Client and file evidence
+
 Client evidence includes the actual packaged server identities, copied original client sources, immutable client images, raw JUnit/TRX/ExUnit/libtest reports, container inspection, and drained owner receipts.
 The run's `packages` entries name the original reference/native package manifests and their retained source/artifact closure.
 The validator reparses the original framework reports and checks that stored cases match them exactly.

@@ -98,6 +98,15 @@ def native_build(evidence, run, implementation):
 
 
 def sql_cases(evidence, run, revision, implementation):
+    return list(iter_sql_cases(evidence, run, revision, implementation))
+
+
+def iter_sql_cases(evidence, run, revision, implementation):
+    """Yield original assertions with observations in reference, reference-repeat and native order.
+
+    Consume the iterator through exhaustion to validate trailing records and assertion counts.
+    Invalid or incomplete evidence raises an error during iteration.
+    """
     build = native_build(evidence, run, implementation)
     plan = evidence.read("plan/plan.json")
     if plan.get("reference") != revision:
@@ -148,7 +157,6 @@ def sql_cases(evidence, run, revision, implementation):
             evidence.path(str(path.relative_to(evidence.root)))
         observations[side] = files
     sources = index(run["sources"], lambda value: value["source"], "SQL logic original source")
-    result = []
     for position, script in enumerate(plan["scripts"]):
         source = sources[script["source"]]
         original_path = evidence.recorded(source["artifact"])
@@ -179,16 +187,15 @@ def sql_cases(evidence, run, revision, implementation):
                     passed = passed and len({value["result"]["text"] for value in actual}) == 1
                 if raw["assertion_ordinal"] is not None:
                     assertions += 1
-                    result.append({"runtime_identity": expected_identity, "source": script["source"], "passed": passed,
-                        "native_build_configuration": build["configuration"], "native_build_selection": build["selection"],
-                        "outcome": "expected_error_passed" if passed and dispositions[0] == "statement_expected_error" else "passed" if passed else "unverified",
-                        "observations": actual, "errors": errors})
+                    yield {"runtime_identity": expected_identity, "source": script["source"], "passed": passed,
+                           "native_build_configuration": build["configuration"], "native_build_selection": build["selection"],
+                           "outcome": "expected_error_passed" if passed and dispositions[0] == "statement_expected_error" else "passed" if passed else "unverified",
+                           "observations": actual, "errors": errors}
                 limit = script.get("options", {}).get("query_limit")
                 if not script.get("parse_errors", 0) and (limit is None or queries != limit) and (raw.get("record") or {}).get("type") == "query":
                     queries += 1
         if count != script["records"] or assertions != script["assertions"]:
             raise ValueError("SQL logic record/assertion denominator differs")
-    return result
 
 
 def client_cases(evidence, run, revision, implementation):

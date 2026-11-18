@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "runtime_identity": {
+    "reference": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
+    "source": "sqlite-test/xtdb.test",
+    "source_sha256": "2afd8e5cd3ec9e1575aff95890e6e389749acdc93eac404224c822f898099469",
+    "selection": "slt-test",
+    "options": {
+      "direct_sql": false,
+      "decorrelate": true,
+      "query_limit": null,
+      "max_rows": 1000000,
+      "max_result_bytes": 134217728
+    },
+    "ordinal": 4,
+    "assertion_ordinal": 3,
+    "line": 9
+  },
+  "source_assertion_lines": [9, 10, 11, 12],
+  "sql": "SELECT ( 4 ) IN ( NULL )",
+  "formatted_result": {"type_string": "T", "sort": "rowsort", "text": "NULL\n"},
+  "clock": "wall_clock_or_CURRENT_TIMESTAMP_variable",
+  "timezone": "UTC"
+}
