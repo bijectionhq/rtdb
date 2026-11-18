@@ -19,7 +19,7 @@ enum TablePurpose { Query, Mutation, Erase }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ListTableKind { Series, Unnest }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum FormAllocation<'a> { Tracked(&'a Arc<MemoryBudget>), Untracked }
 impl FormAllocation<'_> {
     pub(crate) fn literal(self, value: &Value) -> Result<RegexForm> {
@@ -88,7 +88,9 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
     Ok(expression)
 }
 
-pub(crate) fn bind(parsed: ParsedStatement, source: &str, catalog: &dyn Catalog, options: &PrepareOptions, forms: FormAllocation<'_>) -> Result<PreparedStatement> {
+pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
+    let source = parsed.source;
+    let forms = parsed.forms;
     let scoped_catalog = TransactionCatalog(catalog);
     let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();

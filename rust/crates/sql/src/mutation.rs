@@ -43,7 +43,7 @@ fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::Prepar
         _ => false,
     };
     if !eligible { return Ok(None); }
-    let prepared = crate::bind::bind(statement, sql, catalog, options, forms)?;
+    let prepared = statement.bind(catalog, options)?;
     let output = match prepared.statement {
         Statement::Dml(Dml::Insert { table, input }) => StaticMutation { table, input, patch: false, valid_time: TemporalFilter::Default },
         Statement::Dml(Dml::Patch { table, input, valid_time }) => StaticMutation { table, input, patch: true, valid_time },

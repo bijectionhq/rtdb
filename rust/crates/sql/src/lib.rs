@@ -61,7 +61,7 @@ pub fn prepare_in(sql: &str, catalog: &dyn Catalog, options: &PrepareOptions, me
 pub(crate) fn prepare_with(sql: &str, catalog: &dyn Catalog, options: &PrepareOptions, forms: bind::FormAllocation<'_>) -> Result<PreparedStatement> {
     let mut statements = parse::parse_with(sql, forms)?;
     if statements.len() != 1 { return Err(rtdb_types::Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
-    bind::bind(statements.remove(0), sql, catalog, options, forms)
+    statements.remove(0).bind(catalog, options)
 }
 
 #[cfg(test)]
@@ -89,6 +89,24 @@ mod owner_tests {
         drop(clone);
         assert_eq!(memory.used_bytes(), 0);
     }
+    #[test]
+    fn parsed_statement_binds_with_its_source_and_raw_metadata_budget() {
+        let source = "SELECT regexp_replace('abc', 'a', 'x')";
+        let budget = MemoryBudget::new(1 << 20);
+        let statement = parse_in(source, &budget).unwrap().remove(0);
+        let prepared = statement.bind(&ScalarCatalog, &PrepareOptions::default()).unwrap();
+        assert_eq!(prepared.source, source);
+        assert!(budget.used_bytes() > 0);
+        drop(prepared);
+        assert_eq!(budget.used_bytes(), 0);
+
+        let budget = MemoryBudget::new(0);
+        let statement = parse_in(source, &budget).unwrap().remove(0);
+        let error = statement.bind(&ScalarCatalog, &PrepareOptions::default()).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(budget.used_bytes(), 0);
+    }
+
     #[test]
     fn source_without_raw_metadata_and_noncontrol_probes_do_not_acquire_an_eager_scope() {
         let memory = MemoryBudget::new(0);

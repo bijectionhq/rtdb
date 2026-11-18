@@ -63,11 +63,11 @@ impl PreparedSql {
         let mut notices = Vec::new();
         let result = match parsed.kind() {
             StatementKind::Dml => {
-                if dml_notices { notices = rtdb_sql::prepare_in(source, &context.catalog, &options, &context.memory).map(|prepared| prepared.notices).unwrap_or_default(); }
+                if dml_notices { notices = parsed.bind(&context.catalog, &options).map(|prepared| prepared.notices).unwrap_or_default(); }
                 PreparedResult::Dml
             }
             StatementKind::Query => {
-                let prepared = rtdb_sql::prepare_in(source, &context.catalog, &options, &context.memory)?;
+                let prepared = parsed.bind(&context.catalog, &options)?;
                 for (index, ty) in &prepared.parameter_types {
                     if !options.parameter_types.contains_key(index) { parameters[*index] = ty.clone(); }
                 }
@@ -163,7 +163,7 @@ impl PreparedSql {
     }
 }
 
-fn one_statement(source: &str, memory: &Arc<MemoryBudget>) -> Result<rtdb_sql::ParsedStatement> {
+fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<rtdb_sql::ParsedStatement<'input>> {
     let mut parsed = rtdb_sql::parse_in(source, memory)?;
     if parsed.len() != 1 { return Err(Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
     Ok(parsed.remove(0))

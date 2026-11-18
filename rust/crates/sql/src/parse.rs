@@ -4,8 +4,10 @@ use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::
 use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
-pub struct ParsedStatement {
+pub struct ParsedStatement<'input> {
     pub span: SourceSpan,
+    pub(crate) source: &'input str,
+    pub(crate) forms: crate::bind::FormAllocation<'input>,
     parameter_count: usize,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
@@ -18,7 +20,12 @@ pub struct ParsedStatement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatementKind { Query, Dml, Session }
 
-impl ParsedStatement {
+impl ParsedStatement<'_> {
+    /// Binds this syntax against the caller's catalog using its original source and raw metadata budget.
+    pub fn bind(self, catalog: &dyn rtdb_plan::Catalog, options: &crate::PrepareOptions) -> Result<rtdb_plan::PreparedStatement> {
+        crate::bind::bind(self, catalog, options)
+    }
+
     pub fn parameter_count(&self) -> usize { self.parameter_count }
     /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
     /// This is a syntax classification, not authorization, binding, or proof that referenced tables exist.
@@ -118,17 +125,17 @@ pub(super) fn tokenize_into(
     })
 }
 
-pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {
+pub fn parse(sql: &str) -> Result<Vec<ParsedStatement<'_>>> {
     parse_with(sql, crate::bind::FormAllocation::Untracked)
 }
 
 /// Parses statements while charging reached inline XTQL raw metadata to the existing caller budget.
 /// Syntax, statement-span and source-read order are unchanged; allocation/admission errors propagate.
-pub fn parse_in(sql: &str, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<ParsedStatement>> {
+pub fn parse_in<'input>(sql: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<ParsedStatement<'input>>> {
     parse_with(sql, crate::bind::FormAllocation::Tracked(memory))
 }
 
-pub(crate) fn parse_with(sql: &str, forms: crate::bind::FormAllocation<'_>) -> Result<Vec<ParsedStatement>> {
+pub(crate) fn parse_with<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Vec<ParsedStatement<'input>>> {
     let dialect = SqlDialect::default();
     let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
@@ -218,7 +225,7 @@ pub(crate) fn parse_with(sql: &str, forms: crate::bind::FormAllocation<'_>) -> R
             return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
         }
         crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
-        statements.push(ParsedStatement { span, parameter_count, statement, temporal, inline_xtql, period_columns, settings, wildcard_renames });
+        statements.push(ParsedStatement { span, source: sql, forms, parameter_count, statement, temporal, inline_xtql, period_columns, settings, wildcard_renames });
     }
     Ok(statements)
 }
