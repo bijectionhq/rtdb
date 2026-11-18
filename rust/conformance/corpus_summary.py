@@ -5,7 +5,8 @@ are reported as jvm-api-boundary: the binding documents those types as a migrati
 cannot run natively without changing the original test. So are Vars that read the JVM node's system map for a port
 (their URL has an empty port), plan a logical operator the test itself defines on the JVM, or configure the
 test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials or real cloud endpoints report
-environment-unavailable.
+environment-unavailable. A failed assertion on the spills a test counts by redefining the JVM's temporary-directory
+function observes JVM operator internals, so it reports jvm-internal.
 """
 
 import argparse
@@ -23,6 +24,7 @@ BOUNDARY = re.compile(
     r"jdbc:(postgresql|xtdb)://localhost:/")
 ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|Unable to load credentials from any of the providers|'
                          r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
+JVM_INTERNAL = re.compile(r"\(clojure\.core/deref !spills\)")
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
@@ -32,6 +34,8 @@ def outcome(row):
         return "jvm-api-boundary"
     if row["result"] in ("error", "fail") and ENVIRONMENT.search(detail):
         return "environment-unavailable"
+    if row["result"] == "fail" and JVM_INTERNAL.search(detail):
+        return "jvm-internal"
     return row["result"]
 
 

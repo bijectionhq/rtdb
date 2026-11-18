@@ -98,6 +98,10 @@
 
 (defonce ^:private native-allocator (RootAllocator.))
 
+(def ^:private open-nodes
+  "Native nodes the running Var opened, closed if it times out so its native work stops competing with later Vars."
+  (atom #{}))
+
 (defn native-start-node
   "Opens a native node for a reference `xtdb.node/start-node` options map."
   ([] (native-start-node {}))
@@ -117,9 +121,10 @@
          opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
          config (yaml opts)]
      (try
-       (if (instance? InstantSource clock)
-         (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
-         (NativeDatabase/open native-allocator config (* 512 1024 1024)))
+       (doto (if (instance? InstantSource clock)
+               (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
+               (NativeDatabase/open native-allocator config (* 512 1024 1024)))
+         (->> (swap! open-nodes conj)))
        (catch NativeException e
          (throw (case (.code e)
                   "xtdb/out-of-sync-log" (IllegalStateException. (ex-message e) e)
@@ -225,6 +230,7 @@
                    nil))
         started (System/nanoTime)
         _ (reset! touched {})
+        _ (reset! open-nodes #{})
         task (future
                (binding [t/report report
                          t/*testing-vars* (list v)]
@@ -234,7 +240,10 @@
                      (reset! thrown e)
                      (report {:type :error :actual e})))))
         timed-out? (= ::timeout (deref task timeout-ms ::timeout))]
-    (when timed-out? (future-cancel task))
+    (when timed-out?
+      (future-cancel task)
+      (let [closing (future (doseq [^NativeDatabase node @open-nodes] (try (.close node) (catch Throwable _))))]
+        (deref closing 30000 nil)))
     (let [result (classify @counts @thrown timed-out? @touched)]
       (merge {:var (str (symbol v))
               :result result
