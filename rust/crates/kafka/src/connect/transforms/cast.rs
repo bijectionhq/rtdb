@@ -37,7 +37,7 @@ impl Cast {
         }
         let bound = source.retained_bytes()?.checked_mul(8).and_then(|size| size.checked_add(self.fields.len().max(1).checked_mul(256 << 10)?))
             .ok_or_else(|| error("allocation-overflow", "Cast schema cache allocation exceeds range"))?;
-        let charge = self.environment.memory().reserve(bound)?;
+        let charge = self.environment.reserve(bound)?;
         let output = if let Some(target) = self.whole {
             updated_schema(source, target, true, &self.environment)?
         } else {

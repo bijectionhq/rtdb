@@ -54,7 +54,7 @@ impl TimestampConverter {
         }
         let bound = source.retained_bytes()?.checked_mul(8).and_then(|bytes|bytes.checked_add(self.format.as_ref().map_or(0,DatePattern::maximum_output_bytes).checked_mul(4)?)).and_then(|bytes|bytes.checked_add(4096))
             .ok_or_else(||error("allocation-overflow","Timestamp schema cache allocation exceeds range"))?;
-        let charge = self.environment.memory().reserve(bound)?;
+        let charge = self.environment.reserve(bound)?;
         let mut updated = source.as_ref().clone();
         let SchemaKind::Struct(fields) = &mut updated.kind else { return Err(error("transform-error","Field TimestampConverter requires a Struct")); };
         for field in fields { if field.name == self.field { field.schema = self.schema(field.schema.optional); } }

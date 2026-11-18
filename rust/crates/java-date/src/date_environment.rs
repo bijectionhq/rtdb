@@ -81,6 +81,11 @@ impl DateEnvironment {
         &self.names[match field { NameField::Era => 0,NameField::Year => 1,NameField::Month => 2,NameField::Weekday => 3,NameField::AmPm => 4 }]
     }
     pub(super) fn memory(&self) -> &Arc<MemoryBudget> { self.charge.budget() }
+
+    /// Reserves memory in the environment's budget for state retained by a caller.
+    pub fn reserve(&self, bytes: usize) -> Result<Arc<MemoryReservation>> {
+        self.charge.budget().reserve(bytes)
+    }
     pub(super) fn constructed_at(&self) -> i64 { match &self.clocks { DateClocks::Fixed { constructed_at,.. } => *constructed_at,DateClocks::Live(clock) => clock.now_millis() } }
     pub(super) fn observed_at(&self) -> i64 { match &self.clocks { DateClocks::Fixed { observed_at,.. } => *observed_at,DateClocks::Live(clock) => clock.now_millis() } }
 }
