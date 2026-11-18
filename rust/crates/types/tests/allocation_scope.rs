@@ -21,6 +21,25 @@ fn scope_retains_ancestor_charges_and_rejects_growth_without_leaking() {
 }
 
 #[test]
+fn child_ceiling_checks_local_and_ancestor_capacity() {
+    let parent = MemoryBudget::new(8192);
+    let child = parent.scope_with_limit(512);
+    let inherited = parent.reserve(8000).unwrap();
+    assert_eq!(child.limit_bytes(), 512);
+    assert_eq!(child.reserve(193).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(child.used_bytes(), 0);
+    drop(inherited);
+    let retained = child.reserve(512).unwrap();
+    assert_eq!(child.reserve(1).unwrap_err().code, "rtdb/memory-budget-exceeded");
+    assert_eq!(parent.used_bytes(), 512);
+    drop(child);
+    assert_eq!(parent.used_bytes(), 512);
+    drop(retained);
+    assert_eq!(parent.used_bytes(), 0);
+    assert_eq!(parent.scope_with_limit(usize::MAX).limit_bytes(), 8192);
+}
+
+#[test]
 fn shared_scope_releases_only_after_its_last_caller_drops() {
     let memory = MemoryBudget::new(65536);
     let scope = Arc::new(AllocationScope::new(&memory).unwrap());

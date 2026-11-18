@@ -1,6 +1,6 @@
 use super::*;
 #[cfg(unix)]
-use rtdb_types::{AllocationScope, MemoryBudget};
+use rtdb_types::AllocationScope;
 
 #[cfg(unix)]
 fn properties(roots: &Path) -> Properties {
@@ -29,7 +29,7 @@ fn file_and_directory_values_resolve_once_and_keep_original_missing_placeholders
     original.insert("shared".into(), format!("${{file:{}:name}}", file.display()));
     let memory = MemoryBudget::new(1 << 25);
     let scope = AllocationScope::new(&memory).unwrap();
-    let resolved = resolve(&original, &mut |bytes| scope.reserve(bytes)).unwrap();
+    let resolved = resolve(&original, &memory, &mut |bytes| scope.reserve(bytes)).unwrap();
     assert_eq!(resolved["setting"], format!("café/firstcontinued/${{file:after}}/opaque\r\n/${{dir:{}:nested}}/${{unused:x}}", root.path().display()));
     assert_eq!(resolved["shared"], "café");
     assert!(memory.used_bytes() > 4096);
@@ -50,7 +50,7 @@ fn lookup_paths_follow_canonical_component_roots_and_directory_keys_name_entries
     let mut original = properties(&allowed);
     original.insert("outside".into(), format!("${{file:{}/../prefix-sibling/target:name}}", allowed.display()));
     original.insert("relative-key".into(), format!("${{dir:{}:../prefix-sibling/target}}", allowed.display()));
-    let resolved = resolve(&original, &mut |_| Ok(())).unwrap();
+    let resolved = resolve_test(&original).unwrap();
     assert_eq!(resolved["outside"], original["outside"]);
     assert_eq!(resolved["relative-key"], original["relative-key"]);
 }
@@ -63,13 +63,14 @@ fn provider_classes_and_roots_are_checked_before_placeholder_demand() {
         ("config.providers.file.param.allowed.paths".into(), "relative-root".into()),
     ]);
     let invalid = new();
-    assert_eq!(resolve(&invalid, &mut |_| Ok(())).unwrap_err().code, "xtdb.kafka/config-provider");
+    assert_eq!(resolve_test(&invalid).unwrap_err().code, "xtdb.kafka/config-provider");
     let mut unsupported = new();
     unsupported.insert("config.providers.file.class".into(), "example.Provider".into());
-    assert_eq!(resolve(&unsupported, &mut |_| Ok(())).unwrap_err().code, "xtdb.kafka/config-provider-class");
-    assert_eq!(resolve(&invalid, &mut |_| Err(allocation())).unwrap_err().code, "xtdb.kafka/config-provider-allocation");
+    assert_eq!(resolve_test(&unsupported).unwrap_err().code, "xtdb.kafka/config-provider-class");
+    let memory = MemoryBudget::new(1 << 28);
+    assert_eq!(resolve(&invalid, &memory, &mut |_| Err(allocation())).unwrap_err().code, "xtdb.kafka/config-provider-allocation");
     let untouched = BTreeMap::from([("configuration".into(), "${absent:x}".into())]);
-    assert!(matches!(resolve(&untouched, &mut |_| panic!("missing providers demand no allocation")).unwrap(), Cow::Borrowed(_)));
+    assert!(matches!(resolve(&untouched, &memory, &mut |_| panic!("missing providers demand no allocation")).unwrap(), Cow::Borrowed(_)));
 }
 
 #[test]
@@ -92,7 +93,25 @@ fn file_provider_projects_the_final_selected_property() {
     let mut original = properties(root.path());
     original.insert("setting".into(), format!("${{file:{}:selected}}", file.display()));
     fs::write(&file, "selected=\\uD800\nselected=ready\nignored=\\uD801\n").unwrap();
-    assert_eq!(resolve(&original, &mut |_| Ok(())).unwrap()["setting"], "ready");
+    assert_eq!(resolve_test(&original).unwrap()["setting"], "ready");
     fs::write(&file, "selected=ready\nignored=\\u+001\n").unwrap();
-    assert_eq!(resolve(&original, &mut |_| Ok(())).unwrap_err().code, "xtdb.kafka/properties-file");
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/properties-file");
+}
+
+fn resolve_test(original: &Properties) -> Result<Cow<'_, Properties>> {
+    let memory = MemoryBudget::new(1 << 28);
+    resolve(original, &memory, &mut |_| Ok(()))
+}
+
+#[test]
+fn environment_path_check_runs_after_allowlist_compilation() {
+    let mut original = BTreeMap::from([
+        (PROVIDERS.into(), "environment".into()),
+        ("config.providers.environment.class".into(), ENVIRONMENT.into()),
+        ("config.providers.environment.param.allowlist.pattern".into(), "[".into()),
+        ("setting".into(), "${environment:folder:RTDB_TEST_VALUE}".into()),
+    ]);
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.expression/illegal-argument-exception");
+    original.remove("config.providers.environment.param.allowlist.pattern");
+    assert_eq!(resolve_test(&original).unwrap_err().code, "xtdb.kafka/config-provider");
 }

@@ -61,3 +61,9 @@ The lookup stages follow `ConfigTransformer`, `FileConfigProvider`, `DirectoryCo
 The Rust resolver retains configuration text in its UTF-8 representation and uses the requesting configuration's allocation budget.
 Kafka Connect source assignments also resolve provider placeholders on their `!Kafka` remote before parsing `max.poll.records` and constructing the native consumer.
 The assignment retains admitted expanded configuration through consumer destruction.
+
+Kafka `EnvVarConfigProvider` captures process environment entries when the provider is constructed and filters their names during configuration.
+The allowlist uses the native Java whole-region matcher, with Java's default dot behavior for `.*`.
+A request for `${provider:key}` selects an exact name from the resulting snapshot.
+The retained snapshot and substitutions use the requesting configuration's budget.
+The platform capture uses the Rust standard library's process environment snapshot, whose temporary allocator and encoding behavior still require host qualification.

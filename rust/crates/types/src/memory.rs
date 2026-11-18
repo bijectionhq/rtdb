@@ -21,7 +21,13 @@ impl MemoryBudget {
     /// Tracks a region's retained and peak bytes while charging every reservation to the shared parent limit.
     /// Retained reservations keep both budgets alive after the region closes.
     pub fn scope(self: &Arc<Self>) -> Arc<Self> {
-        Arc::new(Self { limit_bytes: self.limit_bytes, used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)) })
+        self.scope_with_limit(self.limit_bytes)
+    }
+
+    /// Opens a child with its own byte ceiling and the parent's existing admission limits.
+    /// The effective ceiling cannot exceed this budget's byte limit.
+    pub fn scope_with_limit(self: &Arc<Self>, limit_bytes: usize) -> Arc<Self> {
+        Arc::new(Self { limit_bytes: limit_bytes.min(self.limit_bytes), used_bytes: AtomicUsize::new(0), peak_bytes: AtomicUsize::new(0), parent: Some(Arc::clone(self)) })
     }
 
     /// Reserves bytes without waiting; release occurs when the last reservation handle drops.

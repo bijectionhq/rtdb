@@ -129,7 +129,14 @@ pub(super) struct DlqProducer {
 }
 impl DlqProducer {
     pub fn open(options: &BTreeMap<String, String>, context: &mut ConversionContext) -> Result<Self> {
-        let resolved = crate::config::providers::resolve(options, &mut |bytes| context.reserve(bytes).map(drop))?;
+        use crate::config::providers;
+        let resolved = if providers::configured(options) {
+            let memory = context.scratch_budget();
+            let mut provider_context = ConversionContext::new(Arc::clone(&memory));
+            let resolved = providers::resolve(options, &memory, &mut |bytes| provider_context.reserve(bytes).map(drop))?;
+            for charge in provider_context.into_charges() { context.retain(charge)?; }
+            resolved
+        } else { std::borrow::Cow::Borrowed(options) };
         let options = resolved.as_ref();
         let configuration = options.iter().try_fold(65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len())).ok_or_else(overflow))?;
         let mut charges = vec![context.reserve(configuration.checked_mul(8).ok_or_else(overflow)?)?];

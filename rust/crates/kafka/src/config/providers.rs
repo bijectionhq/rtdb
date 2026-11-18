@@ -4,11 +4,14 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Component, Path, PathBuf},
+    sync::Arc,
 };
 
-use rtdb_types::{Anomaly, Result};
+use rtdb_types::{Anomaly, MemoryBudget, Result};
 
 mod file_text;
+mod environment;
+use environment::Environment;
 
 type Properties = BTreeMap<String, String>;
 type Values<'a> = BTreeMap<&'a str, String>;
@@ -16,6 +19,7 @@ type Values<'a> = BTreeMap<&'a str, String>;
 const PROVIDERS: &str = "config.providers";
 const FILE: &str = "org.apache.kafka.common.config.provider.FileConfigProvider";
 const DIRECTORY: &str = "org.apache.kafka.common.config.provider.DirectoryConfigProvider";
+const ENVIRONMENT: &str = "org.apache.kafka.common.config.provider.EnvVarConfigProvider";
 
 pub(crate) fn configured(properties: &Properties) -> bool {
     properties.get(PROVIDERS).is_some_and(|aliases| !aliases.is_empty())
@@ -26,7 +30,7 @@ pub(crate) fn control_property(name: &str) -> bool {
 }
 
 pub(crate) fn resolve<'a>(
-    original: &'a Properties, reserve: &mut impl FnMut(usize) -> Result<()>,
+    original: &'a Properties, memory: &Arc<MemoryBudget>, reserve: &mut impl FnMut(usize) -> Result<()>,
 ) -> Result<Cow<'a, Properties>> {
     let Some(aliases) = original.get(PROVIDERS).filter(|aliases| !aliases.is_empty()) else {
         return Ok(Cow::Borrowed(original));
@@ -42,6 +46,10 @@ pub(crate) fn resolve<'a>(
             let provider = match class.as_str() {
                 FILE => Provider::File(AllowedPaths::new(allowed, reserve)?),
                 DIRECTORY => Provider::Directory(AllowedPaths::new(allowed, reserve)?),
+                ENVIRONMENT => {
+                    let pattern = original.get(&format!("{prefix}param.allowlist.pattern")).map(String::as_str);
+                    Provider::Environment(Environment::capture(pattern, memory)?)
+                }
                 _ => return Err(Anomaly::unsupported("xtdb.kafka/config-provider-class", "Configured Kafka ConfigProvider class requires a native adapter")),
             };
             providers.insert(alias, provider);
@@ -161,11 +169,12 @@ fn normalize_absolute(path: &Path) -> PathBuf {
     normalized
 }
 
-enum Provider { File(AllowedPaths), Directory(AllowedPaths) }
+enum Provider { File(AllowedPaths), Directory(AllowedPaths), Environment(Environment) }
 impl Provider {
     fn get<'a>(&self, path: &str, keys: &BTreeSet<&'a str>, reserve: &mut impl FnMut(usize) -> Result<()>) -> Result<Values<'a>> {
-        if path.is_empty() { return Ok(BTreeMap::new()); }
         match self {
+            Self::Environment(environment) => environment.get(path, keys, reserve),
+            _ if path.is_empty() => Ok(BTreeMap::new()),
             Self::File(allowed) => {
                 let Some(path) = allowed.path(path)? else { return Ok(BTreeMap::new()); };
                 let source = read_text(&path, reserve)?;

@@ -4019,6 +4019,7 @@ dependencies = [
  "regex",
  "reqwest 0.13.4",
  "rtdb-columnar",
+ "rtdb-expr",
  "rtdb-format",
  "rtdb-replication",
  "rtdb-storage",

@@ -129,7 +129,7 @@ impl SourceDriver {
         for key in ["key.deserializer", "value.deserializer", "enable.auto.commit"] { properties.remove(key); }
         let scope = if providers::configured(&properties) {
             let scope = AllocationScope::new(&self.memory)?;
-            if let std::borrow::Cow::Owned(resolved) = providers::resolve(&properties, &mut |bytes| scope.reserve(bytes))? {
+            if let std::borrow::Cow::Owned(resolved) = providers::resolve(&properties, &self.memory, &mut |bytes| scope.reserve(bytes))? {
                 properties = resolved;
             }
             Some(scope)

@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 rtdb-storage.workspace = true
 rtdb-types.workspace = true
+rtdb-expr.workspace = true
 rtdb-tls.workspace = true
 zeroize = "1.8"
 libc = "0.2"
