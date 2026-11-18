@@ -742,6 +742,7 @@ mod tests {
         let (mut frontend, driver) = test_frontend().await;
         let memory = Arc::clone(frontend.node.memory());
 
+        let initial_timezone = frontend.session.state().effective_timezone().to_owned();
         let frame_bytes = (source.len() + 1) * 16 + 8192;
         let baseline = memory.used_bytes();
         let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - portal_peak).unwrap();
@@ -756,7 +757,7 @@ mod tests {
         frontend.handle(frame, &mut writer).await.unwrap();
         assert_eq!(writer.into_inner(), expected.into_inner());
         assert_eq!(frontend.session.state().status(), TransactionStatus::Idle);
-        assert_eq!(frontend.session.state().effective_timezone(), "UTC");
+        assert_eq!(frontend.session.state().effective_timezone(), initial_timezone);
         assert_eq!(memory.peak_bytes(), memory.limit_bytes());
         assert_eq!(memory.used_bytes(), baseline + held.bytes());
         drop(held);

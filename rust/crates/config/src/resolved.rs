@@ -57,7 +57,7 @@ pub(crate) fn describe(config: &NodeConfiguration, report: &mut QualificationRep
     report.runtime = Some(json!({
         "membership":if config.fixed_databases.is_some() { "fixed-ingest" } else { "durable-primary-catalog" },
         "read_only_databases":config.read_only_databases, "skipped_databases":config.skipped_databases,
-        "default_timezone":config.default_timezone, "indexer_enabled":config.indexer.enabled,
+        "default_timezone":config.node_timezone(), "indexer_enabled":config.indexer.enabled,
         "compactor_threads":config.compactor.threads, "gc_enabled":config.garbage.enabled,
         "rows_per_block":config.indexer.rows_per_block, "skipped_transactions":config.indexer.skip_transactions,
         "disk_cache":config.disk_cache.as_ref().map(|cache| json!({"path":cache.path, "maximum_bytes":cache.maximum_bytes, "maximum_ratio":cache.maximum_ratio})),

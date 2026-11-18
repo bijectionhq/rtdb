@@ -32,10 +32,15 @@ pub struct NodeOptions {
     pub automatic_gc: bool,
 }
 
+impl NodeOptions {
+    /// The fixed UTC offset used when no node time zone is configured.
+    pub const DEFAULT_TIMEZONE: &str = "Z";
+}
+
 impl Default for NodeOptions {
     fn default() -> Self {
         Self { membership: Membership::Durable { primary: Default::default(), skipped: Default::default() }, read_only: false,
-            default_timezone: "UTC".into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
+            default_timezone: Self::DEFAULT_TIMEZONE.into(), execution_memory_bytes: 512 * 1024 * 1024, cache_bytes: 256 * 1024 * 1024,
             command_capacity: 64, file_size_target: 100 * 1024 * 1024, trie: TrieConfig::default(), query: QueryOptions::default(),
             replication: ReplicationConfig::default(), compaction: MergeConfig::default(), compaction_threads: 2,
             garbage: GarbageConfig::default(), automatic_compaction: true, automatic_gc: true }

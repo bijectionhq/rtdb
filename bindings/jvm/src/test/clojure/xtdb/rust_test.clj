@@ -265,6 +265,7 @@
 (deftest-original-api original-expr/test-parse-ident)
 (deftest-original-api original-expr/test-arithmetic-precedence-slt)
 (deftest-original-api original-expr/timestamp-literal-exception-3562)
+(deftest-original-api original-expr/timestamptz-literals-and-casts-3612)
 (deftest-original-api original-expr/variadic-overlaps-3441)
 
 (deftest unnest-actor-results

@@ -42,6 +42,7 @@ Ordinary resource-opening failures drop partial owners and drain the child befor
 Cancellation of an in-progress attach leaves its admitted operations in the node parent's final drain.
 Custom resource-factory wrappers must forward closure to their wrapped factory.
 Each native resource factory belongs to one node lifetime; a later node opens a new factory and I/O region while immutable provider configuration and clocks may be shared.
+In-process connections inherit the node's configured time zone, which defaults to the fixed UTC offset `Z`.
 Remote storage requires a shared `DiskCache`, with file keys scoped by database and partition.
 Database names that cannot form a safe single path component use an injective hexadecimal cache-directory encoding.
 Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.

@@ -106,7 +106,9 @@ impl ServerDriver {
                 if port < 0 { continue; }
                 let mut configuration = rtdb_pgwire::ServerConfig { address: address(&settings.host, port).await?, maximum_connections: settings.connections,
                     pending_connections: settings.connections, read_only, playground: config.playground, tls: tls.clone(), ..Default::default() };
-                configuration.parameters.insert("timezone".into(), config.default_timezone.clone());
+                if let Some(zone) = &config.default_timezone {
+                    configuration.parameters.insert("timezone".into(), zone.clone());
+                }
                 let (handle, driver) = rtdb_pgwire::ServerDriver::bind(configuration, node.clone(), auth.clone()).await?;
                 registrations.push(metrics.register_provider(handle.metrics_provider()?)?);
                 if read_only { addresses.read_only_pgwire = Some(handle.address()); } else { addresses.pgwire = Some(handle.address()); }

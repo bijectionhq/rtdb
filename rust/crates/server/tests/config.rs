@@ -21,6 +21,20 @@ fn startup_defaults_match_the_pinned_factories() {
 }
 
 #[test]
+fn yaml_and_edn_preserve_the_difference_between_omitted_and_configured_timezones() {
+    let omitted = decode("{}").unwrap();
+    assert_eq!(omitted.default_timezone, None);
+    assert_eq!(omitted.node_options(1 << 20).unwrap().default_timezone, "Z");
+    let utc = decode("defaultTz: UTC").unwrap();
+    assert_eq!(utc.default_timezone.as_deref(), Some("UTC"));
+    assert_eq!(utc.node_options(1 << 20).unwrap().default_timezone, "UTC");
+    let (paris, _) = NodeConfiguration::from_edn_with_environment(
+        r#"{:default-tz "Europe/Paris"}"#, &|_| None,
+    ).unwrap();
+    assert_eq!(paris.node_options(1 << 20).unwrap().default_timezone, "Europe/Paris");
+}
+
+#[test]
 fn nonpositive_compactor_threads_disable_the_compactor() {
     for threads in [0, -1] { assert_eq!(decode(&format!("compactor: {{threads: {threads}}}")).unwrap().compactor.threads, 0); }
 }

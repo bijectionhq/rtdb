@@ -244,6 +244,8 @@ entity Connection {
     -- See: core/src/main/kotlin/xtdb/api/Xtdb.kt (Xtdb.Connection)
     user: User?                      -- session identity, set once at authentication; null for an in-process connection opened without credentials
     auto_commit: Boolean
+    -- In-process connections inherit the node's configured zone, which defaults to the fixed UTC offset Z.
+    -- PostgreSQL startup uses the configured zone when present and defaults to the UTC region.
     default_tz: ZoneId
     opened_tz: ZoneId                -- the default_tz the connection was constructed with
     await_token: TxBasisToken?       -- advanced by every write, threaded through every read

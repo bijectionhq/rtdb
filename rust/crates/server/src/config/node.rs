@@ -4,6 +4,11 @@ use rtdb_types::Result;
 use super::{NodeConfiguration, invalid};
 
 impl NodeConfiguration {
+    /// Returns the effective node time zone, including the in-process default.
+    pub fn node_timezone(&self) -> &str {
+        self.default_timezone.as_deref().unwrap_or(NodeOptions::DEFAULT_TIMEZONE)
+    }
+
     /// Splits the process allocation ceiling between the shared object cache and execution region.
     /// Each cache and execution reservation is shared across every database on the node.
     pub fn node_options(&self, allocation_limit_bytes: usize) -> Result<NodeOptions> {
@@ -17,7 +22,7 @@ impl NodeConfiguration {
             None => Membership::Durable { primary: self.primary.clone(), skipped: self.skipped_databases.clone() },
         };
         options.read_only = self.read_only_databases;
-        options.default_timezone = self.default_timezone.clone();
+        options.default_timezone = self.node_timezone().to_owned();
         options.query.join_build_rows = self.join_build_rows;
         options.query.generate_series_end_exclusive = self.generate_series_end_exclusive;
         options.query.object_sort = self.object_sort;

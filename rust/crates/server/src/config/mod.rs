@@ -57,7 +57,8 @@ pub struct NodeConfiguration {
     pub fixed_databases: Option<BTreeMap<String, DatabaseConfig>>,
     pub memory_cache: MemoryCacheSettings,
     pub disk_cache: Option<DiskCacheSettings>,
-    pub default_timezone: String,
+    /// A configured time zone shared by the node and PostgreSQL startup.
+    pub default_timezone: Option<String>,
     pub indexer: IndexerSettings,
     pub compactor: CompactorSettings,
     pub garbage: GarbageSettings,
@@ -120,12 +121,12 @@ impl NodeConfiguration {
                 None => BTreeMap::new(),
             };
             Self { playground: false, server: None, flight_sql: None, health, remotes, primary, fixed_databases: Some(fixed_databases), memory_cache, disk_cache,
-                default_timezone: "UTC".into(), indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
+                default_timezone: None, indexer, compactor: compactor(None, environment)?, garbage: garbage(None)?, auth: authentication::default_auth(environment),
                 tracing: tracing(None)?, modules: Vec::new(), read_only_databases: false, skipped_databases: BTreeSet::new(), node_id, local_log_uses_clock, kafka_auto_create_topic, join_build_rows, generate_series_end_exclusive, object_sort: Default::default() }
         } else {
             let server = match fields.take("server") { None => Some(PgwireSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(pgwire(value)?) };
             let flight_sql = match fields.take("flightSql") { None => Some(FlightSettings::default()), Some(Yaml::Null) => None, Some(value) => Some(flight(value)?) };
-            let default_timezone = rtdb_expr::normalize_timezone(fields.string("defaultTz")?.as_deref().unwrap_or("UTC"))?;
+            let default_timezone = fields.string("defaultTz")?.as_deref().map(rtdb_expr::normalize_timezone).transpose()?;
             let compactor = compactor(fields.take("compactor"), environment)?;
             let garbage = garbage(fields.take("garbageCollector"))?;
             let auth = fields.take("authn").map(|value| authentication::decode(value, environment)).transpose()?.unwrap_or_else(|| authentication::default_auth(environment));
