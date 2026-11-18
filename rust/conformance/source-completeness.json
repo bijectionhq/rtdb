@@ -2,7 +2,7 @@
   "schema_version": 1,
   "reference_revision": "c84f9334eb060ceb92d28ecdd4a06e6b625932fd",
   "design_revision": "c995e6b35b6812aa423c8a158c4e201e27532320",
-  "implementation_revision": null,
+  "implementation_revision": "df1c5426e1caf493b55db7c3cc93e3eb7e7d4b7c",
   "areas": {
     "types_columnar_durable_formats": {
       "status": "reviewed",
