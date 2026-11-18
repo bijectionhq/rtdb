@@ -129,6 +129,8 @@ pub(super) struct DlqProducer {
 }
 impl DlqProducer {
     pub fn open(options: &BTreeMap<String, String>, context: &mut ConversionContext) -> Result<Self> {
+        let resolved = crate::config::providers::resolve(options, &mut |bytes| context.reserve(bytes).map(drop))?;
+        let options = resolved.as_ref();
         let configuration = options.iter().try_fold(65_536usize, |bytes, (name, value)| bytes.checked_add(name.len()).and_then(|bytes| bytes.checked_add(value.len())).ok_or_else(overflow))?;
         let mut charges = vec![context.reserve(configuration.checked_mul(8).ok_or_else(overflow)?)?];
         let mut settings = config::Settings::parse(options)?;
@@ -207,6 +209,32 @@ mod tests {
 
     fn rule(mode: Mode) -> DlqRule {
         DlqRule { name: Some("guard".into()), executor: "missing".into(), mode, subject: "events-value".into(), topic: Some("failures".into()), action: Arc::new(DlqAction { name: "_default_".into(), options: BTreeMap::new() }) }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn producer_opens_with_file_supplied_bootstrap_and_settings() {
+        let cluster = rdkafka::mocking::MockCluster::new(1).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("producer.properties");
+        std::fs::write(&file, format!("brokers={}\ntimeout=19\n", cluster.bootstrap_servers())).unwrap();
+        let options = BTreeMap::from([
+            ("config.providers".into(), "file".into()),
+            ("config.providers.file.class".into(), "org.apache.kafka.common.config.provider.FileConfigProvider".into()),
+            ("config.providers.file.param.allowed.paths".into(), root.path().to_str().unwrap().into()),
+            ("bootstrap.servers".into(), format!("${{file:{}:brokers}}", file.display())),
+            ("max.block.ms".into(), format!("${{file:{}:timeout}}", file.display())),
+            ("buffer.memory".into(), "1048576".into()),
+        ]);
+        let memory = MemoryBudget::new(1 << 27);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let producer = DlqProducer::open(&options, &mut context).unwrap();
+        assert_eq!(producer.settings.maximum_block, Duration::from_millis(19));
+        assert_eq!(producer.settings.properties["bootstrap.servers"], cluster.bootstrap_servers());
+        drop(context);
+        assert!(memory.used_bytes() > 0);
+        drop(producer);
+        assert_eq!(memory.used_bytes(), 0);
     }
     #[test]
     fn read_and_migration_actions_retain_original_key_value_and_rule_headers() {

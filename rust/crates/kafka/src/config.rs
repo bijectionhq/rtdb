@@ -5,6 +5,8 @@ use rtdb_format::generated::xtdb::kafka::proto as pb;
 use rtdb_types::{Anomaly, Result};
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod providers;
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct KafkaClusterConfig {
     pub bootstrap_servers: String,
@@ -229,6 +231,10 @@ impl KafkaLogConfig {
 
 pub fn parse_properties(bytes: &[u8]) -> Result<BTreeMap<String, String>> {
     let text: String = bytes.iter().map(|byte| char::from(*byte)).collect();
+    parse_properties_text(&text)
+}
+
+fn parse_properties_text(text: &str) -> Result<BTreeMap<String, String>> {
     let mut logical = Vec::new();
     let mut current = String::new();
     let mut continuation = false;

@@ -48,3 +48,13 @@ Kafka applies Java ConfigDef trimming; Registry preserves raw provider and algor
 
 The adapter decodes `buffer.memory`, `batch.size`, `max.request.size`, `max.block.ms`, `linger.ms`, `delivery.timeout.ms`, `request.timeout.ms`, `send.buffer.bytes` and `receive.buffer.bytes` as Java signed decimal text, including BMP digits and `-0`.
 For those options and serializer class names, the adapter trims outer code units up to U+0020 before validation.
+
+== Kafka configuration providers
+
+Registry dead-letter producer options can declare Kafka `FileConfigProvider` and `DirectoryConfigProvider` classes through `config.providers` and their alias properties.
+A `${provider:path:key}` value is resolved before the producer parses its settings or prepares TLS material.
+The file provider decodes UTF-8 Java properties and the directory provider reads requested regular-file entries as UTF-8 with their original line endings.
+An `allowed.paths` provider parameter limits resolution to the listed absolute roots and their descendants after canonicalization.
+Missing values preserve their original placeholder and inserted text is resolved once from the original option values.
+The lookup stages follow `ConfigTransformer`, `FileConfigProvider`, `DirectoryConfigProvider` and `AllowedPaths` from the Kafka 4.4.0 client sources.
+The Rust resolver retains configuration text in its UTF-8 representation and uses the requesting configuration's allocation budget.
