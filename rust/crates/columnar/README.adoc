@@ -156,7 +156,7 @@ A range on an already indirect leg reader preserves the mask, matching `Indirect
 A first direct range retains Slice topology; another range over an indirect reader reserves and materializes translated selection indices even when its rows are contiguous.
 `Selection::All` invokes the same range behavior over the complete reader.
 The checked `Selection` surface requires a nonnegative source count.
-The source scalar reader exposes the first signed Slice's raw byte and pointer methods described below.
+The source scalar reader exposes raw bytes, pointers and LongLong lanes through its first signed Slice and first explicit index selection.
 `struct_child` also admits a named Struct leg, while `list_elements` and list offsets admit the corresponding plain or named-leg list reader.
 `list_start_index` and `list_count` return signed i32 values.
 Fixed lists compute start with wrapping multiplication and return the declared count without accessing row storage.
@@ -314,9 +314,19 @@ They retain the inner declaration's actual width, unsupported methods and negati
 Raw forwarding is independent of logical row count and validity.
 Slice construction and raw forwarding allocate no payload storage or reservations.
 Slices and returned facts borrow the real writer/vector owner and may outlive intermediate reader or Slice variables within that borrow.
+`SourceScalarReader::select` borrows a caller-owned immutable slice of signed i32 indices and reports its length as the selected row count.
+
+* Construction checks that the length fits the source array's signed count and leaves each stored row unchanged.
+* The byte and pointer getters check the requested index before forwarding the stored row.
+** A failed lookup reports the signed index and array length.
+** Byte views and pointers defer demand for the retained byte span independently of the inner logical count and validity.
+* The returned byte view and pointer borrow the source region independently of the selector and can outlive it.
+* Selection and forwarding use the existing storage and reservations.
+
 Repeated selection, mutable array aliases, copying and close remain required indirect-reader operations.
 
-`get_pointer_into` on the direct reader and first signed Slice replaces the backing, offset and length in the caller's existing pointer slot.
+`get_pointer_into` on the direct reader, first signed Slice and first explicit index selection replaces the backing, offset and length in the caller's existing pointer slot.
+A failed index lookup leaves the slot and its cached hash intact.
 The returned exclusive borrow refers to the same slot.
 The replacement backing outlives the lifetime carried by the pointer.
 The exclusive borrow of the slot can end earlier.
@@ -370,9 +380,12 @@ Each read demands exactly eight bytes, independently of the stored count, validi
 The little-endian Arrow 19 profile reverses its native long load, yielding the signed big-endian value.
 An out-of-bounds lane reports its signed byte offset and retained capacity.
 The direct UUID and Time readers have no LongLong capability.
-A first signed Slice checks its inner class before translating the row, returning a typed class failure for either unsupported inner reader.
+The first Slice and first explicit selection both check their inner class before translating the row.
 
-`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, first signed Slice forwarding, signed LongLong lane demand, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
+* An explicit UUID or Time selection reports the class failure before any array lookup.
+* A FixedBinary selection looks up the index before reading either width-independent lane.
+
+`cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, first signed Slice and explicit index forwarding, signed LongLong lane demand, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
 These tests are unexecuted source under the Phase 1 gate.
 Existing-inner wrapper adoption and mutable aliases remain required constructor work.
 Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.
@@ -417,7 +430,7 @@ Pointer formation retains a signed wrapped i32 row-times-four offset and length 
 Pointer comparison checks both spans, and equality of distinct pointer objects uses the same validation.
 Facts and demanded bytes borrow the actual owner and expose no raw address or mutable alias.
 Rounded padding can therefore be demanded through this source pointer path even when the ordinary checked cell boundary rejects that logical row.
-An Int-produced pointer can supply the slot retargeted by a direct source scalar reader or first signed Slice.
+An Int-produced pointer can supply the slot retargeted by a direct source scalar reader, first signed Slice or first explicit index selection.
 Int source getBytes, primitive null/NPE/object/metadata reads, mutable aliases and retargeting from an Int reader remain outside this byte-fact surface.
 Native scalar copying continues to demand actual retained spans and validity in source order; admitted SDK arrays keep their strict row and range boundary.
 

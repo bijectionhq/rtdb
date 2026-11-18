@@ -2142,3 +2142,124 @@ fn source_pointer_hash_cursor_refuses_the_first_wrapped_eight_byte_guard() {
         assert_eq!(error.code, "rtdb/pointer-hash-cursor-overflow");
     }
 }
+
+#[test]
+fn source_selection_maps_signed_rows_before_raw_bytes_and_fixed_long_long_lanes() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(8), true, &memory);
+    output.write_bytes(&[0x80; 8]).unwrap();
+    output.write_null().unwrap();
+    output.write_bytes(&[0x20; 8]).unwrap();
+    output.write_bytes(&[0xff; 8]).unwrap();
+    let captured = output.finish().unwrap();
+    assert!(captured.cell(1).unwrap().is_null().unwrap());
+    let capacity = data(&captured).bytes.as_slice().len();
+    let past_storage = i32::try_from(capacity / 8).unwrap();
+    let indices = [1, 0, 1, i32::MIN, -1, past_storage];
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    let selected = reader.select(&indices).unwrap();
+
+    assert_eq!(selected.value_count(), 6);
+    for index in [0, 2] {
+        assert_eq!(selected.get_bytes(index).unwrap().demand_native().unwrap(), &[0; 8]);
+        assert_eq!(selected.get_long_long_high(index).unwrap(), i64::from_be_bytes([0x20; 8]));
+        assert_eq!(selected.get_long_long_low(index).unwrap(), -1);
+    }
+    for index in [1, 3] {
+        assert_eq!(selected.get_bytes(index).unwrap().demand_native().unwrap(), &[0x80; 8]);
+        assert_eq!(selected.get_long_long_high(index).unwrap(), i64::from_be_bytes([0x80; 8]));
+        assert_eq!(selected.get_long_long_low(index).unwrap(), 0);
+    }
+    let pointer = selected.get_pointer(4).unwrap();
+    assert_eq!((pointer.offset(), pointer.length()), (-8, 8));
+    read_native(pointer.demand_native());
+    read_reference(selected.get_long_long_high(4), SourceScalarReadFailure::LongLongLaneBounds { offset: -16, capacity });
+    read_reference(selected.get_long_long_low(4), SourceScalarReadFailure::LongLongLaneBounds { offset: -8, capacity });
+    let past = selected.get_bytes(5).unwrap();
+    assert_eq!(past.offset(), i64::from(past_storage) * 8);
+    read_native(past.demand_native());
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, captured));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_selection_reports_lookup_and_receiver_failures_in_source_order() {
+    let memory = memory();
+    for declaration in [SourceScalarDeclaration::FixedBinary(-1), SourceScalarDeclaration::Uuid { inner_width: -1 },
+                        SourceScalarDeclaration::Time32(TimeUnit::Second)] {
+        let output = writer(declaration, false, &memory);
+        let reader = output.source_reader().unwrap().unwrap();
+        let selected = reader.select(&[0]).unwrap();
+        for row in [-1, 1, i32::MAX] {
+            let bounds = SourceScalarReadFailure::SelectionIndexBounds { index: row, length: 1 };
+            read_reference(selected.get_bytes(row), bounds);
+            read_reference(selected.get_pointer(row), bounds);
+            let long_long = if matches!(declaration, SourceScalarDeclaration::FixedBinary(_)) { bounds }
+                else { SourceScalarReadFailure::LongLongReceiverClass { declaration } };
+            read_reference(selected.get_long_long_high(row), long_long);
+            read_reference(selected.get_long_long_low(row), long_long);
+        }
+        let bytes = if matches!(declaration, SourceScalarDeclaration::Time32(_)) {
+            SourceScalarReadFailure::Unsupported { declaration, method: "getBytes" }
+        } else { SourceScalarReadFailure::NegativeViewLength(-1) };
+        read_reference(selected.get_bytes(0), bytes);
+        let pointer = selected.get_pointer(0).unwrap();
+        assert_eq!(pointer.length(), i64::from(declaration.fixed_width()));
+        let empty = reader.select(&[]).unwrap();
+        assert_eq!(empty.value_count(), 0);
+        read_reference(empty.get_bytes(0), SourceScalarReadFailure::SelectionIndexBounds { index: 0, length: 0 });
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_selection_pointer_reuse_keeps_both_owners_and_outlives_the_selector() {
+    let memory = memory();
+    let mut int = ScalarWriter::source_int_arrow19_default("seed", false, 1, Arc::clone(&memory)).unwrap();
+    int.set_int(0, 42).unwrap();
+    let int = int.finish().unwrap();
+    let mut uuid = writer(SourceScalarDeclaration::Uuid { inner_width: 24 }, false, &memory);
+    uuid.write_bytes(&[31; 24]).unwrap();
+    uuid.write_bytes(&[62; 24]).unwrap();
+    let uuid = uuid.finish().unwrap();
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+    let mut pointer = SourceBytePointer::from_int_arrow19_default(&int, 0).unwrap().unwrap();
+    let slot = std::ptr::from_ref(&pointer);
+    let before = pointer.demand_native().unwrap();
+    assert_eq!(pointer.hash_code().unwrap(), 42);
+
+    let (view, span, standalone) = {
+        let indices = vec![1, -1];
+        let reader = SourceScalarReader::new(&uuid).unwrap().unwrap();
+        let selected = reader.select(&indices).unwrap();
+        read_reference(selected.get_pointer_into(2, &mut pointer),
+            SourceScalarReadFailure::SelectionIndexBounds { index: 2, length: 2 });
+        assert_eq!((pointer.offset(), pointer.length(), pointer.cached_hash), (0, 4, Some(42)));
+        assert_eq!(pointer.demand_native().unwrap(), before);
+        let retargeted = selected.get_pointer_into(0, &mut pointer).unwrap();
+        assert_eq!(std::ptr::from_ref(retargeted), slot);
+        assert_eq!((retargeted.offset(), retargeted.length(), retargeted.cached_hash), (24, 24, None));
+        let span = retargeted.demand_native().unwrap();
+        let negative = selected.get_pointer_into(1, &mut pointer).unwrap();
+        assert_eq!(std::ptr::from_ref(negative), slot);
+        assert_eq!((negative.offset(), negative.length()), (-24, 24));
+        read_native(negative.demand_native());
+        (selected.get_bytes(0).unwrap(), span, selected.get_pointer(0).unwrap())
+    };
+
+    assert_eq!(before, &42i32.to_le_bytes());
+    assert_eq!(span, &[62; 24]);
+    assert_eq!(view.demand_native().unwrap(), span);
+    assert_eq!(standalone.demand_native().unwrap(), span);
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, int, uuid));
+    assert_eq!(memory.used_bytes(), 0);
+}

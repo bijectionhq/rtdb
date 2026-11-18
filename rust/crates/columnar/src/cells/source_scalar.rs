@@ -8,6 +8,7 @@ mod tests;
 pub(crate) enum SourceScalarReadFailure {
     Unsupported { declaration: SourceScalarDeclaration, method: &'static str },
     ValidityByteBounds { offset: i32, capacity: usize },
+    SelectionIndexBounds { index: i32, length: i32 },
     LongLongLaneBounds { offset: i32, capacity: usize },
     LongLongReceiverClass { declaration: SourceScalarDeclaration },
     PointerComparisonNegativeLength { operand: PointerComparisonOperand, length: i64 },
@@ -55,6 +56,10 @@ impl<'a> SourceScalarReader<'a> {
     pub(crate) fn slice(&self, start: i32, length: i32) -> SourceScalarSlice<'a> {
         SourceScalarSlice { inner: Self::fixed(self.declaration, self.backing, self.validity), start, length }
     }
+    pub(crate) fn select<'indices>(&self, indices: &'indices [i32]) -> Result<SourceScalarSelection<'a, 'indices>> {
+        vector_length(indices.len())?;
+        Ok(SourceScalarSelection { inner: Self::fixed(self.declaration, self.backing, self.validity), indices })
+    }
     pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
         let width = self.declaration.fixed_width();
         SourceBytePointer { backing: self.backing, offset: i64::from(row.wrapping_mul(width)), length: i64::from(width), cached_hash: None }
@@ -83,6 +88,12 @@ impl<'a> SourceScalarReader<'a> {
         self.supports_long_long().then(|| self.read_long_long(row, LongLongLane::Low))
     }
     fn supports_long_long(&self) -> bool { matches!(self.declaration, SourceScalarDeclaration::FixedBinary(_)) }
+    fn require_long_long(&self) -> SourceScalarReadResult<()> {
+        if self.supports_long_long() { return Ok(()); }
+        Err(SourceScalarReadError::Reference(SourceScalarReadFailure::LongLongReceiverClass {
+            declaration: self.declaration,
+        }))
+    }
     fn read_long_long(&self, row: i32, lane: LongLongLane) -> SourceScalarReadResult<i64> {
         let offset = lane.offset(row);
         let bytes = usize::try_from(offset).ok()
@@ -164,15 +175,56 @@ impl<'a> SourceScalarSlice<'a> {
         self.read_long_long(row, LongLongLane::Low)
     }
     fn read_long_long(&self, row: i32, lane: LongLongLane) -> SourceScalarReadResult<i64> {
-        if !self.inner.supports_long_long() {
-            return Err(SourceScalarReadError::Reference(SourceScalarReadFailure::LongLongReceiverClass {
-                declaration: self.inner.declaration,
-            }));
-        }
+        self.inner.require_long_long()?;
         self.inner.read_long_long(self.start.wrapping_add(row), lane)
     }
     pub(crate) fn binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<Option<OwnedValue>>> {
         self.inner.binary_object(self.start.wrapping_add(row), memory)
+    }
+}
+
+pub(crate) struct SourceScalarSelection<'a, 'indices> {
+    inner: SourceScalarReader<'a>,
+    indices: &'indices [i32],
+}
+impl<'a> SourceScalarSelection<'a, '_> {
+    pub(crate) fn value_count(&self) -> i32 { self.indices.len() as i32 }
+
+    fn index(&self, row: i32) -> SourceScalarReadResult<i32> {
+        usize::try_from(row).ok().and_then(|index| self.indices.get(index)).copied()
+            .ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::SelectionIndexBounds {
+                index: row, length: self.value_count(),
+            }))
+    }
+
+    pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
+        self.inner.get_bytes(self.index(row)?)
+    }
+
+    pub(crate) fn get_pointer(&self, row: i32) -> SourceScalarReadResult<SourceBytePointer<'a>> {
+        Ok(self.inner.get_pointer(self.index(row)?))
+    }
+
+    pub(crate) fn get_pointer_into<'slot, 'region>(
+        &self, row: i32, reuse: &'slot mut SourceBytePointer<'region>,
+    ) -> SourceScalarReadResult<&'slot mut SourceBytePointer<'region>>
+    where
+        'a: 'region,
+    {
+        Ok(self.inner.get_pointer_into(self.index(row)?, reuse))
+    }
+
+    pub(crate) fn get_long_long_high(&self, row: i32) -> SourceScalarReadResult<i64> {
+        self.read_long_long(row, LongLongLane::High)
+    }
+
+    pub(crate) fn get_long_long_low(&self, row: i32) -> SourceScalarReadResult<i64> {
+        self.read_long_long(row, LongLongLane::Low)
+    }
+
+    fn read_long_long(&self, row: i32, lane: LongLongLane) -> SourceScalarReadResult<i64> {
+        self.inner.require_long_long()?;
+        self.inner.read_long_long(self.index(row)?, lane)
     }
 }
 
