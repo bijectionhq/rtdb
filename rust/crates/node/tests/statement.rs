@@ -703,3 +703,20 @@ fn postgres_validates_the_complete_syntax_input_before_retaining_dml_source() {
     drop(prepared);
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn statements_outside_the_reference_grammar_are_sql_errors_while_session_control_stays_on_the_session_api() {
+    let memory = MemoryBudget::new(1 << 26);
+    let context = context(None, &memory);
+    for sql in ["CREATE VIEW v AS SELECT 1", "DROP TABLE foo", "CREATE INDEX i ON foo (a)", "TRUNCATE foo", "ALTER TABLE foo ADD COLUMN x INT"] {
+        let error = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
+        assert_eq!((error.code.as_str(), error.category), ("xtdb/sql-error", rtdb_types::AnomalyCategory::Incorrect), "{sql}");
+        let error = PreparedSql::prepare_postgres(sql, &context, vec!["public".into()], &[]).err().unwrap();
+        assert_eq!(error.code, "xtdb/sql-error", "{sql}");
+    }
+    for sql in ["BEGIN", "COMMIT", "SET TIME ZONE 'UTC'", "SHOW timezone"] {
+        let error = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
+        assert_eq!(error.code, "rtdb.node/prepared-session-statement", "{sql}");
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}

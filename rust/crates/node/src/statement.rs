@@ -113,7 +113,7 @@ impl PreparedSql {
                 let pg_types = schema.fields().iter().map(|field| if dynamic_pg || policy != ResultSignaturePolicy::PostgreSql { Ok(PgType::Default) } else { PgType::from_logical(&field.data_type) }).collect::<Result<_>>()?;
                 PreparedResult::Query { schema, pg_types }
             }
-            StatementKind::Session => return Err(Anomaly::unsupported("rtdb.node/prepared-session-statement", "Session-control statements execute through the session API")),
+            StatementKind::Session => return Err(session_statement(source, &options, &context.memory)),
         };
         let source = source.to_owned();
         let bytes = retained_bytes(&source, &options, &parameters, &notices, &result)?;
@@ -213,6 +213,15 @@ fn admit_sql_syntax(source: &str, memory: &Arc<MemoryBudget>) -> Result<Arc<Memo
 
 fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<ParsedStatement<'input>> {
     exactly_one_statement(rtdb_sql::parse_in(source, memory)?)
+}
+
+/// Statements outside the reference grammar fail there as parse errors rather than as unsupported features.
+fn session_statement(source: &str, options: &PrepareOptions, memory: &Arc<MemoryBudget>) -> Anomaly {
+    match rtdb_sql::parse_admitted_control_in(source, options, memory) {
+        Ok(Some(_)) => Anomaly::unsupported("rtdb.node/prepared-session-statement", "Session-control statements execute through the session API"),
+        Ok(None) => Anomaly::incorrect("xtdb/sql-error", "Unsupported SQL statement"),
+        Err(error) => error,
+    }
 }
 
 fn statement_syntax_error(source: &str, error: Anomaly, memory: &Arc<MemoryBudget>) -> Anomaly {
