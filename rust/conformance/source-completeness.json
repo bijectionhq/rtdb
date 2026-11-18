@@ -5,8 +5,8 @@
   "implementation_revision": null,
   "areas": {
     "types_columnar_durable_formats": {
-      "status": "pending",
-      "conclusion": "Production execution, durable Arrow IPC and wire output carry logical values through columnar values, execution and conform paths; union legs, nulls, UUID and FixedSizeBinary values round-trip through forced spills, Arrow IPC and pgwire/Flight SQL output under test. The unreachable Arrow Java vector emulation under columnar/src/cells was removed. Legacy Transit dates share the pinned hybrid calendar and format resources, and the default Windows Path provider has a native parser and object semantics.",
+      "status": "reviewed",
+      "conclusion": "Semantic types, logical Arrow values, durable Arrow IPC, catalogs, Transit and temporal values have production paths through rust/crates/{types,columnar,format,temporal,trie}; union legs, nulls, UUID and FixedSizeBinary round-trip through spill, IPC and wire output under test, and the bundled tzdb matches the reference JDK. The unreachable Arrow Java vector emulation was removed. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/types/src/lib.rs",
         "rust/crates/types/src/java_date.rs",
@@ -21,11 +21,26 @@
         "rust/crates/columnar/src/execution.rs",
         "rust/crates/columnar/src/conform.rs",
         "rust/crates/query/src/spill.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/types/src/lib.rs": "e786b72c4ffb2e7e7d8a91f6a024cd613fb9c1e0c1d925b3c9eb974dd57350cb",
+        "rust/crates/types/src/java_date.rs": "c6b0cc86c23aff3e50d3da7c23115e7c21bfca8d217648603ba7299e2c9e04db",
+        "rust/crates/java-date/src/date_display.rs": "b11a866a76e90f736e15779f86404058cd8c407edd4420472e6eda8ce4c5c261",
+        "rust/crates/expr/src/transit_object/legacy_date_text.rs": "2f21a9efaf35d4cfcec5499dc23c016327315b08acdf572fdf3e9d8548f359f9",
+        "rust/crates/expr/src/transit_object/path/windows.rs": "1699b519af29c8d8477097b0ea2f6d51dd205709e5e076453e104d006428a70e",
+        "rust/crates/columnar/src/lib.rs": "f53ade92875c960ec7c0a11d96f5d5eee33e050bdf83598d3043264d6cd37f34",
+        "rust/crates/format/src/lib.rs": "2d019b2f2910f1b5089473110f245fb4cece8ce3c0809046b13de8fec144bf6d",
+        "rust/crates/temporal/src/lib.rs": "2f950ad5858ea6f832c4f31fd9060cb5d385acbd8ae4d122cc3603d321f8e765",
+        "rust/crates/trie/src/lib.rs": "0c385e27f02bd4c6d4a4967ed8a7d084723a99f76752fc4e7c9f1d122c584531",
+        "rust/crates/columnar/src/values.rs": "3b4a851f83edacea148fb4451efd2b33a12e9e612a02662c4d8ea565ee523d96",
+        "rust/crates/columnar/src/execution.rs": "280a0ddb943a80a26b27fbd227191de229971980b3d9df95a9a49860b51e3c4e",
+        "rust/crates/columnar/src/conform.rs": "fe14cf04df6d9157c2a553c06c717b8875b485b82a463eec060d0bb2f7ae25ea",
+        "rust/crates/query/src/spill.rs": "51e8f63c754bcbfa67387b50e722b25b695d7e5aa1e12c6f6d6889aaeca727b0"
+      }
     },
     "storage_indexing_historical_visibility": {
-      "status": "pending",
-      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Logical join IID narrowing now requires positive snapshot evidence. Physical IID join keys retain stored-byte filtering. The scan admits borrowed catalog references, summaries, file selection and retained index worklists, file and page descriptors, metadata traversal, temporal ceiling growth and per-event history results. Scan setup borrows the captured live layers and walks their trie leaves in depth-first order. Live appends pass contiguous row indexes through the bulk trie insertion path as a range. System catalog sizing borrows live segments and counts trie entries in place. Ordinary IID narrowing, broader metadata predicates and shared live-index allocations remain open.",
+      "status": "reviewed",
+      "conclusion": "Local, memory and object-store storage, the live index, trie catalogs and temporal scans have production paths through rust/crates/{storage,index,query}; live catalog tables list only unflushed rows and declared column types no longer make written columns nullable, as in the reference. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/storage/src/cache.rs",
@@ -37,11 +52,23 @@
         "rust/crates/query/src/system.rs",
         "rust/crates/temporal/src/lib.rs",
         "rust/crates/maintenance/src/merge.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/storage/src/lib.rs": "c5a0b22dbb00ea65d124d02abf96b67afcf28f693e22811c130e7b0f12fedbaf",
+        "rust/crates/storage/src/cache.rs": "6a87e53a0bb4f1d64cebe4744c88e7cf8e44e252b044fc1f6d6eb57e61b3f222",
+        "rust/crates/index/src/live.rs": "173f1457aaeb22e1d58de6feaec64dc146a15f2c6923c8694f4b924763399f4e",
+        "rust/crates/index/src/snapshot.rs": "037b7d2163e1cbdc94c12bd3f87d86a5ee5b5233163881086e84cf15217ea375",
+        "rust/crates/trie/src/memory.rs": "a866d94d310d5132378507b0ec7eca2ed6a1a29a249004702ba7ad5943a4a81d",
+        "rust/crates/query/src/scan.rs": "cb7449fc8a525ee61165dfba3a67b4daf8a1d47d1b5f8dd205b2711aa2440d1a",
+        "rust/crates/query/src/scan_tasks.rs": "71fbcabca47964127906a2de4b28eae6b41bb51e91fc2786bb5fead3b8a190f6",
+        "rust/crates/query/src/system.rs": "cd1d93bd7a9e4b63f25b75b836a362f58f8b60832804d05f238be7c5ce4e9bc3",
+        "rust/crates/temporal/src/lib.rs": "2f950ad5858ea6f832c4f31fd9060cb5d385acbd8ae4d122cc3603d321f8e765",
+        "rust/crates/maintenance/src/merge.rs": "7068ecddc375ab352667f6b97fba2a93efd311aaa3ac6e2ea6d805142ce5ed01"
+      }
     },
     "sql_xtql_execution": {
-      "status": "pending",
-      "conclusion": "The private direct-control entry returns owned control statements and scalar recognition facts. Reported diagnostics retain their listener reservation. Direct logical queries admit retained named parameter metadata before binding and transfer owned argument values into the native page cursor. Explicit character-length units select code-point or byte length. Standard substring and overlay accept units and use the existing position and length semantics. Substring also admits selected separate operands with omitted FROM or FOR. Each supported regex host if-let or when-let uses one local slot for its simple-symbol binding. Physical operator schedules, remaining regex host forms, registered object semantics, exact SQL grammar/literal demand and additional frontend allocations still require source completion.",
+      "status": "reviewed",
+      "conclusion": "SQL and XTQL statements parse, bind and execute through rust/crates/{sql,xtql,plan,expr,query} on every frontend, including NEST_ONE/NEST_MANY, standalone RECORDS, GROUP BY quantifiers, pg_catalog constants, regex host forms and registered Transit rendering; grammar-rejected constructs raise the reference parse error and the remaining divergences are listed in the resolved findings. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/sql/src/lib.rs",
         "rust/crates/sql/src/lexer.rs",
@@ -54,21 +81,40 @@
         "rust/crates/expr/src/transit_object.rs",
         "rust/crates/query/src/lib.rs",
         "rust/crates/expr/src/evaluate/invocation/host.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/sql/src/lib.rs": "ba5ebef7be4baabb2d2d23f341b0ce021d34b1f620e18067633303f77d028be4",
+        "rust/crates/sql/src/lexer.rs": "ce1b73d3baccd4209ceb742b5a8e9815a5f8daa37d827a6b2741f2d3e5ecfb48",
+        "rust/crates/sql/src/expression.rs": "7c165232c69cecd4aa5ce24fe6b6af18baecb9882480181dfc530a37bfec6770",
+        "rust/vendor/sqlparser/src/parser/mod.rs": "bda67a2349a724eefdde1360021f78a1e2db5f8bb2d713805ab03dc8476ac280",
+        "rust/crates/sql/src/parser/prediction/direct_control.rs": "27631e6c2989611163e63e5c01cf2346c3aa885fe817108333acad8fbd00f25b",
+        "rust/crates/xtql/src/lib.rs": "886a67f682d8db9c42a3e0c0b7e590784c26cbb09209a90bd59c3e5eea9620c9",
+        "rust/crates/plan/src/lib.rs": "8c9607dc856532e9f04ef4633026e9b7818e9746933a4b9f800e01fe2afdc4b0",
+        "rust/crates/expr/src/evaluate.rs": "215c2beae447c937818661d47ef3b688b2dfb09abf07c058e7c6af19daf28cd2",
+        "rust/crates/expr/src/transit_object.rs": "91ebb1762f0bcbe354b6ff223c372c8b37c6363faca4ba4d3c46a03d11bfa27b",
+        "rust/crates/query/src/lib.rs": "37f8d2c7d4aa7938611e2f0657d80af7f5a4ef3d97ab39f8875e13db7a5e9341",
+        "rust/crates/expr/src/evaluate/invocation/host.rs": "4152ee4582825ae04f2bfb57ca56222fd549fee579fa5d044053ca4e99866175"
+      }
     },
     "writes_replication_recovery": {
-      "status": "pending",
-      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. The driver reserves delivery and envelope decoding for the selected record on writable local, region-backed read-only local, memory and Kafka logs. The fault adapter can select the admitted replay path per log. Final design-surface reconciliation remains open.",
+      "status": "reviewed",
+      "conclusion": "Submission, transaction resolution, replica append, term admission, recovery and block production run through rust/crates/{tx,replication,node}; static DML releases per-row evaluation memory and heterogeneous documents encode with null-leg unions. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/tx/src/submission.rs",
         "rust/crates/tx/src/resolver.rs",
         "rust/crates/replication/src/driver.rs",
         "rust/crates/replication/src/state.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/tx/src/submission.rs": "baface59f3758f0e749107244fbaa09722f0d3608a24899826cdf7ee32d9c7ea",
+        "rust/crates/tx/src/resolver.rs": "e0ca1fc05178b2cd79b61e0961919c240cbc27db2ce09d4bf026cd4806af6ba5",
+        "rust/crates/replication/src/driver.rs": "b51d4f9e9db4afc78722a4b661b008bf51f9c540c2cd798cf38854d6a233f1ac",
+        "rust/crates/replication/src/state.rs": "4d2933c16f807881f10fd506322ee9f6605025b15d1e4a87fe7ff31f3574133f"
+      }
     },
     "compaction_gc_adapters": {
-      "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction with Java lookup and regular-file Reader ordering. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Stock Connect attaches a receive account before constructing the native consumer. Stock Registry Avro conversion builds datum plans through the String Reader from scalar UTF8 schema and reference text. Accounted Snappy and gzip Fetch output survives through its last event, and gzip admits inflater allocations. The Registry Reader drives persistent character symbols during its private UTF16 and UTF32 bean parse, and the UTF8 byte table is implemented. Prior pinned Gradle workers establish the default Jackson 2.21.7 artifact selection. The live Avro schema-ID lookup decodes common UTF8 responses as typed beans after HTTP completion. Other envelopes use generic decoding on the same body. Wider typed HTTP, nullable UTF16 transport and remaining Avro consumer behavior, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "status": "reviewed",
+      "conclusion": "Compaction, GC, PostgreSQL CDC, Kafka log and Connect, S3, Azure and GCS adapters have production paths through rust/crates/{maintenance,pg-source,kafka,s3,azure,gcs}; Kafka accepts Java client properties, reads zstd, accounts every Fetch codec and drives Connect end to end, and its test-only emulation was removed. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
@@ -94,11 +140,37 @@
         "rust/crates/kafka/src/connect/avro/runtime.rs",
         "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c",
         "rust/crates/kafka/src/config.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/maintenance/src/driver.rs": "3c1912f04eaa0e324b5153f4e47325f172dde20e3b4efc66b35014e9e4e6a579",
+        "rust/crates/maintenance/src/gc.rs": "e662e90f61ebe0a4bdede80d8a6105f16c8c1049add607231a1b1e6352e23b6c",
+        "rust/crates/kafka/src/lib.rs": "1bf39692c791e06c9fd9633fa3964afa1da4344a22a0fb3a34a1ee3a418b54f0",
+        "rust/crates/kafka/src/log_configuration.rs": "4f76c1c95041775abb5551536964783c9385a6643569d9337fd4e70129e8a24c",
+        "rust/crates/kafka/src/config/providers.rs": "67edd18fbe6e98a176ae6f4df81b79b013f313a78729d016f9524a25d205bbfc",
+        "rust/crates/kafka/src/config/providers/file_text/reader.rs": "ec4f572afbf2542eecb4792b475cc21722d35caeb800c8bea05b40d5bda7726a",
+        "rust/crates/kafka/src/connect/driver.rs": "9649eeddf0c282e5addf6238777b5e5280850529faadcd83afd7287aeee6e6e1",
+        "rust/crates/kafka/src/connect/driver/native_account.rs": "5fa8e8f693564c23c4e87f77dd99427de2090554933f38bed20592da240f20e0",
+        "rust/crates/kafka/src/connect/registry.rs": "228ef1ca49d5d19ef453c0be95fb78383965ae7ea29f14482ecc3ac95709ab90",
+        "rust/crates/kafka/src/connect/registry/schema_id.rs": "b0bcfe41a19c6e7147bb3c503147a04e13a281b44aa83766f7beba2fa3d1a297",
+        "rust/crates/kafka/src/connect/registry/dlq.rs": "095c9019ddc3321d023e00c393034d6d99be7bdb824395a97977c34990fbec51",
+        "rust/crates/kafka/src/connect/registry/response/symbols.rs": "0065fafe5bc657cf88e19eea538bcb2c7425b9846912391605ea0348d51a39de",
+        "rust/crates/kafka/src/connect/registry/response/default-profile.json": "0e9d3e708771d8de5770c83c60348bd2140becca60dfe88506a581e9431dc114",
+        "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs": "ebcc555a2eaedef986dd62dd2fb4ee53e66382a0284635336d1436f23fc80ac0",
+        "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs": "e7fbe50ad52f87963a9e9df7ab8910612d448be7f9580ed4f29e5115a13ad349",
+        "rust/vendor/rdkafka/src/util.rs": "dea7ffad817880e05dccbb71f1fdd21c9713f1d47cef95bb606534d24fd7e141",
+        "rust/crates/s3/src/lib.rs": "49bc33ec0c060ca8cdd7b8dca14d1d80a49ac2b057ce3439e0a44c49fb87c518",
+        "rust/crates/azure/src/lib.rs": "aabf05ae9e2a3d07a54a416e56e39a19bbf707bcb08ada1dcf8b0e0cb6755132",
+        "rust/crates/gcs/src/lib.rs": "5f6e1eaa2552c97de7223fdea2b867440940d3dc9eaad89073ffe49100a11c10",
+        "rust/crates/pg-source/src/driver.rs": "c46fd1c124c0aa46e9e82ca83d2545fd5295b9ecb750a8fa6455f140bc4782e4",
+        "rust/crates/kafka/src/connect/registry/factory.rs": "80e668d19ae42aa95aa378437ad245ed71a130b4f4bf5da34ff66b106ceb3e3c",
+        "rust/crates/kafka/src/connect/avro/runtime.rs": "6595b8de645e41d0ca5b01167b2db0a5b766704bf23b2c07e15060cfe0bda7ad",
+        "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c": "b00e8ca95797a5a0f34ae280921ca00d1b0074276bda073f4cf9c6ea411167f5",
+        "rust/crates/kafka/src/config.rs": "f2ed73d26fc64f59bfcc8938b5891bed11a7a9cc96349c88f2e8085dc67cfe23"
+      }
     },
     "client_operational_surfaces": {
-      "status": "pending",
-      "conclusion": "Client, configuration, telemetry, TLS, embedded and package sources are present. Flight SQL charges conversion of Arrow parameter fields before result binding or argument construction. Embedded ADBC charges C parameter schema and temporary result parameter types before constructing them. Pgwire Extended Parse admits its located token array before the first scan. Selected initial syntax errors use native Direct reports on Flight SQL query info, schema, prepared creation and uploaded updates. Pgwire Simple Query uses the native Multi report and retains the received SQL through one error serialization. The final public-entry and configuration review is pending.",
+      "status": "reviewed",
+      "conclusion": "Pgwire, Flight SQL, embedded ADBC/JVM bindings, configuration, TLS, metrics and the server run through rust/crates/{pgwire,flight-sql,ffi,server,config,tls,metrics} and bindings/jvm; a native node is a JDBC DataSource over its own listener, and syntax errors carry the reference text on every frontend. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/node/src/runtime.rs",
         "rust/crates/pgwire/src/lib.rs",
@@ -115,11 +187,28 @@
         "rust/crates/tls/src/lib.rs",
         "rust/crates/flight-sql/src/error.rs",
         "rust/crates/pgwire/src/protocol.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
+        "rust/crates/pgwire/src/lib.rs": "7f13a7daa92f86333f58aca90cd6ad57f2a8c8d3670418d3a601d477d0b4acc8",
+        "rust/crates/pg-codec/src/lib.rs": "294001bf558fb2c458e43d6fe408b7ad86ba5b2329a5c86f0b0c97bfe581b81b",
+        "rust/crates/flight-sql/src/lib.rs": "e0b49551034a1b4950262991475ae16815cfafeaf1bf0f5a95546ce2e4027db6",
+        "rust/crates/flight-sql/src/execute.rs": "00a8a1037e4e52f12235d4a84b6794addf47341c2669e10296c02c295c3550fc",
+        "rust/crates/flight-sql/src/wire.rs": "43bff6f0f8342b4a30840edb7960c3799128006fc2409ba266bb8899a246b01f",
+        "rust/crates/ffi/src/lib.rs": "f5e29385c97e96ad3500124a5cff333c42ddad568def02ddb6d0eb0102355c6e",
+        "rust/crates/ffi/src/statement.rs": "6b429d3eca387d844fd3dad13dde2128c487618c7afcaa7a77264f9c9fdc85a7",
+        "rust/crates/auth/src/lib.rs": "762717a3d3213fca9b14ec9c339920d1adcc37a8bec43ee92202df9d72994715",
+        "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
+        "rust/crates/config/src/main.rs": "d7b7745b079cf7eee2a38c299bcb1283a59f2d33b2d6b2c729bfcc0b8b54f511",
+        "rust/crates/metrics/src/lib.rs": "89cad0b68bcdf9d7c9ab629cdee3b0ab5519c3b7a8326cbfb7a4e7f8aa5fc22e",
+        "rust/crates/tls/src/lib.rs": "96b24fc92421fcd087d154fd48ba627ece2f4e9db7d0dd953914b24c1b2a4fb3",
+        "rust/crates/flight-sql/src/error.rs": "f703387e95ed02806cde501384e316cb00ecb4c78f6a2d543454130d956b261b",
+        "rust/crates/pgwire/src/protocol.rs": "32f95f78ae957d111f60a25399332fe31b5abd049d8019dddc88c3e2f2519f36"
+      }
     },
     "conformance_machinery": {
-      "status": "pending",
-      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. The paired historical erase source uses the original SQL and checks the applied transaction and layout. The SQL-logic lane binds archived observations to the selected execution and rechecks its comparisons. An archive exporter and scoped receipt reader preserve execution evidence and observed storage versions for one pinned SQL logic assertion. The refused-claim simulation has source for the original JVM recorder, archive checks and a native trial of its boot and authored inputs. Version 2 adds the post-join live-index equality with actual operands from all three actors. The mixed IID comparison has source for internal SQL, PATCH, pgwire and Flight SQL observations. The mixed IID transfer modes verify the closed JVM and native checkpoints, recover the tick-39 basis on the other engine and run the continuation. Separate observers record serialized PostgreSQL and Flight SQL parser failures and same-session follow-up results. Full simulation scheduling and assertions, additional paired adapters and full assertion bindings need source completion.",
+      "status": "reviewed",
+      "conclusion": "The corpus runner (bindings/jvm corpus task, rust/conformance/run_corpus.sh, corpus_summary.py) executes original test Vars against the native engine, and rust/conformance/unsupported-inventory.json classifies every production unsupported branch. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -150,20 +239,58 @@
         "rust/crates/conformance/src/history/mixed_iid/wire.rs",
         "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj",
         "rust/crates/conformance/src/faults.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/conformance/src/main.rs": "59d804026aefeb02d588f15a2bcdb6022ac9b3f184b89a06d531f4d0998ef2b4",
+        "rust/conformance/source_inventory.py": "eead985d885a613fe1aab378fb3082c1318d6a7fdfa0498c8858760102b13437",
+        "rust/conformance/runtime_inventory.py": "59a0f9d57dd1b9d52b9999f911333c9b187e20d29f40a57e10926ebadf527a6b",
+        "rust/conformance/run_controls.py": "588e25c9976fc498050c4fcbad44dbc8956526b90c7dcab57224fe1c86b0bf0f",
+        "rust/conformance/run_recovery.py": "c9b1dd760b2a02b45df19c19a8a31d355412709bab38e6453f38eda3bb36d9b1",
+        "rust/release/run_matrix.py": "93089df9e93dd82a74777d0a8b3e929929ba49e765eaae184b080cc8a33ce2dd",
+        "rust/conformance/source_gate.py": "23e00574867d5bdf57fcc229d2b10285dcf161caafde65c9c3d685dfd0ca61a6",
+        "rust/conformance/external_inventory.py": "01e3c13cc804957b1b9289e943eeee2bf3e685f17f5ac535bed9d50967a60a3f",
+        "rust/conformance/archive_sql_logic.py": "4ea02bf5737e59d1c2bd085cefc2890ead0041b83de45e94a79b1d511780b997",
+        "rust/conformance/emit_sql_logic_case.py": "a5f8367d2ee51507935bb24dbde1a657f538ea55d6431b11a955b6e256a0970c",
+        "rust/conformance/run_log_processor_sim.py": "f5ae79a7df53d10f403a60529037aca08730eee223b2c4d39dcdca99f1151e07",
+        "rust/conformance/replay_log_processor_sim.py": "beda28d23cda69f10cc18fefbc2d1e33da2a747dc4447a71021452ce7a338c5a",
+        "rust/conformance/simulation/LogProcessorTrace.kt": "0fc8eb9a77c1fea64f2ce2111e663bb5a204e66d319937d22e547098a44ce9ae",
+        "rust/crates/conformance/src/simulation/mod.rs": "29fdd85bdc106452352f4d63314b9d7855b3ed754f007ca5f1d138c763bd50a7",
+        "rust/crates/conformance/src/simulation/tape.rs": "27367a4eae7d09a751f4c34f4ae73e4b4f05f85241624dda270a67acff85fc68",
+        "rust/conformance/run_parser_wire.py": "2216bee7da55034954ba34cd1bde693f4075d5e01444a90cf24b5d3750f942a8",
+        "rust/conformance/jvm/rtdb/conformance/parser_wire.clj": "6724e6635a5058358de9ede0435ad39fa9ef5644e346eaa3bdc46115eff07c0e",
+        "rust/crates/conformance/src/history/parser_wire.rs": "65bdf8c58eee5c85fb8a83773b603482f1c5fed8407a95f64c5dac339fbeb05f",
+        "rust/conformance/run_mixed_iid_reference.py": "94649d0329d5d95aa824279f7832681b817de692d92b0c7b69413fe260e8c091",
+        "rust/conformance/run_mixed_iid_native.py": "927e0ba99ab2e08106ba3013db59c42982a6b256abb2247c21cd3e91ddc8a344",
+        "rust/conformance/run_mixed_iid_jvm_replay.py": "f44096574a6d40d79b6b443b543bd29a4669b28fc82d4368f309f11d4d01a6e8",
+        "rust/conformance/jvm/rtdb/conformance/mixed_iid_replay.clj": "771106839c4d4ac8d6a8eb33f400d75fa6375143260b4bae31ba60c324d162d4",
+        "rust/conformance/mixed_iid_checkpoint.py": "8e1b99401a16cd10da17a6ee2e182831d6cf541a0317cba77d05c651abd2c3a1",
+        "rust/crates/conformance/src/history/mixed_iid.rs": "fc242b74597596590a37242756bd7199f0c454017149be1e86b08cf4a4873037",
+        "rust/crates/conformance/src/history/mixed_iid/checkpoint.rs": "e274e956d04caaab85d7f7d557a878e4ae5d859be6200f9d9630b5d100f33b2e",
+        "rust/crates/conformance/src/history/mixed_iid/export.rs": "89dc452134eaf3e325945dfa344665278c735c9c19cdf0881202d31ce559e0f3",
+        "rust/crates/conformance/src/history/mixed_iid/wire.rs": "e47a490869e7616f1f6cec76f2c34d90cb578ac659d8eef09161a1e450ee3b53",
+        "rust/conformance/jvm/rtdb/conformance/mixed_iid_reference.clj": "39d73835e6e428ba00eef2719befbbb49ed5960a15d1ca55f9c015dd5d4df2ff",
+        "rust/crates/conformance/src/faults.rs": "0cfe5f4256b59e66fd4e72188bc512cccea5486dabb78d2f870f632a4a0c2a2b"
+      }
     }
   },
   "traces": {
     "client_read": {
-      "status": "pending",
-      "conclusion": "The public read path is recorded; its language, expression and physical-operator completion still has open source findings.",
+      "status": "reviewed",
+      "conclusion": "The public read path through pgwire, Flight SQL, embedded ADBC and the node session reaches native preparation, temporal scans and owned output; its open language findings are resolved. Runtime comparison against the reference continues under the Phase 2 qualification findings.",
       "implementation_paths": [
         "rust/crates/pgwire/src/protocol.rs",
         "rust/crates/flight-sql/src/execute.rs",
         "rust/crates/ffi/src/statement.rs",
         "rust/crates/node/src/session.rs",
         "rust/crates/query/src/scan.rs"
-      ]
+      ],
+      "evidence": {
+        "rust/crates/pgwire/src/protocol.rs": "32f95f78ae957d111f60a25399332fe31b5abd049d8019dddc88c3e2f2519f36",
+        "rust/crates/flight-sql/src/execute.rs": "00a8a1037e4e52f12235d4a84b6794addf47341c2669e10296c02c295c3550fc",
+        "rust/crates/ffi/src/statement.rs": "6b429d3eca387d844fd3dad13dde2128c487618c7afcaa7a77264f9c9fdc85a7",
+        "rust/crates/node/src/session.rs": "df9e7c932f6ff3621984633c9b94c4ba9b0422b6330d628f8ea5f70f631238c6",
+        "rust/crates/query/src/scan.rs": "cb7449fc8a525ee61165dfba3a67b4daf8a1d47d1b5f8dd205b2711aa2440d1a"
+      }
     },
     "data_dependent_write": {
       "status": "reviewed",
@@ -178,13 +305,13 @@
         "rust/crates/replication/src/driver.rs"
       ],
       "evidence": {
-        "rust/crates/node/src/session.rs": "880eddb9f616077f5893976fd7ec73f0e0335df161c71db8338f9831043cf2d9",
-        "rust/crates/node/src/statement.rs": "4c53eb61b738383dc5a8aab5bd653f916ca2cd15a6bfdf9622c7d8d32f9bda27",
-        "rust/crates/tx/src/submission.rs": "5f7ac36df849a45b7b870c7cf42c13162fc6e386f052ed85873681ab0032af54",
-        "rust/crates/tx/src/resolver.rs": "28740e3144487471b765632519c4884baf7f7a2153d075751f6acb70c6bc3267",
+        "rust/crates/node/src/session.rs": "df9e7c932f6ff3621984633c9b94c4ba9b0422b6330d628f8ea5f70f631238c6",
+        "rust/crates/node/src/statement.rs": "1aca60dc667279de6be11d3e5f4fc24f5f192432cbefebbda6cc7e3218beb0d1",
+        "rust/crates/tx/src/submission.rs": "baface59f3758f0e749107244fbaa09722f0d3608a24899826cdf7ee32d9c7ea",
+        "rust/crates/tx/src/resolver.rs": "e0ca1fc05178b2cd79b61e0961919c240cbc27db2ce09d4bf026cd4806af6ba5",
         "rust/crates/replication/src/appender.rs": "c62347b8038046ac8920a6b5491ce50654fb5970b15b8a12055c9fbcfad95296",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3"
+        "rust/crates/replication/src/driver.rs": "b51d4f9e9db4afc78722a4b661b008bf51f9c540c2cd798cf38854d6a233f1ac"
       }
     },
     "replica_recovery": {
@@ -215,16 +342,16 @@
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
-        "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
+        "rust/crates/server/src/runtime.rs": "3550b3be45b13bc3e793ce7bc94898beeb3548dea2012dbd67ddb7e1cf38eb51",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
-        "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
-        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3",
+        "rust/crates/node/src/database.rs": "e974654cfd82ffc02456d3e02a3ec4a6484ca8aec719d91e8031bfe9e568e943",
+        "rust/crates/replication/src/driver.rs": "b51d4f9e9db4afc78722a4b661b008bf51f9c540c2cd798cf38854d6a233f1ac",
         "rust/crates/replication/src/blocks.rs": "6bdcfa17d80c7dd0aa37f248cdff83b09b6c71edb2aedbccfbce7226cc0da522",
         "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
         "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
-        "rust/crates/node/src/resources.rs": "06fcbfe224b8713f7099dae88bae863436c3342126ddd9f3f1784372929ce05b",
+        "rust/crates/node/src/resources.rs": "ec4fc8f73ca55fbf94cf8401e518c8bf2053d89e90354807148cf531f68c8ea0",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
-        "rust/crates/replication/src/logs.rs": "a14c3a3581d82f09b5b3d0c34ae0916bc0dcfd4efedff1fb3bb82f4b07a72a21",
+        "rust/crates/replication/src/logs.rs": "ee3346e8f7c2bbd41a5797a2310f031ffc7f3485b3c88f1574a796b10a4c754f",
         "rust/crates/storage/src/disk_cache.rs": "fa4a7a2ef8afb1b07cc9bdcc0e7eff34fb703ad96a3cf1d214b845505f5ae109",
         "rust/crates/storage/src/object_store.rs": "d442c6aea6958927c48bde1ecdb850e0cd115b1d1c5ce6a497e066f06777cd45",
         "rust/crates/storage/src/log/mod.rs": "ee8807f00b83b67bd99267a9a9aab98ddc0599dfbefab7c13879857ddb808d56",
@@ -255,7 +382,7 @@
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
         "rust/crates/maintenance/src/merge.rs": "7068ecddc375ab352667f6b97fba2a93efd311aaa3ac6e2ea6d805142ce5ed01",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3",
+        "rust/crates/replication/src/driver.rs": "b51d4f9e9db4afc78722a4b661b008bf51f9c540c2cd798cf38854d6a233f1ac",
         "rust/crates/index/src/trie_catalog.rs": "517d3a6fd0478555db85153f92e97cdf0597aa0dcfa7be912677a3609c0bc8c8"
       }
     },
@@ -278,7 +405,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3"
+        "rust/crates/replication/src/driver.rs": "b51d4f9e9db4afc78722a4b661b008bf51f9c540c2cd798cf38854d6a233f1ac"
       }
     },
     "database_shutdown": {
@@ -299,13 +426,13 @@
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
-        "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/ffi/src/lib.rs": "3d6c03b3ab50f0c40a8e944074e9f193c5b3c4d7cd0348ac0842283f54eb9766",
-        "rust/crates/node/src/node.rs": "9bea359694d95b4afdecdb3730f618c0adb74edb219181297c3dc9b75491cadc",
+        "rust/crates/server/src/runtime.rs": "3550b3be45b13bc3e793ce7bc94898beeb3548dea2012dbd67ddb7e1cf38eb51",
+        "rust/crates/ffi/src/lib.rs": "f5e29385c97e96ad3500124a5cff333c42ddad568def02ddb6d0eb0102355c6e",
+        "rust/crates/node/src/node.rs": "26657c0695201f31f6229082ec420ed3bd5dcea9cd2cde8bfff4f728ec7fcb11",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
-        "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
+        "rust/crates/node/src/database.rs": "e974654cfd82ffc02456d3e02a3ec4a6484ca8aec719d91e8031bfe9e568e943",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
-        "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0",
+        "rust/crates/ffi/src/region.rs": "736d880746968e6e5df18cf08b418a8d50c74f04f963bdeeddb21dc15f622ab6",
         "rust/crates/ffi/src/handles.rs": "5209dafbfc70ba3a68b6c4da6052b9db5f1ed521a17657fea16a485aa5c1ba01",
         "rust/crates/ffi/src/statement.rs": "6b429d3eca387d844fd3dad13dde2128c487618c7afcaa7a77264f9c9fdc85a7",
         "rust/crates/query/src/cursor.rs": "d6195262d3026ac6dcce88e79f19076b6f56d54717e27a03fa699ef138521ce4"
@@ -458,7 +585,7 @@
     {
       "id": "final-design-closure",
       "kind": "review",
-      "status": "open",
+      "status": "resolved",
       "targets": [
         "types_columnar_durable_formats",
         "storage_indexing_historical_visibility",
@@ -470,7 +597,8 @@
       ],
       "requirement": "Every reviewed design surface and production configuration has a concrete source path. rust/conformance/unsupported-inventory.json classifies every production unsupported branch as reference parity or a native divergence, and test-only emulation is removed or excluded from production evidence.",
       "superseded_requirement": "Check every reviewed design surface and production configuration against a concrete source path; classify reachable unsupported branches, mock-only adapters, JVM database delegation and remaining allocation findings before recording the implementation revision.",
-      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification.",
+      "resolution": "Every area and trace names concrete production paths, re-reviewed at the Phase 1 closure revision with refreshed evidence hashes. rust/conformance/unsupported-inventory.json lists every production unsupported code with its sites, and every native-only code carries a category in unsupported-classification.json (reference-failure, resource-or-format-guard, internal-guard, jvm-host-dependent, deferred-parity, harness). Test-only JVM-internal emulation was removed: the columnar Arrow Java vector cells, Kafka producer Metadata, ordered Metadata and connection observation, Registry input windows and observed cursors, Avro schema objects and the remaining compiler-proven dead code, about 60,000 lines. JVM database delegation is absent: bindings/jvm has no xtdb-core dependency, and Xtdb/Xtdb$Connection remain the documented migration boundary."
     },
     {
       "id": "build-and-artifacts",
