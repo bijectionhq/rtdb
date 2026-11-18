@@ -194,6 +194,17 @@ The prepared send retains its generation independently of the producer monitor.
 The DLQ activation still requires its production network owner and use of the returned queue budget and append time.
 That integration must account for the native timestamp zero sentinel.
 
+== Connection addresses
+
+`ConnectionAddresses` retains the current connection entry's preferred-family DNS list and last attempted address.
+Resolving uses the first returned Java address family and preserves encounter order among addresses of that family.
+The caller advances the retained list at each same-host connection attempt and clears it on an established disconnect.
+When a new list has multiple preferred addresses, the first is skipped if its IP bytes match the last attempt.
+IPv6 scope is retained for socket selection and does not affect that source IP equality.
+Lists are admitted before allocation and released when cleared or exhausted.
+The caller supplies a qualified resolution for the original host and uses the selected address for the actual connection.
+Four additive source fixtures cover selection, duplicate and scope behavior, failure retention and final release.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.

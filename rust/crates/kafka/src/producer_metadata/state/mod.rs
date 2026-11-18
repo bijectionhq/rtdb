@@ -16,6 +16,7 @@ mod updater;
 mod wait;
 mod fatal;
 mod monitor;
+mod addresses;
 
 pub use keys::{IdentityWitness, NoIdentityWitness, TopicId, TopicPartitionKey};
 pub use owned::Text;
@@ -28,6 +29,7 @@ pub use updater::{MetadataNetwork, MetadataUpdater, SendMetadata, UpdateFailure,
 pub use wait::{MetadataWait, WaitFailure, WaitStep};
 pub use fatal::{FatalKind, MetadataError, MetadataTopicError, MetadataWaitObservation};
 pub use monitor::{MetadataClock, MetadataMonitor, TopicMetadata, TopicWaitFailure, TopicWaitRequest, WaitCompletion};
+pub use addresses::{ConnectionAddress, ConnectionAddresses};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};

@@ -23,6 +23,11 @@
         "prefix_bytes": 799,
         "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
       },
+      "org/apache/kafka/clients/ClientUtils.java": {
+        "sha256": "7f496c33a1edbfd3e5b50897da2944615963ca7d5c791d2f4d602e988fac711c",
+        "prefix_bytes": 799,
+        "prefix_sha256": "298a9bf0a4c7693e613add1555c5a48d276a521ac0fc70d6a0e57329da3cde7a"
+      },
       "org/apache/kafka/clients/producer/KafkaProducer.java": {
         "sha256": "ef8914cd6af41bc030eabc14a77d0625682796a19eae91f4990b30328aa45986",
         "prefix_bytes": 800,
@@ -185,6 +190,16 @@
     "file": "/tmp/rtdb-provider-sources/openjdk25-time/src.zip",
     "sha256": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482",
     "members": {
+      "java.base/java/net/Inet4Address.java": {
+        "sha256": "684871d29555551cc0ea6c255f2a3f8f1138e9d4499a51eb1dfaa0f2d50a7e48",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "eac888b811586a9a022e35075518b266580d73dd3dd845d4749889c052c885dd"
+      },
+      "java.base/java/net/Inet6Address.java": {
+        "sha256": "ca91aee1770a193caafa624d29116ecc66cd504b273bb25b2d0d7ac4d3b23e55",
+        "prefix_bytes": 1214,
+        "prefix_sha256": "53d5498ba9045a071811504b80de643aaf96220aba896f6b42079ea11a0843f9"
+      },
       "java.base/java/util/HashMap.java": {
         "sha256": "f3f1d144fdd482730280697ebd94971cfff0480e6016dd5c7e46c47f4b9e3d44",
         "prefix_bytes": 1214,
