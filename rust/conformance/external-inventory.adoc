@@ -32,9 +32,26 @@ An expected-error assertion only passes when the original statement required an 
 Matching unexpected failures, query mismatches, skips, suppression, parse failures and query limits remain unverified.
 They cannot contribute passing coverage.
 
+== Capturing a SQL-logic archive
+
+Use `python3 rust/conformance/archive_sql_logic.py --run-dir RUN_DIR --production-build PRODUCTION/production-artifacts.json --reference C84 --output ARCHIVE` on the worker that still has the recorded JVM classpath and runner input files.
+`RUN_DIR` is the completed SQL-logic directory from `run_sql_logic.py` or the `run` directory inside a release SQL-logic lane.
+Use the `production-artifacts.json` from the local native production lane whose executable ran the SQL-logic command.
+`C84` is the pinned reference checkout or a copy with matching original SQL source and selection input bytes.
+The command copies the run files and verifies the process records, original sources, selected executable, and both JVM runtime closures.
+It also accepts a completed run whose aggregate result failed.
+
+The exporter publishes a new `ARCHIVE` directory with `EXTERNAL.json` and the retained files.
+Choose an existing parent for `ARCHIVE` and keep the new directory outside `RUN_DIR`, `PRODUCTION`, and `C84`.
+`EXTERNAL.json` appears only after the copied evidence has been validated.
+The output preserves original command and artifact paths through relocations and can be moved without the worker's directory layout.
+The run ID defaults to `sql-logic` and can be set with `--id`.
+Use that ID with the scoped receipt command.
+The archive leaves run bindings and file mappings empty until they can be reviewed for inventory reconciliation.
+
 == Scoped original SQL assertion receipt
 
-`python3 rust/conformance/emit_sql_logic_case.py --external EXTERNAL.json --run RUN --output CASE` extracts one observation from a retained SQL-logic run using link:configurations/sql-logic-scalar-case.json[the pinned case configuration].
+`python3 rust/conformance/emit_sql_logic_case.py --external EXTERNAL.json --run RUN_ID --output CASE` extracts one observation from a retained SQL-logic run using link:configurations/sql-logic-scalar-case.json[the pinned case configuration].
 Use an output directory outside the external evidence archive.
 Keep the original absolute Linux invocation paths in the archive manifest and use its relocations to locate retained bytes.
 The reader checks the complete retained streams, original source, selected local production executable, and the two JVM invocations and native invocation.
