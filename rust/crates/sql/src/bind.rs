@@ -465,10 +465,12 @@ impl Context<'_> {
                 Expr::Column { id, .. } => input.schema().get(*id),
                 _ => None,
             };
-            let name = expression_label(group, &expr, input.schema(), index);
+            let label = implicit_expression_label(group, &expr, input.schema());
+            let unnamed = label.is_none();
+            let name = label.unwrap_or_else(|| format!("_column_{}", index + 1));
             let mut field = self.binder.field(name, None, expr.data_type())?;
             field.qualifier = source.and_then(|field| field.qualifier.clone());
-            field.unnamed = source.is_some_and(|field| field.unnamed);
+            field.unnamed = unnamed;
             replacements.insert(ReplacementKey::Expression(group.to_string()), field.clone());
             named_groups.push(NamedExpr { field, expr });
         }
@@ -563,7 +565,8 @@ impl Context<'_> {
                     let expression = self.expr_bound(expr, input, replacements)?;
                     let name = match item {
                         ast::SelectItem::ExprWithAlias { alias, .. } => identifier(alias).normalized(),
-                        _ => expression_label(expr, &expression, input.schema(), index),
+                        _ => implicit_expression_label(expr, &expression, input.schema())
+                            .unwrap_or_else(|| format!("_column_{}", index + 1)),
                     };
                     let field = self.binder.field(name, None, expression.data_type())?;
                     projected.push(NamedExpr { field, expr: expression });
@@ -1007,7 +1010,7 @@ pub(crate) fn aggregate_relation(input: Arc<Relation>, groups: Vec<NamedExpr>, a
     Ok(Arc::new(Relation::new(schema, RelationNode::Aggregate { input, groups, aggregates })?))
 }
 
-fn expression_label(mut syntax: &ast::Expr, expression: &Expr, schema: &Schema, index: usize) -> String {
+fn implicit_expression_label(mut syntax: &ast::Expr, expression: &Expr, schema: &Schema) -> Option<String> {
     while let ast::Expr::Nested(inner) | ast::Expr::UnaryOp { op: ast::UnaryOperator::Plus, expr: inner } = syntax {
         syntax = inner;
     }
@@ -1016,7 +1019,7 @@ fn expression_label(mut syntax: &ast::Expr, expression: &Expr, schema: &Schema, 
         ast::Expr::CompoundIdentifier(names) => names.last().map(|name| (name, names.len())),
         _ => None,
     };
-    let name = if let Some((column, parts)) = column {
+    if let Some((column, parts)) = column {
         let column = identifier(column);
         if crate::expression::bare_scalar_name(&column, parts).is_some() {
             None
@@ -1041,8 +1044,7 @@ fn expression_label(mut syntax: &ast::Expr, expression: &Expr, schema: &Schema, 
             }
             _ => None,
         }
-    };
-    name.unwrap_or_else(|| format!("_column_{}", index + 1))
+    }
 }
 
 fn ordinal(expr: &ast::Expr) -> Result<Option<usize>> {

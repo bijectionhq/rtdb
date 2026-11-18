@@ -51,8 +51,16 @@ impl Context<'_> {
             }
             ast::Expr::Identifier(name) => {
                 let name = identifier(name);
-                if let Some(function) = bare_scalar_name(&name, 1) { call(function, Vec::new())? }
-                else { self.resolve_column(&[name], input.schema())? }
+                if let Some(function) = bare_scalar_name(&name, 1) {
+                    call(function, Vec::new())?
+                } else {
+                    match self.resolve_column(std::slice::from_ref(&name), input.schema()) {
+                        Err(missing) if missing.code == "xtdb/column-not-found" && name.normalized() == "user" => {
+                            call("current_user".into(), Vec::new())?
+                        }
+                        resolved => resolved?,
+                    }
+                }
             }
             ast::Expr::CompoundIdentifier(names) => {
                 let names: Vec<_> = names.iter().map(identifier).collect();

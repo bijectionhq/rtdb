@@ -28,6 +28,25 @@ async fn query(source: &str) -> Result<Vec<Vec<V>>> {
 fn text(value: &str) -> V { V::Utf8(value.into()) }
 
 #[tokio::test]
+async fn user_resolves_visible_columns_before_using_the_session_value() {
+    for (source, expected) in [
+        ("SELECT USER", "xtdb"),
+        ("SELECT \"user\"", "xtdb"),
+        ("SELECT user FROM (VALUES ('alice')) AS t(user)", "alice"),
+        ("SELECT (SELECT user) FROM (VALUES ('alice')) AS t(user)", "alice"),
+        ("SELECT user.u FROM (VALUES ('alice')) AS user(u)", "alice"),
+        ("SELECT user FROM (VALUES (1)) AS t(n) WHERE USER = 'xtdb'", "xtdb"),
+    ] {
+        assert_eq!(query(source).await.unwrap(), [vec![text(expected)]], "{source}");
+    }
+    for source in ["SELECT \"USER\"", "SELECT t.user FROM (VALUES (1)) AS t(n)"] {
+        assert_eq!(query(source).await.unwrap_err().code, "xtdb/column-not-found", "{source}");
+    }
+    let error = query("SELECT user FROM (VALUES ('a')) t(user), (VALUES ('b')) u(user)").await.unwrap_err();
+    assert!(error.message.as_deref().is_some_and(|message| message.contains("Ambiguous")), "{error}");
+}
+
+#[tokio::test]
 async fn session_information_keywords_aliases_and_scalar_calls_share_reference_values() {
     assert_eq!(query("SELECT CURRENT_USER,CURRENT_CATALOG,CURRENT_SCHEMA,CURRENT_SCHEMA() AS test_output_4,CURRENT_DATABASE(),pg_catalog.CURRENT_SCHEMA(),CURRENT_SCHEMAS(TRUE),CURRENT_SCHEMAS(FALSE) AS test_output_8,CURRENT_SETTING('search_path'),CURRENT_SETTING('server_version_num') AS test_output_10").await.unwrap(),
         [vec![text("xtdb"),text("xtdb"),text("public"),text("public"),text("xtdb"),text("public"),V::List(vec![text("pg_catalog"),text("public")]),V::List(vec![text("public")]),text("public"),text("160000")]]);

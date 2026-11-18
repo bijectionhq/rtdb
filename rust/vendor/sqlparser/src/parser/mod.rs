@@ -1541,6 +1541,7 @@ impl<'a> Parser<'a> {
                 self.prev_token();
                 Ok(Some(Expr::Value(self.parse_value()?)))
             }
+            Keyword::USER if self.dialect.supports_user_as_identifier() => Ok(None),
             Keyword::CURRENT_CATALOG
             | Keyword::CURRENT_USER
             | Keyword::SESSION_USER

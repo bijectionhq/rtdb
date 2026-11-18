@@ -67,6 +67,9 @@
 (deftest test-xt-version
   (run-original-api-case #'original-sql/test-xt-version))
 
+(deftest test-bare-user-keyword
+  (run-original-api-case #'original-expr/test-bare-user-keyword))
+
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

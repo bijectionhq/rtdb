@@ -52,6 +52,14 @@ fn select_column_labels_follow_expression_provenance_and_sublist_positions() {
             "SELECT COUNT(*), pg_catalog.CURRENT_USER FROM (VALUES (1)) t(v) GROUP BY pg_catalog.CURRENT_USER",
             vec!["_column_1", "_column_2"],
         ),
+        (
+            "SELECT COUNT(*), USER FROM (VALUES (1)) t(v) GROUP BY USER",
+            vec!["_column_1", "_column_2"],
+        ),
+        (
+            "SELECT COUNT(*), USER FROM (VALUES ('alice')) t(user) GROUP BY USER",
+            vec!["_column_1", "user"],
+        ),
     ] {
         let prepared = prepare(source, &EmptyCatalog, &PrepareOptions::default()).unwrap();
         let rtdb_plan::Statement::Query(relation) = prepared.statement else { panic!("Expected a query") };

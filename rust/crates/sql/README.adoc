@@ -227,6 +227,8 @@ A qualified wildcard occupies one sublist position and expands its fields in pla
 An unqualified wildcard expands before the sublist and uses its own positions for unnamed fields.
 Column binding metadata belongs to the immutable plan field and remains attached when a scope is captured by a subquery.
 New table aliases establish a fresh name-binding scope.
+An unqualified USER resolves through the local and enclosing column scopes.
+When no column matches, it evaluates the current user and receives the positional expression label.
 
 SELECT ordering evaluates after its output expressions and before final projection and DISTINCT.
 Nonprojected sort columns do not participate in duplicate elimination.

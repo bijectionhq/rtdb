@@ -1122,6 +1122,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Allows USER to use the ordinary identifier expression grammar.
+    fn supports_user_as_identifier(&self) -> bool {
+        false
+    }
+
     /// Returns true if this dialect allows dollar placeholders
     /// e.g. `SELECT $var` (SQLite)
     fn supports_dollar_placeholder(&self) -> bool {
