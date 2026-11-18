@@ -1,5 +1,5 @@
 mod checkpoint;
-mod wire;
+pub(super) mod wire;
 
 use super::{Error, artifacts, combine, flush, instant, store::Reads, support::{FixtureClock, Identity, RunningNode}, write_new};
 use arrow_array::RecordBatch;

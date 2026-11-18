@@ -81,7 +81,10 @@
   (let [^java.net.URL location (.. clazz getProtectionDomain getCodeSource getLocation)]
     (.getPath (canonical-file (io/file (.toURI location))))))
 
-(defn- runtime-closure [classes library-path]
+(defn runtime-closure
+  "Returns this JVM's classpath and JDK inventory and the locations of the supplied Class values.
+  Pass nil for library-path when the observer has no native library."
+  [classes library-path]
   (let [classpath (mapv canonical-file (str/split (System/getProperty "java.class.path")
                                                 (Pattern/compile (Pattern/quote File/pathSeparator)) -1))
         {:keys [present absent]} (group-by #(if (.exists ^File %) :present :absent) classpath)

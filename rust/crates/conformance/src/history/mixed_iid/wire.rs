@@ -1,6 +1,6 @@
 use super::Error;
 use arrow_array::{Array, FixedSizeBinaryArray};
-use arrow_flight::{FlightDescriptor, HandshakeRequest, decode::{DecodedPayload, FlightDataDecoder},
+use arrow_flight::{FlightDescriptor, HandshakeRequest, HandshakeResponse, decode::{DecodedPayload, FlightDataDecoder},
     flight_service_client::FlightServiceClient, sql::{CommandStatementQuery, ProstMessageExt}};
 use arrow_schema::{DataType, Schema};
 use async_trait::async_trait;
@@ -11,9 +11,9 @@ use rtdb_node::{Node, SystemClock};
 use rtdb_types::Anomaly;
 use serde::Serialize;
 use serde_json::{Value as Json, json};
-use std::{net::{Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
+use std::{future::Future, net::{Ipv4Addr, SocketAddr}, sync::Arc, time::Duration};
 use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpStream, task::JoinError};
-use tonic::{Request, metadata::MetadataMap, transport::Channel};
+use tonic::{Request, Response, Streaming, metadata::MetadataMap, transport::Channel};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const PG_FRAME_LIMIT: usize = 64 * 1024;
@@ -35,7 +35,7 @@ async fn auth(node: &Node) -> Result<Arc<Authenticator>, Error> {
         Arc::new(SystemClock), Arc::new(UnusedHttp)).await?)
 }
 
-fn listener_result(work: Result<Json, Error>, joined: Result<rtdb_types::Result<()>, JoinError>, drained: bool) -> Result<Json, Error> {
+fn listener_result<T>(work: Result<T, Error>, joined: Result<rtdb_types::Result<()>, JoinError>, drained: bool) -> Result<T, Error> {
     let closed = joined.map_err(Error::from).and_then(|result| result.map_err(Error::from)).and_then(|()| {
         if drained { Ok(()) } else { Err("Mixed IID wire listener did not drain".into()) }
     });
@@ -47,11 +47,16 @@ fn listener_result(work: Result<Json, Error>, joined: Result<rtdb_types::Result<
 }
 
 pub(super) async fn pgwire(node: &Node, sql: &str) -> Result<Json, Error> {
+    with_pgwire(node, |address| pg_query(address, sql)).await
+}
+
+pub(in crate::history) async fn with_pgwire<T, F>(node: &Node, observe: impl FnOnce(SocketAddr) -> F) -> Result<T, Error>
+where F: Future<Output = Result<T, Error>> {
     let (server, driver) = rtdb_pgwire::ServerDriver::bind(rtdb_pgwire::ServerConfig {
         address: (Ipv4Addr::LOCALHOST, 0).into(), ..Default::default()
     }, node.clone(), auth(node).await?).await?;
     let owner = tokio::spawn(driver.run());
-    let work = tokio::time::timeout(QUERY_TIMEOUT, pg_query(server.address(), sql)).await
+    let work = tokio::time::timeout(QUERY_TIMEOUT, observe(server.address())).await
         .map_err(Error::from).and_then(|result| result);
     server.shutdown();
     let joined = owner.await;
@@ -60,11 +65,16 @@ pub(super) async fn pgwire(node: &Node, sql: &str) -> Result<Json, Error> {
 }
 
 pub(super) async fn flight_sql(node: &Node) -> Result<Json, Error> {
+    with_flight(node, flight_query).await
+}
+
+pub(in crate::history) async fn with_flight<T, F>(node: &Node, observe: impl FnOnce(SocketAddr) -> F) -> Result<T, Error>
+where F: Future<Output = Result<T, Error>> {
     let (server, driver) = rtdb_flight_sql::ServerDriver::bind(rtdb_flight_sql::FlightConfig {
         address: (Ipv4Addr::LOCALHOST, 0).into(), maximum_message_bytes: FLIGHT_FRAME_LIMIT, ..Default::default()
     }, node.clone(), auth(node).await?).await?;
     let owner = tokio::spawn(driver.run());
-    let work = tokio::time::timeout(QUERY_TIMEOUT, flight_query(server.address())).await
+    let work = tokio::time::timeout(QUERY_TIMEOUT, observe(server.address())).await
         .map_err(Error::from).and_then(|result| result);
     server.shutdown();
     let joined = owner.await;
@@ -72,7 +82,7 @@ pub(super) async fn flight_sql(node: &Node) -> Result<Json, Error> {
     listener_result(work, joined, status.stopped && status.active_calls == 0)
 }
 
-async fn pg_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
+pub(in crate::history) async fn pg_raw_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
     let tag = stream.read_u8().await?;
     let length = stream.read_u32().await? as usize;
     if !(4..=PG_FRAME_LIMIT).contains(&length) {
@@ -80,11 +90,16 @@ async fn pg_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
     }
     let mut body = vec![0; length - 4];
     stream.read_exact(&mut body).await?;
+    Ok((tag, body))
+}
+
+async fn pg_frame(stream: &mut TcpStream) -> Result<(u8, Vec<u8>), Error> {
+    let (tag, body) = pg_raw_frame(stream).await?;
     if tag == b'E' { return Err(format!("PostgreSQL fixture error: {}", String::from_utf8_lossy(&body)).into()); }
     Ok((tag, body))
 }
 
-async fn pg_send(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<(), Error> {
+pub(in crate::history) async fn pg_send(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<(), Error> {
     stream.write_u8(tag).await?;
     stream.write_u32(u32::try_from(body.len() + 4)?).await?;
     stream.write_all(body).await?;
@@ -92,7 +107,7 @@ async fn pg_send(stream: &mut TcpStream, tag: u8, body: &[u8]) -> Result<(), Err
     Ok(())
 }
 
-async fn pg_startup(address: SocketAddr) -> Result<TcpStream, Error> {
+pub(in crate::history) async fn pg_startup(address: SocketAddr) -> Result<TcpStream, Error> {
     let mut stream = TcpStream::connect(address).await?;
     let parameters = b"user\0xtdb\0database\0xtdb\0\0";
     stream.write_u32(u32::try_from(parameters.len() + 8)?).await?;
@@ -228,16 +243,21 @@ fn flight_schema(schema: &Schema) -> Result<Json, Error> {
         "nullable":field.is_nullable(),"metadata":field.metadata()}],"metadata":schema.metadata()}))
 }
 
-fn request<T>(body: T, headers: &MetadataMap) -> Request<T> {
+pub(in crate::history) fn request<T>(body: T, headers: &MetadataMap) -> Request<T> {
     let mut request = Request::new(body);
     *request.metadata_mut() = headers.clone();
     request
 }
 
-async fn flight_query(address: SocketAddr) -> Result<Json, Error> {
+pub(in crate::history) async fn flight_handshake(address: SocketAddr) -> Result<(FlightServiceClient<Channel>, Response<Streaming<HandshakeResponse>>), Error> {
     let channel = Channel::from_shared(format!("http://{address}"))?.connect().await?;
     let mut client = FlightServiceClient::new(channel).max_decoding_message_size(FLIGHT_FRAME_LIMIT);
     let response = client.handshake(futures::stream::iter([HandshakeRequest::default()])).await?;
+    Ok((client, response))
+}
+
+async fn flight_query(address: SocketAddr) -> Result<Json, Error> {
+    let (mut client, response) = flight_handshake(address).await?;
     let mut headers = MetadataMap::new();
     if let Some(cookie) = response.metadata().get("set-cookie") { headers.insert("cookie", cookie.clone()); }
     if let Some(authorization) = response.metadata().get("authorization") { headers.insert("authorization", authorization.clone()); }

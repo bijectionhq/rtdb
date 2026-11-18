@@ -51,6 +51,18 @@ gradle.projectsEvaluated {
         argumentProviders.add({ ["-m", "rtdb.conformance.mixed-iid-reference", output.get()] } as CommandLineArgumentProvider)
         outputs.upToDateWhen { false }
     }
+    root.tasks.register("rtdbConformanceParserWire", JavaExec) { task ->
+        configureRuntime(task)
+        def test = referenceTest.get()
+        dependsOn root.tasks.named("testClasses")
+        classpath = test.classpath + root.files(root.providers.gradleProperty("rtdb.adapterRoot").get())
+        jvmArgumentProviders.addAll(test.jvmArgumentProviders)
+        environment(test.environment)
+        workingDir(root.file(output.get()))
+        mainClass = "clojure.main"
+        argumentProviders.add({ ["-m", "rtdb.conformance.parser-wire", fixture.get(), output.get()] } as CommandLineArgumentProvider)
+        outputs.upToDateWhen { false }
+    }
     root.tasks.register("rtdbConformanceColumnTableAdapterTest", JavaExec) { task ->
         configureRuntime(task)
         dependsOn root.tasks.named("testClasses")

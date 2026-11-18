@@ -309,6 +309,35 @@ The separate `rtdbConformanceHistoryAdapterTest` Gradle task exercises measureme
 The runner and adapter sources remain under review, and no history runner, adapter test or comparison test has executed.
 Successful history selection does not reconcile the complete assertion ledger.
 
+== Serialized parser diagnostics
+
+The scoped comparison records the pinned C84 query `SELEC 1` through PostgreSQL simple query and Flight SQL GetFlightInfo.
+The C84 API test asserts the category, error code and a message pattern through in-process ADBC, pgwire and Flight SQL.
+The supplemental input `extra SELECT 1` comes from the later authored parser source test.
+Each protocol keeps one session for both failures and the successful bigint answer from `SELECT 42::bigint AS answer`.
+
+After Phase 2 begins, use clean implementation and pinned reference checkouts, a conformance binary built from the implementation revision, and a new output directory outside both checkouts.
+
+[source,shell]
+----
+python3 rust/conformance/run_parser_wire.py --phase-two \
+  --reference /absolute/path/to/pinned-reference \
+  --native /absolute/path/to/rtdb-conformance \
+  --output /absolute/new/parser-wire
+----
+
+The PostgreSQL receipt retains each response frame and checks that each query ends at idle ReadyForQuery.
+The Flight clients require a server-issued cookie and accepted session options.
+Each later call presents that cookie and rejects any `Set-Cookie` header.
+The Flight receipt retains GetFlightInfo's status, description and binary anomaly metadata.
+The follow-up records the declared, DoGet and batch schemas and the ordered typed rows.
+The runner compares the diagnostic fields and serialized bytes from both engines independently for each of the four protocol and statement combinations.
+The comparison retains both observed diagnostics and identifies differing fields.
+A cross-engine difference in diagnostics or in the Flight follow-up schemas or rows retains `result.json` with the corresponding match field set to false and exits with status 1.
+Missing evidence or disagreement among one engine's declared, DoGet and batch schemas exits with status 2.
+The comparison covers the selected wire observations.
+Embedded parser cause compatibility remains a separate obligation.
+
 == Mixed plain and run-end IID reference
 
 After Phase 2 opens, the reference observer selects the original mixed-IID test in the clean C84 checkout through Jovial.

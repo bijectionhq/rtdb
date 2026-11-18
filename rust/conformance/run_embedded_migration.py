@@ -93,7 +93,7 @@ def gradle_command(side, repository, fixture, directory, library=None):
     return command
 
 
-def verify_runtime(runtime, side, library):
+def verify_runtime(runtime, side, library, *, classes=None):
     artifacts = runtime["artifacts"]
     paths = {value["path"] for value in artifacts}
     classpath = set(runtime["classpath"])
@@ -108,7 +108,7 @@ def verify_runtime(runtime, side, library):
             or len(paths) != len(artifacts) or paths != (classpath - absent) | jdk | native_paths):
         raise ValueError("embedded JVM runtime closure differs from the observed classpath")
     locations = runtime["class_locations"]
-    if set(locations) != CLASSES[side] or not set(locations.values()) <= classpath - absent:
+    if set(locations) != (CLASSES[side] if classes is None else classes) or not set(locations.values()) <= classpath - absent:
         raise ValueError("embedded JVM classes lack their observed artifact identities")
     if str(JVM.resolve()) not in classpath - absent:
         raise ValueError("embedded JVM did not load the selected adapter classpath")
