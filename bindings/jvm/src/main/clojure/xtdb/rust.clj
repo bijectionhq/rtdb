@@ -128,7 +128,7 @@
     (into {} (map-indexed (fn [index value] [(str "?_" index) value])) args)
     (or args {})))
 
-(defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types?] :as options
+(defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types? explain? explain-analyze?] :as options
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
     (with-open [connection (connect node {:database default-db})]
@@ -136,18 +136,22 @@
         (set-await-token! connection token))
       (with-read-settings connection options
         (fn []
-          (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (logical-arguments args)))]
-            (let [key-fn (serde/read-key-fn key-fn)
-                  rows (loop [rows (transient [])]
-                         (if-let [bytes (.next result)]
-                           (let [page (read-rows bytes key-fn)]
-                             (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
-                           (persistent! rows)))]
-              (if with-types?
-                {:res rows
-                 :types (into {} (map (fn [^Field field] [(symbol (.getName field)) (VectorType/fromField field)]))
-                              (.getFields (.schema result)))}
-                rows))))))))
+          (let [relation (cond
+                           explain? [:explain {:mode :plan} relation]
+                           explain-analyze? [:explain {:mode :analyze} relation]
+                           :else relation)]
+            (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (logical-arguments args)))]
+              (let [key-fn (serde/read-key-fn key-fn)
+                    rows (loop [rows (transient [])]
+                           (if-let [bytes (.next result)]
+                             (let [page (read-rows bytes key-fn)]
+                               (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
+                             (persistent! rows)))]
+                (if with-types?
+                  {:res rows
+                   :types (into {} (map (fn [^Field field] [(symbol (.getName field)) (VectorType/fromField field)]))
+                                (.getFields (.schema result)))}
+                  rows)))))))))
 
 (defn- merge-node-token! [^NativeDatabase database next-token]
   (loop []

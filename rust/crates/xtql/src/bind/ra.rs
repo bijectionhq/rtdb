@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Edn, EdnKind};
-use rtdb_plan::{MaterializedBinding, PercentileFraction, PercentileKind, WindowExpr, WindowFunction};
+use rtdb_plan::{ExplainMode, MaterializedBinding, PercentileFraction, PercentileKind, WindowExpr, WindowFunction};
 
 /// Imports a Clojure logical relation into the native plan using exact column symbols.
 /// Named parameter bindings describe the caller's typed argument positions.
@@ -23,8 +23,18 @@ pub fn compile_ra_in(source: &str, catalog: &dyn Catalog, options: &CompileOptio
     let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms: FormAllocation::Tracked(memory), symbols };
     let relations = BTreeMap::new();
     let importer = Importer { compiler: &mut compiler, parameters: &parameters, relations: &relations, memory };
-    let relation = importer.relation(&form)?;
-    Ok(PreparedStatement { statement: Statement::Query(relation), parameter_types: binder.parameter_types().clone(), source: source.into(), notices: Vec::new(), settings: Default::default() })
+    let statement = match form.vector() {
+        Some([op, options, relation]) if op.keyword() == Some("explain") => {
+            let mode = match options.option("mode").and_then(Edn::keyword) {
+                Some("plan") => ExplainMode::Plan,
+                Some("analyze") => ExplainMode::Analyze,
+                _ => return Err(invalid("Logical explain requires :mode :plan or :mode :analyze")),
+            };
+            Statement::Explain { relation: importer.relation(relation)?, mode }
+        }
+        _ => Statement::Query(importer.relation(&form)?),
+    };
+    Ok(PreparedStatement { statement, parameter_types: binder.parameter_types().clone(), source: source.into(), notices: Vec::new(), settings: Default::default() })
 }
 
 struct Importer<'a, 'b, 'c> {

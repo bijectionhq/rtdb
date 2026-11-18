@@ -108,6 +108,8 @@ The embedded native connection accepts logical relation EDN with named Transit a
 The logical relation cursor exposes its declared result types through the Arrow schema, independently of row availability.
 Logical scans bind to the awaited database snapshot and accept stored column symbols, scan predicates, and valid-time and system-time filters.
 Logical relation output preserves operator page boundaries, and a literal page source supplies its pages in the specified order, including empty pages.
+The Clojure logical relation options `:explain?` and `:explain-analyze?` request the native plan or measured execution respectively.
+The native EDN statement form is `[:explain {:mode :plan} relation]` or `[:explain {:mode :analyze} relation]`.
 SQL and logical relation requests use the same transaction settings for the snapshot token, snapshot time, query clock, and time zone.
 Literal pages can declare their Arrow column types when the pages do not carry enough rows to infer a schema.
 Logical group-by uses native aggregates with exact column symbols, including distinct factories, filters, and array ordering.

@@ -811,6 +811,16 @@
 
 (deftest-original-api original-scan/test-scan-col-types)
 
+(deftest-original-api original-scan/test-pushdown-blooms-through-project)
+
+(deftest logical-explain-plan-reports-the-native-scan
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (xt/execute-tx node [[:put-docs :docs {:xt/id 1, :v 42}]])
+    (let [rows (rust/query-ra node '[:scan {:db-name "xtdb", :table #xt/table docs, :columns [v]}]
+                              {:explain? true})]
+      (is (= [:scan] (mapv :op rows))))))
+
 (deftest-original-api original-as-of/test-as-of-tx)
 
 (deftest-original-api original-as-of/test-app-time)
