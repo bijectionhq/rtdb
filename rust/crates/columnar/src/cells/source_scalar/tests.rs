@@ -1703,3 +1703,91 @@ fn first_signed_slice_reports_the_inner_long_long_cast_before_row_demand() {
     }
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn pointer_reuse_keeps_slot_identity_and_retargets_the_live_backing() {
+    let memory = memory();
+    let mut initial = writer(SourceScalarDeclaration::FixedBinary(3), false, &memory);
+    initial.write_bytes(&[5, 6, 7]).unwrap();
+    let captured = initial.finish().unwrap();
+    let mut replacement = writer(SourceScalarDeclaration::FixedBinary(2), false, &memory);
+    replacement.write_bytes(&[13, 17]).unwrap();
+    replacement.write_bytes(&[19, 23]).unwrap();
+
+    let mut pointer = SourceScalarReader::new(&captured).unwrap().unwrap().get_pointer(0);
+    let address = std::ptr::from_ref(&pointer);
+    let original_bytes = pointer.demand_native().unwrap();
+    {
+        let reader = replacement.source_reader().unwrap().unwrap();
+        let reused = reader.get_pointer_into(1, &mut pointer);
+        assert_eq!(std::ptr::from_ref(reused), address);
+        assert_eq!((reused.offset(), reused.length()), (2, 2));
+        assert_eq!(reused.demand_native().unwrap(), &[19u8, 23]);
+    }
+    assert_eq!(pointer.demand_native().unwrap(), &[19u8, 23]);
+    assert_eq!(original_bytes, &[5u8, 6, 7]);
+    drop((replacement, captured));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn signed_slice_pointer_reuse_defers_span_denial_and_allows_the_next_retarget() {
+    let memory = memory();
+    let mut valid = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    valid.write_bytes(&[29]).unwrap();
+    let signed = writer(SourceScalarDeclaration::FixedBinary(-1), true, &memory);
+    let reader = valid.source_reader().unwrap().unwrap();
+    let mut pointer = reader.get_pointer(0);
+    let address = std::ptr::from_ref(&pointer);
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+
+    {
+        let slice = signed.source_reader().unwrap().unwrap().slice(i32::MAX, -1);
+        let reused = slice.get_pointer_into(1, &mut pointer);
+        assert_eq!(std::ptr::from_ref(reused), address);
+        assert_eq!((reused.offset(), reused.length()), (i64::from(i32::MIN), -1));
+    }
+    read_native(pointer.demand_native());
+    let reused = reader.get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(reused), address);
+    assert_eq!((reused.offset(), reused.length()), (0, 1));
+    assert_eq!(reused.demand_native().unwrap(), &[29u8]);
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((blocker, signed, valid));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn reused_int_pointer_accepts_uuid_inner_width_and_time_pointer_forwarding() {
+    let memory = memory();
+    let mut int = ScalarWriter::source_int_arrow19_default("seed", false, 1, Arc::clone(&memory)).unwrap();
+    int.set_int(0, 42).unwrap();
+    let int = int.finish().unwrap();
+    let mut uuid = writer(SourceScalarDeclaration::Uuid { inner_width: 24 }, false, &memory);
+    uuid.write_bytes(&[31; 24]).unwrap();
+    let uuid = uuid.finish().unwrap();
+    let declaration = SourceScalarDeclaration::Time32(TimeUnit::Second);
+    let mut time = writer(declaration, false, &memory);
+    time.write_int(0x1234_5678).unwrap();
+
+    let mut pointer = SourceBytePointer::from_int_arrow19_default(&int, 0).unwrap().unwrap();
+    let address = std::ptr::from_ref(&pointer);
+    assert_eq!(pointer.demand_native().unwrap(), &42i32.to_le_bytes());
+    let uuid_reader = SourceScalarReader::new(&uuid).unwrap().unwrap();
+    let reused = uuid_reader.get_pointer_into(0, &mut pointer);
+    assert_eq!(std::ptr::from_ref(reused), address);
+    assert_eq!(reused.length(), 24);
+    assert_eq!(reused.demand_native().unwrap(), &[31u8; 24]);
+
+    let slice = time.source_reader().unwrap().unwrap().slice(i32::MAX, 0);
+    let reused = slice.get_pointer_into(1, &mut pointer);
+    assert_eq!(std::ptr::from_ref(reused), address);
+    assert_eq!((reused.offset(), reused.length()), (0, 4));
+    assert_eq!(reused.demand_native().unwrap(), &0x1234_5678i32.to_le_bytes());
+    read_reference(slice.get_bytes(1), SourceScalarReadFailure::Unsupported { declaration, method: "getBytes" });
+    drop((int, uuid, time));
+    assert_eq!(memory.used_bytes(), 0);
+}

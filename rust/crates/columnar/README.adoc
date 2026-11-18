@@ -302,7 +302,7 @@ Time getBytes retains its source unsupported-method failure; raw Time primitive,
 `SourceScalarReadError::Reference` preserves unsupported methods, negative view lengths and the first or second UUID long-read underflow producer.
 `demand_native()` separately checks the complete retained span and returns native `rtdb/unretained-byte-view` admission before borrowing payload bytes.
 Facts and admitted slices borrow the actual writer/vector region and may outlive intermediate reader/view variables while that owner borrow remains live.
-They expose no raw address, mutable alias, relative ByteBuffer cursor, pointer-reuse cache, equality or hash operation.
+Raw addresses, mutable backing aliases, relative ByteBuffer cursors, pointer comparison and hash operations remain outside this surface.
 Existing checked Cell and ScalarReader logical row gates remain separate, using actual native widths at their native byte-admission boundary.
 The checked UUID `Value` adapter requires exactly 16 bytes.
 
@@ -313,7 +313,14 @@ They retain the inner declaration's actual width, unsupported methods and negati
 Raw forwarding is independent of logical row count and validity.
 Slice construction and raw forwarding allocate no payload storage or reservations.
 Slices and returned facts borrow the real writer/vector owner and may outlive intermediate reader or Slice variables within that borrow.
-Repeated selection, mutable array aliases, copying, close and pointer reuse remain required indirect-reader operations.
+Repeated selection, mutable array aliases, copying and close remain required indirect-reader operations.
+
+`get_pointer_into` on the direct reader and first signed Slice replaces the backing, offset and length in the caller's existing pointer slot.
+The returned exclusive borrow refers to the same slot.
+The replacement backing outlives the lifetime carried by the pointer.
+The exclusive borrow of the slot can end earlier.
+A byte slice previously demanded from the slot continues to borrow its original backing after retargeting.
+Signed pointer facts are installed before retained-span validation at `demand_native`.
 
 `SourceScalarReader::binary_object0` materializes a FixedBinary or UUID object from its signed byte address.
 The same raw demand applies to null rows and wrapped row offsets.
@@ -391,7 +398,8 @@ The mutable scalar `source_int_pointer` bridge also permits inspection of a `Nat
 Pointer formation retains a signed wrapped i32 row-times-four offset and length four without checking count, validity or payload span.
 Only `demand_native` admits the retained bytes; facts and demanded bytes borrow the actual owner and expose no raw address or mutable alias.
 Rounded padding can therefore be demanded through this source pointer path even when the ordinary checked cell boundary rejects that logical row.
-Int source getBytes, primitive null/NPE/object/metadata reads, mutable aliases and reused source pointers remain outside this byte-fact surface.
+An Int-produced pointer can supply the slot retargeted by a direct source scalar reader or first signed Slice.
+Int source getBytes, primitive null/NPE/object/metadata reads, mutable aliases and retargeting from an Int reader remain outside this byte-fact surface.
 Native scalar copying continues to demand actual retained spans and validity in source order; admitted SDK arrays keep their strict row and range boundary.
 
 `cells/write/count_constructor_tests.rs` records signed constructor counts, exact capacities and cursor histories, budget overlap and cleanup, setter and copy failure prefixes, typed capture, descriptor rebuild and pointer topology.

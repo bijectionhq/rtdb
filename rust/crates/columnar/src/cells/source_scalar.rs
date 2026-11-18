@@ -51,6 +51,15 @@ impl<'a> SourceScalarReader<'a> {
         let width = self.declaration.fixed_width();
         SourceBytePointer { backing: self.backing, offset: i64::from(row.wrapping_mul(width)), length: i64::from(width) }
     }
+    pub(crate) fn get_pointer_into<'slot, 'region>(
+        &self, row: i32, reuse: &'slot mut SourceBytePointer<'region>,
+    ) -> &'slot mut SourceBytePointer<'region>
+    where
+        'a: 'region,
+    {
+        *reuse = self.get_pointer(row);
+        reuse
+    }
     pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
         if !self.declaration.bytes_method() {
             return Err(SourceScalarReadError::Reference(SourceScalarReadFailure::Unsupported { declaration: self.declaration, method: "getBytes" }));
@@ -128,6 +137,14 @@ impl<'a> SourceScalarSlice<'a> {
     pub(crate) fn value_count(&self) -> i32 { self.length }
     pub(crate) fn get_pointer(&self, row: i32) -> SourceBytePointer<'a> {
         self.inner.get_pointer(self.start.wrapping_add(row))
+    }
+    pub(crate) fn get_pointer_into<'slot, 'region>(
+        &self, row: i32, reuse: &'slot mut SourceBytePointer<'region>,
+    ) -> &'slot mut SourceBytePointer<'region>
+    where
+        'a: 'region,
+    {
+        self.inner.get_pointer_into(self.start.wrapping_add(row), reuse)
     }
     pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
         self.inner.get_bytes(self.start.wrapping_add(row))
