@@ -11,7 +11,8 @@ python3 rust/conformance/source_inventory.py --repository . --output rust/confor
 ----
 
 The parity ledger must keep the reference case identity, source assertion location, required configuration, native counterpart, and every required observation.
-Each required observation declares whether it must return a value or reproduce a specific failure stage, category, code, and signature.
+Each required observation declares its expected result.
+A failure expectation names its stage, category, code and signature.
 Run receipts cannot declare a failure to be expected without that ledger entry.
 Typed multiset observations contain a `schema` array and a `rows` array whose rows each match the schema width.
 Reference and Rust run receipts must record artifact and fixture digests, observation values, comparator version, and exact failure location.
@@ -19,6 +20,22 @@ A missing receipt remains unverified even when a corresponding native test exist
 Compilation and execution are pending under the Phase 1 work order.
 link:source-completeness.adoc[The source completeness record] separates missing implementation and unfinished source review from Phase 2 qualification.
 Every execution runner validates that record and its reviewed implementation revision before starting project code.
+
+A `declared_migration` expected outcome uses `exact` observation comparison and names an approved migration with separate `reference` and `native` failure expectations.
+Each side supplies an executed `expected_failure` receipt and must match its declared stage, category, code and signature.
+The comparator validates paired identity, provenance, fixture and configuration before confirming the migration.
+The supported `embedded_sql_parser_cause` declaration uses the `parse_statement_ast` and `statement_prepare` stages with category `incorrect` and code `xtdb/sql-error`.
+The reference signature's `cause` object records `class` as `org.antlr.v4.runtime.InputMismatchException`, `recognizer_class` as `xtdb.antlr.Sql`, `offending_state` as 574 and `shared_decision_array` as true.
+The native signature is `{"cause": null}`.
+These signatures describe the observed embedded capability.
+Remote diagnostics and their messages have separate assertions.
+
+A case with complete matching evidence for a declared migration has disposition `matched_declared_migration` and contributes one group to that count.
+The report omits the count when zero.
+The group stays in the strict agreement denominator and leaves `complete_parity` false.
+The `compare` CLI exit status still measures complete parity.
+Equality controls require `passing_both` and reject selections that include a declared migration.
+The embedded source fixtures need paired observation adapters and explicit discovery bindings to supply this evidence.
 
 `assertion-ledger.json` maps the two mandatory comparison controls and the four compound assertions in `xtdb.operator.table-test/test-single-col`.
 `fixtures/table-column.json` retains that test's inputs and exact typed rows; its native counterpart exercises the column-table operator.

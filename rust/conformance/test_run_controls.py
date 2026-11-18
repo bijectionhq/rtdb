@@ -367,6 +367,44 @@ class SelectionTests(unittest.TestCase):
         self.assertFalse(report["complete_parity"])
         self.assertEqual(report["strict_agreement"], 2 / 3)
 
+    def test_declared_migration_cannot_be_selected_as_an_equality_control(self):
+        ledger = copy.deepcopy(self.ledger)
+        selected = next(case for case in ledger["cases"] if case["identity"] == self.selection["cases"][0])
+        selected["observations"] = [{"id": "parser-cause", "expected": {"kind": "declared_migration"}}]
+        with self.assertRaisesRegex(ValueError, "control selection cannot include a declared migration"):
+            control_scope(ledger, self.selection)
+
+    def test_malformed_selected_observations_report_control_input_errors(self):
+        ledger = copy.deepcopy(self.ledger)
+        selected = next(case for case in ledger["cases"] if case["identity"] == self.selection["cases"][0])
+        for observations in (None, 17, [None], [{"expected": None}], [{"expected": []}]):
+            selected["observations"] = observations
+            with self.subTest(observations=observations), self.assertRaisesRegex(ValueError, "control case observation"):
+                control_scope(ledger, self.selection)
+
+    def test_unselected_migration_remains_missing_with_legacy_control_reports(self):
+        ledger = copy.deepcopy(self.ledger)
+        migration = next(case for case in ledger["cases"] if case["identity"]["qualified_name"] == "sql-table")
+        migration["observations"] = [{"id": "parser-cause", "expected": {"kind": "declared_migration"}}]
+        scope = control_scope(ledger, self.selection)
+        report = comparison([case_report("first"), case_report("second"), case_report("sql-table", "missing_evidence")])
+        scope.require_agreement(report)
+        scope.require_agreement({**report, "matched_declared_migration": 0})
+        for invalid in (1, False, "0"):
+            with self.subTest(count=invalid), self.assertRaisesRegex(ValueError, "summary differs"):
+                scope.require_agreement({**report, "matched_declared_migration": invalid})
+
+    def test_migration_counts_cannot_claim_parity_or_supply_unselected_control_evidence(self):
+        ledger = {**self.ledger, "inventory_complete": True, "runtime_reconciled": True}
+        scope = control_scope(ledger, self.selection)
+        report = comparison([case_report("first"), case_report("second"), case_report("sql-table", "matched_declared_migration")], complete=True)
+        report["matched_declared_migration"] = 1
+        with self.assertRaisesRegex(ValueError, "completeness differs"):
+            scope.require_agreement(report)
+        report["complete_parity"] = False
+        with self.assertRaisesRegex(ValueError, "unexpected evidence outside the control selection"):
+            scope.require_agreement(report)
+
     def test_changed_global_ledger_snapshot_cannot_reach_the_comparator(self):
         scope = control_scope(self.ledger, self.selection)
         with tempfile.TemporaryDirectory() as directory:

@@ -322,7 +322,18 @@ def _select_cases(ledger, selection):
     keys = [case_key(identity) for identity in identities]
     if len(keys) != len(set(keys)) or any(key not in mappings for key in keys):
         raise ValueError("control selection contains a duplicate or unmapped case")
-    return [mappings[key] for key in keys]
+    selected = [mappings[key] for key in keys]
+    for mapping in selected:
+        observations = mapping.get("observations", [])
+        if not isinstance(observations, list):
+            raise ValueError("control case observations must be an array")
+        for observation in observations:
+            expected = observation.get("expected", {}) if isinstance(observation, dict) else None
+            if not isinstance(expected, dict):
+                raise ValueError("control case observation and expectation must be objects")
+            if expected.get("kind") == "declared_migration":
+                raise ValueError("control selection cannot include a declared migration")
+    return selected
 
 
 @dataclass(frozen=True)
@@ -375,12 +386,15 @@ class ControlSelection:
         if set(cases) != self._global_identities or type(report.get("required_groups")) is not int or report["required_groups"] != len(self._global_identities):
             raise ValueError("comparison omitted or added global assertion groups")
         fields = {"passing_both": "passing_both", "matching_expected_failure": "matching_expected_failure",
+                  "matched_declared_migration": "matched_declared_migration",
                   "missing_evidence": "missing_evidence", "mismatches": "mismatch"}
         counts = {field: sum(case["disposition"] == disposition for case in cases.values()) for field, disposition in fields.items()}
-        if sum(counts.values()) != len(cases) or any(type(report.get(field)) is not int or report[field] != count for field, count in counts.items()):
+        recorded = {field: report.get(field) for field in fields}
+        recorded["matched_declared_migration"] = report.get("matched_declared_migration", 0)
+        if sum(counts.values()) != len(cases) or any(type(recorded[field]) is not int or recorded[field] != count for field, count in counts.items()):
             raise ValueError("comparison summary differs from its global case dispositions")
         agreement = None if errors else (counts["passing_both"] + counts["matching_expected_failure"]) / len(cases)
-        parity = not errors and counts["missing_evidence"] == 0 and counts["mismatches"] == 0
+        parity = not errors and counts["missing_evidence"] == 0 and counts["mismatches"] == 0 and counts["matched_declared_migration"] == 0
         agreement_valid = report.get("strict_agreement") is None if agreement is None else type(report.get("strict_agreement")) is float and report["strict_agreement"] == agreement
         if "strict_agreement" not in report or not agreement_valid or report.get("complete_parity") is not parity:
             raise ValueError("comparison completeness differs from the captured global inventory")

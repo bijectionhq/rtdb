@@ -26,6 +26,26 @@ pub enum Comparison { Exact, TypedRowMultiset }
 pub enum ExpectedOutcome {
     Returned,
     Failure { stage: String, category: String, code: String, signature: Value },
+    DeclaredMigration { migration: DeclaredMigration, reference: FailureExpectation, native: FailureExpectation },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeclaredMigration { EmbeddedSqlParserCause }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FailureExpectation {
+    pub stage: String,
+    pub category: String,
+    pub code: String,
+    pub signature: Value,
+}
+
+impl FailureExpectation {
+    fn matches(&self, actual: &Outcome) -> bool {
+        failure_matches(&self.stage, &self.category, &self.code, &self.signature, actual)
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,7 +124,7 @@ pub struct Difference {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Disposition { PassingBoth, MatchingExpectedFailure, Mismatch, MissingEvidence }
+pub enum Disposition { PassingBoth, MatchingExpectedFailure, MatchedDeclaredMigration, Mismatch, MissingEvidence }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CaseReport {
@@ -120,6 +140,8 @@ pub struct Report {
     pub required_groups: usize,
     pub passing_both: usize,
     pub matching_expected_failure: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub matched_declared_migration: usize,
     pub missing_evidence: usize,
     pub mismatches: usize,
     pub strict_agreement: Option<f64>,
@@ -127,6 +149,8 @@ pub struct Report {
     pub cases: Vec<CaseReport>,
     pub manifest_errors: Vec<String>,
 }
+
+fn is_zero(count: &usize) -> bool { *count == 0 }
 
 fn canonical(value: &Value) -> String {
     match value {
@@ -205,19 +229,38 @@ fn valid_identity(identity: &CaseIdentity) -> bool {
         .into_iter().all(|value| nonempty(value))
 }
 
-fn valid_expected(expected: &ExpectedOutcome) -> bool {
-    match expected {
+fn valid_expected(required: &RequiredObservation) -> bool {
+    match &required.expected {
         ExpectedOutcome::Returned => true,
         ExpectedOutcome::Failure { stage, category, code, .. } => [stage, category, code].into_iter().all(|value| nonempty(value)),
+        ExpectedOutcome::DeclaredMigration { migration: DeclaredMigration::EmbeddedSqlParserCause, reference, native } => {
+            required.comparison == Comparison::Exact
+                && reference.stage == "parse_statement_ast"
+                && native.stage == "statement_prepare"
+                && [reference, native].into_iter().all(|side| side.category == "incorrect" && side.code == "xtdb/sql-error")
+                && reference.signature == serde_json::json!({
+                    "cause": {
+                        "class": "org.antlr.v4.runtime.InputMismatchException",
+                        "recognizer_class": "xtdb.antlr.Sql",
+                        "offending_state": 574,
+                        "shared_decision_array": true,
+                    }
+                })
+                && native.signature == serde_json::json!({"cause": null})
+        }
     }
+}
+
+fn failure_matches(stage: &str, category: &str, code: &str, signature: &Value, outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::ExpectedFailure {
+        stage: actual_stage, category: actual_category, code: actual_code, signature: actual_signature,
+    } if stage == actual_stage.as_str() && category == actual_category.as_str() && code == actual_code.as_str() && signature == actual_signature)
 }
 
 fn expected_outcome(expected: &ExpectedOutcome, outcome: &Outcome) -> bool {
     match (expected, outcome) {
         (ExpectedOutcome::Returned, Outcome::Returned { .. }) => true,
-        (ExpectedOutcome::Failure { stage, category, code, signature }, Outcome::ExpectedFailure {
-            stage: actual_stage, category: actual_category, code: actual_code, signature: actual_signature,
-        }) => stage == actual_stage && category == actual_category && code == actual_code && signature == actual_signature,
+        (ExpectedOutcome::Failure { stage, category, code, signature }, _) => failure_matches(stage, category, code, signature, outcome),
         _ => false,
     }
 }
@@ -272,9 +315,10 @@ fn compare_case(mapping: &CaseMapping, reference: Option<&CaseReceipt>, native: 
         }
     }
     let mut expected_failure = false;
+    let mut matched_migration = false;
     let mut required_ids = BTreeSet::new();
     for required in &mapping.observations {
-        if !nonempty(&required.id) || !valid_expected(&required.expected) {
+        if !nonempty(&required.id) || !valid_expected(required) {
             if report.disposition != Disposition::Mismatch { report.disposition = Disposition::MissingEvidence; }
             report.differences.push(evidence_error(&required.id, "required observation has no identity or complete expected outcome"));
             continue;
@@ -294,10 +338,30 @@ fn compare_case(mapping: &CaseMapping, reference: Option<&CaseReceipt>, native: 
             report.differences.push(evidence_error(&required.id, "required observation was not executed"));
             continue;
         }
-        if !matches!(&reference.outcome, Outcome::Unavailable { .. } | Outcome::Skipped { .. })
-            && !matches!(&native.outcome, Outcome::Unavailable { .. } | Outcome::Skipped { .. })
-            && (!expected_outcome(&required.expected, &reference.outcome) || !expected_outcome(&required.expected, &native.outcome))
+        if matches!(&reference.outcome, Outcome::Unavailable { .. } | Outcome::Skipped { .. })
+            || matches!(&native.outcome, Outcome::Unavailable { .. } | Outcome::Skipped { .. })
         {
+            if report.disposition != Disposition::Mismatch { report.disposition = Disposition::MissingEvidence; }
+            report.differences.push(evidence_error(&required.id, "observation unavailable or skipped"));
+            continue;
+        }
+        if let ExpectedOutcome::DeclaredMigration { reference: reference_expected, native: native_expected, .. } = &required.expected {
+            let reference_matches = reference_expected.matches(&reference.outcome);
+            let native_matches = native_expected.matches(&native.outcome);
+            if reference_matches && native_matches {
+                report.comparisons += 1;
+                matched_migration = true;
+            } else {
+                report.disposition = Disposition::Mismatch;
+                for (side, matches) in [("reference", reference_matches), ("native", native_matches)] {
+                    if !matches {
+                        report.differences.push(evidence_error(&required.id, format!("{side} execution outcome does not match its declared migration expectation")));
+                    }
+                }
+            }
+            continue;
+        }
+        if !expected_outcome(&required.expected, &reference.outcome) || !expected_outcome(&required.expected, &native.outcome) {
             report.disposition = Disposition::Mismatch;
             report.differences.push(evidence_error(&required.id, "execution outcome does not match the mapped expectation"));
             continue;
@@ -310,7 +374,6 @@ fn compare_case(mapping: &CaseMapping, reference: Option<&CaseReceipt>, native: 
                 expected_failure = true;
                 Ok((serde_json::to_value(&reference.outcome).expect("outcome serialization"), serde_json::to_value(&native.outcome).expect("outcome serialization")))
             }
-            (Outcome::Unavailable { .. } | Outcome::Skipped { .. }, _) | (_, Outcome::Unavailable { .. } | Outcome::Skipped { .. }) => Err("observation unavailable or skipped".into()),
             _ => {
                 report.disposition = Disposition::Mismatch;
                 report.differences.push(evidence_error(&required.id, "outcomes differ or include an unexpected execution failure"));
@@ -337,14 +400,20 @@ fn compare_case(mapping: &CaseMapping, reference: Option<&CaseReceipt>, native: 
             report.differences.push(evidence_error(id, "receipt observation has no assertion mapping"));
         }
     }
-    if expected_failure && report.disposition == Disposition::PassingBoth { report.disposition = Disposition::MatchingExpectedFailure; }
+    if report.disposition == Disposition::PassingBoth {
+        if matched_migration {
+            report.disposition = Disposition::MatchedDeclaredMigration;
+        } else if expected_failure {
+            report.disposition = Disposition::MatchingExpectedFailure;
+        }
+    }
     report
 }
 
 /// Counts assertion groups only after every required observation has paired execution evidence.
 pub fn compare(ledger: &Ledger, reference: &[CaseReceipt], native: &[CaseReceipt]) -> Report {
     let mut report = Report { comparator_version: env!("CARGO_PKG_VERSION").into(), required_groups: ledger.cases.len(),
-        passing_both: 0, matching_expected_failure: 0, missing_evidence: 0, mismatches: 0,
+        passing_both: 0, matching_expected_failure: 0, matched_declared_migration: 0, missing_evidence: 0, mismatches: 0,
         strict_agreement: None, complete_parity: false, cases: Vec::new(), manifest_errors: Vec::new() };
     if ledger.schema_version != 1 { report.manifest_errors.push("unsupported ledger schema version".into()); }
     let mut reference_by_case = BTreeMap::new();
@@ -372,6 +441,7 @@ pub fn compare(ledger: &Ledger, reference: &[CaseReceipt], native: &[CaseReceipt
         match case.disposition {
             Disposition::PassingBoth => report.passing_both += 1,
             Disposition::MatchingExpectedFailure => report.matching_expected_failure += 1,
+            Disposition::MatchedDeclaredMigration => report.matched_declared_migration += 1,
             Disposition::Mismatch => report.mismatches += 1,
             Disposition::MissingEvidence => report.missing_evidence += 1,
         }
@@ -385,7 +455,7 @@ pub fn compare(ledger: &Ledger, reference: &[CaseReceipt], native: &[CaseReceipt
     if report.required_groups == 0 { report.manifest_errors.push("no required assertion groups".into()); }
     if report.manifest_errors.is_empty() {
         report.strict_agreement = Some((report.passing_both + report.matching_expected_failure) as f64 / report.required_groups as f64);
-        report.complete_parity = report.missing_evidence == 0 && report.mismatches == 0;
+        report.complete_parity = report.missing_evidence == 0 && report.mismatches == 0 && report.matched_declared_migration == 0;
     }
     report
 }
