@@ -1,6 +1,6 @@
 use rtdb_plan::{Identifier, SourceSpan};
 use rtdb_types::{Anomaly, Result};
-use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, Tokenizer}};
+use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
 use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
@@ -77,10 +77,22 @@ pub(crate) enum TemporalExtent {
 }
 
 pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
-    let dialect = SqlDialect::default();
     let mut tokens = Vec::new();
+    tokenize_into(source, &mut tokens, |tokens, token| {
+        tokens.push(token);
+        Ok(())
+    })?;
+    Ok(tokens)
+}
+
+pub(super) fn tokenize_into(
+    source: &str,
+    tokens: &mut Vec<TokenWithSpan>,
+    mut append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<()>,
+) -> Result<()> {
+    let dialect = SqlDialect::default();
     let mut invalid_token = None;
-    let result = Tokenizer::new(&dialect, source).tokenize_with_location_into_buf_with_mapper(&mut tokens, |mut token| {
+    let result = Tokenizer::new(&dialect, source).try_tokenize_with_location_into_buf(tokens, |tokens, mut token| {
         if invalid_token.is_none() {
             let invalid = match &token.token {
                 Token::Word(word) if word.quote_style.is_some() && word.value.contains('/') => Some(("Quoted SQL identifiers cannot contain a slash", token.span)),
@@ -97,11 +109,13 @@ pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
                 _ => {},
             }
         }
-        token
+        append(tokens, token)
     });
     if let Some(error) = invalid_token { return Err(error); }
-    result.map_err(|error| sql_error(error.to_string(), source, Span::new(error.location, error.location)))?;
-    Ok(tokens)
+    result.map_err(|error| match error {
+        TokenizeBufferError::Lexer(error) => sql_error(error.to_string(), source, Span::new(error.location, error.location)),
+        TokenizeBufferError::Append(error) => error,
+    })
 }
 
 pub fn parse(sql: &str) -> Result<Vec<ParsedStatement>> {

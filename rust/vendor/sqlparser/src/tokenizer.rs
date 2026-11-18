@@ -29,6 +29,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
+use core::convert::Infallible;
 use core::num::NonZeroU8;
 use core::str::Chars;
 use core::{cmp, fmt};
@@ -802,6 +803,15 @@ impl fmt::Display for TokenizerError {
 
 impl core::error::Error for TokenizerError {}
 
+/// Failure while tokenizing into a fallible output buffer.
+#[derive(Debug)]
+pub enum TokenizeBufferError<E> {
+    /// The scanner could not produce the next token.
+    Lexer(TokenizerError),
+    /// The caller could not append the current token.
+    Append(E),
+}
+
 struct State<'a> {
     peekable: Peekable<Chars<'a>>,
     line: u64,
@@ -963,6 +973,26 @@ impl<'a> Tokenizer<'a> {
         buf: &mut Vec<TokenWithSpan>,
         mut mapper: impl FnMut(TokenWithSpan) -> TokenWithSpan,
     ) -> Result<(), TokenizerError> {
+        match self.try_tokenize_with_location_into_buf(buf, |buf, token| {
+            buf.push(mapper(token));
+            Ok::<(), Infallible>(())
+        }) {
+            Ok(()) => Ok(()),
+            Err(TokenizeBufferError::Lexer(error)) => Err(error),
+            Err(TokenizeBufferError::Append(never)) => match never {},
+        }
+    }
+
+    /// Tokenizes into the caller's buffer through a fallible appender.
+    /// Keep the existing prefix intact and add exactly one token on success.
+    /// The appender may normalize that token before adding it.
+    /// The next lexical step sees the last token in the buffer, including any supplied prefix.
+    /// An append error stops scanning before the next lexical step.
+    pub fn try_tokenize_with_location_into_buf<E>(
+        &mut self,
+        buf: &mut Vec<TokenWithSpan>,
+        mut append: impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<(), E>,
+    ) -> Result<(), TokenizeBufferError<E>> {
         let mut state = State {
             peekable: self.query.chars().peekable(),
             line: 1,
@@ -970,7 +1000,10 @@ impl<'a> Tokenizer<'a> {
         };
 
         let mut location = state.location();
-        while let Some(token) = self.next_token(&mut state, buf.last().map(|t| &t.token))? {
+        while let Some(token) = self
+            .next_token(&mut state, buf.last().map(|t| &t.token))
+            .map_err(TokenizeBufferError::Lexer)?
+        {
             let span = location.span_to(state.location());
 
             // Check if this is a multiline comment hint that should be expanded
@@ -980,10 +1013,10 @@ impl<'a> Tokenizer<'a> {
                         && comment.starts_with('!') =>
                 {
                     // Re-tokenize the hints and add them to the buffer
-                    self.tokenize_comment_hints(comment, span, buf, &mut mapper)?;
+                    self.tokenize_comment_hints(comment, span, buf, &mut append)?;
                 }
                 _ => {
-                    buf.push(mapper(TokenWithSpan { token, span }));
+                    append(buf, TokenWithSpan { token, span }).map_err(TokenizeBufferError::Append)?;
                 }
             }
 
@@ -994,13 +1027,13 @@ impl<'a> Tokenizer<'a> {
 
     /// Re-tokenize optimizer hints from a multiline comment and add them to the buffer.
     /// For example, `/*!50110 KEY_BLOCK_SIZE = 1024*/` becomes tokens for `KEY_BLOCK_SIZE = 1024`
-    fn tokenize_comment_hints(
+    fn tokenize_comment_hints<E>(
         &self,
         comment: &str,
         span: Span,
         buf: &mut Vec<TokenWithSpan>,
-        mut mapper: impl FnMut(TokenWithSpan) -> TokenWithSpan,
-    ) -> Result<(), TokenizerError> {
+        append: &mut impl FnMut(&mut Vec<TokenWithSpan>, TokenWithSpan) -> Result<(), E>,
+    ) -> Result<(), TokenizeBufferError<E>> {
         // Strip the leading '!' and any version digits (e.g., "50110")
         let hint_content = comment
             .strip_prefix('!')
@@ -1024,12 +1057,13 @@ impl<'a> Tokenizer<'a> {
 
         // Tokenize the hint content and add tokens to the buffer
         let mut location = state.location();
-        while let Some(token) = inner.next_token(&mut state, buf.last().map(|t| &t.token))? {
+        while let Some(token) = inner
+            .next_token(&mut state, buf.last().map(|t| &t.token))
+            .map_err(TokenizeBufferError::Lexer)?
+        {
             let token_span = location.span_to(state.location());
-            buf.push(mapper(TokenWithSpan {
-                token,
-                span: token_span,
-            }));
+            append(buf, TokenWithSpan { token, span: token_span })
+                .map_err(TokenizeBufferError::Append)?;
             location = state.location();
         }
 
@@ -2717,6 +2751,89 @@ mod tests {
         ];
 
         compare(expected, actual);
+    }
+
+    #[test]
+    fn fallible_located_append_preserves_mapped_context_across_hints() {
+        fn map_prefix(mut token: TokenWithSpan) -> TokenWithSpan {
+            if matches!(&token.token, Token::Number(_, false)) {
+                token.token = Token::make_word("prefix", None);
+            }
+            token
+        }
+
+        let dialect = MySqlDialect {};
+        let source = "0/*!50110._y*/._z";
+        let located = |token, start, end| {
+            TokenWithSpan::at(token, Location::new(1, start), Location::new(1, end))
+        };
+        let expected = vec![
+            located(Token::make_word("prefix", None), 1, 2),
+            located(Token::Period, 2, 3),
+            located(Token::make_word("_y", None), 3, 5),
+            located(Token::Period, 15, 16),
+            located(Token::make_word("_z", None), 16, 18),
+        ];
+        let mut legacy = Vec::new();
+        Tokenizer::new(&dialect, source)
+            .tokenize_with_location_into_buf_with_mapper(&mut legacy, map_prefix)
+            .unwrap();
+        assert_eq!(legacy, expected);
+        let mut tokens = Vec::new();
+        Tokenizer::new(&dialect, source)
+            .try_tokenize_with_location_into_buf(&mut tokens, |tokens, token| {
+                tokens.push(map_prefix(token));
+                Ok::<(), &str>(())
+            })
+            .unwrap();
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn append_denial_in_a_comment_hint_retains_the_accepted_prefix() {
+        let dialect = MySqlDialect {};
+        let mut tokens = Vec::new();
+        let result = Tokenizer::new(&dialect, "0/*!50110._y*/ 'unterminated")
+            .try_tokenize_with_location_into_buf(&mut tokens, |tokens, mut token| {
+                if token.token == Token::Period {
+                    return Err("hint denied");
+                }
+                token.token = Token::make_word("prefix", None);
+                tokens.push(token);
+                Ok(())
+            });
+        assert!(matches!(result, Err(TokenizeBufferError::Append("hint denied"))));
+        assert_eq!(
+            tokens,
+            vec![TokenWithSpan::at(
+                Token::make_word("prefix", None),
+                Location::new(1, 1),
+                Location::new(1, 2),
+            )]
+        );
+    }
+
+    #[test]
+    fn fallible_located_append_preserves_prefilled_context_and_lexer_errors() {
+        let dialect = GenericDialect {};
+        let prefix = TokenWithSpan::wrap(Token::make_word("prefix", None));
+        let mut tokens = vec![prefix.clone()];
+        let result = Tokenizer::new(&dialect, "._y 'unterminated")
+            .try_tokenize_with_location_into_buf(&mut tokens, |_, token| {
+                assert_eq!(
+                    token,
+                    TokenWithSpan::at(Token::Period, Location::new(1, 1), Location::new(1, 2))
+                );
+                Err("ordinary append denied")
+            });
+        assert!(matches!(result, Err(TokenizeBufferError::Append("ordinary append denied"))));
+        assert_eq!(tokens, vec![prefix.clone()]);
+        let result = Tokenizer::new(&dialect, "'unterminated")
+            .try_tokenize_with_location_into_buf(&mut tokens, |_, _| -> Result<(), &str> {
+                panic!("unterminated token cannot be appended")
+            });
+        assert!(matches!(result, Err(TokenizeBufferError::Lexer(_))));
+        assert_eq!(tokens, vec![prefix]);
     }
 
     #[test]
