@@ -257,6 +257,7 @@
 (deftest-original-api original-expr/test-lower-upper-period-fns-3660)
 (deftest-original-api original-expr/test-quote-ident)
 (deftest-original-api original-expr/test-parse-ident)
+(deftest-original-api original-expr/test-arithmetic-precedence-slt)
 (deftest-original-api original-expr/timestamp-literal-exception-3562)
 (deftest-original-api original-expr/variadic-overlaps-3441)
 

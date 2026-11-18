@@ -413,6 +413,7 @@ Unnamed table fields retain internal binding identities; wildcard projections as
 UNNEST uses the same table-column naming contract.
 FROM-first queries with an omitted projection expand the visible wildcard; an explicit empty SELECT projection retains zero-column rows.
 Each FROM-first WHERE or SELECT tail uses the columns produced by the preceding tail.
+`SELECT ALL` retains duplicate rows in both SELECT-first queries and FROM-first tails.
 After a SELECT tail, later tails resolve only the projected names and columns local to their own subqueries.
 GROUP BY and HAVING belong to the SELECT tail that follows them.
 ORDER BY can reference the final SELECT's input as well as its output names.

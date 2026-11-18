@@ -384,9 +384,9 @@ impl Context<'_> {
             input = self.bind_filter(input, predicate)?;
         }
         let distinct = match &select.distinct {
-            None => false,
+            None | Some(ast::Distinct::All) => false,
             Some(ast::Distinct::Distinct) => true,
-            Some(_) => return Err(unsupported("DISTINCT ON")),
+            Some(ast::Distinct::On(_)) => return Err(unsupported("DISTINCT ON")),
         };
         self.select_projection(input, SelectProjection {
             items: &select.projection,

@@ -46,6 +46,14 @@ async fn values_rows_accept_scalar_expressions_and_keep_row_constructor_widths()
 }
 
 #[tokio::test]
+async fn select_all_preserves_duplicate_rows() {
+    for sql in ["SELECT ALL x FROM (VALUES (1), (1)) t(x)", "FROM (VALUES (1), (1)) t(x) SELECT ALL x"] {
+        assert_eq!(query(sql, vec![]).await.unwrap(), [vec![Value::I64(1)], vec![Value::I64(1)]]);
+    }
+    assert_eq!(query("SELECT DISTINCT x FROM (VALUES (1), (1)) t(x)", vec![]).await.unwrap(), [vec![Value::I64(1)]]);
+}
+
+#[tokio::test]
 async fn scalar_subquery_in_select_and_where_preserves_empty_and_single_row_results() {
     assert_eq!(query("SELECT (SELECT 42) AS answer", vec![]).await.unwrap(), vec![vec![Value::I64(42)]]);
     assert_eq!(query("SELECT (SELECT x FROM (VALUES (1)) AS t(x) WHERE FALSE) AS answer", vec![]).await.unwrap(), vec![vec![Value::Null]]);
