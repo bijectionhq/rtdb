@@ -36,6 +36,33 @@ async fn temporal_precision_survives_sql_binding_and_arrow_execution() {
 }
 
 #[tokio::test]
+async fn malformed_timestamp_casts_report_the_accepted_prefix() {
+    for (input, display, index) in [
+        ("2021-10-21 12", "2021-10-21T12", 10),
+        ("2021-10-21T12:34:", "2021-10-21T12:34:", 16),
+        ("2021-10-21T12:34:56.1234567890", "2021-10-21T12:34:56.1234567890", 29),
+        ("2021-10-21T12:34:56+01:0", "2021-10-21T12:34:56+01:0", 22),
+        ("2021-10-21T12:34:56[Invalid/Zone]", "2021-10-21T12:34:56[Invalid/Zone]", 19),
+        ("2021-10-21T12:34Z 😀", "2021-10-21T12:34ZT😀", 17),
+    ] {
+        for target in ["TIMESTAMP", "TIMESTAMPTZ"] {
+            let error = query(&format!("SELECT CAST('{input}' AS {target})"), "UTC").await.unwrap_err();
+            assert_eq!(error.code, "xtdb/invalid-date-time");
+            assert_eq!(error.message.as_deref(), Some(format!(
+                "invalid timestamp: Text '{display}' could not be parsed, unparsed text found at index {index}",
+            ).as_str()));
+            assert_eq!(error.context["timestamp"], input);
+        }
+    }
+    let error = query("SELECT CAST('2021-1-21' AS TIMESTAMP)", "UTC").await.unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("invalid timestamp: Text '2021-1-21' could not be parsed at index 5"));
+    let error = query("SELECT CAST('2021-10-21T25:00' AS TIMESTAMP)", "UTC").await.unwrap_err();
+    assert_eq!(error.message.as_deref(), Some(
+        "invalid timestamp: Text '2021-10-21T25:00' could not be parsed: Invalid value for HourOfDay (valid values 0 - 23): 25",
+    ));
+}
+
+#[tokio::test]
 async fn duration_literals_execute_at_microsecond_precision() {
     for (source, micros) in [
         ("SELECT DURATION 'P1D' as duration", 86_400_000_000),

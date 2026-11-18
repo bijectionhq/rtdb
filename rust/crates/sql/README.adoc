@@ -454,6 +454,7 @@ Named bitwise functions remain outside the SQL function catalogue.
 `tests/bitwise.rs` covers operator output types, null demand, prepared argument admission and count overflow as unexecuted regression source.
 
 `EXTRACT(field FROM value)` and `DATE_TRUNC(field, value[, timezone])` lower to shared temporal expressions.
+A malformed timestamp cast identifies the rejected field or the position where parsing stopped.
 Unsupported EXTRACT field and type combinations identify the field and source type in the diagnostic.
 The `DATE_TRUNC` timezone argument uses Java zone ID syntax and reports the supplied timezone when it fails validation.
 SQL normalizes literal truncation fields to uppercase and accepts the grammar's bare field spelling.

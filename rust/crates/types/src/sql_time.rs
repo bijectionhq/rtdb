@@ -20,62 +20,141 @@ fn offset(text: &str) -> Option<FixedOffset> {
     FixedOffset::from_seconds(sign * (hours * 3600 + minutes * 60 + seconds)).ok()
 }
 
-fn date_fields(text: &str) -> Result<(i32, u32, u32)> {
-    let mut pieces = text.rsplitn(3, '-');
-    let day = pieces.next().ok_or_else(invalid)?;
-    let month = pieces.next().ok_or_else(invalid)?;
-    let year = pieces.next().ok_or_else(invalid)?;
-    let digits = year.strip_prefix(['+', '-']).unwrap_or(year);
-    if day.len() != 2 || month.len() != 2 || digits.is_empty() || digits.len() > 10
-        || !day.bytes().chain(month.bytes()).chain(digits.bytes()).all(|byte| byte.is_ascii_digit()) { return Err(invalid()); }
-    Ok((year.parse().map_err(|_| invalid())?, month.parse().map_err(|_| invalid())?, day.parse().map_err(|_| invalid())?))
+enum TimestampParseError {
+    Expected(usize),
+    Trailing(usize),
+    InvalidField { field: &'static str, range: &'static str, value: u32 },
+    OffsetFields,
+    OffsetRange,
+    DateOverflow,
 }
 
-fn timestamp_date(text: &str) -> Result<CivilDate> {
-    let year = text.rsplitn(3, '-').nth(2).ok_or_else(invalid)?;
-    if year.strip_prefix(['+', '-']).unwrap_or(year).len() > 9 { return Err(invalid()); }
-    let (year, month, day) = date_fields(text)?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) { return Err(invalid()); }
-    CivilDate::from_ymd(year, month, day.min(CivilDate::month_length(year, month))).map_err(|_| invalid())
-}
-
-fn timestamp_time(text: &str) -> Result<u64> {
-    let bytes = text.as_bytes();
-    if bytes.len() < 5 || bytes[2] != b':' || !bytes[..2].iter().chain(&bytes[3..5]).all(u8::is_ascii_digit) { return Err(invalid()); }
-    if bytes.len() != 5 {
-        if bytes.len() < 8 || bytes[5] != b':' || !bytes[6..8].iter().all(u8::is_ascii_digit) { return Err(invalid()); }
-        if bytes.len() > 8 && (bytes[8] != b'.' || bytes.len() > 18 || !bytes[9..].iter().all(u8::is_ascii_digit)) { return Err(invalid()); }
+impl TimestampParseError {
+    fn into_anomaly(self, source: &str) -> Anomaly {
+        let mut text = source.replace(' ', "T");
+        let mut utf16 = 0;
+        if let Some((index, _)) = text.char_indices().find(|(_, c)| {
+            utf16 += c.len_utf16();
+            utf16 > 64
+        }) {
+            text.truncate(index);
+            text.push_str("...");
+        }
+        let description = match self {
+            Self::Expected(index) => format!(" at index {index}"),
+            Self::Trailing(index) => format!(", unparsed text found at index {index}"),
+            Self::InvalidField { field, range, value } =>
+                format!(": Invalid value for {field} (valid values {range}): {value}"),
+            Self::OffsetFields => ": Value out of range: Hour[0-23], Minute[0-59], Second[0-59]".into(),
+            Self::OffsetRange => ": Zone offset not in valid range: -18:00 to +18:00".into(),
+            Self::DateOverflow => return invalid(),
+        };
+        Anomaly::incorrect("xtdb/invalid-date-time", format!("invalid timestamp: Text '{text}' could not be parsed{description}"))
+            .with_context("timestamp", source.into())
     }
-    let pair = |at: usize| u32::from(bytes[at] - b'0') * 10 + u32::from(bytes[at + 1] - b'0');
-    let (hour, minute) = (pair(0), pair(3));
-    let second = if bytes.len() >= 8 { pair(6) } else { 0 };
-    let nanos = bytes.get(9..).unwrap_or_default().iter().fold(0u32, |nanos, byte| nanos * 10 + u32::from(byte - b'0')) * 10u32.pow(9 - bytes.len().saturating_sub(9) as u32);
-    if hour == 24 && minute == 0 && second == 0 && nanos == 0 { return Ok(crate::NANOS_PER_DAY); }
-    if hour > 23 || minute > 59 || second > 59 { return Err(invalid()); }
-    Ok(u64::from(hour * 3600 + minute * 60 + second) * 1_000_000_000 + u64::from(nanos))
 }
 
-fn parse(text: &str) -> Result<ParsedTimestamp<'_>> {
-    let (text, zone) = if text.ends_with(']') {
-        let start = text.rfind('[').ok_or_else(invalid)?;
-        let zone = &text[start + 1..text.len() - 1];
-        if zone.is_empty() { return Err(invalid()); }
-        (&text[..start], Some(zone))
-    } else { (text, None) };
-    let date_end = text.char_indices().skip(1).filter(|(_, ch)| *ch == '-').nth(1).map(|(at, _)| at + 3).ok_or_else(invalid)?;
-    let day = timestamp_date(text.get(..date_end).ok_or_else(invalid)?)?;
-    let rest = text.get(date_end..).ok_or_else(invalid)?;
-    let has_clock = rest.starts_with(['T', ' ']);
-    let (clock, offset_text) = if let Some(clock) = rest.strip_prefix('T').or_else(|| rest.strip_prefix(' ')) {
-        let end = clock.find(['Z', '+', '-']).unwrap_or(clock.len());
-        (timestamp_time(&clock[..end])?, &clock[end..])
-    } else { (0, rest) };
-    let offset = if offset_text.is_empty() { None } else { Some(offset(offset_text).ok_or_else(invalid)?) };
-    let local = if clock == crate::NANOS_PER_DAY { CivilDateTime::midnight(day.plus_days(1).map_err(|_| invalid())?) }
-        else { CivilDateTime::new(day, clock).map_err(|_| invalid())? };
-    if let Some(zone) = zone { ZoneId::parse(zone).map_err(|_| invalid())?; }
-    Ok(ParsedTimestamp { local, has_clock, zone, offset })
+fn digits(bytes: &[u8], start: usize) -> Option<u32> {
+    let pair = bytes.get(start..start + 2)?;
+    if !pair.iter().all(u8::is_ascii_digit) { return None; }
+    Some(u32::from(pair[0] - b'0') * 10 + u32::from(pair[1] - b'0'))
 }
+
+fn optional_pair(bytes: &[u8], end: &mut usize) -> Option<u32> {
+    if bytes.get(*end) != Some(&b':') { return None; }
+    let value = digits(bytes, *end + 1)?;
+    *end += 3;
+    Some(value)
+}
+
+fn clock_prefix(bytes: &[u8], start: usize) -> Option<([u32; 4], usize)> {
+    if !matches!(bytes.get(start), Some(b'T' | b' ')) { return None; }
+    let hour = digits(bytes, start + 1)?;
+    let mut end = start + 3;
+    let minute = optional_pair(bytes, &mut end)?;
+    let mut nanos = 0;
+    let second = optional_pair(bytes, &mut end);
+    if second.is_some() && bytes.get(end) == Some(&b'.') {
+        end += 1;
+        let fraction = bytes[end..].iter().take(9).take_while(|byte| byte.is_ascii_digit());
+        let width = fraction.clone().count();
+        nanos = fraction.fold(0, |value, byte| value * 10 + u32::from(byte - b'0')) * 10_u32.pow(9 - width as u32);
+        end += width;
+    }
+    Some(([hour, minute, second.unwrap_or(0), nanos], end))
+}
+
+fn timestamp_offset(bytes: &[u8], start: usize) -> std::result::Result<(Option<FixedOffset>, usize), TimestampParseError> {
+    let sign = match bytes.get(start) {
+        Some(b'Z') => return Ok((Some(FixedOffset::UTC), start + 1)),
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return Ok((None, start)),
+    };
+    let Some(hour) = digits(bytes, start + 1) else { return Ok((None, start)); };
+    let mut end = start + 3;
+    let minute = optional_pair(bytes, &mut end);
+    let second = minute.and_then(|_| optional_pair(bytes, &mut end)).unwrap_or(0);
+    let minute = minute.unwrap_or(0);
+    if hour > 23 || minute > 59 || second > 59 { return Err(TimestampParseError::OffsetFields); }
+    let seconds = sign * (hour * 3600 + minute * 60 + second) as i32;
+    let offset = FixedOffset::from_seconds(seconds).map_err(|_| TimestampParseError::OffsetRange)?;
+    Ok((Some(offset), end))
+}
+
+fn valid_field(value: u32, field: &'static str, range: &'static str, bounds: std::ops::RangeInclusive<u32>) -> std::result::Result<(), TimestampParseError> {
+    if bounds.contains(&value) { Ok(()) } else { Err(TimestampParseError::InvalidField { field, range, value }) }
+}
+
+fn scan_timestamp(text: &str) -> std::result::Result<ParsedTimestamp<'_>, TimestampParseError> {
+    use TimestampParseError::{DateOverflow, Expected, Trailing};
+    let bytes = text.as_bytes();
+    let signed = usize::from(matches!(bytes.first(), Some(b'+' | b'-')));
+    let digits_end = signed + bytes[signed..].iter().take(9).take_while(|byte| byte.is_ascii_digit()).count();
+    if digits_end == signed { return Err(Expected(signed)); }
+    if bytes.get(digits_end) != Some(&b'-') { return Err(Expected(digits_end)); }
+    let year: i32 = text[..digits_end].parse().map_err(|_| Expected(signed))?;
+    let month_start = digits_end + 1;
+    let month = digits(bytes, month_start).ok_or(Expected(month_start))?;
+    let day_start = month_start + 3;
+    if bytes.get(day_start - 1) != Some(&b'-') { return Err(Expected(day_start - 1)); }
+    let day = digits(bytes, day_start).ok_or(Expected(day_start))?;
+    let date_end = day_start + 2;
+    let clock = clock_prefix(bytes, date_end);
+    let (offset, mut end) = timestamp_offset(bytes, clock.map_or(date_end, |(_, end)| end))?;
+    let mut zone = None;
+    if bytes.get(end) == Some(&b'[')
+        && let Some(relative) = text[end + 1..].find(']')
+    {
+        let name = &text[end + 1..end + 1 + relative];
+        if ZoneId::parse(name).is_ok() {
+            zone = Some(name);
+            end += relative + 2;
+        }
+    }
+    if end != bytes.len() { return Err(Trailing(text[..end].encode_utf16().count())); }
+
+    valid_field(month, "MonthOfYear", "1 - 12", 1..=12)?;
+    valid_field(day, "DayOfMonth", "1 - 28/31", 1..=31)?;
+    let mut date = CivilDate::from_ymd(year, month, day.min(CivilDate::month_length(year, month))).map_err(|_| DateOverflow)?;
+    let clock_nanos = match clock {
+        None => 0,
+        Some(([24, 0, 0, 0], _)) => {
+            date = date.plus_days(1).map_err(|_| DateOverflow)?;
+            0
+        }
+        Some(([hour, minute, second, nanos], _)) => {
+            valid_field(hour, "HourOfDay", "0 - 23", 0..=23)?;
+            valid_field(minute, "MinuteOfHour", "0 - 59", 0..=59)?;
+            valid_field(second, "SecondOfMinute", "0 - 59", 0..=59)?;
+            u64::from(hour * 3600 + minute * 60 + second) * 1_000_000_000 + u64::from(nanos)
+        }
+    };
+    let local = CivilDateTime::new(date, clock_nanos).map_err(|_| DateOverflow)?;
+    Ok(ParsedTimestamp { local, has_clock: clock.is_some(), zone, offset })
+}
+
+fn parse(text: &str) -> Result<ParsedTimestamp<'_>> { scan_timestamp(text).map_err(|_| invalid()) }
 
 impl ParsedTimestamp<'_> {
     fn instant(&self, default_zone: &str) -> Result<Instant> {
@@ -125,8 +204,9 @@ pub fn parse_sql_timestamp_literal(text: &str) -> Result<Value> {
 /// Parses the SQL timestamp grammar without reducing its fractional precision.
 /// Zoned casts require an explicit offset or region; local casts discard the parsed zone after resolving it.
 /// Returns epoch nanoseconds for zoned casts and local-clock nanoseconds for local casts.
+/// Invalid source text retains the original input and the position or field rejected by the timestamp grammar.
 pub fn parse_sql_timestamp_cast(text: &str, zoned: bool) -> Result<i128> {
-    let parsed = parse(text)?;
+    let parsed = scan_timestamp(text).map_err(|error| error.into_anomaly(text))?;
     let has_zone = parsed.zone.is_some() || parsed.offset.is_some();
     if zoned && !has_zone { return Err(invalid()); }
     if zoned {

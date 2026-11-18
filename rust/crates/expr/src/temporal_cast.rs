@@ -43,7 +43,13 @@ pub(crate) fn cast_resolved(value: &Value, target: &TemporalCast, timezone: &str
     let LogicalType::Scalar(scalar) = &result_type else { unreachable!() };
     let nanos = match value {
         Value::Utf8(text) => match &target.kind {
-            TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_) => rtdb_types::parse_sql_timestamp_cast(text, matches!(target.kind, TemporalKind::TimestampZone(_))).map_err(|_| invalid(text, if matches!(target.kind, TemporalKind::TimestampLocal) { "timestamp without timezone" } else { "timestamp with timezone" }))?,
+            TemporalKind::TimestampLocal | TemporalKind::TimestampZone(_) => {
+                let zoned = matches!(target.kind, TemporalKind::TimestampZone(_));
+                rtdb_types::parse_sql_timestamp_cast(text, zoned).map_err(|error| {
+                    if error.code == "xtdb/invalid-date-time" { error }
+                    else { invalid(text, if zoned { "timestamp with timezone" } else { "timestamp without timezone" }) }
+                })?
+            }
             TemporalKind::Time => time(text)?,
             TemporalKind::Duration => crate::temporal_text::duration_nanos(text)?,
         },
