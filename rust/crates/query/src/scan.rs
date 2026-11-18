@@ -12,7 +12,7 @@ use rtdb_index::{CatalogTrie, IndexBatch, LiveTable, RowSource, Snapshot, TrieSt
 use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
-use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages};
+use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages, select_pages_with_scratch};
 use rtdb_types::{Anomaly, EventHeader, Iid, Interval, Result, TemporalBounds, TimeUnit, Timestamp, Value};
 
 use crate::{context::Execution, cursor::OwnedRow, pages::{OwnedPage,PageBuilder,PageCursor}, scan_tasks::{PageRange,ScanTask,ScanTaskPlan}, invalid};
@@ -252,7 +252,36 @@ impl PartitionScan {
             summary.page_index = u32::try_from(tries.len().checked_add(index).ok_or_else(|| invalid("page-count", "Candidate count overflow"))?).map_err(|error| invalid("page-count", error))?;
             combined.push(summary);
         }
-        let selected: Vec<_> = select_pages(&combined, self.pruning(), |_| true).iter().filter(|summary| summary.iid_range.is_none_or(|(lower, upper)| self.path_matches(lower, upper))).map(|summary| summary.page_index as usize).filter(|index| *index < tries.len()).collect();
+        let (selected, selected_reservation) = {
+            let count = combined.len();
+            let _selector_reservation = if count == 0 { None } else {
+                let bytes = count.checked_mul(std::mem::size_of::<&PageSummary>()).and_then(|bytes| bytes.checked_add(256))
+                    .and_then(|bytes| bytes.checked_mul(3))
+                    .ok_or_else(|| invalid("scan-selector-size", "Scan selector capacity exceeds addressable memory"))?;
+                Some(memory.reserve(bytes)?)
+            };
+            let references = || -> Result<_> {
+                let mut entries = Vec::new();
+                entries.try_reserve_exact(count).map_err(|error| invalid("scan-selector-size", error))?;
+                Ok(entries)
+            };
+            let mut eligible = references()?;
+            let mut emitted = references()?;
+            let mut dependent = references()?;
+            select_pages_with_scratch(&combined, self.pruning(), |_| true, &mut eligible, &mut emitted, &mut dependent);
+            emitted.retain(|summary| summary.iid_range.is_none_or(|(lower, upper)| self.path_matches(lower, upper))
+                && (summary.page_index as usize) < tries.len());
+            let count = emitted.len();
+            let selected_reservation = if count == 0 { None } else {
+                let bytes = count.checked_mul(std::mem::size_of::<usize>()).and_then(|bytes| bytes.checked_add(256))
+                    .ok_or_else(|| invalid("scan-selected-file-size", "Selected scan index capacity exceeds addressable memory"))?;
+                Some(memory.reserve(bytes)?)
+            };
+            let mut selected = Vec::new();
+            selected.try_reserve_exact(count).map_err(|error| invalid("scan-selected-file-size", error))?;
+            selected.extend(emitted.iter().map(|summary| summary.page_index as usize));
+            (selected, selected_reservation)
+        };
         drop(combined);
         drop(summary_reservation);
         let file_count = selected.len();
@@ -304,6 +333,7 @@ impl PartitionScan {
                 }
             }
         }
+        drop(selected_reservation);
         drop(tries);
         drop(candidate_reservation);
         for (index, page) in pages.entries.iter_mut().enumerate() { page.summary.page_index = u32::try_from(index).map_err(|error| invalid("page-count", error))?; }
@@ -594,6 +624,7 @@ mod tests {
         let mut cursor = ScanCursor::new(scan.clone(), execution.clone(), None).await.unwrap();
         let cursor_open = memory.used_bytes();
         let candidate_extent = if files_used == 0 { 0 } else { std::mem::size_of::<&CatalogTrie>() + 256 };
+        let selected_extent = if files_used == 0 { 0 } else { std::mem::size_of::<usize>() + 256 };
         let file_extent = if files_used == 0 { 0 } else { std::mem::size_of::<DataFile>() + 256 };
         let stack_extent = if files_used == 0 { 0 } else { 4 * std::mem::size_of::<MetadataVisit>() + 256 };
         if files_used != 0 {
@@ -616,24 +647,31 @@ mod tests {
             assert_eq!(memory.used_bytes(), cursor_open);
 
             let summary_extent = std::mem::size_of::<PageSummary>() + 256;
-            let pressure = memory.reserve(memory.limit_bytes() - cursor_open - candidate_extent - summary_extent + 1).unwrap();
-            let retained = cursor_open + pressure.bytes() + candidate_extent;
-            let error = cursor.next_page().await.err().unwrap();
-            let expected = format!("Cannot reserve {summary_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
-            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
-            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
-            let partition = cursor.partitions.front().unwrap();
-            assert!(!partition.initialized);
-            assert!(partition.files.entries.is_empty());
-            assert!(partition.pages.entries.is_empty());
-            assert!(partition.tasks.is_none());
-            assert_eq!(storage.retained_bytes(), 0);
-            assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
-            drop(pressure);
+            let selector_extent = 3 * (std::mem::size_of::<&PageSummary>() + 256);
+            for (requested, earlier) in [
+                (summary_extent, candidate_extent),
+                (selector_extent, candidate_extent + summary_extent),
+                (selected_extent, candidate_extent + summary_extent + selector_extent),
+            ] {
+                let pressure = memory.reserve(memory.limit_bytes() - cursor_open - earlier - requested + 1).unwrap();
+                let retained = cursor_open + pressure.bytes() + earlier;
+                let error = cursor.next_page().await.err().unwrap();
+                let expected = format!("Cannot reserve {requested} bytes from budget {} with {retained} retained", memory.limit_bytes());
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+                let partition = cursor.partitions.front().unwrap();
+                assert!(!partition.initialized);
+                assert!(partition.files.entries.is_empty());
+                assert!(partition.pages.entries.is_empty());
+                assert!(partition.tasks.is_none());
+                assert_eq!(storage.retained_bytes(), 0);
+                assert_eq!(memory.used_bytes(), cursor_open + pressure.bytes());
+            }
+            assert_eq!(memory.used_bytes(), cursor_open);
 
-            let headroom = candidate_extent + metadata_charge + file_extent - 1;
+            let headroom = candidate_extent + selected_extent + metadata_charge + file_extent - 1;
             let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-            let retained = cursor_open + pressure.bytes() + candidate_extent + metadata_charge;
+            let retained = cursor_open + pressure.bytes() + candidate_extent + selected_extent + metadata_charge;
             let error = cursor.next_page().await.err().unwrap();
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {file_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
@@ -651,9 +689,9 @@ mod tests {
             assert_eq!(memory.used_bytes(), cursor_open);
 
             let previous_stack = 2 * std::mem::size_of::<MetadataVisit>() + 256;
-            let headroom = candidate_extent + metadata_charge + file_extent + previous_stack + stack_extent - 1;
+            let headroom = candidate_extent + selected_extent + metadata_charge + file_extent + previous_stack + stack_extent - 1;
             let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-            let retained = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + previous_stack;
+            let retained = cursor_open + pressure.bytes() + candidate_extent + selected_extent + metadata_charge + file_extent + previous_stack;
             let error = cursor.next_page().await.err().unwrap();
             assert_eq!(error.code, "rtdb/memory-budget-exceeded");
             let expected = format!("Cannot reserve {stack_extent} bytes from budget {} with {retained} retained", memory.limit_bytes());
@@ -672,9 +710,9 @@ mod tests {
         }
         let old_extent = 2 * std::mem::size_of::<Page>() + 256;
         let replacement_extent = 4 * std::mem::size_of::<Page>() + 256;
-        let headroom = candidate_extent + metadata_charge + file_extent + stack_extent + old_extent + replacement_extent - 1;
+        let headroom = candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + old_extent + replacement_extent - 1;
         let pressure = memory.reserve(memory.limit_bytes() - cursor_open - headroom).unwrap();
-        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + metadata_charge + file_extent + stack_extent + old_extent;
+        let retained_at_growth = cursor_open + pressure.bytes() + candidate_extent + selected_extent + metadata_charge + file_extent + stack_extent + old_extent;
         let error = cursor.next_page().await.err().unwrap();
         assert_eq!(error.code, "rtdb/memory-budget-exceeded");
         let expected = format!("Cannot reserve {replacement_extent} bytes from budget {} with {retained_at_growth} retained", memory.limit_bytes());

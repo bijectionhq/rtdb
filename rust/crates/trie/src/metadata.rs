@@ -41,45 +41,106 @@ pub struct PruningOptions {
     pub iid: Option<Iid>,
 }
 
-/// Returns candidate pages, preserving superseders, bound constraints, and erases.
-/// `content_matches` is conservative: false means no put in the page can match.
-/// Missing temporal statistics retain all IID-compatible pages.
-pub fn select_pages<'a>(pages: &'a [PageSummary], options: PruningOptions, mut content_matches: impl FnMut(&PageSummary) -> bool) -> Vec<&'a PageSummary> {
-    let pages: Vec<_> = pages.iter().filter(|page| match (options.iid, page.iid_range) {
+/// Returns matching pages followed by pages that can supersede, constrain or erase their rows.
+/// Both groups keep their input order.
+/// Calls `content_matches` in input order for IID-compatible pages whose temporal and recency bounds intersect.
+/// A false result means no put in the page can match.
+/// With temporal pruning bypassed or any IID-compatible page missing temporal bounds or recency, returns all IID-compatible pages in input order and skips the predicate.
+pub fn select_pages<'a>(pages: &'a [PageSummary], options: PruningOptions, content_matches: impl FnMut(&PageSummary) -> bool) -> Vec<&'a PageSummary> {
+    let mut eligible = Vec::new();
+    let mut emitted = Vec::new();
+    let mut dependent = Vec::new();
+    select_pages_with_scratch(pages, options, content_matches, &mut eligible, &mut emitted, &mut dependent);
+    emitted
+}
+
+/// Applies the selection rules of [`select_pages`] using caller-owned worklists.
+/// Clears all three worklists on entry and places the result in `emitted`.
+/// Returning all IID-compatible pages can swap the allocations of `eligible` and `emitted`.
+/// Capacity for one reference per page in each worklist avoids growth during selection.
+#[doc(hidden)]
+pub fn select_pages_with_scratch<'a>(
+    pages: &'a [PageSummary], options: PruningOptions, mut content_matches: impl FnMut(&PageSummary) -> bool,
+    eligible: &mut Vec<&'a PageSummary>, emitted: &mut Vec<&'a PageSummary>, dependent: &mut Vec<&'a PageSummary>,
+) {
+    eligible.clear();
+    emitted.clear();
+    dependent.clear();
+    eligible.extend(pages.iter().filter(|page| match (options.iid, page.iid_range) {
         (Some(iid), Some((lower, upper))) => lower <= iid && iid <= upper,
         _ => true,
-    }).collect();
-    if options.bypass_temporal_pruning || pages.iter().any(|page| page.temporal.is_none() || page.recency.is_none()) {
-        return pages;
+    }));
+    if options.bypass_temporal_pruning || eligible.iter().any(|page| page.temporal.is_none() || page.recency.is_none()) {
+        std::mem::swap(eligible, emitted);
+        return;
     }
     let minimum_recency = options.bounds.valid_time.lower().min(options.bounds.system_time.lower());
     let intersects = |page: &PageSummary, temporal: TemporalSummary| {
         temporal.intersects(options.bounds) && page.recency.is_none_or(|recency| minimum_recency < recency)
     };
-    let mut emit = Vec::new();
-    let mut candidates = Vec::new();
-    for page in pages {
+    for page in eligible.iter().copied() {
         let Some(temporal) = page.temporal else { continue; };
         if intersects(page, temporal) && content_matches(page) {
-            emit.push(page);
+            emitted.push(page);
         } else if temporal.intersects_system_time(options.bounds) || temporal.may_hold_erase() {
-            candidates.push(page);
+            dependent.push(page);
         }
     }
-    if emit.is_empty() { return emit; }
-    let min_valid_from = emit.iter().filter_map(|page| page.temporal.map(|t| t.min_valid_from)).min().unwrap_or(Timestamp::MIN);
-    let min_system_from = emit.iter().filter_map(|page| page.temporal.map(|t| t.min_system_from)).min().unwrap_or(Timestamp::MIN);
-    let mut result = emit.clone();
-    for page in candidates {
+    let initial_matches = emitted.len();
+    if initial_matches == 0 { return; }
+    let min_valid_from = emitted.iter().filter_map(|page| page.temporal.map(|t| t.min_valid_from)).min().unwrap_or(Timestamp::MIN);
+    let min_system_from = emitted.iter().filter_map(|page| page.temporal.map(|t| t.min_system_from)).min().unwrap_or(Timestamp::MIN);
+    for page in dependent.iter().copied() {
         let Some(temporal) = page.temporal else { continue; };
         if temporal.max_system_from < min_system_from { continue; }
         let retains = temporal.may_hold_erase() || if options.projects_temporal_columns && !options.clamp_valid_time {
             page.recency.is_none_or(|recency| recency >= min_valid_from || recency >= min_system_from)
-                && emit.iter().any(|candidate| candidate.temporal.is_none_or(|t| temporal.can_affect(t)))
+                && emitted[..initial_matches].iter().any(|candidate| candidate.temporal.is_none_or(|t| temporal.can_affect(t)))
         } else { intersects(page, temporal) };
-        if retains { result.push(page); }
+        if retains { emitted.push(page); }
     }
-    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rtdb_types::Interval;
+
+    #[test]
+    fn selection_checks_content_in_input_order_and_compares_only_initial_matches() {
+        let page = |page_index, min_valid_from, max_valid_to| PageSummary {
+            page_index,
+            temporal: Some(TemporalSummary { min_valid_from, max_valid_to, min_system_from: Timestamp(5), max_system_from: Timestamp(5) }),
+            recency: Some(Timestamp(100)),
+            iid_range: None,
+        };
+        let pages = [
+            page(0, Timestamp::MIN, Timestamp::MAX),
+            page(1, Timestamp(10), Timestamp(20)),
+            page(2, Timestamp(0), Timestamp(5)),
+        ];
+        let options = PruningOptions {
+            bounds: TemporalBounds {
+                valid_time: Interval::new(Timestamp(10), Timestamp(30)).unwrap(),
+                system_time: Interval::new(Timestamp(0), Timestamp(10)).unwrap(),
+            },
+            projects_temporal_columns: true, clamp_valid_time: false, bypass_temporal_pruning: false, iid: None,
+        };
+        let mut visited = Vec::new();
+        let selected = select_pages(&pages, options, |page| {
+            visited.push(page.page_index);
+            page.page_index == 1
+        });
+        assert_eq!(visited, [0, 1]);
+        assert_eq!(selected, [&pages[1], &pages[0]]);
+
+        let mut eligible = Vec::with_capacity(pages.len());
+        let mut emitted = Vec::with_capacity(pages.len());
+        let mut dependent = Vec::with_capacity(pages.len());
+        select_pages_with_scratch(&pages, PruningOptions { bypass_temporal_pruning: true, ..options },
+            |_| panic!("Bypassed pruning must skip content checks"), &mut eligible, &mut emitted, &mut dependent);
+        assert_eq!(emitted, [&pages[0], &pages[1], &pages[2]]);
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
