@@ -65,98 +65,117 @@
       (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
     ((t/join-fixtures native-fixtures) (:test (meta original)))))
 
-(deftest multiple-query-tails
-  (run-original-api-case #'original-sql/multiple-query-tails))
+(defmacro ^:private deftest-original-api [original]
+  `(deftest ~(symbol (name original))
+     (run-original-api-case (var ~original))))
 
-(deftest duration-literal-query
-  (run-original-api-case #'original-expr/duration-literal-query))
+(deftest-original-api original-sql/multiple-query-tails)
 
-(deftest plan-agg-subqueries-before-group-by-3821
-  (run-original-api-case #'original-sql/plan-agg-subqueries-before-group-by-3821))
+(deftest-original-api original-expr/duration-literal-query)
 
-(deftest test-select-without-from
-  (run-original-api-case #'original-sql/test-select-without-from))
+(deftest-original-api original-sql/plan-agg-subqueries-before-group-by-3821)
 
-(deftest test-generated-column-names
-  (run-original-api-case #'original-sql/test-generated-column-names))
+(deftest-original-api original-sql/test-select-without-from)
 
-(deftest test-empty-array-3818
-  (run-original-api-case #'original-sql/test-empty-array-3818))
+(deftest-original-api original-sql/test-generated-column-names)
 
-(deftest test-function-as-from-source
-  (run-original-api-case #'original-sql/test-function-as-from-source))
+(deftest-original-api original-sql/test-empty-array-3818)
 
-(deftest test-range-3212
-  (run-original-api-case #'original-sql/test-range-3212))
+(deftest-original-api original-sql/test-function-as-from-source)
 
-(deftest test-generate-series-3212
-  (run-original-api-case #'original-sql/test-generate-series-3212))
+(deftest-original-api original-sql/test-range-3212)
 
-(deftest test-order-nulls-first-last
-  (run-original-api-case #'original-sql/test-order-nulls-first-last))
+(deftest-original-api original-sql/test-generate-series-3212)
 
-(deftest test-xt-version
-  (run-original-api-case #'original-sql/test-xt-version))
+(deftest-original-api original-sql/test-order-nulls-first-last)
 
-(deftest test-bare-user-keyword
-  (run-original-api-case #'original-expr/test-bare-user-keyword))
+(deftest-original-api original-sql/test-xt-version)
 
-(deftest test-like-regex-query-case-insensitive
-  (run-original-api-case #'original-expr/test-like-regex-query-case-insensitive))
+(deftest-original-api original-expr/test-bare-user-keyword)
 
-(deftest test-ilike-query
-  (run-original-api-case #'original-expr/test-ilike-query))
+(deftest-original-api original-expr/test-like-regex-query-case-insensitive)
 
-(deftest test-postgres-regex-query
-  (run-original-api-case #'original-expr/test-postgres-regex-query))
+(deftest-original-api original-expr/test-ilike-query)
 
-(deftest test-reverse-query
-  (run-original-api-case #'original-expr/test-reverse-query))
+(deftest-original-api original-expr/test-postgres-regex-query)
 
-(deftest test-concat-function-query
-  (run-original-api-case #'original-expr/test-concat-function-query))
+(deftest-original-api original-expr/test-reverse-query)
 
-(deftest test-position-with-substring
-  (run-original-api-case #'original-expr/test-position-with-substring))
+(deftest-original-api original-expr/test-concat-function-query)
 
-(deftest test-substring-for-length-on-nested-substring
-  (run-original-api-case #'original-expr/test-substring-for-length-on-nested-substring))
+(deftest-original-api original-expr/test-position-with-substring)
 
-(deftest test-length-query
-  (run-original-api-case #'original-expr/test-length-query))
+(deftest-original-api original-expr/test-substring-for-length-on-nested-substring)
 
-(deftest test-replace
-  (run-original-api-case #'original-expr/test-replace))
+(deftest-original-api original-expr/test-length-query)
 
-(deftest interval-literal-query
-  (run-original-api-case #'original-expr/interval-literal-query))
+(deftest-original-api original-expr/test-replace)
 
-(deftest test-postgres-session-information-functions
-  (run-original-api-case #'original-expr/test-postgres-session-information-functions))
+(deftest-original-api original-expr/interval-literal-query)
 
-(deftest test-string-to-array
-  (run-original-api-case #'original-expr/test-string-to-array))
+(deftest-original-api original-expr/test-postgres-session-information-functions)
 
-(deftest test-array-upper
-  (run-original-api-case #'original-expr/test-array-upper))
+(deftest-original-api original-expr/test-string-to-array)
 
-(deftest test-array-lower
-  (run-original-api-case #'original-expr/test-array-lower))
+(deftest-original-api original-expr/test-array-upper)
 
-(deftest test-array-length
-  (run-original-api-case #'original-expr/test-array-length))
+(deftest-original-api original-expr/test-array-lower)
 
-(deftest test-uri-fns
-  (run-original-api-case #'original-expr/test-uri-fns))
+(deftest-original-api original-expr/test-array-length)
 
-(deftest period-nulls-4315
-  (run-original-api-case #'original-expr/period-nulls-4315))
+(deftest-original-api original-expr/test-uri-fns)
 
-(deftest test-lateral-with-unnest-4009
-  (run-original-api-case #'original-sql/test-lateral-with-unnest-4009))
+(deftest-original-api original-expr/period-nulls-4315)
 
-(deftest interval-read-write-bug-4066
-  (run-original-api-case #'original-sql/interval-read-write-bug-4066))
+(deftest-original-api original-sql/test-lateral-with-unnest-4009)
+
+(deftest-original-api original-sql/interval-read-write-bug-4066)
+
+(deftest-original-api original-sql/test-complex-empty-array)
+(deftest-original-api original-sql/array-agg-order-by)
+(deftest-original-api original-sql/test-select-star-lateral-join)
+(deftest-original-api original-sql/test-select-star-subquery)
+(deftest-original-api original-sql/order-by-ignored-4193)
+(deftest-original-api original-sql/anonymous-params-bound-in-lexical-order-5988)
+(deftest-original-api original-sql/test-all-quantified-comparison)
+(deftest-original-api original-sql/test-any-correlated-array-column-4895)
+(deftest-original-api original-sql/test-any-correlated-array-with-nulls-4895)
+(deftest-original-api original-sql/test-is-distinct-from)
+(deftest-original-api original-sql/test-in-subquery)
+(deftest-original-api original-sql/test-scalar-subquery-with-expressions)
+(deftest-original-api original-sql/test-aggregate-filter)
+(deftest-original-api original-sql/test-lead-lag-window-functions)
+(deftest-original-api original-sql/test-operators-with-unresolved-column-references-3640)
+(deftest-original-api original-sql/test-order-by-3065)
+(deftest-original-api original-sql/test-order-by-unqualified-derived-column-refs)
+(deftest-original-api original-sql/test-select-star-projections)
+(deftest-original-api original-sql/able-to-select-star-from-two-tables-bug-3389)
+(deftest-original-api original-sql/test-select-star-asterisk-clause)
+(deftest-original-api original-sql/test-select-star-qualified-join)
+(deftest-original-api original-sql/test-expand-asterisk-parenthesized-joined-table)
+(deftest-original-api original-sql/test-invalid-xt-id-in-query-3324)
+(deftest-original-api original-sql/test-case-sensitivity-in-delimited-cols)
+(deftest-original-api original-sql/test-ordering-of-intersect-and-union)
+(deftest-original-api original-sql/test-set-operations-with-different-column-names)
+(deftest-original-api original-sql/test-union-all)
+(deftest-original-api original-sql/test-union-except)
+(deftest-original-api original-sql/test-join-cond-subqueries)
+(deftest-original-api original-sql/test-erase-with-subquery)
+(deftest-original-api original-sql/select-star-on-non-existent-tables-3005)
+(deftest-original-api original-sql/nested-parenthesized-joined-tables-3185)
+(deftest-original-api original-sql/test-select-same-col-twice-3025)
+(deftest-original-api original-sql/test-assert-3445)
+(deftest-original-api original-sql/test-assert-exists-3686-3689)
+(deftest-original-api original-sql/test-portion-of-valid-time-boundary)
+(deftest-original-api original-sql/contains-precedence-bug-3473)
+(deftest-original-api original-sql/bound-period-contains-timestamp-expression-4381)
+(deftest-original-api original-sql/unescapes-escaped-quotes-3467)
+(deftest-original-api original-sql/info-schema-case-insensitivity-3511)
+(deftest-original-api original-sql/show-canned-responses)
+(deftest-original-api original-sql/valid-time-as-col-name-3661)
+(deftest-original-api original-sql/missing-values-in-insert-shouldnt-stop-ingestion-3721)
+(deftest-original-api original-sql/ignore-returning-keys-3668)
+(deftest-original-api original-sql/read-write-promotion-conflict-in-live-rel-3709)
 
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
@@ -182,11 +201,9 @@
 (deftest unnest-null-or-missing-4075
   (run-original-api-case #'original-sql/test-unnest-null-or-missing-4075))
 
-(deftest test-min-max-over-declared-empty-column-return-nil-6133
-  (run-original-api-case #'original-group-by/test-min-max-over-declared-empty-column-return-nil-6133))
+(deftest-original-api original-group-by/test-min-max-over-declared-empty-column-return-nil-6133)
 
-(deftest test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133
-  (run-original-api-case #'original-group-by/test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133))
+(deftest-original-api original-group-by/test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133)
 
 (deftest incompatible-extrema-retain-the-vector-type-in-transit
   (with-open [allocator (RootAllocator.)
