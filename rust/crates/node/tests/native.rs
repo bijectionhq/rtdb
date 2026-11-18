@@ -252,10 +252,23 @@ async fn control_result_retains_allocation_during_pending_write_and_releases_on_
 
 #[tokio::test]
 async fn control_and_resolver_text_casts_share_captured_relation_names() {
+    use rtdb_plan::{CastTarget, ControlStatement, Expr};
+    use rtdb_types::{LogicalType, ScalarType};
+
     let (node, driver) = running(options(), services()).await;
     let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
     let token = session.state().cancellation().child_token();
-    let statement = rtdb_sql::parse_control("SET application_name = CAST(CAST('pg_class' AS REGCLASS) AS TEXT)", &Default::default()).unwrap().unwrap();
+    let relation = Expr::Cast {
+        expr: Box::new(Expr::Literal(Value::Utf8("pg_class".into()))),
+        target: CastTarget::fixed(LogicalType::Scalar(ScalarType::RegClass)),
+    };
+    let statement = ControlStatement::SetParameter {
+        name: "application_name".into(),
+        value: Expr::Cast {
+            expr: Box::new(relation),
+            target: CastTarget::fixed(LogicalType::Scalar(ScalarType::Utf8)),
+        },
+    };
     drop(session.execute_control(&statement, &[], &token).await.unwrap());
     assert_eq!(session.state().parameter("application_name"), Some("pg_class"));
     let statement = TxOp::Sql { sql: "INSERT INTO docs (_id,value) VALUES (1,CAST(CAST('pg_class' AS REGCLASS) AS TEXT))".into(), args: None };
