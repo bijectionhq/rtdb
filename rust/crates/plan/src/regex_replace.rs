@@ -23,7 +23,7 @@ pub struct RegexForm(Backing);
 #[derive(Clone)]
 enum Backing {
     InlineNull,
-    Tracked { storage: Arc<storage::FormStorage>, reservation: Arc<MemoryReservation> },
+    Tracked { storage: Arc<storage::FormStorage>, _reservation: Arc<MemoryReservation> },
     Untracked(Arc<storage::FormStorage>),
 }
 

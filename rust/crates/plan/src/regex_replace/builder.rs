@@ -442,7 +442,7 @@ impl<'a> RegexFormBuilder<'a> {
         let storage = Arc::new(self.storage);
         Ok(RegexForm(match self.retained.lease {
             Lease::Untracked => Backing::Untracked(storage),
-            Lease::Tracked { reservation: Some(reservation), .. } => Backing::Tracked { storage, reservation: Arc::new(reservation) },
+            Lease::Tracked { reservation: Some(reservation), .. } => Backing::Tracked { storage, _reservation: Arc::new(reservation) },
             Lease::Tracked { reservation: None, .. } => unreachable!("stored root was admitted"),
         }))
     }

@@ -23,7 +23,6 @@ mod temporal_functions;
 mod interval_constructor;
 mod patch;
 mod explain;
-mod json;
 
 pub use catalog::*;
 pub use expr::*;

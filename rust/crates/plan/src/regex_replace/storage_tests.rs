@@ -32,7 +32,7 @@ fn paired_root_clones_keep_backing_and_ancestor_budget_alive_after_creator_exit(
     assert!(retained > 0);
     let clone = value.clone();
     match (&value.0, &clone.0) {
-        (Backing::Tracked { storage: a, reservation: ar }, Backing::Tracked { storage: b, reservation: br }) => { assert!(Arc::ptr_eq(a, b)); assert!(Arc::ptr_eq(ar, br)); }
+        (Backing::Tracked { storage: a, _reservation: ar }, Backing::Tracked { storage: b, _reservation: br }) => { assert!(Arc::ptr_eq(a, b)); assert!(Arc::ptr_eq(ar, br)); }
         _ => panic!("tracked roots"),
     }
     drop(value);
