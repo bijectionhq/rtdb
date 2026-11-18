@@ -1,10 +1,11 @@
 use std::{alloc::Layout, marker::PhantomData};
 use rtdb_types::{AllocationScope, Anomaly};
+use rtdb_types::java_text::JavaText;
 use crate::lexer::{IndexedLexeme, StreamError, TokenStream};
 use crate::parser::grammar::{Grammar, GrammarError, State, StateKindView, TokenSet, TokenType, TransitionView};
 use super::{Alternative, FactoryError, PredictionError, PredictionMode, PredictionStorage, Result, Semantic, push};
 use super::adaptive;
-use super::closure::{ClosureOptions, ClosureRound, with_closure_round_result};
+use super::closure::{ClosureOptions, ClosureRound, LoopEntryOption, SourceAssertions, with_closure_round_result};
 use super::dfa::PredictionDfas;
 use super::storage::{Retained, with_prediction_storage, with_prediction_storage_result};
 
@@ -61,7 +62,25 @@ impl FactoryError for RuntimeError<'_> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct CapturedClassPolicy { options: ClosureOptions }
-impl CapturedClassPolicy { pub(super) fn from_captured(options: ClosureOptions) -> Self { Self { options } } }
+impl CapturedClassPolicy {
+    pub(super) fn from_captured(options: ClosureOptions) -> Self { Self { options } }
+
+    pub(super) fn capture_parser_atn<'text, E>(
+        parser_atn_assertions: SourceAssertions,
+        get_safe_env: impl FnOnce(&'static str) -> std::result::Result<Option<JavaText<'text>>, E>,
+    ) -> std::result::Result<Self, E> {
+        let value = get_safe_env("TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT")?;
+        let disabled = value.is_some_and(|text| {
+            text.len_units() == 4 && text.units().zip(b"true").all(|(unit, &ascii)| {
+                unit == u16::from(ascii) || unit == u16::from(ascii.to_ascii_uppercase())
+            })
+        });
+        Ok(Self { options: ClosureOptions {
+            pruning: if disabled { LoopEntryOption::Disabled } else { LoopEntryOption::Enabled },
+            assertions: parser_atn_assertions,
+        } })
+    }
+}
 pub(super) struct ParserEnvironment { storage: PredictionStorage, policy: CapturedClassPolicy }
 impl ParserEnvironment {
     pub(super) fn new(mut storage: PredictionStorage, policy: CapturedClassPolicy, initialization: &AllocationScope) -> Result<Self> {

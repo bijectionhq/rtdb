@@ -380,7 +380,18 @@ Construction initializes the actual372 C3 decisions through existing admission a
 Exclusive session borrowing retains that same region across predictions, failures and subsequent sessions.
 This private caller-selected native region is not a production classloader sharing or concurrency policy.
 The host snapshot/assertion producer and production cache realm, shared budget, concurrent writer and observable history mapping remain OPEN.
-Policy capture consumes explicit pruning/assertion facts without reading host environment, inferring build assertions or selecting defaults.
+`CapturedClassPolicy::capture_parser_atn` consumes the already resolved assertion status of the defining `ParserATNSimulator` class and one supplied semantic `getSafeEnv` result for `TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT`.
+The provider supplies the frozen environment view for the equivalent class-initialization event.
+It calls the provider once and compares exact borrowed Java UTF-16 units without retaining the text or callback.
+Exactly four ASCII units spelling `true` in any case disable loop-entry pruning.
+A missing value or any other sequence enables it.
+The provider supplies a security-denied semantic lookup as missing.
+Provider failures propagate unchanged.
+The completed copyable policy can outlive the input and is reused by the existing environment across sessions.
+The assertion selection applies to `ParserATNSimulator` sites.
+Other classes have their own source assertion selections.
+`from_captured` remains available for explicit kernel fixtures.
+Native host capture, once-only class-realm publication and failed-initialization behavior remain OPEN.
 
 `ParserSession` is a passive parse transient owning the real admitted `TokenStream`, primary invocation records, current recognizer state/context, witnessed signed precedence stack, matched-EOF fact and failure state.
 Its append-only parse-branded records are the actual context control identities and own the bounded generated tree.

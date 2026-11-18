@@ -214,3 +214,186 @@ fn borrowed_recognition_fact_outlives_session_and_renders_from_original_sql() {
     let sql=String::from("1 @");let result=fixture(&sql,|s,_|{let mut entry=recursive(s,26,0)?;let result=s.with_prediction(83,|_,_,input|{input.lookahead(2)?;Ok(())});s.unroll_recursion(&mut entry)?;result});
     let Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error))))=result else{panic!("original SQL-borrowed recognition fact")};assert_eq!(error.span().start.byte,2);assert_eq!(error.span().end.byte,3);let memory=MemoryBudget::new(8192);let work=AllocationScope::new(&memory).unwrap();let rendered=error.render(&work).unwrap();assert!(rendered.anomaly().message.as_deref().unwrap().contains("'@'"));drop(rendered);drop(work);assert_eq!(memory.used_bytes(),0);
 }
+
+#[test]
+fn class_initialization_accepts_all_sixteen_exact_java_true_spellings() {
+    for assertions in [SourceAssertions::Enabled, SourceAssertions::Disabled] {
+        for mask in 0u8..16 {
+            let mut units = [b't', b'r', b'u', b'e'].map(u16::from);
+            for (index, unit) in units.iter_mut().enumerate() {
+                if mask & (1 << index) != 0 { *unit -= 32; }
+            }
+            let mut calls = 0;
+            let selected = CapturedClassPolicy::capture_parser_atn(assertions, |name| {
+                calls += 1;
+                assert_eq!(name, "TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT");
+                Ok::<_, std::convert::Infallible>(Some(JavaText::from_utf16(&units)))
+            }).unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(selected.options, ClosureOptions { pruning: LoopEntryOption::Disabled, assertions });
+        }
+    }
+}
+
+#[test]
+fn missing_and_nontrue_class_inputs_keep_pruning_enabled_without_trim_or_lossy_projection() {
+    let long = [u16::from(b't'); 128];
+    let units: &[&[u16]] = &[
+        &[0xd800], &[0xdc00], &[0xd800, 0xdc00],
+        &[0x74, 0x72, 0xd800, 0x65], &[0x74, 0x72, 0xdc00, 0x65],
+        &[0x74, 0x72, 0xfc, 0x65], &[0xff54, 0x72, 0x75, 0x65],
+        &[0x74, 0x72, 0x75, 0x65, 0], &long,
+    ];
+    let values = [None].into_iter()
+        .chain(["", "false", "yes", " true", "true ", "true\n", "tr ue", "TRUE\0", "truefalse"]
+            .into_iter().map(|value| Some(JavaText::from_utf8(value))))
+        .chain(units.iter().map(|value| Some(JavaText::from_utf16(value))));
+    for value in values {
+        for assertions in [SourceAssertions::Enabled, SourceAssertions::Disabled] {
+            let mut calls = 0;
+            let selected = CapturedClassPolicy::capture_parser_atn(assertions, |name| {
+                calls += 1;
+                assert_eq!(name, "TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT");
+                Ok::<_, std::convert::Infallible>(value)
+            }).unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(selected.options, ClosureOptions { pruning: LoopEntryOption::Enabled, assertions });
+        }
+    }
+}
+
+#[test]
+fn a_class_input_provider_error_keeps_its_identity_instead_of_selecting_a_policy() {
+    let failure = (17u32, 23u32);
+    let mut calls = 0;
+    let result = CapturedClassPolicy::capture_parser_atn(SourceAssertions::Enabled, |name| {
+        calls += 1;
+        assert_eq!(name, "TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT");
+        Err::<Option<JavaText<'_>>, _>(&failure)
+    });
+    let Err(error) = result else { panic!("provider failure must survive capture"); };
+    assert!(std::ptr::eq(error, &failure));
+    assert_eq!(calls, 1);
+}
+
+#[test]
+fn captured_class_inputs_outlive_the_provider_and_text_across_recursive_predictions() {
+    use std::cell::Cell;
+    use rtdb_types::java_text::JavaString;
+
+    struct Provider<'a>(&'a Cell<usize>);
+    impl Drop for Provider<'_> { fn drop(&mut self) { self.0.set(self.0.get() + 1); } }
+
+    for (spelling, pruning) in [("TrUe", LoopEntryOption::Disabled), ("false", LoopEntryOption::Enabled)] {
+        for assertions in [SourceAssertions::Enabled, SourceAssertions::Disabled] {
+            let text_memory = MemoryBudget::new(8192);
+            let released = Cell::new(0);
+            let calls = Cell::new(0);
+            let selected = {
+                let source = JavaString::copy_utf8(spelling, &text_memory).unwrap();
+                let text = source.view();
+                let provider = Provider(&released);
+                let calls = &calls;
+                CapturedClassPolicy::capture_parser_atn(assertions, move |name| {
+                    let _ = &provider;
+                    calls.set(calls.get() + 1);
+                    assert_eq!(name, "TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT");
+                    Ok::<_, std::convert::Infallible>(Some(text))
+                }).unwrap()
+            };
+            assert_eq!(released.get(), 1);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(text_memory.used_bytes(), 0);
+            let grammar_memory = MemoryBudget::new(8 << 20);
+            let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+            let memory = MemoryBudget::new(64 << 20);
+            let work = AllocationScope::new(&memory).unwrap();
+            let retained = MemoryBudget::new(64 << 20);
+            let mut environment = ParserEnvironment::new(PredictionStorage::new(grammar, &retained), selected, &work).unwrap();
+            let initialized = retained.used_bytes();
+            for _ in 0..2 {
+                with_bail_fallback(&mut environment, "DATE[][]", &work, |session, mode| {
+                    assert_eq!(mode, PredictionMode::Sll);
+                    assert_eq!(session.environment.policy.options, ClosureOptions { pruning, assertions });
+                    let root = session.data_type_sll()?;
+                    let view = session.invocation_view().context(root).unwrap();
+                    assert_eq!(view.class(), Some(ContextClass::ArrayType));
+                    assert_eq!((view.start().unwrap().index(), view.stop().unwrap().index()), (0, 4));
+                    let [ContextChild::Context(inner), ContextChild::Terminal(open), ContextChild::Terminal(close)] = view.children() else {
+                        panic!("actual recursive array children");
+                    };
+                    assert_eq!((open.index(), open.lexeme().raw(), close.index(), close.lexeme().raw()), (3, "[", 4, "]"));
+                    assert_eq!(session.invocation_view().context(*inner).unwrap().class(), Some(ContextClass::ArrayType));
+                    assert!(session.current().is_none());
+                    assert_eq!(session.precedence(), 0);
+                    Ok(())
+                }).unwrap();
+                assert_eq!(calls.get(), 1);
+                assert_eq!(environment.policy, selected);
+                assert!(retained.used_bytes() >= initialized);
+            }
+            drop(environment);
+            assert_eq!(retained.used_bytes(), 0);
+            assert_eq!(grammar_memory.used_bytes(), 0);
+            drop(work);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn captured_class_assertion_status_controls_the_reached_prediction_assertion() {
+    use super::super::SetMode;
+    use super::super::closure::StartSet;
+
+    for assertions in [SourceAssertions::Enabled, SourceAssertions::Disabled] {
+        let selected = CapturedClassPolicy::capture_parser_atn(assertions, |name| {
+            assert_eq!(name, "TURN_OFF_LR_LOOP_ENTRY_BRANCH_OPT");
+            Ok::<_, std::convert::Infallible>(None)
+        }).unwrap();
+        let grammar_memory = MemoryBudget::new(8 << 20);
+        let grammar = OwnedGrammar::load(&grammar_memory).unwrap();
+        let memory = MemoryBudget::new(64 << 20);
+        let work = AllocationScope::new(&memory).unwrap();
+        let retained = MemoryBudget::new(64 << 20);
+        let mut environment = ParserEnvironment::new(PredictionStorage::new(grammar, &retained), selected, &work).unwrap();
+        let result = with_parser_session(&mut environment, "1", &work, |session| {
+            let mut entry = recursive(session, 26, 0)?;
+            let result = session.with_prediction(83, |round, _, input| {
+                let StartSet::Precedence(start) = round.local_start()? else { panic!("dataType precedence start"); };
+                let local = round.precedence_filter(start, input.precedence())?;
+                let (key, parent) = {
+                    let (configs, contexts) = round.parts();
+                    let grammar = contexts.grammar();
+                    let parent = contexts.singleton(contexts.empty(), grammar.state(353)?)?;
+                    let alternative = configs.alternative(grammar.decision(83)?, 1)?;
+                    let key = configs.create(grammar.state(1)?, alternative, parent, Semantic::Unpredicated)?;
+                    configs.clear(local.key())?;
+                    assert_eq!(configs.view_set(local.key()).mode(), SetMode::Local);
+                    configs.add_uncached(local.key(), key, contexts)?;
+                    (key, parent)
+                };
+                let reached = round.local_reach(local, TokenType::EOF);
+                if assertions == SourceAssertions::Enabled {
+                    assert!(matches!(reached, Err(PredictionError::SourceAssertion(SourceAssertionSite::ReachStopEmpty))));
+                } else {
+                    let output = reached.as_ref().unwrap().unwrap();
+                    let (configs, _) = round.parts();
+                    assert_eq!(configs.view_set(output.key()).entry(0), Some(key));
+                    assert_eq!(configs.view(key).context(), parent);
+                }
+                reached.map(|_| ()).map_err(RuntimeError::from)
+            });
+            assert_eq!(session.input_index(), Some(0));
+            session.unroll_recursion(&mut entry)?;
+            assert_eq!(session.precedence(), 0);
+            result
+        });
+        assert_eq!(result.is_err(), assertions == SourceAssertions::Enabled);
+        drop(environment);
+        assert_eq!(retained.used_bytes(), 0);
+        assert_eq!(grammar_memory.used_bytes(), 0);
+        drop(work);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
