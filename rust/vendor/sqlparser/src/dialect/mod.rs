@@ -613,6 +613,11 @@ pub trait Dialect: Debug + Any {
         None
     }
 
+    /// Supports the `USING CHARACTERS` and `USING OCTETS` length units.
+    fn supports_character_length_units(&self) -> bool {
+        false
+    }
+
     /// Dialect-specific prefix parser override
     fn parse_prefix(&self, _parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
         // return None to fall back to the default behavior

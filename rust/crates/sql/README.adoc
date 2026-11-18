@@ -14,6 +14,14 @@ Unsupported aggregate factories and modifiers fail during preparation.
 `tests/aggregate_forms.rs` retains these cases as unexecuted regression source.
 
 Text expressions bind POSITION with CHARACTERS or OCTETS units, OVERLAY with an explicit or inferred replacement length, and binary substring/trim/concatenation.
+`CHARACTER_LENGTH` and `CHAR_LENGTH` count Unicode code points with no units clause or with `USING CHARACTERS`.
+`USING OCTETS` counts bytes in text and binary input.
+Both unit forms propagate null.
+The parser retains the operand's original parameter slots and locations.
+Binding visits the operand first and then requires uppercase `CHARACTERS` or `OCTETS`.
+Other spellings of these keywords report `xtdb.error/illegal-arg` during binding.
+`tests/strings.rs` retains the six planning observations from `xtdb.sql.expr-test/test-character-length-expr` and `test-char-length-alias`, and adds execution and error source cases.
+`tests/generic_admission.rs` retains prepared parameter cases.
 The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
 REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.
 The SQL binder validates the literal arguments before retaining their metadata in the recipe.
@@ -539,7 +547,7 @@ JSON access binds more tightly than unary arithmetic and multiplication, and les
 Scalar argument selection retains the reference's null and control-flow demand rules.
 For example, `POWER(1 / 0, NULL)` returns null, while `POWER(CASE WHEN 1 / 0 = 0 THEN 1 ELSE 2 END, NULL)` evaluates the condition and fails.
 Searched `CASE` tests use `IS TRUE`, so a nonboolean monomorphic test can return false without consuming its payload.
-`CHAR_LENGTH` lowers to the shared `character_length` function.
+`CHAR_LENGTH` without a units clause lowers to the shared `character_length` function.
 
 Dynamic PATCH lowering preserves direct datetime, parameter and current-timestamp endpoints for PatchGaps.
 Session timezone binding around a direct current-timestamp call retains its captured instant endpoint.
@@ -557,7 +565,7 @@ Array subscripts validate the index type after prepared parameters are refined.
 A floating index fails function admission, and a null index yields null.
 
 The SQL function catalog is checked before generic method admission.
-`CHAR_LENGTH` remains a SQL spelling of `character_length`, while unregistered SQL function names fail even with null arguments.
+Unregistered SQL function names fail even with null arguments.
 
 Regex search predicates support `LIKE_REGEX`, optional `NOT` and `FLAG`, and PostgreSQL `~`, `~*`, `!~` and `!~*`.
 The case-insensitive PostgreSQL forms supply literal `i` flags; an omitted FLAG supplies an empty literal.

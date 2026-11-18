@@ -556,6 +556,36 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
 
     #[test]
+    fn length_units_keep_lexical_parameter_occurrences_and_spans() {
+        use sqlparser::ast::Spanned;
+
+        let source = "SELECT 'é', CHAR_LENGTH(? USING CHARACTERS), CHARACTER_LENGTH($2 USING OCTETS), ?";
+        let parsed = parse(source).unwrap();
+        let [statement] = parsed.as_slice() else { panic!("one statement") };
+        assert_eq!(statement.parameter_count(), 2);
+        let Syntax::Standard(ast::Statement::Query(query)) = &statement.tree.statement else { panic!("query") };
+        let ast::SetExpr::Select(select) = query.body.as_ref() else { panic!("select") };
+        for (index, spelling, parameter, parameter_text, units) in [
+            (1, "CHAR_LENGTH", "$1", "?", "CHARACTERS"),
+            (2, "CHARACTER_LENGTH", "$2", "$2", "OCTETS"),
+        ] {
+            let ast::SelectItem::UnnamedExpr(ast::Expr::Function(function)) = &select.projection[index] else { panic!("function") };
+            let ast::FunctionArguments::List(arguments) = &function.args else { panic!("argument list") };
+            let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Value(value)))] = arguments.args.as_slice() else { panic!("parameter argument") };
+            let [ast::FunctionArgumentClause::UsingCharacterLengthUnits(unit)] = arguments.clauses.as_slice() else { panic!("unit clause") };
+            assert_eq!(value.value, ast::Value::Placeholder(parameter.into()));
+            for (span, expected) in [(function.name.span(), spelling), (value.span, parameter_text), (unit.span(), units)] {
+                let span = source_span(source, span);
+                assert_eq!(&source[span.start..span.end], expected);
+            }
+        }
+        let ast::SelectItem::UnnamedExpr(ast::Expr::Value(last)) = &select.projection[3] else { panic!("last parameter") };
+        assert_eq!(last.value, ast::Value::Placeholder("$2".into()));
+        assert_eq!(source_span(source, last.span).start, source.rfind('?').unwrap());
+        assert!(Parser::parse_sql(&GenericDialect {}, source).is_err());
+    }
+
+    #[test]
     fn values_row_ast_retains_scalar_and_tuple_syntax() {
         use sqlparser::ast::Spanned;
         let source = "VALUES 1, (2, 3), ROW(), ()";

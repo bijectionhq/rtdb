@@ -8330,6 +8330,8 @@ impl fmt::Display for FunctionArgumentList {
 #[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
 /// Clauses that can appear inside a function argument list.
 pub enum FunctionArgumentClause {
+    /// A `USING CHARACTERS` or `USING OCTETS` clause after the argument.
+    UsingCharacterLengthUnits(CharacterLengthUnits),
     /// Indicates how `NULL`s should be handled in the calculation, e.g. in `FIRST_VALUE` on [BigQuery].
     ///
     /// Syntax:
@@ -8384,6 +8386,7 @@ pub enum FunctionArgumentClause {
 impl fmt::Display for FunctionArgumentClause {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            FunctionArgumentClause::UsingCharacterLengthUnits(units) => write!(f, "USING {units}"),
             FunctionArgumentClause::IgnoreOrRespectNulls(null_treatment) => {
                 write!(f, "{null_treatment}")
             }
@@ -8399,6 +8402,26 @@ impl fmt::Display for FunctionArgumentClause {
             FunctionArgumentClause::JsonReturningClause(returning_clause) => {
                 write!(f, "{returning_clause}")
             }
+        }
+    }
+}
+
+/// The unit specified by a character length clause.
+/// The identifier retains the unit token’s spelling and span.
+#[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "visitor", derive(Visit, VisitMut))]
+pub enum CharacterLengthUnits {
+    /// Count characters.
+    Characters(Ident),
+    /// Count octets.
+    Octets(Ident),
+}
+
+impl fmt::Display for CharacterLengthUnits {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Characters(unit) | Self::Octets(unit) => unit.fmt(f),
         }
     }
 }

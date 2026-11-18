@@ -134,9 +134,9 @@ impl Context<'_> {
         }
         if let ast::Expr::Function(function) = expression {
             if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
-            let arguments: &[ast::FunctionArg] = match &function.args {
-                ast::FunctionArguments::None => &[],
-                ast::FunctionArguments::List(arguments) if arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty() => &arguments.args,
+            let (arguments, units): (&[ast::FunctionArg], _) = match &function.args {
+                ast::FunctionArguments::None => (&[], None),
+                ast::FunctionArguments::List(arguments) => (&arguments.args, crate::expression::scalar_argument_units(arguments)?),
                 _ => return Err(unsupported("Scalar function argument modifiers")),
             };
             let name = crate::expression::scalar_name(function)?;
@@ -152,6 +152,7 @@ impl Context<'_> {
                 }
                 parameter_count = parameter_count.max(self.setting_value(argument)?.parameter_count());
             }
+            if let Some(units) = units { crate::expression::character_length_function(units)?; }
             return Ok(SettingValue::Unevaluated { parameter_count });
         }
         if let ast::Expr::Interval(interval) = expression {

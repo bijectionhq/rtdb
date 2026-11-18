@@ -192,9 +192,10 @@ impl Context<'_> {
                 if let Some(query) = array_query(function) {
                     return self.query_value(query, input, SubqueryValue::Array);
                 }
-                if let ast::FunctionArguments::List(arguments) = &function.args {
-                    if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(unsupported("Scalar function argument modifiers")); }
-                }
+                let units = match &function.args {
+                    ast::FunctionArguments::List(arguments) => scalar_argument_units(arguments)?,
+                    _ => None,
+                };
                 let name = scalar_name(function)?;
                 if name == "regexp_replace" {
                     let arguments = function_arguments(function)?;
@@ -246,6 +247,10 @@ impl Context<'_> {
                     }
                     _ => Err(unsupported("Named function arguments or scalar wildcard")),
                 }).collect::<Result<Vec<_>>>()?;
+                let name = match units {
+                    Some(units) => character_length_function(units)?.into(),
+                    None => name,
+                };
                 if matches!(name.as_str(), "pg_sleep" | "pg_sleep_for") {
                     if args.len() != 1 { return Err(error(format!("Function {name} requires one argument"))); }
                     call("sleep".into(), vec![Expr::Cast { expr: Box::new(args.into_iter().next().unwrap()), target: rtdb_plan::CastTarget::Fixed(LogicalType::Scalar(ScalarType::Duration(rtdb_types::TimeUnit::Millisecond))) }])?
@@ -441,6 +446,29 @@ pub(crate) fn bare_scalar_name(name: &rtdb_plan::Identifier, parts: usize) -> Op
         | "localtimestamp" | "localtime" | "localdate" | "local_timestamp" | "local_time"
         | "local_date" | "snapshot_token" if parts == 1 => Some(function),
         _ => None,
+    }
+}
+
+pub(crate) fn scalar_argument_units(arguments: &ast::FunctionArgumentList) -> Result<Option<&ast::CharacterLengthUnits>> {
+    if arguments.duplicate_treatment.is_none() {
+        match arguments.clauses.as_slice() {
+            [] => return Ok(None),
+            [ast::FunctionArgumentClause::UsingCharacterLengthUnits(units)] => return Ok(Some(units)),
+            _ => {}
+        }
+    }
+    Err(unsupported("Scalar function argument modifiers"))
+}
+
+pub(crate) fn character_length_function(units: &ast::CharacterLengthUnits) -> Result<&'static str> {
+    let (unit, accepted, function) = match units {
+        ast::CharacterLengthUnits::Characters(unit) => (unit, "CHARACTERS", "character_length"),
+        ast::CharacterLengthUnits::Octets(unit) => (unit, "OCTETS", "octet_length"),
+    };
+    if unit.value == accepted {
+        Ok(function)
+    } else {
+        Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {}", unit.value)))
     }
 }
 

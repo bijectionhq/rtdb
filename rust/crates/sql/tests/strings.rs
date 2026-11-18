@@ -27,6 +27,86 @@ async fn query(source: &str) -> Result<Vec<Vec<V>>> {
 }
 fn text(value: &str) -> V { V::Utf8(value.into()) }
 
+#[test]
+fn character_length_forms_select_the_pinned_scalar_and_projection_label() {
+    let context = context();
+    let options = PrepareOptions::default();
+    for spelling in ["CHARACTER_LENGTH", "CHAR_LENGTH"] {
+        for (clause, expected) in [
+            ("", "character_length"),
+            (" USING CHARACTERS", "character_length"),
+            (" USING OCTETS", "octet_length"),
+        ] {
+            let sql = format!("SELECT {spelling}(foo.a{clause}) FROM (VALUES ('é😀')) foo(a)");
+            let Statement::Query(relation) = prepare(&sql, &context.catalog, &options).unwrap().statement else {
+                panic!("query");
+            };
+            let expressions = relation.expressions();
+            let [rtdb_plan::Expr::Call { name, args, .. }] = expressions.as_slice() else {
+                panic!("scalar projection");
+            };
+            assert_eq!(name, expected, "{sql}");
+            assert!(matches!(args.as_slice(), [rtdb_plan::Expr::Column { .. }]), "{sql}");
+            assert_eq!(relation.schema().fields()[0].name, "_column_1", "{sql}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn character_length_units_count_unicode_and_preserve_nulls_and_binary_octets() {
+    let rows = query("SELECT CHAR_LENGTH('aé😀' USING CHARACTERS), CHARACTER_LENGTH('aé😀' USING OCTETS), \
+        CHARACTER_LENGTH(NULL USING CHARACTERS), CHAR_LENGTH(NULL USING OCTETS), CHAR_LENGTH(X'00FF' USING OCTETS), \
+        CHAR_LENGTH(CAST(CHARACTER_LENGTH('é😀' USING OCTETS) AS TEXT) USING CHARACTERS)")
+        .await.unwrap();
+    assert_eq!(rows, [vec![V::I32(3), V::I32(7), V::Null, V::Null, V::I32(2), V::I32(1)]]);
+    let error = query("SELECT CHAR_LENGTH(X'00FF' USING CHARACTERS)").await.unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/function-type-mismatch");
+}
+
+#[test]
+fn character_length_units_preserve_syntax_and_later_binding_errors() {
+    let context = context();
+    let options = PrepareOptions::default();
+    for spelling in ["CHAR_LENGTH", "CHARACTER_LENGTH"] {
+        for wrong_unit in ["BYTES", "\"OCTETS\"", "$1"] {
+            let sql = format!("SELECT {spelling}('x' USING {wrong_unit})");
+            let error = rtdb_sql::parse(&sql).unwrap_err();
+            assert_eq!(error.code, "xtdb/sql-error");
+            assert!(error.message.as_deref().is_some_and(|message| message.contains("CHARACTERS or OCTETS")), "{sql}: {error}");
+        }
+        for name in [format!("pg_catalog.{spelling}"), format!("\"{spelling}\"")] {
+            let sql = format!("SELECT {name}('x')");
+            assert!(rtdb_sql::parse(&sql).is_ok(), "{sql}");
+            let error = prepare(&sql, &context.catalog, &options).unwrap_err();
+            assert!(error.message.as_deref().is_some_and(|message| message.contains("Unknown function:")), "{sql}: {error}");
+            assert!(rtdb_sql::parse(&format!("SELECT {name}('x' USING OCTETS)")).is_err());
+        }
+        for argument in ["DISTINCT 'x'", "'x', 'y'", "'x' AS alias", "*"] {
+            let sql = format!("SELECT {spelling}({argument} USING OCTETS)");
+            assert!(rtdb_sql::parse(&sql).is_err(), "{sql}");
+        }
+        for null_treatment in ["IGNORE NULLS", "RESPECT NULLS"] {
+            for unit in ["CHARACTERS", "OCTETS"] {
+                let sql = format!("SELECT {spelling}('x' USING {unit}) {null_treatment}");
+                assert!(rtdb_sql::parse(&sql).is_err(), "{sql}");
+            }
+            let sql = format!("SELECT {spelling}('x') {null_treatment}");
+            assert!(prepare(&sql, &context.catalog, &options).is_ok(), "{sql}");
+        }
+        for unit in ["octets", "Characters"] {
+            let sql = format!("SELECT {spelling}('x' USING {unit})");
+            assert!(rtdb_sql::parse(&sql).is_ok(), "{sql}");
+            let error = prepare(&sql, &context.catalog, &options).unwrap_err();
+            assert_eq!(error.code, "xtdb.error/illegal-arg");
+            assert_eq!(error.message, Some(format!("No matching clause: {unit}")));
+        }
+        let sql = format!("SELECT {spelling}(CHAR_LENGTH('x' USING Characters) USING octets)");
+        let error = prepare(&sql, &context.catalog, &options).unwrap_err();
+        assert_eq!(error.code, "xtdb.error/illegal-arg");
+        assert_eq!(error.message.as_deref(), Some("No matching clause: Characters"));
+    }
+}
+
 #[tokio::test]
 async fn sql_concat_stringifies_arguments_and_treats_null_as_empty_text() {
     assert_eq!(query("SELECT CONCAT('a',NULL),CONCAT('a',1) AS test_output_2,CONCAT(1) AS test_output_3,CONCAT(NULL) AS test_output_4,CONCAT(X'0102',TRUE) AS test_output_5").await.unwrap(),

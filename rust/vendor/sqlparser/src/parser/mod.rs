@@ -2548,7 +2548,7 @@ impl<'a> Parser<'a> {
         self.maybe_parse(|p| {
             p.expect_keyword(Keyword::FN)?;
             let fn_name = p.parse_object_name(false)?;
-            let mut fn_call = p.parse_function_call(fn_name)?;
+            let mut fn_call = p.parse_function_call(fn_name, false)?;
             fn_call.uses_odbc_syntax = true;
             Ok(Expr::Function(fn_call))
         })
@@ -2573,10 +2573,18 @@ impl<'a> Parser<'a> {
 
     /// Parse a function call expression named by `name` and return it as an `Expr`.
     pub fn parse_function(&mut self, name: ObjectName) -> Result<Expr, ParserError> {
-        self.parse_function_call(name).map(Expr::Function)
+        let allow_length_units = self.dialect.supports_character_length_units()
+            && (Self::is_simple_unquoted_object_name(&name, "char_length")
+                || Self::is_simple_unquoted_object_name(&name, "character_length"));
+        self.parse_function_call(name, allow_length_units)
+            .map(Expr::Function)
     }
 
-    fn parse_function_call(&mut self, name: ObjectName) -> Result<Function, ParserError> {
+    fn parse_function_call(
+        &mut self,
+        name: ObjectName,
+        allow_length_units: bool,
+    ) -> Result<Function, ParserError> {
         self.expect_token(&Token::LParen)?;
 
         // Snowflake permits a subquery to be passed as an argument without
@@ -2601,7 +2609,7 @@ impl<'a> Parser<'a> {
         {
             self.parse_xmlparse_argument_list()?
         } else {
-            self.parse_function_argument_list()?
+            self.parse_function_argument_list(allow_length_units)?
         };
         let mut parameters = FunctionArguments::None;
         // ClickHouse aggregations support parametric functions like `HISTOGRAM(0.5, 0.6)(x, y)`
@@ -2610,7 +2618,7 @@ impl<'a> Parser<'a> {
             && self.consume_token(&Token::LParen)
         {
             parameters = FunctionArguments::List(args);
-            args = self.parse_function_argument_list()?;
+            args = self.parse_function_argument_list(false)?;
         }
 
         let within_group = if self.parse_keywords(&[Keyword::WITHIN, Keyword::GROUP]) {
@@ -2640,7 +2648,13 @@ impl<'a> Parser<'a> {
         let null_treatment = if args
             .clauses
             .iter()
-            .all(|clause| !matches!(clause, FunctionArgumentClause::IgnoreOrRespectNulls(_)))
+            .all(|clause| {
+                !matches!(
+                    clause,
+                    FunctionArgumentClause::IgnoreOrRespectNulls(_)
+                        | FunctionArgumentClause::UsingCharacterLengthUnits(_)
+                )
+            })
         {
             self.parse_null_treatment()?
         } else {
@@ -2689,7 +2703,7 @@ impl<'a> Parser<'a> {
     /// Parse time-related function `name` possibly followed by `(...)` arguments.
     pub fn parse_time_functions(&mut self, name: ObjectName) -> Result<Expr, ParserError> {
         let args = if self.consume_token(&Token::LParen) {
-            FunctionArguments::List(self.parse_function_argument_list()?)
+            FunctionArguments::List(self.parse_function_argument_list(false)?)
         } else {
             FunctionArguments::None
         };
@@ -13678,7 +13692,7 @@ impl<'a> Parser<'a> {
     pub fn parse_table_object(&mut self) -> Result<TableObject, ParserError> {
         if self.dialect.supports_insert_table_function() && self.parse_keyword(Keyword::FUNCTION) {
             let fn_name = self.parse_object_name(false)?;
-            self.parse_function_call(fn_name)
+            self.parse_function_call(fn_name, false)
                 .map(TableObject::TableFunction)
         } else if self.dialect.supports_insert_table_query() && self.peek_subquery_or_cte_start() {
             self.parse_parenthesized(|p| p.parse_query())
@@ -19194,7 +19208,10 @@ impl<'a> Parser<'a> {
     /// FIRST_VALUE(x ORDER BY 1,2,3);
     /// FIRST_VALUE(x IGNORE NULL);
     /// ```
-    fn parse_function_argument_list(&mut self) -> Result<FunctionArgumentList, ParserError> {
+    fn parse_function_argument_list(
+        &mut self,
+        allow_length_units: bool,
+    ) -> Result<FunctionArgumentList, ParserError> {
         let mut clauses = vec![];
 
         // Handle clauses that may exist with an empty argument list
@@ -19219,6 +19236,23 @@ impl<'a> Parser<'a> {
 
         let duplicate_treatment = self.parse_duplicate_treatment()?;
         let args = self.parse_comma_separated(Parser::parse_function_args)?;
+
+        if allow_length_units
+            && duplicate_treatment.is_none()
+            && clauses.is_empty()
+            && matches!(args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))]
+                if !matches!(expr, Expr::Named { .. }))
+        {
+            if let Some(units) = self.parse_optional_character_length_units()? {
+                clauses.push(FunctionArgumentClause::UsingCharacterLengthUnits(units));
+                self.expect_token(&Token::RParen)?;
+                return Ok(FunctionArgumentList {
+                    duplicate_treatment,
+                    args,
+                    clauses,
+                });
+            }
+        }
 
         if self.parse_keyword(Keyword::WHERE) {
             clauses.push(FunctionArgumentClause::Where(self.parse_expr()?));
@@ -19282,6 +19316,25 @@ impl<'a> Parser<'a> {
             args,
             clauses,
         })
+    }
+
+    fn parse_optional_character_length_units(
+        &mut self,
+    ) -> Result<Option<CharacterLengthUnits>, ParserError> {
+        if !self.dialect.supports_character_length_units() || !self.parse_keyword(Keyword::USING) {
+            return Ok(None);
+        }
+        let token = self.peek_token_ref();
+        let Token::Word(word) = &token.token else {
+            return self.expected_ref("CHARACTERS or OCTETS", token);
+        };
+        let units = match word.keyword {
+            Keyword::CHARACTERS => CharacterLengthUnits::Characters(word.to_ident(token.span)),
+            Keyword::OCTETS => CharacterLengthUnits::Octets(word.to_ident(token.span)),
+            _ => return self.expected_ref("CHARACTERS or OCTETS", token),
+        };
+        self.advance_token();
+        Ok(Some(units))
     }
 
     fn parse_json_null_clause(&mut self) -> Option<JsonNullClause> {

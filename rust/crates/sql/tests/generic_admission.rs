@@ -37,3 +37,18 @@ async fn sql_catalog_keeps_character_length_alias_and_rejects_unregistered_funct
         assert!(prepare(&format!("SELECT {name}(NULL)"),&context.catalog,&PrepareOptions::default()).is_err(),"{name}");
     }
 }
+
+#[tokio::test]
+async fn character_length_units_work_with_prepared_query_arguments() {
+    let sql = "SELECT CHAR_LENGTH(? USING CHARACTERS), CHARACTER_LENGTH($2 USING OCTETS), \
+        CHAR_LENGTH(? USING OCTETS), ?";
+    assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 3);
+    let arguments = vec![V::Utf8("é😀".into()), V::Utf8("é".into()), V::I64(7)];
+    assert_eq!(query(sql, arguments).await.unwrap(), [vec![V::I32(2), V::I32(2), V::I32(2), V::I64(7)]]);
+
+    let context = context();
+    let sql = "SETTING SNAPSHOT_TIME=CHARACTER_LENGTH(? USING OCTETS) SELECT ?";
+    let prepared = prepare(sql, &context.catalog, &PrepareOptions::default()).unwrap();
+    assert_eq!(prepared.settings.snapshot_time, Some(rtdb_plan::SettingValue::Unevaluated { parameter_count: 1 }));
+    assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 2);
+}

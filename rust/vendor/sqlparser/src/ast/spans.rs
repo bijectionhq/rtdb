@@ -1846,6 +1846,7 @@ impl Spanned for FunctionArgumentList {
 impl Spanned for FunctionArgumentClause {
     fn span(&self) -> Span {
         match self {
+            FunctionArgumentClause::UsingCharacterLengthUnits(units) => units.span(),
             FunctionArgumentClause::IgnoreOrRespectNulls(_) => Span::empty(),
             FunctionArgumentClause::Where(expr) => expr.span(),
             FunctionArgumentClause::OrderBy(vec) => union_spans(vec.iter().map(|i| i.expr.span())),
@@ -1855,6 +1856,14 @@ impl Spanned for FunctionArgumentClause {
             FunctionArgumentClause::Separator(value) => value.span(),
             FunctionArgumentClause::JsonNullClause(_) => Span::empty(),
             FunctionArgumentClause::JsonReturningClause(_) => Span::empty(),
+        }
+    }
+}
+
+impl Spanned for super::CharacterLengthUnits {
+    fn span(&self) -> Span {
+        match self {
+            Self::Characters(unit) | Self::Octets(unit) => unit.span,
         }
     }
 }
