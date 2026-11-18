@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use rtdb_plan::{ColumnId, Expr, PatchEndpoint, Schema};
+use rtdb_format::transit::{TransitValue, to_json_value};
 use rtdb_types::{Anomaly, Iid, Result, TimeUnit, Timestamp, Value};
 
 use crate::{context::Execution, cursor::OwnedRow, pages::{BoxPageCursor, OwnedPage, PageBuilder, PageCursor}, invalid};
@@ -30,12 +31,9 @@ impl PatchGaps {
         let to = bound(to, false, &execution, &scope)?;
         if from > to {
             scope.reserve(4096)?;
-            let instant = |value: Timestamp| {
-                use rtdb_format::transit::{TransitValue, to_json_value};
-                to_json_value(&TransitValue::Tagged { tag: "time/instant".into(), representation: Box::new(TransitValue::String(rtdb_types::Instant::from(value).to_iso_string()?)) })
-            };
             return Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "Invalid valid times")
-                .with_context("valid-from", instant(from)?).with_context("valid-to", instant(to)?));
+                .with_context("valid-from", to_json_value(&TransitValue::instant(from.into())?)?)
+                .with_context("valid-to", to_json_value(&TransitValue::instant(to.into())?)?));
         }
         let columns = columns.map(|id| schema.position(id).ok_or_else(|| invalid("patch-column", "Patch column is absent")));
         let [iid, vf, vt, doc] = columns;

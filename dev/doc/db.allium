@@ -755,6 +755,7 @@ rule LeaderProcessesTx {
     ensures:
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
+        -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use prost::Message;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
 use rtdb_format::{envelope::ReplicaBody, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
+use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
 use rtdb_plan::Statement;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
@@ -438,7 +439,11 @@ fn check_table(table: &TableRef) -> Result<()> {
     if ["xt", "information_schema", "pg_catalog"].contains(&table.schema.as_str()) { Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}.{}", table.schema, table.table))) } else { Ok(()) }
 }
 fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
-    if from >= to { return Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "Invalid valid times").with_context("valid-from", from.0.into()).with_context("valid-to", to.0.into())); }
+    if from >= to {
+        return Err(Anomaly::incorrect("xtdb.indexer/invalid-valid-times", "Invalid valid times")
+            .with_context("valid-from", transit::to_json_value(&T::instant(from.into())?)?)
+            .with_context("valid-to", transit::to_json_value(&T::instant(to.into())?)?));
+    }
     Interval::new(from, to)
 }
 fn timestamp(value: &Value, fallback: Timestamp) -> Result<Timestamp> {
@@ -447,31 +452,12 @@ fn timestamp(value: &Value, fallback: Timestamp) -> Result<Timestamp> {
 fn valid_range(from: Value, to: Value, current_time: Timestamp) -> Result<Interval> { interval(timestamp(&from, current_time)?, timestamp(&to, Timestamp::MAX)?) }
 fn time_value(time: Timestamp) -> Value { Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) } }
 fn tx_key_context(key: TransactionKey) -> Result<serde_json::Value> {
-    use rtdb_format::transit::TransitValue as T;
-    rtdb_format::transit::to_json_value(&T::Tagged { tag: "xtdb/tx-key".into(), representation: Box::new(T::Map(vec![
+    transit::to_json_value(&T::Tagged { tag: "xtdb/tx-key".into(), representation: Box::new(T::Map(vec![
         (T::Keyword("tx-id".into()), T::Integer(key.tx_id.0)),
-        (T::Keyword("system-time".into()), T::Tagged { tag: "time/instant".into(), representation: Box::new(T::String(instant_text(key.system_time))) }),
+        (T::Keyword("system-time".into()), T::instant(key.system_time.into())?),
     ])) })
 }
 
-fn instant_text(value: Timestamp) -> String {
-    // Gregorian civil_from_days: https://howardhinnant.github.io/date_algorithms.html#civil_from_days
-    let days = value.0.div_euclid(86_400_000_000) + 719_468;
-    let era = days.div_euclid(146_097);
-    let day_of_era = days - era * 146_097;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = month_index + if month_index < 10 { 3 } else { -9 };
-    let year = year_of_era + era * 400 + i64::from(month <= 2);
-    let year = if year < 0 { format!("-{:04}", -year) } else if year > 9999 { format!("+{year}") } else { format!("{year:04}") };
-    let time = value.0.rem_euclid(86_400_000_000);
-    let seconds = time / 1_000_000;
-    let micros = time % 1_000_000;
-    let fraction = if micros == 0 { String::new() } else if micros % 1000 == 0 { format!(".{:03}", micros / 1000) } else { format!(".{micros:06}") };
-    format!("{year}-{month:02}-{day:02}T{:02}:{:02}:{:02}{fraction}Z", seconds / 3600, seconds / 60 % 60, seconds % 60)
-}
 fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction position or allocation exceeded its range") }
 
 #[cfg(test)]
@@ -479,6 +465,18 @@ mod tests {
     use super::*;
     #[test]
     fn error_transaction_keys_preserve_jvm_instant_text() {
-        for (micros, text) in [(0, "1970-01-01T00:00:00Z"), (-1, "1969-12-31T23:59:59.999999Z"), (1000, "1970-01-01T00:00:00.001Z"), (946_684_800_000_000, "2000-01-01T00:00:00Z")] { assert_eq!(instant_text(Timestamp(micros)), text); }
+        for (micros, text) in [(0, "1970-01-01T00:00:00Z"), (-1, "1969-12-31T23:59:59.999999Z"), (1000, "1970-01-01T00:00:00.001Z"), (946_684_800_000_000, "2000-01-01T00:00:00Z")] {
+            assert_eq!(T::instant(Timestamp(micros).into()).unwrap(), T::Tagged { tag: "time/instant".into(), representation: Box::new(T::String(text.into())) });
+        }
+    }
+
+    #[test]
+    fn invalid_valid_time_errors_roundtrip_with_instant_bounds() {
+        let error = interval(Timestamp(0), Timestamp(-1)).unwrap_err();
+        assert_eq!(error.code, "xtdb.indexer/invalid-valid-times");
+        let durable = transit::decode_anomaly(&transit::encode_anomaly(&error).unwrap()).unwrap();
+        for (field, text) in [("valid-from", "1970-01-01T00:00:00Z"), ("valid-to", "1969-12-31T23:59:59.999999Z")] {
+            assert_eq!(transit::from_json_value(&durable.context[field]).unwrap(), T::Tagged { tag: "time/instant".into(), representation: Box::new(T::String(text.into())) });
+        }
     }
 }

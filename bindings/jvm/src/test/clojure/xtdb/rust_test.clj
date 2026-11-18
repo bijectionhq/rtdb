@@ -227,6 +227,7 @@
 (deftest-original-api original-sql/test-hashcode-for-tstzrange-4263)
 (deftest-original-api original-sql/patch-uuid-literal-id-4284)
 (deftest-original-api original-sql/interval-mdm)
+(deftest-original-api original-sql/inconsistent-patch-behaviour-4448)
 (deftest-original-api original-sql/order-by-without-select-bug-4560)
 (deftest-original-api original-sql/update-with-many-params-4803)
 (deftest-original-api original-sql/scrambled-update-4803)

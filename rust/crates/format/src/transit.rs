@@ -24,6 +24,12 @@ pub enum TransitValue {
     Tagged { tag: String, representation: Box<TransitValue> },
 }
 
+impl TransitValue {
+    pub fn instant(value: rtdb_types::Instant) -> Result<Self> {
+        Ok(Self::Tagged { tag: "time/instant".into(), representation: Box::new(Self::String(value.to_iso_string()?)) })
+    }
+}
+
 /// Constructs decoded values before they enter the Transit cache; cache hits clone `Value`.
 /// Array and map states remain caller-owned until completion; item insertion runs in wire order and may fail.
 /// Sizes are allocation hints for raw containers, whose tags or JSON map markers can select another constructor.
