@@ -227,3 +227,22 @@ fn static_and_direct_puts_share_missing_id_validation_before_encoding() {
         assert_eq!(from_json_value(&error.context["doc"]).unwrap(), T::Map(vec![(T::String("v".into()), T::String("value".into()))]));
     }
 }
+
+#[test]
+fn separate_puts_of_heterogeneous_documents_mark_absent_union_columns_nullable() {
+    let memory = MemoryBudget::new(1 << 26);
+    let doc = |fields: Vec<(&str, Value)>| fields.into_iter().map(|(k, v)| (k.to_owned(), v)).chain([("_id".to_owned(), Value::I64(1))]).collect::<std::collections::BTreeMap<_, _>>();
+    let mut shapes = vec![vec![("a", Value::Null)]; 7];
+    shapes.push(vec![("e", Value::Bool(false))]);
+    shapes.push(vec![("a", Value::Null)]);
+    shapes.push(vec![("a", Value::Null), ("e", Value::I64(0)), ("b", Value::Null)]);
+    let operations = shapes.into_iter().enumerate().map(|(day, fields)| TxOp::PutDocs {
+        table: rtdb_types::TableRef::new("public", "docs"),
+        documents: Documents::new(vec![doc(fields)], &memory).unwrap(),
+        valid_from: Some(rtdb_types::Timestamp(1_546_300_800_000_000 + day as i64 * 86_400_000_000)),
+        valid_to: None,
+    }).collect();
+    let transaction = prepare_submission(operations, SubmitOptions::default(), "xtdb", &memory).unwrap();
+    let message = SourceMessage::decode(transaction.encode().unwrap().as_slice()).unwrap().unwrap();
+    SourceTransaction::decode(&message, &memory).unwrap();
+}

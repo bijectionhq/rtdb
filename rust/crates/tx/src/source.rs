@@ -268,7 +268,7 @@ fn operation_leg(values: Vec<SourceOperation<'_>>, arrays: &mut BatchBuilder) ->
         fields.push(Arc::new(Field::new("documents", documents.data_type().clone(), false)));
         columns.push(documents);
     }
-    Ok(Arc::new(StructArray::try_new_with_length(fields.into(), columns, None, values.len()).map_err(|error| invalid(error.to_string()))?))
+    rtdb_columnar::build_struct_array(fields.into(), &columns, values.len(), None).map_err(|error| invalid(error.to_string()))
 }
 
 fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<ArrayRef> {
@@ -310,7 +310,7 @@ fn document_leg(lists: Vec<&Documents>, arrays: &mut BatchBuilder) -> Result<Arr
         columns.push(array);
         schema.push(Arc::new(to_field(name, &ty)?));
     }
-    let structs = Arc::new(StructArray::try_new_with_length(schema.into(), columns, None, length).map_err(|error| invalid(error.to_string()))?);
+    let structs = rtdb_columnar::build_struct_array(schema.into(), &columns, length, None).map_err(|error| invalid(error.to_string()))?;
     let field = Arc::new(Field::new("$data$", structs.data_type().clone(), false));
     Ok(Arc::new(ListArray::try_new(field, OffsetBuffer::new(ScalarBuffer::from(offsets)), structs, None).map_err(|error| invalid(error.to_string()))?))
 }
