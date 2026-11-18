@@ -6,11 +6,11 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_plan::CatalogMetric;
 use rtdb_types::{Anomaly, Result};
 
-struct ReservedText { value: String, reservation: Arc<MemoryReservation>, limit: usize }
+struct ReservedText { value: String, _reservation: Arc<MemoryReservation>, limit: usize }
 impl ReservedText {
     fn new(limit: usize, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let reservation = memory.reserve(limit.checked_mul(2).and_then(|bytes| bytes.checked_add(128)).ok_or_else(overflow)?)?;
-        Ok(Self { value: String::with_capacity(limit), reservation, limit })
+        Ok(Self { value: String::with_capacity(limit), _reservation: reservation, limit })
     }
 }
 impl Write for ReservedText {
