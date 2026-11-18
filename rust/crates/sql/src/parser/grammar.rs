@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget};
 pub(crate) use token::{ExpectedSymbol, TokenSet, TokenType};
+pub(super) use source::pinned_symbol;
 
 type Result<T> = std::result::Result<T, GrammarError>;
 

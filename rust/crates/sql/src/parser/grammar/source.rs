@@ -5,6 +5,12 @@ use super::token::MAX_TOKEN;
 
 pub(super) const PINNED: &str = include_str!("Sql.interp");
 
+pub(in crate::parser) fn pinned_symbol(name: &str) -> Option<TokenType> {
+    let source = Source::read(PINNED).ok()?;
+    let number = source.symbols.lines().position(|symbol| symbol == name)?;
+    TokenType::read(number as i32, number).ok()
+}
+
 pub(super) struct Source {
     literals: &'static str,
     symbols: &'static str,

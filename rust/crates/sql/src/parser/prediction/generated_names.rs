@@ -33,7 +33,7 @@ fn non_reserved_case(token: TokenType) -> Option<u32> {
         .map(|alternative| FIRST_KEYWORD_ALTERNATIVE + alternative as u32)
 }
 
-pub(super) fn is_identifier_token(token: TokenType) -> bool {
+pub(in crate::parser) fn is_identifier_token(token: TokenType) -> bool {
     matches!(token.number(), REGULAR_IDENTIFIER | DELIMITED_IDENTIFIER) || non_reserved_case(token).is_some()
 }
 

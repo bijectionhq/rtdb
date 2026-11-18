@@ -1,20 +1,21 @@
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
 use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::QueryCursor;
+use rtdb_sql::{BatchStatement, ExecutableSyntax};
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
-enum PrepareInput<'control> {
-    Standalone,
-    SimpleRange(&'control mut Option<ControlStatement>),
-    LocaleDependentSimpleRange(&'control mut Option<ControlStatement>),
+struct PreparedShape {
+    kind: PreparedKind,
+    columns: Option<Vec<Column>>,
+    parameter_count: usize,
 }
 struct Prepared { source: String, kind: PreparedKind, oids: Vec<i32>, columns: Option<Vec<Column>>, _reservation: Arc<MemoryReservation> }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
@@ -70,7 +71,7 @@ impl ProtocolSession {
                 self.extended = true;
                 let name = input.string()?.to_owned(); let sql = input.string()?;
                 let count = usize::from(input.short()?); let oids = (0..count).map(|_| input.integer()).collect::<Result<Vec<_>>>()?; input.end()?;
-                let prepared = self.prepare(sql, oids, PrepareInput::Standalone).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
+                let prepared = self.prepare(sql, oids).await.inspect_err(|_| { if self.session.state().is_read_write() { self.record_transaction_error(); } })?;
                 Self::planning_warnings(&prepared, writer).await?;
                 self.register_statement(name, prepared)?; writer.empty(b'1').await?;
             }
@@ -126,37 +127,58 @@ impl ProtocolSession {
         Ok(())
     }
 
-    async fn prepare(&mut self, original: &str, mut oids: Vec<i32>, input: PrepareInput<'_>) -> Result<Arc<Prepared>> {
+    async fn prepare(&mut self, original: &str, oids: Vec<i32>) -> Result<Arc<Prepared>> {
         let _scratch = self.node.memory().reserve(original.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
         let spans = rtdb_sql::split_statements(original)?;
         if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
         let source = spans.first().map_or("", |span| &original[span.start..span.end]);
-        let source = match &input {
-            PrepareInput::Standalone => replace_namespace_query(source, (source, "")),
-            PrepareInput::SimpleRange(_) | PrepareInput::LocaleDependentSimpleRange(_) => source,
-        };
-        let legacy_keywords = matches!(&input, PrepareInput::Standalone | PrepareInput::LocaleDependentSimpleRange(_));
-        let options = self.options(); let token = self.token();
-        let (kind, columns, count) = if source.is_empty() { (PreparedKind::Empty, None, 0) }
-        else if legacy_keywords && source.to_ascii_lowercase().starts_with(KEYWORDS_PREFIX) { (PreparedKind::Keywords, Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]), 0) }
-        else if let Some(control) = match input {
-            PrepareInput::SimpleRange(control) | PrepareInput::LocaleDependentSimpleRange(control) if source == original => control.take(),
-            _ => rtdb_sql::parse_control_in(source, &options, self.node.memory())?,
-        } {
-            let count = match &control { ControlStatement::Execute { .. } => control.parameter_count(), ControlStatement::Show { .. } => 0, _ => oids.len() }; let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })).collect::<Result<_>>()).transpose()?;
-            (PreparedKind::Control(control), columns, count)
+        let source = replace_namespace_query(source, (source, ""));
+        let options = self.options();
+        let shape = if source.is_empty() {
+            PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
+        } else if legacy_keyword_probe(source) {
+            keyword_shape()
+        } else if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.node.memory())? {
+            control_shape(control, oids.len())?
         } else {
-            let context = self.session.prepare_context(&token).await?;
+            let context = self.session.prepare_context(&self.token()).await?;
             let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
-            let prepared = PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?;
-            let count = prepared.parameter_count();
-            if prepared.is_dml() { (PreparedKind::Dml(prepared), None, oids.len()) }
-            else { let columns = prepared.prepared_schema().zip(prepared.postgres_types()).map(|(schema, types)| schema.fields().iter().zip(types).map(|(field, ty)| Column { name: field.name.clone(), ty: *ty, format: Format::Text }).collect()); (PreparedKind::Query(prepared), columns, count) }
+            sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
         };
-        oids.resize(count, 0);
+        self.retain_prepared(source, oids, shape)
+    }
+
+    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>, locale_dependent_keyword: bool) -> Result<Arc<Prepared>> {
+        let source = syntax.source();
+        let options = self.options();
+        let shape = if locale_dependent_keyword && legacy_keyword_probe(source) {
+            drop(syntax);
+            keyword_shape()
+        } else {
+            match syntax {
+                ExecutableSyntax::Control(control) => control_shape(control.bind(&options)?, 0)?,
+                ExecutableSyntax::Sql(syntax) => {
+                    let context = self.session.prepare_context(&self.token()).await?;
+                    sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
+                }
+            }
+        };
+        drop(allocation);
+        self.retain_prepared(source, Vec::new(), shape)
+    }
+
+    fn retain_prepared(&self, source: &str, mut oids: Vec<i32>, shape: PreparedShape) -> Result<Arc<Prepared>> {
+        let PreparedShape { kind, columns, parameter_count } = shape;
+        oids.resize(parameter_count, 0);
         let column_bytes = columns.as_deref().unwrap_or_default().iter().try_fold(0usize, |bytes, column| bytes.checked_add(column.name.capacity()).and_then(|bytes| bytes.checked_add(256)).ok_or_else(|| protocol("Column descriptors are too large")))?;
-        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(count.checked_mul(256)?)).and_then(|n| n.checked_add(oids.capacity().checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
+        let reservation = self.node.memory().reserve(source.len().checked_mul(128).and_then(|n| n.checked_add(parameter_count.checked_mul(256)?)).and_then(|n| n.checked_add(oids.capacity().checked_mul(std::mem::size_of::<i32>())?)).and_then(|n| n.checked_add(column_bytes)).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("Prepared statement is too large"))?)?;
         Ok(Arc::new(Prepared { source: source.into(), kind, oids, columns, _reservation: reservation }))
+    }
+
+    async fn install_sql_prepare<W: AsyncWrite + Unpin>(&mut self, name: String, prepared: Arc<Prepared>, writer: &mut Writer<W>) -> Result<()> {
+        Self::planning_warnings(&prepared, writer).await?;
+        self.register_statement(name, prepared)?;
+        writer.string(b'C', "PREPARE").await
     }
 
     async fn planning_warnings<W: AsyncWrite + Unpin>(prepared: &Prepared, writer: &mut Writer<W>) -> Result<()> {
@@ -236,7 +258,10 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::Prepare { name, source, allocation: _allocation } => { let prepared = self.prepare(&source, Vec::new(), PrepareInput::Standalone).await?; Self::planning_warnings(&prepared, writer).await?; self.register_statement(name, prepared)?; writer.string(b'C', "PREPARE").await },
+                    ControlResult::Prepare { name, source, allocation: _allocation } => {
+                        let prepared = self.prepare(&source, Vec::new()).await?;
+                        self.install_sql_prepare(name, prepared, writer).await
+                    },
                     ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
                     _ => Err(protocol("Unexpected control execution result")),
                 }
@@ -302,29 +327,64 @@ impl ProtocolSession {
             return self.settle_simple_transaction().await;
         }
 
-        let source = replace_namespace_query(source, normalized);
-        let spans = rtdb_sql::split_statements_in(source, self.node.memory())?;
-        if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
-        for span in spans.as_slice() {
-            let sql = &source[span.start..span.end];
-            let mut control = rtdb_sql::parse_control_in(sql, &self.options(), self.node.memory())?;
-            if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
-            let result: Result<()> = async {
-                let input = if keyword == KeywordPrefix::LocaleDependent {
-                    PrepareInput::LocaleDependentSimpleRange(&mut control)
-                } else {
-                    PrepareInput::SimpleRange(&mut control)
+        let memory = Arc::clone(self.node.memory());
+        let rewritten = replace_namespace_query(source, normalized);
+        let (source, _normalized_allocation) = if !std::ptr::eq(rewritten, source) {
+            (Cow::Borrowed(rewritten), None)
+        } else if normalized.1.is_empty() {
+            (Cow::Borrowed(normalized.0), None)
+        } else {
+            let allocation = memory.reserve(normalized.0.len() + normalized.1.len())?;
+            (Cow::Owned([normalized.0, normalized.1].concat()), Some(allocation))
+        };
+        for statement in rtdb_sql::parse_statement_batch(&source, &memory)? {
+            let start_transaction = !statement.preparations.is_empty()
+                || match &statement.command {
+                    ExecutableSyntax::Sql(_) => true,
+                    ExecutableSyntax::Control(control) => control.starts_implicit_transaction(),
                 };
-                let prepared = self.prepare(sql, Vec::new(), input).await?;
-                Self::planning_warnings(&prepared, writer).await?;
-                if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
-                let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
-                if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
-                self.execute(&mut portal, 0, writer).await
-            }.await;
+            if start_transaction { self.begin_implicit(None)?; }
+            let result = self.run_simple_statement(statement, keyword == KeywordPrefix::LocaleDependent, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         self.settle_simple_transaction().await
+    }
+
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchStatement<'_>, locale_dependent_keyword: bool, writer: &mut Writer<W>) -> Result<()> {
+        let BatchStatement { preparations, command: syntax, allocation } = statement;
+        let mut layers = preparations.into_iter();
+        if let Some(layer) = layers.next() {
+            if self.session.state().status() == TransactionStatus::Failed {
+                return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received"));
+            }
+            let nested = layers.next();
+            let source = nested.as_ref().map_or(syntax.source(), |layer| layer.source);
+            let command = ControlStatement::Prepare { name: layer.name, source: source.into() };
+            let token = self.token();
+            let options = self.control_options();
+            let ControlResult::Prepare { name, allocation: _allocation, .. } =
+                self.session.execute_control_with(&command, &[], &token, options).await? else {
+                    return Err(protocol("PREPARE did not produce a statement"));
+                };
+            let prepared = if let Some(nested) = nested {
+                let source = layers.next().map_or(syntax.source(), |layer| layer.source);
+                let control = ControlStatement::Prepare { name: nested.name, source: source.into() };
+                drop(layers);
+                drop(syntax);
+                drop(allocation);
+                self.retain_prepared(nested.source, Vec::new(), control_shape(control, 0)?)?
+            } else {
+                drop(layers);
+                self.prepare_batch_command(syntax, allocation, false).await?
+            };
+            return self.install_sql_prepare(name, prepared, writer).await;
+        }
+        let prepared = self.prepare_batch_command(syntax, allocation, locale_dependent_keyword).await?;
+        Self::planning_warnings(&prepared, writer).await?;
+        if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
+        let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
+        if portal.columns.is_some() { Self::description(portal.columns.as_deref(), self.environment()?.fallback(), writer).await?; }
+        self.execute(&mut portal, 0, writer).await
     }
 
     async fn simple_statement_result<W: AsyncWrite + Unpin>(&mut self, result: Result<()>, writer: &mut Writer<W>) -> Result<()> {
@@ -348,6 +408,42 @@ impl ProtocolSession {
             }
         }
         Ok(())
+    }
+}
+
+fn legacy_keyword_probe(source: &str) -> bool {
+    source.as_bytes().get(..KEYWORDS_PREFIX.len()).is_some_and(|prefix| prefix.eq_ignore_ascii_case(KEYWORDS_PREFIX.as_bytes()))
+}
+
+fn keyword_shape() -> PreparedShape {
+    PreparedShape {
+        kind: PreparedKind::Keywords,
+        columns: Some(vec![Column { name: "col1".into(), ty: PgType::VarChar, format: Format::Text }]),
+        parameter_count: 0,
+    }
+}
+
+fn control_shape(control: ControlStatement, declared_parameters: usize) -> Result<PreparedShape> {
+    let parameter_count = match &control {
+        ControlStatement::Execute { .. } => control.parameter_count(),
+        ControlStatement::Show { .. } => 0,
+        _ => declared_parameters,
+    };
+    let columns = control_schema(&control)?.map(|schema| schema.fields().iter().map(|field| {
+        Ok(Column { name: field.name.clone(), ty: PgType::from_logical(&field.data_type)?, format: Format::Text })
+    }).collect::<Result<_>>()).transpose()?;
+    Ok(PreparedShape { kind: PreparedKind::Control(control), columns, parameter_count })
+}
+
+fn sql_shape(prepared: PreparedSql, declared_parameters: usize) -> PreparedShape {
+    if prepared.is_dml() {
+        PreparedShape { kind: PreparedKind::Dml(prepared), columns: None, parameter_count: declared_parameters }
+    } else {
+        let columns = prepared.prepared_schema().zip(prepared.postgres_types()).map(|(schema, types)| {
+            schema.fields().iter().zip(types).map(|(field, ty)| Column { name: field.name.clone(), ty: *ty, format: Format::Text }).collect()
+        });
+        let parameter_count = prepared.parameter_count();
+        PreparedShape { kind: PreparedKind::Query(prepared), columns, parameter_count }
     }
 }
 
@@ -559,24 +655,23 @@ mod tests {
 
         let sql = format!("SET TIME ZONE /*{}*/ COALESCE($1, REGEXP_REPLACE('UTC', 'U', 'U'))", "x".repeat(512));
         let source = format!("-- début\r\n{sql} /* ignored */;  ");
-        let split_probe = MemoryBudget::new(1 << 20);
-        let ranges = rtdb_sql::split_statements_in(&source, &split_probe).unwrap();
-        let [range] = ranges.as_slice() else { panic!("one Simple range"); };
-        assert_eq!(&source[range.start..range.end], sql);
-        let resplit = rtdb_sql::split_statements(&sql).unwrap();
-        let [resplit] = resplit.as_slice() else { panic!("one prepared range"); };
-        assert_eq!(&sql[resplit.start..resplit.end], sql);
-        let ranges_bytes = split_probe.used_bytes();
-        drop(ranges);
-        assert_eq!(split_probe.used_bytes(), 0);
-
         let parse_probe = MemoryBudget::new(1 << 20);
-        let control = rtdb_sql::parse_control_in(&sql, &Default::default(), &parse_probe).unwrap().unwrap();
+        let mut batch = rtdb_sql::parse_statement_batch(normalized_simple_text(&source).0, &parse_probe).unwrap();
+        let BatchStatement { command, allocation, preparations } = batch.next().unwrap();
+        assert!(batch.next().is_none());
+        assert!(preparations.is_empty());
+        assert_eq!(command.source(), sql);
+        let syntax_bytes = parse_probe.used_bytes();
+        let batch_bytes = syntax_bytes - allocation.bytes();
+        let ExecutableSyntax::Control(syntax) = command else { panic!("control syntax"); };
+        let control = syntax.bind(&Default::default()).unwrap();
         assert!(matches!(control, ControlStatement::SetTimeZone(_)));
         assert_eq!(control.parameter_count(), 1);
-        let control_bytes = parse_probe.used_bytes();
+        let control_bytes = parse_probe.used_bytes() - syntax_bytes;
         assert!(control_bytes > 0);
         drop(control);
+        drop(allocation);
+        drop(batch);
         assert_eq!(parse_probe.used_bytes(), 0);
 
         let missing = Anomaly::incorrect("xtdb/missing-parameter", "Control statement has fewer parameters than its expressions");
@@ -589,11 +684,9 @@ mod tests {
         assert_eq!(writer_probe.used_bytes(), 0);
 
         let statement_bytes = sql.len() * 128 + 8192;
-        let prepare_peak = ranges_bytes + control_bytes + 2 * statement_bytes;
-        assert!(split_probe.peak_bytes() < prepare_peak);
-        assert!(ranges_bytes + parse_probe.peak_bytes() < prepare_peak);
-        assert!(ranges_bytes + control_bytes + statement_bytes + 8192 < prepare_peak);
-        assert!(ranges_bytes + writer_probe.peak_bytes() < prepare_peak);
+        let portal_peak = batch_bytes + control_bytes + statement_bytes + 8192;
+        assert!(parse_probe.peak_bytes() < portal_peak);
+        assert!(batch_bytes + writer_probe.peak_bytes() < portal_peak);
 
         let fixtures = Arc::new(Services);
         let auth = rtdb_auth::Authenticator::open(
@@ -611,7 +704,7 @@ mod tests {
 
         let frame_bytes = (source.len() + 1) * 16 + 8192;
         let baseline = memory.used_bytes();
-        let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - prepare_peak).unwrap();
+        let held = memory.reserve(memory.limit_bytes() - baseline - frame_bytes - portal_peak).unwrap();
         let mut input = vec![b'Q'];
         input.extend_from_slice(&i32::try_from(source.len() + 5).unwrap().to_be_bytes());
         input.extend_from_slice(source.as_bytes());

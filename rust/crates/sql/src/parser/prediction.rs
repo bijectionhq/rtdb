@@ -7,6 +7,7 @@ mod dfa;
 mod closure;
 mod runtime;
 mod adaptive;
+pub(super) use runtime::is_identifier_token;
 
 use rtdb_types::{AllocationScope, Anomaly};
 use super::grammar::{ArtifactIssue, Grammar, GrammarError};

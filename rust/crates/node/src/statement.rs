@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
-use rtdb_sql::{ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
+use rtdb_sql::{DeferredStatementSyntax, ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
 
@@ -44,8 +44,18 @@ impl PreparedSql {
     pub fn prepare_postgres_syntax(
         syntax: StatementSyntaxBatch<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32],
     ) -> Result<Self> {
-        let source = syntax.source();
         let parsed = exactly_one_statement(syntax.resolve_in(&context.memory)?)?;
+        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids)
+    }
+
+    /// Resolves and prepares the selected statement in the reached query context.
+    pub fn prepare_postgres_statement(syntax: DeferredStatementSyntax<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+        let parsed = syntax.resolve_in(&context.memory)?;
+        Self::prepare_postgres_parsed(parsed, context, search_path, parameter_oids)
+    }
+
+    fn prepare_postgres_parsed(parsed: ParsedStatement<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
+        let source = parsed.source();
         if parsed.kind() == StatementKind::Dml {
             let mut options = PrepareOptions { search_path, ..Default::default() };
             let source_reservation = admit_source(source, context, &mut options)?;

@@ -9,6 +9,7 @@ use crate::dialect::SqlDialect;
 pub struct ParsedStatement<'input> {
     pub span: SourceSpan,
     pub(crate) tree: StatementTree<'input>,
+    pub(crate) forms: crate::bind::FormAllocation<'input>,
     parameter_count: usize,
     pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
 }
@@ -16,6 +17,13 @@ pub struct ParsedStatement<'input> {
 /// A complete SQL syntax tree with pending argument assignments and embedded XTQL text.
 #[derive(Clone, Debug)]
 pub struct StatementSyntax<'input> {
+    syntax: DeferredStatementSyntax<'input>,
+    forms: crate::bind::FormAllocation<'input>,
+}
+
+/// Statement syntax whose operands will be resolved in a later preparation context.
+#[derive(Clone, Debug)]
+pub struct DeferredStatementSyntax<'input> {
     span: SourceSpan,
     tree: StatementTree<'input>,
     parameters: crate::inline_xtql::SourceArguments,
@@ -37,9 +45,7 @@ impl<'input> StatementSyntaxBatch<'input> {
     /// A different budget fails before resolution, including for empty input.
     /// A clone of the original `Arc` shares the same budget.
     pub fn resolve_in(self, memory: &Arc<MemoryBudget>) -> Result<Vec<ParsedStatement<'input>>> {
-        if !matches!(self.forms, crate::bind::FormAllocation::Tracked(origin) if Arc::ptr_eq(origin, memory)) {
-            return Err(Anomaly::incorrect("rtdb.sql/syntax-budget", "SQL syntax belongs to a different raw metadata budget"));
-        }
+        require_syntax_budget(self.forms, memory)?;
         self.resolve()
     }
 
@@ -57,19 +63,57 @@ impl<'input> IntoIterator for StatementSyntaxBatch<'input> {
 
 impl<'input> StatementSyntax<'input> {
     /// Assigns source-order argument slots and reads inline XTQL using the originating metadata budget.
-    pub fn resolve(mut self) -> Result<ParsedStatement<'input>> {
-        let crate::inline_xtql::ParameterAssignments { count, dynamic, inline } = self.parameters.assign(self.tree.source, self.tree.forms)?;
-        if !dynamic.is_empty() && let ControlFlow::Break(span) = self.tree.visit(&mut AssignParameters(&dynamic)) {
-            return Err(sql_error("Invalid anonymous parameter occurrence", self.tree.source, span));
-        }
-        Ok(ParsedStatement { span: self.span, tree: self.tree, parameter_count: count, inline_xtql: inline })
+    pub fn resolve(self) -> Result<ParsedStatement<'input>> {
+        self.syntax.resolve(self.forms)
     }
+}
+
+impl<'input> DeferredStatementSyntax<'input> {
+    /// Returns the exact statement text from the batch.
+    pub fn source(&self) -> &'input str { self.tree.source.text() }
+
+    /// Resolves the operands using the budget of the reached preparation context.
+    pub fn resolve_in<'bind>(self, memory: &'bind Arc<MemoryBudget>) -> Result<ParsedStatement<'bind>> where 'input: 'bind {
+        self.resolve(crate::bind::FormAllocation::Tracked(memory))
+    }
+
+    fn resolve<'bind>(mut self, forms: crate::bind::FormAllocation<'bind>) -> Result<ParsedStatement<'bind>> where 'input: 'bind {
+        let crate::inline_xtql::ParameterAssignments { count, dynamic, inline } = self.parameters.assign(self.tree.source.input, forms)?;
+        if !dynamic.is_empty() && let ControlFlow::Break(span) = self.tree.visit(&mut AssignParameters(&dynamic)) {
+            return Err(sql_error("Invalid anonymous parameter occurrence", self.tree.source.input, span));
+        }
+        Ok(ParsedStatement { span: self.span, tree: self.tree, forms, parameter_count: count, inline_xtql: inline })
+    }
+}
+
+fn require_syntax_budget(forms: crate::bind::FormAllocation<'_>, memory: &Arc<MemoryBudget>) -> Result<()> {
+    if !matches!(forms, crate::bind::FormAllocation::Tracked(origin) if Arc::ptr_eq(origin, memory)) {
+        return Err(Anomaly::incorrect("rtdb.sql/syntax-budget", "SQL syntax belongs to a different raw metadata budget"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StatementSource<'input> {
+    pub(crate) input: &'input str,
+    span: SourceSpan,
+}
+
+impl<'input> StatementSource<'input> {
+    pub(super) fn full(input: &'input str) -> Self { Self { input, span: SourceSpan { start: 0, end: input.len() } } }
+
+    pub(super) fn tokens(input: &'input str, first: &TokenWithSpan, last: &TokenWithSpan) -> Self {
+        Self { input, span: source_span(input, Span::new(first.span.start, last.span.end)) }
+    }
+
+    pub(super) fn bounded(input: &'input str, span: SourceSpan) -> Self { Self { input, span } }
+    pub(super) fn span(self) -> SourceSpan { self.span }
+    pub(super) fn text(self) -> &'input str { &self.input[self.span.start..self.span.end] }
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct StatementTree<'input> {
-    pub(crate) source: &'input str,
-    pub(crate) forms: crate::bind::FormAllocation<'input>,
+    pub(crate) source: StatementSource<'input>,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
     pub(crate) period_columns: std::collections::BTreeSet<String>,
@@ -117,8 +161,9 @@ impl<'input> ParsedStatement<'input> {
         crate::bind::bind(self, catalog, options)
     }
 
-    /// Returns the source input for this statement's byte offsets.
-    pub fn source(&self) -> &'input str { self.tree.source }
+    /// Returns the original text for preparation and execution.
+    /// The span refers to the complete input supplied to the parser.
+    pub fn source(&self) -> &'input str { self.tree.source.text() }
 
     pub fn parameter_count(&self) -> usize { self.parameter_count }
     /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
@@ -252,99 +297,111 @@ pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input Arc<MemoryBudge
 }
 
 fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<StatementSyntaxBatch<'input>> {
-    let dialect = SqlDialect::default();
     let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
+    validate_common_syntax(&tokens, sql)?;
+    let source = StatementSource::full(sql);
+    let statements = tokens.split(|token| token.token == Token::SemiColon).filter(|slice| !slice.is_empty())
+        .map(|slice| {
+            let span = StatementSource::tokens(sql, &slice[0], &slice[slice.len() - 1]).span();
+            Ok(StatementSyntax { syntax: parse_statement_syntax(source, span, slice)?, forms })
+        }).collect::<Result<_>>()?;
+    Ok(StatementSyntaxBatch { source: sql, forms, statements })
+}
+
+pub(super) fn validate_common_syntax(tokens: &[TokenWithSpan], sql: &str) -> Result<()> {
     for pair in tokens.windows(2) {
         if word(pair.first(),"LIMIT") && word(pair.get(1),"ALL") { return Err(sql_error("LIMIT requires an unsigned integer or parameter",sql,pair[1].span)); }
     }
-    let mut statements = Vec::new();
-    for slice in tokens.split(|token| token.token == Token::SemiColon) {
-        if slice.is_empty() { continue; }
-        let span = source_span(sql, Span::new(slice[0].span.start, slice[slice.len() - 1].span.end));
-        let (prefix, returning) = crate::returning::split(slice, sql)?;
-        if let Some(returning) = returning { returning.validate(sql)?; }
-        let period_columns = prefix.iter().filter_map(|token| match &token.token {
-            Token::Word(word) => {
-                let name = if word.quote_style.is_some() { word.value.clone() } else { word.value.to_lowercase() };
-                matches!(name.as_str(), "_valid_time" | "_system_time").then_some(name)
-            }
-            _ => None,
-        }).collect();
-        let (tokens, parameters) = crate::inline_xtql::extract(prefix, sql)?;
-        let (tokens, settings) = crate::settings::extract(tokens, sql)?;
-        let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
-        let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
-        let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
-        let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
-            let patch = word(tokens.first(), "PATCH");
-            let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
-            let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
-            let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
-            if patch {
-                let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
-                if temporal.iter().any(|clause| Some(clause.owner_end) == end && matches!(clause.extent, TemporalExtent::All)) {
-                    return Err(sql_error("PATCH valid time requires FROM with an optional TO", sql, slice[0].span));
-                }
-            }
-            if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
-            let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
-            if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
-            Syntax::Records { patch, table, records }
-        } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
-            let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
-            let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
-            let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
-            let mut columns = Vec::new();
-            if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
-                loop {
-                    columns.push(identifier_token(&parser.next_token())?);
-                    if parser.consume_token(&Token::RParen) { break; }
-                    parser.expect_token(&Token::Comma).map_err(|error| sql_error(error.to_string(), sql, parser.peek_token().span))?;
-                }
-            }
-            if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
-            Syntax::CreateTable { table, columns }
-        } else if word(tokens.first(), "GRANT") || word(tokens.first(), "REVOKE") {
-            let revoke = word(tokens.first(), "REVOKE");
-            if tokens.len() != 4 || !word(tokens.get(2), if revoke { "FROM" } else { "TO" }) { return Err(sql_error("Expected one role and one user", sql, slice[0].span)); }
-            Syntax::GrantRole { role: identifier_token(&tokens[1])?, user: identifier_token(&tokens[3])?, revoke }
-        } else if word(tokens.first(), "ERASE") {
-            let replacement = Tokenizer::new(&dialect, "DELETE").tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
-            tokens[0].token = replacement.into_iter().next().ok_or_else(|| Anomaly::fault("rtdb.sql/lexer", "Missing DELETE token"))?;
-            let statement = standard(tokens, sql)?;
-            let ast::Statement::Delete(delete) = statement else { return Err(sql_error("ERASE must target a table", sql, slice[0].span)); };
-            Syntax::Erase(delete)
-        } else if word(tokens.first(), "ASSERT") {
-            let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[1..].to_vec());
-            let expression = dialect.checked(parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
-            let message = if parser.consume_token(&Token::Comma) {
-                match parser.next_token().token { Token::SingleQuotedString(message) => Some(message), _ => return Err(sql_error("ASSERT message must be a string", sql, slice[0].span)) }
-            } else { None };
-            if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after ASSERT", sql, parser.peek_token().span)); }
-            Syntax::Assert(expression, message)
-        } else if word(tokens.first(), "SHOW") {
-            Syntax::Show(tokens[1..].iter().map(identifier_token).collect::<Result<_>>()?)
-        } else if word(tokens.first(), "SET") && !word(tokens.get(1), "TRANSACTION") && !word(tokens.get(1), "ROLE") {
-            let mut index = 1;
-            let local = word(tokens.get(index), "LOCAL");
-            if local || word(tokens.get(index), "SESSION") { index += 1; }
-            let mut name = vec![identifier_token(tokens.get(index).ok_or_else(|| sql_error("SET requires a variable", sql, slice[0].span))?)?];
-            index += 1;
-            if name[0].normalized() == "time" && word(tokens.get(index), "ZONE") { name.push(identifier_token(&tokens[index])?); index += 1; }
-            if tokens.get(index).is_some_and(|token| token.token == Token::Eq) || word(tokens.get(index), "TO") { index += 1; }
-            let (value, used) = expression(&tokens[index..], sql, 0)?;
-            if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
-            Syntax::Set { name, value, local }
-        } else { Syntax::Standard(standard(tokens, sql)?) };
-        if !settings.is_empty() && !matches!(&statement, Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. })) {
-            return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
+    Ok(())
+}
+
+pub(super) fn parse_statement_syntax<'input>(
+    source: StatementSource<'input>, span: SourceSpan, slice: &[TokenWithSpan],
+) -> Result<DeferredStatementSyntax<'input>> {
+    let sql = source.input;
+    let dialect = SqlDialect::default();
+    let (prefix, returning) = crate::returning::split(slice, sql)?;
+    if let Some(returning) = returning { returning.validate(sql)?; }
+    let period_columns = prefix.iter().filter_map(|token| match &token.token {
+        Token::Word(word) => {
+            let name = if word.quote_style.is_some() { word.value.clone() } else { word.value.to_lowercase() };
+            matches!(name.as_str(), "_valid_time" | "_system_time").then_some(name)
         }
-        crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
-        let tree = StatementTree { source: sql, forms, statement, temporal, period_columns, settings, wildcard_renames };
-        statements.push(StatementSyntax { span, tree, parameters });
+        _ => None,
+    }).collect();
+    let (tokens, parameters) = crate::inline_xtql::extract(prefix, sql)?;
+    let (tokens, settings) = crate::settings::extract(tokens, sql)?;
+    let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
+    let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
+    let (mut tokens, mut temporal) = extract_temporal(tokens, sql)?;
+    let mut statement = if word(tokens.first(), "PATCH") || (word(tokens.first(), "INSERT") && tokens.iter().any(|token| word(Some(token), "RECORDS"))) {
+        let patch = word(tokens.first(), "PATCH");
+        let start = if word(tokens.get(1), "INTO") { 2 } else { 1 };
+        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+        let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        if patch {
+            let end = table.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
+            if temporal.iter().any(|clause| Some(clause.owner_end) == end && matches!(clause.extent, TemporalExtent::All)) {
+                return Err(sql_error("PATCH valid time requires FROM with an optional TO", sql, slice[0].span));
+            }
+        }
+        if !word(Some(&parser.next_token()), "RECORDS") { return Err(sql_error("Expected RECORDS after mutation target", sql, slice[0].span)); }
+        let records = dialect.checked(parser.parse_comma_separated(|parser| parser.parse_expr())).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after RECORDS", sql, parser.peek_token().span)); }
+        Syntax::Records { patch, table, records }
+    } else if word(tokens.first(), "CREATE") && (word(tokens.get(1), "TABLE") || (word(tokens.get(1), "OR") && word(tokens.get(2), "ALTER") && word(tokens.get(3), "TABLE"))) {
+        let start = if word(tokens.get(1), "TABLE") { 2 } else { 4 };
+        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[start..].to_vec());
+        let table = parser.parse_object_name(false).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let mut columns = Vec::new();
+        if parser.consume_token(&Token::LParen) && !parser.consume_token(&Token::RParen) {
+            loop {
+                columns.push(identifier_token(&parser.next_token())?);
+                if parser.consume_token(&Token::RParen) { break; }
+                parser.expect_token(&Token::Comma).map_err(|error| sql_error(error.to_string(), sql, parser.peek_token().span))?;
+            }
+        }
+        if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after CREATE TABLE", sql, parser.peek_token().span)); }
+        Syntax::CreateTable { table, columns }
+    } else if word(tokens.first(), "GRANT") || word(tokens.first(), "REVOKE") {
+        let revoke = word(tokens.first(), "REVOKE");
+        if tokens.len() != 4 || !word(tokens.get(2), if revoke { "FROM" } else { "TO" }) { return Err(sql_error("Expected one role and one user", sql, slice[0].span)); }
+        Syntax::GrantRole { role: identifier_token(&tokens[1])?, user: identifier_token(&tokens[3])?, revoke }
+    } else if word(tokens.first(), "ERASE") {
+        let replacement = Tokenizer::new(&dialect, "DELETE").tokenize().map_err(|error| Anomaly::fault("rtdb.sql/lexer", error.to_string()))?;
+        tokens[0].token = replacement.into_iter().next().ok_or_else(|| Anomaly::fault("rtdb.sql/lexer", "Missing DELETE token"))?;
+        let statement = standard(tokens, sql)?;
+        let ast::Statement::Delete(delete) = statement else { return Err(sql_error("ERASE must target a table", sql, slice[0].span)); };
+        Syntax::Erase(delete)
+    } else if word(tokens.first(), "ASSERT") {
+        let mut parser = Parser::new(&dialect).with_tokens_with_locations(tokens[1..].to_vec());
+        let expression = dialect.checked(parser.parse_expr()).map_err(|error| sql_error(error.to_string(), sql, slice[0].span))?;
+        let message = if parser.consume_token(&Token::Comma) {
+            match parser.next_token().token { Token::SingleQuotedString(message) => Some(message), _ => return Err(sql_error("ASSERT message must be a string", sql, slice[0].span)) }
+        } else { None };
+        if parser.peek_token().token != Token::EOF { return Err(sql_error("Unexpected input after ASSERT", sql, parser.peek_token().span)); }
+        Syntax::Assert(expression, message)
+    } else if word(tokens.first(), "SHOW") {
+        Syntax::Show(tokens[1..].iter().map(identifier_token).collect::<Result<_>>()?)
+    } else if word(tokens.first(), "SET") && !word(tokens.get(1), "TRANSACTION") && !word(tokens.get(1), "ROLE") {
+        let mut index = 1;
+        let local = word(tokens.get(index), "LOCAL");
+        if local || word(tokens.get(index), "SESSION") { index += 1; }
+        let mut name = vec![identifier_token(tokens.get(index).ok_or_else(|| sql_error("SET requires a variable", sql, slice[0].span))?)?];
+        index += 1;
+        if name[0].normalized() == "time" && word(tokens.get(index), "ZONE") { name.push(identifier_token(&tokens[index])?); index += 1; }
+        if tokens.get(index).is_some_and(|token| token.token == Token::Eq) || word(tokens.get(index), "TO") { index += 1; }
+        let (value, used) = expression(&tokens[index..], sql, 0)?;
+        if index + used != tokens.len() { return Err(sql_error("Unexpected input after SET", sql, tokens[index + used].span)); }
+        Syntax::Set { name, value, local }
+    } else { Syntax::Standard(standard(tokens, sql)?) };
+    if !settings.is_empty() && !matches!(&statement, Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. })) {
+        return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
     }
-    Ok(StatementSyntaxBatch { source: sql, forms, statements })
+    crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
+    let tree = StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames };
+    Ok(DeferredStatementSyntax { span, tree, parameters })
 }
 
 pub(crate) fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {

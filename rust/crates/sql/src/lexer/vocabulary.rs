@@ -38,7 +38,7 @@ const ALIASES: &[(&str, &str)] = &[
     ("_PG_EXPANDARRAY", "PG_EXPANDARRAY"),
 ];
 
-pub(super) fn keyword(value: &str) -> Option<Keyword> {
+pub(crate) fn keyword(value: &str) -> Option<Keyword> {
     KEYWORDS.iter().find(|candidate| value.eq_ignore_ascii_case(candidate)).map(|value| Keyword(value))
         .or_else(|| ALIASES.iter().find(|(spelling, _)| value.eq_ignore_ascii_case(spelling)).map(|(_, name)| Keyword(name)))
 }

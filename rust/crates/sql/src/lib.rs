@@ -22,11 +22,13 @@ mod returning;
 mod lexer;
 mod parser;
 mod literal_text;
+mod batch;
 
-pub use parse::{ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};
+pub use parse::{DeferredStatementSyntax, ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
 pub use control::{ParsedControl, parse_control, parse_control_in, parse_control_syntax_in};
 pub use split::{SplitStatements, split_statements, split_statements_in};
+pub use batch::{BatchStatement, ExecutableSyntax, PrepareSyntax, StatementBatch, parse_statement_batch};
 
 use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, MemoryBudget, Result};

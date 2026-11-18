@@ -38,6 +38,7 @@ mod generated_expr;
 
 #[path = "generated_names.rs"]
 mod generated_names;
+pub(in crate::parser) use generated_names::is_identifier_token;
 
 #[path = "generated_select.rs"]
 mod generated_select;

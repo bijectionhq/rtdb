@@ -83,15 +83,13 @@ A probe prepared that way carries a RowDescription.
 On success the markers preserve an existing explicit transaction's status and settle an implicit transaction through the normal Simple Query path.
 The DBeaver namespace query rewrite matches the complete normalized Simple message before tokenization.
 The namespace query keeps its original projection when it appears in a multi-statement message.
-Ordinary Simple Query admits located-token array growth as the tokenizer emits each token.
-The prior array retains its charge until replacement storage has been admitted and the tokens have moved.
-A denied append ends tokenization, and a lexical error already observed by the validator keeps precedence.
-The ordinary source passes lexical validation before Simple Query admits the nonempty statement ranges and executes the first statement.
-The token array keeps its charge during range construction and releases it before execution.
-The range buffer keeps its reservation through batch execution and releases it on completion, error, or cancellation.
+Ordinary Simple Query retains the batch's parsed syntax before any statement can change the session.
+The grammar validates nested PREPARE statements and requires a statement between separators.
+The tokenizer charges the located-token array as it grows and releases it after syntax construction.
 The input frame retains the source bytes.
-Empty and comment-only sources require no statement-range reservation.
-Token payloads and tokenizer scratch still need separate admission, and statements undergo AST validation individually.
+Each statement releases its syntax reservation once preparation consumes the tree.
+Each statement resolves its parameters, embedded XTQL and control expressions against the context reached during execution.
+A reached planning or execution error is reported in statement order, with subsequent statements subject to normal transaction status.
 Arrow COPY inspects metadata and compressed buffer lengths before loading payloads, then holds a reservation through the reader and each selected-value conversion.
 Transit COPY reserves the bounded file's decoding allowance before reading it into memory.
 Temporary-file reads and writes run synchronously on the owning future; cancellation is observed between those operations and during asynchronous transaction work.

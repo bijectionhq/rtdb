@@ -514,13 +514,16 @@ async fn simple_batch_lexical_failure_precedes_session_effects_and_recovers() {
 }
 
 #[tokio::test]
-async fn simple_empty_groups_and_canned_keyword_result_keep_protocol_shapes() {
+async fn simple_comments_separators_and_canned_keyword_results_keep_protocol_shapes() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;
-    let empty = client.query(" -- idle\n /* ; */ ; ;").await;
+    let empty = client.query(" -- idle\n -- still idle ; ;").await;
     assert_eq!(tags(&empty), b"IZ");
     assert!(empty[0].1.is_empty());
     assert_eq!(empty[1].1, b"I");
+    let block = client.query(" -- idle\n /* ; */ ; ;").await;
+    assert_eq!(tags(&block), b"EZ");
+    assert_eq!(block[1].1, b"I");
     let semicolon = client.query("; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords(); ;").await;
     assert_eq!(semicolon, vec![(b'n', vec![]), (b'C', b" 0\0".to_vec()), (b'Z', b"I".to_vec())]);
     let canned = client.query("SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords()").await;
@@ -530,6 +533,63 @@ async fn simple_empty_groups_and_canned_keyword_result_keep_protocol_shapes() {
     assert_eq!(canned[2].1, b"SELECT 1\0");
     assert_eq!(canned[3].1, b"I");
     drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn simple_batch_rejects_sql_grammar_before_session_effects() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for sql in [
+        "SET TIME ZONE 'America/New_York'; SELEC 7",
+        "SET TIME ZONE 'America/New_York'; BEGIN READ ONLY, CLOCK_TIME = )",
+        "SET TIME ZONE 'America/New_York'; PREPARE p AS PREPARE q AS SELEC 7",
+        "SET TIME ZONE 'America/New_York'; PREPARE BEGIN AS SELECT 7",
+        "SET TIME ZONE 'America/New_York'; PREPARE p AS PREPARE BEGIN AS SELECT 7",
+        "SET TIME ZONE 'America/New_York';; SELECT 7",
+        "SET TIME ZONE 'America/New_York'; XTQL $$($$; SELEC 7",
+    ] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"EZ", "{sql}");
+        assert_eq!(frames[1].1, b"I");
+        assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"UTC".to_vec())]]);
+    }
+    for sql in ["SELECT 1;;", "SELECT 1; /* tail */"] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"TDCZ", "{sql}");
+        assert_eq!(rows(&frames), [vec![Some(b"1".to_vec())]]);
+    }
+    for sql in ["SELECT 1;;;", "SELECT 1;; /* tail */"] {
+        assert_eq!(tags(&client.query(sql).await), b"EZ", "{sql}");
+    }
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn simple_batch_binds_each_statement_and_continues_after_reached_errors() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for source in [
+        "SET TIME ZONE 'America/New_York'; XTQL $$($$; SELECT 7",
+        "SET TIME ZONE 'America/New_York'; PREPARE p AS SELECT unknown_combo(); SELECT 7",
+    ] {
+        let frames = client.query(source).await;
+        assert_eq!(tags(&frames), b"SCETDCZ", "{source}");
+        assert_eq!(rows(&frames), [vec![Some(b"7".to_vec())]]);
+        assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"UTC".to_vec())]]);
+    }
+    let frames = client.query("PREPARE first_query AS SELECT 7; EXECUTE first_query;").await;
+    assert_eq!(tags(&frames), b"CTDCZ");
+    assert_eq!(rows(&frames), [vec![Some(b"7".to_vec())]]);
+    for name in ["\"BEGIN\"", "SELECT"] {
+        let frames = client.query(&format!("PREPARE {name} AS SELECT 5; EXECUTE {name};")).await;
+        assert_eq!(tags(&frames), b"CTDCZ", "{name}");
+        assert_eq!(rows(&frames), [vec![Some(b"5".to_vec())]]);
+    }
+    let frames = client.query("PREPARE outer_q AS PREPARE inner_q AS SELECT 5; EXECUTE outer_q;").await;
+    assert_eq!(tags(&frames), b"CEZ");
+    let message = frames[1].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"M"));
+    assert_eq!(message, Some(b"EXECUTE only supports a prepared query or DML statement".as_slice()));
+    running.stop().await;
 }
 
 #[tokio::test]

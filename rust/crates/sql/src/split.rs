@@ -47,13 +47,13 @@ pub fn split_statements(source: &str) -> Result<Vec<SourceSpan>> {
     Ok(SpanBoundaryCursor::new(tokens.into_iter()).map(|span| crate::parse::source_span(source, span)).collect())
 }
 
-struct SplitTokens {
-    values: Vec<TokenWithSpan>,
+pub(super) struct SplitTokens {
+    pub(super) values: Vec<TokenWithSpan>,
     reservation: Option<Arc<MemoryReservation>>,
 }
 
 impl SplitTokens {
-    fn tokenize_in(source: &str, memory: &Arc<MemoryBudget>) -> Result<Self> {
+    pub(super) fn tokenize_in(source: &str, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let mut tokens = Self { values: Vec::new(), reservation: None };
         let reservation = &mut tokens.reservation;
         crate::parse::tokenize_into(source, &mut tokens.values, |values, token| {

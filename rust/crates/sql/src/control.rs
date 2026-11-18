@@ -4,7 +4,7 @@ use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStat
 use rtdb_types::Result;
 use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
-use crate::{PrepareOptions, parse::{source_span, sql_error}};
+use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}};
 
 pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<ControlStatement>> {
     parse_control_with(source, options, crate::bind::FormAllocation::Untracked)
@@ -21,16 +21,27 @@ fn parse_control_with(source: &str, options: &PrepareOptions, forms: crate::bind
 }
 
 /// A parsed session command whose expressions bind against the later statement context.
+#[derive(Debug)]
 pub struct ParsedControl<'input> {
-    source: &'input str,
+    source: StatementSource<'input>,
     forms: crate::bind::FormAllocation<'input>,
     syntax: ControlStatement<ast::Expr>,
 }
 
-impl ParsedControl<'_> {
+impl<'input> ParsedControl<'input> {
+    /// Returns the original text of this control command.
+    pub fn source(&self) -> &'input str { self.source.text() }
+
+    /// Determines whether Simple Query starts an implicit transaction around this command.
+    pub fn starts_implicit_transaction(&self) -> bool {
+        !matches!(self.syntax, ControlStatement::Begin(_) | ControlStatement::Discard(_)
+            | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })
+    }
+
     /// Compiles the control expressions using their original source and raw metadata budget.
     pub fn bind(self, options: &PrepareOptions) -> Result<ControlStatement> {
-        let bind = |expression| crate::bind::control_expression(self.source, &expression, options, self.forms);
+        let source = self.source.input;
+        let bind = |expression| crate::bind::control_expression(source, &expression, options, self.forms);
         self.syntax.try_map_expressions(bind, |expression| {
             match crate::settings::clock_timestamp_literal(&expression)? {
                 Some(text) => Ok(ControlValue::TimestampLiteral(text)),
@@ -49,19 +60,46 @@ fn parse_control_syntax<'input>(source: &'input str, forms: crate::bind::FormAll
     let mut tokens: Vec<_> = crate::parse::tokenize(source)?
         .into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
     if tokens.last().is_some_and(|token| token.token == Token::SemiColon) { tokens.pop(); }
+    if let Some(first) = tokens.first()
+        && is_control_head(first) && tokens.iter().any(|token| token.token == Token::SemiColon) {
+        return Err(sql_error("A control statement must contain exactly one statement", source, first.span));
+    }
+    parse_control_tokens(StatementSource::full(source), &tokens, forms)
+}
+
+fn is_control_head(first: &TokenWithSpan) -> bool {
+    ["BEGIN", "START", "SET", "COMMIT", "ROLLBACK", "DISCARD", "SHOW", "PREPARE", "EXECUTE", "ATTACH", "DETACH", "COPY"]
+        .into_iter().any(|head| word(Some(first), head))
+}
+
+pub(super) fn prepare_name(input: &str, tokens: &[TokenWithSpan]) -> Result<Option<String>> {
+    if !word(tokens.first(), "PREPARE") { return Ok(None); }
+    let mut parser = ControlParser { source: input, tokens: tokens[..tokens.len().min(3)].to_vec(), index: 1 };
+    let name = parser.statement_name()?;
+    parser.expect("AS")?;
+    if tokens.get(parser.index).is_none() { return Err(parser.error("PREPARE requires a statement")); }
+    Ok(Some(name))
+}
+
+pub(super) fn parse_control_tokens<'input>(
+    source: StatementSource<'input>, tokens: &[TokenWithSpan], forms: crate::bind::FormAllocation<'input>,
+) -> Result<Option<ParsedControl<'input>>> {
     let Some(first) = tokens.first() else { return Ok(None); };
-    if !["BEGIN", "START", "SET", "COMMIT", "ROLLBACK", "DISCARD", "SHOW", "PREPARE", "EXECUTE", "ATTACH", "DETACH", "COPY"].iter().any(|head| word(Some(first), head)) { return Ok(None); }
-    if tokens.iter().any(|token| token.token == Token::SemiColon) { return Err(sql_error("A control statement must contain exactly one statement", source, first.span)); }
+    if !is_control_head(first) { return Ok(None); }
+    if let Some(name) = prepare_name(source.input, tokens)? {
+        let inner = StatementSource::tokens(source.input, &tokens[3], tokens.last().expect("PREPARE body was checked"));
+        return Ok(Some(ParsedControl {
+            source, forms, syntax: ControlStatement::Prepare { name, source: inner.text().into() },
+        }));
+    }
     let mut next_parameter = 1usize;
+    let mut tokens = tokens.to_vec();
     for token in &mut tokens {
         if let Token::Placeholder(parameter) = &mut token.token {
             if parameter == "?" { *parameter = format!("${next_parameter}"); next_parameter += 1; }
-            if parameter.strip_prefix('$').and_then(|index| index.parse::<usize>().ok()).is_none_or(|index| index == 0) {
-                return Err(sql_error("SQL parameters use ? or a positive $n index", source, token.span));
-            }
         }
     }
-    let mut parser = ControlParser { source, tokens, index: 0 };
+    let mut parser = ControlParser { source: source.input, tokens, index: 0 };
     let syntax = parser.statement()?;
     if parser.index != parser.tokens.len() { return Err(parser.error("Unexpected input after control statement")); }
     Ok(Some(ParsedControl { source, forms, syntax }))
@@ -85,6 +123,14 @@ impl ControlParser<'_> {
         let identifier = Identifier { text: word.value.clone(), quoted: word.quote_style.is_some() };
         self.index += 1;
         Ok(identifier)
+    }
+    fn statement_name(&mut self) -> Result<String> {
+        let token = self.index;
+        let identifier = self.identifier()?;
+        if !identifier.quoted && !crate::parser::is_unquoted_identifier(&identifier.text) {
+            return Err(sql_error("Expected a prepared statement name", self.source, self.tokens[token].span));
+        }
+        Ok(identifier.normalized())
     }
     fn string(&mut self) -> Result<String> {
         let Some(token) = self.tokens.get(self.index) else { return Err(self.error("Expected a string literal")); };
@@ -224,16 +270,8 @@ impl ControlParser<'_> {
             if name == "transaction" { self.expect("ISOLATION")?; self.expect("LEVEL")?; name = "transaction_isolation".into(); }
             return Ok(ControlStatement::Show { name });
         }
-        if self.eat("PREPARE") {
-            let name = self.identifier()?.normalized(); self.expect("AS")?;
-            let first = self.tokens.get(self.index).ok_or_else(|| self.error("PREPARE requires a statement"))?;
-            let last = self.tokens.last().ok_or_else(|| self.error("PREPARE requires a statement"))?;
-            let span = source_span(self.source, Span::new(first.span.start, last.span.end));
-            let source = self.source[span.start..span.end].to_owned(); self.index = self.tokens.len();
-            return Ok(ControlStatement::Prepare { name, source });
-        }
         if self.eat("EXECUTE") {
-            let name = self.identifier()?.normalized(); let mut arguments = Vec::new();
+            let name = self.statement_name()?; let mut arguments = Vec::new();
             if self.token(Token::LParen) {
                 if self.token(Token::RParen) { return Err(self.error("EXECUTE parentheses require an argument")); }
                 loop { arguments.push(self.expression()?); if self.token(Token::RParen) { break; } if !self.token(Token::Comma) { return Err(self.error("Expected comma between EXECUTE arguments")); } }
