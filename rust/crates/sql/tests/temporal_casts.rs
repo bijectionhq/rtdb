@@ -36,6 +36,25 @@ async fn temporal_precision_survives_sql_binding_and_arrow_execution() {
 }
 
 #[tokio::test]
+async fn explicit_date_casts_and_implicit_timestamp_and_date_comparisons_report_invalid_text() {
+    let mut errors = Vec::new();
+    for sql in [
+        "SELECT CAST('not-a-date' AS DATE)",
+        "SELECT DATE '2020-01-01' >= 'not-a-date'",
+    ] {
+        let error = query(sql, "UTC").await.unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/invalid-temporal-string", "{sql}");
+        assert_eq!(error.context["s"], "not-a-date", "{sql}");
+        assert_eq!(error.context["date-type"], "date", "{sql}");
+        errors.push(error);
+    }
+    assert_eq!(errors[0], errors[1]);
+    let timestamp = query("SELECT TIMESTAMP '2020-01-01T00:00Z' >= 'not-a-timestamp'", "UTC").await.unwrap_err();
+    assert_eq!(timestamp.code, "xtdb/invalid-date-time");
+    assert_eq!(timestamp.context["timestamp"], "not-a-timestamp");
+}
+
+#[tokio::test]
 async fn malformed_timestamp_casts_report_the_accepted_prefix() {
     for (input, display, index) in [
         ("2021-10-21 12", "2021-10-21T12", 10),

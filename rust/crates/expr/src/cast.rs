@@ -166,7 +166,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         }
         S::DateDay | S::DateMilli => {
             let days = match value {
-                Value::Utf8(text) => CivilDate::parse_iso(text)?.epoch_day(),
+                Value::Utf8(text) => CivilDate::parse_iso(text).map_err(|_| crate::temporal_cast::invalid_temporal_text(text, "date"))?.epoch_day(),
                 Value::Timestamp { value, unit, timezone: source_zone } => local_seconds(*value, *unit, source_zone.as_ref().map(|_| timezone))?.div_euclid(86_400),
                 _ => return Err(inapplicable("date", &[value])),
             };
