@@ -21,6 +21,7 @@ use futures_channel::oneshot;
 use futures_util::future::{FutureExt, Map};
 
 use crate::log::trace;
+use crate::native_byte_account::NativeByteAccount;
 
 use rdkafka_sys as rdsys;
 
@@ -371,6 +372,36 @@ where
 
     pub(crate) fn ptr(&self) -> *mut T {
         self.ptr.as_ptr()
+    }
+}
+
+pub(crate) struct AccountedNativePtr<T: KafkaDrop> {
+    native: NativePtr<T>,
+    byte_account: Option<Arc<NativeByteAccount>>,
+}
+
+impl<T: KafkaDrop> AccountedNativePtr<T> {
+    /// # Safety
+    /// A nonnull `ptr` must transfer native ownership, and every monitor reached by its destructor must stay alive through destruction.
+    pub(crate) unsafe fn from_ptr(
+        ptr: *mut T,
+        byte_account: Option<Arc<NativeByteAccount>>,
+    ) -> Option<Self> {
+        unsafe { NativePtr::from_ptr(ptr) }.map(|native| Self { native, byte_account })
+    }
+
+    pub(crate) fn byte_account(&self) -> Option<&Arc<NativeByteAccount>> {
+        self.byte_account.as_ref()
+    }
+
+    pub(crate) fn ptr(&self) -> *mut T {
+        self.native.ptr()
+    }
+}
+
+impl<T: KafkaDrop> fmt::Debug for AccountedNativePtr<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.native.fmt(f)
     }
 }
 

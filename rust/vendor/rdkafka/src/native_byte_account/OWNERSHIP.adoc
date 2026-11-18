@@ -1,0 +1,43 @@
+= SDK native account ownership
+
+Public ClientConfig::set_native_byte_account installs a shared account in producer configuration.
+Generic producer Client, BaseProducer, FutureProducer and AdminClient construction retain that account through native client destruction.
+AdminClient uses the native producer type.
+Consumer construction still rejects an attached account before native creation.
+This ownership slice does not activate a public accounted consumer or change Connect, log or DLQ construction.
+
+AccountedNativePtr is a passive destruction region owning one NativePtr and its optional account lease.
+Its native field is destroyed before the lease field, so the existing native destructor completes while the lease is still held.
+NativeClient stores its pointer and account in that owner and exposes the same borrowed account to its dependent owners.
+The existing NativePtr and its pointer-array representation remain unchanged for all other native resources, including admin input arrays.
+The separate accounted constructor retains a supplied Arc without reserving its capacity again.
+The account remains the existing monitor whose final Rust owner waits for attached native clients and outstanding charges before releasing the caller's reservation.
+
+Every SDK queue handle inherits the account of its originating client: the setup log queue, independent queue, main queue, consumer queue and split partition queue.
+Queue polling returns an owned NativeEvent immediately, retaining the same queue account before the event leaves the poll call.
+Both ordinary client event handling and the admin polling thread use this owned result.
+There is no separate raw event handoff that can omit the account lease.
+An empty result releases its temporary account reference without retaining an event.
+The admin oneshot sender transfers the complete event owner to its receiver, including when the result outlives AdminClient.
+BorrowedMessage and RetainedConsumerMessage keep their existing native-event and consumer lifetime rules.
+Existing independent Metadata and ordered completion/connection account owners retain their separate destruction order.
+
+The account lease protects the native account monitor; it does not retain the native client or authorize queue use after client destruction.
+Polling and queue operations require their existing live client and callback owners.
+Client teardown disables and purges the native main, consumer and partition queue owners before final client disposal.
+A remaining SDK handle can then release the native queue reference without losing its account early.
+The independent admin queue is destroyed before the native client after its existing polling thread has joined.
+An escaped admin-result event owns its independent result payloads; event destruction frees those native result owners before returning any op charge and releasing the Rust lease.
+No native client reference cycle, additional actor, task, waiter, queue, side table or stored callback is introduced.
+
+The unexecuted SDK source fixtures enqueue an actually accounted native error op on a queue belonging to a publicly constructed accounted producer Client.
+They cover independent-queue purge after client disposal, a polled charged event retained after both queue and client disposal, rejected oneshot handoff, native main-queue purge before its last handle, empty/missing queue results, denied op allocation and the legacy NULL-account profile.
+The injected error op has no callback, topic, buffer or other client-dependent final destructor.
+A separate actual AdminClient request times out through its real polling thread and oneshot channel, then retains the returned native event after admin/config destruction and checks final reservation release.
+That admin result remains an unadmitted native output allocation; its fixture proves the existing escape edge's account lifetime.
+These private SDK unit fixtures require the vendored SDK's own test target and have not been compiled or run in Phase 1.
+
+This slice propagates lifetime authority and does not add allocation admission for SDK wrapper bookkeeping, native client/queue construction, admin results, detached outputs, native sorting internals or all native allocation classes.
+Unsafe raw FFI pointers remain the unsafe caller's ownership obligation.
+Public accounted consumer construction, a whole-native bound and runtime/Phase 2 verification remain separate gates.
+link:sources.json[The source record] pins the inspected SDK and native destruction paths, and link:COPYRIGHT[the source notices] retains the complete inspected native leading notices and SDK license.

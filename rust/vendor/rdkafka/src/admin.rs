@@ -25,7 +25,7 @@ use crate::client::{Client, ClientContext, DefaultClientContext, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::error::{IsError, KafkaError, KafkaResult};
 use crate::log::{trace, warn};
-use crate::util::{cstr_to_owned, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout};
+use crate::util::{cstr_to_owned, AccountedNativePtr, AsCArray, ErrBuf, IntoOpaque, KafkaDrop, NativePtr, Timeout};
 use crate::TopicPartitionList;
 
 //
@@ -433,16 +433,12 @@ fn start_poll_thread(queue: Arc<NativeQueue>, should_stop: Arc<AtomicBool>) -> J
         .spawn(move || {
             trace!("Admin polling thread loop started");
             loop {
-                let event = queue.poll(Duration::from_millis(100));
-                if event.is_null() {
+                let Some(event) = queue.poll(Duration::from_millis(100)) else {
                     if should_stop.load(Ordering::Relaxed) {
-                        // We received nothing and the thread should stop, so
-                        // break the loop.
                         break;
                     }
                     continue;
-                }
-                let event = unsafe { NativeEvent::from_ptr(event).unwrap() };
+                };
                 let tx: Box<oneshot::Sender<NativeEvent>> =
                     unsafe { IntoOpaque::from_ptr(rdsys::rd_kafka_event_opaque(event.ptr())) };
                 let _ = tx.send(event);
@@ -452,7 +448,10 @@ fn start_poll_thread(queue: Arc<NativeQueue>, should_stop: Arc<AtomicBool>) -> J
         .expect("Failed to start polling thread")
 }
 
-pub(crate) type NativeEvent = NativePtr<RDKafkaEvent>;
+pub(crate) type NativeEvent = AccountedNativePtr<RDKafkaEvent>;
+
+#[cfg(test)]
+mod native_account_tests;
 
 unsafe impl KafkaDrop for RDKafkaEvent {
     const TYPE: &'static str = "event";
@@ -462,7 +461,7 @@ unsafe impl KafkaDrop for RDKafkaEvent {
 unsafe impl Send for NativeEvent {}
 unsafe impl Sync for NativeEvent {}
 
-impl NativePtr<RDKafkaEvent> {
+impl NativeEvent {
     fn check_error(&self) -> KafkaResult<()> {
         let err = unsafe { rdsys::rd_kafka_event_error(self.ptr()) };
         if err.is_error() {

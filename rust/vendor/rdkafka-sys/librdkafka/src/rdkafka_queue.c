@@ -1149,3 +1149,5 @@ void rd_kafka_enq_once_trigger_destroy(void *ptr) {
 
         rd_kafka_enq_once_trigger(eonce, RD_KAFKA_RESP_ERR__DESTROY, "destroy");
 }
+
+#include "rdkafka_native_account_owner_test.h"

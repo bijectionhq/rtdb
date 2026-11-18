@@ -57,6 +57,7 @@ use rdkafka_sys as rdsys;
 use rdkafka_sys::rd_kafka_vtype_t::*;
 use rdkafka_sys::types::*;
 
+use crate::admin::NativeEvent;
 use crate::client::{Client, EventPollResult, NativeQueue};
 use crate::config::{ClientConfig, FromClientConfig, FromClientConfigAndContext};
 use crate::consumer::ConsumerGroupMetadata;
@@ -67,7 +68,7 @@ use crate::producer::{
     DefaultProducerContext, Partitioner, Producer, ProducerContext, PurgeConfig,
 };
 use crate::topic_partition_list::TopicPartitionList;
-use crate::util::{Deadline, IntoOpaque, NativePtr, Timeout};
+use crate::util::{Deadline, IntoOpaque, Timeout};
 
 pub use crate::message::DeliveryResult;
 
@@ -385,7 +386,7 @@ where
         }
     }
 
-    fn handle_delivery_report_event(&self, event: NativePtr<RDKafkaEvent>) {
+    fn handle_delivery_report_event(&self, event: NativeEvent) {
         let max_messages = unsafe { rdsys::rd_kafka_event_message_count(event.ptr()) };
         let messages: Vec<*const RDKafkaMessage> = Vec::with_capacity(max_messages);
 
@@ -408,7 +409,7 @@ where
         }
     }
 
-    fn handle_error_event(&self, event: NativePtr<RDKafkaEvent>) {
+    fn handle_error_event(&self, event: NativeEvent) {
         let rdkafka_err = unsafe { rdsys::rd_kafka_event_error(event.ptr()) };
         let error = KafkaError::Global(rdkafka_err.into());
         let reason = unsafe {

@@ -32,7 +32,7 @@ use crate::metadata::Metadata;
 use crate::mocking::MockCluster;
 use crate::native_byte_account::NativeByteAccount;
 use crate::statistics::Statistics;
-use crate::util::{self, ErrBuf, KafkaDrop, NativePtr, Timeout};
+use crate::util::{self, AccountedNativePtr, ErrBuf, KafkaDrop, NativePtr, Timeout};
 
 /// Client-level context.
 ///
@@ -157,8 +157,7 @@ impl ClientContext for DefaultClientContext {}
 /// higher level `Client` or producers and consumers.
 // TODO(benesch): this should be `pub(crate)`.
 pub struct NativeClient {
-    ptr: NativePtr<RDKafka>,
-    _byte_account: Option<Arc<NativeByteAccount>>,
+    ptr: AccountedNativePtr<RDKafka>,
     _ssl_context: Option<Arc<SslContextConfig>>,
     material_lease: Option<Box<dyn SslMaterialLease>>,
 }
@@ -182,8 +181,7 @@ impl NativeClient {
         byte_account: Option<Arc<NativeByteAccount>>,
     ) -> NativeClient {
         NativeClient {
-            ptr: NativePtr::from_ptr(ptr).unwrap(),
-            _byte_account: byte_account,
+            ptr: AccountedNativePtr::from_ptr(ptr, byte_account).unwrap(),
             _ssl_context: ssl_context,
             material_lease,
         }
@@ -195,7 +193,7 @@ impl NativeClient {
     }
 
     pub(crate) fn byte_account(&self) -> Option<&Arc<NativeByteAccount>> {
-        self._byte_account.as_ref()
+        self.ptr.byte_account()
     }
 
     pub(crate) fn rebalance_protocol(&self) -> RebalanceProtocol {
@@ -316,7 +314,12 @@ impl<C: ClientContext> Client<C> {
         if let Some(lease) = &mut native.material_lease { lease.loaded(); }
         trace!("Create new librdkafka client {:p}", client_ptr);
 
-        let log_queue = unsafe { NativeQueue::from_ptr(rdsys::rd_kafka_queue_get_main(client_ptr)).unwrap() };
+        let log_queue = unsafe {
+            NativeQueue::from_ptr(
+                rdsys::rd_kafka_queue_get_main(client_ptr),
+                native.byte_account().cloned(),
+            ).unwrap()
+        };
         let ret = unsafe {
             rdsys::rd_kafka_set_log_queue(client_ptr, log_queue.ptr())
         };
@@ -351,7 +354,7 @@ impl<C: ClientContext> Client<C> {
         queue: &NativeQueue,
         timeout: T,
     ) -> EventPollResult<NativeEvent> {
-        let event = unsafe { NativeEvent::from_ptr(queue.poll(timeout)) };
+        let event = queue.poll(timeout);
         if let Some(ev) = event {
             let evtype = unsafe { rdsys::rd_kafka_event_type(ev.ptr()) };
             match evtype {
@@ -623,19 +626,33 @@ impl<C: ClientContext> Client<C> {
         })
     }
 
-    /// Returns a NativeQueue from the current client. The NativeQueue shouldn't
-    /// outlive the client it was generated from.
+    /// Queue operations require the originating client to remain alive.
     pub(crate) fn new_native_queue(&self) -> NativeQueue {
-        unsafe { NativeQueue::from_ptr(rdsys::rd_kafka_queue_new(self.native_ptr())).unwrap() }
+        unsafe {
+            NativeQueue::from_ptr(
+                rdsys::rd_kafka_queue_new(self.native_ptr()),
+                self.native.byte_account().cloned(),
+            ).unwrap()
+        }
     }
 
     pub(crate) fn consumer_queue(&self) -> Option<NativeQueue> {
-        unsafe { NativeQueue::from_ptr(rdsys::rd_kafka_queue_get_consumer(self.native_ptr())) }
+        unsafe {
+            NativeQueue::from_ptr(
+                rdsys::rd_kafka_queue_get_consumer(self.native_ptr()),
+                self.native.byte_account().cloned(),
+            )
+        }
     }
 
     /// Returns a NativeQueue for the main librdkafka event queue from the current client.
     pub(crate) fn main_queue(&self) -> NativeQueue {
-        unsafe { NativeQueue::from_ptr(rdsys::rd_kafka_queue_get_main(self.native_ptr())).unwrap() }
+        unsafe {
+            NativeQueue::from_ptr(
+                rdsys::rd_kafka_queue_get_main(self.native_ptr()),
+                self.native.byte_account().cloned(),
+            ).unwrap()
+        }
     }
 }
 
@@ -649,7 +666,7 @@ unsafe impl KafkaDrop for RDKafkaTopic {
 unsafe impl Send for NativeTopic {}
 unsafe impl Sync for NativeTopic {}
 
-pub(crate) type NativeQueue = NativePtr<RDKafkaQueue>;
+pub(crate) type NativeQueue = AccountedNativePtr<RDKafkaQueue>;
 
 unsafe impl KafkaDrop for RDKafkaQueue {
     const TYPE: &'static str = "queue";
@@ -661,10 +678,18 @@ unsafe impl Sync for NativeQueue {}
 unsafe impl Send for NativeQueue {}
 
 impl NativeQueue {
-    pub fn poll<T: Into<Timeout>>(&self, t: T) -> *mut RDKafkaEvent {
-        unsafe { rdsys::rd_kafka_queue_poll(self.ptr(), t.into().as_millis()) }
+    pub fn poll<T: Into<Timeout>>(&self, t: T) -> Option<NativeEvent> {
+        unsafe {
+            NativeEvent::from_ptr(
+                rdsys::rd_kafka_queue_poll(self.ptr(), t.into().as_millis()),
+                self.byte_account().cloned(),
+            )
+        }
     }
 }
+
+#[cfg(test)]
+mod native_account_tests;
 
 /// A generated OAuth token and its associated metadata.
 ///
