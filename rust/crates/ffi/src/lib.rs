@@ -348,7 +348,7 @@ pub unsafe extern "C" fn rtdb_v1_cursor_next_transit(handle: u64, out: *mut u64,
                 let schema = batch.schema();
                 let mut bound = add(8192, mul(batch.num_rows(), 1024)?)?;
                 for row in 0..batch.num_rows() { for (field, column) in schema.fields().iter().zip(batch.columns()) {
-                    bound = add(bound, add(rtdb_columnar::estimate_read_value_bytes(field, column.as_ref(), row)?, add(mul(field.name().len(), 4)?, 2048)?)?)?;
+                    bound = add(bound, add(rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)?, add(mul(field.name().len(), 4)?, 2048)?)?)?;
                 } }
                 let _rows = memory.reserve(bound)?;
                 let mut rows = Vec::with_capacity(batch.num_rows());

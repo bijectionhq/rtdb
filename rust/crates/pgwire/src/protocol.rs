@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
@@ -372,7 +372,7 @@ impl ProtocolSession {
             let row = query.row;
             let memory = Arc::clone(self.node.memory());
             let consumption: Result<()> = async {
-                let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
+                let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(rtdb_columnar::estimate_read_cell_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
                 let _scratch = memory.reserve(bound)?;
                 let mut values = Vec::with_capacity(columns.len());
                 for (index, column) in columns.iter().enumerate() { let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), batch.batch().column(index).as_ref(), row)?; values.push(rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)?); }

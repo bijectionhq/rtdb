@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, StructArray};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
@@ -123,7 +123,7 @@ impl Documents {
                 preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row))
             });
             let temporary = children().try_fold(4096usize, |bytes, ((field, column), _)| {
-                let value = if bottom(field) { 0 } else { estimate_read_value_bytes(field, column.as_ref(), row)? };
+                let value = if bottom(field) { 0 } else { rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)? };
                 bytes.checked_add(value).and_then(|bytes| bytes.checked_add(field.name().len()))
                     .and_then(|bytes| bytes.checked_add(entry)).ok_or_else(overflow)
             })?;

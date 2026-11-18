@@ -167,3 +167,18 @@ fn wide_sparse_nested_documents_estimate_their_builders_once_per_type_node() {
     assert!(bound < 128 << 20, "{bound} bytes estimated for 40 sparse documents");
     retains_within_bound(logical, values);
 }
+
+#[test]
+fn a_cell_estimate_charges_the_column_schema_once_not_per_nested_value() {
+    use rtdb_columnar::{build_array, estimate_read_cell_bytes, estimate_read_value_bytes, to_field};
+    use rtdb_types::{LogicalType, Value};
+    let elements = (0..200).map(|i| if i % 2 == 0 { Value::I64(i) } else { Value::Utf8(format!("v{i}")) }).collect::<Vec<_>>();
+    let values = vec![Value::List(elements)];
+    let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
+    let field = to_field("v", &logical).unwrap();
+    let array = build_array(&logical, &values).unwrap();
+    let cell = estimate_read_cell_bytes(&field, array.as_ref(), 0).unwrap();
+    let with_schema = estimate_read_value_bytes(&field, array.as_ref(), 0).unwrap();
+    assert!(with_schema > cell);
+    assert!(with_schema - cell < cell, "schema charged once: cell {cell}, with schema {with_schema}");
+}

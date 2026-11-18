@@ -1,7 +1,7 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
 use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, from_field, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -202,7 +202,7 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     let mut bound = super::add(4096, super::mul(batch.num_rows(), 64)?)?;
     for row in 0..batch.num_rows() {
         for (field, column) in fields.fields().iter().zip(batch.columns()) {
-            bound = super::add(bound, estimate_read_value_bytes(field, column.as_ref(), row)?)?;
+            bound = super::add(bound, rtdb_columnar::estimate_read_cell_bytes(field, column.as_ref(), row)?)?;
         }
     }
     let _scratch = memory.reserve(super::mul(bound, 2)?)?;

@@ -13,7 +13,7 @@ pub use allocation::{estimate_builder_bytes, estimate_builder_bytes_refs};
 pub use conform::{DeclaredBatch, conform_batch};
 pub use decimal::{DecimalParameters, INTERNAL_DECIMAL_PRECISION_KEY, INTERNAL_DECIMAL_SCALE_KEY, decimal_field_parameters, decimal_parameters, decimal_scale, decimal_storage_precision, decimal_storage_scale, map_schema_fields, with_decimal_parameters, with_decimal_scale};
 pub use execution::{admit_execution_value, execution_field_type, execution_type, read_execution_value, read_execution_value_as};
-pub use read_allocation::estimate_read_value_bytes;
+pub use read_allocation::{estimate_read_cell_bytes, estimate_read_value_bytes};
 pub use iid::{IidView, build_iids};
 pub use hash::{hash_cell, hash_value, hash_value_murmur3, murmur3_32, xxhash32};
 pub use memory::{BatchBuilder, MemoryBudget, MemoryReservation, OwnedBatch, OwnedColumn, Selection};
