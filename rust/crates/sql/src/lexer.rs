@@ -4,7 +4,7 @@ mod vocabulary;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt::{self, Write}, sync::Arc};
+use std::{fmt::{self, Write}, ops::Range, sync::Arc};
 use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, Result};
 pub(crate) use vocabulary::{Keyword, Punctuation, keyword};
 pub(crate) use stream::{IndexedLexeme, StreamError, TokenStream, TokenText};
@@ -243,9 +243,8 @@ impl<'sql, 'scope> Lexer<'sql, 'scope> {
             let start = self.state.cursor;
             let Some(first) = start.peek() else { return Ok(start.lexeme(Kind::Eof, start)); };
             if let Mode::Dollar { opening } = self.state.mode { return Ok(self.dollar(opening)); }
-            if whitespace(first) { self.state = LexerState { cursor: start.while_matches(whitespace), mode: Mode::Default }; continue; }
-            if start.remaining().starts_with("--") {
-                self.state = LexerState { cursor: start.while_matches(|value| !matches!(value, '\r' | '\n')), mode: Mode::Default };
+            if let Some(end) = simple_trivia_end(start, first) {
+                self.state = LexerState { cursor: end, mode: Mode::Default };
                 continue;
             }
             if start.remaining().starts_with("/*") {
@@ -253,15 +252,7 @@ impl<'sql, 'scope> Lexer<'sql, 'scope> {
             }
             let mut mode = Mode::Default;
             let (kind, end) = if identifier_start(first) {
-                let identifier = start.while_matches(identifier_part);
-                let raw = &start.source.0[start.position.byte..identifier.position.byte];
-                let mut accepted = (vocabulary::keyword(raw).map_or(Kind::Identifier, Kind::Keyword), identifier);
-                if first.eq_ignore_ascii_case(&'e') && start.advance(1).peek() == Some('\'') {
-                    if let Some(end) = quoted(start.advance(1), QuotedRule::Escaped).accepted { accepted = (Kind::EscapedString, end); }
-                } else if first.eq_ignore_ascii_case(&'x') && start.advance(1).remaining().starts_with("('") {
-                    if let Some(end) = binary(start) { accepted = (Kind::BinaryString, end); }
-                }
-                accepted
+                word_or_literal(start, first)
             } else if first.is_ascii_digit() {
                 number(start)
             } else if matches!(first, '\'' | '"' | '`') {
@@ -365,6 +356,48 @@ fn number(start: Cursor<'_>) -> (Kind, Cursor<'_>) {
         }
     }
     (kind, end)
+}
+
+fn simple_trivia_end(start: Cursor<'_>, first: char) -> Option<Cursor<'_>> {
+    if whitespace(first) { return Some(start.while_matches(whitespace)); }
+    if start.remaining().starts_with("--") {
+        return Some(start.while_matches(|value| !matches!(value, '\r' | '\n')));
+    }
+    None
+}
+
+fn word_or_literal(start: Cursor<'_>, first: char) -> (Kind, Cursor<'_>) {
+    let identifier = start.while_matches(identifier_part);
+    let raw = &start.source.0[start.position.byte..identifier.position.byte];
+    let mut accepted = (vocabulary::keyword(raw).map_or(Kind::Identifier, Kind::Keyword), identifier);
+    if first.eq_ignore_ascii_case(&'e') && start.advance(1).peek() == Some('\'') {
+        if let Some(end) = quoted(start.advance(1), QuotedRule::Escaped).accepted { accepted = (Kind::EscapedString, end); }
+    } else if first.eq_ignore_ascii_case(&'x') && start.advance(1).remaining().starts_with("('") {
+        if let Some(end) = binary(start) { accepted = (Kind::BinaryString, end); }
+    }
+    accepted
+}
+
+pub(crate) fn is_first_identifier(source: &str, span: &Range<usize>, memory: &Arc<MemoryBudget>) -> bool {
+    let mut start = Cursor { source: Source(source), position: Position::START };
+    while start.position.byte < span.start {
+        let Some(first) = start.peek() else { return false; };
+        if let Some(end) = simple_trivia_end(start, first) {
+            start = end;
+        } else if start.remaining().starts_with("/*") {
+            // The native comment recognizer owns the grammar's overlapping and nested cases.
+            let Ok(work) = AllocationScope::new(memory) else { return false; };
+            let Ok(token) = Lexer::new(source, &work).next() else { return false; };
+            let actual = token.span();
+            return token.kind() == Kind::Identifier && (actual.start.byte..actual.end.byte) == *span;
+        } else {
+            return false;
+        }
+    }
+    if start.position.byte != span.start { return false; }
+    let Some(first) = start.peek().filter(|&first| identifier_start(first)) else { return false; };
+    let (kind, end) = word_or_literal(start, first);
+    kind == Kind::Identifier && end.position.byte == span.end
 }
 
 fn whitespace(value: char) -> bool { matches!(value, ' ' | '\n' | '\r' | '\t') }

@@ -1,3 +1,4 @@
+use std::ops::Range;
 use rtdb_types::Anomaly;
 use crate::lexer::{IndexedLexeme, Kind};
 use crate::parser::grammar::{ExpectedSymbol, TokenSet, TokenType};
@@ -41,6 +42,13 @@ impl<'sql> TokenDiagnostic<'sql> {
         }
     }
     pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
+    pub(super) fn is_initial_statement(&self, expected: &Range<usize>) -> bool {
+        let token = self.offending();
+        let span = token.lexeme().span();
+        token.index() == 0 && (span.start.byte..span.end.byte) == *expected
+            && matches!(&self.report, TokenReport::Unwanted(_)
+                | TokenReport::Mismatch(InputMismatch { state: ParserState::State(574), .. }))
+    }
     pub(super) fn into_listener(self) -> ListenerDiagnostic { self.listener }
 }
 

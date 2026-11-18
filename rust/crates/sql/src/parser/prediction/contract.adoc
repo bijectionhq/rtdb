@@ -104,7 +104,7 @@ The failed access remains sealed, but a subsequent access has fresh work and abo
 Canonical entries are strong roots and are not evicted or reset to recover memory.
 Dropping a work scope does not release retained cache storage; dropping `PredictionStorage` releases its DFA, configuration and context blocks before its owned grammar.
 The region exposes neither raw stores nor graph replacement, and takes no ambient budget or cache.
-Production parser-environment sharing and adoption of the private DFA constituent remain separate required work.
+Sharing the private DFA constituent across production parser requests remains required.
 
 == Configuration objects and ordered sets
 
@@ -226,7 +226,7 @@ The private DFA constituent now directly traces actual map keys and values, ordi
 Completed predicate pairs own inline semantic values and checked alternatives, with no outgoing configuration or context IDs in this domain.
 The private test-only fixture still supplies two fixed key/value set pairs for the generic configuration regressions.
 It is absent from production and does not model DFA insertion, equality or hash behavior.
-The production parser does not adopt this cache in this slice.
+Initial Flight statement reports use a request-local cache.
 
 == Private DFA storage and phases
 
@@ -282,7 +282,7 @@ The current native diagnostic projection's null Java cause is a compatibility ga
 Pgwire and remote Flight project serialized diagnostics; direct in-process exceptions can retain their cause objects.
 
 This private foundation exports no DFA facade, cache put, cached set/config key or raw ID beyond the prediction boundary.
-Before production adoption or compatibility closure, an owning adapter plan must preserve the required embedded observations and shared-history effects, or deliver a specific reviewed-design-compatible migration for each incompatible extension.
+Before embedded production adoption or compatibility closure, an owning adapter plan must preserve the required embedded observations and shared-history effects, or deliver a specific reviewed-design-compatible migration for each incompatible extension.
 Ordinary results, errors, first-error timing and SLL/Bail-to-LL cache histories remain required under either resolution.
 Source assertions and Phase 2 receipts must cover cause nullability, recognizer and dead-end configuration access, post-error shared-cache behavior, the native projection and separate wire results.
 No public cause behavior is removed or waived by this slice.
@@ -372,7 +372,7 @@ Reached checks retain the RuleStop-Empty and MIN_VALUE-before-pop/falloff sites 
 Disabled checks retain Java wrapping arithmetic without an artificial depth cap.
 No-reach `None` lets the adaptive target path publish an ERROR edge.
 The adaptive execution loop captures the private no-viable token and recognizer-state facts at their source location.
-The OPEN `embedded-parser-error-capability` gate still blocks production adoption and compatibility closure; wire projection does not discharge the embedded cause/recognizer/config/DFA obligation.
+The OPEN `embedded-parser-error-capability` gate still blocks embedded production adoption and compatibility closure.
 Compiler and runtime qualification remain unrun.
 
 == Private runtime and Full continuation
@@ -808,6 +808,22 @@ The source fixture's live recognizer and shared DFA access remain subject to the
 Trailing input after a completed child can fail at root sync 354 with expected SEMI and EOF or after a matched semicolon at inline state 356 with expected EOF.
 A viable deletion reports a null cause before consumption.
 An ordinary suffix mismatch is assigned to the root, which finally records the last matched terminal.
+
+== Initial Flight statement reports
+
+Flight SQL GetFlightInfo asks for a Direct diagnostic only after its initial context-bound SQL preparation returns the existing vendor statement-head error.
+* Eligibility requires a first unquoted ASCII identifier absent from both keyword vocabularies.
+** The identifier occupies the byte range of the vendor parser error.
+** The original error is retained when the native lexer cannot confirm that identifier after leading block trivia.
+* The request-local Direct parser uses the query’s memory budget.
+** An unwanted token report at index zero or a mismatch there at state 574 supplies the diagnostic when the offending byte range agrees.
+** An admission failure after eligibility reaches the Flight status.
+** Other Direct outcomes retain the original preparation error.
+* The report retains its listener allowance through gRPC status construction.
+** The status owns the description and any anomaly metadata serialized within the 4 KiB limit.
+
+Shared parser history across requests, other parser surfaces and embedded cause capabilities remain open.
+Phase 2 compilation, runtime and paired Flight diagnostics remain pending.
 
 == Statement lists, controls and identifiers
 

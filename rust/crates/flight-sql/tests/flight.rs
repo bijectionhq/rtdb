@@ -238,24 +238,46 @@ async fn bearer_cookie_disagreement_and_replayed_different_basic_header_are_reje
 }
 
 #[tokio::test]
-async fn sql_parse_failures_return_anomaly_metadata_on_remote_flight() {
+async fn initial_statement_reports_use_direct_parser_anomaly_metadata_on_remote_flight() {
     let running = Running::start(None, FlightConfig::default()).await;
     let mut client = Client::connect(&running.server, None).await;
-    for sql in ["SELEC 1", "extra SELECT 1"] {
+    for (sql, diagnostic) in [
+        ("SELEC 1", "mismatched input 'SELEC'"),
+        ("extra SELECT 1", "extraneous input 'extra'"),
+    ] {
         let command = CommandStatementQuery { query: sql.into(), transaction_id: None };
         let descriptor = FlightDescriptor::new_cmd(command.as_any().encode_to_vec());
         let request = client.request(descriptor);
         let error = client.client.get_flight_info(request).await.unwrap_err();
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
-        assert!(!error.message().is_empty());
+        let prefix = format!("Errors parsing SQL statement:\n  - line 1:0 {diagnostic} expecting ");
+        assert!(error.message().starts_with(&prefix), "{}", error.message());
         let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
         let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
         assert_eq!(detail["category"], "incorrect");
         assert_eq!(detail["code"], "xtdb/sql-error");
         assert_eq!(detail["message"], error.message());
         assert!(detail.get("cause").is_none());
+        assert!(detail.get("data").is_none());
     }
     assert_eq!(integer(&client.query("SELECT 42::bigint AS answer").await[0], 0, 0), 42);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn get_schema_keeps_the_existing_statement_error_and_span() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let command = CommandStatementQuery { query: "SELEC 1".into(), transaction_id: None };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let error = client.client.get_schema(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert!(error.message().starts_with("sql parser error: Expected: an SQL statement, found: SELEC "));
+    let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(detail["category"], "incorrect");
+    assert_eq!(detail["code"], "xtdb/sql-error");
+    assert_eq!(detail["data"]["span"], serde_json::json!({"start": 0, "end": 5}));
     running.stop().await;
 }
 

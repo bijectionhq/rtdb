@@ -1,3 +1,4 @@
+use std::ops::Range;
 use rtdb_plan::{ControlCommitMode, ControlStatement, DiscardTarget};
 use rtdb_types::{AllocationScope, Anomaly};
 use crate::lexer::{IndexedLexeme, Kind, ScanError, Span, StreamError};
@@ -6,6 +7,15 @@ use super::{
     ParserState, PredictionError, RuntimeError, RuntimeProblem, RuntimeResult, with_bail_fallback,
 };
 use super::no_viable_report::ListenerDiagnostic;
+
+/// An initial statement syntax report holding its listener allocation until drop.
+#[derive(Debug)]
+pub struct InitialStatementDiagnostic(ListenerDiagnostic);
+
+impl InitialStatementDiagnostic {
+    /// Borrows the incorrect `xtdb/sql-error` anomaly with the listener’s text and empty context.
+    pub fn anomaly(&self) -> &Anomaly { &self.0.anomaly }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::parser) struct TokenOccurrence {
@@ -120,6 +130,23 @@ impl DirectControlError {
 }
 
 impl ParserEnvironment {
+    pub(in crate::parser) fn initial_statement_diagnostic(
+        &mut self, source: &str, span: &Range<usize>, work: &AllocationScope,
+    ) -> rtdb_types::Result<Option<InitialStatementDiagnostic>> {
+        let result = with_bail_fallback(self, source, work, |session, _| {
+            session.direct_sql_statement()?;
+            Ok(())
+        });
+        match result {
+            Err(RuntimeError::ReportedTokenSyntax(report)) if report.is_initial_statement(span) => {
+                Ok(Some(InitialStatementDiagnostic(report.into_listener())))
+            }
+            Err(RuntimeError::Prediction(PredictionError::Admission(error))
+                | RuntimeError::Input(StreamError::Scan(ScanError::Admission(error)))) => Err(error),
+            _ => Ok(None),
+        }
+    }
+
     pub(in crate::parser) fn parse_direct_control(
         &mut self, source: &str, work: &AllocationScope,
     ) -> Result<ControlStatement, DirectControlError> {

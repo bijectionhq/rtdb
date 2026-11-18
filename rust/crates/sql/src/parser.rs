@@ -1,5 +1,9 @@
 mod grammar;
+mod initial_statement;
 mod prediction;
+
+pub use initial_statement::initial_statement_diagnostic;
+pub use prediction::InitialStatementDiagnostic;
 
 pub(crate) fn is_unquoted_identifier(text: &str) -> bool {
     crate::lexer::keyword(text).is_none_or(|keyword| grammar::pinned_symbol(keyword.name())

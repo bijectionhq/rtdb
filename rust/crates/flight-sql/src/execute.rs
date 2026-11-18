@@ -9,7 +9,7 @@ use rtdb_query::QueryContext;
 use rtdb_tx::SqlArguments;
 use tokio_util::sync::CancellationToken;
 use tonic::{Response, Status};
-use crate::{error::{cancelled, invalid, status}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
+use crate::{error::{cancelled, invalid, status, status_ref}, service::{Call, Output, Service, query_ticket}, state::ConnectionResource, ticket::Ticket, wire};
 
 pub(crate) struct Shape { pub schema: Option<wire::OwnedSchema>, pub parameters: usize }
 impl Service {
@@ -84,7 +84,13 @@ impl Service {
         } else {
             let prepared = {
                 let context = native.prepare_context(&token).await.map_err(status)?;
-                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(status)?
+                PreparedSql::prepare(source, &context, options.clone(), ResultSignaturePolicy::Dynamic).map_err(|error| {
+                    match rtdb_sql::initial_statement_diagnostic(source, &error, &context.memory) {
+                        Ok(Some(diagnostic)) => status_ref(diagnostic.anomaly()),
+                        Ok(None) => status(error),
+                        Err(admission) => status(admission),
+                    }
+                })?
             };
             if prepared.is_dml() {
                 let arguments = decode_arguments()?;

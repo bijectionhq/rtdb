@@ -10,7 +10,9 @@ impl std::io::Write for MetadataBytes {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-pub(crate) fn status(error: Anomaly) -> Status {
+pub(crate) fn status(error: Anomaly) -> Status { status_ref(&error) }
+
+pub(crate) fn status_ref(error: &Anomaly) -> Status {
     let code = match error.category {
         AnomalyCategory::Incorrect => Code::InvalidArgument,
         AnomalyCategory::Forbidden => Code::Unauthenticated,
@@ -22,9 +24,9 @@ pub(crate) fn status(error: Anomaly) -> Status {
         AnomalyCategory::Interrupted => Code::Cancelled,
         AnomalyCategory::Fault => Code::Internal,
     };
-    let mut result = Status::new(code, description(&error));
+    let mut result = Status::new(code, description(error));
     let mut bytes = MetadataBytes(Vec::with_capacity(4096));
-    if serde_json::to_writer(&mut bytes, &JsonAnomaly::from(&error)).is_ok() { result.metadata_mut().insert_bin("xtdb-anomaly-bin", tonic::metadata::MetadataValue::from_bytes(&bytes.0)); }
+    if serde_json::to_writer(&mut bytes, &JsonAnomaly::from(error)).is_ok() { result.metadata_mut().insert_bin("xtdb-anomaly-bin", tonic::metadata::MetadataValue::from_bytes(&bytes.0)); }
     result
 }
 pub(crate) fn anomaly_json(error: &Anomaly) -> Result<serde_json::Value, Status> {
