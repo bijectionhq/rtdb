@@ -254,6 +254,7 @@
 (deftest-original-api original-expr/test-cast-nested-interval-to-string-prints-interval)
 (deftest-original-api original-expr/test-current-setting)
 (deftest-original-api original-expr/test-date-trunc-query)
+(deftest-original-api original-expr/test-date-trunc-with-timezone-query)
 (deftest-original-api original-expr/test-date-trunc-with-interval-query)
 (deftest-original-api original-expr/test-date-bin)
 (deftest-original-api original-expr/test-age-function)

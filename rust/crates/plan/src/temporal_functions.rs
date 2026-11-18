@@ -1,5 +1,5 @@
 use crate::{BinaryOp, Expr};
-use rtdb_types::{Anomaly, IntervalUnit, LogicalType as L, Result, ScalarType as S, TimeUnit, Value};
+use rtdb_types::{Anomaly, IntervalUnit, LogicalType as L, Result, ScalarType as S, TimeUnit, Value, ZoneId};
 
 /// A parsed EXTRACT or DATE_TRUNC field; applicability also depends on the function and source type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,13 @@ pub fn bind_clock_timezone(expr: Expr, timezone: Option<&str>) -> Result<Expr> {
     let target = crate::TemporalCast { kind: crate::TemporalKind::TimestampZone(zone),unit: *unit,precision: None };
     Ok(Expr::Cast { expr: Box::new(expr),target: crate::CastTarget::Temporal(target) })
 }
+pub fn truncation_zone(timezone: &str) -> Result<ZoneId> {
+    ZoneId::parse(timezone).map_err(|mut error| {
+        error.code = "xtdb.expression/invalid-timezone".into();
+        error.with_context("timezone", timezone.into())
+    })
+}
+
 pub(crate) fn signature(name: &str,args: &[L]) -> Option<Result<L>> {
     let name = canonical(name);
     if !clock(name) && !matches!(name,"extract" | "date_trunc" | "age" | "date_bin" | "range_bins") { return None; }
@@ -148,7 +155,7 @@ pub(crate) fn with_args(name: &str,args: &[Expr],base: L) -> Result<L> {
         }
         if let Some(timezone) = args.get(2) {
             let Expr::Literal(Value::Utf8(timezone)) = timezone else { return Err(Anomaly::unsupported("xtdb.expression/non-literal-timezone","Truncation timezone must be a literal string")); };
-            rtdb_types::ZoneId::parse(timezone)?;
+            truncation_zone(timezone)?;
         }
     }
     Ok(base)

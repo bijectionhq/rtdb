@@ -43,7 +43,7 @@ pub use inspection::*;
 pub use observer::*;
 pub use trace::*;
 pub use temporal::temporal_arithmetic_type;
-pub use temporal_functions::{TemporalField, range_bin_element_type, bind_clock_timezone};
+pub use temporal_functions::{TemporalField, range_bin_element_type, bind_clock_timezone, truncation_zone};
 pub use interval_constructor::{IntervalConstructor, interval_constructor};
 pub use patch::PatchEndpoint;
 pub use explain::{ExplainMode, explain_analyze_schema};

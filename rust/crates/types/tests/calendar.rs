@@ -88,3 +88,23 @@ fn fixed_offsets_preserve_seconds_and_normalized_prefix_identity() {
     }
     for text in ["+18:00:01", "-19", "Europe/paris", "UTC+1:00", "PST"] { assert!(ZoneId::parse(text).is_err(), "{text}"); }
 }
+
+#[test]
+fn timezone_errors_distinguish_unknown_regions_invalid_names_and_bad_offsets() {
+    for (input, message) in [
+        ("NotRealRegion", "Unknown time-zone ID: NotRealRegion"),
+        ("Not Real Region", "Invalid ID for region-based ZoneId, invalid format: Not Real Region"),
+        ("A", "Invalid ID for ZoneOffset, invalid format: A"),
+        ("", "Invalid ID for ZoneOffset, invalid format: "),
+        ("+A", "Invalid ID for ZoneOffset, non numeric characters found: +0A"),
+        ("+12x30", "Invalid ID for ZoneOffset, colon not found when expected: +12x30"),
+        ("-19", "Zone offset hours not in valid range: value -19 is not in the range -18 to 18"),
+        ("+01:99", "Zone offset minutes not in valid range: value 99 is not in the range -59 to 59"),
+        ("+18:00:01", "Zone offset not in valid range: -18:00 to +18:00"),
+        ("UTC+19:00", "Invalid ID for offset-based ZoneId: UTC+19:00"),
+    ] {
+        let error = ZoneId::parse(input).unwrap_err();
+        assert_eq!(error.code, "xtdb/invalid-timezone");
+        assert_eq!(error.message.as_deref(), Some(message));
+    }
+}

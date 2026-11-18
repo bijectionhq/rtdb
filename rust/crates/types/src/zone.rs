@@ -5,7 +5,7 @@ use crate::legacy_zone::{LegacyRules,LegacyRecurring,LegacyTransition};
 const MIN_INSTANT_SECOND: i64 = -31_557_014_167_219_200;
 const MAX_INSTANT_SECOND: i64 = 31_556_889_864_403_199;
 
-fn invalid(name: &str) -> Anomaly { Anomaly::incorrect("xtdb/invalid-timezone", format!("Invalid time zone: {name}")) }
+fn invalid(message: impl Into<String>) -> Anomaly { Anomaly::incorrect("xtdb/invalid-timezone", message) }
 fn overflow() -> Anomaly { Anomaly::incorrect("xtdb/time-overflow", "Temporal value exceeds its calendar representation") }
 
 /// An integral UTC offset in the inclusive range −18 through +18 hours.
@@ -16,31 +16,54 @@ impl FixedOffset {
     pub const UTC: Self = Self(0);
     /// Validates seconds east of UTC.
     pub fn from_seconds(seconds: i32) -> Result<Self> {
-        if !(-64_800..=64_800).contains(&seconds) { return Err(invalid(&seconds.to_string())); }
+        if !(-64_800..=64_800).contains(&seconds) { return Err(invalid("Zone offset not in valid range: -18:00 to +18:00")); }
         Ok(Self(seconds))
     }
     pub fn seconds(self) -> i32 { self.0 }
     /// Parses Java `ZoneOffset.of` spellings: `Z`, signed hours, compact hour/minute/second, or colon-separated forms.
     pub fn parse(text: &str) -> Result<Self> {
         if text == "Z" { return Ok(Self::UTC); }
-        let bytes = text.as_bytes();
-        let sign = match bytes.first() { Some(b'+') => 1, Some(b'-') => -1, _ => return Err(invalid(text)) };
-        let pair = |at: usize| -> Option<i32> {
-            let digits = bytes.get(at..at + 2)?;
-            digits.iter().all(u8::is_ascii_digit).then(|| i32::from(digits[0] - b'0') * 10 + i32::from(digits[1] - b'0'))
+        let invalid_format = || invalid(format!("Invalid ID for ZoneOffset, invalid format: {text}"));
+        let mut units = [0u16; 9];
+        let mut len = 0;
+        for unit in text.encode_utf16() {
+            *units.get_mut(len).ok_or_else(invalid_format)? = unit;
+            len += 1;
+        }
+        if len == 2 {
+            units[2] = units[1];
+            units[1] = u16::from(b'0');
+            len = 3;
+        }
+        let fail = |reason| invalid(format!("Invalid ID for ZoneOffset, {reason}: {}", String::from_utf16_lossy(&units[..len])));
+        let pair = |start: usize, after_colon: bool| {
+            if after_colon && units[start - 1] != u16::from(b':') {
+                return Err(fail("colon not found when expected"));
+            }
+            let [first, second] = [units[start], units[start + 1]];
+            let digit = |value| (u16::from(b'0')..=u16::from(b'9')).contains(&value);
+            if !digit(first) || !digit(second) { return Err(fail("non numeric characters found")); }
+            Ok(i32::from(first - u16::from(b'0')) * 10 + i32::from(second - u16::from(b'0')))
         };
-        let parts = match bytes.len() {
-            2 if bytes[1].is_ascii_digit() => Some((i32::from(bytes[1] - b'0'), 0, 0)),
-            3 => pair(1).map(|h| (h, 0, 0)),
-            5 => pair(1).zip(pair(3)).map(|(h, m)| (h, m, 0)),
-            6 if bytes[3] == b':' => pair(1).zip(pair(4)).map(|(h, m)| (h, m, 0)),
-            7 => pair(1).zip(pair(3)).zip(pair(5)).map(|((h, m), s)| (h, m, s)),
-            9 if bytes[3] == b':' && bytes[6] == b':' => pair(1).zip(pair(4)).zip(pair(7)).map(|((h, m), s)| (h, m, s)),
-            _ => None,
+        let (hours, minutes, seconds) = match len {
+            3 => (pair(1, false)?, 0, 0),
+            5 => (pair(1, false)?, pair(3, false)?, 0),
+            6 => (pair(1, false)?, pair(4, true)?, 0),
+            7 => (pair(1, false)?, pair(3, false)?, pair(5, false)?),
+            9 => (pair(1, false)?, pair(4, true)?, pair(7, true)?),
+            _ => return Err(invalid_format()),
         };
-        let (hour, minute, second) = parts.ok_or_else(|| invalid(text))?;
-        if hour > 18 || minute > 59 || second > 59 || hour == 18 && (minute != 0 || second != 0) { return Err(invalid(text)); }
-        Ok(Self(sign * (hour * 3600 + minute * 60 + second)))
+        let sign = match units[0] {
+            value if value == u16::from(b'+') => 1,
+            value if value == u16::from(b'-') => -1,
+            _ => return Err(fail("plus/minus not found when expected")),
+        };
+        for (name, offset, limit) in [("hours", hours, 18), ("minutes", minutes, 59), ("seconds", seconds, 59)] {
+            if offset > limit {
+                return Err(invalid(format!("Zone offset {name} not in valid range: value {} is not in the range -{limit} to {limit}", sign * offset)));
+            }
+        }
+        Self::from_seconds(sign * (hours * 3600 + minutes * 60 + seconds))
     }
 }
 
@@ -73,11 +96,24 @@ impl ZoneId {
         for (text, prefix) in [("UTC", Prefix::Utc), ("GMT", Prefix::Gmt), ("UT", Prefix::Ut)] {
             if let Some(suffix) = name.strip_prefix(text) {
                 if suffix.is_empty() { return Ok(Self { kind: ZoneKind::Fixed { offset: FixedOffset::UTC, prefix } }); }
-                if suffix.starts_with(['+', '-']) { return Ok(Self { kind: ZoneKind::Fixed { offset: FixedOffset::parse(suffix)?, prefix } }); }
+                if suffix.starts_with(['+', '-']) {
+                    let offset = FixedOffset::parse(suffix).map_err(|_| invalid(format!("Invalid ID for offset-based ZoneId: {name}")))?;
+                    return Ok(Self { kind: ZoneKind::Fixed { offset, prefix } });
+                }
             }
         }
-        if name == "Z" || name.starts_with(['+', '-']) { return Ok(Self { kind: ZoneKind::Fixed { offset: FixedOffset::parse(name)?, prefix: Prefix::None } }); }
-        let index = ZONES.binary_search_by_key(&name, |zone| zone.name).map_err(|_| invalid(name))?;
+        if name.encode_utf16().nth(1).is_none() || name.starts_with(['+', '-']) {
+            return Ok(Self { kind: ZoneKind::Fixed { offset: FixedOffset::parse(name)?, prefix: Prefix::None } });
+        }
+        let index = ZONES.binary_search_by_key(&name, |zone| zone.name).map_err(|_| {
+            let mut bytes = name.bytes();
+            if bytes.next().is_some_and(|byte| byte.is_ascii_alphabetic())
+                && bytes.all(|byte| byte.is_ascii_alphanumeric() || b"/~._+-".contains(&byte)) {
+                invalid(format!("Unknown time-zone ID: {name}"))
+            } else {
+                invalid(format!("Invalid ID for region-based ZoneId, invalid format: {name}"))
+            }
+        })?;
         Ok(Self { kind: ZoneKind::Region(index) })
     }
 

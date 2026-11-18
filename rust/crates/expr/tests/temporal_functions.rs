@@ -145,6 +145,18 @@ async fn range_bin_table_views_reserve_one_generated_cell_and_materialization_is
 }
 
 #[test]
+fn date_trunc_reports_the_same_invalid_timezone_in_planning_and_evaluation() {
+    let timezone = "NotRealRegion";
+    let value = ts(0, U::Microsecond, Some("UTC"));
+    let prepared = function_type_with_args("date_trunc", &[text("DAY"), lit(value.clone()), text(timezone)]).unwrap_err();
+    let evaluated = scalar_call("date_trunc", &[V::Utf8("DAY".into()), value, V::Utf8(timezone.into())], &EvalContext::default()).unwrap_err();
+    assert_eq!(prepared, evaluated);
+    assert_eq!(prepared.code, "xtdb.expression/invalid-timezone");
+    assert_eq!(prepared.message.as_deref(), Some("Unknown time-zone ID: NotRealRegion"));
+    assert_eq!(prepared.context["timezone"], timezone);
+}
+
+#[test]
 fn direct_temporal_calls_validate_fields_and_map_delegated_checked_overflow() {
     for field in ["DOW","ISODOW","DOY","EPOCH","TIMEZONE_HOUR","TIMEZONE_MINUTE"] {
         assert_eq!(scalar_call("date_trunc",&[V::Utf8(field.into()),V::DateDay(0)],&EvalContext::default()).unwrap_err().code,"xtdb.expression/extract-not-supported");
