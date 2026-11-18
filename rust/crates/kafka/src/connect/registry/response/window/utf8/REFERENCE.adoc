@@ -1,0 +1,76 @@
+= UTF8 Registry symbol cursor
+
+`schema_string_from_utf8` and `schema_from_utf8` consume a fresh detected Utf8Window, its actual ByteSymbols factory root, a borrowed InternAuthority, actual value TextBufferObservations and the caller's ConversionContext.
+Transfer occurs after bootstrap/BOM detection and before the first parser byte.
+The root's immutable FactoryProfile selects the lexical version; the entry takes no independent profile or accepted-name tape.
+The retained link:../../DEFAULT-PROFILE.adoc[worker evidence] grounds Jackson core/databind 2.21.7 as the normal pinned C84 reference profile.
+The independently pinned 2.16.0 profile remains supported.
+Packaged distribution selection, actual read/recycler binding and factory seed/interner ownership remain separate qualification boundaries.
+The installed Registry HTTP route is unchanged by this cohort.
+
+== Construction and demand
+
+The entry snapshots a byte child before admitting the parser's initial sixteen-quad array, matching constructor argument and field-initializer order.
+A preparation failure drops native owners without inventing a parser close call.
+Once constructed, the cursor owns the source through token/bean decoding and close.
+The existing ordered bean machine preserves nullable values, duplicate/coercion/creator order and exact UTF16 carriers.
+
+Field-name scanning checks raw quote/control/escape spelling while packing raw UTF8 bytes without decoding them.
+Escaped units are encoded into the same byte quads used by the source parser.
+Jackson216 encodes each escaped UTF16 unit separately; Jackson221 requires escaped surrogate pairs and encodes their supplementary point into four bytes.
+Raw non-ASCII bytes remain undecoded during that packing stage.
+A full current quad is held until the next already demanded byte or final quote.
+Quad growth checks the prior array's byte length before allocating a doubled replacement.
+The unrolled same-window source path and slow path have the same source-byte/refill and quad-growth demand retained by this loop for the supported quoted-name grammar.
+
+The actual ByteChild lookup runs on the completed padded quads before missed-name UTF8 decoding and before colon/value prefetch.
+A hit returns its admitted stored JavaString directly.
+A miss checks the completed byte name length, decodes the retained quads, admits immutable name backing and adds through the actual child/interner.
+The decoder makes no additional source reads.
+It retains profile-specific three-byte surrogate rejection, source acceptance of the inspected overlong/out-of-range byte spellings, and addition when emitting the high unit of a four-byte name.
+Escaped/control validation before lookup remains distinct from malformed raw bytes rejected only by the miss decoder.
+Long cached names can bypass the miss-only name-length guard while still encountering the source quad-array growth guard.
+
+Quad decoding uses an immutable aligned byte view rather than temporarily shifting the final quad and restoring it before add.
+No callback or source read observes that private representation difference.
+Remaining literal/error scanning, nondefault features and over-limit value text retain the existing explicit lexical qualification.
+No complete Java exception text or location-rendering profile is established.
+
+== Owners, admission and close
+
+NameAuthority's Byte variant is a passive parser-local single-writer transient owning ByteChild, call-borrowed interning authority and QuadBuffer.
+Its closed-byte state retains quad scratch until cursor drop.
+QuadBuffer is a passive admitted reusable quad-array owner; Packing is inline transient current-quad/count state and PackedName is immutable inline result metadata.
+WindowCursor remains the passive source-demand owner.
+Decoded misses use the existing admitted Values scratch and SymbolName full leases.
+No task, second input copy, retained admission callback, context memory handle or additional budget pool is added.
+
+Initial and replacement quad arrays are admitted before allocation while old/new backing overlaps.
+Packing uses only fixed four-byte stack encoding scratch beyond that owned array.
+Hit lookup allocates no decoded output text.
+On a miss, decoded scratch stays owned while immutable text is admitted and while byte-table copy/rehash/add may allocate.
+The existing region retains accepted charges until context drop; persistent symbols and returned bean text keep their original leases afterward.
+All name preparation, additions and release use the byte child's creation context.
+
+Close first closes the underlying InputStream, then releases byte symbols in ParserBase.close's finally stage, then releases recyclable input backing when symbol release succeeds.
+Quad scratch stays owned until cursor drop.
+A symbol-release failure replaces an earlier source close failure.
+An existing decode failure remains primary and retains that resulting close failure as suppressed.
+Successful decoding followed by a close failure does not publish its bean.
+Accepted names can publish after lexical, bean, source-read or source-close errors; a native failure inside the byte table poisons its unpublished prefix.
+The legacy window close still composes its original input-close/backing-release behavior.
+
+== Evidence and fixtures
+
+link:sources.json[The source manifest] pins the selected primary entries and retained complete prefixes, archive licenses, worker evidence and source owner dependencies.
+Nineteen additive unexecuted fixture functions cover ordinary split-window parsing, duplicate creator demand, raw/escaped aliases and profile differences, constructed malformed-cache controls, miss-only length and quad-growth guards, raw controls, source four-byte arithmetic, read/colon/intern/close failure order, preparation denial, BOM/refill demand, accepted-prefix publication, finally replacement and post-context reservation survival.
+Cached malformed/over-limit controls explicitly construct an actual ByteQuads table state through its own API; they do not assume such a state exists on live HTTP or supply accepted-name observations.
+All pre-existing fixture bodies in the owned paths remain unchanged.
+Disjoint incoming byte-symbol geometry corrections and independently published interner work belong to their parent-owned cohorts.
+No compiler, formatter, tests, native/Java runtime, Cargo/Gradle or project scripts were executed.
+
+A direct admitted-slice/live-pull binding is the next input-owner boundary.
+The current API still consumes the published read authority; native HTTP frame boundaries do not become a retrospective Java tape.
+Async response bounds, cancellation, close and unread-tail failure order require an explicit transport bridge.
+Nullable DTO/reference/rule activation and Registry version/cache timing remain separate coordinated changes.
+Phase 2, whole-native memory and source completeness remain open.

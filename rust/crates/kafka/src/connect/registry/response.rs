@@ -19,6 +19,8 @@ pub(super) use beans::{Metadata, Properties, Rule, RuleKind, RuleMode, RuleSet};
 pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
 #[cfg(test)]
 pub(super) use window::{ReaderInput, schema_from_reader, schema_string_from_reader};
+#[cfg(test)]
+pub(super) use window::{schema_from_utf8, schema_string_from_utf8};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::connect) enum Profile {

@@ -1,7 +1,9 @@
 use rtdb_types::java_text::JavaString;
 use super::{ConversionContext, Failure, FailureKind, Frame, Kind, Profile, Result, TextBufferObservation, Token, Usage,
     copy_string, input::{Encoding, Input, Utf8Demand}, scan_name, text_buffer::TextBufferDemand, utf8_unit_bytes};
-use super::super::{owned::Values, symbols::{ChildSymbols, InternAuthority}, window::{LexicalObservations, NameObservation, WindowInput, symbol_failure, unavailable}};
+use super::super::{owned::Values, symbols::{ChildSymbols, InternAuthority, bytes}, window::{LexicalObservations, NameObservation, WindowInput, byte_symbol_failure, symbol_failure, unavailable}};
+
+mod utf8_name;
 
 struct Lookahead { value: Option<u16>, before: usize, after: usize }
 struct WindowCursor<'a> { source: WindowInput<'a>, lookahead: Option<Lookahead>, at: usize }
@@ -58,6 +60,8 @@ impl Spelling {
 enum NameAuthority<'a> {
     Observed { names: &'a [NameObservation<'a>], next: usize },
     Reader { child: ChildSymbols, intern: &'a mut dyn InternAuthority },
+    Byte { child: bytes::ByteChild, intern: &'a mut dyn InternAuthority, buffer: utf8_name::QuadBuffer },
+    ClosedByte { _buffer: utf8_name::QuadBuffer },
     Closed,
 }
 
@@ -75,10 +79,18 @@ impl<'a> ObservedCursor<'a> {
         Self { input: WindowCursor::new(input), profile, frames: Values::new(), token: None,
             spelling: Spelling::new(), names: NameAuthority::Reader { child, intern: authority }, text_buffers: &[] }
     }
+    pub(super) fn utf8(input: WindowInput<'a>, child: bytes::ByteChild, authority: &'a mut dyn InternAuthority,
+        text_buffers: &'a [TextBufferObservation], context: &mut ConversionContext) -> Result<Self> {
+        let profile = child.factory().profile;
+        let buffer = utf8_name::QuadBuffer::new(context)?;
+        Ok(Self { input: WindowCursor::new(input), profile, frames: Values::new(), token: None,
+            spelling: Spelling::new(), names: NameAuthority::Byte { child, intern: authority, buffer }, text_buffers })
+    }
     pub(super) fn start(&mut self) -> Result<()> {
         if matches!(&self.names, NameAuthority::Reader { .. }) && self.input.source.is_utf8() {
             return Err(unavailable("Reader symbols cannot qualify a UTF8 byte parser"));
         }
+        if matches!(&self.names, NameAuthority::Byte { .. }) && !self.input.source.is_utf8() { return Err(unavailable("Byte symbols require a UTF8 byte parser")); }
         self.input.source.validate_profile(self.profile)?; self.input.initialize()?; self.token = Some(self.lex(true)?); Ok(())
     }
     pub(super) fn offset(&self) -> usize { self.token.map_or(self.input.at, |token| token.start) }
@@ -183,6 +195,9 @@ impl<'a> ObservedCursor<'a> {
         Ok(())
     }
     fn name(&mut self, context: &mut ConversionContext) -> Result<JavaString> {
+        if let NameAuthority::Byte { child, intern, buffer } = &mut self.names {
+            return utf8_name::name(&mut self.input, self.profile, buffer, child, &mut **intern, context);
+        }
         if !self.input.source.is_utf8() {
             let mut units = Values::new();
             self.string_units(Usage::Name, None, Some((&mut units, context)))?;
@@ -191,6 +206,8 @@ impl<'a> ObservedCursor<'a> {
                 NameAuthority::Observed { .. } => Ok(JavaString::copy_utf16_with_admission(units.as_slice(), |bytes| context.reserve(bytes))?),
                 NameAuthority::Reader { child, intern } => child.find(units.as_slice(), &mut **intern, context).map_err(|cause| symbol_failure(cause, offset)),
                 NameAuthority::Closed => Err(unavailable("Reader name authority has already been closed")),
+                NameAuthority::ClosedByte { .. } => Err(unavailable("Byte name authority has already been closed")),
+                NameAuthority::Byte { .. } => unreachable!(),
             };
         }
         let mut raw = Values::new();
@@ -377,11 +394,17 @@ impl<'a> ObservedCursor<'a> {
     fn syntax(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Syntax, self.input.at, detail) }
     fn coercion(&self, detail: &'static str) -> Failure { Failure::at(FailureKind::Coercion, self.offset(), detail) }
     pub(super) fn close(&mut self, context: &mut ConversionContext) -> Result<()> {
-        if matches!(&self.names, NameAuthority::Closed) { return Ok(()); }
+        if matches!(&self.names, NameAuthority::Closed | NameAuthority::ClosedByte { .. }) { return Ok(()); }
         if matches!(&self.names, NameAuthority::Observed { .. }) { return self.input.source.close(); }
         let input_close = self.input.source.close_input_stage();
-        let NameAuthority::Reader { child, .. } = std::mem::replace(&mut self.names, NameAuthority::Closed) else { unreachable!() };
-        let symbol_close = child.release(context).map(|_| ()).map_err(|cause| symbol_failure(cause, self.input.at));
+        let symbol_close = match std::mem::replace(&mut self.names, NameAuthority::Closed) {
+            NameAuthority::Reader { child, .. } => child.release(context).map(|_| ()).map_err(|cause| symbol_failure(cause, self.input.at)),
+            NameAuthority::Byte { child, buffer, .. } => {
+                self.names = NameAuthority::ClosedByte { _buffer: buffer };
+                child.release(context).map(|_| ()).map_err(|cause| byte_symbol_failure(cause, self.input.at))
+            }
+            _ => unreachable!(),
+        };
         if symbol_close.is_ok() { self.input.source.release_parser_buffer(); }
         symbol_close.and(input_close)
     }

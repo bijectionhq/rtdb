@@ -11,6 +11,7 @@ No entry point selects an HTTP segmentation, recycler capacity, Jackson profile 
 The production HTTP routes do not call these entry points.
 All24 regression sources are unexecuted.
 The separate link:reader/REFERENCE.adoc[Reader-symbol entry points] accept fresh UTF16/UTF32 decoders before character-window allocation and use the actual persistent character canonicalizer instead of successful-name observations.
+The link:utf8/REFERENCE.adoc[UTF8 symbol entry points] consume a fresh detected UTF8 window and use actual quad lookup before missed-name decoding, with no successful-name tape.
 
 == Demand and lifetime
 
@@ -95,4 +96,5 @@ ObjectMapper._readMapAndClose uses try-with-resources and only verifies trailing
 The inspected Registry mapper uses the default disabled trailing-token feature.
 The parent link:../../input_window/REFERENCE.adoc[input-window reference] owns bootstrap, UTF8 refill, UTF32 reader and UTF16 StreamDecoder/MergedStream behavior and source pins.
 The Reader-symbol entry points compose persistent character symbols at actual field-name demand.
-Actual HTTP capture, global interning/profile qualification, UTF8 ByteQuads, the remaining lexical branches, nullable UTF16 consumer activation, version/cache timing, Phase2 execution, whole-native memory and source completeness remain open.
+The UTF8 symbol entry points compose the actual ByteQuads table before missed-name decoding.
+Actual HTTP input/recycler binding, factory/interner qualification, the remaining lexical branches, nullable UTF16 consumer activation, version/cache timing, Phase2 execution, whole-native memory and source completeness remain open.

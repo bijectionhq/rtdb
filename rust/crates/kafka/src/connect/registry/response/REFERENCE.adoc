@@ -12,6 +12,7 @@ Confluent7.8.0 JacksonMapper constructs a fresh JsonMapper with ALLOW_NON_NUMERI
 The declared Confluent profile uses Jackson databind/core/annotations2.16.0.
 Connect JSON4.4.0 declares databind2.21.7, whose matching BOM selects core2.21.7 and annotations2.21.
 These declarations do not establish the effective runtime classloader or shaded distribution.
+The retained link:DEFAULT-PROFILE.adoc[worker classpath evidence] establishes Jackson core/databind 2.21.7 for the pinned C84 reference workers; packaged distributions retain their separate qualification.
 Profile is explicit at each decoder entry point.
 
 Both inspected profiles preserve duplicate field order, nullable primitive wrappers, Java String UTF16 units, scalar coercions and ordinal enums.
@@ -122,7 +123,8 @@ An invalid UTF32 suffix can fail before a completed root bean is returned, and a
 Core2.21.7 also reports a non-identifier UTF8 literal suffix when decoding that suffix reloads its input buffer.
 The legacy byte-only cursor has no HTTP read-segmentation observation and does not reproduce those reader-window effects.
 The inactive link:window/REFERENCE.adoc[observed-window entry points] consume the published UTF8/UTF16/UTF32 windows directly for the qualified lexical branches.
-They retain a borrowed successful canonicalizer-result observation at each field occurrence and explicitly reject unmodeled error-token, rewind and over-limit Reader branches.
+The link:window/utf8/REFERENCE.adoc[UTF8 symbol cursor] composes actual ByteQuads lookup before missed-name decoding without accepted-name observations.
+The observation-driven diagnostic entry points retain a borrowed successful canonicalizer-result observation at each field occurrence and explicitly reject unmodeled error-token, rewind and over-limit Reader branches.
 Actual HTTP observation capture and persistent mapper symbol state remain required for that entry point.
 
 JsonFactory also shares seeded ByteQuadsCanonicalizer/CharsToNameCanonicalizer state across parser calls and enables FAIL_ON_SYMBOL_HASH_OVERFLOW by default.

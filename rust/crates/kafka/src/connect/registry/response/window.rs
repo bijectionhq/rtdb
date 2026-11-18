@@ -43,13 +43,13 @@ impl WindowInput<'_> {
     }
     pub(super) fn close_input_stage(&mut self) -> Result<()> {
         match self {
-            Self::Utf8(window) => window.close().map_err(source_failure),
+            Self::Utf8(window) => window.close_input_stage().map_err(source_failure),
             Self::Utf16(window) => window.close_input_stage().map_err(source_failure),
             Self::Utf32(window) => window.close_input_stage().map_err(source_failure),
         }
     }
     pub(super) fn release_parser_buffer(&mut self) {
-        match self { Self::Utf8(_) => (), Self::Utf16(window) => window.release_parser_buffer(), Self::Utf32(window) => window.release_parser_buffer() }
+        match self { Self::Utf8(window) => window.release_parser_buffer(), Self::Utf16(window) => window.release_parser_buffer(), Self::Utf32(window) => window.release_parser_buffer() }
     }
     pub(super) fn observations_consumed(&self) -> usize {
         match self {
@@ -113,6 +113,20 @@ pub(super) fn unavailable(detail: &'static str) -> Failure {
     rtdb_types::Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-source-profile", detail).into()
 }
 
+pub(super) fn byte_symbol_failure(cause: symbols::bytes::Failure, offset: usize) -> Failure {
+    use symbols::bytes::Failure as ByteFailure;
+    let (kind, detail) = match cause {
+        ByteFailure::Native(cause) => return Failure::Native(cause),
+        ByteFailure::CollisionOverflow { .. } => (FailureKind::Constraint, "UTF8 symbol spill-over slots are full"),
+        ByteFailure::LongNameOffset { profile: Profile::Jackson216, .. } => (FailureKind::Unchecked, "UTF8 long-name arraycopy offset is invalid"),
+        ByteFailure::LongNameOffset { .. } => (FailureKind::Unchecked, "UTF8 long-name offset overflow"),
+        ByteFailure::ArrayLength { .. } => (FailureKind::Unchecked, "UTF8 symbol array length overflow"),
+        ByteFailure::RehashCount { .. } => (FailureKind::Unchecked, "UTF8 symbol count differs during rehash"),
+        ByteFailure::Poisoned => return rtdb_types::Anomaly::fault("xtdb.kafka-connect-source/registry-symbol-poisoned", "A failed byte-symbol child cannot continue parsing").into(),
+    };
+    Failure::at(kind, offset, detail)
+}
+
 fn source_failure(cause: input_window::Failure<'_>) -> Failure {
     match cause {
         input_window::Failure::Native(cause) => Failure::Native(cause),
@@ -130,3 +144,5 @@ mod tests;
 
 mod reader;
 pub(in crate::connect::registry) use reader::{ReaderInput, schema_from_reader, schema_string_from_reader};
+mod utf8;
+pub(in crate::connect::registry) use utf8::{schema_from_utf8, schema_string_from_utf8};

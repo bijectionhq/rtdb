@@ -171,13 +171,15 @@ impl<'a> Utf8Window<'a> {
             }
         }
     }
-    pub(super) fn close(&mut self) -> Result<'a, ()> {
+    pub(super) fn close_input_stage(&mut self) -> Result<'a, ()> {
         if self.closed { return Ok(()); }
         self.input.ptr = self.input.ptr.max(self.input.end);
         self.closed = true;
-        let result = self.input.close_after_success();
-        self.input.buffer = None;
-        result
+        self.input.close_after_success()
+    }
+    pub(super) fn release_parser_buffer(&mut self) { self.input.buffer = None; }
+    pub(super) fn close(&mut self) -> Result<'a, ()> {
+        let result = self.close_input_stage(); self.release_parser_buffer(); result
     }
 }
 

@@ -378,6 +378,10 @@ impl<'a> Cursor<'a> {
         authority: &'a mut dyn super::symbols::InternAuthority) -> Self {
         Self::Observed(observed::ObservedCursor::reader(input, child, authority))
     }
+    pub(super) fn utf8(input: super::window::WindowInput<'a>, child: super::symbols::bytes::ByteChild,
+        authority: &'a mut dyn super::symbols::InternAuthority, text_buffers: &'a [TextBufferObservation], context: &mut ConversionContext) -> Result<Self> {
+        Ok(Self::Observed(observed::ObservedCursor::utf8(input, child, authority, text_buffers, context)?))
+    }
     pub(super) fn start(&mut self) -> Result<()> { match self { Self::Slice(_) => Ok(()), Self::Observed(cursor) => cursor.start() } }
     pub(super) fn offset(&self) -> usize { match self { Self::Slice(cursor) => cursor.offset(), Self::Observed(cursor) => cursor.offset() } }
     pub(super) fn profile(&self) -> Profile { match self { Self::Slice(cursor) => cursor.profile(), Self::Observed(cursor) => cursor.profile() } }
