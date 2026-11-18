@@ -5,8 +5,11 @@
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
+            [xtdb.operator.distinct-test :as original-distinct]
             [xtdb.operator.project-test :as original-project]
+            [xtdb.operator.rename-test :as original-rename]
             [xtdb.operator.select-test :as original-select]
+            [xtdb.operator.set-test :as original-set]
             [xtdb.operator.table-test :as original-table]
             [xtdb.sql.expr-test :as original-expr]
             [xtdb.sql.correlated-subquery-nulls-test :as original-correlated]
@@ -18,6 +21,7 @@
             [xtdb.sql.identifier-test :as original-identifiers]
             [xtdb.sql.with-test :as original-with]
             [xtdb.expression.pg-test :as original-pg-expression]
+            [xtdb.serde.types :as st]
             [xtdb.node-test :as original-node]
             [xtdb.update-test :as original-update]
             [xtdb.sql-test :as original-sql]
@@ -104,9 +108,10 @@
 (defn- import-logical-inputs [query]
   (let [[operator options & operands] query]
     (if (= operator ::tu/pages)
-      (if (empty? operands)
-        [:literal-pages {:pages options}]
-        (throw (ex-info "Declared fixture page types require a native schema representation" {:query query})))
+      (case (count operands)
+        0 [:literal-pages {:pages options}]
+        1 [:literal-pages {:pages (first operands) :types (update-vals options st/render-type)}]
+        (throw (ex-info "Invalid fixture page source" {:query query})))
       (into [operator options] (map import-logical-inputs) operands))))
 
 (defn- run-native-logical-query [query {:keys [node] :as options}]
@@ -142,6 +147,24 @@
 (deftest-original-api original-select/test-select)
 
 (deftest-original-api original-project/test-project)
+
+(deftest-original-api original-project/test-project-star)
+
+(deftest-original-api original-rename/test-rename)
+
+(deftest-original-api original-distinct/test-distinct)
+
+(deftest-original-api original-set/test-union-all)
+
+(deftest-original-api original-set/test-union-all-empty-left-side-bug)
+
+(deftest-original-api original-set/test-union-all-empty-batches-both-sides)
+
+(deftest-original-api original-set/test-intersection)
+
+(deftest-original-api original-set/test-difference)
+
+(deftest-original-api original-set/first-tuple-in-rhs-is-taken-into-account-test)
 
 (deftest-original-api original-table/test-table-handles-exprs)
 

@@ -124,7 +124,7 @@ fn unit(form: &Edn) -> Result<TimeUnit> {
     }
 }
 
-fn data_type(form: &Edn) -> Result<LogicalType> {
+pub(crate) fn data_type(form: &Edn) -> Result<LogicalType> {
     if let EdnKind::Tagged { tag, value } = &form.kind {
         return if tag == "xt/type" { data_type(value) } else { Err(error("xtdb/invalid-type", "Nested type tags require #xt/type")) };
     }

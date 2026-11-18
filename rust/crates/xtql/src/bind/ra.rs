@@ -55,8 +55,16 @@ impl Importer<'_, '_, '_> {
                 input.filter(predicate)?
             }
             ("project" | "π" | "pi" | "map" | "ⲭ" | "chi", [input]) => self.project(options, input, matches!(op, "map" | "ⲭ" | "chi"))?,
+            ("rename" | "ρ" | "rho", [input]) => self.rename(options, input)?,
             ("sort", [input]) => self.sort(options, input)?,
-            ("union-all" | "∪", [left, right]) => self.union_all(left, right)?,
+            ("union-all" | "∪", [left, right]) => self.set(SetOperator::Union, left, right)?,
+            ("intersect" | "∩", [left, right]) => self.set(SetOperator::Intersect, left, right)?,
+            ("difference" | "except" | "−", [left, right]) => self.set(SetOperator::Except, left, right)?,
+            ("cross-join", [left, right]) => {
+                let left = self.lower(left)?;
+                let right = self.lower(right)?;
+                Relation::new(left.schema().concat(right.schema())?, RelationNode::Join { left, right, kind: JoinKind::Cross, condition: None })?
+            }
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -180,11 +188,22 @@ impl Importer<'_, '_, '_> {
                 Ok(row)
             }).collect::<Result<Vec<_>>>()
         }).collect::<Result<Vec<_>>>()?;
-        let columns = output_names(options, inferred)?;
+        let declared = options.option("types").map(|types| {
+            types.map().ok_or_else(|| invalid("Literal page types must be a map"))?.iter().map(|(name, ty)| {
+                Ok((column_name(name)?.to_owned(), crate::cast::data_type(ty)?))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        }).transpose()?;
+        let columns = output_names(options, declared.as_ref().map_or(inferred, |types| types.keys().cloned().collect()))?;
         let pages = pages.into_iter().map(|page| page.into_iter().map(|mut row| {
             columns.iter().map(|column| PExpr::Literal(row.remove(column).unwrap_or(Value::Null))).collect()
         }).collect()).collect::<Vec<_>>();
-        let schema = self.row_schema(columns, &pages)?;
+        let schema = match declared {
+            Some(types) => Schema::new(columns.into_iter().map(|name| {
+                let ty = types.get(&name).cloned().unwrap_or(LogicalType::Null);
+                self.compiler.binder.field(name, None, ty)
+            }).collect::<Result<_>>()?)?,
+            None => self.row_schema(columns, &pages)?,
+        };
         Relation::new(schema, RelationNode::LiteralPages { pages })
     }
 
@@ -256,11 +275,32 @@ impl Importer<'_, '_, '_> {
             }
             let Some([(name, form)]) = projection.map() else { return Err(invalid("Expected a projected column or a one-entry map")); };
             let name = column_name(name)?;
-            let expr = self.scalar(form, &mut bound)?;
+            let expr = if form.symbol() == Some("*") {
+                PExpr::Struct(bound.relation.schema().fields().iter().map(|field| (field.name.clone(), field.expression())).collect())
+            } else { self.scalar(form, &mut bound)? };
             let field = self.compiler.binder.field(name, None, expr.data_type())?;
             expressions.push(NamedExpr { field, expr });
         }
         if append { bound.relation.extend(expressions) } else { bound.relation.project(expressions) }
+    }
+
+    fn rename(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
+        let input = self.lower(input)?;
+        let prefix = options.option("prefix").map(column_name).transpose()?;
+        let aliases = options.option("columns").map(|columns| {
+            columns.map().ok_or_else(|| invalid("Rename columns must be a map"))?.iter().map(|(from, to)| {
+                Ok((column_name(from)?, column_name(to)?))
+            }).collect::<Result<BTreeMap<_, _>>>()
+        }).transpose()?.unwrap_or_default();
+        let expressions = input.schema().fields().iter().map(|field| {
+            let name = aliases.get(field.name.as_str()).copied().unwrap_or(&field.name);
+            let name = match prefix {
+                Some(prefix) => format!("{}/{}", symbol_name(prefix), symbol_name(name)),
+                None => name.to_owned(),
+            };
+            Ok(NamedExpr { field: self.compiler.binder.field(name, None, field.data_type.clone())?, expr: field.expression() })
+        }).collect::<Result<Vec<_>>>()?;
+        input.project(expressions)
     }
 
     fn sort(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
@@ -296,7 +336,7 @@ impl Importer<'_, '_, '_> {
         Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })
     }
 
-    fn union_all(&mut self, left: &Edn, right: &Edn) -> Result<Relation> {
+    fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {
         let left = self.lower(left)?;
         let right = self.lower(right)?;
         let left_fields = left.schema().fields();
@@ -314,7 +354,7 @@ impl Importer<'_, '_, '_> {
         }
         let right = if projections.iter().map(|projection| &projection.field).eq(right_fields.iter()) { right }
             else { Arc::new(right.project(projections)?) };
-        Relation::new(Schema::new(schema)?, RelationNode::Set { left, right, operator: SetOperator::Union, all: true })
+        Relation::new(Schema::new(schema)?, RelationNode::Set { left, right, operator, all: true })
     }
 }
 
@@ -349,6 +389,8 @@ fn sequence(form: &Edn) -> Result<&[Edn]> {
 }
 
 fn column_name(form: &Edn) -> Result<&str> { form.symbol().ok_or_else(|| invalid("Expected a logical column symbol")) }
+
+fn symbol_name(symbol: &str) -> &str { symbol.split_once('/').map_or(symbol, |(_, name)| name) }
 
 fn field_name(form: &Edn) -> Result<&str> {
     match &form.kind {
