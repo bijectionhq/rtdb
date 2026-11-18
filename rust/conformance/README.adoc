@@ -324,10 +324,9 @@ It records the physical layout, page row and run counts, and byte digests at eac
 At the original live-trie check it inspects the mixed-layout data files for `readings` that the test identified as live above level zero.
 The runner verifies the live file bytes, runtime closure, exact assertion set, and successful Jovial outcome before publishing the scoped reference result.
 A failed or incomplete worker run leaves its process logs and any available observations.
-This source prepares the reference side of the parity case.
-Portable checkpoint transfer and the paired native run, including both wire clients, remain pending.
+Portable checkpoint transfer remains pending.
 
-The native internal comparison uses an independently written pair of local stores and a successful retained reference run from the command above.
+The native comparison uses an independently written pair of local stores and a successful retained reference run from the command above.
 Both stores ingest the two original tick ranges with the reference block threshold, file-size target and default timezone.
 The harness waits for each explicit flush and compaction, keeps garbage collection disabled to retain evidence, and joins the first node owners before rewriting the mixed data.
 The rewrite re-encodes the IID column with signed 32-bit run ends in each compacted data file and retains the other Arrow arrays, metadata files and recorded catalog sizes.
@@ -346,7 +345,12 @@ python3 rust/conformance/run_mixed_iid_native.py --phase-two \
 
 Use a native executable built from the same clean implementation revision and a new output directory outside both checkouts and the retained reference evidence.
 Keep the reference run workspace and its JVM runtime artifacts available at the recorded paths.
+The comparison identifies the exact reference result bytes it consumed and verifies the retained inputs again before publishing success.
 The comparison uses the two ordered SQL projections, the direct IID join and self-intersection counts, and the ordered readback from the original PATCH.
 It retains each raw typed native row and compares timestamp instants and the non-null keys observed by the reference JDBC row builder.
 The receipt checks the exact user transaction action tape, physical file hashes and native build revision.
-Native pgwire and Flight SQL observations remain pending.
+Before either PATCH, the fixture captures ordered bigint and bytea columns through a PostgreSQL simple query.
+After both PATCH operations, Flight SQL GetFlightInfo and DoGet capture the signed IID values, declared schema, stream schema and every batch field.
+The runner compares the retained wire observations with the original JVM case after the native listeners and nodes have closed.
+The mixed Flight SQL result must span multiple batches under one declared fixed-size 16-byte binary field.
+All listeners bind to loopback on ephemeral ports and join before their node closes.

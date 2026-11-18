@@ -1,3 +1,5 @@
+mod wire;
+
 use super::{Error, artifacts, combine, flush, instant, store::Reads, support::{FixtureClock, Identity, RunningNode}, write_new};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema};
@@ -387,17 +389,24 @@ async fn second_phase(control: &Node, mixed: &Node, control_clock: &FixtureClock
     }
     let mut control_rows = observations(control).await?;
     let mut mixed_rows = observations(mixed).await?;
+    let control_pgwire = wire::pgwire(control, SORTED_IIDS).await?;
+    let mixed_pgwire = wire::pgwire(mixed, SORTED_IIDS).await?;
     let (control_patch, control_result) = patch(control, control_clock).await?;
     control_rows["patch"] = control_result;
     let (mixed_patch, mixed_result) = patch(mixed, mixed_clock).await?;
     mixed_rows["patch"] = mixed_result;
-    Ok((layout, json!({"ticks":control_ticks,"patch":control_patch,"observations":control_rows}),
-               json!({"ticks":mixed_ticks,"patch":mixed_patch,"observations":mixed_rows})))
+    let control_flight = wire::flight_sql(control).await?;
+    let mixed_flight = wire::flight_sql(mixed).await?;
+    Ok((layout, json!({"ticks":control_ticks,"patch":control_patch,"observations":control_rows,
+                       "wire":{"pgwire":control_pgwire,"flight_sql":control_flight}}),
+               json!({"ticks":mixed_ticks,"patch":mixed_patch,"observations":mixed_rows,
+                       "wire":{"pgwire":mixed_pgwire,"flight_sql":mixed_flight}})))
 }
 
 /// Runs the native mixed IID fixture in a fresh directory and joins both local node owners.
 /// The parent of `output` must exist, and `output` must be a new directory.
-/// The receipt covers internal observations through PATCH.
+/// Returns the internal and wire observations from the same reopened nodes.
+/// Writes the returned JSON to `output/execution.json` after both nodes have joined.
 pub async fn execute(output: &Path) -> Result<Json, Error> {
     fs::create_dir(output)?;
     let clock = || -> Result<Arc<FixtureClock>, Error> { Ok(Arc::new(FixtureClock(AtomicI64::new(instant("2020-01-01T00:00:00Z")?.0)))) };
@@ -427,10 +436,10 @@ pub async fn execute(output: &Path) -> Result<Json, Error> {
         receipt["first_ticks"] = json!(prefix);
         receipt["artifacts"] = json!(artifacts(&layout_directory(output, name))?);
     }
-    let execution = json!({"schema_version":1,"engine":"rust","source_sha256":SOURCE_SHA256,
+    let execution = json!({"schema_version":2,"engine":"rust","source_sha256":SOURCE_SHA256,
         "binary_sha256":crate::controls::digest_file(&std::env::current_exe()?)?,
         "artifact_revision":env!("RTDB_CONFORMANCE_REVISION"),"source_dirty":env!("RTDB_CONFORMANCE_DIRTY")!="false",
-        "execution_complete":true,"complete_parity":false,"wire_pending":["pgwire","flight-sql"],
+        "execution_complete":true,"complete_parity":false,
         "settings":{"timezone":"Europe/London","rows_per_block":200,"file_size_target":16384,
             "automatic_compaction":false,"automatic_gc":false,"plain_compaction":true},
         "rewritten_files":rewritten,"live_layout":layout,"control":control,"mixed":mixed});

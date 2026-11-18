@@ -21,10 +21,16 @@ rtdb-sql.workspace = true
 rtdb-expr.workspace = true
 rtdb-tx.workspace = true
 rtdb-server.workspace = true
+rtdb-auth.workspace = true
+rtdb-pgwire.workspace = true
+rtdb-flight-sql.workspace = true
 rtdb-metrics.workspace = true
 rtdb-index.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
+arrow-flight = { version = "=58.4.1", features = ["flight-sql"] }
+tonic = "=0.14.5"
+futures.workspace = true
 prost.workspace = true
 sqlparser.workspace = true
 regex.workspace = true
