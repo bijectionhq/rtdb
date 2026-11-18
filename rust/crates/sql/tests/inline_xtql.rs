@@ -178,3 +178,55 @@ fn inline_xtql_insert_source_uses_native_mutation_planning() {
     assert!(has_values(&input));
     assert_eq!(input.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(),["_id","v"]);
 }
+
+#[test]
+fn explicit_inline_xtql_checks_its_sql_arguments_and_closing_parenthesis_before_reading_edn() {
+    let sql = "XTQL ($$[$$, 1)";
+    let error = parse(sql).unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert_eq!(error.message.as_deref(), Some("XTQL arguments must be SQL parameters"));
+    assert_eq!(error.context["position"], serde_json::json!(sql.find('1').unwrap() + 1));
+    assert!(!error.context.contains_key("offset"));
+
+    let error = parse("XTQL ($$[$$, ?").unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert_eq!(error.message.as_deref(), Some("Expected closing parenthesis after XTQL parameters"));
+    assert_eq!(error.context["position"], serde_json::json!(1));
+    assert!(!error.context.contains_key("offset"));
+
+    let sql = "XTQL ($$[$$, ?)";
+    let error = parse(sql).unwrap_err();
+    assert_eq!(error.code, "xtql/edn-reader");
+    assert_eq!(error.context["offset"], serde_json::json!(1));
+    assert_eq!(error.context["position"], serde_json::json!(sql.find("$$").unwrap() + 1));
+}
+
+#[test]
+fn explicit_inline_xtql_admits_body_metadata_after_valid_sql_arguments() {
+    let embedded = r#"$$(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))$$"#;
+    let invalid = format!("XTQL ({embedded}, 1)");
+    let valid = format!("XTQL ({embedded})");
+    let context = context();
+    let options = PrepareOptions::default();
+    let denied = MemoryBudget::new(0);
+
+    let error = rtdb_sql::parse_in(&invalid, &denied).unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert_eq!(error.message.as_deref(), Some("XTQL arguments must be SQL parameters"));
+    assert_eq!(error.context["position"], serde_json::json!(invalid.find('1').unwrap() + 1));
+    assert_eq!(rtdb_sql::prepare_in(&invalid, &context.catalog, &options, &denied).unwrap_err(), error);
+
+    let error = rtdb_sql::parse_in(&valid, &denied).unwrap_err();
+    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+    assert_eq!(error.context["position"], serde_json::json!(valid.find("$$").unwrap() + 1));
+    assert_eq!(rtdb_sql::prepare_in(&valid, &context.catalog, &options, &denied).unwrap_err(), error);
+    assert_eq!(denied.used_bytes(), 0);
+
+    let memory = MemoryBudget::new(1 << 20);
+    let parsed = rtdb_sql::parse_in(&valid, &memory).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].parameter_count(), 0);
+    assert!(memory.used_bytes() > 0);
+    drop(parsed);
+    assert_eq!(memory.used_bytes(), 0);
+}
