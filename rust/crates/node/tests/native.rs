@@ -1485,3 +1485,15 @@ async fn clock_time_is_shown_in_the_session_zone_and_database_controls_report_th
     session.execute_control(&parse("ROLLBACK"), &[], &token).await.unwrap();
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn txs_table_lists_every_submitted_transaction() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for value in 0..40 { assert!(session.state_mut().execute_tx(vec![put(&node, 1, value)], AutonomousTxOptions::default()).await.unwrap().committed()); }
+    let txs = tokio::time::timeout(Duration::from_secs(20), async { rows(session.query_sql("FROM xt.txs", vec![]).await.unwrap()).await }).await.expect("FROM xt.txs completes");
+    assert_eq!(txs.len(), 40);
+    let history = rows(session.query_sql("SELECT * FROM docs FOR VALID_TIME ALL", vec![]).await.unwrap()).await;
+    assert_eq!(history.len(), 40);
+    stop(&node, driver).await;
+}

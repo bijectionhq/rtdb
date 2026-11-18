@@ -494,7 +494,11 @@ fn project(row: &ResolvedRow<RowSource>, name: &str) -> Result<Value> {
     let put = op.child(id).as_any().downcast_ref::<StructArray>().ok_or_else(|| invalid("event-schema", "Visible event is not a put struct"))?;
     let DataType::Struct(fields) = put.data_type() else { return Err(invalid("event-schema", "Put has no struct fields")); };
     let Some(index) = fields.iter().position(|field| field.name() == name) else { return Ok(Value::Null); };
-    rtdb_columnar::read_execution_value(&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)).map(|value| if matches!(value, Value::Undefined) { Value::Null } else { value })
+    let value = match row.source.batch.put_field_type(index) {
+        Some(logical) => rtdb_columnar::read_execution_value_as(logical, &fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)),
+        None => rtdb_columnar::read_execution_value(&fields[index], put.column(index).as_ref(), op.value_offset(row.source.row)),
+    };
+    value.map(|value| if matches!(value, Value::Undefined) { Value::Null } else { value })
 }
 fn invalid_iid_path() -> Anomaly { invalid("iid-path", "Trie path exceeds 64 base-four buckets") }
 fn path_range(path: &[u8]) -> Result<(Iid, Iid)> {

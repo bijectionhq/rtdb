@@ -359,3 +359,25 @@ fn deeply_nested_union_cells_round_trip_promptly() {
     round_trip(ty, vec![value]);
     assert!(started.elapsed() < std::time::Duration::from_secs(60), "took {:?}", started.elapsed());
 }
+
+#[test]
+fn a_column_reader_reads_every_cell_as_read_value_does() {
+    use rtdb_columnar::{ColumnReader, build_array, read_value, read_value_as, to_field};
+    use rtdb_types::{LogicalType, Value};
+    let values = vec![
+        Value::List(vec![Value::I64(1), Value::Utf8("a".into()), Value::Null]),
+        Value::Utf8("b".into()),
+        Value::List(vec![Value::Bool(true), Value::List(vec![Value::F64(1.5)])]),
+        Value::Null,
+    ];
+    let logical = LogicalType::join_all(values.iter().map(Value::logical_type).collect::<Vec<_>>().iter());
+    let field = to_field("v", &logical).unwrap();
+    let array = build_array(&logical, &values).unwrap();
+    let reader = ColumnReader::new(&field).unwrap();
+    for row in 0..values.len() {
+        let expected = read_value(&field, array.as_ref(), row).unwrap();
+        assert_eq!(reader.read(array.as_ref(), row).unwrap(), expected);
+        assert_eq!(read_value_as(reader.logical(), &field, array.as_ref(), row).unwrap(), expected);
+    }
+    assert!(matches!(reader.logical(), LogicalType::Union(_)));
+}

@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
@@ -46,7 +46,7 @@ impl Prepared {
     }
 }
 struct RegisteredStatement { prepared: Arc<Prepared>, _reservation: Arc<MemoryReservation> }
-struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, row: usize, sent: u64 }
+struct QueryPortal { cursor: QueryCursor, batch: Option<OwnedBatch>, types: Vec<rtdb_types::LogicalType>, row: usize, sent: u64 }
 enum PortalState { Query(QueryPortal), Ready }
 struct Portal {
     prepared: Arc<Prepared>,
@@ -276,7 +276,7 @@ impl ProtocolSession {
                 let actual = cursor.runtime_schema();
                 if columns.len() != actual.len() || columns.iter().zip(actual.fields()).any(|(column, field)| !column.ty.accepts_result(&field.data_type).unwrap_or(false)) { return Err(Anomaly::new(rtdb_types::AnomalyCategory::Conflict, "xtdb/prepared-query-out-of-date", "cached plan must not change result type")); }
             }
-            portal.state = PortalState::Query(QueryPortal { cursor, batch: None, row: 0, sent: 0 });
+            portal.state = PortalState::Query(QueryPortal { cursor, batch: None, types: Vec::new(), row: 0, sent: 0 });
         }
         Ok(portal)
     }
@@ -365,6 +365,7 @@ impl ProtocolSession {
         while limit == 0 || emitted < limit {
             if query.batch.as_ref().is_none_or(|batch| query.row == batch.batch().num_rows()) {
                 loop { query.batch = query.cursor.next_batch().await?; query.row = 0; if query.batch.as_ref().is_none_or(|batch| batch.batch().num_rows() != 0) { break; } }
+                query.types = query.batch.as_ref().map(|batch| batch.batch().schema().fields().iter().map(|field| rtdb_columnar::from_field(field)).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default();
             }
             let Some(batch) = &query.batch else { break; };
             let schema = batch.batch().schema();
@@ -374,7 +375,7 @@ impl ProtocolSession {
                 let bound = (0..columns.len()).try_fold(columns.len() * 128 + 4096, |bound, column| bound.checked_add(estimate_read_value_bytes(schema.field(column), batch.batch().column(column).as_ref(), row)?).ok_or_else(|| protocol("Result row allocation overflow")))?;
                 let _scratch = memory.reserve(bound)?;
                 let mut values = Vec::with_capacity(columns.len());
-                for (index, column) in columns.iter().enumerate() { let value = read_value(schema.field(index), batch.batch().column(index).as_ref(), row)?; values.push(rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)?); }
+                for (index, column) in columns.iter().enumerate() { let value = rtdb_columnar::read_value_as(&query.types[index], schema.field(index), batch.batch().column(index).as_ref(), row)?; values.push(rtdb_pg_codec::encode(column.ty, column.format, &value, &environment, &memory)?); }
                 writer.row(&values).await
             }.await;
             if let Err(error) = consumption { query.cursor.record_consumer_error(); return Err(error); }

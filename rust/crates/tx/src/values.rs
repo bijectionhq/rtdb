@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, StructArray};
 use arrow_schema::{DataType, Fields, Schema};
-use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, read_value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field};
 use rtdb_types::{Anomaly, EntityId, LogicalType, Result, TableRef, Timestamp, TransactionKey, TxId, Value};
 
 #[derive(Clone, Debug)]
@@ -114,14 +114,15 @@ impl Documents {
         let mut reservation = memory.reserve(retained)?;
         let entry = std::mem::size_of::<(String, Value)>() * 16 + 256;
         let bottom = |field: &arrow_schema::Field| field.data_type() == &DataType::Null && !field.is_nullable();
+        let readers = array.fields().iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
         let mut rows = Vec::with_capacity(array.len());
         for row in 0..array.len() {
             if array.is_null(row) { return Err(Anomaly::incorrect("rtdb.tx/invalid-ipc", "Document is not a struct")); }
             let preserve_null = |field: &arrow_schema::Field| !omit_nulls || field.name() == "_id";
-            let children = || array.fields().iter().zip(array.columns()).filter(|(field, column)| {
+            let children = || array.fields().iter().zip(array.columns()).zip(&readers).filter(|((field, column), _)| {
                 preserve_null(field) || bottom(field) || (field.data_type() != &DataType::Null && column.is_valid(row))
             });
-            let temporary = children().try_fold(4096usize, |bytes, (field, column)| {
+            let temporary = children().try_fold(4096usize, |bytes, ((field, column), _)| {
                 let value = if bottom(field) { 0 } else { estimate_read_value_bytes(field, column.as_ref(), row)? };
                 bytes.checked_add(value).and_then(|bytes| bytes.checked_add(field.name().len()))
                     .and_then(|bytes| bytes.checked_add(entry)).ok_or_else(overflow)
@@ -129,8 +130,8 @@ impl Documents {
             let reservation = Arc::get_mut(&mut reservation).expect("document decoding owns its reservation");
             reservation.grow_to(retained.checked_add(temporary).ok_or_else(overflow)?)?;
             let mut document = BTreeMap::new();
-            for (field, column) in children() {
-                let mut value = if bottom(field) { Value::Undefined } else { read_value(field, column.as_ref(), row)? };
+            for ((field, column), reader) in children() {
+                let mut value = if bottom(field) { Value::Undefined } else { reader.read(column.as_ref(), row)? };
                 if preserve_null(field) || !matches!(value, Value::Null) {
                     value.admit_object_dates();
                     document.insert(field.name().clone(), value);

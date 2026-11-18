@@ -7,13 +7,15 @@ use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, owned_event_ba
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, EventOp, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
 
-use crate::{Snapshot, TableMeta, declare_column_types, merge_column_types};
+use crate::{Snapshot, TableMeta, absent_type, declare_column_types, merge_column_types};
 
 #[derive(Debug)]
 pub struct IndexBatch {
     owned: OwnedBatch,
     events: EventBatch,
     put_types: BTreeMap<String, LogicalType>,
+    /// The exact logical type of each put struct child, in field order, for reading cells without re-deriving it.
+    put_field_types: Vec<LogicalType>,
     system_times: Option<(Timestamp, Timestamp)>,
     canonical_iids: OnceLock<bool>,
 }
@@ -31,12 +33,19 @@ impl IndexBatch {
         let index = schema.index_of("op").map_err(invalid)?;
         let ty = from_field(schema.field(index))?;
         let put_types = ty.legs().into_iter().find_map(|leg| match leg { LogicalType::Struct(fields) => Some(fields), _ => None }).unwrap_or_default();
+        let put_field_types = match schema.field(index).data_type() {
+            arrow_schema::DataType::Union(legs, _) => match legs.iter().find(|(_, leg)| leg.name() == "put").map(|(_, leg)| leg.data_type()) {
+                Some(arrow_schema::DataType::Struct(fields)) => fields.iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?,
+                _ => Vec::new(),
+            },
+            _ => Vec::new(),
+        };
         let mut system_times: Option<(Timestamp, Timestamp)> = None;
         for row in 0..events.len() {
             let time = events.header(row)?.system_from;
             system_times = Some(system_times.map_or((time, time), |(first, last)| (first.min(time), last.max(time))));
         }
-        Ok(Arc::new(Self { owned, events, put_types, system_times, canonical_iids: OnceLock::new() }))
+        Ok(Arc::new(Self { owned, events, put_types, put_field_types, system_times, canonical_iids: OnceLock::new() }))
     }
     pub fn from_events(events: &[StoredEvent], declared: &BTreeMap<String, LogicalType>, budget: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
         Self::build_events(events, declared, EventBuild::Write, budget)
@@ -62,17 +71,17 @@ impl IndexBatch {
             }
         }
         let _schema_scratch = budget.reserve(schema_bytes.checked_mul(4).ok_or_else(|| invalid("Put schema allocation size overflow"))?)?;
-        let mut rows: Option<BTreeMap<String, LogicalType>> = None;
         let mut has_put = matches!(mode, EventBuild::CopyCaptured) || !declared.is_empty();
+        let mut documents = Vec::new();
         for event in events {
             if let StoredOperation::Put(document) = &event.operation {
                 if !matches!(mode, EventBuild::CopyCaptured) {
-                    let next: BTreeMap<_, _> = document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect();
-                    rows = Some(match rows { Some(fields) if fields != next => merge_column_types(&fields, &next), Some(fields) => fields, None => next });
+                    documents.push(document.iter().map(|(name, value)| (name.clone(), value.logical_type())).collect::<BTreeMap<_, _>>());
                 }
                 has_put = true;
             }
         }
+        let rows = row_column_types(&documents);
         let fields = match rows { Some(rows) => declare_column_types(&rows, declared), None => declared.clone() };
         let copy = !matches!(mode, EventBuild::Write);
         Self::from_owned(owned_event_batch(events, has_put.then_some(fields), copy, budget)?)
@@ -109,6 +118,8 @@ impl IndexBatch {
     pub fn len(&self) -> usize { self.events.len() }
     pub fn is_empty(&self) -> bool { self.events.is_empty() }
     pub fn put_types(&self) -> &BTreeMap<String, LogicalType> { &self.put_types }
+    /// The logical type of the put struct's `index`th child field, as `from_field` derives it.
+    pub fn put_field_type(&self, index: usize) -> Option<&LogicalType> { self.put_field_types.get(index) }
 }
 
 #[derive(Clone, Debug)]
@@ -498,4 +509,42 @@ fn denied_iid_verification_preserves_the_write_and_cannot_promote_its_generation
     let blocker = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
     assert!(empty.append(&first, first_time).unwrap().has_canonical_entity_iids());
     drop(blocker);
+}
+
+/// Joins every document's column types once per column, which equals folding `merge_column_types` over the documents
+/// in order: each document lacking a column contributes its own absence.
+fn row_column_types(documents: &[BTreeMap<String, LogicalType>]) -> Option<BTreeMap<String, LogicalType>> {
+    let (first, rest) = documents.split_first()?;
+    if rest.iter().all(|document| document == first) { return Some(first.clone()); }
+    let absences: Vec<_> = documents.iter().map(absent_type).collect();
+    let names: std::collections::BTreeSet<&String> = documents.iter().flat_map(BTreeMap::keys).collect();
+    Some(names.into_iter().map(|name| {
+        let joined = LogicalType::join_all(documents.iter().zip(&absences).map(|(document, absent)| document.get(name).unwrap_or(absent)));
+        (name.clone(), joined)
+    }).collect())
+}
+
+#[cfg(test)]
+mod row_column_type_tests {
+    use super::*;
+    use rtdb_types::{ListKind, ScalarType};
+
+    #[test]
+    fn joining_each_column_once_matches_folding_documents_in_order() {
+        let scalar = |scalar| LogicalType::Scalar(scalar);
+        let list = |element| LogicalType::List { kind: ListKind::List, element: Box::new(element) };
+        let structure = |fields: &[(&str, LogicalType)]| LogicalType::Struct(fields.iter().map(|(name, ty)| ((*name).into(), ty.clone())).collect());
+        let document = |fields: &[(&str, LogicalType)]| fields.iter().map(|(name, ty)| ((*name).to_owned(), ty.clone())).collect::<BTreeMap<_, _>>();
+        let documents = vec![
+            document(&[("_id", scalar(ScalarType::I64)), ("a", list(scalar(ScalarType::Utf8)))]),
+            document(&[("_id", scalar(ScalarType::I64)), ("b", structure(&[("x", scalar(ScalarType::Bool))]))]),
+            document(&[("_id", scalar(ScalarType::Utf8)), ("a", list(structure(&[("y", scalar(ScalarType::F64))]))), ("b", scalar(ScalarType::I64))]),
+            document(&[("_id", scalar(ScalarType::I64)), ("c", LogicalType::Null)]),
+            document(&[("_id", scalar(ScalarType::I64)), ("b", structure(&[("x", scalar(ScalarType::I64)), ("z", list(scalar(ScalarType::Bool)))]))]),
+        ];
+        let folded = documents.iter().cloned().reduce(|left, right| if left == right { left } else { merge_column_types(&left, &right) });
+        assert_eq!(row_column_types(&documents), folded);
+        assert_eq!(row_column_types(&documents[..1]), Some(documents[0].clone()));
+        assert_eq!(row_column_types(&[]), None);
+    }
 }

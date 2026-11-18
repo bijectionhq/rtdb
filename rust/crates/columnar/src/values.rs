@@ -440,6 +440,18 @@ pub fn read_value(field: &Field, array: &dyn Array, row: usize) -> Result<Value>
     read_typed(&from_field(field)?, field, array, row)
 }
 
+/// Reads the cells of one column, deriving its logical type once rather than per cell as `read_value` does.
+pub struct ColumnReader<'a> { field: &'a Field, logical: LogicalType }
+
+impl<'a> ColumnReader<'a> {
+    pub fn new(field: &'a Field) -> Result<Self> { Ok(Self { logical: from_field(field)?, field }) }
+    pub fn read(&self, array: &dyn Array, row: usize) -> Result<Value> { read_typed(&self.logical, self.field, array, row) }
+    pub fn logical(&self) -> &LogicalType { &self.logical }
+}
+
+/// `read_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
+pub fn read_value_as(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> { read_typed(logical, field, array, row) }
+
 /// `read_value` with the field's logical type already derived, so nested cells reuse their parent's types.
 fn read_typed(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
@@ -463,7 +475,11 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
         let union = downcast::<UnionArray>(array)?;
         let id = union.type_id(row);
         let child = fields.iter().find_map(|(child_id, field)| (child_id == id).then_some(field)).ok_or_else(layout_error)?;
-        return read_value(child, union.child(id).as_ref(), union.value_offset(row));
+        let leg = match logical { LogicalType::Union(legs) => legs.iter().find(|leg| crate::schema::leg_name(leg).is_ok_and(|name| name == *child.name())), _ => None };
+        return match leg {
+            Some(leg) => read_typed(leg, child, union.child(id).as_ref(), union.value_offset(row)),
+            None => read_value(child, union.child(id).as_ref(), union.value_offset(row)),
+        };
     }
     if array.is_null(row) { return Ok(Value::Null); }
     match logical {

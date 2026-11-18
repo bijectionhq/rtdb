@@ -352,8 +352,9 @@ pub unsafe extern "C" fn rtdb_v1_cursor_next_transit(handle: u64, out: *mut u64,
                 } }
                 let _rows = memory.reserve(bound)?;
                 let mut rows = Vec::with_capacity(batch.num_rows());
+                let readers = schema.fields().iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
                 for row in 0..batch.num_rows() {
-                    rows.push(rtdb_types::Value::Struct(schema.fields().iter().zip(batch.columns()).map(|(field, column)| Ok((field.name().clone(), rtdb_columnar::read_value(field, column.as_ref(), row)?))).collect::<Result<_>>()?));
+                    rows.push(rtdb_types::Value::Struct(schema.fields().iter().zip(&readers).zip(batch.columns()).map(|((field, reader), column)| Ok((field.name().clone(), reader.read(column.as_ref(), row)?))).collect::<Result<_>>()?));
                 }
                 let value = rtdb_types::Value::List(rows);
                 let reservation = memory.reserve(add(mul(value.retained_bytes()?, 16)?, 8192)?)?;

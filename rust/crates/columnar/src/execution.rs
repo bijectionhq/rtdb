@@ -40,6 +40,13 @@ pub fn admit_execution_value(value: &mut Value) {
 
 /// Decodes one domain cell with opened-vector semantics; raw `read_value` remains lossless.
 /// The caller reserves the same decoding bound required by `read_value` before calling.
+/// `read_execution_value` for a caller that has derived `logical` from `field` once, for many cells of the column.
+pub fn read_execution_value_as(logical: &LogicalType, field: &Field, array: &dyn Array, index: usize) -> Result<Value> {
+    let mut value = crate::read_value_as(logical, field, array, index)?;
+    admit_execution_value(&mut value);
+    Ok(value)
+}
+
 pub fn read_execution_value(field: &Field, array: &dyn Array, index: usize) -> Result<Value> {
     let mut value = crate::read_value(field, array, index)?;
     admit_execution_value(&mut value);

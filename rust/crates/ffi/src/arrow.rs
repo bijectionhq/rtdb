@@ -1,7 +1,7 @@
 use std::{ffi::{CStr, CString, c_char, c_void}, sync::Arc};
 use arrow_array::{Array, RecordBatch, StructArray, ffi::{FFI_ArrowArray, from_ffi}};
 use arrow_schema::{DataType, Schema, ffi::FFI_ArrowSchema};
-use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, read_value, to_field};
+use rtdb_columnar::{DecimalParameters, MemoryBudget, MemoryReservation, estimate_read_value_bytes, from_field, to_field};
 use rtdb_tx::SqlArguments;
 use rtdb_types::{Anomaly, LogicalType, Result};
 
@@ -207,8 +207,9 @@ pub(crate) unsafe fn import_rows(array: &mut FFI_ArrowArray, schema: &mut FFI_Ar
     }
     let _scratch = memory.reserve(super::mul(bound, 2)?)?;
     let mut rows = Vec::with_capacity(batch.num_rows());
+    let readers = fields.fields().iter().map(|field| rtdb_columnar::ColumnReader::new(field)).collect::<Result<Vec<_>>>()?;
     for row in 0..batch.num_rows() {
-        rows.push(fields.fields().iter().zip(batch.columns()).map(|(field, column)| read_value(field, column.as_ref(), row)).collect::<Result<Vec<_>>>()?);
+        rows.push(readers.iter().zip(batch.columns()).map(|(reader, column)| reader.read(column.as_ref(), row)).collect::<Result<Vec<_>>>()?);
     }
     let types = fields.fields().iter().map(|field| from_field(field)).collect::<Result<Vec<_>>>()?;
     let names = fields.fields().iter().map(|field| field.name().clone()).collect();

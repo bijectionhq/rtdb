@@ -52,8 +52,9 @@ fn write_column(field: &Field, array: &dyn Array, root: bool, calculate_blooms: 
     let with_bloom = calculate_blooms || (root && field.name() == "_iid");
     fold(field, array, mask, with_bloom, calculate_blooms, output, &mut statistics, depth)?;
     let mut count = 0i64;
+    let reader = rtdb_columnar::ColumnReader::new(field)?;
     for row in 0..array.len() {
-        if mask.includes(row) && !matches!(rtdb_columnar::read_value(field, array, row)?, Value::Null | Value::Undefined) { count += 1; }
+        if mask.includes(row) && !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) { count += 1; }
     }
     statistics.fields.insert("col-name".into(), Value::Utf8(field.name().clone()));
     statistics.fields.insert("root-col?".into(), Value::Bool(root));
@@ -154,9 +155,10 @@ fn fold(field: &Field, array: &dyn Array, mask: &Mask, with_bloom: bool, calcula
         _ => return Err(Anomaly::unsupported("rtdb.format/metadata-flavour", format!("Unsupported column metadata type: {:?}", field.data_type()))),
     };
     let bounds = statistics.numeric.entry(group).or_insert((f64::INFINITY, f64::NEG_INFINITY));
+    let reader = rtdb_columnar::ColumnReader::new(field)?;
     for row in 0..array.len() {
         if !mask.includes(row) { continue; }
-        let value = rtdb_columnar::read_value(field, array, row)?;
+        let value = reader.read(array, row)?;
         if matches!(value, Value::Null | Value::Undefined) { continue; }
         let value = numeric_value(&value)?;
         if value.is_nan() || bounds.0.is_nan() { bounds.0 = f64::NAN; } else { bounds.0 = bounds.0.min(value); }

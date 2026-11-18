@@ -75,9 +75,12 @@ pub fn hashes(hash1: i32, hash2: i32) -> [u32; BLOOM_K as usize] {
 
 pub fn from_column(field: &Field, array: &dyn Array) -> Result<BloomFilter> {
     let mut bloom = BloomFilter::default();
+    let reader = rtdb_columnar::ColumnReader::new(field)?;
     for row in 0..array.len() {
-        if !matches!(rtdb_columnar::read_value(field, array, row)?, Value::Null | Value::Undefined) {
-            bloom.insert_cell(field, array, row)?;
+        let value = reader.read(array, row)?;
+        if !matches!(value, Value::Null | Value::Undefined) {
+            let (first, second) = byte_hashes(&value)?;
+            bloom.insert_hashes(first, second);
         }
     }
     Ok(bloom)

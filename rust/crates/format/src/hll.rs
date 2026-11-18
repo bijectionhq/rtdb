@@ -87,8 +87,9 @@ pub fn combine(left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
 
 pub fn from_column(field: &Field, array: &dyn Array) -> Result<Vec<u8>> {
     let mut hll = Hll::default();
-    if rtdb_columnar::from_field(field)? != LogicalType::Nothing {
-        for row in 0..array.len() { add_cell(&mut hll, field, array, row)?; }
+    let reader = rtdb_columnar::ColumnReader::new(field)?;
+    if reader.logical() != &LogicalType::Nothing {
+        for row in 0..array.len() { add_cell(&mut hll, &reader, field, array, row)?; }
     }
     Ok(hll.into_bytes())
 }
@@ -105,9 +106,10 @@ pub fn from_event_batch(batch: &RecordBatch, rows: Range<usize>) -> Result<BTree
     let mut result = BTreeMap::new();
     for (index, field) in fields.iter().enumerate() {
         let mut hll = Hll::default();
-        if rtdb_columnar::from_field(field)? != LogicalType::Nothing {
+        let reader = rtdb_columnar::ColumnReader::new(field)?;
+        if reader.logical() != &LogicalType::Nothing {
             for row in rows.clone() {
-                if op.type_id(row) == put_id { add_cell(&mut hll, field, put.column(index).as_ref(), op.value_offset(row))?; }
+                if op.type_id(row) == put_id { add_cell(&mut hll, &reader, field, put.column(index).as_ref(), op.value_offset(row))?; }
             }
         }
         result.insert(field.name().clone(), hll.into_bytes());
@@ -115,8 +117,8 @@ pub fn from_event_batch(batch: &RecordBatch, rows: Range<usize>) -> Result<BTree
     Ok(result)
 }
 
-fn add_cell(hll: &mut Hll, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
-    if !matches!(rtdb_columnar::read_value(field, array, row)?, Value::Null | Value::Undefined) {
+fn add_cell(hll: &mut Hll, reader: &rtdb_columnar::ColumnReader<'_>, field: &Field, array: &dyn Array, row: usize) -> Result<()> {
+    if !matches!(reader.read(array, row)?, Value::Null | Value::Undefined) {
         hll.insert_hash(rtdb_columnar::hash_cell(field, array, row, 0)?);
     }
     Ok(())

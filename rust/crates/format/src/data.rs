@@ -4,7 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, NullArray, RecordBatch, TimestampMicrosecondArray, UnionArray};
 use arrow_buffer::ScalarBuffer;
 use arrow_schema::{DataType, Field, Schema, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
-use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, read_value, struct_field_cell, to_field};
+use rtdb_columnar::{BatchBuilder, IidView, MemoryBudget, OwnedBatch, build_array, build_iids, build_struct_array, copy_array, estimate_builder_bytes_refs, struct_field_cell, to_field};
 use rtdb_types::{Anomaly, EventHeader, EventOp, Iid, Interval, LogicalType, Result, RunEndWidth, Timestamp, Value};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -40,6 +40,8 @@ pub struct EventBatch {
     valid_to: usize,
     op: usize,
     recency: Option<usize>,
+    /// The put leg's logical type, derived from its field on the first put read.
+    put_type: std::sync::Arc<std::sync::OnceLock<LogicalType>>,
 }
 
 impl EventBatch {
@@ -72,7 +74,7 @@ impl EventBatch {
                 (name, _) => return Err(invalid(format!("Unknown event operation: {name}"))),
             }
         }
-        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency })
+        Ok(Self { batch, iid, system_from, valid_from, valid_to, op, recency, put_type: Default::default() })
     }
 
     pub fn arrow(&self) -> &RecordBatch { &self.batch }
@@ -102,7 +104,8 @@ impl EventBatch {
         let operation = match header.op {
             EventOp::Put => {
                 let (field, array, offset) = self.operation(row)?;
-                let Value::Struct(document) = read_value(field, array.as_ref(), offset)? else {
+                let logical = match self.put_type.get() { Some(logical) => logical, None => { let derived = rtdb_columnar::from_field(field)?; self.put_type.get_or_init(|| derived) } };
+                let Value::Struct(document) = rtdb_columnar::read_value_as(logical, field, array.as_ref(), offset)? else {
                     return Err(invalid("A put operation must contain a document struct"));
                 };
                 StoredOperation::Put(document)
