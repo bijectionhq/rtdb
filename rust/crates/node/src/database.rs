@@ -100,7 +100,7 @@ impl DatabaseFactory {
         let resources = self.resources.open_storage(&name, &configuration).await?;
         let io = Arc::clone(&resources.io);
         let opened = async {
-            let storage = Arc::new(BufferPool::with_budget(Arc::clone(&resources.store), Arc::clone(&self.cache)));
+            let storage = Arc::new(BufferPool::with_metadata_budget(Arc::clone(&resources.store), Arc::clone(&self.cache), Arc::clone(&self.memory)));
             let blocks = BlockStore::new(Arc::clone(&resources.store), Arc::clone(&storage), Arc::clone(&self.memory), self.options.file_size_target)?;
             let recovered = blocks.recover(self.options.trie, SourcePosition(-1), self.clock.now()).await?;
             let opened_logs = self.resources.open_logs(&name, &configuration, access, log_cancellation.clone(), &resources).await?;

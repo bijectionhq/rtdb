@@ -31,6 +31,13 @@ Remote copies use provider-side conditional publication and compare existing des
 Both source and destination regions retain a copy until provider completion.
 The ordinary `ObjectStore::copy` method uses these paths within its configured root.
 
+Native database buffer pools reserve cache entry metadata from the node execution memory budget before inserting a key.
+An entry holds that charge while cached or in use by concurrent fetchers.
+If metadata admission fails, the pool can reclaim one idle entry and retry.
+An empty entry is removed when its last fetcher fails or is cancelled.
+Pools sharing a payload budget report its retained encoded bytes and in-flight read reservations.
+An evicted payload remains charged until its last lease or slice drops.
+
 `DiskCache` is a shared monitor for immutable remote files, with per-entry load exclusion and passive leases that prevent eviction during reads.
 Downloads publish a complete temporary file atomically and charge each in-flight chunk and retained entry to the supplied allocation budget.
 Cancelled or failed loads release their temporary files and allow a later reader to retry.

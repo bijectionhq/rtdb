@@ -1,12 +1,13 @@
-use std::{ops::Range, path::Path, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}};
+use std::{future::{Future, poll_fn}, ops::Range, path::Path, pin::Pin, sync::{Arc, atomic::{AtomicBool, AtomicUsize, Ordering}}, task::Poll};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
-use rtdb_storage::{Error, MemoryStore, ObjectKey, ObjectStore, ReadReservation, Result, StoredObject, disk_cache::DiskCache};
+use rtdb_storage::{Error, MemoryStore, ObjectKey, ObjectStore, ReadReservation, Result, StoredObject, cache::{BufferPool, CacheBudget}, disk_cache::DiskCache};
 use tokio::sync::Semaphore;
 
 struct ObservedStore {
     inner: MemoryStore,
+    heads: AtomicUsize,
     reads: AtomicUsize,
     fail: AtomicBool,
     hold_first: bool,
@@ -15,12 +16,15 @@ struct ObservedStore {
 }
 impl ObservedStore {
     fn new(hold_first: bool) -> Self {
-        Self { inner: MemoryStore::default(), reads: AtomicUsize::new(0), fail: AtomicBool::new(false), hold_first, entered: Semaphore::new(0), release: Semaphore::new(0) }
+        Self { inner: MemoryStore::default(), heads: AtomicUsize::new(0), reads: AtomicUsize::new(0), fail: AtomicBool::new(false), hold_first, entered: Semaphore::new(0), release: Semaphore::new(0) }
     }
 }
 #[async_trait]
 impl ObjectStore for ObservedStore {
-    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> { self.inner.head(key).await }
+    async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
+        self.heads.fetch_add(1, Ordering::SeqCst);
+        self.inner.head(key).await
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         if self.reads.fetch_add(1, Ordering::SeqCst) == 0 && self.hold_first {
@@ -37,6 +41,173 @@ impl ObjectStore for ObservedStore {
     }
     async fn list(&self, directory: Option<&ObjectKey>) -> Result<Vec<StoredObject>> { self.inner.list(directory).await }
     async fn delete(&self, key: &ObjectKey) -> Result<()> { self.inner.delete(key).await }
+}
+
+async fn assert_pending<F: Future>(mut future: Pin<&mut F>) {
+    poll_fn(|context| { assert!(future.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+}
+
+#[tokio::test]
+async fn buffer_pool_charges_entry_metadata_before_head_and_releases_failed_entries() {
+    let store = Arc::new(ObservedStore::new(false));
+    let key = ObjectKey::new("present").unwrap();
+    store.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    let memory = MemoryBudget::new(4096);
+    let cache = BufferPool::with_metadata_budget(store.clone(), CacheBudget::new(4), Arc::clone(&memory));
+    let pressure = memory.reserve(memory.limit_bytes()).unwrap();
+    assert!(matches!(cache.get(&key).await, Err(Error::MemoryLimit { requested, limit: 4096, retained: 4096 }) if requested > key.as_str().len()));
+    assert_eq!(store.heads.load(Ordering::SeqCst), 0);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+    assert!(!cache.evict(&key));
+    drop(pressure);
+
+    for path in ["missing/one", "missing/two"] {
+        let absent = ObjectKey::new(path).unwrap();
+        assert!(matches!(cache.get(&absent).await, Err(Error::MissingObject(_))));
+        assert!(!cache.evict(&absent));
+        assert_eq!(memory.used_bytes(), 0);
+    }
+    store.fail.store(true, Ordering::SeqCst);
+    assert!(matches!(cache.get(&key).await, Err(Error::Task(message)) if message == "injected download failure"));
+    assert!(!cache.evict(&key));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(cache.retained_bytes(), 0);
+
+    let lease = cache.get(&key).await.unwrap();
+    let entry_bytes = memory.used_bytes();
+    assert!(entry_bytes > key.as_str().len());
+    let pressure = memory.reserve(memory.limit_bytes() - entry_bytes).unwrap();
+    assert_eq!(cache.get(&key).await.unwrap().as_slice(), b"data");
+    assert_eq!(memory.used_bytes(), entry_bytes + pressure.bytes());
+    assert_eq!(store.heads.load(Ordering::SeqCst), 4);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+    let slice = lease.slice(1..2).unwrap();
+    drop(lease);
+    assert!(cache.evict(&key));
+    assert_eq!(memory.used_bytes(), pressure.bytes());
+    drop(pressure);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(cache.retained_bytes(), 4);
+    assert_eq!(slice.as_slice(), b"a");
+    drop(slice);
+    assert_eq!(cache.retained_bytes(), 0);
+}
+
+#[tokio::test]
+async fn buffer_pool_shares_one_admitted_active_entry_between_fetchers() {
+    let store = Arc::new(ObservedStore::new(true));
+    let key = ObjectKey::new("data").unwrap();
+    store.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    let memory = MemoryBudget::new(4096);
+    let cache = BufferPool::with_metadata_budget(store.clone(), CacheBudget::new(4), Arc::clone(&memory));
+    let mut loader = Box::pin(cache.get(&key));
+    assert_pending(loader.as_mut()).await;
+    assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    let entry_bytes = memory.used_bytes();
+    assert!(entry_bytes > 0);
+    let pressure = memory.reserve(memory.limit_bytes() - entry_bytes).unwrap();
+
+    let mut waiter = Box::pin(cache.get(&key));
+    assert_pending(waiter.as_mut()).await;
+    assert_eq!(memory.used_bytes(), pressure.bytes() + entry_bytes);
+    assert_eq!(cache.retained_bytes(), 4);
+    assert!(!cache.evict(&key));
+    let other = ObjectKey::new("next").unwrap();
+    assert!(matches!(cache.get(&other).await, Err(Error::MemoryLimit { limit: 4096, .. })));
+    assert!(!cache.evict(&other));
+    assert_eq!(store.heads.load(Ordering::SeqCst), 1);
+    assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+
+    store.release.add_permits(1);
+    let (first, second) = tokio::join!(loader, waiter);
+    let first = first.unwrap();
+    let second = second.unwrap();
+    assert_eq!(first.as_slice(), b"data");
+    assert_eq!(second.as_slice(), b"data");
+    assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+    assert_eq!(memory.used_bytes(), pressure.bytes() + entry_bytes);
+    assert!(cache.evict(&key));
+    assert_eq!(memory.used_bytes(), pressure.bytes());
+    drop(pressure);
+    assert_eq!(memory.used_bytes(), 0);
+    drop(first);
+    assert_eq!(cache.retained_bytes(), 4);
+    drop(second);
+    assert_eq!(cache.retained_bytes(), 0);
+}
+
+#[tokio::test]
+async fn buffer_pool_retires_a_cancelled_empty_entry_after_its_last_fetcher() {
+    for loader_first in [false, true] {
+        let store = Arc::new(ObservedStore::new(true));
+        let key = ObjectKey::new("data").unwrap();
+        store.put(&key, Bytes::from_static(b"data")).await.unwrap();
+        let memory = MemoryBudget::new(4096);
+        let cache = BufferPool::with_metadata_budget(store.clone(), CacheBudget::new(4), Arc::clone(&memory));
+        let mut loader = Box::pin(cache.get(&key));
+        assert_pending(loader.as_mut()).await;
+        assert_eq!(store.reads.load(Ordering::SeqCst), 1);
+        let entry_bytes = memory.used_bytes();
+        assert!(entry_bytes > 0);
+        let mut waiter = Box::pin(cache.get(&key));
+        assert_pending(waiter.as_mut()).await;
+        assert_eq!(cache.retained_bytes(), 4);
+
+        let (first, second) = if loader_first { (loader, waiter) } else { (waiter, loader) };
+        drop(first);
+        assert_eq!(memory.used_bytes(), entry_bytes);
+        assert_eq!(cache.retained_bytes(), if loader_first { 0 } else { 4 });
+        assert!(!cache.evict(&key));
+        drop(second);
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(cache.retained_bytes(), 0);
+        assert!(!cache.evict(&key));
+
+        assert_eq!(cache.get(&key).await.unwrap().as_slice(), b"data");
+        assert_eq!(store.reads.load(Ordering::SeqCst), 2);
+        assert_eq!(memory.used_bytes(), entry_bytes);
+        drop(cache);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[tokio::test]
+async fn buffer_pool_reclaims_only_the_oldest_idle_entry_under_metadata_pressure() {
+    let store = Arc::new(MemoryStore::default());
+    let keys = ["000", "111", "222"].map(|name| ObjectKey::new(name).unwrap());
+    for key in &keys { store.put(key, Bytes::new()).await.unwrap(); }
+    let [first, second, third] = &keys;
+
+    let memory = MemoryBudget::new(4096);
+    let probe = BufferPool::with_metadata_budget(store.clone(), CacheBudget::new(0), Arc::clone(&memory));
+    assert!(probe.get(first).await.unwrap().as_slice().is_empty());
+    let entry_bytes = memory.used_bytes();
+    assert!(entry_bytes > 0);
+    drop(probe);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let memory = MemoryBudget::new(entry_bytes);
+    let cache = BufferPool::with_metadata_budget(store.clone(), CacheBudget::new(0), Arc::clone(&memory));
+    assert!(cache.get(first).await.unwrap().as_slice().is_empty());
+    assert!(cache.get(second).await.unwrap().as_slice().is_empty());
+    assert!(!cache.evict(first));
+    assert_eq!(cache.retained_bytes(), 0);
+    assert_eq!(memory.used_bytes(), entry_bytes);
+    assert!(cache.evict(second));
+    assert_eq!(memory.used_bytes(), 0);
+
+    let memory = MemoryBudget::new(entry_bytes * 2);
+    let cache = BufferPool::with_metadata_budget(store, CacheBudget::new(0), Arc::clone(&memory));
+    for key in [first, second, first, third] {
+        assert!(cache.get(key).await.unwrap().as_slice().is_empty());
+    }
+    assert!(!cache.evict(second));
+    assert_eq!(memory.used_bytes(), entry_bytes * 2);
+    assert_eq!(cache.retained_bytes(), 0);
+    assert!(cache.evict(first));
+    assert!(cache.evict(third));
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test]
