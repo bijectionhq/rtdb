@@ -17,6 +17,7 @@
            [java.time Duration InstantSource]
            [java.util.concurrent TimeUnit]
            [org.apache.arrow.memory RootAllocator]
+           [xtdb.api PasswordHash PasswordHash$Argon2id PasswordHash$BCrypt]
            [xtdb.rust NativeDatabase NativeException]))
 
 
@@ -59,19 +60,38 @@
     :else "no-assertions"))
 
 
-(defn- camel [k]
+(def ^:private config-key-aliases
+  "Clojure node-option keys whose YAML spelling isn't their camel-case form."
+  {:keystore "keyStore", :keystore-password "keyStorePassword"})
+
+(defn- camel-case [k]
   (let [[head & more] (str/split (str/replace (name k) #"\?$" "") #"-")]
     (apply str head (map str/capitalize more))))
+
+(defn- camel [k]
+  (if-let [alias (config-key-aliases k)]
+    alias
+    (camel-case k)))
+
+(defn- enum-constant
+  "The Kotlin enum constant a Clojure keyword option names, e.g. `:device-auth` -> `DEVICE_AUTH`."
+  [k]
+  (str/upper-case (str/replace (name k) "-" "_")))
 
 (defn- tag [k] (str "!" (str/join (map str/capitalize (str/split (name k) #"-")))))
 
 (defn- yaml [v]
   (cond
-    (map? v) (str "{" (str/join ", " (for [[k x] v] (str (json/write-value-as-string (if (keyword? k) (camel k) (str k))) ": " (yaml x)))) "}")
+    (map? v) (str "{" (str/join ", " (for [[k x] v]
+                                       (str (json/write-value-as-string (if (keyword? k) (camel k) (str k))) ": "
+                                            (yaml (cond-> x (and (= :method k) (keyword? x)) enum-constant)))))
+                  "}")
     (and (vector? v) (= 2 (count v)) (keyword? (first v)) (map? (second v))) (str (tag (first v)) " " (yaml (second v)))
     (and (vector? v) (= 1 (count v)) (keyword? (first v))) (str (tag (first v)) " {}")
     (sequential? v) (str "[" (str/join ", " (map yaml v)) "]")
     (keyword? v) (json/write-value-as-string (name v))
+    (instance? PasswordHash$Argon2id v) (str "!Argon2id " (json/write-value-as-string (.getEncoded ^PasswordHash v)))
+    (instance? PasswordHash$BCrypt v) (str "!BCrypt " (json/write-value-as-string (.getEncoded ^PasswordHash v)))
     (or (instance? Path v) (instance? File v) (instance? Duration v)) (json/write-value-as-string (str v))
     (nil? v) "null"
     :else (json/write-value-as-string v)))
@@ -91,6 +111,9 @@
                 (update-in [:log 1] (fn [{use? :instant-source-for-non-tx-msgs? :as log}]
                                       (cond-> (dissoc log :instant-source-for-non-tx-msgs?)
                                         (= :local (get-in opts [:log 0])) (assoc :use-instant-source-for-non-tx (boolean use?))))))
+         opts (cond-> opts
+                (contains? opts :xtdb.pgwire/server)
+                (-> (update :server merge (:xtdb.pgwire/server opts)) (dissoc :xtdb.pgwire/server)))
          opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
          config (yaml opts)]
      (try
@@ -98,8 +121,9 @@
          (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
          (NativeDatabase/open native-allocator config (* 512 1024 1024)))
        (catch NativeException e
-         (throw (if (= "xtdb/out-of-sync-log" (.code e))
-                  (IllegalStateException. (ex-message e) e)
+         (throw (case (.code e)
+                  "xtdb/out-of-sync-log" (IllegalStateException. (ex-message e) e)
+                  "xtdb.error/illegal-arg" (IllegalArgumentException. (ex-message e) e)
                   e)))))))
 
 (defn- import-logical-inputs [query]
@@ -110,7 +134,10 @@
                    1 [:literal-pages {:pages (first operands) :types (update-vals options st/render-type)}]
                    (throw (ex-info "Invalid fixture page source" {:query query})))
       :list [:list (update options :batch-size #(or % list-operator/*batch-size*))]
-      (into [operator options] (map import-logical-inputs) operands))))
+      :mega-join [:mega-join options (mapv import-logical-inputs (first operands))]
+      (if (qualified-keyword? operator)
+        (throw (ex-info "The test plans a logical operator it defines on the JVM" {:operator operator}))
+        (into [operator options] (map import-logical-inputs) operands)))))
 
 (defn- native-query-ra [query {:keys [node] :as options}]
   (let [query (import-logical-inputs query)]

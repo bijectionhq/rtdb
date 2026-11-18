@@ -2,7 +2,9 @@
 
 Errors raised because a test reaches a JVM-only API (a cast to xtdb.api.Xtdb, NodeBase or the database catalog)
 are reported as jvm-api-boundary: the binding documents those types as a migration boundary, so such Vars
-cannot run natively without changing the original test. Vars that need cloud CLIs or real cloud endpoints report
+cannot run natively without changing the original test. So are Vars that read the JVM node's system map for a port
+(their URL has an empty port), plan a logical operator the test itself defines on the JVM, or configure the
+test-namespace in-memory object store. Vars that need cloud CLIs, cloud credentials or real cloud endpoints report
 environment-unavailable.
 """
 
@@ -16,8 +18,11 @@ BOUNDARY = re.compile(
     r"cannot be cast to class xtdb\.api\.Xtdb\b|xtdb\.NodeBase|xtdb\.database\.Database\$Catalog|"
     r"cannot be cast to class xtdb\.api\.Xtdb\$Connection|No implementation of method: :\S+ of protocol: #'xtdb\.(db|node)|"
     r"NativeDatabase cannot be cast to class clojure\.lang\.(Associative|ILookup|IPersistentMap)|"
-    r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog")
-ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
+    r"Unsupported native start-node options|No serializer found for class|plans through the JVM database catalog|"
+    r"plans a logical operator it defines on the JVM|Unknown object store configuration tag '!InMemory'|"
+    r"jdbc:(postgresql|xtdb)://localhost:/")
+ENVIRONMENT = re.compile(r'Cannot run program "(az|gcloud)"|Unable to load credentials from any of the providers|'
+                         r'error occurred while loading credentials|POST https://oauth\d*\.googleapis\.com/token|xtdb-object-store-iam-test|addressed using the specified endpoint|Moved Permanently \(Service: S3')
 NOISE = re.compile(r"\d+|0x[0-9a-f]+")
 
 
