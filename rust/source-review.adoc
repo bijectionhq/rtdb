@@ -1580,13 +1580,13 @@ Receipts at the last fully verified main revisions:
 * JVM integration-test and property-test at 0beb8887d: all 3,115 property iterations passed, and integration passed except three tests.
   Two of those passed on a targeted rerun; xtdb.kafka-test/test-stale-log-recovery also fails on the pristine reference checkout c84f9334e against the same colima Kafka.
 
-Nine further commits are on the local branch handoff/b432-unverified, in worktree ~/.codex/worktrees/b432/rtdb, and were not pushed because their full workspace run was stopped.
+The nine commits from 71e5140f2 to bff655f06 were pushed to main at the owner's request before their all-feature workspace run completed.
 They add EXPLAIN shape parity, linear-time union unencoding and cell reads, a node sync FFI entry, a corrected builder memory estimate for wide sparse documents, and corpus classification of the SQL logic engine.
 Scoped crate tests passed for each.
 
 Next steps:
 
-. Run the all-feature workspace tests on handoff/b432-unverified, then rebase it onto main and push.
+. Run the all-feature workspace tests on main; nothing after e1a1123c5 has a full run, so fix whatever fails first.
 . Rerun the corpus and confirm that the block-boundary timeouts clear with the corrected memory estimate.
 . Fix the remaining corpus clusters:
 .. indexer-test golden xt$txs metadata files differ from the JVM's;
