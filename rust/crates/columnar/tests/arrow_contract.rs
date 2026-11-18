@@ -345,3 +345,17 @@ fn rejected_reservation_does_not_change_budget() {
     drop(reservation);
     assert_eq!(budget.used_bytes(), 0);
 }
+
+#[test]
+fn deeply_nested_union_cells_round_trip_promptly() {
+    let mut ty = scalar(ScalarType::I64);
+    let mut value = Value::I64(7);
+    for depth in 0..40 {
+        let other = if depth % 2 == 0 { scalar(ScalarType::Utf8) } else { LogicalType::Struct(BTreeMap::from([("v".into(), scalar(ScalarType::Bool))])) };
+        ty = LogicalType::list(LogicalType::from_legs([ty, other, LogicalType::Null]));
+        value = Value::List(vec![value, Value::Null]);
+    }
+    let started = std::time::Instant::now();
+    round_trip(ty, vec![value]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "took {:?}", started.elapsed());
+}

@@ -349,19 +349,25 @@ fn same_representation(left: &Value, right: &Value) -> bool {
 /// Reads a logical cell, expanding unions and run-end layouts by the declared field.
 /// Reading bottom is a fault; slices retain their physical offset through Arrow's accessors.
 pub fn read_value(field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+    read_typed(&from_field(field)?, field, array, row)
+}
+
+/// `read_value` with the field's logical type already derived, so nested cells reuse their parent's types.
+fn read_typed(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     if row >= array.len() { return Err(Anomaly::incorrect("rtdb/row-index", "Cell index exceeds array length")); }
     if field.data_type() != array.data_type() { return Err(layout_error()); }
-    let logical = from_field(field)?;
-    read(&logical, field, array, row)
+    read(logical, field, array, row)
 }
 
 fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     if matches!(logical, LogicalType::Nothing) { return Err(Anomaly::fault("xtdb/zero-leg-read", "The bottom type has no values to read")); }
     if let DataType::RunEndEncoded(ends, values) = field.data_type() {
+        let derived;
+        let value = match logical { LogicalType::RunEndEncoded { value, .. } => value.as_ref(), _ => { derived = from_field(values)?; &derived } };
         return match ends.data_type() {
-            DataType::Int16 => { let runs = downcast::<RunArray<Int16Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
-            DataType::Int32 => { let runs = downcast::<RunArray<Int32Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
-            DataType::Int64 => { let runs = downcast::<RunArray<Int64Type>>(array)?; read_value(values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int16 => { let runs = downcast::<RunArray<Int16Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int32 => { let runs = downcast::<RunArray<Int32Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
+            DataType::Int64 => { let runs = downcast::<RunArray<Int64Type>>(array)?; read_typed(value, values, runs.values().as_ref(), runs.get_physical_index(row)) }
             _ => Err(layout_error()),
         };
     }
@@ -383,12 +389,12 @@ fn read(logical: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> 
             for (i, child) in fields.iter().enumerate() {
                 let child_type = children.get(child.name()).ok_or_else(layout_error)?;
                 let value = if matches!(child_type, LogicalType::Nothing) { Value::Undefined }
-                    else { read_value(child, array.column(i).as_ref(), row)? };
+                    else { read_typed(child_type, child, array.column(i).as_ref(), row)? };
                 values.insert(child.name().clone(), value);
             }
             Ok(Value::Struct(values))
         }
-        LogicalType::List { kind, .. } => read_list(kind, field, array, row),
+        LogicalType::List { kind, element } => read_list(kind, element, field, array, row),
         _ => Err(layout_error()),
     }
 }
@@ -472,14 +478,14 @@ fn read_scalar(scalar: &ScalarType, array: &dyn Array, row: usize) -> Result<Val
     }
 }
 
-fn read_list(kind: &ListKind, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
+fn read_list(kind: &ListKind, element: &LogicalType, field: &Field, array: &dyn Array, row: usize) -> Result<Value> {
     let (child_field, values) = match field.data_type() {
         DataType::List(child) => (child, downcast::<ListArray>(array)?.value(row)),
         DataType::FixedSizeList(child, _) => (child, downcast::<FixedSizeListArray>(array)?.value(row)),
         DataType::Map(child, _) => (child, Arc::new(downcast::<MapArray>(array)?.value(row)) as ArrayRef),
         _ => return Err(layout_error()),
     };
-    let values = (0..values.len()).map(|index| read_value(child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
+    let values = (0..values.len()).map(|index| read_typed(element, child_field, values.as_ref(), index)).collect::<Result<Vec<_>>>()?;
     match kind {
         ListKind::List => Ok(Value::List(values)),
         ListKind::Set => Ok(Value::Set(values)),
