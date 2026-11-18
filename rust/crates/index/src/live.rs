@@ -63,9 +63,16 @@ impl IndexBatch {
                 has_put = true;
             }
         }
-        let mut bytes = events.len().checked_mul(256).and_then(|bytes| bytes.checked_add(65_536)).ok_or_else(|| invalid("Event allocation size overflow"))?;
+        let (metadata, schema_scratch) = if has_put {
+            let document_type = LogicalType::Struct(fields.clone());
+            let metadata = document_type.retained_bytes()?.checked_mul(8).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
+            (metadata, estimate_builder_bytes(&document_type, &[])?)
+        } else { (0, 0) };
+        let mut bytes = events.len().checked_mul(256)
+            .and_then(|bytes| bytes.checked_add(65_536))
+            .and_then(|bytes| bytes.checked_add(schema_scratch.max(metadata)))
+            .ok_or_else(|| invalid("Event allocation size overflow"))?;
         if has_put {
-            bytes = bytes.checked_add(estimate_builder_bytes(&LogicalType::Struct(fields.clone()), &[])?).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
             for (name, ty) in &fields {
                 let values = events.iter().filter_map(|event| match &event.operation {
                     StoredOperation::Put(document) => Some(struct_field_cell(document, name, ty)), _ => None,
@@ -79,11 +86,15 @@ impl IndexBatch {
                 }
             }
         }
-        let reservation = budget.reserve(bytes)?;
+        let mut reservation = budget.reserve(bytes)?;
         let batch = match mode {
             EventBuild::Write => build_event_batch(events, has_put.then_some(fields), None)?,
             EventBuild::CopyInferred | EventBuild::CopyCaptured => copy_event_batch(events, has_put.then_some(fields), None)?,
         };
+        let retained = batch.get_array_memory_size().checked_add(metadata)
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| invalid("Retained event batch size overflow"))?;
+        Arc::get_mut(&mut reservation).expect("event construction owns its reservation").shrink_to(retained)?;
         Self::from_owned(OwnedBatch::with_reservation(batch, reservation)?)
     }
     fn put_id_matches(&self, row: usize, iid: Iid) -> Option<bool> {
@@ -319,6 +330,27 @@ impl TransactionBuffer {
 }
 
 fn invalid(message: impl std::fmt::Display) -> Anomaly { Anomaly::incorrect("rtdb.index/invalid-live-index", message.to_string()) }
+
+#[cfg(test)]
+#[test]
+fn staged_batches_release_event_builder_scratch_before_they_enter_the_live_index() {
+    let memory = MemoryBudget::new(16 << 20);
+    let events = (0..1024).map(|id| StoredEvent {
+        iid: EntityId::Integer(id).iid(),
+        system_from: Timestamp(1),
+        valid_time: Interval::ALL,
+        operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(id))])),
+        recency: None,
+    }).collect::<Vec<_>>();
+    let batches = (0..32).map(|_| IndexBatch::copy_events(&events, &BTreeMap::new(), &memory).unwrap()).collect::<Vec<_>>();
+    assert_eq!(batches.iter().map(|batch| batch.len()).sum::<usize>(), 32_768);
+    assert!(memory.used_bytes() < 4 << 20);
+    let arrow = batches[0].arrow().clone();
+    drop(batches);
+    assert_ne!(memory.used_bytes(), 0);
+    drop(arrow);
+    assert_eq!(memory.used_bytes(), 0);
+}
 
 #[cfg(test)]
 #[test]

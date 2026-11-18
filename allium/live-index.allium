@@ -202,6 +202,8 @@ entity StagedTx {
 
 entity StagedTxTable {
     -- One transaction's rows for one table, imported into the matching durable LiveTable when the transaction is applied.
+    -- Staging retains the completed rows and their schema.
+    -- Temporary memory used during construction is released before staging.
     staged_tx: StagedTx
     table_ref: TableRef
     rows: Set<Row>
