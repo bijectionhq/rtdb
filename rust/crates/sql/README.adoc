@@ -446,11 +446,12 @@ SQL normalizes literal truncation fields to uppercase and accepts the grammar's 
 `DATE_BIN` requires an interval literal stride; `RANGE_BINS` takes that stride, a period and an optional origin, lowering the period to its lower and upper bounds.
 An unbounded upper period bound propagates null through `RANGE_BINS`.
 Current and local clock forms support their unsigned integer precision argument; `CURRENT_TIMEZONE` exposes the session zone.
+`NOW` is a synonym for `CURRENT_TIMESTAMP` in expressions, including table periods and query settings.
 `CURRENT_TIME`, `LOCAL_TIME` and `LOCAL_TIMESTAMP` require a precision when parentheses are present; `CURRENT_TIMESTAMP()` and `NOW()` retain their empty forms.
 The shared temporal syntax validator applies the same field, timezone-literal and precision grammar to query expressions and query settings.
 `CURRENT_DATE` and `CURRENT_TIME` retain the reference UTC semantics, while the `LOCAL_` forms use the session zone.
 Each query preparation binds `CURRENT_TIMESTAMP` output metadata to its command's timezone, and retained controls defer that zone to execution.
-`tests/temporal_functions.rs` contains planner and real query-path regression sources for fields, units, bins, clocks, aliases and rejected forms; they remain unexecuted.
+`tests/temporal_functions.rs` covers planning and execution for fields, units, bins, clocks, aliases and rejected forms.
 
 Field access uses `(expression).field` for Struct members and Transit map fields, including stored error data and transaction-key records.
 Missing Struct members and unsupported source types return null; Transit map access checks keyword keys before string keys and suppresses final false or null values.

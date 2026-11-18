@@ -184,6 +184,10 @@ impl Dialect for SqlDialect {
         }
         let Token::Word(word) = &token.token else { return None; };
         if let Some(expr) = current_catalog(parser, word, token.span) { return Some(Ok(expr)); }
+        if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("NOW") {
+            parser.next_token();
+            return Some(parser.parse_time_functions(ast::ObjectName::from(vec![word.to_ident(token.span)])));
+        }
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("SUBSTR") && parser.peek_nth_token(1).token == Token::LParen {
             let name = ast::ObjectName::from(vec![word.to_ident(token.span)]);
             parser.next_token();

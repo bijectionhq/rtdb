@@ -40,6 +40,13 @@ async fn sql_range_bins_lower_period_bounds_and_support_lazy_cardinality() {
 }
 
 #[tokio::test]
+async fn now_uses_the_query_clock_in_each_form() {
+    let rows = query("SELECT NOW, now(), Now(3), CURRENT_TIMESTAMP(3), t.\"now\" FROM (VALUES (1)) t(\"now\")", "UTC").await.unwrap();
+    let timestamp = |unit| V::Timestamp { value: 0, unit, timezone: Some("UTC".into()) };
+    assert_eq!(rows, [vec![timestamp(U::Microsecond), timestamp(U::Microsecond), timestamp(U::Millisecond), timestamp(U::Millisecond), V::I64(1)]]);
+}
+
+#[tokio::test]
 async fn sql_clock_aliases_capture_zone_metadata_at_command_preparation() {
     let rows = query("SELECT CURRENT_DATE,LOCAL_DATE,CURRENT_TIME(0),LOCAL_TIME(0),CURRENT_TIMESTAMP(0),LOCAL_TIMESTAMP(0),CURRENT_TIMEZONE","+05:45").await.unwrap();
     assert_eq!(rows,[vec![V::DateDay(0),V::DateDay(0),V::Time { value: 0,unit: U::Second,bit_width: 32 },V::Time { value: 20700,unit: U::Second,bit_width: 32 },V::Timestamp { value: 0,unit: U::Second,timezone: Some("+05:45".into()) },V::Timestamp { value: 20700,unit: U::Second,timezone: None },V::Utf8("+05:45".into())]]);
@@ -79,7 +86,7 @@ fn temporal_sql_grammar_is_identical_in_query_and_setting_expressions() {
             assert!(prepare(&source,&context.catalog,&PrepareOptions::default()).is_err(),"{source}");
         }
     }
-    for expression in ["NOW()","CURRENT_TIMESTAMP()","CURRENT_TIME","LOCAL_TIME(9)","LOCAL_TIMESTAMP(0)","DATE_TRUNC('DOW',NULL)","DATE_TRUNC(NANOSECOND,NULL)","DATE_TRUNC(day,NULL,'UTC')","EXTRACT(EPOCH FROM NULL)"] {
+    for expression in ["NOW","NOW()","NOW(3)","CURRENT_TIMESTAMP()","CURRENT_TIME","LOCAL_TIME(9)","LOCAL_TIMESTAMP(0)","DATE_TRUNC('DOW',NULL)","DATE_TRUNC(NANOSECOND,NULL)","DATE_TRUNC(day,NULL,'UTC')","EXTRACT(EPOCH FROM NULL)"] {
         for source in [format!("SELECT {expression}"),format!("SETTING SNAPSHOT_TIME={expression} SELECT 1")] {
             prepare(&source,&context.catalog,&PrepareOptions::default()).unwrap();
         }
