@@ -8,9 +8,9 @@ use rtdb_types::{Anomaly, Result};
 use tokio::{sync::Notify, time::timeout};
 
 use super::{
-    Budget, Failure, FatalKind, IdentityWitness, JavaShuffleObservations, MetadataError, MetadataWait,
-    MetadataWaitObservation, Outcome, ProducerMetadata, RequestScope, ResponseAction, Shared,
-    Snapshot, WaitStep,
+    Budget, Failure, FatalKind, IdentityWitness, JavaBackoffObservations, JavaShuffleObservations,
+    MetadataError, MetadataNetwork, MetadataUpdater, MetadataWait, MetadataWaitObservation, Outcome,
+    ProducerMetadata, RequestScope, ResponseAction, Shared, Snapshot, UpdateFailure, WaitStep,
 };
 
 mod topic;
@@ -59,6 +59,52 @@ impl MetadataMonitor {
     /// Retains the current metadata generation independently of subsequent publications.
     pub fn snapshot(&self) -> Outcome<Snapshot> {
         Ok(self.lock()?.snapshot())
+    }
+
+    fn apply_sender_change<T>(
+        &self, change: impl FnOnce(&mut ProducerMetadata) -> std::result::Result<T, UpdateFailure>,
+    ) -> std::result::Result<T, UpdateFailure> {
+        let (result, wake) = {
+            let mut metadata = self.lock()?;
+            let previous = metadata.fatal.clone();
+            let was_usable = !metadata.failed;
+            let result = change(&mut metadata);
+            let fatal_published = metadata.fatal.as_ref().is_some_and(|error| {
+                previous.as_ref().is_none_or(|old| !std::ptr::eq(old.cause(), error.cause()))
+            });
+            (result, fatal_published || (was_usable && metadata.failed))
+        };
+        if wake { self.state.changed.notify_waiters(); }
+        result
+    }
+
+    /// Drives the caller's serialized updater and broadcasts its request fatal publications.
+    /// Timing and observation order follow [`MetadataUpdater::maybe_update`].
+    /// Network and source-observation callbacks run under this monitor's lock and must not reenter it.
+    pub fn drive_update(
+        &self,
+        updater: &mut MetadataUpdater,
+        now_ms: i64,
+        backoff: &mut impl JavaBackoffObservations,
+        identity: &mut impl IdentityWitness,
+        shuffle: &mut impl JavaShuffleObservations,
+        network: &mut impl MetadataNetwork,
+    ) -> std::result::Result<i64, UpdateFailure> {
+        self.apply_sender_change(|metadata| updater.maybe_update(metadata, now_ms, backoff, identity, shuffle, network))
+    }
+
+    /// Records the caller's observed disconnect and publishes any request fatal outcome.
+    /// Ordering follows [`MetadataUpdater::disconnect`].
+    /// Network and source-observation callbacks run under this monitor's lock and must not reenter it.
+    pub fn drive_disconnect(
+        &self,
+        updater: &mut MetadataUpdater,
+        now_ms: i64,
+        fatal: Option<Anomaly>,
+        backoff: &mut impl JavaBackoffObservations,
+        network: &mut impl MetadataNetwork,
+    ) -> std::result::Result<(), UpdateFailure> {
+        self.apply_sender_change(|metadata| updater.disconnect(metadata, now_ms, fatal, backoff, network))
     }
 
     /// Applies the matching response after connection throttling and broadcasts successful metadata publication.

@@ -1,8 +1,8 @@
 use rtdb_types::{Anomaly, Result};
 
 use super::{
-    Failure, IdentityWitness, JavaBackoffObservations, JavaShuffleObservations, MetadataRequest, Node,
-    ProducerMetadata, RequestScope, ResponseAction,
+    Failure, FatalKind, IdentityWitness, JavaBackoffObservations, JavaShuffleObservations,
+    MetadataRequest, Node, Outcome, ProducerMetadata, RequestScope, ResponseAction,
 };
 use super::super::node_selection::{Bootstrap, ConnectionObservations, SelectionFailure, can_send_request};
 
@@ -26,6 +26,18 @@ pub enum SendMetadata {
     UnsupportedVersion(Anomaly),
 }
 
+/// A write permit for the ordinary fatal slot during a synchronous sender action.
+pub struct RequestFatal<'a>(&'a mut ProducerMetadata);
+
+impl RequestFatal<'_> {
+    /// Admits the caller's payload bound before constructing and publishing the error.
+    /// When driven by the monitor, publication wakes waiters after the sender action releases its lock.
+    pub fn publish(self, payload_bytes: usize, build: impl FnOnce() -> Result<Anomaly>) -> Outcome<()> {
+        let error = self.0.prepare_fatal_error(payload_bytes, build)?;
+        self.0.record_fatal_error(FatalKind::Request, error)
+    }
+}
+
 /// Synchronous operations on the same serialized NetworkClient inventory used by node selection.
 pub trait MetadataNetwork: ConnectionObservations<Node> {
     /// Observes CONNECTING for the node's connection ID, excluding other preparing states.
@@ -37,8 +49,9 @@ pub trait MetadataNetwork: ConnectionObservations<Node> {
     /// UnsupportedVersion and native errors accept no wire operation.
     /// A native error leaves the updater's in-progress scope unchanged.
     fn send_metadata(&mut self, node: &Node, request: MetadataRequest, now_ms: i64) -> Result<SendMetadata>;
-    /// Publishes the source fatal error and its waiter notification before returning.
-    fn fatal_error(&mut self, cause: Anomaly) -> Result<()>;
+    /// Publishes the source fatal error through the supplied slot.
+    /// The callback runs inside the current sender action and must not reenter its monitor.
+    fn fatal_error(&mut self, cause: Anomaly, target: RequestFatal<'_>) -> std::result::Result<(), UpdateFailure>;
 }
 
 /// Native capability and source-state failures at their observed demand point.
@@ -188,7 +201,7 @@ impl MetadataUpdater {
         network: &mut impl MetadataNetwork,
     ) -> UpdateResult<()> {
         if let Some(cause) = fatal {
-            network.fatal_error(cause)?;
+            network.fatal_error(cause, RequestFatal(&mut *metadata))?;
         }
         metadata.failed_response(now_ms)?;
         self.in_progress = None;
@@ -205,7 +218,7 @@ impl MetadataUpdater {
             self.failed_request(metadata, now_ms, None, network)?;
         }
         if let Some(cause) = fatal {
-            network.fatal_error(cause)?;
+            network.fatal_error(cause, RequestFatal(&mut *metadata))?;
         }
         metadata.request_full(false)?;
         Ok(())

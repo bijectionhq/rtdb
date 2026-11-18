@@ -30,6 +30,7 @@ struct Network<'a> {
     connectable: bool,
     unsupported_version: bool,
     reject_fatal: bool,
+    publish_fatal: bool,
     send: Option<SendFixture<'a>>,
 }
 
@@ -97,10 +98,12 @@ impl MetadataNetwork for Network<'_> {
         }
     }
 
-    fn fatal_error(&mut self, _: Anomaly) -> rtdb_types::Result<()> {
+    fn fatal_error(&mut self, cause: Anomaly, target: RequestFatal<'_>) -> std::result::Result<(), UpdateFailure> {
         self.demands.push(Demand::Fatal);
         if self.reject_fatal {
-            Err(Anomaly::unsupported("fixture/metadata-fatal", "Fatal publication unavailable"))
+            Err(Anomaly::unsupported("fixture/metadata-fatal", "Fatal publication unavailable").into())
+        } else if self.publish_fatal {
+            target.publish(128, || Ok(cause)).map_err(UpdateFailure::Metadata)
         } else {
             Ok(())
         }
@@ -199,6 +202,7 @@ fn observed_response_retires_the_request_and_publishes_the_matching_scope_once()
         request_timeout_ms, reconnect_backoff_ms: 50, bootstrap_enabled: true, rebootstrap_enabled: true,
     });
     let expected_scope = producer.request(100).unwrap().scope();
+    let monitor = MetadataMonitor::new(producer).unwrap();
     let queue_budget = MemoryBudget::new(1 << 16);
     let mut flights = InFlightQueue::new(1, queue_budget.clone()).unwrap();
     let port = port.parse().unwrap();
@@ -208,10 +212,9 @@ fn observed_response_retires_the_request_and_publishes_the_matching_scope_once()
             request.submit_in_flight(&mut flights, observation, 65536, sent_ms, request_timeout_ms).unwrap();
         };
         let mut network = Network { ready_node: Some(-1), capacity: true, send: Some(&mut send), ..Network::default() };
-        assert_eq!(tick(&mut updater, &mut producer, 100, &mut math, &mut shuffle, &mut network), i64::from(request_timeout_ms));
+        assert_eq!(monitor.drive_update(&mut updater, 100, &mut math, &mut NoIdentityWitness, &mut shuffle, &mut network).unwrap(), i64::from(request_timeout_ms));
     }
     assert_eq!(updater.in_progress(), Some(expected_scope));
-    let monitor = MetadataMonitor::new(producer).unwrap();
     let connection_backoffs = ConnectionBackoffs::new(ConnectionSettings {
         reconnect_ms: 10, reconnect_max_ms: 10, setup_ms: 20, setup_max_ms: 20,
     }, &mut math);
@@ -240,6 +243,68 @@ fn observed_response_retires_the_request_and_publishes_the_matching_scope_once()
     assert_eq!(queue_budget.used_bytes(), 0);
     drop(native);
     assert_eq!(account.used(), 0);
+}
+
+#[tokio::test]
+async fn monitored_sender_delivers_unsupported_version_and_disconnect_fatal_errors() {
+    use std::{future::Future, pin::pin, task::Poll, time::Duration};
+
+    for disconnect in [false, true] {
+        let mut math = Math::default();
+        let mut shuffle = Shuffle::default();
+        let producer = producer_with_cluster(&mut math, &mut shuffle, true);
+        let version = producer.refresh().update_version();
+        let monitor = MetadataMonitor::new(producer).unwrap();
+        let mut wait = MetadataWait::new(version, 60_000, || Ok(100)).unwrap();
+        let mut waiter = pin!(monitor.await_update(&mut wait, || Ok(100)));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+
+        let mut updater = updater();
+        let mut network = Network { ready_node: Some(-1), capacity: true, unsupported_version: true, publish_fatal: true, ..Network::default() };
+        let expected = if disconnect {
+            let cause = Anomaly::unsupported("fixture/authentication", "Authentication failed");
+            monitor.drive_disconnect(&mut updater, 100, Some(cause), &mut math, &mut network).unwrap();
+            assert!(updater.in_progress().is_none());
+            "fixture/authentication"
+        } else {
+            monitor.drive_update(&mut updater, 100, &mut math, &mut NoIdentityWitness, &mut shuffle, &mut network).unwrap();
+            assert!(updater.in_progress().is_some());
+            "fixture/metadata-version"
+        };
+        let observed = tokio::time::timeout(Duration::from_secs(1), waiter).await.unwrap().unwrap();
+        assert!(matches!(observed, WaitCompletion::Fatal(error) if error.cause().code == expected));
+    }
+}
+
+#[tokio::test]
+async fn monitored_disconnect_notifies_when_fatal_admission_ends_the_capability() {
+    use std::{future::Future, pin::pin, task::Poll, time::Duration};
+
+    let mut math = Math::default();
+    let mut shuffle = Shuffle::default();
+    let producer = producer_with_cluster(&mut math, &mut shuffle, false);
+    let memory = producer.budget.0.clone();
+    let version = producer.refresh().update_version();
+    let monitor = MetadataMonitor::new(producer).unwrap();
+    let full = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+    let mut wait = MetadataWait::new(version, 60_000, || Ok(100)).unwrap();
+    let mut waiter = pin!(monitor.await_update(&mut wait, || Ok(100)));
+    std::future::poll_fn(|cx| {
+        assert!(waiter.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }).await;
+
+    let mut updater = updater();
+    let mut network = Network { publish_fatal: true, ..Network::default() };
+    let cause = Anomaly::unsupported("fixture/authentication", "Authentication failed");
+    let result = monitor.drive_disconnect(&mut updater, 100, Some(cause), &mut math, &mut network);
+    assert!(matches!(result, Err(UpdateFailure::Metadata(Failure::Native(_)))));
+    let observed = tokio::time::timeout(Duration::from_secs(1), waiter).await.unwrap();
+    assert!(matches!(observed, Err(Failure::CapabilityFailed)));
+    drop(full);
 }
 
 #[test]

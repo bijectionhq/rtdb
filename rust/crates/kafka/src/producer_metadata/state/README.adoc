@@ -159,6 +159,9 @@ A bootstrap fatal is retained across observations and takes priority without cle
 `poll_wait` observes the retained handle before checking the version and timer.
 The topic error path clears both recoverable sets after an ordinary fatal or a topic-specific lookup.
 The monitor must notify waiters after publishing a fatal cause.
+The sender can drive an updater tick or disconnect through the monitor's existing exclusive write region.
+The network callback receives a one-call write permit for the request-error slot.
+The monitor broadcasts a newly retained fatal error or terminal capability failure after releasing the write region.
 
 `MetadataMonitor` holds the producer state and the broadcast under one admitted owner.
 Successful response publication, fatal publication and close wake every waiter.
