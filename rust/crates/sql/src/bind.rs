@@ -121,6 +121,7 @@ pub(crate) fn bind_static_document_source(
         _ => return Ok(None),
     }
     bind_using(parsed, catalog, options, |context, statement, _settings| {
+        if context.literals.has_errors() { return Ok(None); }
         let result = match statement {
             Syntax::Records { patch, table, records } => context.record_rows(*patch, table, records).map(Some),
             Syntax::Standard(ast::Statement::Insert(insert)) => {

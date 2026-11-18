@@ -80,13 +80,16 @@ impl Context<'_> {
             },
             ast::Expr::TypedString(value) => {
                 use crate::dialect::CustomStringLiteral;
+                use crate::literal_admission::TemporalLiteralKind as Temporal;
                 let literal = crate::types::literal(&value.value.value)?;
                 match (&value.data_type, &literal) {
-                    (ast::DataType::Date, Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_date_literal(text).map_err(|failure| error(format!("Cannot parse date: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?),
-                    (ast::DataType::Timestamp(..), Value::Utf8(text)) => Expr::Literal(rtdb_types::parse_sql_timestamp_literal(text).map_err(|failure| error(format!("Cannot parse timestamp: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?),
+                    (ast::DataType::Date, Value::Utf8(text)) =>
+                        Expr::Literal(self.literals.temporal(value.value.span, Temporal::Date, text)),
+                    (ast::DataType::Timestamp(..), Value::Utf8(text)) =>
+                        Expr::Literal(self.literals.temporal(value.value.span, Temporal::Timestamp, text)),
                     (ast::DataType::Time(..), Value::Utf8(text)) => {
-                        rtdb_types::validate_sql_time_literal(text).map_err(|failure| error(format!("Cannot parse time: {text} - failed with message {}", failure.message.as_deref().unwrap_or("null"))))?;
-                        Expr::Cast { expr: Box::new(Expr::Literal(literal)), target: self.cast_target(&value.data_type)? }
+                        let admitted = self.literals.temporal(value.value.span, Temporal::Time, text);
+                        Expr::Cast { expr: Box::new(Expr::Literal(admitted)), target: self.cast_target(&value.data_type)? }
                     }
                     (_, Value::Utf8(text)) if let Some(kind) = CustomStringLiteral::from_type(&value.data_type) => {
                         match kind {

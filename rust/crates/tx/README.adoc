@@ -25,6 +25,7 @@ Its temporary SQL syntax reservation releases after plan admission and before ex
 SQL argument payloads retain their physical Arrow fields and raw values through source encoding and replay.
 Binding uses their signed execution field view, and parameter evaluation admits unsigned cells at the same signed width.
 Static SQL expansion applies that admission before producing logical documents.
+An invalid temporal literal leaves the mutation in SQL form so transaction resolution records the planning error and the aborted transaction.
 Static SQL inserts and direct document writes share the source encoder's entity ID validation before publication.
 Forbidden fields in concrete document writes abort during source-log resolution and are reported in document schema order.
 SQL mutations that read live data or depend on transaction context report forbidden projected fields as planning diagnostics during resolution.

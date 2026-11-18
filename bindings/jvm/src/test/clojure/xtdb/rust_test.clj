@@ -156,6 +156,8 @@
 
 (deftest-original-api original-node/test-nulling-valid-time-columns-2504)
 
+(deftest-original-api original-node/test-indexer-cleans-up-aborted-transactions-2489)
+
 (deftest-original-api original-with/disallow-period-specs-on-ctes-3440)
 
 (deftest-original-api original-expr/duration-literal-query)

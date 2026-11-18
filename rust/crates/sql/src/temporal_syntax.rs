@@ -76,7 +76,7 @@ impl crate::bind::Context<'_> {
             let return_type = rtdb_plan::function_type_with_args(name, &args)?;
             Expr::Call { name: name.into(), args, return_type }
         } else {
-            Expr::Literal(self.literals.interval(interval.value.span(), text))
+            Expr::Literal(self.literals.temporal(interval.value.span(), crate::literal_admission::TemporalLiteralKind::Interval, &text))
         };
         Ok(if negative { Expr::unary(rtdb_plan::UnaryOp::Negate, expression) } else { expression })
     }

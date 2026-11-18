@@ -141,6 +141,20 @@ impl Context<'_> {
     pub(crate) fn admit_expression_literals(&mut self, expression: &ast::Expr) -> Result<()> {
         match expression {
             ast::Expr::Interval(interval) => { self.interval_literal(interval)?; }
+            ast::Expr::TypedString(value) => {
+                use crate::literal_admission::TemporalLiteralKind as Temporal;
+                let kind = match &value.data_type {
+                    ast::DataType::Date => Some(Temporal::Date),
+                    ast::DataType::Time(..) => Some(Temporal::Time),
+                    ast::DataType::Timestamp(..) => Some(Temporal::Timestamp),
+                    _ => None,
+                };
+                if let Some(kind) = kind
+                    && let rtdb_types::Value::Utf8(text) = crate::types::literal(&value.value.value)?
+                {
+                    self.literals.temporal(value.value.span, kind, &text);
+                }
+            }
             ast::Expr::Subquery(query) | ast::Expr::Exists { subquery: query, .. } => self.admit_query_literals(query)?,
             ast::Expr::InSubquery { expr, subquery, .. } => { self.admit_expression_literals(expr)?; self.admit_query_literals(subquery)?; }
             ast::Expr::Tuple(expressions) => for expression in expressions { self.admit_expression_literals(expression)?; },

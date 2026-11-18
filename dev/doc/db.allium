@@ -718,6 +718,8 @@ rule ClientSubmitsTransaction {
     -- A client submits a transaction: it is appended to the SOURCE log, which every node shares, so this succeeds whether or not this node happens to be the leader.
     -- Static expansion requires a declared column list for a VALUES insert.
     -- A VALUES insert whose source width cannot match its declared projection proceeds to transaction resolution as SQL.
+    -- A static SQL mutation with an invalid temporal literal proceeds to transaction resolution as SQL.
+    -- The resolved abort records the literal planning diagnostic and consumes a transaction position.
     -- Static expansion reads the referenced argument positions and can expand an operation that supplies additional arguments.
     -- An operation missing a referenced argument proceeds to transaction resolution as SQL, where the argument failure aborts the transaction.
     -- A document write aimed at a system schema is rejected at submission.

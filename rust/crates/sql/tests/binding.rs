@@ -350,3 +350,21 @@ fn static_insert_values_keep_declared_column_renames() {
     assert_eq!(plan.input.schema().fields().iter().map(|field|field.name.as_str()).collect::<Vec<_>>(), ["_id", "v"]);
     assert!(rtdb_sql::prepare_static("INSERT INTO foo (_id, v) SELECT _id, v FROM foo", &Fixture, &PrepareOptions::default()).unwrap().is_none());
 }
+
+#[test]
+fn temporal_literal_plan_errors_remain_sql_in_the_source_transaction() {
+    let options = PrepareOptions::default();
+    for (constructor, input, key) in [
+        ("DATE", "2030- 01-01", "d-str"),
+        ("TIME", "bad", "t-str"),
+        ("TIMESTAMP", "bad", "ts-str"),
+        ("INTERVAL", "bad", "i-str"),
+    ] {
+        let source = format!("INSERT INTO foo (_id, v) VALUES (1, {constructor} '{input}')");
+        assert!(rtdb_sql::prepare_static(&source, &Fixture, &options).unwrap().is_none());
+        let error = rtdb_sql::prepare_tx(&source, &Fixture, &options).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert!(error.message.as_deref().unwrap().starts_with(&format!("Errors planning SQL statement:\n  - Cannot parse {}: ", constructor.to_ascii_lowercase())));
+        assert_eq!(error.context["errors"][0][key], input);
+    }
+}
