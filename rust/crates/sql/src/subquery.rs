@@ -141,7 +141,7 @@ impl ExpressionAttachment {
             }
             Self::Mark { dependent, arguments, comparison, output } => {
                 let schema = input.schema().concat(&Schema::new(vec![output.clone()])?)?;
-                Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison, output })?
+                Relation::new(schema, RelationNode::Mark { input, dependent, arguments, condition: None, comparison, output })?
             }
             Self::Filter(predicate) => input.filter(predicate)?,
             Self::Window(window) => return window.bind(input),

@@ -264,7 +264,7 @@ pub enum RelationNode {
     /// - A match yields true, an unmatched unknown comparison yields null, and an empty or all-false comparison set yields false.
     /// Empty arguments select a shared build before input evaluation, with scalar equality hash selection and whole-build null facts.
     /// Correlated builds evaluate their complete comparison batch for each input row; shared comparisons stop at true.
-    Mark { input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, comparison: Expr, output: Field },
+    Mark { input: Arc<Relation>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, #[serde(default)] condition: Option<Expr>, comparison: Expr, output: Field },
     Aggregate { input: Arc<Relation>, groups: Vec<NamedExpr>, aggregates: Vec<AggregateExpr> },
     Window { input: Arc<Relation>, partition_by: Vec<ColumnId>, order_by: Vec<SortExpr>, expressions: Vec<WindowExpr> },
     Sort { input: Arc<Relation>, order_by: Vec<SortExpr> },
@@ -343,7 +343,7 @@ impl Relation {
             RelationNode::Filter { predicate, .. } => vec![predicate],
             RelationNode::Join { condition, .. } => condition.iter().collect(),
             RelationNode::Apply { arguments, .. } => arguments.iter().map(|(_, expr)| expr).collect(),
-            RelationNode::Mark { arguments, comparison, .. } => arguments.iter().map(|(_, expr)| expr).chain(std::iter::once(comparison)).collect(),
+            RelationNode::Mark { arguments, condition, comparison, .. } => arguments.iter().map(|(_, expr)| expr).chain(condition.iter()).chain(std::iter::once(comparison)).collect(),
             RelationNode::Aggregate { groups, aggregates, .. } => groups.iter().map(|expr| &expr.expr).chain(aggregates.iter().flat_map(|agg| {
                 agg.argument.iter().chain(agg.filter.iter()).chain(agg.order_by.iter().map(|order| &order.expr))
             })).collect(),
@@ -438,14 +438,15 @@ impl Relation {
                 let expected = kind.result_schema(left.schema(), right.schema())?;
                 if self.schema != expected { return invalid("Join schema does not describe its output"); }
             }
-            RelationNode::Mark { input, dependent, arguments, comparison, output } => {
+            RelationNode::Mark { input, arguments, condition, comparison, output, .. } => {
                 let mut parameters = BTreeSet::new();
                 for (index, expr) in arguments {
                     if !parameters.insert(index) { return invalid("Mark parameter is bound more than once"); }
                     expr.validate_columns(&input.schema.ids())?;
                 }
-                if dependent.schema.len() != 1 { return invalid("Mark requires a single candidate column"); }
-                if comparison.data_type().legs().iter().any(|ty| !matches!(ty, LogicalType::Null | LogicalType::Nothing | LogicalType::Scalar(ScalarType::Bool))) { return invalid("Mark comparison must be Boolean or null"); }
+                for predicate in condition.iter().chain([comparison]) {
+                    if predicate.data_type().legs().iter().any(|ty| !matches!(ty, LogicalType::Null | LogicalType::Nothing | LogicalType::Scalar(ScalarType::Bool))) { return invalid("Mark predicates must be Boolean or null"); }
+                }
                 if output.data_type != LogicalType::Scalar(ScalarType::Bool).maybe() { return invalid("Mark output must be nullable Boolean"); }
                 if self.schema != input.schema.concat(&Schema::new(vec![output.clone()])?)? { return invalid("Mark schema does not describe its output"); }
             }

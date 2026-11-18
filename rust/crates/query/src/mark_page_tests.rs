@@ -27,13 +27,58 @@ fn union(left: Arc<Relation>,right: Arc<Relation>) -> Arc<Relation> {
 fn mark(input: Arc<Relation>,dependent: Arc<Relation>,comparison: Expr,correlated: bool) -> Arc<Relation> {
     let output = field(2,LogicalType::Scalar(ScalarType::Bool).maybe());
     let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
-    Arc::new(Relation::new(schema,RelationNode::Mark { input,dependent,arguments: if correlated { vec![(0,column(0))] } else { vec![] },comparison,output }).unwrap())
+    Arc::new(Relation::new(schema,RelationNode::Mark { input,dependent,arguments: if correlated { vec![(0,column(0))] } else { vec![] },condition: None,comparison,output }).unwrap())
 }
 async fn open(relation: Arc<Relation>,execution: &Execution) -> BoxPageCursor {
     let runtime = EmittedRelation::derive(Arc::clone(&relation),&execution.context.catalog,execution.parameters.types(),&execution.context.memory).unwrap();
     build_pages(Arc::clone(&runtime),execution.clone()).await.unwrap()
 }
 fn inverse_equals_one(column: Expr) -> Expr { Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Divide,literal(1),column),literal(1)) }
+
+#[tokio::test]
+async fn mark_hashes_eligibility_keys_and_keeps_unknown_marks_in_memory_and_on_disk() {
+    let data_type = LogicalType::Scalar(ScalarType::I64).maybe();
+    let left_field = field(0,data_type.clone());
+    let left_schema = Schema::new(vec![left_field.clone()]).unwrap();
+    let input = Arc::new(Relation::new(left_schema.clone(),RelationNode::Values {
+        rows: [Value::I64(1),Value::I64(2),Value::I64(3),Value::Null].into_iter().map(|value|vec![Expr::Literal(value)]).collect(),
+    }).unwrap());
+    let right_key = field(1,data_type.clone());
+    let right_value = field(2,data_type);
+    let dependent = Arc::new(Relation::new(Schema::new(vec![right_key.clone(),right_value.clone()]).unwrap(),RelationNode::Values {
+        rows: vec![
+            vec![literal(2),literal(2)], vec![literal(3),Expr::Literal(Value::Null)],
+            vec![literal(5),literal(7)], vec![Expr::Literal(Value::Null),literal(9)],
+        ],
+    }).unwrap());
+    let condition = Expr::binary(BinaryOp::Eq,Expr::binary(BinaryOp::Add,left_field.expression(),literal(1)),right_key.expression());
+    let comparison = Expr::binary(BinaryOp::Gt,right_value.expression(),literal(0));
+    let output = field(3,LogicalType::Scalar(ScalarType::Bool).maybe());
+    let schema = left_schema.concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
+    let relation = Arc::new(Relation::new(schema,RelationNode::Mark {
+        input,dependent,arguments: vec![],condition: Some(condition),comparison,output,
+    }).unwrap());
+    for threshold in [1,100] {
+        let execution = execution_threshold(1,threshold);
+        let baseline = execution.context.memory.used_bytes();
+        let mut cursor = open(Arc::clone(&relation),&execution).await;
+        let mut results = std::collections::BTreeMap::new();
+        while let Some(mut page) = cursor.next_page().await.unwrap() {
+            if threshold == 1 { assert!(execution.context.spill_bytes() > 0); }
+            while let Some(row) = page.next() {
+                let [probe,mark] = <[Value;2]>::try_from(row.values).unwrap();
+                let key = match probe { Value::I64(value) => Some(value),Value::Null => None,_ => panic!("Unexpected mark input") };
+                assert!(results.insert(key,mark).is_none());
+            }
+        }
+        assert_eq!(results,std::collections::BTreeMap::from([
+            (Some(1),Value::Bool(true)),(Some(2),Value::Null),(Some(3),Value::Bool(false)),(None,Value::Bool(false)),
+        ]));
+        drop(cursor);
+        assert_eq!(execution.context.memory.used_bytes(),baseline);
+        assert_eq!(execution.context.spill_bytes(),0);
+    }
+}
 
 #[tokio::test]
 async fn mark_publishes_one_complete_page_for_each_nonempty_probe_page() {

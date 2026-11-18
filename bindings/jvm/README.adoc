@@ -107,6 +107,7 @@ SQL and logical relation requests use the same transaction settings for the snap
 Literal pages can declare their Arrow column types when the pages do not carry enough rows to infer a schema.
 Logical group-by uses native aggregates with exact column symbols, including distinct factories, filters, and array ordering.
 Logical joins bind each equijoin expression to its own input and run the native cross, inner, outer, semi, anti, or single join.
+Logical mark joins apply eligibility conditions before evaluating the three-valued mark across each probe row's candidates.
 Logical row numbering can count across a relation or restart at each operator page.
 Logical sort and limit accept named or positional arguments and keep the boundaries of the retained input pages when ordering is absent.
 Native logical relation tests run with the original Clojure assertions and the native relation cursor.

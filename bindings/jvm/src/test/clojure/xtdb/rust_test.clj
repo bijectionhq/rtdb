@@ -261,6 +261,16 @@
 
 (deftest-original-api original-join/test-single-join)
 
+(deftest-original-api original-join/test-mark-equi-join)
+
+(deftest-original-api original-join/test-mark-join-nils)
+
+(deftest-original-api original-join/test-mark-join-theta)
+
+(deftest-original-api original-join/test-mark-join-conditions-are-two-valued)
+
+(deftest-original-api original-join/test-exists-as-mark-join)
+
 (deftest-original-api original-join/can-join-on-lists-491)
 
 (deftest-original-api original-join/can-join-on-structs-491)

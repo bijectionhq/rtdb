@@ -138,10 +138,11 @@ impl Rebuilder<'_> {
                 *dependent = self.relation(dependent)?;
                 self.expressions(arguments.iter_mut().map(|(_, expression)| expression))?;
             }
-            RelationNode::Mark { input, dependent, arguments, comparison, .. } => {
+            RelationNode::Mark { input, dependent, arguments, condition, comparison, .. } => {
                 *input = self.relation(input)?;
                 *dependent = self.relation(dependent)?;
                 self.expressions(arguments.iter_mut().map(|(_, expression)| expression))?;
+                self.expressions(condition.iter_mut())?;
                 self.expression(comparison)?;
             }
         }
@@ -332,7 +333,7 @@ mod tests {
             ("Filter", relation(input.schema().clone(), RelationNode::Filter { input: Arc::clone(&input), predicate: Expr::Literal(V::Bool(true)) })),
             ("Join", cross(Arc::clone(&input), Arc::clone(&right))),
             ("Apply", relation(input.schema().concat(right.schema()).unwrap(), RelationNode::Apply { input: Arc::clone(&input), dependent: Arc::clone(&right), arguments: vec![(0, input.schema().fields()[0].expression())], kind: ApplyKind::Inner, output: None })),
-            ("Mark", relation(input.schema().concat(&Schema::new(vec![mark.clone()]).unwrap()).unwrap(), RelationNode::Mark { input: Arc::clone(&input), dependent: Arc::clone(&right), arguments: vec![(0, input.schema().fields()[0].expression())], comparison: Expr::binary(BinaryOp::Eq, input.schema().fields()[0].expression(), right.schema().fields()[0].expression()), output: mark })),
+            ("Mark", relation(input.schema().concat(&Schema::new(vec![mark.clone()]).unwrap()).unwrap(), RelationNode::Mark { input: Arc::clone(&input), dependent: Arc::clone(&right), arguments: vec![(0, input.schema().fields()[0].expression())], condition: Some(Expr::Literal(V::Bool(true))), comparison: Expr::binary(BinaryOp::Eq, input.schema().fields()[0].expression(), right.schema().fields()[0].expression()), output: mark })),
             ("Aggregate", relation(Schema::new(vec![output.clone()]).unwrap(), RelationNode::Aggregate { input: Arc::clone(&input), groups: Vec::new(), aggregates: vec![AggregateExpr { field: output.clone(), function: AggregateFunction::CountStar, argument: None, distinct: false, filter: None, order_by: Vec::new() }] })),
             ("Window", relation(input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap(), RelationNode::Window { input: Arc::clone(&input), partition_by: vec![ColumnId(0)], order_by: vec![order.clone()], expressions: vec![WindowExpr { field: output, function: WindowFunction::RowNumber }] })),
             ("Sort", relation(input.schema().clone(), RelationNode::Sort { input: Arc::clone(&input), order_by: vec![order.clone()] })),
@@ -376,8 +377,9 @@ mod tests {
                     assert_eq!(arguments.as_slice(), [(0, Expr::column(ColumnId(0), L::Scalar(S::I64)))]);
                     assert_eq!(*kind, ApplyKind::Inner); assert!(output.is_none());
                 }
-                RelationNode::Mark { arguments, comparison, output, .. } => {
+                RelationNode::Mark { arguments, condition, comparison, output, .. } => {
                     assert_eq!(arguments.as_slice(), [(0, Expr::column(ColumnId(0), L::Scalar(S::I64)))]);
+                    assert_eq!(*condition, Some(Expr::Literal(V::Bool(true))));
                     assert_eq!(comparison, &Expr::binary(BinaryOp::Eq, Expr::column(ColumnId(0), L::Scalar(S::I64)), Expr::column(ColumnId(1), L::Scalar(S::I64))));
                     assert_eq!(output.id, ColumnId(2)); assert_eq!(output.data_type, L::Scalar(S::Bool).maybe());
                 }

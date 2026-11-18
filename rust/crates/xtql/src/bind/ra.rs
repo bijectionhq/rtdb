@@ -68,6 +68,7 @@ impl Importer<'_, '_, '_> {
             ("semi-join" | "⋉", [left, right]) => self.join(JoinKind::Semi, options, left, right)?,
             ("anti-join" | "▷", [left, right]) => self.join(JoinKind::Anti, options, left, right)?,
             ("single-join", [left, right]) => self.join(JoinKind::Single, options, left, right)?,
+            ("mark-join", [left, right]) => self.mark(options, left, right)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -435,20 +436,8 @@ impl Importer<'_, '_, '_> {
         let right = self.lower(right)?;
         let mut left_input = bind_input(&left);
         let mut right_input = bind_input(&right);
-        let condition = if kind == JoinKind::Cross { None } else {
-            let variables = left_input.variables.iter().chain(&right_input.variables)
-                .map(|(name, field)| (name.clone(), field.clone())).collect();
-            let mut combined = Bound { variables, ..Bound::unit() };
-            let conditions = required(options, "conditions")?.vector().ok_or_else(|| invalid("Join conditions must be a vector"))?;
-            let predicates = conditions.iter().map(|condition| {
-                if let Some([(left, right)]) = condition.map() {
-                    let left = self.join_key(left, &mut left_input)?;
-                    let right = self.join_key(right, &mut right_input)?;
-                    Ok(PExpr::binary(BinaryOp::Eq, left, right))
-                } else { self.scalar(condition, &mut combined) }
-            }).collect::<Result<Vec<_>>>()?;
-            and(predicates)
-        };
+        let condition = if kind == JoinKind::Cross { None }
+            else { self.join_conditions(options, &mut left_input, &mut right_input)? };
         let relation = Relation::join(left_input.relation, right_input.relation, kind, condition)?;
         let mut outputs: BTreeMap<&str, NamedExpr> = BTreeMap::new();
         for field in relation.schema().fields() {
@@ -464,11 +453,54 @@ impl Importer<'_, '_, '_> {
         Arc::new(relation).project(outputs)
     }
 
+    fn join_conditions(&mut self, options: &Edn, left: &mut Bound, right: &mut Bound) -> Result<Option<PExpr>> {
+        let mut combined = join_scope(left, right);
+        let conditions = required(options, "conditions")?.vector().ok_or_else(|| invalid("Join conditions must be a vector"))?;
+        let predicates = conditions.iter().map(|condition| {
+            if let Some([(left_key, right_key)]) = condition.map() {
+                let left = self.join_key(left_key, left)?;
+                let right = self.join_key(right_key, right)?;
+                Ok(PExpr::binary(BinaryOp::Eq, left, right))
+            } else { self.scalar(condition, &mut combined) }
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(and(predicates))
+    }
+
     fn join_key(&mut self, form: &Edn, input: &mut Bound) -> Result<PExpr> {
         if form.symbol().is_some_and(|name| !name.starts_with('?')) {
             return Ok(self.column_or_null(form, input)?.expression());
         }
         self.scalar(form, input)
+    }
+
+    fn mark(&mut self, options: &Edn, left: &Edn, right: &Edn) -> Result<Relation> {
+        let left = self.lower(left)?;
+        let mut probe = bind_input(&left);
+        let mut candidates = bind_input(&self.lower(right)?);
+        let Some([(name, comparisons)]) = required(options, "mark-spec")?.map() else {
+            return Err(invalid("Mark specification must be a one-entry map"));
+        };
+        let mut combined = join_scope(&probe, &candidates);
+        let comparisons = comparisons.vector().ok_or_else(|| invalid("Mark comparisons must be a vector"))?
+            .iter().map(|comparison| {
+                if comparison.map().is_some() { return Err(invalid("Mark comparisons must be scalar predicates")); }
+                self.scalar(comparison, &mut combined)
+            }).collect::<Result<Vec<_>>>()?;
+        let comparison = and(comparisons).unwrap_or(PExpr::Literal(Value::Bool(true)));
+        let condition = self.join_conditions(options, &mut probe, &mut candidates)?;
+        let name = column_name(name)?;
+        let output = self.compiler.binder.field(name, None, LogicalType::Scalar(ScalarType::Bool).maybe())?;
+        let schema = probe.relation.schema().concat(&Schema::new(vec![output.clone()])?)?;
+        let relation = Relation::new(schema, RelationNode::Mark {
+            input: probe.relation, dependent: candidates.relation, arguments: Vec::new(), condition, comparison, output: output.clone(),
+        })?;
+        if relation.schema().len() == left.schema().len() + 1 && !left.schema().fields().iter().any(|field| field.name == name) {
+            return Ok(relation);
+        }
+        let expressions = left.schema().fields().iter().filter(|field| field.name != name)
+            .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+            .chain([NamedExpr { field: output.clone(), expr: output.expression() }]).collect();
+        Arc::new(relation).project(expressions)
     }
 
     fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {
@@ -505,6 +537,12 @@ fn ordinality_scope(form: &Edn) -> Option<rtdb_plan::OrdinalityScope> {
         "local-row-number" => Some(rtdb_plan::OrdinalityScope::Page),
         _ => None,
     }
+}
+
+fn join_scope(left: &Bound, right: &Bound) -> Bound {
+    let variables = left.variables.iter().chain(&right.variables)
+        .map(|(name, field)| (name.clone(), field.clone())).collect();
+    Bound { variables, ..Bound::unit() }
 }
 
 fn output_names(options: &Edn, inferred: BTreeSet<String>) -> Result<Vec<String>> {

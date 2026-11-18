@@ -184,7 +184,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
         RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => expression(expr)?,
         RelationNode::Join { condition, .. } => if let Some(condition) = condition { expression(condition)?; },
         RelationNode::Apply { arguments, .. } => for (_, expr) in arguments { expression(expr)?; },
-        RelationNode::Mark { arguments, comparison, .. } => { for (_, expr) in arguments { expression(expr)?; } expression(comparison)?; },
+        RelationNode::Mark { arguments, condition, comparison, .. } => { for (_, expr) in arguments { expression(expr)?; } for expr in condition.iter().chain([comparison]) { expression(expr)?; } },
         RelationNode::Filter { predicate, .. } => expression(predicate)?,
         RelationNode::Sort { order_by, .. } | RelationNode::Window { order_by, .. } => for order in order_by { expression(&order.expr)?; },
         RelationNode::SortLimit { order_by, offset, fetch, .. } => {
@@ -335,13 +335,14 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
             fields.extend(ordinality.iter().cloned());
             Schema::new(fields)?
         }
-        RelationNode::Mark { input, dependent, arguments, comparison, output } => {
+        RelationNode::Mark { input, dependent, arguments, condition, comparison, output } => {
             let input = child(input)?;
             let mut bound = emitter.parameters.clone();
             for (index, expr) in arguments { bound.insert(*index, type_of(expr, &input)?); }
             let mut scopes = emitter.outer.to_vec(); scopes.push(input.clone());
             let dependent_types = relation_types(dependent, &Emitter { parameters: &bound, outer: &scopes, ..*emitter })?;
-            type_of(comparison, &input.concat(dependent_types.schema())?)?;
+            let comparison_schema = input.concat(dependent_types.schema())?;
+            for predicate in condition.iter().chain([comparison]) { type_of(predicate, &comparison_schema)?; }
             children.push(dependent_types);
             input.concat(&Schema::new(vec![field_type(output, L::Scalar(ScalarType::Bool).maybe())])?)?
         }
@@ -516,7 +517,7 @@ mod parameter_tests {
         let apply = Relation::new(schema, RelationNode::Apply { input: Arc::clone(&input), dependent: Arc::clone(&dependent), arguments: arguments.clone(), kind: ApplyKind::Scalar, output: Some(output) }).unwrap();
         let output = field(2, L::Scalar(ScalarType::Bool).maybe());
         let schema = input.schema().concat(&Schema::new(vec![output.clone()]).unwrap()).unwrap();
-        let mark = Relation::new(schema, RelationNode::Mark { input, dependent, arguments, comparison: Expr::Literal(Value::Bool(true)), output }).unwrap();
+        let mark = Relation::new(schema, RelationNode::Mark { input, dependent, arguments, condition: None, comparison: Expr::Literal(Value::Bool(true)), output }).unwrap();
         for relation in [&apply, &mark] {
             assert_eq!(parameter_types(relation, &[Value::I64(-1)], EmissionMode::Execution), [L::Scalar(ScalarType::I64).maybe()]);
         }

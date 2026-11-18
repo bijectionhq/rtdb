@@ -61,9 +61,9 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let left = prepare(Arc::clone(left))?; let right = prepare(Arc::clone(right))?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Join { left, right, kind: *kind, condition: condition.clone() })?))
         }
-        RelationNode::Mark { input, dependent, arguments, comparison, output } => {
+        RelationNode::Mark { input, dependent, arguments, condition, comparison, output } => {
             let input = prepare(Arc::clone(input))?; let dependent = prepare(Arc::clone(dependent))?;
-            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Mark { input, dependent, arguments: arguments.clone(), comparison: comparison.clone(), output: output.clone() })?))
+            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Mark { input, dependent, arguments: arguments.clone(), condition: condition.clone(), comparison: comparison.clone(), output: output.clone() })?))
         }
         RelationNode::Apply { input, dependent, arguments, kind, output } => {
             let input = prepare(Arc::clone(input))?; let dependent = prepare(Arc::clone(dependent))?;

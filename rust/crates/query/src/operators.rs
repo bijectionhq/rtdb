@@ -212,10 +212,11 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Mark { arguments,comparison,.. } => {
+        RelationNode::Mark { arguments,condition,comparison,.. } => {
+            let probe = runtime.child(0)?;
             let pages = Box::new(crate::mark::Mark::new(
-                DeferredInput { runtime: runtime.child(0)?,execution: execution.child(0),constraints,pushdowns },
-                runtime.child(0)?.schema().clone(),runtime.child(1)?,arguments.clone(),comparison.clone(),execution,
+                DeferredInput { runtime: Arc::clone(&probe),execution: execution.child(0),constraints,pushdowns },
+                &probe,runtime.child(1)?,arguments.clone(),condition.clone(),comparison.clone(),execution,
             )?);
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));

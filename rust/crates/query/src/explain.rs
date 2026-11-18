@@ -503,10 +503,14 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             if let Some(field) = ordinality { fields.insert("ordinality", text(field_symbol(field, work)?)?)?; }
             fields.finish()?
         }
-        RelationNode::Mark { arguments, comparison, .. } if arguments.is_empty() => {
+        RelationNode::Mark { arguments, condition, comparison, .. } if arguments.is_empty() => {
             let comparison = expression(comparison)?;
+            let condition = if let Some(condition) = condition {
+                let condition = expression(condition)?;
+                work.pieces(&[RenderPiece::Text("["), RenderPiece::Text(condition.as_str()), RenderPiece::Text("]")])?
+            } else { work.copy_text("[]")? };
             map(work, [
-                ("condition", text(work.copy_text("[]")?)?),
+                ("condition", text(condition)?),
                 ("mark", text(work.pieces(&[RenderPiece::Text("(and "), RenderPiece::Text(comparison.as_str()), RenderPiece::Text(")")])?)?),
             ])?
         }
