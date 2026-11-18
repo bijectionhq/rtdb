@@ -327,8 +327,9 @@ General registered-object text rendering requires the source Date environment an
 FORMAT uses scalar ExceptionInfo text for a root stored MessagePack `xtdb/exception-info` with exactly two array elements, a string or null message, and null or empty-map data.
 This shape uses the Throwable constructor and scalar renderer under the default Clojure print-binding profile.
 Its message copy and local Throwable acquire a construction reservation before allocation, and text growth retains the existing caller-scope admission.
-FORMAT resolves root stored MessagePack `time/date` and `time/time` string representations through their registered ISO constructors.
+FORMAT resolves root stored MessagePack `time/date`, `time/time`, `time/duration`, `time/day-of-week` and `time/month` string representations through their registered constructors.
 It uses LocalDate scalar text with signed extended years and LocalTime scalar text with three, six or nine fractional digits when needed.
+Durations use Java `Duration.toString()` text, and day-of-week and month values use their exact declared enum names.
 The scalar renderer admits temporary text and output growth in the existing caller scope.
 FORMAT decodes MessagePack once per Transit argument.
 Other Transit shapes use raw rendering.

@@ -171,3 +171,57 @@ fn invalid_stored_local_dates_and_times_fail_before_format_directives() {
         assert_eq!(scalar_call("format",&args,&EvalContext::default()).unwrap_err().code,code);
     }
 }
+
+#[test]
+fn format_renders_stored_durations_and_enum_names_as_scalars() {
+    let memory = MemoryBudget::new(8 << 20);
+    {
+        let scope = EvaluationScope::new(&memory).unwrap();
+        for context in [EvalContext::default(), EvalContext { allocation: Some(&scope), ..Default::default() }] {
+            for (tag_name, source, expected) in [
+                ("time/duration", "P1DT2H", "PT26H"),
+                ("time/duration", "P1Dt", "PT24H"),
+                ("time/duration", "-PT-6H+3M", "PT5H57M"),
+                ("time/duration", "PT-0,100000000S", "PT-0.1S"),
+                ("time/duration", "PT1H-60M", "PT0S"),
+                ("time/duration", "PT9223372036854775807.999999999S", "PT2562047788015215H30M7.999999999S"),
+                ("time/duration", "PT-9223372036854775808S", "PT-2562047788015215H-30M-8S"),
+                ("time/day-of-week", "MONDAY", "MONDAY"),
+                ("time/day-of-week", "SUNDAY", "SUNDAY"),
+                ("time/month", "JANUARY", "JANUARY"),
+                ("time/month", "DECEMBER", "DECEMBER"),
+            ] {
+                let args = [text("%s"), stored(&tag(tag_name, T::String(source.into())))];
+                assert_eq!(scalar_call("format", &args, &context).unwrap(), text(expected));
+            }
+
+            let duration = stored(&tag("time/duration", T::String("PT-0.10S".into())));
+            let day = stored(&tag("time/day-of-week", T::String("MONDAY".into())));
+            let month = stored(&tag("time/month", T::String("MARCH".into())));
+            let args = [text("%3$L/%2$I/%1$s/%3$s"), duration, day, month];
+            assert_eq!(scalar_call("format", &args, &context).unwrap(), text("'MARCH'/\"MONDAY\"/PT-0.1S/MARCH"));
+        }
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn invalid_stored_durations_and_enum_names_fail_before_format_directives() {
+    for (tag_name, source, code) in [
+        ("time/duration", "P1DT", "xtdb.expression/invalid-temporal-string"),
+        ("time/duration", "PT2562047788015216H", "xtdb.expression/invalid-temporal-string"),
+        ("time/duration", "PT1M9223372036854775807S", "xtdb.expression/invalid-temporal-string"),
+        ("time/duration", "PT-9223372036854775808.1S", "xtdb.expression/invalid-temporal-string"),
+        ("time/duration", "-PT-9223372036854775808S", "xtdb.expression/invalid-temporal-string"),
+        ("time/day-of-week", "monday", "xtdb.expression/invalid-transit-object"),
+        ("time/day-of-week", "MONDAY ", "xtdb.expression/invalid-transit-object"),
+        ("time/month", "January", "xtdb.expression/invalid-transit-object"),
+        ("time/month", "MONDAY", "xtdb.expression/invalid-transit-object"),
+    ] {
+        let value = stored(&tag(tag_name, T::String(source.into())));
+        for directive in ["literal", "%0$s"] {
+            let args = [text(directive), value.clone()];
+            assert_eq!(scalar_call("format", &args, &EvalContext::default()).unwrap_err().code, code);
+        }
+    }
+}

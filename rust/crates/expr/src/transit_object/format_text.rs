@@ -7,7 +7,7 @@ pub(crate) enum FormatArgument { Semantic(String),Wire(T) }
 
 pub(crate) fn format_argument(value: T,admission: Admission<'_>) -> Result<FormatArgument> {
     if let T::Tagged { tag,representation } = &value
-        && matches!(tag.as_str(),"time/date" | "time/time")
+        && matches!(tag.as_str(),"time/date" | "time/time" | "time/duration" | "time/day-of-week" | "time/month")
         && let T::String(source) = representation.as_ref()
         && let Some(time) = Time::read_text(tag,source)?
     {
