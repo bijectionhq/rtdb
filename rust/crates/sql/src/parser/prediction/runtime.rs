@@ -30,6 +30,9 @@ mod generated_data_type;
 #[path = "generated_isolation.rs"]
 mod generated_isolation;
 
+#[path = "generated_names.rs"]
+mod generated_names;
+
 #[path = "generated_statement.rs"]
 mod generated_statement;
 
@@ -138,14 +141,17 @@ enum InvocationException<'parse, 'sql> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextClass {
     ReadUncommittedIsolation, ReadCommittedIsolation, RepeatableReadIsolation, SerializableIsolation, IsolationLevelTxMode,
-    DateType, ArrayType, RegularIdentifier, RollbackStatement,
+    DateType, ArrayType, RegularIdentifier, DelimitedIdentifier,
+    CommitStatement, RollbackStatement, DiscardStatement, SetRoleStatement,
+    DiscardAll, DiscardPlans, DiscardTemp, DiscardSequences,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
-            Self::RollbackStatement => 2,
+            Self::CommitStatement | Self::RollbackStatement | Self::DiscardStatement | Self::SetRoleStatement => 2,
+            Self::DiscardAll | Self::DiscardPlans | Self::DiscardTemp | Self::DiscardSequences => 3,
             Self::DateType | Self::ArrayType => 26,
-            Self::RegularIdentifier => 22,
+            Self::RegularIdentifier | Self::DelimitedIdentifier => 22,
             Self::IsolationLevelTxMode => 164,
             Self::ReadUncommittedIsolation | Self::ReadCommittedIsolation | Self::RepeatableReadIsolation | Self::SerializableIsolation => 175,
         }
@@ -567,6 +573,30 @@ impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
             self.control = ParserControl::PendingNoViable(PendingNoViableReport { invocation, cause: *cause, mode });
         }
         result
+    }
+
+    fn generated_ordinary(
+        &mut self, rule: u16,
+        body: impl FnOnce(&mut Self, &mut InvocationKey<'parse>) -> PassResult<'parse, 'sql, ()>,
+    ) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        let mut local = self.new_invocation(rule)?;
+        self.enter_tree_rule(local)?;
+        let result = match body(self, &mut local) {
+            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_) | RuntimeError::InputMismatch(_))) => self.catch_recognition(local),
+            result => result,
+        };
+        self.exit_rule()?;
+        result.map(|()| local)
+    }
+
+    fn generated_no_viable<T>(&mut self) -> RuntimeResult<'sql, T> {
+        let mode = self.generated_mode()?;
+        let invocation = self.finish(self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation)))?;
+        let start = self.lookahead(1)?.expect("positive lookahead");
+        let offending = self.lookahead(1)?.expect("positive lookahead");
+        let cause = NoViableAlternative { start, offending, state: self.state };
+        self.control = ParserControl::PendingNoViable(PendingNoViableReport { invocation, cause, mode });
+        Err(RuntimeError::NoViableAlternative(cause))
     }
 
     fn capture_input_mismatch(&mut self, state: ParserState) -> RuntimeResult<'sql, (InvocationKey<'parse>, InputMismatch<'sql>)> {

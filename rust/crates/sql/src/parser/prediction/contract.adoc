@@ -782,7 +782,7 @@ Additional generated window branches and production parser entry adoption remain
 The private single-statement action runs `directSqlStatement` and its actual `directlyExecutableStatement` call at 352 under both wrapper profiles.
 The child reaches required sync at 574 before real adaptive decision 34.
 The adopted alternative 14 constructs the labelled ROLLBACK record from its entered generic context and replaces the root's actual tail child before matching state 488.
-Other alternatives report the private site limit after the decision and before their context construction.
+Unadopted alternatives report the private site limit after the decision and before their context construction.
 The shared inline atom path also supplies the root's semicolon and EOF matches at 353 and 356.
 The root reaches its required sync at 354 before the separate `LA(1)` for the optional semicolon.
 Its within-rule set contains SEMI and EOF because the skipped semicolon still reaches required EOF.
@@ -806,6 +806,39 @@ The source fixture's live recognizer and shared DFA access remain subject to the
 Trailing input after a completed child can fail at root sync 354 with expected SEMI and EOF or after a matched semicolon at inline state 356 with expected EOF.
 A viable deletion reports a null cause before consumption.
 An ordinary suffix mismatch is assigned to the root, which finally records the last matched terminal.
+
+== Statement lists, controls and identifiers
+
+The private list root enters `multiSqlStatement` and calls the adopted executable rule at 358 for the first statement and at 360 after each inter-statement semicolon.
+Each iteration synchronizes at the reached star-loop state before asking decision 1 to choose an alternative.
+LL sync at entry 363 tests a failed first token against the deletion branch's second lookahead.
+LL sync at backedge 365 reports the current unwanted token through the throwing listener.
+Both states expect SEMI or EOF within the rule.
+The throwing listener ends the loopback report before source recovery consumes a token.
+The root has a separate optional trailing semicolon at 366, then matches EOF at 369.
+Both roots retain each actual rule child and indexed terminal in source order.
+
+Decision 34 selects the adopted COMMIT, ROLLBACK, DISCARD and SET ROLE labels.
+COMMIT's optional ASYNC or SYNC reaches nullable sync at 486, followed by the generated token predicate and the set match at 485 when selected.
+An accepted first token clears the sync capture.
+A nullable miss retains the first captured context and state until a later accepted sync or parser reset.
+The outer root's required sync constructs any reached mismatch from its own current state.
+
+DISCARD invokes the labelled target rule at 502 and accepts ALL, PLANS, TEMP or TEMPORARY, and SEQUENCES.
+Its generated switch default constructs the no-viable fact from two current-token demands at 580.
+The SLL catch reports it and shares the assigned exception through the entered ancestor chain.
+On retry the LL required sync can report an unwanted token before consuming it, or create its own mismatch before reaching the switch.
+SET ROLE invokes the identifier rule at 505 for its source identifier cases and matches NONE at 506 for its other case.
+The identifier retains its regular or delimited label, and a nonreserved keyword has its own child record under the regular label.
+The ordered 87 alternatives at 848 cover 111 keyword tokens through 83 atom branches and four grouped rule calls.
+The grouped branches preserve the aggregate, date field, extraction field and rank child rules.
+The primary date field calls rule 19 at 1894 for non-SECOND fields and matches SECOND at 1895.
+
+The generated set operation uses a sole ATN set transition at each adopted site.
+A membership match demands current lookahead for the EOF check, then performs the existing consume sequence and credits the indexed terminal to the current primary record.
+The Bail mismatch uses the existing same-cause cancellation.
+The LL inline path checks deletion before insertion and anchors a mismatch to the selected context.
+The current statement switches select eligible set tokens before entering those bodies.
 
 == Finishing-alternative selection
 

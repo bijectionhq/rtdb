@@ -72,13 +72,17 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         self.finish(entered)?;
         let (matched, actual) = self.lookahead_token(1)?;
         if actual != expected {
-            let (current, cause) = self.capture_input_mismatch(self.state)?;
-            self.records[current.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
-            return self.cancel_bail(current, BailRecovery::Clear);
+            return self.cancel_inline_mismatch();
         }
 
         self.consume_match(expected)?;
         Ok(matched)
+    }
+
+    pub(super) fn cancel_inline_mismatch<T>(&mut self) -> PassResult<'parse, 'sql, T> {
+        let (current, cause) = self.capture_input_mismatch(self.state)?;
+        self.records[current.index].exception = Some(InvocationException::Owned(InvocationCause::InputMismatch(cause)));
+        self.cancel_bail(current, BailRecovery::Clear)
     }
 
     pub(super) fn consume_match(&mut self, expected: TokenType) -> RuntimeResult<'sql, ()> {

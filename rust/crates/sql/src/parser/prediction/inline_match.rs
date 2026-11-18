@@ -1,11 +1,20 @@
 use crate::lexer::IndexedLexeme;
-use crate::parser::grammar::{ExpectedSymbol, StateKindView, TransitionView};
+use crate::parser::grammar::{ExpectedSymbol, StateKindView, TokenSet, TokenType, TransitionView};
 use super::{MismatchExpectation, ParserControl, ParserProfile, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
 use super::required_block_sync::TokenReport;
 
+#[derive(Clone, Copy)]
+enum TerminalMatch { Atom, Set }
+
+#[derive(Clone, Copy)]
+enum TerminalExpectation {
+    Atom(TokenType),
+    Set(TokenSet),
+}
+
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     pub(in crate::parser::prediction) fn match_isolation_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
-        self.match_generated_atom(|state| match state {
+        self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
             ParserState::State(number @ (2882 | 2883)) => Some((number, 164)),
             ParserState::State(number @ 3007..=3013) => Some((number, 175)),
             _ => None,
@@ -13,22 +22,39 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     }
 
     pub(super) fn match_window_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
-        self.match_generated_atom(|state| match state {
+        self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
             ParserState::State(number @ (2218 | 2220)) => Some((number, 96)),
             _ => None,
         })
     }
 
     pub(super) fn match_statement_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
-        self.match_generated_atom(|state| match state {
+        self.match_generated_terminal(TerminalMatch::Atom, |state| match state {
             ParserState::State(number @ (353 | 356)) => Some((number, 0)),
-            ParserState::State(488) => Some((488, 2)),
+            ParserState::State(number @ (359 | 366 | 369)) => Some((number, 1)),
+            ParserState::State(number @ (484 | 488 | 501 | 503 | 504 | 506)) => Some((number, 2)),
+            ParserState::State(number @ (576 | 577 | 579)) => Some((number, 3)),
+            ParserState::State(number @ (754 | 758)) => Some((number, 22)),
+            ParserState::State(number @ (761..=796 | 801..=847)) => Some((number, 23)),
+            ParserState::State(1895) => Some((1895, 63)),
             _ => None,
         })
     }
 
-    fn match_generated_atom(
-        &mut self, site: impl FnOnce(ParserState) -> Option<(u32, u16)>,
+    pub(super) fn match_statement_set(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
+        self.match_generated_terminal(TerminalMatch::Set, |state| match state {
+            ParserState::State(485) => Some((485, 2)),
+            ParserState::State(578) => Some((578, 3)),
+            ParserState::State(734) => Some((734, 19)),
+            ParserState::State(1804) => Some((1804, 44)),
+            ParserState::State(1900) => Some((1900, 65)),
+            ParserState::State(2718) => Some((2718, 147)),
+            _ => None,
+        })
+    }
+
+    fn match_generated_terminal(
+        &mut self, shape: TerminalMatch, site: impl FnOnce(ParserState) -> Option<(u32, u16)>,
     ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
         let site = (|| {
             self.ready()?;
@@ -44,24 +70,38 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             let grammar = self.environment.storage.grammar_view();
             let state = grammar.state(number)?;
             let mut edges = state.transitions();
-            match (state.kind(), edges.next(), edges.len()) {
-                (StateKindView::Basic, Some(TransitionView::Atom { token, .. }), 0) => Ok((number, token)),
+            match (shape, state.kind(), edges.next(), edges.len()) {
+                (TerminalMatch::Atom, StateKindView::Basic, Some(TransitionView::Atom { token, .. }), 0) =>
+                    Ok((number, TerminalExpectation::Atom(token))),
+                (TerminalMatch::Set, StateKindView::Basic, Some(TransitionView::Set { tokens, .. }), 0) =>
+                    Ok((number, TerminalExpectation::Set(*tokens))),
                 _ => Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
             }
         })();
         let (number, expected) = self.finish(site)?;
-        if self.profile == ParserProfile::SllBail {
-            return self.match_bail(expected);
+        if let TerminalExpectation::Atom(token) = expected && self.profile == ParserProfile::SllBail {
+            return self.match_bail(token);
         }
         let (matched, actual) = self.lookahead_token(1)?;
-        if actual != expected {
-            return self.recover_inline_atom(number).map_err(PassError::from);
+        let accepts = match expected {
+            TerminalExpectation::Atom(token) => actual == token,
+            TerminalExpectation::Set(tokens) => tokens.contains(ExpectedSymbol::Token(actual)),
+        };
+        if !accepts {
+            if self.profile == ParserProfile::SllBail {
+                return self.cancel_inline_mismatch();
+            }
+            return self.recover_inline(number).map_err(PassError::from);
         }
-        self.consume_match(expected)?;
+        let current = match shape {
+            TerminalMatch::Atom => actual,
+            TerminalMatch::Set => self.lookahead_token(1)?.1,
+        };
+        self.consume_match(current)?;
         Ok(matched)
     }
 
-    fn recover_inline_atom(&mut self, number: u32) -> RuntimeResult<'sql, IndexedLexeme<'sql>> {
+    fn recover_inline(&mut self, number: u32) -> RuntimeResult<'sql, IndexedLexeme<'sql>> {
         let (_, second) = self.lookahead_token(2)?;
         let expected = {
             let grammar = self.environment.storage.grammar_view();
@@ -76,8 +116,9 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         let following = (|| {
             let grammar = self.environment.storage.grammar_view();
             let state = grammar.state(number)?;
-            let Some(TransitionView::Atom { target, .. }) = state.transitions().next() else {
-                return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
+            let target = match state.transitions().next() {
+                Some(TransitionView::Atom { target, .. } | TransitionView::Set { target, .. }) => target,
+                _ => return Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
             };
             let invocations = self.invocation_view();
             Ok(target.next_tokens_with_context(invocations.invocations(&grammar), self.work)?)

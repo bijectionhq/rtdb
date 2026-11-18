@@ -3,7 +3,7 @@ use crate::lexer::{IndexedLexeme, Kind};
 use crate::parser::grammar::{ExpectedSymbol, StateKindView, TokenSet};
 use super::no_viable_report::{ListenerDiagnostic, listener_diagnostic, message_buffer, message_size, quoted_len, write_quoted};
 use super::{
-    InputMismatch, InvocationCause, InvocationException, InvocationKey, InvocationView, MismatchExpectation,
+    InputMismatch, InvocationCause, InvocationException, InvocationKey, InvocationView, MismatchExpectation, NextTokensCapture,
     ParserControl, ParserProfile, ParserSession, ParserState,
     RuntimeError, RuntimeProblem, RuntimeResult,
 };
@@ -42,8 +42,38 @@ impl<'sql> TokenDiagnostic<'sql> {
     pub(in crate::parser::prediction) fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
 }
 
+#[derive(Clone, Copy)]
+enum SyncShape { RequiredBlock, NullableBlock, LoopEntry, Loopback }
+
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
     pub(in crate::parser::prediction) fn sync_required_block(&mut self) -> RuntimeResult<'sql, ()> {
+        self.sync_generated(|state| match state {
+            ParserState::State(354) => Some((354, 0, SyncShape::RequiredBlock)),
+            ParserState::State(574) => Some((574, 2, SyncShape::RequiredBlock)),
+            ParserState::State(2886) => Some((2886, 164, SyncShape::RequiredBlock)),
+            ParserState::State(3014) => Some((3014, 175, SyncShape::RequiredBlock)),
+            _ => None,
+        })
+    }
+
+    pub(super) fn sync_statement(&mut self) -> RuntimeResult<'sql, ()> {
+        self.sync_generated(|state| match state {
+            ParserState::State(363) => Some((363, 1, SyncShape::LoopEntry)),
+            ParserState::State(365) => Some((365, 1, SyncShape::Loopback)),
+            ParserState::State(367) => Some((367, 1, SyncShape::RequiredBlock)),
+            ParserState::State(486) => Some((486, 2, SyncShape::NullableBlock)),
+            ParserState::State(507) => Some((507, 2, SyncShape::RequiredBlock)),
+            ParserState::State(580) => Some((580, 3, SyncShape::RequiredBlock)),
+            ParserState::State(number @ (756 | 759)) => Some((number, 22, SyncShape::RequiredBlock)),
+            ParserState::State(848) => Some((848, 23, SyncShape::RequiredBlock)),
+            ParserState::State(1896) => Some((1896, 63, SyncShape::RequiredBlock)),
+            _ => None,
+        })
+    }
+
+    fn sync_generated(
+        &mut self, site: impl FnOnce(ParserState) -> Option<(u32, u16, SyncShape)>,
+    ) -> RuntimeResult<'sql, ()> {
         let ready = self.ready();
         self.finish(ready)?;
         match self.profile {
@@ -52,30 +82,28 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             ParserProfile::Kernel => return self.finish(Err(RuntimeError::Control(RuntimeProblem::Aborted))),
         }
         let site = (|| {
-            let (number, rule) = match self.state {
-                ParserState::State(354) => (354, 0),
-                ParserState::State(574) => (574, 2),
-                ParserState::State(2886) => (2886, 164),
-                ParserState::State(3014) => (3014, 175),
-                _ => return Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
-            };
-            let invocation = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
-            let record = self.record(invocation)?;
+            let (number, rule, shape) = site(self.state).ok_or(RuntimeError::Control(RuntimeProblem::PredictionSite))?;
+            let context = self.current.ok_or(RuntimeError::Control(RuntimeProblem::Invocation))?;
+            let record = self.record(context)?;
             if record.rule != rule || record.start.is_none() {
                 return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
             }
             let grammar = self.environment.storage.grammar_view();
-            if !matches!(grammar.state(number)?.kind(), StateKindView::BlockStart { .. }) {
+            if !matches!((shape, grammar.state(number)?.kind()),
+                (SyncShape::RequiredBlock | SyncShape::NullableBlock, StateKindView::BlockStart { .. })
+                | (SyncShape::LoopEntry, StateKindView::StarLoopEntry { precedence: false, .. })
+                | (SyncShape::Loopback, StateKindView::StarLoopback))
+            {
                 return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
             }
-            Ok(number)
+            Ok((NextTokensCapture { context, state: number }, shape))
         })();
-        let number = self.finish(site)?;
+        let (site, shape) = self.finish(site)?;
         let (_, first) = self.lookahead_token(1)?;
         let next = (|| {
             let grammar = self.environment.storage.grammar_view();
-            let tokens = grammar.state(number)?.next_tokens(self.work)?;
-            if tokens.contains(ExpectedSymbol::Epsilon) {
+            let tokens = grammar.state(site.state)?.next_tokens(self.work)?;
+            if tokens.contains(ExpectedSymbol::Epsilon) != matches!(shape, SyncShape::NullableBlock) {
                 return Err(RuntimeError::Control(RuntimeProblem::PredictionSite));
             }
             Ok(tokens)
@@ -84,6 +112,13 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         if expected.contains(ExpectedSymbol::Token(first)) {
             self.next_tokens_capture = None;
             return Ok(());
+        }
+        if matches!(shape, SyncShape::NullableBlock) {
+            self.next_tokens_capture.get_or_insert(site);
+            return Ok(());
+        }
+        if matches!(shape, SyncShape::Loopback) {
+            return self.report_unwanted_token(expected);
         }
 
         let (_, second) = self.lookahead_token(2)?;

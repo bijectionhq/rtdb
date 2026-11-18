@@ -408,3 +408,367 @@ fn warm_rollback_budget_preserves_actual_current_cleanup_and_eof_stop() {
     result.unwrap();
     assert_eq!(memory.used_bytes(), 0);
 }
+
+fn both_statement_profiles<'sql>(
+    environment: &mut ParserEnvironment, source: &'sql str, work: &AllocationScope, multi: bool,
+    mut check: impl for<'parse, 'env, 'work> FnMut(&ParserSession<'parse, 'sql, 'env, 'work>, InvocationKey<'parse>),
+) {
+    with_bail_fallback(environment, source, work, |session, mode| {
+        assert_eq!(mode, PredictionMode::Sll);
+        let root = if multi { session.multi_sql_statement()? } else { session.direct_sql_statement()? };
+        check(session, root);
+        Ok(())
+    }).unwrap();
+    with_parser_session(environment, source, work, |session| {
+        session.profile = ParserProfile::LlDefault;
+        let root = if multi { session.multi_sql_statement().unwrap() } else { session.direct_sql_statement().unwrap() };
+        check(session, root);
+        Ok(())
+    }).unwrap();
+}
+
+fn context_child<'parse>(child: ContextChild<'parse, '_>) -> InvocationKey<'parse> {
+    let ContextChild::Context(key) = child else { panic!("expected child rule"); };
+    key
+}
+
+#[test]
+fn direct_commit_and_discard_use_the_complete_optional_and_target_schedules() {
+    let ((), memory) = environment_fixture(|environment, work, _| {
+        for (source, suffix, target) in [
+            ("COMMIT", None, None),
+            ("COMMIT ASYNC", Some("ASYNC"), None),
+            ("commit sYnC;", Some("sYnC"), None),
+            ("DISCARD ALL", Some("ALL"), Some(ContextClass::DiscardAll)),
+            ("DISCARD PLANS", Some("PLANS"), Some(ContextClass::DiscardPlans)),
+            ("DISCARD TEMP", Some("TEMP"), Some(ContextClass::DiscardTemp)),
+            ("DISCARD TEMPORARY", Some("TEMPORARY"), Some(ContextClass::DiscardTemp)),
+            ("DISCARD SEQUENCES;", Some("SEQUENCES"), Some(ContextClass::DiscardSequences)),
+        ] {
+            both_statement_profiles(environment, source, work, false, |session, root| {
+                let tree = session.invocation_view();
+                let root = tree.context(root).unwrap();
+                let child = context_child(root.children()[0]);
+                let statement = tree.context(child).unwrap();
+                assert_eq!(statement.invoking_state(), ParserState::State(352));
+                let terminals = if let Some(target_class) = target {
+                    assert_eq!(statement.class(), Some(ContextClass::DiscardStatement));
+                    assert!(matches!(statement.children(), [ContextChild::Terminal(head), ContextChild::Context(_)]
+                        if head.lexeme().raw() == "DISCARD"));
+                    let target = tree.context(context_child(statement.children()[1])).unwrap();
+                    assert_eq!((target.class(), target.parent(), target.invoking_state()),
+                        (Some(target_class), Some(child), ParserState::State(502)));
+                    target.children()
+                } else {
+                    assert_eq!(statement.class(), Some(ContextClass::CommitStatement));
+                    assert!(matches!(statement.children()[0], ContextChild::Terminal(head)
+                        if head.lexeme().raw().eq_ignore_ascii_case("commit")));
+                    &statement.children()[1..]
+                };
+                if let Some(raw) = suffix {
+                    assert!(matches!(terminals, [ContextChild::Terminal(token)]
+                        if token.index() == 1 && token.lexeme().raw() == raw));
+                } else {
+                    assert!(terminals.is_empty());
+                }
+                assert_eq!(statement.stop().unwrap().index(), if suffix.is_some() { 1 } else { 0 });
+                assert!(session.next_tokens_capture.is_none());
+                assert_eq!(session.syntax_errors, 0);
+                assert_finished(session, root.stop().unwrap().index(), true);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn set_role_reaches_the_complete_identifier_domain_through_actual_decision34() {
+    use crate::parser::grammar::ExpectedSymbol;
+
+    let ((), memory) = environment_fixture(|environment, work, _| {
+        let keywords: Vec<_> = {
+            let grammar = environment.storage.grammar_view();
+            let first = grammar.state(848).unwrap().next_tokens(work).unwrap();
+            first.iter().map(|symbol| {
+                let ExpectedSymbol::Token(token) = symbol else { panic!("keyword token"); };
+                let literal = grammar.display_name(token);
+                (token.number(), literal.strip_prefix('\'').unwrap().strip_suffix('\'').unwrap())
+            }).collect()
+        };
+        assert_eq!(keywords.len(), 111);
+        for (number, raw) in keywords.into_iter().chain([(365, "my_role"), (366, "\"My Role\""), (215, "NONE")]) {
+            let source = format!("SET ROLE {raw}");
+            both_statement_profiles(environment, &source, work, false, |session, root| {
+                let tree = session.invocation_view();
+                let root = tree.context(root).unwrap();
+                let statement_key = context_child(root.children()[0]);
+                let statement = tree.context(statement_key).unwrap();
+                assert_eq!(statement.class(), Some(ContextClass::SetRoleStatement));
+                let [ContextChild::Terminal(set), ContextChild::Terminal(role), operand] = statement.children() else {
+                    panic!("SET ROLE children");
+                };
+                assert_eq!((set.index(), set.lexeme().raw(), role.index(), role.lexeme().raw()), (0, "SET", 1, "ROLE"));
+                let terminal = if number == 215 {
+                    *operand
+                } else {
+                    let name_key = context_child(*operand);
+                    let name = tree.context(name_key).unwrap();
+                    let class = if number == 366 { ContextClass::DelimitedIdentifier } else { ContextClass::RegularIdentifier };
+                    assert_eq!((name.class(), name.parent(), name.invoking_state()),
+                        (Some(class), Some(statement_key), ParserState::State(505)));
+                    if matches!(number, 365 | 366) { name.children()[0] } else {
+                        let keyword = tree.context(context_child(name.children()[0])).unwrap();
+                        assert_eq!((keyword.rule(), keyword.parent(), keyword.invoking_state()),
+                            (23, Some(name_key), ParserState::State(755)));
+                        let child = keyword.children()[0];
+                        if let ContextChild::Context(group) = child {
+                            let group = tree.context(group).unwrap();
+                            assert!(matches!((group.rule(), group.invoking_state()),
+                                (147, ParserState::State(797)) | (63, ParserState::State(798))
+                                | (65, ParserState::State(799)) | (44, ParserState::State(800))));
+                            if group.rule() == 63 && number != 286 {
+                                let field = tree.context(context_child(group.children()[0])).unwrap();
+                                assert_eq!((field.rule(), field.invoking_state()), (19, ParserState::State(1894)));
+                                field.children()[0]
+                            } else {
+                                group.children()[0]
+                            }
+                        } else {
+                            child
+                        }
+                    }
+                };
+                assert!(matches!(terminal, ContextChild::Terminal(token) if token.index() == 2 && token.lexeme().raw() == raw));
+                assert_eq!(statement.stop().unwrap().index(), 2);
+                assert_finished(session, 3, true);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_session_variable_alternative_is_not_labelled_as_set_role() {
+    let (result, memory) = wrapped("SET ROLE = 'v'", |session, mode, first, result| {
+        assert_eq!(mode, PredictionMode::Sll);
+        assert_eq!(first, 0);
+        assert!(matches!(result, Err(PassError::Runtime(RuntimeError::Control(RuntimeProblem::PredictionSite)))));
+        let (root, child) = frames(session, first);
+        let tree = session.invocation_view();
+        assert!(matches!(tree.context(root).unwrap().children(), [ContextChild::Context(key)] if *key == child));
+        assert!(tree.context(child).unwrap().class().is_none());
+        assert!(session.next_tokens_capture.is_none());
+        assert_finished(session, 0, false);
+    });
+    assert!(matches!(result, Err(RuntimeError::Control(RuntimeProblem::PredictionSite))));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn multi_root_keeps_ordered_calls_and_the_distinct_trailing_semicolon() {
+    let ((), memory) = environment_fixture(|environment, work, _| {
+        for source in [
+            "ROLLBACK; COMMIT ASYNC; DISCARD TEMPORARY; SET ROLE COUNT",
+            "ROLLBACK; COMMIT ASYNC; DISCARD TEMPORARY; SET ROLE COUNT;",
+            "ROLLBACK; COMMIT ASYNC; DISCARD TEMPORARY; SET ROLE COUNT;",
+        ] {
+            both_statement_profiles(environment, source, work, true, |session, root| {
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                assert_eq!((root_view.rule(), root_view.parent(), root_view.invoking_state()),
+                    (MULTI_SQL_STATEMENT, None, ParserState::RootSentinel));
+                let children = root_view.children();
+                let classes = [ContextClass::RollbackStatement, ContextClass::CommitStatement,
+                    ContextClass::DiscardStatement, ContextClass::SetRoleStatement];
+                for (index, (class, stop)) in classes.into_iter().zip([0, 3, 6, 10]).enumerate() {
+                    let statement = tree.context(context_child(children[index * 2])).unwrap();
+                    assert_eq!((statement.class(), statement.parent(), statement.invoking_state(), statement.stop().unwrap().index()),
+                        (Some(class), Some(root), ParserState::State(if index == 0 { 358 } else { 360 }), stop));
+                }
+                let trailing = source.ends_with(';');
+                let delimiters = if trailing { &[(1, 1), (3, 4), (5, 7), (7, 11)][..] } else { &[(1, 1), (3, 4), (5, 7)][..] };
+                for &(child, token_index) in delimiters {
+                    assert!(matches!(children[child], ContextChild::Terminal(token)
+                        if token.index() == token_index && token.lexeme().raw() == ";"));
+                }
+                let eof = if trailing { 12 } else { 11 };
+                assert_eq!(children.len(), if trailing { 9 } else { 8 });
+                assert!(matches!(children.last().unwrap(), ContextChild::Terminal(token)
+                    if token.index() == eof && token.lexeme().kind() == Kind::Eof));
+                assert_eq!(root_view.stop().unwrap().index(), eof);
+                assert_eq!(session.syntax_errors, 0);
+                assert!(session.next_tokens_capture.is_none());
+                assert_finished(session, eof, true);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+
+    let (result, memory) = wrapped("ROLLBACK; COMMIT ASYNC", |session, mode, _, _| {
+        if mode == PredictionMode::Ll {
+            assert_eq!(session.input_index(), Some(2));
+            assert!(!session.matched_eof);
+        }
+    });
+    assert_report(result, &memory, Some(356), 2, "1:10 mismatched input 'COMMIT' expecting <EOF>");
+}
+
+#[test]
+fn discard_switch_bail_reports_one_live_cause_before_ll_sync_handles_the_same_prefix() {
+    for source in ["DISCARD junk ALL", "DISCARD junk @"] {
+        let mut modes = Vec::new();
+        let (result, memory) = wrapped(source, |session, mode, first, result| {
+            modes.push(mode);
+            let root = InvocationKey::at(first);
+            let tree = session.invocation_view();
+            let statement = context_child(tree.context(root).unwrap().children()[0]);
+            let target = context_child(tree.context(statement).unwrap().children()[1]);
+            let discard = tree.context(target).unwrap();
+            assert_eq!((discard.class(), discard.invoking_state(), discard.stop().unwrap().index()),
+                (None, ParserState::State(502), 0));
+            assert!(discard.children().is_empty());
+            assert_eq!(tree.context(root).unwrap().stop().unwrap().index(), 0);
+            assert_finished(session, 1, false);
+            if mode == PredictionMode::Sll {
+                assert!(matches!(result, Err(PassError::Cancelled(_))));
+                let cause = tree.exception(target).unwrap();
+                assert!(std::ptr::eq(cause, tree.exception(statement).unwrap()));
+                assert!(std::ptr::eq(cause, tree.exception(root).unwrap()));
+                let InvocationCause::NoViableAlternative(cause) = cause else { panic!("direct generated switch error"); };
+                assert_eq!((cause.state, cause.start.index(), cause.offending.index()), (ParserState::State(580), 1, 1));
+                assert_eq!(cause.offending.lexeme().raw(), "junk");
+                assert!(matches!(&session.control, ParserControl::BailCancelled { exception, recovery: BailRecovery::Entered } if *exception == target));
+                assert_eq!(session.syntax_errors, 1);
+                assert!(session.buffered_token(2).is_none());
+            } else {
+                assert!(tree.exception(root).is_none());
+                assert!(tree.exception(statement).is_none());
+                assert!(tree.exception(target).is_none());
+                assert!(session.buffered_token(3).is_none());
+                if source.ends_with('@') {
+                    assert!(session.buffered_token(2).is_none());
+                    assert_eq!(session.syntax_errors, 0);
+                } else {
+                    assert_eq!(session.buffered_token(2).unwrap().lexeme().raw(), "ALL");
+                    assert_eq!(session.syntax_errors, 1);
+                }
+            }
+        });
+        assert_eq!(modes, [PredictionMode::Sll, PredictionMode::Ll]);
+        if source.ends_with('@') {
+            let Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error)))) = result else { panic!("LL LA(2) lexer error"); };
+            assert_eq!(error.span().start.column, 13);
+            assert_eq!(memory.used_bytes(), 0);
+        } else {
+            assert_report(result, &memory, None, 1, "1:8 extraneous input 'junk' expecting {'ALL', 'PLANS', 'SEQUENCES', 'TEMP', 'TEMPORARY'}");
+        }
+    }
+}
+
+#[test]
+fn multi_loop_entry_demands_lexer_la2_and_loopback_reports_before_that_demand() {
+    for (source, cursor, last) in [("ROLLBACK junk @", 1, 0), ("ROLLBACK; ROLLBACK junk @", 3, 2)] {
+        let (result, memory) = environment_fixture(|environment, work, _| {
+            with_parser_session(environment, source, work, |session| {
+                session.profile = ParserProfile::LlDefault;
+                let result = session.multi_sql_statement();
+                let root = InvocationKey::at(0);
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                assert_eq!(root_view.stop().unwrap().index(), last);
+                assert!(tree.exception(root).is_none());
+                assert_finished(session, cursor, false);
+                assert!(session.buffered_token(cursor + 1).is_none());
+                assert_eq!(session.syntax_errors, if cursor == 3 { 1 } else { 0 });
+                match result {
+                    Err(PassError::Runtime(error)) => Err(error),
+                    _ => panic!("expected LL sync error"),
+                }
+            })
+        });
+        if cursor == 3 {
+            assert_report(result, &memory, None, cursor, "1:19 extraneous input 'junk' expecting {<EOF>, ';'}");
+        } else {
+            let Err(RuntimeError::Input(StreamError::Scan(ScanError::Recognition(error)))) = result else { panic!("loop entry LA(2) lexer error"); };
+            assert_eq!(error.span().start.column, 14);
+            assert_eq!(memory.used_bytes(), 0);
+        }
+    }
+}
+
+#[test]
+fn commit_optional_capture_survives_only_until_the_next_accepted_required_sync() {
+    let (result, memory) = environment_fixture(|environment, work, _| {
+        with_parser_session(environment, "COMMIT junk bad", work, |session| {
+            session.profile = ParserProfile::LlDefault;
+            let Err(PassError::Runtime(error)) = session.direct_sql_statement() else { panic!("root required mismatch"); };
+            let root = InvocationKey::at(0);
+            let tree = session.invocation_view();
+            let commit = context_child(tree.context(root).unwrap().children()[0]);
+            let capture = session.next_tokens_capture.unwrap();
+            assert_eq!((capture.context, capture.state), (commit, 486));
+            assert!(tree.exception(commit).is_none());
+            assert!(matches!(tree.exception(root), Some(InvocationCause::InputMismatch(cause))
+                if cause.state == ParserState::State(354)));
+            assert_finished(session, 1, false);
+            Err(error)
+        })
+    });
+    assert_report(result, &memory, Some(354), 1, "1:7 mismatched input 'junk' expecting {<EOF>, ';'}");
+}
+
+#[test]
+fn warm_multi_budget_preserves_later_child_entry_and_eof_finally_prefixes() {
+    const SOURCE: &str = "ROLLBACK; ROLLBACK;";
+    let (result, memory) = environment_fixture(|environment, work, memory| {
+        with_bail_fallback(environment, SOURCE, work, |session, mode| {
+            assert_eq!(mode, PredictionMode::Sll);
+            session.multi_sql_statement().map(|_| ())
+        })?;
+        let records = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+        for (extra, capacity) in [
+            (2 * child_charge(1) + child_charge(2), 4),
+            (3 * child_charge(1) + child_charge(2) + child_charge(4), 8),
+        ] {
+            with_parser_session(environment, SOURCE, work, |session| {
+                session.profile = ParserProfile::SllBail;
+                let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - records - extra).unwrap();
+                let result = session.multi_sql_statement();
+                let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = result else {
+                    panic!("expected multi child vector admittance failure");
+                };
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                let requested = format!("Cannot reserve {} bytes from budget ", child_charge(capacity));
+                assert!(error.message.as_deref().unwrap().starts_with(requested.as_str()));
+                let root = InvocationKey::at(0);
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                assert!(tree.exception(root).is_none());
+                assert_eq!(session.syntax_errors, 0);
+                assert!(matches!(session.control, ParserControl::Failed));
+                if capacity == 4 {
+                    let child = InvocationKey::at(3);
+                    assert_eq!((session.current(), session.state()), (Some(root), ParserState::State(360)));
+                    assert!(matches!(session.records[child.index].role, InvocationRole::OrdinaryTreeAttachmentFailed));
+                    assert_eq!(tree.context(child).unwrap().stop().unwrap().index(), 1);
+                    assert!(root_view.stop().is_none());
+                    assert_eq!(root_view.children().len(), 2);
+                    assert_eq!(session.input_index(), Some(2));
+                    assert!(session.buffered_token(3).is_none());
+                    assert!(!session.matched_eof);
+                } else {
+                    assert_eq!(root_view.children().len(), 4);
+                    assert_eq!(root_view.stop().unwrap().index(), 4);
+                    assert!(matches!(root_view.children()[3], ContextChild::Terminal(token)
+                        if token.index() == 3 && token.lexeme().raw() == ";"));
+                    assert_finished(session, 4, true);
+                }
+                drop(held);
+                Ok(())
+            })?;
+        }
+        Ok::<(), RuntimeError<'_>>(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}

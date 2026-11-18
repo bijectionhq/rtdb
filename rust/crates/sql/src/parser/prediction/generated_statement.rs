@@ -1,4 +1,4 @@
-use super::{ContextChild, ContextClass, InvocationKey, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem};
+use super::{ContextChild, ContextClass, InvocationKey, ParserSession, ParserState, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
 use super::super::PredictionMode;
 
 #[cfg(test)]
@@ -6,63 +6,149 @@ use super::super::PredictionMode;
 mod tests;
 
 const DIRECT_SQL_STATEMENT: u16 = 0;
+const MULTI_SQL_STATEMENT: u16 = 1;
 const DIRECTLY_EXECUTABLE_STATEMENT: u16 = 2;
+const DISCARD_TARGET: u16 = 3;
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
-    pub(in crate::parser::prediction) fn direct_sql_statement(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+    fn statement_root_mode(&mut self) -> RuntimeResult<'sql, PredictionMode> {
         let mode = self.generated_mode()?;
         if self.current.is_some() || self.state != ParserState::RootSentinel {
-            return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from);
+            return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite)));
         }
-        let local = self.new_invocation(DIRECT_SQL_STATEMENT)?;
-        self.enter_tree_rule(local)?;
-        let body = (|| {
-            self.set_state(352)?;
-            self.directly_executable_statement(mode)?;
-            self.set_state(354)?;
-            self.sync_required_block()?;
-            let (_, token) = self.lookahead_token(1)?;
+        Ok(mode)
+    }
+
+    pub(in crate::parser::prediction) fn direct_sql_statement(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        let mode = self.statement_root_mode()?;
+        self.generated_ordinary(DIRECT_SQL_STATEMENT, |session, local| {
+            session.set_state(352)?;
+            session.directly_executable_statement(mode)?;
+            session.set_state(354)?;
+            session.sync_required_block()?;
+            let (_, token) = session.lookahead_token(1)?;
             if token.number() == 12 {
-                self.match_statement_terminal(local, 353)?;
+                session.match_statement_terminal(*local, 353)?;
             }
-            self.match_statement_terminal(local, 356)?;
-            Ok(local)
-        })();
-        self.finish_statement_rule(local, body)
+            session.match_statement_terminal(*local, 356)
+        })
+    }
+
+    pub(in crate::parser::prediction) fn multi_sql_statement(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        let mode = self.statement_root_mode()?;
+        self.generated_ordinary(MULTI_SQL_STATEMENT, |session, local| {
+            session.set_state(358)?;
+            session.directly_executable_statement(mode)?;
+            session.set_state(363)?;
+            session.sync_statement()?;
+            while session.adaptive_predict(1, mode)?.number() == 1 {
+                session.match_statement_terminal(*local, 359)?;
+                session.set_state(360)?;
+                session.directly_executable_statement(mode)?;
+                session.set_state(365)?;
+                session.sync_statement()?;
+            }
+
+            session.set_state(367)?;
+            session.sync_statement()?;
+            let (_, token) = session.lookahead_token(1)?;
+            if token.number() == 12 {
+                session.match_statement_terminal(*local, 366)?;
+            }
+            session.match_statement_terminal(*local, 369)
+        })
     }
 
     fn directly_executable_statement(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
-        let mut local = self.new_invocation(DIRECTLY_EXECUTABLE_STATEMENT)?;
-        self.enter_tree_rule(local)?;
-        let body = (|| {
-            self.set_state(574)?;
-            self.sync_required_block()?;
-            if self.adaptive_predict(34, mode)?.number() != 14 {
-                return self.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from);
+        self.generated_ordinary(DIRECTLY_EXECUTABLE_STATEMENT, |session, local| {
+            session.set_state(574)?;
+            session.sync_required_block()?;
+            let alt = session.adaptive_predict(34, mode)?.number();
+            let class = match alt {
+                13 => ContextClass::CommitStatement,
+                14 => ContextClass::RollbackStatement,
+                16 => ContextClass::DiscardStatement,
+                17 => ContextClass::SetRoleStatement,
+                _ => return session.finish(Err(RuntimeError::Control(RuntimeProblem::PredictionSite))).map_err(PassError::from),
+            };
+            *local = session.labelled_context(*local, class)?;
+            session.enter_outer_alt(*local)?;
+            match class {
+                ContextClass::CommitStatement => session.commit_statement(*local),
+                ContextClass::RollbackStatement => session.match_statement_terminal(*local, 488),
+                ContextClass::DiscardStatement => {
+                    session.match_statement_terminal(*local, 501)?;
+                    session.set_state(502)?;
+                    session.discard_target()?;
+                    Ok(())
+                }
+                ContextClass::SetRoleStatement => session.set_role_statement(*local),
+                _ => unreachable!("selected statement class"),
             }
-            local = self.labelled_context(local, ContextClass::RollbackStatement)?;
-            self.enter_outer_alt(local)?;
-            self.match_statement_terminal(local, 488)?;
-            Ok(local)
-        })();
-        self.finish_statement_rule(local, body)
+        })
     }
 
-    fn match_statement_terminal(&mut self, local: InvocationKey<'parse>, state: u32) -> PassResult<'parse, 'sql, ()> {
+    fn commit_statement(&mut self, local: InvocationKey<'parse>) -> PassResult<'parse, 'sql, ()> {
+        self.match_statement_terminal(local, 484)?;
+        self.set_state(486)?;
+        self.sync_statement()?;
+        let (_, token) = self.lookahead_token(1)?;
+        if matches!(token.number(), 59 | 307) {
+            self.match_statement_set_terminal(local, 485)?;
+        }
+        Ok(())
+    }
+
+    fn discard_target(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(DISCARD_TARGET, |session, local| {
+            session.set_state(580)?;
+            session.sync_statement()?;
+            let (_, token) = session.lookahead_token(1)?;
+            let (class, number) = match token.number() {
+                48 => (ContextClass::DiscardAll, 576),
+                253 => (ContextClass::DiscardPlans, 577),
+                310 | 311 => (ContextClass::DiscardTemp, 578),
+                288 => (ContextClass::DiscardSequences, 579),
+                _ => return session.generated_no_viable().map_err(PassError::from),
+            };
+            *local = session.labelled_context(*local, class)?;
+            session.enter_outer_alt(*local)?;
+            if number == 578 {
+                session.match_statement_set_terminal(*local, number)
+            } else {
+                session.match_statement_terminal(*local, number)
+            }
+        })
+    }
+
+    fn set_role_statement(&mut self, local: InvocationKey<'parse>) -> PassResult<'parse, 'sql, ()> {
+        self.match_statement_terminal(local, 503)?;
+        self.match_statement_terminal(local, 504)?;
+        self.set_state(507)?;
+        self.sync_statement()?;
+        let (_, token) = self.lookahead_token(1)?;
+        if token.number() == 215 {
+            self.match_statement_terminal(local, 506)?;
+        } else if super::generated_names::is_identifier_token(token) {
+            self.set_state(505)?;
+            self.generated_identifier()?;
+        } else {
+            return self.generated_no_viable().map_err(PassError::from);
+        }
+        Ok(())
+    }
+
+    pub(super) fn match_statement_terminal(&mut self, local: InvocationKey<'parse>, state: u32) -> PassResult<'parse, 'sql, ()> {
         self.set_state(state)?;
         let token = self.match_statement_atom()?;
         self.append_child(local, ContextChild::Terminal(token))?;
         Ok(())
     }
 
-    fn finish_statement_rule<T>(
-        &mut self, local: InvocationKey<'parse>, body: PassResult<'parse, 'sql, T>,
-    ) -> PassResult<'parse, 'sql, T> {
-        let result = match body {
-            Err(PassError::Runtime(RuntimeError::NoViableAlternative(_) | RuntimeError::InputMismatch(_))) => self.catch_recognition(local),
-            result => result,
-        };
-        self.exit_rule()?;
-        result
+    pub(super) fn match_statement_set_terminal(&mut self, local: InvocationKey<'parse>, state: u32) -> PassResult<'parse, 'sql, ()> {
+        self.set_state(state)?;
+        let token = self.match_statement_set()?;
+        self.append_child(local, ContextChild::Terminal(token))?;
+        Ok(())
     }
 }

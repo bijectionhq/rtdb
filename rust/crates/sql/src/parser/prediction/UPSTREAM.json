@@ -225,7 +225,7 @@
     "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
     "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. The directSqlStatement root and ROLLBACK alternative adopt generated statement tree assembly, both required sync blocks and EOF. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. The directSqlStatement and multiSqlStatement roots adopt generated statement tree assembly and EOF, with COMMIT, ROLLBACK, DISCARD and SET ROLE alternatives and the complete reached identifier rules. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -344,6 +344,16 @@
     "generated": "Sql.java windowSpecification and windowSpecificationDetails, rules 96 and 97. States 2218/2219/2220 are the root matches and child call, and states 2223/2226/2229/2232 precede the actual option guards of decisions 235 through 238.",
     "strategy": "DefaultErrorStrategy.sync retains the first missed nullable context and clears it on a subsequent accepted FIRST. The inline alternate constructor projects captured state 2223 and obtains the current offending occurrence at live match 2220.",
     "report": "RecognitionException.getExpectedTokens expands state 2223 from the retained child context via call 2219 and follow 2220 after the lexical parent catch assigns the original exception. The direct root input (: :) reports 119 expected token types."
+  },
+  "statement_list_and_names": {
+    "predecessor": "7e9796363fc30ed64ed05f239333a8eb8f4b55e0",
+    "source_plan_sha256": "02aa792515f913f308273ba832c619d24720db3528726ed44c244cd473887a43",
+    "source_geometry_sha256": "78a8709929bd3bea5237e388759ec5cbbddabfeae197eae97bf8964530e50980",
+    "generated": "Sql.java rule 1 at 447–498, rule 2 alternatives 13, 14, 16, 17, and completed rules 3, 19, 22, 23, 44, 63, 65, 147. Rule 23 dispatch preserves 87 alternatives over 111 tokens, and rule 22 extends the identifier domain to 113 tokens.",
+    "loop": "Decision 1 is called after sync at state 363 StarLoopEntry and state 365 StarLoopBack. State 367 has a separate optional semicolon branch, followed by EOF at 369.",
+    "set_matches": [485, 578, 734, 1804, 1900, 2718],
+    "modes": "Same-session SLL Bail and LL Default with throwing syntax listener, passive primary tree and scoped generated switch, sync and match sites.",
+    "qualification": "Static source and ATN inspection."
   },
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
