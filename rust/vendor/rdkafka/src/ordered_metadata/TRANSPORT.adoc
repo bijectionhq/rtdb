@@ -268,10 +268,11 @@ The retained list is owned by the serialized consumer-group actor and is cleared
 The built-in range, roundrobin and sticky member-metadata callbacks synchronously copy topic names into their own encoded storage.
 Those encoded outputs, candidate-list and topic-error scratch, consumer error ops/strings, full Metadata copies and their rack scratch, and other assignor/admin owners still require separate admission.
 
-Public accounted construction currently supports producers only.
-The actual topic-info projection callers belong to classic consumers, whose supported public construction still uses NULL accounts.
+The default set_native_byte_account profile supports producers only.
+The explicit set_native_byte_account_with_consumers profile also constructs native consumers with the actual shared account, so classic consumer-group projection callers can use this admission path.
+NULL-account callers retain their legacy behavior.
 The deterministic consumer fixtures exercise the internal fallible copy boundary with an internal account and caller-thread group state.
-An accounted public consumer profile requires separate activation.
+Application call-site activation retains its own capacity and configuration policy.
 They cover exact and short admission, malloc rollback, rack geometry and lifetime, old/new overlap, partial projection prefixes, complete projections, both consumer failure paths, adopted input ownership, equal/changed effective lists, built-in member-metadata lifetime and final group destruction.
 
 == Ordinary Metadata rack computation

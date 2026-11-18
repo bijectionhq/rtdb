@@ -1,4 +1,4 @@
-//! Byte admission for native producer receive frames and accounted requests.
+//! Byte admission for selected native client allocation classes.
 
 use std::fmt;
 use std::ptr::NonNull;
@@ -22,7 +22,7 @@ unsafe impl Sync for NativeByteAccount {}
 
 impl NativeByteAccount {
     /// Takes ownership of an existing reservation covering at least `capacity` bytes.
-    /// Each attached producer shares that ceiling.
+    /// Each attached client shares that ceiling.
     /// A zero capacity denies all positive charges.
     /// Returns a client creation error if the native monitor cannot be allocated.
     pub fn new(capacity: usize, reservation: impl Send + Sync + 'static) -> KafkaResult<Arc<Self>> {

@@ -3,8 +3,9 @@
 Public ClientConfig::set_native_byte_account installs a shared account in producer configuration.
 Generic producer Client, BaseProducer, FutureProducer and AdminClient construction retain that account through native client destruction.
 AdminClient uses the native producer type.
-Consumer construction still rejects an attached account before native creation.
-This ownership slice does not activate a public accounted consumer or change Connect, log or DLQ construction.
+That setter still rejects consumer construction before native creation.
+ClientConfig::set_native_byte_account_with_consumers explicitly enables both native client types with the same shared account.
+Connect, log and DLQ call-site activation is separate from this SDK profile.
 
 AccountedNativePtr is a passive destruction region owning one NativePtr and its optional account lease.
 Its native field is destroyed before the lease field, so the existing native destructor completes while the lease is still held.
@@ -39,5 +40,27 @@ These private SDK unit fixtures require the vendored SDK's own test target and h
 
 This slice propagates lifetime authority and does not add allocation admission for SDK wrapper bookkeeping, native client/queue construction, admin results, detached outputs, native sorting internals or all native allocation classes.
 Unsafe raw FFI pointers remain the unsafe caller's ownership obligation.
-Public accounted consumer construction, a whole-native bound and runtime/Phase 2 verification remain separate gates.
+A whole-native bound and runtime/Phase 2 verification remain separate gates.
 link:sources.json[The source record] pins the inspected SDK and native destruction paths, and link:COPYRIGHT[the source notices] retains the complete inspected native leading notices and SDK license.
+
+== Explicit consumer profile
+
+The two configuration profiles hold one account Arc in a closed attachment value, and both ordinary and native configuration clones preserve that complete value.
+Replacing a setter replaces its profile and owner together.
+The explicit consumer profile selects rd_kafka_new_accounted_consumer, which uses the existing native consumer initialization with the account installed before network threads start.
+Validation failure retains the unconsumed native configuration for Rust cleanup; a consumed failure joins native work before the Rust account can be released.
+Successful construction moves the account into the same reviewed client, queue, event and returned-Metadata lifetime chain.
+
+Uncompressed fetch message ops retain the admitted receive buffer until their final event release.
+RetainedConsumerMessage keeps its event and originating consumer alive through that release.
+Compressed message data may instead live in unadmitted decompression buffers and shadow buffers.
+Individual fetch/error ops and strings, fetch request/list storage, aborted-transaction state and native client/queue/thread construction still require their own bounds.
+
+Receive admission denial follows the existing broker-down, ordinary error and reconnect/backoff path with CRIT_SYS_RESOURCE.
+Existing duplicate-error suppression remains in effect, and ALL_BROKERS_DOWN can also be delivered.
+Admission denial does not create a new native fatal latch.
+BaseConsumer continues to distinguish MessageConsumption from MessageConsumptionFatal using the native fatal flag.
+Caller receive/fetch limits and Kafka's first-large-batch exception require a compatible ceiling policy; the SDK attachment itself supplies no whole-consumer sizing formula.
+
+Eight unexecuted public integration sources cover cloned configuration sharing, complete profile replacement, validation cleanup, raw C constructor ownership, handshake denial, distinct native fatal state, actual uncompressed fetch retention and returned Metadata after consumer/config destruction.
+link:consumer-sources.json[The consumer source record] and link:consumer-COPYRIGHT[its complete source notices] pin this explicit profile separately from the earlier ownership record.

@@ -86,7 +86,31 @@ impl RDKafkaLogLevel {
 pub struct NativeClientConfig {
     ptr: NativePtr<RDKafkaConf>,
     pub(crate) ssl_context: Option<Arc<SslContextConfig>>,
-    pub(crate) byte_account: Option<Arc<NativeByteAccount>>,
+    pub(crate) byte_account: Option<NativeByteAccountAttachment>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum NativeByteAccountAttachment {
+    Producers(Arc<NativeByteAccount>),
+    ProducersAndConsumers(Arc<NativeByteAccount>),
+}
+
+impl NativeByteAccountAttachment {
+    pub(crate) fn allows_consumers(&self) -> bool {
+        matches!(self, Self::ProducersAndConsumers(_))
+    }
+
+    pub(crate) fn account(&self) -> &Arc<NativeByteAccount> {
+        match self {
+            Self::Producers(account) | Self::ProducersAndConsumers(account) => account,
+        }
+    }
+
+    pub(crate) fn into_account(self) -> Arc<NativeByteAccount> {
+        match self {
+            Self::Producers(account) | Self::ProducersAndConsumers(account) => account,
+        }
+    }
 }
 
 /// Native TLS file whose bytes can be supplied by a retained configuration owner.
@@ -318,7 +342,7 @@ impl NativeClientConfig {
 /// Client configuration.
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
-    byte_account: Option<Arc<NativeByteAccount>>,
+    byte_account: Option<NativeByteAccountAttachment>,
     conf_map: HashMap<String, String>,
     ssl_context: Option<Arc<SslContextConfig>>,
     /// The librdkafka logging level. Refer to [`RDKafkaLogLevel`] for the list
@@ -346,7 +370,15 @@ impl ClientConfig {
     /// Shares an admitted byte account among producers created from this configuration.
     /// Consumer creation with an account returns a client creation error.
     pub fn set_native_byte_account(&mut self, account: Arc<NativeByteAccount>) -> &mut Self {
-        self.byte_account = Some(account);
+        self.byte_account = Some(NativeByteAccountAttachment::Producers(account));
+        self
+    }
+
+    /// Shares an admitted byte account among producers and consumers created from this configuration.
+    /// Native clients and retained accounted results keep it alive through final native release.
+    /// Consumer receive frames and implemented Metadata owners use the ceiling; decompression, individual fetch/error ops and other native allocations require separate bounds.
+    pub fn set_native_byte_account_with_consumers(&mut self, account: Arc<NativeByteAccount>) -> &mut Self {
+        self.byte_account = Some(NativeByteAccountAttachment::ProducersAndConsumers(account));
         self
     }
 

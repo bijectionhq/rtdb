@@ -28,7 +28,7 @@ Ordinary Metadata rack computation admits one temporary matching-rack pointer bu
 That scratch overlaps any additional parsed output segment on the same account and borrows rack strings owned by the parsed root and segments.
 Scratch denial returns the native resource error before the current topic's live/cache update, preserving broker and earlier-topic effects and the existing failed-request hint cleanup.
 Independent topic-info projection arenas have an internal fallible admission path retaining the actual client account through their final free.
-Their production callers are classic consumers, and supported public account construction remains producer-only, so this does not activate charged consumer copies.
+Their classic consumer-group callers can use the explicit consumer-enabled SDK account profile; the DLQ constructor retains its existing producer-only attachment.
 Client and broker construction, overlapping broker threads and stacks, live-topic storage, other independent clones and their rack scratch, admin and member-metadata output copies, native sort internals, consumer error owners, TLS/SASL storage, ordinary outbound requests, allocator overhead and the monitor itself still require separate admission bounds.
 The Settings method names the native byte capacity rather than claiming that the formula bounds those excluded owners.
 Java partitioner class validation and actual partition-selection integration retain their existing boundaries.

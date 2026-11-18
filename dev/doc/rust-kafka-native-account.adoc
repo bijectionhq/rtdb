@@ -1,0 +1,33 @@
+= Native Kafka byte-account profiles
+
+The vendored SDK supports a shared NativeByteAccount backed by a caller-owned reservation of at least its declared capacity.
+ClientConfig::set_native_byte_account enables the existing producer-only profile, including AdminClient's underlying producer.
+ClientConfig::set_native_byte_account_with_consumers explicitly permits both native producer and consumer construction.
+The default setter's consumer rejection is unchanged.
+Configuration clones share the same account and capacity reservation.
+Changing the setter replaces the attachment profile and its retained account together.
+
+The native factory attaches the account before its network threads start.
+Native client, queue, event and returned Metadata owners retain it through their native final destruction.
+An unconsumed failed configuration remains owned by its Rust wrapper; native creation joins any consumed construction failure before releasing the account.
+The last account owner waits for attached clients and charged storage to finish before returning the reservation.
+No account-to-client reference cycle is introduced.
+
+The ceiling applies to implemented allocation classes: receive frames, selected request/control owners, ApiVersions arrays and the admitted Metadata parser, cache, rack-scratch and topic-info owners.
+An uncompressed fetched message retains its shared admitted receive frame until the last referencing event is destroyed.
+RetainedConsumerMessage also retains the originating consumer and destroys its event before releasing that consumer.
+Decompression buffers, individual fetch/error ops and strings, request/list scratch, native client/queue/thread construction, allocator overhead and other native allocations require separate bounds.
+This profile establishes neither a whole-consumer nor a whole-producer allocation bound.
+
+An exhausted receive or handshake admission follows the existing native broker failure, ordinary error and reconnect/backoff route.
+The consumer can report CRIT_SYS_RESOURCE as MessageConsumption, with the existing duplicate-error suppression and other connection errors still in effect.
+Native fatal state remains a separate flag and produces MessageConsumptionFatal.
+The account does not add a fatal latch, retry guarantee or rollback of earlier Metadata effects.
+
+Kafka may return the first large record batch beyond its requested fetch target.
+An application activating this profile must provide compatible fetch, receive-frame and reserved-ceiling policies, including an explicit outcome for a larger batch.
+SDK attachment alone supplies no sizing formula for those independent limits.
+Connect and log call-site activation is separate from this public SDK profile.
+
+The new public regression sources are unexecuted in Phase 1.
+Compilation, native runtime checks, complete allocation coverage and Phase 2 gates remain open.

@@ -2928,6 +2928,19 @@ rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
                              account, confp);
 }
 
+rd_kafka_t *rd_kafka_new_accounted_consumer(rd_kafka_conf_t **confp,
+                                            rd_kafka_byte_account_t *account,
+                                            char *errstr, size_t errstr_size) {
+        if (!confp || !account) {
+                if (errstr)
+                        rd_snprintf(errstr, errstr_size, "Missing native byte account or configuration pointer");
+                rd_kafka_set_last_error(RD_KAFKA_RESP_ERR__INVALID_ARG, EINVAL);
+                return NULL;
+        }
+        return rd_kafka_new0(RD_KAFKA_CONSUMER, *confp, errstr, errstr_size,
+                             account, confp);
+}
+
 
 /**
  * Schedules a rebootstrap of the cluster immediately.

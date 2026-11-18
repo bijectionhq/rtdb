@@ -261,7 +261,7 @@ impl<C: ClientContext> Client<C> {
         rd_kafka_type: RDKafkaType,
         context: Arc<C>,
     ) -> KafkaResult<Client<C>> {
-        if native_config.byte_account.is_some() && rd_kafka_type != RDKafkaType::RD_KAFKA_PRODUCER {
+        if native_config.byte_account.as_ref().is_some_and(|attachment| !attachment.allows_consumers()) && rd_kafka_type != RDKafkaType::RD_KAFKA_PRODUCER {
             return Err(KafkaError::ClientCreation("Native byte accounts require a producer".into()));
         }
         let mut err_buf = ErrBuf::new();
@@ -281,10 +281,18 @@ impl<C: ClientContext> Client<C> {
         let byte_account = native_config.byte_account.take();
         let mut configuration = native_config.ptr();
         let client_ptr = match &byte_account {
-            Some(account) => unsafe {
+            Some(attachment) if rd_kafka_type == RDKafkaType::RD_KAFKA_CONSUMER => unsafe {
+                rdsys::rd_kafka_new_accounted_consumer(
+                    &mut configuration,
+                    attachment.account().ptr(),
+                    err_buf.as_mut_ptr(),
+                    err_buf.capacity(),
+                )
+            },
+            Some(attachment) => unsafe {
                 rdsys::rd_kafka_new_accounted_producer(
                     &mut configuration,
-                    account.ptr(),
+                    attachment.account().ptr(),
                     err_buf.as_mut_ptr(),
                     err_buf.capacity(),
                 )
@@ -309,7 +317,7 @@ impl<C: ClientContext> Client<C> {
         }
         std::mem::forget(native_config);
         let mut native = unsafe {
-            NativeClient::from_ptr(client_ptr, ssl_context, material_lease, byte_account)
+            NativeClient::from_ptr(client_ptr, ssl_context, material_lease, byte_account.map(|attachment| attachment.into_account()))
         };
         if let Some(lease) = &mut native.material_lease { lease.loaded(); }
         trace!("Create new librdkafka client {:p}", client_ptr);

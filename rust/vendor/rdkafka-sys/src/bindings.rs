@@ -163,6 +163,9 @@ extern "C" {
     pub fn rd_kafka_new_accounted_producer(conf: *mut *mut rd_kafka_conf_t,
         account: *mut rd_kafka_byte_account_t, errstr: *mut c_char,
         errstr_size: usize) -> *mut rd_kafka_t;
+    pub fn rd_kafka_new_accounted_consumer(conf: *mut *mut rd_kafka_conf_t,
+        account: *mut rd_kafka_byte_account_t, errstr: *mut c_char,
+        errstr_size: usize) -> *mut rd_kafka_t;
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

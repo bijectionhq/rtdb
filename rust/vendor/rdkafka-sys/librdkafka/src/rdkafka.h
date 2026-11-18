@@ -3154,6 +3154,22 @@ rd_kafka_t *rd_kafka_new_accounted_producer(rd_kafka_conf_t **confp,
                                             rd_kafka_byte_account_t *account,
                                             char *errstr, size_t errstr_size);
 
+/**
+ * Creates a consumer attached to a non-NULL account before its network threads start.
+ * A NULL confp or account is rejected with INVALID_ARG and consumes no configuration.
+ * A NULL *confp selects the default configuration.
+ * Sets *confp to NULL when the configuration is consumed, including a failed creation that joins started threads.
+ * On failure, returns NULL, sets the last error and writes errstr.
+ * When errstr_size is nonzero, errstr must provide that many writable bytes.
+ * A remaining non-NULL configuration belongs to the caller.
+ * The account must outlive the client and every independently retained allocation or queue that can reference it.
+ * This covers implemented admission classes; decompression, individual fetch/error ops and other native allocations require separate bounds.
+ */
+RD_EXPORT
+rd_kafka_t *rd_kafka_new_accounted_consumer(rd_kafka_conf_t **confp,
+                                            rd_kafka_byte_account_t *account,
+                                            char *errstr, size_t errstr_size);
+
 typedef struct rd_kafka_ordered_metadata_s rd_kafka_ordered_metadata_t;
 typedef struct rd_kafka_connection_observation_s rd_kafka_connection_observation_t;
 /**
