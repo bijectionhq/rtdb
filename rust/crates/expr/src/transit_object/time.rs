@@ -45,6 +45,20 @@ impl Time {
         }
         Self::read_text(tag,representation.text()?)
     }
+    pub(super) fn read_wire_range(representation: &T) -> Result<Self> {
+        let values = match representation {
+            T::Array(values) => values.as_slice(),
+            T::Tagged { tag, representation } if tag == "list" => {
+                let T::Array(values) = representation.as_ref() else { return Err(invalid()); };
+                values.as_slice()
+            }
+            T::Null => &[],
+            T::String(text) if text.is_empty() => &[],
+            T::Bytes(bytes) if bytes.is_empty() => &[],
+            _ => return Err(invalid()),
+        };
+        Ok(Self::Range { from: Zoned::from_wire(values.first())?, to: Zoned::from_wire(values.get(1))? })
+    }
     pub(super) fn read_text(tag: &str,text: &str) -> Result<Option<Self>> {
         Ok(Some(match tag {
             "t" => Self::LegacyDate(xml_date::parse(text)?),
@@ -150,9 +164,27 @@ impl Zoned {
             None | Some(Object::Null) => None,Some(Object::String(text)) => Some(Self::parse(text)?),
             Some(Object::Time(Time::ZonedDateTime(value))) => Some(*value),
             Some(Object::Time(Time::Instant(value))) => Some(Self::new(*value,ZoneId::utc())?),
-            Some(Object::Time(Time::LegacyDate(value))) => Some(Self::new(Instant::new(value.div_euclid(1000),(value.rem_euclid(1000) * 1_000_000) as u32)?,ZoneId::utc())?),
+            Some(Object::Time(Time::LegacyDate(value))) => Some(Self::from_legacy_date(*value)?),
             _ => return Err(invalid()),
         })
+    }
+    fn from_wire(value: Option<&T>) -> Result<Option<Self>> {
+        match value {
+            None | Some(T::Null) => Ok(None),
+            Some(T::String(text)) => Self::parse(text).map(Some),
+            Some(T::Tagged { tag, representation }) if matches!(tag.as_str(), "m" | "t") => {
+                Self::from_legacy_date(super::legacy_date_text::wire_millis(tag, representation)?).map(Some)
+            }
+            Some(T::Tagged { tag, representation }) if matches!(tag.as_str(), "time/instant" | "time/zoned-date-time") => {
+                let T::String(text) = representation.as_ref() else { return Err(invalid()); };
+                let value = Time::read_text(tag, text)?.map(Object::Time);
+                Self::from_object(value.as_ref())
+            }
+            _ => Err(invalid()),
+        }
+    }
+    fn from_legacy_date(millis: i64) -> Result<Self> {
+        Self::new(Instant::new(millis.div_euclid(1000), (millis.rem_euclid(1000) * 1_000_000) as u32)?, ZoneId::utc())
     }
     fn text(self) -> Result<String> {
         let offset = self.zone.offset_at(self.instant.seconds())?;

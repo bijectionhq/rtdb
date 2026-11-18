@@ -46,7 +46,8 @@ fn wire_text_object(tag: &str, representation: &T) -> Result<Option<Object>> {
     if tag == "xtdb/path" {
         return Ok(Some(Object::Path(Path::read_wire(representation)?)));
     }
-    if Time::recognizes(tag) && !matches!(tag, "m" | "t" | "xtdb/tstz-range") {
+    if tag == "xtdb/tstz-range" { return Ok(Some(Object::Time(Time::read_wire_range(representation)?))); }
+    if Time::recognizes(tag) && !matches!(tag, "m" | "t") {
         let T::String(source) = representation else { return Err(invalid()); };
         return Ok(Some(Time::read_text(tag, source)?.map_or(Object::Null, Object::Time)));
     }

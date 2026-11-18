@@ -112,7 +112,6 @@ pub(super) fn transit(value: &TransitValue, depth: usize) -> Result<String> {
                 ("set", TransitValue::Array(values)) => format!("#{{{}}}", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
                 ("list", TransitValue::Array(values)) => format!("({})", values.iter().map(|value| transit(value, depth + 1)).collect::<Result<Vec<_>>>()?.join(" ")),
                 ("xtdb/period-duration", _) => format!("#xt/period-duration {}", transit(representation, depth + 1)?),
-                ("xtdb/tstz-range", _) => format!("#xt/tstz-range {}", transit(representation, depth + 1)?),
                 ("xtdb/tx-key", _) => format!("#xt/tx-key {}", transit(representation, depth + 1)?),
                 _ => format!("#{tag} {}", transit(representation, depth + 1)?),
             }

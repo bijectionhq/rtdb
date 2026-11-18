@@ -336,7 +336,9 @@ FORMAT resolves string-backed registered temporal roots through their constructo
 It uses scalar object text for dates, local and zoned clocks, offsets, instants, zones, year and month values, periods, durations and intervals.
 STR and text casts use the default Clojure reader tags and the normalized text of those same objects, including nested fields.
 A tagged interval outside the source grammar produces a decoded null, which supplies a null argument to FORMAT and `nil` to readable text.
-It uses LocalDate scalar text with signed extended years and LocalTime scalar text with three, six or nine fractional digits when needed.
+Stored `xtdb/tstz-range` endpoints use the registered zone conversion for strings, instants, legacy Date values and zoned date-times.
+Readable range text preserves normalized zone tags, and FORMAT uses the range object's field text.
+LocalDate scalar text uses signed extended years, and LocalTime uses three, six or nine fractional digits when needed.
 Durations use Java `Duration.toString()` text, and day-of-week and month values use their exact declared enum names.
 Root legacy Date arguments use Java `Date.toString()` with the captured process timezone and US-English abbreviations on Linux and macOS.
 The scalar renderer admits temporary text and output growth in the existing caller scope.

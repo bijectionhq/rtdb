@@ -160,6 +160,33 @@ fn registered_temporal_strings_use_object_text_and_readable_tags() {
 }
 
 #[test]
+fn registered_ranges_normalize_their_endpoints_before_formatting() {
+    let context = EvalContext::default();
+    let cases = [
+        (T::Null, "ZonedDateTimeRange(from=null, to=null)", "#xt/tstz-range [nil nil]"),
+        (
+            T::Array(vec![tag("time/instant", T::String("2024-01-02T03:04+02".into()))]),
+            "ZonedDateTimeRange(from=2024-01-02T01:04Z[UTC], to=null)",
+            "#xt/tstz-range [#xt/zdt \"2024-01-02T01:04Z[UTC]\" nil]",
+        ),
+        (
+            tag("list", T::Array(vec![tag("m", T::Integer(-1)), T::String("2024-01-02T03:04+01[Europe/Paris]".into())])),
+            "ZonedDateTimeRange(from=1969-12-31T23:59:59.999Z[UTC], to=2024-01-02T03:04+01:00[Europe/Paris])",
+            "#xt/tstz-range [#xt/zdt \"1969-12-31T23:59:59.999Z[UTC]\" #xt/zdt \"2024-01-02T03:04+01:00[Europe/Paris]\"]",
+        ),
+    ];
+    for (representation, scalar, readable) in cases {
+        let value = stored(&tag("xtdb/tstz-range", representation));
+        assert_eq!(scalar_call("str", std::slice::from_ref(&value), &context).unwrap(), text(readable));
+        assert_eq!(scalar_call("format", &[text("%s"), value], &context).unwrap(), text(scalar));
+    }
+    let unsupported_endpoint = tag("time/offset-date-time", T::String("2024-01-02T03:04Z".into()));
+    let value = stored(&tag("xtdb/tstz-range", T::Array(vec![unsupported_endpoint])));
+    assert!(scalar_call("str", std::slice::from_ref(&value), &context).is_err());
+    assert!(scalar_call("format", &[text("%s"), value], &context).is_err());
+}
+
+#[test]
 fn public_format_denies_constructor_charge_after_the_existing_transit_prefix() {
     let args = [text("%s"),stored(&info(T::String("message".into()),T::Map(vec![])))];
     let retained = args.iter().map(|value|value.retained_bytes().unwrap()).sum::<usize>();
