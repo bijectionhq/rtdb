@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete generated rule and tree schedules beyond the two-profile statement roots, control statements and constant SELECT with numeric expressions, Boolean and NULL literals, character strings and aliases, the complete identifier family, isolation and empty-details window paths, and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before Simple Query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
+      "requirement": "Complete generated rule and tree schedules beyond the two-profile statement roots, control statements and constant SELECT with numeric expressions, Boolean and NULL literals, raw character strings and flat prefixed character-string literals, aliases, the complete identifier family, isolation and empty-details window paths, and the SLL DATE array and field paths. Extend native sync, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, whole-batch syntax validation before Simple Query effects, actual host policy capture and production cache ownership, and admitted parsed ownership across every frontend."
     },
     {
       "id": "source-signed-binary-width",
@@ -266,7 +266,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer reuse, general ByteBuffer operations, selected readers, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand and FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
+      "requirement": "Complete signed FixedSizeBinary existing-inner adoption, pointer use beyond the reviewed borrowed retargeting and comparison paths, general ByteBuffer operations, selected readers, transport and production consumers. Preserve signed construction and write-copy behavior, direct raw FixedBinary and UUID object demand, borrowed Slice byte and pointer forwarding, direct and first Slice validity-first object demand and FixedBinary LongLong lane demand, distinct reinterpretation and Arrow bounds failures, and actual owner and span lifetimes."
     },
     {
       "id": "embedded-parser-error-capability",
@@ -287,7 +287,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Complete admission before tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Keep Simple Query token-array and range charges overlapping during range construction and preserve the range owner through execution. Reuse classified syntax during initial preparation and retain prepared outputs through their last owner. Cover remaining production preparation and control allocations with the caller-owned finite budget."
+      "requirement": "Complete admission before tokenizer payload and scratch allocation, lexer and parser growth, AST construction and catalog-dependent binding. Keep Simple Query token-array and range charges overlapping during range construction and preserve the range owner through execution. Admit ownership of the full batch of parsed syntax before statement effects. Reuse classified syntax during initial preparation in the remaining frontends and retain prepared outputs through their last owner. Cover remaining production preparation and control allocations with the caller-owned finite budget."
     },
     {
       "id": "azure-desktop-credentials",

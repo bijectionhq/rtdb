@@ -1247,6 +1247,8 @@ The direct and multi-statement roots reach constant SELECT with EXPLAIN, quantif
 Boolean, NULL, standard SQL strings and C-escaped strings share the private expression root and derived-column action while retaining their raw token occurrences.
 Dollar strings retain their opening and closing tokens and the indexed text in a separate child rule.
 The LL path distinguishes a missing closing tag after text from a mismatch immediately after the opener.
+TIME, DURATION, UUID, URI and KEYWORD retain their prefix terminal and characterString child in both profiles.
+Their raw trees reach both SELECT roots, and cleanup identifies the failed attachment by the originating call state.
 Adaptive decision scratch drops when the decision finishes, while the token stream and invocation records stay live through the parse.
 The SELECT list and explicit alias fixtures preserve the reached sync and error sites, including lexical failure during LL recovery.
 Production parsing still requires the remaining grammar and the host cache and diagnostic boundaries.
@@ -1254,11 +1256,16 @@ Production parsing still requires the remaining grammar and the host cache and d
 Simple Query recognizes empty and leading-semicolon markers on the complete normalized message before tokenization.
 The markers preserve an open or failed explicit transaction and participate in ordinary implicit settlement.
 The DBeaver rewrite recognizes the complete normalized namespace query before lexical splitting and replaces `n.oid,n.*` with the explicit namespace fields `n.oid,n.nspname,n.nspowner,n.nspacl`.
+Simple Query takes the whole-message response for fixed keyword spellings with a locale-independent match.
+Locale-dependent spellings retain the existing range behavior pending host locale capture.
 The ordinary Simple Query tokenizer reserves replacement token-array storage while the old array still owns its charge.
 Lexical validation precedes range construction, with both arrays charged while the nonempty ranges are filled.
 The token array drops before execution, the ranges retain their reservation across the batch, and the input frame holds the source text.
 Token payloads and tokenizer scratch still need admission.
-Whole-batch AST validation before execution remains required.
+Simple Query reuses its first lowered control when preparation receives the same source bytes.
+The SQL parser validates the surrounding syntax and explicit inline XTQL argument envelope before reading the embedded EDN and assigning slots.
+The raw read uses the metadata budget carried with the syntax tree.
+Whole-batch syntax validation before execution still requires admitted syntax owners and nested PREPARE classification.
 PostgreSQL preparation consumes the classified AST with its original source and budget after parameter handling.
 The durable DML operation retains that source, and query execution still binds against its own snapshot.
 
@@ -1269,6 +1276,8 @@ The borrowed Slice reader adds the signed start to the signed row before the und
 The returned byte view and pointer borrow the original owner through native span validation.
 The direct and first Slice guarded object paths read the signed validity byte before payload admission and return null without a destination lease.
 The LongLong methods on those readers use signed lane arithmetic and demand all eight bytes within the retained Arrow 19 bounds.
+The direct reader and first Slice can retarget an existing borrowed pointer slot while previously demanded bytes keep their original backing.
+Pointer comparison validates both spans in Arrow 19 operand order before comparing unsigned bytes.
 Existing-inner and selected-reader ownership still require source work.
 
 == Kafka connection state and paired Avro source checkpoint
