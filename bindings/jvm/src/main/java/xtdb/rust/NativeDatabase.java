@@ -152,6 +152,10 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
     public int getServerPort() throws AdbcException {
         try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT); abi.call("database_pgwire_port", handle(), out); return out.get(java.lang.foreign.ValueLayout.JAVA_INT, 0); }
     }
+    /** The bound Flight SQL port, or -1 when the configuration starts no Flight SQL listener. */
+    public int getFlightSqlPort() throws AdbcException {
+        try (Arena arena = Arena.ofConfined()) { MemorySegment out = arena.allocate(java.lang.foreign.ValueLayout.JAVA_INT); abi.call("database_flight_sql_port", handle(), out); return out.get(java.lang.foreign.ValueLayout.JAVA_INT, 0); }
+    }
     @Override public void setAwaitToken(String token) { awaitToken.set(token); }
     /** JDBC connections go through this node's own pgwire listener, as for a JVM node. */
     @Override public xtdb.api.DataSource.ConnectionBuilder createConnectionBuilder() {

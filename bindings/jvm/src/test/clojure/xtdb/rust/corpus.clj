@@ -4,9 +4,13 @@
             [clojure.string :as str]
             [clojure.test :as t]
             [jsonista.core :as json]
+            [xtdb.api :as xt]
+            [xtdb.flight-sql :as fsql]
             [xtdb.node :as xtn]
-            [xtdb.rust]
-            [xtdb.rust-test])
+            [xtdb.operator.list :as list-operator]
+            [xtdb.rust :as rust]
+            [xtdb.serde.types :as st]
+            [xtdb.test-util :as tu])
   (:import [java.io File]
            [java.nio.file Path]
            [java.time Duration InstantSource]
@@ -14,7 +18,6 @@
            [org.apache.arrow.memory RootAllocator]
            [xtdb.rust NativeDatabase]))
 
-(def ^:private run-original-case @#'xtdb.rust-test/run-original-api-case)
 
 (defn- file->ns [^File root ^File file]
   (-> (.relativize (.toPath root) (.toPath file))
@@ -42,14 +45,14 @@
                    (str "\n  expected: " (pr-str expected) "\n  actual: " (pr-str actual))))
             2000))
 
-(defn- classify [{:keys [pass fail error]} thrown timed-out? {:keys [native jvm]}]
+(defn- classify [{:keys [pass fail error]} thrown timed-out? {:keys [native wire jvm]}]
   (cond
     timed-out? "timeout"
     jvm "jvm-node"
-    (some-> ^Throwable thrown ex-message (= "Unsupported original API fixture")) "unsupported-fixture"
     (pos? error) "error"
     (pos? fail) "fail"
     (and (pos? pass) native) "pass"
+    (and (pos? pass) wire) "pass-wire"
     (pos? pass) "jvm-internal"
     :else "no-assertions"))
 
@@ -81,24 +84,88 @@
      (throw (ex-info "Unsupported native start-node options" {:class (str (class opts))})))
    (let [clock (get-in opts [:log 1 :instant-src])
          opts (cond-> opts clock (update-in [:log 1] dissoc :instant-src))
-         opts (merge {:server {:port 0} :flight-sql nil} opts)
+         opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
          config (yaml opts)]
      (if (instance? InstantSource clock)
        (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
        (NativeDatabase/open native-allocator config (* 512 1024 1024))))))
 
+(defn- import-logical-inputs [query]
+  (let [[operator options & operands] query]
+    (case operator
+      ::tu/pages (case (count operands)
+                   0 [:literal-pages {:pages options}]
+                   1 [:literal-pages {:pages (first operands) :types (update-vals options st/render-type)}]
+                   (throw (ex-info "Invalid fixture page source" {:query query})))
+      :list [:list (update options :batch-size #(or % list-operator/*batch-size*))]
+      (into [operator options] (map import-logical-inputs) operands))))
+
+(defn- native-query-ra [query {:keys [node] :as options}]
+  (let [query (import-logical-inputs query)]
+    (if node
+      (rust/query-ra node query options)
+      (with-open [node (native-start-node)]
+        (rust/query-ra node query options)))))
+
+(defn- native-with-node [f]
+  (with-open [node (native-start-node (or tu/*node-opts* {}))]
+    (binding [tu/*node* node]
+      (f))))
+
 (def ^:private touched (atom {}))
+
+(def ^:private native-connectables
+  {:adbc (fn [node f] (f node))
+   :pgwire (fn [^NativeDatabase node f] (swap! touched assoc :wire true) (f (xt/client {:port (.getServerPort node)})))
+   :flight-sql (fn [^NativeDatabase node f]
+                 (swap! touched assoc :wire true)
+                 (with-open [conn (fsql/open-conn {:port (.getFlightSqlPort node)})]
+                   (f conn)))})
+
+(defn- with-root [v value f]
+  (let [original (deref v)]
+    (alter-var-root v (constantly value))
+    (try (f) (finally (alter-var-root v (constantly original))))))
 
 (defn- observing [k f]
   (fn [& args] (swap! touched assoc k true) (apply f args)))
 
-(defn- with-provenance [f]
-  (with-redefs [xtdb.rust/plan (observing :native @#'xtdb.rust/plan)
-                xtdb.rust/transact (observing :native @#'xtdb.rust/transact)
-                xtdb.rust/execute-set! (observing :native @#'xtdb.rust/execute-set!)
-                xtdb.rust/query-ra (observing :native xtdb.rust/query-ra)
+(defn- with-native-engine
+  "Routes the original fixtures and node constructors to the native engine; namespaces must load inside it."
+  [f]
+  (with-redefs [rust/plan (observing :native @#'rust/plan)
+                rust/transact (observing :native @#'rust/transact)
+                rust/execute-set! (observing :native @#'rust/execute-set!)
+                tu/with-node native-with-node
                 xtn/start-node (observing :native-node native-start-node)]
-    (f)))
+    (binding [tu/*query-ra-executor* (observing :native native-query-ra)
+              tu/*flush-block-executor* (fn [^NativeDatabase node timeout] (.flushAll node timeout))]
+      (with-root #'tu/connectables native-connectables f))))
+
+(defn- port-fixture [port-var server-var]
+  (fn [f]
+    (let [^NativeDatabase node tu/*node*]
+      (swap! touched assoc :wire true)
+      (with-bindings (cond-> {(resolve port-var) (.getServerPort node)}
+                       server-var (assoc (resolve server-var) node))
+        (f)))))
+
+(def ^:private fixture-overrides
+  "Original fixtures that read the JVM node's internal system map, by the Var that defines them."
+  {'xtdb.pgwire-test/with-server-and-port (port-fixture 'xtdb.pgwire-test/*port* 'xtdb.pgwire-test/*server*)
+   'xtdb.pgwire.pg2-test/with-server-and-port (port-fixture 'xtdb.pgwire.pg2-test/*port* 'xtdb.pgwire.pg2-test/*server*)
+   'xtdb.pgwire-protocol-test/with-port (port-fixture 'xtdb.pgwire-protocol-test/*port* nil)
+   'xtdb.pgwire.authn-test/with-port (port-fixture 'xtdb.pgwire.authn-test/*port* nil)})
+
+(defn- native-fixtures [fixtures]
+  (let [overrides (into {} (keep (fn [[sym fixture]] (when-let [v (resolve sym)] [@v fixture]))) fixture-overrides)]
+    (mapv #(get overrides % %) fixtures)))
+
+(defn- run-case [v]
+  (let [fixtures (meta (:ns (meta v)))
+        once (t/join-fixtures (native-fixtures (::t/once-fixtures fixtures)))
+        each (t/join-fixtures (native-fixtures (::t/each-fixtures fixtures)))]
+    (once #(tu/with-allocator (fn [] (each (:test (meta v))))))))
 
 (defn run-var [v timeout-ms]
   (let [counts (atom {:pass 0 :fail 0 :error 0})
@@ -116,11 +183,10 @@
                (binding [t/report report
                          t/*testing-vars* (list v)]
                  (try
-                   (run-original-case v)
+                   (run-case v)
                    (catch Throwable e
                      (reset! thrown e)
-                     (when-not (= "Unsupported original API fixture" (ex-message e))
-                       (report {:type :error :actual e}))))))
+                     (report {:type :error :actual e})))))
         timed-out? (= ::timeout (deref task timeout-ms ::timeout))]
     (when timed-out? (future-cancel task))
     (let [result (classify @counts @thrown timed-out? @touched)]
@@ -136,7 +202,7 @@
 
 (defn run-namespace [ns-sym timeout-ms]
   (try
-    (require ns-sym)
+    (require ns-sym :reload)
     (vec (for [v (test-vars ns-sym)]
            (if (:integration (meta v))
              {:var (str (symbol v)) :result "skipped-integration"}
@@ -152,7 +218,7 @@
         totals (atom (sorted-map))]
     (io/make-parents out)
     (with-open [w (io/writer out :append (Boolean/getBoolean "xtdb.corpus.append"))]
-      (with-provenance
+      (with-native-engine
         #(doseq [ns-sym namespaces
               row (run-namespace ns-sym timeout-ms)]
         (swap! totals update (:result row) (fnil inc 0))
