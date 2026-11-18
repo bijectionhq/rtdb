@@ -187,9 +187,20 @@ impl<'a> SourceBytePointer<'a> {
     pub(crate) fn offset(&self) -> i64 { self.offset }
     pub(crate) fn length(&self) -> i64 { self.length }
     pub(crate) fn compare_to(&self, right: &SourceBytePointer<'_>) -> SourceScalarReadResult<Ordering> {
+        let (left, right) = self.comparison_spans(right)?;
+        Ok(left.cmp(right))
+    }
+    pub(crate) fn equals(&self, right: &SourceBytePointer<'_>) -> SourceScalarReadResult<bool> {
+        if std::ptr::eq(self, right) { return Ok(true); }
+        let (left, right) = self.comparison_spans(right)?;
+        Ok(left == right)
+    }
+    fn comparison_spans<'right>(
+        &self, right: &SourceBytePointer<'right>,
+    ) -> SourceScalarReadResult<(&'a [u8], &'right [u8])> {
         let left = self.comparison_span(PointerComparisonOperand::Left)?;
         let right = right.comparison_span(PointerComparisonOperand::Right)?;
-        Ok(left.cmp(right))
+        Ok((left, right))
     }
     fn comparison_span(&self, operand: PointerComparisonOperand) -> SourceScalarReadResult<&'a [u8]> {
         let length = usize::try_from(self.length)

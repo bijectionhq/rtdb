@@ -1916,3 +1916,71 @@ fn source_pointer_comparison_validates_both_operands_in_arrow_order() {
     drop((blocker, signed, empty_owner, oversized, valid));
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn source_pointer_equality_checks_object_identity_before_the_signed_span() {
+    let memory = memory();
+    let writer = writer(SourceScalarDeclaration::FixedBinary(-1), false, &memory);
+    let reader = writer.source_reader().unwrap().unwrap();
+    let slice = reader.slice(i32::MAX, 0);
+    let first = slice.get_pointer(1);
+    let second = slice.get_pointer(1);
+    let alias = &first;
+    assert_eq!((first.offset(), first.length()), (i64::from(i32::MIN), -1));
+    assert_eq!((first.offset(),first.length()), (second.offset(),second.length()));
+    assert!(first.equals(alias).unwrap());
+    assert!(second.equals(&second).unwrap());
+    let failure = SourceScalarReadFailure::PointerComparisonNegativeLength {
+        operand: PointerComparisonOperand::Left, length: -1,
+    };
+    read_reference(first.equals(&second), failure);
+    read_reference(first.compare_to(alias), failure);
+    drop(writer);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn source_pointer_equality_checks_both_spans_before_length_and_byte_results() {
+    let memory = memory();
+    let mut left = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    left.write_bytes(&[0x80]).unwrap();
+    left.write_bytes(&[0x7f]).unwrap();
+    let mut equal = writer(SourceScalarDeclaration::FixedBinary(1), false, &memory);
+    equal.write_bytes(&[0x80]).unwrap();
+    let equal = equal.finish().unwrap();
+    let mut longer = writer(SourceScalarDeclaration::FixedBinary(2), false, &memory);
+    longer.write_bytes(&[0x80, 0]).unwrap();
+    let mut out_of_bounds = writer(SourceScalarDeclaration::FixedBinary(256), false, &memory);
+    out_of_bounds.write_bytes(&[0x80]).unwrap();
+    let out_of_bounds = out_of_bounds.finish().unwrap();
+    let capacity = data(&out_of_bounds).bytes.as_slice().len();
+    assert!(capacity < 256);
+    let empty = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+
+    let blocker = block(&memory, 0);
+    let used = memory.used_bytes();
+    let left_reader = left.source_reader().unwrap().unwrap();
+    let first = left_reader.get_pointer(0);
+    let alternate = left_reader.get_pointer(1);
+    let equal_pointer = SourceScalarReader::new(&equal).unwrap().unwrap().get_pointer(0);
+    let longer_pointer = longer.source_reader().unwrap().unwrap().get_pointer(0);
+    let invalid = SourceScalarReader::new(&out_of_bounds).unwrap().unwrap().get_pointer(0);
+    let empty_reader = empty.source_reader().unwrap().unwrap();
+    let empty_a = empty_reader.get_pointer(i32::MIN);
+    let empty_b = empty_reader.get_pointer(i32::MAX);
+    assert!(first.equals(&equal_pointer).unwrap());
+    assert!(equal_pointer.equals(&first).unwrap());
+    assert!(!first.equals(&alternate).unwrap());
+    assert!(!first.equals(&longer_pointer).unwrap());
+    assert!(!empty_a.equals(&first).unwrap());
+    assert!(empty_a.equals(&empty_b).unwrap());
+    read_reference(empty_a.equals(&invalid), SourceScalarReadFailure::PointerComparisonBounds {
+        operand: PointerComparisonOperand::Right, offset: 0, length: 256, capacity,
+    });
+    read_reference(invalid.equals(&first), SourceScalarReadFailure::PointerComparisonBounds {
+        operand: PointerComparisonOperand::Left, offset: 0, length: 256, capacity,
+    });
+    assert_eq!(memory.used_bytes(), used);
+    drop((blocker, left, equal, longer, out_of_bounds, empty));
+    assert_eq!(memory.used_bytes(), 0);
+}
