@@ -180,6 +180,32 @@ fn coalescing_argument_batches_preserves_old_clones_and_joined_types() {
 }
 
 #[test]
+fn static_record_inserts_release_per_row_evaluation_memory() {
+    let memory = MemoryBudget::new(64 << 20);
+    let arguments = SqlArguments::from_rows((0..1000i64).map(|i| vec![Value::I64(i), Value::I64(i * 2)]).collect(), &memory).unwrap();
+    let operation = TxOp::Sql { sql: r#"INSERT INTO docs RECORDS {"_id": ?, "num": ?}"#.into(), args: Some(arguments) };
+    let request = prepare_submission(vec![operation], SubmitOptions::default(), "xtdb", &memory).unwrap();
+    assert!(memory.used_bytes() < 8 << 20, "{} bytes retained after expanding 1,000 rows", memory.used_bytes());
+    drop(request);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn appending_many_argument_batches_retains_memory_linear_in_their_rows() {
+    let row = |i: i64| vec![Value::I64(i), Value::Utf8(format!("value-{i}"))];
+    let memory = MemoryBudget::new(1 << 28);
+    let whole = SqlArguments::from_rows((0..1000).map(row).collect(), &memory).unwrap();
+    let whole_bytes = memory.used_bytes();
+    drop(whole);
+    let mut appended = SqlArguments::from_rows(vec![row(0)], &memory).unwrap();
+    for i in 1..1000 { appended.append(SqlArguments::from_rows(vec![row(i)], &memory).unwrap()).unwrap(); }
+    assert_eq!(appended.row_count(), 1000);
+    assert!(memory.used_bytes() < whole_bytes * 4 + (1 << 20), "{} bytes retained for appended rows, {whole_bytes} for one batch", memory.used_bytes());
+    drop(appended);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn static_and_direct_puts_share_missing_id_validation_before_encoding() {
     use rtdb_format::transit::{TransitValue as T, from_json_value};
     let memory = MemoryBudget::new(1 << 25);

@@ -60,18 +60,19 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
     if args.map_or(0, |args| args.types().len()) < parameter_count { return Ok(None); }
     let parameter_rows: Box<dyn Iterator<Item = &[Value]> + '_> = match args { Some(args) => Box::new(args.rows()), None => Box::new(std::iter::once(&[][..])) };
     let mut groups: Vec<((Option<Timestamp>, Option<Timestamp>), Vec<BTreeMap<String, Value>>)> = Vec::new();
-    let mut reservations = Vec::new();
+    let mut document_charges = Vec::new();
     for parameters in parameter_rows {
+        let row_scope = scope.scratch();
         let parameters = &parameters[..parameter_count];
         let parameter_bytes = parameters.iter().try_fold(1024usize, |bytes, value| bytes.checked_add(value.retained_bytes()?).ok_or_else(overflow))?;
         let mut expression_count = 0usize;
         fn count(input: &Relation, total: &mut usize) { for expr in input.expressions() { expr.visit(&mut |_| *total += 1); } for child in input.children() { count(child, total); } }
         count(&plan.input, &mut expression_count);
         let bound = parameter_bytes.checked_add(sql.len().checked_mul(128).ok_or_else(overflow)?).and_then(|bytes| bytes.checked_mul(expression_count.checked_add(8)?)).ok_or_else(overflow)?;
-        reservations.push(memory.reserve(bound)?);
+        let _evaluation = memory.reserve(bound)?;
         let mut parameters = parameters.to_vec();
         parameters.iter_mut().for_each(rtdb_columnar::admit_execution_value);
-        let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&scope), catalog: None };
+        let context = EvalContext { parameters: &parameters, parameter_types: None, current_time: Timestamp(0).into(), timezone: &options.default_tz, outer_rows: &[], snapshot_token: None, allocation: Some(&row_scope), catalog: None };
         let temporal = match valid_time {
             TemporalFilter::Default => (None, None),
             TemporalFilter::All => (Some(Timestamp::MIN), Some(Timestamp::MAX)),
@@ -85,6 +86,8 @@ fn expand(sql: &str, args: Option<&SqlArguments>, options: &SubmitOptions, datab
                 let to = document.remove("_valid_to").filter(|value| !matches!(value, Value::Null | Value::Undefined)).map(|value| rtdb_expr::timestamp_micros(&value, &options.default_tz)).transpose()?;
                 (from, to)
             };
+            let document_bytes = document.iter().try_fold(256usize, |bytes, (name, value)| bytes.checked_add(name.capacity())?.checked_add(std::mem::size_of::<(String, Value)>())?.checked_add(value.retained_bytes().ok()?)).ok_or_else(overflow)?;
+            document_charges.push(memory.reserve(document_bytes)?);
             if let Some((_, rows)) = groups.iter_mut().find(|(key, _)| *key == bounds) { rows.push(document); }
             else { groups.push((bounds, vec![document])); }
         }

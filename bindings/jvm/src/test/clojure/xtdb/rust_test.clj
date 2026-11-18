@@ -3,6 +3,7 @@
             [next.jdbc :as jdbc]
             [next.jdbc.result-set :as jdbc-rs]
             [xtdb.api :as xt]
+            [xtdb.flight-sql :as fsql]
             [xtdb.as-of-test :as original-as-of]
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
@@ -102,6 +103,22 @@
     (xt/execute-tx node [[:put-docs :docs {:xt/id 1 :v "native"}]])
     (with-open [conn (jdbc/get-connection node)]
       (is (= [{:_id 1 :v "native"}] (jdbc/execute! conn ["SELECT _id, v FROM docs"] {:builder-fn jdbc-rs/as-unqualified-maps}))))))
+
+(deftest native-memory-returns-after-transactions-and-early-reduced-queries
+  (doseq [client [:adbc :pgwire :flight-sql]]
+    (with-open [allocator (RootAllocator.)
+                node (NativeDatabase/open allocator "server:\n  port: 0\nflightSql:\n  port: 0\n" (* 512 1024 1024))]
+      (let [conn (case client
+                   :adbc node
+                   :pgwire (xt/client {:port (.getServerPort node)})
+                   :flight-sql (fsql/open-conn {:port (.getFlightSqlPort node)}))
+            used #(.nativeMemoryUsed node)
+            step (fn [_label f] (f))]
+        (doseq [batch (partition-all 1000 (map #(hash-map :xt/id % :num %) (range 2000)))]
+          (step "tx" #(xt/execute-tx conn [(into [:put-docs :docs] batch)])))
+        (step "limit" #(reduce (fn [n _] (inc n)) 0 (xt/plan-q conn "SELECT docs.num FROM docs LIMIT 10")))
+        (step "reduced" #(reduce (fn [n _] (let [n (inc n)] (if (== 10 n) (reduced n) n))) 0 (xt/plan-q conn "SELECT docs.num FROM docs")))
+        (is (< (used) (* 16 1024 1024)) (str client))))))
 
 (deftest transit-java-dates-work-as-documents-and-sql-arguments
   (with-open [allocator (RootAllocator.)

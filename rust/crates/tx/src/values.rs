@@ -177,7 +177,7 @@ pub struct SqlArguments {
     types: Arc<Vec<LogicalType>>,
     chunks: Arc<Vec<(usize, Arc<ArgumentChunk>)>>,
     memory: Arc<MemoryBudget>,
-    schema_reservations: Arc<Vec<Arc<MemoryReservation>>>,
+    schema_reservation: Arc<MemoryReservation>,
     row_count: usize,
 }
 impl SqlArguments {
@@ -194,7 +194,7 @@ impl SqlArguments {
         let schema_reservation = memory.reserve(schema_bytes(&types)?)?;
         let row_count = rows.len();
         let chunk = Arc::new(ArgumentChunk { rows, _reservation: memory.reserve(bytes.checked_add(256).ok_or_else(overflow)?)? });
-        Ok(Self { types: Arc::new(types), chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservations: Arc::new(vec![schema_reservation]), row_count })
+        Ok(Self { types: Arc::new(types), chunks: Arc::new(vec![(0, chunk)]), memory: Arc::clone(memory), schema_reservation, row_count })
     }
     pub fn from_rows(rows: Vec<Vec<Value>>, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let width = rows.first().map_or(0, Vec::len);
@@ -219,15 +219,15 @@ impl SqlArguments {
     fn append_rows(&mut self, other: Self, start: usize) -> Result<()> {
         if self.types.len() != other.types.len() { return Err(Anomaly::incorrect("xtdb.indexer/incorrect-sql-arg-count", "Coalesced SQL arguments have different widths")); }
         let count = self.row_count.checked_add(other.row_count).ok_or_else(overflow)?;
-        let bytes = schema_bytes(&self.types)?.checked_add(schema_bytes(&other.types)?).and_then(|bytes| bytes.checked_add(self.chunks.len().checked_add(other.chunks.len())?.checked_mul(128)?)).and_then(|bytes| bytes.checked_add(self.schema_reservations.len().checked_add(other.schema_reservations.len())?.checked_mul(128)?)).ok_or_else(overflow)?;
+        let types: Vec<_> = self.types.iter().zip(other.types.iter()).map(|(left, right)| left.join(right)).collect();
+        let chunk_count = self.chunks.len().checked_add(other.chunks.len()).ok_or_else(overflow)?;
+        let bytes = schema_bytes(&types)?.checked_add(chunk_count.checked_mul(128).ok_or_else(overflow)?).ok_or_else(overflow)?;
         let reservation = self.memory.reserve(bytes)?;
-        self.types = Arc::new(self.types.iter().zip(other.types.iter()).map(|(left, right)| left.join(right)).collect());
         let mut chunks = self.chunks.as_ref().clone();
         for (offset, chunk) in other.chunks.iter() { chunks.push((start.checked_add(*offset).ok_or_else(overflow)?, Arc::clone(chunk))); }
+        self.types = Arc::new(types);
         self.chunks = Arc::new(chunks);
-        let mut reservations: Vec<_> = self.schema_reservations.iter().chain(other.schema_reservations.iter()).cloned().collect();
-        reservations.push(reservation);
-        self.schema_reservations = Arc::new(reservations);
+        self.schema_reservation = reservation;
         self.row_count = count;
         Ok(())
     }

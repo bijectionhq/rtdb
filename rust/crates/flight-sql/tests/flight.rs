@@ -423,3 +423,21 @@ async fn uuid_and_fixed_size_binary_results_keep_their_arrow_storage_and_extensi
     assert_eq!(column("literal"), vec![uuids[0].map(|bytes| bytes.to_vec()); 2]);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn transactional_record_inserts_with_many_parameter_rows_release_their_memory() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let baseline = running.node.memory().used_bytes();
+    for batch in 0..2i64 {
+        let transaction = client.begin().await;
+        let prepared = client.prepare(r#"INSERT INTO docs RECORDS {"_id": ?, "num": ?}"#, Some(transaction.clone())).await;
+        let rows = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false), Field::new("b", DataType::Int64, false)])),
+            vec![Arc::new(Int64Array::from_iter_values((0..1000).map(|i| batch * 1000 + i))), Arc::new(Int64Array::from_iter_values(0..1000))]).unwrap();
+        client.upload(CommandPreparedStatementUpdate { prepared_statement_handle: prepared.prepared_statement_handle }, vec![rows]).await;
+        client.end(transaction, true).await.unwrap();
+    }
+    assert_eq!(integer(&client.query("SELECT COUNT(*) FROM docs").await[0], 0, 0), 2000);
+    assert!(running.node.memory().used_bytes() - baseline < 16 << 20);
+    running.stop().await;
+}
