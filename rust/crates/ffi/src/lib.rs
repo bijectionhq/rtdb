@@ -387,6 +387,15 @@ pub unsafe extern "C" fn rtdb_v1_database_pgwire_port(database: u64, out: *mut i
         Ok(())
     }) }
 }
+/// Writes the bound Flight SQL port, or -1 when the configuration starts no Flight SQL listener.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_flight_sql_port(database: u64, out: *mut i32, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        let port = handles::database(database)?.0.server.addresses().flight_sql.map_or(-1, |address| i32::from(address.port()));
+        *output(out)? = port;
+        Ok(())
+    }) }
+}
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_session_transact(session: u64, operation: u64, request: *const u8, length: usize, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || {

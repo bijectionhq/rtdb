@@ -47,6 +47,16 @@ fn pgwire_port_reports_the_bound_listener_or_its_absence() {
 }
 
 #[test]
+fn flight_sql_port_reports_the_bound_listener_or_its_absence() {
+    let port = |native: &Native| { let mut port = 0; let mut error = 0; ok(unsafe { rtdb_v1_database_flight_sql_port(native.database, &mut port, &mut error) }, error); port };
+    assert_eq!(port(&Native::open()), -1);
+    let listening = Native::open_yaml(b"server: null\nflightSql:\n  port: 0\nnodeId: ffi-flight-port-test\n");
+    let bound = port(&listening);
+    assert!(bound > 0);
+    assert!(std::net::TcpStream::connect(("127.0.0.1", bound as u16)).is_ok());
+}
+
+#[test]
 fn diagnostic_slices_distinguish_absent_empty_and_present_messages_through_retain() {
     for message in [None, Some(String::new()), Some("échec".into())] {
         let original = handles::diagnostic(Anomaly::new_nullable(AnomalyCategory::Fault, "test/error", message.clone()));
