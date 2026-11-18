@@ -1274,3 +1274,318 @@ fn warmed_binary_terminal_denial_keeps_the_ordinary_literal_exit_and_caller_rest
     result.unwrap();
     assert_eq!(memory.used_bytes(), 0);
 }
+
+fn interval_child<'a, 'parse, 'sql>(
+    session: &'a ParserSession<'parse, 'sql, '_, '_>, parent: InvocationKey<'parse>, slot: usize, rule: u16, invoking: u32,
+) -> super::super::RuleContextView<'a, 'parse, 'sql> {
+    let tree = session.invocation_view();
+    let parent_view = tree.context(parent).unwrap();
+    let key = child_rule(&parent_view.children()[slot..=slot]);
+    let child = tree.context(key).unwrap();
+    assert_eq!((child.parent(), child.rule(), child.invoking_state()), (Some(parent), rule, ParserState::State(invoking)));
+    child
+}
+
+#[test]
+fn interval_literals_preserve_raw_strings_fields_signs_and_precision_in_both_profiles() {
+    let ((), memory) = environment(|environment, work, _| {
+        for (source, sign, raw, string_class, qualifier) in [
+            ("INTERVAL 'P1D';", None, "'P1D'", ContextClass::SqlStandardString, None),
+            ("iNtErVaL + e'1' HoUr;", Some("+"), "e'1'", ContextClass::CEscapesString, Some(("HoUr", None, None))),
+            ("INTERVAL - $q$1$q$ MINUTE;", Some("-"), "$q$1$q$", ContextClass::DollarString, Some(("MINUTE", None, None))),
+            ("INTERVAL '1' YEAR;", None, "'1'", ContextClass::SqlStandardString, Some(("YEAR", None, None))),
+            ("INTERVAL '1' MONTH;", None, "'1'", ContextClass::SqlStandardString, Some(("MONTH", None, None))),
+            ("INTERVAL '1' DAY;", None, "'1'", ContextClass::SqlStandardString, Some(("DAY", None, None))),
+            ("INTERVAL '1' YEAR TO MONTH;", None, "'1'", ContextClass::SqlStandardString, Some(("YEAR", Some("MONTH"), None))),
+            ("INTERVAL '1' DAY TO SECOND(3);", None, "'1'", ContextClass::SqlStandardString, Some(("DAY", Some("SECOND"), Some("3")))),
+            ("INTERVAL '1' SECOND;", None, "'1'", ContextClass::SqlStandardString, Some(("SECOND", None, None))),
+            ("INTERVAL '1' SECOND(03);", None, "'1'", ContextClass::SqlStandardString, Some(("SECOND", None, Some("03")))),
+        ] {
+            let string_start = 1 + usize::from(sign.is_some());
+            let field_start = string_start + if string_class == ContextClass::DollarString { 3 } else { 1 };
+            let last = field_start - 1 + qualifier.map_or(0, |(_, end, precision)| {
+                1 + 2 * usize::from(end.is_some()) + 3 * usize::from(precision.is_some())
+            });
+            both_profiles(environment, source, work, |session, root| {
+                let value = expr_value(session, root, last);
+                let literal = interval_child(session, value, 0, LITERAL, 1140);
+                assert_eq!(literal.class(), Some(ContextClass::IntervalLiteral0));
+                assert_eq!(literal.children().len(), 1);
+                let interval = interval_child(session, literal.key(), 0, INTERVAL_LITERAL, 698);
+                assert_eq!(interval.class(), None);
+                for view in [literal, interval] {
+                    let start = view.start().unwrap();
+                    let stop = view.stop().unwrap();
+                    assert_eq!((start.index(), stop.index()), (0, last));
+                    assert_eq!((start.lexeme().span().start.byte, stop.lexeme().span().end.byte), (0, source.len() - 1));
+                }
+                only_terminal(&interval.children()[..1], 0, source.split_whitespace().next().unwrap());
+                if let Some(sign) = sign {
+                    only_terminal(&interval.children()[1..2], 1, sign);
+                }
+                assert_eq!(interval.children().len(), string_start + 1 + usize::from(qualifier.is_some()));
+                let string = interval_child(session, interval.key(), string_start, CHARACTER_STRING, 670);
+                let start = string.start().unwrap();
+                let stop = string.stop().unwrap();
+                assert_eq!((string.class(), start.index(), stop.index()), (Some(string_class), string_start, field_start - 1));
+                assert_eq!(&source[start.lexeme().span().start.byte..stop.lexeme().span().end.byte], raw);
+                if string_class == ContextClass::DollarString {
+                    assert_eq!(string.children().len(), 3);
+                    only_terminal(&string.children()[..1], string_start, "$q$");
+                    let text = interval_child(session, string.key(), 1, DOLLAR_STRING_TEXT, 719);
+                    only_terminal(text.children(), string_start + 1, "1");
+                    only_terminal(&string.children()[2..], string_start + 2, "$q$");
+                } else {
+                    only_terminal(string.children(), string_start, raw);
+                }
+                if let Some((first, end, precision)) = qualifier {
+                    let q = interval_child(session, interval.key(), string_start + 1, INTERVAL_QUALIFIER, 671);
+                    assert_eq!((q.start().unwrap().index(), q.stop().unwrap().index()), (field_start, last));
+                    let (field, word, index) = if let Some(end) = end {
+                        assert_eq!((q.class(), q.children().len()), (Some(ContextClass::MultiFieldInterval), 3));
+                        let start = interval_child(session, q.key(), 0, NON_SECOND_DATETIME_FIELD, 725);
+                        assert_eq!(start.class(), None);
+                        only_terminal(start.children(), field_start, first);
+                        only_terminal(&q.children()[1..2], field_start + 1, "TO");
+                        (interval_child(session, q.key(), 2, SINGLE_DATETIME_FIELD, 727), end, field_start + 2)
+                    } else {
+                        assert_eq!((q.class(), q.children().len()), (Some(ContextClass::SingleFieldInterval), 1));
+                        (interval_child(session, q.key(), 0, SINGLE_DATETIME_FIELD, 729), first, field_start)
+                    };
+                    assert_eq!((field.class(), field.start().unwrap().index(), field.stop().unwrap().index()), (None, index, last));
+                    if let Some(digits) = precision {
+                        assert_eq!(field.children().len(), 4);
+                        only_terminal(&field.children()[..1], index, word);
+                        only_terminal(&field.children()[1..2], index + 1, "(");
+                        let precision = interval_child(session, field.key(), 2, INTERVAL_PRECISION, 739);
+                        assert_eq!(precision.class(), None);
+                        assert_eq!((precision.start().unwrap().index(), precision.stop().unwrap().index()), (index + 2, index + 2));
+                        only_terminal(precision.children(), index + 2, digits);
+                        only_terminal(&field.children()[3..], index + 3, ")");
+                    } else if word == "SECOND" {
+                        only_terminal(field.children(), index, word);
+                    } else {
+                        assert_eq!(field.children().len(), 1);
+                        let unit = interval_child(session, field.key(), 0, NON_SECOND_DATETIME_FIELD, 736);
+                        assert_eq!(unit.class(), None);
+                        only_terminal(unit.children(), index, word);
+                    }
+                }
+                assert_eq!(session.buffered_token(last + 1).unwrap().lexeme().raw(), ";");
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn interval_sign_and_string_recovery_use_the_reached_rule_and_required_probe() {
+    for (source, index, ll_state, expected) in [
+        ("INTERVAL ) 'P1D'", 1, None, "extraneous input ')' expecting {CHARACTER_STRING, C_ESCAPES_STRING, '+', '-', DOLLAR_TAG}"),
+        ("INTERVAL + )", 2, Some(ParserState::State(723)), "mismatched input ')' expecting {CHARACTER_STRING, C_ESCAPES_STRING, DOLLAR_TAG}"),
+    ] {
+        let (result, memory) = environment(|environment, work, _| {
+            let mut modes = Vec::new();
+            let result = with_bail_fallback(environment, source, work, |session, mode| {
+                modes.push(mode);
+                let root = InvocationKey::at(session.records.len() + 1);
+                let action = session.scalar_literal(mode);
+                let tree = session.invocation_view();
+                let literal = tree.context(root).unwrap();
+                assert_eq!(literal.class(), Some(ContextClass::IntervalLiteral0));
+                let interval = interval_child(session, root, 0, INTERVAL_LITERAL, 698);
+                assert_eq!(interval.class(), None);
+                only_terminal(&interval.children()[..1], 0, "INTERVAL");
+                if index == 2 {
+                    only_terminal(&interval.children()[1..2], 1, "+");
+                }
+                assert_eq!((literal.stop().unwrap().index(), interval.stop().unwrap().index()), (index - 1, index - 1));
+                if mode == PredictionMode::Sll || ll_state.is_some() {
+                    assert_eq!(interval.children().len(), index + 1);
+                    let string = interval_child(session, interval.key(), index, CHARACTER_STRING, 670);
+                    assert_eq!((string.class(), string.start().unwrap().index(), string.stop().unwrap().index()), (None, index, index - 1));
+                    assert!(string.children().is_empty());
+                    if mode == PredictionMode::Sll {
+                        assert!(matches!(action, Err(PassError::Cancelled(_))));
+                        let cause = tree.exception(string.key()).unwrap();
+                        assert!(matches!(cause, InvocationCause::NoViableAlternative(cause)
+                            if cause.state == ParserState::State(723) && cause.start.index() == index && cause.offending.index() == index));
+                        assert!(std::ptr::eq(cause, tree.exception(interval.key()).unwrap()));
+                        assert!(std::ptr::eq(cause, tree.exception(root).unwrap()));
+                    } else {
+                        assert!(matches!(tree.exception(string.key()), Some(InvocationCause::InputMismatch(cause))
+                            if cause.state == ParserState::State(723) && cause.offending.index() == index));
+                    }
+                } else {
+                    assert_eq!(interval.children().len(), 1);
+                    assert!(tree.exception(interval.key()).is_none());
+                }
+                if mode == PredictionMode::Sll {
+                    assert!(session.buffered_token(index + 1).is_none());
+                } else {
+                    let next = if index == 1 { Kind::CharacterString } else { Kind::Eof };
+                    assert_eq!(session.buffered_token(index + 1).unwrap().lexeme().kind(), next);
+                    assert!(session.buffered_token(index + 2).is_none());
+                    assert!(tree.exception(root).is_none());
+                }
+                assert_eq!((session.current(), session.state(), session.input_index(), session.matched_eof),
+                    (None, ParserState::RootSentinel, Some(index), false));
+                action.map(|_| ())
+            });
+            assert_eq!(modes, [PredictionMode::Sll, PredictionMode::Ll]);
+            result
+        });
+        let Err(RuntimeError::ReportedTokenSyntax(report)) = result else { panic!("generated interval lexical diagnostic"); };
+        assert_eq!(report.cause().map(|cause| cause.state), ll_state);
+        assert_eq!((report.offending().index(), report.offending().lexeme().raw()), (index, ")"));
+        assert_eq!(report.anomaly().code, "xtdb/sql-error");
+        assert!(report.anomaly().message.as_deref().unwrap().ends_with(expected));
+        drop(report);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn actual_rule18_precision_atom_keeps_inline_mismatch_and_deletion_boundaries() {
+    for (source, raw, next, ll_state, expected) in [
+        (")", ")", Kind::Eof, Some(ParserState::State(732)), "mismatched input ')' expecting UNSIGNED_INTEGER"),
+        ("-1", "-", Kind::Integer, None, "extraneous input '-' expecting UNSIGNED_INTEGER"),
+    ] {
+        let (result, memory) = environment(|environment, work, _| {
+            let mut modes = Vec::new();
+            let result = with_bail_fallback(environment, source, work, |session, mode| {
+                modes.push(mode);
+                let root = InvocationKey::at(session.records.len());
+                let action = session.interval_fractional_seconds_precision();
+                let tree = session.invocation_view();
+                let field = tree.context(root).unwrap();
+                assert_eq!((field.rule(), field.class(), field.parent(), field.invoking_state()),
+                    (INTERVAL_PRECISION, None, None, ParserState::RootSentinel));
+                assert_eq!((field.start().unwrap().index(), field.start().unwrap().lexeme().raw()), (0, raw));
+                assert!(field.children().is_empty() && field.stop().is_none());
+                if mode == PredictionMode::Sll || ll_state.is_some() {
+                    assert!(matches!(tree.exception(root), Some(InvocationCause::InputMismatch(cause))
+                        if cause.state == ParserState::State(732) && cause.offending.index() == 0));
+                } else {
+                    assert!(tree.exception(root).is_none());
+                }
+                if mode == PredictionMode::Sll {
+                    assert!(matches!(action, Err(PassError::Cancelled(_))));
+                    assert!(session.buffered_token(1).is_none());
+                } else {
+                    assert_eq!(session.buffered_token(1).unwrap().lexeme().kind(), next);
+                    assert!(session.buffered_token(2).is_none());
+                }
+                assert_eq!((session.current(), session.state(), session.input_index(), session.matched_eof),
+                    (None, ParserState::RootSentinel, Some(0), false));
+                action.map(|_| ())
+            });
+            assert_eq!(modes, [PredictionMode::Sll, PredictionMode::Ll]);
+            result
+        });
+        let Err(RuntimeError::ReportedTokenSyntax(report)) = result else { panic!("generated precision diagnostic"); };
+        assert_eq!(report.cause().map(|cause| cause.state), ll_state);
+        assert_eq!((report.offending().index(), report.offending().lexeme().raw()), (0, raw));
+        assert_eq!(report.anomaly().code, "xtdb/sql-error");
+        assert!(report.anomaly().message.as_deref().unwrap().ends_with(expected));
+        drop(report);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn warmed_interval_attachments_restore_only_the_reached_ordinary_caller_paths() {
+    type Failed = (usize, u16, u32, usize, Option<usize>);
+    type Exited = (usize, u16, u32, Option<ContextClass>);
+    let cases: [(&str, [usize; 3], Failed, &[Exited]); 11] = [
+        ("INTERVAL 'P1D';", [1, 0, 0], (6, INTERVAL_LITERAL, 698, 0, None),
+            &[]),
+        ("INTERVAL 'P1D';", [3, 0, 0], (7, CHARACTER_STRING, 670, 1, Some(0)),
+            &[(6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL $q$1$q$;", [4, 1, 0], (9, DOLLAR_STRING_TEXT, 719, 2, Some(1)),
+            &[(8, CHARACTER_STRING, 670, Some(ContextClass::DollarString)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' HOUR;", [4, 1, 0], (9, INTERVAL_QUALIFIER, 671, 2, Some(1)),
+            &[(6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' DAY TO SECOND(3);", [4, 1, 1], (11, NON_SECOND_DATETIME_FIELD, 725, 2, Some(1)),
+            &[(10, INTERVAL_QUALIFIER, 671, Some(ContextClass::MultiFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' DAY TO SECOND(3);", [6, 2, 1], (12, SINGLE_DATETIME_FIELD, 727, 4, Some(3)),
+            &[(10, INTERVAL_QUALIFIER, 671, Some(ContextClass::MultiFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' HOUR;", [4, 1, 1], (11, SINGLE_DATETIME_FIELD, 729, 2, Some(1)),
+            &[(10, INTERVAL_QUALIFIER, 671, Some(ContextClass::SingleFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' HOUR;", [5, 1, 1], (12, NON_SECOND_DATETIME_FIELD, 736, 2, Some(1)),
+            &[(11, SINGLE_DATETIME_FIELD, 729, None), (10, INTERVAL_QUALIFIER, 671, Some(ContextClass::SingleFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' YEAR TO MONTH;", [6, 2, 2], (13, NON_SECOND_DATETIME_FIELD, 736, 4, Some(3)),
+            &[(12, SINGLE_DATETIME_FIELD, 727, None), (10, INTERVAL_QUALIFIER, 671, Some(ContextClass::MultiFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' SECOND(3);", [6, 2, 1], (12, INTERVAL_PRECISION, 739, 4, Some(3)),
+            &[(11, SINGLE_DATETIME_FIELD, 729, None), (10, INTERVAL_QUALIFIER, 671, Some(ContextClass::SingleFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+        ("INTERVAL '1' DAY TO SECOND(3);", [7, 3, 2], (13, INTERVAL_PRECISION, 739, 6, Some(5)),
+            &[(12, SINGLE_DATETIME_FIELD, 727, None), (10, INTERVAL_QUALIFIER, 671, Some(ContextClass::MultiFieldInterval)), (6, INTERVAL_LITERAL, 698, None)]),
+    ];
+    for (source, slots, (ordinal, rule, invoking, start, stop), ancestors) in cases {
+        let (result, memory) = environment(|environment, work, memory| {
+            let baseline = work.memory_budget().used_bytes();
+            {
+                let parse_work = AllocationScope::new(memory).unwrap();
+                with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                    assert_eq!(mode, PredictionMode::Sll);
+                    session.numeric_expression().map(|_| ())
+                })?;
+            }
+            assert_eq!(memory.used_bytes(), baseline);
+            let arena = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+            let single = Layout::array::<ContextChild<'_, '_>>(1).unwrap().size() + 256;
+            let pair = Layout::array::<ContextChild<'_, '_>>(2).unwrap().size() + 256;
+            let four = Layout::array::<ContextChild<'_, '_>>(4).unwrap().size() + 256;
+            let capacity = arena + slots[0] * single + slots[1] * pair + slots[2] * four;
+            {
+                let parse_work = AllocationScope::new(memory).unwrap();
+                with_parser_session(environment, source, &parse_work, |session| {
+                    session.profile = ParserProfile::SllBail;
+                    let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - capacity).unwrap();
+                    let action = session.numeric_expression();
+                    let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                        else { panic!("interval child attachment denial"); };
+                    assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                    let request = format!("Cannot reserve {single} bytes from budget ");
+                    assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
+                    assert_eq!(session.records.len(), ordinal + 1);
+                    assert!(matches!(session.records[ordinal].role, InvocationRole::OrdinaryTreeAttachmentFailed));
+                    for entry in [0, 2] {
+                        assert!(matches!(session.records[entry].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                    }
+
+                    let tree = session.invocation_view();
+                    let expr = tree.context(InvocationKey::at(1)).unwrap();
+                    let literal = tree.context(InvocationKey::at(5)).unwrap();
+                    assert_eq!((literal.class(), literal.parent(), literal.invoking_state()),
+                        (Some(ContextClass::IntervalLiteral0), Some(expr.key()), ParserState::State(1140)));
+                    assert_eq!((literal.start().unwrap().index(), literal.stop().map(|token| token.index())), (0, stop));
+                    let failed = tree.context(InvocationKey::at(ordinal)).unwrap();
+                    assert_eq!((failed.rule(), failed.class(), failed.invoking_state()), (rule, None, ParserState::State(invoking)));
+                    assert_eq!((failed.start().unwrap().index(), failed.stop().map(|token| token.index())), (start, stop));
+                    assert!(expr.children().is_empty() && failed.children().is_empty());
+                    let mut parent = failed.parent();
+                    for &(key, rule, state, class) in ancestors {
+                        assert_eq!(parent, Some(InvocationKey::at(key)));
+                        assert!(matches!(session.records[key].role, InvocationRole::Ordinary));
+                        let record = tree.context(InvocationKey::at(key)).unwrap();
+                        assert_eq!((record.rule(), record.class(), record.invoking_state()), (rule, class, ParserState::State(state)));
+                        assert!(record.start().is_some());
+                        assert_eq!(record.stop().map(|token| token.index()), stop);
+                        parent = record.parent();
+                    }
+                    assert_eq!(parent, Some(literal.key()));
+                    assert_eq!((session.current(), session.state(), session.input_index(), session.precedence()),
+                        (None, ParserState::State(698), Some(start), 0));
+                    assert!(!session.matched_eof);
+                    drop(held);
+                    Ok(())
+                })?;
+            }
+            assert_eq!(memory.used_bytes(), baseline);
+            Ok::<(), RuntimeError<'_>>(())
+        });
+        result.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}

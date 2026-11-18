@@ -158,6 +158,7 @@ pub(super) enum ContextClass {
     IntegerLiteral0, FloatLiteral, BooleanLiteral, NullLiteral, CharacterStringLiteral, SqlStandardString, CEscapesString, DollarString,
     TimeLiteral, DurationLiteral, UuidLiteral, UriLiteral, KeywordLiteral,
     BinaryStringLiteral, DateTimeLiteral0, DateLiteral, TimestampLiteral, WithTimeZone, WithoutTimeZone,
+    IntervalLiteral0, MultiFieldInterval, SingleFieldInterval,
     CommonValueExpr0, LiteralExpr, NumericFactorExpr, NumericTermExpr,
 }
 impl ContextClass {
@@ -170,8 +171,9 @@ impl ContextClass {
             Self::DateLiteral | Self::TimestampLiteral => 12,
             Self::IntegerLiteral0 | Self::FloatLiteral | Self::BooleanLiteral | Self::NullLiteral | Self::CharacterStringLiteral
             | Self::TimeLiteral | Self::DurationLiteral | Self::UuidLiteral | Self::UriLiteral | Self::KeywordLiteral
-            | Self::BinaryStringLiteral | Self::DateTimeLiteral0 => 14,
+            | Self::BinaryStringLiteral | Self::DateTimeLiteral0 | Self::IntervalLiteral0 => 14,
             Self::SqlStandardString | Self::CEscapesString | Self::DollarString => 16,
+            Self::MultiFieldInterval | Self::SingleFieldInterval => 17,
             Self::WithTimeZone | Self::WithoutTimeZone => 30,
             Self::CommonValueExpr0 => 33,
             Self::LiteralExpr | Self::NumericFactorExpr | Self::NumericTermExpr => 34,

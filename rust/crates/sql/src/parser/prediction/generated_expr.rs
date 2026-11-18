@@ -9,11 +9,16 @@ use super::super::{Alternative, PredictionMode};
 #[path = "generated_expr_tests.rs"]
 mod tests;
 
+const INTERVAL_LITERAL: u16 = 11;
 const DATE_TIME_LITERAL: u16 = 12;
 const INTEGER_LITERAL: u16 = 13;
 const LITERAL: u16 = 14;
 const DOLLAR_STRING_TEXT: u16 = 15;
 const CHARACTER_STRING: u16 = 16;
+const INTERVAL_QUALIFIER: u16 = 17;
+const INTERVAL_PRECISION: u16 = 18;
+const NON_SECOND_DATETIME_FIELD: u16 = 19;
+const SINGLE_DATETIME_FIELD: u16 = 20;
 const TIME_ZONE: u16 = 30;
 const EXPR: u16 = 33;
 const COMMON_VALUE: u16 = 34;
@@ -34,6 +39,11 @@ const VALUE_BACKEDGE: PredictionAction = PredictionAction {
 };
 const VALUE_TAIL: PredictionAction = prediction(COMMON_VALUE, 1659, 152, 7, SyncShape::RequiredStarBlock);
 const LITERAL_BASE: PredictionAction = prediction(LITERAL, 709, 55, 13, SyncShape::RequiredBlock);
+const INTERVAL_HAS_QUALIFIER: PredictionAction = prediction(INTERVAL_LITERAL, 672, 50, 2, SyncShape::NullableBlock);
+const INTERVAL_QUALIFIER_BASE: PredictionAction = prediction(INTERVAL_QUALIFIER, 730, 59, 2, SyncShape::RequiredBlock);
+const INTERVAL_HAS_PRECISION: PredictionAction = prediction(SINGLE_DATETIME_FIELD, 742, 60, 2, SyncShape::NullableBlock);
+const INTERVAL_OPTIONAL_SIGN: SyncAction = SyncAction { state: 668, rule: INTERVAL_LITERAL, shape: SyncShape::RequiredBlock };
+const INTERVAL_FIELD_BASE: SyncAction = SyncAction { state: 744, rule: SINGLE_DATETIME_FIELD, shape: SyncShape::RequiredBlock };
 const FLOAT_SIGN: SyncAction = SyncAction { state: 689, rule: LITERAL, shape: SyncShape::RequiredBlock };
 const INTEGER_SIGN: SyncAction = SyncAction { state: 684, rule: INTEGER_LITERAL, shape: SyncShape::RequiredBlock };
 const CHARACTER_STRING_BASE: SyncAction = SyncAction { state: 723, rule: CHARACTER_STRING, shape: SyncShape::RequiredBlock };
@@ -68,6 +78,30 @@ const TIMESTAMP_ZONE: CallAction = CallAction {
 const TIMESTAMP_STRING: CallAction = CallAction {
     state: 680, rule: DATE_TIME_LITERAL, called: CHARACTER_STRING, start: 32, follow: 682, precedence: 0,
 };
+const LITERAL_INTERVAL: CallAction = CallAction {
+    state: 698, rule: LITERAL, called: INTERVAL_LITERAL, start: 22, follow: 710, precedence: 0,
+};
+const INTERVAL_STRING: CallAction = CallAction {
+    state: 670, rule: INTERVAL_LITERAL, called: CHARACTER_STRING, start: 32, follow: 672, precedence: 0,
+};
+const INTERVAL_QUALIFIER_CALL: CallAction = CallAction {
+    state: 671, rule: INTERVAL_LITERAL, called: INTERVAL_QUALIFIER, start: 34, follow: 673, precedence: 0,
+};
+const INTERVAL_START_FIELD: CallAction = CallAction {
+    state: 725, rule: INTERVAL_QUALIFIER, called: NON_SECOND_DATETIME_FIELD, start: 38, follow: 726, precedence: 0,
+};
+const INTERVAL_END_FIELD: CallAction = CallAction {
+    state: 727, rule: INTERVAL_QUALIFIER, called: SINGLE_DATETIME_FIELD, start: 40, follow: 728, precedence: 0,
+};
+const INTERVAL_SINGLE_FIELD: CallAction = CallAction {
+    state: 729, rule: INTERVAL_QUALIFIER, called: SINGLE_DATETIME_FIELD, start: 40, follow: 731, precedence: 0,
+};
+const INTERVAL_NON_SECOND_FIELD: CallAction = CallAction {
+    state: 736, rule: SINGLE_DATETIME_FIELD, called: NON_SECOND_DATETIME_FIELD, start: 38, follow: 745, precedence: 0,
+};
+const INTERVAL_PRECISION_CALL: CallAction = CallAction {
+    state: 739, rule: SINGLE_DATETIME_FIELD, called: INTERVAL_PRECISION, start: 36, follow: 740, precedence: 0,
+};
 const DOLLAR_TEXT: CallAction = CallAction {
     state: 719, rule: CHARACTER_STRING, called: DOLLAR_STRING_TEXT, start: 30, follow: 721, precedence: 0,
 };
@@ -97,6 +131,17 @@ const TERM_PREDICATE: PredicateAction = PredicateAction { state: 1642, rule: COM
 const fn literal_atom(rule: u16, state: u32, token: i32, target: u32) -> TerminalAction {
     TerminalAction { state, rule, target, tokens: TokenAction::Atom(token) }
 }
+
+const MATCH_INTERVAL: TerminalAction = literal_atom(INTERVAL_LITERAL, 666, 174, 668);
+const MATCH_INTERVAL_SIGN: TerminalAction = TerminalAction { state: 667, rule: INTERVAL_LITERAL, target: 669, tokens: TokenAction::Set(SIGN_TOKENS) };
+const MATCH_INTERVAL_TO: TerminalAction = literal_atom(INTERVAL_QUALIFIER, 726, 321, 727);
+const MATCH_INTERVAL_PRECISION: TerminalAction = literal_atom(INTERVAL_PRECISION, 732, 5, 733);
+const MATCH_INTERVAL_NON_SECOND_FIELD: TerminalAction = TerminalAction {
+    state: 734, rule: NON_SECOND_DATETIME_FIELD, target: 735, tokens: TokenAction::Set(&[109, 162, 206, 207, 362]),
+};
+const MATCH_INTERVAL_SECOND: TerminalAction = literal_atom(SINGLE_DATETIME_FIELD, 737, 286, 742);
+const MATCH_PRECISION_OPEN: TerminalAction = literal_atom(SINGLE_DATETIME_FIELD, 738, 15, 739);
+const MATCH_PRECISION_CLOSE: TerminalAction = literal_atom(SINGLE_DATETIME_FIELD, 740, 16, 741);
 
 const MATCH_BINARY_STRING: TerminalAction = literal_atom(LITERAL, 694, 8, 710);
 const MATCH_DATE: TerminalAction = literal_atom(DATE_TIME_LITERAL, 674, 106, 675);
@@ -239,6 +284,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 3 => (ContextClass::CharacterStringLiteral, None),
                 4 => (ContextClass::BinaryStringLiteral, None),
                 5 => (ContextClass::DateTimeLiteral0, None),
+                7 => (ContextClass::IntervalLiteral0, None),
                 12 => (ContextClass::BooleanLiteral, None),
                 13 => (ContextClass::NullLiteral, None),
                 alternative => {
@@ -271,6 +317,10 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 ContextClass::DateTimeLiteral0 => {
                     session.generated_call(LITERAL_DATE_TIME)?;
                     session.date_time_literal().map(|_| ())
+                }
+                ContextClass::IntervalLiteral0 => {
+                    session.generated_call(LITERAL_INTERVAL)?;
+                    session.interval_literal(mode).map(|_| ())
                 }
                 ContextClass::BooleanLiteral => session.match_tree_action(*local, MATCH_BOOLEAN),
                 ContextClass::NullLiteral => session.match_tree_action(*local, MATCH_NULL),
@@ -318,6 +368,75 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 318 => session.match_tree_action(*local, actions.timezone),
                 _ => session.generated_no_viable().map_err(PassError::from),
             }
+        })
+    }
+
+    fn interval_literal(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(INTERVAL_LITERAL, |session, local| {
+            session.match_tree_action(*local, MATCH_INTERVAL)?;
+            if matches!(session.lookahead_action(INTERVAL_OPTIONAL_SIGN)?.number(), 24 | 27) {
+                session.match_tree_action(*local, MATCH_INTERVAL_SIGN)?;
+            }
+            session.generated_call(INTERVAL_STRING)?;
+            session.character_string()?;
+            if session.predict_numeric(INTERVAL_HAS_QUALIFIER, mode)?.number() == 1 {
+                session.generated_call(INTERVAL_QUALIFIER_CALL)?;
+                session.interval_qualifier(mode)?;
+            }
+            Ok(())
+        })
+    }
+
+    fn interval_qualifier(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(INTERVAL_QUALIFIER, |session, local| {
+            let (class, field) = match session.predict_numeric(INTERVAL_QUALIFIER_BASE, mode)?.number() {
+                1 => (ContextClass::MultiFieldInterval, INTERVAL_END_FIELD),
+                2 => (ContextClass::SingleFieldInterval, INTERVAL_SINGLE_FIELD),
+                _ => return session.decline_numeric_site(),
+            };
+            *local = session.labelled_context(*local, class)?;
+            session.enter_outer_alt(*local)?;
+            if class == ContextClass::MultiFieldInterval {
+                session.generated_call(INTERVAL_START_FIELD)?;
+                session.non_second_primary_datetime_field()?;
+                session.match_tree_action(*local, MATCH_INTERVAL_TO)?;
+            }
+            session.generated_call(field)?;
+            session.single_datetime_field(mode).map(|_| ())
+        })
+    }
+
+    fn single_datetime_field(&mut self, mode: PredictionMode) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(SINGLE_DATETIME_FIELD, |session, local| {
+            match session.lookahead_action(INTERVAL_FIELD_BASE)?.number() {
+                109 | 162 | 206 | 207 | 362 => {
+                    session.generated_call(INTERVAL_NON_SECOND_FIELD)?;
+                    session.non_second_primary_datetime_field().map(|_| ())
+                }
+                286 => {
+                    session.match_tree_action(*local, MATCH_INTERVAL_SECOND)?;
+                    if session.predict_numeric(INTERVAL_HAS_PRECISION, mode)?.number() == 1 {
+                        session.match_tree_action(*local, MATCH_PRECISION_OPEN)?;
+                        session.generated_call(INTERVAL_PRECISION_CALL)?;
+                        session.interval_fractional_seconds_precision()?;
+                        session.match_tree_action(*local, MATCH_PRECISION_CLOSE)?;
+                    }
+                    Ok(())
+                }
+                _ => session.generated_no_viable().map_err(PassError::from),
+            }
+        })
+    }
+
+    fn non_second_primary_datetime_field(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(NON_SECOND_DATETIME_FIELD, |session, local| {
+            session.match_tree_action(*local, MATCH_INTERVAL_NON_SECOND_FIELD)
+        })
+    }
+
+    fn interval_fractional_seconds_precision(&mut self) -> PassResult<'parse, 'sql, InvocationKey<'parse>> {
+        self.generated_ordinary(INTERVAL_PRECISION, |session, local| {
+            session.match_tree_action(*local, MATCH_INTERVAL_PRECISION)
         })
     }
 
@@ -456,6 +575,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
             (Some(ContextClass::IntegerLiteral0), InvocationRole::Ordinary, ParserState::State(692)) => LITERAL_INTEGER,
             (Some(ContextClass::CharacterStringLiteral), InvocationRole::Ordinary, ParserState::State(693)) => LITERAL_CHARACTER_STRING,
             (Some(ContextClass::DateTimeLiteral0), InvocationRole::Ordinary, ParserState::State(695)) => LITERAL_DATE_TIME,
+            (Some(ContextClass::IntervalLiteral0), InvocationRole::Ordinary, ParserState::State(698)) => LITERAL_INTERVAL,
             (Some(class), InvocationRole::Ordinary, ParserState::State(state)) => {
                 let Some(literal) = PREFIXED_STRINGS.into_iter().find(|literal| literal.class == class && literal.string.state == state) else {
                     return Ok(false);
@@ -474,6 +594,9 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         if call.called == DATE_TIME_LITERAL {
             return self.is_failed_date_time_child(current, child);
         }
+        if call.called == INTERVAL_LITERAL {
+            return self.is_failed_interval_child(current, child);
+        }
         if call.called != CHARACTER_STRING || child.rule != DOLLAR_STRING_TEXT
             || child.invoking != ParserState::State(DOLLAR_TEXT.state) || child.stop.is_none()
         {
@@ -484,6 +607,60 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         Ok(string.rule == CHARACTER_STRING && string.class == Some(ContextClass::DollarString)
             && string.invoking == ParserState::State(call.state) && string.parent == Some(current)
             && string.start.is_some() && string.stop.is_some() && matches!(string.role, InvocationRole::Ordinary))
+    }
+
+    fn is_failed_interval_child(
+        &self, literal: InvocationKey<'parse>, child: &InvocationRecord<'parse, 'sql>,
+    ) -> RuntimeResult<'sql, bool> {
+        let Some(parent) = child.parent else { return Ok(false); };
+        if child.class.is_some() || child.stop.is_none() {
+            return Ok(false);
+        }
+        let invoked = |record: &InvocationRecord<'parse, 'sql>, call: CallAction| {
+            record.rule == call.called && record.invoking == ParserState::State(call.state)
+        };
+        let exited = |record: &InvocationRecord<'parse, 'sql>, call, class| {
+            invoked(record, call) && record.class == class && matches!(record.role, InvocationRole::Ordinary)
+                && record.start.is_some() && record.stop.is_some()
+        };
+
+        let interval = if invoked(child, INTERVAL_STRING) || invoked(child, INTERVAL_QUALIFIER_CALL) {
+            parent
+        } else if invoked(child, DOLLAR_TEXT) {
+            let string = self.record(parent)?;
+            if !exited(string, INTERVAL_STRING, Some(ContextClass::DollarString)) {
+                return Ok(false);
+            }
+            let Some(interval) = string.parent else { return Ok(false); };
+            interval
+        } else {
+            let (qualifier, class) = if invoked(child, INTERVAL_START_FIELD) || invoked(child, INTERVAL_END_FIELD) {
+                (parent, ContextClass::MultiFieldInterval)
+            } else if invoked(child, INTERVAL_SINGLE_FIELD) {
+                (parent, ContextClass::SingleFieldInterval)
+            } else if invoked(child, INTERVAL_NON_SECOND_FIELD) || invoked(child, INTERVAL_PRECISION_CALL) {
+                let field = self.record(parent)?;
+                let class = if exited(field, INTERVAL_END_FIELD, None) {
+                    ContextClass::MultiFieldInterval
+                } else if exited(field, INTERVAL_SINGLE_FIELD, None) {
+                    ContextClass::SingleFieldInterval
+                } else {
+                    return Ok(false);
+                };
+                let Some(qualifier) = field.parent else { return Ok(false); };
+                (qualifier, class)
+            } else {
+                return Ok(false);
+            };
+            let qualifier = self.record(qualifier)?;
+            if !exited(qualifier, INTERVAL_QUALIFIER_CALL, Some(class)) {
+                return Ok(false);
+            }
+            let Some(interval) = qualifier.parent else { return Ok(false); };
+            interval
+        };
+        let interval = self.record(interval)?;
+        Ok(exited(interval, LITERAL_INTERVAL, None) && interval.parent == Some(literal))
     }
 
     fn is_failed_date_time_child(

@@ -417,6 +417,15 @@
     "scope": "Private raw binary literal trees through the expression, direct statement and multi-statement roots in both profiles.",
     "qualification": "Static source and ATN inspection. Execution remains pending."
   },
+  "interval_literal_trees": {
+    "predecessor": "c23c4698b331b3d6461bfc11c27ca44c6fa8c32f",
+    "source_plan_sha256": "a934eb09340e12776e5b8e2890b77b0618587edb6eab728fcf0215e64bf39ae5",
+    "source_geometry_sha256": "4283da9cd316e3cbbf390b0c7d279b0edcf79526eb78e0a810e586181bbaec45",
+    "generated": "Rule 14 decision 55 alternative 7 calls rule 11 at 698. The string and optional qualifier enter at 670 and 671. Rule 17 keeps both labelled routes into the fields and optional precision.",
+    "cleanup": "The failed ordinary leaf links through its exact exited interval, string, qualifier or field callers. The selected qualifier label authenticates its field call.",
+    "scope": "Private raw interval literal and qualifier trees through expression and both statement roots in both profiles.",
+    "qualification": "Static source and ATN inspection. Execution remains pending."
+  },
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
     "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",

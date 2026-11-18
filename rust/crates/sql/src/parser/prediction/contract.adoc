@@ -897,6 +897,12 @@ Decision 55's DATE and TIMESTAMP branch retains an ordinary DateTimeLiteral0 par
 DATE matches its prefix at 674 and enters characterString at 675.
 TIMESTAMP matches its prefix at 676, checks for WITH or WITHOUT at 678 and enters characterString at 680.
 A zone child at 677 preserves its WITH or WITHOUT label and selects TIME ZONE or TIMEZONE at 970 or 976, respectively.
+Decision 55 alternative 7 selects IntervalLiteral0 and calls the ordinary intervalLiteral at 698.
+Rule 11 matches INTERVAL at 666, checks the optional sign at required sync 668 and invokes characterString at 670.
+Nullable decision 50 selects the qualifier call at 671.
+Decision 59 labels the qualifier as MultiFieldInterval or SingleFieldInterval and keeps the distinct singleDatetimeField calls at 727 or 729.
+The multi-field branch keeps the non-second start field at 725 and TO at 726.
+The SECOND branch selects its optional parentheses at nullable decision 60 and retains the unsigned precision child at 739.
 The characterString child synchronizes at 723 and switches on its own current token.
 The standard and C-escaped branches install distinct primary labels and match their atoms at 716 and 717.
 The dollar branch installs its primary label and matches the opening token at 718.
@@ -913,6 +919,11 @@ For a prefixed literal the same check binds the exited characterString context t
 Common-value unroll recognizes a failed dateTimeLiteral attachment at call 695.
 For an attachment denied inside that rule the check binds the failed child through the exited dateTimeLiteral context.
 For a failed dollar text attachment the check also binds the exited characterString context to its DATE or TIMESTAMP call.
+
+The Common Value unroll recognizes a failed intervalLiteral attachment at call 698.
+A failed attachment inside that rule follows its original calls through the exited intervalLiteral context.
+A failed field or precision attachment also binds the selected qualifier label and its actual field call.
+Interval field interpretation, precision defaults and sign evaluation belong to the interval visitor.
 
 Quote transformations, C escape interpretation and dollar-text assembly belong to the separate string visitor.
 The scalar expression and SELECT trees retain the raw token spellings and source spans.
