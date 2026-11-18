@@ -6,9 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_types::Timestamp;
-use super::{AppendReceipt, Log, LogOffset, LogRecord, LogTail};
-use super::local::{corrupt, inspect_record, read_record};
-use crate::{Error, Result};
+use super::{AppendReceipt, Log, LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead};
+use super::local::{corrupt, inspect_record, inspect_record_body, read_record, read_record_body, read_record_header_at};
+use crate::{Error, IoRegion, Result, object_store::ReadReservation};
 
 #[derive(Clone, Debug)]
 pub struct ReadOnlyLocalLogOptions {
@@ -25,16 +25,33 @@ impl Default for ReadOnlyLocalLogOptions {
     }
 }
 
-pub struct ReadOnlyLocalLog { path: Arc<PathBuf>, options: ReadOnlyLocalLogOptions }
+pub struct ReadOnlyLocalLog {
+    path: Arc<PathBuf>,
+    options: ReadOnlyLocalLogOptions,
+    reads: Option<Arc<IoRegion>>,
+}
 
 impl ReadOnlyLocalLog {
     /// Opens the caller-selected LOG or REPLICA_LOG path without creating it or taking a writer lock.
     /// The external writer must preserve the append-only file and its record framing.
     pub fn open(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions) -> Result<Arc<Self>> {
+        Self::open_with_reads(path.as_ref(), options, None)
+    }
+
+    /// Opens the external append-only log as in [`Self::open`] and enables reserved replay.
+    /// Opening and tip lookup use synchronous I/O. Replay readiness and delivery run in the caller's region.
+    /// A closed region rejects opening and new replay reads.
+    /// The caller stops its consumers and closes and drains the region before shutting down the runtime.
+    pub fn open_in(path: impl AsRef<Path>, options: ReadOnlyLocalLogOptions, reads: Arc<IoRegion>) -> Result<Arc<Self>> {
+        let _operation = reads.admit()?;
+        Self::open_with_reads(path.as_ref(), options, Some(reads))
+    }
+
+    fn open_with_reads(path: &Path, options: ReadOnlyLocalLogOptions, reads: Option<Arc<IoRegion>>) -> Result<Arc<Self>> {
         if options.maximum_message_bytes > i32::MAX as usize || options.poll_interval.is_zero() || options.maximum_poll_records == 0 || options.maximum_poll_bytes < options.maximum_message_bytes {
             return Err(Error::Task("read-only log requires a positive polling interval and record limit, an i32 message limit, and room for a maximum-size message".into()));
         }
-        let log = Arc::new(Self { path: Arc::new(path.as_ref().to_path_buf()), options });
+        let log = Arc::new(Self { path: Arc::new(path.to_path_buf()), options, reads });
         log.latest()?;
         Ok(log)
     }
@@ -50,17 +67,31 @@ fn open_existing(path: &Path) -> Result<Option<File>> {
 
 fn latest_in_file(file: &mut File, path: &Path, maximum: usize) -> Result<(LogOffset, u64)> {
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
-    if length == 0 { return Ok((LogOffset(-1), 0)); }
+    Ok((latest_at_length(file, path, maximum, length, TipInspection::CurrentFile)?, length))
+}
+
+enum TipInspection { CurrentFile, CapturedPrefix }
+
+fn latest_at_length(file: &mut File, path: &Path, maximum: usize, length: u64, inspection: TipInspection) -> Result<LogOffset> {
+    if length == 0 { return Ok(LogOffset(-1)); }
     if length < 21 || length >= 1 << 48 { return Err(corrupt(path, length, "local log length is outside its framing bounds")); }
     file.seek(SeekFrom::Start(length - 8)).map_err(|error| Error::io(path, error))?;
     let mut trailer = [0; 8];
     file.read_exact(&mut trailer).map_err(|error| corrupt(path, length - 8, format!("incomplete final offset: {error}")))?;
     let offset = i64::from_be_bytes(trailer);
     if offset < 0 || offset as u64 >= length { return Err(corrupt(path, length - 8, "final offset is outside the log")); }
-    file.seek(SeekFrom::Start(offset as u64)).map_err(|error| Error::io(path, error))?;
-    let metadata = inspect_record(file, path, maximum)?;
+    let metadata = match inspection {
+        TipInspection::CurrentFile => {
+            file.seek(SeekFrom::Start(offset as u64)).map_err(|error| Error::io(path, error))?;
+            inspect_record(file, path, maximum)?
+        }
+        TipInspection::CapturedPrefix => {
+            let header = read_record_header_at(file, path, maximum, offset as u64, length)?;
+            inspect_record_body(file, path, header)?
+        }
+    };
     if file.stream_position().map_err(|error| Error::io(path, error))? != length { return Err(corrupt(path, offset as u64, "final record does not end at the observed file length")); }
-    Ok((metadata.offset, length))
+    Ok(metadata.offset)
 }
 
 fn unavailable(position: LogOffset) -> Error { Error::UnavailableLogRange { requested: position.0, first_retained: 0 } }
@@ -108,7 +139,15 @@ impl Log for ReadOnlyLocalLog {
                 (next, end)
             }
         };
-        Ok(Box::new(ReadOnlyTail { path: Arc::clone(&self.path), options: self.options.clone(), after, next, observed_length }))
+        let tail = ReadOnlyTail {
+            path: Arc::clone(&self.path),
+            options: self.options.clone(),
+            cursor: ReadOnlyCursor { after, next, observed_length },
+        };
+        match &self.reads {
+            Some(reads) => Ok(Box::new(ReadOnlyReplayTail { tail, reads: Arc::clone(reads) })),
+            None => Ok(Box::new(tail)),
+        }
     }
 
     async fn read_range(&self, from: LogOffset, to: LogOffset) -> Result<Vec<LogRecord>> {
@@ -192,35 +231,115 @@ impl super::LogRange for FileRange {
     }
 }
 
-struct ReadOnlyTail { path: Arc<PathBuf>, options: ReadOnlyLocalLogOptions, after: LogOffset, next: u64, observed_length: u64 }
+#[derive(Clone, Copy)]
+struct ReadOnlyCursor { after: LogOffset, next: u64, observed_length: u64 }
+
+impl ReadOnlyCursor {
+    fn observe(self, path: &Path, maximum: usize) -> Result<Option<(File, LogOffset, u64)>> {
+        let Some(mut file) = open_existing(path)? else {
+            return if self.observed_length == 0 { Ok(None) } else { Err(corrupt(path, self.next, "observed log disappeared")) };
+        };
+        let (latest, end) = latest_in_file(&mut file, path, maximum)?;
+        if end < self.observed_length || end < self.next || latest < self.after {
+            return Err(corrupt(path, end, "observed log was truncated"));
+        }
+        Ok(Some((file, latest, end)))
+    }
+
+    fn prepare_head(self, path: &Path, maximum: usize) -> Result<(Option<ReplayHead>, u64)> {
+        let Some((mut file, latest, end)) = self.observe(path, maximum)? else { return Ok((None, 0)); };
+        if latest == self.after { return Ok((None, end)); }
+        if self.next > latest.0 as u64 { return Err(corrupt(path, self.next, "complete tip yielded no record")); }
+        let header = read_record_header_at(&mut file, path, maximum, self.next, end)?;
+        Ok((Some(header.replay_head()), end))
+    }
+
+    fn materialize_head(self, path: &Path, maximum: usize, head: ReplayHead, reservation: ReadReservation) -> Result<(LogRecord, u64)> {
+        if head.metadata.offset.0 != self.next as i64 {
+            return Err(Error::Task("log replay head does not match the next position".into()));
+        }
+        let mut file = open_existing(path)?.ok_or_else(|| corrupt(path, self.next, "observed log disappeared"))?;
+        let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+        if length < self.observed_length { return Err(corrupt(path, length, "observed log was truncated")); }
+        let latest = latest_at_length(&mut file, path, maximum, self.observed_length, TipInspection::CapturedPrefix)?;
+        if head.metadata.offset > latest { return Err(Error::Task("log replay head exceeds the observed tip".into())); }
+        let header = read_record_header_at(&mut file, path, maximum, self.next, self.observed_length)?;
+        if header.replay_head() != head {
+            return Err(corrupt(path, self.next, "log replay head changed before delivery"));
+        }
+        if reservation.length() < head.allocation_bound {
+            return Err(Error::Task("log read reservation is too small".into()));
+        }
+        let record = read_record_body(&mut file, path, header)?.retain(reservation)?;
+        let next = file.stream_position().map_err(|error| Error::io(path, error))?;
+        Ok((record, next))
+    }
+}
+
+struct ReadOnlyTail { path: Arc<PathBuf>, options: ReadOnlyLocalLogOptions, cursor: ReadOnlyCursor }
 
 impl ReadOnlyTail {
     fn read_available(&mut self) -> Result<Vec<LogRecord>> {
-        let Some(mut file) = open_existing(&self.path)? else {
-            return if self.observed_length == 0 { Ok(Vec::new()) } else { Err(corrupt(&self.path, self.next, "observed log disappeared")) };
-        };
-        let (latest, end) = latest_in_file(&mut file, &self.path, self.options.maximum_message_bytes)?;
-        if end < self.observed_length || end < self.next || latest < self.after { return Err(corrupt(&self.path, end, "observed log was truncated")); }
-        self.observed_length = end;
-        if latest == self.after { return Ok(Vec::new()); }
-        let (records, next) = read_batch(&mut file, &self.path, &self.options, self.next, end, latest)?;
-        let last = records.last().ok_or_else(|| corrupt(&self.path, self.next, "complete tip yielded no record"))?;
-        self.after = last.metadata.offset;
-        self.next = next;
+        let Some((mut file, latest, end)) = self.cursor.observe(&self.path, self.options.maximum_message_bytes)? else { return Ok(Vec::new()); };
+        self.cursor.observed_length = end;
+        if latest == self.cursor.after { return Ok(Vec::new()); }
+        let (records, next) = read_batch(&mut file, &self.path, &self.options, self.cursor.next, end, latest)?;
+        let last = records.last().ok_or_else(|| corrupt(&self.path, self.cursor.next, "complete tip yielded no record"))?;
+        self.cursor.after = last.metadata.offset;
+        self.cursor.next = next;
         Ok(records)
     }
+
+    async fn wait_to_poll(&self, deadline: tokio::time::Instant) -> bool {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() { return false; }
+        tokio::time::sleep(remaining.min(self.options.poll_interval)).await;
+        true
+    }
+}
+
+fn poll_deadline(timeout: Duration) -> Result<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(timeout).ok_or_else(|| Error::Task("local log poll deadline overflow".into()))
 }
 
 #[async_trait]
 impl LogTail for ReadOnlyTail {
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
-        let deadline = tokio::time::Instant::now().checked_add(timeout).ok_or_else(|| Error::Task("local log poll deadline overflow".into()))?;
+        let deadline = poll_deadline(timeout)?;
         loop {
             let records = self.read_available()?;
             if !records.is_empty() { return Ok(records); }
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() { return Ok(Vec::new()); }
-            tokio::time::sleep(remaining.min(self.options.poll_interval)).await;
+            if !self.wait_to_poll(deadline).await { return Ok(Vec::new()); }
         }
+    }
+}
+
+struct ReadOnlyReplayTail { tail: ReadOnlyTail, reads: Arc<IoRegion> }
+
+#[async_trait]
+impl LogTail for ReadOnlyReplayTail {
+    async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> { self.tail.poll(timeout).await }
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
+}
+
+#[async_trait]
+impl LogReplayTail for ReadOnlyReplayTail {
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
+        let deadline = poll_deadline(timeout)?;
+        loop {
+            let (path, maximum, cursor) = (Arc::clone(&self.tail.path), self.tail.options.maximum_message_bytes, self.tail.cursor);
+            let (head, observed_length) = self.reads.run(move || cursor.prepare_head(&path, maximum)).await?;
+            self.tail.cursor.observed_length = observed_length;
+            if head.is_some() { return Ok(head); }
+            if !self.tail.wait_to_poll(deadline).await { return Ok(None); }
+        }
+    }
+
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
+        let (path, maximum, cursor) = (Arc::clone(&self.tail.path), self.tail.options.maximum_message_bytes, self.tail.cursor);
+        let (record, next) = self.reads.run(move || cursor.materialize_head(&path, maximum, head, reservation)).await?;
+        self.tail.cursor.after = record.metadata.offset;
+        self.tail.cursor.next = next;
+        Ok(record)
     }
 }

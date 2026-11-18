@@ -45,13 +45,13 @@ pub(super) fn corrupt(path: &Path, offset: u64, reason: impl Into<String>) -> Er
     Error::CorruptLog { path: path.to_path_buf(), offset, reason: reason.into() }
 }
 
-struct RecordHeader {
+pub(super) struct RecordHeader {
     metadata: LogMetadata,
     payload_size: usize,
 }
 
 impl RecordHeader {
-    fn replay_head(&self) -> ReplayHead {
+    pub(super) fn replay_head(&self) -> ReplayHead {
         ReplayHead {
             metadata: self.metadata,
             payload_len: self.payload_size,
@@ -63,6 +63,15 @@ impl RecordHeader {
 fn read_record_header(file: &mut File, path: &Path, maximum: usize) -> Result<RecordHeader> {
     let offset = file.stream_position().map_err(|error| Error::io(path, error))?;
     let length = file.metadata().map_err(|error| Error::io(path, error))?.len();
+    parse_record_header(file, path, maximum, offset, length)
+}
+
+pub(super) fn read_record_header_at(file: &mut File, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
+    file.seek(SeekFrom::Start(offset)).map_err(|error| Error::io(path, error))?;
+    parse_record_header(file, path, maximum, offset, length)
+}
+
+fn parse_record_header(file: &mut File, path: &Path, maximum: usize, offset: u64, length: u64) -> Result<RecordHeader> {
     let mut header = [0; HEADER_BYTES as usize];
     file.read_exact(&mut header).map_err(|error| corrupt(path, offset, format!("incomplete record header: {error}")))?;
     if header[0] != RECORD_SEPARATOR { return Err(corrupt(path, offset, "expected record separator 0x1e")); }
@@ -91,7 +100,7 @@ pub(super) fn read_record(file: &mut File, path: &Path, maximum: usize) -> Resul
     read_record_body(file, path, header)
 }
 
-fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogRecord> {
+pub(super) fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogRecord> {
     let mut payload = vec![0; header.payload_size];
     file.read_exact(&mut payload).map_err(|error| Error::io(path, error))?;
     read_record_trailer(file, path, header.metadata.offset)?;
@@ -100,6 +109,10 @@ fn read_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Resul
 
 pub(super) fn inspect_record(file: &mut File, path: &Path, maximum: usize) -> Result<LogMetadata> {
     let header = read_record_header(file, path, maximum)?;
+    inspect_record_body(file, path, header)
+}
+
+pub(super) fn inspect_record_body(file: &mut File, path: &Path, header: RecordHeader) -> Result<LogMetadata> {
     let mut remaining = header.payload_size;
     let mut scratch = [0; 8 * 1024];
     while remaining > 0 {

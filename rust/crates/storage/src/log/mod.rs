@@ -110,8 +110,9 @@ pub struct ReplayHead {
 
 #[async_trait]
 pub trait LogReplayTail: Send {
-    /// Waits up to the timeout for the next durable record without acquiring its payload or advancing the cursor.
-    /// Only a cursor at the durable tip yields None.
+    /// Waits up to the timeout for the next visible record and prepares its delivery bound.
+    /// Any allocation of the delivered payload uses the reservation passed to `read_head`.
+    /// Returns `None` only when the cursor has reached the observed tip.
     async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>>;
 
     /// Reads the prepared head using a reservation of at least its allocation bound in bytes.

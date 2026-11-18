@@ -2,8 +2,9 @@
 
 `LocalLogDriver` is active and owns append selection, serialization, and durability acknowledgement.
 Its owner cancels and joins the driver before releasing the log.
-Writable-log reader offloads belong to an `IoRegion`, which the owner closes after consumers and the writer join.
-Standalone logs expose `close_and_wait`; native node logs share their region with local object stores.
+Local log reader offloads belong to an `IoRegion`, which the owner closes after consumers and any local writer join.
+Standalone writable logs expose `close_and_wait`.
+Native node logs share their region with local object stores.
 The drain includes queued reads whose caller futures have been cancelled.
 `LocalLog`, `MemoryLog`, and their cursors are passive capabilities.
 The progress channel is a monitor carrying the current tip or terminal failure.
@@ -18,24 +19,28 @@ It reads a record only when the remaining budget covers a maximum-size message.
 The next poll resumes at the first unread byte position.
 
 `ReadOnlyLocalLog` is a passive view of an external append-only file.
-Its cursor is a single-owner transient; polling performs bounded file reads inline and sleeps on the caller's task between attempts.
-Opening and tailing do not create files or directories, acquire writer locks, or start background tasks.
+Its cursor is a single-owner transient.
+Direct batch polling performs bounded file reads inline and sleeps on the caller's task between attempts.
+Opening the log or creating its cursor requires only read access.
 Missing files before first creation represent an empty log.
 Once a cursor observes file contents, disappearance or decreasing length is an error.
 The shared local reader validates the separator, signed payload length, timestamp, and trailing byte offset.
-Incomplete or invalid final framing is an error, including while an external writer is part-way through an append.
+Tip inspection reports incomplete or invalid final framing, including while an external writer is part-way through an append.
 The external writer's fsync completion is not independently observable through this file format.
 
 Poll limits bound retained payload bytes and record count separately.
 `ReadOnlyLocalLog::read_range` uses the same limits and returns `LogReadLimit` when the requested range cannot fit.
 Callers can split large catch-up ranges at known record starts.
-Replication uses caller-reserved single-record delivery for writable local and memory logs.
-An available head identifies the next durable record and its delivery charge.
+Replication uses caller-reserved single-record delivery for native local and memory logs.
+An available head identifies the next record and its delivery charge.
 Only the selected head acquires a reservation from the execution budget.
-Writable local delivery charges its copied payload and delivery overhead.
+Local delivery charges its copied payload and delivery overhead.
 Memory delivery charges the overhead for an alias of the append-owned payload.
 The returned payload and its clones keep the delivery reservation alive.
-Direct tail consumers, read-only local replay and Kafka replay use batch delivery through `LogTail::poll`.
+The read-only native local factory uses `ReadOnlyLocalLog::open_in` to validate readiness and deliver records in the database I/O region.
+Delivery checks the last complete length observed by the cursor.
+The next readiness check validates the current tip framing and inspects the next header.
+Standalone `ReadOnlyLocalLog::open` and Kafka replay use batch delivery through `LogTail::poll`.
 
 `tests/read_only_log.rs` maps to `ReadOnlyLocalLogTest`'s existing/subsequent external-write polling behavior and adds missing-file, writer-lock coexistence, corruption, truncation, range-bound, and no-write checks.
 Partition path selection and retired-message decoding remain the caller's responsibilities.

@@ -1,10 +1,11 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 use bytes::Bytes;
-use rtdb_storage::{Error, log::{LocalLog, LocalLogOptions, Log, LogOffset, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
-use rtdb_types::Timestamp;
+use rtdb_storage::{Error, IoRegion, log::{LocalLog, LocalLogOptions, Log, LogMetadata, LogOffset, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}, object_store::ReadReservation};
+use rtdb_types::{MemoryBudget, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 fn options() -> ReadOnlyLocalLogOptions {
@@ -13,15 +14,19 @@ fn options() -> ReadOnlyLocalLogOptions {
 
 fn append(path: &Path, payload: &[u8], timestamp: i64) -> LogOffset {
     let mut file = OpenOptions::new().create(true).append(true).open(path).unwrap();
-    let offset = file.seek(SeekFrom::End(0)).unwrap();
+    let offset = LogOffset(file.seek(SeekFrom::End(0)).unwrap() as i64);
+    file.write_all(&frame(offset, payload, timestamp)).unwrap();
+    file.sync_all().unwrap();
+    offset
+}
+
+fn frame(offset: LogOffset, payload: &[u8], timestamp: i64) -> Vec<u8> {
     let mut bytes = vec![0x1e];
     bytes.extend_from_slice(&(payload.len() as i32).to_be_bytes());
     bytes.extend_from_slice(&timestamp.to_be_bytes());
     bytes.extend_from_slice(payload);
-    bytes.extend_from_slice(&(offset as i64).to_be_bytes());
-    file.write_all(&bytes).unwrap();
-    file.sync_all().unwrap();
-    LogOffset(offset as i64)
+    bytes.extend_from_slice(&offset.0.to_be_bytes());
+    bytes
 }
 
 fn overwrite(path: &Path, offset: u64, bytes: &[u8]) {
@@ -40,6 +45,203 @@ fn assert_corrupt_at<T>(result: rtdb_storage::Result<T>, expected_path: &Path, e
         }
         other => panic!("expected a corrupt log error, got {other:?}"),
     }
+}
+
+fn reserve(memory: &Arc<MemoryBudget>, bytes: usize) -> ReadReservation {
+    ReadReservation::new(bytes, memory.reserve(bytes).unwrap())
+}
+
+#[tokio::test]
+async fn regional_replay_delivers_a_new_file_with_an_exact_reservation_after_refusal() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("LOG");
+    let reads = IoRegion::new();
+    let log = ReadOnlyLocalLog::open_in(&path, options(), Arc::clone(&reads)).unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+    assert!(!path.exists());
+
+    let offset = append(&path, b"first", 9);
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata, LogMetadata { offset, timestamp: Timestamp(9) });
+    assert_eq!(head.payload_len, 5);
+    assert_eq!(head.allocation_bound, 261);
+
+    let memory = MemoryBudget::new(head.allocation_bound);
+    let short = reserve(&memory, head.allocation_bound - 1);
+    assert!(matches!(replay.read_head(head, short).await, Err(Error::Task(reason)) if reason == "log read reservation is too small"));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+    let record = replay.read_head(head, reserve(&memory, head.allocation_bound)).await.unwrap();
+    assert_eq!(record.metadata, head.metadata);
+    let payload = record.payload.clone();
+    drop(record);
+    assert_eq!(payload.as_ref(), b"first");
+    assert_eq!(memory.used_bytes(), head.allocation_bound);
+    drop(payload);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+    reads.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn regional_replay_delivers_the_captured_prefix_before_checking_an_incomplete_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("REPLICA_LOG");
+    let first = append(&path, b"first", 1);
+    let second = append(&path, b"second", 2);
+    let reads = IoRegion::new();
+    let log = ReadOnlyLocalLog::open_in(&path, options(), Arc::clone(&reads)).unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata.offset, first);
+
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    let third = LogOffset(file.seek(SeekFrom::End(0)).unwrap() as i64);
+    let appended = frame(third, b"third", 3);
+    file.write_all(&appended[..3]).unwrap();
+    file.sync_all().unwrap();
+    let memory = MemoryBudget::new(1024);
+    let record = replay.read_head(head, reserve(&memory, head.allocation_bound)).await.unwrap();
+    assert_eq!(record.payload.as_ref(), b"first");
+    drop(record);
+    assert_corrupt_at(replay.poll_head(Duration::ZERO).await, &path, LogOffset(third.0 + 3 - 8), "final offset is outside the log");
+
+    file.write_all(&appended[3..]).unwrap();
+    file.sync_all().unwrap();
+    for (offset, payload) in [(second, b"second".as_slice()), (third, b"third".as_slice())] {
+        let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+        assert_eq!(head.metadata.offset, offset);
+        let record = replay.read_head(head, reserve(&memory, head.allocation_bound)).await.unwrap();
+        assert_eq!(record.payload.as_ref(), payload);
+    }
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+    reads.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn regional_replay_rejects_a_captured_tip_whose_payload_extends_into_a_new_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("REPLICA_LOG");
+    let first = append(&path, b"first", 1);
+    let captured_tip = append(&path, b"second", 2);
+    let reads = IoRegion::new();
+    let log = ReadOnlyLocalLog::open_in(&path, options(), Arc::clone(&reads)).unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata.offset, first);
+
+    let appended = append(&path, &[42; 32], 3);
+    assert_eq!(appended, LogOffset(53));
+    overwrite(&path, captured_tip.0 as u64 + 1, &24i32.to_be_bytes());
+    let memory = MemoryBudget::new(head.allocation_bound);
+    assert_corrupt_at(
+        replay.read_head(head, reserve(&memory, head.allocation_bound)).await,
+        &path, captured_tip, "incomplete record ends at 71, file length 53",
+    );
+    assert_eq!(memory.used_bytes(), 0);
+
+    overwrite(&path, captured_tip.0 as u64 + 1, &6i32.to_be_bytes());
+    let record = replay.read_head(head, reserve(&memory, head.allocation_bound)).await.unwrap();
+    assert_eq!(record.metadata.offset, first);
+    assert_eq!(record.payload.as_ref(), b"first");
+    drop(record);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap().unwrap().metadata.offset, captured_tip);
+    reads.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn regional_replay_rechecks_the_observed_tip_and_reports_disappearance_and_truncation() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("REPLICA_LOG");
+    let first = append(&path, b"first", 1);
+    let second = append(&path, b"second", 2);
+    let reads = IoRegion::new();
+    let log = ReadOnlyLocalLog::open_in(&path, options(), Arc::clone(&reads)).unwrap();
+    let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+    assert_eq!(head.metadata.offset, first);
+    let memory = MemoryBudget::new(head.allocation_bound);
+    let read = || reserve(&memory, head.allocation_bound);
+
+    overwrite(&path, second.0 as u64, &[0]);
+    assert_corrupt_at(replay.read_head(head, read()).await, &path, second, "expected record separator 0x1e");
+    overwrite(&path, second.0 as u64, &[0x1e]);
+    overwrite(&path, second.0 as u64 - 8, &1i64.to_be_bytes());
+    assert_corrupt_at(replay.read_head(head, read()).await, &path, first, "record trailer does not name its start offset");
+    overwrite(&path, second.0 as u64 - 8, &first.0.to_be_bytes());
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+    OpenOptions::new().write(true).open(&path).unwrap().set_len(second.0 as u64).unwrap();
+    assert_corrupt_at(replay.read_head(head, read()).await, &path, second, "observed log was truncated");
+    assert_corrupt_at(replay.poll_head(Duration::ZERO).await, &path, second, "observed log was truncated");
+    std::fs::remove_file(&path).unwrap();
+    assert_corrupt_at(replay.read_head(head, read()).await, &path, first, "observed log disappeared");
+    assert_corrupt_at(replay.poll_head(Duration::ZERO).await, &path, first, "observed log disappeared");
+    assert_eq!(memory.used_bytes(), 0);
+    reads.close_and_wait().await;
+}
+
+#[test]
+fn cancelled_regional_replay_keeps_its_charge_until_the_undelivered_record_is_dropped() {
+    use std::{future::{Future, poll_fn}, task::Poll};
+    use rtdb_types::MemoryReservation;
+    use tokio::sync::oneshot;
+
+    struct ReportRelease {
+        reservation: Option<Arc<MemoryReservation>>,
+        released: Option<oneshot::Sender<()>>,
+    }
+    impl Drop for ReportRelease {
+        fn drop(&mut self) {
+            drop(self.reservation.take());
+            let _ = self.released.take().unwrap().send(());
+        }
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("LOG");
+        append(&path, b"payload", 1);
+        let reads = IoRegion::new();
+        let log = ReadOnlyLocalLog::open_in(&path, options(), Arc::clone(&reads)).unwrap();
+        let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+
+        let (started, waiting) = oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            paused.recv().unwrap();
+        });
+        waiting.await.unwrap();
+        let memory = MemoryBudget::new(head.allocation_bound);
+        let (released, release) = oneshot::channel();
+        let lease = ReportRelease { reservation: Some(memory.reserve(head.allocation_bound).unwrap()), released: Some(released) };
+        let reservation = ReadReservation::new(head.allocation_bound, lease);
+        let mut delivery = Box::pin(replay.read_head(head, reservation));
+        poll_fn(|context| {
+            assert!(delivery.as_mut().poll(context).is_pending());
+            Poll::Ready(())
+        }).await;
+        drop(delivery);
+        assert_eq!(memory.used_bytes(), head.allocation_bound);
+        resume.send(()).unwrap();
+        blocker.await.unwrap();
+        release.await.unwrap();
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+        reads.close_and_wait().await;
+        assert!(matches!(replay.poll_head(Duration::ZERO).await, Err(Error::Closed(_))));
+    });
 }
 
 #[tokio::test]

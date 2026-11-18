@@ -131,7 +131,7 @@ impl NativeResources {
         Ok(self)
     }
     fn local_log(&self, path: PathBuf, source: bool, read_only: bool, cancellation: CancellationToken, io: Arc<IoRegion>) -> Result<(Arc<dyn Log>, Option<ResourceDriver>)> {
-        if read_only { return Ok((ReadOnlyLocalLog::open(path, self.read_only_log.clone())?, None)); }
+        if read_only { return Ok((ReadOnlyLocalLog::open_in(path, self.read_only_log.clone(), io)?, None)); }
         let timestamps = Arc::new(NativeLogTimestamps { clock: Arc::clone(&self.local_log_clock), source, use_for_non_transactions: self.local_log_uses_clock_for_non_transactions });
         let (log, driver) = LocalLog::open_with_timestamp_source_in(path, LocalLogOptions { maximum_message_bytes: self.maximum_log_message_bytes, queue_capacity: self.log_queue_capacity }, timestamps, io)?;
         Ok((log, Some(async move { driver.run(cancellation).await.map_err(Into::into) }.boxed())))
