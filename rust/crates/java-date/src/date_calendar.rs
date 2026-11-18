@@ -79,11 +79,10 @@ struct Selection { date: DaySelection, hour24: bool }
 #[derive(Clone, Copy, Debug)]
 pub(super) struct CalendarSystem { kind: CalendarKind, first_day: u8, minimal_days: u8 }
 #[derive(Clone, Copy, Debug)]
-pub(super) struct CalendarView { fields: [i32; 17], week_year: i32, week_date_supported: bool }
+pub(super) struct CalendarView { fields: [i32; 17], week_year: i32 }
 impl CalendarView {
     pub fn get(&self, field: CalendarField) -> i32 { self.fields[field as usize] }
     pub fn week_year(&self) -> i32 { self.week_year }
-    pub fn week_date_supported(&self) -> bool { self.week_date_supported }
 }
 
 impl CalendarSystem {
@@ -139,7 +138,7 @@ impl CalendarSystem {
             (Minute,(clock/60_000%60) as i32),(Second,(clock/1000%60) as i32),(Millisecond,(clock%1000) as i32),
             (ZoneOffset,offsets.0),(DstOffset,offsets.1)] { fields[field as usize] = value; }
         let week_year = if self.kind == CalendarKind::Japanese { field_year } else { self.week_year(&fields,year_start,year_end) };
-        Ok(CalendarView { fields, week_year, week_date_supported: self.week_date_supported() })
+        Ok(CalendarView { fields, week_year })
     }
     fn week_year(self, fields: &[i32;17], start: i64, end: i64) -> i32 {
         let mut visible = fields[Year as usize];

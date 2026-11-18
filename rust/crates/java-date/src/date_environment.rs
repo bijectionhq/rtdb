@@ -32,7 +32,6 @@ pub struct DateEnvironment {
     pub(super) names: [FieldNames;5],
     pub(super) default_zone: LegacyTimeZone,
     pub(super) calendar_zone: LegacyTimeZone,
-    pub(super) initialized_at: i64,
     clocks: DateClocks,
     charge: Arc<MemoryReservation>,
 }
@@ -75,7 +74,7 @@ impl DateEnvironment {
         let names = [NameField::Era,NameField::Year,NameField::Month,NameField::Weekday,NameField::AmPm].map(|field|FieldNames::new(&locale,field));
         let default_zone = LegacyTimeZone::parse(&input.timezone);
         let calendar_zone = locale.locale.extensions.get("tz").and_then(|key|super::locale_data::canonical_zone(key)).map_or(default_zone,LegacyTimeZone::parse);
-        Ok(Arc::new(Self { locale,number,names,default_zone,calendar_zone,initialized_at: input.initialized_at,clocks,charge: locale_charge }))
+        Ok(Arc::new(Self { locale,number,names,default_zone,calendar_zone,clocks,charge: locale_charge }))
     }
     pub(super) fn names(&self,field: NameField) -> &FieldNames {
         &self.names[match field { NameField::Era => 0,NameField::Year => 1,NameField::Month => 2,NameField::Weekday => 3,NameField::AmPm => 4 }]
