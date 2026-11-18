@@ -15,7 +15,8 @@ Each required observation declares its expected result.
 A failure expectation names its stage, category, code and signature.
 Run receipts cannot declare a failure to be expected without that ledger entry.
 Typed multiset observations contain a `schema` array and a `rows` array whose rows each match the schema width.
-Reference and Rust run receipts must record artifact and fixture digests, observation values, comparator version, and exact failure location.
+Each reference and Rust `CaseReceipt` names its runner and records artifact, fixture, configuration and trace digests alongside its observations.
+The comparison report records its comparator version and identifies differing observations and their locations.
 A missing receipt remains unverified even when a corresponding native test exists.
 Compilation and execution are pending under the Phase 1 work order.
 link:source-completeness.adoc[The source completeness record] separates missing implementation and unfinished source review from Phase 2 qualification.

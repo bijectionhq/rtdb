@@ -272,12 +272,14 @@ This trace addresses joined shutdown; recovery after abrupt process termination 
 
 == SQL subquery source checkpoint
 
-SQL scalar, existence and quantified subqueries lower to the existing shared Apply executor.
+The initial SQL scalar, existence and quantified subquery paths lowered to the shared Apply executor.
 Correlation scopes are preparation transients; their captured columns become apply-local parameters above the lexical client-parameter range.
 The source follows `xtdb.sql/plan-sq`, `apply-sqs` and the quantified-array NULL normalization.
 Native result test source covers nested correlation and CTE reuse, scalar cardinality, quantified truth tables, grouping, outer joins and parameter arity.
 UPDATE's immutable plan identifies its original target columns, so dependent-query fields cannot enter the persisted document.
-The scalar and quantified paths retain dependent execution; the JVM decorrelation optimizer and its error-elision behavior have not been ported or compared.
+Correlated scalar and quantified paths retain dependent execution.
+The uncorrelated scalar path uses the native single join to report cardinality violations, and the uncorrelated array path shares the same operator.
+The JVM decorrelation optimizer and its error-elision behavior still require comparison.
 Full outer join conditions, temporal scan clauses, RECORDS expressions and standalone controls still reject relational subqueries.
 ORDER BY can use nonprojected inputs and projected aliases, with final projection and DISTINCT following ordering.
 NATURAL/USING joins preserve the pinned left-column common-name binding and qualified wildcard behavior, including unmatched right rows.
@@ -1280,8 +1282,10 @@ Standalone PostgreSQL preparation checks the originating budget on the full synt
 Simple Query uses the complete normalized or rewritten batch for diagnostics and passes the bounded statement text into native preparation and durable DML.
 Query execution still binds against its own snapshot.
 The explicit and mixed Extended/Simple wire fixtures record transaction status through grammar, reached operand failure and Sync.
-Extended Execute can reach a PREPARE command with a raw child, including a command registered through nested Simple Query PREPARE.
-That route prepares the child when the command executes.
+Extended Parse retains the nested PREPARE grammar and original input before acknowledging the statement.
+Simple Query allocates one shared copy of its normalized input when it reaches its first registration that retains a nested child.
+Independently parsed statements retain separate grammar reservations.
+Execution prepares the immediate child against the current session, and located structured errors use the original message's byte positions.
 Child preparation uses ordinary SQL for the keyword and namespace queries that have dedicated client-entry behavior.
 
 The direct source scalar reader materializes raw FixedBinary and UUID objects through its signed byte view.
@@ -1316,9 +1320,44 @@ Rack-aware topic-info comparison reads a zero count for partitions without racks
 Lightweight topic conversion holds the client write lock through topic publication and initialization from the cached entry.
 The Fetch and Produce leader-tag handler holds the client write lock through lookup and the local topic update for each entry.
 After processing the topics, the handler reacquires the client write lock to notify observers and schedule expiry when cached metadata changed.
-Consumer-group Metadata refresh holds the client write lock while replacing pending cache hints after an unsent request.
+Consumer-group Metadata refresh holds the client write lock while recording a pending `NOENT` cache hint after a failed send.
 Cache entry admission and the remaining borrower audit are open.
 Observation fixtures use the ordinary and admin parser paths with separate lifetimes for parsed results and retained cache entries.
+
+== Replay, scan and release evidence source checkpoint
+
+The replica driver reports its stopped state and selected driver fault in one progress update.
+An external transaction removed from the staged queue receives its own read-back, partition application or progress publication fault through its retained receipt.
+External transactions still queued within the term receive the term-ended anomaly during demotion.
+The live-index structured rule still describes successful application, and its resolver-exit rule models failure with a general cause.
+The pinned JVM cancels later queued completions.
+
+The database owner reports a selected non-interrupted peer fault before cancelling its workers.
+Replica initialization preserves faults newly reported during tail opening.
+An initialized replacement can reset the terminal state identified at construction if it still holds its restart permit.
+Source and transaction waits use the last published progress, while fresh tokenless reads use the successfully applied durable partition head.
+The pinned JVM also applies admitted writes before notifying its progress watchers.
+Native teardown cancels workers within the same database, while the pinned JVM supervises sibling workers in that database.
+Built-in log factories pair source and replica epochs.
+If a custom log factory advances the source epoch while keeping an older replica suffix, replay can install an admitted transaction before progress rejects its source position below the new floor.
+The restore policy for that layout remains open.
+
+The in-memory tail delivers a contiguous prefix with a limit on record count and total payload bytes.
+It retains room for one maximum-size record and resumes at the next offset after delivery.
+Writable local tail delivery and integration with the caller's allocation budget remain open.
+The public recovery and shutdown trace hashes include the optional embedded transaction clock.
+Catalog recovery precedes opening logs, and embedded close joins native work before the Java callback arena closes.
+
+A persisted page can be excluded as a source of matches for a direct document-column `IS NOT NULL` predicate when its root count is known to be zero.
+The existing selector retains pages that can constrain or erase matching history.
+The scan still applies the row predicate after visibility resolution.
+Ordinary IID narrowing, broader metadata predicates and retained scan descriptor allocation remain open.
+
+Each reference control receipt binds the exact JVM runtime manifest, the verified runtime files and the artifact verifier source.
+Release comparison uses the ledger submitted to inventory reconciliation and retains the comparator process, input snapshots and report for each platform and native variant.
+Native control receipts identify the same production executable as the comparison lane.
+Other adapter-specific receipt closures, complete assertion mappings and the retained erase-window case still require source work.
+The full ledger and release matrix have no execution receipts from this source checkpoint.
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.

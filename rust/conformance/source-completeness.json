@@ -18,7 +18,7 @@
     },
     "storage_indexing_historical_visibility": {
       "status": "pending",
-      "conclusion": "Storage, cache, snapshot and visibility paths are written; their final source closure and recorded allocation gaps remain to be reconciled.",
+      "conclusion": "A confirmed zero non-null count can prune persisted pages while retaining superseders. Ordinary IID narrowing, broader metadata predicates and retained scan allocation need source completion.",
       "implementation_paths": [
         "rust/crates/storage/src/lib.rs",
         "rust/crates/index/src/live.rs",
@@ -41,7 +41,7 @@
     },
     "writes_replication_recovery": {
       "status": "pending",
-      "conclusion": "The recorded write and recovery traces are source-reviewed; the complete area still needs its final design-surface reconciliation.",
+      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. Writable local replay batch limits, caller-owned replay admission and final design-surface reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/tx/src/submission.rs",
         "rust/crates/tx/src/resolver.rs",
@@ -80,7 +80,7 @@
     },
     "conformance_machinery": {
       "status": "pending",
-      "conclusion": "Source inventory, controls, discovery reconciliation, failure and release runners exist; review their wiring before execution. Runtime discovery and the full assertion denominator belong to Phase 2.",
+      "conclusion": "The release runner compares the exact reconciled ledger and verifies known control artifacts. Remaining paired assertion adapters and their evidence bindings need source completion before runtime discovery and qualification.",
       "implementation_paths": [
         "rust/crates/conformance/src/main.rs",
         "rust/conformance/source_inventory.py",
@@ -255,7 +255,7 @@
         "sql_xtql_execution",
         "client_read"
       ],
-      "requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, raw binary strings, DATE, TIMESTAMP and INTERVAL literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics and locale-dependent probes. Retain classified SQL PREPARE children through Extended Execute and admit parsed ownership across every frontend."
+      "requirement": "Extend the reviewed two-profile statement roots, control statements and constant SELECT tree schedules beyond numeric expressions, Boolean and NULL literals, raw and prefixed character strings, raw binary strings, DATE, TIMESTAMP and INTERVAL literals, aliases, the identifier family, isolation and empty-details windows, and the SLL DATE array and field paths. Extend native synchronization, contextual expected-token and diagnostic schedules across the remaining grammar. Complete exact-unit literal and tree JSON producers, canonical text and codec consumers, host policy capture and production cache ownership. Reconcile the remaining whole-batch diagnostics and locale-dependent probes. Complete admitted syntax ownership on the remaining frontend preparation paths."
     },
     {
       "id": "source-signed-binary-width",
