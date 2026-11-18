@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
+import xtdb.api.storage.ObjectStore.StoredObject
 import xtdb.api.storage.Storage
 import xtdb.cache.MemoryCache
 import xtdb.util.asPath
@@ -74,6 +75,22 @@ class LocalStorageTest : PartitionedStorageTest() {
             partitionedPath.resolve(Storage.storageRoot(Storage.VERSION, 0))
                 .resolve("blocks/b00.binpb").exists()
         )
+    }
+
+    @Test
+    fun `published object listings leave staged uploads alone`() {
+        val local = localBufferPool as LocalStorage
+        val published = "blocks/published.arrow".asPath
+        local.putObjectSync(published, ByteBuffer.wrap(ByteArray(3)))
+        val pending = ".tmp/pending.arrow".asPath
+        Files.createSymbolicLink(local.rootPath.resolve(pending), "moved.arrow".asPath)
+
+        val expected = listOf(StoredObject(published, 3))
+        assertEquals(expected, local.listAllObjects().toList())
+        assertEquals(expected, local.listAllObjects("blocks".asPath).toList())
+        assertTrue(local.listAllObjects(".tmp".asPath).none())
+        assertTrue(local.listAllObjects(pending).none())
+        assertTrue(local.listAllObjects("missing".asPath).none())
     }
 
     @Test

@@ -59,14 +59,14 @@ interface BufferPool : AutoCloseable {
     fun putObjectSync(key: Path, buffer: ByteBuffer) = runBlocking { putObject(key, buffer) }
 
     /**
-     * Recursively lists all objects in the buffer pool
+     * Recursively lists published objects in the buffer pool.
      *
      * Objects are returned in lexicographic order of their path names.
      */
     fun listAllObjects(): Iterable<StoredObject>
 
     /**
-     * Recursively lists all objects in the buffer pool, under the given directory.
+     * Recursively lists published objects in the buffer pool under the given directory.
      *
      * Objects are returned in lexicographic order of their path names.
      */

@@ -20,13 +20,20 @@ import xtdb.cache.MemoryCache
 import xtdb.trie.FileSize
 import xtdb.util.*
 import java.io.Closeable
+import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.ClosedByInterruptException
+import java.nio.file.FileVisitResult
+import java.nio.file.FileVisitResult.CONTINUE
+import java.nio.file.FileVisitResult.SKIP_SUBTREE
 import java.nio.file.Files
 import java.nio.file.Files.newByteChannel
+import java.nio.file.NoSuchFileException
 import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption.*
+import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.CompletableFuture.completedFuture
 import kotlin.io.path.*
 
@@ -39,21 +46,20 @@ internal class LocalStorage(
 ) : BufferPool, IEvictBufferTest, Closeable {
 
     private val allocator = allocator.openChildAllocator("buffer-pool")
+    private val uploadDirectory = rootPath.resolve(".tmp")
 
     private val arrowFooterCache: AsyncCache<Path, ArrowFooter> = arrowFooterCache()
     private val recordBatchRequests: Counter? = meterRegistry?.counter("record-batch-requests")
     private val memCacheMisses: Counter? = meterRegistry?.counter("memory-cache-misses")
 
     companion object {
-        private fun Path.createTempUploadFile(): Path {
-            val tmpDir = resolve(".tmp").also { it.createDirectories() }
-            return createTempFile(tmpDir, "upload", ".arrow")
-        }
-
         private fun objectMissingException(path: Path) = IllegalStateException("Object $path doesn't exist.")
 
         private fun Path.orThrowIfMissing(key: Path) = takeIf { it.exists() } ?: throw objectMissingException(key)
     }
+
+    private fun createTempUploadFile(): Path =
+        createTempFile(uploadDirectory.createDirectories(), "upload", ".arrow")
 
     override fun getByteArray(key: Path): ByteArray =
         runBlocking {
@@ -105,7 +111,7 @@ internal class LocalStorage(
 
     override suspend fun putObject(key: Path, buffer: ByteBuffer) {
         try {
-            val tmpPath = rootPath.createTempUploadFile()
+            val tmpPath = createTempUploadFile()
             buffer.writeToPath(tmpPath)
 
             val filePath = rootPath.resolve(key).also { it.createParentDirectories() }
@@ -115,11 +121,30 @@ internal class LocalStorage(
         }
     }
 
-    private fun Path.listAll() = walk()
-        .map { StoredObject(rootPath.relativize(it), it.fileSize()) }
-        .filter { it.key.getName(0).toString() != ".tmp" }
-        .sortedBy { it.key }
-        .toList()
+    private fun Path.listAll(): List<StoredObject> {
+        val staging = uploadDirectory.normalize()
+        if (normalize().startsWith(staging)) return emptyList()
+
+        val objects = mutableListOf<StoredObject>()
+        Files.walkFileTree(this, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes) =
+                if (dir.normalize() == staging) SKIP_SUBTREE else CONTINUE
+
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                if (file.normalize() != staging) {
+                    val size = if (attrs.isSymbolicLink) file.fileSize() else attrs.size()
+                    objects.add(StoredObject(rootPath.relativize(file), size))
+                }
+                return CONTINUE
+            }
+
+            override fun visitFileFailed(file: Path, error: IOException): FileVisitResult {
+                if (error is NoSuchFileException) return CONTINUE
+                throw error
+            }
+        })
+        return objects.sortedBy { it.key }
+    }
 
     override fun listAllObjects(): Iterable<StoredObject> = rootPath.listAll()
     override fun listAllObjects(dir: Path) = rootPath.resolve(dir).listAll()
@@ -136,7 +161,7 @@ internal class LocalStorage(
     }
 
     override fun openArrowWriter(key: Path, rel: Relation): ArrowWriter {
-        val tmpPath = rootPath.createTempUploadFile()
+        val tmpPath = createTempUploadFile()
         return newByteChannel(tmpPath, WRITE, TRUNCATE_EXISTING, CREATE).closeOnCatch { fileChannel ->
             rel.startUnload(fileChannel).closeOnCatch { unloader ->
                 object : ArrowWriter {

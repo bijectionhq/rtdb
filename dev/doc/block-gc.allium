@@ -50,6 +50,7 @@ given {
 -- `blocks/b{idx}.binpb` and per-table block files at
 -- `tables/{table}/blocks/b{idx}.binpb`; deletes are idempotent) is reached
 -- via the ObjectStoreDelete deferred specification.
+-- Storage listings expose objects published at their final keys.
 
 
 entity BlockGarbageCollector {
