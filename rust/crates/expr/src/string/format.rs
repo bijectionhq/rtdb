@@ -1,4 +1,4 @@
-use crate::EvalContext;
+use crate::{EvalContext,admission::Admission,transit_object::{FormatArgument,format_argument}};
 use rtdb_types::{Anomaly, Result, Value};
 use super::{add, float_text, illegal, scalar_text};
 
@@ -115,7 +115,11 @@ fn resolve(value: &Value, context: &EvalContext<'_>) -> Result<Option<String>> {
         Value::Transit(bytes) => {
             context.reserve(super::render::allocation_bound(value)?)?;
             let decoded = rtdb_format::transit::decode_msgpack(bytes)?;
-            match decoded { rtdb_format::transit::TransitValue::String(value) => value, value => super::render::transit(&value, 0)? }
+            match format_argument(decoded,Admission::for_context(context.allocation))? {
+                FormatArgument::Semantic(value) => value,
+                FormatArgument::Wire(rtdb_format::transit::TransitValue::String(value)) => value,
+                FormatArgument::Wire(value) => super::render::transit(&value, 0)?,
+            }
         }
         Value::Uuid(value) => String::from_utf8_lossy(value).into_owned(),
         Value::F32(value) => float_text(f64::from(*value), Some(*value)),

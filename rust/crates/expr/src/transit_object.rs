@@ -10,6 +10,8 @@ mod hash;
 mod time;
 mod path;
 mod throwable;
+mod format_text;
+pub(crate) use format_text::{FormatArgument,format_argument};
 mod tagged_value;
 mod render;
 mod table;

@@ -13,11 +13,7 @@ impl Throwable {
     pub(super) fn read(tag: &str,representation: &Object) -> Result<Self> {
         let values = representation.sequence().ok_or_else(invalid)?;
         let at = |index|values.get(index).unwrap_or(&Object::Null);
-        if tag == "xtdb/exception-info" {
-            if !matches!(at(0),Object::Null | Object::String(_)) { return Err(invalid()); }
-            let mut data = at(1).clone();if matches!(data,Object::Null) { data = Object::Map(Map::new()); }data.entries().ok_or_else(invalid)?;
-            return Ok(Self::ExceptionInfo { message: at(0).clone(),data });
-        }
+        if tag == "xtdb/exception-info" { return Self::exception_info(values); }
         let modern = tag == "xt/error";let offset = usize::from(modern);
         let category = if modern {
             let Object::Keyword(category) = at(0) else { return Err(invalid()); };
@@ -32,6 +28,12 @@ impl Throwable {
         let stored_cause = data.take_error_cause()?.unwrap_or(Object::Null);
         let cause = match stored_cause { Object::Null => None,Object::Throwable(cause) => Some(cause),_ => return Err(invalid()) };
         Ok(Self::Anomaly { message: message.clone(),data,cause })
+    }
+    pub(super) fn exception_info(values: &[Object]) -> Result<Self> {
+        let at = |index|values.get(index).unwrap_or(&Object::Null);
+        if !matches!(at(0),Object::Null | Object::String(_)) { return Err(invalid()); }
+        let mut data = at(1).clone();if matches!(data,Object::Null) { data = Object::Map(Map::new()); }data.entries().ok_or_else(invalid)?;
+        Ok(Self::ExceptionInfo { message: at(0).clone(),data })
     }
     pub(super) fn data(&self) -> &Object { match self { Self::Anomaly { data,.. } | Self::ExceptionInfo { data,.. } => data } }
     pub(super) fn wire(&self,allocation: super::Admission<'_>) -> Result<T> {

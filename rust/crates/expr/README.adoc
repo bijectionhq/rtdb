@@ -321,7 +321,14 @@ The time, type, path, table, legacy Date, metadata and link handler families, co
 `tests/transit_objects.rs` and the public SQL/XTQL field-access tests record these scalar conversion, nested failure and allocation contracts as unexecuted regression sources.
 
 Expression evaluation and registered-object construction share a borrowed tracked or standalone admission policy.
-Generic STR, cast and FORMAT still require registered-object rendering integration, including the process-dependent Date and ExceptionInfo cases.
+General registered-object text rendering requires the source Date environment and the ExceptionInfo construction stack for readable text.
+
+FORMAT uses scalar ExceptionInfo text for a root stored MessagePack `xtdb/exception-info` with exactly two array elements, a string or null message, and null or empty-map data.
+This shape uses the Throwable constructor and scalar renderer under the default Clojure print-binding profile.
+Its message copy and local Throwable acquire a construction reservation before allocation, and text growth retains the existing caller-scope admission.
+FORMAT decodes MessagePack once per Transit argument.
+Other Transit shapes use raw rendering.
+`tests/transit_format_text.rs` records the scalar and expression routes, formatting demand order, exclusions and allocation lifetime as unexecuted regression source.
 
 Simple CASE uses an explicit operand binding.
 It evaluates that operand once, including a null payload, before testing equality alternatives in order.
