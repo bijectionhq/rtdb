@@ -832,3 +832,43 @@ async fn simple_batch_reports_the_first_statement_grammar_error_after_lexing() {
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn locale_dependent_keyword_responses_bypass_only_matching_range_grammar() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let prefix = "SELECT STRING_AGG(word, ',') FROM pg_catalog.pg_get_keywords()";
+    let lowercase = prefix.to_ascii_lowercase();
+
+    let canned = client.query(&format!("{prefix}) LIMIT ALL")).await;
+    assert_eq!(tags(&canned), b"TDCZ");
+    assert_eq!(rows(&canned), [vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(canned[2].1, b"SELECT 1\0");
+    assert_eq!(canned[3].1, b"I");
+
+    let mixed = client.query(&format!("{prefix}); SELECT 42; {lowercase})")).await;
+    assert_eq!(tags(&mixed), b"TDCTDCTDCZ");
+    assert_eq!(rows(&mixed), [vec![Some(b"xtdb".to_vec())], vec![Some(b"42".to_vec())], vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(mixed[9].1, b"I");
+
+    let ordinary = client.query(&format!("SELECT 42; {prefix})")).await;
+    assert_eq!(tags(&ordinary), b"EZ");
+    assert_eq!(ordinary[1].1, b"I");
+
+    assert_eq!(tags(&client.query("SET application_name = 'before'").await), b"SCZ");
+    for (suffix, message) in [("SELEC 7", "SELEC"), ("SELECT @", "Invalid character in SQL source")] {
+        let source = format!("{prefix}); SET application_name = 'changed'; {suffix}");
+        let failed = client.query(&source).await;
+        assert_eq!(tags(&failed), b"EZ");
+        assert_eq!(failed[1].1, b"I");
+        let detail = failed[0].1.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+        let anomaly: serde_json::Value = serde_json::from_slice(detail).unwrap();
+        assert_eq!(anomaly["code"], "xtdb/sql-error");
+        assert!(anomaly["message"].as_str().unwrap().contains(message));
+        let offset = if suffix == "SELECT @" { source.find('@').unwrap() } else { source.len() - suffix.len() };
+        assert_eq!(anomaly["data"]["position"], serde_json::json!(offset + 1));
+        assert_eq!(rows(&client.query("SHOW application_name").await), [vec![Some(b"before".to_vec())]]);
+    }
+    drop(client);
+    running.stop().await;
+}

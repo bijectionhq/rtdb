@@ -11,7 +11,7 @@ use crate::{
     split::SplitTokens,
 };
 
-/// The syntax of a complete SQL batch and the reservation for its retained trees.
+/// The commands in a complete SQL batch and the reservation for their array.
 #[derive(Debug)]
 pub struct StatementBatch<'input> {
     statements: std::vec::IntoIter<BatchStatement<'input>>,
@@ -29,7 +29,7 @@ pub struct BatchStatement<'input> {
     /// SQL PREPARE wrappers in source order, outermost first.
     pub preparations: Vec<PrepareSyntax<'input>>,
     pub command: ExecutableSyntax<'input>,
-    /// Retained until this command's syntax has been consumed.
+    /// Keep this reservation live until preparation consumes or discards the command.
     pub allocation: Arc<MemoryReservation>,
 }
 
@@ -43,6 +43,8 @@ pub struct PrepareSyntax<'input> {
 pub enum ExecutableSyntax<'input> {
     Sql(DeferredStatementSyntax<'input>),
     Control(ParsedControl<'input>),
+    /// The unparsed statement source selected for a frontend response.
+    FrontendResponse(&'input str),
 }
 
 impl<'input> ExecutableSyntax<'input> {
@@ -50,12 +52,24 @@ impl<'input> ExecutableSyntax<'input> {
         match self {
             Self::Sql(syntax) => syntax.source(),
             Self::Control(syntax) => syntax.source(),
+            Self::FrontendResponse(source) => source,
         }
     }
 }
 
 /// Parses every statement before returning. Inline XTQL text and option values remain unresolved.
 pub fn parse_statement_batch<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<StatementBatch<'input>> {
+    parse_statement_batch_with_frontend_response(source, memory, |_| false)
+}
+
+/// Validates the full batch lexically before classifying statement ranges.
+/// Calls the selector in source order on each nonempty semicolon-delimited range it reaches.
+/// The selector receives the original text from the first through the last significant token.
+/// A matching range bypasses grammar and becomes `ExecutableSyntax::FrontendResponse` with an empty PREPARE list.
+/// Parses the grammar of each remaining range before returning.
+pub fn parse_statement_batch_with_frontend_response<'input>(
+    source: &'input str, memory: &'input Arc<MemoryBudget>, is_frontend_response: impl Fn(&str) -> bool,
+) -> Result<StatementBatch<'input>> {
     let mut tokens = SplitTokens::tokenize_in(source, memory)?;
     tokens.values.retain(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
     let mut end = tokens.values.len();
@@ -78,12 +92,18 @@ pub fn parse_statement_batch<'input>(source: &'input str, memory: &'input Arc<Me
             let span = tokens.get(next).or_else(|| tokens.last()).map_or_else(Span::empty, |token| token.span);
             return Err(sql_error("Expected an SQL statement between semicolons", source, span));
         };
-        validate_common_syntax(range, source)?;
         let start = starts.offset(first.span.start);
         let end = ends.offset(last.span.end);
+        let range_source = &source[start..end];
+        let frontend_response = is_frontend_response(range_source);
+        if !frontend_response { validate_common_syntax(range, source)?; }
         let bytes = (end - start).checked_mul(128).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(batch_size)?;
         let allocation = memory.reserve(bytes)?;
-        let (preparations, command) = parse_batch_statement(source, range, end, &mut starts, forms)?;
+        let (preparations, command) = if frontend_response {
+            (Vec::new(), ExecutableSyntax::FrontendResponse(range_source))
+        } else {
+            parse_batch_statement(source, range, end, &mut starts, forms)?
+        };
         statements.push(BatchStatement { preparations, command, allocation });
         next += range.len() + 1;
     }

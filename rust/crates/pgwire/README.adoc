@@ -78,8 +78,9 @@ A leading semicolon that survives that check returns NoData and a zero-row comma
 The empty marker returns EmptyQueryResponse.
 A normalized message selects the keyword marker when its prefix lowercases to `select string_agg(word, ',') from pg_catalog.pg_get_keywords()` under every Java default locale.
 It ignores the rest of the message and returns NoData, one text row containing `xtdb`, and the `SELECT 1` command tag.
-For locale-dependent prefixes, Simple Query tokenizes the message and recognizes keyword probes per statement using ASCII lowercasing.
-A probe prepared that way carries a RowDescription.
+When the normalized whole-message prefix is locale-dependent, Simple Query validates the full message lexically and recognizes keyword probes per range using ASCII case-insensitive prefix matching.
+A matching range bypasses SQL grammar checks and returns RowDescription, one text row containing `xtdb`, and the `SELECT 1` command tag.
+Every other range must pass grammar validation before any statement runs.
 On success the markers preserve an existing explicit transaction's status and settle an implicit transaction through the normal Simple Query path.
 The DBeaver namespace query rewrite matches the complete normalized Simple message before tokenization.
 The namespace query keeps its original projection when it appears in a multi-statement message.

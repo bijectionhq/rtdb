@@ -148,19 +148,15 @@ impl ProtocolSession {
         self.retain_prepared(source, oids, shape)
     }
 
-    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>, locale_dependent_keyword: bool) -> Result<Arc<Prepared>> {
+    async fn prepare_batch_command(&mut self, syntax: ExecutableSyntax<'_>, allocation: Arc<MemoryReservation>) -> Result<Arc<Prepared>> {
         let source = syntax.source();
         let options = self.options();
-        let shape = if locale_dependent_keyword && legacy_keyword_probe(source) {
-            drop(syntax);
-            keyword_shape()
-        } else {
-            match syntax {
-                ExecutableSyntax::Control(control) => control_shape(control.bind(&options)?, 0)?,
-                ExecutableSyntax::Sql(syntax) => {
-                    let context = self.session.prepare_context(&self.token()).await?;
-                    sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
-                }
+        let shape = match syntax {
+            ExecutableSyntax::FrontendResponse(_) => keyword_shape(),
+            ExecutableSyntax::Control(control) => control_shape(control.bind(&options)?, 0)?,
+            ExecutableSyntax::Sql(syntax) => {
+                let context = self.session.prepare_context(&self.token()).await?;
+                sql_shape(PreparedSql::prepare_postgres_statement(syntax, &context, options.search_path, &[])?, 0)
             }
         };
         drop(allocation);
@@ -337,20 +333,25 @@ impl ProtocolSession {
             let allocation = memory.reserve(normalized.0.len() + normalized.1.len())?;
             (Cow::Owned([normalized.0, normalized.1].concat()), Some(allocation))
         };
-        for statement in rtdb_sql::parse_statement_batch(&source, &memory)? {
+        let batch = if keyword == KeywordPrefix::LocaleDependent {
+            rtdb_sql::parse_statement_batch_with_frontend_response(&source, &memory, legacy_keyword_probe)?
+        } else {
+            rtdb_sql::parse_statement_batch(&source, &memory)?
+        };
+        for statement in batch {
             let start_transaction = !statement.preparations.is_empty()
                 || match &statement.command {
-                    ExecutableSyntax::Sql(_) => true,
+                    ExecutableSyntax::Sql(_) | ExecutableSyntax::FrontendResponse(_) => true,
                     ExecutableSyntax::Control(control) => control.starts_implicit_transaction(),
                 };
             if start_transaction { self.begin_implicit(None)?; }
-            let result = self.run_simple_statement(statement, keyword == KeywordPrefix::LocaleDependent, writer).await;
+            let result = self.run_simple_statement(statement, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
         self.settle_simple_transaction().await
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchStatement<'_>, locale_dependent_keyword: bool, writer: &mut Writer<W>) -> Result<()> {
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchStatement<'_>, writer: &mut Writer<W>) -> Result<()> {
         let BatchStatement { preparations, command: syntax, allocation } = statement;
         let mut layers = preparations.into_iter();
         if let Some(layer) = layers.next() {
@@ -375,11 +376,11 @@ impl ProtocolSession {
                 self.retain_prepared(nested.source, Vec::new(), control_shape(control, 0)?)?
             } else {
                 drop(layers);
-                self.prepare_batch_command(syntax, allocation, false).await?
+                self.prepare_batch_command(syntax, allocation).await?
             };
             return self.install_sql_prepare(name, prepared, writer).await;
         }
-        let prepared = self.prepare_batch_command(syntax, allocation, locale_dependent_keyword).await?;
+        let prepared = self.prepare_batch_command(syntax, allocation).await?;
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
         let mut portal = self.bind(prepared, Vec::new(), Vec::new(), &[]).await?;
