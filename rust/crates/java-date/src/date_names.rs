@@ -1,6 +1,6 @@
 use super::date_locale::{CalendarKind, LocaleData};
 
-#[path = "../../../../vendor/fancy-regex/src/unicode_case.rs"]
+#[path = "../../../vendor/fancy-regex/src/unicode_case.rs"]
 mod unicode_case;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
