@@ -38,21 +38,25 @@ impl BootTransport {
         Arc::new(ActorLog { actor, boot: Arc::clone(self) })
     }
 
-    async fn wait(&self, ready: impl Fn(&BootState) -> bool) -> Result<()> {
+    async fn wait(&self, ready: impl Fn(&BootState) -> bool) -> Result<bool> {
         let mut state = self.state.subscribe();
         self.cancellation.run_until_cancelled(state.wait_for(ready)).await
-            .ok_or_else(|| Error::Closed("Processor simulation stopped".into()))?
-            .map(|_| ()).map_err(|_| invalid("boot monitor closed"))
+            .transpose().map(|grant| grant.is_some()).map_err(|_| invalid("boot monitor closed"))
+    }
+
+    async fn require(&self, ready: impl Fn(&BootState) -> bool) -> Result<()> {
+        if self.wait(ready).await? { Ok(()) }
+        else { Err(Error::Closed("Processor simulation stopped".into())) }
     }
 
     pub async fn open(&self, actor: usize) -> Result<()> {
         self.state.send_modify(|state| state.open[actor] = true);
-        self.wait(|state| state.opened[actor]).await
+        self.require(|state| state.opened[actor]).await
     }
 
     pub async fn attempt(&self, actor: usize) -> Result<()> {
         self.state.send_modify(|state| state.attempt[actor] = true);
-        self.wait(|state| state.attempted[actor]).await
+        self.require(|state| state.attempted[actor]).await
     }
 
     pub async fn commit(&self) -> Result<CommittedClaim> {
@@ -71,7 +75,7 @@ impl BootTransport {
 
     pub async fn deliver(&self, actor: usize) -> Result<()> {
         self.state.send_modify(|state| state.deliver[actor] = true);
-        self.wait(|state| state.delivered[actor]).await
+        self.require(|state| state.delivered[actor]).await
     }
 }
 
@@ -103,7 +107,7 @@ impl Log for ActorLog {
         if !claim || frame.term != Term(1) {
             return Err(invalid("native actor's initial append was not the term-one boot claim"));
         }
-        self.boot.wait(|state| state.attempt[self.actor]).await?;
+        self.boot.require(|state| state.attempt[self.actor]).await?;
         if self.actor != 0 {
             self.boot.state.send_modify(|state| state.attempted[self.actor] = true);
             return Err(invalid("captured peer refuses replica claim"));
@@ -120,7 +124,7 @@ impl Log for ActorLog {
 
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
         if after != LogOffset(-1) { return Err(invalid("native actor opened a nonempty first replica tail")); }
-        self.boot.wait(|state| state.open[self.actor]).await?;
+        self.boot.require(|state| state.open[self.actor]).await?;
         let tail = self.boot.replica.tail(after).await?;
         self.boot.state.send_modify(|state| state.opened[self.actor] = true);
         Ok(Box::new(BootTail { actor: self.actor, boot: Arc::clone(&self.boot), tail, first: true }))
@@ -144,7 +148,7 @@ impl LogTail for BootTail {
 #[async_trait]
 impl LogReplayTail for BootTail {
     async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
-        if self.first { self.boot.wait(|state| state.deliver[self.actor]).await?; }
+        if self.first && !self.boot.wait(|state| state.deliver[self.actor]).await? { return Ok(None); }
         self.tail.replay().ok_or_else(|| invalid("provider lacks admitted replay"))?.poll_head(timeout).await
     }
 
@@ -169,6 +173,20 @@ mod tests {
         ReplicaEnvelope {
             term: Term(1), term_sequence: Some(TermSequence(0)), message: ReplicaBody::NoOp(NoOp { src_msg_id: None }),
         }.encode().into()
+    }
+
+    #[tokio::test]
+    async fn stopping_an_ungranted_delivery_leaves_the_replica_log_open() {
+        let provider = Arc::new(MemoryLog::new(4096));
+        let cancellation = CancellationToken::new();
+        let transport = BootTransport::new(Arc::clone(&provider), cancellation.clone());
+        let actor = transport.actor(0);
+        let (tail, opened) = tokio::join!(actor.tail(LogOffset(-1)), transport.open(0));
+        opened.unwrap();
+        let mut tail = tail.unwrap();
+        cancellation.cancel();
+        assert!(tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap().is_none());
+        assert_eq!(provider.enqueue(claim(), Timestamp(4)).await.unwrap().durable().await.unwrap().offset, LogOffset(0));
     }
 
     #[tokio::test]
