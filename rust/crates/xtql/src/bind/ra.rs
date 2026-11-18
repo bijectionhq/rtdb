@@ -70,6 +70,7 @@ impl Importer<'_, '_, '_> {
             ("anti-join" | "▷", [left, right]) => self.join(JoinKind::Anti, options, left, right)?,
             ("single-join", [left, right]) => self.join(JoinKind::Single, options, left, right)?,
             ("mark-join", [left, right]) => self.mark(options, left, right)?,
+            ("apply", [input, dependent]) => self.apply(options, input, dependent)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -533,6 +534,50 @@ impl Importer<'_, '_, '_> {
             .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
             .chain([NamedExpr { field: output.clone(), expr: output.expression() }]).collect();
         Arc::new(relation).project(expressions)
+    }
+
+    fn apply(&mut self, options: &Edn, input: &Edn, dependent: &Edn) -> Result<Relation> {
+        let input = self.lower(input)?;
+        let scope = bind_input(&input);
+        let mut parameters = self.parameters.clone();
+        let mut arguments = Vec::new();
+        let mut names = BTreeSet::new();
+        for (column, parameter) in required(options, "columns")?.map().ok_or_else(|| invalid("Apply parameter columns must be a map"))? {
+            let column = column_name(column)?;
+            let field = scope.variables.get(column).ok_or_else(|| {
+                error("xtdb.apply/missing-column", format!("Column missing from independent relation: {column}")).with_context("column", column.into())
+            })?;
+            let name = parameter.symbol().filter(|name| name.starts_with('?'))
+                .ok_or_else(|| invalid("Apply parameter must be a parameter symbol"))?;
+            let name = self.compiler.symbols.parameter(name);
+            if !names.insert(name.clone()) { return Err(invalid("Apply parameter is bound more than once")); }
+            let index = self.compiler.parameter_index()?;
+            parameters.insert(name, PExpr::Parameter { index, data_type: field.data_type.clone() });
+            arguments.push((index, field.expression()));
+        }
+        let mut child = Importer { compiler: self.compiler, parameters: &parameters, memory: self.memory };
+        let mut dependent = child.lower(dependent)?;
+        let kind = match required(options, "mode")?.keyword() {
+            Some("cross-join") => ApplyKind::Inner,
+            Some("left-outer-join") => ApplyKind::Left,
+            Some("semi-join") => ApplyKind::Semi,
+            Some("anti-join") => ApplyKind::Anti,
+            Some("single-join") => ApplyKind::Single,
+            Some("mark-join") => ApplyKind::Mark,
+            _ => return Err(invalid("Unknown apply join mode")),
+        };
+        let output = if kind == ApplyKind::Mark {
+            let Some([(name, comparison)]) = required(options, "mark-join-projection")?.map() else {
+                return Err(invalid("Mark apply requires one projected comparison"));
+            };
+            let expr = child.scalar(comparison, &mut bind_input(&dependent))?;
+            let projected = child.compiler.binder.field("xt$comparison", None, expr.data_type())?;
+            dependent = Arc::new(dependent.project(vec![NamedExpr { field: projected, expr }])?);
+            let output = child.compiler.binder.field(column_name(name)?, None, LogicalType::Scalar(ScalarType::Bool).maybe())?;
+            Some(output)
+        } else { None };
+        let schema = kind.result_schema(input.schema(), dependent.schema(), output.as_ref())?;
+        Relation::new(schema, RelationNode::Apply { input, dependent, arguments, kind, output })
     }
 
     fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {

@@ -354,19 +354,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
             let dependent_types = relation_types(dependent, &Emitter { parameters: &bound, outer: &scopes, ..*emitter })?;
             let dependent = dependent_types.schema().clone();
             children.push(dependent_types);
-            match kind {
-                ApplyKind::Inner => input.concat(&dependent)?,
-                ApplyKind::Left => input.concat(&dependent.nullable()?)?,
-                _ => {
-                    let output = output.as_ref().ok_or_else(|| invalid("runtime-apply", "Scalar apply has no output field"))?;
-                    let ty = match kind {
-                        ApplyKind::Scalar => dependent.fields()[0].data_type.clone().maybe(),
-                        ApplyKind::Exists => L::Scalar(ScalarType::Bool),
-                        _ => { let document = L::Struct(dependent.fields().iter().map(|field| (field.name.clone(), field.data_type.clone())).collect()); if *kind == ApplyKind::PullMany { L::list(document).maybe() } else { document.maybe() } }
-                    };
-                    input.concat(&Schema::new(vec![field_type(output, ty)])?)?
-                }
-            }
+            kind.result_schema(&input,&dependent,output.as_ref())?
         }
     };
     let node = match (relation.node(), children.as_slice()) {

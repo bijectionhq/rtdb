@@ -56,7 +56,44 @@ impl JoinKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 /// Evaluates the dependent relation for each input row with apply-local argument bindings.
 /// Scalar and Pull reject multiple dependent rows; Scalar, Pull, and PullMany yield null on no rows.
-pub enum ApplyKind { Inner, Left, Scalar, Exists, Pull, PullMany }
+pub enum ApplyKind { Inner, Left, Single, Semi, Anti, Mark, Scalar, Exists, Pull, PullMany }
+
+impl ApplyKind {
+    pub fn result_schema(self, input: &Schema, dependent: &Schema, output: Option<&Field>) -> Result<Schema> {
+        let invalid = |message| Anomaly::fault("rtdb.plan/invalid-relation", message);
+        match self {
+            Self::Inner | Self::Left | Self::Single | Self::Semi | Self::Anti => {
+                if output.is_some() { return Err(invalid("Relational apply cannot declare a scalar output")); }
+                match self {
+                    Self::Inner => input.concat(dependent),
+                    Self::Left | Self::Single => input.concat(&dependent.nullable()?),
+                    _ => Ok(input.clone()),
+                }
+            }
+            _ => {
+                let mut output = output.cloned().ok_or_else(|| invalid("Scalar apply requires an output field"))?;
+                output.data_type = match self {
+                    Self::Mark | Self::Scalar => {
+                        let [field] = dependent.fields() else { return Err(invalid("Mark and scalar apply require one dependent column")); };
+                        if self == Self::Mark {
+                            if field.data_type.legs().iter().any(|ty| !matches!(ty, LogicalType::Null | LogicalType::Nothing | LogicalType::Scalar(ScalarType::Bool))) {
+                                return Err(invalid("Mark apply requires a Boolean or null dependent column"));
+                            }
+                            LogicalType::Scalar(ScalarType::Bool).maybe()
+                        } else { field.data_type.clone().maybe() }
+                    }
+                    Self::Exists => LogicalType::Scalar(ScalarType::Bool),
+                    Self::Pull | Self::PullMany => {
+                        let document = LogicalType::Struct(dependent.fields().iter().map(|field| (field.name.clone(), field.data_type.clone())).collect());
+                        if self == Self::PullMany { LogicalType::list(document).maybe() } else { document.maybe() }
+                    }
+                    _ => unreachable!(),
+                };
+                input.concat(&Schema::new(vec![output])?)
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetOperator { Union, Intersect, Except }
@@ -456,29 +493,8 @@ impl Relation {
                     if !parameters.insert(index) { return invalid("Apply parameter is bound more than once"); }
                     expr.validate_columns(&input.schema.ids())?;
                 }
-                let expected = match kind {
-                    ApplyKind::Inner | ApplyKind::Left => {
-                        if output.is_some() { return invalid("Relational apply cannot declare a scalar output"); }
-                        if *kind == ApplyKind::Left { input.schema.concat(&dependent.schema.nullable()?)? }
-                        else { input.schema.concat(&dependent.schema)? }
-                    }
-                    _ => {
-                        let Some(output) = output else { return invalid("Scalar apply requires an output field"); };
-                        let document = LogicalType::Struct(dependent.schema.fields().iter().map(|field| (field.name.clone(), field.data_type.clone())).collect());
-                        let data_type = match kind {
-                            ApplyKind::Scalar => {
-                                if dependent.schema.len() != 1 { return invalid("Scalar apply requires a single dependent column"); }
-                                dependent.schema.fields()[0].data_type.clone().maybe()
-                            }
-                            ApplyKind::Exists => LogicalType::Scalar(ScalarType::Bool),
-                            ApplyKind::Pull => document.maybe(),
-                            ApplyKind::PullMany => LogicalType::list(document).maybe(),
-                            ApplyKind::Inner | ApplyKind::Left => return invalid("Relational apply cannot declare a scalar result type"),
-                        };
-                        if output.data_type != data_type { return invalid("Scalar apply output type differs from its result"); }
-                        input.schema.concat(&Schema::new(vec![output.clone()])?)?
-                    }
-                };
+                let expected = kind.result_schema(input.schema(), dependent.schema(), output.as_ref())?;
+                if output.as_ref().is_some_and(|field| expected.get(field.id) != Some(field)) { return invalid("Scalar apply output type differs from its result"); }
                 if self.schema != expected { return invalid("Apply schema does not describe its output"); }
             }
             RelationNode::Aggregate { groups, aggregates, .. } => {

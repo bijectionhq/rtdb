@@ -559,10 +559,40 @@ impl PageCursor for Apply {
                 continue;
             }
             let first = cursor.next().await?;
+            if matches!(self.kind, ApplyKind::Semi | ApplyKind::Anti) {
+                if first.is_some() == (self.kind == ApplyKind::Semi) {
+                    output.push_growing(OwnedRow::copy_parts(&[&row.values],0,0,&self.execution.context.memory)?,&self.execution.context.memory)?;
+                }
+                continue;
+            }
+            if self.kind == ApplyKind::Single {
+                if cursor.next().await?.is_some() { return Err(crate::cardinality_violation()); }
+                let result = match first {
+                    Some(dependent) => OwnedRow::copy_parts(&[&row.values,&dependent.values],0,0,&self.execution.context.memory)?,
+                    None => OwnedRow::copy_parts(&[&row.values],0,self.dependent.schema().len(),&self.execution.context.memory)?,
+                };
+                output.push_growing(result,&self.execution.context.memory)?;
+                continue;
+            }
             let output_scope = self.execution.scope()?;
             output_scope.reserve(row.bytes().checked_add(512).ok_or_else(|| invalid("row-size", "Apply output allocation overflow"))?)?;
             let result = match self.kind {
                 ApplyKind::Exists => Value::Bool(first.is_some()),
+                ApplyKind::Mark => {
+                    let mut mark = Value::Bool(false);
+                    let mut next = first;
+                    while let Some(candidate) = next {
+                        self.execution.context.check_cancelled()?;
+                        match candidate.values.first() {
+                            Some(Value::Bool(true)) => { mark = Value::Bool(true); break; }
+                            Some(Value::Bool(false)) => (),
+                            Some(Value::Null | Value::Undefined) => mark = Value::Null,
+                            _ => return Err(invalid("mark-type","Mark comparison must return Boolean or null")),
+                        }
+                        next = cursor.next().await?;
+                    }
+                    mark
+                }
                 ApplyKind::Scalar | ApplyKind::Pull => {
                     if cursor.next().await?.is_some() { return Err(crate::cardinality_violation()); }
                     if let Some(row) = &first { output_scope.reserve(self.document_bound(row)?)?; }

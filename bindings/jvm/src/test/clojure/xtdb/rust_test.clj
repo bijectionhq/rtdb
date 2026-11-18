@@ -4,6 +4,7 @@
             [xtdb.as-of-test :as original-as-of]
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
+            [xtdb.operator.apply-test :as original-apply]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.operator.distinct-test :as original-distinct]
             [xtdb.operator.join-test :as original-join]
@@ -270,6 +271,22 @@
 (deftest-original-api original-join/test-mark-join-conditions-are-two-valued)
 
 (deftest-original-api original-join/test-exists-as-mark-join)
+
+(deftest-original-api original-apply/test-apply-operator)
+
+(deftest-original-api original-apply/test-apply-mark)
+
+(deftest-original-api original-apply/test-apply-single)
+
+(deftest-original-api original-apply/test-apply-empty-rel-bug-237)
+
+(deftest-original-api original-apply/test-nested-apply)
+
+(deftest-original-api original-apply/test-shadowed-param)
+
+(deftest-original-api original-apply/test-forwarding-nullable-type-information-494)
+
+(deftest-original-api original-apply/test-missing-column-in-independent-rel)
 
 (deftest-original-api original-join/can-join-on-lists-491)
 
