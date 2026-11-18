@@ -163,10 +163,35 @@ Gradle loads the inventory adapter from the retained copy inside that directory.
 It records the seed, authored actions and role samples, dispatcher choices, actual claim refusals, ordered log enqueue and durability, tail delivery, external apply acknowledgements and the original assertions' completion.
 The existing JUnit worker listener binds the trace bytes to the concrete successful invocation.
 The output retains the task selection, Gradle logs and report, and the worker's classpath and runtime evidence.
+The runtime receipt records the requested paths, their resolved roots, and the regular files found beneath selected directory roots at capture time.
+The capture keeps the resolved Java modules path from the worker and mirrors the selected external JVM files under its own artifact directory.
+Offline verification checks archived directory contents against the captured inventory and uses the worker and tape bytes it validates.
+Capture and offline verification require readable runtime directories and consistent resolutions for repeated path requests.
 The optional `--seed` uses the original simulation's explicit seed annotation to repeat the generated inputs.
 The runner writes `reference-capture.json` after verifying a successful capture.
 A failed or incomplete capture remains available for diagnosis.
-The pilot covers one reference invocation, with internal time samples, native replay and matching assertion receipts still pending.
+The pilot covers one reference invocation.
+
+After Phase 2 begins, run the native trial with the closed JVM capture and a conformance binary built from the current clean implementation checkout.
+Choose a new output directory outside both the checkout and the JVM capture.
+Create the JVM capture with a recorder that writes runtime receipt schema version 2.
+
+[source,shell]
+----
+python3 rust/conformance/replay_log_processor_sim.py --phase-two \
+  --capture JVM_RUN_DIR --native RTDB_CONFORMANCE_BINARY --output NATIVE_RUN_DIR
+----
+
+The launcher verifies the retained JVM worker, derived source and artifact receipts before projecting the native subcommand input.
+Three writable native processors share a memory source log, replica log and object store.
+The trial replays the recorded initial claim acceptance, refusal attempts, provider durability, append receipt release and offset-zero deliveries.
+It submits the recorded external actions and source flushes in their original stimulus order, including source appends reached before boot.
+The surviving writer uses the original typed UUIDs and the captured effective transaction times, supplied explicitly in microseconds.
+The launcher verifies each captured token against its action index, and the native driver submits that index in the original big-endian encoding.
+The native trace records the assigned and applied transaction keys, source position mapping and each processor's progress at its selected final observation.
+The native driver owns later scheduling and block production.
+Comparison of internal time samples, intermediate apply and role edges, block and snapshot layouts, and matched assertion receipts remains pending.
+
 
 `list_native.py` reads Cargo JSON build messages and lists the already-built test executables, preserving target, feature configuration, binary digest, and exact test name.
 It requires a single terminal successful `build-finished` record and a `--selection` JSON manifest with `schema_version: 1`, the absolute `workspace`, `implementation_revision`, `configuration`, build `command` argv, and `targets`.

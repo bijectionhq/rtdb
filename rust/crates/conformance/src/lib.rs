@@ -7,6 +7,7 @@ pub mod faults;
 pub mod history;
 pub mod sql_logic;
 pub mod backend;
+pub mod simulation;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CaseIdentity {

@@ -12,6 +12,7 @@ rtdb-temporal.workspace = true
 rtdb-types.workspace = true
 rtdb-storage.workspace = true
 rtdb-node.workspace = true
+rtdb-replication.workspace = true
 rtdb-columnar.workspace = true
 rtdb-maintenance.workspace = true
 rtdb-plan.workspace = true

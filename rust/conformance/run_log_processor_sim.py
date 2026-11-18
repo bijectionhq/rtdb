@@ -6,13 +6,15 @@ import hashlib
 import json
 import re
 import shutil
+import stat
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 
 from run_controls import HERE, REFERENCE, REPOSITORY, digest, git, run_process, write_json
-from runtime_inventory import read_plan
+from runtime_inventory import inspect_plan
 from source_gate import require_phase_two
 
 
@@ -367,32 +369,54 @@ def regular(path):
     return path
 
 
+def bounded_bytes(path):
+    with regular(path).open("rb") as source:
+        data = source.read(MAX_JSON + 1)
+    require(len(data) <= MAX_JSON, f"evidence file exceeds its size bound: {path}")
+    return data
+
+
 def bounded_json(path):
-    require(regular(path).stat().st_size <= MAX_JSON, f"evidence file exceeds its size bound: {path}")
-    return json.loads(path.read_bytes())
+    return json.loads(bounded_bytes(path))
+
+
+@dataclass(frozen=True)
+class RecordedFile:
+    path: Path
+    data: bytes
+    sha256: str
+
+    @classmethod
+    def read(cls, path):
+        data = bounded_bytes(path)
+        return cls(path, data, hashlib.sha256(data).hexdigest())
+
+    def receipt(self, root):
+        return {"path": self.path.relative_to(root).as_posix(), "sha256": self.sha256, "bytes": len(self.data)}
 
 
 def selected_invocation(run):
     inventory = run / "inventory"
-    lanes = bounded_json(inventory / "requested-lanes.json")
+    lanes_file = RecordedFile.read(inventory / "requested-lanes.json")
+    lanes = json.loads(lanes_file.data)
     require(lanes == {"schema_version": 1, "lanes": [{"project": PROJECT, "task": TASK, "enabled": True}]},
             "Gradle did not select exactly the requested property task")
     directory = inventory / LANE
-    selection = bounded_json(directory / "selection.json")
+    selection_file = RecordedFile.read(directory / "selection.json")
+    selection = json.loads(selection_file.data)
     require(selection["schema_version"] == 1 and selection["project"] == PROJECT and selection["task"] == TASK
             and selection["include_tags"] == ["property"] and str(selection["simulation_iterations"]) == "1",
             "Gradle selected different task options")
     streams = list(directory.glob("*.jsonl"))
     require(len(streams) == 1, "expected one selected JUnit worker stream")
-    journal = regular(streams[0])
-    require(journal.stat().st_size <= MAX_JSON, "JUnit worker recording exceeds its size bound")
-    plan = read_plan(journal)
+    journal = RecordedFile.read(streams[0])
+    frames = [json.loads(line) for line in journal.data.decode("utf-8").splitlines() if line.strip()]
+    plan = inspect_plan(journal.path, frames, journal.sha256)
     require(not plan["errors"] and plan["project"] == PROJECT and plan["task"] == TASK and len(plan["cases"]) == 1,
             "the JUnit worker did not record exactly one concrete selected case")
     case, = plan["cases"]
     unique = case["descriptor"]["unique_id"]
     require(case["outcome"].get("status") == "SUCCESSFUL", "original assertion invocation did not succeed")
-    frames = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]
     descriptors = {frame["descriptor"]["unique_id"]: frame["descriptor"] for frame in frames
                    if frame["event"] in {"discovered", "dynamic_registered"}}
     descriptor = case["descriptor"]
@@ -414,11 +438,11 @@ def selected_invocation(run):
     require(marker["descriptor"]["unique_id"] == unique and start < marker["sequence"] < case["outcome"]["sequence"],
             "simulation tape marker belongs to a different invocation")
     name = f"causal/{hashlib.sha256(unique.encode('utf-8')).hexdigest()}.json"
-    recorded = run / name
+    recorded = RecordedFile.read(run / name)
     require(marker["entries"]["rtdb.simulation.trace"] == name and
-            marker["entries"].get("rtdb.simulation.sha256") == digest(regular(recorded)),
+            marker["entries"].get("rtdb.simulation.sha256") == recorded.sha256,
             "JUnit simulation tape link differs from the retained bytes")
-    return unique, selection, journal, recorded
+    return unique, selection, (lanes_file, selection_file, journal), recorded
 
 
 def int_value(value, lower, upper=2**63 - 1):
@@ -692,13 +716,86 @@ def check_tape(tape, unique, seed):
     return {"seed": tape["seed"], "events": len(frames), "actions": actions, "steps": steps}
 
 
+def runtime_requests(selection, tape):
+    home = Path(tape["java_home_request"])
+    jvm_args = tape["jvm_args"]
+    require(home.is_absolute() and isinstance(jvm_args, list) and all(isinstance(value, str) for value in jvm_args),
+            "malformed JVM home or arguments")
+    agents = [value.removeprefix("-javaagent:").split("=", 1)[0]
+              for value in jvm_args if value.startswith("-javaagent:")]
+    require(agents, "JUnit worker omitted the original watchdog agent")
+    requests = {
+        "classpath": selection["classpath"],
+        "test_class_directories": selection["test_class_directories"],
+        "java": [tape["java_executable_request"], str(home / "bin/java")],
+        "modules": [str(home / "lib/modules")],
+        "java_agents": agents,
+    }
+    require(requests["classpath"] and all(isinstance(paths, list) and
+            all(isinstance(path, str) and Path(path).is_absolute() for path in paths) for paths in requests.values()),
+            "Gradle runtime paths are missing or relative")
+    return requests
+
+
+def resolve_runtime_requests(requests):
+    def resolve(name, optional):
+        try:
+            return str(Path(name).resolve(strict=True))
+        except FileNotFoundError:
+            require(optional, f"required JVM runtime path is missing: {name}")
+            return None
+
+    return {kind: [{"requested": name, "canonical": resolve(name, kind in {"classpath", "test_class_directories"})}
+                   for name in paths] for kind, paths in requests.items()}
+
+
+def require_consistent_runtime_aliases(resolved):
+    canonical_by_request = {}
+    for entries in resolved.values():
+        for entry in entries:
+            canonical = entry["canonical"]
+            require(canonical_by_request.setdefault(entry["requested"], canonical) == canonical,
+                    "one JVM runtime request has inconsistent resolutions")
+
+
+def require_disjoint_runtime_root(run, location):
+    artifacts = run / "artifacts"
+    require(not location.is_relative_to(artifacts) and not artifacts.is_relative_to(location),
+            f"runtime root overlaps its own artifact directory: {location}")
+
+
+def runtime_tree(directory):
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        require(stat.S_ISDIR(current.lstat().st_mode), f"invalid runtime directory: {current}")
+        for member in current.iterdir():
+            mode = member.lstat().st_mode
+            is_directory = stat.S_ISDIR(mode)
+            require(is_directory or stat.S_ISREG(mode), f"non-regular runtime member: {member}")
+            if is_directory:
+                pending.append(member)
+            yield member, is_directory
+
+
+def runtime_locations(entries):
+    return {Path(entry["canonical"]) for entry in entries if entry["canonical"] is not None}
+
+
+def retained_runtime_path(original_run, path):
+    if path.is_relative_to(original_run):
+        return path.relative_to(original_run)
+    return Path("artifacts/external").joinpath(*path.parts[1:])
+
+
 def retain_runtime(run, tree, selection, tape):
-    classpath = [Path(name) for name in selection["classpath"]]
-    require(classpath and all(path.is_absolute() for path in classpath), "Gradle test classpath is missing or relative")
-    canonical = {path.resolve() for path in classpath if path.exists()}
+    requests = runtime_requests(selection, tape)
+    resolved = resolve_runtime_requests(requests)
+    require_consistent_runtime_aliases(resolved)
+    canonical = runtime_locations(resolved["classpath"])
     require({run / "adapter/jvm-services", tree / "build/rtdb-conformance/recorder"} <= canonical,
             "Gradle did not use the owned adapter services and compiled listener")
-    test_directories = {Path(name).resolve() for name in selection["test_class_directories"]}
+    test_directories = runtime_locations(resolved["test_class_directories"])
     locations = {name: Path(path) for name, path in tape["classes"].items()}
     require(set(locations) == CLOSURE_CLASSES and set(locations.values()) <= canonical,
             "observed JVM classes are outside the selected test classpath")
@@ -718,16 +815,19 @@ def retain_runtime(run, tree, selection, tape):
             with ZipFile(regular(location)) as archive:
                 require(entry in archive.namelist(), f"observed class is missing from its artifact: {name}")
 
-    home = Path(tape["java_home"])
-    java = regular(Path(tape["java_executable"]))
-    require(home.is_absolute() and java == (home / "bin/java").resolve(), "JUnit worker executable differs from its JDK")
-    modules = regular(home / "lib/modules")
-    jvm_args = tape["jvm_args"]
-    require(isinstance(jvm_args, list) and all(isinstance(value, str) for value in jvm_args), "malformed JVM arguments")
-    agents = [Path(value.removeprefix("-javaagent:").split("=", 1)[0]).resolve()
-              for value in jvm_args if value.startswith("-javaagent:")]
-    require(agents, "JUnit worker omitted the original watchdog agent")
-    runtime = canonical | {java, modules, *agents}
+    java = runtime_locations(resolved["java"])
+    require(Path(tape["java_home_request"]).resolve(strict=True) == Path(tape["java_home"]),
+            "JUnit worker JDK home differs from its request")
+    require(java == {Path(tape["java_executable"])}, "JUnit worker executable differs from its JDK")
+    modules = runtime_locations(resolved["modules"])
+    require(modules == {Path(tape["java_modules"])}, "JDK modules differ from the worker observation")
+    fixed_files = java | modules | runtime_locations(resolved["java_agents"])
+    require(all(path.is_file() for path in fixed_files), "worker executable, modules and agents must be regular files")
+    require(all(path.is_dir() for path in test_directories), "Gradle test class roots must be directories")
+    runtime = canonical | test_directories | fixed_files
+    for location in runtime:
+        require_disjoint_runtime_root(run, location)
+    roots = []
     retained = {}
 
     def capture(path):
@@ -735,13 +835,12 @@ def retain_runtime(run, tree, selection, tape):
             return
         sha256 = digest(regular(path))
         size = path.stat().st_size
-        if path.is_relative_to(run):
-            owned = path
-        else:
-            owned = run / "artifacts" / sha256
-            if not owned.exists():
-                with path.open("rb") as source, owned.open("xb") as target:
-                    shutil.copyfileobj(source, target)
+        relative = retained_runtime_path(run, path)
+        owned = run / relative
+        if owned != path:
+            owned.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("rb") as source, owned.open("xb") as target:
+                shutil.copyfileobj(source, target)
         require(regular(owned).stat().st_size == size and digest(owned) == sha256 and digest(path) == sha256,
                 f"runtime artifact changed during capture: {path}")
         retained[path] = {"path": str(path), "retained": owned.relative_to(run).as_posix(),
@@ -749,16 +848,23 @@ def retain_runtime(run, tree, selection, tape):
 
     for location in sorted(runtime):
         if location.is_dir():
-            for member in sorted(location.rglob("*")):
-                require(not member.is_symlink() and (member.is_dir() or member.is_file()),
-                        f"non-regular classpath directory member: {member}")
-                if member.is_file():
+            destination = run / retained_runtime_path(run, location)
+            destination.mkdir(parents=True, exist_ok=True)
+            members = []
+            for member, is_directory in sorted(runtime_tree(location)):
+                if not is_directory:
                     capture(member)
+                    members.append(member.relative_to(location).as_posix())
+            roots.append({"path": str(location), "kind": "directory", "members": sorted(members)})
         else:
             capture(location)
+            roots.append({"path": str(location), "kind": "file", "members": []})
     require(retained, "JVM runtime closure is empty")
-    return {"classpath": selection["classpath"], "absent_classpath": [str(path) for path in classpath if not path.exists()],
-            "java_home": str(home), "java_executable": str(java), "jvm_args": jvm_args,
+    require(resolve_runtime_requests(requests) == resolved, "a selected JVM runtime path changed during capture")
+    write_json(run / "runtime-paths.json", resolved)
+    return {"schema_version": 2, "classpath": selection["classpath"], "requested_roots": resolved, "roots": roots,
+            "java_home": tape["java_home"], "java_executable": tape["java_executable"],
+            "java_modules": tape["java_modules"], "jvm_args": tape["jvm_args"],
             "class_sources": tape["classes"], "artifacts": list(retained.values())}
 
 
@@ -804,15 +910,14 @@ def capture(args):
                 for name, sha256 in inputs.items()), "adapter source changed during recording")
     require(process.get("completed") is True and process.get("exit_code") == 0, "the selected Gradle property task failed")
 
-    unique, selection, journal, tape_path = selected_invocation(run)
-    tape = bounded_json(tape_path)
+    unique, selection, worker_files, tape_file = selected_invocation(run)
+    tape = json.loads(tape_file.data)
     observed = check_tape(tape, unique, args.seed)
     xml = regular(tree / "core/build/test-results/property-test" / f"TEST-{TEST_CLASS}.xml")
     runtime = retain_runtime(run, tree, selection, tape)
     write_json(run / "runtime-artifacts.json", runtime)
-    closure = [run / name for name in ("inputs.json", "process.json", "runtime-artifacts.json", "gradle.stderr.log",
-                                       "inventory/requested-lanes.json", f"inventory/{LANE}/selection.json")]
-    closure.extend([logs / "test-run.log", journal, tape_path, xml])
+    closure = [run / name for name in ("inputs.json", "process.json", "runtime-artifacts.json", "runtime-paths.json", "gradle.stderr.log")]
+    closure.extend([logs / "test-run.log", xml])
     closure.extend(run / "original" / name for name in OVERLAY_HASHES)
     closure.extend(tree / name for name in overlay)
     closure.extend(run / "adapter" / name for name in inputs)
@@ -822,7 +927,7 @@ def capture(args):
         "task": TASK, "unique_id": unique, "selected_iterations": 1, "original_assertion_status": "SUCCESSFUL",
         "observation": observed,
         "artifacts": [{"path": path.relative_to(run).as_posix(), "sha256": digest(path), "bytes": path.stat().st_size}
-                      for path in closure],
+                      for path in closure] + [file.receipt(run) for file in (*worker_files, tape_file)],
     })
     return run / "reference-capture.json"
 

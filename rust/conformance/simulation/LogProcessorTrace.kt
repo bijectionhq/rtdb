@@ -76,7 +76,8 @@ internal class LogProcessorTrace(private val seed: Int) {
         Files.createDirectories(directory)
         val name = "${digest(context.uniqueId.toByteArray(Charsets.UTF_8))}.json"
         val path = directory.resolve(name)
-        val worker = ProcessHandle.current().info().command().orElseThrow()
+        val worker = Path.of(ProcessHandle.current().info().command().orElseThrow()).toAbsolutePath()
+        val javaHome = Path.of(System.getProperty("java.home")).toAbsolutePath()
         val classes = listOf(LogProcessorSimTest::class.java, DeterministicDispatcher::class.java, SimLog::class.java,
             LogProcessorTrace::class.java, LogProcessor::class.java,
             Class.forName("rtdb.conformance.JunitRecorder", false, LogProcessorSimTest::class.java.classLoader))
@@ -86,8 +87,11 @@ internal class LogProcessorTrace(private val seed: Int) {
             put("seed", seed)
             put("assertions_finished", finished)
             put("overflow", overflow)
-            put("java_home", Path.of(System.getProperty("java.home")).toRealPath().toString())
-            put("java_executable", Path.of(worker).toRealPath().toString())
+            put("java_home", javaHome.toRealPath().toString())
+            put("java_home_request", javaHome.toString())
+            put("java_modules", javaHome.resolve("lib/modules").toRealPath().toString())
+            put("java_executable", worker.toRealPath().toString())
+            put("java_executable_request", worker.toString())
             put("jvm_args", json(ManagementFactory.getRuntimeMXBean().inputArguments))
             put("classes", buildJsonObject {
                 for (type in classes) {

@@ -90,8 +90,19 @@ class LogProcessorReferenceTest(unittest.TestCase):
             compiled.mkdir(parents=True)
             external = run / "external-services"
             external.mkdir()
+            java = external / "bin/java"
+            agent = external / "watchdog.jar"
+            modules = external / "lib/modules"
+            for path in (java, agent, modules):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"fixture")
             with self.assertRaisesRegex(ValueError, "owned adapter services"):
-                sim.retain_runtime(run, tree, {"classpath": [str(compiled), str(external)]}, {})
+                sim.retain_runtime(run, tree, {
+                    "classpath": [str(compiled), str(external)], "test_class_directories": [],
+                }, {
+                    "java_home_request": str(external), "java_executable_request": str(java),
+                    "jvm_args": [f"-javaagent:{agent}"],
+                })
 
     def test_overlay_requires_the_pinned_input_and_a_unique_anchor(self):
         self.assertEqual(sim.replace_once("original anchor", "anchor", "anchor + observer"), "original anchor + observer")

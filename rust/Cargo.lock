@@ -3797,6 +3797,7 @@ dependencies = [
  "rtdb-node",
  "rtdb-plan",
  "rtdb-query",
+ "rtdb-replication",
  "rtdb-server",
  "rtdb-sql",
  "rtdb-storage",

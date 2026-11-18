@@ -14,8 +14,12 @@ def file_digest(path):
 
 
 def read_plan(path):
-    trace_digest = file_digest(path)
-    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    data = path.read_bytes()
+    records = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
+    return inspect_plan(path, records, hashlib.sha256(data).hexdigest())
+
+
+def inspect_plan(path, records, trace_digest):
     errors = []
     if not records or records[0].get("event") != "plan_started" or records[-1].get("event") != "plan_finished":
         errors.append("plan is missing its start or successful recording completion")
