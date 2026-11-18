@@ -18,7 +18,6 @@ mod default_scalar;
 mod default_property;
 mod default_materialize;
 mod to_connect_context;
-mod schema_objects;
 mod java_schema;
 pub(super) use java_schema::{FixedBytesLimit, SourcePolicy};
 pub(super) use java_schema::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
