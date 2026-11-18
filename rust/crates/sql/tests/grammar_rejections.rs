@@ -96,3 +96,12 @@ fn standard_isolation_levels_are_accepted_and_ignored() {
         assert!(matches!(prepared.statement, Statement::Begin { .. }), "{sql}");
     }
 }
+
+#[test]
+fn quoted_identifiers_after_a_date_keyword_and_out_of_range_integers_are_sql_errors() {
+    let date = rejection(r#"INSERT INTO docs (_id, a) VALUES (1, DATE "2020-01-01")"#);
+    assert_eq!((date.category, date.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"));
+    let integer = rejection("INSERT INTO docs (_id, a) VALUES (1, 9223372036854775808)");
+    assert_eq!((integer.category, integer.code.as_str()), (AnomalyCategory::Incorrect, "xtdb/sql-error"));
+    assert!(integer.message.as_deref().unwrap().contains("Cannot parse integer: 9223372036854775808"), "{integer:?}");
+}

@@ -54,7 +54,7 @@ async fn sql_case_tests_use_true_predicates_and_keep_control_selection() {
     ] { assert_eq!(query(&format!("SELECT {expression}"),vec![]).await.unwrap_err().code,"xtdb.expression/division-by-zero","{expression}"); }
     assert_eq!(query("SELECT POWER(NULL,CASE WHEN 1 / 0 = 0 THEN 1 ELSE 2 END)",vec![]).await.unwrap(),[vec![V::Null]]);
     assert_eq!(query("SELECT ROUND('Infinity'::DOUBLE,1 / 0)",vec![]).await.unwrap(),[vec![V::F64(f64::INFINITY)]]);
-    assert_eq!(query("SELECT LOG(1 / 0,CAST('invalid-number' AS DOUBLE))",vec![]).await.unwrap_err().code,"xtdb/invalid-argument-types");
+    assert_eq!(query("SELECT LOG(1 / 0,CAST('invalid-number' AS DOUBLE))",vec![]).await.unwrap_err().code,"xtdb.expression/number-format-error");
 }
 
 #[tokio::test(start_paused = true)]
