@@ -721,8 +721,10 @@ impl Context<'_> {
             .then(|| input.schema().clone());
         let mut replacements = BTreeMap::new();
         let mut named_groups = Vec::new();
+        let groups = groups.into_iter()
+            .map(|group| Ok(ordinal_projection(group, projection)?.or_else(|| alias_projection(group, projection, input.schema())).unwrap_or(group)))
+            .collect::<Result<Vec<_>>>()?;
         for (index, &group) in groups.iter().enumerate() {
-            let group = ordinal_projection(group, projection)?.unwrap_or(group);
             let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
             let source = match &expr {
                 Expr::Column { id, .. } => input.schema().get(*id),
@@ -778,7 +780,6 @@ impl Context<'_> {
             input = Arc::new(input.project(retained)?);
             let mut order_replacements = replacements.clone();
             for &group in &groups {
-                let group = ordinal_projection(group, projection)?.unwrap_or(group);
                 if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&ReplacementKey::Expression(group.to_string())); }
             }
             let mut order = Vec::new();
@@ -1395,6 +1396,17 @@ fn ordinal(expr: &ast::Expr) -> Result<Option<usize>> {
         }
     }
     Ok(None)
+}
+
+/// A bare GROUP BY name that no input column takes groups by the select item it aliases; an input column wins a clash.
+fn alias_projection<'a>(expr: &ast::Expr, projection: &'a [ast::SelectItem], input: &Schema) -> Option<&'a ast::Expr> {
+    let ast::Expr::Identifier(name) = expr else { return None; };
+    let name = identifier(name);
+    if input.resolve(std::slice::from_ref(&name)).is_ok() { return None; }
+    projection.iter().find_map(|item| match item {
+        ast::SelectItem::ExprWithAlias { expr, alias } if identifier(alias).normalized() == name.normalized() => Some(expr),
+        _ => None,
+    })
 }
 
 fn ordinal_projection<'a>(expr: &ast::Expr, projection: &'a [ast::SelectItem]) -> Result<Option<&'a ast::Expr>> {

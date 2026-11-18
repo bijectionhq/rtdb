@@ -258,3 +258,12 @@ async fn xtql_factory_spelling_and_explicit_all_quantifiers_survive_explanation(
         assert!(rtdb_xtql::compile(&source, &context.catalog, &rtdb_xtql::CompileOptions::default()).is_err(), "{name}");
     }
 }
+
+#[tokio::test]
+async fn group_by_a_select_alias_groups_by_its_expression_unless_an_input_column_has_the_name() {
+    let context = context();
+    assert_eq!(sql(&context, "SELECT UPPER(c) AS cat, COUNT(*) AS cnt FROM (VALUES ('a'),('a'),('b')) t(c) GROUP BY cat ORDER BY cat").await.unwrap(),
+        [vec![Value::Utf8("A".into()), Value::I64(2)], vec![Value::Utf8("B".into()), Value::I64(1)]]);
+    assert!(prepare("SELECT c AS d, COUNT(*) AS cnt FROM (VALUES ('a', 1)) t(c, d) GROUP BY d", &context.catalog, &PrepareOptions::default()).is_err());
+    assert_eq!(context.memory.used_bytes(), 0);
+}
