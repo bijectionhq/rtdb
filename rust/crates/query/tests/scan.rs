@@ -439,7 +439,7 @@ async fn iid_lookup_and_pruned_scans_match_general_history_across_live_leaves() 
 }
 
 #[tokio::test]
-async fn reopened_catalog_reads_persisted_data_and_caps_system_time_at_its_basis() {
+async fn reopened_catalog_reads_persisted_data_and_reads_a_later_system_time_as_of_its_basis() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let budget = MemoryBudget::new(1 << 27);
     let store = Arc::new(MemoryStore::default());
@@ -454,7 +454,7 @@ async fn reopened_catalog_reads_persisted_data_and_caps_system_time_at_its_basis
     let context = query_context(reopened.value().snapshot(), Arc::clone(&store), false);
     assert_eq!(collect(scan(&context, &["v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap(), vec![vec![Value::I64(9)]]);
     let context = query_context(reopened.value().snapshot(), store, false);
-    assert!(collect(scan(&context, &["v"], TemporalFilter::All, at(200), None), context).await.unwrap().is_empty());
+    assert_eq!(collect(scan(&context, &["v"], TemporalFilter::All, at(200), None), context).await.unwrap(), vec![vec![Value::I64(9)]]);
 }
 
 #[tokio::test]

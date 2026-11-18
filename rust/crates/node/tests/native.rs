@@ -1497,3 +1497,15 @@ async fn txs_table_lists_every_submitted_transaction() {
     assert_eq!(history.len(), 40);
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn system_time_as_of_after_the_basis_reads_as_of_the_basis() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    for value in [1, 2] { assert!(session.state_mut().execute_tx(vec![put(&node, 1, value)], AutonomousTxOptions::default()).await.unwrap().committed()); }
+    let query = "SELECT value FROM docs FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '3002-01-01 00:00:00+00:00' ORDER BY value";
+    assert_eq!(rows(session.query_sql(query, vec![]).await.unwrap()).await, [vec![Value::I64(1)], vec![Value::I64(2)]]);
+    let past = "SELECT value FROM docs FOR ALL VALID_TIME FOR SYSTEM_TIME AS OF TIMESTAMP '1960-01-01 00:00:00+00:00'";
+    assert!(rows(session.query_sql(past, vec![]).await.unwrap()).await.is_empty());
+    stop(&node, driver).await;
+}
