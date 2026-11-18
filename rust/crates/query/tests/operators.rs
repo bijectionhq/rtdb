@@ -619,3 +619,87 @@ fn extension_rejects_reused_columns_and_appended_sibling_references() {
     ]).unwrap_err();
     assert_eq!(sibling.code, "rtdb.plan/unbound-column");
 }
+
+fn spill_payload_columns() -> Vec<(&'static str, Vec<Value>)> {
+    use rtdb_types::{Keyword, TimeUnit};
+    let uuid = |seed: u8| Value::Uuid(std::array::from_fn(|index| seed.wrapping_mul(17).wrapping_add(index as u8)));
+    let structure = |pairs: Vec<(&str, Value)>| Value::Struct(pairs.into_iter().map(|(name, value)| (name.to_owned(), value)).collect());
+    vec![
+        ("uuid", vec![uuid(1), Value::Null, uuid(2), Value::Uuid([0; 16]), Value::Uuid([0xff; 16]), uuid(3), Value::Null, uuid(4)]),
+        ("fsb", vec![Value::FixedSizeBinary(vec![1, 2, 3, 4]), Value::Null, Value::FixedSizeBinary(vec![0; 4]), Value::FixedSizeBinary(vec![0xff; 4]), Value::FixedSizeBinary(vec![9, 8, 7, 6]), Value::Null, Value::FixedSizeBinary(vec![0, 1, 0, 1]), Value::FixedSizeBinary(vec![5; 4])]),
+        ("mixed", vec![Value::I64(1), Value::Utf8("x".into()), Value::F64(2.5), Value::Bool(true), Value::Null, Value::Keyword(Keyword::parse("a/b").unwrap()), uuid(5), Value::List(vec![Value::I64(1), Value::Null])]),
+        ("f64", vec![Value::F64(f64::NAN), Value::F64(f64::INFINITY), Value::F64(f64::NEG_INFINITY), Value::F64(-0.0), Value::F64(0.0), Value::F64(f64::MIN_POSITIVE), Value::Null, Value::F64(-1.5)]),
+        ("f32", vec![Value::F32(f32::NAN), Value::F32(f32::INFINITY), Value::F32(f32::NEG_INFINITY), Value::F32(-0.0), Value::Null, Value::F32(f32::MAX), Value::F32(f32::MIN_POSITIVE), Value::F32(0.25)]),
+        ("decimal", vec![decimal_cell(12_345, 32, 2, 128), decimal_cell(-1, 32, 2, 128), Value::Null, decimal_cell(0, 32, 2, 128), decimal_cell(99_999_999, 32, 2, 128), decimal_cell(-99_999_999, 32, 2, 128), decimal_cell(1, 32, 2, 128), Value::Null]),
+        ("temporal", vec![
+            Value::DateDay(19_000),
+            Value::Timestamp { value: 1_700_000_000_123_456, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) },
+            Value::Timestamp { value: -1, unit: TimeUnit::Microsecond, timezone: None },
+            Value::Time { value: 86_399_999_999_999, unit: TimeUnit::Nanosecond, bit_width: 64 },
+            Value::Duration { value: -42, unit: TimeUnit::Microsecond },
+            Value::IntervalMonthDayNano { months: 1, days: -2, nanoseconds: 3 },
+            Value::Null,
+            Value::Timestamp { value: 5, unit: TimeUnit::Microsecond, timezone: Some("Europe/London".into()) },
+        ]),
+        ("nested", vec![
+            Value::List(vec![structure(vec![("a", Value::I64(1)), ("b", Value::List(vec![Value::Utf8("x".into())]))])]),
+            Value::Set(vec![Value::I64(3), Value::I64(1)]),
+            Value::Map { entries: vec![(Value::Utf8("k".into()), Value::List(vec![Value::F64(-0.0)]))], sorted: false },
+            structure(vec![("a", Value::Null), ("c", structure(vec![("d", uuid(6))]))]),
+            Value::Null,
+            Value::List(vec![]),
+            Value::List(vec![Value::Null, Value::Set(vec![])]),
+            structure(vec![]),
+        ]),
+        ("scalars", vec![Value::I8(-8), Value::I16(-16), Value::I32(i32::MIN), Value::Binary(vec![0, 0xff]), Value::Utf8(String::new()), Value::Uri("https://example.com/a?b".into()), Value::Bool(false), Value::Null]),
+    ]
+}
+
+fn spill_payload(id_column: u32, id_name: &str, ids: &[i64]) -> Arc<Relation> {
+    let columns = spill_payload_columns();
+    let mut fields = vec![field(id_column, id_name, scalar(ScalarType::I64))];
+    fields.extend(columns.iter().enumerate().map(|(index, (name, cells))| {
+        field(id_column + 1 + index as u32, &format!("{id_name}_{name}"), LogicalType::join_all(&cells.iter().map(Value::logical_type).collect::<Vec<_>>()))
+    }));
+    let rows = ids.iter().map(|&id| {
+        let row = usize::try_from(id).unwrap() % columns[0].1.len();
+        std::iter::once(Expr::Literal(Value::I64(id))).chain(columns.iter().map(|(_, cells)| Expr::Literal(cells[row].clone()))).collect()
+    }).collect();
+    Arc::new(Relation::new(Schema::new(fields).unwrap(), RelationNode::Values { rows }).unwrap())
+}
+
+fn bit_exact(rows: &[Vec<Value>]) -> serde_json::Value { serde_json::to_value(rows).unwrap() }
+
+#[tokio::test]
+async fn every_value_kind_survives_spilled_sort_and_join_unchanged() {
+    let ids = [5, 2, 7, 0, 3, 6, 1, 4, 13, 8, 11, 10, 9, 15, 14, 12];
+    let input = spill_payload(0, "l", &ids);
+    let key = input.schema().fields()[0].expression();
+    let sorted = Arc::new(Arc::clone(&input).sort(vec![SortExpr { expr: key.clone(), descending: false, nulls_first: false }]).unwrap());
+    let in_memory = query_context(QueryOptions::default());
+    let expected = collect(Arc::clone(&sorted), Arc::clone(&in_memory)).await.unwrap();
+    assert_eq!(in_memory.spill_peak_bytes(), 0);
+    assert_eq!(expected.iter().map(|row| row[0].clone()).collect::<Vec<_>>(), (0..16).map(Value::I64).collect::<Vec<_>>());
+    let spilled = query_context(QueryOptions { sort_memory_bytes: 1, batch_rows: 3, ..QueryOptions::default() });
+    let actual = collect(sorted, Arc::clone(&spilled)).await.unwrap();
+    assert!(spilled.spill_peak_bytes() > 0);
+    assert_eq!(bit_exact(&actual), bit_exact(&expected));
+    assert_eq!(spilled.spill_bytes(), 0);
+    assert_eq!(spilled.memory.used_bytes(), 0);
+
+    let right = spill_payload(100, "r", &ids[..12]);
+    let condition = Expr::binary(BinaryOp::Eq, key, right.schema().fields()[0].expression());
+    let joined = join(input, right, JoinKind::Inner, Some(condition));
+    let by_key = |mut rows: Vec<Vec<Value>>| { rows.sort_by_key(|row| match row[0] { Value::I64(id) => id, _ => panic!("Expected I64 join key") }); rows };
+    let in_memory = query_context(QueryOptions { join_build_rows: i64::MAX, ..QueryOptions::default() });
+    let expected = by_key(collect(Arc::clone(&joined), Arc::clone(&in_memory)).await.unwrap());
+    assert_eq!(in_memory.spill_peak_bytes(), 0);
+    assert_eq!(expected.len(), 12);
+    assert!(expected.iter().all(|row| bit_exact(&[row[1..10].to_vec()]) == bit_exact(&[row[11..].to_vec()])));
+    let spilled = query_context(QueryOptions { join_build_rows: 0, batch_rows: 3, ..QueryOptions::default() });
+    let actual = by_key(collect(joined, Arc::clone(&spilled)).await.unwrap());
+    assert!(spilled.spill_peak_bytes() > 0);
+    assert_eq!(bit_exact(&actual), bit_exact(&expected));
+    assert_eq!(spilled.spill_bytes(), 0);
+    assert_eq!(spilled.memory.used_bytes(), 0);
+}
