@@ -18,6 +18,21 @@ fn context(state: Option<&PartitionState>, memory: &Arc<MemoryBudget>) -> Arc<Qu
 }
 
 #[tokio::test]
+async fn postgres_preparation_keeps_inline_xtql_source_and_result_fields() {
+    let memory = MemoryBudget::new(1 << 26);
+    let context = context(None, &memory);
+    let source = r#"XTQL $$(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))$$"#;
+    let prepared = PreparedSql::prepare_postgres(source, &context, vec!["public".into()], &[]).unwrap();
+    assert_eq!(prepared.source(), source);
+    assert_eq!(prepared.prepared_schema().unwrap().fields()[0].name, "v");
+    let mut cursor = prepared.open_query(context, vec![]).await.unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::Utf8("xbc".into()));
+    drop((page, cursor, prepared));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn prepared_temporal_cast_schema_rebinds_to_execution_timezone() {
     let memory = MemoryBudget::new(1 << 26);
     let initial = context(None,&memory);
