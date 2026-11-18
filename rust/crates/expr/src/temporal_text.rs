@@ -1,6 +1,6 @@
 use regex::Regex;
 use rtdb_types::{Anomaly, Result};
-use crate::{numeric::overflow, temporal::IntervalParts};
+use crate::{numeric::overflow, temporal::{IntervalParts, interval_overflow}};
 
 fn invalid_duration(text: &str) -> Anomaly {
     Anomaly::incorrect("xtdb.expression/invalid-temporal-string", format!("String '{text}' has invalid format for type duration"))
@@ -40,19 +40,19 @@ pub(crate) fn interval(text: &str) -> Result<IntervalParts> {
     let mut parts = IntervalParts { months: 0, days: 0, nanos: 0 };
     let mut months = 0i64;
     for capture in regex(r"(-?[0-9]+)([YMWD])")?.captures_iter(period) {
-        let value = capture[1].parse::<i32>().map_err(|_| overflow())?;
+        let value = capture[1].parse::<i32>().map_err(|_| interval_overflow())?;
         match &capture[2] {
             "Y" => months += i64::from(value) * 12,
             "M" => months += i64::from(value),
-            "W" => parts.days = parts.days.checked_add(value.checked_mul(7).ok_or_else(overflow)?).ok_or_else(overflow)?,
-            "D" => parts.days = parts.days.checked_add(value).ok_or_else(overflow)?,
+            "W" => parts.days = parts.days.checked_add(value.checked_mul(7).ok_or_else(interval_overflow)?).ok_or_else(interval_overflow)?,
+            "D" => parts.days = parts.days.checked_add(value).ok_or_else(interval_overflow)?,
             _ => unreachable!(),
         }
     }
-    parts.months = i32::try_from(months).map_err(|_| overflow())?;
+    parts.months = i32::try_from(months).map_err(|_| interval_overflow())?;
     if !duration.is_empty() {
         let nanos = iso_duration(&format!("PT{duration}"))?;
-        parts.nanos = i64::try_from(nanos.div_euclid(1000) * 1000).map_err(|_| overflow())?;
+        parts.nanos = i64::try_from(nanos.div_euclid(1000) * 1000).map_err(|_| interval_overflow())?;
     }
     Ok(parts)
 }

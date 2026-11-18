@@ -116,6 +116,21 @@ async fn interval_sql_qualifiers_keep_source_dependent_output_types() {
 }
 
 #[tokio::test]
+async fn interval_overflow_uses_the_same_diagnostic_for_arithmetic_and_casts() {
+    for sql in [
+        "SELECT INTERVAL '1' HOUR * 2147483647",
+        "SELECT INTERVAL '1' MONTH * 4294967297",
+        "SELECT INTERVAL '1' DAY * 4294967297",
+        "SELECT CAST(INTERVAL '200000' DAY AS INTERVAL HOUR)",
+        "SELECT CAST('PT3000000H' AS INTERVAL)",
+    ] {
+        let error = query(sql, "UTC").await.unwrap_err();
+        assert_eq!(error.code, "xtdb.expression/overflow-error", "{sql}");
+        assert_eq!(error.message.as_deref(), Some("data exception - overflow error"), "{sql}");
+    }
+}
+
+#[tokio::test]
 async fn interval_casts_validate_the_bound_qualifier() {
     for (start, end, message) in [
         ("MINUTE", "HOUR", "Interval end field must have less significance than the start field."),

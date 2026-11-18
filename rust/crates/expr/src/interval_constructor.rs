@@ -1,13 +1,11 @@
 use rtdb_plan::IntervalConstructor;
-use rtdb_types::{Anomaly, Result, Value};
+use rtdb_types::{Result, Value};
 
 pub(crate) fn is_name(name: &str) -> bool {
     ["single_field_interval","single-field-interval","multi_field_interval","multi-field-interval"].iter().any(|candidate| name.eq_ignore_ascii_case(candidate))
 }
 pub(crate) fn construct(value: &Value,recipe: &IntervalConstructor) -> Result<Value> {
-    crate::interval_cast::cast(value,recipe.qualifier()).map_err(|error| if error.code == "xtdb/numeric-value-out-of-range" {
-        Anomaly::incorrect("xtdb.expression/overflow-error","data exception - overflow error")
-    } else { error })
+    crate::interval_cast::cast(value, recipe.qualifier())
 }
 pub(crate) fn call(name: &str,args: &[Value]) -> Option<Result<Value>> {
     if !is_name(name) { return None; }

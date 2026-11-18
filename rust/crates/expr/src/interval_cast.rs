@@ -3,7 +3,7 @@ use num_traits::ToPrimitive;
 use regex::Regex;
 use rtdb_plan::{IntervalField as F, IntervalQualifier};
 use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, Value};
-use crate::{numeric::{inapplicable, integer, overflow}, temporal::IntervalParts};
+use crate::{numeric::{inapplicable, integer}, temporal::{IntervalParts, interval_overflow}};
 
 const SECOND: i128 = 1_000_000_000;
 const DAY: i128 = 86_400 * SECOND;
@@ -14,11 +14,11 @@ pub(crate) fn cast(value: &Value, qualifier: &IntervalQualifier) -> Result<Value
     let parts = if let Value::Utf8(text) = value {
         if qualifier.end.is_some() { multi(text, qualifier)? } else { single(text, qualifier.start)? }
     } else if let Some(value) = integer(value) {
-        integer_interval(i64::try_from(value).map_err(|_| overflow())?, qualifier.start)?
+        integer_interval(i64::try_from(value).map_err(|_| interval_overflow())?, qualifier.start)?
     } else if let Value::Duration { value, unit } = value {
         let nanos = i128::from(*value) * (SECOND / i128::from(unit.units_per_second()));
         let nanos = if matches!(target, ScalarType::IntervalMonthDayMicro) { nanos / 1000 * 1000 } else { nanos };
-        normalize(IntervalParts { months: 0, days: 0, nanos: i64::try_from(nanos).map_err(|_| overflow())? }, qualifier)?
+        normalize(IntervalParts { months: 0, days: 0, nanos: i64::try_from(nanos).map_err(|_| interval_overflow())? }, qualifier)?
     } else if let Some(parts) = IntervalParts::of(value) { normalize(parts, qualifier)? }
     else { return Err(inapplicable("interval", &[value])); };
     parts.into_value(&target)
@@ -27,10 +27,10 @@ pub(crate) fn cast(value: &Value, qualifier: &IntervalQualifier) -> Result<Value
 fn integer_interval(value: i64, field: F) -> Result<IntervalParts> {
     let mut result = IntervalParts { months: 0, days: 0, nanos: 0 };
     match field {
-        F::Year => result.months = i32::try_from(value).map_err(|_| overflow())?.checked_mul(12).ok_or_else(overflow)?,
-        F::Month => result.months = i32::try_from(value).map_err(|_| overflow())?,
-        F::Day => result.days = i32::try_from(value).map_err(|_| overflow())?,
-        F::Hour | F::Minute | F::Second => result.nanos = i64::try_from(i128::from(value) * SECOND * match field { F::Hour => 3600, F::Minute => 60, _ => 1 }).map_err(|_| overflow())?,
+        F::Year => result.months = i32::try_from(value).map_err(|_| interval_overflow())?.checked_mul(12).ok_or_else(interval_overflow)?,
+        F::Month => result.months = i32::try_from(value).map_err(|_| interval_overflow())?,
+        F::Day => result.days = i32::try_from(value).map_err(|_| interval_overflow())?,
+        F::Hour | F::Minute | F::Second => result.nanos = i64::try_from(i128::from(value) * SECOND * match field { F::Hour => 3600, F::Minute => 60, _ => 1 }).map_err(|_| interval_overflow())?,
     }
     Ok(result)
 }
@@ -43,15 +43,15 @@ fn single(text: &str, field: F) -> Result<IntervalParts> {
         return integer_interval(i64::from(value), field);
     }
     let (coefficient, scale) = crate::parse_decimal(text).map_err(|_| Anomaly::incorrect("xtdb.expression/invalid-interval", "Parse error. SECOND INTERVAL string must contain a positive or negative integer or decimal.").with_context("interval", text.into()))?.into_bigint_and_scale();
-    let nanos = crate::decimal::rescale_coefficient(coefficient, scale, 9, 29, RoundingMode::Down)?.to_i128().ok_or_else(overflow)?;
-    Ok(IntervalParts { months: 0, days: 0, nanos: i64::try_from(nanos).map_err(|_| overflow())? })
+    let nanos = crate::decimal::rescale_coefficient(coefficient, scale, 9, 29, RoundingMode::Down).map_err(|_| interval_overflow())?.to_i128().ok_or_else(interval_overflow)?;
+    Ok(IntervalParts { months: 0, days: 0, nanos: i64::try_from(nanos).map_err(|_| interval_overflow())? })
 }
 
 fn normalize(parts: IntervalParts, qualifier: &IntervalQualifier) -> Result<IntervalParts> {
     if qualifier.year_month() {
         let months = match (qualifier.start, qualifier.end) {
             (F::Year, None) => parts.months / 12 * 12,
-            (F::Year, Some(F::Month)) => (parts.months / 12 * 12).checked_add(parts.months.rem_euclid(12)).ok_or_else(overflow)?,
+            (F::Year, Some(F::Month)) => (parts.months / 12 * 12).checked_add(parts.months.rem_euclid(12)).ok_or_else(interval_overflow)?,
             (F::Month, None) => parts.months,
             _ => return Err(invalid(qualifier)),
         };
@@ -61,7 +61,7 @@ fn normalize(parts: IntervalParts, qualifier: &IntervalQualifier) -> Result<Inte
     let nanos = i128::from(parts.nanos);
     let whole_days = nanos / DAY;
     let days = i128::from(parts.days);
-    let second_precision = || alter_interval_precision(nanos, qualifier.fractional_precision.ok_or_else(overflow)?);
+    let second_precision = || alter_interval_precision(nanos, qualifier.fractional_precision.ok_or_else(interval_overflow)?);
     let (days, nanos) = match (qualifier.start, qualifier.end) {
         (F::Day, None) => (days + whole_days, 0),
         (F::Day, Some(F::Hour)) => (days + whole_days, nanos / (3600 * SECOND) % 24 * 3600 * SECOND),
@@ -72,7 +72,7 @@ fn normalize(parts: IntervalParts, qualifier: &IntervalQualifier) -> Result<Inte
         (F::Hour | F::Minute, Some(F::Second)) | (F::Second, None) => (0, second_precision()? + days * DAY),
         _ => return Err(invalid(qualifier)),
     };
-    Ok(IntervalParts { months: 0, days: i32::try_from(days).map_err(|_| overflow())?, nanos: i64::try_from(nanos).map_err(|_| overflow())? })
+    Ok(IntervalParts { months: 0, days: i32::try_from(days).map_err(|_| interval_overflow())?, nanos: i64::try_from(nanos).map_err(|_| interval_overflow())? })
 }
 
 fn alter_interval_precision(nanos: i128, precision: i64) -> Result<i128> {
@@ -99,7 +99,7 @@ fn multi(text: &str, qualifier: &IntervalQualifier) -> Result<IntervalParts> {
     };
     let regex = Regex::new(pattern).map_err(|error| Anomaly::fault("rtdb.expr/interval-pattern", error.to_string()))?;
     let captures = regex.captures(text).ok_or_else(|| invalid(qualifier))?;
-    let part = |index| -> Result<i128> { captures.get(index).ok_or_else(|| invalid(qualifier))?.as_str().parse::<i32>().map(i128::from).map_err(|_| overflow()) };
+    let part = |index| -> Result<i128> { captures.get(index).ok_or_else(|| invalid(qualifier))?.as_str().parse::<i32>().map(i128::from).map_err(|_| interval_overflow()) };
     let sign = if &captures[1] == "-" { -1i128 } else { 1 };
     let (months, days, seconds, fraction) = match (qualifier.start, qualifier.end) {
         (F::Year, Some(F::Month)) => (part(2)? * 12 + part(3)?, 0, 0, None),
@@ -112,11 +112,11 @@ fn multi(text: &str, qualifier: &IntervalQualifier) -> Result<IntervalParts> {
         _ => return Err(invalid(qualifier)),
     };
     let fraction = if let Some(fraction) = fraction {
-        let value = fraction.as_str().parse::<i64>().map_err(|_| overflow())?;
+        let value = fraction.as_str().parse::<i64>().map_err(|_| interval_overflow())?;
         let nanos = 10f64.powf(9.0 - fraction.len() as f64) * value as f64;
-        let factor = 10f64.powf(9.0 - qualifier.fractional_precision.ok_or_else(overflow)? as f64);
+        let factor = 10f64.powf(9.0 - qualifier.fractional_precision.ok_or_else(interval_overflow)? as f64);
         ((nanos / factor).floor() * factor) as i128
     } else { 0 };
-    let nanos = i64::try_from(seconds * SECOND + fraction).map_err(|_| overflow())?;
-    Ok(IntervalParts { months: i32::try_from(sign * months).map_err(|_| overflow())?, days: i32::try_from(sign * days).map_err(|_| overflow())?, nanos: if sign < 0 { nanos.checked_neg().ok_or_else(overflow)? } else { nanos } })
+    let nanos = i64::try_from(seconds * SECOND + fraction).map_err(|_| interval_overflow())?;
+    Ok(IntervalParts { months: i32::try_from(sign * months).map_err(|_| interval_overflow())?, days: i32::try_from(sign * days).map_err(|_| interval_overflow())?, nanos: if sign < 0 { nanos.checked_neg().ok_or_else(interval_overflow)? } else { nanos } })
 }

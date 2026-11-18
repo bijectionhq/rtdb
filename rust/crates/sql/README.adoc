@@ -457,6 +457,7 @@ Named bitwise functions remain outside the SQL function catalogue.
 A malformed timestamp cast identifies the rejected field or the position where parsing stopped.
 Interval casts retain both fields of a qualifier so that binding can report unsupported field combinations.
 An invalid date string reports its expected type in explicit casts and in comparisons that coerce the literal.
+Interval arithmetic and casts report a data exception when the result overflows its interval representation.
 Unsupported EXTRACT field and type combinations identify the field and source type in the diagnostic.
 The `DATE_TRUNC` timezone argument uses Java zone ID syntax and reports the supplied timezone when it fails validation.
 SQL normalizes literal truncation fields to uppercase and accepts the grammar's bare field spelling.

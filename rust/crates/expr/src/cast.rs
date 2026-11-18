@@ -210,7 +210,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             if crate::temporal::IntervalParts::of(value).is_some() { return Ok(value.clone()); }
             let (parts, target) = match value {
                 Value::Utf8(text) => (crate::temporal_text::interval(text)?, S::IntervalMonthDayMicro),
-                Value::Duration { value, unit } => (crate::temporal::IntervalParts { months: 0, days: 0, nanos: rescale_units(*value, *unit, TimeUnit::Nanosecond)? },
+                Value::Duration { value, unit } => (crate::temporal::IntervalParts { months: 0, days: 0, nanos: rescale_units(*value, *unit, TimeUnit::Nanosecond).map_err(|_| crate::temporal::interval_overflow())? },
                     if *unit == TimeUnit::Nanosecond { S::Interval(rtdb_types::IntervalUnit::MonthDayNano) } else { S::IntervalMonthDayMicro }),
                 _ => return Err(inapplicable("interval", &[value])),
             };

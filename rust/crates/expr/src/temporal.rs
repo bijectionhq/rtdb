@@ -2,6 +2,10 @@ use rtdb_plan::BinaryOp;
 use rtdb_types::{Anomaly, IntervalUnit, LogicalType, Result, ScalarType, TimeUnit, Value};
 use crate::{cast::cast, numeric::{division_by_zero, inapplicable, integer, number, overflow}, timezone::{Zone, zone}};
 
+pub(crate) fn interval_overflow() -> Anomaly {
+    Anomaly::incorrect("xtdb.expression/overflow-error", "data exception - overflow error")
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct IntervalParts { pub months: i32, pub days: i32, pub nanos: i64 }
 impl IntervalParts {
@@ -16,7 +20,7 @@ impl IntervalParts {
     pub fn into_value(self, target: &ScalarType) -> Result<Value> {
         Ok(match target {
             ScalarType::Interval(IntervalUnit::YearMonth) => Value::IntervalYearMonth(self.months),
-            ScalarType::Interval(IntervalUnit::DayTime) => Value::IntervalDayTime { days: self.days, milliseconds: i32::try_from(self.nanos / 1_000_000).map_err(|_| overflow())? },
+            ScalarType::Interval(IntervalUnit::DayTime) => Value::IntervalDayTime { days: self.days, milliseconds: i32::try_from(self.nanos / 1_000_000).map_err(|_| interval_overflow())? },
             ScalarType::Interval(IntervalUnit::MonthDayNano) => Value::IntervalMonthDayNano { months: self.months, days: self.days, nanoseconds: self.nanos },
             ScalarType::IntervalMonthDayMicro => Value::IntervalMonthDayMicro { months: self.months, days: self.days, nanoseconds: self.nanos },
             _ => return Err(inapplicable("interval", &[])),
@@ -25,9 +29,9 @@ impl IntervalParts {
     fn mixed(self) -> bool { usize::from(self.months != 0) + usize::from(self.days != 0) + usize::from(self.nanos != 0) > 1 }
     fn scale(self, factor: i64) -> Result<Self> {
         Ok(Self {
-            months: i32::try_from(i64::from(self.months).checked_mul(factor).ok_or_else(overflow)?).map_err(|_| overflow())?,
-            days: i32::try_from(i64::from(self.days).checked_mul(factor).ok_or_else(overflow)?).map_err(|_| overflow())?,
-            nanos: self.nanos.checked_mul(factor).ok_or_else(overflow)?,
+            months: i32::try_from(i64::from(self.months).checked_mul(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
+            days: i32::try_from(i64::from(self.days).checked_mul(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?,
+            nanos: self.nanos.checked_mul(factor).ok_or_else(interval_overflow)?,
         })
     }
 }
@@ -120,8 +124,8 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
     use BinaryOp as B;
     if let (Some(a), Some(b)) = (IntervalParts::of(left), IntervalParts::of(right)) {
         let parts = match op {
-            B::Add => IntervalParts { months: a.months.checked_add(b.months).ok_or_else(overflow)?, days: a.days.checked_add(b.days).ok_or_else(overflow)?, nanos: a.nanos.checked_add(b.nanos).ok_or_else(overflow)? },
-            B::Subtract => IntervalParts { months: a.months.checked_sub(b.months).ok_or_else(overflow)?, days: a.days.checked_sub(b.days).ok_or_else(overflow)?, nanos: a.nanos.checked_sub(b.nanos).ok_or_else(overflow)? },
+            B::Add => IntervalParts { months: a.months.checked_add(b.months).ok_or_else(interval_overflow)?, days: a.days.checked_add(b.days).ok_or_else(interval_overflow)?, nanos: a.nanos.checked_add(b.nanos).ok_or_else(interval_overflow)? },
+            B::Subtract => IntervalParts { months: a.months.checked_sub(b.months).ok_or_else(interval_overflow)?, days: a.days.checked_sub(b.days).ok_or_else(interval_overflow)?, nanos: a.nanos.checked_sub(b.nanos).ok_or_else(interval_overflow)? },
             _ => return Err(inapplicable("interval arithmetic", &[left, right])),
         };
         return parts.into_value(target);
@@ -129,12 +133,12 @@ fn arithmetic_value(op: BinaryOp, left: &Value, right: &Value, target: &ScalarTy
     if matches!(op, B::Multiply | B::Divide) {
         if let Some(parts) = IntervalParts::of(left).or_else(|| (op == B::Multiply).then(|| IntervalParts::of(right)).flatten()) {
             let factor = if IntervalParts::of(left).is_some() { right } else { left };
-            let factor = i64::try_from(integer(factor).ok_or_else(|| inapplicable("interval arithmetic", &[left, right]))?).map_err(|_| overflow())?;
+            let factor = i64::try_from(integer(factor).ok_or_else(|| inapplicable("interval arithmetic", &[left, right]))?).map_err(|_| interval_overflow())?;
             let parts = if op == B::Multiply { parts.scale(factor)? }
             else {
                 if parts.mixed() { return Err(Anomaly::unsupported("xtdb.expression/cannot-divide-mixed-intervals", "Cannot divide mixed (month, day, time) intervals")); }
                 if factor == 0 { return Err(division_by_zero()); }
-                IntervalParts { months: i32::try_from(i64::from(parts.months).checked_div(factor).ok_or_else(overflow)?).map_err(|_| overflow())?, days: i32::try_from(i64::from(parts.days).checked_div(factor).ok_or_else(overflow)?).map_err(|_| overflow())?, nanos: parts.nanos.checked_div(factor).ok_or_else(overflow)? }
+                IntervalParts { months: i32::try_from(i64::from(parts.months).checked_div(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?, days: i32::try_from(i64::from(parts.days).checked_div(factor).ok_or_else(interval_overflow)?).map_err(|_| interval_overflow())?, nanos: parts.nanos.checked_div(factor).ok_or_else(interval_overflow)? }
             };
             return parts.into_value(target);
         }
