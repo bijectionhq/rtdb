@@ -103,6 +103,17 @@ pub unsafe extern "C" fn rtdb_v1_database_flush_all(handle: u64, timeout_nanos: 
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn rtdb_v1_database_sync_all(handle: u64, timeout_nanos: i64, error: *mut u64) -> i32 {
+    unsafe { call(error, || {
+        if timeout_nanos <= 0 { return Err(invalid("Sync timeout must be positive")); }
+        let database = handles::database(handle)?;
+        let _admitted = database.0.enter()?;
+        let node = database.0.server.node();
+        database.0.run(node.sync_all(std::time::Duration::from_nanos(timeout_nanos as u64), node.cancellation()))
+    }) }
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn rtdb_v1_retain(handle: u64, out: *mut u64, error: *mut u64) -> i32 {
     unsafe { call(error, || { let out = output(out)?; *out = 0; *out = if handle == 1 { 1 } else { handles::insert(handles::get(handle)?)? }; Ok(()) }) }
 }

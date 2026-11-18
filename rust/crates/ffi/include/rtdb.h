@@ -76,6 +76,10 @@ int32_t rtdb_v1_database_open_with_log_clock(const uint8_t *yaml, size_t yaml_le
  * through each request. timeout_nanos is a positive overall deadline.
  */
 int32_t rtdb_v1_database_flush_all(RtdbHandle handle, int64_t timeout_nanos, RtdbHandle *error);
+/* Waits until each open database has indexed every message its source log held when the call
+ * began. timeout_nanos is a positive overall deadline.
+ */
+int32_t rtdb_v1_database_sync_all(RtdbHandle handle, int64_t timeout_nanos, RtdbHandle *error);
 int32_t rtdb_v1_retain(RtdbHandle handle, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_release(RtdbHandle handle, RtdbHandle *error);
 

@@ -6,6 +6,7 @@
             [jsonista.core :as json]
             [xtdb.api :as xt]
             [xtdb.flight-sql :as fsql]
+            [xtdb.log :as xt-log]
             [xtdb.node :as xtn]
             [xtdb.operator.list :as list-operator]
             [xtdb.rust :as rust]
@@ -149,7 +150,12 @@
                 rust/execute-set! (observing :native @#'rust/execute-set!)
                 rust/connect (observing :native @#'rust/connect)
                 tu/with-node native-with-node
-                xtn/start-node (observing :native-node native-start-node)]
+                xtn/start-node (observing :native-node native-start-node)
+                xt-log/sync-node (let [jvm-sync-node @#'xt-log/sync-node]
+                                   (fn [node timeout]
+                                     (if (instance? NativeDatabase node)
+                                       (.syncAll ^NativeDatabase node timeout)
+                                       (jvm-sync-node node timeout))))]
     (binding [tu/*query-ra-executor* (observing :native native-query-ra)
               tu/*flush-block-executor* (fn [^NativeDatabase node timeout] (.flushAll node timeout))]
       (with-root #'tu/connectables native-connectables f))))
@@ -212,10 +218,12 @@
 (defn- test-vars [ns-sym]
   (->> (ns-interns ns-sym) vals (filter (comp :test meta)) (sort-by (comp :line meta))))
 
-(defn run-namespace [ns-sym timeout-ms]
+(defn run-namespace
+  "`ns-sym` names a namespace, or a single test Var as `ns/var`."
+  [ns-sym timeout-ms]
   (try
-    (require ns-sym :reload)
-    (vec (for [v (test-vars ns-sym)]
+    (require (symbol (or (namespace ns-sym) (name ns-sym))) :reload)
+    (vec (for [v (if (namespace ns-sym) [(resolve ns-sym)] (test-vars ns-sym))]
            (if (:integration (meta v))
              {:var (str (symbol v)) :result "skipped-integration"}
              (run-var v timeout-ms))))

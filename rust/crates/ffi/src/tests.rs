@@ -40,6 +40,20 @@ fn flush_all_validates_timeout_and_refuses_closed_handles() {
 }
 
 #[test]
+fn sync_all_validates_timeout_waits_on_an_open_node_and_refuses_closed_handles() {
+    let native = Native::open();
+    let mut error = 0;
+    for timeout in [0, -1] {
+        let status = unsafe { rtdb_v1_database_sync_all(native.database, timeout, &mut error) };
+        incorrect(status, error, "rtdb.ffi/invalid-argument");
+    }
+    ok(unsafe { rtdb_v1_database_sync_all(native.database, 1_000_000_000, &mut error) }, error);
+    ok(unsafe { rtdb_v1_close(native.database, &mut error) }, error);
+    let status = unsafe { rtdb_v1_database_sync_all(native.database, 1_000_000, &mut error) };
+    incorrect(status, error, "rtdb.ffi/closed");
+}
+
+#[test]
 fn pgwire_port_reports_the_bound_listener_or_its_absence() {
     let port = |native: &Native| { let mut port = 0; let mut error = 0; ok(unsafe { rtdb_v1_database_pgwire_port(native.database, &mut port, &mut error) }, error); port };
     assert_eq!(port(&Native::open()), -1);

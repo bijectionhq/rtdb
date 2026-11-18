@@ -132,6 +132,19 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
         abi.call("database_flush_all", handle(), nanos);
     }
 
+    /** Awaits indexing of every message each open database's source log held when the call began. */
+    public void syncAll(Duration timeout) throws AdbcException {
+        if (timeout == null || timeout.isZero() || timeout.isNegative())
+            throw AdbcException.invalidArgument("Sync timeout must be positive");
+        long nanos;
+        try {
+            nanos = timeout.toNanos();
+        } catch (ArithmeticException tooLarge) {
+            throw AdbcException.invalidArgument("Sync timeout exceeds the signed nanosecond range").withCause(tooLarge);
+        }
+        abi.call("database_sync_all", handle(), nanos);
+    }
+
     @Override public NativeConnection connect() throws AdbcException { return connect("xtdb"); }
     public String getAwaitToken() { return awaitToken.get(); }
     /** Publishes next only when the stored token is the same object as previous, including null. */
