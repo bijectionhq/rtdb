@@ -1,6 +1,6 @@
-use std::ops::Range;
+use std::{ops::Range, sync::Arc};
 use rtdb_plan::{ControlCommitMode, ControlStatement, DiscardTarget};
-use rtdb_types::{AllocationScope, Anomaly};
+use rtdb_types::{AllocationScope, Anomaly, MemoryReservation};
 use crate::lexer::{IndexedLexeme, Kind, ScanError, Span, StreamError};
 use super::{
     ContextChild, ContextClass, InputMismatch, InvocationKey, NoViableAlternative, ParserEnvironment, ParserSession,
@@ -16,6 +16,29 @@ pub struct InitialStatementDiagnostic(ListenerDiagnostic);
 impl InitialStatementDiagnostic {
     /// Borrows the incorrect `xtdb/sql-error` anomaly with the listener’s text and empty context.
     pub fn anomaly(&self) -> &Anomaly { &self.0.anomaly }
+
+    /// Copies the unnormalized input into `sql` context under the listener’s existing budget.
+    /// Returns an error if the size overflows or the budget declines the reservation.
+    pub fn with_sql_context(self, original: &str) -> rtdb_types::Result<ContextualStatementDiagnostic> {
+        let mut listener = self.0;
+        let bytes = original.len().checked_add(1024)
+            .ok_or_else(|| Anomaly::incorrect("rtdb.sql/allocation-size", "SQL diagnostic context exceeds addressable memory"))?;
+        let context_charge = listener.budget().reserve(bytes)?;
+        listener.anomaly.context.insert("sql".into(), original.into());
+        Ok(ContextualStatementDiagnostic { listener, _context_charge: context_charge })
+    }
+}
+
+/// A listener report and original SQL context whose separate reservations last until drop.
+#[derive(Debug)]
+pub struct ContextualStatementDiagnostic {
+    listener: ListenerDiagnostic,
+    _context_charge: Arc<MemoryReservation>,
+}
+
+impl ContextualStatementDiagnostic {
+    /// The anomaly preserves the listener code and message and includes the copied `sql` context.
+    pub fn anomaly(&self) -> &Anomaly { &self.listener.anomaly }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1,5 +1,5 @@
 use std::{fmt::Write, sync::Arc};
-use rtdb_types::{AllocationScope, Anomaly, MemoryReservation};
+use rtdb_types::{AllocationScope, Anomaly, MemoryBudget, MemoryReservation};
 use crate::lexer::{Kind, Position};
 use super::{NoViableAlternative, ParserControl, ParserSession, RuntimeError, RuntimeProblem, RuntimeResult};
 use super::super::{PredictionError, PredictionMode, capacity_error};
@@ -21,7 +21,11 @@ pub(in crate::parser::prediction) struct NoViableDiagnostic<'sql> {
 #[derive(Debug)]
 pub(super) struct ListenerDiagnostic {
     pub(super) anomaly: Anomaly,
-    _lease: Arc<MemoryReservation>,
+    lease: Arc<MemoryReservation>,
+}
+
+impl ListenerDiagnostic {
+    pub(super) fn budget(&self) -> &Arc<MemoryBudget> { self.lease.budget() }
 }
 
 impl<'sql> NoViableDiagnostic<'sql> {
@@ -93,7 +97,7 @@ pub(super) fn listener_diagnostic(
     message.push_str(parser_message);
     let mut code = message_buffer(CODE.len())?;
     code.push_str(CODE);
-    Ok(ListenerDiagnostic { anomaly: Anomaly::incorrect(code, message), _lease: lease })
+    Ok(ListenerDiagnostic { anomaly: Anomaly::incorrect(code, message), lease })
 }
 
 pub(super) fn message_size(sizes: impl IntoIterator<Item = usize>) -> Result<usize, PredictionError> {

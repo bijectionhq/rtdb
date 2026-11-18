@@ -28,7 +28,7 @@ mod batch;
 pub use parse::{DeferredStatementSyntax, ParsedStatement, StatementKind, StatementSyntax, StatementSyntaxBatch, parse, parse_in, parse_syntax_in};
 pub use mutation::{Mutation, StaticMutation, StaticMutationKind, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
 pub use control::{AdmittedControl, ParsedControl, parse_admitted_control_in, parse_control, parse_control_in, parse_control_syntax_in};
-pub use parser::{InitialStatementDiagnostic, initial_batch_diagnostic, initial_statement_diagnostic};
+pub use parser::{ContextualStatementDiagnostic, InitialStatementDiagnostic, initial_batch_diagnostic, initial_statement_diagnostic};
 pub use split::{SplitStatements, split_statements, split_statements_in};
 pub use batch::{BatchExecution, BatchPrepare, BatchStatement, ExecutableSyntax, PrepareSyntax, StatementBatch, parse_statement_batch, parse_statement_batch_with_frontend_response};
 pub use batch::{ExtendedParse, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax, parse_extended_statement};

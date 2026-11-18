@@ -137,6 +137,36 @@ async fn sql_parse_failures_return_anomaly_details_and_an_idle_connection() {
 }
 
 #[tokio::test]
+async fn first_simple_query_report_preserves_an_open_transaction_and_json_ld_detail() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET fallback_output_format = 'json-ld'").await), b"SCZ");
+    assert_eq!(client.query("BEGIN READ ONLY").await.last().unwrap().1, b"T");
+
+    let sql = "  SELEC 1; SELECT 2; ";
+    let frames = client.query(sql).await;
+    assert_eq!(tags(&frames), b"EZ");
+    assert_eq!(frames[1].1, b"T");
+    let fields = frames[0].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(fields[&b'C'], b"08P01");
+    let message = std::str::from_utf8(fields[&b'M']).unwrap();
+    assert!(message.starts_with("Errors parsing SQL statement:\n  - line 1:0 mismatched input 'SELEC' expecting "));
+    let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
+    assert_eq!(detail["@type"], "xt:incorrect");
+    assert_eq!(detail["@value"]["xtdb.error/message"], message);
+    let data = &detail["@value"]["xtdb.error/data"];
+    assert_eq!(data["xtdb.error/code"], serde_json::json!({"@type":"xt:keyword","@value":"xtdb/sql-error"}));
+    assert_eq!(data["sql"], sql);
+
+    let resumed = client.query("SELECT 42 AS answer").await;
+    assert_eq!(resumed.last().unwrap().1, b"T");
+    assert_eq!(rows(&resumed), [vec![Some(b"42".to_vec())]]);
+    assert_eq!(client.query("ROLLBACK").await.last().unwrap().1, b"I");
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn min_max_incomparable_default_json_pgwire() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

@@ -5,7 +5,7 @@ use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlR
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::QueryCursor;
-use rtdb_sql::{AdmittedControl, BatchExecution, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
+use rtdb_sql::{AdmittedControl, BatchExecution, ContextualStatementDiagnostic, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
@@ -379,13 +379,14 @@ impl ProtocolSession {
     async fn simple<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
         self.extended = false; self.portals.remove("");
         let result = self.simple_statements(source, writer).await;
-        if let Err(error) = result { writer.error(&error, self.environment()?.fallback(), false).await?; }
+        if let Err(error) = result { writer.error(error.anomaly(), self.environment()?.fallback(), false).await?; }
         if self.copy.is_none() { writer.ready(self.ready()).await?; }
         Ok(())
     }
-    async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
-        let received = source;
-        let normalized = normalized_simple_text(source);
+    async fn simple_statements<W: AsyncWrite + Unpin>(
+        &mut self, original: &str, writer: &mut Writer<W>,
+    ) -> std::result::Result<(), SimpleQueryFailure> {
+        let normalized = normalized_simple_text(original);
         let keyword = keyword_prefix(normalized);
         let marker = simple_query_marker(normalized)
             .or((keyword == KeywordPrefix::MatchesEveryLocale).then_some(SimpleQueryMarker::Keywords));
@@ -406,12 +407,12 @@ impl ProtocolSession {
                 }
             }.await;
             self.simple_statement_result(result, writer).await?;
-            return self.settle_simple_transaction().await;
+            return self.settle_simple_transaction().await.map_err(Into::into);
         }
 
         let memory = Arc::clone(self.node.memory());
-        let rewritten = replace_namespace_query(source, normalized);
-        let (source, _normalized_allocation) = if !std::ptr::eq(rewritten, source) {
+        let rewritten = replace_namespace_query(original, normalized);
+        let (source, _normalized_allocation) = if !std::ptr::eq(rewritten, original) {
             (Cow::Borrowed(rewritten), None)
         } else if normalized.1.is_empty() {
             (Cow::Borrowed(normalized.0), None)
@@ -419,24 +420,12 @@ impl ProtocolSession {
             let allocation = memory.reserve(normalized.0.len() + normalized.1.len())?;
             (Cow::Owned([normalized.0, normalized.1].concat()), Some(allocation))
         };
-        let batch = if keyword == KeywordPrefix::LocaleDependent {
+        let parsed = if keyword == KeywordPrefix::LocaleDependent {
             rtdb_sql::parse_statement_batch_with_frontend_response(&source, &memory, legacy_keyword_probe)
         } else {
             rtdb_sql::parse_statement_batch(&source, &memory)
         };
-        let mut batch = match batch {
-            Ok(batch) => batch,
-            Err(error) => {
-                let Some(diagnostic) = rtdb_sql::initial_batch_diagnostic(&source, &error, &memory)? else { return Err(error); };
-                let listener = diagnostic.anomaly();
-                let bytes = received.len().checked_add(listener.code.len())
-                    .and_then(|bytes| bytes.checked_add(listener.message.as_ref().map_or(0, String::len)))
-                    .and_then(|bytes| bytes.checked_add(1024)).ok_or_else(|| protocol("SQL error detail too large"))?;
-                let _detail = memory.reserve(bytes)?;
-                let error = listener.clone().with_context("sql", received.into());
-                return writer.error(&error, self.environment()?.fallback(), false).await;
-            }
-        };
+        let mut batch = parsed.map_err(|error| SimpleQueryFailure::from_batch(error, &source, original, &memory))?;
         while let Some(statement) = batch.next_for_execution() {
             let start_transaction = match &statement {
                 BatchExecution::Prepare(_) => true,
@@ -450,7 +439,7 @@ impl ProtocolSession {
             self.simple_statement_result(result, writer).await?;
         }
         drop(batch);
-        self.settle_simple_transaction().await
+        self.settle_simple_transaction().await.map_err(Into::into)
     }
 
     async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, writer: &mut Writer<W>) -> Result<()> {
@@ -533,6 +522,34 @@ fn sql_shape(prepared: PreparedSql, declared_parameters: usize) -> PreparedShape
         });
         let parameter_count = prepared.parameter_count();
         PreparedShape { kind: PreparedKind::Query(prepared), columns, parameter_count }
+    }
+}
+
+enum SimpleQueryFailure {
+    Ordinary(Anomaly),
+    Statement(ContextualStatementDiagnostic),
+}
+
+impl From<Anomaly> for SimpleQueryFailure {
+    fn from(error: Anomaly) -> Self { Self::Ordinary(error) }
+}
+
+impl SimpleQueryFailure {
+    fn from_batch(legacy: Anomaly, source: &str, original: &str, memory: &Arc<MemoryBudget>) -> Self {
+        let diagnostic = rtdb_sql::initial_batch_diagnostic(source, &legacy, memory)
+            .and_then(|report| report.map(|report| report.with_sql_context(original)).transpose());
+        match diagnostic {
+            Ok(Some(report)) => Self::Statement(report),
+            Ok(None) => Self::Ordinary(legacy),
+            Err(error) => Self::Ordinary(error),
+        }
+    }
+
+    fn anomaly(&self) -> &Anomaly {
+        match self {
+            Self::Ordinary(error) => error,
+            Self::Statement(report) => report.anomaly(),
+        }
     }
 }
 
@@ -792,6 +809,45 @@ mod tests {
         let startup = Startup { parameters: BTreeMap::new(), reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
+    }
+
+    #[tokio::test]
+    async fn initial_simple_query_error_is_written_once_on_partial_connection_failure() {
+        use std::{io, pin::Pin, task::{Context, Poll}};
+
+        #[derive(Default)]
+        struct PartialWriteFailure {
+            writes: usize,
+            bytes: Vec<u8>,
+        }
+
+        impl AsyncWrite for PartialWriteFailure {
+            fn poll_write(mut self: Pin<&mut Self>, _: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+                self.writes += 1;
+                if self.writes == 2 { return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into())); }
+                self.bytes.extend_from_slice(bytes);
+                Poll::Ready(Ok(bytes.len()))
+            }
+
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> { Poll::Ready(Ok(())) }
+        }
+
+        let (mut frontend, driver) = test_frontend().await;
+        let memory = Arc::clone(frontend.node.memory());
+        let baseline = memory.used_bytes();
+        let input = b"Q\0\0\0\x0cSELEC 1\0";
+        let mut reader = crate::wire::Reader::new(input.as_slice(), Arc::clone(&memory));
+        let frame = reader.read(1024).await.unwrap().unwrap();
+        let mut writer = Writer::new(PartialWriteFailure::default(), Arc::clone(&memory));
+        let error = frontend.handle(frame, &mut writer).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.pgwire/connection-error");
+        let output = writer.into_inner();
+        assert_eq!(output.writes, 2);
+        assert_eq!(output.bytes, b"E");
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
     }
 
     #[tokio::test]

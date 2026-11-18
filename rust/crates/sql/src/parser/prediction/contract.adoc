@@ -825,6 +825,14 @@ Flight SQL GetFlightInfo asks for a Direct diagnostic only after its initial con
 Shared parser history across requests, other parser surfaces and embedded cause capabilities remain open.
 Phase 2 compilation, runtime and paired Flight diagnostics remain pending.
 
+== PostgreSQL Simple Query diagnostic ownership
+
+* The selected Multi parser report retains its listener reservation and an independent reservation for the received SQL in anomaly context.
+** The protocol holds both until ErrorResponse serialization returns.
+** A successful ErrorResponse is followed by ReadyForQuery when COPY IN is inactive.
+*** Its transaction status reflects the state before the batch parse failed.
+** A connection error ends processing of the message before another ErrorResponse or ReadyForQuery can be written.
+
 == Statement lists, controls and identifiers
 
 The private list root enters `multiSqlStatement` and calls the adopted executable rule at 358 for the first statement and at 360 after each inter-statement semicolon.

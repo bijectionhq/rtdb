@@ -92,6 +92,37 @@ mod tests {
     }
 
     #[test]
+    fn multi_report_owns_original_sql_and_releases_both_reservations() {
+        let memory = MemoryBudget::new(64 << 20);
+        let source = "SELEC 1; SELECT 2";
+        let legacy = crate::parse_statement_batch(source, &memory).unwrap_err();
+        assert_eq!(memory.used_bytes(), 0);
+        let parse_report = || initial_batch_diagnostic(source, &legacy, &memory).unwrap().unwrap();
+        let report = parse_report();
+        let listener_bytes = memory.used_bytes();
+        assert!(listener_bytes > 0);
+        let diagnostic = {
+            let original = format!("  {source}; \n");
+            let bytes = original.len();
+            let diagnostic = report.with_sql_context(&original).unwrap();
+            assert_eq!(memory.used_bytes(), listener_bytes + bytes + 1024);
+            diagnostic
+        };
+        let anomaly = diagnostic.anomaly();
+        assert_eq!(anomaly.context["sql"], "  SELEC 1; SELECT 2; \n");
+        assert!(anomaly.message.as_deref().unwrap().starts_with("Errors parsing SQL statement:\n  - line 1:0 mismatched input 'SELEC' expecting "));
+        drop(diagnostic);
+        assert_eq!(memory.used_bytes(), 0);
+
+        let report = parse_report();
+        let occupied = memory.reserve(memory.limit_bytes() - memory.used_bytes()).unwrap();
+        assert_eq!(report.with_sql_context(source).unwrap_err().code, "rtdb/memory-budget-exceeded");
+        assert_eq!(memory.used_bytes(), occupied.bytes());
+        drop(occupied);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
     fn other_failures_keep_the_vendor_anomaly() {
         let memory = MemoryBudget::new(64 << 20);
         for source in ["SELECT 1; SELEC 1", "\"SELEC\" 1", "SELECT 1 +", "extra @", "PG_SLEEP 1", "ADD 1"] {
