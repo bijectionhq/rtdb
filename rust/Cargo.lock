@@ -3846,6 +3846,7 @@ dependencies = [
  "rtdb-plan",
  "rtdb-types",
  "serde_json",
+ "stacker",
  "tokio",
  "uuid",
 ]

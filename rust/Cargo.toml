@@ -16,6 +16,7 @@ publish = false
 repository = "https://github.com/bijectionhq/rtdb"
 
 [workspace.dependencies]
+stacker = "0.1.25"
 rtdb-types = { path = "crates/types" }
 rtdb-java-date = { path = "crates/java-date" }
 rtdb-columnar = { path = "crates/columnar" }

@@ -6,6 +6,10 @@ use crate::jvm_number::{Binary,Bit,Cast,Classification,Comparison,Dispatch,Error
 
 pub(super) struct Program<'a> { expression: Expression<'a>,locals: usize }
 pub(super) enum PatternText<'a> { Borrowed(JavaText<'a>),Computed(JavaString) }
+/// Host forms nest up to the depth limit, and an unoptimised frame of either recursion exceeds 30 KiB.
+const RED_ZONE: usize = 128 * 1024;
+const STACK_SEGMENT: usize = 2 * 1024 * 1024;
+
 impl PatternText<'_> { pub(super) fn view(&self) -> JavaText<'_> { match self { Self::Borrowed(value) => *value,Self::Computed(value) => value.view() } } }
 enum Expression<'a> {
     Constant(FormView<'a>),Number(Arc<Number>),Nil,Local { index: usize,emission: Emission },Function(Function),
@@ -91,6 +95,9 @@ impl<'a> Program<'a> {
 
 impl<'a> Compiler<'a,'_,'_> {
     fn expression(&mut self,form: FormView<'a>,depth: usize) -> Result<Expression<'a>> {
+        stacker::maybe_grow(RED_ZONE, STACK_SEGMENT, || self.expression_frame(form, depth))
+    }
+    fn expression_frame(&mut self,form: FormView<'a>,depth: usize) -> Result<Expression<'a>> {
         self.nodes += 1;
         if depth > 128 || self.nodes > 65_536 { return Err(limit()); }
         self.context.reserve(256)?;
@@ -341,6 +348,9 @@ impl<'a> Expression<'a> {
         }
     }
     fn evaluate(&self,locals: &mut [HostValue<'a>],context: &EvalContext<'_>) -> Result<HostValue<'a>> {
+        stacker::maybe_grow(RED_ZONE, STACK_SEGMENT, || self.evaluate_frame(locals, context))
+    }
+    fn evaluate_frame(&self,locals: &mut [HostValue<'a>],context: &EvalContext<'_>) -> Result<HostValue<'a>> {
         Ok(match self {
             Self::Constant(form) => HostValue::Constant(*form),Self::Number(value) => HostValue::Number(Arc::clone(value)),Self::Nil => HostValue::Nil,
             Self::Local { index,.. } => locals[*index].clone(),Self::Function(function) => HostValue::Function(*function),
