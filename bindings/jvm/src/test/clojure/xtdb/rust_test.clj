@@ -35,6 +35,7 @@
             [xtdb.operator.group-by.percentile-test :as original-percentile]
             [xtdb.operator.scan-test :as original-scan]
             [xtdb.operator.unnest-test :as original-unnest]
+            [xtdb.operator.window-test :as original-window]
             [xtdb.expression.pg-test :as original-pg-expression]
             [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
@@ -290,6 +291,22 @@
 (deftest-original-api original-apply/test-missing-column-in-independent-rel)
 
 (deftest-original-api original-let/test-let)
+
+(deftest-original-api original-window/test-window-operator)
+
+(deftest-original-api original-window/test-lead-lag-window-functions)
+
+(deftest named-logical-windows-use-their-own-ordering
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (is (= #{{:a 1 :up 1 :down 3} {:a 2 :up 2 :down 2} {:a 3 :up 3 :down 1}}
+           (set (rust/query-ra node
+                               '[:window {:windows {ascending {:order-specs [[a]]}
+                                                   descending {:order-specs [[a {:direction :desc}]]}}
+                                          :projections [{up {:window-name ascending :window-agg (row-number)}}
+                                                        {down {:window-name descending :window-agg (row-number)}}]}
+                                 [:table {:rows [{:a 2} {:a 3} {:a 1}]}]]
+                               {}))))))
 
 (deftest-original-api original-join/can-join-on-lists-491)
 

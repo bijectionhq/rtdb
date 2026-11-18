@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Edn, EdnKind};
-use rtdb_plan::{MaterializedBinding, PercentileFraction, PercentileKind};
+use rtdb_plan::{MaterializedBinding, PercentileFraction, PercentileKind, WindowExpr, WindowFunction};
 
 /// Imports a Clojure logical relation into the native plan using exact column symbols.
 /// Named parameter bindings describe the caller's typed argument positions.
@@ -63,6 +63,7 @@ impl Importer<'_, '_, '_> {
             ("rename" | "ρ" | "rho", [input]) => self.rename(options, input)?,
             ("sort", [input]) => return self.sort(options, input),
             ("group-by" | "γ" | "gamma", [input]) => self.group_by(options, input)?,
+            ("window", [input]) => return self.window(options, input),
             ("union-all" | "∪", [left, right]) => self.set(SetOperator::Union, left, right)?,
             ("intersect" | "∩", [left, right]) => self.set(SetOperator::Intersect, left, right)?,
             ("difference" | "except" | "−", [left, right]) => self.set(SetOperator::Except, left, right)?,
@@ -403,6 +404,60 @@ impl Importer<'_, '_, '_> {
             .collect::<Result<Vec<_>>>()?;
         let schema = Schema::new(groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect())?;
         Relation::new(schema, RelationNode::Aggregate { input: bound.relation, groups, aggregates })
+    }
+
+    fn window(&mut self, options: &Edn, input: &Edn) -> Result<Arc<Relation>> {
+        let mut input = self.lower(input)?;
+        let scope = bind_input(&input);
+        let windows = required(options, "windows")?.map().ok_or_else(|| invalid("Named windows must be a map"))?;
+        let mut grouped = BTreeMap::<&str, Vec<WindowExpr>>::new();
+        for projection in sequence(required(options, "projections")?)? {
+            let Some([(column, spec)]) = projection.map() else { return Err(invalid("Window projection requires one output column")); };
+            let window = required(spec, "window-name")?.symbol().ok_or_else(|| invalid("Window name must be a symbol"))?;
+            let function = Self::window_function(required(spec, "window-agg")?, &scope)?;
+            let field = self.compiler.binder.field(column_name(column)?, None, function.result_type(input.schema())?)?;
+            grouped.entry(window).or_default().push(WindowExpr { field, function });
+        }
+        if grouped.is_empty() { return Err(invalid("Window requires at least one projection")); }
+        let mut named = BTreeSet::new();
+        for (window, spec) in windows {
+            let window = window.symbol().ok_or_else(|| invalid("Window name must be a symbol"))?;
+            if !named.insert(window) { return Err(invalid("Duplicate window name")); }
+            if spec.map().is_none() { return Err(invalid("Window specification must be a map")); }
+            let Some(expressions) = grouped.remove(window) else { continue; };
+            let partition_by = spec.option("partition-cols").map(sequence).transpose()?.unwrap_or_default().iter().map(|column| {
+                let name = column_name(column)?;
+                scope.variables.get(name).map(|field|field.id).ok_or_else(|| invalid(format!("Unknown partition column: {name}")))
+            }).collect::<Result<_>>()?;
+            let order_by = Self::sort_specs(spec, |column| {
+                let name = column_name(column)?;
+                Ok(scope.variables.get(name).map_or(PExpr::Literal(Value::Null), Field::expression))
+            })?;
+            let schema = Schema::new(input.schema().fields().iter().cloned().chain(expressions.iter().map(|expr|expr.field.clone())).collect())?;
+            input = Arc::new(Relation::new(schema, RelationNode::Window { input, partition_by, order_by, expressions })?);
+        }
+        if let Some(name) = grouped.keys().next() { return Err(invalid(format!("Unknown window: {name}"))); }
+        Ok(input)
+    }
+
+    fn window_function(form: &Edn, scope: &Bound) -> Result<WindowFunction> {
+        let EdnKind::List(call) = &form.kind else { return Err(invalid("Window function must be a list")); };
+        let [function, arguments @ ..] = call.as_slice() else { return Err(invalid("Window requires a function name")); };
+        let name = function.symbol().ok_or_else(|| invalid("Window function must be a symbol"))?;
+        match (normal(name).as_str(), arguments) {
+            ("row_number", []) => Ok(WindowFunction::RowNumber),
+            (kind @ ("lead" | "lag"), [column, offset @ ..]) => {
+                let name = column_name(column)?;
+                let column = scope.variables.get(name).ok_or_else(|| invalid(format!("Unknown window column: {name}")))?.id;
+                let offset = match offset {
+                    [] => 1,
+                    [Edn { kind: EdnKind::Integer(value), .. }] if *value >= 0 => *value as u64,
+                    _ => return Err(invalid("Window offset must be a non-negative integer")),
+                };
+                Ok(if kind == "lead" { WindowFunction::Lead { column, offset } } else { WindowFunction::Lag { column, offset } })
+            }
+            _ => Err(invalid("Unsupported window function or arguments")),
+        }
     }
 
     fn aggregate(&mut self, name: &str, form: &Edn, bound: &mut Bound, grouped: bool) -> Result<AggregateExpr> {

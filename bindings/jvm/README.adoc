@@ -112,5 +112,6 @@ Logical mark joins apply eligibility conditions before evaluating the three-valu
 Logical apply binds each probe row's values in a lexical scope for the dependent relation, including when a nested apply shadows a parameter.
 Logical let bindings expose a materialized relation to each reference in their lexical scope and retain its page boundaries.
 Logical row numbering can count across a relation or restart at each operator page.
+Logical windows bind named partition and ordering specifications for row number, lead, and lag.
 Logical sort and limit accept named or positional arguments and keep the boundaries of the retained input pages when ordering is absent.
 Native logical relation tests run with the original Clojure assertions and the native relation cursor.
