@@ -75,11 +75,15 @@ impl PartitionLogs {
         let (from, to) = inspection_offsets(from.0, to.0, self.replica_epoch)?;
         self.replica.range(from, to).await.map_err(Into::into)
     }
-    pub fn validate_source_boundary(&self, after: SourcePosition) -> Result<()> {
+    pub fn validate_source_boundary(&self, database: &str, after: SourcePosition) -> Result<()> {
         let offset = after.after_offset(self.source_epoch);
         let latest = self.source.latest()?.0;
         if after.0 >= 0 && after.epoch() > self.source_epoch || offset > latest {
-            return Err(Anomaly::fault("xtdb/out-of-sync-log", "Persisted source position is ahead of the configured source log")
+            let log_state = if latest == -1 { "the log is empty".to_owned() } else { format!("epoch={}, offset={latest}", self.source_epoch.0) };
+            let message = format!("Database '{database}' failed to start due to an invalid transaction log state ({log_state}) \
+                that does not correspond with the latest processed message (epoch={} and offset={}).\n\n\
+                Please see https://docs.xtdb.com/ops/backup-and-restore/out-of-sync-log.html for more information and next steps.", after.epoch().0, after.offset());
+            return Err(Anomaly::fault("xtdb/out-of-sync-log", message)
                 .with_context("persisted-position", after.0.into()).with_context("source-latest-offset", latest.into()));
         }
         Ok(())

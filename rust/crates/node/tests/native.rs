@@ -532,6 +532,7 @@ async fn local_recovery_rejects_out_of_sync_source_logs_before_open_returns_in_e
                     Err(error) => error,
                 };
                 assert_eq!(error.code, "xtdb/out-of-sync-log");
+                assert!(error.message.as_deref().unwrap().starts_with("Database 'xtdb' failed to start due to an invalid transaction log state (the log is empty) that does not correspond with the latest processed message (epoch=1 and offset="), "{:?}", error.message);
             }
         }
     }).await.unwrap();

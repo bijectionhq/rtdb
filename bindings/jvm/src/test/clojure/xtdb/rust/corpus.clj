@@ -16,7 +16,7 @@
            [java.time Duration InstantSource]
            [java.util.concurrent TimeUnit]
            [org.apache.arrow.memory RootAllocator]
-           [xtdb.rust NativeDatabase]))
+           [xtdb.rust NativeDatabase NativeException]))
 
 
 (defn- file->ns [^File root ^File file]
@@ -92,9 +92,14 @@
                                         (= :local (get-in opts [:log 0])) (assoc :use-instant-source-for-non-tx (boolean use?))))))
          opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
          config (yaml opts)]
-     (if (instance? InstantSource clock)
-       (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
-       (NativeDatabase/open native-allocator config (* 512 1024 1024))))))
+     (try
+       (if (instance? InstantSource clock)
+         (NativeDatabase/open native-allocator config (* 512 1024 1024) ^InstantSource clock)
+         (NativeDatabase/open native-allocator config (* 512 1024 1024)))
+       (catch NativeException e
+         (throw (if (= "xtdb/out-of-sync-log" (.code e))
+                  (IllegalStateException. (ex-message e) e)
+                  e)))))))
 
 (defn- import-logical-inputs [query]
   (let [[operator options & operands] query]

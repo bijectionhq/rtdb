@@ -282,7 +282,7 @@ impl ReplicationDriver {
             return Err(invalid("Progress monitor does not describe the recovered partition"));
         }
         if let Some(boundary) = recovered.block.as_ref().and_then(BlockCatalog::latest_source_position) {
-            logs.validate_source_boundary(boundary)?;
+            logs.validate_source_boundary(&resolve.database, boundary)?;
         }
         let read_position = recovered.block.as_ref().and_then(BlockCatalog::boundary_replica_position).unwrap_or(logs.replica_floor()?);
         let initial = DriverStatus { role: Role::Following, highest_term: recovered.fence.highest_term(), replica_position: read_position,
