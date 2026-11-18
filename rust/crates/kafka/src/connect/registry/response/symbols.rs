@@ -4,7 +4,6 @@ use super::ConversionContext;
 pub(in crate::connect) use super::Profile;
 
 mod storage;
-pub(in crate::connect) mod bytes;
 mod intern;
 pub(in crate::connect) use intern::InternCache;
 use storage::{Bucket, OverflowBits, Table};

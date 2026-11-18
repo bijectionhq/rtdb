@@ -1,9 +1,8 @@
 use rtdb_types::MemoryBudget;
 use super::*;
-use crate::connect::registry::reader_symbols::bytes::prepare_name;
 
 fn candidate(units: &[u16], context: &mut ConversionContext) -> Arc<SymbolName> {
-    prepare_name(units, context).unwrap()
+    SymbolName::copy(units, context).unwrap()
 }
 
 #[test]

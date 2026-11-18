@@ -18,8 +18,6 @@ pub(super) use factory::ParserFactories;
 use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
-#[cfg(test)]
-mod input_window;
 mod response;
 pub(super) use response::symbols as reader_symbols;
 

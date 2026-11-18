@@ -96,10 +96,8 @@ link:COPYRIGHT[Notices] retain complete pre-package prefixes, including an expli
 link:LICENSES[License material] retains complete selected archive license/notice entries and the Registry Apache license.
 
 Sixteen new unexecuted source fixture functions cover ordinary persistent hits, exact unmatched UTF16, empty/length demands, COW/growth, equal-count/stale/failed compare publication, raw-zero rehash behavior, both collision spills and retained mismatch, source-failure release, reuse/max-size limits, native poisoning, incompatible interning and reservation survival/reattachment.
-All115 existing rule, bean, cursor and input-window fixture bodies remain unchanged.
 No compiler, formatter, test/runtime, Cargo/Gradle or project script was executed.
 
-The link:../window/reader/REFERENCE.adoc[Reader-symbol entry points] compose this authority at actual Reader name demand before immutable text publication, derive the lexical profile from the factory child, and release symbols in parser-close order.
 UTF8 ByteQuads, remaining lexical branches, physical read/recycler authority, the effective mapper/intern profile, nullable DTO/reference/rule activation and version/cache timing remain open.
 Native HTTP frames do not supply Java refill tapes or accepted-name observations.
 Avro's exact JavaText schema input remains coordinated with its owner.

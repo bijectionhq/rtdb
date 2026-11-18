@@ -8,18 +8,10 @@ mod beans;
 mod scalars;
 mod collections;
 mod decode;
-#[cfg(test)]
-mod window;
 pub(in crate::connect) mod symbols;
 
 #[cfg(test)]
 pub(super) use beans::{Metadata, Properties, Rule, RuleKind, RuleMode, RuleSet};
-#[cfg(test)]
-pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
-#[cfg(test)]
-pub(super) use window::{ReaderInput, schema_from_reader, schema_string_from_reader};
-#[cfg(test)]
-pub(super) use window::{schema_from_utf8, schema_string_from_utf8};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::connect) enum Profile {
@@ -41,8 +33,6 @@ pub(super) enum FailureKind {
     #[cfg(test)]
     MissingSetter,
     Constraint,
-    #[cfg(test)]
-    Unchecked,
 }
 
 #[derive(Debug)]
@@ -54,10 +44,6 @@ pub(super) enum Failure {
 impl From<Anomaly> for Failure { fn from(cause: Anomaly) -> Self { Self::Native(cause) } }
 impl Failure {
     fn at(kind: FailureKind, offset: usize, detail: &'static str) -> Self { Self::Decode { kind, offset, detail } }
-    #[cfg(test)]
-    pub(super) fn into_anomaly(self) -> Anomaly {
-        match self { Self::Native(cause) => cause, cause => error("schema-registry", cause) }
-    }
 }
 impl fmt::Display for Failure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
