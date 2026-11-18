@@ -22,6 +22,14 @@ pub trait SchemaNamePolicy {
         true
     }
 
+    /// Parses a record field's `type` value independently of its surrounding field metadata when enabled.
+    /// Textual enum, fixed, array and map names use ordinary named lookup.
+    /// Logical metadata inside `type` applies to the child, while field-level `logicalType` is filtered from native field attributes.
+    /// The default preserves parsing through the surrounding field object.
+    fn record_field_type_is_separate(&self) -> bool {
+        false
+    }
+
     /// Indexes named definition aliases for schema reference lookup by default.
     /// Returning false retains alias metadata while resolving references by declared names only.
     fn named_aliases_are_references(&self) -> bool {

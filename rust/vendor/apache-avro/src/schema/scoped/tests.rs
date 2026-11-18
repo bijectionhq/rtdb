@@ -420,3 +420,71 @@ fn scoped_logical_fixed_references_can_preserve_nominal_identity_with_the_origin
     assert!(OpenNames { fallback: true }.named_aliases_are_references());
     assert!(!OpenNames { fallback: true }.logical_fixed_references_are_named());
 }
+
+struct SeparateFieldTypes;
+impl SchemaNamePolicy for SeparateFieldTypes {
+    fn name(&self, name: &str, namespace: &Namespace) -> AvroResult<Name> {
+        DeclaredReferences.name(name, namespace)
+    }
+    fn record_field(&self, name: &str) -> AvroResult<()> {
+        DeclaredReferences.record_field(name)
+    }
+    fn enum_symbol(&self, symbol: &str) -> AvroResult<()> {
+        DeclaredReferences.enum_symbol(symbol)
+    }
+    fn reference_fallback(&self, name: &str, namespace: &Namespace) -> AvroResult<Option<Name>> {
+        DeclaredReferences.reference_fallback(name, namespace)
+    }
+    fn named_aliases_are_references(&self) -> bool { false }
+    fn logical_fixed_references_are_named(&self) -> bool { true }
+    fn record_field_type_is_separate(&self) -> bool { true }
+}
+
+#[test]
+fn scoped_separate_field_types_keep_keyword_named_uses_nominal() {
+    let references = [
+        r#"{"type":"enum","name":"enum","symbols":["A"]}"#,
+        r#"{"type":"fixed","name":"fixed","size":1}"#,
+        r#"{"type":"record","name":"array","fields":[]}"#,
+        r#"{"type":"fixed","name":"map","size":2}"#,
+    ];
+    let root = r#"{"type":"record","name":"Root","fields":[{"name":"e","type":"enum"},{"name":"f","type":"fixed"},{"name":"a","type":"array"},{"name":"m","type":"map"}]}"#;
+    let (root, definitions) = Schema::parse_str_with_list_with_name_policy(root, references, &SeparateFieldTypes).unwrap();
+    let Schema::Record(root) = root else { panic!("expected record") };
+    for (field, expected) in root.fields.iter().zip(["enum", "fixed", "array", "map"]) {
+        assert!(matches!(&field.schema, Schema::Ref { name } if name.fullname(None) == expected));
+    }
+    assert!(matches!(&definitions[0], Schema::Enum(value) if value.symbols == ["A"]));
+    assert!(matches!(&definitions[1], Schema::Fixed(value) if value.size == 1));
+    let ordinary = r#"{"type":"record","name":"Root","fields":[{"name":"e","type":"enum"},{"name":"f","type":"fixed"}]}"#;
+    let (ordinary, _) = Schema::parse_str_with_list_with_name_policy(ordinary, references, &DeclaredReferences).unwrap();
+    let Schema::Record(ordinary) = ordinary else { panic!("expected record") };
+    assert!(matches!(&ordinary.fields[0].schema, Schema::Enum(_)));
+    assert!(matches!(&ordinary.fields[1].schema, Schema::Fixed(_)));
+    for name in ["array", "map"] {
+        let root = format!(r#"{{"type":"record","name":"Root","fields":[{{"name":"f","type":"{name}"}}]}}"#);
+        assert!(Schema::parse_str_with_list_with_name_policy(&root, references, &DeclaredReferences).is_err());
+    }
+    assert!(!DeclaredReferences.record_field_type_is_separate());
+}
+
+#[test]
+fn scoped_separate_field_types_keep_field_logical_metadata_outside_child_parsing() {
+    let root = r#"{"type":"record","name":"Root","fields":[{"name":"flat","type":"int","logicalType":"date"},{"name":"nested","type":{"type":"int","logicalType":"date"}}]}"#;
+    let (separate, _) = Schema::parse_str_with_list_with_name_policy(root, Vec::<&str>::new(), &SeparateFieldTypes).unwrap();
+    let Schema::Record(separate) = separate else { panic!("expected record") };
+    assert!(matches!(&separate.fields[0].schema, Schema::Int));
+    assert!(!separate.fields[0].custom_attributes.contains_key("logicalType"));
+    assert!(matches!(&separate.fields[1].schema, Schema::Date));
+    let (ordinary, _) = Schema::parse_str_with_list_with_name_policy(root, Vec::<&str>::new(), &DeclaredReferences).unwrap();
+    let Schema::Record(ordinary) = ordinary else { panic!("expected record") };
+    assert!(matches!(&ordinary.fields[0].schema, Schema::Date));
+    assert!(matches!(&ordinary.fields[1].schema, Schema::Date));
+}
+
+#[test]
+fn scoped_separate_field_types_require_the_actual_type_member() {
+    let root = r#"{"type":"record","name":"Root","fields":[{"name":"missing"}]}"#;
+    let error = Schema::parse_str_with_list_with_name_policy(root, Vec::<&str>::new(), &SeparateFieldTypes).unwrap_err();
+    assert!(matches!(error.details(), Details::GetComplexTypeField));
+}

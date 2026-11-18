@@ -14,3 +14,8 @@ The original definition retains its physical Fixed name, properties and reader a
 
 Four additive regression functions cover default controls, parsed/resolving aliases, alias/declaration collisions and the owned logical-reference path.
 They are source fixtures only under the Phase 1 work order; no compiler or regression execution has been performed.
+
+A policy can parse a record field's actual type member independently with record_field_type_is_separate; the default is disabled.
+Textual uses then pass through ordinary named-reference lookup even when the name is enum, fixed, array or map, and field-level logicalType does not change the child schema.
+The surrounding field keeps its existing defaults, aliases, order and custom-attribute filtering; logicalType remains excluded from native field custom attributes.
+Three additional source regressions cover nominal keyword names, flat versus nested logical metadata and a missing type member, with default-policy controls.

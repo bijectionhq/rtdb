@@ -675,12 +675,19 @@ impl RecordField {
 
         parser.validate_field_name(&name)?;
 
-        // TODO: "type" = "<record name>"
-        let schema = parser.parse_complex(
-            field,
-            &enclosing_record.namespace,
-            RecordSchemaParseLocation::FromField,
-        )?;
+        let schema = if parser
+            .name_policy
+            .is_some_and(|policy| policy.record_field_type_is_separate())
+        {
+            let field_type = field.get("type").ok_or(Details::GetComplexTypeField)?;
+            parser.parse(field_type, &enclosing_record.namespace)?
+        } else {
+            parser.parse_complex(
+                field,
+                &enclosing_record.namespace,
+                RecordSchemaParseLocation::FromField,
+            )?
+        };
 
         let default = field.get("default").cloned();
         Self::resolve_default_value(
