@@ -4,7 +4,7 @@ use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use rtdb_columnar::{MemoryBudget, MemoryReservation};
-use rtdb_format::{data::{EventBatch, StoredEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::{MetadataBuilder, page_metadata_reservation}};
+use rtdb_format::{data::{EventBatch, StoredEvent}, ipc::{ArrowFile, ArrowFileWriter}, metadata::MetadataBuilder};
 use rtdb_types::{Iid, LogicalType, Result, RunEndWidth, Timestamp};
 use tokio_util::sync::CancellationToken;
 use super::{MergeConfig, MergeFile, OutputSchema, check_disk, create_file, disk_remaining, event_reservation, limit_writer, open_input, read_page, row_bytes};
@@ -49,8 +49,7 @@ impl FinalWriter<'_> {
         if self.cancellation.is_cancelled() { return Err(crate::closed()); }
         let _batch = event_reservation(self.memory, events, 8)?;
         let batch = self.schema.batch(events)?;
-        let metadata_charge = self.memory.reserve(page_metadata_reservation(&batch)?)?;
-        let leaf = self.metadata.write_leaf(&batch)?;
+        let (leaf, metadata_charge) = self.metadata.write_leaf_reserved(&batch, self.memory)?;
         limit_writer(&mut self.data, self.directory, self.disk_limit)?;
         self.data.write(&batch)?;
         self.metadata_charges.push(metadata_charge);
@@ -255,6 +254,7 @@ pub(super) fn normalize(input: &MergeFile, put: &Option<BTreeMap<String, Logical
     limit_writer(&mut output.data, directory, config.temporary_byte_limit)?;
     let data = output.data.finish()?;
     let size = data.metadata().map_err(crate::invalid)?.len();
+    let _metadata_serialization = memory.reserve(output.metadata.serialization_bound()?)?;
     let (metadata, details) = output.metadata.finish()?;
     let encoded = metadata.write()?;
     check_disk(directory, config.temporary_byte_limit, encoded.len() as u64)?;

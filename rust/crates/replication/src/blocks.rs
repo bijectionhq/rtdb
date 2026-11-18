@@ -238,6 +238,7 @@ impl BlockStore {
             let size = i64::try_from(file.metadata().map_err(io_error)?.len()).map_err(io_error)?;
             self.store.put_file(&ObjectKey::new(entry.slug.data_key(&trie))?, temporary.path()).await?;
             check_cancelled(cancellation)?;
+            let _metadata_serialization = self.memory.reserve(metadata.serialization_bound()?)?;
             let (metadata_file, summary) = metadata.finish()?;
             let bytes = metadata_file.write()?;
             self.store.put(&ObjectKey::new(entry.slug.metadata_key(&trie))?, Bytes::from(bytes)).await?;
@@ -293,8 +294,7 @@ fn write_node<'a>(node: &'a TrieNode, live: &'a LiveTable, memory: &'a Arc<Memor
             let batch = IndexBatch::copy_events_with_put_schema(&events, live.column_types(), memory)?;
             if writer.is_none() { *writer = Some(ArrowFileWriter::new_reserved(temporary.reopen().map_err(io_error)?, batch.arrow().schema().as_ref(), memory)?); }
             writer.as_mut().ok_or_else(|| invalid("Missing page writer"))?.write(batch.arrow())?;
-            let metadata_charge = memory.reserve(rtdb_format::metadata::page_metadata_reservation(batch.arrow())?)?;
-            let node = metadata.write_leaf(batch.arrow())?;
+            let (node, metadata_charge) = metadata.write_leaf_reserved(batch.arrow(), memory)?;
             retained.push(metadata_charge);
             drop(batch);
             drop(events);

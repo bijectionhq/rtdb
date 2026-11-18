@@ -4,6 +4,7 @@ use std::sync::Arc;
 use arrow_array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, UnionArray};
 use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef, TimeUnit as ArrowTimeUnit, UnionFields, UnionMode};
+use rtdb_columnar::{MemoryBudget, MemoryReservation};
 use rtdb_types::{Anomaly, LogicalType, Result, TimeUnit, Timestamp, Value};
 
 use crate::ipc::ArrowFile;
@@ -34,17 +35,32 @@ pub struct MetadataBuilder {
     calculate_blooms: bool,
 }
 
-/// Estimates the retained metadata and its serialization scratch for one page, separately from the page's Arrow buffers.
-pub fn page_metadata_reservation(page: &arrow_array::RecordBatch) -> Result<usize> {
+fn page_metadata_reservation(page: &RecordBatch) -> Result<usize> {
     let mut bytes = page.get_array_memory_size().checked_mul(4).and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
     let mut arrays: Vec<_> = page.columns().iter().map(|array| array.to_data()).collect();
     while let Some(array) = arrays.pop() {
         bytes = bytes.checked_add(array.len().checked_mul(256).ok_or_else(|| invalid("Page metadata reservation overflow"))?)
-            .and_then(|size| size.checked_add(1024)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
+            .and_then(|size| size.checked_add(65_536)).ok_or_else(|| invalid("Page metadata reservation overflow"))?;
         arrays.extend(array.child_data().iter().cloned());
     }
     Ok(bytes)
 }
+
+fn retained_node_bytes(node: &MetadataNode) -> Result<usize> {
+    let base = 512;
+    match node {
+        MetadataNode::Nil => Ok(base),
+        MetadataNode::IidBranch(children) => children.capacity().checked_mul(std::mem::size_of::<Option<usize>>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size),
+        MetadataNode::RecencyBranch(children) => children.capacity().checked_mul(std::mem::size_of::<(Timestamp, usize)>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size),
+        MetadataNode::Leaf { columns, .. } => {
+            let unused = columns.capacity() - columns.len();
+            let bytes = unused.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(base)).ok_or_else(metadata_size)?;
+            columns.iter().try_fold(bytes, |bytes, column| bytes.checked_add(column.retained_bytes()?).ok_or_else(metadata_size))
+        }
+    }
+}
+
+fn metadata_size() -> Anomaly { invalid("Metadata allocation exceeds addressable memory") }
 
 impl MetadataBuilder {
     pub fn new(recency_branches: bool, calculate_blooms: bool) -> Self {
@@ -106,6 +122,22 @@ impl MetadataBuilder {
         self.row_count = row_count;
         self.temporal = temporal;
         Ok(index)
+    }
+
+    /// The returned reservation covers the retained leaf through serialization.
+    pub fn write_leaf_reserved(&mut self, batch: &RecordBatch, memory: &Arc<MemoryBudget>) -> Result<(usize, Arc<MemoryReservation>)> {
+        let mut reservation = memory.reserve(page_metadata_reservation(batch)?)?;
+        let index = self.write_leaf(batch)?;
+        let retained = retained_node_bytes(&self.nodes[index])?;
+        Arc::get_mut(&mut reservation).expect("metadata construction owns its reservation").shrink_to(retained)?;
+        Ok((index, reservation))
+    }
+
+    /// Admits schema construction and serialization for the accumulated metadata.
+    pub fn serialization_bound(&self) -> Result<usize> {
+        self.nodes.iter().try_fold(65_536usize, |bytes, node| {
+            retained_node_bytes(node)?.checked_mul(8).and_then(|size| bytes.checked_add(size)).ok_or_else(metadata_size)
+        })
     }
 
     pub fn finish(self) -> Result<(MetadataFile, crate::log::proto::TrieMetadata)> {

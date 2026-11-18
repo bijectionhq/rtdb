@@ -106,6 +106,34 @@ fn iid_metadata_builds_bloom_when_other_columns_do_not() {
 }
 
 #[test]
+fn metadata_pages_keep_their_summaries_after_releasing_page_scratch() {
+    use rtdb_columnar::MemoryBudget;
+    use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
+    use rtdb_format::metadata::MetadataBuilder;
+    use rtdb_types::{EntityId, Interval};
+
+    let events = (0..1024).map(|id| StoredEvent {
+        iid: EntityId::Integer(id).iid(), system_from: Timestamp(1), valid_time: Interval::ALL,
+        operation: StoredOperation::Put(BTreeMap::from([("_id".into(), Value::I64(id))])), recency: None,
+    }).collect::<Vec<_>>();
+    let fields = BTreeMap::from([("_id".into(), LogicalType::Scalar(ScalarType::I64))]);
+    let page = build_event_batch(&events, Some(fields), None).unwrap();
+    let memory = MemoryBudget::new(64 << 20);
+    let mut builder = MetadataBuilder::new(false, true);
+    let leaves = (0..64).map(|_| builder.write_leaf_reserved(&page, &memory).unwrap().1).collect::<Vec<_>>();
+    assert!(memory.used_bytes() < 8 << 20);
+    let serialization = memory.reserve(builder.serialization_bound().unwrap()).unwrap();
+    let (metadata, summary) = builder.finish().unwrap();
+    let bytes = metadata.write().unwrap();
+    assert_eq!(summary.row_count, Some(65_536));
+    assert_eq!(MetadataFile::read(bytes.into()).unwrap().nodes().len(), 64);
+    drop(metadata);
+    drop(serialization);
+    drop(leaves);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn metadata_builder_rebases_nested_column_indices_across_data_pages() {
     use rtdb_format::data::{StoredEvent, StoredOperation, build_event_batch};
     use rtdb_format::metadata::MetadataBuilder;

@@ -25,6 +25,7 @@ The key format retains its two-digit month and day fields.
 Parsing follows the reference formatter's lenient year width and SMART date resolution: one through nine year digits with an optional plus sign, valid month and day ranges, and clamping to the month's last day.
 
 The Arrow readers accept files and streams through Arrow IPC, including multiple pages and run-end encoded IIDs.
+Trie metadata writers release the scan scratch after each page and admit the final schema and encoded file separately.
 Decimal metadata is checked recursively before Arrow's native schema conversion in file, stream, standalone schema, COPY, and Flight input paths.
 Unsupported bit widths return an Unsupported anomaly before Arrow 58.4.1's schema conversion.
 Decimal precision and scale retain the complete signed 32-bit JVM and Arrow IPC range.

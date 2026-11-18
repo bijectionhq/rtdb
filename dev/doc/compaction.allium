@@ -176,6 +176,7 @@ config {
 -- Stage 2's re-partitioning by IID never splits a run, because a run is one IID.
 -- Leaves it coalesces into one page never share an IID, so their runs carry over unchanged.
 -- Page metadata is computed over the IIDs the runs encode, so a meta file is identical whether or not its data file's `_iid` is encoded.
+-- When a page summary is complete, it is retained for the metadata file and temporary allocations for scanning the page are released.
 -- With the setting off, `_iid` is a plain 16-byte fixed-size binary column.
 --
 -- == Upload ==
