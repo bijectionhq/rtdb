@@ -86,6 +86,9 @@ Spill files are scoped temporary resources with a retained-byte quota.
 * Page selection uses temporal summaries, recency ceilings, and IID ranges, with a bypass option for comparison tests.
   Trie recency dates retain the Java calendar range; UTC midnight scan ceilings require a representable signed 64-bit microsecond value.
   `xt.trie_stats.recency` narrows the epoch day to its stored Date32 value at the system-table boundary.
+* A persisted page with a known zero non-null count cannot supply a matching row for a scan with one direct `IS NOT NULL` predicate on that document column.
+  Missing or ambiguous counts leave the page eligible under this check.
+  Page selection retains pages whose events can constrain or erase matching history.
 * Metadata IID paths begin at the metadata root; a trie key's partition is a coarse file filter rather than an additional root prefix.
 * Projection, filters, offset/fetch, union-all, and unnest advance incrementally.
 * Inner, outer, semi, and anti joins accumulate complete build pages and use in-memory hashing or shuffled spill partitions.

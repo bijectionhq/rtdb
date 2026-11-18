@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_builder_bytes, from_field};
 use rtdb_format::{ipc::{ArrowFile, inspect_file_reserved}, metadata::{MetadataFile, MetadataNode}};
 use rtdb_index::{IndexBatch, LiveTable, RowSource, Snapshot};
-use rtdb_plan::{Scan, Schema, TemporalFilter};
+use rtdb_plan::{Expr, Scan, Schema, TemporalFilter, UnaryOp};
 use rtdb_storage::{ObjectKey, cache::BufferPool};
 use rtdb_temporal::{HistoryResolver, ResolvedRow};
 use rtdb_trie::{PageSummary, PruningOptions, TemporalSummary, select_pages};
@@ -180,7 +180,8 @@ impl PartitionScan {
                     },
                     MetadataNode::RecencyBranch(children) => for (upper, child) in children.iter().rev() { pending.push((*child, path.clone(), recency.min(*upper))); },
                     MetadataNode::Leaf { data_page_index, columns } => pages.push(Page { lower, upper, priority: live.len() + index,
-                        content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true),
+                        content_matches: self.pushdowns.as_ref().map(|filters| filters.page_matches(&self.scan.columns, columns, &self.execution.context.memory)).transpose()?.unwrap_or(true)
+                            && may_satisfy_not_null(&self.scan, columns),
                         source: PageSource::File { file, page: *data_page_index }, summary: PageSummary { page_index: 0, temporal: page_temporal(columns),
                             recency: Some(recency), iid_range: Some((lower, upper)) } }),
                 }
@@ -366,6 +367,36 @@ fn summarize_rows(rows: impl IntoIterator<Item = Result<RowSource>>) -> Result<O
     }
     Ok(result)
 }
+fn may_satisfy_not_null(scan: &Scan, columns: &[Value]) -> bool {
+    let [Expr::Unary { op: UnaryOp::IsNotNull, expr }] = scan.predicates.as_slice() else {
+        return true;
+    };
+    let Expr::Column { id, .. } = expr.as_ref() else {
+        return true;
+    };
+    let mut fields = scan.columns.iter().filter(|field| field.id == *id);
+    let (Some(field), None) = (fields.next(), fields.next()) else {
+        return true;
+    };
+    if matches!(
+        field.name.as_str(),
+        "_iid" | "_valid_from" | "_valid_to" | "_system_from" | "_system_to" | "_valid_time" | "_system_time" | "_recency"
+    ) {
+        return true;
+    }
+    let mut matching = columns.iter().filter(|column| {
+        matches!(column.field("col-name"), Some(Value::Utf8(name)) if name == &field.name)
+            && !matches!(column.field("root-col?"), Some(Value::Bool(false)))
+    });
+    let (Some(column), None) = (matching.next(), matching.next()) else {
+        return true;
+    };
+    !matches!(
+        (column.field("root-col?"), column.field("count")),
+        (Some(Value::Bool(true)), Some(Value::I64(0)))
+    )
+}
+
 fn page_temporal(columns: &[Value]) -> Option<TemporalSummary> {
     let bound = |name: &str, key: &str, lower: bool| -> Option<Timestamp> {
         let column = columns.iter().find(|column| column.field("col-name") == Some(&Value::Utf8(name.to_owned())) && column.field("root-col?") == Some(&Value::Bool(true)))?;

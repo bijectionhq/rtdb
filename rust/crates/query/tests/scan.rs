@@ -150,7 +150,9 @@ fn scan(context: &QueryContext, columns: &[&str], valid_time: TemporalFilter, sy
     Arc::new(Relation::scan(Scan { table: binding, columns: fields, valid_time, system_time, clamp_valid_time: false, iids, predicates: Vec::new() }).unwrap())
 }
 async fn collect(relation: Arc<Relation>, context: Arc<QueryContext>) -> Result<Vec<Vec<Value>>> {
-    let mut cursor = PreparedQuery::new(relation)?.execute(context, vec![]).await?;
+    collect_rows(PreparedQuery::new(relation)?.execute(context, vec![]).await?).await
+}
+async fn collect_rows(mut cursor: rtdb_query::QueryCursor) -> Result<Vec<Vec<Value>>> {
     let mut result = Vec::new();
     while let Some(batch) = cursor.next_batch().await? {
         for row in 0..batch.batch().num_rows() {
@@ -467,4 +469,178 @@ async fn each_partition_uses_its_own_read_basis() {
     let context = QueryContext::new(catalog, Arc::clone(&budget), Timestamp(50), "UTC", QueryOptions::default(), &CancellationToken::new()).unwrap();
     let rows = collect(scan(&context, &["_id", "v"], TemporalFilter::Default, TemporalFilter::Default, None), context).await.unwrap();
     assert_eq!(rows, vec![vec![Value::I64(1), Value::I64(1)], vec![Value::I64(2), Value::I64(2)]]);
+}
+
+async fn persisted_root_count(snapshot: &Snapshot, store: &MemoryStore, block: &BlockCatalog, name: &str) -> Option<i64> {
+    use rtdb_format::metadata::{MetadataFile, MetadataNode};
+
+    let slug = &snapshot.table_entry(&table()).unwrap().slug;
+    let trie_key = TrieKey::l0(block.block_index()).unwrap();
+    let key = ObjectKey::new(slug.metadata_key(&trie_key)).unwrap();
+    let bytes = store.get(&key).await.unwrap();
+    let metadata = MetadataFile::read_reader(std::io::Cursor::new(bytes)).unwrap();
+    let [MetadataNode::Leaf { columns, .. }] = metadata.nodes() else {
+        panic!("Expected one metadata leaf for the persisted block");
+    };
+    let column = columns.iter().find(|column| {
+        matches!(column.field("col-name"), Some(Value::Utf8(column_name)) if column_name.as_str() == name)
+            && column.field("root-col?") == Some(&Value::Bool(true))
+    })?;
+    let Some(Value::I64(count)) = column.field("count") else {
+        panic!("Expected a non-null count for the persisted column");
+    };
+    Some(*count)
+}
+
+async fn collect_with_scan_counts(relation: Arc<Relation>, context: Arc<QueryContext>) -> (Vec<Vec<Value>>, (u64, u64, u64)) {
+    use rtdb_plan::{PreparedStatement, Statement};
+
+    let (tracer, mut receiver) = rtdb_metrics::TraceRecorder::new(Arc::clone(&context.memory), 16, true, true).unwrap();
+    let context = context.with_tracer(Some(tracer.clone()), None);
+    let prepared = PreparedQuery::from_prepared(PreparedStatement {
+        statement: Statement::Query(relation),
+        parameter_types: BTreeMap::new(),
+        source: String::new(),
+        notices: Vec::new(),
+        settings: Default::default(),
+    }, &context.memory).unwrap();
+    let rows = collect_rows(prepared.execute(context, vec![]).await.unwrap()).await.unwrap();
+    tracer.close();
+    let mut scan_span = None;
+    while let Some(span) = receiver.next().await {
+        if span.name == "query.cursor.scan.public.docs" {
+            scan_span = Some(span);
+        }
+    }
+    let scan_span = scan_span.unwrap();
+    let attributes: BTreeMap<_, _> = scan_span.attributes().collect();
+    let pages_used = attributes["scan_pages_used"].parse().unwrap();
+    let pages_pruned = attributes["scan_pages_pruned"].parse().unwrap();
+    let rows_read = attributes["scan_rows_read"].parse().unwrap();
+    (rows, (pages_used, pages_pruned, rows_read))
+}
+
+#[tokio::test]
+async fn is_not_null_prunes_a_known_zero_root_through_direct_columns_and_identity_aliases() {
+    use rtdb_plan::{NamedExpr, UnaryOp};
+
+    let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+    let budget = MemoryBudget::new(1 << 27);
+    let store = Arc::new(MemoryStore::default());
+    let valid = Interval::from_micros(0, 100).unwrap();
+
+    let mut first = tx(&state, &budget, 0, 100);
+    first.put(table(), document(1, Value::Null), valid).unwrap();
+    state.apply(&first.stage().unwrap()).unwrap();
+    let (all_null, _) = persist(&state, &store).await;
+
+    let mut second = tx(&state, &budget, 1, 200);
+    for id in [2, 6] {
+        second.put(table(), BTreeMap::from([("_id".into(), Value::I64(id))]), valid).unwrap();
+    }
+    state.apply(&second.stage().unwrap()).unwrap();
+    let (missing, _) = persist(&state, &store).await;
+
+    let mut third = tx(&state, &budget, 2, 300);
+    third.put(table(), document(3, Value::Null), valid).unwrap();
+    third.put(table(), document(4, Value::I64(7)), valid).unwrap();
+    third.put(table(), document(5, Value::Utf8("mixed".into())), valid).unwrap();
+    state.apply(&third.stage().unwrap()).unwrap();
+    let (mixed, _) = persist(&state, &store).await;
+
+    let snapshot = state.value().snapshot();
+    assert_eq!(persisted_root_count(&snapshot, &store, &all_null, "v").await, Some(0));
+    assert_eq!(persisted_root_count(&snapshot, &store, &missing, "v").await, None);
+    assert_eq!(persisted_root_count(&snapshot, &store, &mixed, "v").await, Some(2));
+
+    for bypass in [false, true] {
+        let context = query_context(snapshot.clone(), Arc::clone(&store), bypass);
+        let source = scan(&context, &["v"], at(50), at(300), None);
+        let field = source.schema().fields()[0].clone();
+        let alias = Field { id: ColumnId(100), name: "alias".into(), ..field.clone() };
+        let identity = Arc::new(Arc::clone(&source).project(vec![NamedExpr {
+            field: alias.clone(),
+            expr: field.expression(),
+        }]).unwrap());
+        for (input, column) in [(Arc::clone(&source), field.expression()), (identity, alias.expression())] {
+            let filter = Arc::new(input.filter(Expr::unary(UnaryOp::IsNotNull, column)).unwrap());
+            let (rows, counts) = collect_with_scan_counts(filter, Arc::clone(&context)).await;
+            assert_eq!(rows.len(), 2);
+            assert!(rows.contains(&vec![Value::I64(7)]));
+            assert!(rows.contains(&vec![Value::Utf8("mixed".into())]));
+            assert_eq!(counts, if bypass { (3, 0, 6) } else { (2, 1, 5) });
+        }
+
+        let computed = Field { data_type: LogicalType::Scalar(ScalarType::Bool), ..field.clone() };
+        let project = Arc::new(source.project(vec![NamedExpr {
+            field: computed.clone(),
+            expr: Expr::unary(UnaryOp::IsNull, field.expression()),
+        }]).unwrap());
+        let filter = Arc::new(project.filter(Expr::unary(UnaryOp::IsNotNull, computed.expression())).unwrap());
+        let (rows, counts) = collect_with_scan_counts(filter, context).await;
+        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.iter().filter(|row| row[0] == Value::Bool(true)).count(), 4);
+        assert_eq!(rows.iter().filter(|row| row[0] == Value::Bool(false)).count(), 2);
+        assert_eq!(counts, (3, 0, 6));
+    }
+}
+
+#[tokio::test]
+async fn is_not_null_keeps_zero_count_pages_that_correct_delete_or_erase_matching_history() {
+    use rtdb_plan::UnaryOp;
+    use rtdb_types::EventOp;
+
+    for operation in [EventOp::Put, EventOp::Delete, EventOp::Erase] {
+        let state = PartitionState::empty(TrieConfig::new(32, 32).unwrap()).unwrap();
+        let budget = MemoryBudget::new(1 << 27);
+        let store = Arc::new(MemoryStore::default());
+        let original = Interval::from_micros(0, 100).unwrap();
+        let corrected = Interval::from_micros(20, 80).unwrap();
+        let target = EntityId::Integer(1);
+
+        let mut first = tx(&state, &budget, 0, 100);
+        first.put(table(), document(1, Value::I64(1)), original).unwrap();
+        first.put(table(), document(2, Value::I64(2)), original).unwrap();
+        state.apply(&first.stage().unwrap()).unwrap();
+        persist(&state, &store).await;
+
+        let mut second = tx(&state, &budget, 1, 200);
+        match operation {
+            EventOp::Put => second.put(table(), document(1, Value::Null), corrected),
+            EventOp::Delete => second.delete(table(), &target, corrected),
+            EventOp::Erase => second.erase(table(), &target),
+        }.unwrap();
+        second.put(table(), document(3, Value::Null), corrected).unwrap();
+        state.apply(&second.stage().unwrap()).unwrap();
+        let (superseder, _) = persist(&state, &store).await;
+        let snapshot = state.value().snapshot();
+        assert_eq!(persisted_root_count(&snapshot, &store, &superseder, "v").await, Some(0));
+
+        for bypass in [false, true] {
+            let context = query_context(snapshot.clone(), Arc::clone(&store), bypass);
+            let points = match operation {
+                EventOp::Erase => vec![(50, TemporalFilter::FromTo {
+                    from: Expr::Literal(timestamp(120)),
+                    to: Expr::Literal(timestamp(150)),
+                })],
+                EventOp::Put | EventOp::Delete => vec![(50, at(200)), (10, at(200))],
+            };
+            for (valid, system) in points {
+                let source = scan(&context, &["v", "_valid_from", "_valid_to", "_system_from", "_system_to"], at(valid), system, None);
+                let predicate = Expr::unary(UnaryOp::IsNotNull, source.schema().fields()[0].expression());
+                let filter = Arc::new(source.filter(predicate).unwrap());
+                let (rows, counts) = collect_with_scan_counts(filter, Arc::clone(&context)).await;
+                let unaffected = vec![Value::I64(2), timestamp(0), timestamp(100), timestamp(100), Value::Null];
+                if valid == 10 {
+                    let shortened = vec![Value::I64(1), timestamp(0), timestamp(20), timestamp(100), Value::Null];
+                    assert_eq!(rows.len(), 2);
+                    assert!(rows.contains(&unaffected));
+                    assert!(rows.contains(&shortened));
+                } else {
+                    assert_eq!(rows, [unaffected]);
+                }
+                assert_eq!(counts, (2, 0, 4));
+            }
+        }
+    }
 }
