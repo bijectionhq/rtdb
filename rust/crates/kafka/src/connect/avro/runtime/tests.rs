@@ -187,8 +187,6 @@ fn exact_utf16_datum_survives_runtime_input_and_construction_context_drop() {
     let wrapper = context.reserve(size_of::<AvroDatumPlan>().checked_mul(16).unwrap() + 4096).unwrap();
     let datum = Arc::new(datum);
     let connect = datum.connect_plan(None, None, &mut 0, &mut context).unwrap();
-    assert_eq!(connect.connect.resolved().doc, None);
-    assert_eq!(connect.connect.resolved().parameters.get("io.confluent.connect.avro.record.doc").map(String::as_str), Some("😀"));
     drop(root);
     drop(reference);
     drop(runtime);
@@ -196,6 +194,12 @@ fn exact_utf16_datum_survives_runtime_input_and_construction_context_drop() {
     drop(receipt);
     drop(context);
     assert!(budget.used_bytes() > 0);
+    let paired = connect.datum.paired_root().unwrap().canonical().unwrap();
+    assert!(paired.is_record());
+    drop(paired);
+    let schema = connect.connect.resolved();
+    assert_eq!(schema.doc, None);
+    assert_eq!(schema.parameters["io.confluent.connect.avro.record.doc"], "😀");
     let mut next = ConversionContext::new(Arc::clone(&budget));
     let converted = connect.decode(&[14], &mut next).unwrap();
     assert_eq!(converted.value, Value::Struct(BTreeMap::from([("x".into(), Value::I32(7))])));
