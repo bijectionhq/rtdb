@@ -198,6 +198,16 @@ async fn lz4_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
     compressed_output_denial("lz4").await;
 }
 
+#[tokio::test]
+async fn retained_zstd_fetch_keeps_decoded_storage_until_final_message_drop() {
+    retained_compressed_fetch("zstd").await;
+}
+
+#[tokio::test]
+async fn zstd_output_denial_preserves_the_accepted_prefix_and_failed_offset() {
+    compressed_output_denial("zstd").await;
+}
+
 #[test]
 fn native_fetch_decoders_admit_and_return_every_charge() {
     unsafe extern "C" {

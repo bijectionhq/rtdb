@@ -1,0 +1,19 @@
+{
+  "native_upstream_commit": "d5203d7b0c097d912d076681fd9e0922725b7575",
+  "derived_from": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_zstd.h": [
+      "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_zstd.c"
+    ]
+  },
+  "source_inputs": {
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_zstd.h": "0d0350c9c91cff1a76c4cb48338bce479bac227be1181ca97eaf9d9c3a654b9d",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_zstd_test.h": "ecd025b7d25d7453172ff115d3b2354485a364345825c48b7ad269904eda8d52",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_zstd.c": "a5c3e0b5e71f1c9e22a51435ef6aa6772b411364d537cb457b25ee048264787c",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_zstd.h": "a4c0fa15cd16138e77d84bf6ea46e6df2ffc910eafab7c6c4192fb3c3feada95",
+    "rust/Cargo.lock": "d478a156f3fcc7907b1fcad6ae19f6760f1a5d791966c1c9947e034d6d1bca8b",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c": "b00e8ca95797a5a0f34ae280921ca00d1b0074276bda073f4cf9c6ea411167f5",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_decode.h": "8bb5b14ef933be1d03840f8526c89bde717ef6977ef301ece2a5e52ceb11b380",
+    "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_fetch_decode_test.h": "f13edd128f00f159f3643c13883b82f3b42ca2e03ae9ce9292ca33b71401fe99",
+    "rust/crates/kafka/tests/native_fetch_decode_admission.rs": "800744b420e4b85c59e559d99f27bfed55da78de0885db33bc3ff3b505f9fb3b"
+  }
+}

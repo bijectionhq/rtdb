@@ -40,11 +40,12 @@ No new unsupported-setting rejection is introduced.
 
 The unexecuted source fixtures cover native default normalization and message-size floor, isolated scalar probing, explicit larger demands, incompatible limits, integer/product/sum overflow, exact and one-byte-short capacity, actual SourceDriver configuration denial, consumer/configuration lifetime, failed native construction, independent Metadata retention and provider-scope retention.
 All existing client_tests.rs assertions remain exact.
-Gzip, bundled LZ4 and raw or Xerial Snappy output and shadow storage use this account through their final Fetch event.
+Gzip, bundled LZ4, Zstd and raw or Xerial Snappy output and shadow storage use this account through their final Fetch event.
 Gzip also admits each actual zlib state/window callback allocation and its source two-pass overlap with output plus terminal NUL.
 LZ4 also admits each LZ4F decompression-context block and the overlap of old and replacement output during growth.
+Zstd also admits its decompression context and each candidate output.
 Compressed wire input fitting the receive allowance can still be rejected when its decoded expansion exceeds available capacity, through the existing nonfatal decompression error/backoff path.
 link:../../../../../vendor/rdkafka/src/native_byte_account/FETCH-DECODE.adoc[The native decode contract] describes preserved prefix/offset behavior and the remaining codec boundaries.
-Zstd decode storage, individual fetch/error ops, native requests/lists, construction/thread/queue storage, allocator overhead and other allocation classes remain separate admission obligations.
+Individual fetch/error ops, native requests/lists, construction/thread/queue storage, allocator overhead and other allocation classes remain separate admission obligations.
 Log-client activation, the native plugin path, whole-native coverage and runtime/Phase 2 verification remain open.
 link:native-account-sources.json[The source record] and link:native-account-COPYRIGHT[its complete retained notices] pin this caller policy.

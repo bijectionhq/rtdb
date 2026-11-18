@@ -247,6 +247,7 @@ static int ut_fetch_snappy_java_demand(void) {
 
 #include "rdkafka_fetch_gzip_test.h"
 #include "rdkafka_fetch_lz4_test.h"
+#include "rdkafka_fetch_zstd_test.h"
 
 int unittest_fetch_decode_admission(void) {
         int fails = 0;
@@ -270,6 +271,13 @@ int unittest_fetch_decode_admission(void) {
         fails += ut_fetch_lz4_round_trip(rd_false, rd_true, rd_true);
         fails += ut_fetch_lz4_each_denial_returns_every_charge();
         fails += ut_fetch_lz4_legacy_header_checksum();
+#endif
+#if WITH_ZSTD
+        fails += ut_fetch_zstd_allocator_boundaries();
+        fails += ut_fetch_zstd_round_trip(rd_true, rd_false, rd_false);
+        fails += ut_fetch_zstd_round_trip(rd_false, rd_true, rd_true);
+        fails += ut_fetch_zstd_each_denial_returns_every_charge();
+        fails += ut_fetch_zstd_rejects_invalid_and_oversized_frames();
 #endif
         return fails;
 }

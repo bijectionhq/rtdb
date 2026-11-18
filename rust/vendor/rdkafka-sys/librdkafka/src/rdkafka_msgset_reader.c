@@ -82,6 +82,7 @@
 #include "rdkafka_fetch_decode.h"
 #include "rdkafka_fetch_gzip.h"
 #include "rdkafka_fetch_lz4.h"
+#include "rdkafka_fetch_zstd.h"
 
 
 static RD_INLINE int64_t
@@ -456,6 +457,18 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
 
 #if WITH_ZSTD
         case RD_KAFKA_COMPRESSION_ZSTD: {
+                if (decode_account) {
+                        err = rd_kafka_fetch_zstd(
+                            decode_account, (const char *)compressed,
+                            compressed_size,
+                            (unsigned long long)msetr->msetr_rkb->rkb_rk->rk_conf
+                                .recv_max_msg_size,
+                            &msetr->msetr_rkb->rkb_c.zbuf_grow,
+                            &iov.iov_base, &iov.iov_len, malloc);
+                        if (err)
+                                goto err;
+                        break;
+                }
                 err = rd_kafka_zstd_decompress(
                     msetr->msetr_rkb, (char *)compressed, compressed_size,
                     &iov.iov_base, &iov.iov_len);
@@ -490,6 +503,9 @@ rd_kafka_msgset_reader_decompress(rd_kafka_msgset_reader_t *msetr,
                                codec == RD_KAFKA_COMPRESSION_GZIP
 #if !WITH_LZ4_EXT
                                || codec == RD_KAFKA_COMPRESSION_LZ4
+#endif
+#if WITH_ZSTD
+                               || codec == RD_KAFKA_COMPRESSION_ZSTD
 #endif
                                )) {
                 rkbufz = rd_kafka_fetch_decode_shadow(

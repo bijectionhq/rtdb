@@ -1,13 +1,13 @@
 = Native Fetch decode admission
 
-For an accounted native client, gzip, bundled LZ4 and raw or Xerial Snappy Fetch output is admitted against the actual client's shared NativeByteAccount before output allocation.
+For an accounted native client, gzip, bundled LZ4, Zstd and raw or Xerial Snappy Fetch output is admitted against the actual client's shared NativeByteAccount before output allocation.
 The output owner retains its prefix and exact physical byte capacity until final native destruction.
 The bundled Snappy decoder uses stack decode state, without a separate heap decode context.
 Clients without an account use the original decoder and allocation paths.
-Zstd remains outside this scope, as does LZ4 built against an external liblz4.
+LZ4 built against an external liblz4 remains outside this scope.
 
 The broker actor remains the sole writer of its MessageSet reader transient.
-The reader takes admission authority from its actual client, so nested gzip, LZ4 or Snappy remains accounted even when its immediate input is an unaccounted outer-codec shadow.
+The reader takes admission authority from its actual client, so nested gzip, LZ4, Zstd or Snappy remains accounted even when its immediate input is an unaccounted outer-codec shadow.
 The passive output owner stores only its account pointer and immutable physical charge.
 The existing native client and SDK queue/event owners retain the account monitor through native final release.
 No new actor, callback lifetime, queue or waiter is introduced.
@@ -48,6 +48,13 @@ Growth admits the replacement output before copying and frees the old output aft
 The context is freed before the output and its logical length are published.
 Input that ends before the frame does publishes the partial output, as the source helper does.
 
+Zstd follows the source helper's capacity choice: the frame's declared content size, or twice the input when it is unknown, growing by twice the candidate capacity with a 4000-byte floor while the candidate stays within receive.message.max.bytes.
+One decompression context, created through Zstd's custom-memory hooks, serves every candidate; each context request is admitted with an aligned ownership prefix before fallible malloc.
+Each candidate output is admitted before allocation and freed, with its charge, before the next candidate is admitted.
+A denial inside the context maps to CRIT_SYS_RESOURCE; a declared or grown capacity beyond the receive limit, a truncated frame or a bad magic number returns BAD_COMPRESSION.
+The context is freed before the output and its logical length are published.
+librdkafka links the zstd-sys static library resolved by the Cargo lock.
+
 Only after successful decompression does the private shadow constructor admit its native buffer root and one aligned segment header.
 It uses a preallocated segment and does not enter RdBuf's fallback allocation path.
 A failed root or segment malloc releases the metadata charge and leaves output ownership with the caller for cleanup.
@@ -69,16 +76,17 @@ The unexecuted native regression sources cover exact, one-byte-short, zero and o
 Public mock-cluster sources cover actual retained Snappy Fetch output and resource denial after an accepted prefix without advancing the failed offset or setting native fatal state.
 Five additive gzip native fixture functions cover aligned callback allocation, overflow and malloc rollback, exact observed peak and one-byte-short denial, every actual inflater/output malloc failure, wrappers, empty output, checksum errors, trailing bytes, first-member behavior, observed partial-input termination and the retained NUL byte through final Fetch-event destruction.
 Two additive public mock-cluster sources cover actual retained gzip Fetch output and expansion denial after an accepted prefix.
-LZ4 native fixtures cover callback admission, alignment and malloc rollback, known and unknown content sizes with growth, every-capacity denial without residual charge, and legacy header-checksum repair; two mock-cluster tests cover retained LZ4 Fetch output and expansion denial after an accepted prefix.
+LZ4 and Zstd native fixtures each cover callback admission, alignment and malloc rollback, known and unknown content sizes with growth, every-capacity denial without residual charge, and LZ4's legacy header-checksum repair or Zstd's receive-limit, truncation and magic rejection; mock-cluster tests cover retained LZ4 and Zstd Fetch output and expansion denial after an accepted prefix.
 All existing native and SDK test/assertion sources remain unchanged apart from additive unit registration.
 The `native_fetch_decoders_admit_and_return_every_charge` test runs these native fixtures.
 Valid empty output initializes its shadow reader over the pushed zero-length segment.
 
-The active stock Connect account shares this bounded gzip, LZ4 and Snappy storage with its existing native owners.
+The active stock Connect account shares this bounded gzip, LZ4, Zstd and Snappy storage with its existing native owners.
 Its finite ceiling can reject an expansion even when the compressed wire response fits receive.message.max.bytes.
 The capacity policy is not a guarantee that every expansion fits.
-Zstd's candidate buffers and internals, individual Fetch/error ops and strings, native client/queue/thread construction, plugins, allocator overhead and whole-native bounds remain separate obligations.
+Individual Fetch/error ops and strings, native client/queue/thread construction, plugins, allocator overhead and whole-native bounds remain separate obligations.
 Runtime and Phase 2 gates remain open.
 link:fetch-decode-sources.json[The source record] pins the inspected source and link:fetch-decode-COPYRIGHT[the retained notices] includes both leading Snappy blocks and the available full licenses.
 link:gzip-sources.json[The gzip source record] pins the additive native adapter and exact lock-resolved zlib sources, with complete notices in link:gzip-COPYRIGHT[the gzip notice record].
 link:lz4-sources.json[The LZ4 source record] pins the adapter and the librdkafka and bundled LZ4 sources it follows, with their notices in link:lz4-COPYRIGHT[the LZ4 notice record].
+link:zstd-sources.json[The Zstd source record] and link:zstd-COPYRIGHT[its notice record] do the same for the Zstd adapter.
