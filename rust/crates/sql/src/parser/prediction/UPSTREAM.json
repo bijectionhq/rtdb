@@ -408,6 +408,15 @@
     "scope": "Private raw date-time literal trees through the expression, direct statement and multi-statement roots in both profiles.",
     "qualification": "Static source and ATN inspection. Execution remains pending."
   },
+  "binary_string_literal_trees": {
+    "predecessor": "8893e067274f5431b66f383e3cac8f8e0ec652df",
+    "source_plan_sha256": "3ea56de9c959c85af1f4bb4fd98fe1fe96ee67fddf6d05fa500ea15c148d0dca",
+    "source_geometry_sha256": "633bd465b771e9ccc319de5a9461d69d888987fee2f939f9da7fea41fcbb3862",
+    "generated": "Rule 14 decision 55 alternative 4 installs BinaryStringLiteral and matches the token 8 atom at 694 to 710.",
+    "cleanup": "The entered ordinary literal exits to the common-value head after terminal admission fails. The normal recursive finally operations restore their callers.",
+    "scope": "Private raw binary literal trees through the expression, direct statement and multi-statement roots in both profiles.",
+    "qualification": "Static source and ATN inspection. Execution remains pending."
+  },
   "private_runtime_full_domain": {
     "ownership": "One transferred PredictionStorage retained across exclusive sessions; real TokenStream, primary invocation records and witnessed signed precedence stack belong to one parse transient. No production classloader/cache/concurrency mapping is selected.",
     "recursion": "Five actual entries and all42 saved-parent constructors: immutable entry outer links, admitted primary records, active capabilities only after real LT1, source push/unroll prefixes, actual one top pop before LT(-1), no Recognizer-state restore.",

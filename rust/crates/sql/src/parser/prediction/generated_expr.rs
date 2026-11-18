@@ -98,6 +98,7 @@ const fn literal_atom(rule: u16, state: u32, token: i32, target: u32) -> Termina
     TerminalAction { state, rule, target, tokens: TokenAction::Atom(token) }
 }
 
+const MATCH_BINARY_STRING: TerminalAction = literal_atom(LITERAL, 694, 8, 710);
 const MATCH_DATE: TerminalAction = literal_atom(DATE_TIME_LITERAL, 674, 106, 675);
 const MATCH_TIMESTAMP: TerminalAction = literal_atom(DATE_TIME_LITERAL, 676, 316, 678);
 
@@ -236,6 +237,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                 1 => (ContextClass::FloatLiteral, None),
                 2 => (ContextClass::IntegerLiteral0, None),
                 3 => (ContextClass::CharacterStringLiteral, None),
+                4 => (ContextClass::BinaryStringLiteral, None),
                 5 => (ContextClass::DateTimeLiteral0, None),
                 12 => (ContextClass::BooleanLiteral, None),
                 13 => (ContextClass::NullLiteral, None),
@@ -265,6 +267,7 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
                     session.generated_call(LITERAL_CHARACTER_STRING)?;
                     session.character_string().map(|_| ())
                 }
+                ContextClass::BinaryStringLiteral => session.match_tree_action(*local, MATCH_BINARY_STRING),
                 ContextClass::DateTimeLiteral0 => {
                     session.generated_call(LITERAL_DATE_TIME)?;
                     session.date_time_literal().map(|_| ())

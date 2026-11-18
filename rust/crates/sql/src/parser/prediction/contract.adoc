@@ -879,11 +879,16 @@ A denied characterString entry at 693 follows the same lexical finally order, wi
 A denial of outer attachment leaves the recursive precedence popped and saved caller restored.
 These failure paths keep the admission error category and execute the entered ancestor finally.
 
-== Boolean, NULL and character string literals
+== Generated scalar literal trees
 
 Decision 55 selects the labelled BooleanLiteral and NullLiteral contexts before the set match at 707 or the NULL atom at 708.
 The Boolean set contains FALSE, OFF, ON and TRUE.
 UNKNOWN belongs to the separate Boolean predicate grammar.
+
+Decision 55 alternative 4 selects BinaryStringLiteral and matches the BINARY_STRING atom at 694.
+The tree retains one terminal with the original spelling and span, including empty or odd-length hexadecimal bodies.
+The JVM source visitor decodes the hexadecimal body.
+After a denied terminal attachment the entered literal exits to its common-value parent with the consumed token as its stop.
 
 The CharacterStringLiteral alternative invokes the ordinary characterString rule at 693.
 The TIME, DURATION, UUID, URI and KEYWORD alternatives each retain a prefix terminal before their characterString child.

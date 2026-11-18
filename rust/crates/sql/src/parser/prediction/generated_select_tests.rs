@@ -791,3 +791,122 @@ fn warmed_select_restores_the_query_body_after_a_date_dollar_text_attachment_den
     result.unwrap();
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[test]
+fn binary_projections_keep_raw_terminals_and_aliases_in_both_statement_roots() {
+    let ((), memory) = environment(|environment, work, _| {
+        let direct = "SELECT x('aF01') AS b, X('0') AS odd;";
+        let multiple = format!("{direct} ROLLBACK;");
+        for (source, multi, statement_call, eof) in [(direct, false, 352, 9), (multiple.as_str(), true, 358, 11)] {
+            both_profiles(environment, source, work, multi, |session, root| {
+                let (_, _, list) = projection(session, root, 0, statement_call, 0, false);
+                assert_eq!(list.children().len(), 3);
+                terminal(list.children()[1], 4, ",");
+                for (item, index, raw, name) in [(0, 1, "x('aF01')", "b"), (2, 5, "X('0')", "odd")] {
+                    let column = derived(session, list.key(), item, item == 0);
+                    let expr = child(session, column.key(), 0, 33, 2405);
+                    let value = child(session, expr.key(), 0, 34, 1000);
+                    let literal = child(session, value.key(), 0, 14, 1140);
+                    assert_eq!((expr.class(), value.class(), literal.class()),
+                        (Some(ContextClass::CommonValueExpr0), Some(ContextClass::LiteralExpr), Some(ContextClass::BinaryStringLiteral)));
+                    for view in [expr, value, literal] {
+                        bounds(view, index, index);
+                        assert_eq!(view.children().len(), 1);
+                    }
+                    terminal(literal.children()[0], index, raw);
+                    let lexeme = literal.start().unwrap().lexeme();
+                    assert_eq!(lexeme.kind(), Kind::BinaryString);
+                    let start = source.find(raw).unwrap();
+                    assert_eq!((lexeme.span().start.byte, lexeme.span().end.byte), (start, start + raw.len()));
+
+                    let alias = child(session, column.key(), 1, AS_CLAUSE, 2406);
+                    terminal(alias.children()[0], index + 1, "AS");
+                    let label = child(session, alias.key(), 1, COLUMN_LABEL, 2410);
+                    let identifier = child(session, label.key(), 0, 22, 852);
+                    terminal(identifier.children()[0], index + 2, name);
+                }
+                let tree = session.invocation_view();
+                let root_view = tree.context(root).unwrap();
+                terminal(root_view.children()[1], 8, ";");
+                if multi {
+                    let rollback = child(session, root, 2, STATEMENT, 360);
+                    assert_eq!(rollback.class(), Some(ContextClass::RollbackStatement));
+                    terminal(root_view.children()[3], 10, ";");
+                }
+                complete_root(session, root, if multi { 1 } else { 0 }, eof);
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn warmed_select_restores_its_query_body_after_binary_terminal_denial() {
+    let (result, memory) = environment(|environment, work, memory| {
+        let source = "SELECT x('aF01');";
+        let baseline = work.memory_budget().used_bytes();
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                assert_eq!(mode, PredictionMode::Sll);
+                session.direct_sql_statement().map(|_| ())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        let arena16 = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+        let arena32 = Layout::array::<InvocationRecord<'_, '_>>(32).unwrap().size() + 256;
+        let single = Layout::array::<ContextChild<'_, '_>>(1).unwrap().size() + 256;
+        let pair = Layout::array::<ContextChild<'_, '_>>(2).unwrap().size() + 256;
+        let capacity = arena16 + arena32 + 8 * single + pair;
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_parser_session(environment, source, &parse_work, |session| {
+                session.profile = ParserProfile::SllBail;
+                let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - capacity).unwrap();
+                let action = session.direct_sql_statement();
+                let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                    else { panic!("SELECT binary terminal attachment denial"); };
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                let request = format!("Cannot reserve {single} bytes from budget ");
+                assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
+                assert_eq!(session.records.len(), 17);
+                for ordinal in [5, 11, 13] {
+                    assert!(matches!(session.records[ordinal].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                }
+                assert!(matches!(session.records[16].role, InvocationRole::Ordinary));
+
+                let tree = session.invocation_view();
+                let body = tree.context(InvocationKey::at(6)).unwrap();
+                assert_eq!(body.class(), Some(ContextClass::QuerySpecification));
+                assert_eq!(body.children().len(), 1);
+                bounds(body, 0, 1);
+                let clause = child(session, body.key(), 0, SELECT_CLAUSE, 2455);
+                assert_eq!(clause.key(), InvocationKey::at(7));
+                bounds(clause, 0, 1);
+                let expr = tree.context(InvocationKey::at(12)).unwrap();
+                let value = tree.context(InvocationKey::at(14)).unwrap();
+                assert_eq!((expr.class(), value.class(), value.parent()),
+                    (Some(ContextClass::CommonValueExpr0), Some(ContextClass::LiteralExpr), Some(expr.key())));
+                let literal = child(session, value.key(), 0, 14, 1140);
+                assert_eq!((literal.key(), literal.class()), (InvocationKey::at(16), Some(ContextClass::BinaryStringLiteral)));
+                assert_eq!(value.children().len(), 1);
+                assert!(expr.children().is_empty() && literal.children().is_empty());
+                for view in [expr, value, literal] {
+                    bounds(view, 1, 1);
+                }
+                assert_eq!(literal.stop().unwrap().lexeme().raw(), "x('aF01')");
+                assert_eq!((session.current(), session.state(), session.input_index(), session.precedence()),
+                    (None, ParserState::RootSentinel, Some(2), 0));
+                assert_eq!(session.buffered_token(2).unwrap().lexeme().raw(), ";");
+                assert_eq!(session.syntax_errors, 0);
+                assert!(!session.matched_eof);
+                drop(held);
+                Ok(())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        Ok::<(), RuntimeError<'_>>(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}

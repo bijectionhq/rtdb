@@ -1121,3 +1121,156 @@ fn warmed_date_time_literals_restore_direct_and_nested_failed_attachments() {
         assert_eq!(memory.used_bytes(), 0);
     }
 }
+
+#[test]
+fn binary_literals_keep_one_raw_terminal_with_its_original_span_in_both_profiles() {
+    let ((), memory) = environment(|environment, work, _| {
+        for (raw, body) in [("X('')", ""), ("x('aF01')", "aF01"), ("X('0')", "0")] {
+            let source = format!("/* é */\r\n {raw}; @");
+            both_profiles(environment, &source, work, |session, root| {
+                let value = expr_value(session, root, 0);
+                let tree = session.invocation_view();
+                let value_view = tree.context(value).unwrap();
+                assert_eq!(value_view.class(), Some(ContextClass::LiteralExpr));
+                let literal = tree.context(child_rule(value_view.children())).unwrap();
+                assert_eq!((literal.rule(), literal.class(), literal.parent(), literal.invoking_state()),
+                    (LITERAL, Some(ContextClass::BinaryStringLiteral), Some(value), ParserState::State(1140)));
+                only_terminal(literal.children(), 0, raw);
+                let [ContextChild::Terminal(token)] = literal.children() else { panic!("one binary terminal"); };
+                let lexeme = token.lexeme();
+                let span = lexeme.span();
+                assert_eq!((lexeme.kind(), lexeme.raw(), lexeme.body()), (Kind::BinaryString, raw, Some(body)));
+                assert_eq!((span.start.byte, span.start.code_point, span.start.line, span.start.column), (11, 10, 2, 1));
+                assert_eq!((span.end.byte, span.end.code_point, span.end.line, span.end.column),
+                    (11 + raw.len(), 10 + raw.len(), 2, 1 + raw.len()));
+                for view in [value_view, literal] {
+                    assert_eq!((view.start().unwrap().index(), view.stop().unwrap().index()), (0, 0));
+                    assert_eq!((view.start().unwrap().lexeme().span(), view.stop().unwrap().lexeme().span()), (span, span));
+                }
+                assert_eq!(session.buffered_token(1).unwrap().lexeme().raw(), ";");
+                assert!(session.buffered_token(2).is_none());
+            });
+        }
+    });
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn malformed_binary_spellings_reach_rule14_recovery_before_a_literal_label() {
+    let expected = "{UNSIGNED_FLOAT, UNSIGNED_INTEGER, CHARACTER_STRING, C_ESCAPES_STRING, BINARY_STRING, '+', '-', 'DATE', 'DURATION', 'FALSE', 'INTERVAL', 'KEYWORD', 'NULL', 'OFF', 'ON', 'TIME', 'TIMESTAMP', 'TRUE', 'URI', 'UUID', DOLLAR_TAG}";
+    for (source, second, ll_state, message) in [
+        ("X('GG')", "(", Some(ParserState::State(709)), "mismatched input 'X' expecting"),
+        ("X'00'", "'00'", None, "extraneous input 'X' expecting"),
+    ] {
+        let (result, memory) = environment(|environment, work, _| {
+            let mut modes = Vec::new();
+            let result = with_bail_fallback(environment, source, work, |session, mode| {
+                modes.push(mode);
+                let count = session.records.len();
+                let key = InvocationKey::at(count);
+                let action = session.scalar_literal(mode);
+                assert_eq!(session.records.len(), count + 1);
+                let tree = session.invocation_view();
+                let literal = tree.context(key).unwrap();
+                assert_eq!((literal.rule(), literal.class(), literal.parent(), literal.invoking_state()),
+                    (LITERAL, None, None, ParserState::RootSentinel));
+                assert_eq!(literal.start().unwrap().index(), 0);
+                assert_eq!(literal.start().unwrap().lexeme().kind(), Kind::Identifier);
+                assert_eq!(literal.start().unwrap().lexeme().raw(), "X");
+                assert!(literal.stop().is_none() && literal.children().is_empty());
+                if mode == PredictionMode::Sll {
+                    assert!(matches!(action, Err(PassError::Cancelled(_))));
+                    assert!(matches!(tree.exception(key), Some(InvocationCause::NoViableAlternative(cause))
+                        if cause.state == ParserState::State(709) && cause.start.index() == 0 && cause.offending.index() == 0));
+                    assert!(session.buffered_token(1).is_none());
+                } else {
+                    if let Some(state) = ll_state {
+                        assert!(matches!(tree.exception(key), Some(InvocationCause::InputMismatch(cause))
+                            if cause.state == state && cause.offending.index() == 0));
+                    } else {
+                        assert!(tree.exception(key).is_none());
+                    }
+                    assert_eq!(session.buffered_token(1).unwrap().lexeme().raw(), second);
+                    assert!(session.buffered_token(2).is_none());
+                }
+                assert_eq!((session.current(), session.state(), session.input_index(), session.matched_eof),
+                    (None, ParserState::RootSentinel, Some(0), false));
+                action.map(|_| ())
+            });
+            assert_eq!(modes, [PredictionMode::Sll, PredictionMode::Ll]);
+            result
+        });
+        let Err(RuntimeError::ReportedTokenSyntax(report)) = result else { panic!("generated literal diagnostic"); };
+        assert_eq!(report.cause().map(|cause| cause.state), ll_state);
+        let offending = report.offending();
+        assert_eq!((offending.index(), offending.lexeme().raw()), (0, "X"));
+        let span = offending.lexeme().span();
+        assert_eq!((span.start.byte, span.end.byte), (0, 1));
+        assert_eq!(report.anomaly().code, "xtdb/sql-error");
+        let suffix = format!("{message} {expected}");
+        assert!(report.anomaly().message.as_deref().unwrap().ends_with(suffix.as_str()));
+        drop(report);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[test]
+fn warmed_binary_terminal_denial_keeps_the_ordinary_literal_exit_and_caller_restoration() {
+    let (result, memory) = environment(|environment, work, memory| {
+        let source = "x('aF01'); @";
+        let baseline = work.memory_budget().used_bytes();
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_bail_fallback(environment, source, &parse_work, |session, mode| {
+                assert_eq!(mode, PredictionMode::Sll);
+                session.numeric_expression().map(|_| ())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        let arena = Layout::array::<InvocationRecord<'_, '_>>(16).unwrap().size() + 256;
+        let single = Layout::array::<ContextChild<'_, '_>>(1).unwrap().size() + 256;
+        let capacity = arena + single;
+        {
+            let parse_work = AllocationScope::new(memory).unwrap();
+            with_parser_session(environment, source, &parse_work, |session| {
+                session.profile = ParserProfile::SllBail;
+                let held = memory.reserve(memory.limit_bytes() - memory.used_bytes() - capacity).unwrap();
+                let action = session.numeric_expression();
+                let Err(PassError::Runtime(RuntimeError::Prediction(PredictionError::Admission(error)))) = action
+                    else { panic!("binary terminal attachment denial"); };
+                assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+                let request = format!("Cannot reserve {single} bytes from budget ");
+                assert!(error.message.as_deref().unwrap().starts_with(request.as_str()));
+                assert_eq!(session.records.len(), 6);
+                for ordinal in [0, 2] {
+                    assert!(matches!(session.records[ordinal].role, InvocationRole::RecursiveEntry { phase: RecursionPhase::Closed, .. }));
+                }
+                assert!(matches!(session.records[5].role, InvocationRole::Ordinary));
+
+                let tree = session.invocation_view();
+                let expr = tree.context(InvocationKey::at(1)).unwrap();
+                let value = tree.context(InvocationKey::at(3)).unwrap();
+                let literal = tree.context(child_rule(value.children())).unwrap();
+                assert_eq!((value.class(), value.parent()), (Some(ContextClass::LiteralExpr), Some(expr.key())));
+                assert_eq!((literal.key(), literal.rule(), literal.class(), literal.parent(), literal.invoking_state()),
+                    (InvocationKey::at(5), LITERAL, Some(ContextClass::BinaryStringLiteral), Some(value.key()), ParserState::State(1140)));
+                for view in [expr, value, literal] {
+                    assert_eq!((view.start().unwrap().index(), view.stop().unwrap().index()), (0, 0));
+                }
+                assert_eq!(literal.stop().unwrap().lexeme().raw(), "x('aF01')");
+                assert!(expr.children().is_empty() && literal.children().is_empty());
+                assert_eq!((session.current(), session.state(), session.input_index(), session.precedence()),
+                    (None, ParserState::State(1140), Some(1), 0));
+                assert_eq!(session.buffered_token(1).unwrap().lexeme().raw(), ";");
+                assert!(session.buffered_token(2).is_none());
+                assert!(!session.matched_eof);
+                drop(held);
+                Ok(())
+            })?;
+        }
+        assert_eq!(memory.used_bytes(), baseline);
+        Ok::<(), RuntimeError<'_>>(())
+    });
+    result.unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}
