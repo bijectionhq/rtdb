@@ -172,8 +172,12 @@ def verify(matrix, roots, plan_sha256, implementation_revision, reference_revisi
                             raise ValueError("successful lane retained an unjoined process")
                 if process_count == 0:
                     raise ValueError("successful lane omitted invocation owner receipts")
-                verify_lane_artifacts(closure_file.parent, receipt)
-                verify_bindings(selections[receipt["id"]], closure_file.parent, root, dependency)
+                lane = selections[receipt["id"]]
+                if receipt["runner"] == "sql-logic":
+                    verify_bindings(lane, closure_file.parent, root, dependency, retained_paths={item["path"] for item in files})
+                else:
+                    verify_lane_artifacts(closure_file.parent, receipt)
+                    verify_bindings(lane, closure_file.parent, root, dependency)
                 attempts.setdefault(receipt["id"], []).append(receipt)
     if any(len(values) != 1 for values in attempts.values()):
         raise ValueError("multiple successful receipts for a lane require an explicit retained selection")

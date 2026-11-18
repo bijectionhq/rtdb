@@ -1,12 +1,13 @@
+import hashlib
 import json
 import tempfile
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 from evidence import closure, retained, sha256
-from lane_artifacts import ASSERTION_COMPARISON_INPUTS, assertion_comparison_command, bind_inputs, verify_bindings
+from lane_artifacts import ASSERTION_COMPARISON_INPUTS, assertion_comparison_command, bind_inputs, sql_logic_command, verify_bindings
 from matrix_plan import expand
 from verify_matrix import verify, verify_lane_artifacts
 
@@ -14,6 +15,183 @@ from verify_matrix import verify, verify_lane_artifacts
 def write_record(path, value):
     path.write_text(json.dumps(value))
     return path
+
+
+def write_json_line(path, value):
+    path.write_text(json.dumps(value) + "\n")
+    return path
+
+
+def write_sql_logic_trace(directory, revision):
+    write_record(directory / "trace.json", {"artifact_revision": revision, **{
+        f"{name}_sha256": sha256(directory / relative) for name, relative in (
+            ("process", "process.json"), ("stdout", "stdout.log"), ("stderr", "stderr.log"),
+            ("execution", "observations/execution.json"))}})
+
+
+def sql_logic_fixture_record(source):
+    if source == "sqlite-test/xtdb.test":
+        return 9, 4, 3, ["query T rowsort", "SELECT ( 4 ) IN ( NULL )", "----", "NULL"]
+    if source == "sqlite-test/select4.test":
+        return 1, 1, 1, ["statement ok", "CREATE TABLE t1(", "  a1 INTEGER,", "  b1 INTEGER,", "  c1 INTEGER,",
+                         "  d1 INTEGER,", "  e1 INTEGER,", "  x1 VARCHAR(30)", ")"]
+    if source.startswith("sqlite-test/select"):
+        line, ordinal = (1, 1) if source == "sqlite-test/select1.test" else (3, 2)
+        return line, ordinal, 1, ["statement ok", "CREATE TABLE t1(a INTEGER, b INTEGER, c INTEGER, d INTEGER, e INTEGER)"]
+    return 3, 2, 1, ["statement ok", "CREATE TABLE tab0(col0 INTEGER, col1 INTEGER, col2 INTEGER)"]
+
+
+def write_sql_logic_capture(directory, command, repository, native_sha, revisions, script_count=None):
+    from sql_logic_records import parse_record
+    from sql_logic_results import compare
+    from sql_logic_selections import NON_DIRECT, selections
+
+    reference, original_output, native = (PurePosixPath(command[position]) for position in (4, 6, 8))
+    selection = command[10]
+    pinned = revisions["reference_revision"]
+    run = directory / "run"
+    plan = run / "plan"
+    plan.mkdir(parents=True)
+    inventory = Path(__file__).resolve().parent.parent / "conformance/source-inventory.json"
+    corpus = {item["path"]: item["sha256"] for item in json.loads(inventory.read_bytes())["files"]
+              if item["path"].startswith(("sqlite-test/", "src/test/resources/xtdb/sql/logic_test/")) and item["path"].endswith(".test")}
+    roster = selections([selection])
+    selected_paths = {source for _, source, _, _ in roster}
+    records_paths, scripts, raw_observations = [], [], []
+    for position, (name, source, direct, decorrelate) in enumerate(roster[:script_count]):
+        options = {"direct_sql": direct, "decorrelate": decorrelate, "query_limit": None,
+                   "max_rows": 1_000_000, "max_result_bytes": 128 * 1024 * 1024}
+        line, ordinal, assertion_ordinal, lines = sql_logic_fixture_record(source)
+        original = {"ordinal": ordinal, "assertion_ordinal": assertion_ordinal, "line": line}
+        identity = {**original, "reference": pinned, "source": source, "source_sha256": corpus[source],
+                    "selection": name, "options": options}
+        record = parse_record(lines)
+        records = write_json_line(plan / f"records-{position:05}.jsonl", {**original, "lines": lines,
+                                  "identity": identity, "parse_error": None, "record": record})
+        records_paths.append(records)
+        scripts.append({"source": source, "source_sha256": corpus[source], "records": 1, "assertions": 1, "parse_errors": 0,
+                        "records_file": records.name, "records_sha256": sha256(records), "selection": name, "options": options})
+        query = record["type"] == "query"
+        expected = record.get("expected")
+        raw_observations.append({"identity": identity, "executed": True, "engine_executed": True,
+                                 "result": {**expected, "md5": hashlib.md5(expected["text"].encode()).hexdigest()} if query else None,
+                                 "disposition": "query_ok" if query else "statement_ok", "query_count_before": 0,
+                                 "query_count_after": int(query), "error": None})
+
+    plan_data = {"schema_version": 1, "reference": pinned, "selection": selection, "scripts": scripts}
+    plan_path = write_record(plan / "plan.json", plan_data)
+    selected = write_record(run / "selection.json", {"reference": pinned, "names": [selection], "query_limit": None,
+                            "original_task_allowances": NON_DIRECT, "allowances_grant_passing_records": False,
+                            "sources": [{"path": name, "sha256": digest, "selected": name in selected_paths,
+                                         "reason": "selected" if name in selected_paths else "outside_explicit_original_selection"}
+                                        for name, digest in corpus.items()]})
+    inputs = write_record(run / "inputs.json", {**revisions, "inputs": [{"path": str(native), "sha256": native_sha}, *(
+        {"path": str(original_output / path.relative_to(run).as_posix()), "sha256": sha256(path)}
+        for path in (plan_path, selected, *records_paths))]})
+
+    adapter = repository / "rust/conformance"
+    observations = {}
+    for side, engine in (("reference", "jvm"), ("reference-repeat", "jvm"), ("native", "rust")):
+        observed = run / side / "observations"
+        observed.mkdir(parents=True)
+        output = original_output / side / "observations"
+        if engine == "rust":
+            argv = [native, "sql-logic", original_output / "plan/plan.json", output]
+            cwd, revision = repository, revisions["implementation_revision"]
+        else:
+            argv = [reference / "gradlew", "--no-daemon", "--console=plain", "-PfullJdk", "--init-script",
+                    adapter / "reference.init.gradle", "rtdbConformanceSqlLogic", f"-Prtdb.adapterRoot={adapter / 'jvm'}",
+                    f"-Prtdb.fixture={original_output / 'plan/plan.json'}", f"-Prtdb.output={output}"]
+            cwd, revision = reference, pinned
+        write_record(observed.parent / "process.json", {"command": [str(value) for value in argv], "cwd": str(cwd),
+                                                       "completed": True, "exit_code": 0})
+        rows = [write_json_line(observed / f"script-{position:05}.jsonl", raw)
+                for position, raw in enumerate(raw_observations)]
+        observations[side] = rows
+        execution = {"schema_version": 1, "engine": engine, "selection": selection, "plan_sha256": sha256(plan_path),
+                     "artifact_revision": revision, "execution_complete": True, "complete_parity": False,
+                     "scripts": [{"source": script["source"], "selection": script["selection"], "execution_complete": True,
+                                  "observations": {"path": observation.name, "sha256": sha256(observation)}}
+                                 for script, observation in zip(scripts, rows)]}
+        if engine == "rust":
+            execution.update(source_dirty=False, binary_sha256=native_sha)
+            write_record(observed.parent / "stdout.log", execution)
+        else:
+            runtime = [{"path": str(reference / "jdk/lib/modules"), "kind": "file", "sha256": "c" * 64, "bytes": 32}]
+            runtime_path = write_record(observed / "runtime-artifacts.json", runtime)
+            execution.update(artifacts=runtime, binary_sha256=sha256(runtime_path))
+            (observed.parent / "stdout.log").write_text(side)
+        write_record(observed / "execution.json", execution)
+        (observed.parent / "stderr.log").write_text("")
+        write_sql_logic_trace(observed.parent, revision)
+
+    result = {"selection_passed": True, "inputs_sha256": sha256(inputs),
+              "complete_parity": False, "assertion_ledger_reconciled": False}
+    for name, side in (("comparison", "native"), ("repeat", "reference-repeat")):
+        report = compare(plan_data, plan, observations["reference"], observations[side], run / f"{name}-records.jsonl")
+        summary = write_record(run / f"{name}.json", report)
+        result[f"{name}_sha256"] = sha256(summary)
+    write_record(run / "result.json", result)
+
+
+def sql_logic_fixture(root):
+    from run_controls import REFERENCE
+
+    matrix_path = Path(__file__).with_name("matrix.json")
+    matrix = json.loads(matrix_path.read_bytes())
+    lanes = expand(matrix)
+    prefix = "linux-arm64/rust/local"
+    production, lane = (next(item for item in lanes if item["id"] == f"{prefix}/{name}") for name in ("production", "slt-test"))
+    revisions = {"reference_revision": REFERENCE, "implementation_revision": "b" * 40}
+    write_record(root / "inputs.json", revisions)
+    directory = root / "production"
+    directory.mkdir()
+    native = directory / "rtdb-conformance"
+    native.write_bytes(b"selected production executable bytes")
+    compiler_artifact = {"reason": "compiler-artifact", "target": {"name": "rtdb-conformance"}, "profile": {"test": False}}
+    cargo = ["cargo", "build"]
+    process = write_record(directory / "cargo.process.json", {"command": cargo, "completed": True, "exit_code": 0})
+    messages = directory / "cargo.stdout.log"
+    messages.write_text("\n".join(map(json.dumps, (compiler_artifact, {"reason": "build-finished", "success": True}))) + "\n")
+    build = write_record(directory / "production-artifacts.json", {
+        "configuration": production["id"], "selection": production["selection"], "implementation_revision": revisions["implementation_revision"],
+        "command": cargo, "process": retained(directory, process), "messages": retained(directory, messages),
+        "binaries": [{"compiler_artifact": compiler_artifact, "retained_artifact": retained(directory, native), "sha256": sha256(native)}]})
+    production_closure = write_record(directory / "closure.json", closure(directory))
+    production_receipt = write_record(directory / "receipt.json", {**production, "verified": True, "process_joined": True,
+                                      "artifacts": [retained(root, build)], "closure": retained(root, production_closure)})
+    return matrix, matrix_path, lanes, production, lane, revisions, native, production_receipt
+
+
+def offline_sql_logic_fixture(root, script_count=None):
+    matrix, matrix_path, lanes, production, lane, revisions, native, production_receipt = sql_logic_fixture(root)
+    directory = root / "sql-logic"
+    directory.mkdir()
+    bindings = bind_inputs(lane, directory, root, {"native": native}.__getitem__, lambda _: (production, native.parent))
+    original = PurePosixPath("/original/sql-logic-worker")
+    repository = original / "implementation"
+    original_native = original / native.relative_to(root).as_posix()
+    bindings[0]["consumed_path"] = str(original_native)
+    write_record(directory / "artifact-bindings.json", bindings)
+    command = sql_logic_command("python3", repository, original / "reference", original / "sql-logic/run", original_native, lane["selection"])
+    write_record(directory / "sql-logic.process.json", {"command": command, "cwd": str(repository), "completed": True, "exit_code": 0})
+    for name in ("stdout", "stderr"):
+        (directory / f"sql-logic.{name}.log").touch()
+    write_sql_logic_capture(directory, command, repository, sha256(native), revisions, script_count)
+    selection = write_record(root / "selection.json", lanes)
+    matrix_sha, plan_sha = sha256(matrix_path), "a" * 64
+
+    def verify_worker(exclude=()):
+        files = [item for item in closure(directory) if item["path"] not in {"closure.json", "receipt.json", *exclude}]
+        lane_closure = write_record(directory / "closure.json", files)
+        receipt = write_record(directory / "receipt.json", {**lane, "verified": True, "process_joined": True,
+                               "artifacts": [retained(root, directory / "run/result.json")], "closure": retained(root, lane_closure)})
+        write_record(root / "result.json", {**revisions, "plan_sha256": plan_sha, "matrix_sha256": matrix_sha,
+                     "selection_sha256": sha256(selection), "inputs_sha256": sha256(root / "inputs.json"), "worker_platform": lane["platform"],
+                     "receipt_artifacts": [retained(root, path) for path in (production_receipt, receipt)]})
+        return verify(matrix, [root], plan_sha, revisions["implementation_revision"], revisions["reference_revision"], matrix_sha)
+
+    return lane, directory / "run", revisions, verify_worker
 
 
 def assertion_comparison_fixture(root):
@@ -300,6 +478,159 @@ class RetainedLaneArtifacts(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "absent from the retained lane closure"):
                 verify(matrix, [root], plan_sha256, revisions["implementation_revision"],
                        revisions["reference_revision"], matrix_sha256)
+
+
+    def test_sql_logic_provenance_survives_worker_relocation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            lane, run, _, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            plan = json.loads((run / "plan/plan.json").read_bytes())
+            self.assertEqual(len(plan["scripts"]), 9)
+            original_comparisons = closure(run)
+            with patch.dict("os.environ", {"TMPDIR": str(run.parent.parent)}):
+                report = verify_worker()
+            self.assertEqual(closure(run), original_comparisons)
+            self.assertIn(lane["id"], report["verified_lanes"])
+            self.assertFalse(report["release_matrix_verified"])
+
+    def test_sql_logic_rejects_an_incomplete_script_roster_with_a_passing_subset(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, _, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve(), script_count=1)
+            self.assertTrue(json.loads((run / "comparison.json").read_bytes())["selection_passed"])
+            with self.assertRaisesRegex(ValueError, "pinned ordered script selection"):
+                verify_worker()
+
+    def test_sql_logic_reruns_both_comparisons_on_digest_consistent_raw_evidence(self):
+        for side, comparison in (("native", "comparison"), ("reference-repeat", "repeat")):
+            with self.subTest(side=side), tempfile.TemporaryDirectory() as temporary:
+                _, run, revisions, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+                executed = run / side
+                raw = executed / "observations/script-00000.jsonl"
+                if side == "native":
+                    raw.write_bytes(b"")
+                    revision = revisions["implementation_revision"]
+                else:
+                    observation = json.loads(raw.read_bytes())
+                    different_text = "different\n"
+                    different = {"text": different_text, "count": 1, "md5": hashlib.md5(different_text.encode()).hexdigest()}
+                    write_json_line(raw, {**observation, "disposition": "query_mismatch", "result": different})
+                    revision = revisions["reference_revision"]
+                execution_path = executed / "observations/execution.json"
+                execution = json.loads(execution_path.read_bytes())
+                execution["scripts"][0]["observations"]["sha256"] = sha256(raw)
+                write_record(execution_path, execution)
+                if side == "native":
+                    write_record(executed / "stdout.log", execution)
+                write_sql_logic_trace(executed, revision)
+                with self.assertRaisesRegex(ValueError, f"{comparison} differs from the comparison of retained observations"):
+                    verify_worker()
+
+    def test_sql_logic_rejects_a_same_revision_execution_from_different_binary_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, revisions, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            side = run / "native"
+            path = side / "observations/execution.json"
+            execution = json.loads(path.read_bytes())
+            execution["binary_sha256"] = hashlib.sha256(b"another executable from the same revision").hexdigest()
+            write_record(path, execution)
+            write_record(side / "stdout.log", execution)
+            write_sql_logic_trace(side, revisions["implementation_revision"])
+            with self.assertRaisesRegex(ValueError, "differs from the selected production executable"):
+                verify_worker()
+
+    def test_sql_logic_rejects_an_inner_command_using_a_different_executable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, revisions, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            side = run / "native"
+            path = side / "process.json"
+            process = json.loads(path.read_bytes())
+            process["command"][0] += ".other"
+            write_record(path, process)
+            write_sql_logic_trace(side, revisions["implementation_revision"])
+            with self.assertRaisesRegex(ValueError, "native invocation differs from the selected execution"):
+                verify_worker()
+
+    def test_sql_logic_reference_trace_cannot_be_replaced_with_its_repeat(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, _, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            repeat = run / "reference-repeat"
+            for path in repeat.rglob("*"):
+                if path.is_file():
+                    (run / "reference" / path.relative_to(repeat)).write_bytes(path.read_bytes())
+            with self.assertRaisesRegex(ValueError, "reference invocation differs from the selected execution"):
+                verify_worker()
+
+    def test_sql_logic_checks_raw_files_and_trace_digests_after_worker_closure_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, _, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            side = run / "reference"
+            stderr = side / "stderr.log"
+            original_stderr = stderr.read_bytes()
+            stderr.write_bytes(b"different reference diagnostics")
+            with self.assertRaisesRegex(ValueError, "reference trace differs from retained execution files"):
+                verify_worker()
+            stderr.write_bytes(original_stderr)
+
+            observations = side / "observations/script-00000.jsonl"
+            original_observations = observations.read_bytes()
+            observations.write_bytes(original_observations + b"\n")
+            with self.assertRaisesRegex(ValueError, "observations differ from retained digest"):
+                verify_worker()
+            observations.write_bytes(original_observations)
+            with self.assertRaisesRegex(ValueError, "absent from the retained lane closure"):
+                verify_worker(exclude=("run/reference/observations/script-00000.jsonl",))
+
+    def test_sql_logic_rejects_another_plan_selection_and_a_failed_inner_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            _, run, revisions, verify_worker = offline_sql_logic_fixture(Path(temporary).resolve())
+            path = run / "plan/plan.json"
+            selected_plan = path.read_bytes()
+            plan = json.loads(selected_plan)
+            write_record(path, {**plan, "selection": "slt-test-2"})
+            with self.assertRaisesRegex(ValueError, "plan differs from its pinned lane selection"):
+                verify_worker()
+            path.write_bytes(selected_plan)
+
+            side = run / "native"
+            path = side / "process.json"
+            process = json.loads(path.read_bytes())
+            write_record(path, {**process, "exit_code": 1})
+            write_sql_logic_trace(side, revisions["implementation_revision"])
+            with self.assertRaisesRegex(ValueError, "execution owner did not join successfully"):
+                verify_worker()
+
+    def test_sql_logic_worker_checks_inner_provenance_before_accepting_the_lane(self):
+        from run_matrix import Run
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            _, _, _, production, lane, revisions, native, _ = sql_logic_fixture(root)
+            args = types.SimpleNamespace(output=root, plan=root / "plan.json", reference=root / "reference", timeout=10)
+            worker = Run(args, {}, [production, lane], {})
+            worker.completed[production["id"]] = {"verified": True}
+            worker.directories[production["id"]] = native.parent
+            binding = {"inputs": {"native": {"from_lane": production["id"], "path": native.name}}}
+
+            def capture(command, cwd, output, log, timeout):
+                write_sql_logic_capture(output.parent, command, cwd, sha256(native), revisions)
+                if output.parent.name == "wrong-executable":
+                    side = output.parent / "run/native"
+                    path = side / "observations/execution.json"
+                    execution = json.loads(path.read_bytes())
+                    execution["binary_sha256"] = "c" * 64
+                    write_record(path, execution)
+                    write_record(side / "stdout.log", execution)
+                    write_sql_logic_trace(side, revisions["implementation_revision"])
+                output.touch()
+                log.touch()
+                return {"command": command, "cwd": str(cwd), "completed": True, "exit_code": 0}
+
+            with patch("run_matrix.run_process", side_effect=capture):
+                valid, wrong = root / "valid-executable", root / "wrong-executable"
+                valid.mkdir()
+                wrong.mkdir()
+                self.assertEqual(worker.invoke(lane, binding, valid), [valid / "run/result.json"])
+                with self.assertRaisesRegex(ValueError, "differs from the selected production executable"):
+                    worker.invoke(lane, binding, wrong)
 
 
 if __name__ == "__main__":

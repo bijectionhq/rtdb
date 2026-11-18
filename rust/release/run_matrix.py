@@ -19,7 +19,7 @@ from evidence import artifact, closure, read_json, retained
 from matrix_plan import expand, summarize, validate_bindings, validate_workflows
 from runtime_bundle import merge_runtime
 from lane_artifacts import (ASSERTION_COMPARISON_INPUTS, assertion_comparison_command, bind_inputs, package_matches,
-                            selected_input_snapshot, verify_bindings, verify_inventory_ledger)
+                            selected_input_snapshot, sql_logic_command, verify_bindings, verify_inventory_ledger)
 
 
 def host_platform():
@@ -180,9 +180,7 @@ class Run:
             write_json(directory / "reference-results.json", {"selection": selection, "cases": cases})
             return [directory / "reference-results.json", output / "requested-lanes.json"]
         if runner == "sql-logic":
-            argv = [sys.executable, CONFORMANCE / "run_sql_logic.py", *common, "--native", source("native"), "--selection", selection["selection"]]
-            if "directory" in selection:
-                argv += ["--directory", selection["directory"]]
+            argv = sql_logic_command(sys.executable, REPOSITORY, self.args.reference, output, source("native"), selection)
             result, field = "result.json", "selection_passed"
         elif runner in {"controls", "history", "recovery"}:
             argv = [sys.executable, CONFORMANCE / ("run_" + runner + ".py"), *common, "--native", source("native")]
@@ -261,6 +259,8 @@ class Run:
         record = read_json(output / result)
         if record.get(field) is not True:
             raise ValueError("lane did not satisfy its selected assertions or measurements")
+        if runner == "sql-logic":
+            verify_bindings(lane, directory, self.args.output, dependency)
         return [output / result]
 
     def run(self):
@@ -318,7 +318,7 @@ def main():
     bindings = validate_bindings(lanes, plan["bindings"])
     validate_workflows(args.reference)
     protected_paths = [args.plan, *HERE.glob("*.py"), HERE / "matrix.init.gradle", matrix_path,
-        *CONFORMANCE.glob("*.py"), *CONFORMANCE.glob("*.gradle"), *CONFORMANCE.glob("clients/*"),
+        *CONFORMANCE.glob("*.py"), *CONFORMANCE.glob("*.gradle"), CONFORMANCE / "source-inventory.json", *CONFORMANCE.glob("clients/*"),
         args.reference / ".github/workflows/slt.yml", args.reference / ".github/workflows/nightly-property-test.yml",
         args.reference / ".github/workflows/nightly-test.yml"]
     protected = [{"path": str(path), "sha256": digest(path)} for path in protected_paths if path.is_file()]

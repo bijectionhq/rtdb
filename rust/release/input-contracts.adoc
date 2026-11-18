@@ -53,6 +53,14 @@ Workers execute only their native architecture; unmatched or unavailable lanes r
 
 Each executable/package/library input is checked against the actual selected producer bytes before invocation.
 `artifact-bindings.json` records those producer and consumed identities for independent verification.
+
+The SQL-logic lane verifies the selected production executable against the inner native command and its reported executable digest during collection and offline verification.
+It checks the plan's ordered scripts, source digests and options against the committed source inventory and pinned selection.
+The offline verifier checks the original recorded command paths and both JVM traces, then recomputes both comparisons from the retained record and observation streams in scratch space outside the worker archive.
+The recomputed reports and their record comparison digests must match the retained results.
+The SQL-logic runner verifies JVM runtime artifact bytes during execution, and the lane binds the retained runtime manifest to that execution record.
+The link:../conformance/external-inventory.adoc[external inventory validator] also reparses retained original source bytes to check how the record streams were derived.
+
 `package_capabilities` identifies the available package pair; actual remote-backend coverage additionally requires its original integration and recovery lanes.
 
 === Native build selection

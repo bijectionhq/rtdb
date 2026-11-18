@@ -1,6 +1,8 @@
-from pathlib import Path
+from os import W_OK, access, environ
+from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 
-from evidence import artifact, closure, index, integer, read_json, retained, sha256, text
+from evidence import artifact, canonical, closure, index, integer, read_json, retained, sha256, text
 
 
 ASSERTION_COMPARISON_INPUTS = (
@@ -215,7 +217,199 @@ def verify_assertion_comparison(directory, expected, bindings, revisions):
         raise ValueError("assertion comparison summary differs from its complete case results")
 
 
-def verify_bindings(lane, directory, root, dependency):
+def sql_logic_command(python, repository, reference, output, native, selection):
+    command = [python, repository / "rust/conformance/run_sql_logic.py", "--phase-two", "--reference", reference,
+               "--output", output, "--native", native, "--selection", selection["selection"]]
+    if "directory" in selection:
+        command += ["--directory", selection["directory"]]
+    return [str(value) for value in command]
+
+
+def verify_sql_logic_selection(selection, plan, selected, pinned):
+    from sql_logic_selections import NON_DIRECT, selections
+
+    inventory = read_json(Path(__file__).resolve().parent.parent / "conformance/source-inventory.json")
+    if integer(inventory.get("schema_version"), "source inventory schema", 1) != 1 or inventory.get("reference") != pinned:
+        raise ValueError("SQL logic source inventory differs from the pinned reference")
+    prefixes = ("sqlite-test/", "src/test/resources/xtdb/sql/logic_test/")
+    corpus = index([item for item in inventory["files"] if item["path"].startswith(prefixes) and item["path"].endswith(".test")],
+                   lambda item: item["path"], "pinned SQL logic source")
+    selection_name = selection["selection"]
+    if selection_name == "slt-test-dir":
+        directory = PurePosixPath(selection["directory"])
+        prefix = PurePosixPath("sqlite-test") / directory
+        paths = sorted(path for path in map(PurePosixPath, corpus) if path.is_relative_to(prefix))
+        roster = [(f"slt-test-dir:{directory}", str(path), False, True) for path in paths]
+    else:
+        roster = selections([selection_name])
+
+    expected_scripts = [{"selection": name, "source": source, "source_sha256": corpus[source]["sha256"],
+                         "options": {"direct_sql": direct, "decorrelate": decorrelate, "query_limit": None,
+                                     "max_rows": 1_000_000, "max_result_bytes": 128 * 1024 * 1024}}
+                        for name, source, direct, decorrelate in roster]
+    fields = ("selection", "source", "source_sha256", "options")
+    actual_scripts = [{field: script.get(field) for field in fields} for script in plan["scripts"]]
+    if not roster or canonical(actual_scripts) != canonical(expected_scripts):
+        raise ValueError("SQL logic plan differs from the pinned ordered script selection")
+
+    selected_paths = {source for _, source, _, _ in roster}
+    expected_sources = {name: {"path": name, "sha256": entry["sha256"], "selected": name in selected_paths,
+                               "reason": "selected" if name in selected_paths else "outside_explicit_original_selection"}
+                        for name, entry in corpus.items()}
+    recorded_sources = index(selected["sources"], lambda item: item["path"], "recorded SQL logic source")
+    if (canonical(recorded_sources) != canonical(expected_sources) or "query_limit" not in selected or selected["query_limit"] is not None
+            or selected.get("allowances_grant_passing_records") is not False
+            or canonical(selected.get("original_task_allowances")) != canonical(NON_DIRECT)):
+        raise ValueError("SQL logic recorded source selection differs from the pinned corpus")
+
+
+def sql_logic_scratch_parent(archive_root):
+    archive_root = archive_root.resolve()
+    for candidate in (environ.get("TMPDIR"), environ.get("TEMP"), environ.get("TMP"), "/tmp", "/var/tmp", archive_root.parent):
+        if candidate:
+            path = Path(candidate).resolve()
+            if not path.is_relative_to(archive_root) and path.is_dir() and access(path, W_OK):
+                return path
+    raise ValueError("SQL logic offline verification requires scratch outside the worker archive")
+
+
+def verify_sql_logic(directory, archive_root, selection, native, revisions, retained_paths):
+    from sql_logic_results import compare, verify_execution
+
+    def retained_file(relative):
+        relative = Path(relative)
+        if retained_paths is not None and relative.as_posix() not in retained_paths:
+            raise ValueError(f"SQL logic evidence is absent from the retained lane closure: {relative}")
+        path = directory
+        for part in relative.parts:
+            path /= part
+            if path.is_symlink():
+                raise ValueError(f"SQL logic evidence path traverses a symbolic link: {relative}")
+        if not path.is_file():
+            raise ValueError(f"SQL logic evidence is missing: {relative}")
+        return path
+
+    def joined(path):
+        process = read_json(path)
+        if (process.get("completed") is not True or process.get("unexpected_live_descendants")
+                or type(process.get("exit_code")) is not int or process["exit_code"] != 0):
+            raise ValueError("SQL logic execution owner did not join successfully")
+        return process
+
+    outer = joined(retained_file("sql-logic.process.json"))
+    retained_file("sql-logic.stdout.log")
+    retained_file("sql-logic.stderr.log")
+    command = outer["command"]
+    repository = PurePosixPath(outer["cwd"])
+    executable = PurePosixPath(native["consumed_path"])
+    if len(command) not in (11, 13):
+        raise ValueError("SQL logic invocation differs from its selected lane")
+    reference, output = PurePosixPath(command[4]), PurePosixPath(command[6])
+    if (any(not path.is_absolute() for path in (repository, reference, output, executable)) or output.name != "run"
+            or command != sql_logic_command(command[0], repository, reference, output, executable, selection)):
+        raise ValueError("SQL logic invocation differs from its selected lane")
+
+    plan_path = retained_file("run/plan/plan.json")
+    selection_path = retained_file("run/selection.json")
+    inputs_path = retained_file("run/inputs.json")
+    plan, selected, inputs = (read_json(path) for path in (plan_path, selection_path, inputs_path))
+    selection_name = selection["selection"]
+    pinned = revisions["reference_revision"]
+    implementation = revisions["implementation_revision"]
+    if (integer(plan.get("schema_version"), "SQL logic plan schema", 1) != 1 or plan.get("selection") != selection_name
+            or plan.get("reference") != pinned or selected.get("reference") != pinned or selected.get("names") != [selection_name]
+            or inputs.get("reference_revision") != pinned or inputs.get("implementation_revision") != implementation
+            or not isinstance(plan.get("scripts"), list) or not plan["scripts"]):
+        raise ValueError("SQL logic plan differs from its pinned lane selection")
+    verify_sql_logic_selection(selection, plan, selected, pinned)
+
+    recorded_inputs = index(inputs["inputs"], lambda value: text(value.get("path"), "SQL logic input path"), "SQL logic input")
+    plan_sha = sha256(plan_path)
+    expected_inputs = {str(executable): native["consumed_sha256"], str(output / "plan/plan.json"): plan_sha,
+                       str(output / "selection.json"): sha256(selection_path)}
+    observation_names = []
+    for position, script in enumerate(plan["scripts"]):
+        records_name = f"records-{position:05}.jsonl"
+        records_sha = sha256(retained_file(f"run/plan/{records_name}"))
+        if script.get("records_file") != records_name or script.get("records_sha256") != records_sha:
+            raise ValueError("SQL logic record stream differs from its selected plan")
+        expected_inputs[str(output / "plan" / records_name)] = records_sha
+        observation_names.append(f"script-{position:05}.jsonl")
+    if any(recorded_inputs.get(path, {}).get("sha256") != digest for path, digest in expected_inputs.items()):
+        raise ValueError("SQL logic retained inputs differ from the selected executable or plan")
+
+    adapter = repository / "rust/conformance"
+    observations = {}
+    for side, engine, revision in (("reference", "jvm", pinned), ("reference-repeat", "jvm", pinned),
+                                   ("native", "rust", implementation)):
+        prefix = f"run/{side}"
+        process_path = retained_file(f"{prefix}/process.json")
+        stdout_path = retained_file(f"{prefix}/stdout.log")
+        stderr_path = retained_file(f"{prefix}/stderr.log")
+        execution_path = retained_file(f"{prefix}/observations/execution.json")
+        run_output = output / side / "observations"
+        process = joined(process_path)
+        if engine == "rust":
+            argv = [executable, "sql-logic", output / "plan/plan.json", run_output]
+            cwd = repository
+        else:
+            argv = [reference / "gradlew", "--no-daemon", "--console=plain", "-PfullJdk", "--init-script",
+                    adapter / "reference.init.gradle", "rtdbConformanceSqlLogic", f"-Prtdb.adapterRoot={adapter / 'jvm'}",
+                    f"-Prtdb.fixture={output / 'plan/plan.json'}", f"-Prtdb.output={run_output}"]
+            cwd = reference
+        if process.get("command") != [str(value) for value in argv] or process.get("cwd") != str(cwd):
+            raise ValueError(f"SQL logic {side} invocation differs from the selected execution")
+
+        trace = read_json(retained_file(f"{prefix}/trace.json"))
+        if trace != {"artifact_revision": revision, "process_sha256": sha256(process_path),
+                     "stdout_sha256": sha256(stdout_path), "stderr_sha256": sha256(stderr_path),
+                     "execution_sha256": sha256(execution_path)}:
+            raise ValueError(f"SQL logic {side} trace differs from retained execution files")
+        execution = read_json(execution_path)
+        if (execution.get("engine") != engine or execution.get("artifact_revision") != revision
+                or execution.get("selection") != selection_name):
+            raise ValueError(f"SQL logic {side} execution belongs to another artifact or selection")
+        if engine == "rust":
+            if (execution.get("source_dirty") is not False or execution.get("binary_sha256") != native["consumed_sha256"]
+                    or read_json(stdout_path) != execution):
+                raise ValueError("SQL logic native execution differs from the selected production executable or stdout")
+        else:
+            runtime_path = retained_file(f"{prefix}/observations/runtime-artifacts.json")
+            runtime = read_json(runtime_path)
+            if (not isinstance(runtime, list) or not runtime or execution.get("binary_sha256") != sha256(runtime_path)
+                    or execution.get("artifacts") != runtime):
+                raise ValueError(f"SQL logic {side} execution differs from its retained JVM runtime manifest")
+        if [script["observations"]["path"] for script in execution["scripts"]] != observation_names:
+            raise ValueError(f"SQL logic {side} observation files differ from the selected plan")
+        for filename in observation_names:
+            retained_file(f"{prefix}/observations/{filename}")
+        observations[side] = verify_execution(plan, plan_sha, execution, execution_path.parent)
+
+    result = read_json(retained_file("run/result.json"))
+    if result.get("selection_passed") is not True or result.get("inputs_sha256") != sha256(inputs_path):
+        raise ValueError("SQL logic result differs from the selected run inputs")
+    summaries = {}
+    for name in ("comparison", "repeat"):
+        summary_path = retained_file(f"run/{name}.json")
+        summary = read_json(summary_path)
+        records_path = retained_file(f"run/{name}-records.jsonl")
+        if (result.get(f"{name}_sha256") != sha256(summary_path) or summary.get("selection_passed") is not True
+                or summary.get("record_comparison_sha256") != sha256(records_path)):
+            raise ValueError(f"SQL logic {name} summary differs from retained comparison evidence")
+        summaries[name] = summary
+
+    if retained_paths is not None:
+        with TemporaryDirectory(dir=sql_logic_scratch_parent(archive_root)) as temporary:
+            for name, side in (("comparison", "native"), ("repeat", "reference-repeat")):
+                report = compare(plan, plan_path.parent, observations["reference"], observations[side],
+                                 Path(temporary) / f"{name}-records.jsonl")
+                if canonical(report) != canonical(summaries[name]):
+                    raise ValueError(f"SQL logic {name} differs from the comparison of retained observations")
+
+
+def verify_bindings(lane, directory, root, dependency, retained_paths=None):
+    if lane["runner"] == "sql-logic" and retained_paths is not None and "artifact-bindings.json" not in retained_paths:
+        raise ValueError("SQL logic artifact bindings are absent from the retained lane closure")
     expected = expected_artifacts(lane, dependency)
     records = read_json(directory / "artifact-bindings.json")
     bindings = {value["role"]: value for value in records}
@@ -229,6 +423,13 @@ def verify_bindings(lane, directory, root, dependency):
             raise ValueError("consumed artifact binding differs from selected producer")
         if role == "history" and value.get("files") != closure(produced.parent):
             raise ValueError("consumed history closure differs from selected producer")
+    if lane["runner"] == "sql-logic":
+        revisions = read_json(root / "inputs.json")
+        _, production = dependency(bindings["native"]["dependency"])
+        if read_json(production / "production-artifacts.json")["implementation_revision"] != revisions["implementation_revision"]:
+            raise ValueError("SQL logic executable was built from another implementation revision")
+        verify_sql_logic(directory, root, lane["selection"], bindings["native"], revisions, retained_paths)
+        return
     if lane["runner"] == "assertion-comparison":
         revisions = read_json(root / "inputs.json")
         _, production = dependency(bindings["native"]["dependency"])
