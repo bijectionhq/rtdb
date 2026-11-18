@@ -131,11 +131,11 @@ impl SystemCursor {
                 let table = &binding.name.table;
                 match name {
                     "live_tables" => {
-                        if !snapshot.contains_table(table) { continue; }
-                        let count = snapshot.iter_segments(table).map(|segment| i64::from(segment.row_count())).sum();
+                        let count: i64 = snapshot.iter_segments(table).map(|segment| i64::from(segment.row_count())).sum();
+                        if count == 0 { continue; }
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("row_count", Value::I64(count))]));
                     }
-                    "live_columns" => for segment in snapshot.iter_segments(table) { for (column, ty) in segment.column_types() {
+                    "live_columns" => for segment in snapshot.iter_segments(table).filter(|segment| segment.row_count() > 0) { for (column, ty) in segment.column_types() {
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("col_name", text(column)), ("col_type", text(&ty.to_edn()?))]));
                     } },
                     "trie_stats" => for trie in snapshot.trie_catalog().all_tries(table) {

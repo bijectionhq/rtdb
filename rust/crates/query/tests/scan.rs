@@ -159,6 +159,23 @@ async fn live_catalog_shows_staged_columns_before_applied_columns_and_respects_l
     }
 }
 
+#[tokio::test]
+async fn live_catalog_omits_tables_whose_live_rows_are_all_flushed() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let mut applied = tx(&state, &memory, 0, 10);
+    applied.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
+    state.apply(&applied.stage().unwrap()).unwrap();
+    let covering = CatalogTrie::notification(TrieKey::l0(state.value().snapshot().block_index()).unwrap(), 0, None).unwrap();
+    state.add_tries(&BTreeMap::from([(table(), vec![covering])]), Timestamp(30)).unwrap();
+    let context = query_context(state.value().snapshot(), Arc::new(MemoryStore::default()), false);
+    let docs = Value::Utf8("docs".into());
+    let tables = collect(system_scan(&context, "live_tables", &["table_name"]), Arc::clone(&context)).await.unwrap();
+    assert!(!tables.iter().any(|row| row[0] == docs), "{tables:?}");
+    let columns = collect(system_scan(&context, "live_columns", &["table_name"]), context).await.unwrap();
+    assert!(!columns.iter().any(|row| row[0] == docs), "{columns:?}");
+}
+
 fn system_scan(context: &QueryContext, table: &str, columns: &[&str]) -> Arc<Relation> {
     let binding = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table: TableRef::new("xt", table) }).unwrap().unwrap();
     let columns = columns.iter().enumerate().map(|(id, column)| Field {
