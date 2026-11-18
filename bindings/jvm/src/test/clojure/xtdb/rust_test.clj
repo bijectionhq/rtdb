@@ -1,6 +1,8 @@
 (ns xtdb.rust-test
   (:require [clojure.test :as t :refer [deftest is]]
             [xtdb.api :as xt]
+            [xtdb.information-schema-test :as original-info-schema]
+            [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.sql.expr-test :as original-expr]
             [xtdb.sql.correlated-subquery-nulls-test :as original-correlated]
@@ -445,6 +447,10 @@
 (deftest-original-api original-node/test-select-left-join-2302)
 
 (deftest-original-api original-node/test-list-round-trip-2342)
+
+(deftest-original-api original-issue/test-nested-lists-3341)
+
+(deftest-original-api original-info-schema/columns-data-type-follows-postgres-spelling)
 
 (deftest-original-api original-node/test-mutable-data-buffer-bug)
 

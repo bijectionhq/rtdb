@@ -120,7 +120,20 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
         T::Tagged { tag, representation } => {
             let string = || match representation.as_ref() { T::String(text) => Ok(text.as_str()), _ => Err(invalid("Transit tag requires text")) };
             match tag.as_str() {
-                "u" => read_text(2950, string()?)?, "f" => decimal(string()?)?,
+                "u" => match representation.as_ref() {
+                    T::String(text) => read_text(2950, text)?,
+                    T::Array(parts) => {
+                        let [T::Integer(high), T::Integer(low)] = parts.as_slice() else {
+                            return Err(invalid("Transit UUID requires two signed 64-bit words"));
+                        };
+                        let mut bytes = [0; 16];
+                        bytes[..8].copy_from_slice(&high.to_be_bytes());
+                        bytes[8..].copy_from_slice(&low.to_be_bytes());
+                        Value::Uuid(bytes)
+                    }
+                    _ => return Err(invalid("Transit UUID requires text or two signed 64-bit words")),
+                },
+                "f" => decimal(string()?)?,
                 "r" => { let text = string()?; rtdb_types::UriParts::parse(text)?; Value::Uri(text.to_owned()) },
                 "m" => {
                     let millis = match representation.as_ref() {
@@ -150,6 +163,10 @@ fn transit(value: rtdb_format::transit::TransitValue) -> Result<Value> {
                     rtdb_expr::cast(&value, &rtdb_types::LogicalType::Scalar(scalar), "UTC")?
                 }
                 "set" => { let T::Array(values) = *representation else { return Err(invalid("Transit set requires an array")); }; Value::Set(unique(values.into_iter().map(transit).collect::<Result<_>>()?)) },
+                "list" => {
+                    let T::Array(values) = *representation else { return Err(invalid("Transit list requires an array")); };
+                    Value::List(values.into_iter().map(transit).collect::<Result<_>>()?)
+                }
                 "xtdb/byte-array" => read_text(17, &format!("\\x{}", string()?.get(2..).ok_or_else(|| invalid("Transit byte-array requires a hexadecimal prefix"))?))?,
                 "xtdb/tstz-range" => {
                     let T::Array(bounds) = *representation else { return Err(invalid("Transit timestamp range requires an array")); };

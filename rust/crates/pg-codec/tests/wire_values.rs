@@ -293,3 +293,19 @@ fn transit_preserves_postgres_reference_types_through_nested_values() {
     let data = T::Tagged { tag: "xt/regclass".into(), representation: Box::new(T::Integer(i64::MAX)) };
     assert!(rtdb_pg_codec::from_transit(data).is_err());
 }
+
+#[test]
+fn jvm_transit_preserves_nested_lists_and_uuid_words() {
+    use rtdb_format::transit::{decode_json, decode_msgpack};
+    use rtdb_pg_codec::from_transit;
+    let lists = b"\x92\xa6~#list\x92\x92\xa2^0\x91\x01\x92\xa2^0\x90";
+    assert_eq!(from_transit(decode_msgpack(lists).unwrap()).unwrap(),
+        Value::List(vec![Value::List(vec![Value::I64(1)]), Value::List(vec![])]));
+    let uuid = b"\x92\xa3~#'\x92\xa3~#u\x92\xff\xd3\x87\x65\x43\x21\xab\xcd\xef\x09";
+    let text = "ffffffff-ffff-ffff-8765-4321abcdef09";
+    assert_eq!(from_transit(decode_msgpack(uuid).unwrap()).unwrap(), read_text(2950, text).unwrap());
+    assert_eq!(from_transit(decode_json(format!(r#""~u{text}""#).as_bytes()).unwrap()).unwrap(), read_text(2950, text).unwrap());
+    for data in [br#"["~#u",[0]]"#.as_slice(), br#"["~#u",[0,"1"]]"#, br#"["~#list",1]"#] {
+        assert!(from_transit(decode_json(data).unwrap()).is_err());
+    }
+}

@@ -97,3 +97,4 @@ Applications that depend on changing parser state to alter later parses need to 
 `NativeException.getMessage()` preserves an absent native diagnostic message as Java null and an empty message as an empty string.
 The Clojure bridge retains that distinction when reading the diagnostic Transit payload.
 The embedded Clojure API carries OID, REGCLASS and REGPROC values as typed Transit values using their Arrow extension names as tags.
+Native requests preserve the JVM numeric widths of Byte, Short, Integer and Float in transaction documents and query arguments.

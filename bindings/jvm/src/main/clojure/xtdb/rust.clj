@@ -9,7 +9,7 @@
             [xtdb.serde :as serde]
             [xtdb.time :as time])
   (:import [clojure.lang IReduceInit]
-           [java.io ByteArrayInputStream]
+           [java.io ByteArrayInputStream ByteArrayOutputStream]
            [xtdb.api.query IKeyFn]
            [xtdb.rust NativeConnection NativeDatabase NativeException NativeRows NativeStatement]
            [xtdb.util NormalForm]))
@@ -22,10 +22,23 @@
         (err/->anomaly (serde/read-transit wire) context)
         (err/unavailable (keyword (.code error)) (ex-message error) context)))))
 
+(def ^:private request-write-handlers
+  (transit/write-handler-map
+   (into serde/transit-write-handlers
+         {Byte (transit/write-handler "i8" long)
+          Short (transit/write-handler "i16" long)
+          Integer (transit/write-handler "i32" long)
+          Float (transit/write-handler "f32" double)})))
+
+(defn- write-request ^bytes [value]
+  (with-open [out (ByteArrayOutputStream.)]
+    (transit/write (transit/writer out :msgpack {:handlers request-write-handlers}) value)
+    (.toByteArray out)))
+
 (defn- execute-set! [^NativeConnection connection sql arguments]
   (with-open [^NativeStatement statement (.createStatement connection sql)]
     (when (some? arguments)
-      (.bindTransit statement (serde/write-transit [(vec arguments)])))
+      (.bindTransit statement (write-request [(vec arguments)])))
     (.executeUpdate statement)))
 
 (defn- current-await-token [^NativeConnection connection]
@@ -64,7 +77,7 @@
                                 (when (seq options) (mapv second options)))))
               (with-open [^NativeStatement statement (.createStatement connection sql)]
                 (.prepare statement)
-                (when (seq args) (.bindTransit statement (serde/write-transit [(vec args)])))
+                (when (seq args) (.bindTransit statement (write-request [(vec args)])))
                 (with-open [^NativeRows rows (.executeRows statement)]
                   (loop [acc initial]
                     (if (reduced? acc)
@@ -94,7 +107,7 @@
                                default-tz (assoc "default_timezone" (str default-tz))
                                system-time (assoc "system_time" (time/->instant system-time {:default-tz default-tz}))
                                metadata (assoc "metadata" metadata))}
-          result (serde/read-transit (.transact connection (serde/write-transit request)) :json)]
+          result (serde/read-transit (.transact connection (write-request request)) :json)]
       (if asynchronous?
         {:tx-id (get result "tx_id")}
         (serde/->TxKey (get result "tx_id") (time/->instant (get result "system_time")))))))
