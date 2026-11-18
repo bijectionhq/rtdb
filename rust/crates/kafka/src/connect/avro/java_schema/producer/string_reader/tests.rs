@@ -455,13 +455,13 @@ fn all_source_schemas_and_closes_precede_transport_of_an_earlier_unrepresentable
 }
 
 #[derive(Clone)]
-struct Trace { events: Rc<RefCell<Vec<&'static str>>>, charge: Arc<MemoryReservation> }
+struct Trace { events: Rc<RefCell<Vec<&'static str>>>, _charge: Arc<MemoryReservation> }
 impl Trace {
     fn new(context: &mut ConversionContext) -> Self {
         let charge = context.reserve(4096).unwrap();
         let mut events = Vec::new();
         events.try_reserve_exact(8).unwrap();
-        Self { events: Rc::new(RefCell::new(events)), charge }
+        Self { events: Rc::new(RefCell::new(events)), _charge: charge }
     }
     fn push(&self, event: &'static str) {
         let mut events = self.events.borrow_mut();

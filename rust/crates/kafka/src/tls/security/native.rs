@@ -1,5 +1,5 @@
 use std::{ffi::c_void, sync::OnceLock};
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::ForeignTypeRef;
 use openssl::{error::ErrorStack, ex_data::Index, nid::Nid, ssl::{SslContext, SslContextBuilder, SslContextRef, SslOptions}, x509::X509Ref};
 use rtdb_types::Result;
 use super::super::invalid;

@@ -1,5 +1,4 @@
 use std::{collections::BTreeMap, ptr, sync::Arc};
-use foreign_types::ForeignType;
 use openssl::{ssl::{SslContext, SslContextBuilder, SslMode, SslVerifyMode}, x509::X509};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::KeyStore;

@@ -26,7 +26,6 @@ impl Name {
         Ok(Self { full: Some(Text::copy_units(&full, context)?) })
     }
     pub(in crate::connect::avro) fn full(&self) -> Option<&Text> { self.full.as_ref() }
-    pub(super) fn hash(&self) -> i32 { self.full.as_ref().map_or(0, |full| full.view().java_hash_code()) }
     pub(super) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
         if let Some(full) = &self.full { full.retain(context)?; }
         Ok(())

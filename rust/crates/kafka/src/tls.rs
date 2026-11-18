@@ -1,5 +1,5 @@
 use std::{collections::BTreeMap, ffi::c_void, io::Read, sync::Arc};
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::ForeignTypeRef;
 use openssl::{asn1::Asn1Time, ssl::{SslContextBuilder, SslOptions, SslRef, SslVersion}, x509::{X509, store::X509StoreBuilder}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_tls::{StoreFormat, StoreUse};

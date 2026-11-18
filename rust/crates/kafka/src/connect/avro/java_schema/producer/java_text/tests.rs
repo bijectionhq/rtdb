@@ -1,5 +1,6 @@
 use super::*;
 use super::super::super::test_support as support;
+use super::super::super::logical::FactoryOutcome;
 
 fn policy() -> SourcePolicy { SourcePolicy { validate_defaults: false, fixed_bytes: FixedBytesLimit::DEFAULT } }
 fn text(value: &str, context: &mut ConversionContext) -> Text {
@@ -110,10 +111,6 @@ fn utf16_projection_counts_native_bytes_and_matches_existing_source_node_relatio
     let existing = super::super::parse(source, &[], policy(), &mut context).unwrap();
     assert_eq!(projected.inputs.root, source);
     assert_eq!(projected.canonical.native.bound().unwrap(), existing.native.bound().unwrap());
-    let mut seen = RecursionState::new();
-    let mut witness = support::Observed::default();
-    let mut evaluation = Evaluation::new(&mut seen, &mut context, &mut witness).unwrap();
-    assert!(evaluation.equal(&projected.canonical.root, &existing.root).unwrap());
     assert_ne!(projected.canonical.root.id(), existing.root.id());
 }
 

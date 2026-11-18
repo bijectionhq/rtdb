@@ -83,6 +83,7 @@ pub(in crate::connect) struct ChildSymbols { state: ChildState, root: Arc<Reader
 pub(in crate::connect) enum Release { Unchanged, Published, Reset, LostPublication, Disabled, Poisoned }
 
 impl ChildSymbols {
+    #[cfg(test)]
     pub(in crate::connect) fn factory(&self) -> FactoryProfile { self.root.factory }
     pub(in crate::connect) fn find(&mut self, units: &[u16], authority: &mut (impl InternAuthority + ?Sized),
         context: &mut ConversionContext) -> Result<JavaString> {

@@ -42,7 +42,6 @@ impl AvroMap {
             Self::Insertions { first_block, entries, strings: false } => map_order::indices(*first_block, entries.iter().map(|(key, _)| key)),
         }
     }
-    pub(super) fn visible_indices(&self) -> Result<Vec<usize>> { self.order() }
     pub(super) fn first_value(&self) -> Result<Option<&Avro>> { Ok(self.order()?.first().map(|index| &self.entries()[*index].1)) }
     pub(super) fn ordered(self) -> Result<Vec<(MapKey, Avro)>> {
         if let Self::Ordered(entries) = self { return Ok(entries); }

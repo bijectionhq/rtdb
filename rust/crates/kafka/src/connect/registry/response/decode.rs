@@ -1,5 +1,7 @@
 use rtdb_types::java_text::JavaString;
-use super::{ConversionContext, Failure, FailureKind, Result, beans::*, collections, cursor::{Cursor, Kind}, owned::Values, scalars};
+#[cfg(test)]
+use super::{Failure, FailureKind};
+use super::{ConversionContext, Result, beans::*, collections, cursor::{Cursor, Kind}, owned::Values, scalars};
 
 struct Creator { seen: u16, all: u16, built: bool }
 impl Creator {

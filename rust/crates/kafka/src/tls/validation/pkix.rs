@@ -1,14 +1,19 @@
 use std::{ffi::c_void, ptr, sync::Arc};
 use foreign_types::{ForeignType, ForeignTypeRef};
-use openssl::{asn1::{Asn1Time, Asn1TimeRef}, ssl::SslContextBuilder, stack::{Stack, StackRef}, x509::{X509, X509PurposeId, X509Ref, X509StoreContext, X509StoreContextRef, store::X509StoreRef, verify::{X509VerifyFlags, X509VerifyParamRef}}};
+use openssl::{asn1::{Asn1Time, Asn1TimeRef}, ssl::SslContextBuilder, stack::{Stack, StackRef}, x509::{X509, X509PurposeId, X509Ref, X509StoreContext, X509StoreContextRef, verify::{X509VerifyFlags, X509VerifyParamRef}}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use super::super::invalid;
 mod path;
 mod policy;
 
+#[cfg(test)]
+use openssl::x509::store::X509StoreRef;
+
+#[cfg(test)]
 pub(crate) struct VerifiedChain { pub(crate) certificates: Vec<X509>, _charge: Arc<MemoryReservation> }
 
+#[cfg(test)]
 pub(crate) fn verify_store(store: &X509StoreRef, peer: &[X509], now: &Asn1TimeRef, charge: &Arc<MemoryReservation>) -> Result<VerifiedChain> {
     let leaf = peer.first().ok_or_else(|| invalid("TLS peer supplied no certificate"))?;
     let charge = reserve(peer.iter().map(X509::as_ref), charge)?;

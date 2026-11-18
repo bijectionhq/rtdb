@@ -6,8 +6,6 @@ For example, 1152921573326323713 becomes the Float with bits 0x5d800000 through 
 The same rule applies to scalar defaults and Float values nested in array or map defaults.
 Connect JsonNode Float defaults already use the Double accessor.
 
-link:../../rust/crates/kafka/src/connect/avro/default_input/sources.sha256[The source manifest] pins the inspected Apache Avro 1.11.4 JacksonUtils implementation, including both integral-to-Float branches.
-Its full original source header and the Apache license accompany the borrowed default-input reference.
 Regression sources cover positive and negative rounding boundaries through the production schema/metadata/default graph, including scalar, array, map and Connect JsonNode defaults.
 This bounded correction introduces no additional retained owner or allocation.
 The separate Java name/reference policy, default-origin materialization, graph admission, union-context and cache-lifetime work remains gated; Rust/Java regression execution is pending under the Phase 1 work order.

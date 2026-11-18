@@ -79,14 +79,13 @@ fn decimal_requires_actual_integer_nodes_and_preserves_optional_scale_zero() {
 #[test]
 fn decimal_object_access_distinguishes_unmatched_numeric_fallthrough_from_null_sentinel() {
     let mut context = support::context();
-    for (value, expected) in [("decimal", Some(LogicalType::Decimal { precision: 4, scale: 0 })), ("integer", Some(LogicalType::Decimal { precision: 4, scale: 0 })), ("null", None), ("long", None)] {
+    for (value, expected) in [("integer", Some(LogicalType::Decimal { precision: 4, scale: 0 })), ("null", None), ("long", None)] {
         let mut builder = SchemasBuilder::new(&mut context).unwrap();
         let id = builder.primitive(Type::Bytes, &mut context).unwrap();
         let name = support::text("decimal", &mut context);
         let name = support::node(JsonValue::Text(name), &mut context);
         let precision = support::node(JsonValue::I32(4), &mut context);
         let scale = match value {
-            "decimal" => JsonNode::decimal("2.0", &mut context).unwrap(),
             "integer" => JsonNode::integer_decimal(JavaText::from_utf8("2"), &mut context).unwrap(),
             "null" => support::node(JsonValue::Null, &mut context),
             _ => support::node(JsonValue::I64(2), &mut context),
@@ -205,39 +204,6 @@ fn factory_runs_after_children_and_properties_but_before_named_aliases() {
 }
 
 #[test]
-fn singleton_identity_and_decimal_value_equality_are_distinct_from_fresh_decimal_identity() {
-    let mut context = support::context();
-    let date = parse(r#"{"type":"int","logicalType":"date"}"#, &mut context);
-    let other = parse(r#"{"type":"int","logicalType":"date"}"#, &mut context);
-    assert_eq!(date.view().logical_identity(), other.view().logical_identity());
-    let text = r#"{"type":"bytes","logicalType":"decimal","precision":4,"scale":2}"#;
-    let decimal = parse(text, &mut context);
-    let equal = parse(text, &mut context);
-    assert_ne!(decimal.view().logical_identity(), equal.view().logical_identity());
-    assert_eq!(decimal.view().logical_type(), equal.view().logical_type());
-    assert_eq!(decimal.view().logical_type().unwrap().decimal_hash(), Some(126));
-}
-
-#[test]
-fn logical_object_construction_does_not_enter_schema_equality_or_hash() {
-    let mut context = support::context();
-    let constructed = parse(r#"{"type":"int","logicalType":"date"}"#, &mut context);
-    let mut builder = SchemasBuilder::new(&mut context).unwrap();
-    let id = builder.primitive(Type::Int, &mut context).unwrap();
-    let text = support::text("date", &mut context);
-    let value = support::node(JsonValue::Text(text), &mut context);
-    let properties = support::properties(vec![("logicalType", value)], &mut context);
-    builder.properties(id, properties).unwrap();
-    let unconstructed = builder.finish(id, &mut context).unwrap();
-    assert!(unconstructed.view().logical_type().is_none());
-    let mut seen = RecursionState::new();
-    let mut witness = support::Observed::default();
-    let mut evaluation = Evaluation::new(&mut seen, &mut context, &mut witness).unwrap();
-    assert!(evaluation.equal(&constructed, &unconstructed).unwrap());
-    assert_eq!(evaluation.hash_code(&constructed).unwrap(), evaluation.hash_code(&unconstructed).unwrap());
-}
-
-#[test]
 fn admitted_datum_references_keep_the_actual_source_logical_object_after_context_drop() {
     let budget = rtdb_columnar::MemoryBudget::new(usize::MAX);
     let mut context = ConversionContext::new(Arc::clone(&budget));
@@ -246,7 +212,6 @@ fn admitted_datum_references_keep_the_actual_source_logical_object_after_context
     let selected = datum.paired_root().unwrap().field(0).unwrap().canonical().unwrap();
     let definition = datum.paired_definition("ns.Money").unwrap().unwrap().canonical().unwrap();
     assert!(selected.same_object(&definition));
-    assert_eq!(selected.view().logical_identity(), definition.view().logical_identity());
     drop(context);
     assert_eq!(selected.view().logical_type(), Some(LogicalType::Decimal { precision: 4, scale: 2 }));
     drop(datum);

@@ -12,12 +12,6 @@ mod output;
 mod default_json;
 mod reader;
 mod names;
-mod conversion;
-mod default_input;
-mod default_scalar;
-mod default_property;
-mod default_materialize;
-mod to_connect_context;
 mod java_schema;
 pub(super) use java_schema::{FixedBytesLimit, SourcePolicy};
 pub(super) use java_schema::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
@@ -47,12 +41,12 @@ impl AvroPlan {
     pub fn parse_version(text: &str, references: &[String], options: &BTreeMap<String, String>, version: Option<i32>) -> Result<Self> {
         Self::parse_version_index(text, references, options, version, &mut 0)
     }
+    #[cfg(test)]
     pub fn parse_version_index(text: &str, references: &[String], options: &BTreeMap<String, String>, version: Option<i32>, next_union: &mut i32) -> Result<Self> {
         let datum = Arc::new(AvroDatumPlan::parse(text, references, options)?);
         let connect = datum.build_connect(None, version, next_union)?;
         Ok(Self { datum, branch: None, connect, charges: Vec::new() })
     }
-    pub fn datum_plan(&self) -> &AvroDatumPlan { &self.datum }
     pub fn convert(&self, datum: AvroDatum, next_union: &mut i32, context: &mut ConversionContext) -> Result<ConnectData> {
         self.datum.retain_source(context)?;
         datum.plan.retain_source(context)?;
@@ -97,8 +91,7 @@ fn naming_references(references: Vec<String>) -> Result<Vec<String>> {
     Ok(named)
 }
 impl AvroDatumPlan {
-    /// Admits and retains the bounded same-input source/native assembly; Connect graph/default conversion remains a separate stage.
-    /// Uses the unregistered LogicalTypes profile; threshold-dependent Fixed Decimal precision reports a required source-math observation.
+    #[cfg(test)]
     pub fn parse_admitted_source(
         text: &str,
         references: &[String],
@@ -108,6 +101,7 @@ impl AvroDatumPlan {
     ) -> Result<Self> {
         java_schema::ParsedPair::parse(text, references, options, policy, context).map(java_schema::ParsedPair::into_datum)
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn parse_admitted_source_with_logical(
         text: &str,
         references: &[String],
@@ -119,8 +113,7 @@ impl AvroDatumPlan {
         java_schema::ParsedPair::parse_with_logical(text, references, options, policy, logical, context)
             .map(java_schema::ParsedPair::into_datum)
     }
-    /// Borrows charged, stable source documents through same-input canonical/native assembly.
-    /// Uses the bounded scalar-only standard-JSON input profile; unmatched units require the source JavaText Reader path.
+    #[cfg(test)]
     pub fn parse_admitted_java_text(
         text: rtdb_types::java_text::JavaText<'_>,
         references: &[rtdb_types::java_text::JavaText<'_>],
@@ -135,6 +128,7 @@ impl AvroDatumPlan {
         if let Some(source) = &self.source { source.retain(context)?; }
         Ok(())
     }
+    #[cfg(test)]
     pub fn parse(text: &str, references: &[String], options: &BTreeMap<String, String>) -> Result<Self> {
         Self::parse_with_name_policy(text, references, options, None)
     }
@@ -142,7 +136,7 @@ impl AvroDatumPlan {
         let defaults = default_json::Defaults::parse(text, references)?;
         let metadata_text = default_json::metadata_text(text)?;
         let metadata_references = references.iter().map(|text| default_json::metadata_text(text)).collect::<Result<Vec<_>>>()?;
-        let metadata = metadata::Metadata::new(&metadata_text, &metadata_references, options, None)?;
+        let metadata = metadata::Metadata::new(&metadata_text, &metadata_references, options)?;
         let unions = graph::UnionOptions::parse(options)?;
         let reader = reader::ReaderMode::parse(options)?;
         let schema_bytes = references.iter().try_fold(text.len(), |bytes, text| bytes.checked_add(text.len()).ok_or_else(|| error("allocation-overflow", "Avro schema size overflow")))?;

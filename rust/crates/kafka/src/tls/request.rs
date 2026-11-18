@@ -1,5 +1,5 @@
 use std::{ffi::c_void, sync::{Arc, OnceLock}};
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::ForeignTypeRef;
 use openssl::{error::ErrorStack, ex_data::Index, ssl::{Ssl, SslContextBuilder, SslRef}};
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;

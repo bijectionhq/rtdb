@@ -3,19 +3,16 @@ use rtdb_types::{Result, Value};
 use serde_json::Value as Json;
 use super::{ConnectSchema, SchemaKind, error};
 
-pub(super) struct Metadata { root: Json, names: BTreeMap<String, Json>, connect: bool, discard_docs: bool, version: Option<i32>, generalized: bool }
+pub(super) struct Metadata { root: Json, names: BTreeMap<String, Json>, connect: bool, discard_docs: bool, generalized: bool }
 impl Metadata {
-    pub fn new(text: &str, references: &[String], options: &BTreeMap<String, String>, version: Option<i32>) -> Result<Self> {
+    pub fn new(text: &str, references: &[String], options: &BTreeMap<String, String>) -> Result<Self> {
         let root = serde_json::from_str(text).map_err(|cause| error("avro-schema", cause))?;
         let mut names = BTreeMap::new(); collect(&root, "", &mut names);
         for reference in references { collect(&serde_json::from_str(reference).map_err(|cause| error("avro-schema", cause))?, "", &mut names); }
-        Ok(Self { root, names, connect: super::super::converter::option_bool(options, "connect.meta.data", true)?, discard_docs: super::super::converter::option_bool(options, "discard.type.doc.default", false)?, version, generalized: super::super::converter::option_bool(options, "generalized.sum.type.support", false)? })
+        Ok(Self { root, names, connect: super::super::converter::option_bool(options, "connect.meta.data", true)?, discard_docs: super::super::converter::option_bool(options, "discard.type.doc.default", false)?, generalized: super::super::converter::option_bool(options, "generalized.sum.type.support", false)? })
     }
     pub fn root(&self) -> &Json { &self.root }
     pub fn named(&self, name: &str) -> Option<&Json> { self.names.get(name) }
-    pub fn decorate_node(&self, schema: &ConnectSchema, raw: &Json, default: Option<&Json>, field_doc: Option<&str>, root: bool) -> Result<super::super::schema_graph::Metadata> {
-        self.decorate_node_at_version(schema, raw, default, field_doc, root, self.version)
-    }
     pub fn decorate_node_at_version(&self, schema: &ConnectSchema, raw: &Json, default: Option<&Json>, field_doc: Option<&str>, root: bool, version: Option<i32>) -> Result<super::super::schema_graph::Metadata> {
         let mut schema = self.schema(Arc::new(schema.clone()), raw, default, field_doc, 0)?;
         if root && raw.get("connect.version").is_none() && !raw.is_array() && !raw.get("type").is_some_and(Json::is_array) {

@@ -12,6 +12,7 @@ impl Properties {
         let (order, charge) = super::property_order::snapshot(&members, context)?;
         Ok(Self { members, order, charges: vec![charge] })
     }
+    #[cfg(test)]
     pub(super) fn equal(&self, other: &Self, context: &mut ConversionContext, depth: usize) -> Result<bool> {
         if std::ptr::eq(self, other) { return Ok(true); }
         for index in &self.order {
@@ -24,14 +25,6 @@ impl Properties {
             if !right.equal(left, context, depth + 1)? { return Ok(false); }
         }
         Ok(true)
-    }
-    pub(super) fn hash(&self, context: &mut ConversionContext, depth: usize) -> Result<i32> {
-        let mut hash = 0i32;
-        for index in &self.order {
-            let (key, value) = self.members.entry(*index);
-            hash = hash.wrapping_add(key.view().java_hash_code() ^ value.hash(context, depth + 1)?);
-        }
-        Ok(hash)
     }
     pub(super) fn retain<'a>(&'a self, context: &mut ConversionContext, seen: &mut json::JsonSeen<'a>) -> Result<()> {
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }

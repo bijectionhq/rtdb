@@ -1,6 +1,6 @@
 use super::*;
 use std::{ffi::CString, ptr};
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::ForeignTypeRef;
 use openssl::{asn1::{Asn1Object, Asn1OctetString, Asn1Time}, hash::MessageDigest, pkcs12::Pkcs12, ssl::{SslContextBuilder, SslContextRef, SslMethod}, symm::Cipher,
     x509::{X509CrlBuilder, X509Extension}};
 use rdkafka::{ClientConfig, client::{Client, DefaultClientContext}, producer::BaseProducer, types::RDKafkaType};

@@ -79,7 +79,6 @@ impl ConnectSchema {
     pub fn resolved(&self) -> std::borrow::Cow<'_, Self> {
         match &self.kind { SchemaKind::Reference(reference) => std::borrow::Cow::Owned(super::schema_graph::Metadata::from_schema(self).schema(reference.resolve().kind)), _ => std::borrow::Cow::Borrowed(self) }
     }
-    pub(crate) fn borrowed(&self) -> super::schema_graph::SchemaView<'_> { super::schema_graph::SchemaView::new(self) }
     pub fn field(&self, name: &str) -> Option<ConnectField> { match &self.resolved().kind { SchemaKind::Struct(fields) => fields.iter().find(|field| field.name == name).cloned(), _ => None } }
     pub(crate) fn view_allocation_bound(&self) -> usize {
         match &self.kind {

@@ -12,16 +12,13 @@ pub(in crate::connect::avro) enum LogicalType {
     Decimal { precision: i32, scale: i32 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::connect::avro) enum LogicalIdentity {
-    Singleton(Builtin),
-    Decimal(SchemaId),
-}
-
 pub(in crate::connect::avro) enum FactoryOutcome {
     NoType,
+    #[cfg(test)]
     RuntimeException,
+    #[cfg(test)]
     Singleton(Builtin),
+    #[cfg(test)]
     UnmodelledType,
 }
 
@@ -80,14 +77,9 @@ impl Builtin {
     }
 }
 impl LogicalType {
+    #[cfg(test)]
     pub(in crate::connect::avro) fn name(self) -> &'static str {
         match self { Self::Builtin(kind) => kind.name(), Self::Decimal { .. } => "decimal" }
-    }
-    fn identity(self, schema: SchemaId) -> LogicalIdentity {
-        match self { Self::Builtin(kind) => LogicalIdentity::Singleton(kind), Self::Decimal { .. } => LogicalIdentity::Decimal(schema) }
-    }
-    pub(in crate::connect::avro) fn decimal_hash(self) -> Option<i32> {
-        match self { Self::Decimal { precision, scale } => Some(precision.wrapping_mul(31).wrapping_add(scale)), _ => None }
     }
 }
 
@@ -95,7 +87,7 @@ fn integer(schema: SchemaView<'_>, key: &str) -> Option<i32> {
     match property(schema, key)?.value() { JsonValue::I32(value) => Some(*value), _ => None }
 }
 fn has_object_property(schema: SchemaView<'_>, key: &str) -> bool {
-    property(schema, key).is_some_and(|node| !matches!(node.value(), JsonValue::Integer(_) | JsonValue::Decimal(_)))
+    property(schema, key).is_some_and(|node| !matches!(node.value(), JsonValue::Integer(_)))
 }
 fn decimal(schema: SchemaView<'_>) -> Option<LogicalType> {
     let precision = integer(schema, "precision")?;
@@ -154,8 +146,12 @@ pub(super) fn construct(
         LogicalType::Builtin(kind)
     } else {
         match environment.factory(name, schema, context)? {
-            FactoryOutcome::NoType | FactoryOutcome::RuntimeException => return Ok(None),
+            FactoryOutcome::NoType => return Ok(None),
+            #[cfg(test)]
+            FactoryOutcome::RuntimeException => return Ok(None),
+            #[cfg(test)]
             FactoryOutcome::Singleton(value) => LogicalType::Builtin(value),
+            #[cfg(test)]
             FactoryOutcome::UnmodelledType => return Err(Anomaly::unsupported(
                 "rtdb/avro-custom-logical-type",
                 "Custom source logical type requires its actual retained class/value model",
@@ -176,8 +172,9 @@ impl SchemasBuilder {
     }
 }
 impl<'a> SchemaView<'a> {
+    #[cfg(test)]
     pub(in crate::connect::avro) fn logical_type(self) -> Option<LogicalType> { self.node().logical }
-    pub(in crate::connect::avro) fn logical_identity(self) -> Option<LogicalIdentity> { self.logical_type().map(|value| value.identity(self.id)) }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn raw_logical_name(self) -> Option<JavaText<'a>> { textual(self, "logicalType") }
 }
 

@@ -1,3 +1,0 @@
-2498d3af7097b373cf5c75280fc22ad6fa2bbaf66a3d9d2832cc8500ed165b9d  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/SchemaBuilder.java
-20f8c2fe25a68cee9a82b238d8dca9aea7423110725aca83ee6a0780d567c696  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/ConnectSchema.java
-6f64acafe927fd899afcb8ba70730152235f3088eb824afb7d882bb90e1949df  kafka-connect-api-4.4.0/org/apache/kafka/connect/data/Struct.java

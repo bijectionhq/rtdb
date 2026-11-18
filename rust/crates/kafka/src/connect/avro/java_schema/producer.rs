@@ -7,7 +7,9 @@ mod java_text;
 mod string_reader;
 pub(in crate::connect) use string_reader::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
 use native_bound::NativeFootprint;
-pub(in crate::connect::avro) use pair::{AdmittedSource, ParsedPair, PairSelection};
+pub(in crate::connect::avro) use pair::AdmittedSource;
+#[cfg(test)]
+pub(in crate::connect::avro) use pair::ParsedPair;
 
 #[derive(Clone, Copy)]
 pub(in crate::connect) struct SourcePolicy { pub validate_defaults: bool, pub fixed_bytes: FixedBytesLimit }
@@ -16,9 +18,11 @@ struct Producer<'a> { builder: SchemasBuilder, policy: SourcePolicy, native: Nat
 const SCHEMA_RESERVED: &[&str] = &["doc", "fields", "items", "name", "namespace", "size", "symbols", "values", "type", "aliases"];
 const FIELD_RESERVED: &[&str] = &["default", "doc", "name", "order", "type", "aliases"];
 
+#[cfg(test)]
 pub(super) fn parse(text: &str, references: &[String], policy: SourcePolicy, context: &mut ConversionContext) -> Result<CanonicalSource> {
     parse_with_logical(text, references, policy, &mut logical::Unregistered, context)
 }
+#[cfg(test)]
 pub(super) fn parse_with_logical(text: &str, references: &[String], policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<CanonicalSource> {
     let mut producer = Producer { builder: SchemasBuilder::new(context)?, policy, native: NativeFootprint::new(), logical };
     for reference in references {
@@ -56,7 +60,7 @@ fn namespace(name: &Name) -> Option<JavaText<'_>> {
 }
 fn vector_bytes<T>(count: usize) -> Result<usize> { add(mul(mul(count, size_of::<T>())?, 16)?, 256) }
 fn number(node: &JsonNode) -> bool {
-    matches!(node.value(), JsonValue::I32(_) | JsonValue::I64(_) | JsonValue::Integer(_) | JsonValue::F32(_) | JsonValue::F64(_) | JsonValue::Decimal(_))
+    matches!(node.value(), JsonValue::I32(_) | JsonValue::I64(_) | JsonValue::Integer(_) | JsonValue::F64(_))
 }
 impl Producer<'_> {
     fn lookup(&mut self, reference: JavaText<'_>, space: Option<JavaText<'_>>, fallback: bool, context: &mut ConversionContext) -> Result<SchemaId> {

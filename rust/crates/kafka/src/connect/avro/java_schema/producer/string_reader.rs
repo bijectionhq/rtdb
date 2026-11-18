@@ -44,6 +44,7 @@ impl SchemaStringFactory {
         })();
         match session.close(buffers, context) { Err(cause) => Err(cause), Ok(()) => result }
     }
+    #[cfg(test)]
     pub(super) fn parse_canonical(
         &self, text: JavaText<'_>, references: &[JavaText<'_>], buffers: &mut dyn InputBuffers,
         intern: &mut dyn InternAuthority, policy: SourcePolicy, logical: &mut dyn LogicalEnvironment,

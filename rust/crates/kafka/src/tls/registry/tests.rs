@@ -1,4 +1,5 @@
 use super::*;
+use foreign_types::ForeignType;
 use openssl::ssl::{Ssl, SslMethod, SslOptions, SslStream, SslVersion};
 use rtdb_columnar::MemoryBudget;
 use rtdb_tls::{StoreFormat, StoreUse};

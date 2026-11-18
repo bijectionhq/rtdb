@@ -1,9 +1,9 @@
-= Canonical Avro schema relations and cycle collections
+= Canonical Avro schema objects
 
-The canonical module is registered for owned source objects, scoped Schema relations, cycle collections and explicit admitted-source datum assembly.
+The canonical module is registered for owned source objects and explicit admitted-source datum assembly.
 link:producer/ADMITTED-OWNER.adoc[] records that actual datum-plan ownership and its consumer retention.
 The Registry entry still uses the legacy parser, and canonical graph/default/conversion/SMT/writer consumers remain required before full activation.
-The relation/cycle, producer and subsequent logical regression sources have not been compiled or executed under the Phase 1 work order.
+The producer and subsequent logical regression sources have not been compiled or executed under the Phase 1 work order.
 
 == Objects and lifetime
 
@@ -26,8 +26,8 @@ Namespace text is not subjected to simple-name character validation.
 The declaration binding tree is a producer index over validated names, rather than an implementation of the source parser's HashMap allocation and diagnostic stages.
 
 JsonNode is an immutable admitted Arc handle to one concrete source node value.
-Integer, Long, BigInteger, Float, Double and Decimal remain separate node classes.
-BigInteger coefficients are unbounded admitted magnitude words, and Decimal preserves its admitted coefficient and signed scale without a writer digit limit.
+Integer, Long, BigInteger and Double remain separate node classes.
+BigInteger coefficients are unbounded admitted magnitude words.
 The supported node domain contains concrete parsed-JSON values and non-null numeric/text factory payloads.
 Programmatic BinaryNode, POJONode and MissingNode values are outside this schema-document input domain.
 Programmatic TextNode, BigIntegerNode and DecimalNode constructors carrying Java null are outside that domain and are not collapsed to NullNode.
@@ -37,49 +37,9 @@ JsonNode owners retain child handles, text storage and coefficient storage after
 
 == Schema operations
 
-Each source node owns an AtomicI32 hash memo initialized to Integer.MIN_VALUE.
-Public hashCode consults and stores that memo; a computed Integer.MIN_VALUE remains the source sentinel and is recomputed on the next call.
-computeHash remains a separate operation.
-Field, Array, Map and Union hash computation calls child computeHash directly and bypasses child public hash memos.
-Record hash tracks identity across the whole outer computation, including repeated child records, and clears only in the source outer finally stage.
-
-Schema equality first preserves source object identity, source class/type and the cached-hash guard.
-Record equality then checks name and properties before SeenPair contains/add and ordered fields.
-Array and Map compare the child before properties.
-Union and record LockableArrayList comparisons visit the common prefix before checking the final list lengths.
-Enum defaults, docs, aliases and record error flags do not participate in the pinned equality/hash relations.
-Field equality checks name, schema, raw default, field order and properties, while Field.hashCode uses only name and child computeHash.
-The raw default NaN rule uses node double-accessor semantics, rather than the text asDouble coercion.
 FixedSchema receives an explicit FixedBytesLimit effective policy, with DEFAULT equal to Integer.MAX_VALUE-8.
 The pinned SystemLimitException check runs after named-schema validation, then rejects negative size, size above that VM array cap and size above the effective bytes limit.
 Effective signed limits preserve the source unsigned-property parser result, including negative wrapped values; the native constructor does not discover environment properties.
-Decimal accessor formatting scratch is admitted at that demand; it is distinct from the allocation-free numeric Decimal equality relation.
-
-Witness is a synchronous borrowed source-operation authority.
-Type.hashCode and System.identityHashCode observations belong to source class/object identities and must remain stable while those objects are retained.
-Native region IDs, Pair IDs and allocation addresses are not Java identity hash observations.
-The witness includes Enum.hashCode's source memo semantics rather than requiring a new identity-hash call at every type hash.
-
-== Recursion and cycle collections
-
-RecursionState is a passive caller-owned logical Java-thread value.
-Its lazy seen-hash IdentityTable and seen-equality HashSet retain warmed storage across top-level operations and fresh ConversionContexts.
-Evaluation borrows it, the current admission scope and the witness for a synchronous operation.
-IdentityTable models eager default storage, identity hashing on empty lookup, resize/retry hash order, closeDeletion and clear with retained geometry.
-SeenPair retains its two canonical schema handles and its distinct source Pair identity.
-Its ordinary equality compares both schema identities and its hash adds their source identity hashes.
-The shared admitted HashMap supplies actual HashSet hash filtering, collision traversal, tree geometry and first-key retention.
-A native failed table mutation poisons the unpublished state; it is not a claim about JVM recovery from OutOfMemoryError.
-
-CycleContext is a passive graph-construction transient owning IdentityTable cycleReferences and an actual structural Schema HashSet for detectedCycles.
-Record registration and cached-record seeding share the canonical object.
-A reference checks identity containsKey, inserts into the detected-cycle HashSet, then performs a separate identity get to select the wrapper target.
-Finish checks detected-set membership, then identity containsKey and identity remove when required.
-The detected set invokes these actual Avro hash/equality relations at insertion and lookup, rather than deferring structural comparison until finish.
-Target tokens are copied identities; the creating graph/cache owner retains their graph objects separately.
-CycleContext retention walks actual collection keys and their arenas, without a parallel owner table.
-One admitted borrowed RetainSeen deduplicates actual creating arenas across both tables and shares JsonSeen scratch for the call.
-Each arena is walked once even when many record keys and detected-cycle keys retain it.
 
 == Property maps
 
@@ -96,19 +56,18 @@ The existing producer expiry-map algorithm supplied source evidence only; its sp
 
 == Native traversal scope
 
-Hash, compute, equality and JSON/default retention enforce a native demand-depth limit of 128.
+JSON/default retention enforces a native demand-depth limit of 128.
 A deeper demanded traversal returns avro-native-traversal-limit even when the schema/value is valid for Java.
 This is an explicit partial native resource boundary; the pinned Avro/JVM has no equivalent fixed depth limit of 128.
 The depth counts field/property operation boundaries as well as recursive containers, and source identity/cache/size fast paths can avoid a deeper demand.
-The callable Evaluation, JsonNode and SchemaHandle retention contracts state this boundary.
+The JsonNode and SchemaHandle retention contracts state this boundary.
 It must not be presented as unrestricted Avro relation or retention support at production activation.
 
 == Admission and activation boundary
 
 Owners reserve checked storage before allocation and retain leases after temporary conversion scopes drop.
 Native growth reservations retain overlap with replaced vector/table storage.
-Cached owner recounting includes text, JSON, collection geometry and warmed recursion storage.
-Callers retain SchemaHandle owners independently of equality/hash demands, so a source identity fast path does not invent a payload traversal.
+Cached owner recounting includes text, JSON and collection geometry.
 
 The constructor accepts a validated parsed-schema snapshot and preserves canonical object/value relations.
 Field/default validation, reserved-property screening and declaration-order diagnostics belong to that producer boundary; this constructor is not an alternative raw Avro parser.
@@ -116,7 +75,6 @@ It does not yet implement the complete raw parser and mutable addProp error/allo
 Production input integration must select the actual parser numeric-node profile and apply Schema.parse's textual Float/Double field-default conversion before Field construction.
 The coordinated exact UTF16 response/document decoder and canonical name gate must supply those objects without a replacement Rust String schema tree.
 The Connect typed arena preserves exact UTF16 text; the complete document/input and consumer wiring remains coordinated integration work.
-The old ToConnectContext seam remains unchanged until graph wiring is released.
 Full graph/default provenance, generalized union selection, arbitrary-key conversion, cache import ownership, native data ownership, downstream SMT and writer admission remain activation work.
 
 The existing A09 array[String] connect.default:[null] suppression assertion is unchanged.

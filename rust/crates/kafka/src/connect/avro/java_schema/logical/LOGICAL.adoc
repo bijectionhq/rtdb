@@ -11,9 +11,6 @@ Aliases remain absent during logical factory callbacks and are installed afterwa
 Node is a passive schema-object value within the immutable Schemas owner.
 It owns an optional LogicalType source-class/value sum, with storage admitted through the actual Node slot size.
 No duplicate logical-property tree or additional payload allocation is retained.
-Pinned built-in instances are class singletons; a direct decimal declaration creates a fresh Decimal identity scoped to its actual schema node.
-Decimal ordinary equality compares precision and scale, and hash is31*precision+scale with Java int wrapping, despite those distinct object identities.
-Schema equality/hash ignores the constructed logical object and continues to use the unchanged raw properties.
 
 Construction obtains logicalType only from a textual property and matches the built-in names case-sensitively.
 Unknown names reach the supplied factory environment.

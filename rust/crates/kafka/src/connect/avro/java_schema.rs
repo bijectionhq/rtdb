@@ -7,26 +7,23 @@ use rtdb_columnar::MemoryReservation;
 use rtdb_types::{Anomaly, Result, java_text::JavaText};
 use super::{error, super::ConversionContext};
 
-mod identity;
 mod text;
 mod names;
 mod json;
 mod properties;
 mod property_order;
-mod evaluation;
-mod context;
 mod producer;
 mod logical;
 pub(super) use text::Text;
 pub(super) use names::Name;
 pub(super) use json::{JsonNode, JsonValue, Members};
 pub(super) use properties::Properties;
-pub(super) use evaluation::{Evaluation, RecursionState, Witness};
-pub(super) use context::{CycleContext, CycleReference};
-pub(super) use producer::{AdmittedSource, ParsedPair, PairSelection};
+pub(super) use producer::AdmittedSource;
+#[cfg(test)]
+pub(super) use producer::ParsedPair;
 pub(in crate::connect) use producer::SourcePolicy;
 pub(in crate::connect) use producer::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
-pub(in crate::connect::avro) use logical::{Builtin as LogicalBuiltin, FactoryOutcome, LogicalEnvironment, LogicalIdentity, LogicalType};
+pub(in crate::connect::avro) use logical::{LogicalEnvironment, LogicalType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct SchemaId { region: u64, index: usize }
@@ -156,6 +153,7 @@ fn validate_named(name: &Name) -> Result<()> {
 
 impl FixedBytesLimit {
     pub(in crate::connect) const DEFAULT: Self = Self { effective: MAX_ARRAY_VM_LIMIT };
+    #[cfg(test)]
     pub(in crate::connect) fn effective(value: i32) -> Self { Self { effective: value } }
     fn check(self, size: i32) -> Result<()> {
         if size < 0 {
@@ -283,11 +281,6 @@ impl SchemasBuilder {
         self.owner.nodes[id.index].hash.store(NO_HASHCODE, Ordering::Relaxed);
         Ok(())
     }
-    pub(super) fn annotations_with(&mut self, id: SchemaId, doc: Option<Text>, bound: usize, context: &mut ConversionContext, build: impl FnOnce() -> Result<Vec<Name>>) -> Result<()> {
-        self.aliases_with(id, bound, context, build)?;
-        self.owner.nodes[id.index].doc = doc;
-        Ok(())
-    }
     pub(super) fn named_doc(&mut self, id: SchemaId, doc: Option<Text>) -> Result<()> {
         self.require(id)?;
         if named(&self.owner.nodes[id.index].kind).is_none() { return Err(invalid("Unnamed Avro type cannot receive named annotations")); }
@@ -301,6 +294,7 @@ impl SchemasBuilder {
         self.owner.nodes[id.index].aliases = build()?;
         Ok(())
     }
+    #[cfg(test)]
     pub(super) fn reference(&mut self, name: JavaText<'_>, namespace: Option<JavaText<'_>>, context: &mut ConversionContext) -> Result<SchemaId> {
         if let Some(kind) = primitive(name) { return self.primitive(kind, context); }
         let resolved = Name::new(Some(name), namespace, context)?;
@@ -325,13 +319,18 @@ impl Schemas {
     }
 }
 impl SchemaHandle {
+    #[cfg(test)]
     pub(super) fn at(&self, id: SchemaId) -> Result<Self> {
         self.owner.require(id)?;
         Ok(Self { owner: Arc::clone(&self.owner), id })
     }
+    #[cfg(test)]
     pub(super) fn id(&self) -> SchemaId { self.id }
+    #[cfg(test)]
     pub(super) fn view(&self) -> SchemaView<'_> { SchemaView { owner: &self.owner, id: self.id } }
+    #[cfg(test)]
     pub(super) fn same_object(&self, other: &Self) -> bool { self.id == other.id && Arc::ptr_eq(&self.owner, &other.owner) }
+    #[cfg(test)]
     pub(super) fn is_record(&self) -> bool { matches!(&self.owner.nodes[self.id.index].kind, Kind::Record { .. }) }
     /// JSON/default traversal can return avro-native-traversal-limit beyond the native traversal depth limit of 128.
     pub(super) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
@@ -385,6 +384,7 @@ impl SchemaHandle {
 }
 impl<'a> SchemaView<'a> {
     fn node(self) -> &'a Node { &self.owner.nodes[self.id.index] }
+    #[cfg(test)]
     fn child(self, id: SchemaId) -> Result<SchemaView<'a>> {
         self.owner.require(id)?;
         Ok(SchemaView { owner: self.owner, id })

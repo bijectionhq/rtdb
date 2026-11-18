@@ -41,12 +41,14 @@ impl ProjectedInputs {
     }
 }
 
+#[cfg(test)]
 fn scalar(point: u32) -> Result<char> {
     char::from_u32(point).ok_or_else(|| Anomaly::unsupported(
         "rtdb/avro-java-text-reader-required",
         "Unmatched schema input units require the source JavaText Reader path",
     ))
 }
+#[cfg(test)]
 fn length(source: JavaText<'_>) -> Result<usize> {
     let mut bytes = 0usize;
     for point in source.code_points() {
@@ -55,6 +57,7 @@ fn length(source: JavaText<'_>) -> Result<usize> {
     }
     Ok(bytes)
 }
+#[cfg(test)]
 fn project(source: JavaText<'_>, context: &mut ConversionContext) -> Result<Projection> {
     let bytes = length(source)?;
     let charge = context.reserve(add(mul(bytes, 16)?, 256)?)?;
@@ -64,6 +67,7 @@ fn project(source: JavaText<'_>, context: &mut ConversionContext) -> Result<Proj
     Ok(Projection { text, charge })
 }
 
+#[cfg(test)]
 pub(super) fn parse(
     text: JavaText<'_>, references: &[JavaText<'_>], policy: SourcePolicy,
     logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext,

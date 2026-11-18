@@ -1,23 +1,33 @@
 use super::*;
+#[cfg(test)]
 use serde_json::value::RawValue;
+#[cfg(test)]
 use crate::connect::json_value::RawObject;
 use rtdb_types::jvm_number::{Error as NumberError, Number};
+#[cfg(test)]
 pub(super) const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+#[cfg(test)]
 const MAX_TEXT_UNITS: usize = 50_000;
+#[cfg(test)]
 const MAX_NUMBER_BYTES: usize = 1000;
 
+#[cfg(test)]
 pub(super) fn profile_limit() -> Anomaly { Anomaly::unsupported("xtdb.kafka-connect-source/unsupported-avro-input-profile", "Input exceeds the bounded standard-JSON schema document profile") }
 
+#[cfg(test)]
 pub(super) fn parse(text: &str, context: &mut ConversionContext) -> Result<JsonNode> {
     if text.len() > MAX_DOCUMENT_BYTES { return Err(profile_limit()); }
     context.reserve(bytes(text.len(), size_of::<usize>())?)?;
     let raw = json::<&RawValue>(text)?;
     value(raw, context, 0)
 }
+#[cfg(test)]
 fn json<'a, T: serde::Deserialize<'a>>(text: &'a str) -> Result<T> {
     serde_json::from_str(text).map_err(|cause| error("avro-native-json-input", cause))
 }
+#[cfg(test)]
 fn bytes(count: usize, item: usize) -> Result<usize> { add(mul(mul(count, item)?, 16)?, 4096) }
+#[cfg(test)]
 fn value(raw: &RawValue, context: &mut ConversionContext, depth: usize) -> Result<JsonNode> {
     guard_depth(depth, "Schema document exceeds the native traversal depth limit of 128")?;
     match raw.get().as_bytes().first() {

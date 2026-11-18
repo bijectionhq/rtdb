@@ -200,15 +200,6 @@ impl DecodeBudget {
     fn new(encoded_bytes: usize) -> Result<Self> { Ok(Self { remaining: encoded_bytes.checked_mul(512).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(|| error("allocation-overflow", "Connect decode budget overflow"))? }) }
     fn claim(&mut self, bytes: usize) -> Result<()> { self.remaining = self.remaining.checked_sub(bytes).ok_or_else(|| error("batch-too-large", "Connect decoded allocation exceeds its reserved bound"))?; Ok(()) }
 }
-pub(super) fn convert(schema: &Option<Arc<ConnectSchema>>, json: &Json, replace: bool, depth: usize) -> Result<Value> {
-    let encoded = json.to_vec().map_err(|cause| error("conversion-error", cause))?;
-    convert_budget(schema, json, replace, depth, &mut DecodeBudget::new(encoded.len())?)
-}
-
-pub(super) fn parse_schema(json: &Json) -> Result<Option<Arc<ConnectSchema>>> {
-    let bytes = json.to_vec().map_err(|cause| error("conversion-error", cause))?;
-    schema(json, true, 0, &mut DecodeBudget::new(bytes.len())?)
-}
 pub(super) fn convert_registry(schema: &Arc<ConnectSchema>, json: &Json, limit: usize) -> Result<Value> {
     registry_value(schema, Some(json), 0, &mut DecodeBudget { remaining: limit })
 }

@@ -1,6 +1,5 @@
 use super::*;
 use crate::tls::{NativeTls, tests::support::{self, Credential}};
-use foreign_types::ForeignType;
 use openssl::{ssl::{Ssl, SslContextBuilder, SslMethod, SslStream, SslVerifyMode, SslVersion}, x509::X509NameBuilder};
 use std::{collections::BTreeMap, io, net::{TcpListener, TcpStream}, thread, time::{Duration, Instant}};
 

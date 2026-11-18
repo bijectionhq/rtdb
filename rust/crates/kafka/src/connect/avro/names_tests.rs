@@ -62,7 +62,6 @@ fn canonical_names_validate_only_suffix_and_preserve_namespace_override_and_empt
         assert_eq!(parts.fullname_bytes().unwrap(), fullname.len());
         assert_eq!(parts.owned_text_bytes().unwrap(), expected_namespace.len() + simple.len());
         assert_eq!(parts.owned().namespace.as_deref(), Some(expected_namespace));
-        assert_eq!(canonical_fullname(input, namespace).unwrap(), fullname);
     }
     assert_eq!(NameParts::parse(".A", None).unwrap(), NameParts::parse("A", Some("")).unwrap());
     for input in ["bad.", ".", "qualified.1A"] { assert!(NameParts::parse(input, Some("parent")).is_err()); }
@@ -83,49 +82,4 @@ fn java_policy_isolated_calls_preserve_global_validation_and_raw_field_aliases()
     assert_eq!(global.namespace.as_deref(), Some(""));
     assert_eq!(global.name, "A");
     assert!(JavaNames.reference_fallback("qualified.A", &None).unwrap().is_none());
-}
-
-#[test]
-fn streaming_scrub_matches_form_url_encoding_then_ascii_word_replacement() {
-    for (input, expected) in [
-        ("", ""), ("_abc9", "_abc9"), ("9start", "x9start"), ("é", "_C3_A9"), ("名", "_E5_90_8D"),
-        ("éA", "_C3_A9A"), ("a b+c%d.e-f*g", "a_b_2Bc_25d_e_f_g"),
-        ("😀", "_F0_9F_98_80"), ("!~'()/#", "_21_7E_27_28_29_2F_23"), ("\0", "_00"), ("9é", "x9_C3_A9"),
-    ] {
-        assert!(LookupName::matches(input, expected, true), "{input}");
-        assert_eq!(LookupName::new(input, true).collect::<Vec<_>>(), expected.as_bytes());
-        assert!(LookupName::matches(input, input, false));
-    }
-    assert!(!LookupName::matches("é", "_c3_a9", true));
-    assert!(!LookupName::matches("é", "é", true));
-    assert!(!LookupName::matches("9start", "9start", true));
-}
-
-#[test]
-fn scrub_collisions_borrow_the_same_actual_child_and_keep_its_physical_schema() {
-    let record = record(r#"{"type":"record","name":"R","fields":[{"name":"é","type":"int"},{"name":"_C3_A9","type":"string"}]}"#);
-    let values = vec![("é".into(), Avro::Int(7)), ("_C3_A9".into(), Avro::String("selected".into()))];
-    let first = record_value(&record, &values, "é", true).unwrap();
-    let second = record_value(&record, &values, "_C3_A9", true).unwrap();
-    assert!(std::ptr::eq(first.value, second.value));
-    assert!(std::ptr::eq(first.value, &values[1].1));
-    assert!(std::ptr::eq(first.schema, &record.fields[1].schema));
-    assert_eq!(first.schema, &Schema::String);
-    let raw = record_value(&record, &values, "é", false).unwrap();
-    assert_eq!(raw.value, &Avro::Int(7));
-    assert_eq!(raw.schema, &Schema::Int);
-    assert_eq!(values.len(), 2);
-}
-
-#[test]
-fn ordinary_record_selection_uses_raw_field_names_and_never_field_aliases() {
-    let record = record(r#"{"type":"record","name":"R","fields":[{"name":"original","aliases":["_C3_A9"],"type":"int"}]}"#);
-    assert!(record.lookup.contains_key("_C3_A9"));
-    assert!(record_field(&record, "é", true).is_none());
-    assert!(record_field(&record, "_C3_A9", false).is_none());
-    assert_eq!(record_field(&record, "original", true).unwrap().0, 0);
-    let values = [("original".into(), Avro::Int(4))];
-    assert!(record_value(&record, &values, "é", true).is_err());
-    assert!(record_value(&record, &[], "original", false).is_err());
-    assert!(record_value(&record, &[("wrong".into(), Avro::Int(4))], "original", false).is_err());
 }

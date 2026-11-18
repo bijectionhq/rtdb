@@ -18,6 +18,7 @@ struct PairOwner<'a> {
     source: &'a SchemaHandle,
 }
 #[derive(Clone, Copy)]
+#[cfg(test)]
 pub(in crate::connect::avro) struct PairSelection<'a> {
     pair: PairOwner<'a>,
     native: &'a Schema,
@@ -45,16 +46,20 @@ fn admit_native<T>(bytes: usize, context: &mut ConversionContext, parse: impl Fn
     Ok((parse()?, charge))
 }
 impl ParsedPair {
+    #[cfg(test)]
     pub(in crate::connect::avro) fn parse(text: &str, references: &[String], options: &BTreeMap<String, String>, policy: SourcePolicy, context: &mut ConversionContext) -> Result<Self> {
         Self::parse_with_logical(text, references, options, policy, &mut logical::Unregistered, context)
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn parse_with_logical(text: &str, references: &[String], options: &BTreeMap<String, String>, policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<Self> {
         let canonical = super::parse_with_logical(text, references, policy, logical, context)?;
         Self::assemble(canonical, text, references, options, context)
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn parse_java_text(text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy, context: &mut ConversionContext) -> Result<Self> {
         Self::parse_java_text_with_logical(text, references, options, policy, &mut logical::Unregistered, context)
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn parse_java_text_with_logical(text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy, logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext) -> Result<Self> {
         let super::java_text::ParsedInput { canonical, inputs } = super::java_text::parse(text, references, policy, logical, context)?;
         Self::assemble(canonical, inputs.root(), inputs.references(), options, context)
@@ -82,8 +87,11 @@ impl ParsedPair {
         Ok(pair)
     }
     fn owner(&self) -> PairOwner<'_> { PairOwner { datum: &self.datum, source: &self.source } }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn root(&self) -> PairSelection<'_> { self.owner().root() }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn definition(&self, name: &str) -> Result<PairSelection<'_>> { self.owner().definition(name) }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn retain(&self, context: &mut ConversionContext) -> Result<()> {
         retain_canonical_then_completion(&self.source, &self.charge, context)
     }
@@ -114,15 +122,19 @@ impl AvroDatumPlan {
         ParsedPair::parse_java_text_with_reader(text, references, options, policy, factory, buffers, intern, &mut logical::Unregistered, context)
             .map(ParsedPair::into_datum)
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn paired_root(&self) -> Option<PairSelection<'_>> {
         self.source.as_ref().map(|source| PairOwner { datum: self, source: &source.root }.root())
     }
+    #[cfg(test)]
     pub(in crate::connect::avro) fn paired_definition(&self, name: &str) -> Result<Option<PairSelection<'_>>> {
         self.source.as_ref().map(|source| PairOwner { datum: self, source: &source.root }.definition(name)).transpose()
     }
 }
 impl<'a> PairOwner<'a> {
+    #[cfg(test)]
     fn root(self) -> PairSelection<'a> { PairSelection { pair: self, native: &self.datum.root, id: self.source.id } }
+    #[cfg(test)]
     fn definition(self, name: &str) -> Result<PairSelection<'a>> {
         let native = self.datum.names.get(name).ok_or_else(|| error("avro-native-pairing", "Native definition is absent"))?;
         let id = self.source.owner.bindings.iter().find_map(|(full, id)| full.view().units().eq(name.encode_utf16()).then_some(*id))
@@ -187,6 +199,7 @@ impl<'a> PairOwner<'a> {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
 impl<'a> PairSelection<'a> {
     pub(in crate::connect::avro) fn canonical(self) -> Result<SchemaHandle> { self.pair.source.at(self.id) }
     /// Borrows the native physical representation; source metadata and default node classes belong to canonical().
