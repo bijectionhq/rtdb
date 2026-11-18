@@ -164,7 +164,7 @@ impl Compiler<'_, '_> {
         for (period, from, to) in [("_valid_time", "_valid_from", "_valid_to"), ("_system_time", "_system_from", "_system_to")] {
             if names.remove(period) { names.insert(from.into()); names.insert(to.into()); }
         }
-        let columns = names.iter().map(|name| self.binder.field(name, None, source_type(&table, name))).collect::<Result<Vec<_>>>()?;
+        let columns = names.iter().map(|name| self.binder.field(name, None, table.scan_column_type(name))).collect::<Result<Vec<_>>>()?;
         let mut temporal_scope = Bound::unit();
         let valid_time = self.temporal(from.valid_time.as_ref(), &mut temporal_scope, parameters)?;
         let system_time = self.temporal(from.system_time.as_ref(), &mut temporal_scope, parameters)?;
@@ -575,13 +575,6 @@ fn binding_variable<'a>(expr: &'a Expr, parameters: &Parameters) -> Option<&'a s
 }
 fn pass_through(bound: &Bound) -> Vec<NamedExpr> { bound.variables.values().map(|field| NamedExpr { field: field.clone(), expr: field.expression() }).collect() }
 fn timestamp_type() -> LogicalType { LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }) }
-fn source_type(table: &TableBinding, name: &str) -> LogicalType {
-    match name {
-        "_valid_from" | "_valid_to" | "_system_from" | "_system_to" => timestamp_type(),
-        "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
-        _ => table.columns.get(name).cloned().unwrap_or(LogicalType::Null),
-    }
-}
 fn field_type(logical: &LogicalType, name: &str) -> LogicalType {
     rtdb_plan::field_type(logical, name)
 }

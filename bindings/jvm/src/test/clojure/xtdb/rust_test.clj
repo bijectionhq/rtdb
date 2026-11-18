@@ -154,6 +154,8 @@
 
 (deftest-original-api original-node/test-array-element-reference-is-one-based-336)
 
+(deftest-original-api original-node/test-nulling-valid-time-columns-2504)
+
 (deftest-original-api original-with/disallow-period-specs-on-ctes-3440)
 
 (deftest-original-api original-expr/duration-literal-query)

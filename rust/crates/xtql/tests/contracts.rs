@@ -198,3 +198,20 @@ fn temporal_period_projection_keeps_hidden_endpoints_out_of_the_result() {
     assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["period"]);
     assert!(find(&relation, &|node| matches!(node, RelationNode::Project { expressions, .. } if expressions.iter().any(|value| matches!(&value.expr, PlanExpr::Call { name, .. } if name == "period")))).is_some());
 }
+
+#[test]
+fn temporal_scan_bounds_admit_null_upper_endpoints() {
+    let source = "(from :docs {:bind [{:xt/valid-from vf, :xt/valid-to vt, :xt/system-from sf, :xt/system-to st}]
+                               :for-valid-time :all-time :for-system-time :all-time})";
+    let result = plan(source);
+    let timestamp = LogicalType::Scalar(ScalarType::Timestamp {
+        unit: rtdb_types::TimeUnit::Microsecond,
+        timezone: Some("UTC".into()),
+    });
+    let fields: BTreeMap<_, _> = result.schema().fields().iter().map(|field| (field.name.as_str(), &field.data_type)).collect();
+    assert_eq!(fields["vf"], &timestamp);
+    assert_eq!(fields["sf"], &timestamp);
+    let nullable = timestamp.maybe();
+    assert_eq!(fields["vt"], &nullable);
+    assert_eq!(fields["st"], &nullable);
+}

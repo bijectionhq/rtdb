@@ -1,5 +1,5 @@
 use crate::{ColumnId, Expr};
-use rtdb_types::{Anomaly, LogicalType, Result, TableRef};
+use rtdb_types::{Anomaly, LogicalType, Result, ScalarType, TableRef, TimeUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,6 +25,19 @@ pub struct TableBinding {
     pub name: QualifiedTable,
     pub oid: Option<i32>,
     pub columns: BTreeMap<String, LogicalType>,
+}
+
+impl TableBinding {
+    /// Resolves a scan column, including virtual bitemporal columns that are absent from document schemas.
+    pub fn scan_column_type(&self, name: &str) -> LogicalType {
+        let timestamp = || LogicalType::Scalar(ScalarType::Timestamp { unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) });
+        match name {
+            "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
+            "_valid_from" | "_system_from" => timestamp(),
+            "_valid_to" | "_system_to" => timestamp().maybe(),
+            _ => self.columns.get(name).cloned().unwrap_or(LogicalType::Null),
+        }
+    }
 }
 
 /// Implementations resolve names, OIDs, and column types from one retained catalog basis.

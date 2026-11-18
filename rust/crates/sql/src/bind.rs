@@ -996,11 +996,8 @@ impl Context<'_> {
                 for name in requested {
                     let period = matches!(name.as_str(), "_valid_time" | "_system_time");
                     let ty = match name.as_str() {
-                        "_iid" => LogicalType::Scalar(ScalarType::FixedSizeBinary(16)),
-                        "_valid_from" | "_system_from" => crate::mutation::instant_type(),
-                        "_valid_to" | "_system_to" => crate::mutation::instant_type().maybe(),
                         "_valid_time" | "_system_time" if purpose == TablePurpose::Query => rtdb_plan::function_type("period", &[crate::mutation::instant_type(), crate::mutation::instant_type().maybe()])?,
-                        _ => binding.columns.get(&name).cloned().unwrap_or(LogicalType::Null),
+                        _ => binding.scan_column_type(&name),
                     };
                     let mut field = self.binder.field(name.clone(), Some(qualifier.clone()), ty)?;
                     if purpose == TablePurpose::Query {
