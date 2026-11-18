@@ -658,16 +658,18 @@ impl Context<'_> {
             Some(ast::GroupByExpr::Expressions(expressions, modifiers)) if modifiers.is_empty() => expressions,
             _ => return Err(unsupported("GROUP BY ALL or grouping sets")),
         };
+        let empty_grouping_set = groups.iter().any(|group| matches!(group, ast::Expr::Tuple(elements) if elements.is_empty()));
+        let groups = groups.iter().filter(|group| !matches!(group, ast::Expr::Tuple(elements) if elements.is_empty())).collect::<Vec<_>>();
         let mut aggregate_calls = Vec::new();
         for item in projection {
             if let ast::SelectItem::UnnamedExpr(expr) | ast::SelectItem::ExprWithAlias { expr, .. } = item { crate::expression::aggregate_calls(expr, &mut aggregate_calls)?; crate::expression::aggregate_notices(expr, &mut self.notices); }
         }
         if let Some(having) = select.having { crate::expression::aggregate_calls(having, &mut aggregate_calls)?; crate::expression::aggregate_notices(having, &mut self.notices); }
-        let inferred_scope = (groups.is_empty() && !aggregate_calls.is_empty())
+        let inferred_scope = (groups.is_empty() && !empty_grouping_set && !aggregate_calls.is_empty())
             .then(|| input.schema().clone());
         let mut replacements = BTreeMap::new();
         let mut named_groups = Vec::new();
-        for (index, group) in groups.iter().enumerate() {
+        for (index, &group) in groups.iter().enumerate() {
             let group = ordinal_projection(group, projection)?.unwrap_or(group);
             let expr = self.relational_expr(group, &mut input, &BTreeMap::new())?;
             let source = match &expr {
@@ -704,7 +706,7 @@ impl Context<'_> {
             let grouped = aggregate_relation(input, keys, aggregates)?;
             (deferred.bind(grouped)?, projected, names)
         } else {
-            if !named_groups.is_empty() || !aggregates.is_empty() {
+            if !named_groups.is_empty() || !aggregates.is_empty() || empty_grouping_set {
                 input = aggregate_relation(input, named_groups, aggregates)?;
             }
             let (projected, names) = self.select_outputs(
@@ -723,7 +725,7 @@ impl Context<'_> {
             retained.extend(projected);
             input = Arc::new(input.project(retained)?);
             let mut order_replacements = replacements.clone();
-            for group in groups {
+            for &group in &groups {
                 let group = ordinal_projection(group, projection)?.unwrap_or(group);
                 if crate::expression::references_unqualified_names(group, &names) { order_replacements.remove(&ReplacementKey::Expression(group.to_string())); }
             }
@@ -744,6 +746,8 @@ impl Context<'_> {
         if select.distinct {
             input = Arc::new(Relation::new(input.schema().clone(), RelationNode::Distinct { input })?);
         }
+        // The reference parses `GROUP BY ()` but its plan never conforms, so the rest of the query is bound first for its errors to take precedence.
+        if empty_grouping_set { return Err(Anomaly::incorrect("xtdb.query/invalid-query-plan", "internal error conforming query plan")); }
         Ok(input)
     }
 

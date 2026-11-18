@@ -98,6 +98,18 @@ async fn inferred_group_keys_include_outer_columns_demanded_by_projection_subque
     assert_eq!(rows, expected);
 }
 
+#[test]
+fn empty_grouping_sets_fail_as_the_reference_plan_does() {
+    let context = context();
+    for query in ["SELECT COUNT(*) AS n FROM (VALUES (1), (2)) t(x) GROUP BY ()", "SELECT 1 AS n FROM (VALUES (1)) t(x) GROUP BY ()",
+        "SELECT x, COUNT(*) AS n FROM (VALUES (1), (2)) t(x) GROUP BY x, ()"] {
+        let error = prepare(query, &context.catalog, &PrepareOptions::default()).unwrap_err();
+        assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.query/invalid-query-plan", Some("internal error conforming query plan")), "{query}");
+    }
+    assert_eq!(prepare("SELECT x, COUNT(*) AS n FROM (VALUES (1)) t(x) GROUP BY ()", &context.catalog, &PrepareOptions::default()).unwrap_err().code, "xtdb/column-not-found",
+        "an empty grouping set leaves no group key to infer");
+}
+
 #[tokio::test]
 async fn inferred_group_keys_include_having_windows_and_wildcards() {
     let context = context();
