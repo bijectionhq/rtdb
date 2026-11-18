@@ -659,6 +659,44 @@ async fn dbeaver_namespace_projection_is_rewritten_only_for_the_whole_simple_mes
 }
 
 #[tokio::test]
+async fn extended_namespace_rewrite_preserves_the_registration_after_a_case_mismatch() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let query = "SELECT n.oid,n.*,d.description FROM pg_catalog.pg_namespace n LEFT OUTER JOIN pg_catalog.pg_description d ON d.objoid=n.oid AND d.objsubid=0 AND d.classoid='pg_namespace'::regclass ORDER BY nspname";
+    let describe = b"Snamespace\0";
+    client.parse("namespace", query, &[]).await;
+    client.send(b'D', describe).await;
+    client.send(b'S', &[]).await;
+    let prepared = client.through(b'Z').await;
+    assert_eq!(tags(&prepared), b"1tTZ");
+    assert_eq!(prepared[1].1, b"\0\0");
+    assert_eq!(prepared[3].1, b"I");
+    let (count, mut fields) = prepared[2].1.split_at(2);
+    assert_eq!(count, &5u16.to_be_bytes());
+    for name in ["oid", "nspname", "nspowner", "nspacl", "description"] {
+        let end = fields.iter().position(|&byte| byte == 0).unwrap();
+        assert_eq!(&fields[..end], name.as_bytes());
+        fields = &fields[end + 19..];
+    }
+    assert!(fields.is_empty());
+
+    client.parse("namespace", &query.to_ascii_lowercase(), &[]).await;
+    client.send(b'S', &[]).await;
+    let rejected = client.through(b'Z').await;
+    assert_eq!(tags(&rejected), b"EZ");
+    let message = rejected[0].1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"M"));
+    assert_eq!(message, Some(b"Duplicate column projection: oid".as_slice()));
+    assert_eq!(rejected[1].1, b"I");
+
+    client.send(b'D', describe).await;
+    client.send(b'S', &[]).await;
+    let retained = client.through(b'Z').await;
+    assert_eq!(retained.as_slice(), &prepared[1..]);
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn whole_simple_keyword_marker_ignores_its_suffix_and_preserves_explicit_status() {
     let running = Running::start(ServerConfig::default(), None).await;
     let mut client = Client::connect(&running.server, None).await;

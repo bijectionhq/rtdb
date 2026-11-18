@@ -1,6 +1,6 @@
 use std::{borrow::Cow, collections::BTreeMap};
 use std::sync::Arc;
-use rtdb_columnar::{MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_read_value_bytes, read_value};
 use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlResult, NativeSession, Node, PreparedSql, TransactionStatus, control_schema};
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
@@ -179,6 +179,7 @@ impl ProtocolSession {
             control_shape(PreparedControl::Extended(control), oids.len())?
         } else {
             let context = self.session.prepare_context(&self.token()).await?;
+            let _rewrite_syntax = admit_rewrite_syntax(original.len(), source.len(), &context.memory)?;
             let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
             sql_shape(PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?, oids.len())
         };
@@ -595,6 +596,14 @@ fn replace_namespace_query<'source>(source: &'source str, (body, suffix): (&str,
     }
 }
 
+fn admit_rewrite_syntax(original_bytes: usize, rewritten_bytes: usize, memory: &Arc<MemoryBudget>) -> Result<Option<Arc<MemoryReservation>>> {
+    if rewritten_bytes <= original_bytes { return Ok(None); }
+    let too_large = || protocol("Prepared statement is too large");
+    let original = rtdb_sql::statement_syntax_estimate(original_bytes).ok_or_else(too_large)?;
+    let rewritten = rtdb_sql::statement_syntax_estimate(rewritten_bytes).ok_or_else(too_large)?;
+    Ok(Some(memory.reserve(rewritten - original)?))
+}
+
 #[cfg(test)]
 mod tests {
     use rtdb_sql::BatchStatement;
@@ -659,6 +668,35 @@ mod tests {
     }
 
     #[test]
+    fn extended_namespace_rewrite_admits_only_syntax_growth_over_the_full_input() {
+        let original = DBEAVER_NAMESPACE_QUERY.len();
+        let rewritten = DBEAVER_NAMESPACE_REPLACEMENT.len();
+        let initial = rtdb_sql::statement_syntax_estimate(original).unwrap();
+        let growth = 3328;
+        let short = MemoryBudget::new(initial + growth - 1);
+        let classification = short.reserve(initial).unwrap();
+        let error = admit_rewrite_syntax(original, rewritten, &short).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(short.peak_bytes(), initial);
+        assert_eq!(short.used_bytes(), initial);
+        drop(classification);
+        assert_eq!(short.used_bytes(), 0);
+
+        let exact = MemoryBudget::new(initial + growth);
+        let classification = exact.reserve(initial).unwrap();
+        let extra = admit_rewrite_syntax(original, rewritten, &exact).unwrap().unwrap();
+        assert_eq!(extra.bytes(), growth);
+        assert_eq!(exact.used_bytes(), rtdb_sql::statement_syntax_estimate(rewritten).unwrap());
+        for padded in [rewritten, rewritten + 1] {
+            assert!(admit_rewrite_syntax(padded, rewritten, &exact).unwrap().is_none());
+        }
+        drop(extra);
+        assert_eq!(exact.used_bytes(), initial);
+        drop(classification);
+        assert_eq!(exact.used_bytes(), 0);
+    }
+
+    #[test]
     fn keyword_prefix_distinguishes_openjdk_locale_independent_and_dependent_spellings() {
         for (spelling, expected) in [
             ("StriNG", KeywordPrefix::MatchesEveryLocale),
@@ -718,6 +756,79 @@ mod tests {
         let startup = Startup { parameters: BTreeMap::new(), reservation: node.memory().reserve(0).unwrap() };
         let frontend = ProtocolSession::new(session, node, Arc::new(ServerConfig::default()), startup, Arc::new(CancellationSlot::default()));
         (frontend, driver)
+    }
+
+    #[tokio::test]
+    async fn extended_namespace_rewrite_holds_syntax_growth_through_plan_admission() {
+        let (mut frontend, driver) = test_frontend().await;
+        let memory = Arc::clone(frontend.node.memory());
+        let baseline = memory.used_bytes();
+        let original = DBEAVER_NAMESPACE_QUERY;
+        let rewritten = DBEAVER_NAMESPACE_REPLACEMENT;
+        let padded = format!("{original}{}", " ".repeat(rewritten.len() - original.len()));
+        let syntax_bytes = rtdb_sql::statement_syntax_estimate(rewritten.len()).unwrap();
+
+        let scratch = MemoryBudget::new(32 << 20);
+        let mut options = frontend.options();
+        assert!(rtdb_sql::parse_admitted_control_in(rewritten, &options, &scratch).unwrap().is_none());
+        let control_peak = scratch.peak_bytes();
+        let token = frontend.token();
+        let context = frontend.session.prepare_context(&token).await.unwrap();
+        let context_bytes = memory.used_bytes() - baseline;
+        let probe = context.memory.reserve(1).unwrap();
+        assert_eq!(memory.used_bytes(), baseline + context_bytes + 1);
+        drop(probe);
+        options.default_timezone = context.timezone.clone();
+        options.generate_series_end_exclusive = context.options.generate_series_end_exclusive;
+        let raw = rtdb_sql::prepare_in(rewritten, &context.catalog, &options, &scratch).unwrap();
+        assert_eq!(scratch.used_bytes(), 0);
+        let plan = rtdb_query::PreparedQuery::from_prepared(raw, &scratch).unwrap();
+        let plan_bytes = scratch.used_bytes();
+        drop((plan, context));
+        assert_eq!(scratch.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let before_plan = syntax_bytes + context_bytes + 2 * 1024 + rewritten.len() + 256;
+        let plan_boundary = before_plan + plan_bytes;
+        assert!(plan_boundary - 1 >= syntax_bytes + control_peak);
+
+        let limit = memory.limit_bytes();
+        let previous_peak = memory.peak_bytes();
+        let calibration = memory.reserve(limit / 2 - baseline).unwrap();
+        let calibration_floor = memory.used_bytes();
+        assert!(calibration_floor > previous_peak);
+        let prepared = frontend.prepare_client(&padded, Vec::new()).await.unwrap();
+        let successful_headroom = memory.peak_bytes() - calibration_floor;
+        let retained = memory.used_bytes() - calibration_floor;
+        assert!(successful_headroom >= plan_boundary);
+        assert!(matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(query)) if query.source() == rewritten));
+        drop((prepared, calibration));
+        assert_eq!(memory.used_bytes(), baseline);
+
+        let short = memory.reserve(limit - baseline - plan_boundary + 1).unwrap();
+        let retained_at_plan = memory.used_bytes() + before_plan;
+        let expected = format!("Cannot reserve {plan_bytes} bytes from budget {limit} with {retained_at_plan} retained");
+        for source in [padded.as_str(), original] {
+            let error = frontend.prepare_client(source, Vec::new()).await.err().unwrap();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(error.message.as_deref(), Some(expected.as_str()));
+            assert_eq!(memory.used_bytes(), baseline + short.bytes());
+        }
+        drop(short);
+
+        let exact = memory.reserve(limit - baseline - successful_headroom).unwrap();
+        for source in [padded.as_str(), original] {
+            let prepared = frontend.prepare_client(source, Vec::new()).await.unwrap();
+            assert!(matches!(prepared.ordinary_kind(), Some(PreparedKind::Query(query)) if query.source() == rewritten));
+            assert_eq!(memory.used_bytes(), baseline + exact.bytes() + retained);
+            drop(prepared);
+            assert_eq!(memory.used_bytes(), baseline + exact.bytes());
+        }
+        assert_eq!(memory.peak_bytes(), limit);
+        drop(exact);
+        assert_eq!(memory.used_bytes(), baseline);
+        drop(frontend);
+        driver.close_without_run().await.unwrap();
     }
 
     #[tokio::test]
