@@ -105,5 +105,6 @@ Typed context continues to use the internal Transit JSON wrappers, including non
 `tests/transit.rs` records current and legacy null, empty and text messages, typed-context retention and invalid message-type rejection as unexecuted regression source.
 
 File and stream readers adapt nested dense-union field nullability for Arrow Rust when a union leg can produce null.
+Map keys retain their declared nonnullable field contract.
 The decoded batches retain the declared type IDs, metadata and payload buffers.
 The writer retains the Arrow field flags supplied by the storage schema.

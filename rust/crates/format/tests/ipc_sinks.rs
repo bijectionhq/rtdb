@@ -44,6 +44,34 @@ fn file_and_stream_decoding_admit_logical_nulls_in_nested_dense_unions() {
 }
 
 #[test]
+fn decoding_a_map_preserves_the_nonnullable_union_key_field() {
+    use arrow_array::{Array, MapArray, NullArray, StringArray, StructArray, UnionArray};
+    use arrow_buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow_schema::{Fields, UnionFields};
+    use rtdb_format::ipc::{ArrowFile, ArrowStream};
+    use rtdb_types::Value;
+
+    let legs = UnionFields::try_new([1, 4, 7], [Field::new("null", DataType::Null, true), Field::new("i64", DataType::Int64, false), Field::new("utf8", DataType::Utf8, false)]).unwrap();
+    let keys = UnionArray::try_new(legs, ScalarBuffer::from(vec![4, 7]), Some(ScalarBuffer::from(vec![0, 0])), vec![
+        Arc::new(NullArray::new(0)), Arc::new(Int64Array::from(vec![7])), Arc::new(StringArray::from(vec!["key"])),
+    ]).unwrap();
+    let fields = Fields::from(vec![Field::new("key", keys.data_type().clone(), false), Field::new("value", DataType::Int64, false)]);
+    let entry_field = Arc::new(Field::new("entries", DataType::Struct(fields.clone()), false));
+    let entries = StructArray::try_new(fields, vec![Arc::new(keys), Arc::new(Int64Array::from(vec![1, 2]))], None).unwrap();
+    let map = MapArray::try_new(entry_field, OffsetBuffer::new(ScalarBuffer::from(vec![0, 2])), entries, None, false).unwrap();
+    let schema = Arc::new(Schema::new(vec![Field::new("m", map.data_type().clone(), false)]));
+    let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(map)]).unwrap();
+    let mut file = ArrowFile::open(Arc::from(write_file(&schema, std::slice::from_ref(&batch)).unwrap()), None).unwrap();
+    let mut stream = ArrowStream::open(Arc::from(write_stream(&schema, &[batch]).unwrap()), None).unwrap();
+    for batch in [file.read_page(0).unwrap(), stream.next().unwrap().unwrap()] {
+        assert_eq!(batch.schema(), schema);
+        assert_eq!(rtdb_columnar::read_value(schema.field(0), batch.column(0).as_ref(), 0).unwrap(), Value::Map {
+            entries: vec![(Value::I64(7), Value::I64(1)), (Value::Utf8("key".into()), Value::I64(2))], sorted: false,
+        });
+    }
+}
+
+#[test]
 fn incremental_sinks_match_buffered_jvm_end_markers() {
     let batch = page();
     let expected = write_file(&batch.schema(), std::slice::from_ref(&batch)).unwrap();
