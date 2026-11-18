@@ -737,3 +737,75 @@ async fn locale_dependent_simple_and_extended_keyword_responses_keep_their_descr
     assert_eq!(extended[5].1, b"I");
     drop(client); running.stop().await;
 }
+
+#[tokio::test]
+async fn simple_batch_grammar_errors_preserve_transactions_and_reached_errors_fail_them() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let source = "-- début\r\nSELEC 42 /* tail */ ;  ";
+    let normalized = source.strip_suffix(";  ").unwrap();
+    let syntax = rtdb_sql::parse_statement_batch(normalized, &MemoryBudget::new(1 << 20)).unwrap_err();
+    assert_eq!(syntax.context["position"], serde_json::json!(12));
+    assert_eq!(syntax.context["span"], serde_json::json!({"start": 11, "end": 16}));
+    let expected = rtdb_pg_codec::encode_error(&syntax, rtdb_types::PgType::Json).unwrap();
+
+    let idle = client.query(source).await;
+    assert_eq!(tags(&idle), b"EZ");
+    assert_eq!(idle[1].1, b"I");
+    let detail = idle[0].1.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+    assert_eq!(detail, expected);
+
+    let begun = client.query("BEGIN").await;
+    assert_eq!(tags(&begun), b"CZ");
+    assert_eq!(begun[1].1, b"T");
+    let malformed = client.query(source).await;
+    assert_eq!(tags(&malformed), b"EZ");
+    assert_eq!(malformed[0], idle[0]);
+    assert_eq!(malformed[1].1, b"T");
+    let valid = client.query("SELECT 42").await;
+    assert_eq!(tags(&valid), b"TDCZ");
+    assert_eq!(rows(&valid), [vec![Some(b"42".to_vec())]]);
+    assert_eq!(valid[3].1, b"T");
+    assert_eq!(client.query("ROLLBACK").await.last().unwrap().1, b"I");
+
+    let error_detail = |body: &[u8]| {
+        let detail = body.split(|byte| *byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+        serde_json::from_slice::<serde_json::Value>(detail).unwrap()
+    };
+    for (sql, code) in [("XTQL $$[$$", "xtql/edn-reader"), ("SELECT $0", "xtdb/sql-error")] {
+        assert_eq!(client.query("BEGIN").await.last().unwrap().1, b"T");
+        let failed = client.query(sql).await;
+        assert_eq!(tags(&failed), b"EZ");
+        assert_eq!(failed[1].1, b"E");
+        assert_eq!(error_detail(&failed[0].1)["code"], code);
+        let context = client.query("SELECT 42").await;
+        assert_eq!(tags(&context), b"EZ");
+        assert_eq!(context[1].1, b"E");
+        assert_eq!(error_detail(&context[0].1)["code"], "xtdb/tx-failed");
+        assert_eq!(client.query("ROLLBACK").await.last().unwrap().1, b"I");
+    }
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn single_range_grammar_error_keeps_an_extended_transaction_open_until_sync() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("scalar", "SELECT 42", &[]).await;
+    client.bind("scalar", "scalar").await;
+    client.execute("scalar", 0).await;
+    client.send(b'H', &[]).await;
+    let extended = client.through(b'C').await;
+    assert_eq!(tags(&extended), b"12DC");
+    assert_eq!(rows(&extended), [vec![Some(b"42".to_vec())]]);
+
+    let malformed = client.query("SELEC 42").await;
+    assert_eq!(tags(&malformed), b"EZ");
+    assert_eq!(malformed[1].1, b"T");
+
+    client.send(b'S', &[]).await;
+    assert_eq!(client.through(b'Z').await, vec![(b'Z', b"I".to_vec())]);
+    drop(client);
+    running.stop().await;
+}
