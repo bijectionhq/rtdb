@@ -7,7 +7,6 @@ use rtdb_columnar::{MemoryBudget, MemoryReservation, read_value};
 use rtdb_format::{envelope::ReplicaBody, data::{StoredEvent, StoredOperation}, generated::xtdb::log::proto::{ResolvedTx as WireResolvedTx, resolved_tx::DbOp}};
 use rtdb_format::transit::{self, TransitValue as T};
 use rtdb_index::{Snapshot, StagedWrite, TransactionBuffer};
-use rtdb_plan::Statement;
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryCursor, QueryOptions};
 use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, LogicalType, Result, ScalarType, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
