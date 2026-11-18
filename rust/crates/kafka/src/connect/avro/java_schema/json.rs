@@ -11,6 +11,35 @@ pub(in crate::connect::avro) enum JsonValue {
     Text(Text), Array(Vec<JsonNode>), Object(Members),
 }
 pub(in crate::connect::avro) struct Integer { negative: bool, words: Vec<u32> }
+impl Integer {
+    pub(super) fn with_decimal<T>(&self, context: &mut ConversionContext, use_text: impl FnOnce(&str) -> Result<T>) -> Result<T> {
+        let slots = add(mul(self.words.len(), 2)?, 1)?;
+        context.reserve(add(mul(mul(slots, size_of::<u32>())?, 16)?, 4096)?)?;
+        let mut chunks = Vec::new();
+        chunks.try_reserve_exact(slots).map_err(allocation)?;
+        chunks.push(0u32);
+        for word in self.words.iter().rev() {
+            let mut carry = u64::from(*word);
+            for chunk in &mut chunks {
+                let value = u64::from(*chunk) * (1u64 << 32) + carry;
+                *chunk = (value % 1_000_000_000) as u32;
+                carry = value / 1_000_000_000;
+            }
+            while carry != 0 { chunks.push((carry % 1_000_000_000) as u32); carry /= 1_000_000_000; }
+        }
+        let bound = add(mul(chunks.len(), 9)?, 1)?;
+        context.reserve(add(mul(bound, 16)?, 4096)?)?;
+        let mut text = String::new();
+        text.try_reserve_exact(bound).map_err(allocation)?;
+        if self.negative && chunks.iter().any(|chunk| *chunk != 0) { text.push('-'); }
+        use std::fmt::Write;
+        write!(&mut text, "{}", chunks.last().unwrap()).map_err(|_| invalid("Integer decimal formatting failed"))?;
+        for chunk in chunks[..chunks.len()-1].iter().rev() {
+            write!(&mut text, "{chunk:09}").map_err(|_| invalid("Integer decimal formatting failed"))?;
+        }
+        use_text(&text)
+    }
+}
 pub(in crate::connect::avro) struct Members {
     fields: Vec<(Text, JsonNode)>,
     lookup: Vec<usize>,

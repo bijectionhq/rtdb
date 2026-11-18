@@ -1,0 +1,117 @@
+= Avro String Reader ownership and pairing
+
+SchemaStringFactory reads borrowed JavaText through a distinct retained Avro Schema.FACTORY symbol root, then constructs the canonical schema and its native datum from that same Reader tree.
+ParsedPair::parse_java_text_with_reader and AvroDatumPlan::parse_admitted_java_text_with_reader exercise the complete admitted pairing route.
+These entry points and their module remain test-gated with the shared Reader facade; Registry and the normal converter continue using their existing routes.
+The supplied source document owners remain alive and charged for the synchronous parse.
+No input borrow, parser cursor or callback escapes into the returned datum.
+
+== Source environment and object roles
+
+SchemaStringFactory is a passive persistent handle for one actual Avro factory/classloader profile.
+Its ReaderSymbols root is distinct from Registry's factory/root, even for the same Jackson release.
+The caller supplies the effective factory identity-hash seed and retains that factory across the reference/root parses belonging to it.
+The constructor selects the pinned default mapper and stream constraints, ALLOW_COMMENTS, usable character arrays and no input decorator.
+It does not discover a JVM identity, select a global recycler pool or infer environment overrides.
+
+InternAuthority is a separate borrowed synchronous effective-source operator.
+InputBuffers is the borrowed authority for the actual captured token-buffer recycler slot0.
+TokenRecycler is a passive single-writer captured slot, and TokenBuffer is its exclusive UTF16 storage value with a trailing captured lease.
+Jackson2.16.0 returns a buffer by replacing that slot; Jackson2.21.7 keeps an already larger or equal buffer.
+A reused buffer keeps its actual length, so its buffered trailing content can differ from that of a fresh4000-unit buffer.
+The factory does not retain either borrowed authority.
+
+Session is a passive call-local parser transient owning a child snapshot, token buffer and source closed flag.
+StringInput owns the buffer and cursor while borrowing exact source units.
+The decoder produces the existing admitted JsonNode/Text/Members owners rather than retaining a second serde tree.
+The identifier ranges are immutable BMP data derived from the pinned JDK CharacterData tables.
+Projection and ProjectedInputs are passive call-local owners of backend text and its captured leases.
+No active object, monitor or background work is added.
+
+== String creation, semantic assembly and close
+
+Schema.java115–123 owns FACTORY/MAPPER and enables comments.
+Schema.Parser.parse(String),1456–1499, creates a parser, reads a tree, constructs Schema, checks releaseBuffered output with Java String.trim and closes in finally.
+Confluent AvroSchema.java110–123 parses references in encounter order using that parser before the non-null root.
+
+For at most0x8000 source units, JsonFactory admits/copies the token buffer before taking the child-symbol snapshot.
+For a longer String, the StringReader branch takes the child snapshot before its parser constructor allocates the token buffer.
+The native adapter preserves those two orders and uses the actual shared child.find/intern/release operations.
+Both Jackson2.16.0 and2.21.7 have this split.
+
+The tree contains default mapper Int, Long, BigInteger and Double classes.
+Raw and escaped unmatched units remain exact UTF16 inside names and values.
+Comments follow the source line/block control-character rules; a String BOM remains a token error rather than invoking byte-stream bootstrap.
+Literal token boundaries use Character.isJavaIdentifierPart on a single UTF16 unit.
+link:identifier-proof.json[] records the pinned-data derivation, including independent Latin1 agreement and equality with the published Registry identifier bitmap.
+No host Unicode classification is used for that predicate.
+
+The schema callback runs before the dangling-content check.
+That check examines only the currently buffered tail and treats units at most0x20 as Java trim characters.
+It neither scans unread StringReader content nor parses trailing comments.
+An earlier schema error wins over dangling content.
+An empty readTree result is absent and closes the parser at EOF before the callback; an explicit NullNode remains distinct.
+
+Close sets the source closed flag before releasing anything, so a failed close is not repeated by finally.
+The shared symbol child is released before the token buffer is returned.
+A close failure overrides an earlier schema failure, and failed symbol release skips the later token return.
+Native decoder scratch is owned by the context rather than pretending to be Jackson's complete TextBuffer/recycler-pool implementation.
+
+== Backend projection and admitted ownership
+
+Each reference is read and assembled, checked for buffered dangling content and closed before its native projection is demanded.
+The root follows those same stages after all references.
+An admitted call-local Vec retains the original Reader trees in reference/root order until every source stage and canonical arena finalization succeeds.
+Only then does transport projection begin, so an unprojectable earlier reference cannot hide a later source schema, dangling-content or close failure.
+The projection serializes the original Reader tree, including original field defaults; canonical FLOAT/DOUBLE default normalization is not serialized in its place.
+It is a backend transport normalization and does not claim Jackson's exact JSON serialization spelling.
+The original canonical owners remain the authority for source metadata and default node classes.
+
+The serializer preserves scalar text and default numeric values, including signed zero and arbitrary-size Integer payloads.
+Unmatched text and nonfinite Double values report an explicit native projection error after the source stages.
+They are not replaced by a Unicode replacement character or JSON null.
+The canonical-only entry can retain those source-valid values even when the native backend cannot represent them.
+
+Projection first measures exact output bytes and independently admits sixteen times that count plus4096 before allocating its output String.
+It writes into the fixed admitted capacity and checks the measured length.
+Scalar number text admits sixteen times the shared Number text-capacity bound plus4096 before formatting.
+Integer::with_decimal admits base1e9 chunks before conversion and temporary decimal text before the synchronous borrowed callback.
+For N binary words,2*N+1 decimal slots suffice because each binary word adds32 bits, less than two base1e9 chunks.
+The multiplication accumulator is at most(10^9-1)*2^32+(2^32-1), which fits u64.
+Decimal text needs at most9*chunk_count+1 bytes including a possible sign.
+All integer slot, byte and envelope arithmetic is checked.
+
+TokenBuffer admits sixteen times its requested UTF16 storage plus4096 before allocating and captures that lease through recycler residence.
+Decoder vector growth uses the existing checked growth admission before allocation.
+At publication, actual retained array/member capacity is independently admitted into the existing JsonNode/Members owner; this lease coexists with the earlier scratch reservations.
+Text, child nodes and member indexes retain their existing separate owners.
+Dropping the parser, factory, recycler or construction context therefore cannot release the only reservation for a surviving tree.
+
+ProjectedInputs reuses the existing root/reference String and lease vectors with checked admitted slot capacity.
+The retained document-handle list admits sixteen times(reference_count+1)*sizeof(JsonNode) plus4096 before allocating and keeps that lease through its final backing-storage use.
+Its JsonNode handles retain existing payload ownership without cloning the source trees.
+NativeFootprint receives the actual projected byte lengths and document items after successful source completion.
+The shared ParsedPair native assembly, byte bound and recursive root/reference/field validation remain unchanged.
+The returned datum retains canonical ownership and the native completion reservation through later cached-plan/decode use.
+No temporary projection tree or text owner is retained after native assembly.
+
+== Qualified profile and integration boundary
+
+The adapter has explicit native limits of256Ki UTF16 document units,1000 numeric token units and traversal depth128.
+These limits, scratch admission and diagnostics do not establish complete Jackson stream-constraint, TextBuffer segmentation, global recycler selection or JVM allocation-failure timing parity.
+The caller still needs the actual effective factory/recycler/intern scope before normal parser activation.
+The Reader facade and this Avro module must be registered together by their owners.
+
+The native projection boundary remains narrower than the canonical source domain.
+Complete unmatched-unit and source-valid class/value handling through public schema/value, SMT and writer consumers remains integration work.
+Typed graph/default conversion, generalized unions, arbitrary MapEntry keys, structural cache consumers and custom logical classes also remain separate obligations.
+The A09 explicit-null default assertion/source conflict is preserved without altering its published expectation.
+
+link:sources.sha256[] pins58 primary Java sources, six Jackson license/notice entries, three published shared-facade sources and six native helper sources.
+link:COPYRIGHT[] retains the complete pre-package prefix of every primary source, including empty prefixes.
+link:source-profile.json[] records archive hashes, source intervals, native limits and the shared facade baseline.
+The retained link:../NOTICE-JACKSON[], link:../../../names/LICENSE-APACHE[], link:../../../names/LICENSE[] and link:../../../names/ADDITIONAL_LICENSE_INFO[] supply the existing Jackson, Apache and JDK notices/licenses.
+
+Twenty-two new source regression functions cover creation/snapshot order, buffered versus unread tails, semantic/close failure order, exact units, actual persistent symbols, retained tree storage, native normalization, recursive pairing, complete source-group precedence over transport and datum/decode use after construction-owner drop.
+All previously published fixture bodies and assertions remain unchanged.
+No compiler, formatter, runtime, test or project helper was executed for this Phase1 slice.

@@ -59,6 +59,15 @@ impl ParsedPair {
         let super::java_text::ParsedInput { canonical, inputs } = super::java_text::parse(text, references, policy, logical, context)?;
         Self::assemble(canonical, inputs.root(), inputs.references(), options, context)
     }
+    #[cfg(test)]
+    pub(in crate::connect::avro) fn parse_java_text_with_reader(
+        text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy,
+        factory: &SchemaStringFactory, buffers: &mut dyn InputBuffers, intern: &mut dyn crate::connect::registry::reader_symbols::InternAuthority,
+        logical: &mut dyn LogicalEnvironment, context: &mut ConversionContext,
+    ) -> Result<Self> {
+        let super::java_text::ParsedInput { canonical, inputs } = factory.parse_input(text, references, buffers, intern, policy, logical, context)?;
+        Self::assemble(canonical, inputs.root(), inputs.references(), options, context)
+    }
     fn assemble(canonical: CanonicalSource, text: &str, references: &[String], options: &BTreeMap<String, String>, context: &mut ConversionContext) -> Result<Self> {
         let (datum, charge) = admit_native(canonical.native.bound()?, context, || {
             AvroDatumPlan::parse_with_name_policy(text, references, options, Some(&NativePolicy))
@@ -98,6 +107,15 @@ impl AdmittedSource {
     }
 }
 impl AvroDatumPlan {
+    #[cfg(test)]
+    pub fn parse_admitted_java_text_with_reader(
+        text: JavaText<'_>, references: &[JavaText<'_>], options: &BTreeMap<String, String>, policy: SourcePolicy,
+        factory: &SchemaStringFactory, buffers: &mut dyn crate::connect::avro::InputBuffers, intern: &mut dyn crate::connect::registry::reader_symbols::InternAuthority,
+        context: &mut ConversionContext,
+    ) -> Result<Self> {
+        ParsedPair::parse_java_text_with_reader(text, references, options, policy, factory, buffers, intern, &mut logical::Unregistered, context)
+            .map(ParsedPair::into_datum)
+    }
     pub(in crate::connect::avro) fn paired_root(&self) -> Option<PairSelection<'_>> {
         self.source.as_ref().map(|source| PairOwner { datum: self, source: &source.root }.root())
     }

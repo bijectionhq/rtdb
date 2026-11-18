@@ -42,6 +42,9 @@ The current standard-JSON cursor does not reproduce that complete String Reader,
 The following integration reuses the independently reviewed ReaderSymbols/InternAuthority capability with a distinct Avro factory/root, rather than borrowing Registry factory state or inventing a second canonicalizer.
 Registry DTO activation waits for that actual source Reader boundary and the coordinated parser/profile owner.
 
+The test-gated link:string_reader/READER.adoc[String Reader capability] composes a distinct Avro factory/root with that shared symbol interface and the actual canonical/native pair and datum entry points.
+It retains its explicit native representability and source-environment qualifications before normal converter/Registry activation.
+
 == Source and regression scope
 
 link:java_text/sources.sha256[] pins two primary source files and three existing native carrier files.

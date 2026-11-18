@@ -1,0 +1,132 @@
+{
+  "source_only": true,
+  "runtime_discovery": false,
+  "primary_java_source_count": 58,
+  "pinned_file_count": 73,
+  "source_snapshot": "/tmp/rtdb-avro-string-reader-sources",
+  "source_archives": {
+    "jackson-core-2.16.0-sources.jar": "ea95a196a9ad7abdcd0b72fa079b307cccaa1d123b727dfb62b0cbefe6cfd864",
+    "jackson-databind-2.16.0-sources.jar": "9967c9d76cd6cabdce763149d643bc0b66e580208d635684b1bda5e09da44b30",
+    "jackson-core-2.21.7-sources.jar": "8c463d7b86fc44851f180c38e91580d32505b5e06443514212ca93c40efdde5c",
+    "jackson-databind-2.21.7-sources.jar": "9d0088f4990df572c2e3aa1c14d4c03fd8200283d801836c8044d01b9ccb7e73",
+    "temurin-25.0.1+8-src.zip": "3ed5aadae786d9e35101a67e94818c4590f5b8a81e7ee44ad4ce4add58881482"
+  },
+  "shared_reader_baseline": "ad9680380",
+  "source_intervals": {
+    "Schema.java": [
+      "115-123",
+      "1456-1499"
+    ],
+    "AvroSchema.java": [
+      "110-123"
+    ],
+    "JsonFactory216": [
+      "1335-1347",
+      "1898-1924"
+    ],
+    "JsonFactory221": [
+      "1362-1374",
+      "1925-1953"
+    ],
+    "ReaderBasedJsonParser216": [
+      "140-180",
+      "198-207",
+      "248-260",
+      "1812-1838",
+      "2600-2685",
+      "2735-2830"
+    ],
+    "ReaderBasedJsonParser221": [
+      "108-149",
+      "166-175",
+      "216-228",
+      "1778-1801",
+      "2582-2672",
+      "2717-2814"
+    ],
+    "ParserBase216": [
+      "386-401"
+    ],
+    "ParserBase221": [
+      "401-417"
+    ],
+    "BufferRecycler216": [
+      "161-175"
+    ],
+    "BufferRecycler221": [
+      "190-211"
+    ],
+    "ObjectMapper221": [
+      "3200-3221",
+      "5004-5032"
+    ],
+    "JsonNodeDeserializer221": [
+      "704-790"
+    ],
+    "CharacterData00": [
+      "73-77",
+      "105-107",
+      "1120-2013"
+    ],
+    "CharacterDataLatin1": [
+      "120-122",
+      "336-593"
+    ]
+  },
+  "native_limits": {
+    "document_utf16_units": 262144,
+    "numeric_token_units": 1000,
+    "traversal_depth": 128
+  },
+  "source_features": {
+    "factory": "actual distinct Avro Schema.FACTORY/classloader root supplied by caller",
+    "comments": true,
+    "decorator": null,
+    "char_arrays": true,
+    "mapper": "default tree number features: Int/Long/BigInteger/Double",
+    "constraints": "pinned defaults only; no environment overrides",
+    "symbol_seed": "explicit effective factory identity-hash seed, never generated here",
+    "intern": "separate borrowed actual effective InternAuthority",
+    "recycler": "separate borrowed actual captured slot0, no pool-selection inference"
+  },
+  "source_order": [
+    "native document-handle slot/control admission",
+    "direct buffer copy before child OR fallback child before buffer for each ordered reference/root",
+    "readTree with actual name-symbol demand and semantic schema construction",
+    "each source currently-buffered release/Java trim check and finally close once",
+    "canonical arena finalization after all source schemas/close operations succeed",
+    "ProjectedInputs control admission then ordered native backend JSON projection",
+    "complete native footprint bound and same-owner native parse/pair validation",
+    "datum publication with retained canonical/native ownership"
+  ],
+  "projection": {
+    "authority": "actual Reader tree, never transformed canonical defaults or native serde metadata",
+    "accepted": "scalar UTF16, finite Double and default Int/Long/BigInteger classes; ordinary JSON arrays/objects",
+    "unsupported": "unmatched text or nonfinite Double; no replacement/null erasure",
+    "scope": "backend transport normalization; does not claim Jackson JsonNode serialization spelling",
+    "numeric_scratch": "existing Number text capacity*16+4096 and Integer base1e9 callback admitted before formatting"
+  },
+  "admission": {
+    "token_buffer": "16*length*sizeof(u16)+4096; captured lease survives recycler/context",
+    "tree_growth": "existing checked growth admission before allocation",
+    "retained_containers": "16*actual final Vec capacity*sizeof(element)+256 captured in existing JsonNode/Members owner; coexists with scratch",
+    "backend_output": "16*exact measured UTF8 bytes+4096 captured with String",
+    "integer_chunks": "2*binary_word_count+1 u32 slots,16*slots*sizeof(u32)+4096",
+    "integer_text": "9*decimal_chunk_count+1 bytes,16*bound+4096",
+    "native_pair": "published NativeFootprint bound and ParsedPair validation unchanged",
+    "source_documents": "16*(reference_count+1)*sizeof(JsonNode)+4096 before call-local Vec allocation; existing node payload leases retained, vector dropped before local lease"
+  },
+  "regression_function_count": 22,
+  "fixture_seed": {
+    "value": 37,
+    "scope": "explicit deterministic source-algorithm test profile; not discovered JVM identity"
+  },
+  "existing_published_tests_edited": false,
+  "remaining": [
+    "normal coordinated shared Reader export/registration and actual effective factory/recycler/intern owners",
+    "full source TextBuffer segmentation/recycler-pool selection, constraint overrides/diagnostics and JVM allocation-failure timing",
+    "unmatched/nonfinite source values across native backend and public schema/value/SMT/writer consumers",
+    "complete typed graph/default/generalized-union/arbitrary-key conversion and source cache consumers",
+    "A09 explicit-null default assertion/source conflict remains unresolved"
+  ]
+}

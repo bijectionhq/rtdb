@@ -10,10 +10,10 @@ pub(super) struct ProjectedInputs {
     payloads: Vec<Arc<MemoryReservation>>,
     _control: Arc<MemoryReservation>,
 }
-struct Projection { text: String, charge: Arc<MemoryReservation> }
+pub(super) struct Projection { pub(super) text: String, pub(super) charge: Arc<MemoryReservation> }
 
 impl ProjectedInputs {
-    fn new(reference_count: usize, context: &mut ConversionContext) -> Result<Self> {
+    pub(super) fn new(reference_count: usize, context: &mut ConversionContext) -> Result<Self> {
         let payload_count = add(reference_count, 1)?;
         let slots = add(mul(reference_count, size_of::<String>())?, mul(payload_count, size_of::<Arc<MemoryReservation>>())?)?;
         let control = context.reserve(add(mul(slots, 16)?, 4096)?)?;
@@ -25,6 +25,20 @@ impl ProjectedInputs {
     }
     pub(super) fn root(&self) -> &str { &self.root }
     pub(super) fn references(&self) -> &[String] { &self.references }
+    pub(super) fn push_reference(&mut self, projected: Projection) -> Result<()> {
+        if self.references.len() == self.references.capacity() || self.payloads.len() == self.payloads.capacity() {
+            return Err(invalid("Backend input exceeds its admitted reference slots"));
+        }
+        self.references.push(projected.text);
+        self.payloads.push(projected.charge);
+        Ok(())
+    }
+    pub(super) fn set_root(&mut self, projected: Projection) -> Result<()> {
+        if self.payloads.len() == self.payloads.capacity() { return Err(invalid("Backend input exceeds its admitted root slot")); }
+        self.root = projected.text;
+        self.payloads.push(projected.charge);
+        Ok(())
+    }
 }
 
 fn scalar(point: u32) -> Result<char> {

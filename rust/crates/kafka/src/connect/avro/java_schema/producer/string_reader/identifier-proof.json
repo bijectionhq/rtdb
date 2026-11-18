@@ -1,0 +1,40 @@
+{
+  "source_only_data_derivation": true,
+  "JDK": "temurin-25.0.1+8",
+  "input_sha256": {
+    "CharacterData00.java": "7ca89f8177f7df516091a495de1e53105c085cb487ecf083561158f4a8dff941",
+    "CharacterDataLatin1.java": "d34c8903d1caa4befafacd761494f927c7eb453d4cd01e727b64a5f487b0f047",
+    "Character.java": "bd864040a42498f6c15cfc61786570924e75072c61e576847c57434ded10ac52",
+    "CharacterData.java": "04ee9000969ba7e09b62f1b33296aab1ad01fd33318ba5618be7bf9fadf0e55c"
+  },
+  "dispatch": "A[Y[X[unit>>5]|((unit>>1)&15)]|(unit&1)]; Latin1 A prefix independently checked after stripping source comments",
+  "predicate": "(properties &0x3000)!=0",
+  "bmp_bitmap_sha256": "6000633a5ee3cc9009cb876f71661c72379b18a89bee3fa87dd7e7ed7e20c175",
+  "true_units": 50900,
+  "ranges": 452,
+  "registry_published_bitmap_byte_equal": true,
+  "source_no_execution": true,
+  "observations": {
+    "0": true,
+    "8": true,
+    "9": false,
+    "14": true,
+    "27": true,
+    "32": false,
+    "36": true,
+    "48": true,
+    "65": true,
+    "95": true,
+    "127": true,
+    "769": true,
+    "8364": true,
+    "55296": false,
+    "56320": false,
+    "65535": false
+  },
+  "registry_bitmap": {
+    "path": "rust/crates/kafka/src/connect/registry/response/cursor/identifier-parts.bin",
+    "published_baseline": "ad9680380",
+    "sha256": "6000633a5ee3cc9009cb876f71661c72379b18a89bee3fa87dd7e7ed7e20c175"
+  }
+}

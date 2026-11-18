@@ -25,6 +25,8 @@ pub(super) use evaluation::{Evaluation, RecursionState, Witness};
 pub(super) use context::{CycleContext, CycleReference};
 pub(super) use producer::{AdmittedSource, ParsedPair, PairSelection};
 pub(in crate::connect) use producer::SourcePolicy;
+#[cfg(test)]
+pub(in crate::connect) use producer::{SchemaStringFactory, InputBuffers, TokenBuffer, TokenRecycler};
 pub(in crate::connect::avro) use logical::{Builtin as LogicalBuiltin, FactoryOutcome, LogicalEnvironment, LogicalIdentity, LogicalType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
