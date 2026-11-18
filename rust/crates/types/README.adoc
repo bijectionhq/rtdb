@@ -57,6 +57,11 @@ The derived tables are limited to one million entries before generation; an over
 Existing `ZoneId` lookup and local resolution remain independent of the legacy view.
 `tests/legacy_zone.rs` exercises historical, recurring, overlap, custom-ID and signed64-boundary cases as unexecuted source.
 
+`java_date` supplies the October 1582 cutover calendar used with `java.util.Date`.
+It translates raw signed 64-bit milliseconds to hybrid calendar fields without first wrapping a timezone-adjusted sum.
+The inverse accepts lenient fields and wraps when the Date storage domain overflows.
+Kafka Connect's legacy calendar and date truncation use these shared primitives.
+
 `UriParts::java_hash_code` provides the URI object hash beside object equality, including UTF-16 hashing and component-specific case folding.
 `tests/uri.rs` records numeric and equivalent-spelling fixtures as unexecuted regression source.
 

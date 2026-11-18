@@ -2,6 +2,7 @@ mod error;
 mod calendar;
 mod zone;
 mod legacy_zone;
+pub mod java_date;
 mod float_text;
 mod id;
 mod java_map;

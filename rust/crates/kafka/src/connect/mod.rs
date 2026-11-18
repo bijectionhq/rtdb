@@ -12,7 +12,7 @@ mod json_decimal;
 mod registry;
 mod header;
 mod schema_graph;
-mod legacy_calendar;
+use rtdb_types::java_date as legacy_calendar;
 mod locale_data;
 mod date_locale;
 mod date_names;
