@@ -3077,7 +3077,10 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse `SUBSTRING`/`SUBSTR` expressions: `SUBSTRING(expr FROM start FOR length)` or `SUBSTR(expr, start, length)`.
+    /// Parse the keyword or comma forms of `SUBSTRING` and `SUBSTR`.
+    ///
+    /// Dialects with [`Dialect::supports_bare_substring_length`] accept `SUBSTRING(expr FROM start length)`
+    /// when an unsigned decimal integer, placeholder token, or `(` starts a separate length expression.
     pub fn parse_substring(&mut self) -> Result<Expr, ParserError> {
         let shorthand = match self.expect_one_of_keywords(&[Keyword::SUBSTR, Keyword::SUBSTRING])? {
             Keyword::SUBSTR => true,
@@ -3098,10 +3101,22 @@ impl<'a> Parser<'a> {
         let mut to_expr = None;
         let for_keyword = self.parse_keyword(Keyword::FOR);
         let length_comma = !for_keyword && self.consume_token(&Token::Comma);
-        if for_keyword || length_comma {
+        let explicit_from_form = !shorthand && !special && from_expr.is_some() && !length_comma;
+        if for_keyword
+            || length_comma
+            || (explicit_from_form
+                && self.dialect.supports_bare_substring_length()
+                && match &self.peek_token_ref().token {
+                    Token::Number(value, false) => {
+                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                    }
+                    Token::Placeholder(_) | Token::LParen => true,
+                    _ => false,
+                })
+        {
             to_expr = Some(self.parse_expr()?);
         }
-        if !shorthand && !special && from_expr.is_some() && !length_comma {
+        if explicit_from_form {
             self.parse_optional_character_length_units()?;
         }
         self.expect_token(&Token::RParen)?;

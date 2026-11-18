@@ -52,3 +52,13 @@ async fn character_length_units_work_with_prepared_query_arguments() {
     assert_eq!(prepared.settings.snapshot_time, Some(rtdb_plan::SettingValue::Unevaluated { parameter_count: 1 }));
     assert_eq!(rtdb_sql::parse(sql).unwrap()[0].parameter_count(), 2);
 }
+
+#[tokio::test]
+async fn bare_substring_length_uses_the_prepared_argument() {
+    let sql = "SELECT SUBSTRING(? FROM $2 ?) AS sub, ? AS tail";
+    let arguments = vec![V::Utf8("aé😀z".into()), V::I64(2), V::I64(7)];
+    assert_eq!(
+        query(sql, arguments).await.unwrap(),
+        [vec![V::Utf8("é😀".into()), V::I64(7)]],
+    );
+}

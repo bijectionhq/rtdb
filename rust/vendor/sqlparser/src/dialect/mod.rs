@@ -618,6 +618,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Supports omitting `FOR` from a substring length after an explicit `FROM`.
+    fn supports_bare_substring_length(&self) -> bool {
+        false
+    }
+
     /// Dialect-specific prefix parser override
     fn parse_prefix(&self, _parser: &mut Parser) -> Option<Result<Expr, ParserError>> {
         // return None to fall back to the default behavior

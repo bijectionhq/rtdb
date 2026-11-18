@@ -26,6 +26,8 @@ Other spellings of these keywords report `xtdb.error/illegal-arg` during binding
 `SUBSTRING(source FROM start [FOR length])` and `OVERLAY` accept a trailing `USING CHARACTERS` or `USING OCTETS` inside the parentheses.
 These clauses accept case-insensitive unit keywords.
 For either unit, positions and lengths count Unicode code points in text and bytes in binary input.
+After an explicit `FROM`, `SUBSTRING` parses the complete start expression first.
+A following unsigned decimal integer, `?`, `$n`, or `(` can begin the length without `FOR`.
 
 The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
 REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.

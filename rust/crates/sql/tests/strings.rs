@@ -162,6 +162,54 @@ fn substring_and_overlay_units_require_a_complete_standard_operand_list() {
 }
 
 #[tokio::test]
+async fn substring_bare_length_preserves_start_expression_precedence_and_units() {
+    let rows = query("SELECT SUBSTRING('abcdef' FROM 2 3), SUBSTRING('abcdef' FROM 1 + 1 2 * 1), \
+        SUBSTRING('abcdef' FROM 2 (1 + 2)), SUBSTRING('abcdef' FROM ABS (2) (1 + 1)), \
+        SUBSTRING('abcdef' FROM ABS (2)), SUBSTRING('abcdef' FROM 2 - 1), \
+        SUBSTRING('é😀x' FROM 2 1 USING OCTETS)")
+        .await.unwrap();
+    assert_eq!(
+        rows,
+        [vec![text("bcd"), text("bc"), text("bcd"), text("bc"), text("bcdef"), text("abcdef"), text("😀")]],
+    );
+}
+
+#[test]
+fn substring_bare_length_requires_a_separate_operand_after_explicit_from() {
+    for sql in [
+        "SELECT SUBSTRING('abc' FROM 2 1, 3)",
+        "SELECT SUBSTRING('abc' FROM 2 1 3)",
+        "SELECT SUBSTRING('abc', 2 1)",
+        "SELECT SUBSTRING('abc' 2 1)",
+        "SELECT SUBSTRING('abc' FROM 2 FROM)",
+        "SELECT SUBSTR('abc' FROM 2 1)",
+        "SELECT OVERLAY('abc' PLACING 'x' FROM 2 1)",
+    ] {
+        assert_eq!(rtdb_sql::parse(sql).unwrap_err().code, "xtdb/sql-error", "{sql}");
+    }
+    let generic = sqlparser::dialect::GenericDialect {};
+    assert!(sqlparser::parser::Parser::parse_sql(&generic, "SELECT SUBSTRING('abc' FROM 2 1)").is_err());
+    for sql in [
+        "SELECT SUBSTRING('abc' FROM 2 FOR 1)",
+        "SELECT SUBSTRING('abc' FROM 2)",
+        "SELECT SUBSTRING('abc', 2, 1)",
+    ] {
+        assert!(sqlparser::parser::Parser::parse_sql(&generic, sql).is_ok(), "{sql}");
+        assert!(rtdb_sql::parse(sql).is_ok(), "{sql}");
+    }
+}
+
+#[test]
+fn substring_bare_length_gates_numeric_spelling_before_parsing_the_expression() {
+    for length in ["1L", ".1", "1."] {
+        let bare = format!("SELECT SUBSTRING('abc' FROM 2 {length})");
+        assert_eq!(rtdb_sql::parse(&bare).unwrap_err().code, "xtdb/sql-error", "{bare}");
+        let explicit = format!("SELECT SUBSTRING('abc' FROM 2 FOR {length})");
+        assert!(rtdb_sql::parse(&explicit).is_ok(), "{explicit}");
+    }
+}
+
+#[tokio::test]
 async fn string_null_policy_is_preserved_when_virtual_columns_narrow_at_execution() {
     let context = context();
     let source = "SELECT STR(_valid_from),STRING_TO_ARRAY('ab',CAST(_valid_from AS TEXT)),FORMAT('%s',_valid_from) FROM pg_catalog.pg_namespace LIMIT 1";

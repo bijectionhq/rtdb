@@ -101,6 +101,7 @@ impl Dialect for SqlDialect {
     fn supports_single_word_time_zone(&self) -> bool { true }
     fn supports_interval_field_ranges(&self) -> bool { true }
     fn supports_character_length_units(&self) -> bool { true }
+    fn supports_bare_substring_length(&self) -> bool { true }
     fn unparameterized_data_type(&self, word: &Word) -> Option<ast::DataType> {
         if word.quote_style.is_some() { return None; }
         match word.keyword {

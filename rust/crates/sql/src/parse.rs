@@ -586,6 +586,53 @@ mod tests {
     }
 
     #[test]
+    fn substring_bare_length_retains_parameter_slots_and_byte_spans() {
+        let source = "SELECT 'é', SUBSTRING(? FROM $2 ?), ?";
+        let mut ordinary = parse(source).unwrap();
+        assert_eq!(ordinary.len(), 1);
+
+        let memory = MemoryBudget::new(1 << 20);
+        let mut batch = crate::parse_statement_batch(source, &memory).unwrap();
+        let crate::BatchStatement { command, allocation: _allocation, .. } = batch.next().unwrap();
+        assert!(batch.next().is_none());
+        let crate::ExecutableSyntax::Sql(deferred) = command else { panic!("SQL statement") };
+
+        let mut positions = source.match_indices('?').map(|(position, _)| position);
+        let source_argument = positions.next().unwrap();
+        let start_argument = source.find("$2").unwrap();
+        let length_argument = positions.next().unwrap();
+        let last_argument = positions.next().unwrap();
+        for statement in [ordinary.remove(0), deferred.resolve_in(&memory).unwrap()] {
+            assert_eq!(statement.parameter_count(), 3);
+            let Syntax::Standard(ast::Statement::Query(query)) = &statement.tree.statement else { panic!("query") };
+            let ast::SetExpr::Select(select) = query.body.as_ref() else { panic!("select") };
+            let [
+                _,
+                ast::SelectItem::UnnamedExpr(ast::Expr::Substring {
+                    expr,
+                    substring_from: Some(start),
+                    substring_for: Some(length),
+                    special: false,
+                    shorthand: false,
+                }),
+                ast::SelectItem::UnnamedExpr(last),
+            ] = select.projection.as_slice() else { panic!("substring and trailing parameter") };
+            for (operand, assigned, original, at) in [
+                (expr.as_ref(), "$1", "?", source_argument),
+                (start.as_ref(), "$2", "$2", start_argument),
+                (length.as_ref(), "$2", "?", length_argument),
+                (last, "$3", "?", last_argument),
+            ] {
+                let ast::Expr::Value(value) = operand else { panic!("parameter expression") };
+                assert_eq!(value.value, ast::Value::Placeholder(assigned.into()));
+                let span = source_span(source, value.span);
+                assert_eq!(span.start, at);
+                assert_eq!(&source[span.start..span.end], original);
+            }
+        }
+    }
+
+    #[test]
     fn values_row_ast_retains_scalar_and_tuple_syntax() {
         use sqlparser::ast::Spanned;
         let source = "VALUES 1, (2, 3), ROW(), ()";
