@@ -159,13 +159,17 @@ impl DlqProducer {
         Ok(Self { producer, settings, charges })
     }
     pub async fn send(&mut self, record: Record, context: &mut ConversionContext) -> Result<()> {
+        let timestamp = rdkafka::util::current_time_millis();
+        self.send_at(record, context, timestamp).await
+    }
+    async fn send_at(&mut self, record: Record, context: &mut ConversionContext, timestamp: i64) -> Result<()> {
         for charge in &self.charges { context.retain(Arc::clone(charge))?; }
         self.settings.validate_bytes(record.key.as_deref(), record.value.as_deref())?;
         if record.kafka_batch_upper_bound()? > self.settings.maximum_record_bytes { return Err(error("dlq", "Dead-letter record exceeds producer allocation or request size")); }
         let receipt_charge = context.reserve(size_of::<Delivery>().checked_add(size_of::<*const ()>()).and_then(|bytes| bytes.checked_mul(16)).and_then(|bytes| bytes.checked_add(4096)).ok_or_else(overflow)?)?;
         let receipt = self.producer.context().register(Arc::clone(&record.charge), receipt_charge);
         let headers = record.headers.iter().fold(OwnedHeaders::new_with_capacity(5), |headers, (name, value)| headers.insert(Header { key: name, value: value.as_deref() }));
-        let mut pending = BaseRecord::<[u8], [u8], usize>::with_opaque_to(&record.topic, receipt.identity).headers(headers);
+        let mut pending = BaseRecord::<[u8], [u8], usize>::with_opaque_to(&record.topic, receipt.identity).headers(headers).timestamp(timestamp);
         pending.key = record.key.as_deref(); pending.payload = record.value.as_deref();
         let start = Instant::now();
         loop {
@@ -300,6 +304,37 @@ mod cancellation_tests {
     use super::super::rules::{DlqAction, Mode};
     use rdkafka::mocking::MockCluster;
     use rtdb_columnar::MemoryBudget;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dlq_append_passes_the_frozen_epoch_timestamp_to_the_native_message() {
+        use rdkafka::{Message, Offset, Timestamp, TopicPartitionList, consumer::{BaseConsumer, Consumer}};
+
+        let cluster = MockCluster::new(1).unwrap();
+        cluster.create_topic("timestamp-dlq", 1, 1).unwrap();
+        let bootstrap = cluster.bootstrap_servers();
+        let options = BTreeMap::from([
+            ("bootstrap.servers".into(), bootstrap.clone()),
+            ("buffer.memory".into(), (1 << 20).to_string()),
+            ("dlq.auto.flush".into(), "true".into()),
+        ]);
+        let mut context = ConversionContext::new(MemoryBudget::new(64 << 20));
+        let mut producer = DlqProducer::open(&options, &mut context).unwrap();
+        let rule = DlqRule { name: None, executor: "missing".into(), mode: Mode::Read, subject: "events-value".into(), topic: None, action: Arc::new(DlqAction { name: "_default_".into(), options }) };
+        let record = Record::new(&rule, "timestamp-dlq", "events", false, Original::Framed, b"record", &mut context).unwrap();
+        tokio::time::timeout(Duration::from_secs(10), producer.send_at(record, &mut context, 0)).await.unwrap().unwrap();
+        let consumer: BaseConsumer = rdkafka::ClientConfig::new().set("bootstrap.servers", &bootstrap)
+            .set("group.id", "dlq-timestamp").set("enable.auto.commit", "false").create().unwrap();
+        let mut assignment = TopicPartitionList::new();
+        assignment.add_partition_offset("timestamp-dlq", 0, Offset::Beginning).unwrap();
+        consumer.assign(&assignment).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let message = loop {
+            if let Some(result) = consumer.poll(Duration::from_millis(20)) { break result.unwrap(); }
+            assert!(Instant::now() < deadline);
+        };
+        assert_eq!(message.payload(), Some(b"record".as_slice()));
+        assert_eq!(message.timestamp(), Timestamp::CreateTime(0));
+    }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cancelled_auto_flush_retains_delivery_until_the_owner_drains() {

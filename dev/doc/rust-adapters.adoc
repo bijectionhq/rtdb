@@ -70,3 +70,6 @@ The allowlist uses the native Java whole-region matcher, with Java's default dot
 A request for `${provider:key}` selects an exact name from the resulting snapshot.
 The retained snapshot and substitutions use the requesting configuration's budget.
 The platform capture uses the Rust standard library's process environment snapshot, whose temporary allocator and encoding behavior still require host qualification.
+
+The Registry dead-letter producer captures one create timestamp before native queue admission and carries it through every enqueue retry.
+The source metadata wait and its effect on the append timestamp require the live sender integration.
