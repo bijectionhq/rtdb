@@ -1,6 +1,7 @@
 use arrow_schema::IntervalUnit;
 use rtdb_types::{DecimalValue, ScalarType};
 use super::*;
+use super::source_scalar::LongLongLane;
 
 #[derive(Clone, Copy)]
 enum RunGetter { Pointer, LongLong }
@@ -32,18 +33,17 @@ impl<'a> CellRef<'a> {
     /// Reads the first big-endian long at the fixed binary reader's 16-byte row stride with i32 wrapping, without a validity check.
     /// Plain/indirect fixed binary and run-end wrappers expose it; extension and union readers do not.
     /// A read beyond the retained byte span returns a bounds error.
-    pub fn get_long_long_high(&self) -> Result<i64> { self.long_long(0) }
+    pub fn get_long_long_high(&self) -> Result<i64> { self.long_long(LongLongLane::High) }
 
     /// Reads the second big-endian long under the same admission and bounds as get_long_long_high.
-    pub fn get_long_long_low(&self) -> Result<i64> { self.long_long(8) }
+    pub fn get_long_long_low(&self) -> Result<i64> { self.long_long(LongLongLane::Low) }
 
-    fn long_long(&self, part: usize) -> Result<i64> {
+    fn long_long(&self, lane: LongLongLane) -> Result<i64> {
         let cell = self.run_delegate(RunGetter::LongLong)?;
         if cell.node.descriptor.metadata().contains_key(crate::EXTENSION_NAME_KEY) { return Err(unsupported("LongLongVectorReader")); }
         let Some(DataType::FixedSizeBinary(_)) = cell.node.descriptor.scalar_field().map(Field::data_type) else { return Err(unsupported("LongLongVectorReader")); };
         let cell = cell.payload()?;
-        let lane = (cell.row as i32).wrapping_mul(2).wrapping_add((part / 8) as i32);
-        let offset = usize::try_from(lane.wrapping_mul(8)).map_err(|_| index_error())?;
+        let offset = usize::try_from(lane.offset(cell.row as i32)).map_err(|_| index_error())?;
         Ok(i64::from_be_bytes(fixed_bytes(&cell, 16, offset, 8)?.try_into().map_err(|_| layout())?))
     }
 

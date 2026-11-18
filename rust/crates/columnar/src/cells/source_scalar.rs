@@ -7,6 +7,8 @@ mod tests;
 pub(crate) enum SourceScalarReadFailure {
     Unsupported { declaration: SourceScalarDeclaration, method: &'static str },
     ValidityByteBounds { offset: i32, capacity: usize },
+    LongLongLaneBounds { offset: i32, capacity: usize },
+    LongLongReceiverClass { declaration: SourceScalarDeclaration },
     NegativeViewLength(i64),
     UuidFirstLongUnderflow,
     UuidSecondLongUnderflow,
@@ -15,6 +17,15 @@ pub(crate) enum SourceScalarReadFailure {
 #[derive(Debug)]
 pub(crate) enum SourceScalarReadError { Reference(SourceScalarReadFailure), Native(Anomaly) }
 pub(crate) type SourceScalarReadResult<T> = std::result::Result<T, SourceScalarReadError>;
+
+#[derive(Clone, Copy)]
+pub(super) enum LongLongLane { High, Low }
+impl LongLongLane {
+    pub(super) fn offset(self, row: i32) -> i32 {
+        let lane = match self { Self::High => 0, Self::Low => 1 };
+        row.wrapping_mul(2).wrapping_add(lane).wrapping_mul(8)
+    }
+}
 
 pub(crate) struct SourceScalarReader<'a> {
     declaration: SourceScalarDeclaration,
@@ -47,6 +58,23 @@ impl<'a> SourceScalarReader<'a> {
         let pointer = self.get_pointer(row);
         let length = usize::try_from(pointer.length).map_err(|_| SourceScalarReadError::Reference(SourceScalarReadFailure::NegativeViewLength(pointer.length)))?;
         Ok(SourceByteView { backing: pointer.backing, offset: pointer.offset, length })
+    }
+    pub(crate) fn get_long_long_high(&self, row: i32) -> Option<SourceScalarReadResult<i64>> {
+        self.supports_long_long().then(|| self.read_long_long(row, LongLongLane::High))
+    }
+    pub(crate) fn get_long_long_low(&self, row: i32) -> Option<SourceScalarReadResult<i64>> {
+        self.supports_long_long().then(|| self.read_long_long(row, LongLongLane::Low))
+    }
+    fn supports_long_long(&self) -> bool { matches!(self.declaration, SourceScalarDeclaration::FixedBinary(_)) }
+    fn read_long_long(&self, row: i32, lane: LongLongLane) -> SourceScalarReadResult<i64> {
+        let offset = lane.offset(row);
+        let bytes = usize::try_from(offset).ok()
+            .and_then(|start| self.backing.get(start..))
+            .and_then(|tail| tail.first_chunk::<8>())
+            .ok_or(SourceScalarReadError::Reference(SourceScalarReadFailure::LongLongLaneBounds {
+                offset, capacity: self.backing.len(),
+            }))?;
+        Ok(i64::from_be_bytes(*bytes))
     }
     pub(crate) fn binary_object0(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<OwnedValue>> {
         self.declaration.bytes_method().then(|| self.read_binary_object(row, memory))
@@ -103,6 +131,20 @@ impl<'a> SourceScalarSlice<'a> {
     }
     pub(crate) fn get_bytes(&self, row: i32) -> SourceScalarReadResult<SourceByteView<'a>> {
         self.inner.get_bytes(self.start.wrapping_add(row))
+    }
+    pub(crate) fn get_long_long_high(&self, row: i32) -> SourceScalarReadResult<i64> {
+        self.read_long_long(row, LongLongLane::High)
+    }
+    pub(crate) fn get_long_long_low(&self, row: i32) -> SourceScalarReadResult<i64> {
+        self.read_long_long(row, LongLongLane::Low)
+    }
+    fn read_long_long(&self, row: i32, lane: LongLongLane) -> SourceScalarReadResult<i64> {
+        if !self.inner.supports_long_long() {
+            return Err(SourceScalarReadError::Reference(SourceScalarReadFailure::LongLongReceiverClass {
+                declaration: self.inner.declaration,
+            }));
+        }
+        self.inner.read_long_long(self.start.wrapping_add(row), lane)
     }
     pub(crate) fn binary_object(&self, row: i32, memory: &Arc<crate::MemoryBudget>) -> Option<SourceScalarReadResult<Option<OwnedValue>>> {
         self.inner.binary_object(self.start.wrapping_add(row), memory)

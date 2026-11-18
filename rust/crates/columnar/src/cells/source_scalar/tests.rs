@@ -1594,3 +1594,112 @@ fn missing_validity_preserves_signed_payload_addresses_and_time_capability_absen
     assert_eq!(destination.used_bytes(), 0);
     assert_eq!(source.used_bytes(), 0);
 }
+
+#[test]
+fn borrowed_fixed_binary_long_long_uses_its_own_stride_even_at_a_null_row() {
+    let memory = memory();
+    let high = i64::MIN + 0x1234_5678;
+    let low = i64::MAX - 0x7654_3210;
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(8), true, &memory);
+    output.write_bytes(&11i64.to_be_bytes()).unwrap();
+    output.write_null().unwrap();
+    output.write_bytes(&high.to_be_bytes()).unwrap();
+    output.write_bytes(&low.to_be_bytes()).unwrap();
+    {
+        let reader = output.source_reader().unwrap().unwrap();
+        assert_eq!(reader.get_long_long_high(1).unwrap().unwrap(), high);
+        assert_eq!(reader.get_long_long_low(1).unwrap().unwrap(), low);
+        assert_eq!(reader.get_pointer(1).offset(), 8);
+        assert_eq!(reader.get_bytes(1).unwrap().demand_native().unwrap(), &[0u8; 8]);
+    }
+    let captured = output.finish().unwrap();
+    let cell = captured.cell(1).unwrap();
+    assert!(cell.is_null().unwrap());
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    assert_eq!(reader.get_long_long_high(1).unwrap().unwrap(), cell.get_long_long_high().unwrap());
+    assert_eq!(reader.get_long_long_low(1).unwrap().unwrap(), cell.get_long_long_low().unwrap());
+    drop(captured);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_long_long_wraps_the_two_multiplications_after_signed_slice_translation() {
+    let memory = memory();
+    let high = i64::MIN + 0x1234_5678_9abc;
+    let low = i64::MAX - 0x1234_5678_9abc;
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(-1), false, &memory);
+    output.write_long_long(high, low).unwrap();
+    let captured = output.finish().unwrap();
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    for row in [0, 1 << 28] {
+        assert_eq!(reader.get_long_long_high(row).unwrap().unwrap(), high);
+        assert_eq!(reader.get_long_long_low(row).unwrap().unwrap(), low);
+    }
+    let slice = reader.slice(i32::MAX, -1);
+    assert_eq!(slice.value_count(), -1);
+    assert_eq!(slice.get_long_long_high(1).unwrap(), high);
+    assert_eq!(slice.get_long_long_low(1).unwrap(), low);
+    read_reference(slice.get_bytes(1), SourceScalarReadFailure::NegativeViewLength(-1));
+    drop(captured);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_long_long_demands_eight_bytes_from_the_retained_capacity() {
+    let memory = memory();
+    let mut output = writer(SourceScalarDeclaration::FixedBinary(0), false, &memory);
+    {
+        let empty = output.source_reader().unwrap().unwrap();
+        read_reference(empty.get_long_long_high(0).unwrap(),
+            SourceScalarReadFailure::LongLongLaneBounds { offset: 0, capacity: 0 });
+        read_reference(empty.get_long_long_low(0).unwrap(),
+            SourceScalarReadFailure::LongLongLaneBounds { offset: 8, capacity: 0 });
+    }
+    output.write_long_long(5, -8).unwrap();
+    let captured = output.finish().unwrap();
+    assert_eq!(captured.value_count(), 1);
+    assert_eq!(data(&captured).append, 16);
+    let capacity = data(&captured).bytes.as_slice().len();
+    let first_missing = i32::try_from(capacity / 16).unwrap();
+    let last_retained = first_missing - 1;
+    assert!(last_retained >= captured.value_count());
+    assert!(matches!(captured.cell(last_retained as usize), Err(error) if error.code == "rtdb/row-index"));
+
+    let capped = block(&memory, 0);
+    let used = memory.used_bytes();
+    let peak = memory.peak_bytes();
+    let reader = SourceScalarReader::new(&captured).unwrap().unwrap();
+    read_reference(reader.get_long_long_high(-1).unwrap(),
+        SourceScalarReadFailure::LongLongLaneBounds { offset: -16, capacity });
+    read_reference(reader.get_long_long_low(-1).unwrap(),
+        SourceScalarReadFailure::LongLongLaneBounds { offset: -8, capacity });
+    assert_eq!(reader.get_long_long_low(last_retained).unwrap().unwrap(), 0);
+    read_reference(reader.get_long_long_high(first_missing).unwrap(),
+        SourceScalarReadFailure::LongLongLaneBounds { offset: first_missing * 16, capacity });
+    assert_eq!(memory.used_bytes(), used);
+    assert_eq!(memory.peak_bytes(), peak);
+    drop((capped, captured));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn first_signed_slice_reports_the_inner_long_long_cast_before_row_demand() {
+    let memory = memory();
+    for (declaration, width) in [
+        (SourceScalarDeclaration::Uuid { inner_width: 8 }, 8i64),
+        (SourceScalarDeclaration::Time32(TimeUnit::Second), 4),
+        (SourceScalarDeclaration::Time64(TimeUnit::Nanosecond), 8),
+    ] {
+        let output = writer(declaration, true, &memory);
+        let reader = output.source_reader().unwrap().unwrap();
+        assert!(reader.get_long_long_high(i32::MIN).is_none());
+        assert!(reader.get_long_long_low(i32::MIN).is_none());
+        let slice = reader.slice(i32::MAX, -1);
+        let expected = SourceScalarReadFailure::LongLongReceiverClass { declaration };
+        read_reference(slice.get_long_long_high(1), expected);
+        read_reference(slice.get_long_long_low(1), expected);
+        assert_eq!(slice.get_pointer(1).offset(), 0);
+        assert_eq!(slice.get_pointer(1).length(), width);
+    }
+    assert_eq!(memory.used_bytes(), 0);
+}
