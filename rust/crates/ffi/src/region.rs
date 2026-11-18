@@ -29,7 +29,7 @@ impl EmbeddedRegion {
         let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().map_err(|error| Anomaly::fault("rtdb.ffi/runtime", error.to_string()))?;
         let (server, driver) = runtime.block_on(async {
             match transaction_clock {
-                Some(clock) => ServerDriver::open_with_in_memory_log_clock(configuration, memory_bytes, memory, clock).await,
+                Some(clock) => ServerDriver::open_with_log_clock(configuration, memory_bytes, memory, clock).await,
                 None => ServerDriver::open_with_memory(configuration, memory_bytes, memory).await,
             }
         })?;

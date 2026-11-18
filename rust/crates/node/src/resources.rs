@@ -95,7 +95,7 @@ pub struct NativeResources {
     disk_cache: Option<Arc<DiskCache>>,
     io: Arc<IoRegion>,
     memory_transaction_clock: Option<Arc<TransactionClock>>,
-    local_log_clock: Arc<dyn crate::Clock>,
+    local_log_clock: Arc<TransactionClock>,
     local_log_uses_clock_for_non_transactions: bool,
 }
 
@@ -103,20 +103,21 @@ impl Default for NativeResources {
     fn default() -> Self {
         Self { maximum_log_message_bytes: 64 * 1024 * 1024, log_queue_capacity: 64, read_only_log: ReadOnlyLocalLogOptions::default(),
             log_factories: BTreeMap::new(), storage_factories: BTreeMap::new(), disk_cache: None, io: IoRegion::new(),
-            memory_transaction_clock: None, local_log_clock: Arc::new(crate::SystemClock), local_log_uses_clock_for_non_transactions: false }
+            memory_transaction_clock: None, local_log_clock: Arc::new(|| Ok(crate::Clock::now(&crate::SystemClock))), local_log_uses_clock_for_non_transactions: false }
     }
 }
 
 impl NativeResources {
     pub fn with_disk_cache(mut self, cache: Arc<DiskCache>) -> Self { self.disk_cache = Some(cache); self }
-    /// Samples this clock for each transaction appended to an in-memory source log.
+    /// Samples this clock for each transaction appended to an in-memory or local source log.
     /// Calls into a shared clock can originate from different databases concurrently.
-    pub fn with_in_memory_log_clock(mut self, clock: Arc<TransactionClock>) -> Self {
-        self.memory_transaction_clock = Some(clock);
+    pub fn with_log_clock(mut self, clock: Arc<TransactionClock>) -> Self {
+        self.memory_transaction_clock = Some(Arc::clone(&clock));
+        self.local_log_clock = clock;
         self
     }
     pub fn with_local_log_clock(mut self, clock: Arc<dyn crate::Clock>, use_for_non_transactions: bool) -> Self {
-        self.local_log_clock = clock;
+        self.local_log_clock = Arc::new(move || Ok(clock.now()));
         self.local_log_uses_clock_for_non_transactions = use_for_non_transactions;
         self
     }
@@ -138,12 +139,16 @@ impl NativeResources {
     }
 }
 
-struct NativeLogTimestamps { clock: Arc<dyn crate::Clock>, source: bool, use_for_non_transactions: bool }
+struct NativeLogTimestamps { clock: Arc<TransactionClock>, source: bool, use_for_non_transactions: bool }
 impl AppendTimestampSource for NativeLogTimestamps {
     fn timestamp(&self, payload: &[u8], _: rtdb_types::Timestamp) -> rtdb_storage::Result<rtdb_types::Timestamp> {
         use crate::Clock;
         let transaction = self.source && is_source_transaction(payload)?;
-        Ok(if transaction || self.use_for_non_transactions { self.clock.now() } else { crate::SystemClock.now() })
+        if transaction || self.use_for_non_transactions {
+            (self.clock)().map_err(|error| rtdb_storage::Error::Task(error.to_string()))
+        } else {
+            Ok(crate::SystemClock.now())
+        }
     }
 }
 

@@ -16,7 +16,7 @@ Unknown names, nonstring values, malformed JSON, oversized input and exhausted s
 The resolved selection remains immutable through the native node's lifetime.
 This entry does not read JVM properties; an embedded host supplies the value it captured for the reference lifetime it is matching.
 
-`rtdb_v1_database_open_with_in_memory_log_clock` accepts the same properties and a host callback for in-memory source transaction timestamps.
+`rtdb_v1_database_open_with_log_clock` accepts the same properties and a host callback for in-memory and local source transaction timestamps.
 The callback supplies epoch seconds and a nanosecond fraction, which the log records at microsecond precision.
 A rejected or invalid clock reading leaves the source log position available for a later append.
 The host retains the callback and its context until database close joins admitted operations and drivers.

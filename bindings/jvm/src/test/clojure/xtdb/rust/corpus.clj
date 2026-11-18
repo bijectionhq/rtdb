@@ -85,6 +85,11 @@
      (throw (ex-info "Unsupported native start-node options" {:class (str (class opts))})))
    (let [clock (get-in opts [:log 1 :instant-src])
          opts (cond-> opts clock (update-in [:log 1] dissoc :instant-src))
+         opts (cond-> opts
+                (contains? (get-in opts [:log 1]) :instant-source-for-non-tx-msgs?)
+                (update-in [:log 1] (fn [{use? :instant-source-for-non-tx-msgs? :as log}]
+                                      (cond-> (dissoc log :instant-source-for-non-tx-msgs?)
+                                        (= :local (get-in opts [:log 0])) (assoc :use-instant-source-for-non-tx (boolean use?))))))
          opts (merge {:server {:port 0} :flight-sql {:port 0}} opts)
          config (yaml opts)]
      (if (instance? InstantSource clock)

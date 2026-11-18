@@ -240,6 +240,31 @@ async fn local_log_clock_applies_to_transactions_and_optionally_to_other_message
 }
 
 #[tokio::test]
+async fn host_log_clock_stamps_local_source_transactions_and_keeps_the_non_transaction_policy() {
+    use rtdb_types::Timestamp;
+    use rtdb_format::envelope::{SourceBody, SourceMessage};
+    struct FixedClock;
+    impl rtdb_node::Clock for FixedClock { fn now(&self) -> Timestamp { Timestamp(123) } }
+    for use_for_non_transactions in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let native = NativeResources::default().with_local_log_clock(Arc::new(FixedClock), use_for_non_transactions).with_log_clock(Arc::new(|| Ok(Timestamp(456))));
+        let config = DatabaseConfig { log: Some(database_config::Log::LocalLog(rtdb_format::database::proto::LocalLog {
+            path: Some(directory.path().to_string_lossy().into_owned()), epoch: None,
+        })), ..Default::default() };
+        let shutdown = CancellationToken::new();
+        let opened = native.open("xtdb", &config, rtdb_node::LogAccess::ReadWrite, shutdown.clone()).await.unwrap();
+        let tasks = opened.logs.drivers.into_iter().map(tokio::spawn).collect::<Vec<_>>();
+        let transaction = SourceMessage::Protobuf(SourceBody::Tx(Default::default())).encode().unwrap();
+        let other = SourceMessage::Protobuf(SourceBody::DetachDatabase(Default::default())).encode().unwrap();
+        assert_eq!(opened.logs.source.enqueue(transaction.into(), Timestamp(10)).await.unwrap().durable().await.unwrap().timestamp, Timestamp(456));
+        let source = opened.logs.source.enqueue(other.into(), Timestamp(10)).await.unwrap().durable().await.unwrap().timestamp;
+        assert_eq!(source == Timestamp(456), use_for_non_transactions);
+        shutdown.cancel();
+        for task in tasks { task.await.unwrap().unwrap(); }
+    }
+}
+
+#[tokio::test]
 async fn source_writer_log_access_leaves_replica_writer_ownership_available() {
     use rtdb_storage::log::{LocalLog, LocalLogOptions};
     let directory = tempfile::tempdir().unwrap();

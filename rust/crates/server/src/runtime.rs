@@ -54,8 +54,8 @@ impl ServerDriver {
         Self::open_mode(config, allocation_limit_bytes, memory, false, None).await
     }
 
-    /// Uses a host clock for transactions appended to in-memory source logs.
-    pub async fn open_with_in_memory_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
+    /// Uses a host clock for transactions appended to in-memory and local source logs.
+    pub async fn open_with_log_clock(config: NodeConfiguration, allocation_limit_bytes: usize, memory: Arc<MemoryBudget>, clock: Arc<TransactionClock>) -> Result<(ServerHandle, Self)> {
         Self::open_mode(config, allocation_limit_bytes, memory, false, Some(clock)).await
     }
 
@@ -89,7 +89,7 @@ impl ServerDriver {
         let auth = Authenticator::open(config.auth.clone(), Arc::clone(&memory), Arc::new(SystemClock), http).await?;
         let (resources, external_sources, mut registrations) = crate::resources::open(&config, &memory, &metrics)?;
         let resources = match transaction_clock {
-            Some(clock) => resources.with_in_memory_log_clock(clock),
+            Some(clock) => resources.with_log_clock(clock),
             None => resources,
         };
         let services = NodeServices { resources: Arc::new(resources), external_sources, execution_observer: Some(metrics.clone()), tracer,

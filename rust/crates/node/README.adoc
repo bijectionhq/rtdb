@@ -46,6 +46,7 @@ In-process connections inherit the node's configured time zone, which defaults t
 Remote storage requires a shared `DiskCache`, with file keys scoped by database and partition.
 Database names that cannot form a safe single path component use an injective hexadecimal cache-directory encoding.
 Production local-log writers sample the configured clock for source transactions and the system clock for other messages, unless `with_local_log_clock` enables the configured clock for all records.
+`with_log_clock` replaces that clock with a fallible host clock for in-memory and local source transactions, keeping the local log's policy for other messages.
 The clock is sampled during append, after queue admission.
 `Node::snapshot_export` requires indexing and compaction to be disabled and returns a passive, charged manifest for the loaded block.
 The plan copies through the existing object-store capability, accepts completed immutable copies on retry and checks cancellation between copies.

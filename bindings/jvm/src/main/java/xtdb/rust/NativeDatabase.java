@@ -54,13 +54,13 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
         }
         return database;
     }
-    /** Supplies timestamps for transactions appended to in-memory source logs.
+    /** Supplies timestamps for transactions appended to in-memory and local source logs.
      * The clock can be called on native threads, concurrently across logs, and must never reenter the database.
      * Clock failures reject the append. The database retains the clock until it closes.
      */
-    public static NativeDatabase open(BufferAllocator allocator, String yaml, long nativeMemoryBytes, InstantSource inMemoryLogClock) throws AdbcException {
+    public static NativeDatabase open(BufferAllocator allocator, String yaml, long nativeMemoryBytes, InstantSource logClock) throws AdbcException {
         if (nativeMemoryBytes <= 0) throw AdbcException.invalidArgument("Native memory limit must be positive");
-        if (inMemoryLogClock == null) throw AdbcException.invalidArgument("In-memory log clock must be supplied");
+        if (logClock == null) throw AdbcException.invalidArgument("Log clock must be supplied");
         NativeAbi abi = NativeAbi.get();
         Arena clockArena = Arena.ofShared();
         try (Arena arena = Arena.ofConfined()) {
@@ -68,8 +68,8 @@ public final class NativeDatabase extends NativeResource implements AdbcDatabase
             var database = new NativeDatabase(abi, handle, allocator, clockArena);
             MemorySegment text = NativeAbi.text(arena, yaml);
             MemorySegment properties = sortProperties(arena, SortProperty.LEGACY);
-            MemorySegment clock = LogClock.upcall(inMemoryLogClock, clockArena);
-            handle.set(abi.handle("database_open_with_in_memory_log_clock", text, text.byteSize(), nativeMemoryBytes,
+            MemorySegment clock = LogClock.upcall(logClock, clockArena);
+            handle.set(abi.handle("database_open_with_log_clock", text, text.byteSize(), nativeMemoryBytes,
                 properties, properties.byteSize(), clock, 0L));
             return database;
         } catch (AdbcException | RuntimeException | Error failure) {

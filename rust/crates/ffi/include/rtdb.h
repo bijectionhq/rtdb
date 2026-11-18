@@ -62,16 +62,16 @@ int32_t rtdb_v1_database_open_with_properties(const uint8_t *yaml, size_t yaml_l
                                            const uint8_t *properties, size_t properties_length, RtdbHandle *out, RtdbHandle *error);
 /* The callback supplies epoch seconds and a nanosecond fraction on success (0).
  * A nonzero return or an unrepresentable instant rejects the transaction append.
- * Each in-memory source log samples in append order, and different logs can call concurrently.
+ * Each in-memory or local source log samples in append order, and different logs can call concurrently.
  * The callback must be callable on native threads and must not reenter RTDB.
  * Keep the callback and context alive until database close completes, including on other aliases.
  * Output pointers are writable only for the duration of the callback.
  * Properties and configuration have the same contract as database_open_with_properties.
  */
 typedef int32_t (*RtdbInstantSource)(uintptr_t context, int64_t *seconds, uint32_t *nanos);
-int32_t rtdb_v1_database_open_with_in_memory_log_clock(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes,
-                                                    const uint8_t *properties, size_t properties_length,
-                                                    RtdbInstantSource clock, uintptr_t context, RtdbHandle *out, RtdbHandle *error);
+int32_t rtdb_v1_database_open_with_log_clock(const uint8_t *yaml, size_t yaml_length, size_t memory_bytes,
+                                          const uint8_t *properties, size_t properties_length,
+                                          RtdbInstantSource clock, uintptr_t context, RtdbHandle *out, RtdbHandle *error);
 /* Requests a block flush in each open writable database and waits for indexed progress
  * through each request. timeout_nanos is a positive overall deadline.
  */

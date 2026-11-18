@@ -38,7 +38,7 @@ final class NativeAdbcTest {
         }
     }
 
-    @Test void inMemoryLogClockRejectsFailedReadsAndAllowsTheNextAppend() throws Exception {
+    @Test void logClockRejectsFailedReadsAndAllowsTheNextAppend() throws Exception {
         var reads = new AtomicInteger();
         try (var allocator = new RootAllocator();
              var database = NativeDatabase.open(allocator, YAML, 512L * 1024 * 1024, () -> {
@@ -52,7 +52,7 @@ final class NativeAdbcTest {
              var insert = connection.createStatement("INSERT INTO docs (_id) VALUES (1)")) {
             assertEquals(0, reads.get());
             var failed = assertThrows(NativeException.class, insert::executeUpdate);
-            assertTrue(failed.getMessage().contains("The host in-memory log clock failed"));
+            assertTrue(failed.getMessage().contains("The host log clock failed"));
             var outOfRange = assertThrows(NativeException.class, insert::executeUpdate);
             assertTrue(outOfRange.getMessage().contains("Instant exceeds microsecond timestamp range"));
             insert.executeUpdate();

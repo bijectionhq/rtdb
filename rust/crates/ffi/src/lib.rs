@@ -71,7 +71,7 @@ pub unsafe extern "C" fn rtdb_v1_database_open_with_properties(yaml: *const u8, 
 pub type RtdbInstantSource = unsafe extern "C" fn(context: usize, seconds: *mut i64, nanos: *mut u32) -> i32;
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn rtdb_v1_database_open_with_in_memory_log_clock(
+pub unsafe extern "C" fn rtdb_v1_database_open_with_log_clock(
     yaml: *const u8, yaml_length: usize, memory_bytes: usize, properties: *const u8, properties_length: usize,
     clock: Option<RtdbInstantSource>, context: usize, out: *mut u64, error: *mut u64,
 ) -> i32 {
@@ -79,12 +79,12 @@ pub unsafe extern "C" fn rtdb_v1_database_open_with_in_memory_log_clock(
         let out = output(out)?;
         *out = 0;
         if properties_length > 4096 { return Err(invalid("Native system properties exceed 4096 bytes")); }
-        let clock = clock.ok_or_else(|| invalid("The in-memory log clock callback is null"))?;
+        let clock = clock.ok_or_else(|| invalid("The log clock callback is null"))?;
         let clock = Arc::new(move || {
             let mut seconds = 0;
             let mut nanos = 0;
             if clock(context, &mut seconds, &mut nanos) != 0 {
-                return Err(Anomaly::fault("rtdb.ffi/clock", "The host in-memory log clock failed"));
+                return Err(Anomaly::fault("rtdb.ffi/clock", "The host log clock failed"));
             }
             Timestamp::from_epoch_parts(seconds, nanos as i32)
         });
