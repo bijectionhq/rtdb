@@ -418,6 +418,7 @@ static int unittest_rdclock(void) {
 extern int unittest_string(void);
 extern int unittest_metadata_account(void);
 extern int unittest_connection_observation(void);
+extern int unittest_metadata_cache_ownership(void);
 extern int unittest_cgrp(void);
 extern int unittest_mock_cluster(void);
 #if WITH_SASL_SCRAM
@@ -461,6 +462,7 @@ int rd_unittest(void) {
                 {"ordered_metadata", unittest_ordered_metadata},
                 {"metadata_account", unittest_metadata_account},
                 {"connection_observation", unittest_connection_observation},
+                {"metadata_cache_ownership", unittest_metadata_cache_ownership},
                 {"request", unittest_request},
 #if WITH_SASL_OAUTHBEARER
                 {"sasl_oauthbearer", unittest_sasl_oauthbearer},

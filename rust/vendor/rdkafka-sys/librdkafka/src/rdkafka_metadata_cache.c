@@ -257,14 +257,12 @@ int rd_kafka_metadata_partition_id_cmp(const void *_a, const void *_b) {
  *
  * @param mdt Topic to insert in the cache entry.
  * @param mdti Topic to insert in the cache entry (internal structure).
- * @param include_racks Include partition racks.
  *
  * @return The new metadata cache entry, to free with `rd_free`.
  */
 static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
     const rd_kafka_metadata_topic_t *mtopic,
-    const rd_kafka_metadata_topic_internal_t *metadata_internal_topic,
-    rd_bool_t include_racks) {
+    const rd_kafka_metadata_topic_internal_t *metadata_internal_topic) {
         struct rd_kafka_metadata_cache_entry *rkmce;
         rd_tmpabuf_t tbuf;
         int i;
@@ -286,8 +284,10 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
                              mtopic->partition_cnt *
                                  sizeof(*metadata_internal_topic->partitions));
 
-        for (i = 0; include_racks && i < mtopic->partition_cnt; i++) {
+        for (i = 0; i < mtopic->partition_cnt; i++) {
                 size_t j;
+                if (!metadata_internal_topic->partitions[i].racks)
+                        continue;
                 rd_tmpabuf_add_alloc(
                     &tbuf, metadata_internal_topic->partitions[i].racks_cnt *
                                sizeof(char *));
@@ -309,15 +309,12 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
 
         rkmce->rkmce_metadata_internal_topic = *metadata_internal_topic;
 
-        /* Copy topic name and update pointer */
         rkmce->rkmce_mtopic.topic = rd_tmpabuf_write_str(&tbuf, mtopic->topic);
 
-        /* Copy partition array and update pointer */
         rkmce->rkmce_mtopic.partitions = rd_tmpabuf_write(
             &tbuf, mtopic->partitions,
             mtopic->partition_cnt * sizeof(*mtopic->partitions));
 
-        /* Copy partition array (internal) and update pointer */
         rkmce->rkmce_metadata_internal_topic.partitions =
             rd_tmpabuf_write(&tbuf, metadata_internal_topic->partitions,
                              mtopic->partition_cnt *
@@ -331,25 +328,21 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_entry_new(
 
         /* partitions (internal) are already sorted. */
 
-        if (include_racks) {
-                for (i = 0; i < rkmce->rkmce_mtopic.partition_cnt; i++) {
-                        size_t j;
-                        rd_kafka_metadata_partition_t *mdp =
-                            &rkmce->rkmce_mtopic.partitions[i];
-                        rd_kafka_metadata_partition_internal_t *mdpi =
-                            &rkmce->rkmce_metadata_internal_topic.partitions[i];
-                        rd_kafka_metadata_partition_internal_t *mdpi_orig =
-                            &metadata_internal_topic->partitions[i];
+        for (i = 0; i < rkmce->rkmce_mtopic.partition_cnt; i++) {
+                size_t j;
+                rd_kafka_metadata_partition_internal_t *mdpi =
+                    &rkmce->rkmce_metadata_internal_topic.partitions[i];
+                rd_kafka_metadata_partition_internal_t *mdpi_orig =
+                    &metadata_internal_topic->partitions[i];
 
-                        if (mdp->replica_cnt == 0 || mdpi->racks_cnt == 0)
-                                continue;
+                if (!mdpi_orig->racks)
+                        continue;
 
-                        mdpi->racks = rd_tmpabuf_alloc(
-                            &tbuf, sizeof(char *) * mdpi->racks_cnt);
-                        for (j = 0; j < mdpi_orig->racks_cnt; j++)
-                                mdpi->racks[j] = rd_tmpabuf_write_str(
-                                    &tbuf, mdpi_orig->racks[j]);
-                }
+                mdpi->racks = rd_tmpabuf_alloc(
+                    &tbuf, sizeof(char *) * mdpi->racks_cnt);
+                for (j = 0; j < mdpi_orig->racks_cnt; j++)
+                        mdpi->racks[j] = rd_tmpabuf_write_str(
+                            &tbuf, mdpi_orig->racks[j]);
         }
 
         /* Clear uncached fields. */
@@ -409,8 +402,6 @@ rd_kafka_metadata_cache_insert(rd_kafka_t *rk,
                     !*"Different cache entries for topic name and topic id");
         }
 
-        /* Explicitly not freeing the tmpabuf since rkmce points to its
-         * memory. */
         return rkmce;
 }
 
@@ -426,13 +417,9 @@ static struct rd_kafka_metadata_cache_entry *rd_kafka_metadata_cache_insert_new(
     const rd_kafka_metadata_topic_t *mtopic,
     const rd_kafka_metadata_topic_internal_t *metadata_internal_topic,
     rd_ts_t now,
-    rd_ts_t ts_expires,
-    rd_bool_t include_racks) {
-        /* Create entry */
+    rd_ts_t ts_expires) {
         struct rd_kafka_metadata_cache_entry *rkmce =
-            rd_kafka_metadata_cache_entry_new(mtopic, metadata_internal_topic,
-                                              include_racks);
-        /* Insert/replace entry */
+            rd_kafka_metadata_cache_entry_new(mtopic, metadata_internal_topic);
         return rd_kafka_metadata_cache_insert(rk, rkmce, now, ts_expires);
 }
 
@@ -502,12 +489,10 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
         size_t i, current_partition_cnt, new_partition_cnt, partition_cnt;
 
         if (!has_reliable_epochs || !rkmce_current ||
-            /* Different topic ids */
             rd_kafka_Uuid_cmp(
                 mdti->topic_id,
                 rkmce_current->rkmce_metadata_internal_topic.topic_id) != 0) {
-                return rd_kafka_metadata_cache_entry_new(mdt, mdti,
-                                                         include_racks);
+                return rd_kafka_metadata_cache_entry_new(mdt, mdti);
         }
 
         current_partition_cnt = rkmce_current->rkmce_mtopic.partition_cnt;
@@ -520,8 +505,9 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
         rd_tmpabuf_add_alloc(&tbuf, partition_cnt * sizeof(*mdt->partitions));
         rd_tmpabuf_add_alloc(&tbuf, partition_cnt * sizeof(*mdti->partitions));
 
-        for (i = 0; include_racks && i < partition_cnt; i++) {
+        for (i = 0; i < partition_cnt; i++) {
                 size_t j;
+                const rd_kafka_metadata_partition_t *partition;
                 rd_kafka_metadata_partition_internal_t *partition_internal;
                 rd_bool_t replace_partition =
                     rd_kafka_metadata_cache_topic_update_replace_partition(
@@ -535,6 +521,17 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
                         ? &mdti->partitions[i]
                         : &rkmce_current->rkmce_metadata_internal_topic
                                .partitions[i];
+                partition = replace_partition
+                                ? &mdt->partitions[i]
+                                : &rkmce_current->rkmce_mtopic.partitions[i];
+                if (partition->replicas)
+                        rd_tmpabuf_add_alloc(
+                            &tbuf, partition->replica_cnt * sizeof(*partition->replicas));
+                if (partition->isrs)
+                        rd_tmpabuf_add_alloc(
+                            &tbuf, partition->isr_cnt * sizeof(*partition->isrs));
+                if (!include_racks)
+                        continue;
                 rd_tmpabuf_add_alloc(&tbuf, partition_internal->racks_cnt *
                                                 sizeof(char *));
                 for (j = 0; j < partition_internal->racks_cnt; j++) {
@@ -551,14 +548,11 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
 
         rkmce->rkmce_metadata_internal_topic = *mdti;
 
-        /* Copy topic name */
         rkmce->rkmce_mtopic.topic = rd_tmpabuf_write_str(&tbuf, mdt->topic);
 
-        /* Allocate partition array */
         rkmce->rkmce_mtopic.partitions =
             rd_tmpabuf_alloc(&tbuf, partition_cnt * sizeof(*mdt->partitions));
 
-        /* Allocate partition array (internal) */
         rkmce->rkmce_metadata_internal_topic.partitions =
             rd_tmpabuf_alloc(&tbuf, partition_cnt * sizeof(*mdti->partitions));
 
@@ -584,6 +578,14 @@ rd_kafka_metadata_cache_topic_update_merge_partitions(
                 }
 
                 rkmce->rkmce_mtopic.partitions[i] = *partition;
+                if (partition->replicas)
+                        rkmce->rkmce_mtopic.partitions[i].replicas = rd_tmpabuf_write(
+                            &tbuf, partition->replicas,
+                            partition->replica_cnt * sizeof(*partition->replicas));
+                if (partition->isrs)
+                        rkmce->rkmce_mtopic.partitions[i].isrs = rd_tmpabuf_write(
+                            &tbuf, partition->isrs,
+                            partition->isr_cnt * sizeof(*partition->isrs));
                 rkmce->rkmce_metadata_internal_topic.partitions[i] =
                     *partition_internal;
 
@@ -829,7 +831,7 @@ int rd_kafka_metadata_cache_hint(rd_kafka_t *rk,
 
                 rd_kafka_metadata_cache_insert_new(rk, &mtopic,
                                                    &metadata_internal_topic,
-                                                   now, ts_expires, rd_false);
+                                                   now, ts_expires);
                 cnt++;
 
                 if (dst)
@@ -1181,3 +1183,5 @@ void rd_kafka_metadata_cache_dump(FILE *fp, rd_kafka_t *rk) {
 }
 
 /**@}*/
+
+#include "rdkafka_metadata_cache_ownership_test.h"

@@ -174,3 +174,22 @@ The fixed observation/control charges do not close whole-native, source-complete
 Additive native sources cover serial exhaustion, half-allocation cleanup, cancellation/publication, exact-owner/epoch/socket fences and a real broker decommission while its ready observation remains retained.
 The MockCluster source fixture establishes a learned native connection, uses the safe observation and consuming submission APIs, and retains the completed request after producer destruction.
 The fixtures have not been compiled or executed in the source-only phase.
+
+== Ordinary Metadata cache retained values
+
+A full ordinary native cache entry owns every rack array/string that it retains, including force_racks data when this client has no rack and nonnull zero-length array presence.
+The reliable-epoch merge owns each selected replica/ISR array and retains its existing optional-rack behavior.
+A replacement preserves the source epoch choice, maximum physical partition extent, incoming logical count and aligned arena seed.
+Cached values survive the parsed Metadata arena's destruction and the replaced entry's final free.
+Public parsed Metadata ownership and ordered native observation APIs retain their separate contracts.
+
+Additive regression sources cover full/merged pointee lifetime, absent versus present empty arrays, old/new/new-only epoch winners, and source physical/logical partition counts.
+The actual native main actor also runs ordinary and admin parser fixtures and checks retained cache values after releasing their independent parsed arenas.
+Those fixtures use existing native actor queues and client teardown rather than fabricated actor identities or abandoned thread handles.
+The source fixtures have not been compiled or executed.
+
+Cache entry arenas still have no automatic byte admission.
+Retained payloads and source padding/slack must be admitted together, including old/new replacement overlap, in a later source slice.
+The tag-update/cgrp hint borrowing repairs remain a separate proposed lock change, including the lightweight-topic constructor caller audit.
+The adjacent topic-info clone's NULL-rack count initialization also requires a separate source correction.
+Native request/cache scratch, topic-info/assignor/admin clones, allocator overhead and all runtime/Phase2 qualification remain separate obligations.

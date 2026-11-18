@@ -2254,3 +2254,4 @@ rd_kafka_metadata_update_op(rd_kafka_t *rk, rd_kafka_metadata_internal_t *mdi) {
 }
 
 #include "rdkafka_metadata_account_test.h"
+#include "rdkafka_metadata_cache_parser_test.h"
