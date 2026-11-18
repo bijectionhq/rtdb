@@ -29,21 +29,108 @@ pub fn copy_array(logical: &LogicalType, values: &[Value]) -> Result<ArrayRef> {
 
 fn build_values(logical: &LogicalType, values: &[Value], check_precision: bool) -> Result<ArrayRef> {
     logical.validate()?;
+    let admission = Admission::new(logical);
     for (row, value) in values.iter().enumerate() {
-        if !accepts(logical, value) {
+        if !admission.accepts(value) {
             return Err(Anomaly::incorrect("rtdb/column-type-mismatch", format!("Value at row {row} does not belong to {logical:?}")));
         }
     }
     build(logical, values, check_precision)
 }
 
-pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool {
-    if matches!(value, Value::Undefined) { return matches!(logical.unencoded(), LogicalType::Nothing); }
-    let plain = logical.unencoded();
-    let actual = value.logical_type();
-    plain == actual
-        || matches!(&plain, LogicalType::Maybe(inner) if **inner == actual || actual == LogicalType::Null)
-        || plain.join(&actual) == plain
+pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool { Admission::new(logical).accepts(value) }
+
+/// Whether values belong to a column type: joining a value's type into the column's leaves it unchanged.
+/// Built once per column so that each value is checked against the type without re-deriving it.
+pub(crate) struct Admission { plain: LogicalType, join_normal: bool }
+
+impl Admission {
+    pub(crate) fn new(logical: &LogicalType) -> Self {
+        let plain = logical.unencoded();
+        let join_normal = join_normal(&plain);
+        Self { plain, join_normal }
+    }
+
+    pub(crate) fn accepts(&self, value: &Value) -> bool {
+        let plain = &self.plain;
+        if matches!(value, Value::Undefined) { return matches!(plain, LogicalType::Nothing); }
+        if self.join_normal { return covers(plain, value); }
+        let actual = value.logical_type();
+        *plain == actual
+            || matches!(plain, LogicalType::Maybe(inner) if **inner == actual || actual == LogicalType::Null)
+            || plain.join(&actual) == *plain
+    }
+}
+
+/// Whether `ty` is its own join: the canonical leg shape, one struct leg and one list leg per kind at every depth.
+fn join_normal(ty: &LogicalType) -> bool {
+    match ty {
+        LogicalType::Nothing | LogicalType::Null | LogicalType::Scalar(_) => true,
+        LogicalType::Maybe(inner) => matches!(inner.as_ref(), LogicalType::Scalar(_) | LogicalType::List { .. } | LogicalType::Struct(_)) && join_normal(inner),
+        LogicalType::List { element, .. } => join_normal(element),
+        LogicalType::Struct(fields) => fields.values().all(join_normal),
+        LogicalType::Union(legs) => {
+            let mut structs = 0;
+            let mut kinds = std::collections::BTreeSet::new();
+            legs.iter().filter(|leg| **leg != LogicalType::Null).count() >= 2 && legs.iter().all(|leg| match leg {
+                LogicalType::Null | LogicalType::Scalar(_) => true,
+                LogicalType::List { kind, element } => kinds.insert(kind.clone()) && join_normal(element),
+                LogicalType::Struct(fields) => { structs += 1; structs == 1 && fields.values().all(join_normal) }
+                _ => false,
+            })
+        }
+        LogicalType::RunEndEncoded { .. } => false,
+    }
+}
+
+/// `plain.join(value.logical_type()) == plain` for a join-normal `plain`, without building the value's type.
+fn covers(plain: &LogicalType, value: &Value) -> bool {
+    let legs: Vec<&LogicalType> = match (plain, value) {
+        (_, Value::Undefined) => return true,
+        (LogicalType::Null | LogicalType::Maybe(_), Value::Null) => return true,
+        (LogicalType::Union(legs), Value::Null) => return legs.contains(&LogicalType::Null),
+        (_, Value::Null) => return false,
+        (LogicalType::Nothing, _) => return false,
+        (LogicalType::Maybe(inner), _) => vec![inner.as_ref()],
+        (LogicalType::Union(legs), _) => legs.iter().collect(),
+        (leg, _) => vec![leg],
+    };
+    let nullable = |ty: &LogicalType| match ty {
+        LogicalType::Null | LogicalType::Maybe(_) => true,
+        LogicalType::Union(legs) => legs.contains(&LogicalType::Null),
+        _ => false,
+    };
+    match value {
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => {
+            let expected = match value {
+                Value::Set(_) => ListKind::Set,
+                Value::FixedSizeList(_) => ListKind::FixedSizeList(i32::try_from(values.len()).unwrap_or(i32::MAX)),
+                _ => ListKind::List,
+            };
+            legs.iter().any(|leg| matches!(leg, LogicalType::List { kind, element } if *kind == expected && values.iter().all(|value| covers(element, value))))
+        }
+        Value::Map { entries, sorted } => legs.iter().any(|leg| match leg {
+            LogicalType::List { kind: ListKind::Map { sorted: expected }, element } => match element.as_ref() {
+                LogicalType::Struct(fields) => expected == sorted
+                    && fields.iter().all(|(name, ty)| name == "key" || name == "value" || nullable(ty))
+                    && match (fields.get("key"), fields.get("value")) {
+                        (Some(key), Some(item)) => entries.iter().all(|(k, v)| covers(key, k) && covers(item, v)),
+                        _ => false,
+                    },
+                _ => false,
+            },
+            _ => false,
+        }),
+        Value::Struct(values) => legs.iter().any(|leg| match leg {
+            LogicalType::Struct(fields) => values.iter().all(|(name, value)| fields.get(name).is_some_and(|ty| covers(ty, value)))
+                && fields.iter().all(|(name, ty)| values.contains_key(name) || nullable(ty)),
+            _ => false,
+        }),
+        value => match value.logical_type() {
+            LogicalType::Scalar(actual) => legs.iter().any(|leg| matches!(leg, LogicalType::Scalar(scalar) if *scalar == actual)),
+            actual => plain.join(&actual) == *plain,
+        },
+    }
 }
 
 /// Resolves a struct field's cell in its declared layout.
@@ -291,12 +378,13 @@ fn build_union(logical: &LogicalType, values: &[Value], check_precision: bool) -
     let DataType::Union(fields, UnionMode::Dense) = field.data_type() else { return build(&from_field(&field)?, values, check_precision); };
     let legs = fields.iter().map(|(_, field)| from_field(field)).collect::<Result<Vec<_>>>()?;
     let ids = fields.iter().map(|(id, _)| id).collect::<Vec<_>>();
+    let admissions = legs.iter().map(Admission::new).collect::<Vec<_>>();
     let mut children: Vec<Vec<Value>> = legs.iter().map(|_| Vec::new()).collect();
     let mut type_ids = Vec::with_capacity(values.len());
     let mut offsets = Vec::with_capacity(values.len());
     for value in values {
         let leg = if matches!(value, Value::Undefined) { 0 } else {
-            legs.iter().position(|leg| accepts(leg, value)).ok_or_else(|| Anomaly::incorrect("rtdb/union-value", "Value has no matching union leg"))?
+            admissions.iter().position(|leg| leg.accepts(value)).ok_or_else(|| Anomaly::incorrect("rtdb/union-value", "Value has no matching union leg"))?
         };
         type_ids.push(ids[leg]);
         offsets.push(i32::try_from(children[leg].len()).map_err(|_| Anomaly::incorrect("rtdb/union-offset-overflow", "Union child exceeds i32 offsets"))?);
@@ -513,3 +601,42 @@ fn downcast<T: 'static>(array: &dyn Array) -> Result<&T> { array.as_any().downca
 fn layout_error() -> Anomaly { Anomaly::incorrect("rtdb/array-layout", "Arrow array and logical field layout disagree") }
 fn decimal_width() -> Anomaly { Anomaly::incorrect("rtdb/decimal-width", "Decimal coefficient must fill its declared signed width") }
 fn run_overflow() -> Anomaly { Anomaly::incorrect("rtdb/run-end-overflow", "Array length exceeds its run-end index width") }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn joined(plain: &LogicalType, value: &Value) -> bool {
+        if matches!(value, Value::Undefined) { return matches!(plain, LogicalType::Nothing); }
+        let actual = value.logical_type();
+        *plain == actual
+            || matches!(plain, LogicalType::Maybe(inner) if **inner == actual || actual == LogicalType::Null)
+            || plain.join(&actual) == *plain
+    }
+
+    #[test]
+    fn admission_of_join_normal_types_agrees_with_the_lattice_join() {
+        let s = |fields: &[(&str, Value)]| Value::Struct(fields.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect());
+        let values = vec![
+            Value::Null, Value::Undefined, Value::I64(1), Value::Utf8("a".into()), Value::Bool(true),
+            Value::List(vec![]), Value::List(vec![Value::I64(1)]), Value::List(vec![Value::I64(1), Value::Utf8("b".into())]),
+            Value::List(vec![Value::Null]), Value::Set(vec![Value::I64(2)]), Value::FixedSizeList(vec![Value::I64(1), Value::I64(2)]),
+            s(&[("a", Value::I64(1))]), s(&[("a", Value::Null)]), s(&[("b", Value::Utf8("x".into()))]), s(&[("a", Value::Undefined)]),
+            s(&[("a", Value::List(vec![s(&[("c", Value::Bool(false))])]))]), s(&[]),
+            Value::Map { entries: vec![(Value::Utf8("k".into()), Value::I64(1))], sorted: false },
+            Value::Map { entries: vec![], sorted: false },
+            Value::TimestampTzRange { lower: 0, upper: 1 },
+        ];
+        let mut types = vec![LogicalType::Nothing];
+        for a in &values { for b in &values { for c in &values {
+            let ty = LogicalType::join_all([&a.logical_type(), &b.logical_type(), &c.logical_type()]);
+            types.push(ty.clone().maybe());
+            types.push(ty);
+        } } }
+        for ty in &types {
+            let admission = Admission::new(ty);
+            assert!(admission.join_normal, "{ty:?}");
+            for value in &values { assert_eq!(admission.accepts(value), joined(&admission.plain, value), "{ty:?} admits {value:?}"); }
+        }
+    }
+}

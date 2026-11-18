@@ -12,8 +12,9 @@ pub fn estimate_builder_bytes_refs<'a>(logical: &LogicalType, values: impl IntoI
     logical.validate()?;
     let (schema, depth) = schema_cost(logical)?;
     let mut bytes = multiply(schema, depth)?;
+    let admission = super::values::Admission::new(logical);
     for value in values {
-        if !super::values::accepts(logical, value) {
+        if !admission.accepts(value) {
             return Err(Anomaly::incorrect("rtdb/column-type-mismatch", "Allocation estimate requires values belonging to the declared logical type"));
         }
         bytes = add(bytes, cell_cost(logical, value)?)?;
