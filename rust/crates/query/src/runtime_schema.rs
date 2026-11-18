@@ -394,7 +394,7 @@ fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result
         }
         Expr::Unary { op, expr } => {
             let ty = child(expr)?;
-            if *op == UnaryOp::BitNot { return rtdb_plan::function_type("bit_not", &[ty]); }
+            if *op == UnaryOp::BitNot { return rtdb_plan::function_type("bit_not", &[rtdb_columnar::execution_type(&ty)]); }
             if ty == expr.data_type() { return Ok(Expr::unary(*op, typed(ty)).data_type()); }
             if ty == L::Null && matches!(op, UnaryOp::Negate | UnaryOp::BitNot | UnaryOp::Not) { L::Null }
             else { Expr::unary(*op, typed(ty)).data_type() }
@@ -404,7 +404,9 @@ fn expression_type(expr: &Expr, input: &Schema, emitter: &Emitter<'_>) -> Result
             if matches!(op,BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq) { rtdb_plan::validate_ordered_predicate_types(&left_type,&right_type)?; }
             if matches!(op, BinaryOp::Eq | BinaryOp::NotEq | BinaryOp::IsDistinctFrom | BinaryOp::IsNotDistinctFrom) { rtdb_plan::validate_equality_types(&left_type, &right_type)?; }
             if matches!(op, BinaryOp::BitAnd | BinaryOp::BitOr | BinaryOp::BitXor | BinaryOp::ShiftLeft | BinaryOp::ShiftRight) {
-                let expression = Expr::binary(*op, Expr::Parameter { index: 0,data_type: left_type }, Expr::Parameter { index: 1,data_type: right_type });
+                let left = Expr::Parameter { index: 0, data_type: rtdb_columnar::execution_type(&left_type) };
+                let right = Expr::Parameter { index: 1, data_type: rtdb_columnar::execution_type(&right_type) };
+                let expression = Expr::binary(*op, left, right);
                 expression.validate_columns(&Default::default())?;
                 return Ok(expression.data_type());
             }

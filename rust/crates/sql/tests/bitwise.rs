@@ -35,6 +35,7 @@ async fn sql_bitwise_operators_keep_signed_widths_and_parameter_admission() {
     assert_eq!(query("SELECT CAST(1 AS INTEGER) << 2147483648",vec![]).await.unwrap_err().code,"xtdb.expression/overflow-error");
     assert_eq!(query("SELECT $1 << $2",vec![V::I8(127),V::I64(1)]).await.unwrap(),[vec![V::I8(-2)]]);
     assert_eq!(query("SELECT $1 & 1",vec![V::U8(1)]).await.unwrap(),[vec![V::I64(1)]]);
+    assert_eq!(query("SELECT ~$1,$1 << $2",vec![V::U8(u8::MAX),V::U64(1)]).await.unwrap(),[vec![V::I8(0),V::I8(-2)]]);
     let context = context();
     for expression in ["1.0 & 1","~TRUE","bit_and(1,2)","bit_not(1)","6 ^ 3"] {
         assert!(prepare(&format!("SELECT {expression}"),&context.catalog,&PrepareOptions::default()).is_err(),"{expression}");
