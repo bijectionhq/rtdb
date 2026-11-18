@@ -4,7 +4,7 @@ use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStat
 use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
-use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}, split::SplitTokens};
+use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}, split::{SplitTokens, boundary_lexical_bytes}};
 
 const CONTROL_EXPRESSION_RECURSION_LIMIT: usize = 50;
 
@@ -36,7 +36,7 @@ impl AdmittedControl {
 pub fn parse_admitted_control_in(source: &str, options: &PrepareOptions, memory: &Arc<MemoryBudget>) -> Result<Option<AdmittedControl>> {
     let reservation;
     let syntax = {
-        let lexical_bytes = source.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(control_size)?;
+        let lexical_bytes = boundary_lexical_bytes(source).ok_or_else(control_size)?;
         let _lexical = memory.reserve(lexical_bytes)?;
         let mut tokens = SplitTokens::tokenize_in(source, memory)?;
         if !probe_control(source, &mut tokens.values)? { return Ok(None); }

@@ -77,6 +77,10 @@ impl SplitTokens {
 
 fn token_array_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/token-array-size", "SQL token array exceeds addressable memory") }
 
+pub(super) fn boundary_lexical_bytes(source: &str) -> Option<usize> {
+    source.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1024))
+}
+
 /// Admits located-token array growth during lexical validation, then admits the returned byte ranges.
 /// Source line and block comments occupy located slots with empty text fields.
 /// The token array is released before return.

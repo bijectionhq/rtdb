@@ -8,7 +8,7 @@ use crate::{
     bind::FormAllocation,
     control::{RetainedControlSyntax, parse_control_tokens, prepare_name},
     parse::{RetainedStatementSyntax, StatementSource, parse_statement_syntax, sql_error, validate_common_syntax},
-    split::SplitTokens,
+    split::{SplitTokens, boundary_lexical_bytes},
 };
 
 /// The commands in a complete SQL batch and the reservation for their array.
@@ -286,6 +286,7 @@ pub fn parse_statement_batch<'input>(source: &'input str, memory: &'input Arc<Me
 pub fn parse_statement_batch_with_frontend_response<'input>(
     source: &'input str, memory: &'input Arc<MemoryBudget>, is_frontend_response: impl Fn(&str) -> bool,
 ) -> Result<StatementBatch<'input>> {
+    let _lexical = memory.reserve(boundary_lexical_bytes(source).ok_or_else(batch_size)?)?;
     let mut tokens = SplitTokens::tokenize_in(source, memory)?;
     tokens.values.retain(|token| !matches!(token.token, Token::Whitespace(_) | Token::EOF));
     let mut end = tokens.values.len();
@@ -380,6 +381,48 @@ impl<'input> SourceOffsets<'input> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_admits_lexer_work_before_token_capacity_and_validates_all_input_before_grammar() {
+        let source = format!("SELEC '{}'; SELECT @", "é".repeat(4096));
+        let lexical_bytes = boundary_lexical_bytes(&source).unwrap();
+        let too_small = MemoryBudget::new(lexical_bytes - 1);
+        let error = parse_statement_batch(&source, &too_small).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(too_small.peak_bytes(), 0);
+        assert_eq!(too_small.used_bytes(), 0);
+
+        let lexer_only = MemoryBudget::new(lexical_bytes);
+        let error = parse_statement_batch(&source, &lexer_only).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(lexer_only.peak_bytes(), lexical_bytes);
+        assert_eq!(lexer_only.used_bytes(), 0);
+
+        let enough = MemoryBudget::new(1 << 20);
+        let error = parse_statement_batch(&source, &enough).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error");
+        assert_eq!(error.message.as_deref(), Some("Invalid character in SQL source"));
+        let invalid = source.find('@').unwrap();
+        assert_eq!(error.context["span"], serde_json::json!({"start": invalid, "end": invalid + 1}));
+        assert_eq!(enough.used_bytes(), 0);
+    }
+
+    #[test]
+    fn batch_retains_statement_storage_after_releasing_lexical_admission() {
+        let source = "SELECT 'café'; SHOW TIME ZONE";
+        let memory = MemoryBudget::new(1 << 20);
+        let mut batch = parse_statement_batch(source, &memory).unwrap();
+        let first = batch.next().unwrap();
+        let second = batch.next().unwrap();
+        assert_eq!(first.command.source(), "SELECT 'café'");
+        assert_eq!(second.command.source(), "SHOW TIME ZONE");
+        assert_eq!(memory.used_bytes(), batch._storage.bytes() + first.allocation.bytes() + second.allocation.bytes());
+        assert!(memory.peak_bytes() > memory.used_bytes());
+        drop(first);
+        drop(second);
+        drop(batch);
+        assert_eq!(memory.used_bytes(), 0);
+    }
 
     #[test]
     fn batch_rejects_later_grammar_before_reading_an_earlier_xtql_literal() {

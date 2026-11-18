@@ -293,6 +293,9 @@ Control parsing retains expression syntax for scalar binding independently of a 
 The parser checks the literal positions in session settings and transaction ASYNC options before collecting the command.
 Binding compiles the final transaction options in option order and resolves a CLOCK_TIME timestamp literal at that stage.
 `split_statements` separates statements by tokenizer spans before classification, preserving semicolons inside strings and comments.
+Before scanning the batch, Simple Query reserves an allowance for token payloads and tokenizer scratch.
+It charges the located token array separately as the array grows.
+Batch parsing releases both reservations before returning.
 `parse_control_in` charges raw expression forms during binding.
 Flight SQL uses `parse_admitted_control_in` to classify the full input under a tokenizer allowance and admit located token capacity as it grows.
 A recognized control command reserves an estimate for parsing and binding, including simultaneous token copies and AST storage.
