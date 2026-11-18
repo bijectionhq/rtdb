@@ -19,6 +19,14 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         })
     }
 
+    pub(super) fn match_statement_atom(&mut self) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {
+        self.match_generated_atom(|state| match state {
+            ParserState::State(number @ (353 | 356)) => Some((number, 0)),
+            ParserState::State(488) => Some((488, 2)),
+            _ => None,
+        })
+    }
+
     fn match_generated_atom(
         &mut self, site: impl FnOnce(ParserState) -> Option<(u32, u16)>,
     ) -> PassResult<'parse, 'sql, IndexedLexeme<'sql>> {

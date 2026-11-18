@@ -1,6 +1,10 @@
 use crate::lexer::IndexedLexeme;
 use crate::parser::grammar::{TokenType, TransitionView};
-use super::{ContextChild, ContextClass, InvocationKey, ParserProfile, ParserSession, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
+use super::{ContextChild, ContextClass, InvocationKey, ParserSession, PassError, PassResult, RuntimeError, RuntimeProblem, RuntimeResult};
+
+#[cfg(test)]
+use super::ParserProfile;
+#[cfg(test)]
 use super::super::PredictionMode;
 
 #[cfg(test)]
@@ -8,15 +12,6 @@ use super::super::PredictionMode;
 mod tests;
 
 impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
-    fn generated_mode(&mut self) -> RuntimeResult<'sql, PredictionMode> {
-        let result = self.ready().and_then(|()| match self.profile {
-            ParserProfile::SllBail => Ok(PredictionMode::Sll),
-            ParserProfile::LlDefault => Ok(PredictionMode::Ll),
-            ParserProfile::Kernel => Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
-        });
-        self.finish(result)
-    }
-
     fn expected_at(&mut self, number: u32) -> RuntimeResult<'sql, TokenType> {
         let result = (|| {
             let grammar = self.environment.storage.grammar_view();

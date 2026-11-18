@@ -30,6 +30,9 @@ mod generated_data_type;
 #[path = "generated_isolation.rs"]
 mod generated_isolation;
 
+#[path = "generated_statement.rs"]
+mod generated_statement;
+
 #[path = "generated_window.rs"]
 mod generated_window;
 
@@ -135,11 +138,12 @@ enum InvocationException<'parse, 'sql> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ContextClass {
     ReadUncommittedIsolation, ReadCommittedIsolation, RepeatableReadIsolation, SerializableIsolation, IsolationLevelTxMode,
-    DateType, ArrayType, RegularIdentifier,
+    DateType, ArrayType, RegularIdentifier, RollbackStatement,
 }
 impl ContextClass {
     fn rule(self) -> u16 {
         match self {
+            Self::RollbackStatement => 2,
             Self::DateType | Self::ArrayType => 26,
             Self::RegularIdentifier => 22,
             Self::IsolationLevelTxMode => 164,
@@ -237,6 +241,14 @@ pub(super) fn with_parser_session<'sql, 'env, 'work, R>(
 impl<'parse, 'sql, 'work> ParserSession<'parse, 'sql, '_, 'work> {
     fn ready(&self) -> RuntimeResult<'sql, ()> { if self.control.is_ready() { Ok(()) } else { Err(RuntimeError::Control(RuntimeProblem::Aborted)) } }
     fn finish<T>(&mut self, result: RuntimeResult<'sql, T>) -> RuntimeResult<'sql, T> { if result.is_err() { self.control.abort(); } result }
+    fn generated_mode(&mut self) -> RuntimeResult<'sql, PredictionMode> {
+        let result = self.ready().and_then(|()| match self.profile {
+            ParserProfile::SllBail => Ok(PredictionMode::Sll),
+            ParserProfile::LlDefault => Ok(PredictionMode::Ll),
+            ParserProfile::Kernel => Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),
+        });
+        self.finish(result)
+    }
     fn record(&self, key: InvocationKey<'parse>) -> RuntimeResult<'sql, &InvocationRecord<'parse, 'sql>> { self.records.get(key.index).ok_or(RuntimeError::Control(RuntimeProblem::Invocation)) }
     fn append(&mut self, rule: u16, saved: SavedOuterLink<'parse>, role: InvocationRole<'parse>) -> RuntimeResult<'sql, InvocationKey<'parse>> {
         let key = InvocationKey::at(self.records.len());

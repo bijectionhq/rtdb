@@ -53,6 +53,8 @@ impl<'parse, 'sql> ParserSession<'parse, 'sql, '_, '_> {
         }
         let site = (|| {
             let (number, rule) = match self.state {
+                ParserState::State(354) => (354, 0),
+                ParserState::State(574) => (574, 2),
                 ParserState::State(2886) => (2886, 164),
                 ParserState::State(3014) => (3014, 175),
                 _ => return Err(RuntimeError::Control(RuntimeProblem::PredictionSite)),

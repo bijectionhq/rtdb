@@ -2,7 +2,7 @@
 
 This private parser component implements adaptive SLL and LL prediction from ANTLR 4.13.2 over real SQL tokens, ordered configurations and retained DFA storage.
 `UPSTREAM.json` pins the primary sources, and link:../../../LICENSE-ANTLR[the ANTLR license] covers the adapted algorithms.
-Complete generated SQL rule recognition and production parser integration remain required beyond the bounded isolation, window and recursive DATE paths.
+Complete generated SQL rule recognition and production parser integration remain required beyond the bounded statement, isolation, window and recursive DATE paths.
 
 == Owner and keys
 
@@ -578,7 +578,7 @@ Only after the second seek succeeds does reset clear recovery, current context, 
 This profile has no trace listener and the pinned interpreter's reset has no state effects.
 Recognizer state, previous invocation records, buffered tokens and retained DFA history persist.
 The wrapper then selects the LL strategy, listener and prediction profile, and calls the same action once more.
-The adapter runs the generated isolation action for caught adaptive no-viable and inline mismatch cancellation.
+The adapter runs generated isolation and direct-statement actions for caught adaptive no-viable and inline mismatch cancellation.
 Further generated rule bodies, recognition and recovery branches, and production adoption remain required.
 
 == SLL Bail token matches
@@ -600,14 +600,14 @@ A runtime fault during token demand propagates before any inline exception assig
 
 A real decision 371 can select the REPEATABLE alternative before demanding its following occurrence.
 Matching REPEATABLE at state 3011 demands that occurrence, then matching READ at state 3012 can enter inline Bail.
-Generated context and terminal attachment beyond the bounded isolation, window and recursive DATE paths, further expected-token capabilities and production adoption remain open.
+Further generated context and terminal attachment, expected-token capabilities and production adoption remain open.
 
-== Required isolation block synchronization
+== Required block synchronization
 
-The generated `commonTxMode` block at 2886 and `levelOfIsolation` block at 3014 use one sync operation.
+The generated `commonTxMode` block at 2886 and `levelOfIsolation` block at 3014 share the same sync operation as the direct statement blocks at 354 and 574.
 SLL Bail sync returns without reading input.
 LL first observes the current token type and derives the within-rule lookahead set from the actual ATN.
-Both block sets lack epsilon, so the source's later expected-token queries return the same set.
+The block sets lack epsilon, so the source's later expected-token queries return the same set.
 An accepted first type returns without another lookahead.
 
 A rejected first type demands `LA(2)` before checking whether deletion could help.
@@ -776,6 +776,36 @@ The throwing listener interrupts recovery.
 The window finally records the opening parenthesis as the stop.
 Deletion and insertion reports keep their null causes and leave before consumption or synthesis.
 Additional generated window branches and production parser entry adoption remain required.
+
+== Direct statement root and ROLLBACK
+
+The private single-statement action runs `directSqlStatement` and its actual `directlyExecutableStatement` call at 352 under both wrapper profiles.
+The child reaches required sync at 574 before real adaptive decision 34.
+The adopted alternative 14 constructs the labelled ROLLBACK record from its entered generic context and replaces the root's actual tail child before matching state 488.
+Other alternatives report the private site limit after the decision and before their context construction.
+The shared inline atom path also supplies the root's semicolon and EOF matches at 353 and 356.
+The root reaches its required sync at 354 before the separate `LA(1)` for the optional semicolon.
+Its within-rule set contains SEMI and EOF because the skipped semicolon still reaches required EOF.
+
+Upon successful ROLLBACK, consuming the token demands the following occurrence before it becomes a terminal of the labelled child.
+The child finally stops at the ROLLBACK occurrence.
+A root match of EOF sets matched EOF before consume's separate current-token demand.
+EOF stays current and is attached as a normal terminal after that demand.
+Root finally reads that actual EOF as its stop.
+If EOF terminal growth is denied, the already-set flag still selects the actual EOF stop in finally.
+If child entry cannot append its context after becoming current, only the already-entered root's finally runs and exits that actual child.
+
+`SELEC 1` and `extra SELECT 1` enter the same generic child and first fail SLL decision 34 at token zero.
+The child catch assigns the original no-viable cause after prediction restoration and reports once through the empty syntax listener.
+Bail links the root to that cause before both finally operations restore the root sentinel.
+The LL attempt reuses the real stream and DFA history and reaches the nonnullable 30-token set at 574.
+For `SELEC 1`, `LA(2)` yields an unsigned integer and the child catch assigns the ordinary mismatch at 574 before reporting.
+For `extra SELECT 1`, `LA(2)` yields SELECT and the unwanted report carries a null cause before consuming either token or demanding the literal.
+The source fixture's live recognizer and shared DFA access remain subject to the embedded cause capability gate.
+
+Trailing input after a completed child can fail at root sync 354 with expected SEMI and EOF or after a matched semicolon at inline state 356 with expected EOF.
+A viable deletion reports a null cause before consumption.
+An ordinary suffix mismatch is assigned to the root, which finally records the last matched terminal.
 
 == Finishing-alternative selection
 

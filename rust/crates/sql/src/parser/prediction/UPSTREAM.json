@@ -225,7 +225,7 @@
     "url": "https://github.com/xtdb/xtdb/blob/c84f9334eb060ceb92d28ecdd4a06e6b625932fd/core/src/main/kotlin/xtdb/query/SqlParser.kt",
     "sha256": "8c92acc27d71359beb31c7821889dd5bb58c07eb1c08927d1b6375f8619966bc"
   },
-  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
+  "scope": "Private adaptive SLL and LL prediction over real tokens and a retained 372-decision DFA, including Local and Full producers over one merge round and an adaptive no-viable catch and report, SLL token matching with inline Bail cancellation, required LL isolation block synchronization, LL inline recovery at nine isolation atom sites, and all four generated levelOfIsolation alternatives with their primary labelled context/terminal tree and ISOLATION-only commonTxMode caller through the same-session two-profile retry. The directSqlStatement root and ROLLBACK alternative adopt generated statement tree assembly, both required sync blocks and EOF. A private direct two-profile windowSpecification tree exercises nullable sync and a captured-context inline mismatch. A private SLL DATE/bracket dataType tree and regular-name fieldDefinition preserve recursive attachment and actual-current cleanup. A private class-initialization input decoder supplies the existing environment with exact loop-pruning and resolved assertion choices. Remaining generated schedules, actual host-policy capture, production cache mapping and the capability adapter remain mandatory successors.",
   "configuration_domain": {
     "decision_count": 372,
     "maximum_alternative": 87,
@@ -330,6 +330,16 @@
     ],
     "capture": "Private CapturedClassPolicy decoder consumes supplied semantic getSafeEnv text and the resolved ParserATNSimulator assertion fact without retaining either input. OPEN: actual source-equivalent frozen environment/assertion capture, defining-class realm publication, failed initialization and production writer/cache ownership require the admitted host adapter."
   },
+  "private_direct_statement": {
+    "generated": "Sql.java directSqlStatement and directlyExecutableStatement, rules 0 and 2. Actual call 352, required syncs 354 and 574, d34 alternative 14, and matches 353 SEMI, 356 EOF and 488 ROLLBACK.",
+    "expected_sets": "Within-rule state 354 admits EOF and SEMI. Nonnullable state 574 admits 30 token types including SELECT, excluding ordinary identifiers and unsigned integers. This separates the LL ordinary mismatch from the null-cause unwanted-token report.",
+    "source_fixture": {
+      "path": "core/src/test/kotlin/xtdb/query/SqlParserCauseTest.kt",
+      "revision": "97cef7809c7f702c1876a360c13806c4d765edf8",
+      "sha256": "7c82b6d4aee31bc645835f42ef375fe623145082a08f90a22b42ad826b06af00"
+    },
+    "scope": "Bounded two-profile ROLLBACK through the direct root and malformed source paths."
+  },
   "private_nullable_window": {
     "generated": "Sql.java windowSpecification and windowSpecificationDetails, rules 96 and 97. States 2218/2219/2220 are the root matches and child call, and states 2223/2226/2229/2232 precede the actual option guards of decisions 235 through 238.",
     "strategy": "DefaultErrorStrategy.sync retains the first missed nullable context and clears it on a subsequent accepted FIRST. The inline alternate constructor projects captured state 2223 and obtains the current offending occurrence at live match 2220.",
@@ -348,7 +358,7 @@
       "Actual host snapshot/assertion producer",
       "Production classloader/cache realm, budget and concurrent writer policy",
       "embedded-parser-error-capability",
-      "Generated rule and tree coverage beyond the bounded two-profile isolation and window paths and the SLL recursive DATE path, plus remaining strategy and diagnostic branches",
+      "Generated rule and tree coverage beyond the bounded two-profile statement, isolation and window paths and the SLL recursive DATE path, plus remaining strategy and diagnostic branches",
       "Phase2 and executed compiler/discovery/tests"
     ]
   }
