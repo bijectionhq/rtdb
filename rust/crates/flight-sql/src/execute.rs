@@ -16,9 +16,9 @@ impl Service {
         let mut native = connection.borrow().await?;
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(&native);
-        if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
+        if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
             native.prepare_context(&token).await.map_err(status)?;
-            return Ok(Shape { schema: control_schema(&control).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
+            return Ok(Shape { schema: control_schema(control.statement()).map_err(status)?.as_ref().map(|schema| wire::plan_schema(schema, self.memory())).transpose()?, parameters: 0 });
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
@@ -39,9 +39,9 @@ impl Service {
     async fn execute_update_in(&self, native: &mut NativeSession, source: &str, arguments: Option<SqlArguments>) -> Result<(), Status> {
         let token = native.state().cancellation().child_token(); let _cancel = token.clone().drop_guard();
         let options = options(native);
-        if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
-            if control_schema(&control).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
-            return execute_control_update(native, &control, arguments.as_ref(), &token).await;
+        if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
+            if control_schema(control.statement()).map_err(status)?.is_some() { return Err(invalid("executeUpdate does not support queries")); }
+            return execute_control_update(native, control.statement(), arguments.as_ref(), &token).await;
         }
         let context = native.prepare_context(&token).await.map_err(status)?;
         let prepared = PreparedSql::prepare(source, &context, options, ResultSignaturePolicy::Dynamic).map_err(status)?;
@@ -60,10 +60,11 @@ impl Service {
             let batch = wire::parameter_batch(params, self.memory())?;
             wire::arguments(batch.batch(), self.memory())
         }).transpose();
-        let (basis, schema) = if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.memory()).map_err(status)? {
-            let Some(schema) = control_schema(&control).map_err(status)? else {
+        let (basis, schema) = if let Some(control) = rtdb_sql::parse_admitted_control_in(source, &options, self.memory()).map_err(status)? {
+            let Some(schema) = control_schema(control.statement()).map_err(status)? else {
                 let arguments = decode_arguments()?;
-                execute_control_update(&mut native, &control, arguments.as_ref(), &token).await?;
+                execute_control_update(&mut native, control.statement(), arguments.as_ref(), &token).await?;
+                drop(control);
                 return self.empty_update_info();
             };
             let basis = native.state_mut().unchecked_read_basis().await.map_err(status)?;
@@ -103,9 +104,9 @@ impl Service {
             let options = options(&native);
             let params = params.as_ref().map(|value| STANDARD.decode(value).map(Bytes::from).map_err(|_| invalid("invalid ticket parameters"))).transpose()?;
             let arguments = params.as_ref().map(|bytes| wire::parameter_batch(bytes, self.memory()).and_then(|batch| wire::arguments(batch.batch(), self.memory()))).transpose()?;
-            let cursor = if let Some(control) = rtdb_sql::parse_control_in(&sql, &options, self.memory()).map_err(status)? {
-                if control_schema(&control).map_err(status)?.is_none() { return Err(invalid("ticket query cannot execute an update")); }
-                match native.execute_control_with(&control, &[], &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
+            let cursor = if let Some(control) = rtdb_sql::parse_admitted_control_in(&sql, &options, self.memory()).map_err(status)? {
+                if control_schema(control.statement()).map_err(status)?.is_none() { return Err(invalid("ticket query cannot execute an update")); }
+                match native.execute_control_with(control.statement(), &[], &token, ControlExecutionOptions { frontend: ControlFrontend::FlightSql, implicit_transaction: false }).await.map_err(status)? {
                     ControlResult::Rows(cursor) => cursor, _ => return Err(invalid("ticket query has no result set")),
                 }
             } else {

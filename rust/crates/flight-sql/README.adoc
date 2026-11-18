@@ -104,7 +104,9 @@ Each output encoder retains its declared native schema and rejects batches whose
 Decoded Arrow owners and encoded `Bytes` retain their reservations through clones and transport delivery.
 Metadata enumeration reserves borrowed schema bounds before cloning table bindings; returned catalog snapshots retain those reservations.
 The schema and codec estimates are conservative allowances, not a demonstrated bound for every possible nested Arrow representation.
-HTTP/2, prost, TLS-free tonic buffers, parser scratch, and scalar-expression peak allocations still require full end-to-end accounting qualification.
+During classification of the complete SQL input, Flight SQL charges token array capacity and an estimate for lexer scratch to the node's memory budget.
+A classified control command retains an estimated parsing and binding allowance through schema preparation or execution.
+HTTP/2, prost, TLS-free tonic buffers, ordinary SQL parser scratch, and scalar-expression peak allocations still require end-to-end accounting qualification.
 Leases use the shared microsecond clock and have not been compared with the JVM nanosecond clock at submicrosecond timeout boundaries.
 Native server-version metadata uses the Rust package version.
 Ticket timestamps use chrono's supported calendar range, which is narrower than the JVM Instant range.

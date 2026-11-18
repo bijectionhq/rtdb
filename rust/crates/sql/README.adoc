@@ -293,7 +293,11 @@ Control parsing retains expression syntax for scalar binding independently of a 
 The parser checks the literal positions in session settings and transaction ASYNC options before collecting the command.
 Binding compiles the final transaction options in option order and resolves a CLOCK_TIME timestamp literal at that stage.
 `split_statements` separates statements by tokenizer spans before classification, preserving semicolons inside strings and comments.
-Callers classify each span with `parse_control` before passing query or DML text to the relational binder.
+`parse_control_in` charges raw expression forms during binding.
+Flight SQL uses `parse_admitted_control_in` to classify the full input under a tokenizer allowance and admit located token capacity as it grows.
+A recognized control command reserves an estimate for parsing and binding, including simultaneous token copies and AST storage.
+The bound command holds that reservation until dropped.
+A separate scratch estimate uses the control expression parser's recursion limit to cap the number of nested speculative `POSITION` parses accounted for at once.
 The frontend owns prepared statement registries and COPY wire state; `rtdb-node` owns session transitions and control effects.
 COPY formats and ATTACH configuration accept standard, dollar-quoted and escaped character strings.
 These control values retain escaped-string bodies verbatim, following the pinned control visitor; standard strings decode doubled quotes.

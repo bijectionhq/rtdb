@@ -1,5 +1,5 @@
 use std::{sync::{Arc, atomic::{AtomicI64, Ordering}}, time::Duration};
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_flight::{Action, FlightDescriptor, FlightInfo, flight_service_client::FlightServiceClient, sql::{Any, ActionBeginTransactionRequest, ActionBeginTransactionResult, ActionCreatePreparedStatementRequest, ActionCreatePreparedStatementResult, ActionEndTransactionRequest, CommandGetCatalogs, CommandGetSqlInfo, CommandGetTables, CommandPreparedStatementQuery, CommandPreparedStatementUpdate, CommandStatementIngest, CommandStatementQuery, CommandStatementUpdate, EndTransaction, ProstMessageExt}};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
@@ -256,6 +256,40 @@ async fn sql_parse_failures_return_anomaly_metadata_on_remote_flight() {
         assert!(detail.get("cause").is_none());
     }
     assert_eq!(integer(&client.query("SELECT 42::bigint AS answer").await[0], 0, 0), 42);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn commented_controls_set_and_report_the_flight_session_timezone() {
+    let running = Running::start(None, FlightConfig::default()).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.update("/* outer /* nested */ comment */ SET TIME ZONE 'America/New_York';", None).await;
+
+    let show = "SHOW TIME -- ;\n ZONE;";
+    let command = CommandStatementQuery { query: show.into(), transaction_id: None };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let schema = Schema::try_from(client.client.get_schema(request).await.unwrap().into_inner()).unwrap();
+    assert_eq!(schema.field(0).name(), "timezone");
+    assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+    let info = client.info(show, None).await;
+    assert_eq!(info.clone().try_decode_schema().unwrap(), schema);
+    let timezone = |batches: &[RecordBatch]| {
+        assert_eq!(batches[0].num_rows(), 1);
+        let column = batches[0].column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        column.value(0).to_owned()
+    };
+    assert_eq!(timezone(&client.redeem(&info).await), "America/New_York");
+
+    let update = client.info("SET TIME ZONE /* zone */ 'UTC';", None).await;
+    assert!(client.redeem(&update).await.is_empty());
+    let command = CommandStatementQuery { query: "SET TIME ZONE 'Asia/Tokyo' TRAILING".into(), transaction_id: None };
+    let request = client.request(FlightDescriptor::new_cmd(command.as_any().encode_to_vec()));
+    let error = client.client.get_flight_info(request).await.unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    let wire = error.metadata().get_bin("xtdb-anomaly-bin").unwrap().to_bytes().unwrap();
+    let detail: serde_json::Value = serde_json::from_slice(&wire).unwrap();
+    assert_eq!(detail["code"], "xtdb/sql-error");
+    assert_eq!(timezone(&client.query(show).await), "UTC");
     running.stop().await;
 }
 

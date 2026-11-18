@@ -1,10 +1,12 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
 use rtdb_plan::{AccessMode, ControlAccessOptions, ControlCommitMode, ControlStatement, ControlValue, CopyFormat, DiscardTarget, Identifier, ReadOnlyOptions, ReadWriteOptions, TransactionOptions};
-use rtdb_types::Result;
+use rtdb_types::{Anomaly, MemoryBudget, MemoryReservation, Result};
 use sqlparser::{ast, parser::Parser, tokenizer::{Span, Token, TokenWithSpan}};
 
-use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}};
+use crate::{PrepareOptions, parse::{StatementSource, source_span, sql_error}, split::SplitTokens};
+
+const CONTROL_EXPRESSION_RECURSION_LIMIT: usize = 50;
 
 pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<ControlStatement>> {
     parse_control_with(source, options, crate::bind::FormAllocation::Untracked)
@@ -14,6 +16,60 @@ pub fn parse_control(source: &str, options: &PrepareOptions) -> Result<Option<Co
 /// A non-control probe creates no raw owner; native allocation/admission errors propagate.
 pub fn parse_control_in(source: &str, options: &PrepareOptions, memory: &std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Option<ControlStatement>> {
     parse_control_with(source, options, crate::bind::FormAllocation::Tracked(memory))
+}
+
+/// A bound control command that retains its parsing and binding allowance until dropped.
+#[derive(Debug)]
+pub struct AdmittedControl {
+    statement: ControlStatement,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl AdmittedControl {
+    /// Borrows the command while its allowance is held.
+    pub fn statement(&self) -> &ControlStatement { &self.statement }
+}
+
+/// Validates the full SQL input lexically, then parses and binds recognized controls.
+/// With sufficient budget, a lexically valid input without a control head returns `None` and releases the classification allowance.
+/// A refused reservation can return before syntax or binding errors.
+pub fn parse_admitted_control_in(source: &str, options: &PrepareOptions, memory: &Arc<MemoryBudget>) -> Result<Option<AdmittedControl>> {
+    let reservation;
+    let syntax = {
+        let lexical_bytes = source.len().checked_mul(8).and_then(|bytes| bytes.checked_add(1024)).ok_or_else(control_size)?;
+        let _lexical = memory.reserve(lexical_bytes)?;
+        let mut tokens = SplitTokens::tokenize_in(source, memory)?;
+        if !probe_control(source, &mut tokens.values)? { return Ok(None); }
+
+        reservation = memory.reserve(control_parser_bytes(source.len(), tokens.values.len())?)?;
+        let position_bytes = position_parser_bytes(source.len(), &tokens.values)?;
+        let _position = (position_bytes != 0).then(|| memory.reserve(position_bytes)).transpose()?;
+        parse_control_tokens(StatementSource::full(source), &tokens.values, crate::bind::FormAllocation::Tracked(memory))?
+    };
+    syntax.map(|syntax| syntax.bind(options).map(|statement| AdmittedControl { statement, _reservation: reservation })).transpose()
+}
+
+fn control_size() -> Anomaly { Anomaly::incorrect("rtdb.sql/control-size", "SQL control statement exceeds addressable memory") }
+
+fn control_parser_bytes(source_len: usize, tokens: usize) -> Result<usize> {
+    let per_token = 4 * (size_of::<TokenWithSpan>() + size_of::<ast::Expr>() + size_of::<rtdb_plan::Expr>()) + 64;
+    source_len.checked_mul(8)
+        .and_then(|payload| tokens.checked_mul(per_token)?.checked_add(payload)?.checked_add(8192))
+        .ok_or_else(control_size)
+}
+
+fn position_parser_bytes(source_len: usize, tokens: &[TokenWithSpan]) -> Result<usize> {
+    if word(tokens.first(), "PREPARE") { return Ok(0); }
+    let sites = tokens.windows(2).filter(|pair| word(pair.first(), "POSITION") && pair[1].token == Token::LParen)
+        .take(CONTROL_EXPRESSION_RECURSION_LIMIT).count();
+    if sites == 0 { return Ok(0); }
+
+    // Each nested POSITION needle parse keeps its token snapshots under the same parser recursion counter.
+    let placeholder_bytes = 2 + usize::MAX.ilog10() as usize;
+    let per_token = 3 * (size_of::<TokenWithSpan>() + placeholder_bytes);
+    source_len.checked_mul(4)
+        .and_then(|payload| tokens.len().checked_add(1)?.checked_mul(per_token)?.checked_add(payload)?.checked_mul(sites))
+        .ok_or_else(control_size)
 }
 
 fn parse_control_with(source: &str, options: &PrepareOptions, forms: crate::bind::FormAllocation<'_>) -> Result<Option<ControlStatement>> {
@@ -81,14 +137,19 @@ pub fn parse_control_syntax_in<'input>(source: &'input str, memory: &'input std:
 }
 
 fn parse_control_syntax<'input>(source: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Option<ParsedControl<'input>>> {
-    let mut tokens: Vec<_> = crate::parse::tokenize(source)?
-        .into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
+    let mut tokens = crate::parse::tokenize(source)?;
+    if !probe_control(source, &mut tokens)? { return Ok(None); }
+    parse_control_tokens(StatementSource::full(source), &tokens, forms)
+}
+
+fn probe_control(source: &str, tokens: &mut Vec<TokenWithSpan>) -> Result<bool> {
+    tokens.retain(|token| !matches!(token.token, Token::Whitespace(_)));
     if tokens.last().is_some_and(|token| token.token == Token::SemiColon) { tokens.pop(); }
-    if let Some(first) = tokens.first()
-        && is_control_head(first) && tokens.iter().any(|token| token.token == Token::SemiColon) {
+    let Some(first) = tokens.first().filter(|first| is_control_head(first)) else { return Ok(false); };
+    if tokens.iter().any(|token| token.token == Token::SemiColon) {
         return Err(sql_error("A control statement must contain exactly one statement", source, first.span));
     }
-    parse_control_tokens(StatementSource::full(source), &tokens, forms)
+    Ok(true)
 }
 
 fn is_control_head(first: &TokenWithSpan) -> bool {
@@ -174,7 +235,8 @@ impl ControlParser<'_> {
         if self.eat("ON") { return Ok(ast::Expr::Value(ast::Value::Boolean(true).into())); }
         if self.eat("OFF") { return Ok(ast::Expr::Value(ast::Value::Boolean(false).into())); }
         let dialect = crate::dialect::SqlDialect::default();
-        let mut parser = Parser::new(&dialect).with_tokens_with_locations(self.tokens[self.index..].to_vec());
+        let mut parser = Parser::new(&dialect).with_recursion_limit(CONTROL_EXPRESSION_RECURSION_LIMIT)
+            .with_tokens_with_locations(self.tokens[self.index..].to_vec());
         let expression = dialect.checked(parser.parse_expr()).map_err(|error| self.error(error.to_string()))?;
         self.index += parser.index();
         Ok(expression)
@@ -369,5 +431,79 @@ fn is_literal(expression: &ast::Expr) -> bool {
             matches!(value, ast::Expr::Value(value) if character_string(&value.value))
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn admitted_control_preserves_legacy_values_and_diagnostics() {
+        let options = PrepareOptions::default();
+        let legacy_memory = MemoryBudget::new(1 << 20);
+        let memory = MemoryBudget::new(1 << 20);
+        for source in [
+            "/* outer /* nested */ comment */ sHoW TIME -- ;\n ZONE; -- end",
+            "SET application_name = E'café\\nexample'",
+            "ATTACH DATABASE example WITH $body$clé: valeur$body$",
+            "PREPARE p AS SELECT /* retained café */ 1;",
+            "SET TIME ZONE POSITION(POSITION('a' IN ('ba'))::VARCHAR IN '1')::VARCHAR",
+            "BEGIN READ ONLY WITH (CLOCK_TIME TIMESTAMP 'bad', CLOCK_TIME TIMESTAMP '2020-01-01T00:00:00Z')",
+            "EXECUTE p(?, $3, ?)",
+        ] {
+            let legacy = parse_control_in(source, &options, &legacy_memory).unwrap().unwrap();
+            let admitted = parse_admitted_control_in(source, &options, &memory).unwrap().unwrap();
+            assert_eq!(admitted.statement(), &legacy, "{source}");
+        }
+        for source in ["", "-- nothing\n;", "\"SHOW\" TIME ZONE;", "SELECT ';' /* ; */; SELECT 2"] {
+            assert!(parse_control_in(source, &options, &legacy_memory).unwrap().is_none(), "{source}");
+            assert!(parse_admitted_control_in(source, &options, &memory).unwrap().is_none(), "{source}");
+        }
+        for source in [
+            "SHOW TIME ZONE;;",
+            "SHOW TIME ZONE; SELECT 1",
+            "SHOW TIME ZONE 'unterminated",
+            "SELECT 'unterminated",
+            "/* café */\n SELECT $$unterminated",
+            "SET TIME ZONE unknown() TRAILING",
+            "BEGIN READ ONLY WITH (CLOCK_TIME TIMESTAMP 'bad')",
+        ] {
+            let legacy = parse_control_in(source, &options, &legacy_memory).unwrap_err();
+            let admitted = parse_admitted_control_in(source, &options, &memory).unwrap_err();
+            assert_eq!(admitted, legacy, "{source}");
+        }
+        assert_eq!(legacy_memory.used_bytes(), 0);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    #[test]
+    fn classification_releases_lexical_charges_and_retains_the_bound_command() {
+        let options = PrepareOptions::default();
+        let zero = MemoryBudget::new(0);
+        for source in ["SELECT 1", "SHOW abc"] {
+            let error = parse_admitted_control_in(source, &options, &zero).unwrap_err();
+            assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+            assert_eq!(zero.used_bytes(), 0);
+        }
+
+        let enough = MemoryBudget::new(1 << 20);
+        assert!(parse_admitted_control_in("SELECT 1", &options, &enough).unwrap().is_none());
+        let lexical_peak = enough.peak_bytes();
+        assert!(lexical_peak > 0);
+        assert_eq!(enough.used_bytes(), 0);
+
+        let lexical_only = MemoryBudget::new(lexical_peak);
+        let error = parse_admitted_control_in("SHOW abc", &options, &lexical_only).unwrap_err();
+        assert_eq!(error.code, "rtdb/memory-budget-exceeded");
+        assert_eq!(lexical_only.peak_bytes(), lexical_peak);
+        assert_eq!(lexical_only.used_bytes(), 0);
+
+        let control = parse_admitted_control_in("SHOW abc", &options, &enough).unwrap().unwrap();
+        assert_eq!(control.statement(), &ControlStatement::Show { name: "abc".into() });
+        assert!(enough.used_bytes() > 0);
+        assert!(enough.peak_bytes() > enough.used_bytes());
+        drop(control);
+        assert_eq!(enough.used_bytes(), 0);
     }
 }
