@@ -1390,3 +1390,28 @@ The full ledger and release matrix have no execution receipts from this source c
 
 The implementation revision remains unset and the source-completeness gate remains false.
 Compilation, runtime discovery and regression execution remain pending.
+
+== Producer, Registry and Avro ownership checkpoint
+
+The ordered Metadata sender admits its logical flight before native submission and installs it only after acceptance.
+The receive path retires the oldest logical flight before field validation, applies the broker's versioned throttle to the remaining flights and publishes through the metadata monitor.
+The updater clears its scope after successful state application.
+Prepared RoundRobin records carry the partition and append time from their completed metadata wait.
+The native produce path preserves an explicit Unix epoch timestamp through enqueue and fetch.
+Live DLQ wiring still requires qualified connection and clock observations, sender polling, and use of the remaining queue budget.
+
+Retained native Metadata cache arenas acquire the client account before allocation and release it after final free.
+An admission failure reaches ordinary and admin response callers as a resource error.
+Earlier cache updates retain their entries, observer notifications and expiry schedules.
+Eligible queries retain their destination when suppression hint admission fails.
+Live-topic allocations, independent clones and admin output need separate admission.
+
+Live Registry HTTP collection borrows bounded windows from the current native response frame and retains the admitted raw body through its final consumer.
+The production route feeds generic JSON after HTTP EOF.
+Typed Registry parsing still requires source read and symbol observations, nullable UTF16 consumers and format-specific lookup timing.
+The admitted Avro datum API retains the validated canonical/native pair through Connect planning, resolution, decoding and migration.
+The Registry Avro entry still uses legacy parsing.
+Canonical graph, default, logical type and exact string integration remain source commitments.
+
+The implementation revision remains unset.
+The new regression sources and the Phase 2 release matrix await execution after source closure.
