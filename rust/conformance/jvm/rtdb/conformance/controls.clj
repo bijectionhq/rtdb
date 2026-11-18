@@ -4,11 +4,12 @@
             [jsonista.core :as json]
             [rtdb.conformance.table-column :as table-column])
   (:import (com.carrotsearch.hppc LongArrayList)
-           (java.io File)
+           (java.io File InputStream)
            (java.nio ByteBuffer)
-           (java.nio.file Files)
+           (java.nio.file Files FileVisitOption LinkOption OpenOption Path StandardOpenOption)
            (java.security MessageDigest)
            (java.util HexFormat)
+           (java.util.stream Stream)
            (org.apache.arrow.memory RootAllocator)
            (org.apache.arrow.vector.types.pojo ArrowType$Struct)
            (xtdb.api.log ReplicaMessage ReplicaMessage$Codec)
@@ -19,11 +20,13 @@
 
 (set! *warn-on-reflection* true)
 
+(def ^:private no-links (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
 (defn- sha256 [^bytes bytes]
   (.formatHex (HexFormat/of) (.digest (MessageDigest/getInstance "SHA-256") bytes)))
 
 (defn- file-digest [^File file]
-  (with-open [stream (io/input-stream file)]
+  (with-open [^InputStream stream (io/input-stream file)]
     (let [digest (MessageDigest/getInstance "SHA-256")
           buffer (byte-array 65536)]
       (loop []
@@ -33,15 +36,26 @@
             (recur))))
       (.formatHex (HexFormat/of) (.digest digest)))))
 
-(defn- artifact [^File path]
-  (if (.isDirectory path)
-    {:path (.getCanonicalPath path)
-     :kind "directory"
-     :files (mapv (fn [^File f]
-                    {:path (str (.relativize (.toPath path) (.toPath f)))
-                     :sha256 (file-digest f)})
-                  (sort-by #(.getPath ^File %) (filter #(.isFile ^File %) (file-seq path))))}
-    {:path (.getCanonicalPath path), :kind "file", :sha256 (file-digest path)}))
+(defn- artifact-file [^Path path name]
+  {:path name, :bytes (Files/size path), :sha256 (file-digest (.toFile path))})
+
+(defn- artifact [^File entry]
+  (let [^Path path (.toPath (.getCanonicalFile entry))]
+    (if (Files/isDirectory path no-links)
+      (with-open [^Stream paths (Files/walk path (make-array FileVisitOption 0))]
+        {:path (str path)
+         :kind "directory"
+         :files (->> (iterator-seq (.iterator paths))
+                     (keep (fn [^Path file]
+                             (cond
+                               (Files/isDirectory file no-links) nil
+                               (Files/isRegularFile file no-links) (artifact-file file (str (.relativize path file)))
+                               :else (throw (ex-info "JVM runtime artifact is not a regular file" {:path (str file)})))))
+                     (sort-by :path)
+                     vec)})
+      (if (Files/isRegularFile path no-links)
+        (assoc (artifact-file path (str path)) :kind "file")
+        (throw (ex-info "JVM runtime artifact is not a regular file" {:path (str path)}))))))
 
 (defn- artifacts []
   (mapv (comp artifact io/file)
@@ -107,16 +121,21 @@
 (defn -main [fixture-path output-path]
   (let [input (Files/readAllBytes (.toPath (io/file fixture-path)))
         fixture (json/read-value input json/keyword-keys-object-mapper)
+        runtime (artifacts)
         observations (case (:kind fixture)
                        "temporal_ceilings" (temporal-observations fixture)
                        "replica_term_sequence" (replica-observations fixture)
                        "table_column_assertions" (table-column/observe (:cases fixture)))
-        ids (mapv :id observations)
-        artifacts (artifacts)]
+        ids (mapv :id observations)]
     (when (or (empty? ids) (some str/blank? ids) (not= (count ids) (count (distinct ids))))
       (throw (ex-info "Fixture must produce distinct nonempty observations" {})))
-    (spit output-path
-          (json/write-value-as-string
-            {:schema_version 1, :fixture_sha256 (sha256 input)
-             :binary_sha256 (sha256 (json/write-value-as-bytes artifacts))
-             :artifacts artifacts, :observations observations}))))
+    (when-not (= runtime (artifacts))
+      (throw (ex-info "JVM runtime artifacts changed during the observation" {})))
+    (let [^bytes manifest (json/write-value-as-bytes runtime)
+          ^Path execution (.toPath (io/file output-path))]
+      (Files/write (.resolveSibling execution "runtime-artifacts.json") manifest
+                   (into-array OpenOption [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE]))
+      (spit output-path
+            (json/write-value-as-string
+              {:schema_version 1, :fixture_sha256 (sha256 input), :binary_sha256 (sha256 manifest)
+               :artifacts runtime, :observations observations})))))

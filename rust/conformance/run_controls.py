@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from history_results import verify_runtime_artifacts
 from source_gate import require_phase_two
 
 
@@ -227,6 +228,20 @@ def validate_native_revision(execution, revision):
         raise ValueError("native executable was not built from this clean implementation revision")
 
 
+def validate_reference_artifacts(execution, path):
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("JVM observation has no retained runtime artifact manifest")
+    manifest = path.read_bytes()
+    manifest_digest = hashlib.sha256(manifest).hexdigest()
+    artifacts = json.loads(manifest)
+    if manifest_digest != execution.get("binary_sha256") or artifacts != execution.get("artifacts"):
+        raise ValueError("JVM runtime artifact manifest differs from its execution record")
+    verify_runtime_artifacts(artifacts)
+    if digest(path) != manifest_digest:
+        raise ValueError("JVM runtime artifact manifest changed during verification")
+    return manifest_digest
+
+
 def execute_case(mapping, side, args, directory, config, revision):
     fixture = REPOSITORY / mapping["identity"]["parameter_fixture"]
     fixture_digest = digest(fixture)
@@ -246,6 +261,7 @@ def execute_case(mapping, side, args, directory, config, revision):
     write_json(directory / "process.json", process)
     if not process["completed"] or process["exit_code"] != 0:
         raise RuntimeError(f"{side} control process failed; inspect {directory}")
+    reference_artifacts_digest = None
     if side == "native":
         execution = json.loads(output.read_bytes())
         write_json(result, execution)
@@ -254,6 +270,7 @@ def execute_case(mapping, side, args, directory, config, revision):
             raise ValueError("native executable changed during the observation")
     else:
         execution = json.loads(result.read_bytes())
+        reference_artifacts_digest = validate_reference_artifacts(execution, directory / "runtime-artifacts.json")
     validate_execution(execution, fixture_digest, mapping)
     validate_assertions(execution, json.loads(fixture.read_bytes()))
     if digest(fixture) != fixture_digest:
@@ -262,6 +279,9 @@ def execute_case(mapping, side, args, directory, config, revision):
              "execution_sha256": digest(result), "runner_sha256": digest(__file__),
              "reference_adapter_sha256": digest(HERE / "jvm/rtdb/conformance/controls.clj"),
              "gradle_init_sha256": digest(HERE / "reference.init.gradle")}
+    if reference_artifacts_digest is not None:
+        trace["runtime_artifacts_sha256"] = reference_artifacts_digest
+        trace["runtime_artifact_verifier_sha256"] = digest(HERE / "history_results.py")
     write_json(directory / "trace.json", trace)
     receipt = {"identity": mapping["identity"], "runner": f"rtdb-controls/{side}/1",
                "trace_sha256": digest(directory / "trace.json"),

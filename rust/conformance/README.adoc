@@ -91,9 +91,12 @@ They resolve fixture and output arguments only for the selected task, so an adap
 Fixture selection names the event index and observable field; expected observations are never inputs to either implementation.
 The JVM adapter is loaded through an external Gradle init script against the clean pinned reference checkout.
 Its artifact manifest hashes the actual runtime classpath, adapter, Java executable, and runtime modules.
+The adapter checks those files before and after observing the fixture and retains the exact manifest bytes beside the execution record.
+The orchestrator verifies the recorded JVM closure against those bytes and the referenced files before writing its receipt.
 The native runner hashes its running executable and reports its embedded build revision and source-cleanliness flag.
 The orchestrator rejects an executable built from another revision or a dirty tree.
-The orchestrator hashes fixtures, configuration, process logs, execution output, and its own sources into each receipt's trace.
+The orchestrator records the fixture and configuration digests in each receipt's context.
+The receipt's trace binds the process logs, execution output, and the runner and adapter sources.
 
 The fixture descriptors, execution records, and receipts are passive values.
 The process runner is an Active Object whose subprocess region owns the selected command, timeout, cancellation, and process-group termination.

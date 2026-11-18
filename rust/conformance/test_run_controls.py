@@ -169,6 +169,57 @@ os._exit(0)
                 runner.validate_native_revision(execution, "current")
         runner.validate_native_revision({"artifact_revision": "current", "source_dirty": False}, "current")
 
+    def test_reference_receipt_binds_the_retained_manifest_and_actual_artifact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            runtime = root / "runtime"
+            runtime.mkdir()
+            jar = runtime / "adapter.jar"
+            jar.write_bytes(b"original")
+            adapter = {"path": jar.name, "bytes": jar.stat().st_size, "sha256": runner.digest(jar)}
+            artifacts = [{"kind": "directory", "path": str(runtime), "files": [adapter]}]
+            fixture = root / "fixture.json"
+            runner.write_json(fixture, {"kind": "temporal_ceilings", "expected_observations": {"ceiling": [2]}})
+            configuration = root / "configuration.json"
+            config = dict(applied_basis=None, valid_time=None, system_time=None, clock="fixed", timezone="UTC",
+                          storage_version=6, features=[])
+            runner.write_json(configuration, config)
+            args = SimpleNamespace(reference=root, timeout=1, configuration=configuration)
+            selected = {**mapping("first"), "observations": [{"id": "ceiling"}]}
+
+            def observe(command, cwd, stdout, stderr, timeout):
+                stdout.write_bytes(b"")
+                stderr.write_bytes(b"")
+                manifest = stdout.parent / "runtime-artifacts.json"
+                runner.write_json(manifest, artifacts)
+                execution = {"schema_version": 1, "fixture_sha256": runner.digest(fixture), "artifacts": artifacts,
+                             "binary_sha256": runner.digest(manifest), "observations": [{"id": "ceiling", "executed": True,
+                                 "outcome": {"kind": "returned", "typed_value": [2]}}]}
+                runner.write_json(stdout.parent / "execution.json", execution)
+                if stdout.parent.name == "altered-manifest":
+                    manifest.write_bytes(manifest.read_bytes() + b"\n")
+                return {"completed": True, "exit_code": 0}
+
+            with mock.patch.object(runner, "REPOSITORY", root), mock.patch.object(runner, "run_process", side_effect=observe):
+                passed = root / "verified"
+                receipt = runner.execute_case(selected, "reference", args, passed, config, runner.REFERENCE)
+                trace = json.loads((passed / "trace.json").read_bytes())
+                self.assertEqual(trace["runtime_artifacts_sha256"], runner.digest(passed / "runtime-artifacts.json"))
+                self.assertEqual(trace["runtime_artifact_verifier_sha256"], runner.digest(runner.HERE / "history_results.py"))
+                self.assertEqual(receipt["context"]["binary_sha256"], trace["runtime_artifacts_sha256"])
+                self.assertEqual(receipt["trace_sha256"], runner.digest(passed / "trace.json"))
+
+                changed = root / "altered-manifest"
+                with self.assertRaisesRegex(ValueError, "manifest differs"):
+                    runner.execute_case(selected, "reference", args, changed, config, runner.REFERENCE)
+                self.assertFalse((changed / "receipt.json").exists())
+
+                jar.write_bytes(b"modified")
+                stale = root / "altered-artifact"
+                with self.assertRaisesRegex(ValueError, "artifact bytes changed"):
+                    runner.execute_case(selected, "reference", args, stale, config, runner.REFERENCE)
+                self.assertFalse((stale / "receipt.json").exists())
+
     def test_column_table_assertions_check_original_names_types_cells_and_negative_control(self):
         fixture = json.loads((runner.HERE / "fixtures/table-column.json").read_bytes())
         execution = {"observations": [{"id": case["id"], "outcome": {"kind": "returned",
