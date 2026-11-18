@@ -251,7 +251,7 @@
     },
     "database_shutdown": {
       "status": "reviewed",
-      "conclusion": "The recorded source review covers public server signals, unstarted and failed startup, embedded closure, listeners, database and term tasks, log owners, and retained I/O drain.",
+      "conclusion": "The recorded source review covers public server signals, unstarted and failed startup, embedded closure, listeners, database and term tasks, log owners, and retained I/O drain. Embedded direct logical relations enter the same call admission and session cancellation tree as SQL, and their native cursor reads use the same close fence.",
       "implementation_paths": [
         "rust/crates/server/src/main.rs",
         "rust/crates/server/src/runtime.rs",
@@ -260,17 +260,21 @@
         "rust/crates/node/src/runtime.rs",
         "rust/crates/node/src/database.rs",
         "rust/crates/storage/src/io_region.rs",
-        "rust/crates/ffi/src/region.rs"
+        "rust/crates/ffi/src/region.rs",
+        "rust/crates/ffi/src/handles.rs",
+        "rust/crates/ffi/src/statement.rs"
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/ffi/src/lib.rs": "b36c93d3727fb89d04d3b031dcc2878ef5cb7020c3abae445bcce1d7f600c448",
-        "rust/crates/node/src/node.rs": "3e185cb1bc9942912fa9bbc49a4333ff12c312e7173f85e82fea0d963cfab133",
+        "rust/crates/ffi/src/lib.rs": "297959eca4306d004a509791ac80d52525359582be94cfd236961366d89c7c7c",
+        "rust/crates/node/src/node.rs": "e2637a95f5df22f11e3cf5ad6d305f5cefed7f9f45d891c1a7eec609fecc5f41",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
-        "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0"
+        "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0",
+        "rust/crates/ffi/src/handles.rs": "5209dafbfc70ba3a68b6c4da6052b9db5f1ed521a17657fea16a485aa5c1ba01",
+        "rust/crates/ffi/src/statement.rs": "51c6cc270571dd64abc2ae8d844666ac6c28b74b9a8edf4c8ef2b29cdbd427d8"
       }
     }
   },
