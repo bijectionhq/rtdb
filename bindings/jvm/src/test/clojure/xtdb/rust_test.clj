@@ -805,7 +805,19 @@
 
 (deftest-original-api original-scan/dont-use-fast-path-on-non-literals-2768)
 
+(deftest-original-api original-scan/test-past-point-point-queries)
+
 (deftest-original-api original-scan/test-past-point-point-queries-with-valid-time)
+
+(deftest-original-api original-scan/test-scanning-temporal-cols)
+
+(deftest-original-api original-scan/test-only-scanning-temporal-cols-45)
+
+(deftest-original-api original-scan/test-for-valid-time-in-params)
+
+(deftest-original-api original-scan/test-content-pred)
+
+(deftest-original-api original-scan/test-absent-columns)
 
 (deftest-original-api original-scan/test-aligns-temporal-columns-correctly-363)
 
