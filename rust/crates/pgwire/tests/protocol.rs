@@ -1055,3 +1055,116 @@ async fn extended_prepare_portals_keep_their_body_across_name_replacement_and_re
     drop(client);
     running.stop().await;
 }
+
+#[tokio::test]
+async fn nested_simple_prepare_reports_a_later_execute_error_in_the_normalized_message() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let normalized = "SELECT 'café';\r\n/* ☕ */ PREPARE err_root AS PREPARE err_leaf AS XTQL $$($$";
+    let source = format!("\u{2003}{normalized}; ");
+    let outer = client.query(&source).await;
+    assert_eq!(tags(&outer), b"TDCCZ");
+    assert_eq!(rows(&outer), [vec![Some("café".as_bytes().to_vec())]]);
+    assert_eq!(outer[3].1, b"PREPARE\0");
+    assert_eq!(outer[4].1, b"I");
+
+    client.bind("", "err_root").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let reached = client.through(b'Z').await;
+    assert_eq!(tags(&reached), b"2EZ");
+    assert_eq!(reached[2].1, b"I");
+    let error = prepare_error_detail(&reached[1]);
+    let start = normalized.find("$$").unwrap();
+    assert_eq!(error["code"], "xtql/edn-reader");
+    assert_eq!(error["data"]["position"], serde_json::json!(start + 1));
+    assert_eq!(error["data"]["span"], serde_json::json!({"start": start, "end": start + "$$($$".len()}));
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn two_nested_simple_prepare_roots_keep_their_bound_bodies_through_replacement() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let begun = client.query("BEGIN").await;
+    assert_eq!(tags(&begun), b"CZ");
+    assert_eq!(begun[1].1, b"T");
+
+    for (sql, alpha, beta) in [
+        ("PREPARE alpha AS PREPARE alpha_q AS SELECT 7 AS n; PREPARE beta AS PREPARE beta_q AS SELECT 9 AS n", "old_alpha", "old_beta"),
+        ("PREPARE alpha AS PREPARE new_alpha_q AS SELECT 17 AS n; PREPARE beta AS PREPARE new_beta_q AS SELECT 19 AS n", "new_alpha", "new_beta"),
+    ] {
+        let prepared = client.query(sql).await;
+        assert_eq!(tags(&prepared), b"CCZ");
+        assert_eq!(prepared[0].1, b"PREPARE\0");
+        assert_eq!(prepared[1].1, b"PREPARE\0");
+        assert_eq!(prepared[2].1, b"T");
+        client.bind(alpha, "alpha").await;
+        client.bind(beta, "beta").await;
+        client.send(b'S', &[]).await;
+        let bound = client.through(b'Z').await;
+        assert_eq!(tags(&bound), b"22Z");
+        assert_eq!(bound[2].1, b"T");
+    }
+    for portal in ["old_alpha", "old_beta", "new_alpha", "new_beta", "old_beta"] {
+        client.execute(portal, 0).await;
+    }
+    client.send(b'S', &[]).await;
+    let reached = client.through(b'Z').await;
+    assert_eq!(tags(&reached), b"CCCCCZ");
+    assert!(reached[..5].iter().all(|(_, body)| body == b"PREPARE\0"));
+    assert_eq!(reached[5].1, b"T");
+
+    let mut close = vec![b'P'];
+    close.extend_from_slice(&cstring("old_alpha"));
+    client.send(b'C', &close).await;
+    client.bind("old_alpha", "beta").await;
+    client.execute("old_alpha", 0).await;
+    client.send(b'S', &[]).await;
+    let rebound = client.through(b'Z').await;
+    assert_eq!(tags(&rebound), b"32CZ");
+    assert_eq!(rebound[2].1, b"PREPARE\0");
+    assert_eq!(rebound[3].1, b"T");
+
+    for (sql, value) in [
+        ("EXECUTE alpha_q", "7"), ("EXECUTE beta_q", "9"),
+        ("EXECUTE new_alpha_q", "17"), ("EXECUTE new_beta_q", "19"),
+    ] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"TDCZ");
+        assert_eq!(rows(&frames), [vec![Some(value.as_bytes().to_vec())]]);
+        assert_eq!(frames[3].1, b"T");
+    }
+    client.execute("old_beta", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(client.through(b'Z').await, vec![(b'C', b"PREPARE\0".to_vec()), (b'Z', b"T".to_vec())]);
+    let rolled_back = client.query("ROLLBACK").await;
+    assert_eq!(tags(&rolled_back), b"CZ");
+    assert_eq!(rolled_back[1].1, b"I");
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn nested_simple_prepare_emits_terminal_planning_warnings_when_the_child_is_prepared() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let query = "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY v NULLS FIRST) AS p FROM (VALUES (1), (3)) AS t(v)";
+    let outer = client.query(&format!("PREPARE warn_root AS PREPARE warn_leaf AS {query}")).await;
+    assert_eq!(tags(&outer), b"CZ");
+    assert_eq!(outer[0].1, b"PREPARE\0");
+    assert_eq!(outer[1].1, b"I");
+
+    client.bind("", "warn_root").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let reached = client.through(b'Z').await;
+    assert_eq!(tags(&reached), b"2NCZ");
+    assert_eq!(reached[1].1, b"SWARNING\0VWARNING\0C01000\0MNULL ordering is ignored for percentile_cont (nulls are excluded from ordered-set aggregates)\0\0");
+    assert_eq!(reached[2].1, b"PREPARE\0");
+    assert_eq!(reached[3].1, b"I");
+    assert_eq!(tags(&client.query("EXECUTE warn_leaf").await), b"TDCZ");
+    drop(client);
+    running.stop().await;
+}

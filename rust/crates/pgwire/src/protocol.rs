@@ -5,14 +5,13 @@ use rtdb_node::{CommitResult, ControlExecutionOptions, ControlFrontend, ControlR
 use rtdb_pg_codec::{Format, SessionEnvironment};
 use rtdb_plan::{ControlStatement, DiscardTarget};
 use rtdb_query::QueryCursor;
-use rtdb_sql::{BatchStatement, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
+use rtdb_sql::{BatchExecution, ExecutableSyntax, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax};
 use rtdb_types::{Anomaly, PgType, Result, Value};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
 use crate::{ServerConfig, connection::{Startup, apply_startup, display_parameter}, error::{cancelled, protocol}, server::CancellationSlot, wire::{Column, Frame, Input, Writer}};
 
 enum PreparedKind { Empty, Query(PreparedSql), Dml(PreparedSql), Control(ControlStatement), Keywords }
-enum PrepareOrigin { ClientParse, SqlPrepareChild }
 struct PreparedShape {
     kind: PreparedKind,
     columns: Option<Vec<Column>>,
@@ -153,24 +152,11 @@ impl ProtocolSession {
             ExtendedStatement::Ordinary(source) => source,
             ExtendedStatement::Prepare(syntax) => return self.retain_sql_prepare(syntax, oids),
         };
-        self.prepare_ordinary(source, oids, PrepareOrigin::ClientParse).await
-    }
-
-    async fn prepare_raw_child(&mut self, original: &str) -> Result<Arc<Prepared>> {
-        let _scratch = self.node.memory().reserve(original.len().checked_mul(128).and_then(|n| n.checked_add(8192)).ok_or_else(|| protocol("SQL is too large"))?)?;
-        let spans = rtdb_sql::split_statements(original)?;
-        if spans.len() > 1 { return Err(protocol("A prepared statement must contain exactly one statement")); }
-        let source = spans.first().map_or("", |span| &original[span.start..span.end]);
-        self.prepare_ordinary(source, Vec::new(), PrepareOrigin::SqlPrepareChild).await
-    }
-
-    async fn prepare_ordinary(&mut self, source: &str, oids: Vec<i32>, origin: PrepareOrigin) -> Result<Arc<Prepared>> {
-        let client_parse = matches!(origin, PrepareOrigin::ClientParse);
-        let source = if client_parse { replace_namespace_query(source, (source, "")) } else { source };
+        let source = replace_namespace_query(source, (source, ""));
         let options = self.options();
         let shape = if source.is_empty() {
             PreparedShape { kind: PreparedKind::Empty, columns: None, parameter_count: 0 }
-        } else if client_parse && legacy_keyword_probe(source) {
+        } else if legacy_keyword_probe(source) {
             keyword_shape()
         } else if let Some(control) = rtdb_sql::parse_control_in(source, &options, self.node.memory())? {
             control_shape(control, oids.len())?
@@ -299,10 +285,6 @@ impl ProtocolSession {
                         if matches!(statement, ControlStatement::SetRole) { return Ok(()); }
                         writer.string(b'C', &tag).await
                     }
-                    ControlResult::Prepare { name, source, allocation: _allocation } => {
-                        let prepared = self.prepare_raw_child(&source).await?;
-                        self.install_sql_prepare(name.into(), prepared, writer).await
-                    },
                     ControlResult::CopyIn { table, format, allocation: _allocation } => { self.copy = Some(crate::copy::CopyInput::new(table, format, self.node.memory(), self.config.maximum_copy_bytes)?); let format = self.copy.as_ref().ok_or_else(|| protocol("COPY state missing"))?.wire_format(); writer.send(b'G', &[format.code() as u8, 0, 1, 0, format.code() as u8]).await?; writer.flush().await },
                     _ => Err(protocol("Unexpected control execution result")),
                 }
@@ -315,11 +297,15 @@ impl ProtocolSession {
     ) -> Result<()> {
         let _allocation = self.session.admit_frontend_prepare(&portal.arguments, &portal.cancellation).await?;
         let memory = Arc::clone(self.node.memory());
-        let prepared = match syntax.child(&memory)? {
-            SqlPrepareChild::Prepare(child) => self.retain_sql_prepare(child, Vec::new())?,
-            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation).await?,
-        };
+        let prepared = self.prepare_sql_child(syntax.child(&memory)?).await?;
         self.install_sql_prepare(Cow::Borrowed(syntax.name()), prepared, writer).await
+    }
+
+    async fn prepare_sql_child(&mut self, child: SqlPrepareChild<'_>) -> Result<Arc<Prepared>> {
+        match child {
+            SqlPrepareChild::Prepare(child) => self.retain_sql_prepare(child, Vec::new()),
+            SqlPrepareChild::Command { syntax, allocation } => self.prepare_batch_command(syntax, allocation).await,
+        }
     }
 
     async fn stream<W: AsyncWrite + Unpin>(&mut self, portal: &mut Portal, source: &str, limit: usize, writer: &mut Writer<W>) -> Result<()> {
@@ -390,53 +376,41 @@ impl ProtocolSession {
             let allocation = memory.reserve(normalized.0.len() + normalized.1.len())?;
             (Cow::Owned([normalized.0, normalized.1].concat()), Some(allocation))
         };
-        let batch = if keyword == KeywordPrefix::LocaleDependent {
+        let mut batch = if keyword == KeywordPrefix::LocaleDependent {
             rtdb_sql::parse_statement_batch_with_frontend_response(&source, &memory, legacy_keyword_probe)?
         } else {
             rtdb_sql::parse_statement_batch(&source, &memory)?
         };
-        for statement in batch {
-            let start_transaction = !statement.preparations.is_empty()
-                || match &statement.command {
+        while let Some(statement) = batch.next_for_execution() {
+            let start_transaction = match &statement {
+                BatchExecution::Prepare(_) => true,
+                BatchExecution::Command { syntax, .. } => match syntax {
                     ExecutableSyntax::Sql(_) | ExecutableSyntax::FrontendResponse(_) => true,
                     ExecutableSyntax::Control(control) => control.starts_implicit_transaction(),
-                };
+                },
+            };
             if start_transaction { self.begin_implicit(None)?; }
             let result = self.run_simple_statement(statement, writer).await;
             self.simple_statement_result(result, writer).await?;
         }
+        drop(batch);
         self.settle_simple_transaction().await
     }
 
-    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchStatement<'_>, writer: &mut Writer<W>) -> Result<()> {
-        let BatchStatement { preparations, command: syntax, allocation } = statement;
-        let mut layers = preparations.into_iter();
-        if let Some(layer) = layers.next() {
-            if self.session.state().status() == TransactionStatus::Failed {
-                return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received"));
+    async fn run_simple_statement<W: AsyncWrite + Unpin>(&mut self, statement: BatchExecution<'_, '_>, writer: &mut Writer<W>) -> Result<()> {
+        let (syntax, allocation) = match statement {
+            BatchExecution::Command { syntax, allocation } => (syntax, allocation),
+            BatchExecution::Prepare(statement) => {
+                if self.session.state().status() == TransactionStatus::Failed {
+                    return Err(protocol("current transaction is aborted, commands ignored until ROLLBACK is received"));
+                }
+                let token = self.token();
+                let _allocation = self.session.admit_frontend_prepare(&[], &token).await?;
+                let (name, child) = statement.into_child()?;
+                let prepared = self.prepare_sql_child(child).await?;
+                return self.install_sql_prepare(name.into(), prepared, writer).await;
             }
-            let nested = layers.next();
-            let source = nested.as_ref().map_or(syntax.source(), |layer| layer.source);
-            let command = ControlStatement::Prepare { name: layer.name, source: source.into() };
-            let token = self.token();
-            let options = self.control_options();
-            let ControlResult::Prepare { name, allocation: _allocation, .. } =
-                self.session.execute_control_with(&command, &[], &token, options).await? else {
-                    return Err(protocol("PREPARE did not produce a statement"));
-                };
-            let prepared = if let Some(nested) = nested {
-                let source = layers.next().map_or(syntax.source(), |layer| layer.source);
-                let control = ControlStatement::Prepare { name: nested.name, source: source.into() };
-                drop(layers);
-                drop(syntax);
-                drop(allocation);
-                self.retain_prepared(nested.source, Vec::new(), control_shape(control, 0)?)?
-            } else {
-                drop(layers);
-                self.prepare_batch_command(syntax, allocation).await?
-            };
-            return self.install_sql_prepare(name.into(), prepared, writer).await;
-        }
+        };
         let prepared = self.prepare_batch_command(syntax, allocation).await?;
         Self::planning_warnings(&prepared, writer).await?;
         if !prepared.oids.is_empty() { return Err(protocol("Parameters not allowed in simple queries")); }
@@ -603,6 +577,7 @@ fn replace_namespace_query<'source>(source: &'source str, (body, suffix): (&str,
 
 #[cfg(test)]
 mod tests {
+    use rtdb_sql::BatchStatement;
     use super::*;
 
     fn simple_query_marker(source: &str) -> Option<SimpleQueryMarker> {

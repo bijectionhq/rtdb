@@ -44,8 +44,9 @@ Parse/Bind/Describe/Execute/Close/Flush/Sync retain named prepared statements an
 Extended Parse validates the grammar of every SQL `PREPARE` body before sending ParseComplete.
 A bound portal retains the body selected at Bind when a later Parse replaces the statement name.
 Executing the wrapper prepares its immediate child in the current session context.
-Planning warnings are sent during preparation with severity `WARNING` and SQLSTATE `01000`, before ParseComplete or simple-query results.
-Their occurrence order is retained; Bind and execution-time rebinding do not emit them again.
+Planning warnings use severity `WARNING` and SQLSTATE `01000` and are sent in occurrence order before ParseComplete, simple-query results, or SQL `PREPARE` completion.
+A nested SQL `PREPARE` emits its terminal child's planning warnings when execution reaches that child.
+Planning warnings are sent once per preparation.
 Interactive DML warning planning is best-effort and is skipped when the client supplied parameter OIDs.
 DML and unprepared control parameter descriptions retain the supplied OID list.
 Query and EXECUTE descriptions use their planned placeholder count, padding missing OIDs with the fallback type and truncating excess OIDs.
@@ -91,8 +92,10 @@ The namespace query keeps its original projection when it appears in a multi-sta
 Ordinary Simple Query retains the batch's parsed syntax before any statement can change the session.
 The grammar validates nested PREPARE statements and requires a statement between separators.
 The tokenizer charges the located-token array as it grows and releases it after syntax construction.
-The input frame retains the source bytes.
-Each statement releases its syntax reservation once preparation consumes the tree.
+The input frame retains the source bytes for the duration of the message.
+Nested SQL `PREPARE` statements reached in a Simple Query share a retained copy of the normalized message for later source positions.
+A borrowed syntax reservation ends when preparation consumes the tree.
+A retained syntax reservation follows its registered wrappers and bound portals.
 Each statement resolves its parameters, embedded XTQL and control expressions against the context reached during execution.
 A reached planning or execution error is reported in statement order, with subsequent statements subject to normal transaction status.
 Arrow COPY inspects metadata and compressed buffer lengths before loading payloads, then holds a reservation through the reader and each selected-value conversion.
@@ -110,7 +113,6 @@ These cases map to `src/test/clojure/xtdb/pgwire_protocol_test.clj`, `src/test/c
 Protocol references are https://www.postgresql.org/docs/17/protocol-message-formats.html[message formats] and https://www.postgresql.org/docs/17/protocol-flow.html[protocol flow].
 TLS uses https://docs.rs/tokio-rustls/0.26.6/tokio_rustls/[tokio-rustls 0.26.6].
 Interop with PostgreSQL clients, successful TLS handshakes, external authentication, connection-saturation fault injection, client-disconnect write races, and full resource accounting remain unexecuted qualification work.
-Planning warnings are not yet exposed as protocol notices by the shared preparation API.
 
 An absent anomaly message becomes an empty primary `M` field; structured detail retains its JSON, JSON-LD or Transit presence rules.
 Incomparable MIN/MAX inputs include the input vector type in structured detail.

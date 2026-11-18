@@ -74,6 +74,7 @@ external entity SqlParser {
     -- Each parsed statement resolves its operands when the connection reaches it.
     -- Extended Parse validates the grammar of every nested PREPARE body before installing the prepared statement.
     -- Executing a PREPARE prepares its immediate child in the current session context.
+    -- Native pgwire reports locations in structured errors from a reached SQL PREPARE child as byte positions in the normalized Simple Query message that supplied it.
     -- pgwire acts on the tx-control statements it classifies; the other frontends reject them.
     -- See: core/src/main/kotlin/xtdb/query/SqlParser.kt
 }

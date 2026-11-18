@@ -104,7 +104,8 @@ impl NativeSession {
         cancellation.run_until_cancelled(self.control(statement, arguments, cancellation, options)).await.ok_or_else(cancelled)?
     }
 
-    /// Revalidates a frontend-owned SQL PREPARE and admits the supplied arguments.
+    /// Revalidates the session and admits the arguments for a frontend-owned SQL PREPARE.
+    /// A failed transaction or an argument reservation failure rejects preparation.
     /// The cancellation token must descend from this session.
     /// Keep the returned scope through preparation of the immediate child.
     pub async fn admit_frontend_prepare(&mut self, arguments: &[Value], cancellation: &CancellationToken) -> Result<Arc<EvaluationScope>> {
