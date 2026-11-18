@@ -720,3 +720,25 @@ fn statements_outside_the_reference_grammar_are_sql_errors_while_session_control
     }
     assert_eq!(memory.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn records_query_unions_record_keys_and_leaves_missing_keys_null() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    for sql in [
+        "RECORDS {_id: 1, x: 1}, {x: 2.0}",
+        "SELECT * FROM (RECORDS {_id: 1, x: 1}, {x: 2.0}) AS r",
+        "RECORDS {_id: 1, x: 1} UNION ALL RECORDS {_id: NULL, x: 2.0}",
+    ] {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let names: Vec<_> = statement.prepared_schema().unwrap().fields().iter().map(|field| field.name.clone()).collect();
+        assert_eq!(names, ["_id", "x"], "{sql}");
+        let mut cursor = statement.open_query(Arc::clone(&context), vec![]).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        let batch = page.batch();
+        let rows: Vec<Vec<Value>> = (0..batch.num_rows()).map(|row| (0..batch.num_columns())
+            .map(|column| read_value(batch.schema().field(column), batch.column(column).as_ref(), row).unwrap()).collect()).collect();
+        assert_eq!(rows, [vec![Value::I64(1), Value::I64(1)], vec![Value::Null, Value::F64(2.0)]], "{sql}");
+    }
+    let error = PreparedSql::prepare("RECORDS ?", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).err().unwrap();
+    assert_eq!(error, Anomaly::incorrect("xtdb.sql/records-param-outside-DML", "RECORDS ? not supported outside of DML"));
+}

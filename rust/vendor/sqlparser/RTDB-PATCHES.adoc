@@ -31,3 +31,6 @@ The RTDB dialect disables dedicated `TABLE(expr)` parsing in table-factor positi
 
 `VALUES` rows retain either a scalar expression or a row constructor in the AST.
 The RTDB dialect accepts both forms and allows empty row constructors.
+
+RTDB's dialect parses `RECORDS` followed by `{` or a placeholder as a query body holding one expression per row.
+The same prefix starts a statement and a parenthesized subquery, so an unquoted `records` column reference still parses as an identifier.

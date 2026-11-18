@@ -1171,6 +1171,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Returns true if an unquoted `RECORDS` followed by `{` or a placeholder starts a query body.
+    fn supports_records_query(&self) -> bool {
+        false
+    }
+
     /// Allows USER to use the ordinary identifier expression grammar.
     fn supports_user_as_identifier(&self) -> bool {
         false

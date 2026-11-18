@@ -90,6 +90,7 @@ impl Context<'_> {
             }
             ast::SetExpr::Query(query) => self.admit_query_literals(query)?,
             ast::SetExpr::Values(values) => for row in &values.rows { for expression in row.expressions() { self.admit_expression_literals(expression)?; } },
+            ast::SetExpr::Records(records) => for expression in records { self.admit_expression_literals(expression)?; },
             ast::SetExpr::SetOperation { left, right, .. } => { self.admit_set_literals(left)?; self.admit_set_literals(right)?; }
             _ => (),
         }

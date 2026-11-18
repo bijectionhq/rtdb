@@ -623,6 +623,10 @@ impl<'a> Parser<'a> {
             return statement;
         }
 
+        if self.peek_records_query(0) {
+            return self.parse_query().map(Into::into);
+        }
+
         let next_token = self.next_token();
         match &next_token.token {
             Token::Word(w) => match w.keyword {
@@ -15240,6 +15244,9 @@ impl<'a> Parser<'a> {
             let subquery = self.parse_query()?;
             self.expect_token(&Token::RParen)?;
             SetExpr::Query(subquery)
+        } else if self.peek_records_query(0) {
+            self.next_token();
+            SetExpr::Records(self.parse_comma_separated(Parser::parse_expr)?)
         } else if self.parse_keyword(Keyword::VALUES) {
             let is_mysql = dialect_of!(self is MySqlDialect);
             SetExpr::Values(self.parse_values(is_mysql, false)?)
@@ -18943,10 +18950,10 @@ impl<'a> Parser<'a> {
     /// i.e. `(WITH ...` or `(SELECT ...`.
     fn peek_subquery_or_cte_start(&mut self) -> bool {
         self.peek_token_ref().token == Token::LParen
-            && match &self.peek_nth_token_ref(1).token {
+            && (match &self.peek_nth_token_ref(1).token {
                 Token::Word(w) => self.is_subquery_keyword(w.keyword),
                 _ => false,
-            }
+            } || self.peek_records_query(1))
     }
 
     fn parse_conflict_clause(&mut self) -> Option<SqliteOnConflict> {
@@ -21284,10 +21291,18 @@ impl<'a> Parser<'a> {
     }
 
     fn peek_sub_query(&mut self) -> bool {
-        match &self.peek_token_ref().token {
+        let keyword = match &self.peek_token_ref().token {
             Token::Word(w) => self.is_subquery_keyword(w.keyword),
             _ => false,
-        }
+        };
+        keyword || self.peek_records_query(0)
+    }
+
+    fn peek_records_query(&self, n: usize) -> bool {
+        self.dialect.supports_records_query()
+            && matches!(&self.peek_nth_token_ref(n).token,
+                Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("RECORDS"))
+            && matches!(self.peek_nth_token_ref(n + 1).token, Token::LBrace | Token::Placeholder(_))
     }
 
     fn is_subquery_keyword(&self, keyword: Keyword) -> bool {

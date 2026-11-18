@@ -169,6 +169,8 @@ pub enum SetExpr {
     },
     /// `VALUES (...)`
     Values(Values),
+    /// `RECORDS {...}, ...`, one document expression per row
+    Records(Vec<Expr>),
     /// `INSERT` statement
     Insert(Statement),
     /// `UPDATE` statement
@@ -203,6 +205,7 @@ impl fmt::Display for SetExpr {
                 f.write_str(")")
             }
             SetExpr::Values(v) => v.fmt(f),
+            SetExpr::Records(records) => write!(f, "RECORDS {}", display_comma_separated(records)),
             SetExpr::Insert(v) => v.fmt(f),
             SetExpr::Update(v) => v.fmt(f),
             SetExpr::Delete(v) => v.fmt(f),

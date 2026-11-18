@@ -230,6 +230,7 @@ impl Spanned for SetExpr {
                 right,
             } => left.span().union(&right.span()),
             SetExpr::Values(values) => values.span(),
+            SetExpr::Records(records) => union_spans(records.iter().map(|record| record.span())),
             SetExpr::Insert(statement) => statement.span(),
             SetExpr::Table(_) => Span::empty(),
             SetExpr::Update(statement) => statement.span(),

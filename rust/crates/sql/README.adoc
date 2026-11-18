@@ -78,7 +78,8 @@ The SQL LEADS predicates retain the endpoint comparisons in `sql.clj`; quoted sc
 `tests/periods.rs` maps `test-valid-time-correlated-subquery`, `cte-exporting-valid-time-4054`, `test-lower-upper-period-fns-3660`, `test-derived-columns-with-periods`, the period-intersection assertions in `sql/temporal_test.clj`, and the DML period-reference golden plan.
 Exact diagnostic wording remains outstanding; these source assertions have not been executed.
 
-Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, PATCH RECORDS, INSERT RECORDS, CREATE TABLE declarations, GRANT/REVOKE role membership, and basic transaction and session controls.
+Implemented source paths include SELECT, VALUES, non-recursive CTEs, joins with ON, grouping and aggregate filters, set operators, ordering, limits, array and object expressions, prepared parameters, INSERT, UPDATE, DELETE, ERASE, ASSERT, PATCH RECORDS, INSERT RECORDS, standalone RECORDS queries, CREATE TABLE declarations, GRANT/REVOKE role membership, and basic transaction and session controls.
+A RECORDS query's columns are the union of its record keys in first-appearance order, with null where a record omits a key; the pinned planner orders them by hash-set iteration instead.
 Canonical mutation lowering preserves unassigned document fields, derives valid-time windows, and builds PATCH gap filling and shallow merge plans.
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.

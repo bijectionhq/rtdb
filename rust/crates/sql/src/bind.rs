@@ -306,7 +306,29 @@ impl Context<'_> {
     }
 
     fn record_rows(&mut self, patch: bool, table: &ast::ObjectName, records: &[ast::Expr]) -> Result<crate::StaticMutation> {
-        let expressions = records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect::<Result<Vec<_>>>()?;
+        let input = self.bind_records(records).and_then(|records| self.records(records))?;
+        let target = self.target(table)?;
+        let (valid_time, system_time, _) = self.temporal_filters(table)?;
+        if system_time != TemporalFilter::Default || (!patch && valid_time != TemporalFilter::Default) {
+            return Err(error("Invalid temporal clause for RECORDS"));
+        }
+        let kind = if patch { crate::StaticMutationKind::Patch(valid_time) } else { crate::StaticMutationKind::Put };
+        Ok(crate::StaticMutation { table: target, input, kind })
+    }
+
+    fn bind_records(&mut self, records: &[ast::Expr]) -> Result<Vec<Expr>> {
+        records.iter().map(|expr| self.expr(expr, &Schema::default(), &BTreeMap::new())).collect()
+    }
+
+    fn records_query(&mut self, records: &[ast::Expr]) -> Result<Arc<Relation>> {
+        let records = self.bind_records(records)?;
+        if records.iter().any(|record| matches!(record, Expr::Parameter { data_type, .. } if data_type.legs().is_empty())) {
+            return Err(Anomaly::incorrect("xtdb.sql/records-param-outside-DML", "RECORDS ? not supported outside of DML"));
+        }
+        self.records(records)
+    }
+
+    fn records(&mut self, expressions: Vec<Expr>) -> Result<Arc<Relation>> {
         let mut types = BTreeMap::<String, LogicalType>::new();
         let mut order = Vec::new();
         let mut register = |name: String, ty: LogicalType| match types.entry(name) {
@@ -330,14 +352,7 @@ impl Context<'_> {
         let rows = expressions.into_iter().map(|expr| fields.iter().map(|field| Expr::Field {
             expr: Box::new(expr.clone()), name: field.name.clone(), data_type: field.data_type.clone(),
         }).collect()).collect();
-        let input = Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?);
-        let target = self.target(table)?;
-        let (valid_time, system_time, _) = self.temporal_filters(table)?;
-        if system_time != TemporalFilter::Default || (!patch && valid_time != TemporalFilter::Default) {
-            return Err(error("Invalid temporal clause for RECORDS"));
-        }
-        let kind = if patch { crate::StaticMutationKind::Patch(valid_time) } else { crate::StaticMutationKind::Put };
-        Ok(crate::StaticMutation { table: target, input, kind })
+        Ok(Arc::new(Relation::new(Schema::new(fields)?, RelationNode::Values { rows })?))
     }
 
     fn insert_rows(&mut self, insert: &ast::Insert) -> std::result::Result<InsertRows, InsertRowsError> {
@@ -565,6 +580,7 @@ impl Context<'_> {
             ast::SetExpr::FromPipeline(pipeline) => self.from_pipeline(pipeline, None),
             ast::SetExpr::Query(query) => self.query(query),
             ast::SetExpr::Values(values) => self.values(&values.rows),
+            ast::SetExpr::Records(records) => self.records_query(records),
             ast::SetExpr::SetOperation { left, op, set_quantifier, right } => {
                 let left = self.set_expr(left)?;
                 let right = self.set_expr(right)?;
