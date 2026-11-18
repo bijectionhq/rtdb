@@ -132,10 +132,10 @@ impl SystemCursor {
                 match name {
                     "live_tables" => {
                         if !snapshot.contains_table(table) { continue; }
-                        let count = snapshot.segments(table).iter().map(|segment| i64::from(segment.row_count())).sum();
+                        let count = snapshot.iter_segments(table).map(|segment| i64::from(segment.row_count())).sum();
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("row_count", Value::I64(count))]));
                     }
-                    "live_columns" => for segment in snapshot.segments(table) { for (column, ty) in segment.column_types() {
+                    "live_columns" => for segment in snapshot.iter_segments(table) { for (column, ty) in segment.column_types() {
                         rows.push(record([("schema_name", text(&table.schema)), ("table_name", text(&table.table)), ("col_name", text(column)), ("col_type", text(&ty.to_edn()?))]));
                     } },
                     "trie_stats" => for trie in snapshot.trie_catalog().all_tries(table) {
@@ -213,10 +213,10 @@ fn allocation_bound(tables: &[TableBinding], runtime: &RuntimeRows, execution: &
             bytes = checked(bytes, checked(checked(ty.retained_bytes()?, checked(name.len(), names)?)?.checked_mul(32).ok_or_else(size_error)?, 16384)?)?;
         }
         for snapshot in &execution.context.catalog.database(&table.name.database)?.partitions {
-            for segment in snapshot.segments(&table.name.table) {
+            for segment in snapshot.iter_segments(&table.name.table) {
                 for (name, ty) in segment.column_types() { bytes = checked(bytes, checked(checked(name.len(), ty.retained_bytes()?)?.checked_mul(32).ok_or_else(size_error)?, 16384)?)?; }
             }
-            bytes = checked(bytes, snapshot.trie_catalog().all_tries(&table.name.table).len().checked_mul(32768).ok_or_else(size_error)?)?;
+            bytes = checked(bytes, snapshot.trie_catalog().iter_tries(&table.name.table).count().checked_mul(32768).ok_or_else(size_error)?)?;
         }
     }
     let mut add_name = |name: &str| -> Result<()> { bytes = checked(bytes, checked(name.len().checked_mul(32).ok_or_else(size_error)?, 16384)?)?; Ok(()) };

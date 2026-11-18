@@ -123,11 +123,50 @@ async fn trie_stats_admits_java_maximum_recency_with_date32_narrowing() {
     let trie = CatalogTrie::notification("l02-r9999999991231-b00".parse().unwrap(), 0, None).unwrap();
     state.add_tries(&BTreeMap::from([(table(), vec![trie])]), Timestamp(20)).unwrap();
     let context = query_context(state.value().snapshot(), Arc::new(MemoryStore::default()), false);
-    let binding = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table: TableRef::new("xt", "trie_stats") }).unwrap().unwrap();
-    let field = Field { id: ColumnId(0), name: "recency".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: binding.columns["recency"].clone() };
-    let relation = Arc::new(Relation::scan(Scan { table: binding, columns: vec![field], valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
-        clamp_valid_time: false, iids: None, predicates: Vec::new() }).unwrap());
+    let relation = system_scan(&context, "trie_stats", &["recency"]);
     assert_eq!(collect(relation, context).await.unwrap(), vec![vec![Value::DateDay(169_560_311)]]);
+}
+
+#[tokio::test]
+async fn live_catalog_shows_staged_columns_before_applied_columns_and_respects_l0_coverage() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let memory = MemoryBudget::new(1 << 27);
+    let mut applied = tx(&state, &memory, 0, 10);
+    applied.put(table(), BTreeMap::from([("_id".into(), Value::I64(1)), ("applied".into(), Value::I64(10))]), Interval::ALL).unwrap();
+    state.apply(&applied.stage().unwrap()).unwrap();
+    let mut pending = tx(&state, &memory, 1, 20);
+    pending.put(table(), BTreeMap::from([("_id".into(), Value::I64(2)), ("staged".into(), Value::I64(20))]), Interval::ALL).unwrap();
+    let staged = [Arc::new(pending.stage().unwrap())];
+    let uncovered = state.value().snapshot().with_staged(&staged).unwrap();
+    let key = TrieKey::l0(uncovered.block_index()).unwrap();
+    let covering = CatalogTrie::notification(key, 0, None).unwrap();
+    state.add_tries(&BTreeMap::from([(table(), vec![covering])]), Timestamp(30)).unwrap();
+    let covered = state.value().snapshot().with_staged(&staged).unwrap();
+
+    for (snapshot, row_count, columns) in [
+        (uncovered, 2, &["_id", "staged", "_id", "applied"][..]),
+        (covered, 1, &["_id", "staged"][..]),
+    ] {
+        let context = query_context(snapshot, Arc::new(MemoryStore::default()), false);
+        let docs = Value::Utf8("docs".into());
+        let counts = collect(system_scan(&context, "live_tables", &["table_name", "row_count"]), Arc::clone(&context)).await.unwrap();
+        let live_rows: Vec<_> = counts.into_iter().filter(|row| row[0] == docs).collect();
+        assert_eq!(live_rows, [vec![docs.clone(), Value::I64(row_count)]]);
+
+        let names = collect(system_scan(&context, "live_columns", &["table_name", "col_name"]), context).await.unwrap();
+        let live_columns: Vec<_> = names.into_iter().filter(|row| row[0] == docs).map(|mut row| row.remove(1)).collect();
+        assert_eq!(live_columns, columns.iter().map(|name| Value::Utf8((*name).into())).collect::<Vec<_>>());
+    }
+}
+
+fn system_scan(context: &QueryContext, table: &str, columns: &[&str]) -> Arc<Relation> {
+    let binding = context.catalog.table(&QualifiedTable { database: "xtdb".into(), table: TableRef::new("xt", table) }).unwrap().unwrap();
+    let columns = columns.iter().enumerate().map(|(id, column)| Field {
+        id: ColumnId(id as u32), name: (*column).into(), qualifier: None, qualified_only: false, unnamed: false,
+        data_type: binding.columns[*column].clone(),
+    }).collect();
+    Arc::new(Relation::scan(Scan { table: binding, columns, valid_time: TemporalFilter::All, system_time: TemporalFilter::All,
+        clamp_valid_time: false, iids: None, predicates: Vec::new() }).unwrap())
 }
 
 fn at(value: i64) -> TemporalFilter { TemporalFilter::At(Expr::Literal(timestamp(value))) }
