@@ -205,6 +205,19 @@ Lists are admitted before allocation and released when cleared or exhausted.
 The caller supplies a qualified resolution for the original host and uses the selected address for the actual connection.
 Four additive source fixtures cover selection, duplicate and scope behavior, failure retention and final release.
 
+== In-flight requests
+
+`InFlightQueue` owns one serialized connection's original submitted request envelopes.
+The newest request supplies the send-completion gate and leaves immediately after a completed no-response send.
+The oldest request leaves first for a matching receive or disconnected cleanup.
+Queue capacity is admitted with old and new storage live during replacement.
+The consuming disconnect iterator retains the queue storage until its final drop.
+Timeout follows the strict elapsed-minus-throttle comparison with Java long wrapping.
+Throttle applies to the requests present at that source receive.
+The caller owns Selector event delivery, correlation, native cancellation and the connection inventory.
+The pinned `InFlightRequests.java` identity and notice are retained in the adjacent refresh source record.
+Four additive source fixtures cover send capacity, receive and disconnect order, timeout and admission overlap.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.

@@ -17,6 +17,7 @@ mod wait;
 mod fatal;
 mod monitor;
 mod addresses;
+mod in_flight;
 
 pub use keys::{IdentityWitness, NoIdentityWitness, TopicId, TopicPartitionKey};
 pub use owned::Text;
@@ -30,6 +31,7 @@ pub use wait::{MetadataWait, WaitFailure, WaitStep};
 pub use fatal::{FatalKind, MetadataError, MetadataTopicError, MetadataWaitObservation};
 pub use monitor::{MetadataClock, MetadataMonitor, TopicMetadata, TopicWaitFailure, TopicWaitRequest, WaitCompletion};
 pub use addresses::{ConnectionAddress, ConnectionAddresses};
+pub use in_flight::{InFlightQueue, PendingRequest};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};
