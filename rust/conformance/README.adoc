@@ -170,14 +170,23 @@ Bindings without a recorded invocation, missing bindings, unknown discovered tes
 The source inventory and assertion ledger are never modified by reconciliation.
 Complete assertion mappings, external-lane receipts, and fault-injection integration remain in progress.
 
-`rtdb_conformance::faults` wraps the real `Log` and `ObjectStore` interfaces with before/after checkpoints.
+`rtdb_conformance::faults` wraps the real `Log` and `ObjectStore` interfaces with fault checkpoints.
 `FaultSchedule` is a Monitor Object holding the replay rules, matching-call counts, release gates, and bounded event trace.
 Rules, points, and trace events are passive values; each adapter and call guard is passive and retains no independent task.
 The scenario owns the actual database/resource drivers, closes the schedule on cancellation, and joins all users before accepting the trace.
 Unreached rules, active calls, and trace overflow fail the scenario.
 Receipt interception preserves the backend's ownership of an accepted append even when its observer is paused or cancelled.
-Provider calls retain one trace hit from `provider_started` through `provider_returned`, `provider_failure`, or `provider_abandoned`, including cancellation while the provider future is pending.
-The source fixtures cover publication before/after errors, immutable retries, accepted writes with lost receipts, local recovery, interrupted read delivery, gate release, and gate shutdown.
+For operations that support both phases, `provider_started` and its terminal event share a hit ID.
+The `after` checkpoint runs when the provider succeeds.
+Each named log uses batch replay by default.
+A `replay_prepare` or `replay_delivery` rule selects caller-reserved single-record replay for its tails.
+A selected log requires a backend tail that supports reserved replay.
+Selected replay rules require the `any` key match, and a log owner may schedule either `poll` or selected replay rules.
+Direct calls to `LogTail::poll` use the batch trace in either mode.
+`replay_prepare` accepts `before` and `after` rules and traces the provider call.
+The `replay_delivery` trace covers only the `before` checkpoint.
+The schedule counts the call as active until the backend read returns or the caller cancels.
+The source fixtures cover publication before/after errors, immutable retries, accepted writes with lost receipts, local recovery, interrupted batch delivery, selected replay after lost preparation or cancelled delivery, gate release, and gate shutdown.
 These fixtures have not executed.
 
 `run_clients.py` builds the unchanged JavaScript, Python, Elixir, Rust and .NET client images from the pinned reference.

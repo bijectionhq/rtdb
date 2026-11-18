@@ -3,7 +3,7 @@ use bytes::Bytes;
 use parking_lot::Mutex;
 use rtdb_storage::{Error, ObjectKey, ObjectStore, Result,
     object_store::{ReadReservation, RetainedBytes, StoredObject},
-    log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail}};
+    log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogReplayTail, LogTail, ReplayHead}};
 use rtdb_types::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, future::Future, ops::Range, path::Path, sync::Arc, time::Duration};
@@ -12,7 +12,20 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Operation { Enqueue, DurableReceipt, Tail, Poll, Range, RangeNext, ReadRange, Head, Get, GetRange, Put, PutFile, List, Delete, Copy }
+pub enum Operation { Enqueue, DurableReceipt, Tail, Poll, ReplayPrepare, ReplayDelivery, Range, RangeNext, ReadRange, Head, Get, GetRange, Put, PutFile, List, Delete, Copy }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplayMode { Batch, Selected }
+
+impl Operation {
+    fn replay_mode(self) -> Option<ReplayMode> {
+        match self {
+            Self::Poll => Some(ReplayMode::Batch),
+            Self::ReplayPrepare | Self::ReplayDelivery => Some(ReplayMode::Selected),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -108,11 +121,14 @@ pub struct FaultSchedule {
 
 impl FaultSchedule {
     /// Rules count matching calls from one; overlapping rules that fire at the same point are rejected at that point.
+    /// Each log owner can schedule batch polling or selected replay.
+    /// Selected replay rules require `KeyMatch::Any`, and delivery rules require `Phase::Before`.
     /// The scenario owner closes the schedule and joins all users before collecting its final trace.
     pub fn new(rules: Vec<Rule>, maximum_events: usize) -> Result<Arc<Self>> {
         if maximum_events == 0 || rules.iter().any(|rule| rule.occurrence == 0 || rule.owner.is_empty()) {
             return Err(Error::Task("fault rules need an owner, positive occurrence, and bounded trace capacity".into()));
         }
+        Self::validate_replay_rules(&rules)?;
         let gates = rules.iter().filter_map(|rule| match &rule.action {
             Action::Hold(gate) => Some((gate.clone(), Gate::new())), Action::Fail(_) => None,
         }).collect();
@@ -120,6 +136,31 @@ impl FaultSchedule {
         Ok(Arc::new(Self { rules, gates, maximum_events, progress: watch::channel(0).0,
             state: Mutex::new(State { counts: vec![0; count], fired: vec![false; count], next_hit: 0, active: 0,
                 events: Vec::new(), overflow: false, closed: false }) }))
+    }
+
+    fn validate_replay_rules(rules: &[Rule]) -> Result<()> {
+        let mut modes = BTreeMap::new();
+        for rule in rules {
+            let Some(mode) = rule.operation.replay_mode() else { continue; };
+            if mode == ReplayMode::Selected && rule.key != KeyMatch::Any {
+                return Err(Error::Task("selected replay fault rules require KeyMatch::Any".into()));
+            }
+            if rule.operation == Operation::ReplayDelivery && rule.phase == Phase::After {
+                return Err(Error::Task("selected replay delivery fault rules require Phase::Before".into()));
+            }
+            if modes.insert(rule.owner.as_str(), mode).is_some_and(|previous| previous != mode) {
+                return Err(Error::Task(format!("fault log '{}' mixes poll and selected replay rules", rule.owner)));
+            }
+        }
+        Ok(())
+    }
+
+    fn replay_mode(&self, owner: &str) -> ReplayMode {
+        if self.rules.iter().any(|rule| rule.owner == owner && rule.operation.replay_mode() == Some(ReplayMode::Selected)) {
+            ReplayMode::Selected
+        } else {
+            ReplayMode::Batch
+        }
     }
 
     fn record(&self, state: &mut State, hit: usize, point: &Point, kind: EventKind, rule: Option<usize>, detail: Option<String>) -> Result<()> {
@@ -207,13 +248,15 @@ impl FaultSchedule {
 
     pub fn events(&self) -> Vec<Event> { self.state.lock().events.clone() }
 
+    fn begin_call(self: &Arc<Self>) -> Result<Call> {
+        let mut state = self.state.lock();
+        if state.closed { return Err(Error::Closed("fault scenario closed".into())); }
+        state.active += 1;
+        Ok(Call { schedule: Arc::clone(self), phase: CallPhase::Checkpoint })
+    }
+
     async fn around<T: Send>(self: &Arc<Self>, point: Point, action: impl Future<Output = Result<T>> + Send) -> Result<T> {
-        {
-            let mut state = self.state.lock();
-            if state.closed { return Err(Error::Closed("fault scenario closed".into())); }
-            state.active += 1;
-        }
-        let mut call = Call { schedule: Arc::clone(self), phase: CallPhase::Checkpoint };
+        let mut call = self.begin_call()?;
         self.hit(point.clone()).await?;
         call.start_provider(&point)?;
         let result = action.await;
@@ -291,6 +334,9 @@ impl FaultEndpoint {
     async fn around<T: Send>(&self, operation: Operation, key: Option<&ObjectKey>, action: impl Future<Output = Result<T>> + Send) -> Result<T> {
         self.schedule.around(self.point(operation, key), action).await
     }
+    fn require_replay<'a>(&self, tail: &'a mut dyn LogTail) -> Result<&'a mut dyn LogReplayTail> {
+        tail.replay().ok_or_else(|| Error::Task(format!("fault log '{}' does not support selected replay", self.name)))
+    }
 }
 
 pub struct FaultStore { inner: Arc<dyn ObjectStore>, owner: FaultEndpoint }
@@ -332,8 +378,10 @@ impl Log for FaultLog {
     }
     fn latest(&self) -> Result<LogOffset> { self.inner.latest() }
     async fn tail(&self, after: LogOffset) -> Result<Box<dyn LogTail>> {
-        let inner = self.owner.around(Operation::Tail, None, self.inner.tail(after)).await?;
-        Ok(Box::new(FaultTail { inner, owner: self.owner.clone() }))
+        let mut inner = self.owner.around(Operation::Tail, None, self.inner.tail(after)).await?;
+        let mode = self.owner.schedule.replay_mode(&self.owner.name);
+        if mode == ReplayMode::Selected { self.owner.require_replay(inner.as_mut())?; }
+        Ok(Box::new(FaultTail { inner, owner: self.owner.clone(), mode }))
     }
     async fn range(&self, from: LogOffset, to: LogOffset) -> Result<Box<dyn LogRange>> {
         let inner = self.owner.around(Operation::Range, None, self.inner.range(from, to)).await?;
@@ -344,11 +392,33 @@ impl Log for FaultLog {
     }
 }
 
-struct FaultTail { inner: Box<dyn LogTail>, owner: FaultEndpoint }
+struct FaultTail { inner: Box<dyn LogTail>, owner: FaultEndpoint, mode: ReplayMode }
 #[async_trait]
 impl LogTail for FaultTail {
     async fn poll(&mut self, timeout: Duration) -> Result<Vec<LogRecord>> {
         self.owner.around(Operation::Poll, None, self.inner.poll(timeout)).await
+    }
+
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> {
+        match self.mode {
+            ReplayMode::Batch => None,
+            ReplayMode::Selected => Some(self),
+        }
+    }
+}
+
+#[async_trait]
+impl LogReplayTail for FaultTail {
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
+        let replay = self.owner.require_replay(self.inner.as_mut())?;
+        self.owner.around(Operation::ReplayPrepare, None, replay.poll_head(timeout)).await
+    }
+
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
+        let _call = self.owner.schedule.begin_call()?;
+        // A failed checkpoint after delivery would leave the caller behind the advanced cursor.
+        self.owner.schedule.hit(self.owner.point(Operation::ReplayDelivery, None)).await?;
+        self.owner.require_replay(self.inner.as_mut())?.read_head(head, reservation).await
     }
 }
 

@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_conformance::faults::{Action, EventKind, FaultLog, FaultSchedule, FaultStore, KeyMatch, Operation, Phase, Rule};
-use rtdb_storage::{MemoryStore, ObjectKey, ObjectStore, Result, object_store::StoredObject, log::{LocalLog, LocalLogOptions, Log, LogOffset, MemoryLog}};
-use rtdb_types::Timestamp;
+use rtdb_storage::{Error, MemoryStore, ObjectKey, ObjectStore, Result, object_store::{ReadReservation, StoredObject},
+    log::{LocalLog, LocalLogOptions, Log, LogOffset, MemoryLog, ReadOnlyLocalLog, ReadOnlyLocalLogOptions}};
+use rtdb_types::{MemoryBudget, Timestamp};
 use std::{future::{Future, pending, poll_fn}, ops::Range, path::Path, sync::{Arc, atomic::{AtomicBool, Ordering}}, task::Poll, time::Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -148,6 +149,121 @@ async fn post_poll_failure_replays_from_the_last_applied_position_on_a_new_tail(
     let records = replay.poll(Duration::ZERO).await.unwrap();
     assert_eq!(records.iter().map(|record| record.metadata.offset.0).collect::<Vec<_>>(), vec![0, 1]);
     schedule.assert_exhausted().unwrap();
+}
+
+#[test]
+fn selected_local_record_survives_lost_readiness_and_cancelled_delivery() {
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(1).max_blocking_threads(1).enable_all().build().unwrap();
+    runtime.block_on(async {
+        let directory = tempfile::tempdir().unwrap();
+        let (inner, driver) = LocalLog::open(directory.path().join("LOG"), LocalLogOptions { maximum_message_bytes: 1024, queue_capacity: 4 }).unwrap();
+        let cancellation = CancellationToken::new();
+        let writer = tokio::spawn(driver.run(cancellation.clone()));
+        let payload = Bytes::from_static(b"selected");
+        let metadata = inner.enqueue(payload.clone(), Timestamp(9)).await.unwrap().durable().await.unwrap();
+        let mut lost_readiness = rule(Operation::ReplayPrepare, Phase::After, Action::Fail("readiness response lost".into()));
+        lost_readiness.occurrence = 2;
+        let schedule = FaultSchedule::new(vec![lost_readiness,
+            rule(Operation::ReplayDelivery, Phase::Before, Action::Hold("selected delivery".into()))], 128).unwrap();
+        let log = FaultLog::new(inner.clone(), "database".into(), schedule.clone());
+        let mut tail = log.tail(LogOffset(-1)).await.unwrap();
+        let replay = tail.replay().unwrap();
+        let head = replay.poll_head(Duration::ZERO).await.unwrap().unwrap();
+        assert_eq!(head.metadata, metadata);
+        assert_eq!(head.payload_len, payload.len());
+        assert!(matches!(replay.poll_head(Duration::ZERO).await,
+            Err(Error::Task(message)) if message == "injected fault: readiness response lost"));
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+        let memory = MemoryBudget::new(head.allocation_bound);
+        let reserve = || ReadReservation::new(head.allocation_bound, memory.reserve(head.allocation_bound).unwrap());
+        let mut held = replay.read_head(head, reserve());
+        poll_fn(|context| { assert!(held.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        assert_eq!(memory.used_bytes(), head.allocation_bound);
+        assert!(schedule.assert_exhausted().is_err());
+        assert!(schedule.events().iter().any(|event| event.point.operation == Operation::ReplayDelivery && event.kind == EventKind::Waiting));
+        drop(held);
+        assert_eq!(memory.used_bytes(), 0);
+        schedule.assert_exhausted().unwrap();
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let (resume, paused) = std::sync::mpsc::channel();
+        let blocker = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            paused.recv().unwrap();
+        });
+        waiting.await.unwrap();
+        let mut delivery = replay.read_head(head, reserve());
+        poll_fn(|context| { assert!(delivery.as_mut().poll(context).is_pending()); Poll::Ready(()) }).await;
+        assert!(schedule.assert_exhausted().is_err());
+        resume.send(()).unwrap();
+        blocker.await.unwrap();
+        let record = delivery.await.unwrap();
+        assert_eq!(record.metadata, metadata);
+        let clone = record.payload.clone();
+        drop(record);
+        assert_eq!(clone, payload);
+        assert_eq!(memory.used_bytes(), head.allocation_bound);
+        drop(clone);
+        assert_eq!(memory.used_bytes(), 0);
+        assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), None);
+
+        let delivery_events: Vec<_> = schedule.events().into_iter().filter(|event| event.point.operation == Operation::ReplayDelivery)
+            .map(|event| (event.point.phase, event.kind)).collect();
+        assert_eq!(delivery_events, [(Phase::Before, EventKind::Entered), (Phase::Before, EventKind::Waiting),
+            (Phase::Before, EventKind::Abandoned), (Phase::Before, EventKind::Entered), (Phase::Before, EventKind::Passed)]);
+        drop(tail);
+        schedule.close();
+        cancellation.cancel();
+        writer.await.unwrap().unwrap();
+        inner.close_and_wait().await;
+        schedule.assert_exhausted().unwrap();
+    });
+}
+
+#[test]
+fn selected_replay_rules_are_keyless_and_exclude_after_delivery_and_batch_rules_for_the_same_owner() {
+    let action = || Action::Fail("injected".into());
+    assert!(matches!(FaultSchedule::new(vec![rule(Operation::ReplayDelivery, Phase::After, action())], 32),
+        Err(Error::Task(message)) if message == "selected replay delivery fault rules require Phase::Before"));
+    for operation in [Operation::ReplayPrepare, Operation::ReplayDelivery] {
+        let mut keyed = rule(operation, Phase::Before, action());
+        keyed.key = KeyMatch::Prefix("log/".into());
+        assert!(matches!(FaultSchedule::new(vec![keyed], 32),
+            Err(Error::Task(message)) if message == "selected replay fault rules require KeyMatch::Any"));
+        assert!(matches!(FaultSchedule::new(vec![rule(operation, Phase::Before, action()), rule(Operation::Poll, Phase::After, action())], 32),
+            Err(Error::Task(message)) if message == "fault log 'database' mixes poll and selected replay rules"));
+    }
+}
+
+#[tokio::test]
+async fn named_logs_select_independent_modes_and_selected_tails_keep_direct_batch_polling() {
+    let mut batch = rule(Operation::Poll, Phase::After, Action::Fail("batch observation lost".into()));
+    batch.owner = "batch".into();
+    let schedule = FaultSchedule::new(vec![batch, rule(Operation::ReplayPrepare, Phase::Before, Action::Fail("selected preparation refused".into()))], 64).unwrap();
+    let inner = Arc::new(MemoryLog::new(1024));
+    let batch_log = FaultLog::new(inner.clone(), "batch".into(), schedule.clone());
+    let selected_log = FaultLog::new(inner, "database".into(), schedule.clone());
+    let mut batch_tail = batch_log.tail(LogOffset(-1)).await.unwrap();
+    let mut selected_tail = selected_log.tail(LogOffset(-1)).await.unwrap();
+    assert!(batch_tail.replay().is_none());
+    assert!(matches!(batch_tail.poll(Duration::ZERO).await,
+        Err(Error::Task(message)) if message == "injected fault: batch observation lost"));
+    assert!(selected_tail.poll(Duration::ZERO).await.unwrap().is_empty());
+    assert!(matches!(selected_tail.replay().unwrap().poll_head(Duration::ZERO).await,
+        Err(Error::Task(message)) if message == "injected fault: selected preparation refused"));
+    schedule.assert_exhausted().unwrap();
+}
+
+#[tokio::test]
+async fn selected_endpoint_rejects_a_backend_without_replay_capability() {
+    let directory = tempfile::tempdir().unwrap();
+    let inner = ReadOnlyLocalLog::open(directory.path().join("LOG"), ReadOnlyLocalLogOptions::default()).unwrap();
+    let schedule = FaultSchedule::new(vec![rule(Operation::ReplayDelivery, Phase::Before, Action::Hold("selected delivery".into()))], 32).unwrap();
+    let log = FaultLog::new(inner, "database".into(), schedule);
+    assert!(matches!(log.tail(LogOffset(-1)).await,
+        Err(Error::Task(message)) if message == "fault log 'database' does not support selected replay"));
 }
 
 #[tokio::test]
