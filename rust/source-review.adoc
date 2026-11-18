@@ -1346,13 +1346,20 @@ The in-memory tail delivers a contiguous prefix with a limit on record count and
 It retains room for one maximum-size record and resumes at the next offset after delivery.
 The writable local tail also bounds the delivered record count and payload bytes before reading the next consecutive frame.
 Writable startup and resume, and read-only tip and resume inspection, validate framing with fixed scratch while still reading the payload and reporting I/O failures.
-Writable local and memory replay can report the next record without allocating its payload.
+Writable local and memory tails can prepare the next record for replication without allocating its delivered payload.
+The native resource factory uses the same interface for read-only local replay under the database I/O region.
+Read-only delivery checks the final frame in the captured prefix and the selected frame's header before copying its payload.
+The next readiness probe validates the current tip and can report a newly incomplete external append.
+Kafka replay retains the next fetched event until delivery and copies its payload after admission on the replication path.
+Librdkafka prefetch and decompression storage remains outside the delivery reservation.
 The driver reserves the selected head's delivery and envelope decode together before reading it.
 A refused reservation reports a read failure at the same cursor position.
 Local I/O keeps the delivery reservation through disposal of a cancelled waiter's result.
 Memory replay charges a delivered alias while the append-owned backing remains shared.
-Read-only local, Kafka and fault-wrapped replay use batch polling.
+Read-only local tails opened without an I/O region and fault-wrapped tails use batch polling.
 Single-record native replay checks flush deadlines between records, so elapsed time can place a block cut differently from batch delivery.
+The link:crates/kafka/README.adoc[Kafka qualification example] covers delivery admission on an unused fixture topic and reopening at a separately prepared broker retention boundary.
+Both schedules require a real broker in Phase 2.
 
 A static SQL insert can expand only when its referenced arguments are available.
 The static expansion uses the referenced prefix and leaves a statement with missing arguments for transaction resolution.
@@ -1384,7 +1391,10 @@ The original Gradle invocation, the paired execution and the mismatch result are
 The SQL-logic release lane checks the selected native executable, the pinned script roster, and the archived process and observation files.
 Offline verification recomputes the paired and repeated-reference comparisons from the retained streams.
 The external inventory validator checks normalized SQL-logic records against retained original SQL source bytes.
+A query passes inventory reconciliation when both JVM runs and the native run satisfy its source expectation and produce identical formatted text.
+The inventory retains each full assertion observation.
 Flight SQL GetFlightInfo retains the classified update through argument decoding while the shared session owns execution and transaction buffering.
+Flight SQL reserves memory before classifying the full SQL input and retains a control's estimated parsing and binding allowance through schema preparation or execution.
 Other adapter-specific receipt closures and complete assertion mappings still require source work.
 The full ledger and release matrix have no execution receipts from this source checkpoint.
 

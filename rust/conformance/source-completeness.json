@@ -41,7 +41,7 @@
     },
     "writes_replication_recovery": {
       "status": "pending",
-      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. Writable local and memory replay reserve selected-record delivery and envelope decoding before delivery. Read-only local, Kafka, fault-wrapper admission and final design-surface reconciliation remain open.",
+      "conclusion": "The reviewed traces include selected receipts and terminal fault publication. The driver reserves delivery and envelope decoding for the selected record on writable local, region-backed read-only local, memory and Kafka logs. Fault-wrapper admission and final design-surface reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/tx/src/submission.rs",
         "rust/crates/tx/src/resolver.rs",
@@ -128,22 +128,44 @@
     },
     "replica_recovery": {
       "status": "reviewed",
-      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, replay and adoption, readable restored state, and failure restart.",
+      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, native local and Kafka replay admission, adoption, readable restored state, and failure restart.",
       "implementation_paths": [
         "rust/crates/server/src/main.rs",
         "rust/crates/server/src/runtime.rs",
         "rust/crates/node/src/runtime.rs",
         "rust/crates/node/src/database.rs",
         "rust/crates/replication/src/driver.rs",
-        "rust/crates/replication/src/blocks.rs"
+        "rust/crates/replication/src/blocks.rs",
+        "rust/crates/server/src/resources.rs",
+        "rust/crates/node/src/backends.rs",
+        "rust/crates/node/src/resources.rs",
+        "rust/crates/storage/src/io_region.rs",
+        "rust/crates/storage/src/log/mod.rs",
+        "rust/crates/storage/src/log/local.rs",
+        "rust/crates/storage/src/log/memory.rs",
+        "rust/crates/storage/src/log/read_only.rs",
+        "rust/crates/kafka/src/lib.rs",
+        "rust/crates/kafka/src/tail.rs",
+        "rust/vendor/rdkafka/src/message.rs"
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
-        "rust/crates/server/src/runtime.rs": "a8662ff85a43dcd6955419ac9536e1955de1a8d1c1943a5106f1eabb1bb7092f",
+        "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
         "rust/crates/node/src/database.rs": "dd8235d4ee0c1608f6b04ec029958abdf64b2a0deb06ea2f8e09d75f83ab5b86",
         "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6",
-        "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d"
+        "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d",
+        "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
+        "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
+        "rust/crates/node/src/resources.rs": "06fcbfe224b8713f7099dae88bae863436c3342126ddd9f3f1784372929ce05b",
+        "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
+        "rust/crates/storage/src/log/mod.rs": "ee8807f00b83b67bd99267a9a9aab98ddc0599dfbefab7c13879857ddb808d56",
+        "rust/crates/storage/src/log/local.rs": "6120a36e774aec5598e0da629c27045bc843f559943c360ccdeb125ec4da2d5c",
+        "rust/crates/storage/src/log/memory.rs": "3a431b06592f32559c31768da6bc8b5f9fa6a98e6fe11a386d647f6d31892aca",
+        "rust/crates/storage/src/log/read_only.rs": "ec0a94c3d47f5cc447c27f051748da9f18800d559d10d52bc288a49129b1a22a",
+        "rust/crates/kafka/src/lib.rs": "4cf1ee2ee6617927f3f61434c18e61289a293be3c33ed1223efdeb2a7dd83f44",
+        "rust/crates/kafka/src/tail.rs": "9b97e91caf8ff9a91086470e5f3af25d270cbe916c3aac49c61f353b5c3358b1",
+        "rust/vendor/rdkafka/src/message.rs": "8992730b18b16a1b500c237a48f4814f8288e4cbf37d60575965a8487d5103ec"
       }
     },
     "compaction_retry": {
@@ -205,7 +227,7 @@
       ],
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
-        "rust/crates/server/src/runtime.rs": "a8662ff85a43dcd6955419ac9536e1955de1a8d1c1943a5106f1eabb1bb7092f",
+        "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/ffi/src/lib.rs": "de48f64941ee1e58e76fb73b08ecad8562defc797318c7ea0b995e55597614c7",
         "rust/crates/node/src/node.rs": "983581e9a3c7e7239d06c2d709745896aa3bf6cf75889ad32ef1150a5f2fa3ba",
         "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
