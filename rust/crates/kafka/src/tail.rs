@@ -2,11 +2,19 @@ use std::sync::{Arc, atomic::Ordering};
 use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
-use rdkafka::{Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, error::KafkaError};
-use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord, LogTail}};
+use rdkafka::{Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, error::KafkaError, message::RetainedConsumerMessage};
+use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead}, object_store::ReadReservation};
 use crate::{KafkaLogOptions, Progress, metadata, transport_error};
 
-pub(crate) struct KafkaTail { consumer: BaseConsumer, options: KafkaLogOptions, progress: Arc<Progress>, next: i64 }
+const DELIVERY_OVERHEAD_BYTES: usize = 256;
+
+pub(crate) struct KafkaTail {
+    consumer: Arc<BaseConsumer>,
+    pending: Option<RetainedConsumerMessage>,
+    options: KafkaLogOptions,
+    progress: Arc<Progress>,
+    next: i64,
+}
 
 pub(crate) struct KafkaRange { tail: KafkaTail, end: i64, maximum: usize, timeout: Duration }
 impl KafkaRange {
@@ -14,8 +22,8 @@ impl KafkaRange {
 }
 #[async_trait]
 impl rtdb_storage::log::LogRange for KafkaRange {
-    fn allocation_bound(&self) -> usize { self.maximum.saturating_add(256) }
-    async fn next(&mut self, reservation: rtdb_storage::object_store::ReadReservation) -> Result<Option<LogRecord>> {
+    fn allocation_bound(&self) -> usize { self.maximum.saturating_add(DELIVERY_OVERHEAD_BYTES) }
+    async fn next(&mut self, reservation: ReadReservation) -> Result<Option<LogRecord>> {
         if reservation.length() < self.allocation_bound() { return Err(Error::Task("log read reservation is too small".into())); }
         if self.tail.next_offset() >= self.end { return Ok(None); }
         let record = self.tail.poll(self.timeout).await?.pop().ok_or_else(|| Error::Remote { key: self.tail.options.topic.clone(), message: "Kafka range ended before its captured tip".into() })?;
@@ -33,7 +41,7 @@ impl KafkaTail {
         assignment.add_partition_offset(&options.topic, 0, Offset::Offset(next)).map_err(|error| transport_error(&options.topic, error))?;
         consumer.assign(&assignment).map_err(|error| transport_error(&options.topic, error))?;
         progress.advance(high - 1);
-        Ok(Self { consumer, options, progress, next })
+        Ok(Self { consumer: Arc::new(consumer), pending: None, options, progress, next })
     }
 
     pub fn next_offset(&self) -> i64 { self.next }
@@ -44,6 +52,59 @@ impl KafkaTail {
         if high - 1 < self.progress.observed_tip.load(Ordering::Acquire) { return Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka withdrew an observed log position".into() }); }
         self.progress.advance(high - 1);
         Ok(high)
+    }
+
+    fn available_head(&mut self) -> Result<Option<ReplayHead>> {
+        if self.pending.is_none() {
+            match RetainedConsumerMessage::poll_from(&self.consumer, Duration::ZERO) {
+                Some(Ok(message)) => self.pending = Some(message),
+                Some(Err(KafkaError::PartitionEOF(_))) | None => return Ok(None),
+                Some(Err(error)) => return Err(transport_error(&self.options.topic, error)),
+            }
+        }
+        self.pending_head().map(Some)
+    }
+
+    fn pending_message(&self) -> Result<&RetainedConsumerMessage> {
+        self.pending.as_ref().ok_or_else(|| Error::Task("Kafka replay has no prepared head".into()))
+    }
+
+    fn pending_head(&self) -> Result<ReplayHead> {
+        let message = self.pending_message()?.as_borrowed();
+        let header = metadata(message, &self.options.topic)?;
+        if header.offset.0 != self.next {
+            return Err(Error::UnavailableLogRange { requested: self.next, first_retained: header.offset.0 });
+        }
+        let payload_len = message.payload().ok_or_else(|| self.tombstone())?.len();
+        if payload_len > self.options.maximum_message_bytes {
+            return Err(Error::MessageTooLarge { size: payload_len, maximum: self.options.maximum_message_bytes });
+        }
+        if header.offset.0 == i64::MAX {
+            return Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka offset space exhausted".into() });
+        }
+        Ok(ReplayHead { metadata: header, payload_len, allocation_bound: payload_len.saturating_add(DELIVERY_OVERHEAD_BYTES) })
+    }
+
+    fn tombstone(&self) -> Error {
+        Error::Remote { key: self.options.topic.clone(), message: "Kafka log contains a tombstone".into() }
+    }
+
+    fn deliver_head(&mut self, head: ReplayHead, reservation: Option<ReadReservation>) -> Result<LogRecord> {
+        if reservation.as_ref().is_some_and(|reservation| reservation.length() < head.allocation_bound) {
+            return Err(Error::Task("log read reservation is too small".into()));
+        }
+        let payload = self.pending_message()?.as_borrowed().payload().ok_or_else(|| self.tombstone())?;
+        let record = LogRecord { metadata: head.metadata, payload: Bytes::copy_from_slice(payload) };
+        let record = match reservation { Some(reservation) => record.retain(reservation)?, None => record };
+        self.pending = None;
+        self.next = record.metadata.offset.0 + 1;
+        self.progress.advance(record.metadata.offset.0);
+        Ok(record)
+    }
+
+    fn confirm_tip(&self) -> Result<()> {
+        if self.next == self.end()? { return Ok(()); }
+        Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka fetch timed out before the observed tip".into() })
     }
 }
 
@@ -56,29 +117,45 @@ impl LogTail for KafkaTail {
         loop {
             self.progress.check()?;
             if records.len() == self.options.maximum_poll_records || bytes.checked_add(self.options.maximum_message_bytes).is_none_or(|bytes| bytes > self.options.maximum_poll_bytes) { return Ok(records); }
-            match self.consumer.poll(Duration::ZERO) {
-                Some(Ok(message)) => {
-                    let header = metadata(&message, &self.options.topic)?;
-                    if header.offset.0 != self.next { return Err(Error::UnavailableLogRange { requested: self.next, first_retained: header.offset.0 }); }
-                    let payload = message.payload().ok_or_else(|| Error::Remote { key: self.options.topic.clone(), message: "Kafka log contains a tombstone".into() })?;
-                    if payload.len() > self.options.maximum_message_bytes { return Err(Error::MessageTooLarge { size: payload.len(), maximum: self.options.maximum_message_bytes }); }
-                    bytes += payload.len();
-                    self.next = header.offset.0.checked_add(1).ok_or_else(|| Error::Remote { key: self.options.topic.clone(), message: "Kafka offset space exhausted".into() })?;
-                    self.progress.advance(header.offset.0);
-                    records.push(LogRecord { metadata: header, payload: Bytes::copy_from_slice(payload) });
-                    continue;
-                }
-                Some(Err(KafkaError::PartitionEOF(_))) | None => (),
-                Some(Err(error)) => return Err(transport_error(&self.options.topic, error)),
+            if let Some(head) = self.available_head()? {
+                records.push(self.deliver_head(head, None)?);
+                bytes += head.payload_len;
+                continue;
             }
             if !records.is_empty() { return Ok(records); }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                let end = self.end()?;
-                if self.next == end { return Ok(records); }
-                return Err(Error::Remote { key: self.options.topic.clone(), message: "Kafka fetch timed out before the observed tip".into() });
+                self.confirm_tip()?;
+                return Ok(records);
             }
             tokio::time::sleep(remaining.min(self.options.poll_interval)).await;
         }
+    }
+
+    fn replay(&mut self) -> Option<&mut dyn LogReplayTail> { Some(self) }
+}
+
+#[async_trait]
+impl LogReplayTail for KafkaTail {
+    async fn poll_head(&mut self, timeout: Duration) -> Result<Option<ReplayHead>> {
+        let deadline = tokio::time::Instant::now().checked_add(timeout).ok_or_else(|| Error::Task("Kafka poll deadline overflow".into()))?;
+        loop {
+            self.progress.check()?;
+            if let Some(head) = self.available_head()? { return Ok(Some(head)); }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                self.confirm_tip()?;
+                return Ok(None);
+            }
+            tokio::time::sleep(remaining.min(self.options.poll_interval)).await;
+        }
+    }
+
+    async fn read_head(&mut self, head: ReplayHead, reservation: ReadReservation) -> Result<LogRecord> {
+        self.progress.check()?;
+        if self.pending_head()? != head {
+            return Err(Error::Task("Kafka replay head does not match the pending record".into()));
+        }
+        self.deliver_head(head, Some(reservation))
     }
 }

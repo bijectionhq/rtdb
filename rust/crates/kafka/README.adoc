@@ -51,6 +51,11 @@ Retention, withdrawn observed offsets, unexpected gaps, tombstones, and fetch ti
 Empty polling means the cursor reached the observed tip.
 The transport does not open Kafka transactions; externally written transaction/control records that introduce offset gaps are rejected.
 Poll batches and range reads have explicit limits; a range exceeding its limits fails instead of truncating silently.
+Replication prepares the next Kafka record by retaining one fetched native event on the tail.
+Preparation leaves the delivered offset unchanged.
+The selected read copies the payload after caller admission and releases the native event on delivery.
+A refused or cancelled selected read keeps the pending record at its original offset.
+Direct polling drains a pending record before polling for another one.
 Native client contexts, prefetch and decompression allocations still require qualification against the process-wide memory contract.
 
 Source references are `modules/kafka/src/main/kotlin/xtdb/api/log/KafkaCluster.kt`, `KafkaClusterTest.kt`, `KafkaLogFactoryTest.kt`, `KafkaDurabilityTest.kt`, and `allium/log-processor-lifecycle.allium`.
@@ -58,6 +63,13 @@ The Rust test sources cover configuration precedence, JAAS credentials, acknowle
 TLS assembly regressions cover admission before connection setup, failed-setup release, retained configuration and native-client clones, source-consumer options, and producer defaults.
 They have not been compiled or executed during Phase 1.
 Real broker failover, retained-range truncation, authentication, and native shutdown qualification remain required before backend compatibility can be claimed.
+
+The standalone replay qualification example requires explicitly supplied broker access and a preprovisioned disposable topic named with the `rtdb-replay-` prefix.
+The delivery check requires an unused topic whose first append receives offset zero.
+Run `cargo run -p rtdb-kafka --example qualify_log_replay -- BROKER TOPIC` from the `rust/` directory.
+Pass `--properties-file FILE` for client properties that preserve the supplied broker endpoint.
+Pass `--first-retained OFFSET` for a read-only check after the fixture owner advances the broker's retained boundary.
+The offset must be positive and the topic must retain a record at that offset.
 
 == Kafka Connect ingestion
 

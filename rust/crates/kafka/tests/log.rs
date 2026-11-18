@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use bytes::Bytes;
-use rdkafka::mocking::MockCluster;
+use rdkafka::{ClientConfig, mocking::MockCluster, producer::{FutureProducer, FutureRecord}};
 use rtdb_columnar::MemoryBudget;
 use rtdb_kafka::{KafkaClusterConfig, KafkaLog, KafkaLogOptions, KafkaObserver, KafkaWarning};
-use rtdb_storage::{Error, log::{Log, LogOffset}};
+use rtdb_storage::{Error, log::{Log, LogOffset}, object_store::ReadReservation};
 use rtdb_types::Timestamp;
 use tokio_util::sync::CancellationToken;
 
@@ -67,6 +67,125 @@ async fn durable_delivery_is_read_back_by_offset_and_read_only_handles_have_no_d
     cancellation.cancel();
     driver.await.unwrap().unwrap();
     assert!(matches!(opened.log.latest(), Err(Error::Closed(_))));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_kafka_head_survives_refused_and_cancelled_delivery_and_can_be_read_by_direct_poll() {
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("replay", 1, 1).unwrap();
+    let configuration = KafkaClusterConfig::new(cluster.bootstrap_servers());
+    let mut options = KafkaLogOptions::new("replay");
+    options.auto_create_topic = false;
+    let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let writer = tokio::spawn(opened.driver.unwrap().run(cancellation.clone()));
+    let first = opened.log.enqueue(Bytes::from_static(b"first"), Timestamp(42)).await.unwrap().durable().await.unwrap();
+    let second = opened.log.enqueue(Bytes::from_static(b"second"), Timestamp(43)).await.unwrap().durable().await.unwrap();
+    assert_eq!((first.offset, second.offset), (LogOffset(0), LogOffset(1)));
+    let mut tail = opened.log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+    assert_eq!(head.metadata.offset, first.offset);
+    assert_eq!(head.metadata.timestamp.0 % 1000, 0);
+    assert_eq!(head.payload_len, 5);
+    assert_eq!(head.allocation_bound, 261);
+
+    let memory = MemoryBudget::new(head.allocation_bound);
+    let undersized = ReadReservation::new(260, memory.reserve(260).unwrap());
+    assert!(matches!(replay.read_head(head, undersized).await, Err(Error::Task(message)) if message == "log read reservation is too small"));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+    let cancelled = ReadReservation::new(261, memory.reserve(261).unwrap());
+    drop(replay.read_head(head, cancelled));
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(replay.poll_head(Duration::ZERO).await.unwrap(), Some(head));
+
+    let exact = ReadReservation::new(261, memory.reserve(261).unwrap());
+    let (mut tail, record) = tokio::spawn(async move {
+        let record = tail.replay().unwrap().read_head(head, exact).await.unwrap();
+        (tail, record)
+    }).await.unwrap();
+    assert_eq!(record.metadata, head.metadata);
+    let clone = record.payload.clone();
+    drop(record);
+    assert_eq!(clone.as_ref(), b"first");
+    assert_eq!(memory.used_bytes(), 261);
+    drop(clone);
+    assert_eq!(memory.used_bytes(), 0);
+
+    let head = tail.replay().unwrap().poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+    assert_eq!(head.metadata.offset, second.offset);
+    let batch = tail.poll(Duration::ZERO).await.unwrap();
+    assert_eq!(batch.len(), 1);
+    assert_eq!(batch[0].metadata, head.metadata);
+    assert_eq!(batch[0].payload.as_ref(), b"second");
+    assert_eq!(tail.replay().unwrap().poll_head(Duration::ZERO).await.unwrap(), None);
+
+    let mut closing_tail = opened.log.tail(first.offset).await.unwrap();
+    let closing = closing_tail.replay().unwrap();
+    let head = closing.poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+    assert_eq!(head.metadata, batch[0].metadata);
+    let closure_budget = MemoryBudget::new(head.allocation_bound);
+    let exact = ReadReservation::new(head.allocation_bound, closure_budget.reserve(head.allocation_bound).unwrap());
+    cancellation.cancel();
+    writer.await.unwrap().unwrap();
+    assert!(matches!(closing.read_head(head, exact).await, Err(Error::Closed(_))));
+    assert!(matches!(closing.poll_head(Duration::ZERO).await, Err(Error::Closed(_))));
+    assert_eq!(closure_budget.used_bytes(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prepared_kafka_tail_distinguishes_empty_tombstone_and_oversized_payloads() {
+    let cluster = MockCluster::new(1).unwrap();
+    let endpoint = cluster.bootstrap_servers();
+    let configuration = KafkaClusterConfig::new(endpoint.as_str());
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", endpoint.as_str())
+        .set("message.timeout.ms", "5000")
+        .create().unwrap();
+    for (topic, payload) in [("replay-tombstone", None), ("replay-oversized", Some(b"large".as_slice()))] {
+        cluster.create_topic(topic, 1, 1).unwrap();
+        let record = FutureRecord::<(), [u8]>::to(topic).partition(0);
+        let record = match payload { Some(payload) => record.payload(payload), None => record };
+        producer.send(record, Duration::from_secs(5)).await.unwrap();
+        producer.send(FutureRecord::<(), [u8]>::to(topic).partition(0).payload(b"next"), Duration::from_secs(5)).await.unwrap();
+        let mut options = KafkaLogOptions::new(topic);
+        options.auto_create_topic = false;
+        options.read_only = true;
+        options.maximum_message_bytes = 4;
+        let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
+        let mut tail = opened.log.tail(LogOffset(-1)).await.unwrap();
+        for timeout in [Duration::from_secs(5), Duration::ZERO] {
+            let result = tail.replay().unwrap().poll_head(timeout).await;
+            if payload.is_some() {
+                assert!(matches!(result, Err(Error::MessageTooLarge { size: 5, maximum: 4 })));
+            } else {
+                assert!(matches!(result, Err(Error::Remote { key, message }) if key == topic && message == "Kafka log contains a tombstone"));
+            }
+        }
+        let mut restarted = opened.log.tail(LogOffset(0)).await.unwrap();
+        let head = restarted.replay().unwrap().poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+        assert_eq!(head.metadata.offset, LogOffset(1));
+    }
+
+    cluster.create_topic("replay-empty", 1, 1).unwrap();
+    producer.send(FutureRecord::<(), [u8]>::to("replay-empty").partition(0).payload(b""), Duration::from_secs(5)).await.unwrap();
+    let mut options = KafkaLogOptions::new("replay-empty");
+    options.auto_create_topic = false;
+    options.read_only = true;
+    let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), MemoryBudget::new(64 << 20)).await.unwrap();
+    let mut tail = opened.log.tail(LogOffset(-1)).await.unwrap();
+    let replay = tail.replay().unwrap();
+    let head = replay.poll_head(Duration::from_secs(5)).await.unwrap().unwrap();
+    assert_eq!(head.payload_len, 0);
+    assert_eq!(head.allocation_bound, 256);
+    let memory = MemoryBudget::new(256);
+    let reservation = ReadReservation::new(256, memory.reserve(256).unwrap());
+    let record = replay.read_head(head, reservation).await.unwrap();
+    assert!(record.payload.is_empty());
+    assert_eq!(memory.used_bytes(), 256);
+    drop(record);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

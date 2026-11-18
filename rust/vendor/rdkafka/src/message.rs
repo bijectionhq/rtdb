@@ -13,8 +13,9 @@ use rdkafka_sys as rdsys;
 use rdkafka_sys::types::*;
 
 use crate::admin::NativeEvent;
+use crate::consumer::{BaseConsumer, ConsumerContext, DefaultConsumerContext};
 use crate::error::{IsError, KafkaError, KafkaResult};
-use crate::util::{self, millis_to_epoch, KafkaDrop, NativePtr};
+use crate::util::{self, millis_to_epoch, KafkaDrop, NativePtr, Timeout};
 
 /// Timestamp of a Kafka message.
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
@@ -310,6 +311,33 @@ pub struct BorrowedMessage<'a> {
     ptr: NativePtr<RDKafkaMessage>,
     _event: Arc<NativeEvent>,
     _owner: PhantomData<&'a u8>,
+}
+
+/// Keeps a fetched message's native event and consumer alive without copying its data.
+/// The event can retain shared native fetch and decompression buffers until this owner is dropped.
+pub struct RetainedConsumerMessage<C: ConsumerContext = DefaultConsumerContext> {
+    // The event must be destroyed before the final consumer reference.
+    message: BorrowedMessage<'static>,
+    _consumer: Arc<BaseConsumer<C>>,
+}
+
+impl<C: ConsumerContext> RetainedConsumerMessage<C> {
+    /// Polls the retained consumer, preserving the outcomes of [`BaseConsumer::poll`].
+    pub fn poll_from<T: Into<Timeout>>(
+        consumer: &Arc<BaseConsumer<C>>,
+        timeout: T,
+    ) -> Option<KafkaResult<Self>> {
+        consumer.poll(timeout).map(|result| {
+            result.map(|BorrowedMessage { ptr, _event, .. }| Self {
+                message: BorrowedMessage { ptr, _event, _owner: PhantomData },
+                _consumer: Arc::clone(consumer),
+            })
+        })
+    }
+
+    pub fn as_borrowed(&self) -> &BorrowedMessage<'_> {
+        &self.message
+    }
 }
 
 // When using the Event API, messages must not be freed with rd_kafka_message_destroy

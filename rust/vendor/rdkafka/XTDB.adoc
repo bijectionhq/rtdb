@@ -3,6 +3,12 @@
 This directory contains rust-rdkafka 0.38.0, paired with `../rdkafka-sys` 4.9.0+2.10.0 and its bundled librdkafka 2.10.0.
 The upstream distributions and their license notices are retained.
 
+`RetainedConsumerMessage` is a passive owner of a fetched native event and the consumer that produced it.
+Its construction polls that consumer and moves the existing event into the owner without copying the payload.
+The owner destroys the event before dropping its consumer reference.
+The borrowed message view lasts for the owner's lifetime.
+The event can retain a larger fetch or decompression buffer shared by native records.
+
 `SslContextConfigurer` is a passive, shared configuration capability.
 Its callback receives the linked OpenSSL `SSL_CTX` after native certificate and verification setup and before any connection starts.
 The callback may install per-connection callbacks that borrow its immutable state.

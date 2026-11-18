@@ -31,16 +31,18 @@ The external writer's fsync completion is not independently observable through t
 Poll limits bound retained payload bytes and record count separately.
 `ReadOnlyLocalLog::read_range` uses the same limits and returns `LogReadLimit` when the requested range cannot fit.
 Callers can split large catch-up ranges at known record starts.
-Replication uses caller-reserved single-record delivery for native local and memory logs.
+Replication uses caller-reserved single-record delivery for native local, memory, and Kafka logs.
 An available head identifies the next record and its delivery charge.
 Only the selected head acquires a reservation from the execution budget.
-Local delivery charges its copied payload and delivery overhead.
+Local and Kafka delivery charge their copied payloads and delivery overhead.
 Memory delivery charges the overhead for an alias of the append-owned payload.
 The returned payload and its clones keep the delivery reservation alive.
 The read-only native local factory uses `ReadOnlyLocalLog::open_in` to validate readiness and deliver records in the database I/O region.
 Delivery checks the last complete length observed by the cursor.
 The next readiness check validates the current tip framing and inspects the next header.
-Standalone `ReadOnlyLocalLog::open` and Kafka replay use batch delivery through `LogTail::poll`.
+Kafka keeps one fetched native event per prepared cursor and releases it on successful delivery.
+Librdkafka prefetch and decompression storage remains outside the caller's delivery reservation.
+Standalone `ReadOnlyLocalLog::open` uses batch delivery through `LogTail::poll`.
 
 `tests/read_only_log.rs` maps to `ReadOnlyLocalLogTest`'s existing/subsequent external-write polling behavior and adds missing-file, writer-lock coexistence, corruption, truncation, range-bound, and no-write checks.
 Partition path selection and retired-message decoding remain the caller's responsibilities.
