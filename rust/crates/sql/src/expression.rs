@@ -196,6 +196,7 @@ impl Context<'_> {
                 if let Some((query, value)) = function_query(function) {
                     return self.query_value(query, input, value);
                 }
+                if let Some(literal) = binary_string_literal(function) { return literal.map(Expr::Literal); }
                 if let ast::FunctionArguments::List(arguments) = &function.args
                     && arguments.duplicate_treatment.is_none() && arguments.clauses.is_empty()
                     && let Some(constant) = catalog_constant(&identifiers(&function.name)?, Some(&arguments.args))? {
@@ -504,6 +505,22 @@ pub(crate) fn character_length_function(units: &ast::CharacterLengthUnits) -> Re
     } else {
         Err(rtdb_types::Anomaly::incorrect("xtdb.error/illegal-arg", format!("No matching clause: {}", unit.value)))
     }
+}
+
+/// The reference lexes `X('hex')`, with nothing between `X` and the quote, as one binary string token; the SQL parser reads it as a call.
+fn binary_string_literal(function: &ast::Function) -> Option<Result<Value>> {
+    let [ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else { return None; };
+    if name.quote_style.is_some() || !name.value.eq_ignore_ascii_case("x") { return None; }
+    let ast::FunctionArguments::List(arguments) = &function.args else { return None; };
+    let [ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::Value(value)))] = arguments.args.as_slice() else { return None; };
+    let ast::Value::SingleQuotedString(body) = &value.value else { return None; };
+    let contiguous = value.span.start.line == name.span.end.line && value.span.start.column == name.span.end.column + 1
+        && value.span.end.line == value.span.start.line && value.span.end.column == value.span.start.column + body.len() as u64 + 2;
+    if !contiguous || !body.bytes().all(|byte| byte.is_ascii_hexdigit()) { return None; }
+    if body.len() % 2 != 0 {
+        return Some(Err(error(format!("Cannot parse binary hex string: {}('{body}') - failed with message Odd number of characters.", name.value))));
+    }
+    Some(Ok(Value::Binary((0..body.len()).step_by(2).map(|index| u8::from_str_radix(&body[index..index + 2], 16).expect("hex digits")).collect())))
 }
 
 pub(crate) fn scalar_name(function: &ast::Function) -> Result<String> {

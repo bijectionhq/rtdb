@@ -328,3 +328,13 @@ fn position_retry_exhaustion_is_a_public_sql_error() {
         assert!(error.message.as_deref().is_some_and(|message| message.contains("POSITION cumulative parsing work limit exceeded")),"{error:?}");
     }
 }
+
+#[tokio::test]
+async fn contiguous_x_quote_is_a_binary_literal_and_a_spaced_one_is_a_call() {
+    assert_eq!(query("SELECT X('00f0') AS v, x('5C') AS w, X('') AS e").await.unwrap(), [vec![V::Binary(vec![0x00, 0xf0]), V::Binary(vec![0x5c]), V::Binary(vec![])]]);
+    let odd = query("SELECT X('0') AS v").await.unwrap_err();
+    assert_eq!(odd.message.as_deref(), Some("Cannot parse binary hex string: X('0') - failed with message Odd number of characters."));
+    for call in ["SELECT X ('00') AS v", "SELECT X('GG') AS v", "SELECT \"X\"('00') AS v"] {
+        assert!(query(call).await.unwrap_err().message.unwrap().starts_with("Unknown function: "), "{call}");
+    }
+}
