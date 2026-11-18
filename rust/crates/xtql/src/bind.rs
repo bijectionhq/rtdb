@@ -226,6 +226,7 @@ impl Compiler<'_, '_> {
     fn outputs(&mut self, mut bound: Bound, bindings: &[Binding], star: Option<&BTreeSet<String>>, parameters: &Parameters) -> Result<Bound> {
         let sources = bound.variables.clone();
         let mut output: BTreeMap<String, NamedExpr> = BTreeMap::new();
+        let mut order = Vec::new();
         if let Some(star) = star {
             for (name, source) in sources.iter().filter(|(name, _)| star.contains(*name)) {
                 output.insert(name.clone(), NamedExpr { field: self.binder.field(name, None, source.data_type.clone())?, expr: source.expression() });
@@ -237,6 +238,7 @@ impl Compiler<'_, '_> {
             let source = sources.get(&normal(&binding.name)).ok_or_else(|| error("xtql/invalid-expression", format!("Missing source column {}", binding.name)))?;
             if let Some(variable) = binding_variable(&binding.expression, parameters) {
                 let variable = normal(variable);
+                if !order.contains(&variable) { order.push(variable.clone()); }
                 if let Some(existing) = output.get(&variable) {
                     if existing.expr != source.expression() { predicates.push(PExpr::binary(BinaryOp::Eq, existing.expr.clone(), source.expression())); }
                 }
@@ -253,7 +255,9 @@ impl Compiler<'_, '_> {
             predicates.push(PExpr::binary(BinaryOp::Eq, source, value));
         }
         for predicate in predicates { bound.relation = Arc::new(bound.relation.filter(predicate)?); }
-        Ok(Bound::from_relation(bound.relation.project(output.into_values().collect())?))
+        let mut projections: Vec<_> = order.iter().filter_map(|name| output.remove(name)).collect();
+        projections.extend(output.into_values());
+        Ok(Bound::from_relation(bound.relation.project(projections)?))
     }
 
     fn rel(&mut self, input: &RelationInput, bindings: &[Binding], parameters: &Parameters) -> Result<Bound> {

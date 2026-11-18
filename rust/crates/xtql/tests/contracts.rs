@@ -73,8 +73,8 @@ fn xtdb_xtql_test_parse_from_rejects_missing_bindings_and_invalid_options() {
 #[test]
 fn xtdb_xtql_plan_test_from_normalizes_aliases_and_preserves_duplicate_projections() {
     let relation = plan("(from :docs [{:xt/id e} {:first-name name} {:first-name also-name}])");
-    assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["also_name", "e", "name"]);
-    assert_ne!(relation.schema().fields()[0].id, relation.schema().fields()[2].id);
+    assert_eq!(relation.schema().fields().iter().map(|field| field.name.as_str()).collect::<Vec<_>>(), ["e", "name", "also_name"]);
+    assert_ne!(relation.schema().fields()[1].id, relation.schema().fields()[2].id);
 }
 
 #[test]
@@ -214,4 +214,13 @@ fn temporal_scan_bounds_admit_null_upper_endpoints() {
     let nullable = timestamp.maybe();
     assert_eq!(fields["vt"], &nullable);
     assert_eq!(fields["st"], &nullable);
+}
+
+#[test]
+fn xtdb_api_test_explain_plan_2383_from_projects_columns_in_binding_order() {
+    let prepared = compile("(fn [id] (from :people [{:xt/id id} last_name age xt/valid-from first_name]))", &FixtureCatalog,
+        &CompileOptions { parameter_types: vec![LogicalType::Scalar(ScalarType::Keyword)], ..Default::default() }).unwrap();
+    let Statement::Query(relation) = prepared.statement else { panic!("Expected query") };
+    let names: Vec<_> = relation.schema().fields().iter().map(|field| field.name.as_str()).collect();
+    assert_eq!(names, ["last_name", "age", "_valid_from", "first_name"]);
 }

@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{BinaryOp, ColumnId, Expr, Relation, RelationNode, Schema, WindowFunction};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, NamedExpr, Relation, RelationNode, Schema, WindowFunction};
 use rtdb_types::Result;
 
 pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
@@ -14,7 +14,13 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let columns = expressions.iter().flat_map(|named| named.expr.referenced_columns()).collect();
             let input = prune(Arc::clone(input), &columns)?;
             let schema = Schema::new(expressions.iter().map(|named| named.field.clone()).collect())?;
-            let node = match relation.node() { RelationNode::Rename { prefix, .. } => RelationNode::Rename { input, prefix: prefix.clone(), expressions }, _ => RelationNode::Project { input, expressions } };
+            let node = match relation.node() {
+                RelationNode::Rename { prefix, .. } => RelationNode::Rename { input, prefix: prefix.clone(), expressions },
+                _ => match superseded(&expressions, &input) {
+                    Some((input, expressions)) => RelationNode::Project { input, expressions },
+                    None => RelationNode::Project { input, expressions },
+                },
+            };
             Ok(Arc::new(Relation::new(schema, node)?))
         }
         RelationNode::Extend { input, expressions } => {
@@ -102,6 +108,18 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
         }
         RelationNode::PatchGaps { .. } | RelationNode::Reference { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => Ok(relation),
     }
+}
+
+/// Folds a projection that only selects distinct columns of an inner projection into that inner projection.
+fn superseded(outer: &[NamedExpr], input: &Arc<Relation>) -> Option<(Arc<Relation>, Vec<NamedExpr>)> {
+    let RelationNode::Project { input: inner_input, expressions: inner } = input.node() else { return None; };
+    let mut used = BTreeSet::new();
+    let expressions = outer.iter().map(|named| {
+        let Expr::Column { id, data_type } = &named.expr else { return None; };
+        let source = inner.iter().find(|source| source.field.id == *id && source.field.data_type == *data_type && named.field.data_type == *data_type)?;
+        used.insert(*id).then(|| NamedExpr { field: named.field.clone(), expr: source.expr.clone() })
+    }).collect::<Option<Vec<_>>>()?;
+    Some((Arc::clone(inner_input), expressions))
 }
 
 fn select(input: Arc<Relation>, predicate: Expr) -> Result<Arc<Relation>> {
@@ -308,5 +326,27 @@ mod tests {
         let prepared = prepare(applied).unwrap();
         let RelationNode::Apply { dependent, .. } = prepared.node() else { panic!("Expected captured application") };
         assert!(matches!(dependent.node(), RelationNode::Unnest { input, .. } if matches!(input.node(), RelationNode::Filter { .. })));
+    }
+
+    #[test]
+    fn column_selection_over_a_projection_folds_into_one_projection() {
+        let [a, b, inner_a, inner_b, outer_b, outer_a] = [0, 1, 2, 3, 4, 5].map(field);
+        let doubled = Expr::binary(BinaryOp::Add, a.expression(), a.expression());
+        let inner = Arc::new(base_scan(vec![a.clone(), b.clone()]).project(vec![
+            NamedExpr { field: inner_a.clone(), expr: doubled.clone() }, NamedExpr { field: inner_b.clone(), expr: b.expression() },
+        ]).unwrap());
+        let outer = inner.project(vec![
+            NamedExpr { field: outer_b.clone(), expr: inner_b.expression() }, NamedExpr { field: outer_a.clone(), expr: inner_a.expression() },
+        ]).unwrap();
+        let prepared = prepare(Arc::new(outer)).unwrap();
+        let RelationNode::Project { input, expressions } = prepared.node() else { panic!("Expected a projection"); };
+        assert!(matches!(input.node(), RelationNode::Scan(_)));
+        assert_eq!(expressions, &[NamedExpr { field: outer_b.clone(), expr: b.expression() }, NamedExpr { field: outer_a.clone(), expr: doubled }]);
+
+        let repeated = Arc::new(base_scan(vec![a.clone()]).project(vec![NamedExpr { field: inner_a.clone(), expr: a.expression() }]).unwrap())
+            .project(vec![NamedExpr { field: outer_a, expr: inner_a.expression() }, NamedExpr { field: outer_b, expr: inner_a.expression() }]).unwrap();
+        let prepared = prepare(Arc::new(repeated)).unwrap();
+        let RelationNode::Project { input, .. } = prepared.node() else { panic!("Expected a projection"); };
+        assert!(matches!(input.node(), RelationNode::Project { .. }), "a column selected twice keeps both projections");
     }
 }
