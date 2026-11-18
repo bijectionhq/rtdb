@@ -1,6 +1,5 @@
 use std::{collections::{BTreeMap, VecDeque}, sync::Arc, time::Instant};
 use async_trait::async_trait;
-use futures::StreamExt;
 use rtdb_columnar::MemoryReservation;
 use rtdb_types::Result;
 use serde::{Deserialize, Serialize};
@@ -204,13 +203,8 @@ impl RegistryConverter {
                 if response.status().is_server_error() { failure = Some(cause); continue; } return Err(cause);
             }
             if response.content_length().is_some_and(|length| length > self.maximum_schema_bytes as u64) { return Err(error("schema-registry", "Schema response exceeds its byte limit")); }
-            let mut bytes = Vec::new(); let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|cause| error("schema-registry", cause.without_url()))?;
-                if bytes.len().checked_add(chunk.len()).is_none_or(|size| size > self.maximum_schema_bytes) { return Err(error("schema-registry", "Schema response exceeds its byte limit")); }
-                bytes.extend_from_slice(&chunk);
-            }
-            return Ok(http::RawResponse::body(bytes, response_charge));
+            let input = http::BodyInput::new(response, self.maximum_schema_bytes);
+            return http::RawResponse::collect(input, response_charge).await;
         }
         Err(failure.unwrap_or_else(|| error("schema-registry", "No Schema Registry endpoint is configured")))
     }

@@ -1,0 +1,45 @@
+= Registry HTTP response input
+
+Registry requests collect successful HTTP 200 bodies through a caller-owned, bounded input window.
+HTTP 204 retains its absent-body result, while an empty HTTP 200 body remains present.
+The byte response preserves field order, duplicate fields and encoding bytes until its existing JSON consumer runs.
+The general JSON helper continues to parse only after successful body completion.
+An incomplete HTTP body therefore fails at the transport stage before an invalid JSON prefix is interpreted.
+
+== Owners and admission
+
+`BodyInput` is a passive transient containing the existing HTTP response stream, at most one owned native byte frame and its unread position.
+Every operation runs on the requesting caller.
+It returns a borrowed slice of at most the requested nonzero window size and finishes that frame before polling the source again.
+It releases a consumed frame before replacing it or releasing the response stream.
+
+The full arriving frame contributes to the checked response byte count before any of that frame is exposed.
+This preserves the existing stream-limit stage and the earlier `Content-Length` rejection.
+The collector requests slices of at most 8 KiB without allocating a separate window buffer.
+Empty source frames do not produce data windows, and EOF is final.
+HTTP read errors keep their existing Registry diagnostic and discard the partial collected body.
+
+`RawBodyBuilder` is the passive, single-writer vector transient used during collection.
+The existing pre-request allowance of four times the maximum response size admits its backing storage before client creation.
+Growth checks the required length and replacement capacity before requesting allocation.
+The proposed capacity is at most the response byte limit; old and replacement vectors coexist within the existing allowance.
+A failed allocation returns a native allocation anomaly.
+The reservation is checked before source polling, and an undersized supplied reservation is an internal contract fault.
+
+`RawBody` publishes the completed immutable byte vector with that same reservation after EOF.
+The vector drops before its reservation.
+Retaining the response after dropping its converter and conversion context retains exactly the original response allowance.
+Cancellation drops the partial vector, current frame and HTTP response owner on the caller.
+The conversion context may retain its existing reservation until its own final release.
+Request and TLS lifetime rules remain in link:../../rust/crates/kafka/src/connect/registry/http/README.adoc[the HTTP transport reference].
+
+== Decoder boundary
+
+These windows contain bytes from the actual native HTTP stream.
+The live route feeds the completed body to the generic JSON consumer.
+The Registry bean decoder requires separate Java `InputStream` refill observations, a Jackson profile, canonicalizer results and exact nullable UTF16 schema, rule and reference carriers.
+Phase 2 qualifies native parser and allocator allowances.
+
+Focused regression sources cover buffered demand before a later error, empty frames and present empty bodies, full-frame and cumulative byte limits, raw duplicate preservation, admission before polling, vector growth and both context/cancellation release orders.
+Real HTTP fixture sources cover a chunked body exceeding one collector window, incomplete body framing, byte limits and pending-body cancellation.
+They assert byte and ownership observations from the native transport.
