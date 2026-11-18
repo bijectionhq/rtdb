@@ -515,3 +515,80 @@ fn postgres_dml_reuses_the_admitted_syntax_and_retains_the_exact_source() {
     assert_eq!(error.code, "rtdb/memory-budget-exceeded");
     assert_eq!(short.used_bytes(), 0);
 }
+
+#[tokio::test]
+async fn postgres_prepares_the_supplied_inline_syntax_and_rebinds_its_parameters() {
+    let memory = MemoryBudget::new(1 << 26);
+    let context = context(None, &memory);
+    let source = "-- original\nSELECT ?::INTEGER AS prefix, t.value::BIGINT AS value FROM (XTQL $$#(rel [{:value %}] [value])$$) t; ";
+    let syntax = rtdb_sql::parse_syntax_in(source, &memory).unwrap();
+    let prepared = PreparedSql::prepare_postgres_syntax(syntax, &context, vec!["public".into()], &[23, 20]).unwrap();
+    assert_eq!(prepared.source(), source);
+    assert_eq!(prepared.parameter_count(), 2);
+    assert_eq!(prepared.postgres_types().unwrap(), &[PgType::Int4, PgType::Int8]);
+
+    let mut cursor = prepared.open_query(Arc::clone(&context), vec![Value::I32(7), Value::I64(42)]).await.unwrap();
+    let page = cursor.next_batch().await.unwrap().unwrap();
+    let batch = page.batch();
+    let values = batch.schema().fields().iter().zip(batch.columns())
+        .map(|(field, array)| read_value(field, array.as_ref(), 0).unwrap()).collect::<Vec<_>>();
+    assert_eq!(values, [Value::I32(7), Value::I64(42)]);
+    drop(page);
+    drop(cursor);
+    drop(prepared);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn postgres_rejects_foreign_syntax_budget_even_for_empty_input() {
+    let origin = MemoryBudget::new(1 << 20);
+    let foreign = MemoryBudget::new(1 << 20);
+    let context = context(None, &foreign);
+    let raw = r#"XTQL $$(-> (rel [{}] []) (return {:v (regexp-replace "abc" "a" "x")}))$$"#;
+    for source in ["", raw] {
+        let syntax = rtdb_sql::parse_syntax_in(source, &origin).unwrap();
+        let Err(error) = PreparedSql::prepare_postgres_syntax(syntax, &context, Vec::new(), &[])
+            else { panic!("expected a budget identity error"); };
+        assert_eq!(error.code, "rtdb.sql/syntax-budget");
+        assert_eq!(origin.peak_bytes(), 0);
+        assert_eq!(foreign.peak_bytes(), 0);
+    }
+
+    let syntax = rtdb_sql::parse_syntax_in(raw, &origin).unwrap();
+    let same_budget = Arc::clone(&origin);
+    let resolved = syntax.resolve_in(&same_budget).unwrap();
+    assert!(origin.used_bytes() > 0);
+    drop(resolved);
+    assert_eq!(origin.used_bytes(), 0);
+    assert_eq!(foreign.used_bytes(), 0);
+}
+
+#[test]
+fn postgres_validates_the_complete_syntax_input_before_retaining_dml_source() {
+    let memory = MemoryBudget::new(1 << 20);
+    let context = context(None, &memory);
+    let multiple = "INSERT INTO docs (_id) VALUES ($1); SELECT 8";
+    let unresolved = "INSERT INTO docs (_id) VALUES ($1); XTQL $$[$$";
+    for (source, code) in [(multiple, "xtdb/sql-error"), (unresolved, "xtql/edn-reader")] {
+        let syntax = rtdb_sql::parse_syntax_in(source, &memory).unwrap();
+        let Err(consuming) = PreparedSql::prepare_postgres_syntax(syntax, &context, Vec::new(), &[23])
+            else { panic!("expected a complete-source error"); };
+        let Err(text) = PreparedSql::prepare_postgres(source, &context, Vec::new(), &[23])
+            else { panic!("expected the same source error"); };
+        assert_eq!(consuming, text);
+        assert_eq!(consuming.code, code);
+        if source == multiple {
+            assert_eq!(consuming.message.as_deref(), Some("A prepared statement must contain exactly one SQL statement"));
+        }
+        assert_eq!(memory.used_bytes(), 0);
+    }
+
+    let source = "-- original\nINSERT INTO docs (_id) VALUES ($1); ";
+    let syntax = rtdb_sql::parse_syntax_in(source, &memory).unwrap();
+    let prepared = PreparedSql::prepare_postgres_syntax(syntax, &context, Vec::new(), &[23]).unwrap();
+    assert_eq!(prepared.parameter_count(), 1);
+    let TxOp::Sql { sql, args: None } = prepared.dml_operation(None).unwrap() else { panic!("expected SQL operation"); };
+    assert_eq!(sql, source);
+    drop(prepared);
+    assert_eq!(memory.used_bytes(), 0);
+}

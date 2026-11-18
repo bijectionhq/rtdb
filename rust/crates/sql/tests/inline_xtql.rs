@@ -163,7 +163,7 @@ fn numbered_parameter_values_are_checked_after_sql_grammar() {
     assert!(error.message.as_deref().unwrap().contains("SELEC"));
     for parameter in ["$0", "$99999999999999999999999999"] {
         let source = format!("SELECT {parameter}");
-        let syntax = parse_syntax_in(&source, &memory).unwrap().remove(0);
+        let syntax = parse_syntax_in(&source, &memory).unwrap().into_iter().next().unwrap();
         let error = syntax.resolve().unwrap_err();
         assert_eq!(error.message.as_deref(), Some("SQL parameters use ? or a positive $n index"));
     }

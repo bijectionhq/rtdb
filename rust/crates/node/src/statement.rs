@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{ColumnId, Field, Schema, SqlNotice};
 use rtdb_query::{PreparedQuery, QueryContext, QueryCursor, RuntimeSchema};
-use rtdb_sql::{ParsedStatement, PrepareOptions, StatementKind};
+use rtdb_sql::{ParsedStatement, PrepareOptions, StatementKind, StatementSyntaxBatch};
 use rtdb_tx::{SqlArguments, TxOp};
 use rtdb_types::{Anomaly, AnomalyCategory, LogicalType, MemoryBudget, PgType, Result, Value};
 
@@ -34,10 +34,21 @@ impl PreparedSql {
     }
 
     pub fn prepare_postgres(source: &str, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32]) -> Result<Self> {
-        let parsed = one_statement(source, &context.memory)?;
+        let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
+        Self::prepare_postgres_syntax(syntax, context, search_path, parameter_oids)
+    }
+
+    /// Requires syntax parsed with the same budget as the context.
+    /// Returns the first source-order resolution error before checking that the input contains exactly one statement.
+    /// Query parameter OIDs are positional. Missing OIDs or OIDs without a logical type leave query typing dynamic.
+    pub fn prepare_postgres_syntax(
+        syntax: StatementSyntaxBatch<'_>, context: &Arc<QueryContext>, search_path: Vec<String>, parameter_oids: &[i32],
+    ) -> Result<Self> {
+        let source = syntax.source();
+        let parsed = exactly_one_statement(syntax.resolve_in(&context.memory)?)?;
         if parsed.kind() == StatementKind::Dml {
             let mut options = PrepareOptions { search_path, ..Default::default() };
-            let source_reservation = admit_source(parsed.source(), context, &mut options)?;
+            let source_reservation = admit_source(source, context, &mut options)?;
             return Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, false, parameter_oids.is_empty(), source_reservation);
         }
         let count = parsed.parameter_count();
@@ -50,7 +61,7 @@ impl PreparedSql {
                 None => { dynamic = true; }
             }
         }
-        let source_reservation = admit_source(parsed.source(), context, &mut options)?;
+        let source_reservation = admit_source(source, context, &mut options)?;
         Self::prepare_parsed(parsed, context, options, ResultSignaturePolicy::PostgreSql, dynamic, parameter_oids.is_empty(), source_reservation)
     }
 
@@ -175,7 +186,10 @@ fn admit_source(source: &str, context: &QueryContext, options: &mut PrepareOptio
 }
 
 fn one_statement<'input>(source: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<ParsedStatement<'input>> {
-    let mut parsed = rtdb_sql::parse_in(source, memory)?;
+    exactly_one_statement(rtdb_sql::parse_in(source, memory)?)
+}
+
+fn exactly_one_statement(mut parsed: Vec<ParsedStatement<'_>>) -> Result<ParsedStatement<'_>> {
     if parsed.len() != 1 { return Err(Anomaly::incorrect("xtdb/sql-error", "A prepared statement must contain exactly one SQL statement")); }
     Ok(parsed.remove(0))
 }

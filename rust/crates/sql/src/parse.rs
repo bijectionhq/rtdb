@@ -1,6 +1,6 @@
 use rtdb_plan::{Identifier, SourceSpan};
-use rtdb_types::{Anomaly, Result};
-use std::ops::ControlFlow;
+use rtdb_types::{Anomaly, MemoryBudget, Result};
+use std::{ops::ControlFlow, sync::Arc};
 use sqlparser::ast::VisitMut;
 use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
 use crate::dialect::SqlDialect;
@@ -19,6 +19,40 @@ pub struct StatementSyntax<'input> {
     span: SourceSpan,
     tree: StatementTree<'input>,
     parameters: crate::inline_xtql::SourceArguments,
+}
+
+/// A sequence of syntax trees from one complete SQL input.
+#[derive(Debug)]
+pub struct StatementSyntaxBatch<'input> {
+    source: &'input str,
+    forms: crate::bind::FormAllocation<'input>,
+    statements: Vec<StatementSyntax<'input>>,
+}
+
+impl<'input> StatementSyntaxBatch<'input> {
+    /// Returns the complete source supplied to the parser.
+    pub fn source(&self) -> &'input str { self.source }
+
+    /// Resolves statements in source order using the original budget.
+    /// A different budget fails before resolution, including for empty input.
+    /// A clone of the original `Arc` shares the same budget.
+    pub fn resolve_in(self, memory: &Arc<MemoryBudget>) -> Result<Vec<ParsedStatement<'input>>> {
+        if !matches!(self.forms, crate::bind::FormAllocation::Tracked(origin) if Arc::ptr_eq(origin, memory)) {
+            return Err(Anomaly::incorrect("rtdb.sql/syntax-budget", "SQL syntax belongs to a different raw metadata budget"));
+        }
+        self.resolve()
+    }
+
+    fn resolve(self) -> Result<Vec<ParsedStatement<'input>>> {
+        self.into_iter().map(StatementSyntax::resolve).collect()
+    }
+}
+
+impl<'input> IntoIterator for StatementSyntaxBatch<'input> {
+    type Item = StatementSyntax<'input>;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter { self.statements.into_iter() }
 }
 
 impl<'input> StatementSyntax<'input> {
@@ -208,15 +242,16 @@ pub fn parse_in<'input>(sql: &'input str, memory: &'input std::sync::Arc<rtdb_ty
 }
 
 pub(crate) fn parse_with<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Vec<ParsedStatement<'input>>> {
-    parse_syntax(sql, forms)?.into_iter().map(StatementSyntax::resolve).collect()
+    parse_syntax(sql, forms)?.resolve()
 }
 
-/// Parses the surrounding SQL before interpreting embedded XTQL text.
-pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<StatementSyntax<'input>>> {
+/// Parses the surrounding SQL and carries the caller's budget into `StatementSyntaxBatch::resolve_in`.
+/// Resolution interprets embedded XTQL text.
+pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input Arc<MemoryBudget>) -> Result<StatementSyntaxBatch<'input>> {
     parse_syntax(sql, crate::bind::FormAllocation::Tracked(memory))
 }
 
-fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Vec<StatementSyntax<'input>>> {
+fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<StatementSyntaxBatch<'input>> {
     let dialect = SqlDialect::default();
     let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
@@ -309,7 +344,7 @@ fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'in
         let tree = StatementTree { source: sql, forms, statement, temporal, period_columns, settings, wildcard_renames };
         statements.push(StatementSyntax { span, tree, parameters });
     }
-    Ok(statements)
+    Ok(StatementSyntaxBatch { source: sql, forms, statements })
 }
 
 pub(crate) fn quantified_values(tokens: Vec<TokenWithSpan>, source: &str) -> Result<Vec<TokenWithSpan>> {

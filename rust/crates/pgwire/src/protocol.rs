@@ -147,7 +147,8 @@ impl ProtocolSession {
             (PreparedKind::Control(control), columns, count)
         } else {
             let context = self.session.prepare_context(&token).await?;
-            let prepared = PreparedSql::prepare_postgres(source, &context, options.search_path, &oids)?;
+            let syntax = rtdb_sql::parse_syntax_in(source, &context.memory)?;
+            let prepared = PreparedSql::prepare_postgres_syntax(syntax, &context, options.search_path, &oids)?;
             let count = prepared.parameter_count();
             if prepared.is_dml() { (PreparedKind::Dml(prepared), None, oids.len()) }
             else { let columns = prepared.prepared_schema().zip(prepared.postgres_types()).map(|(schema, types)| schema.fields().iter().zip(types).map(|(field, ty)| Column { name: field.name.clone(), ty: *ty, format: Format::Text }).collect()); (PreparedKind::Query(prepared), columns, count) }
