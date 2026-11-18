@@ -24,10 +24,7 @@ impl BoundWindow {
         let input = if self.keys.is_empty() {
             input
         } else {
-            let projections = input.schema().fields().iter()
-                .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
-                .chain(self.keys).collect();
-            Arc::new(input.project(projections)?)
+            Arc::new(input.extend(self.keys)?)
         };
         let schema = input.schema().concat(&Schema::new(vec![self.expression.field.clone()])?)?;
         Ok(Arc::new(Relation::new(schema, RelationNode::Window {
@@ -63,6 +60,9 @@ impl Context<'_> {
             }
             _ => return Err(unsupported(format!("Window function {name}"))),
         };
+        let result_name = format!("xt${name}_{}", self.allocate_symbol()?);
+        // Inline specifications occupy a symbol between the window result and the projected sort keys.
+        self.allocate_symbol()?;
         let partition_by = specification.partition_by.iter().map(|column| {
             if !matches!(column, ast::Expr::Identifier(_) | ast::Expr::CompoundIdentifier(_)) { return Err(error("Window partitions require column references")); }
             match self.expr(column, schema, replacements)? {
@@ -75,15 +75,14 @@ impl Context<'_> {
             if matches!(&order.expr, ast::Expr::Value(value) if matches!(&value.value, ast::Value::Number(value, _) if !value.contains(['.', 'e', 'E']))) { return Err(error("Window ORDER BY has no output ordinal positions")); }
             let expr = self.expr(&order.expr, schema, &BTreeMap::new())?;
             let descending = crate::bind::sort_descending(&order.options)?;
-            let mut field = self.binder.field("",None,expr.data_type())?;
-            field.name = format!("_window_order_{}",field.id.0);
+            let name = format!("_ob{}", self.allocate_symbol()?);
+            let field = self.binder.field(name, None, expr.data_type())?;
             self.hidden_columns.insert(field.id,HiddenColumn::Internal);
             let key = field.expression();
             keys.push(NamedExpr { field,expr });
             Ok(SortExpr { expr: key, descending, nulls_first: order.options.nulls_first.unwrap_or(descending) })
         }).collect::<Result<Vec<_>>>()?;
-        let mut field = self.binder.field("", None, function.result_type(schema)?)?;
-        field.name = format!("_window_{}", field.id.0);
+        let field = self.binder.field(result_name, None, function.result_type(schema)?)?;
         self.hidden_columns.insert(field.id,HiddenColumn::Internal);
         Ok(BoundWindow { keys, partition_by, order_by, expression: WindowExpr { field, function } })
     }

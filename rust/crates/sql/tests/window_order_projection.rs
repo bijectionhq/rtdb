@@ -35,12 +35,12 @@ fn window_order_inputs_are_private_upstream_projections_in_source_order() {
     let Statement::Query(relation) = prepare("SELECT *,ROW_NUMBER() OVER(PARTITION BY p ORDER BY v,v+1) AS rn FROM (VALUES (1,2)) t(p,v)",&context.catalog,&PrepareOptions::default()).unwrap().statement else { panic!("query") };
     assert_eq!(relation.schema().fields().iter().map(|field|field.name.as_str()).collect::<Vec<_>>(),["p","v","rn"]);
     let RelationNode::Window { input,order_by,.. } = window(&relation).unwrap().node() else { panic!("window") };
-    let RelationNode::Project { input: source,expressions } = input.node() else { panic!("projection") };
+    let RelationNode::Extend { input: source,expressions } = input.node() else { panic!("append projection") };
     assert_eq!(source.schema().len(),2);
-    assert_eq!(expressions.len(),4);
-    assert!(matches!(expressions[2].expr,Expr::Column {..}));
-    assert!(matches!(expressions[3].expr,Expr::Binary {..}));
-    for (order,projection) in order_by.iter().zip(&expressions[2..]) {
+    assert_eq!(expressions.len(),2);
+    assert!(matches!(expressions[0].expr,Expr::Column {..}));
+    assert!(matches!(expressions[1].expr,Expr::Binary {..}));
+    for (order,projection) in order_by.iter().zip(expressions) {
         assert_eq!(order.expr,projection.field.expression());
         assert!(source.schema().get(projection.field.id).is_none());
     }

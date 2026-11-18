@@ -158,6 +158,8 @@
 
 (deftest-original-api original-node/test-explain-plan-sql)
 
+(deftest-original-api original-node/test-explain-plan-window-fn-5990)
+
 (deftest independent-quantified-subqueries-retain-unknown-and-empty-set-semantics
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

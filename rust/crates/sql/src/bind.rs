@@ -1228,7 +1228,7 @@ impl Context<'_> {
         Ok(format!("{name}.{}", self.allocate_symbol()?))
     }
 
-    fn allocate_symbol(&mut self) -> Result<u64> {
+    pub(crate) fn allocate_symbol(&mut self) -> Result<u64> {
         self.next_symbol = self.next_symbol.checked_add(1).ok_or_else(|| error("SQL symbol counter overflow"))?;
         Ok(self.next_symbol)
     }

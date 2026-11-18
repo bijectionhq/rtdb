@@ -460,11 +460,15 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             let mut windows = ScratchVec::new(work);
             for window in expressions {
                 let function = match window.function {
-                    rtdb_plan::WindowFunction::RowNumber => work.copy_text("(row-number)")?,
+                    rtdb_plan::WindowFunction::RowNumber => work.copy_text("[:nullary {:f row-number}]")?,
                     rtdb_plan::WindowFunction::Lead { column: id, offset } | rtdb_plan::WindowFunction::Lag { column: id, offset } => {
-                        let name = if matches!(window.function, rtdb_plan::WindowFunction::Lead { .. }) { "(lead " } else { "(lag " };
+                        let name = if matches!(window.function, rtdb_plan::WindowFunction::Lead { .. }) { "lead" } else { "lag" };
                         let symbol = column(id, &input_columns, work)?;
-                        work.pieces(&[RenderPiece::Text(name), RenderPiece::Text(symbol.as_str()), RenderPiece::Text(" "), RenderPiece::U64(offset), RenderPiece::Text(")")])?
+                        work.pieces(&[
+                            RenderPiece::Text("[:unary-with-offset {:f "), RenderPiece::Text(name),
+                            RenderPiece::Text(", :from-column "), RenderPiece::Text(symbol.as_str()),
+                            RenderPiece::Text(", :offset "), RenderPiece::U64(offset), RenderPiece::Text("}]"),
+                        ])?
                     }
                 };
                 windows.push(work.list_array([text(work.copy_text(&window.field.name)?)?, text(function)?])?)?;
