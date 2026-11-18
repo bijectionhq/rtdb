@@ -555,15 +555,23 @@ config {
 -- == Leader Startup ==
 --
 -- A writable restart restores the latest persisted block and reads the replica suffix from that block's boundary.
--- For a boundary in the configured replica epoch, an admitted upload confirms the restored checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
+-- An admitted upload after a recovered boundary in the configured replica epoch confirms its checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
 -- An omitted upload storage epoch means zero.
--- If its next leadership claim wins before it observes such an upload, it announces the restored checkpoint in its new term.
--- The announcement describes the L0 tries recorded for that block in the table blocks.
--- The node waits for admitted read-back before producing a later pending block or resuming ordinary source and external-source processing.
--- That read-back gives followers still holding the restored block's boundary their signal to adopt and drain.
+-- A writable restart also checks contiguous retained older catalogs whose admitted replica history reaches the selected boundary and agrees with its startup fence.
+-- That check observes confirmations while keeping the restored partition and applied progress in place.
+-- After an elected term observes the retained prefix through its claim, it announces each still-missing confirmation in block order.
+-- Each announcement describes the L0 tries recorded for that block in its table blocks.
+-- The node waits for each admitted read-back before appending the next announcement.
+-- The term confirms the missing uploads before producing a later pending block or resuming ordinary source and external-source processing.
+-- Followers still holding a matching boundary adopt and drain on the admitted upload.
 -- The restored checkpoint is already installed on the restarted node.
 -- A replica that already installed the checkpoint skips its upload before the hold for a later pending block.
 -- If producing that later block fails during promotion, the replica follows with the checkpoint confirmed and the later block still pending.
+-- The writer checks shared storage for the catalog, table and L0 files before appending an older confirmation.
+-- Those files remain required until follower adoption.
+-- A failed historical check or older candidate preparation discards the remaining older confirmations.
+-- The writer continues recovery of the selected checkpoint.
+-- A follower that reopens loads the latest persisted checkpoint and applies its retained suffix.
 --
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --

@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, Verdict};
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
-use crate::blocks::RecoveredBlockConfirmation;
+use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
 use crate::logs::replica_decode_bound;
 use crate::progress::{DriverRestart, stopped, term_ended};
 use crate::state::fail_pending;
@@ -256,6 +256,7 @@ pub struct ReplicationDriver {
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken, clock: ReplicationClock,
     recovered_confirmation: Option<RecoveredBlockConfirmation>,
+    historical_confirmations: VecDeque<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
     leader: Option<LeaderState>, commands: mpsc::Receiver<Command>, status: watch::Sender<DriverStatus>, flush_timer: FlushTimer,
@@ -294,7 +295,7 @@ impl ReplicationDriver {
             recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
         } else { None };
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, clock, recovered_confirmation, historical_confirmations: VecDeque::new(), fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -316,6 +317,9 @@ impl ReplicationDriver {
             return Ok(());
         }
         let tail = self.logs.replica_tail(self.read_position).await?;
+        let cancellation = self.cancellation.clone();
+        let Some(history) = cancellation.run_until_cancelled(self.prove_historical_confirmations()).await else { return Ok(()); };
+        self.historical_confirmations = history.unwrap_or_default();
         if self.cancellation.is_cancelled() { return Ok(()); }
         self.progress.driver_initialized(self.restart.take())?;
         self.replica_tail = Some(tail);
@@ -398,6 +402,65 @@ impl ReplicationDriver {
             }
         }
     }
+    async fn prove_historical_confirmations(&mut self) -> Result<VecDeque<RecoveredBlockConfirmation>> {
+        let Some(selected) = &self.recovered_confirmation else { return Ok(VecDeque::new()); };
+        let selected = &selected.catalog;
+        let mut retained = self.blocks.retained_catalogs(selected, self.logs.replica_epoch, &self.cancellation).await?;
+        let Some(oldest) = retained.first() else { return Ok(VecDeque::new()); };
+        let mut tail = self.logs.replica_tail(oldest.boundary).await?;
+        let mut witness = TermFence::from_catalog(&oldest.catalog)?;
+        let mut position = oldest.boundary;
+        let mut next_boundary = 1;
+        let end = selected.boundary_replica_position().ok_or_else(|| invalid("Selected checkpoint has no replica boundary"))?;
+        loop {
+            let head = tail.replay().ok_or_else(|| invalid("Historical replay requires an admitted replica tail"))?
+                .poll_head(self.config.assertion_interval.saturating_mul(10)).await?
+                .ok_or_else(|| invalid("Retained replica history ended before the selected checkpoint"))?;
+            let Some(selected_record) = read_replay_head(tail.as_mut(), head, self.logs.memory(), replica_decode_bound, &self.cancellation).await? else {
+                return Ok(VecDeque::new());
+            };
+            let next = ReplicaPosition::from_epoch_offset(self.logs.replica_epoch, selected_record.raw.metadata.offset.0)?;
+            if next <= position || next > end {
+                return Err(invalid("Retained replica history did not reach the selected boundary in order"));
+            }
+            position = next;
+            let record = self.logs.decode_reserved_replica(selected_record.raw, selected_record.decode_reservation)?;
+            let record = if let Some(record) = record {
+                let admission = witness.admit(record.envelope.term, record.envelope.term_sequence)?;
+                if admission.verdict == Verdict::Apply { Some(self.logs.resolve_oversized(record).await?) } else { None }
+            } else { None };
+            if position == end {
+                if next_boundary != retained.len() || witness != self.fence
+                    || !record.as_ref().is_some_and(|record| matches_catalog_boundary(selected, record)) {
+                    return Err(invalid("Historical replica fence or checkpoint does not match startup"));
+                }
+                break;
+            }
+            if let Some(candidate) = retained.get(next_boundary).filter(|candidate| candidate.boundary <= position) {
+                if !record.as_ref().is_some_and(|record| matches_catalog_boundary(&candidate.catalog, record)) {
+                    return Err(invalid("Historical block catalog boundary is missing from admitted replica history"));
+                }
+                next_boundary += 1;
+            }
+            if let Some(record) = record {
+                if let ReplicaBody::BlockUploaded(upload) = &record.envelope.message {
+                    if let Some(candidate) = retained.iter_mut().find(|candidate| {
+                        candidate.boundary < position
+                            && matches_confirmation(&candidate.catalog, upload, self.logs.storage_version, self.logs.storage_epoch)
+                    }) {
+                        candidate.confirmed = true;
+                    }
+                }
+            }
+        }
+        let mut confirmations = VecDeque::new();
+        for candidate in retained.into_iter().filter(|candidate| !candidate.confirmed) {
+            let confirmation = self.blocks.historical_confirmation(&candidate.catalog, self.logs.storage_version, self.logs.storage_epoch, &self.cancellation).await?;
+            confirmations.push_back(confirmation);
+        }
+        Ok(confirmations)
+    }
+
     fn prepare_polls(&mut self) {
         if self.replica_poll.is_none() && self.replica_head.is_none() && self.replica_batch.is_empty() {
             if let Some(tail) = self.replica_tail.take() {
@@ -458,9 +521,7 @@ impl ReplicationDriver {
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory),
             term, self.config.assertion_interval, cancellation.clone(), Arc::clone(&self.clock));
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
-        let recovery_write = self.recovered_confirmation.as_ref().map(|checkpoint| {
-            PendingWrite::clone_message(&checkpoint.body, self.partition.value().live().block_index(), &self.resolve.memory)
-        }).transpose()?;
+        let recovery_write = self.next_recovery_write().await?;
         let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
         let confirmed = recovery_write.is_none() && !produce_inherited;
         let job = pump.run(recovery_write.clone());
@@ -535,29 +596,61 @@ impl ReplicationDriver {
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
     }
-    async fn confirm_recovered_block(&mut self, record: &ReplicaRecord) -> Result<bool> {
-        if !self.recovered_confirmation.as_ref().is_some_and(|checkpoint| checkpoint.matches(&record.envelope.message)) {
-            return Ok(false);
+    async fn next_recovery_write(&mut self) -> Result<Option<Arc<PendingWrite>>> {
+        let block = self.partition.value().live().block_index();
+        if let Some(checkpoint) = self.historical_confirmations.front() {
+            if self.blocks.require_confirmation_files(checkpoint, &self.cancellation).await.is_ok() {
+                if let Ok(write) = PendingWrite::clone_message(&checkpoint.body, block, &self.resolve.memory) {
+                    return Ok(Some(write));
+                }
+            }
+            self.historical_confirmations.clear();
         }
-        let mut produce_inherited = false;
-        if let Some(leader) = &mut self.leader {
+        self.recovered_confirmation.as_ref().map(|checkpoint| {
+            PendingWrite::clone_message(&checkpoint.body, block, &self.resolve.memory)
+        }).transpose()
+    }
+
+    async fn confirm_recovered_block(&mut self, record: &ReplicaRecord) -> Result<bool> {
+        let historical = self.historical_confirmations.iter().position(|checkpoint| checkpoint.matches(record));
+        let current = self.recovered_confirmation.as_ref().is_some_and(|checkpoint| checkpoint.matches(record));
+        if historical.is_none() && !current { return Ok(false); }
+
+        let own = if let Some(leader) = &self.leader {
             if let Some(write) = &leader.recovery_write {
                 let sequence = write.sequence().ok_or_else(|| invalid("Recovered block upload has no assigned sequence"))?;
                 if record.envelope.term != leader.term || record.envelope.term_sequence != Some(sequence) {
                     return Err(invalid("Recovered block upload does not match this term's pending confirmation"));
                 }
-                leader.recovery_write = None;
-                produce_inherited = self.pending_block.is_some();
-                leader.confirmed = !produce_inherited;
-            }
-        }
-        self.recovered_confirmation = None;
-        if produce_inherited {
-            if let Err(error) = self.produce_pending() {
+                true
+            } else { false }
+        } else { false };
+
+        if let Some(index) = historical { self.historical_confirmations.remove(index); }
+        if current { self.recovered_confirmation = None; }
+        if own {
+            if let Err(error) = self.continue_recovery().await {
                 self.promotion_failed(error).await?;
             }
         }
         Ok(true)
+    }
+
+    async fn continue_recovery(&mut self) -> Result<()> {
+        let next = self.next_recovery_write().await?;
+        let leader = self.leader.as_mut().ok_or_else(term_ended)?;
+        if let Some(write) = next {
+            leader.appender.enqueue(Arc::clone(&write))?;
+            leader.recovery_write = Some(write);
+            return Ok(());
+        }
+
+        leader.recovery_write = None;
+        leader.confirmed = self.pending_block.is_none();
+        if self.pending_block.is_some() {
+            self.produce_pending()?;
+        }
+        Ok(())
     }
 
     async fn apply_admitted(&mut self, record: ReplicaRecord) -> Result<()> {

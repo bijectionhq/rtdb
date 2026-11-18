@@ -1,14 +1,14 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock, legacy_table_ref}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPreparation, CatalogTrie, IndexBatch, LiveTable, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_trie::{TrieConfig, TrieNode};
-use rtdb_types::{Anomaly, BlockIndex, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, ReplicaPosition, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AppliedProgress, ReplicaRecord, TermFence};
@@ -32,9 +32,21 @@ impl RecoveredPartition {
         let Some(boundary) = catalog.boundary_replica_position() else { return Ok(None); };
         if boundary.after_offset(replica_epoch) < 0 { return Ok(None); }
 
+        RecoveredBlockConfirmation::new(catalog.clone(), &self.table_blocks, storage_version, storage_epoch, memory).map(Some)
+    }
+}
+
+pub(crate) struct RecoveredBlockConfirmation {
+    pub catalog: BlockCatalog,
+    pub body: ReplicaBody,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl RecoveredBlockConfirmation {
+    fn new(catalog: BlockCatalog, table_blocks: &BTreeMap<rtdb_types::TableRef, TableBlock>, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Self> {
         let key = TrieKey::l0(catalog.block_index())?.to_string();
         let token_bytes = catalog.external_source_token().map_or(0, <[u8]>::len);
-        let bytes = self.table_blocks.iter().try_fold(token_bytes, |bytes, (table, block)| {
+        let bytes = table_blocks.iter().try_fold(token_bytes, |bytes, (table, block)| {
             let count = l0_details(block, &key).count();
             let detail_bytes = table.schema.len().checked_add(table.table.len()).and_then(|len| len.checked_add(key.len()))
                 .and_then(|len| len.checked_add(1024)).and_then(|len| len.checked_mul(count));
@@ -42,31 +54,46 @@ impl RecoveredPartition {
         }).and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| invalid("Recovered block notification exceeds addressable memory"))?;
         let reservation = memory.reserve(bytes)?;
-        let tries = l0_tries(catalog.block_index(), &self.table_blocks)?;
+        let tries = l0_tries(catalog.block_index(), table_blocks)?;
         let upload = proto::BlockUploaded {
             storage_version: Some(storage_version.0), storage_epoch: Some(storage_epoch.0), block_index: Some(catalog.block_index().0),
             latest_processed_msg_id: catalog.as_proto().latest_processed_msg_id,
             external_source_token: catalog.external_source_token().map(<[u8]>::to_vec),
             tries: tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
         };
-        Ok(Some(RecoveredBlockConfirmation { body: ReplicaBody::BlockUploaded(upload), _reservation: reservation }))
+        Ok(Self { catalog, body: ReplicaBody::BlockUploaded(upload), _reservation: reservation })
+    }
+
+    pub fn matches(&self, record: &ReplicaRecord) -> bool {
+        let (ReplicaBody::BlockUploaded(expected), ReplicaBody::BlockUploaded(observed)) = (&self.body, &record.envelope.message) else { return false; };
+        self.catalog.boundary_replica_position().is_some_and(|boundary| record.metadata.position > boundary)
+            && matches_confirmation(&self.catalog, observed, StorageVersion(expected.storage_version.unwrap_or_default()), StorageEpoch(expected.storage_epoch.unwrap_or_default()))
     }
 }
 
-pub(crate) struct RecoveredBlockConfirmation {
-    pub body: ReplicaBody,
+pub(crate) struct HistoricalCatalog {
+    pub catalog: BlockCatalog,
+    pub boundary: ReplicaPosition,
+    pub confirmed: bool,
     _reservation: Arc<MemoryReservation>,
 }
 
-impl RecoveredBlockConfirmation {
-    pub fn matches(&self, body: &ReplicaBody) -> bool {
-        let (ReplicaBody::BlockUploaded(expected), ReplicaBody::BlockUploaded(observed)) = (&self.body, body) else { return false; };
-        observed.storage_version == expected.storage_version
-            && observed.storage_epoch.unwrap_or_default() == expected.storage_epoch.unwrap_or_default()
-            && observed.block_index == expected.block_index
-            && observed.latest_processed_msg_id == expected.latest_processed_msg_id
-            && observed.external_source_token == expected.external_source_token
-    }
+pub(crate) fn matches_confirmation(catalog: &BlockCatalog, upload: &proto::BlockUploaded, storage_version: StorageVersion, storage_epoch: StorageEpoch) -> bool {
+    upload.storage_version == Some(storage_version.0)
+        && upload.storage_epoch.unwrap_or_default() == storage_epoch.0
+        && upload.block_index == Some(catalog.block_index().0)
+        && upload.latest_processed_msg_id == catalog.as_proto().latest_processed_msg_id
+        && upload.external_source_token.as_deref() == catalog.external_source_token()
+}
+
+pub(crate) fn matches_catalog_boundary(catalog: &BlockCatalog, record: &ReplicaRecord) -> bool {
+    let ReplicaBody::BlockBoundary(boundary) = &record.envelope.message else { return false; };
+    catalog.boundary_replica_position() == Some(record.metadata.position)
+        && catalog.boundary_term() == record.envelope.term
+        && catalog.boundary_term_sequence() == record.envelope.term_sequence
+        && boundary.block_index == Some(catalog.block_index().0)
+        && boundary.latest_processed_msg_id == catalog.as_proto().latest_processed_msg_id
+        && boundary.external_source_token.as_deref() == catalog.external_source_token()
 }
 
 #[derive(Clone, Debug)]
@@ -107,11 +134,65 @@ impl BlockStore {
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
         Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
     }
-    pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
+    async fn load_catalog(&self, index: BlockIndex) -> Result<BlockCatalog> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
         let reservation = self.reserve_decode(lease.as_slice().len())?;
         let block = BlockCatalog::decode_reserved(lease.as_slice(), reservation)?;
         if block.block_index() != index { return Err(invalid("Block filename and payload index differ")); }
+        Ok(block)
+    }
+
+    pub(crate) async fn retained_catalogs(&self, selected: &BlockCatalog, replica_epoch: StorageEpoch, cancellation: &CancellationToken) -> Result<Vec<HistoricalCatalog>> {
+        let Some(mut next_boundary) = selected.boundary_replica_position() else { return Ok(Vec::new()); };
+        let mut retained = Vec::new();
+        for index in (0..selected.block_index().0).rev().map(BlockIndex) {
+            check_cancelled(cancellation)?;
+            let key = ObjectKey::new(block_key(index)?)?;
+            match self.store.head_fresh(&key).await {
+                Ok(_) => (),
+                Err(rtdb_storage::Error::MissingObject(_)) => break,
+                Err(error) => return Err(error.into()),
+            }
+            let catalog = self.load_catalog(index).await?;
+            let Some(boundary) = catalog.boundary_replica_position().filter(|boundary| {
+                boundary.after_offset(replica_epoch) >= 0 && *boundary < next_boundary
+            }) else { break; };
+            let reservation = self.memory.reserve(1024)?;
+            retained.push(HistoricalCatalog { catalog, boundary, confirmed: false, _reservation: reservation });
+            next_boundary = boundary;
+        }
+        retained.reverse();
+        Ok(retained)
+    }
+
+    pub(crate) async fn historical_confirmation(&self, expected: &BlockCatalog, storage_version: StorageVersion, storage_epoch: StorageEpoch, cancellation: &CancellationToken) -> Result<RecoveredBlockConfirmation> {
+        let (catalog, tables) = self.load(expected.block_index()).await?;
+        if catalog.as_proto() != expected.as_proto() { return Err(invalid("Historical block differs from its observed boundary checkpoint")); }
+        let confirmation = RecoveredBlockConfirmation::new(catalog, &tables, storage_version, storage_epoch, &self.memory)?;
+        self.require_confirmation_files(&confirmation, cancellation).await?;
+        Ok(confirmation)
+    }
+
+    pub(crate) async fn require_confirmation_files(&self, confirmation: &RecoveredBlockConfirmation, cancellation: &CancellationToken) -> Result<()> {
+        let index = confirmation.catalog.block_index();
+        let key = TrieKey::l0(index)?;
+        let ReplicaBody::BlockUploaded(upload) = &confirmation.body else { return Err(invalid("Recovered confirmation has no upload body")); };
+        let written = upload.tries.iter().map(|detail| legacy_table_ref(detail.table_name.as_deref().unwrap_or_default())).collect::<Result<BTreeSet<_>>>()?;
+        check_cancelled(cancellation)?;
+        self.store.head_fresh(&ObjectKey::new(block_key(index)?)?).await?;
+        for entry in confirmation.catalog.table_entries()? {
+            check_cancelled(cancellation)?;
+            self.store.head_fresh(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;
+            if written.contains(&entry.table) {
+                self.store.head_fresh(&ObjectKey::new(entry.slug.data_key(&key))?).await?;
+                self.store.head_fresh(&ObjectKey::new(entry.slug.metadata_key(&key))?).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
+        let block = self.load_catalog(index).await?;
         let mut tables = BTreeMap::new();
         for entry in block.table_entries()? {
             let lease = self.cache.get(&ObjectKey::new(entry.slug.block_key(index)?)?).await?;

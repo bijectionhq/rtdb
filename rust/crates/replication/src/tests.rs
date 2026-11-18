@@ -426,8 +426,8 @@ async fn submit_recovery_row(handle: &ReplicationHandle, memory: &Arc<MemoryBudg
 }
 
 #[tokio::test]
-async fn native_local_restart_confirms_the_recovered_block_before_a_newer_pending_block() {
-    for legacy_suffix in [false, true] {
+async fn native_local_restart_confirms_missing_retained_blocks_in_order_for_a_surviving_follower() {
+    for (legacy_suffix, persisted_successors) in [(false, 0), (true, 0), (true, 1), (true, 2)] {
         let directory = tempfile::tempdir().unwrap();
         let source_path = directory.path().join("LOG");
         let replica_path = directory.path().join("REPLICA_LOG");
@@ -490,10 +490,49 @@ async fn native_local_restart_confirms_the_recovered_block_before_a_newer_pendin
                     tx_id: Some(legacy.0), system_time_micros: Some(200), committed: Some(true),
                     src_msg_id: Some(legacy.0), ..Default::default()
                 })),
-                (2, boundary(1, legacy.0)),
+                (2, ReplicaBody::BlockBoundary(proto::BlockBoundary {
+                    block_index: Some(1), latest_processed_msg_id: Some(legacy.0), external_source_token: Some(vec![1]),
+                })),
             ] {
                 old.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(seq)), message }, BlockIndex(1), Timestamp(200))
                     .await.unwrap().durable().await.unwrap();
+                if seq == 0 && persisted_successors > 0 {
+                    let ReplicaBody::BlockUploaded(mut fenced) = upload(0, first.0) else { unreachable!(); };
+                    fenced.tries = expected_tries.clone();
+                    old.logs.enqueue_replica(&ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(3)), message: ReplicaBody::BlockUploaded(fenced) },
+                        BlockIndex(1), Timestamp(200)).await.unwrap().durable().await.unwrap();
+                }
+            }
+            if persisted_successors > 0 {
+                let (_, mut pre_repair_reader) = local_recovery_driver(source.clone(), replica.clone(), Arc::clone(&store), false, interval).await;
+                let mut tail = pre_repair_reader.logs.replica_tail(pre_repair_reader.read_position).await.unwrap();
+                let first_tip = replica.latest().unwrap();
+                while pre_repair_reader.read_position.0 < first_tip.0 {
+                    let records = tail.poll(Duration::from_secs(5)).await.unwrap();
+                    assert!(!records.is_empty());
+                    for record in records {
+                        pre_repair_reader.consume(record).await.unwrap();
+                    }
+                }
+                let pending = pre_repair_reader.pending_block.as_ref().unwrap();
+                let block = pre_repair_reader.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+                assert_eq!(block.catalog.block_index(), BlockIndex(1));
+                if persisted_successors > 1 {
+                    let ReplicaBody::BlockUploaded(mut confirmed) = upload(1, legacy.0) else { unreachable!(); };
+                    confirmed.tries = block.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect();
+                    confirmed.external_source_token = Some(vec![1]);
+                    let later_boundary = ReplicaBody::BlockBoundary(proto::BlockBoundary {
+                        block_index: Some(2), latest_processed_msg_id: Some(legacy.0), external_source_token: Some(vec![2]),
+                    });
+                    for (sequence, message) in [(3, ReplicaBody::BlockUploaded(confirmed)), (4, later_boundary)] {
+                        pre_repair_reader.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(sequence)), message },
+                            BlockIndex(2), Timestamp(200)).await.unwrap().durable().await.unwrap();
+                        pre_repair_reader.consume(next_local_record(tail.as_mut()).await).await.unwrap();
+                    }
+                    let pending = pre_repair_reader.pending_block.as_ref().unwrap();
+                    let block = pre_repair_reader.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+                    assert_eq!(block.catalog.block_index(), BlockIndex(2));
+                }
             }
             replica.latest().unwrap()
         } else { boundary_offset };
@@ -520,6 +559,12 @@ async fn native_local_restart_confirms_the_recovered_block_before_a_newer_pendin
                 let tx = handle.await_tx(TxId(second.0), &cancellation).await.unwrap().unwrap();
                 assert!(tx.committed());
                 assert_eq!(tx.tx_key().tx_id, TxId(second.0));
+                let progress = handle.progress().current();
+                let token: Option<&[u8]> = if legacy_suffix {
+                    Some(if persisted_successors > 1 { &[2] } else { &[1] })
+                } else { None };
+                assert_eq!(progress.source_position, second);
+                assert_eq!(progress.external_token.as_deref(), token);
             }
         }).await.unwrap();
         let term = if legacy_suffix { Term(3) } else { Term(2) };
@@ -550,7 +595,7 @@ async fn native_local_restart_confirms_the_recovered_block_before_a_newer_pendin
             }
         }).await.unwrap();
         let mut expected = vec![(0, None)];
-        if legacy_suffix { expected.push((1, None)); }
+        if legacy_suffix { expected.push((persisted_successors.max(1), None)); }
         expected.push((-1, Some(second.0)));
         assert_eq!(applied, expected);
         let follower_value = follower_partition.value();
@@ -686,6 +731,115 @@ async fn deliver_checkpoint_record(fixture: &Fixture, driver: &mut ReplicationDr
     let position = fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap().position;
     let mut records = fixture.replica.read_range(LogOffset(position.0), LogOffset(position.0 + 1)).await.unwrap();
     driver.consume(records.pop().unwrap()).await
+}
+
+async fn produce_newer_memory_checkpoint(fixture: &Fixture) -> ReplicationDriver {
+    let (_, mut prior) = reopen_memory_checkpoint_with_config(fixture, ReplicationConfig {
+        may_lead: false, ..Default::default()
+    }).await;
+    deliver_checkpoint_record(fixture, &mut prior, 2, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    deliver_checkpoint_record(fixture, &mut prior, 2, 1, boundary(1, -1)).await.unwrap();
+    let pending = prior.pending_block.as_ref().unwrap();
+    let selected = prior.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    assert_eq!(selected.catalog.boundary_replica_position(), Some(rtdb_types::ReplicaPosition(3)));
+    prior
+}
+
+#[tokio::test]
+async fn promotion_ignores_a_deleted_historical_catalog_still_present_in_the_disk_cache() {
+    let fixture = produced_memory_checkpoint(true).await;
+    produce_newer_memory_checkpoint(&fixture).await;
+    let directory = tempfile::tempdir().unwrap();
+    let disk = rtdb_storage::disk_cache::DiskCache::open(directory.path(), 1 << 20, Arc::clone(&fixture.memory)).unwrap();
+    let old_catalog = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+    let cached = disk.scope(rtdb_storage::ObjectKey::new("recovery").unwrap(), fixture.store.clone()).unwrap();
+    let buffer = Arc::new(BufferPool::new(Arc::clone(&cached), 1 << 20));
+    let (handle, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        assertion_interval: Duration::from_secs(3600), ..Default::default()
+    }).await;
+    writer.blocks = BlockStore::new(Arc::clone(&cached), buffer, Arc::clone(&fixture.memory), 100_000_000).unwrap();
+    writer.historical_confirmations = writer.prove_historical_confirmations().await.unwrap();
+    assert_eq!(writer.historical_confirmations.len(), 1);
+    assert_eq!(writer.historical_confirmations[0].catalog.block_index(), BlockIndex(0));
+
+    fixture.store.delete(&old_catalog).await.unwrap();
+    assert!(cached.head(&old_catalog).await.is_ok());
+    writer.claim = Some(rtdb_types::ReplicaPosition(4));
+    deliver_checkpoint_record(&fixture, &mut writer, 3, 0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })).await.unwrap();
+    assert!(writer.historical_confirmations.is_empty());
+    assert_eq!(writer.role(), Role::Following);
+    let mut tail = fixture.replica.tail(LogOffset(4)).await.unwrap();
+    let actual = next_local_record(tail.as_mut()).await;
+    let envelope = ReplicaEnvelope::decode(&actual.payload).unwrap().unwrap();
+    assert_eq!(envelope.term_sequence, Some(TermSequence(1)));
+    let ReplicaBody::BlockUploaded(upload) = envelope.message else { panic!("expected a recovered block upload"); };
+    assert_eq!(upload.block_index, Some(1));
+    writer.consume(actual).await.unwrap();
+    assert_eq!(handle.status().role, Role::Leading(Term(3)));
+    writer.demote().await.unwrap();
+    disk.close_and_wait().await;
+}
+
+#[tokio::test]
+async fn unavailable_older_confirmation_evidence_keeps_latest_checkpoint_reopen_and_writes_live() {
+    for missing_catalog in [false, true] {
+        let fixture = produced_memory_checkpoint(true).await;
+        let mut prior = produce_newer_memory_checkpoint(&fixture).await;
+        deliver_checkpoint_record(&fixture, &mut prior, 2, 2, upload(1, -1)).await.unwrap();
+
+        if missing_catalog {
+            let key = rtdb_storage::ObjectKey::new(rtdb_format::keys::block_key(BlockIndex(0)).unwrap()).unwrap();
+            fixture.store.delete(&key).await.unwrap();
+        } else {
+            fixture.replica.truncate_before(LogOffset(4)).unwrap();
+        }
+        let (writer_handle, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+            assertion_interval: Duration::from_millis(10), ..Default::default()
+        }).await;
+        let visible = writer.partition.value();
+        let fence = writer.fence.clone();
+        let history = writer.prove_historical_confirmations().await;
+        if missing_catalog {
+            assert!(history.unwrap().is_empty());
+        } else {
+            assert_eq!(history.err().unwrap().code, "rtdb.storage/log-range-unavailable");
+        }
+        assert!(Arc::ptr_eq(&writer.partition.value(), &visible));
+        assert_eq!(writer.fence, fence);
+        assert_eq!(writer.read_position, rtdb_types::ReplicaPosition(3));
+        assert_eq!(writer_handle.status().adopted_block.unwrap().block_index(), BlockIndex(1));
+
+        let (follower_handle, follower) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+            may_lead: false, ..Default::default()
+        }).await;
+        let follower_value = Arc::clone(&follower.partition);
+        let submitted = submit_recovery_row(&writer_handle, &writer.resolve.memory, 3, 300).await;
+        let writer_task = tokio::spawn(writer.run());
+        let follower_task = tokio::spawn(follower.run());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for handle in [&writer_handle, &follower_handle] {
+                let result = handle.await_tx(TxId(submitted.0), &CancellationToken::new()).await.unwrap().unwrap();
+                assert!(result.committed());
+                assert_eq!(result.tx_key().tx_id, TxId(submitted.0));
+            }
+        }).await.unwrap();
+        let tip = fixture.replica.latest().unwrap();
+        let records = fixture.replica.read_range(LogOffset(5), LogOffset(tip.0 + 1)).await.unwrap();
+        for record in records {
+            let envelope = ReplicaEnvelope::decode(&record.payload).unwrap().unwrap();
+            assert!(!matches!(envelope.message, ReplicaBody::BlockUploaded(_)));
+        }
+        let docs = TableRef::new("public", "docs");
+        let value = follower_value.value();
+        let row = value.live().tables()[&docs].row(0).unwrap().event().unwrap();
+        let rtdb_index::StoredOperation::Put(document) = row.operation else { panic!("expected the post-reopen row"); };
+        assert_eq!(document.get("_id"), Some(&Value::I64(3)));
+
+        writer_handle.shutdown();
+        follower_handle.shutdown();
+        writer_task.await.unwrap().unwrap();
+        follower_task.await.unwrap().unwrap();
+    }
 }
 
 #[tokio::test]
