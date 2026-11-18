@@ -127,8 +127,15 @@ pub(crate) fn sql_not_eq_scoped(left: &Value, right: &Value, timezone: &str, all
     Ok(Some(!emitted_eq(left, right, allocation)?))
 }
 
+fn postgres_reference(value: &Value) -> Option<i32> {
+    match value {
+        Value::Oid(oid) | Value::RegClass(oid) | Value::RegProc(oid) => Some(*oid),
+        _ => None,
+    }
+}
+
 fn emitted_integer(value: &Value) -> Option<i128> {
-    integer(value).or_else(|| date_days(value).map(i128::from)).or_else(|| match value {
+    integer(value).or_else(|| postgres_reference(value).map(i128::from)).or_else(|| date_days(value).map(i128::from)).or_else(|| match value {
         Value::Timestamp { value, .. } | Value::Time { value, .. } | Value::Duration { value, .. } => Some(i128::from(*value)),
         _ => None,
     })
@@ -233,6 +240,14 @@ fn interval_order(left: &Value, right: &Value, a: IntervalParts, b: IntervalPart
 }
 
 pub(crate) fn predicate_order(left: &Value, right: &Value, timezone: &str) -> Result<Ordering> {
+    let left_reference = postgres_reference(left).map(Value::I32);
+    let right_reference = postgres_reference(right).map(Value::I32);
+    if left_reference.is_some() || right_reference.is_some() {
+        if let (Some(left), Some(right)) = (emitted_integer(left), emitted_integer(right)) {
+            return Ok(left.cmp(&right));
+        }
+        return compare_in_timezone(left_reference.as_ref().unwrap_or(left), right_reference.as_ref().unwrap_or(right), false, timezone);
+    }
     if std::mem::discriminant(left) != std::mem::discriminant(right) {
         if let (Some(left), Some(right)) = (emitted_byte_buffer(left), emitted_byte_buffer(right)) {
             return Ok(left.iter().map(|byte| *byte as i8).cmp(right.iter().map(|byte| *byte as i8)));

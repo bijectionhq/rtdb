@@ -223,6 +223,10 @@ String clock inputs follow `Time.asInstant`'s date fallback; typed SQL timestamp
 Temporal calls retain the strict continuation behavior: a null argument can discard a pending monomorphic payload, while CASE selection and polymorphic boxing remain demanded.
 Direct scalar field calls validate applicability, and checked arithmetic delegated by temporal functions reports the expression overflow anomaly.
 
+OID, REGCLASS and REGPROC scalar predicates use their emitted signed integer values.
+Equality compares those values with other emitted integers, including the cells of temporal scalar types.
+Ordering predicates also compare a reference with floating-point operands.
+
 == Series readers
 
 `generate_series` accepts signed integer or compatible temporal endpoints, a stride, and an optional endpoint-inclusion Boolean.

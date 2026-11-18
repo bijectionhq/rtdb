@@ -146,6 +146,10 @@
 
 (deftest-original-api original-pg-expression/test-regproc)
 
+(deftest-original-api original-pg-expression/test-regclass)
+
+(deftest-original-api original-pg-expression/test-regclass-where-expr)
+
 (deftest-original-api original-pg-expression/test-regclass-search-path-precedence)
 
 (deftest-original-api original-node/test-array-element-reference-is-one-based-336)

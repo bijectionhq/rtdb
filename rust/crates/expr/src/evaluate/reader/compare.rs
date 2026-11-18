@@ -80,6 +80,20 @@ pub(super) fn order<'a>(left: EvalValue<'a>,right: EvalValue<'a>,frame: &'a Eval
 mod tests {
     use super::*;
 
+    #[test]
+    fn postgres_references_compare_as_emitted_integers_in_scalar_predicates() {
+        let lhs = Value::RegClass(17);
+        let memory = rtdb_types::MemoryBudget::new(1 << 20);
+        let scope = crate::EvaluationScope::new(&memory).unwrap();
+        for rhs in [Value::I16(17), Value::I64(17), Value::Oid(17), Value::RegProc(17), Value::DateDay(17)] {
+            assert_eq!(crate::compare::sql_eq(&lhs, &rhs, &scope).unwrap(), Some(true));
+        }
+        assert_eq!(crate::compare::sql_not_eq_in_timezone(&lhs, &Value::I64(17), "UTC", &scope).unwrap(), Some(false));
+        assert_eq!(crate::compare::sql_eq(&lhs, &Value::F64(17.0), &scope).unwrap(), Some(false));
+        assert_eq!(crate::compare::predicate_order(&lhs, &Value::RegProc(18), "UTC").unwrap(), Ordering::Less);
+        assert_eq!(crate::compare::predicate_order(&lhs, &Value::F64(16.5), "UTC").unwrap(), Ordering::Greater);
+    }
+
     #[tokio::test]
     async fn strict_set_reader_aliases_compare_by_identity_without_reading_children() {
         let schema = Schema::default();
