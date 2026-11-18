@@ -357,7 +357,10 @@ fn time_fields(body: &mut BTreeMap<String, Value>, from: Option<Timestamp>, to: 
     let time = |time: Option<Timestamp>| time.map(|time| Value::Timestamp { value: time.0, unit: TimeUnit::Microsecond, timezone: Some("UTC".into()) }).unwrap_or(Value::Null);
     body.insert("_valid_from".into(), time(from)); body.insert("_valid_to".into(), time(to));
 }
-fn table_name(table: &TableRef) -> String { format!("{}/{}", table.schema, table.table) }
+pub(crate) fn table_name(table: &TableRef) -> String { format!("{}/{}", table.schema, table.table) }
+pub(crate) fn is_reserved_write_schema(schema: &str) -> bool {
+    matches!(schema, "xt" | "information_schema" | "pg_catalog")
+}
 fn check_writable_table(operation: &Operation) -> Result<()> {
     let table = match operation {
         Operation::Public(TxOp::PutDocs { table, .. } | TxOp::PatchDocs { table, .. } | TxOp::DeleteDocs { table, .. } | TxOp::EraseDocs { table, .. })
@@ -365,7 +368,7 @@ fn check_writable_table(operation: &Operation) -> Result<()> {
         _ => return Ok(()),
     };
     parse_table(&table_name(table))?;
-    if matches!(table.schema.as_str(), "xt" | "information_schema" | "pg_catalog") {
+    if is_reserved_write_schema(&table.schema) {
         return Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {table}"))
             .with_context("schema", table.schema.clone().into()).with_context("table", table.table.clone().into()));
     }
@@ -444,7 +447,11 @@ mod tests {
         ], SubmitOptions::default(), &memory).unwrap();
         assert!(roundtrip(&source).operations.is_empty());
         let source = SourceTransaction::new(vec![TxOp::EraseDocs { table: TableRef::new("xt", "txs"), ids }], SubmitOptions::default(), &memory).unwrap();
-        assert_eq!(source.encode().unwrap_err().code, "xtdb/forbidden-table");
+        let error = source.encode().unwrap_err();
+        assert_eq!(error.code, "xtdb/forbidden-table");
+        assert_eq!(error.message.as_deref(), Some("Cannot write to table: xt.txs"));
+        assert_eq!(error.context["schema"], "xt");
+        assert_eq!(error.context["table"], "txs");
     }
 
     #[test]

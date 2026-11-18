@@ -206,7 +206,7 @@ impl Object {
             Self::KeyFn(value) => tagged("xtdb/key-fn",T::Keyword(value.clone())),Self::ClojureForm(value) => tagged("xtdb/clj-form",value.wire_with(allocation)?),
             Self::Time(value) => value.wire()?,
             Self::Path(value) => value.wire(),
-            Self::TableRef(value) => table::wire(value),
+            Self::TableRef(value) => T::table_ref(value),
             Self::VectorType(value) => value.wire(allocation)?,
             Self::Link(entries) => tagged("link",T::Map(wire_entries(entries.iter().map(|(key,value)|(key,value)),entries.len(),allocation)?)),
             Self::Throwable(value) => value.wire(allocation)?,

@@ -707,6 +707,7 @@ rule ClientSubmitsTransaction {
     -- Static expansion requires a declared column list for a VALUES insert.
     -- Static expansion reads the referenced argument positions and can expand an operation that supplies additional arguments.
     -- An operation missing a referenced argument proceeds to transaction resolution as SQL, where the argument failure aborts the transaction.
+    -- A document write aimed at a system schema is rejected at submission.
     when: ClientSubmitsTx(client, database, tx_ops, opts)
 
     requires: database.external_source = null
@@ -756,6 +757,7 @@ rule LeaderProcessesTx {
         -- Resolve and stage on the resolver's queue, advancing the RESOLVED head.
         -- An aborted transaction is staged too, and still consumes a tx_id (live-index.allium, AbortTransaction).
         -- An invalid valid-time interval reports its two bounds as instants in the transaction failure and the durable error.
+        -- A SQL mutation that targets a reserved table aborts with the table reference in the error data.
         let resolved = ResolveTx(tx_resolver, msg)
         AppendTx(resolved, src_msg_id: msg.msg_id)
 }

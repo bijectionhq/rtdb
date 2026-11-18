@@ -28,6 +28,16 @@ impl TransitValue {
     pub fn instant(value: rtdb_types::Instant) -> Result<Self> {
         Ok(Self::Tagged { tag: "time/instant".into(), representation: Box::new(Self::String(value.to_iso_string()?)) })
     }
+
+    pub fn table_ref(table: &rtdb_types::TableRef) -> Self {
+        Self::Tagged {
+            tag: "xt/table".into(),
+            representation: Box::new(Self::Map(vec![
+                (Self::Keyword("schema-name".into()), Self::String(table.schema.clone())),
+                (Self::Keyword("table-name".into()), Self::String(table.table.clone())),
+            ])),
+        }
+    }
 }
 
 /// Constructs decoded values before they enter the Transit cache; cache hits clone `Value`.

@@ -13,7 +13,7 @@ use rtdb_storage::cache::BufferPool;
 use rtdb_types::{Anomaly, AnomalyCategory, Iid, Interval, Result, SourcePosition, TableRef, TimeUnit, Timestamp, TransactionKey, TxId, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments}};
+use crate::{SourceTransaction, SubmitOptions, TransactionResult, TxOp, UserMetadata, source::{Operation, decode_arguments, is_reserved_write_schema, table_name}};
 
 pub trait TransactionAuthorization: Send + Sync {
     /// Rejects an absent principal or a principal without the reference superuser authority.
@@ -436,7 +436,11 @@ async fn execute(input: Arc<rtdb_plan::Relation>, context: Arc<QueryContext>, ar
     PreparedQuery::new(input)?.execute(context, arguments.to_vec()).await
 }
 fn check_table(table: &TableRef) -> Result<()> {
-    if ["xt", "information_schema", "pg_catalog"].contains(&table.schema.as_str()) { Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}.{}", table.schema, table.table))) } else { Ok(()) }
+    if is_reserved_write_schema(&table.schema) {
+        return Err(Anomaly::incorrect("xtdb/forbidden-table", format!("Cannot write to table: {}", table_name(table)))
+            .with_context("table", transit::to_json_value(&T::table_ref(table))?));
+    }
+    Ok(())
 }
 fn interval(from: Timestamp, to: Timestamp) -> Result<Interval> {
     if from >= to {
@@ -463,6 +467,16 @@ fn overflow() -> Anomaly { Anomaly::fault("rtdb.tx/overflow", "Transaction posit
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reserved_tables_in_resolution_retain_the_table_reference() {
+        let table = TableRef::new("information_schema", "columns");
+        let error = check_table(&table).unwrap_err();
+        assert_eq!(error.code, "xtdb/forbidden-table");
+        assert_eq!(error.message.as_deref(), Some("Cannot write to table: information_schema/columns"));
+        assert_eq!(transit::from_json_value(&error.context["table"]).unwrap(), T::table_ref(&table));
+        assert!(check_table(&TableRef::new("public", "columns")).is_ok());
+    }
+
     #[test]
     fn error_transaction_keys_preserve_jvm_instant_text() {
         for (micros, text) in [(0, "1970-01-01T00:00:00Z"), (-1, "1969-12-31T23:59:59.999999Z"), (1000, "1970-01-01T00:00:00.001Z"), (946_684_800_000_000, "2000-01-01T00:00:00Z")] {
