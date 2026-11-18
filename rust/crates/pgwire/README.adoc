@@ -72,6 +72,11 @@ Inside an explicit transaction, all batches remain buffered until the user's com
 Keyword document keys use the source normalization, including `:xt/id` to `_id`; the literal string `xt/id` remains a different key.
 
 Frame, parameter, environment, prepared-registration, portal-descriptor, decoded-row, and encoded-value owners retain memory reservations.
+Simple Query validates the whole source lexically before admitting the nonempty statement ranges and executing the first statement.
+The range buffer keeps its reservation through batch execution and releases it on completion, error, or cancellation.
+The input frame retains the source bytes.
+Empty and comment-only sources require no statement-range reservation.
+Fallback tokenizer scratch still needs separate admission, and statements undergo AST validation individually.
 Arrow COPY inspects metadata and compressed buffer lengths before loading payloads, then holds a reservation through the reader and each selected-value conversion.
 Transit COPY reserves the bounded file's decoding allowance before reading it into memory.
 Temporary-file reads and writes run synchronously on the owning future; cancellation is observed between those operations and during asynchronous transaction work.

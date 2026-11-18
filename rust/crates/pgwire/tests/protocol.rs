@@ -466,3 +466,41 @@ async fn ssl_upgrade_authenticates_and_queries_over_the_owned_tls_transport() {
     }).await.unwrap();
     drop(socket); running.stop().await;
 }
+
+#[tokio::test]
+async fn simple_batch_lexical_failure_precedes_session_effects_and_recovers() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    assert_eq!(tags(&client.query("SET application_name = 'before'").await), b"SCZ");
+    let frames = client.query("SET application_name = 'changed'; SELECT @").await;
+    assert_eq!(tags(&frames), b"EZ");
+    assert_eq!(frames[1].1, b"I");
+    let fields = frames[0].1.split(|&byte| byte == 0).filter_map(|field| field.split_first()).collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(std::str::from_utf8(fields[&b'M']).unwrap(), "Invalid character in SQL source");
+    let detail: serde_json::Value = serde_json::from_slice(fields[&b'D']).unwrap();
+    assert_eq!(detail["code"], "xtdb/sql-error");
+    let unchanged = client.query("SHOW application_name").await;
+    assert_eq!(tags(&unchanged), b"TDCZ");
+    assert_eq!(rows(&unchanged), vec![vec![Some(b"before".to_vec())]]);
+    let recovered = client.query("SELECT 42 AS answer").await;
+    assert_eq!(tags(&recovered), b"TDCZ");
+    assert_eq!(rows(&recovered), vec![vec![Some(b"42".to_vec())]]);
+    assert_eq!(recovered.last().unwrap().1, b"I");
+    drop(client); running.stop().await;
+}
+
+#[tokio::test]
+async fn simple_empty_groups_and_canned_keyword_result_keep_protocol_shapes() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let empty = client.query(" -- idle\n /* ; */ ; ;").await;
+    assert_eq!(tags(&empty), b"IZ");
+    assert!(empty[0].1.is_empty());
+    assert_eq!(empty[1].1, b"I");
+    let canned = client.query("; SELECT string_agg(word, ',') FROM pg_catalog.pg_get_keywords(); ;").await;
+    assert_eq!(tags(&canned), b"TDCZ");
+    assert_eq!(rows(&canned), vec![vec![Some(b"xtdb".to_vec())]]);
+    assert_eq!(canned[2].1, b"SELECT 1\0");
+    assert_eq!(canned[3].1, b"I");
+    drop(client); running.stop().await;
+}

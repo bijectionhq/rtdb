@@ -264,9 +264,9 @@ impl ProtocolSession {
         Ok(())
     }
     async fn simple_statements<W: AsyncWrite + Unpin>(&mut self, source: &str, writer: &mut Writer<W>) -> Result<()> {
-        let spans = rtdb_sql::split_statements(source)?;
+        let spans = rtdb_sql::split_statements_in(source, self.node.memory())?;
         if spans.is_empty() { writer.empty(b'I').await?; return Ok(()); }
-        for span in spans {
+        for span in spans.as_slice() {
             let sql = &source[span.start..span.end]; let control = rtdb_sql::parse_control_in(sql, &self.options(), self.node.memory())?;
             if !matches!(control, Some(ControlStatement::Begin(_) | ControlStatement::Discard(_) | ControlStatement::SetTransaction(_) | ControlStatement::Show { .. } | ControlStatement::CopyIn { .. })) { self.begin_implicit(None)?; }
             let result: Result<()> = async {

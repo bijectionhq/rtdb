@@ -26,7 +26,7 @@ mod literal_text;
 pub use parse::{ParsedStatement, StatementKind, parse, parse_in};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
 pub use control::{parse_control, parse_control_in};
-pub use split::split_statements;
+pub use split::{SplitStatements, split_statements, split_statements_in};
 
 use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, MemoryBudget, Result};
