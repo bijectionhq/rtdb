@@ -55,7 +55,10 @@ impl Database {
     pub(crate) async fn close_io(&self) { self.io.close_and_wait().await; }
     pub(crate) fn require_writable(&self) -> Result<()> {
         if self.cancellation.is_cancelled() { return Err(closed()); }
-        if self.read_only { return Err(Anomaly::incorrect("xtdb/read-only-database", "Database is read-only").with_context("db-name", self.name.clone().into())); }
+        if self.read_only {
+            let message = match self.configuration.log { Some(rtdb_format::database::proto::database_config::Log::LocalLog(_)) => "Cannot write to read-only database log", _ => "Cannot append to read-only database log" };
+            return Err(Anomaly::incorrect("xtdb/read-only-database", message).with_context("db-name", self.name.clone().into()));
+        }
         Ok(())
     }
 }

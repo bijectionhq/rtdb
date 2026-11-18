@@ -1509,3 +1509,16 @@ async fn system_time_as_of_after_the_basis_reads_as_of_the_basis() {
     assert!(rows(session.query_sql(past, vec![]).await.unwrap()).await.is_empty());
     stop(&node, driver).await;
 }
+
+#[tokio::test]
+async fn a_write_to_a_read_only_database_is_rejected_by_its_log() {
+    let (node, driver) = running(options(), services()).await;
+    let token = CancellationToken::new();
+    let mut configuration = rtdb_format::config::default_database_config();
+    configuration.mode = Some(1);
+    assert!(node.attach_database("ro_db".into(), configuration, &Authority, &token).await.unwrap().committed());
+    let mut session = node.session("ro_db", Arc::new(Authority)).unwrap();
+    let error = match session.state_mut().execute_tx(vec![put(&node, 1, 1)], AutonomousTxOptions::default()).await { Ok(result) => result.error().cloned().expect("rejected"), Err(error) => error };
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/read-only-database", Some("Cannot append to read-only database log")));
+    stop(&node, driver).await;
+}
