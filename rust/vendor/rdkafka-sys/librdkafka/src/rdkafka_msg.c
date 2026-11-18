@@ -271,7 +271,7 @@ static rd_kafka_msg_t *rd_kafka_msg_new0(rd_kafka_topic_t *rkt,
 
         memset(&rkm->rkm_u.producer, 0, sizeof(rkm->rkm_u.producer));
 
-        if (timestamp)
+        if (timestamp || (msgflags & RD_KAFKA_MSG_F_EXPLICIT_TIMESTAMP))
                 rkm->rkm_timestamp = timestamp;
         else
                 rkm->rkm_timestamp = rd_uclock() / 1000;

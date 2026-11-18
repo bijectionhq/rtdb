@@ -56,6 +56,7 @@ impl TopicMetadata<'_> {
 
     /// Fixes the native record's partition using the generation and producer from this wait.
     /// The caller supplies the already admitted, serialized record with the original topic and explicit partition, if any.
+    /// A record without an explicit timestamp receives the append time from this wait.
     /// Mismatched records and zero bytes in the topic fail before a counter draw.
     /// A source explicit partition bypasses the counter.
     /// RoundRobin consumes its counter before rejecting a negative result.
@@ -64,6 +65,7 @@ impl TopicMetadata<'_> {
     pub fn prepare_round_robin<'record, K: ToBytes + ?Sized, P: ToBytes + ?Sized, D: IntoOpaque>(
         self, record: BaseRecord<'record, K, P, D>,
     ) -> Outcome<PreparedSend<BaseRecord<'record, K, P, D>>> {
+        let timestamp = record.timestamp.unwrap_or_else(|| self.append_time_ms());
         let Self { monitor, request, snapshot, .. } = self;
         if record.topic != request.topic || record.partition != request.partition {
             return Err(Failure::RecordMetadataMismatch);
@@ -82,7 +84,7 @@ impl TopicMetadata<'_> {
         if partition < 0 {
             return Err(Failure::InvalidPartition(partition));
         }
-        prepared.record = prepared.record.partition(partition);
+        prepared.record = prepared.record.partition(partition).timestamp(timestamp);
         Ok(prepared)
     }
 }

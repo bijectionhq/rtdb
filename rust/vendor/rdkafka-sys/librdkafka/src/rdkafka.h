@@ -1262,7 +1262,8 @@ typedef struct rd_kafka_vu_s {
         _LRK_TYPECHECK(RD_KAFKA_VTYPE_MSGFLAGS, int, msgflags), (int)msgflags
 /*!
  * Timestamp in milliseconds since epoch UTC (int64_t).
- * A value of 0 will use the current wall-clock time.
+ * A value of 0 uses the current wall-clock time unless the message flags
+ * include RD_KAFKA_MSG_F_EXPLICIT_TIMESTAMP.
  *
  * rd_kafka_vu_t field: u.i64
  */
@@ -5010,6 +5011,8 @@ RD_EXPORT rd_kafka_error_t *rd_kafka_consumer_group_metadata_read(
 #define RD_KAFKA_MSG_F_PARTITION                                               \
         0x8 /**< produce_batch() will honor                                    \
              * per-message partition. */
+#define RD_KAFKA_MSG_F_EXPLICIT_TIMESTAMP                                      \
+        0x10 /**< With RD_KAFKA_V_TIMESTAMP(0), preserve Unix epoch zero. */
 
 
 

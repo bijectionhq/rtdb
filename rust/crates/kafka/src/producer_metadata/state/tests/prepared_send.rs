@@ -49,6 +49,7 @@ async fn partitioning_uses_the_waited_generation_and_keeps_the_producer_counter(
 
     let original = waited.prepare_round_robin(BaseRecord::<[u8], [u8]>::to("t").key(b"key")).unwrap();
     assert_eq!(original.record().partition, Some(5));
+    assert_eq!(original.record().timestamp, Some(10));
     assert_eq!(original.record().key, Some(b"key".as_slice()));
     let next = cached_wait(&monitor, None).await;
     let expected = next.snapshot().partitions("t")[1].id;
@@ -80,14 +81,17 @@ async fn a_metadata_wait_charges_the_original_budget_before_queue_admission() {
     ).await.unwrap();
     assert_eq!(waited.elapsed_ms(), 33);
     assert_eq!((waited.append_time_ms(), waited.queue_wait_ms()), (43, 17));
+    let prepared = waited.prepare_round_robin(BaseRecord::<[u8], [u8]>::to("t").partition(1)).unwrap();
+    assert_eq!(prepared.record().timestamp, Some(43));
 }
 
 #[tokio::test]
 async fn explicit_partition_and_mismatched_records_leave_the_round_robin_counter_untouched() {
     let (monitor, _) = initial(&[(5, 1, 1, 0), (1, 1, 1, 0)]);
     let explicit = cached_wait(&monitor, Some(1)).await;
-    let explicit = explicit.prepare_round_robin(BaseRecord::<[u8], [u8]>::to("t").partition(1)).unwrap();
+    let explicit = explicit.prepare_round_robin(BaseRecord::<[u8], [u8]>::to("t").partition(1).timestamp(0)).unwrap();
     assert_eq!(explicit.record().partition, Some(1));
+    assert_eq!(explicit.record().timestamp, Some(0));
 
     let mismatch = cached_wait(&monitor, None).await;
     assert!(matches!(mismatch.prepare_round_robin(
@@ -145,8 +149,50 @@ async fn native_queue_full_returns_the_selected_partition_and_original_record() 
     assert!(matches!(error, KafkaError::MessageProduction(RDKafkaErrorCode::QueueFull)));
     assert_eq!(retry.partition, Some(partition.id()));
     assert_eq!(retry.partition, Some(5));
+    assert_eq!(retry.timestamp, Some(10));
     assert_eq!(retry.topic, "t");
     assert_eq!(retry.key, Some(b"key".as_slice()));
     assert_eq!(retry.payload, Some(b"payload".as_slice()));
     assert_eq!(snapshot.partitions("t").len(), 2);
+}
+
+#[test]
+fn native_produce_and_fetch_distinguish_explicit_epoch_from_automatic_time() {
+    use std::time::{Duration, Instant};
+    use rdkafka::{
+        Message, Offset, Timestamp, TopicPartitionList,
+        consumer::{BaseConsumer, Consumer},
+        mocking::MockCluster,
+        producer::Producer,
+    };
+
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("timestamps", 1, 1).unwrap();
+    let endpoint = cluster.bootstrap_servers();
+    let producer: BaseProducer = ClientConfig::new().set("bootstrap.servers", &endpoint).create().unwrap();
+    producer.send(BaseRecord::<[u8], [u8]>::to("timestamps").partition(0).payload(b"explicit").timestamp(0)).unwrap();
+    producer.send(BaseRecord::<[u8], [u8]>::to("timestamps").partition(0).payload(b"automatic")).unwrap();
+    producer.flush(Duration::from_secs(5)).unwrap();
+
+    let consumer: BaseConsumer = ClientConfig::new()
+        .set("bootstrap.servers", &endpoint)
+        .set("group.id", "timestamp-observation")
+        .set("enable.auto.commit", "false")
+        .create().unwrap();
+    let mut assignment = TopicPartitionList::new();
+    assignment.add_partition_offset("timestamps", 0, Offset::Beginning).unwrap();
+    consumer.assign(&assignment).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for expected in [b"explicit".as_slice(), b"automatic".as_slice()] {
+        let message = loop {
+            if let Some(result) = consumer.poll(Duration::from_millis(10)) { break result.unwrap(); }
+            assert!(Instant::now() < deadline);
+        };
+        assert_eq!(message.payload(), Some(expected));
+        if expected == b"explicit" {
+            assert_eq!(message.timestamp(), Timestamp::CreateTime(0));
+        } else {
+            assert!(matches!(message.timestamp(), Timestamp::CreateTime(ms) if ms > 0));
+        }
+    }
 }

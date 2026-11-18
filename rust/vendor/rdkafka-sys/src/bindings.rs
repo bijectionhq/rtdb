@@ -15,6 +15,7 @@ pub const RD_KAFKA_MSG_F_FREE: i32 = 1;
 pub const RD_KAFKA_MSG_F_COPY: i32 = 2;
 pub const RD_KAFKA_MSG_F_BLOCK: i32 = 4;
 pub const RD_KAFKA_MSG_F_PARTITION: i32 = 8;
+pub const RD_KAFKA_MSG_F_EXPLICIT_TIMESTAMP: i32 = 16;
 pub const RD_KAFKA_PURGE_F_QUEUE: i32 = 1;
 pub const RD_KAFKA_PURGE_F_INFLIGHT: i32 = 2;
 pub const RD_KAFKA_PURGE_F_NON_BLOCKING: i32 = 4;

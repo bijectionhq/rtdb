@@ -194,10 +194,11 @@ The caller provides its serialized, admitted record using the same topic and req
 A source explicit partition bypasses the counter.
 The RoundRobin counter selects from the waited generation even if a newer one was published during serialization.
 A negative selected partition fails after the draw and before native enqueue.
-The resulting native `BaseRecord` carries the selected partition, and a returned queue-full record can be sent again with that assignment.
+The resulting native `BaseRecord` carries the selected partition and the caller's explicit timestamp or the source append time.
+A returned queue-full record carries the same assignment and timestamp.
+The native send marks explicit Unix epoch zero so it survives librdkafka's default-time sentinel.
 The prepared send retains its generation independently of the producer monitor.
-The DLQ activation still requires its production network owner and use of the returned queue budget and append time.
-That integration must account for the native timestamp zero sentinel.
+The DLQ activation still requires its production network owner and use of the returned queue budget.
 
 == Connection addresses
 

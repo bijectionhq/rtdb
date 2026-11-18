@@ -119,6 +119,7 @@ pub struct BaseRecord<'a, K: ToBytes + ?Sized = (), P: ToBytes + ?Sized = (), D:
     /// Optional key.
     pub key: Option<&'a K>,
     /// Optional timestamp.
+    /// An explicit zero denotes the Unix epoch.
     ///
     /// Note that Kafka represents timestamps as the number of milliseconds
     /// since the Unix epoch.
@@ -165,6 +166,7 @@ impl<'a, K: ToBytes + ?Sized, P: ToBytes + ?Sized, D: IntoOpaque> BaseRecord<'a,
     ///
     /// Note that Kafka represents timestamps as the number of milliseconds
     /// since the Unix epoch.
+    /// Zero is preserved as an explicit timestamp.
     pub fn timestamp(mut self, timestamp: i64) -> BaseRecord<'a, K, P, D> {
         self.timestamp = Some(timestamp);
         self
@@ -458,6 +460,11 @@ where
         let (key_ptr, key_len) = as_bytes(record.key);
         let topic_cstring = CString::new(record.topic).unwrap();
         let opaque_ptr = record.delivery_opaque.into_ptr();
+        let flags = rdsys::RD_KAFKA_MSG_F_COPY | if record.timestamp == Some(0) {
+            rdsys::RD_KAFKA_MSG_F_EXPLICIT_TIMESTAMP
+        } else {
+            0
+        };
         let produce_error = unsafe {
             rdsys::rd_kafka_producev(
                 self.native_ptr(),
@@ -466,7 +473,7 @@ where
                 RD_KAFKA_VTYPE_PARTITION,
                 record.partition.unwrap_or(-1),
                 RD_KAFKA_VTYPE_MSGFLAGS,
-                rdsys::RD_KAFKA_MSG_F_COPY,
+                flags,
                 RD_KAFKA_VTYPE_VALUE,
                 payload_ptr,
                 payload_len,
