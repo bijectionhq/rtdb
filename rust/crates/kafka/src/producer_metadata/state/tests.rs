@@ -391,3 +391,4 @@ mod updater;
 mod wait;
 mod fatal;
 mod monitor;
+mod topic_wait;

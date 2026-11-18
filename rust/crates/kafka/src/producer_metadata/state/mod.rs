@@ -27,7 +27,7 @@ pub use exchange::{MetadataExchange, MetadataTarget, SubmissionFailure};
 pub use updater::{MetadataNetwork, MetadataUpdater, SendMetadata, UpdateFailure, UpdateSettings};
 pub use wait::{MetadataWait, WaitFailure, WaitStep};
 pub use fatal::{FatalKind, MetadataError, MetadataTopicError, MetadataWaitObservation};
-pub use monitor::{MetadataMonitor, WaitCompletion};
+pub use monitor::{MetadataClock, MetadataMonitor, TopicMetadata, TopicWaitFailure, TopicWaitRequest, WaitCompletion};
 use keys::Ops;
 use owned::{Budget, Lease, Shared, Vector};
 use response::{Holder, Table, invalid_metadata};

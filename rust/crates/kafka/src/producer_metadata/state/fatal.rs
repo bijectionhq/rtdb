@@ -21,6 +21,12 @@ impl MetadataError {
     pub fn cause(&self) -> &Anomaly { &self.payload.cause }
 }
 
+impl std::fmt::Debug for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.cause(), f)
+    }
+}
+
 /// Which source fatal error slot is replaced.
 pub enum FatalKind {
     /// Ordinary request errors are consumed when first observed.
@@ -30,6 +36,7 @@ pub enum FatalKind {
 }
 
 /// A fatal or recoverable error observed while resolving a topic.
+#[derive(Debug)]
 pub enum MetadataTopicError {
     /// The source fatal error takes precedence over the topic's recoverable result.
     Fatal(MetadataError),

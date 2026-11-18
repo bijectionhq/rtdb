@@ -13,6 +13,9 @@ use super::{
     Snapshot, WaitStep,
 };
 
+mod topic;
+pub use topic::{MetadataClock, TopicMetadata, TopicWaitFailure, TopicWaitRequest};
+
 /// The terminal source result of waiting for metadata.
 pub enum WaitCompletion {
     /// A newer signed update version is available.

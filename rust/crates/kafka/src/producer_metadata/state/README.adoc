@@ -158,6 +158,25 @@ Empty responses and server rebootstrap outcomes leave notification to the subseq
 The Tokio 1.54.1 notifier captures broadcasts before the condition check, with the lock released before parking or waking callers.
 The caller owns its wait future, source clock and runtime timer.
 
+== Waiting for a topic
+
+`MetadataMonitor::wait_for_topic` follows the pinned `KafkaProducer.waitOnMetadata` ordering.
+A cached invalid topic fails before the initial topic addition.
+A usable cached partition count succeeds after that addition without a clock observation or sender wake.
+Each miss refreshes topic expiry, requests a version, wakes the sender outside the monitor lock and creates a Timer with the remaining budget.
+The Timer timeout retains the previous partition count, original budget and any retained topic error.
+After an update, the total elapsed limit retains a cause only if the pinned exception class descends from `RetriableException`.
+Each timeout samples one coherent error table under the monitor lock.
+The pinned Java path can read the table more than once, so those cause observations agree when the table is stable across its reads.
+The next iteration uses the new partition count and remaining budget after the source topic error check.
+Success returns the retained generation and measured nanosecond interval for the caller's metrics.
+A topic mutation that ends the native capability broadcasts to other waiters.
+
+The exception ancestry evidence covers 146 Java members from the pinned Kafka archive.
+Following the exception constructors from `Errors.java` to `RetriableException`, `RuntimeException` or `Exception` produces the member-set digest `585ecf92407eb5296e5cc199631db46023d521e78227f5e225502e3dfeb35825`.
+Its input is the archive paths in lexical order, each followed by an ASCII space, lowercase SHA-256 of the entire member and LF.
+The production caller still supplies the qualified clock, actual sender wake operation and metrics sink.
+
 `sources.json` records the exact consulted Kafka and OpenJDK archive members.
 `COPYRIGHT` retains each complete pre-package prefix, including adjacent legal blocks.
 The accompanying license and notice files are verbatim copies.
