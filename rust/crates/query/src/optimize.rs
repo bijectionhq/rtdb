@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
-use rtdb_plan::{BinaryOp, ColumnId, Expr, Relation, RelationNode, Schema};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, Relation, RelationNode, Schema, WindowFunction};
 use rtdb_types::Result;
 
 pub(crate) fn prepare(relation: Arc<Relation>) -> Result<Arc<Relation>> {
@@ -18,7 +18,7 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             Ok(Arc::new(Relation::new(schema, node)?))
         }
         RelationNode::Extend { input, expressions } => {
-            let mut columns = input.schema().ids();
+            let mut columns = required.clone();
             columns.extend(expressions.iter().flat_map(|named| named.expr.referenced_columns()));
             let input = prune(Arc::clone(input), &columns)?;
             Ok(Arc::new(input.extend(expressions.clone())?))
@@ -74,8 +74,16 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Aggregate { input, groups: groups.clone(), aggregates: aggregates.clone() })?))
         }
         RelationNode::Window { input, partition_by, order_by, expressions } => {
-            let input = prepare(Arc::clone(input))?;
-            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Window { input, partition_by: partition_by.clone(), order_by: order_by.clone(), expressions: expressions.clone() })?))
+            let mut columns = required.clone();
+            columns.extend(partition_by);
+            columns.extend(order_by.iter().flat_map(|order| order.expr.referenced_columns()));
+            columns.extend(expressions.iter().filter_map(|expression| match expression.function {
+                WindowFunction::Lead { column, .. } | WindowFunction::Lag { column, .. } => Some(column),
+                WindowFunction::RowNumber => None,
+            }));
+            let input = prune(Arc::clone(input), &columns)?;
+            let schema = Schema::new(input.schema().fields().iter().cloned().chain(expressions.iter().map(|expression| expression.field.clone())).collect())?;
+            Ok(Arc::new(Relation::new(schema, RelationNode::Window { input, partition_by: partition_by.clone(), order_by: order_by.clone(), expressions: expressions.clone() })?))
         }
         RelationNode::Set { left, right, operator, all } => {
             let left = prepare(Arc::clone(left))?; let right = prepare(Arc::clone(right))?;
@@ -86,8 +94,11 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::PageOrdinality { input, field: field.clone() })?))
         }
         RelationNode::Unnest { input, expr, element, ordinality, outer } => {
-            let input = prepare(Arc::clone(input))?;
-            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Unnest { input, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer })?))
+            let mut columns = required.clone();
+            columns.extend(expr.referenced_columns());
+            let input = prune(Arc::clone(input), &columns)?;
+            let schema = Schema::new(input.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinality.iter().cloned()).collect())?;
+            Ok(Arc::new(Relation::new(schema, RelationNode::Unnest { input, expr: expr.clone(), element: element.clone(), ordinality: ordinality.clone(), outer: *outer })?))
         }
         RelationNode::PatchGaps { .. } | RelationNode::Reference { .. } | RelationNode::List { .. } | RelationNode::ColumnTable { .. } => Ok(relation),
     }
@@ -202,6 +213,44 @@ mod tests {
             id: ColumnId(id), name: format!("column_{id}"), qualifier: None,
             qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64),
         }
+    }
+
+    #[test]
+    fn window_and_unnest_keep_requested_and_expression_input_columns() {
+        use rtdb_plan::{NamedExpr, QualifiedTable, Scan, SortExpr, TableBinding, TemporalFilter, WindowExpr};
+        use rtdb_types::TableRef;
+
+        let [selected, partition, ordered, list_value, lagged, unused] = [0, 1, 2, 3, 4, 5].map(field);
+        let source = vec![selected.clone(), partition.clone(), ordered.clone(), list_value.clone(), lagged.clone(), unused];
+        let table = TableBinding {
+            name: QualifiedTable { database: "xtdb".into(), table: TableRef::new("public", "docs") },
+            oid: None,
+            columns: source.iter().map(|field| (field.name.clone(), field.data_type.clone())).collect(),
+        };
+        let scan = Arc::new(Relation::scan(Scan {
+            table, columns: source, valid_time: TemporalFilter::Default, system_time: TemporalFilter::Default,
+            clamp_valid_time: false, iids: None, predicates: Vec::new(),
+        }).unwrap());
+        let list_expr = Expr::List(vec![list_value.expression()]);
+        let list = Field { data_type: list_expr.data_type(), ..field(6) };
+        let extended = Arc::new(scan.extend(vec![NamedExpr { field: list.clone(), expr: list_expr }]).unwrap());
+        let element = field(7);
+        let schema = extended.schema().concat(&Schema::new(vec![element.clone()]).unwrap()).unwrap();
+        let values = Arc::new(Relation::new(schema, RelationNode::Unnest { input: extended, expr: list.expression(), element, ordinality: None, outer: false }).unwrap());
+        let lag = Field { data_type: lagged.data_type.clone().maybe(), ..field(8) };
+        let schema = values.schema().concat(&Schema::new(vec![lag.clone()]).unwrap()).unwrap();
+        let window = Arc::new(Relation::new(schema, RelationNode::Window {
+            input: values, partition_by: vec![partition.id],
+            order_by: vec![SortExpr { expr: ordered.expression(), descending: false, nulls_first: false }],
+            expressions: vec![WindowExpr { field: lag.clone(), function: WindowFunction::Lag { column: lagged.id, offset: 1 } }],
+        }).unwrap());
+        let output = window.project([selected, lag].into_iter().map(|field| NamedExpr { expr: field.expression(), field }).collect()).unwrap();
+        let optimized = prepare(Arc::new(output)).unwrap();
+        let RelationNode::Project { input: window, .. } = optimized.node() else { panic!("Expected output projection"); };
+        let RelationNode::Window { input: unnest, .. } = window.node() else { panic!("Expected window"); };
+        let RelationNode::Unnest { input: extended, .. } = unnest.node() else { panic!("Expected UNNEST"); };
+        let RelationNode::Extend { input: scan, .. } = extended.node() else { panic!("Expected list projection"); };
+        assert_eq!(scan.schema().fields().iter().map(|field| field.id).collect::<Vec<_>>(), (0..5).map(ColumnId).collect::<Vec<_>>());
     }
 
     #[test]
