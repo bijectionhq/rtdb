@@ -12,8 +12,13 @@ Store and private-key passwords are independent.
 `ssl.truststore.location` accepts the same store formats, and PEM roots also accept `ssl.truststore.certificates`.
 A store file is limited to 4 MiB.
 Java and librdkafka-native identity or trust inputs cannot both supply the same role.
-The Kafka log and Connect source consumer continue to accept librdkafka-native properties, including OpenSSL cipher expressions.
-They do not invoke the Java TLS configuration decoder.
+The Kafka log and Connect source consumer accept librdkafka-native properties, including OpenSSL cipher expressions.
+They also consume Java TLS options through the native Java configuration decoder before opening their native clients.
+
+The Kafka log resolves configured providers separately for admin, consumer and producer creation.
+Provider substitution precedes Java TLS decoding and native configuration import.
+The consumer's explicit deserializers and the producer's explicit serializers and forced acknowledgements replace their raw properties before the corresponding provider lookups.
+Each derived native client retains its own configuration admission through destruction, including a log tail or producer driver that outlives the log handle.
 
 The producer retains every decoded private-key entry.
 An empty Java identity store supplies no client certificate.

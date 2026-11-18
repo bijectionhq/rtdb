@@ -12,6 +12,40 @@ use tokio_util::sync::CancellationToken;
 struct Warnings(Mutex<Vec<KafkaWarning>>);
 impl KafkaObserver for Warnings { fn warning(&self, warning: KafkaWarning) { self.0.lock().unwrap().push(warning); } }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_clients_resolve_provider_bootstrap_and_keep_configuration_through_native_destruction() {
+    let cluster = MockCluster::new(1).unwrap();
+    cluster.create_topic("provider-log", 1, 1).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("client.properties");
+    std::fs::write(&file, format!("brokers={}\n", cluster.bootstrap_servers())).unwrap();
+    let mut configuration = KafkaClusterConfig::new(format!("${{file:{}:brokers}}", file.display()));
+    configuration.properties_map.extend([
+        ("config.providers".into(), "file".into()),
+        ("config.providers.file.class".into(), "org.apache.kafka.common.config.provider.FileConfigProvider".into()),
+        ("config.providers.file.param.allowed.paths".into(), directory.path().to_str().unwrap().into()),
+    ]);
+    let memory = MemoryBudget::new(64 << 20);
+    let mut options = KafkaLogOptions::new("provider-log");
+    options.auto_create_topic = false;
+    let opened = KafkaLog::open(&configuration, options, Arc::new(Warnings::default()), Arc::clone(&memory)).await.unwrap();
+    let cancellation = CancellationToken::new();
+    let driver = tokio::spawn(opened.driver.unwrap().run(cancellation.clone()));
+    let written = opened.log.enqueue(Bytes::from_static(b"configured"), Timestamp(0)).await.unwrap().durable().await.unwrap();
+    let tail = opened.log.tail(LogOffset(-1)).await.unwrap();
+    assert_eq!(written.offset, LogOffset(0));
+    let before_releasing_log = memory.used_bytes();
+    drop(opened.log);
+    assert!(memory.used_bytes() < before_releasing_log);
+    assert!(memory.used_bytes() > 0);
+    drop(tail);
+    assert!(memory.used_bytes() > 0);
+    cancellation.cancel();
+    driver.await.unwrap().unwrap();
+    assert_eq!(memory.used_bytes(), 0);
+}
+
 #[tokio::test]
 async fn log_tls_admission_fails_before_broker_setup_and_releases_failed_material() {
     let mut configuration = KafkaClusterConfig::new("unused.invalid:9092");

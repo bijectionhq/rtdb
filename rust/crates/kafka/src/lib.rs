@@ -1,6 +1,7 @@
 mod config;
 mod client;
 mod driver;
+mod log_configuration;
 mod tail;
 mod tls;
 pub mod connect;
@@ -14,10 +15,11 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rtdb_columnar::MemoryBudget;
 use rdkafka::{ClientConfig, Message, admin::{AdminClient, AdminOptions, NewTopic, ResourceSpecifier, TopicReplication}, client::DefaultClientContext,
-    consumer::{BaseConsumer, Consumer}, error::{KafkaError, RDKafkaErrorCode}, message::BorrowedMessage, producer::BaseProducer};
+    consumer::{BaseConsumer, Consumer}, error::{KafkaError, RDKafkaErrorCode}, message::BorrowedMessage};
 use rtdb_storage::{Error, Result as StorageResult, log::{AppendReceipt, Log, LogMetadata, LogOffset, LogRecord, LogTail}};
 use rtdb_types::{Anomaly, Result, Timestamp};
 use tokio::sync::{Semaphore, mpsc, oneshot};
+use log_configuration::{ConfiguredLogClient, LogConfiguration, PreparedLogClient, Role};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KafkaWarning {
@@ -42,7 +44,7 @@ enum Access {
     Writable { queue: mpsc::Sender<driver::Queued>, bytes: Arc<Semaphore>, records: Arc<Semaphore> },
 }
 
-pub struct KafkaLog { configuration: ClientConfig, options: KafkaLogOptions, progress: Arc<Progress>, access: Access }
+pub struct KafkaLog { configuration: LogConfiguration, options: KafkaLogOptions, progress: Arc<Progress>, access: Access }
 pub struct OpenedKafkaLog { pub log: Arc<KafkaLog>, pub driver: Option<KafkaLogDriver> }
 
 impl KafkaLog {
@@ -50,14 +52,18 @@ impl KafkaLog {
     /// TLS material is admitted against `memory` and remains charged until the last derived native client is destroyed.
     pub async fn open(cluster: &KafkaClusterConfig, options: KafkaLogOptions, observer: Arc<dyn KafkaObserver>, memory: Arc<MemoryBudget>) -> Result<OpenedKafkaLog> {
         options.validate()?;
-        let configuration = client::prepare(&cluster.properties()?, &memory)?;
-        if configuration.get("transactional.id").is_some() { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
-        ensure_topic(&configuration, &options, observer.as_ref()).await?;
+        let configuration = LogConfiguration::from_cluster(cluster.properties()?, memory)?;
+        let admin_config = configuration.prepare(Role::Admin)?;
+        if admin_config.configuration.get("transactional.id").is_some() { return Err(Anomaly::incorrect("xtdb.kafka/invalid-config", "XTDB logs do not open Kafka producer transactions")); }
+        ensure_topic(admin_config, &options, observer.as_ref()).await?;
         let consumer = consumer(&configuration, &options).map_err(Anomaly::from)?;
         let (_, end) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
         let progress = Arc::new(Progress::new(end - 1));
         let (access, driver) = if options.read_only { (Access::ReadOnly, None) } else {
-            let producer: BaseProducer<driver::DeliveryContext> = producer_config(&configuration, &options, observer.as_ref()).create_with_context(driver::DeliveryContext { progress: Arc::clone(&progress), topic: options.topic.clone() })
+            if let Some(configured) = configuration.overridden_acks() { observer.warning(KafkaWarning::AcknowledgementsOverridden { configured: configured.into() }); }
+            let producer = configuration.prepare(Role::Producer)?.open(|configuration| {
+                producer_config(&configuration, &options, observer.as_ref()).create_with_context(driver::DeliveryContext { progress: Arc::clone(&progress), topic: options.topic.clone() })
+            })
                 .map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
             let (queue, receiver) = mpsc::channel(options.queue_capacity);
             let bytes = Arc::new(Semaphore::new(options.queued_bytes));
@@ -90,15 +96,17 @@ fn producer_config(configuration: &ClientConfig, options: &KafkaLogOptions, obse
     result
 }
 
-fn consumer(configuration: &ClientConfig, options: &KafkaLogOptions) -> StorageResult<BaseConsumer> {
-    let mut config = configuration.clone();
-    config.set("group.id", "rtdb-explicit-assignment").set("enable.auto.commit", "false").set("enable.auto.offset.store", "false")
-        .set("allow.auto.create.topics", "false")
-        .set("isolation.level", "read_committed").set("auto.offset.reset", "error").set("enable.partition.eof", "true")
-        .set("queued.max.messages.kbytes", options.maximum_poll_bytes.div_ceil(1024).to_string())
-        .set("fetch.message.max.bytes", options.maximum_message_bytes.saturating_add(1024).to_string())
-        .set("receive.message.max.bytes", options.maximum_poll_bytes.saturating_add(1024 * 1024).to_string());
-    config.create().map_err(|error| transport_error(&options.topic, error))
+fn consumer(configuration: &LogConfiguration, options: &KafkaLogOptions) -> StorageResult<ConfiguredLogClient<Arc<BaseConsumer>>> {
+    let prepared = configuration.prepare(Role::Consumer).map_err(|error| Error::Remote { key: options.topic.clone(), message: error.to_string() })?;
+    prepared.open(|mut config| {
+        config.set("group.id", "rtdb-explicit-assignment").set("enable.auto.commit", "false").set("enable.auto.offset.store", "false")
+            .set("allow.auto.create.topics", "false")
+            .set("isolation.level", "read_committed").set("auto.offset.reset", "error").set("enable.partition.eof", "true")
+            .set("queued.max.messages.kbytes", options.maximum_poll_bytes.div_ceil(1024).to_string())
+            .set("fetch.message.max.bytes", options.maximum_message_bytes.saturating_add(1024).to_string())
+            .set("receive.message.max.bytes", options.maximum_poll_bytes.saturating_add(1024 * 1024).to_string());
+        config.create::<BaseConsumer>().map(Arc::new)
+    }).map_err(|error| transport_error(&options.topic, error))
 }
 
 fn transport_error(topic: &str, error: KafkaError) -> Error {
@@ -115,10 +123,11 @@ fn metadata(message: &BorrowedMessage<'_>, topic: &str) -> StorageResult<LogMeta
     Ok(LogMetadata { offset: LogOffset(message.offset()), timestamp: Timestamp(millis.checked_mul(1000).ok_or_else(|| Error::Remote { key: topic.into(), message: "Kafka timestamp exceeds microsecond range".into() })?) })
 }
 
-async fn ensure_topic(configuration: &ClientConfig, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> Result<()> {
-    let mut admin_config = configuration.clone();
-    admin_config.set("allow.auto.create.topics", "false");
-    let admin: AdminClient<DefaultClientContext> = admin_config.create().map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
+async fn ensure_topic(configuration: PreparedLogClient, options: &KafkaLogOptions, observer: &dyn KafkaObserver) -> Result<()> {
+    let admin = configuration.open(|mut config| {
+        config.set("allow.auto.create.topics", "false");
+        config.create::<AdminClient<DefaultClientContext>>()
+    }).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
     let mut metadata = admin.inner().fetch_metadata(Some(&options.topic), options.request_timeout).map_err(|error| Anomaly::from(transport_error(&options.topic, error)))?;
     let missing = metadata.topics().iter().find(|topic| topic.name() == options.topic).is_none_or(|topic| topic.error().is_some_and(|error| RDKafkaErrorCode::from(error) == RDKafkaErrorCode::UnknownTopicOrPartition));
     let admin_options = AdminOptions::new().request_timeout(Some(options.request_timeout)).operation_timeout(Some(options.request_timeout));

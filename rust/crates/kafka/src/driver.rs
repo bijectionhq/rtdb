@@ -5,7 +5,7 @@ use rdkafka::{ClientContext, error::{KafkaError, RDKafkaErrorCode}, producer::{B
 use rtdb_storage::{Error, Result, log::LogMetadata};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use crate::{KafkaLogOptions, Progress, metadata, transport_error};
+use crate::{ConfiguredLogClient, KafkaLogOptions, Progress, metadata, transport_error};
 
 pub(crate) struct Delivery { pub reply: oneshot::Sender<Result<LogMetadata>>, pub _bytes: OwnedSemaphorePermit, pub _record: OwnedSemaphorePermit }
 pub(crate) struct Queued { pub payload: Bytes, pub accepted: oneshot::Sender<Result<()>>, pub completion: Box<Delivery> }
@@ -20,10 +20,10 @@ impl ProducerContext for DeliveryContext {
     }
 }
 
-pub struct KafkaLogDriver { producer: BaseProducer<DeliveryContext>, queue: mpsc::Receiver<Queued>, progress: Arc<Progress>, options: KafkaLogOptions, bytes: Arc<Semaphore>, records: Arc<Semaphore> }
+pub struct KafkaLogDriver { producer: ConfiguredLogClient<BaseProducer<DeliveryContext>>, queue: mpsc::Receiver<Queued>, progress: Arc<Progress>, options: KafkaLogOptions, bytes: Arc<Semaphore>, records: Arc<Semaphore> }
 
 impl KafkaLogDriver {
-    pub(crate) fn new(producer: BaseProducer<DeliveryContext>, queue: mpsc::Receiver<Queued>, progress: Arc<Progress>, options: KafkaLogOptions, bytes: Arc<Semaphore>, records: Arc<Semaphore>) -> Self { Self { producer, queue, progress, options, bytes, records } }
+    pub(crate) fn new(producer: ConfiguredLogClient<BaseProducer<DeliveryContext>>, queue: mpsc::Receiver<Queued>, progress: Arc<Progress>, options: KafkaLogOptions, bytes: Arc<Semaphore>, records: Arc<Semaphore>) -> Self { Self { producer, queue, progress, options, bytes, records } }
 
     /// Shutdown rejects queued records and drains broker acknowledgements before returning.
     /// A delivery failure after submission can have an unknown broker outcome and must be reconciled by the replication protocol.

@@ -4,13 +4,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use rdkafka::{Message, Offset, TopicPartitionList, consumer::{BaseConsumer, Consumer}, error::KafkaError, message::RetainedConsumerMessage};
 use rtdb_storage::{Error, Result, log::{LogOffset, LogRecord, LogReplayTail, LogTail, ReplayHead}, object_store::ReadReservation};
-use crate::{KafkaLogOptions, Progress, metadata, transport_error};
+use crate::{ConfiguredLogClient, KafkaLogOptions, Progress, metadata, transport_error};
 
 const DELIVERY_OVERHEAD_BYTES: usize = 256;
 
 pub(crate) struct KafkaTail {
-    consumer: Arc<BaseConsumer>,
     pending: Option<RetainedConsumerMessage>,
+    consumer: ConfiguredLogClient<Arc<BaseConsumer>>,
     options: KafkaLogOptions,
     progress: Arc<Progress>,
     next: i64,
@@ -32,7 +32,7 @@ impl rtdb_storage::log::LogRange for KafkaRange {
 }
 
 impl KafkaTail {
-    pub fn new(consumer: BaseConsumer, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset) -> Result<Self> {
+    pub fn new(consumer: ConfiguredLogClient<Arc<BaseConsumer>>, options: KafkaLogOptions, progress: Arc<Progress>, after: LogOffset) -> Result<Self> {
         progress.check()?;
         let next = after.0.checked_add(1).filter(|next| *next >= 0).ok_or_else(|| Error::UnavailableLogRange { requested: after.0, first_retained: 0 })?;
         let (low, high) = consumer.fetch_watermarks(&options.topic, 0, options.request_timeout).map_err(|error| transport_error(&options.topic, error))?;
@@ -41,7 +41,7 @@ impl KafkaTail {
         assignment.add_partition_offset(&options.topic, 0, Offset::Offset(next)).map_err(|error| transport_error(&options.topic, error))?;
         consumer.assign(&assignment).map_err(|error| transport_error(&options.topic, error))?;
         progress.advance(high - 1);
-        Ok(Self { consumer: Arc::new(consumer), pending: None, options, progress, next })
+        Ok(Self { consumer, pending: None, options, progress, next })
     }
 
     pub fn next_offset(&self) -> i64 { self.next }
@@ -56,7 +56,7 @@ impl KafkaTail {
 
     fn available_head(&mut self) -> Result<Option<ReplayHead>> {
         if self.pending.is_none() {
-            match RetainedConsumerMessage::poll_from(&self.consumer, Duration::ZERO) {
+            match RetainedConsumerMessage::poll_from(&*self.consumer, Duration::ZERO) {
                 Some(Ok(message)) => self.pending = Some(message),
                 Some(Err(KafkaError::PartitionEOF(_))) | None => return Ok(None),
                 Some(Err(error)) => return Err(transport_error(&self.options.topic, error)),
