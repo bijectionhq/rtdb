@@ -19,3 +19,10 @@ A policy can parse a record field's actual type member independently with record
 Textual uses then pass through ordinary named-reference lookup even when the name is enum, fixed, array or map, and field-level logicalType does not change the child schema.
 The surrounding field keeps its existing defaults, aliases, order and custom-attribute filtering; logicalType remains excluded from native field custom attributes.
 Three additional source regressions cover nominal keyword names, flat versus nested logical metadata and a missing type member, with default-policy controls.
+
+A policy can enable parse_references_in_input_order to consume and parse each reference before requesting the next.
+On that route only preceding declarations and the current record's resolving name are available; later document bodies are never preloaded into input_schemas.
+The default continues preloading all referenced documents and resolving forward dependencies.
+The existing input_order vector retains duplicate-root checks and output order; a repeated root is rejected when encountered after earlier documents have parsed.
+Each document starts with no inherited namespace, and the root parses after all referenced documents.
+Three additional source regressions cover a small declared dependency sequence with nominal self recursion and default control, forward rejection, demand/iterator failure order, duplicate roots and namespace restoration.

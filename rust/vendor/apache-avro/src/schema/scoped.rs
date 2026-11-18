@@ -43,6 +43,13 @@ pub trait SchemaNamePolicy {
         false
     }
 
+    /// Parses each referenced document before consuming the next when enabled.
+    /// Only preceding declarations and the current declaration's recursive references are available.
+    /// The default preloads referenced documents and permits forward dependencies.
+    fn parse_references_in_input_order(&self) -> bool {
+        false
+    }
+
     /// Validates one enum symbol before duplicate and default checks.
     fn enum_symbol(&self, symbol: &str) -> AvroResult<()>;
 
@@ -56,11 +63,12 @@ pub trait SchemaNamePolicy {
 
 impl Schema {
     /// Parses the JSON root `schema` and named JSON definitions from `schemata` using one borrowed name policy.
-    /// Referenced record, enum, and fixed definitions may depend on each other and on themselves.
+    /// Referenced record, enum, and fixed definitions may depend on each other and on themselves by default.
+    /// With [`SchemaNamePolicy::parse_references_in_input_order`], a document can use preceding declarations and its own recursive name, but cannot resolve a later document.
     /// As in ordinary parsing, aliases of unparsed external definitions are not preindexed.
     /// Object-valued `type` wrappers use the effective inner declaration, as in ordinary schema parsing.
     /// Returns a tuple of the parsed root and referenced schemas in their input iterator order.
-    /// Duplicate policy-resolved names among referenced inputs return `Details::NameCollision`.
+    /// Duplicate policy-resolved names among referenced inputs return `Details::NameCollision` before parsing in the default mode, or when the duplicate is encountered in input-order mode.
     ///
     /// Every dynamic declaration, type alias, reference, field, and enum symbol uses the policy.
     /// The library parser does not read or register global validators on this route; the supplied policy controls its own calls.
@@ -81,16 +89,27 @@ impl Schema {
             input_order: Vec::with_capacity(count),
             parsed_schemas: HashMap::with_capacity(count),
         };
+        let input_order = policy.parse_references_in_input_order();
         for json in schemata {
             let schema: Value = serde_json::from_str(json.as_ref()).map_err(Details::ParseSchemaJson)?;
             let Value::Object(inner) = &schema else {
                 return Err(Details::GetNameField.into());
             };
             let name = parser.parse_name(inner, &None)?;
-            if parser.input_schemas.insert(name.clone(), schema).is_some() {
-                return Err(Details::NameCollision(name.fullname(None)).into());
+            if input_order {
+                if parser.input_order.contains(&name) {
+                    return Err(Details::NameCollision(name.fullname(None)).into());
+                }
+                let parsed = parser.parse(&schema, &None)?;
+                let name = parser.schema_type_name(name, schema, &parsed)?;
+                parser.parsed_schemas.insert(name.clone(), parsed);
+                parser.input_order.push(name);
+            } else {
+                if parser.input_schemas.insert(name.clone(), schema).is_some() {
+                    return Err(Details::NameCollision(name.fullname(None)).into());
+                }
+                parser.input_order.push(name);
             }
-            parser.input_order.push(name);
         }
         parser.parse_input_schemas()?;
         let value = serde_json::from_str(schema).map_err(Details::ParseSchemaJson)?;

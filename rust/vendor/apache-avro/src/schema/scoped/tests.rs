@@ -488,3 +488,82 @@ fn scoped_separate_field_types_require_the_actual_type_member() {
     let error = Schema::parse_str_with_list_with_name_policy(root, Vec::<&str>::new(), &SeparateFieldTypes).unwrap_err();
     assert!(matches!(error.details(), Details::GetComplexTypeField));
 }
+
+struct InputOrderReferences;
+impl SchemaNamePolicy for InputOrderReferences {
+    fn name(&self, name: &str, namespace: &Namespace) -> AvroResult<Name> {
+        SeparateFieldTypes.name(name, namespace)
+    }
+    fn record_field(&self, name: &str) -> AvroResult<()> {
+        SeparateFieldTypes.record_field(name)
+    }
+    fn enum_symbol(&self, symbol: &str) -> AvroResult<()> {
+        SeparateFieldTypes.enum_symbol(symbol)
+    }
+    fn reference_fallback(&self, name: &str, namespace: &Namespace) -> AvroResult<Option<Name>> {
+        SeparateFieldTypes.reference_fallback(name, namespace)
+    }
+    fn named_aliases_are_references(&self) -> bool { false }
+    fn logical_fixed_references_are_named(&self) -> bool { true }
+    fn record_field_type_is_separate(&self) -> bool { true }
+    fn parse_references_in_input_order(&self) -> bool { true }
+}
+
+#[test]
+fn scoped_input_order_references_use_prior_declarations_and_nominal_self_references() {
+    let references = [
+        r#"{"type":"fixed","name":"ns.Base","size":1}"#,
+        r#"{"type":"record","name":"Global","fields":[{"name":"base","type":"ns.Base"}]}"#,
+        r#"{"type":"record","name":"ns.Last","fields":[{"name":"prior","type":"Global"},{"name":"next","type":["null","Last"]}]}"#,
+    ];
+    let (root, definitions) = Schema::parse_str_with_list_with_name_policy("\"ns.Last\"", references, &InputOrderReferences).unwrap();
+    assert!(matches!(root, Schema::Ref { name } if name.fullname(None) == "ns.Last"));
+    assert_eq!(definitions.iter().map(|schema| schema.name().unwrap().fullname(None)).collect::<Vec<_>>(), ["ns.Base", "Global", "ns.Last"]);
+    let Schema::Record(global) = &definitions[1] else { panic!("expected global record") };
+    assert!(matches!(&global.fields[0].schema, Schema::Ref { name } if name.fullname(None) == "ns.Base"));
+    let Schema::Record(last) = &definitions[2] else { panic!("expected last record") };
+    assert!(matches!(&last.fields[0].schema, Schema::Ref { name } if name.fullname(None) == "Global"));
+    let Schema::Union(next) = &last.fields[1].schema else { panic!("expected recursive union") };
+    assert!(matches!(&next.variants()[1], Schema::Ref { name } if name == &last.name));
+    let (_, ordinary) = Schema::parse_str_with_list_with_name_policy("\"ns.Last\"", references, &SeparateFieldTypes).unwrap();
+    assert_eq!(ordinary.iter().map(|schema| schema.name().unwrap().fullname(None)).collect::<Vec<_>>(), ["ns.Base", "Global", "ns.Last"]);
+    let reversed = references.into_iter().rev();
+    assert!(Schema::parse_str_with_list_with_name_policy("\"ns.Last\"", reversed, &InputOrderReferences).is_err());
+    assert!(Schema::parse_str_with_list_with_name_policy("\"ns.Last\"", references.into_iter().rev(), &SeparateFieldTypes).is_ok());
+    assert!(!SeparateFieldTypes.parse_references_in_input_order());
+}
+
+#[test]
+fn scoped_input_order_errors_before_consuming_a_later_document() {
+    let references = [
+        r#"{"type":"record","name":"First","fields":[{"name":"missing","type":"Missing"}]}"#,
+        "invalid JSON",
+    ];
+    let consumed = std::cell::Cell::new(0);
+    let input = references.into_iter().inspect(|_| consumed.set(consumed.get() + 1));
+    let error = Schema::parse_str_with_list_with_name_policy("\"int\"", input, &InputOrderReferences).unwrap_err();
+    assert_eq!(consumed.get(), 1);
+    assert!(matches!(error.details(), Details::ParsePrimitive(name) if name == "Missing"));
+    let consumed = std::cell::Cell::new(0);
+    let input = references.into_iter().inspect(|_| consumed.set(consumed.get() + 1));
+    let error = Schema::parse_str_with_list_with_name_policy("\"int\"", input, &SeparateFieldTypes).unwrap_err();
+    assert_eq!(consumed.get(), 2);
+    assert!(matches!(error.details(), Details::ParseSchemaJson(_)));
+}
+
+#[test]
+fn scoped_input_order_preserves_duplicate_root_checks_and_document_namespaces() {
+    let duplicate = [r#"{"type":"fixed","name":"ns.A","size":1}"#, r#"{"type":"fixed","name":"ns.A","size":2}"#];
+    let error = Schema::parse_str_with_list_with_name_policy("\"ns.A\"", duplicate, &InputOrderReferences).unwrap_err();
+    assert!(matches!(error.details(), Details::NameCollision(name) if name == "ns.A"));
+    let error = Schema::parse_str_with_list_with_name_policy("\"ns.A\"", duplicate, &SeparateFieldTypes).unwrap_err();
+    assert!(matches!(error.details(), Details::NameCollision(name) if name == "ns.A"));
+    let distinct = [r#"{"type":"fixed","name":"ns.A","size":1}"#, r#"{"type":"fixed","name":"A","size":2}"#];
+    let (root, definitions) = Schema::parse_str_with_list_with_name_policy(r#"["ns.A","A"]"#, distinct, &InputOrderReferences).unwrap();
+    assert_eq!(definitions.iter().map(|schema| schema.name().unwrap().fullname(None)).collect::<Vec<_>>(), ["ns.A", "A"]);
+    assert!(matches!(&definitions[0], Schema::Fixed(value) if value.size == 1));
+    assert!(matches!(&definitions[1], Schema::Fixed(value) if value.size == 2));
+    let Schema::Union(root) = root else { panic!("expected union") };
+    assert!(matches!(&root.variants()[0], Schema::Ref { name } if name.fullname(None) == "ns.A"));
+    assert!(matches!(&root.variants()[1], Schema::Ref { name } if name.fullname(None) == "A"));
+}
