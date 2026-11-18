@@ -25,9 +25,19 @@ pub(crate) struct PendingWrite {
 }
 impl PendingWrite {
     pub fn new(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
-        let extra = match &body { WriteBody::Resolved(_) => 1024, WriteBody::Message(body) =>
-            body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192)).ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))? };
-        Ok(Arc::new(Self { body, block, sequence: AtomicI64::new(-1), completion: Mutex::new(completion), _reservation: memory.reserve(extra)? }))
+        let extra = match &body { WriteBody::Resolved(_) => 1024, WriteBody::Message(body) => Self::message_bound(body)? };
+        Ok(Self::reserved(body, block, completion, memory.reserve(extra)?))
+    }
+    pub fn clone_message(body: &ReplicaBody, block: BlockIndex, memory: &Arc<MemoryBudget>) -> Result<Arc<Self>> {
+        let reservation = memory.reserve(Self::message_bound(body)?)?;
+        Ok(Self::reserved(WriteBody::Message(body.clone()), block, None, reservation))
+    }
+    fn message_bound(body: &ReplicaBody) -> Result<usize> {
+        body.encoded_len().checked_mul(4).and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| Anomaly::fault("rtdb.replication/payload-size", "Pending message allocation size overflow"))
+    }
+    fn reserved(body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, reservation: Arc<MemoryReservation>) -> Arc<Self> {
+        Arc::new(Self { body, block, sequence: AtomicI64::new(-1), completion: Mutex::new(completion), _reservation: reservation })
     }
     pub fn sequence(&self) -> Option<TermSequence> { let value = self.sequence.load(Ordering::Acquire); (value >= 0).then_some(TermSequence(value)) }
     pub fn finish(&self, result: Result<Applied>) { if let Some(completion) = self.completion.lock().take() { let _ = completion.send(result); } }
@@ -58,20 +68,21 @@ impl ReplicaAppender {
         let (sender, queue) = mpsc::unbounded_channel();
         (AppenderHandle { sender }, Self { logs, memory, term, sequence: TermSequence(1), queue, assertion_interval, cancellation })
     }
-    pub async fn run(mut self) -> Result<()> {
+    pub async fn run(mut self, mut first: Option<Arc<PendingWrite>>) -> Result<()> {
         let mut timer = tokio::time::interval(self.assertion_interval);
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         timer.tick().await;
         let mut receipts: futures::stream::FuturesUnordered<futures::future::BoxFuture<'static, Result<()>>> = futures::stream::FuturesUnordered::new();
         use futures::StreamExt;
         let outcome = loop {
+            let start_with_confirmation = first.is_some();
             tokio::select! {
                 biased;
                 _ = self.cancellation.cancelled() => break Ok(()),
                 receipt = receipts.next(), if !receipts.is_empty() => {
                     if let Some(Err(error)) = receipt { break Err(error); }
                 },
-                _ = timer.tick() => {
+                _ = timer.tick(), if !start_with_confirmation => {
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
                     let envelope = ReplicaEnvelope { term: self.term, term_sequence: Some(sequence), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
@@ -81,7 +92,12 @@ impl ReplicaAppender {
                         Err(error) => break Err(error),
                     }
                 }
-                request = self.queue.recv() => {
+                request = async {
+                    match first.take() {
+                        Some(write) => Some(AppendRequest { write, durable: None }),
+                        None => self.queue.recv().await,
+                    }
+                } => {
                     let Some(request) = request else { break Ok(()); };
                     let sequence = self.sequence;
                     self.sequence = match sequence.next() { Ok(next) => next, Err(error) => break Err(error) };
@@ -183,14 +199,14 @@ mod tests {
         let (sender, receiver) = oneshot::channel();
         let write = PendingWrite::new(WriteBody::Message(ReplicaBody::NoOp(proto::NoOp { src_msg_id: Some(1) })), BlockIndex(0), Some(sender), &memory).unwrap();
         handle.enqueue(write).unwrap();
-        let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
+        let error = tokio::time::timeout(Duration::from_secs(1), appender.run(None)).await.unwrap().unwrap_err();
         assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
         assert!(receiver.await.unwrap().unwrap_err().message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
     }
     #[tokio::test]
     async fn heartbeat_receipt_failure_stops_pump_without_waiting_for_readback() {
         let (_handle, appender, _) = pump(Duration::from_millis(1));
-        let error = tokio::time::timeout(Duration::from_secs(1), appender.run()).await.unwrap().unwrap_err();
+        let error = tokio::time::timeout(Duration::from_secs(1), appender.run(None)).await.unwrap().unwrap_err();
         assert!(error.message.as_deref().is_some_and(|message| message.contains("provider rejected durability")));
     }
 

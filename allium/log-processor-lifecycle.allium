@@ -460,6 +460,10 @@ rule DiscardInVoidedTerm {
 -- Rules: adjudicate a claim
 --
 -- A claim is read back like any other record, so by the time it is judged it has already been applied.
+-- The activation steps in ClaimConferredLeadership describe a promotion whose recovered-checkpoint obligation has been satisfied.
+-- When a persisted checkpoint still requires confirmation, the node remains publicly following while the elected term performs the recovery append.
+-- The replica reader retains that obligation across terms until it admits the matching upload.
+-- It admits the upload before starting any later pending block and preserves the observation if that later promotion step fails.
 ------------------------------------------------------------
 
 rule ClaimConferredLeadership {

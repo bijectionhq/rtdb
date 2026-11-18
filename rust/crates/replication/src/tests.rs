@@ -381,6 +381,392 @@ async fn source_transaction_reads_back_applies_flushes_and_recovers() {
     assert_eq!(recovered.partition.value().table_catalog().metadata(&TableRef::new("public", "docs")).unwrap().row_count, 1);
 }
 
+async fn local_recovery_driver(
+    source: Arc<dyn Log>, replica: Arc<dyn Log>, store: Arc<MemoryStore>, may_lead: bool, assertion_interval: Duration,
+) -> (ReplicationHandle, ReplicationDriver) {
+    let memory = MemoryBudget::new(1 << 28);
+    let cache = Arc::new(BufferPool::new(store.clone(), 1 << 25));
+    let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), Arc::clone(&memory), 100_000_000).unwrap();
+    let recovered = blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    let progress = ProgressMonitor::new(recovered.progress.clone());
+    let logs = PartitionLogs::new(source, replica, StorageEpoch(0), StorageEpoch(0), CURRENT_STORAGE_VERSION, StorageEpoch(0),
+        store, Arc::clone(&cache), Arc::clone(&memory)).unwrap();
+    let resolve = Arc::new(ResolveContext { database: "xtdb".into(), storage: cache, memory, query_options: Default::default(),
+        cancellation: CancellationToken::new(), default_tz: "UTC".into(), authorization: Arc::new(AllowRoles),
+        execution_observer: None, tracer: None });
+    ReplicationDriver::new(ReplicationConfig { may_lead, assertion_interval, ..Default::default() },
+        logs, blocks, recovered, progress, resolve, Arc::new(NoEffects), CancellationToken::new()).unwrap()
+}
+
+async fn next_local_record(tail: &mut dyn rtdb_storage::log::LogTail) -> LogRecord {
+    let mut records = tail.poll(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(records.len(), 1);
+    records.pop().unwrap()
+}
+
+async fn submit_recovery_row(handle: &ReplicationHandle, memory: &Arc<MemoryBudget>, id: i64, time: i64) -> SourcePosition {
+    let documents = Documents::new(vec![BTreeMap::from([("_id".into(), Value::I64(id))])], memory).unwrap();
+    let tx = SourceTransaction::new(vec![TxOp::PutDocs {
+        table: TableRef::new("public", "docs"), documents, valid_from: Some(Timestamp(0)), valid_to: None,
+    }], SubmitOptions::default(), memory).unwrap();
+    handle.submit_source_encoded(tx.encode().unwrap().into_bytes(), Timestamp(time)).await.unwrap()
+}
+
+#[tokio::test]
+async fn native_local_restart_confirms_the_recovered_block_before_a_newer_pending_block() {
+    for legacy_suffix in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("LOG");
+        let replica_path = directory.path().join("REPLICA_LOG");
+        let options = || LocalLogOptions { maximum_message_bytes: 1 << 20, queue_capacity: 8 };
+        let (source, source_driver) = LocalLog::open(&source_path, options()).unwrap();
+        let (replica, replica_driver) = LocalLog::open(&replica_path, options()).unwrap();
+        let writers = CancellationToken::new();
+        let source_writer = tokio::spawn(source_driver.run(writers.clone()));
+        let replica_writer = tokio::spawn(replica_driver.run(writers.clone()));
+        let store = Arc::new(MemoryStore::default());
+        let read_only_source = ReadOnlyLocalLog::open(&source_path, ReadOnlyLocalLogOptions::default()).unwrap();
+        let read_only_replica = ReadOnlyLocalLog::open(&replica_path, ReadOnlyLocalLogOptions::default()).unwrap();
+        let interval = Duration::from_secs(3600);
+        let (follower_handle, follower) = local_recovery_driver(read_only_source, read_only_replica, Arc::clone(&store), false, interval).await;
+        let follower_partition = Arc::clone(&follower.partition);
+        let follower_task = tokio::spawn(follower.run());
+        let (old_handle, mut old) = local_recovery_driver(source.clone(), replica.clone(), Arc::clone(&store), true, interval).await;
+        let mut old_tail = old.logs.replica_tail(old.read_position).await.unwrap();
+
+        old.start_claim().unwrap();
+        let result = super::pending_claim(&mut old.claiming).await;
+        old.claim_finished(result).await.unwrap();
+        old.consume(next_local_record(old_tail.as_mut()).await).await.unwrap();
+        assert_eq!(old.role(), Role::Leading(Term(1)));
+
+        let first = submit_recovery_row(&old_handle, &old.resolve.memory, 1, 100).await;
+        let mut source_tail = old.logs.source_tail(SourcePosition(-1)).await.unwrap();
+        let source_record = next_local_record(source_tail.as_mut()).await;
+        old.leader.as_mut().unwrap().source_batch.push_back(source_record);
+        old.resolve_next_source().await.unwrap();
+        let (resolver, result) = super::pending_resolution(&mut old.leader.as_mut().unwrap().resolution).await;
+        old.resolution_finished(resolver, result).await.unwrap();
+        old.consume(next_local_record(old_tail.as_mut()).await).await.unwrap();
+
+        old.cut().await.unwrap();
+        let boundary_record = next_local_record(old_tail.as_mut()).await;
+        let boundary_offset = boundary_record.metadata.offset;
+        old.consume(boundary_record).await.unwrap();
+        let mut production = old.leader.as_mut().unwrap().production.take();
+        let super::ProductionResult::Written(Ok(produced)) = super::pending_production(&mut production).await else {
+            panic!("expected the catalog to be persisted before the upload append");
+        };
+        drop(production);
+        assert_eq!(replica.latest().unwrap(), boundary_offset);
+        assert_eq!(produced.catalog.latest_source_position(), Some(first));
+        let expected_tries: Vec<_> = produced.tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect();
+        assert!(!expected_tries.is_empty());
+        old.demote().await.unwrap();
+        let mut follower_status = follower_handle.watch_status();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while follower_status.borrow_and_update().replica_position.0 < boundary_offset.0 { follower_status.changed().await.unwrap(); }
+        }).await.unwrap();
+        assert!(follower_handle.status().adopted_block.is_none());
+
+        let after = if legacy_suffix {
+            let legacy = submit_recovery_row(&old_handle, &old.resolve.memory, 10, 200).await;
+            for (seq, message) in [
+                (0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })),
+                (1, ReplicaBody::ResolvedTx(proto::ResolvedTx {
+                    tx_id: Some(legacy.0), system_time_micros: Some(200), committed: Some(true),
+                    src_msg_id: Some(legacy.0), ..Default::default()
+                })),
+                (2, boundary(1, legacy.0)),
+            ] {
+                old.logs.enqueue_replica(&ReplicaEnvelope { term: Term(2), term_sequence: Some(TermSequence(seq)), message }, BlockIndex(1), Timestamp(200))
+                    .await.unwrap().durable().await.unwrap();
+            }
+            replica.latest().unwrap()
+        } else { boundary_offset };
+        drop((old, old_handle, old_tail, source_tail));
+        writers.cancel();
+        source_writer.await.unwrap().unwrap();
+        replica_writer.await.unwrap().unwrap();
+        source.close_and_wait().await;
+        replica.close_and_wait().await;
+        drop((source, replica));
+
+        let (source, source_driver) = LocalLog::open(&source_path, options()).unwrap();
+        let (replica, replica_driver) = LocalLog::open(&replica_path, options()).unwrap();
+        let writers = CancellationToken::new();
+        let source_writer = tokio::spawn(source_driver.run(writers.clone()));
+        let replica_writer = tokio::spawn(replica_driver.run(writers.clone()));
+        let (restarted_handle, restarted) = local_recovery_driver(source.clone(), replica.clone(), store, true, Duration::from_millis(10)).await;
+        let second = submit_recovery_row(&restarted_handle, &restarted.resolve.memory, 2, 300).await;
+        let mut output = replica.tail(after).await.unwrap();
+        let restarted_task = tokio::spawn(restarted.run());
+        let cancellation = CancellationToken::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for handle in [&restarted_handle, &follower_handle] {
+                let tx = handle.await_tx(TxId(second.0), &cancellation).await.unwrap().unwrap();
+                assert!(tx.committed());
+                assert_eq!(tx.tx_key().tx_id, TxId(second.0));
+            }
+        }).await.unwrap();
+        let term = if legacy_suffix { Term(3) } else { Term(2) };
+        let applied = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut applied = Vec::new();
+            loop {
+                for record in output.poll(Duration::from_secs(1)).await.unwrap() {
+                    let envelope = ReplicaEnvelope::decode(&record.payload).unwrap().unwrap();
+                    assert_eq!(envelope.term, term);
+                    match envelope.message {
+                        ReplicaBody::NoOp(_) => (),
+                        ReplicaBody::BlockUploaded(upload) => {
+                            if upload.block_index == Some(0) {
+                                assert_eq!(envelope.term_sequence, Some(TermSequence(1)));
+                                assert_eq!(upload.latest_processed_msg_id, Some(first.0));
+                                assert_eq!(upload.tries, expected_tries);
+                            }
+                            applied.push((upload.block_index.unwrap(), None));
+                        }
+                        ReplicaBody::ResolvedTx(tx) if tx.tx_id == Some(second.0) => {
+                            assert_eq!(tx.committed, Some(true));
+                            applied.push((-1, tx.tx_id));
+                            return applied;
+                        }
+                        _ => panic!("unexpected replica record"),
+                    }
+                }
+            }
+        }).await.unwrap();
+        let mut expected = vec![(0, None)];
+        if legacy_suffix { expected.push((1, None)); }
+        expected.push((-1, Some(second.0)));
+        assert_eq!(applied, expected);
+        let follower_value = follower_partition.value();
+        let docs = TableRef::new("public", "docs");
+        assert_eq!(follower_value.table_catalog().metadata(&docs).unwrap().row_count, 1);
+        assert_eq!(follower_value.live().latest_completed_tx().unwrap().tx_id, TxId(second.0));
+        let live = &follower_value.live().tables()[&docs];
+        assert_eq!(live.row_count(), 1);
+        let rtdb_index::StoredOperation::Put(document) = live.row(0).unwrap().event().unwrap().operation else {
+            panic!("expected the follower to import the follow-on put");
+        };
+        assert_eq!(document.get("_id"), Some(&Value::I64(2)));
+
+        restarted_handle.shutdown();
+        follower_handle.shutdown();
+        restarted_task.await.unwrap().unwrap();
+        follower_task.await.unwrap().unwrap();
+        writers.cancel();
+        source_writer.await.unwrap().unwrap();
+        replica_writer.await.unwrap().unwrap();
+        source.close_and_wait().await;
+        replica.close_and_wait().await;
+    }
+}
+
+async fn produced_memory_checkpoint(sequenced: bool) -> Fixture {
+    let mut fixture = fixture(ReplicationConfig { may_lead: false, ..Default::default() }, 1 << 20).await;
+    for (seq, message) in [(0, ReplicaBody::NoOp(proto::NoOp { src_msg_id: None })), (1, boundary(0, -1))] {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: sequenced.then_some(TermSequence(seq)), message };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(0), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        fixture.driver.consume(raw_with_envelope(seq, &envelope)).await.unwrap();
+    }
+    let pending = fixture.driver.pending_block.as_ref().unwrap();
+    fixture.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    fixture
+}
+
+fn raw_with_envelope(position: i64, envelope: &ReplicaEnvelope) -> LogRecord {
+    LogRecord { metadata: LogMetadata { offset: LogOffset(position), timestamp: Timestamp(0) }, payload: envelope.encode().into() }
+}
+
+async fn reopen_memory_checkpoint(fixture: &Fixture) -> (ReplicationHandle, ReplicationDriver) {
+    reopen_memory_checkpoint_with_config(fixture, ReplicationConfig::default()).await
+}
+
+async fn reopen_memory_checkpoint_with_config(fixture: &Fixture, config: ReplicationConfig) -> (ReplicationHandle, ReplicationDriver) {
+    let recovered = fixture.blocks.recover(TrieConfig::default(), SourcePosition(-1), Timestamp(0)).await.unwrap();
+    assert!(recovered.confirmation(StorageEpoch(1), CURRENT_STORAGE_VERSION, StorageEpoch(0), &fixture.memory).unwrap().is_none());
+    let progress = ProgressMonitor::new(recovered.progress.clone());
+    ReplicationDriver::new(config, Arc::clone(&fixture.logs), Arc::clone(&fixture.blocks), recovered,
+        progress, Arc::clone(&fixture.driver.resolve), Arc::new(NoEffects), CancellationToken::new()).unwrap()
+}
+
+#[tokio::test]
+async fn a_recovered_checkpoint_uses_only_matching_admitted_confirmation_and_accepts_legacy_epoch_zero() {
+    for sequenced in [false, true] {
+        let fixture = produced_memory_checkpoint(sequenced).await;
+        let (handle, mut restarted) = reopen_memory_checkpoint(&fixture).await;
+        let before = restarted.partition.value();
+        let ReplicaBody::BlockUploaded(complete) = upload(0, -1) else { unreachable!(); };
+        let wrong = [
+            proto::BlockUploaded { storage_version: None, ..complete.clone() },
+            proto::BlockUploaded { storage_epoch: Some(2), ..complete.clone() },
+            proto::BlockUploaded { block_index: None, ..complete.clone() },
+            proto::BlockUploaded { latest_processed_msg_id: None, ..complete.clone() },
+            proto::BlockUploaded { external_source_token: Some(Vec::new()), ..complete.clone() },
+        ];
+        let matching = proto::BlockUploaded { storage_epoch: None, ..complete };
+        for (index, confirmation) in (2_i64..).zip(wrong.into_iter().chain([matching])) {
+            let envelope = ReplicaEnvelope {
+                term: Term(1), term_sequence: sequenced.then_some(TermSequence(index)), message: ReplicaBody::BlockUploaded(confirmation),
+            };
+            fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
+            let mut records = fixture.replica.read_range(LogOffset(index), LogOffset(index + 1)).await.unwrap();
+            restarted.consume(records.pop().unwrap()).await.unwrap();
+            assert_eq!(restarted.recovered_confirmation.is_some(), index < 7);
+        }
+        assert!(restarted.recovered_confirmation.is_none());
+        assert!(Arc::ptr_eq(&restarted.partition.value(), &before));
+        assert_eq!(handle.progress().current().source_position, SourcePosition(-1));
+        assert!(handle.progress().current().tx_key.is_none());
+
+        restarted.fence.admit(Term(2), Some(TermSequence(0))).unwrap();
+        restarted.promote().await.unwrap();
+        assert_eq!(restarted.role(), Role::Leading(Term(2)));
+        assert!(restarted.leader.as_ref().unwrap().recovery_write.is_none());
+        restarted.demote().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_recovered_checkpoint_reannounces_when_an_older_term_upload_was_fenced() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (_handle, mut restarted) = reopen_memory_checkpoint(&fixture).await;
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    for (index, term, sequence, message) in [(2, 2, 0, claim.clone()), (3, 1, 2, upload(0, -1)), (4, 3, 0, claim)] {
+        let envelope = ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        let mut records = fixture.replica.read_range(LogOffset(index), LogOffset(index + 1)).await.unwrap();
+        if index == 4 { restarted.claim = Some(rtdb_types::ReplicaPosition(index)); }
+        restarted.consume(records.pop().unwrap()).await.unwrap();
+        assert!(restarted.recovered_confirmation.is_some());
+    }
+    assert_eq!(restarted.role(), Role::Following);
+    assert!(!restarted.leader.as_ref().unwrap().accepting());
+    let mut tail = fixture.replica.tail(LogOffset(4)).await.unwrap();
+    let mut batch = tail.poll(Duration::from_secs(5)).await.unwrap();
+    let repair = batch.remove(0);
+    assert_eq!(ReplicaEnvelope::decode(&repair.payload).unwrap().unwrap().term_sequence, Some(TermSequence(1)));
+    restarted.consume(repair).await.unwrap();
+    assert!(restarted.recovered_confirmation.is_none());
+    assert_eq!(restarted.role(), Role::Leading(Term(3)));
+    restarted.demote().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_recovered_checkpoint_does_not_replace_missing_required_replica_records_with_a_claim() {
+    let fixture = produced_memory_checkpoint(true).await;
+    for sequence in [2, 3] {
+        let envelope = ReplicaEnvelope { term: Term(1), term_sequence: Some(TermSequence(sequence)), message: ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }) };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(1)).await.unwrap().durable().await.unwrap();
+    }
+    fixture.replica.truncate_before(LogOffset(3)).unwrap();
+    let (handle, restarted) = reopen_memory_checkpoint(&fixture).await;
+    let error = restarted.run().await.unwrap_err();
+    assert_eq!(error, Anomaly::from(rtdb_storage::Error::UnavailableLogRange { requested: 2, first_retained: 3 }));
+    assert_eq!(fixture.replica.latest().unwrap(), LogOffset(3));
+    assert_eq!(handle.status().replica_position, rtdb_types::ReplicaPosition(1));
+}
+
+async fn deliver_checkpoint_record(fixture: &Fixture, driver: &mut ReplicationDriver, term: i64, sequence: i64, message: ReplicaBody) -> Result<()> {
+    let envelope = ReplicaEnvelope { term: Term(term), term_sequence: Some(TermSequence(sequence)), message };
+    let position = fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap().position;
+    let mut records = fixture.replica.read_range(LogOffset(position.0), LogOffset(position.0 + 1)).await.unwrap();
+    driver.consume(records.pop().unwrap()).await
+}
+
+#[tokio::test]
+async fn an_installed_block_upload_bypasses_a_newer_full_pending_block() {
+    for may_lead in [false, true] {
+        let fixture = produced_memory_checkpoint(true).await;
+        let (handle, mut reader) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+            may_lead, pending_block_records: 1, ..Default::default()
+        }).await;
+        deliver_checkpoint_record(&fixture, &mut reader, 1, 2, upload(0, -1)).await.unwrap();
+        assert!(reader.recovered_confirmation.is_none());
+        deliver_checkpoint_record(&fixture, &mut reader, 1, 3, boundary(1, -1)).await.unwrap();
+        deliver_checkpoint_record(&fixture, &mut reader, 1, 4, resolved(1, 0)).await.unwrap();
+        assert_eq!(reader.pending_block.as_ref().unwrap().buffered_len(), 1);
+        deliver_checkpoint_record(&fixture, &mut reader, 1, 5, upload(0, -1)).await.unwrap();
+        assert_eq!(reader.read_position, rtdb_types::ReplicaPosition(5));
+        assert_eq!(reader.pending_block.as_ref().unwrap().block_index(), BlockIndex(1));
+        assert_eq!(reader.pending_block.as_ref().unwrap().buffered_len(), 1);
+        assert_eq!(handle.progress().current().source_position, SourcePosition(-1));
+        let ReplicaBody::BlockUploaded(mut other_storage) = upload(0, -1) else { unreachable!(); };
+        other_storage.storage_epoch = Some(1);
+        let error = deliver_checkpoint_record(&fixture, &mut reader, 1, 6, ReplicaBody::BlockUploaded(other_storage)).await.unwrap_err();
+        assert_eq!(error.code, "xtdb.indexer/follower-buffer-overflow");
+        assert_eq!(reader.read_position, rtdb_types::ReplicaPosition(5));
+    }
+}
+
+struct FailFirstInheritedProduction(std::sync::atomic::AtomicBool);
+
+fn failed_inherited_production() -> Anomaly {
+    Anomaly::fault("test/inherited-block", "Could not read secondary database configurations")
+}
+
+#[async_trait]
+impl DatabaseEffects for FailFirstInheritedProduction {
+    fn check_db_op(&self, _: &DbOp) -> Result<()> { Ok(()) }
+    async fn apply_db_op(&self, _: &DbOp) -> Result<()> { Ok(()) }
+    fn secondary_databases(&self) -> Result<BTreeMap<String, DatabaseConfig>> {
+        if self.0.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            return Err(failed_inherited_production());
+        }
+        Ok(BTreeMap::new())
+    }
+}
+
+#[tokio::test]
+async fn recovered_confirmation_survives_a_failed_later_block_start_and_the_next_term_retries_it() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (handle, mut restarted) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        assertion_interval: Duration::from_secs(3600), ..Default::default()
+    }).await;
+    restarted.effects = Arc::new(FailFirstInheritedProduction(std::sync::atomic::AtomicBool::new(true)));
+    let claim = ReplicaBody::NoOp(proto::NoOp { src_msg_id: None });
+    deliver_checkpoint_record(&fixture, &mut restarted, 2, 0, claim.clone()).await.unwrap();
+    deliver_checkpoint_record(&fixture, &mut restarted, 2, 1, boundary(1, -1)).await.unwrap();
+    restarted.claim = Some(rtdb_types::ReplicaPosition(4));
+    deliver_checkpoint_record(&fixture, &mut restarted, 3, 0, claim.clone()).await.unwrap();
+    assert_eq!(restarted.role(), Role::Following);
+    assert!(restarted.leader.as_ref().unwrap().production.is_none());
+    let mut tail = fixture.replica.tail(LogOffset(4)).await.unwrap();
+
+    let repair = next_local_record(tail.as_mut()).await;
+    restarted.consume(repair).await.unwrap();
+    assert!(restarted.recovered_confirmation.is_none());
+    assert!(restarted.leader.is_none());
+    assert_eq!(restarted.role(), Role::Following);
+    assert_eq!(restarted.read_position, rtdb_types::ReplicaPosition(5));
+    assert_eq!(restarted.pending_block.as_ref().unwrap().block_index(), BlockIndex(1));
+    assert_eq!(handle.status().promotion_failure, Some(failed_inherited_production()));
+    assert!(handle.progress().fault().is_none());
+
+    restarted.claim = Some(rtdb_types::ReplicaPosition(6));
+    deliver_checkpoint_record(&fixture, &mut restarted, 4, 0, claim).await.unwrap();
+    assert_eq!(restarted.role(), Role::Following);
+    assert!(handle.status().promotion_failure.is_none());
+    let leader = restarted.leader.as_mut().unwrap();
+    assert!(leader.recovery_write.is_none());
+    assert!(leader.production.is_some());
+    let written = tokio::time::timeout(Duration::from_secs(5), super::pending_production(&mut leader.production)).await.unwrap();
+    restarted.production_finished(written).await.unwrap();
+    let appended = tokio::time::timeout(Duration::from_secs(5),
+        super::pending_production(&mut restarted.leader.as_mut().unwrap().production)).await.unwrap();
+    restarted.production_finished(appended).await.unwrap();
+    let mut tail = fixture.replica.tail(LogOffset(6)).await.unwrap();
+    let next = next_local_record(tail.as_mut()).await;
+    let envelope = ReplicaEnvelope::decode(&next.payload).unwrap().unwrap();
+    assert!(matches!(envelope.message, ReplicaBody::BlockUploaded(upload) if upload.block_index == Some(1)));
+    restarted.consume(next).await.unwrap();
+    assert_eq!(restarted.role(), Role::Leading(Term(4)));
+    assert!(restarted.pending_block.is_none());
+    assert_eq!(handle.status().adopted_block.unwrap().block_index(), BlockIndex(1));
+    restarted.demote().await.unwrap();
+}
+
 struct WaitingWriter {
     started: Option<tokio::sync::oneshot::Sender<()>>,
     dropped: Arc<std::sync::atomic::AtomicBool>,

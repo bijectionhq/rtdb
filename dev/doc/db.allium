@@ -554,6 +554,17 @@ config {
 
 -- == Leader Startup ==
 --
+-- A writable restart restores the latest persisted block and reads the replica suffix from that block's boundary.
+-- For a boundary in the configured replica epoch, an admitted upload confirms the restored checkpoint when the block index, storage version and epoch, source watermark, and external token match its recorded identity.
+-- An omitted upload storage epoch means zero.
+-- If its next leadership claim wins before it observes such an upload, it announces the restored checkpoint in its new term.
+-- The announcement describes the L0 tries recorded for that block in the table blocks.
+-- The node waits for admitted read-back before producing a later pending block or resuming ordinary source and external-source processing.
+-- That read-back gives followers still holding the restored block's boundary their signal to adopt and drain.
+-- The restored checkpoint is already installed on the restarted node.
+-- A replica that already installed the checkpoint skips its upload before the hold for a later pending block.
+-- If producing that later block fails during promotion, the replica follows with the checkpoint confirmed and the later block still pending.
+--
 -- A new leader can always reconstruct correct state from the last persisted block and the follower's in-memory state, which has been built by processing replica messages.
 --
 -- Claiming a replay target and awaiting it ensures the follower has fully caught up before its state is captured and it is stopped: the follower is the sole replica-log consumer and the leader consumes the source log instead, so records between the follower's position and the target would otherwise be silently skipped.
@@ -930,8 +941,12 @@ rule LeaderAppliesRecord {
                and record.storage_epoch = storage_format.storage_epoch:
                 AdoptOwnBlock(record)
             else:
-                log_processor.pending_block.buffered_records =
-                    log_processor.pending_block.buffered_records.append(record)
+                if not (record.kind = BlockUploadedMessage
+                        and record.storage_version = storage_format.storage_version
+                        and record.storage_epoch = storage_format.storage_epoch
+                        and record.block_index <= (table_catalog.current_block_index ?? -1)):
+                    log_processor.pending_block.buffered_records =
+                        log_processor.pending_block.buffered_records.append(record)
         else:
             ApplyOwnRecord(record)
 }
@@ -1136,7 +1151,9 @@ rule ExternalSourceIndexesTx {
 
 -- A follower applies already-durable messages, so it imports straight into the durable live index and advances the watchers as it goes.
 -- The TERM FENCE (see Fencing) runs on the read, above everything below: only admitted messages reach a role at all.
--- The pending-block hold runs next, while a block is open, either matching the upload that closes the block or holding the record; STALENESS (see Staleness) runs last, skipping a message whose effect is already applied.
+-- While a block is open, the pending-block handler first recognizes the upload that closes it and skips current-storage uploads for already-installed blocks.
+-- The hold buffers remaining records until the pending block closes.
+-- STALENESS (see Staleness) skips other messages whose effects are already applied when they reach the handlers.
 -- So only unheld, non-stale messages reach the handlers below, and all of them have been admitted.
 
 rule LogProcessorDispatchesRecord {
@@ -1184,6 +1201,10 @@ rule FollowerHoldsRecordBehindPendingBlock {
                    and msg.block_index = log_processor.pending_block.boundary_message.block_index
                    and msg.storage_version = storage_format.storage_version
                    and msg.storage_epoch = storage_format.storage_epoch)
+    requires: not (msg.kind = BlockUploadedMessage
+                   and msg.storage_version = storage_format.storage_version
+                   and msg.storage_epoch = storage_format.storage_epoch
+                   and msg.block_index <= (table_catalog.current_block_index ?? -1))
 
     ensures:
         log_processor.pending_block.buffered_records =
@@ -1224,7 +1245,7 @@ rule HandleReplicaMessage {
             trie_cat/trie_catalog.deleteTries(msg.table_name, msg.trie_keys)
 
         if msg.kind = BlockBoundaryMessage:
-            -- The follower opens a pending block. Every subsequent message except the matching upload is held by the hold above.
+            -- The follower opens a pending block and uses the hold above for subsequent records other than the closing upload and current-storage uploads for already-installed blocks.
             log_processor.pending_block = PendingBlock(msg.msg_id, msg)
 
         if msg.kind = NoOpMessage and msg.src_msg_id != null:

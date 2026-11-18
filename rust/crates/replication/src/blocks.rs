@@ -4,11 +4,11 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use rtdb_columnar::{MemoryBudget, MemoryReservation, estimate_read_value_bytes};
-use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, metadata::MetadataBuilder};
+use rtdb_format::{block::proto as block_pb, catalog::{BlockCatalog, TableBlock}, database::proto::DatabaseConfig, envelope::ReplicaBody, ipc::ArrowFileWriter, keys::{block_index_from_key, block_key, TrieKey}, log::proto, metadata::MetadataBuilder};
 use rtdb_index::{BlockPreparation, CatalogTrie, IndexBatch, LiveTable, PartitionState, PartitionValue, TableCatalog, TrieCatalog};
 use rtdb_storage::{ObjectKey, ObjectStore, cache::BufferPool};
 use rtdb_trie::{TrieConfig, TrieNode};
-use rtdb_types::{Anomaly, BlockIndex, Result, SourcePosition, Timestamp};
+use rtdb_types::{Anomaly, BlockIndex, Result, SourcePosition, StorageEpoch, StorageVersion, Timestamp};
 use tokio_util::sync::CancellationToken;
 
 use crate::{AppliedProgress, ReplicaRecord, TermFence};
@@ -18,12 +18,54 @@ pub struct RecoveredPartition {
     pub block: Option<BlockCatalog>,
     pub progress: AppliedProgress,
     pub fence: TermFence,
+    table_blocks: BTreeMap<rtdb_types::TableRef, TableBlock>,
 }
 impl RecoveredPartition {
     /// Selects initial source progress for the configured log epoch while retaining persisted identities.
     pub fn with_source_floor(mut self, source_floor: SourcePosition) -> Self {
         self.progress.source_position = self.progress.source_position.max(source_floor);
         self
+    }
+
+    pub(crate) fn confirmation(&self, replica_epoch: StorageEpoch, storage_version: StorageVersion, storage_epoch: StorageEpoch, memory: &Arc<MemoryBudget>) -> Result<Option<RecoveredBlockConfirmation>> {
+        let Some(catalog) = &self.block else { return Ok(None); };
+        let Some(boundary) = catalog.boundary_replica_position() else { return Ok(None); };
+        if boundary.after_offset(replica_epoch) < 0 { return Ok(None); }
+
+        let key = TrieKey::l0(catalog.block_index())?.to_string();
+        let token_bytes = catalog.external_source_token().map_or(0, <[u8]>::len);
+        let bytes = self.table_blocks.iter().try_fold(token_bytes, |bytes, (table, block)| {
+            let count = l0_details(block, &key).count();
+            let detail_bytes = table.schema.len().checked_add(table.table.len()).and_then(|len| len.checked_add(key.len()))
+                .and_then(|len| len.checked_add(1024)).and_then(|len| len.checked_mul(count));
+            detail_bytes.and_then(|detail_bytes| bytes.checked_add(detail_bytes))
+        }).and_then(|bytes| bytes.checked_mul(4)).and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid("Recovered block notification exceeds addressable memory"))?;
+        let reservation = memory.reserve(bytes)?;
+        let tries = l0_tries(catalog.block_index(), &self.table_blocks)?;
+        let upload = proto::BlockUploaded {
+            storage_version: Some(storage_version.0), storage_epoch: Some(storage_epoch.0), block_index: Some(catalog.block_index().0),
+            latest_processed_msg_id: catalog.as_proto().latest_processed_msg_id,
+            external_source_token: catalog.external_source_token().map(<[u8]>::to_vec),
+            tries: tries.iter().flat_map(|(table, tries)| tries.iter().map(|trie| trie.to_proto(table))).collect(),
+        };
+        Ok(Some(RecoveredBlockConfirmation { body: ReplicaBody::BlockUploaded(upload), _reservation: reservation }))
+    }
+}
+
+pub(crate) struct RecoveredBlockConfirmation {
+    pub body: ReplicaBody,
+    _reservation: Arc<MemoryReservation>,
+}
+
+impl RecoveredBlockConfirmation {
+    pub fn matches(&self, body: &ReplicaBody) -> bool {
+        let (ReplicaBody::BlockUploaded(expected), ReplicaBody::BlockUploaded(observed)) = (&self.body, body) else { return false; };
+        observed.storage_version == expected.storage_version
+            && observed.storage_epoch.unwrap_or_default() == expected.storage_epoch.unwrap_or_default()
+            && observed.block_index == expected.block_index
+            && observed.latest_processed_msg_id == expected.latest_processed_msg_id
+            && observed.external_source_token == expected.external_source_token
     }
 }
 
@@ -63,7 +105,7 @@ impl BlockStore {
             external_token: block.as_ref().and_then(BlockCatalog::external_source_token).map(Arc::from),
         };
         let fence = match &block { Some(block) => TermFence::from_catalog(block)?, None => TermFence::from_boundary(rtdb_types::Term(0), None)? };
-        Ok(RecoveredPartition { partition, block, progress, fence }.with_source_floor(source_floor))
+        Ok(RecoveredPartition { partition, block, progress, fence, table_blocks }.with_source_floor(source_floor))
     }
     pub async fn load(&self, index: BlockIndex) -> Result<(BlockCatalog, BTreeMap<rtdb_types::TableRef, TableBlock>)> {
         let lease = self.cache.get(&ObjectKey::new(block_key(index)?)?).await?;
@@ -183,14 +225,35 @@ fn write_node<'a>(node: &'a TrieNode, live: &'a LiveTable, memory: &'a Arc<Memor
     })
 }
 
+fn block_tries(block: &TableBlock) -> impl Iterator<Item = &proto::TrieDetails> {
+    let wire = block.as_proto();
+    wire.partitions.iter().flat_map(|partition| &partition.tries)
+        .chain(wire.tries.iter().filter(|_| wire.partitions.is_empty()))
+}
+
+fn l0_details<'a>(block: &'a TableBlock, key: &'a str) -> impl Iterator<Item = &'a proto::TrieDetails> {
+    block_tries(block).filter(move |detail| detail.trie_key.as_deref().is_some_and(|recorded| recorded.eq_ignore_ascii_case(key)))
+}
+
 pub(crate) fn l0_tries(index: BlockIndex, tables: &BTreeMap<rtdb_types::TableRef, TableBlock>) -> Result<BTreeMap<rtdb_types::TableRef, Vec<CatalogTrie>>> {
     let key = TrieKey::l0(index)?;
+    let wire_key = key.to_string();
     let mut result = BTreeMap::new();
     for (table, block) in tables {
-        for detail in block.as_proto().partitions.iter().flat_map(|partition| &partition.tries).chain(&block.as_proto().tries) {
-            let trie = CatalogTrie::from_proto(detail)?;
-            if trie.key == key { result.entry(table.clone()).or_insert_with(Vec::new).push(trie); }
+        let mut notification = None;
+        for detail in l0_details(block, &wire_key) {
+            let recorded: TrieKey = detail.trie_key.as_deref().unwrap_or_default().parse()?;
+            if recorded != key { return Err(invalid("Recovered L0 key does not describe this block")); }
+            let summary = detail.trie_metadata.as_ref().map(|summary| proto::TrieMetadata {
+                temporal_metadata: summary.temporal_metadata.clone(), row_count: summary.row_count, iid_bloom: None,
+            });
+            let trie = CatalogTrie::notification(key.clone(), detail.data_file_size.unwrap_or_default(), summary)?;
+            if notification.as_ref().is_some_and(|existing| existing != &trie) {
+                return Err(invalid("Conflicting L0 notifications for one table and block"));
+            }
+            notification = Some(trie);
         }
+        if let Some(notification) = notification { result.insert(table.clone(), vec![notification]); }
     }
     Ok(result)
 }

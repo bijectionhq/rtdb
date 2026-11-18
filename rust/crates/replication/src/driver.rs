@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, Verdict};
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
+use crate::blocks::RecoveredBlockConfirmation;
 use crate::logs::replica_decode_bound;
 use crate::progress::{DriverRestart, stopped, term_ended};
 use crate::state::fail_pending;
@@ -226,6 +227,7 @@ async fn pending_production(production: &mut Option<Production>) -> ProductionRe
 
 struct LeaderState {
     term: Term, resolver: Option<TxResolver>, resolution: Option<Resolution>, production: Option<Production>, confirmed: bool,
+    recovery_write: Option<Arc<PendingWrite>>,
     held: VecDeque<ReplicaRecord>, held_bytes: usize, cycle: BlockCycle, pending: VecDeque<Arc<PendingWrite>>,
     source_tail: Option<Box<dyn LogTail>>, source_poll: Option<Poll>, source_batch: VecDeque<LogRecord>, source_head: Option<ReplayHead>,
     appender: AppenderHandle, job: Option<JoinHandle<Result<()>>>, cancellation: CancellationToken,
@@ -235,7 +237,8 @@ struct LeaderState {
 impl LeaderState {
     fn resolver(&self) -> Result<&TxResolver> { self.resolver.as_ref().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
     fn resolver_mut(&mut self) -> Result<&mut TxResolver> { self.resolver.as_mut().ok_or_else(|| invalid("Resolver is owned by an in-flight transaction")) }
-    fn accepting(&self) -> bool { self.cycle.accepting() && self.resolution.is_none() }
+    fn can_poll_source(&self) -> bool { self.recovery_write.is_none() && self.cycle.accepting() }
+    fn accepting(&self) -> bool { self.can_poll_source() && self.resolution.is_none() }
     fn enqueue(&mut self, body: WriteBody, block: BlockIndex, completion: Option<oneshot::Sender<Result<Applied>>>, memory: &Arc<MemoryBudget>) -> Result<()> {
         let write = PendingWrite::new(body, block, completion, memory)?;
         self.appender.enqueue(Arc::clone(&write))?;
@@ -248,6 +251,7 @@ pub struct ReplicationDriver {
     config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, partition: Arc<PartitionState>, progress: Arc<ProgressMonitor>,
     restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken,
+    recovered_confirmation: Option<RecoveredBlockConfirmation>,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>, replica_head: Option<ReplayHead>,
     leader: Option<LeaderState>, commands: mpsc::Receiver<Command>, status: watch::Sender<DriverStatus>, flush_timer: FlushTimer,
@@ -270,8 +274,11 @@ impl ReplicationDriver {
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone() };
         let persisted_tx = recovered.block.as_ref().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         let flush_timer = FlushTimer::new(now(), persisted_tx, config.flush_timeout)?;
+        let recovered_confirmation = if config.enabled && config.may_lead {
+            recovered.confirmation(logs.replica_epoch, logs.storage_version, logs.storage_epoch, logs.memory())?
+        } else { None };
         let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, fence: recovered.fence,
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, recovered_confirmation, fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), replica_head: None, leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -384,7 +391,7 @@ impl ReplicationDriver {
             }
         }
         if let Some(leader) = &mut self.leader {
-            if leader.cycle.accepting() && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
+            if leader.can_poll_source() && leader.source_poll.is_none() && leader.source_head.is_none() && leader.source_batch.is_empty() {
                 if let Some(tail) = leader.source_tail.take() { leader.source_poll = Some(start_poll(tail, self.config.assertion_interval)); }
             }
         }
@@ -413,10 +420,15 @@ impl ReplicationDriver {
     }
     async fn try_promote(&mut self) -> Result<()> {
         if let Err(error) = self.promote().await {
-            let held = self.demote().await?;
-            for held in held { self.apply_admitted(held).await?; }
-            self.status.send_modify(|status| status.promotion_failure = Some(error));
+            self.promotion_failed(error).await?;
         } else { self.status.send_modify(|status| status.promotion_failure = None); }
+        Ok(())
+    }
+
+    async fn promotion_failed(&mut self, error: Anomaly) -> Result<()> {
+        let held = self.demote().await?;
+        for held in held { self.apply_admitted(held).await?; }
+        self.status.send_modify(|status| status.promotion_failure = Some(error));
         Ok(())
     }
     async fn promote(&mut self) -> Result<()> {
@@ -428,10 +440,16 @@ impl ReplicationDriver {
         let source_tail = self.logs.source_tail(progress.source_position).await?;
         let (appender, pump) = ReplicaAppender::new(Arc::clone(&self.logs), Arc::clone(&self.resolve.memory), term, self.config.assertion_interval, cancellation.clone());
         let cycle = if self.pending_block.is_some() { BlockCycle::Cut } else { BlockCycle::Filling { rows: self.partition.value().live().block_row_count() } };
+        let recovery_write = self.recovered_confirmation.as_ref().map(|checkpoint| {
+            PendingWrite::clone_message(&checkpoint.body, self.partition.value().live().block_index(), &self.resolve.memory)
+        }).transpose()?;
+        let produce_inherited = recovery_write.is_none() && self.pending_block.is_some();
+        let confirmed = recovery_write.is_none() && !produce_inherited;
+        let job = pump.run(recovery_write.clone());
         self.leader = Some(LeaderState { term, resolver: Some(TxResolver::new(progress.tx_key, progress.source_position, progress.external_token.as_deref().map(<[u8]>::to_vec), &self.resolve.memory)?), resolution: None,
-            production: None, confirmed: self.pending_block.is_none(), held: VecDeque::new(), held_bytes: 0, cycle,
-            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(pump.run())), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
-        if self.pending_block.is_some() {
+            production: None, confirmed, recovery_write, held: VecDeque::new(), held_bytes: 0, cycle,
+            pending: VecDeque::new(), source_tail: Some(source_tail), source_poll: None, source_batch: VecDeque::new(), source_head: None, appender, job: Some(tokio::spawn(job)), cancellation, deferred_commands: VecDeque::new(), compactor_reset: None });
+        if produce_inherited {
             self.produce_pending()?;
         }
         self.publish_status(self.role());
@@ -487,13 +505,40 @@ impl ReplicationDriver {
         if admission.verdict == Verdict::Apply {
             if wins { self.try_promote().await?; }
             let record = self.logs.resolve_oversized(record).await?;
-            self.apply_admitted(record).await?;
+            if !self.confirm_recovered_block(&record).await? {
+                self.apply_admitted(record).await?;
+            }
         }
         self.read_position = position;
         self.publish_status(self.role());
         if admission.verdict == Verdict::Voided { self.start_claim()?; }
         Ok(())
     }
+    async fn confirm_recovered_block(&mut self, record: &ReplicaRecord) -> Result<bool> {
+        if !self.recovered_confirmation.as_ref().is_some_and(|checkpoint| checkpoint.matches(&record.envelope.message)) {
+            return Ok(false);
+        }
+        let mut produce_inherited = false;
+        if let Some(leader) = &mut self.leader {
+            if let Some(write) = &leader.recovery_write {
+                let sequence = write.sequence().ok_or_else(|| invalid("Recovered block upload has no assigned sequence"))?;
+                if record.envelope.term != leader.term || record.envelope.term_sequence != Some(sequence) {
+                    return Err(invalid("Recovered block upload does not match this term's pending confirmation"));
+                }
+                leader.recovery_write = None;
+                produce_inherited = self.pending_block.is_some();
+                leader.confirmed = !produce_inherited;
+            }
+        }
+        self.recovered_confirmation = None;
+        if produce_inherited {
+            if let Err(error) = self.produce_pending() {
+                self.promotion_failed(error).await?;
+            }
+        }
+        Ok(true)
+    }
+
     async fn apply_admitted(&mut self, record: ReplicaRecord) -> Result<()> {
         if matches!(&record.envelope.message, ReplicaBody::NoOp(message) if message.src_msg_id.is_none()) { return Ok(()); }
         if let Some(leader) = &mut self.leader {
@@ -547,6 +592,10 @@ impl ReplicationDriver {
                         leader.compactor_reset.take().expect("matched reset block").complete();
                     }
                 }
+                continue;
+            }
+            if self.pending_block.is_some() && self.upload_for_installed_block(&record) {
+                self.complete_control(&record);
                 continue;
             }
             if let Some(pending) = &mut self.pending_block { pending.hold(record)?; continue; }
@@ -637,6 +686,14 @@ impl ReplicationDriver {
         }
         Ok(())
     }
+    fn upload_for_installed_block(&self, record: &ReplicaRecord) -> bool {
+        let ReplicaBody::BlockUploaded(upload) = &record.envelope.message else { return false; };
+        upload.storage_version == Some(self.logs.storage_version.0)
+            && upload.storage_epoch.unwrap_or_default() == self.logs.storage_epoch.0
+            && upload.block_index.zip(self.partition.value().table_catalog().block_index())
+                .is_some_and(|(uploaded, installed)| uploaded <= installed.0)
+    }
+
     fn stale(&self, record: &ReplicaRecord) -> bool {
         let progress = self.progress.current();
         let block = self.partition.value().table_catalog().block_index().map_or(-1, |index| index.0);
@@ -673,10 +730,7 @@ impl ReplicationDriver {
         if let Some(error) = error {
             let error = error.clone();
             if leader.confirmed { return Err(error); }
-            let held = self.demote().await?;
-            for held in held { self.apply_admitted(held).await?; }
-            self.status.send_modify(|status| status.promotion_failure = Some(error));
-            return Ok(());
+            return self.promotion_failed(error).await;
         }
         match result {
             ProductionResult::Written(result) => {

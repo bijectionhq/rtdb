@@ -22,6 +22,15 @@ Recovery itself does not require writable log capabilities.
 Recovered source progress is the greater of the persisted source position and the configured source epoch floor.
 The persisted transaction key, external token and block boundary retain their recorded identities.
 
+An indexing-enabled writer restart checks the retained replica suffix for the recovered block's matching upload when its recorded boundary belongs to the configured replica epoch.
+If its elected term has seen no admitted upload, it queues the recovered block's upload before heartbeat assertions or any later block production.
+The upload carries the original source position, external token, and L0 notifications recovered from the table blocks.
+On admitted read-back, the restarted writer can produce a later pending block and followers still holding the recovered boundary can adopt it.
+Ordinary source processing resumes when the restarted writer has no pending block to finish.
+The restored partition generation and applied progress are already in place on the restarted node.
+A replica that already installed the block skips its current-storage upload before buffering for a later pending block.
+A failure starting that later block during promotion preserves the recovered confirmation and returns the later block to the follower.
+
 `ProgressMonitor` owns one published value containing the applied source position, transaction key and most recent result, and the most recent non-null external token.
 A driver publishes that value only after the corresponding effects apply.
 `DriverStatus` is a separate watched value for role, observed term, consumed replica position, open block, adopted block, and the latest failed promotion.
