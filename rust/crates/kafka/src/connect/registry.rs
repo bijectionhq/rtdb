@@ -188,6 +188,12 @@ impl RegistryConverter {
         }
     }
     async fn request_raw(&mut self, path: &[String], query: &[(String, String)], body: Option<&Json>, context: &mut ConversionContext) -> Result<http::RawResponse> {
+        match self.request_body(path, query, body, context).await? {
+            Some((input, charge)) => http::RawResponse::collect(input, charge).await,
+            None => Ok(http::RawResponse::NoContent),
+        }
+    }
+    async fn request_body(&mut self, path: &[String], query: &[(String, String)], body: Option<&Json>, context: &mut ConversionContext) -> Result<Option<(http::BodyInput<http::Response>, Arc<MemoryReservation>)>> {
         let response_charge = context.reserve(self.maximum_schema_bytes.checked_mul(4).ok_or_else(|| error("allocation-overflow", "Schema response bound overflow"))?)?;
         if self.client.is_none() { self.client = Some(security::client(&self.options, context)?); }
         let (client, charge) = self.client.as_ref().expect("registry client initialized");
@@ -209,14 +215,14 @@ impl RegistryConverter {
                 None => (::http::Method::GET, Vec::new()),
             };
             let response = match client.request(method, url, headers, body).await { Ok(response) => response, Err(cause) => { failure = Some(error("schema-registry", cause.without_url())); continue; } };
-            if response.status() == ::http::StatusCode::NO_CONTENT { return Ok(http::RawResponse::NoContent); }
+            if response.status() == ::http::StatusCode::NO_CONTENT { return Ok(None); }
             if response.status() != ::http::StatusCode::OK {
                 let cause = error("schema-registry", format!("Schema Registry returned HTTP {}", response.status()));
                 if response.status().is_server_error() { failure = Some(cause); continue; } return Err(cause);
             }
             if response.content_length().is_some_and(|length| length > self.maximum_schema_bytes as u64) { return Err(error("schema-registry", "Schema response exceeds its byte limit")); }
             let input = http::BodyInput::new(response, self.maximum_schema_bytes);
-            return http::RawResponse::collect(input, response_charge).await;
+            return Ok(Some((input, response_charge)));
         }
         Err(failure.unwrap_or_else(|| error("schema-registry", "No Schema Registry endpoint is configured")))
     }

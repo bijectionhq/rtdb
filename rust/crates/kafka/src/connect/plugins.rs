@@ -33,6 +33,22 @@ impl ConversionContext {
     pub(crate) fn retains(&self, charge: &Arc<MemoryReservation>) -> bool {
         self.charges.iter().any(|existing| Arc::ptr_eq(existing, charge))
     }
+    #[cfg(test)]
+    pub(super) fn fork_parser(&mut self, task_bytes: usize) -> Result<Self> {
+        let slots = self.charges.len().checked_add(1).ok_or_else(parser_scope_overflow)?;
+        let bytes = slots.checked_mul(std::mem::size_of::<Arc<MemoryReservation>>())
+            .and_then(|bytes| bytes.checked_add(task_bytes)).ok_or_else(parser_scope_overflow)?;
+        self.reserve(bytes)?;
+        let mut charges = Vec::new();
+        charges.try_reserve_exact(slots).map_err(|cause| error("allocation-failed", cause))?;
+        charges.extend(self.charges.iter().cloned());
+        Ok(Self { memory: Arc::clone(&self.memory), charges, limit: self.limit, reserved: self.reserved, registry_key: None })
+    }
+    #[cfg(test)]
+    pub(super) fn adopt_parser(&mut self, parser: Self) {
+        self.charges = parser.charges;
+        self.reserved = parser.reserved;
+    }
     pub(super) fn set_registry_key(&mut self, bytes: Option<&[u8]>) -> Result<()> {
         if let Some(bytes) = bytes { self.reserve(bytes.len().checked_add(64).ok_or_else(|| error("allocation-overflow", "Registry key allocation overflow"))?)?; }
         self.registry_key = bytes.map(<[u8]>::to_vec);
@@ -42,6 +58,8 @@ impl ConversionContext {
     pub(super) fn clear_registry_key(&mut self) { self.registry_key = None; }
     pub(crate) fn into_charges(self) -> Vec<Arc<MemoryReservation>> { self.charges }
 }
+#[cfg(test)]
+fn parser_scope_overflow() -> rtdb_types::Anomaly { error("allocation-overflow", "Registry parser scope allocation overflow") }
 pub trait ConverterFactory: Send + Sync { fn open(&self, options: &BTreeMap<String, String>, is_key: bool) -> Result<Box<dyn Converter>>; }
 pub trait Transform: Send {
     /// Peak additional allocation before `apply`; override when expansion exceeds four times the input's retained bytes.

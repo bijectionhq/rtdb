@@ -51,3 +51,19 @@ Phase 2 qualifies native parser and allocator allowances.
 Focused regression sources cover buffered demand before a later error, empty frames and present empty bodies, full-frame and cumulative byte limits, raw duplicate preservation, admission before polling, vector growth and both context/cancellation release orders.
 Real HTTP fixture sources cover a chunked body exceeding one collector window, incomplete body framing, byte limits and pending-body cancellation.
 The writer schema-ID fixtures cover typed admission, the same-response generic fallback and the subject request after either decoder.
+
+== Pull reader for typed parsing
+
+Confluent RestService passes the HTTP input stream to ObjectMapper before it closes the stream.
+The native pull reader transfers the owned response into a blocking parser operation admitted by an I/O region.
+Each read requests one bounded window through the caller's Tokio runtime.
+Immediate availability counts bytes already held in the current frame.
+Closing the reader releases the response without demanding another frame.
+
+The operation retains a copy of the current conversion reservations, with the same per-record limit and cache admission rules.
+The caller adopts the returned reservations through both a successful decode and a parser failure.
+Cancellation wakes a pending read and the I/O region waits for worker completion and destruction of any undelivered answer.
+
+The pull reader is covered by source fixtures for close without tail demand, separate stream and byte-limit failures, retained charges on failure, and cancellation of a pending read.
+It remains under test registration until the live parser accepts this input authority.
+Readiness beyond the current frame and socket behavior during close require the HTTP transport qualification.

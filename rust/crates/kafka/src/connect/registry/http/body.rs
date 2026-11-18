@@ -6,6 +6,9 @@ use rtdb_types::{Anomaly, Result};
 use crate::connect::error;
 use super::Error;
 
+#[cfg(test)]
+mod reader;
+
 pub(in crate::connect::registry) enum RawResponse { NoContent, Body(RawBody) }
 pub(in crate::connect::registry) struct RawBody { bytes: Vec<u8>, _charge: Arc<MemoryReservation> }
 impl RawResponse {
@@ -26,15 +29,28 @@ impl RawResponse {
 }
 
 enum Window { Empty, Data { bytes: Bytes, position: usize }, End }
+#[derive(Debug)]
+pub(in crate::connect::registry) enum ReadFailure { Source(Error), Native(Anomaly) }
+impl ReadFailure {
+    fn into_anomaly(self) -> Anomaly {
+        match self { Self::Source(cause) => error("schema-registry", cause.without_url()), Self::Native(cause) => cause }
+    }
+}
+
 pub(in crate::connect::registry) struct BodyInput<S> { window: Window, source: S, received: usize, maximum: usize }
 impl<S> BodyInput<S> where S: Stream<Item = std::result::Result<Bytes, Error>> + Unpin {
     pub(in crate::connect::registry) fn new(source: S, maximum: usize) -> Self {
         Self { window: Window::Empty, source, received: 0, maximum }
     }
     pub(in crate::connect::registry) async fn next_window(&mut self, maximum: NonZeroUsize) -> Result<Option<&[u8]>> {
+        self.pull_window(maximum).await.map_err(ReadFailure::into_anomaly)
+    }
+    fn buffered(&self) -> usize {
+        match &self.window { Window::Data { bytes, position } => bytes.len() - position, _ => 0 }
+    }
+    async fn pull_window(&mut self, maximum: NonZeroUsize) -> std::result::Result<Option<&[u8]>, ReadFailure> {
         if matches!(self.window, Window::End) { return Ok(None); }
-        let buffered = matches!(&self.window, Window::Data { bytes, position } if *position < bytes.len());
-        if !buffered {
+        if self.buffered() == 0 {
             self.window = Window::Empty;
             loop {
                 let bytes = match self.source.next().await {
@@ -42,13 +58,13 @@ impl<S> BodyInput<S> where S: Stream<Item = std::result::Result<Bytes, Error>> +
                     Some(Ok(bytes)) => bytes,
                     Some(Err(cause)) => {
                         self.window = Window::End;
-                        return Err(error("schema-registry", cause.without_url()));
+                        return Err(ReadFailure::Source(cause));
                     }
                     None => { self.window = Window::End; return Ok(None); }
                 };
                 let Some(received) = self.received.checked_add(bytes.len()).filter(|received| *received <= self.maximum) else {
                     self.window = Window::End;
-                    return Err(too_large());
+                    return Err(ReadFailure::Native(too_large()));
                 };
                 self.received = received;
                 self.window = Window::Data { bytes, position: 0 };
