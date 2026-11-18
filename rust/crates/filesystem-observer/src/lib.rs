@@ -8,7 +8,9 @@ mod filesystem;
 pub mod driver;
 
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::{Arc, Mutex}};
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::{Arc, Mutex};
 
 pub const BOUNDARY: &str = "successful_backing_filesystem_payload_and_requests";
 
@@ -46,6 +48,7 @@ impl Config {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Default, Serialize)]
 pub(crate) struct Counters {
     pub successful_read_bytes: u64,
@@ -62,8 +65,10 @@ pub(crate) struct Counters {
     pub overflowed: bool,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Default)]
 pub(crate) struct Measurements(Arc<Mutex<Counters>>);
+#[cfg(target_os = "linux")]
 impl Measurements {
     pub fn snapshot(&self) -> Counters { self.0.lock().unwrap_or_else(|e|e.into_inner()).clone() }
     pub fn request(&self) -> RequestGuard {
@@ -77,8 +82,11 @@ impl Measurements {
     pub fn rejected(&self) { self.update(|v|add(&mut v.rejected_requests,1,&mut v.overflowed)); }
     fn update(&self, f: impl FnOnce(&mut Counters)) { f(&mut self.0.lock().unwrap_or_else(|e|e.into_inner())); }
 }
+#[cfg(target_os = "linux")]
 fn add(value: &mut u64, n: u64, overflow: &mut bool) { match value.checked_add(n) { Some(next)=>*value=next, None=>*overflow=true } }
+#[cfg(target_os = "linux")]
 pub(crate) struct RequestGuard(Measurements);
+#[cfg(target_os = "linux")]
 impl Drop for RequestGuard {
     fn drop(&mut self) { self.0.update(|v|v.in_flight_requests-=1); }
 }
