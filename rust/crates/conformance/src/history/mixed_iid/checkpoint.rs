@@ -5,7 +5,7 @@ use rtdb_types::{ReplicaPosition, SourcePosition, Timestamp};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File}, io::Read, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{collections::{BTreeMap, BTreeSet}, fs::{self, File}, io::Read, path::Path, sync::Arc, time::Duration};
 
 const MAX_REQUEST: u64 = 8 << 20;
 pub(super) const MAX_ENTRIES: usize = 4096;
