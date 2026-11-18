@@ -211,16 +211,32 @@ def read_capture(root):
             and process["command"] == [str(part) for part in reference.gradle_command(tree, tree.parent)],
             "archive has a different original Gradle invocation")
     unique, selection, worker_files, tape_file = reference.selected_invocation(root)
+    tape = json.loads(tape_file.data)
     require(capture["unique_id"] == unique, "capture marker identifies a different worker invocation")
     runtime = reference.RecordedFile.read(owned_file(root, "runtime-artifacts.json"))
     resolved = reference.RecordedFile.read(owned_file(root, "runtime-paths.json"))
     validated = {file.path.relative_to(root).as_posix(): file
                  for file in (*worker_files, tape_file, runtime, resolved, inputs_file, process_file)}
+    for path, checksum in inputs["adapter"].items():
+        name = f"adapter/{path}"
+        file = reference.RecordedFile.read(owned_file(root, name))
+        require(file.sha256 == checksum, f"wrong archived adapter source: {path}")
+        validated[name] = file
+    for path in reference.OVERLAY_HASHES:
+        original_name, derived_name = f"original/{path}", f"reference/{path}"
+        original = reference.RecordedFile.read(owned_file(root, original_name))
+        derived = reference.RecordedFile.read(owned_file(root, derived_name))
+        expected_source = reference.derived_source(path, original.data, inputs["requested_seed"], tape["schema_version"])
+        require(derived.data == expected_source and derived.sha256 == inputs["derived_sources"][path],
+                f"wrong archived derived source: {path}")
+        validated[original_name], validated[derived_name] = original, derived
+    helper_name = f"reference/{reference.HELPER}"
+    helper = reference.RecordedFile.read(owned_file(root, helper_name))
+    require(helper.sha256 == inputs["derived_sources"][reference.HELPER] == inputs["adapter"]["simulation/LogProcessorTrace.kt"],
+            "wrong archived observer helper")
+    validated[helper_name] = helper
     expected = {"gradle.stderr.log", "reference/build/test-run.log",
                 f"reference/core/build/test-results/property-test/TEST-{reference.TEST_CLASS}.xml"} | set(validated)
-    expected.update(f"original/{path}" for path in reference.OVERLAY_HASHES)
-    expected.update(f"reference/{path}" for path in inputs["derived_sources"])
-    expected.update(f"adapter/{path}" for path in ADAPTER_FILES)
     paths = [item["path"] for item in capture["artifacts"]]
     require(len(paths) == len(expected) and set(paths) == expected, "capture marker omitted or repeated archived paths")
     for item in capture["artifacts"]:
@@ -229,19 +245,6 @@ def read_capture(root):
         else:
             verify_file(root, item, "path")
 
-    for path, checksum in inputs["adapter"].items():
-        require(digest(owned_file(root, f"adapter/{path}")) == checksum, f"wrong archived adapter source: {path}")
-    for path in reference.OVERLAY_HASHES:
-        raw = owned_file(root, f"original/{path}").read_bytes()
-        actual = owned_file(root, f"reference/{path}")
-        expected_source = reference.derived_source(path, raw, inputs["requested_seed"])
-        require(actual.read_bytes() == expected_source and digest(actual) == inputs["derived_sources"][path],
-                f"wrong archived derived source: {path}")
-    helper = owned_file(root, f"reference/{reference.HELPER}")
-    require(digest(helper) == inputs["derived_sources"][reference.HELPER] == inputs["adapter"]["simulation/LogProcessorTrace.kt"],
-            "wrong archived observer helper")
-
-    tape = json.loads(tape_file.data)
     require(reference.check_tape(tape, unique, inputs["requested_seed"]) == capture["observation"],
             "tape does not match its original capture summary")
     verify_runtime(root, tree.parent, selection, tape, json.loads(runtime.data), json.loads(resolved.data))
@@ -249,6 +252,8 @@ def read_capture(root):
 
 
 def project(tape, tape_sha, capture_sha):
+    schema = tape["schema_version"]
+    require(type(schema) is int and schema in (1, reference.LIVE_INDEX_TAPE_SCHEMA), "unknown simulation tape version")
     rows_per_block, _, _, documents = tape["events"][1]["fields"]
     boot = []
     inputs = []
@@ -316,9 +321,57 @@ def project(tape, tape_sha, capture_sha):
     require(assignments == [[None, 0]] and opened == {0, 1, 2} and refused == {1, 2} and delivered == opened
             and len(boot) == 11 and len(starts) == len(writers) == len(documents),
             "capture lacks the boot and single-assignment stimulus required by this trial")
-    return {"schema_version": 1, "reference_revision": REFERENCE, "unique_id": tape["unique_id"],
+    return {"schema_version": schema, "reference_revision": REFERENCE, "unique_id": tape["unique_id"],
             "seed": tape["seed"], "reference_capture_sha256": capture_sha, "tape_sha256": tape_sha,
             "rows_per_block": rows_per_block, "boot": boot, "inputs": inputs}
+
+
+def match_live_index_assertion(tape, execution):
+    if tape["schema_version"] != reference.LIVE_INDEX_TAPE_SCHEMA:
+        return []
+    frames = [frame for frame in tape["events"] if frame["kind"] == reference.LIVE_INDEX_ASSERTION]
+    require(len(frames) == 3, "reference live-index assertion lacks the three actor operands")
+    summary = execution["summary"]
+    joined = summary["joined_live_index"]
+    prefix = summary["native_replica"]
+    suffix = joined["replica_suffix"]
+    selected_tip, tip = summary["captured_replica_tip"], joined["replica_tip"]
+    require(isinstance(prefix, list) and isinstance(suffix, list) and reference.int_value(tip, 0, 4095)
+            and reference.int_value(selected_tip, 0, tip) and len(prefix) == selected_tip + 1
+            and len(prefix) + len(suffix) == tip + 1,
+            "native joined replica evidence does not cover its complete prefix")
+    records = prefix + suffix
+    admitted = []
+    for offset, record in enumerate(records):
+        require(type(record["offset"]) is int and record["offset"] == offset and type(record["term_admitted"]) is bool,
+                "invalid native replica offset or term admission")
+        message = record["message"]
+        if record["term_admitted"] and message["kind"] == "transaction":
+            require(reference.int_value(message["tx_id"], 0), "invalid admitted native replica transaction ID")
+            admitted.append(message["tx_id"])
+    require(admitted and type(joined["last_applied_tx_id"]) is int and joined["last_applied_tx_id"] == max(admitted),
+            "native live-index expectation differs from the admitted replica transactions")
+    expected_tx = max(admitted)
+    actors = joined["actors"]
+    require(isinstance(actors, list) and len(actors) == 3, "native live-index assertion lacks the three actor operands")
+    jvm = []
+    native = []
+    for actor, frame, observed in zip(range(3), frames, actors):
+        observed_actor, reference_expected, reference_actual = frame["fields"]
+        require(type(observed_actor) is int and observed_actor == actor
+                and reference.int_value(reference_expected, 0) and reference.int_value(reference_actual, 0)
+                and reference_expected == reference_actual, "invalid captured reference live-index operands")
+        require(set(observed) == {"actor", "tx_id"} and type(observed["actor"]) is int and observed["actor"] == actor
+                and reference.int_value(observed["tx_id"], 0) and observed["tx_id"] == expected_tx,
+                "native joined live index differs from its admitted replica transactions")
+        require((expected_tx, observed["tx_id"]) == (reference_expected, reference_actual),
+                "native joined live-index operands differ from the original JVM assertion")
+        jvm.append({"actor": actor, "expected_tx_id": reference_expected, "actual_tx_id": reference_actual,
+                    "sequence": frame["sequence"]})
+        native.append({"actor": actor, "expected_tx_id": expected_tx, "actual_tx_id": observed["tx_id"]})
+    return [{"source": reference.FIXTURE, "line": reference.LIVE_INDEX_ASSERTION_LINE,
+             "method": "assertLiveIndexesCaughtUp", "unique_id": tape["unique_id"],
+             "reference": jvm, "native": native, "native_replica_tip": tip}]
 
 
 def replay(args):
@@ -339,29 +392,45 @@ def replay(args):
     tape_sha = tape_file.sha256
     capture_sha = capture_file.sha256
     projected_path = run / "projected.json"
-    write_json(projected_path, project(tape, tape_sha, capture_sha))
-    projected_sha = digest(projected_path)
+    projected = project(tape, tape_sha, capture_sha)
+    write_json(projected_path, projected)
+    projected_file = reference.RecordedFile.read(projected_path)
+    require(json.loads(projected_file.data) == projected, "recorded projection differs from the authored replay inputs")
     binary_sha = digest(native)
     output = run / "native"
     process = run_process([native, "simulation-refused-claim", projected_path, output],
                           REPOSITORY, run / "stdout.log", run / "stderr.log", args.timeout)
-    write_json(run / "process.json", process)
-    require(process["completed"] is True and process["exit_code"] == 0, "native refused-claim trial failed")
-    execution_path = output / "execution.json"
-    execution = reference.bounded_json(execution_path)
+    process_path = run / "process.json"
+    write_json(process_path, process)
+    process_file = reference.RecordedFile.read(process_path)
+    require(json.loads(process_file.data) == process and process["completed"] is True and process["exit_code"] == 0,
+            "native refused-claim trial failed or its process receipt differs")
+    execution_file = reference.RecordedFile.read(output / "execution.json")
+    stdout = reference.RecordedFile.read(run / "stdout.log")
+    require(execution_file.data == stdout.data, "native execution receipt bytes differ from stdout")
+    execution = json.loads(execution_file.data)
     validate_native_revision(execution, revision)
-    require(execution == reference.bounded_json(run / "stdout.log") and execution["scope"] == SCOPE
+    require(type(execution["schema_version"]) is int and execution["schema_version"] == projected["schema_version"]
+            and execution["scope"] == SCOPE
             and execution["execution_complete"] is True and execution["binary_sha256"] == digest(native) == binary_sha
-            and execution["input_sha256"] == digest(projected_path) == projected_sha
-            and execution["reference_capture_sha256"] == digest(owned_capture) == capture_sha
-            and execution["tape_sha256"] == digest(owned_tape) == tape_sha
-            and execution["unique_id"] == tape["unique_id"] and execution["seed"] == tape["seed"]
-            and reference.clean_checkout(REPOSITORY) == revision, "native replay receipt differs from its observed inputs")
+            and execution["input_sha256"] == projected_file.sha256
+            and execution["reference_capture_sha256"] == capture_sha and execution["tape_sha256"] == tape_sha
+            and execution["unique_id"] == tape["unique_id"] and execution["seed"] == tape["seed"],
+            "native replay receipt differs from its observed inputs")
+    assertions = match_live_index_assertion(tape, execution)
+    retained = (reference.RecordedFile(owned_capture, capture_file.data, capture_sha),
+                reference.RecordedFile(owned_tape, tape_file.data, tape_sha), projected_file, process_file, stdout, execution_file)
+    stderr = reference.regular(run / "stderr.log")
+    artifacts = [file.receipt(run) for file in retained]
+    artifacts.append({"path": "stderr.log", "sha256": digest(stderr), "bytes": stderr.stat().st_size})
+    require(reference.clean_checkout(REPOSITORY) == revision
+            and all(digest(reference.regular(file.path)) == file.sha256 for file in retained),
+            "validated simulation evidence changed before publication")
     terminal = run / "result.json"
-    retained = (owned_capture, owned_tape, projected_path, run / "process.json", run / "stdout.log", run / "stderr.log", execution_path)
-    write_json(terminal, {"schema_version": 1, "scope": SCOPE, "reference_capture_sha256": capture_sha,
-                          "artifacts": [{"path": path.relative_to(run).as_posix(), "sha256": digest(path),
-                                         "bytes": path.stat().st_size} for path in retained]})
+    result = {"schema_version": 1, "scope": SCOPE, "reference_capture_sha256": capture_sha, "artifacts": artifacts}
+    if assertions:
+        result["matched_assertions"] = assertions
+    write_json(terminal, result)
     return terminal
 
 

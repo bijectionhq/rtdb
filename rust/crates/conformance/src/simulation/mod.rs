@@ -6,7 +6,8 @@ use std::{collections::BTreeMap, fs::{self, File, OpenOptions}, io::{Read, Write
 use async_trait::async_trait;
 use rtdb_columnar::MemoryBudget;
 use rtdb_format::{data::{StoredEvent, StoredOperation}, database::proto::DatabaseConfig, envelope::{ReplicaBody, ReplicaEnvelope, SourceBody, SourceMessage}, keys::CURRENT_STORAGE_VERSION, log::proto::{FlushBlock, resolved_tx::DbOp}};
-use rtdb_replication::{BlockStore, DatabaseEffects, ExternalReceipt, PartitionLogs, ProgressMonitor, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role};
+use rtdb_index::PartitionState;
+use rtdb_replication::{BlockStore, DatabaseEffects, ExternalReceipt, PartitionLogs, ProgressMonitor, ReplicationClock, ReplicationConfig, ReplicationDriver, ReplicationHandle, Role, TermFence, Verdict};
 use rtdb_storage::{MemoryStore, cache::BufferPool, log::{Log, LogOffset, MemoryLog}, object_store::ReadReservation};
 use rtdb_tx::{OpenTransaction, ResolveContext, TransactionAuthorization, TransactionWriter, WriterResult};
 use rtdb_types::{Anomaly, EntityId, Interval, ReplicaPosition, SourcePosition, StorageEpoch, TableRef, Term, Timestamp, TransactionKey, TxId, Value};
@@ -80,6 +81,7 @@ struct Trial {
     replica: Arc<MemoryLog>,
     transport: Arc<BootTransport>,
     handles: Vec<ReplicationHandle>,
+    partitions: Option<Vec<Arc<PartitionState>>>,
     jobs: JoinSet<(usize, rtdb_types::Result<()>)>,
     cancellation: CancellationToken,
     memory: Arc<MemoryBudget>,
@@ -104,12 +106,14 @@ impl Trial {
         let initial = Timestamp(tape.claim_time());
         let clock: ReplicationClock = Arc::new(move || initial);
         let mut actors = Vec::new();
+        let mut partitions = tape.observes_live_indexes().then(Vec::new);
         for actor in 0..3 {
             let cache = Arc::new(BufferPool::new(store.clone(), 64 * 1024 * 1024));
             let logs = PartitionLogs::new(source.clone(), transport.actor(actor), StorageEpoch(0), StorageEpoch(0),
                 CURRENT_STORAGE_VERSION, StorageEpoch(0), store.clone(), Arc::clone(&cache), memory.scope())?;
             let blocks = BlockStore::new(store.clone(), Arc::clone(&cache), memory.scope(), 100_000_000)?;
             let recovered = blocks.recover(Default::default(), logs.source_floor()?, initial).await?;
+            if let Some(partitions) = &mut partitions { partitions.push(Arc::clone(&recovered.partition)); }
             let progress = ProgressMonitor::new(recovered.progress.clone());
             let node_cancellation = cancellation.child_token();
             let context = Arc::new(ResolveContext {
@@ -129,21 +133,37 @@ impl Trial {
             jobs.spawn(async move { (actor, driver.run().await) });
             handle
         }).collect();
-        Ok(Self { source, replica, transport, handles, jobs, cancellation, memory })
+        Ok(Self { source, replica, transport, handles, partitions, jobs, cancellation, memory })
     }
 
     async fn run(&mut self, tape: &Tape, observed: &mut Vec<Json>, current: &mut Option<usize>) -> Result<Json, Error> {
         let mut schedule: Vec<_> = tape.boot.iter().map(Scheduled::Boot).chain(tape.inputs.iter().map(Scheduled::Input)).collect();
         schedule.sort_unstable_by_key(Scheduled::sequence);
         let work = scenario(&self.handles, &self.transport, &self.source, &self.replica, &self.memory, &self.cancellation,
-            &schedule, observed, current);
+            &schedule, observed, current, self.partitions.is_some());
         tokio::select! {
             result = tokio::time::timeout(TRIAL, work) => result.map_err(|_| "native refused-claim replay timed out")?,
             child = self.jobs.join_next() => Err(format!("native driver ended during the scheduled replay: {child:?}").into()),
         }
     }
 
-    async fn shutdown(mut self) -> Vec<String> {
+    async fn finish(mut self, result: Result<Json, Error>) -> (Result<Json, Error>, Vec<String>) {
+        let failures = self.join_drivers().await;
+        let result = match (result, self.partitions.as_deref()) {
+            (Ok(mut summary), Some(partitions)) if failures.is_empty() => {
+                self.joined_live_indexes(&summary, partitions).await.map(|observation| {
+                    summary["joined_live_index"] = observation;
+                    summary
+                })
+            }
+            (result, _) => result,
+        };
+        self.source.close();
+        self.replica.close();
+        (result, failures)
+    }
+
+    async fn join_drivers(&mut self) -> Vec<String> {
         self.cancellation.cancel();
         let collect = async {
             let mut failures = Vec::new();
@@ -156,17 +176,40 @@ impl Trial {
             }
             failures
         };
-        let failures = match tokio::time::timeout(SHUTDOWN, collect).await {
+        match tokio::time::timeout(SHUTDOWN, collect).await {
             Ok(failures) => failures,
             Err(_) => {
                 self.jobs.abort_all();
                 while self.jobs.join_next().await.is_some() {}
                 vec!["driver shutdown exceeded its deadline".into()]
             }
-        };
+        }
+    }
+
+    #[cfg(test)]
+    async fn shutdown(mut self) -> Vec<String> {
+        let failures = self.join_drivers().await;
         self.source.close();
         self.replica.close();
         failures
+    }
+
+    async fn joined_live_indexes(&self, selected: &Json, partitions: &[Arc<PartitionState>]) -> Result<Json, Error> {
+        let prefix = selected["native_replica"].as_array().ok_or("missing selected replica prefix")?;
+        let tip = self.replica.latest()?;
+        let (records, last_applied) = replica_summary(&self.replica, tip, &self.memory, true).await?;
+        if !records.starts_with(prefix) { return Err("joined replica log differs from the selected prefix".into()); }
+        let expected = last_applied.ok_or("joined replica log has no admitted resolved transaction")?;
+        let mut actors = Vec::new();
+        for (actor, partition) in partitions.iter().enumerate() {
+            let actual = partition.value().live().latest_completed_tx();
+            if actual.map(|key| key.tx_id) != Some(expected) {
+                return Err(format!("native live index {actor} reached {actual:?}, expected {expected:?} from the joined replica log").into());
+            }
+            actors.push(json!({"actor":actor,"tx_id":actual.map(|key| key.tx_id.0)}));
+        }
+        let suffix: Vec<_> = records.into_iter().skip(prefix.len()).collect();
+        Ok(json!({"replica_tip":tip.0,"last_applied_tx_id":expected.0,"actors":actors,"replica_suffix":suffix}))
     }
 }
 
@@ -212,6 +255,7 @@ async fn run_boot(frame: &Event<Boot>, transport: &BootTransport, committed: &mu
 async fn scenario(
     handles: &[ReplicationHandle], transport: &BootTransport, source: &MemoryLog, replica: &MemoryLog, memory: &Arc<MemoryBudget>,
     cancellation: &CancellationToken, schedule: &[Scheduled<'_>], observed: &mut Vec<Json>, current: &mut Option<usize>,
+    observe_live_indexes: bool,
 ) -> Result<Json, Error> {
     let mut committed = None;
     let mut pending = None;
@@ -303,7 +347,7 @@ async fn scenario(
             "tx_id":last_tx.tx_id.0, "system_time_micros":last_tx.system_time.0, "committed":final_commit,
             "token":format!("{:08x}", u32::from_be_bytes(token))}));
     }
-    let records = replica_summary(replica, tip, memory).await?;
+    let (records, _) = replica_summary(replica, tip, memory, observe_live_indexes).await?;
     for position in authored_sources {
         if records.iter().filter(|record| record["message"]["kind"] == "noop"
             && record["message"]["source_position"].as_i64() == Some(position)).count() != 1
@@ -314,20 +358,36 @@ async fn scenario(
     Ok(json!({"captured_replica_tip":tip.0,"actors":cohort,"native_replica":records}))
 }
 
-async fn replica_summary(replica: &MemoryLog, tip: LogOffset, memory: &Arc<MemoryBudget>) -> Result<Vec<Json>, Error> {
+async fn replica_summary(
+    replica: &MemoryLog, tip: LogOffset, memory: &Arc<MemoryBudget>, observe_admission: bool,
+) -> Result<(Vec<Json>, Option<TxId>), Error> {
     if !(0..4096).contains(&tip.0) { return Err("native pilot exceeded its replica evidence bound".into()); }
     let mut output = Vec::new();
+    let mut fence = observe_admission.then(|| TermFence::from_boundary(Term(0), None)).transpose()?;
+    let mut last_applied = None;
     let mut range = replica.range(LogOffset(0), LogOffset(tip.0 + 1)).await?;
     let bytes = range.allocation_bound();
     while let Some(raw) = range.next(ReadReservation::new(bytes, memory.reserve(bytes)?)).await? {
         let bound = raw.payload.len().checked_mul(4).and_then(|bytes| bytes.checked_add(4096))
             .ok_or("native replica observation exceeded its decode allowance")?;
         let _decode = memory.reserve(bound)?;
+        if observe_admission && raw.metadata.offset.0 != output.len() as i64 {
+            return Err("native replica evidence has a missing offset".into());
+        }
         let envelope = ReplicaEnvelope::decode(&raw.payload)?.ok_or("native replica record omitted its envelope")?;
+        let admitted = fence.as_mut().map(|fence| {
+            fence.admit(envelope.term, envelope.term_sequence).map(|admission| admission.verdict == Verdict::Apply)
+        }).transpose()?;
         let detail = match envelope.message {
             ReplicaBody::NoOp(noop) => json!({"kind":"noop","source_position":noop.src_msg_id}),
-            ReplicaBody::ResolvedTx(tx) => json!({"kind":"transaction","tx_id":tx.tx_id,"system_time_micros":tx.system_time_micros,
-                "source_position":tx.src_msg_id,"committed":tx.committed,"external_source_token":tx.external_source_token}),
+            ReplicaBody::ResolvedTx(tx) => {
+                if admitted == Some(true) {
+                    let id = tx.tx_id.filter(|id| *id >= 0).ok_or("admitted native replica transaction has no valid ID")?;
+                    last_applied = last_applied.max(Some(TxId(id)));
+                }
+                json!({"kind":"transaction","tx_id":tx.tx_id,"system_time_micros":tx.system_time_micros,
+                    "source_position":tx.src_msg_id,"committed":tx.committed,"external_source_token":tx.external_source_token})
+            }
             ReplicaBody::BlockBoundary(block) => json!({"kind":"boundary","block_index":block.block_index,"source_position":block.latest_processed_msg_id,
                 "external_source_token":block.external_source_token}),
             ReplicaBody::BlockUploaded(block) => json!({"kind":"upload","block_index":block.block_index,"source_position":block.latest_processed_msg_id,
@@ -335,10 +395,16 @@ async fn replica_summary(replica: &MemoryLog, tip: LogOffset, memory: &Arc<Memor
             ReplicaBody::TriesAdded(add) => json!({"kind":"tries_added","source_position":add.source_msg_id}),
             _ => return Err("unexpected message in native refused-claim replay".into()),
         };
-        output.push(json!({"offset":raw.metadata.offset.0, "timestamp_micros":raw.metadata.timestamp.0, "term":envelope.term.0,
-            "term_sequence":envelope.term_sequence.map(|value| value.0), "payload_sha256":format!("{:x}", Sha256::digest(&raw.payload)), "message":detail}));
+        let mut record = json!({"offset":raw.metadata.offset.0, "timestamp_micros":raw.metadata.timestamp.0, "term":envelope.term.0,
+            "term_sequence":envelope.term_sequence.map(|value| value.0),
+            "payload_sha256":format!("{:x}", Sha256::digest(&raw.payload)), "message":detail});
+        if let Some(admitted) = admitted { record["term_admitted"] = Json::Bool(admitted); }
+        output.push(record);
     }
-    Ok(output)
+    if observe_admission && output.len() as i64 != tip.0 + 1 {
+        return Err("native replica evidence ended before the sampled tip".into());
+    }
+    Ok((output, last_applied))
 }
 
 /// Runs three native processors from a projection of at most 1 MiB.
@@ -362,7 +428,7 @@ pub async fn execute(input: &Path, output: &Path) -> Result<Json, Error> {
     let (result, cleanup) = match Trial::open(&tape).await {
         Ok(mut trial) => {
             let result = trial.run(&tape, &mut observed, &mut current).await;
-            (result, trial.shutdown().await)
+            trial.finish(result).await
         }
         Err(error) => (Err(error), Vec::new()),
     };
@@ -372,7 +438,7 @@ pub async fn execute(input: &Path, output: &Path) -> Result<Json, Error> {
         Err(error) => (None, Some(error.to_string())),
     };
     let evidence = json!({
-        "schema_version":1, "scope": SCOPE, "execution_complete":complete,
+        "schema_version":tape.schema_version, "scope": SCOPE, "execution_complete":complete,
         "reference_revision":tape.reference_revision, "unique_id":tape.unique_id, "seed":tape.seed,
         "reference_capture_sha256":tape.reference_capture_sha256, "tape_sha256":tape.tape_sha256,
         "input_sha256":format!("{:x}", Sha256::digest(&raw)), "binary_sha256":crate::controls::digest_file(&std::env::current_exe()?)?,
@@ -418,31 +484,55 @@ mod tests {
 
     #[tokio::test]
     async fn boot_grants_and_authored_receipts_reach_three_real_processors() {
-        let tape = fixture();
-        tape.validate().unwrap();
-        let mut trial = Trial::open(&tape).await.unwrap();
-        let mut observed = Vec::new();
-        let mut current = None;
-        let result = trial.run(&tape, &mut observed, &mut current).await;
-        let failures = trial.shutdown().await;
-        let summary = result.unwrap_or_else(|error| panic!("Replay at sequence {current:?} failed: {error}; shutdown: {failures:?}"));
-        assert!(failures.is_empty(), "{failures:?}");
-        assert_eq!(observed[1]["reference_sequence"], 1);
-        assert_eq!(observed[1]["observation"]["kind"], "source_flush_durable");
-        assert_eq!(observed[4]["observation"]["kind"], "claim_refused");
-        assert_eq!(observed[5]["observation"]["kind"], "claim_provider_durable");
-        assert_eq!(observed[5]["observation"]["offset"], 0);
-        assert_eq!(observed[6]["observation"]["kind"], "claim_receipt_released");
-        assert_eq!(observed[12]["reference_sequence"], 12);
-        assert_eq!(observed[12]["observation"]["kind"], "external_applied");
-        assert_eq!(observed[13]["observation"]["kind"], "claim_delivered");
-        assert_eq!(observed.last().unwrap()["observation"]["committed"], false);
-        assert_eq!(summary["actors"].as_array().unwrap().len(), 3);
-        for actor in summary["actors"].as_array().unwrap() {
-            assert_eq!(actor["tx_id"], 29);
-            assert_eq!(actor["token"], "0000001d");
+        for schema_version in [1, 2] {
+            let mut tape = fixture();
+            tape.schema_version = schema_version;
+            tape.validate().unwrap();
+            let mut trial = Trial::open(&tape).await.unwrap();
+            let mut observed = Vec::new();
+            let mut current = None;
+            let result = trial.run(&tape, &mut observed, &mut current).await;
+            let (result, failures) = trial.finish(result).await;
+            let summary = result.unwrap_or_else(|error| panic!("Replay at sequence {current:?} failed: {error}; shutdown: {failures:?}"));
+            assert!(failures.is_empty(), "{failures:?}");
+            assert_eq!(observed[1]["reference_sequence"], 1);
+            assert_eq!(observed[1]["observation"]["kind"], "source_flush_durable");
+            assert_eq!(observed[4]["observation"]["kind"], "claim_refused");
+            assert_eq!(observed[5]["observation"]["kind"], "claim_provider_durable");
+            assert_eq!(observed[5]["observation"]["offset"], 0);
+            assert_eq!(observed[6]["observation"]["kind"], "claim_receipt_released");
+            assert_eq!(observed[12]["reference_sequence"], 12);
+            assert_eq!(observed[12]["observation"]["kind"], "external_applied");
+            assert_eq!(observed[13]["observation"]["kind"], "claim_delivered");
+            assert_eq!(observed.last().unwrap()["observation"]["committed"], false);
+            assert_eq!(summary["actors"].as_array().unwrap().len(), 3);
+            for actor in summary["actors"].as_array().unwrap() {
+                assert_eq!(actor["tx_id"], 29);
+                assert_eq!(actor["token"], "0000001d");
+            }
+            if tape.observes_live_indexes() {
+                let joined = &summary["joined_live_index"];
+                assert_eq!(joined["last_applied_tx_id"], 29);
+                assert_eq!(joined["actors"], json!([{"actor":0,"tx_id":29},{"actor":1,"tx_id":29},{"actor":2,"tx_id":29}]));
+                assert!(summary["native_replica"].as_array().unwrap().iter().any(|entry| {
+                    entry["term_admitted"] == true && entry["message"]["kind"] == "transaction"
+                        && entry["message"]["tx_id"] == 29 && entry["message"]["committed"] == false
+                }));
+            } else {
+                assert!(summary.get("joined_live_index").is_none());
+                assert!(summary["native_replica"].as_array().unwrap().iter().all(|entry| entry.get("term_admitted").is_none()));
+            }
+            assert!(current.is_none());
         }
-        assert!(current.is_none());
+    }
+
+    #[test]
+    fn replay_projection_accepts_only_the_two_defined_versions() {
+        let mut tape = fixture();
+        for schema_version in [0, 3, u32::MAX] {
+            tape.schema_version = schema_version;
+            assert!(tape.validate().is_err());
+        }
     }
 
     #[tokio::test]

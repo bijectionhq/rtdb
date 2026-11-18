@@ -82,7 +82,7 @@ internal class LogProcessorTrace(private val seed: Int) {
             LogProcessorTrace::class.java, LogProcessor::class.java,
             Class.forName("rtdb.conformance.JunitRecorder", false, LogProcessorSimTest::class.java.classLoader))
         val header = buildJsonObject {
-            put("schema_version", 1)
+            put("schema_version", 2)
             put("unique_id", context.uniqueId)
             put("seed", seed)
             put("assertions_finished", finished)

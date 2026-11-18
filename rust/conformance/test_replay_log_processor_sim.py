@@ -1,3 +1,4 @@
+import argparse
 from copy import deepcopy
 import json
 import shutil
@@ -10,7 +11,143 @@ import replay_log_processor_sim as replay
 from test_run_log_processor_sim import tape
 
 
+def joined_execution():
+    return {"summary": {"captured_replica_tip": 1, "native_replica": [
+        {"offset": 0, "term_admitted": True, "message": {"kind": "noop"}},
+        {"offset": 1, "term_admitted": True, "message": {"kind": "transaction", "tx_id": 29}},
+    ], "joined_live_index": {"replica_tip": 2, "last_applied_tx_id": 29,
+        "actors": [{"actor": actor, "tx_id": 29} for actor in range(3)],
+        "replica_suffix": [{"offset": 2, "term_admitted": False, "message": {"kind": "transaction", "tx_id": 99}}]}}}
+
+
 class ProjectedSimulationTest(unittest.TestCase):
+    def test_legacy_capture_keeps_its_original_replay_scope(self):
+        original = tape()
+        projected = replay.project(original, "a" * 64, "b" * 64)
+        self.assertEqual(projected["schema_version"], 1)
+        self.assertEqual(replay.match_live_index_assertion(original, {}), [])
+
+    def test_matches_original_live_index_operands_to_the_joined_native_replica(self):
+        original = tape(schema_version=replay.reference.LIVE_INDEX_TAPE_SCHEMA)
+        replay.reference.check_tape(original, original["unique_id"], -123)
+        projected = replay.project(original, "a" * 64, "b" * 64)
+        legacy = replay.project(tape(), "a" * 64, "b" * 64)
+        self.assertEqual(projected["schema_version"], 2)
+        self.assertEqual(projected["boot"], legacy["boot"])
+        self.assertEqual(projected["inputs"], legacy["inputs"])
+        execution = joined_execution()
+        match, = replay.match_live_index_assertion(original, execution)
+        self.assertEqual((match["source"], match["line"], match["method"], match["unique_id"]), (
+            replay.reference.FIXTURE, 461, "assertLiveIndexesCaughtUp", original["unique_id"],
+        ))
+        self.assertEqual(match["native"], [{"actor": actor, "expected_tx_id": 29, "actual_tx_id": 29} for actor in range(3)])
+        self.assertEqual([row["sequence"] for row in match["reference"]],
+                         [frame["sequence"] for frame in original["events"][-4:-1]])
+        for defect, failure in (
+            ("missing", "lacks the three actor operands"),
+            ("duplicate actor", "native joined live index differs"),
+            ("stale index", "native joined live index differs"),
+            ("fenced expectation", "expectation differs from the admitted replica"),
+            ("short replica", "does not cover its complete prefix"),
+            ("different cohort", "differs from the original JVM assertion"),
+        ):
+            with self.subTest(defect=defect):
+                bad = joined_execution()
+                summary = bad["summary"]
+                joined = summary["joined_live_index"]
+                if defect == "missing":
+                    joined["actors"].pop()
+                elif defect == "duplicate actor":
+                    joined["actors"][2]["actor"] = 1
+                elif defect == "stale index":
+                    joined["actors"][2]["tx_id"] = 28
+                elif defect == "fenced expectation":
+                    joined["last_applied_tx_id"] = 99
+                elif defect == "short replica":
+                    joined["replica_suffix"].clear()
+                else:
+                    summary["native_replica"][1]["message"]["tx_id"] = 28
+                    joined["last_applied_tx_id"] = 28
+                    for actor in joined["actors"]:
+                        actor["tx_id"] = 28
+                with self.assertRaisesRegex(ValueError, failure):
+                    replay.match_live_index_assertion(original, bad)
+
+    def test_native_receipts_require_identical_bytes_and_the_projected_version(self):
+        for defect, failure in (
+            (None, None),
+            ("late replacement", "evidence changed before publication"),
+            ("bool as int", "execution receipt bytes differ from stdout"),
+            ("int as float", "execution receipt bytes differ from stdout"),
+            ("legacy receipt", "receipt differs from its observed inputs"),
+        ):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                capture = root / "capture"
+                capture.mkdir()
+                original = tape(schema_version=replay.reference.LIVE_INDEX_TAPE_SCHEMA)
+                replay.reference.check_tape(original, original["unique_id"], -123)
+                tape_path = capture / "tape.json"
+                marker_path = capture / "marker.json"
+                replay.write_json(tape_path, original)
+                replay.write_json(marker_path, {"original": original["unique_id"]})
+                tape_file = replay.reference.RecordedFile.read(tape_path)
+                marker_file = replay.reference.RecordedFile.read(marker_path)
+                binary = root / "binary"
+                binary.write_bytes(b"native")
+                output = root / "output"
+                execution_path = output / "native" / "execution.json"
+
+                def worker_bytes(value):
+                    return (json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+                def completed(command, _directory, stdout, stderr, _timeout):
+                    execution_path.parent.mkdir()
+                    execution = joined_execution()
+                    execution.update({"schema_version": 1 if defect == "legacy receipt" else 2,
+                        "scope": replay.SCOPE, "execution_complete": True,
+                        "binary_sha256": replay.digest(binary), "input_sha256": replay.digest(command[2]),
+                        "reference_capture_sha256": marker_file.sha256, "tape_sha256": tape_file.sha256,
+                        "unique_id": original["unique_id"], "seed": original["seed"],
+                        "artifact_revision": "clean", "source_dirty": False})
+                    stdout_value = dict(execution)
+                    if defect == "bool as int":
+                        stdout_value["execution_complete"] = 1
+                    elif defect == "int as float":
+                        stdout_value["seed"] = float(execution["seed"])
+                    execution_bytes, stdout_bytes = worker_bytes(execution), worker_bytes(stdout_value)
+                    if defect in ("bool as int", "int as float"):
+                        self.assertEqual(json.loads(execution_bytes), json.loads(stdout_bytes))
+                        self.assertNotEqual(execution_bytes, stdout_bytes)
+                    execution_path.write_bytes(execution_bytes)
+                    stdout.write_bytes(stdout_bytes)
+                    stderr.write_bytes(b"")
+                    return {"completed": True, "exit_code": 0}
+
+                original_match = replay.match_live_index_assertion
+
+                def after_match(tape, execution):
+                    matched = original_match(tape, execution)
+                    if defect == "late replacement":
+                        execution_path.write_bytes(execution_path.read_bytes() + b"\n")
+                    return matched
+
+                args = argparse.Namespace(capture=capture, output=output, native=binary, phase_two=True, timeout=1)
+                with (patch.object(replay, "require_phase_two"),
+                      patch.object(replay.reference, "clean_checkout", return_value="clean"),
+                      patch.object(replay, "read_capture", return_value=(original, tape_file, marker_file)),
+                      patch.object(replay, "run_process", side_effect=completed),
+                      patch.object(replay, "match_live_index_assertion", side_effect=after_match)):
+                    if failure is not None:
+                        with self.assertRaisesRegex(ValueError, failure):
+                            replay.replay(args)
+                        self.assertFalse((output / "result.json").exists())
+                    else:
+                        result = json.loads(replay.replay(args).read_bytes())
+                        self.assertEqual(result["matched_assertions"][0]["line"], 461)
+                        record = next(item for item in result["artifacts"] if item["path"] == "native/execution.json")
+                        self.assertEqual(record["sha256"], replay.digest(execution_path))
+
     def test_projects_exact_boot_and_authored_edge_sequences(self):
         original = tape()
         replay.reference.check_tape(original, original["unique_id"], -123)

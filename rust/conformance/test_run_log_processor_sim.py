@@ -7,7 +7,7 @@ from pathlib import Path
 import run_log_processor_sim as sim
 
 
-def tape(unique="[engine:junit-jupiter]/[test-template-invocation:#1]"):
+def tape(unique="[engine:junit-jupiter]/[test-template-invocation:#1]", *, schema_version=1):
     events = []
 
     def emit(kind, *fields):
@@ -69,8 +69,11 @@ def tape(unique="[engine:junit-jupiter]/[test-template-invocation:#1]"):
         emit("tail_closed", "replica", actor, 31, False, 19)
     emit("tail_closed", "src", 3, 1, False, 0)
     emit("joined")
+    if schema_version == sim.LIVE_INDEX_TAPE_SCHEMA:
+        for actor in range(3):
+            emit(sim.LIVE_INDEX_ASSERTION, actor, 29, 29)
     emit("assertions_finished")
-    return {"schema_version": 1, "unique_id": unique, "seed": -123, "overflow": False,
+    return {"schema_version": schema_version, "unique_id": unique, "seed": -123, "overflow": False,
             "assertions_finished": True, "events": events}
 
 
@@ -128,6 +131,31 @@ class LogProcessorReferenceTest(unittest.TestCase):
                 frame["fields"][index] = update
                 with self.assertRaisesRegex(ValueError, failure):
                     sim.check_tape(invalid, invalid["unique_id"], -123)
+
+    def test_live_index_assertion_requires_each_original_operand_after_join(self):
+        observed = tape(schema_version=sim.LIVE_INDEX_TAPE_SCHEMA)
+        expected = [[actor, 29, 29] for actor in range(3)]
+        self.assertEqual(sim.check_tape(observed, observed["unique_id"], -123)[sim.LIVE_INDEX_ASSERTION], expected)
+        for defect in ("missing", "early", "repeated actor", "wrong expectation", "stale actual", "legacy injection"):
+            with self.subTest(defect=defect):
+                attempt = tape(schema_version=sim.LIVE_INDEX_TAPE_SCHEMA)
+                frames = attempt["events"]
+                if defect == "missing":
+                    del frames[-2]
+                elif defect == "early":
+                    frames[-5], frames[-4] = frames[-4], frames[-5]
+                elif defect == "repeated actor":
+                    frames[-2]["fields"][0] = 1
+                elif defect == "wrong expectation":
+                    frames[-2]["fields"][1:] = [28, 28]
+                elif defect == "stale actual":
+                    frames[-2]["fields"][2] = 28
+                else:
+                    attempt["schema_version"] = 1
+                for sequence, frame in enumerate(frames):
+                    frame["sequence"] = sequence
+                with self.assertRaisesRegex(ValueError, "live-index assertion"):
+                    sim.check_tape(attempt, attempt["unique_id"], -123)
 
     def test_replica_drain_rejects_missing_or_late_delivery(self):
         for absent in (True, False):

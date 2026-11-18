@@ -55,8 +55,10 @@ fn hash(s: &str) -> bool {
 pub(super) fn token(action: u32) -> String { format!("{action:08x}") }
 
 impl Tape {
+    pub fn observes_live_indexes(&self) -> bool { self.schema_version == 2 }
+
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != 1 || self.reference_revision != REFERENCE || self.unique_id.is_empty()
+        if !matches!(self.schema_version, 1 | 2) || self.reference_revision != REFERENCE || self.unique_id.is_empty()
             || self.unique_id.len() > 4096 || !hash(&self.reference_capture_sha256) || !hash(&self.tape_sha256)
             || !(15..=24).contains(&self.rows_per_block) || self.boot.len() != 11 || self.inputs.len() > 157
         {

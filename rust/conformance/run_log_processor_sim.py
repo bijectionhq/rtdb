@@ -25,6 +25,9 @@ TEST_CLASS = "xtdb.indexer.LogProcessorSimTest"
 METHOD = "a node whose claims the log refuses goes on following and indexing"
 FIXTURE = "core/src/test/kotlin/xtdb/indexer/LogProcessorSimTest.kt"
 HELPER = "core/src/test/kotlin/xtdb/LogProcessorTrace.kt"
+LIVE_INDEX_TAPE_SCHEMA = 2
+LIVE_INDEX_ASSERTION = "live_index_caught_up"
+LIVE_INDEX_ASSERTION_LINE = 461
 CLOSURE_CLASSES = {
     TEST_CLASS, "xtdb.DeterministicDispatcher", "xtdb.LogProcessorTrace", "xtdb.indexer.SimLog",
     "xtdb.indexer.LogProcessor", "rtdb.conformance.JunitRecorder",
@@ -286,13 +289,36 @@ CASE_EDITS = (
 )
 
 
+LIVE_INDEX_OVERLAY = (
+    """    private fun assertLiveIndexesCaughtUp(nodes: List<SimNode>) {
+        for ((idx, node) in nodes.withIndex())
+            assertEquals(
+                lastAppliedTxId(), node.liveIndex.state.latestCompletedTx?.txId,
+                "node $idx's live index has not applied the log to its end (seed=$currentSeed)"
+            )
+    }""",
+    """    private fun assertLiveIndexesCaughtUp(nodes: List<SimNode>) {
+        for ((idx, node) in nodes.withIndex()) {
+            val expected = lastAppliedTxId()
+            val actual = node.liveIndex.state.latestCompletedTx?.txId
+            assertEquals(
+                expected, actual,
+                "node $idx's live index has not applied the log to its end (seed=$currentSeed)"
+            )
+            simulationTrace?.event("live_index_caught_up", idx, expected, actual)
+        }
+    }""",
+)
+
+
 def replace_once(source, before, after):
     if source.count(before) != 1:
         raise ValueError(f"reference overlay anchor is missing or repeated: {before.splitlines()[0]}")
     return source.replace(before, after, 1)
 
 
-def derived_source(path, raw, seed):
+def derived_source(path, raw, seed, tape_schema=LIVE_INDEX_TAPE_SCHEMA):
+    require(type(tape_schema) is int and tape_schema in (1, LIVE_INDEX_TAPE_SCHEMA), "unknown simulation tape version")
     if hashlib.sha256(raw).hexdigest() != OVERLAY_HASHES[path]:
         raise ValueError(f"reference test source differs from C84: {path}")
     source = raw.decode("utf-8")
@@ -309,6 +335,8 @@ def derived_source(path, raw, seed):
         if seed is not None:
             selected = f"    @xtdb.WithSeed({seed})\n" + selected
         source = source[:offset] + selected + source[boundary:]
+        if tape_schema == LIVE_INDEX_TAPE_SCHEMA:
+            source = replace_once(source, *LIVE_INDEX_OVERLAY)
     return source.encode("utf-8")
 
 
@@ -496,7 +524,8 @@ def event_fields(kind, fields, size):
 
 
 def check_tape(tape, unique, seed):
-    require(tape["schema_version"] == 1 and tape["unique_id"] == unique
+    schema = tape["schema_version"]
+    require(type(schema) is int and schema in (1, LIVE_INDEX_TAPE_SCHEMA) and tape["unique_id"] == unique
             and int_value(tape["seed"], -(2**31), 2**31 - 1) and (seed is None or tape["seed"] == seed),
             "simulation tape has a different invocation or seed")
     require(tape["assertions_finished"] is True and tape["overflow"] is False, "simulation observer is incomplete")
@@ -536,6 +565,7 @@ def check_tape(tape, unique, seed):
     picked = False
     leaders = None
     checkpoints = []
+    live_indexes = []
     checkpoint_order = ["external_settled", "replica_delivered", "await_tx", "nodes_caught_up", "idle", "quiescence", "joined"]
 
     for frame in frames[2:-1]:
@@ -701,6 +731,14 @@ def check_tape(tape, unique, seed):
                         "quiescence role aggregate contradicts the recorded samples")
                 require(sampled[:2] == sampled[3:], "refused peer role changed between consecutive quiescence reads")
                 leaders = fields
+        elif kind == LIVE_INDEX_ASSERTION:
+            event_fields(kind, fields, 3)
+            actor, expected, actual = fields
+            require(schema == LIVE_INDEX_TAPE_SCHEMA and checkpoints == checkpoint_order
+                    and int_value(actor, 0, 2) and actor == len(live_indexes)
+                    and int_value(expected, 0) and int_value(actual, 0) and expected == actual == applied_tx,
+                    "post-join live-index assertion differs from the original actor or awaited transaction")
+            live_indexes.append(fields)
         else:
             raise ValueError(f"unexpected simulation event: {kind}")
 
@@ -713,7 +751,12 @@ def check_tape(tape, unique, seed):
             and all(durable[stream] == received[stream] == len(enqueued[stream]) for stream in enqueued)
             and enqueued["replica"] and enqueued["replica"][0][1] == ["noop", 1, 0, None],
             "simulation did not observe the original refusal, stream drain and convergence boundaries")
-    return {"seed": tape["seed"], "events": len(frames), "actions": actions, "steps": steps}
+    observed = {"seed": tape["seed"], "events": len(frames), "actions": actions, "steps": steps}
+    if schema == LIVE_INDEX_TAPE_SCHEMA:
+        require(len(live_indexes) == 3 and all(frame["kind"] == LIVE_INDEX_ASSERTION for frame in frames[-4:-1]),
+                "original invocation omitted post-join live-index assertions")
+        observed[LIVE_INDEX_ASSERTION] = live_indexes
+    return observed
 
 
 def runtime_requests(selection, tape):
@@ -912,6 +955,7 @@ def capture(args):
 
     unique, selection, worker_files, tape_file = selected_invocation(run)
     tape = json.loads(tape_file.data)
+    require(tape["schema_version"] == LIVE_INDEX_TAPE_SCHEMA, "current observer omitted the live-index assertion tape")
     observed = check_tape(tape, unique, args.seed)
     xml = regular(tree / "core/build/test-results/property-test" / f"TEST-{TEST_CLASS}.xml")
     runtime = retain_runtime(run, tree, selection, tape)

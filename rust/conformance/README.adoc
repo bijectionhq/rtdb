@@ -161,6 +161,7 @@ After Phase 2 begins, run `python3 rust/conformance/run_log_processor_sim.py --p
 The runner creates a detached reference tree in the output directory and verifies the original and derived test sources.
 Gradle loads the inventory adapter from the retained copy inside that directory.
 It records the seed, authored actions and role samples, dispatcher choices, actual claim refusals, ordered log enqueue and durability, tail delivery, external apply acknowledgements and the original assertions' completion.
+The version 2 tape records both original operands of `assertLiveIndexesCaughtUp` for all three nodes after the original simulation scope joins.
 The existing JUnit worker listener binds the trace bytes to the concrete successful invocation.
 The output retains the task selection, Gradle logs and report, and the worker's classpath and runtime evidence.
 The runtime receipt records the requested paths, their resolved roots, and the regular files found beneath selected directory roots at capture time.
@@ -190,7 +191,11 @@ The surviving writer uses the original typed UUIDs and the captured effective tr
 The launcher verifies each captured token against its action index, and the native driver submits that index in the original big-endian encoding.
 The native trace records the assigned and applied transaction keys, source position mapping and each processor's progress at its selected final observation.
 The native driver owns later scheduling and block production.
-Comparison of internal time samples, intermediate apply and role edges, block and snapshot layouts, and matched assertion receipts remains pending.
+With a version 2 tape, the trial joins all three native drivers, reads each retained live index and finds the maximum resolved transaction ID admitted by the production term fence over the complete native replica log.
+The launcher compares both operands for all three nodes and records the C84 source line and invocation in `matched_assertions` in `result.json`.
+Earlier valid captures with a version 1 tape still replay the boot and authored inputs.
+The launcher requires byte-for-byte equality between native stdout and `execution.json` before publishing `result.json`.
+Comparison of internal time samples, intermediate apply and role edges, and block and snapshot layouts remains pending.
 
 
 `list_native.py` reads Cargo JSON build messages and lists the already-built test executables, preserving target, feature configuration, binary digest, and exact test name.
