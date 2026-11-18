@@ -427,6 +427,7 @@ Binary LIKE retains the reference hexadecimal wildcard transformation; binary IL
 
 LIMIT, OFFSET and explicit FETCH counts accept unsigned integer literals or parameters.
 Parameter values must be nonnegative integers within signed 64-bit range; null, floating and text counts raise the expected-number anomaly.
+The query opens the input cursor, then resolves the offset and row count before requesting any pages.
 FETCH without a count retains its one-row default, and LIMIT ALL is rejected.
 `tests/row_limits.rs` records grammar and execution-path regression source; execution remains pending.
 

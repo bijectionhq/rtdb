@@ -128,9 +128,9 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
         RelationNode::Limit { offset,fetch,.. } => {
+            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
             let offset = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let input = build_pages_constrained(runtime.child(0)?,execution.child(0),crate::inspection::Constraints::default(),None).await?;
             let pages = Box::new(Limit { input: Some(input),offset,remaining,execution });
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
@@ -138,9 +138,9 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
         RelationNode::SortLimit { order_by,offset,fetch,.. } => {
             let mut constraints = constraints;for order in order_by { constraints.require(&order.expr); }
             let pushdowns = if offset.is_some() || fetch.is_some() { None } else { pushdowns };
+            let mut pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
             let offset_value = row_limit(offset.as_ref(),&execution).await?.unwrap_or(0);
             let remaining = row_limit(fetch.as_ref(),&execution).await?;
-            let mut pages = build_pages_constrained(runtime.child(0)?,execution.child(0),constraints,pushdowns).await?;
             if !order_by.is_empty() {
                 let row_limit = offset_value.saturating_add(remaining.unwrap_or(i64::MAX as u64)).min(i64::MAX as u64);
                 pages = Box::new(crate::sort::SortCursor::with_row_limit(pages,runtime.child(0)?.schema().clone(),order_by.clone(),row_limit,execution.clone()));

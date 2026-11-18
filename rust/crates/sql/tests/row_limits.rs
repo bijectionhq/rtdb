@@ -44,6 +44,12 @@ async fn sql_row_limits_accept_unsigned_literals_and_nonnegative_integer_paramet
     }
 }
 
+#[tokio::test]
+async fn sql_row_limit_opens_its_input_before_reading_the_limit_parameter() {
+    let error = query("VALUES (1 / 0) LIMIT $1", vec![V::Utf8("1".into())]).await.unwrap_err();
+    assert_eq!(error.code, "xtdb.expression/division-by-zero");
+}
+
 #[test]
 fn sql_row_limit_syntax_rejects_expression_bounds_and_erased_limit_all() {
     let context = context();

@@ -146,6 +146,24 @@ async fn values_cte_opening_depends_on_inline_or_materialized_lifetime() {
 }
 
 #[tokio::test]
+async fn sorted_and_unsorted_limits_open_their_inputs_before_resolving_bounds() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    for (sql, code) in [
+        ("VALUES (1 / 0) LIMIT $1", "xtdb.expression/division-by-zero"),
+        ("SELECT v FROM (VALUES (1 / 0)) t(v) ORDER BY v LIMIT $1", "xtdb.expression/division-by-zero"),
+        ("SELECT 1 / 0 LIMIT $1", "xtdb/expected-number"),
+        ("SELECT v FROM (VALUES (1)) t(v) ORDER BY v LIMIT $1", "xtdb/expected-number"),
+    ] {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let retained_plan = context.memory.used_bytes();
+        let error = statement.open_query(Arc::clone(&context), vec![Value::Utf8("1".into())]).await.err().unwrap();
+        assert_eq!(error.code, code, "{sql}");
+        assert_eq!(context.memory.used_bytes(), retained_plan, "{sql}");
+    }
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
 async fn lateral_values_open_with_the_dependent_arguments_during_pull() {
     let context = context(None, &MemoryBudget::new(1 << 26));
     let sql = "SELECT t.v, w.b FROM (VALUES (1), (0)) AS t(v), LATERAL (VALUES (1/t.v)) AS w(b) LIMIT 1";
