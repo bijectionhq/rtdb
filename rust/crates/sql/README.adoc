@@ -286,6 +286,8 @@ Quoted identifiers preserve doubled interior quote or backtick delimiters in que
 == Inline XTQL
 
 XTQL string queries enter the ordinary SQL query-expression path, including derived tables, CTEs, set operations, scalar and quantified subqueries, and INSERT sources.
+SQL syntax retains the embedded text and any explicit argument syntax.
+Resolving that syntax reads XTQL and assigns SQL argument slots in source order under the originating raw metadata budget.
 Their parsed descriptors retain the original token span, and the binder recognizes each injected table reference by that span and its generated name together.
 User-written table and CTE names remain ordinary catalog or lexical references.
 SQL and XTQL share the preparation's transient column allocator and internal parameter cursor; the returned relation is immutable.

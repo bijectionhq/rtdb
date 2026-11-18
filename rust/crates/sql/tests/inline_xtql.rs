@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::{MemoryBudget, read_value};
 use rtdb_plan::{Dml, Relation, RelationNode, Statement};
 use rtdb_query::{CatalogSnapshot, DatabaseSnapshot, PreparedQuery, QueryContext, QueryOptions};
-use rtdb_sql::{PrepareOptions, parse, prepare};
+use rtdb_sql::{PrepareOptions, parse, parse_syntax_in, prepare};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{Result, Timestamp, Value as V};
 use tokio_util::sync::CancellationToken;
@@ -130,6 +130,43 @@ fn inline_xtql_arity_and_reader_errors_retain_original_sql_spans() {
     assert!(error.context.contains_key("offset"));
     assert_eq!(error.context["position"],serde_json::json!(malformed.find("$$").unwrap()+1));
     assert!(parse("XTQL ($$(rel [{}] [])$$,1)").is_err());
+}
+
+#[test]
+fn surrounding_sql_syntax_precedes_inline_xtql_reader_errors() {
+    let memory = MemoryBudget::new(0);
+    for source in ["XTQL ($$($$, 1)", "XTQL $$($$; SELEC 8"] {
+        let error = parse_syntax_in(source, &memory).unwrap_err();
+        assert_eq!(error.code, "xtdb/sql-error", "{source}");
+    }
+
+    let source = "XTQL $$($$; SELECT 7";
+    let mut statements = parse_syntax_in(source, &memory).unwrap().into_iter();
+    let error = statements.next().unwrap().resolve().unwrap_err();
+    assert_eq!(error.code, "xtql/edn-reader");
+    assert_eq!(error.context["position"], serde_json::json!(source.find("$$").unwrap() + 1));
+    assert_eq!(statements.next().unwrap().resolve().unwrap().parameter_count(), 0);
+    assert_eq!(memory.peak_bytes(), 0);
+}
+
+#[tokio::test]
+async fn anonymous_and_numbered_grouping_expressions_use_the_same_assigned_slot() {
+    let sql = "SELECT v + ? AS x FROM (VALUES (1)) t(v) GROUP BY v + $1";
+    assert_eq!(query(sql, vec![V::I64(2)]).await.unwrap(), [vec![V::I64(3)]]);
+}
+
+#[test]
+fn numbered_parameter_values_are_checked_after_sql_grammar() {
+    let memory = MemoryBudget::new(0);
+    let error = parse_syntax_in("SELECT $0; SELEC 7", &memory).unwrap_err();
+    assert_eq!(error.code, "xtdb/sql-error");
+    assert!(error.message.as_deref().unwrap().contains("SELEC"));
+    for parameter in ["$0", "$99999999999999999999999999"] {
+        let source = format!("SELECT {parameter}");
+        let syntax = parse_syntax_in(&source, &memory).unwrap().remove(0);
+        let error = syntax.resolve().unwrap_err();
+        assert_eq!(error.message.as_deref(), Some("SQL parameters use ? or a positive $n index"));
+    }
 }
 
 #[test]

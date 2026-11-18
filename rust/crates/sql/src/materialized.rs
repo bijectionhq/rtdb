@@ -131,13 +131,13 @@ mod tests {
     #[test]
     fn materialized_markers_reach_custom_assert_set_and_record_expressions() {
         let mut statements = crate::parse("ASSERT EXISTS (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)").unwrap();
-        let Syntax::Assert(expression, _) = &statements.remove(0).statement else { panic!("ASSERT") };
+        let Syntax::Assert(expression, _) = &statements.remove(0).tree.statement else { panic!("ASSERT") };
         marked(expression);
         let mut statements = crate::parse("SET application_name = (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)").unwrap();
-        let Syntax::Set { value, .. } = &statements.remove(0).statement else { panic!("SET") };
+        let Syntax::Set { value, .. } = &statements.remove(0).tree.statement else { panic!("SET") };
         marked(value);
         let mut statements = crate::parse("INSERT INTO docs RECORDS {_id: 1, v: (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)}").unwrap();
-        let Syntax::Records { records, .. } = &statements.remove(0).statement else { panic!("RECORDS") };
+        let Syntax::Records { records, .. } = &statements.remove(0).tree.statement else { panic!("RECORDS") };
         let ast::Expr::Dictionary(fields) = &records[0] else { panic!("record") };
         marked(&fields[1].value);
     }
@@ -145,7 +145,7 @@ mod tests {
     #[test]
     fn materialized_markers_reach_temporal_and_ignored_returning_subqueries() {
         let mut statements = crate::parse("SELECT * FROM docs FOR SYSTEM_TIME AS OF (WITH MATERIALIZED c AS (SELECT TIMESTAMP '2000-01-01Z' AS t) SELECT t FROM c)").unwrap();
-        let TemporalExtent::At(expression) = &statements.remove(0).temporal[0].extent else { panic!("AS OF") };
+        let TemporalExtent::At(expression) = &statements.remove(0).tree.temporal[0].extent else { panic!("AS OF") };
         marked(expression);
         crate::parse("INSERT INTO docs (_id) VALUES (1) RETURNING (WITH MATERIALIZED c AS (SELECT 1 AS n) SELECT n FROM c)").unwrap();
         assert!(crate::parse("INSERT INTO docs (_id) VALUES (1) RETURNING (WITH c AS MATERIALIZED (SELECT 1 AS n) SELECT n FROM c)").is_err());

@@ -1,20 +1,77 @@
 use rtdb_plan::{Identifier, SourceSpan};
 use rtdb_types::{Anomaly, Result};
+use std::ops::ControlFlow;
+use sqlparser::ast::VisitMut;
 use sqlparser::{ast as ast, dialect::GenericDialect, parser::Parser, tokenizer::{Location, Span, Token, TokenWithSpan, TokenizeBufferError, Tokenizer}};
 use crate::dialect::SqlDialect;
 
 #[derive(Clone, Debug)]
 pub struct ParsedStatement<'input> {
     pub span: SourceSpan,
+    pub(crate) tree: StatementTree<'input>,
+    parameter_count: usize,
+    pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
+}
+
+/// A complete SQL syntax tree with pending argument assignments and embedded XTQL text.
+#[derive(Clone, Debug)]
+pub struct StatementSyntax<'input> {
+    span: SourceSpan,
+    tree: StatementTree<'input>,
+    parameters: crate::inline_xtql::SourceArguments,
+}
+
+impl<'input> StatementSyntax<'input> {
+    /// Assigns source-order argument slots and reads inline XTQL using the originating metadata budget.
+    pub fn resolve(mut self) -> Result<ParsedStatement<'input>> {
+        let crate::inline_xtql::ParameterAssignments { count, dynamic, inline } = self.parameters.assign(self.tree.source, self.tree.forms)?;
+        if !dynamic.is_empty() && let ControlFlow::Break(span) = self.tree.visit(&mut AssignParameters(&dynamic)) {
+            return Err(sql_error("Invalid anonymous parameter occurrence", self.tree.source, span));
+        }
+        Ok(ParsedStatement { span: self.span, tree: self.tree, parameter_count: count, inline_xtql: inline })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StatementTree<'input> {
     pub(crate) source: &'input str,
     pub(crate) forms: crate::bind::FormAllocation<'input>,
-    parameter_count: usize,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
-    pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
     pub(crate) period_columns: std::collections::BTreeSet<String>,
     pub(crate) settings: crate::settings::ParsedSettings,
     pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
+}
+
+impl VisitMut for StatementTree<'_> {
+    fn visit<V: ast::VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
+        match &mut self.statement {
+            Syntax::Standard(statement) => statement.visit(visitor)?,
+            Syntax::Erase(delete) => delete.visit(visitor)?,
+            Syntax::Assert(value, _) | Syntax::Set { value, .. } => value.visit(visitor)?,
+            Syntax::Records { records, .. } => records.visit(visitor)?,
+            Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Show(_) => (),
+        }
+        for clause in &mut self.temporal { clause.extent.visit(visitor)?; }
+        self.settings.visit(visitor)
+    }
+}
+
+struct AssignParameters<'a>(&'a [usize]);
+
+impl ast::VisitorMut for AssignParameters<'_> {
+    type Break = Span;
+
+    fn pre_visit_value(&mut self, value: &mut ast::ValueWithSpan) -> ControlFlow<Span> {
+        if let ast::Value::Placeholder(parameter) = &mut value.value
+            && let Some(ordinal) = parameter.strip_prefix('?') {
+            let Some(index) = ordinal.parse::<usize>().ok().and_then(|ordinal| self.0.get(ordinal)) else {
+                return ControlFlow::Break(value.span);
+            };
+            *parameter = format!("${}", index + 1);
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +84,7 @@ impl<'input> ParsedStatement<'input> {
     }
 
     /// Returns the source input for this statement's byte offsets.
-    pub fn source(&self) -> &'input str { self.source }
+    pub fn source(&self) -> &'input str { self.tree.source }
 
     pub fn parameter_count(&self) -> usize { self.parameter_count }
     /// Identifies parsed reads and table mutations that cannot change database/storage configuration or execute a named prepared statement.
@@ -41,14 +98,14 @@ impl<'input> ParsedStatement<'input> {
                 _ => false,
             }
         }
-        match &self.statement {
+        match &self.tree.statement {
             Syntax::Standard(statement) => standard(statement),
             Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Records { .. } | Syntax::CreateTable { .. } => true,
             _ => false,
         }
     }
     pub fn kind(&self) -> StatementKind {
-        match &self.statement {
+        match &self.tree.statement {
             Syntax::Standard(ast::Statement::Query(_) | ast::Statement::Explain { .. }) => StatementKind::Query,
             Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. }
             | Syntax::Erase(_) | Syntax::Assert(_, _)
@@ -84,6 +141,18 @@ pub(crate) enum TemporalExtent {
     At(ast::Expr),
     FromTo(ast::Expr, Option<ast::Expr>),
     Between(ast::Expr, ast::Expr),
+}
+
+impl VisitMut for TemporalExtent {
+    fn visit<V: ast::VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
+        match self {
+            Self::All => (),
+            Self::At(value) => value.visit(visitor)?,
+            Self::FromTo(from, to) => { from.visit(visitor)?; to.visit(visitor)?; }
+            Self::Between(from, to) => { from.visit(visitor)?; to.visit(visitor)?; }
+        }
+        ControlFlow::Continue(())
+    }
 }
 
 pub(crate) fn tokenize(source: &str) -> Result<Vec<TokenWithSpan>> {
@@ -133,12 +202,21 @@ pub fn parse(sql: &str) -> Result<Vec<ParsedStatement<'_>>> {
 }
 
 /// Parses statements while charging reached inline XTQL raw metadata to the existing caller budget.
-/// Syntax, statement-span and source-read order are unchanged; allocation/admission errors propagate.
+/// Allocation/admission errors propagate when the parsed statements resolve their parameters.
 pub fn parse_in<'input>(sql: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<ParsedStatement<'input>>> {
     parse_with(sql, crate::bind::FormAllocation::Tracked(memory))
 }
 
 pub(crate) fn parse_with<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Vec<ParsedStatement<'input>>> {
+    parse_syntax(sql, forms)?.into_iter().map(StatementSyntax::resolve).collect()
+}
+
+/// Parses the surrounding SQL before interpreting embedded XTQL text.
+pub fn parse_syntax_in<'input>(sql: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>) -> Result<Vec<StatementSyntax<'input>>> {
+    parse_syntax(sql, crate::bind::FormAllocation::Tracked(memory))
+}
+
+fn parse_syntax<'input>(sql: &'input str, forms: crate::bind::FormAllocation<'input>) -> Result<Vec<StatementSyntax<'input>>> {
     let dialect = SqlDialect::default();
     let tokens = tokenize(sql)?;
     let tokens: Vec<_> = tokens.into_iter().filter(|token| !matches!(token.token, Token::Whitespace(_))).collect();
@@ -158,7 +236,7 @@ pub(crate) fn parse_with<'input>(sql: &'input str, forms: crate::bind::FormAlloc
             }
             _ => None,
         }).collect();
-        let (tokens, inline_xtql, parameter_count) = crate::inline_xtql::extract(prefix, sql, forms)?;
+        let (tokens, parameters) = crate::inline_xtql::extract(prefix, sql)?;
         let (tokens, settings) = crate::settings::extract(tokens, sql)?;
         let (tokens, wildcard_renames) = crate::wildcard::extract(tokens, sql)?;
         let (tokens, materialized) = crate::materialized::cte_tokens(quantified_values(tokens, sql)?, sql)?;
@@ -228,7 +306,8 @@ pub(crate) fn parse_with<'input>(sql: &'input str, forms: crate::bind::FormAlloc
             return Err(sql_error("SETTING requires a query expression", sql, slice[0].span));
         }
         crate::materialized::restore(&mut statement, &mut temporal, materialized, sql)?;
-        statements.push(ParsedStatement { span, source: sql, forms, parameter_count, statement, temporal, inline_xtql, period_columns, settings, wildcard_renames });
+        let tree = StatementTree { source: sql, forms, statement, temporal, period_columns, settings, wildcard_renames };
+        statements.push(StatementSyntax { span, tree, parameters });
     }
     Ok(statements)
 }

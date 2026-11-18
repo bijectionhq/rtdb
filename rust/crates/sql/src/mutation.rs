@@ -37,7 +37,7 @@ fn prepare_static_with(sql: &str, catalog: &dyn Catalog, options: &crate::Prepar
     let mut parsed = crate::parse::parse_with(sql, forms)?;
     if parsed.len() != 1 { return Err(invalid("A transaction operation must contain one statement")); }
     let statement = parsed.remove(0);
-    let eligible = match &statement.statement {
+    let eligible = match &statement.tree.statement {
         crate::parse::Syntax::Records { .. } => true,
         crate::parse::Syntax::Standard(sqlparser::ast::Statement::Insert(insert)) => insert.source.as_ref().is_some_and(|query| matches!(query.body.as_ref(), sqlparser::ast::SetExpr::Values(_)) && query.with.is_none() && query.order_by.is_none() && query.limit_clause.is_none()),
         _ => false,

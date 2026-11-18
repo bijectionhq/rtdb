@@ -89,17 +89,16 @@ pub(crate) fn control_expression(source: &str, expression: &ast::Expr, options: 
 }
 
 pub(crate) fn bind(parsed: ParsedStatement<'_>, catalog: &dyn Catalog, options: &PrepareOptions) -> Result<PreparedStatement> {
-    let source = parsed.source;
-    let forms = parsed.forms;
-    let scoped_catalog = TransactionCatalog(catalog);
-    let catalog: &dyn Catalog = if matches!(&parsed.statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
     let next_parameter = parsed.parameter_count();
-    let mut context = Context { forms, literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal: parsed.temporal, inline_xtql: parsed.inline_xtql, wildcard_renames: parsed.wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns: parsed.period_columns, notices: Vec::new(), default_valid: None, default_system: None };
-    let (settings, valid, system) = parsed.settings.bind(&mut context)?;
+    let crate::parse::StatementTree { source, forms, statement, temporal, period_columns, settings, wildcard_renames } = parsed.tree;
+    let scoped_catalog = TransactionCatalog(catalog);
+    let catalog: &dyn Catalog = if matches!(&statement, Syntax::Records { .. } | Syntax::CreateTable { .. } | Syntax::GrantRole { .. } | Syntax::Erase(_) | Syntax::Assert(_, _) | Syntax::Standard(ast::Statement::Insert(_) | ast::Statement::Update(_) | ast::Statement::Delete(_))) { &scoped_catalog } else { catalog };
+    let mut context = Context { forms, literals: Default::default(), source, catalog, options, cast_timezone: Some(&options.default_timezone), binder: Binder::default(), temporal, inline_xtql: parsed.inline_xtql, wildcard_renames, ctes: BTreeMap::new(), next_symbol: 0, hidden_columns: BTreeMap::new(), outer_scopes: Vec::new(), inferred_group_scopes: Vec::new(), next_parameter, period_columns, notices: Vec::new(), default_valid: None, default_system: None };
+    let (settings, valid, system) = settings.bind(&mut context)?;
     context.default_valid = valid;
     context.default_system = system;
-    context.admit_statement_literals(&parsed.statement)?;
-    let statement = context.statement(&parsed.statement)?;
+    context.admit_statement_literals(&statement)?;
+    let statement = context.statement(&statement)?;
     context.literals.check()?;
     Ok(PreparedStatement { statement, parameter_types: context.binder.parameter_types().clone(), source: source.to_owned(), notices: context.notices, settings })
 }

@@ -23,7 +23,7 @@ mod lexer;
 mod parser;
 mod literal_text;
 
-pub use parse::{ParsedStatement, StatementKind, parse, parse_in};
+pub use parse::{ParsedStatement, StatementKind, StatementSyntax, parse, parse_in, parse_syntax_in};
 pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_tx_in, prepare_patch, prepare_static, prepare_static_in};
 pub use control::{ParsedControl, parse_control, parse_control_in, parse_control_syntax_in};
 pub use split::{SplitStatements, split_statements, split_statements_in};

@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 
 use rtdb_plan::{Expr, QuerySettings, Schema, SettingValue, TemporalFilter};
 use rtdb_types::{Result, TimeUnit, Value};
 use sqlparser::{ast, tokenizer::{Token, TokenWithSpan}};
+use sqlparser::ast::VisitMut;
 
 use crate::bind::Context;
 use crate::parse::{TemporalExtent, expression, sql_error, word};
@@ -14,6 +16,18 @@ pub(crate) struct ParsedSettings {
 
 #[derive(Clone, Debug)]
 enum ParsedSetting { Valid(TemporalExtent), System(TemporalExtent), Clock(ast::Expr), Token(ast::Expr), Time(ast::Expr) }
+
+impl VisitMut for ParsedSettings {
+    fn visit<V: ast::VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
+        for entry in &mut self.entries {
+            match entry {
+                ParsedSetting::Valid(extent) | ParsedSetting::System(extent) => extent.visit(visitor)?,
+                ParsedSetting::Clock(value) | ParsedSetting::Token(value) | ParsedSetting::Time(value) => value.visit(visitor)?,
+            }
+        }
+        ControlFlow::Continue(())
+    }
+}
 
 impl ParsedSettings {
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
