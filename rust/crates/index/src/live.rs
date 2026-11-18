@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
-use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, estimate_builder_bytes_refs, from_field};
+use rtdb_columnar::{MemoryBudget, MemoryReservation, OwnedBatch, estimate_builder_bytes, estimate_builder_bytes_refs, from_field, struct_field_cell};
 use rtdb_format::data::{EventBatch, StoredEvent, StoredOperation, build_event_batch, copy_event_batch};
 use rtdb_trie::{EventRow, IidReader, MemoryHashTrie, TrieConfig};
 use rtdb_types::{Anomaly, BlockIndex, EntityId, EventHeader, Iid, Interval, LogicalType, Result, TableRef, Timestamp, TransactionKey, Value};
@@ -68,7 +68,7 @@ impl IndexBatch {
             bytes = bytes.checked_add(estimate_builder_bytes(&LogicalType::Struct(fields.clone()), &[])?).ok_or_else(|| invalid("Put schema allocation size overflow"))?;
             for (name, ty) in &fields {
                 let values = events.iter().filter_map(|event| match &event.operation {
-                    StoredOperation::Put(document) => Some(document.get(name).unwrap_or(&Value::Undefined)), _ => None,
+                    StoredOperation::Put(document) => Some(struct_field_cell(document, name, ty)), _ => None,
                 });
                 bytes = bytes.checked_add(estimate_builder_bytes_refs(ty, values)?).ok_or_else(|| invalid("Put column allocation size overflow"))?;
             }

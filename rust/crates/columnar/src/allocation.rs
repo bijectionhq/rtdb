@@ -64,7 +64,7 @@ fn cell_cost(logical: &LogicalType, value: &Value) -> Result<usize> {
             bytes = add(bytes, width)?;
         }
         LogicalType::Struct(fields) => for (name, logical) in fields {
-            let value = match value { Value::Struct(values) => values.get(name).unwrap_or(&Value::Undefined), _ => &Value::Undefined };
+            let value = match value { Value::Struct(values) => super::values::struct_field_cell(values, name, logical), _ => &Value::Undefined };
             bytes = add(bytes, cell_cost(logical, value)?)?;
         },
         LogicalType::Union(legs) => {

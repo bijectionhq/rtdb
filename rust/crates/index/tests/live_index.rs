@@ -202,6 +202,24 @@ fn empty_declared_table_is_visible_to_later_staged_transactions() {
 }
 
 #[test]
+fn put_omitting_a_declared_column_preserves_its_null_field() {
+    let state = PartitionState::empty(TrieConfig::default()).unwrap();
+    let budget = MemoryBudget::new(1 << 24);
+    let mut tx = TransactionBuffer::new(state.resolving_snapshot(&[]).unwrap(), key(0), Arc::clone(&budget)).unwrap();
+    tx.declare_table(table(), ["v".into()]).unwrap();
+    tx.put(table(), BTreeMap::from([("_id".into(), Value::I64(1))]), Interval::ALL).unwrap();
+
+    let staged = tx.stage().unwrap();
+    state.apply(&staged).unwrap();
+    let snapshot = state.open_snapshot(Some(key(0).system_time));
+    assert_eq!(snapshot.column_types(&table())["v"], LogicalType::Null);
+    let events = snapshot.segments(&table())[0].ordered_events().unwrap();
+    assert_eq!(events[0].source.event().unwrap().operation, StoredOperation::Put(BTreeMap::from([
+        ("_id".into(), Value::I64(1)), ("v".into(), Value::Null),
+    ])));
+}
+
+#[test]
 fn table_membership_includes_seeded_empty_catalogs_and_keeps_its_captured_generation() {
     let state = PartitionState::empty(TrieConfig::default()).unwrap();
     let before = state.open_snapshot(None);

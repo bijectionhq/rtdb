@@ -394,6 +394,8 @@ rule GetTableTx {
 ------------------------------------------------------------
 
 rule LogPut {
+    -- The put preserves the table's explicitly declared columns when the document omits them.
+    -- Reading an omitted column in the row yields null.
     when: LogPut(table_tx, iid, valid_time, doc)
 
     requires: table_tx.transaction.status = active

@@ -43,6 +43,16 @@ pub(crate) fn accepts(logical: &LogicalType, value: &Value) -> bool {
     plain.join(&value.logical_type()) == plain
 }
 
+/// Resolves a struct field's cell in its declared layout.
+/// A missing bottom-typed field returns `Value::Undefined`.
+/// Other missing fields return `Value::Null`.
+pub fn struct_field_cell<'a>(fields: &'a BTreeMap<String, Value>, name: &str, logical: &LogicalType) -> &'a Value {
+    fields.get(name).unwrap_or(match logical {
+        LogicalType::Nothing => &Value::Undefined,
+        _ => &Value::Null,
+    })
+}
+
 fn validity(values: &[Value]) -> Option<NullBuffer> {
     let valid: Vec<_> = values.iter().map(|v| !matches!(v, Value::Null | Value::Undefined)).collect();
     valid.iter().any(|v| !v).then(|| NullBuffer::from(valid))
@@ -59,7 +69,7 @@ fn build(logical: &LogicalType, values: &[Value], check_precision: bool) -> Resu
             let DataType::Struct(fields) = field.data_type() else { return Err(layout_error()); };
             let arrays = children.iter().map(|(name, child_type)| {
                 let child_values = values.iter().map(|v| match v {
-                    Value::Struct(fields) => fields.get(name).cloned().unwrap_or_else(|| if matches!(child_type, LogicalType::Nothing) { Value::Undefined } else { Value::Null }),
+                    Value::Struct(fields) => struct_field_cell(fields, name, child_type).clone(),
                     _ => Value::Undefined,
                 }).collect::<Vec<_>>();
                 build(child_type, &child_values, check_precision)

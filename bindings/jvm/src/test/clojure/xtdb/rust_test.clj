@@ -98,3 +98,27 @@
     (xt/execute-tx node ["CREATE TABLE foo (b)"])
     (xt/execute-tx node ["INSERT INTO foo RECORDS {_id: 1, a: 2}"])
     (is (= [] (xt/q node "SELECT bs.b FROM foo, UNNEST(foo.b) AS bs(b)")))))
+
+(deftest test-min-max-over-declared-empty-column-return-nil-6133
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (xt/execute-tx node [[:sql "CREATE TABLE docs (v)"]])
+
+    (is (= [{}]
+           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx FROM docs"))
+        "directly over the scan")
+
+    (is (= [{}]
+           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx
+                            FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) t"))
+        "over a UNION ALL of the scan")))
+
+(deftest test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133
+  (with-open [allocator (RootAllocator.)
+              node (open-node allocator)]
+    (xt/execute-tx node [[:sql "CREATE TABLE docs (v)"]
+                         [:put-docs :docs {:xt/id 1}]])
+
+    (is (= [{}]
+           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx
+                            FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) t")))))
