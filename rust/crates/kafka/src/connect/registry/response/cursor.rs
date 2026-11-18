@@ -63,7 +63,7 @@ impl<'a> SliceCursor<'a> {
         self.token = None;
         Ok(())
     }
-    pub(super) fn field(&mut self) -> Result<Option<SliceName<'a>>> {
+    pub(super) fn field(&mut self, _context: &mut ConversionContext) -> Result<Option<SliceName<'a>>> {
         self.discard_scalar()?;
         let first = self.frames.as_slice().last().filter(|frame| frame.kind == Kind::Object)
             .ok_or_else(|| self.syntax("Expected an object context"))?.first;
@@ -128,7 +128,7 @@ impl<'a> SliceCursor<'a> {
         self.token = None;
         while self.frames.len() > before {
             let more = match self.frames.as_slice().last().unwrap().kind {
-                Kind::Object => self.field()?.is_some(),
+                Kind::Object => self.field(context)?.is_some(),
                 Kind::Array => self.element()?,
                 _ => unreachable!(),
             };
@@ -345,9 +345,15 @@ fn escaped(input: &mut Input<'_>) -> Result<u16> {
 }
 
 
+#[cfg(not(test))]
+pub(super) type Cursor<'a> = SliceCursor<'a>;
+
+#[cfg(test)]
 mod observed;
 
+#[cfg(test)]
 pub(super) enum Name<'a> { Slice(SliceName<'a>), Observed(JavaString) }
+#[cfg(test)]
 impl Name<'_> {
     pub(super) fn is(&self, expected: &str) -> Result<bool> {
         match self { Self::Slice(name) => name.is(expected), Self::Observed(name) => Ok(name.view().units().eq(expected.encode_utf16())) }
@@ -357,7 +363,9 @@ impl Name<'_> {
     }
 }
 
+#[cfg(test)]
 pub(super) enum Cursor<'a> { Slice(SliceCursor<'a>), Observed(observed::ObservedCursor<'a>) }
+#[cfg(test)]
 impl<'a> Cursor<'a> {
     pub(super) fn new(bytes: &'a [u8], profile: Profile) -> Result<Self> { Ok(Self::Slice(SliceCursor::new(bytes, profile)?)) }
     pub(super) fn with_text_buffers(bytes: &'a [u8], profile: Profile, observations: &'a [TextBufferObservation]) -> Result<Self> {
@@ -383,7 +391,7 @@ impl<'a> Cursor<'a> {
         match self { Self::Slice(cursor) => cursor.begin_array(context), Self::Observed(cursor) => cursor.begin_array(context) }
     }
     pub(super) fn field(&mut self, context: &mut ConversionContext) -> Result<Option<Name<'a>>> {
-        match self { Self::Slice(cursor) => Ok(cursor.field()?.map(Name::Slice)), Self::Observed(cursor) => Ok(cursor.field(context)?.map(Name::Observed)) }
+        match self { Self::Slice(cursor) => Ok(cursor.field(context)?.map(Name::Slice)), Self::Observed(cursor) => Ok(cursor.field(context)?.map(Name::Observed)) }
     }
     pub(super) fn element(&mut self) -> Result<bool> {
         match self { Self::Slice(cursor) => cursor.element(), Self::Observed(cursor) => cursor.element() }

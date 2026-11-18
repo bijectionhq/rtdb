@@ -1,6 +1,15 @@
 use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+async fn request_head(socket: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(socket.read_u8().await.unwrap());
+        assert!(request.len() < 8192);
+    }
+    String::from_utf8(request).unwrap()
+}
+
 #[tokio::test]
 async fn registry_requests_accept_only_ok_or_no_content_as_success() {
     for (status, body, expected) in [(200, "{}", Some(serde_json::json!({}))), (204, "", Some(Json::Null)), (201, "{}", None)] {
@@ -8,8 +17,7 @@ async fn registry_requests_accept_only_ok_or_no_content_as_success() {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); assert!(request.len() < 8192); }
+            request_head(&mut socket).await;
             socket.write_all(format!("HTTP/1.1 {status} fixture\r\nContent-Length: {}\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
         });
         let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([("schema.registry.url".into(), format!("http://{address}"))]) };
@@ -22,6 +30,105 @@ async fn registry_requests_accept_only_ok_or_no_content_as_success() {
         drop(converter); drop(context);
         assert_eq!(memory.used_bytes(), 0);
     }
+}
+
+#[tokio::test]
+async fn writer_schema_id_projects_eligible_envelopes_and_uses_legacy_for_other_fields() {
+    for (body, expected_type) in [
+        (r#"{"schema":"\"string\"","references":[ ]}"#, None),
+        (r#"{"references":null,"schemaType":"AVRO","schema":"\"string\""}"#, Some("AVRO")),
+        (r#"{"schema":"ignored","schema":"\"string\"","schemaType":null,"unknown":1}"#, None),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = request_head(&mut socket).await;
+            assert_eq!(head.lines().next(), Some("GET /schemas/ids/17 HTTP/1.1"));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            drop(socket);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = request_head(&mut socket).await;
+            assert_eq!(head.lines().next(), Some("POST /subjects/events-value?normalize=false&deleted=true HTTP/1.1"));
+            let length = head.lines().filter_map(|line| line.split_once(':'))
+                .find(|(key, _)| key.eq_ignore_ascii_case("content-length")).unwrap().1.trim().parse::<usize>().unwrap();
+            assert!(length < 8192);
+            let mut request = vec![0; length];
+            socket.read_exact(&mut request).await.unwrap();
+            let mut expected = serde_json::json!({"schema": "\"string\""});
+            if let Some(schema_type) = expected_type { expected["schemaType"] = schema_type.into(); }
+            assert_eq!(serde_json::from_slice::<Json>(&request).unwrap(), expected);
+            let version = br#"{"id":17,"version":3}"#;
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", version.len()).as_bytes()).await.unwrap();
+            socket.write_all(version).await.unwrap();
+        });
+        let spec = PluginSpec {
+            class_name: "io.confluent.connect.avro.AvroConverter".into(),
+            options: BTreeMap::from([("schema.registry.url".into(), format!("http://{address}"))]),
+        };
+        let mut converter = RegistryConverter::open(&spec, RegistryFormat::Avro, false).unwrap();
+        let memory = rtdb_columnar::MemoryBudget::new(1 << 27);
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let document = tokio::time::timeout(std::time::Duration::from_secs(5), converter.schema("events", 17, &mut context)).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+        assert_eq!(document.subject, "events-value");
+        assert_eq!(document.version, 3);
+        assert_eq!(document.root.schema_type.as_deref(), expected_type);
+        assert_eq!(document.root.schema, "\"string\"");
+        assert!(Arc::ptr_eq(&document, &converter.schema("events", 17, &mut context).await.unwrap()));
+        drop(document);
+        drop(converter);
+        drop(context);
+        assert_eq!(memory.used_bytes(), 0);
+    }
+}
+
+#[tokio::test]
+async fn eligible_schema_id_response_uses_typed_admission_on_the_live_get() {
+    let body = br#"{"schema":"\"string\"","references":[]}"#;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let head = request_head(&mut socket).await;
+            assert_eq!(head.lines().next(), Some("GET /schemas/ids/17 HTTP/1.1"));
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).as_bytes()).await.unwrap();
+            socket.write_all(body).await.unwrap();
+        }
+    });
+    let spec = PluginSpec {
+        class_name: "io.confluent.connect.avro.AvroConverter".into(),
+        options: BTreeMap::from([("schema.registry.url".into(), format!("http://{address}"))]),
+    };
+    let mut converter = RegistryConverter::open(&spec, RegistryFormat::Avro, false).unwrap();
+    let memory = rtdb_columnar::MemoryBudget::new(1 << 27);
+    let transport_charge = {
+        let mut context = ConversionContext::new(Arc::clone(&memory));
+        let path = ["schemas".into(), "ids".into(), "17".into()];
+        converter.request_raw(&path, &[], None, &mut context).await.unwrap();
+        context.allocation_limit() - context.allocation_remaining()
+    };
+    drop(converter);
+    let mut projection_context = ConversionContext::new(Arc::clone(&memory));
+    schema_id::decode(body, &mut projection_context).unwrap().unwrap();
+    let projection = projection_context.allocation_limit() - projection_context.allocation_remaining();
+    drop(projection_context);
+    let mut converter = RegistryConverter::open(&spec, RegistryFormat::Avro, false).unwrap();
+    let mut combined = ConversionContext::with_limit(Arc::clone(&memory), transport_charge + projection);
+    let root = tokio::time::timeout(std::time::Duration::from_secs(5), converter.fetch_schema_id(17, &mut combined)).await.unwrap().unwrap();
+    assert_eq!(root.schema, "\"string\"");
+    assert_eq!(combined.allocation_remaining(), 0);
+    let mut legacy = ConversionContext::with_limit(Arc::clone(&memory), projection);
+    let failure = json_admission::parse(body, &mut legacy).unwrap_err();
+    assert!(failure.code.ends_with("/batch-too-large"));
+    tokio::time::timeout(std::time::Duration::from_secs(5), server).await.unwrap().unwrap();
+    drop(root);
+    drop(combined);
+    drop(legacy);
+    drop(converter);
+    assert_eq!(memory.used_bytes(), 0);
 }
 
 #[tokio::test]
@@ -97,24 +204,29 @@ async fn chunked_raw_registry_input_preserves_a_multi_window_body_and_duplicate_
 }
 
 #[tokio::test]
-async fn incomplete_http_bodies_fail_before_interpreting_their_invalid_json_prefix() {
-    for wire in [
-        b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{[".as_slice(),
-        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{[\r\n".as_slice(),
+async fn incomplete_http_bodies_fail_before_interpreting_their_json_prefix() {
+    for (wire, schema_id) in [
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\n{[".as_slice(), false),
+        (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{[\r\n".as_slice(), false),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\n\r\n{\"schema\":\"\\\"string\\\"\"}".as_slice(), true),
     ] {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") { request.push(socket.read_u8().await.unwrap()); assert!(request.len() < 8192); }
+            let request = request_head(&mut socket).await;
+            if schema_id { assert_eq!(request.lines().next(), Some("GET /schemas/ids/17 HTTP/1.1")); }
             socket.write_all(wire).await.unwrap();
         });
         let spec = PluginSpec { class_name: "io.confluent.connect.avro.AvroConverter".into(), options: BTreeMap::from([("schema.registry.url".into(), format!("http://{address}"))]) };
         let mut converter = RegistryConverter::open(&spec, RegistryFormat::Avro, false).unwrap();
         let memory = rtdb_columnar::MemoryBudget::new(1 << 27);
         let mut context = ConversionContext::new(Arc::clone(&memory));
-        let failure = converter.request(&["incomplete".into()], None, &mut context).await.unwrap_err();
+        let failure = if schema_id {
+            converter.fetch_schema_id(17, &mut context).await.err().unwrap()
+        } else {
+            converter.request(&["incomplete".into()], None, &mut context).await.unwrap_err()
+        };
         assert!(failure.code.ends_with("/schema-registry"));
         assert!(matches!(failure.message.as_deref(), Some("HTTP response failed" | "HTTP connection failed")));
         server.await.unwrap();

@@ -11,6 +11,7 @@ pub(in crate::connect::registry) struct SchemaString {
     pub(in crate::connect::registry) max_id: Option<i32>,
 }
 
+#[cfg(test)]
 pub(in crate::connect::registry) struct Schema {
     pub(in crate::connect::registry) subject: Option<JavaString>,
     pub(in crate::connect::registry) version: Option<i32>,

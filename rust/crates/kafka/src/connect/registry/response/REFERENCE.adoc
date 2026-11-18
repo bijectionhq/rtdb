@@ -1,9 +1,9 @@
 = Registry REST response beans
 
 The ordered-byte decoder constructs nullable REST bean owners.
-The production Registry HTTP routes continue to use their published response path.
-The Registry test build includes 30 published decoder regression source fixtures and24 observed-window integration fixture sources, with execution pending Phase 2.
-HTTP stream segmentation, persistent Jackson symbol-table state and effective shipped Jackson selection remain required before typed HTTP activation.
+The Avro writer schema-ID lookup uses the borrowed-byte `SchemaString` entry point for the common UTF8 envelope below.
+The published decoder and observed-window regression sources await execution in Phase 2.
+HTTP stream segmentation, persistent Jackson symbol-table state and effective shipped Jackson selection remain required for wider typed HTTP use.
 The Phase 2, whole-native memory and source-completeness gates remain open.
 
 == Source profiles
@@ -24,6 +24,27 @@ These differ for accepted overlong four-byte encodings below0x10000: raw F0 80 8
 Lazy skip validates continuation bytes without publishing either decoded value.
 Core2.16.0's literal-suffix error decoder rereads the non-ASCII lead byte;2.21.7 advances and rewinds that byte and checks the decoded code point truncated to a Java char.
 The bounded-byte fixtures retain these different observations.
+
+== Avro writer schema-ID response
+
+Confluent 7.8.0 `RestService.getId` reads the HTTP 200 response as `SchemaString` (RestService.java:319–324, 986–1005).
+Its setters preserve the schema string and explicit nullable fields (SchemaString.java:35–115).
+`CachedSchemaRegistryClient.getSchemaByIdFromRegistry` then constructs a `Schema` from that response and invokes the provider (CachedSchemaRegistryClient.java:331–350).
+`Schema` defaults a null type to AVRO and null references to an empty list (Schema.java:140–150).
+
+The native lookup runs the decoder after the existing bounded HTTP collector completes.
+Confluent begins reading the stream within `readValue` after HTTP 200 and has separate absent-body and error-body branches (RestService.java:319–345).
+The common UTF8 envelope admits one literal `schema` field containing a string, an optional literal `schemaType` field containing null or AVRO, and an optional literal `references` field containing null or an empty array.
+It requires unique names, a complete object and valid UTF8 without a BOM or Unicode escapes.
+The bounded object uses the same string, null and empty array values in both inspected source profiles.
+The three member names and strings fit within both profiles' limits under the 256 KiB response cap.
+The production borrowed decoder uses Jackson221, the default parser profile identified by the link:DEFAULT-PROFILE.adoc[pinned Gradle worker classpath].
+An allocation-free scan selects the subset before decoding, and the typed projection reserves its native UTF8 strings before copying them.
+The existing native subject request omits absent or null type and preserves explicit AVRO.
+
+Additional fields, other shapes and unsupported projections use the existing generic JSON path on the same collected response.
+A native allocation refusal in the typed path propagates.
+The typed lookup performs no provider parse and retains no parser or symbol-table state.
 
 == Bean construction
 
@@ -48,7 +69,8 @@ SchemaEntity computes normalizedPath at construction; later reflected entityPath
 
 The Registry transport returns a passive RawResponse whose RawBody retains the admitted byte vector through decoding or final release.
 The existing generic response path parses these borrowed bytes through the admitted JSON materializer.
-Cursor is a passive call-local choice between the borrowed slice cursor and the observed-window lexical transient.
+The production cursor borrows the response slice.
+In fixture builds, Cursor is a passive call-local choice between the borrowed slice cursor and the observed-window lexical transient.
 SliceCursor and Input retain the published borrowed-byte rules; SliceName retains an Input snapshot.
 The observed branch owns one existing parser window, admitted field-name values and a bounded inline numeric spelling.
 Name is a complete slice-name or admitted JavaString value, so repeated name comparisons and retained map keys never repeat an observed source read.
@@ -101,7 +123,7 @@ Core2.21.7 also reports a non-identifier UTF8 literal suffix when decoding that 
 The legacy byte-only cursor has no HTTP read-segmentation observation and does not reproduce those reader-window effects.
 The inactive link:window/REFERENCE.adoc[observed-window entry points] consume the published UTF8/UTF16/UTF32 windows directly for the qualified lexical branches.
 They retain a borrowed successful canonicalizer-result observation at each field occurrence and explicitly reject unmodeled error-token, rewind and over-limit Reader branches.
-Actual HTTP observation capture and persistent mapper symbol state remain required before activation.
+Actual HTTP observation capture and persistent mapper symbol state remain required for that entry point.
 
 JsonFactory also shares seeded ByteQuadsCanonicalizer/CharsToNameCanonicalizer state across parser calls and enables FAIL_ON_SYMBOL_HASH_OVERFLOW by default.
 The borrowed cursor preserves decoded names and member order but carries no persistent mapper symbol state.
@@ -109,7 +131,7 @@ Adversarial symbol-hash overflow, mapper reuse and their failure order therefore
 The local cursor's name-length/decode-buffer checks do not discharge that obligation.
 
 Typed HTTP projection must preserve a nullable Java UTF16 schema text, subject and reference name until their actual consumer demands them.
-Current RegistrySchema.schema:String and reference text maps require a coordinated carrier change before activation.
+The native schema and reference strings require a coordinated carrier change for wider typed HTTP use.
 No null-to-empty or isolated-surrogate-to-replacement projection is authorized here.
 Version lookup scheduling and caching remain owned by the separate Registry timing plan.
 

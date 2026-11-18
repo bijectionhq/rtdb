@@ -12,12 +12,12 @@ mod dlq;
 mod http;
 mod references;
 mod json_admission;
+mod schema_id;
 use references::{ResolvedReferences, ResolvedSchema};
 #[cfg(test)]
 mod http_tests;
 #[cfg(test)]
 mod input_window;
-#[cfg(test)]
 mod response;
 #[cfg(test)]
 pub(super) use response::symbols as reader_symbols;
@@ -162,16 +162,26 @@ impl RegistryConverter {
         }
         Ok(Self { client: None, urls, security, format, is_key, options: options.clone(), schemas: BTreeMap::new(), order: VecDeque::new(), capacity, maximum_schema_bytes: 256 * 1024, next_avro_union: 0, reader_selection, latest, bindings: BTreeMap::new(), binding_order: VecDeque::new(), dlq: BTreeMap::new() })
     }
-    async fn fetch(&mut self, path: &[String], context: &mut ConversionContext) -> Result<RegistrySchema> {
-        let value = self.request(path, None, context).await?;
+    async fn fetch_schema_id(&mut self, id: u32, context: &mut ConversionContext) -> Result<RegistrySchema> {
+        let response = self.request_raw(&["schemas".into(), "ids".into(), id.to_string()], &[], None, context).await?;
+        if self.format == RegistryFormat::Avro {
+            if let Some(bytes) = response.bytes() {
+                if let Some(schema) = schema_id::decode(bytes, context)? { return Ok(schema); }
+            }
+        }
+        let value = Self::decode_response(response, context)?;
         references::admit_typed_references(&value, context)?;
         serde_json::from_value(value).map_err(|cause| error("schema-registry", cause))
     }
+    #[cfg(test)]
     async fn request(&mut self, path: &[String], body: Option<&Json>, context: &mut ConversionContext) -> Result<Json> {
         self.request_query(path, &[], body, context).await
     }
     async fn request_query(&mut self, path: &[String], query: &[(String, String)], body: Option<&Json>, context: &mut ConversionContext) -> Result<Json> {
         let response = self.request_raw(path, query, body, context).await?;
+        Self::decode_response(response, context)
+    }
+    fn decode_response(response: http::RawResponse, context: &mut ConversionContext) -> Result<Json> {
         match response.bytes() {
             Some(bytes) => json_admission::parse(bytes, context),
             None => Ok(Json::Null),
@@ -221,7 +231,7 @@ impl RegistryConverter {
             return Ok(schema);
         }
         while self.schemas.len() >= self.capacity { if let Some(id) = self.order.pop_front() { self.schemas.remove(&id); } }
-        let root = self.fetch(&["schemas".into(), "ids".into(), id.to_string()], context).await?;
+        let root = self.fetch_schema_id(id, context).await?;
         self.validate_format(&root)?;
         let resolved = self.resolve_references(root, context).await?;
         let subject = self.subject(topic, &resolved.root.schema)?;

@@ -8,15 +8,23 @@ mod beans;
 mod scalars;
 mod collections;
 mod decode;
+#[cfg(test)]
 mod window;
+#[cfg(test)]
 pub(in crate::connect) mod symbols;
 
+#[cfg(test)]
 pub(super) use beans::{Metadata, Properties, Rule, RuleKind, RuleMode, RuleSet};
+#[cfg(test)]
 pub(super) use window::{LexicalObservations, NameObservation, ObservedDecode, WindowInput, schema_from_window, schema_string_from_window};
+#[cfg(test)]
 pub(super) use window::{ReaderInput, schema_from_reader, schema_string_from_reader};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::connect) enum Profile { Jackson216, Jackson221 }
+pub(in crate::connect) enum Profile {
+    Jackson216,
+    Jackson221,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct TextBufferObservation {
@@ -25,7 +33,16 @@ pub(super) struct TextBufferObservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FailureKind { Syntax, Coercion, Constructor, MissingSetter, Constraint, Unchecked }
+pub(super) enum FailureKind {
+    Syntax,
+    Coercion,
+    Constructor,
+    #[cfg(test)]
+    MissingSetter,
+    Constraint,
+    #[cfg(test)]
+    Unchecked,
+}
 
 #[derive(Debug)]
 pub(super) enum Failure {
@@ -36,6 +53,7 @@ pub(super) enum Failure {
 impl From<Anomaly> for Failure { fn from(cause: Anomaly) -> Self { Self::Native(cause) } }
 impl Failure {
     fn at(kind: FailureKind, offset: usize, detail: &'static str) -> Self { Self::Decode { kind, offset, detail } }
+    #[cfg(test)]
     pub(super) fn into_anomaly(self) -> Anomaly {
         match self { Self::Native(cause) => cause, cause => error("schema-registry", cause) }
     }
@@ -57,15 +75,18 @@ pub(super) fn schema_string(bytes: &[u8], profile: Profile, context: &mut Conver
     decode::schema_string(&mut cursor::Cursor::new(bytes, profile)?, context)
 }
 
+#[cfg(test)]
 pub(super) fn schema(bytes: &[u8], profile: Profile, context: &mut ConversionContext) -> Result<Option<beans::Schema>> {
     decode::schema(&mut cursor::Cursor::new(bytes, profile)?, context)
 }
 
+#[cfg(test)]
 pub(super) fn schema_string_with_text_buffers(bytes: &[u8], profile: Profile, observations: &[TextBufferObservation],
     context: &mut ConversionContext) -> Result<Option<beans::SchemaString>> {
     decode::schema_string(&mut cursor::Cursor::with_text_buffers(bytes, profile, observations)?, context)
 }
 
+#[cfg(test)]
 pub(super) fn schema_with_text_buffers(bytes: &[u8], profile: Profile, observations: &[TextBufferObservation],
     context: &mut ConversionContext) -> Result<Option<beans::Schema>> {
     decode::schema(&mut cursor::Cursor::with_text_buffers(bytes, profile, observations)?, context)

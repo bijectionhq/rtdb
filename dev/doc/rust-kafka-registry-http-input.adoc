@@ -36,10 +36,18 @@ Request and TLS lifetime rules remain in link:../../rust/crates/kafka/src/connec
 == Decoder boundary
 
 These windows contain bytes from the actual native HTTP stream.
-The live route feeds the completed body to the generic JSON consumer.
-The Registry bean decoder requires separate Java `InputStream` refill observations, a Jackson profile, canonicalizer results and exact nullable UTF16 schema, rule and reference carriers.
+The Avro writer schema-ID lookup examines the completed HTTP 200 body before decoding.
+A UTF8 object with one string `schema`, optional `schemaType` of null or `"AVRO"`, and optional `references` of null or an empty array uses the typed `SchemaString` decoder when every field name is literal and unique.
+The schema string may contain ordinary JSON escapes for quotes, slash, backslash or controls.
+Unicode escapes, additional fields, BOMs and other encodings use the generic JSON consumer on the same completed body, as do absent bodies and unsupported projections.
+The projection preserves schema text, omits missing or null schema type from the existing subject lookup, and preserves explicit `"AVRO"`.
+The request's byte allowance covers the buffered response through decoding, and the typed decoder and UTF8 projection reserve their own allocations before allocating.
+The body completes before either decoder runs, and a typed native allocation refusal ends that request.
+The subject, reference and cache stages continue to consume the existing Registry schema value.
+The other Registry routes use the generic JSON consumer.
+The link:../../rust/crates/kafka/src/connect/registry/response/REFERENCE.adoc[Registry response reference] describes the source profile and broader decoder boundaries.
 Phase 2 qualifies native parser and allocator allowances.
 
 Focused regression sources cover buffered demand before a later error, empty frames and present empty bodies, full-frame and cumulative byte limits, raw duplicate preservation, admission before polling, vector growth and both context/cancellation release orders.
 Real HTTP fixture sources cover a chunked body exceeding one collector window, incomplete body framing, byte limits and pending-body cancellation.
-They assert byte and ownership observations from the native transport.
+The writer schema-ID fixtures cover typed admission, the same-response generic fallback and the subject request after either decoder.

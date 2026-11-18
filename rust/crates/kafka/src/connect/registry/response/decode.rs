@@ -33,6 +33,7 @@ pub(super) fn schema_string(cursor: &mut Cursor<'_>, context: &mut ConversionCon
     Ok(Some(value))
 }
 
+#[cfg(test)]
 pub(super) fn schema(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -> Result<Option<Schema>> {
     if cursor.take_null(context)? { return Ok(None); }
     cursor.begin_object(context)?;
@@ -66,6 +67,7 @@ pub(super) fn schema(cursor: &mut Cursor<'_>, context: &mut ConversionContext) -
     Ok(Some(value))
 }
 
+#[cfg(test)]
 fn finish_schema(value: &mut Schema, setters: &mut Values<Option<RuleSet>>, context: &mut ConversionContext) -> Result<()> {
     if value.schema_type.is_none() { value.schema_type = Some(scalars::constant("AVRO", context)?); }
     if value.references.is_none() { value.references = Some(Values::new()); }
