@@ -35,6 +35,7 @@ mod mark;
 
 pub use context::{CatalogSnapshot, DatabaseSnapshot, QueryContext, QueryOptions};
 pub use cursor::{PreparedQuery, QueryCursor};
+pub use settings::unindexed_tx;
 pub use runtime_schema::RuntimeSchema;
 
 fn invalid(code: &str, message: impl std::fmt::Display) -> rtdb_types::Anomaly {

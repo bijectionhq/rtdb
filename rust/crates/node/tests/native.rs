@@ -1440,3 +1440,20 @@ mod peer_failure {
         }).await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn a_read_basis_after_the_latest_completed_tx_names_both_instants() {
+    let (node, driver) = running(options(), services()).await;
+    let cancellation = CancellationToken::new();
+    let basis_at = |micros: i64| QueryBasis {
+        snapshot: rtdb_types::TimeBasis { databases: BTreeMap::from([("xtdb".into(), vec![Some(rtdb_types::Instant::from(Timestamp(micros)))])]) },
+        snapshot_time: None, current_time: node.query_instant(), timezone: "UTC".into() };
+    let error = node.query_context("xtdb", &basis_at(1_577_836_800_000_000), &Authority, &cancellation).await.err().unwrap();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb/unindexed-tx", Some("system-time (2020-01-01T00:00:00Z) is after the latest completed tx (nil)")));
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    assert!(session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap().committed());
+    let error = node.query_context("xtdb", &basis_at(1_609_459_200_000_000), &Authority, &cancellation).await.err().unwrap();
+    let message = error.message.unwrap();
+    assert!(message.starts_with("system-time (2021-01-01T00:00:00Z) is after the latest completed tx (#xt/tx-key {:tx-id 0, :system-time #xt/instant \"1970-01-01T00:00:"), "{message}");
+    stop(&node, driver).await;
+}

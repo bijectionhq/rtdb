@@ -224,8 +224,8 @@ impl Node {
             let head = database.partition.value().live().latest_completed_tx().map(|key| key.system_time);
             let snapshot = database.partition.open_snapshot(head);
             let requested = basis.snapshot.databases.get(&name).and_then(|partitions| partitions.first()).copied().flatten();
-            if requested.is_some_and(|requested| snapshot.tx_basis().is_none_or(|head| requested > head.system_time.into())) {
-                return Err(Anomaly::incorrect("xtdb/unindexed-tx", "Requested system-time is after the latest completed transaction").with_context("db-name", name.into()));
+            if let Some(requested) = requested.filter(|requested| snapshot.tx_basis().is_none_or(|head| *requested > head.system_time.into())) {
+                return Err(rtdb_query::unindexed_tx(&name, requested, snapshot.tx_basis()));
             }
             let cap = requested.map(|time| time.as_micros()).transpose()?;
             let cap = match (cap, basis.snapshot_time) { (Some(time), Some(upper)) => Some(time.min(upper)), (time, _) => time };

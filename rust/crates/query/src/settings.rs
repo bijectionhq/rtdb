@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryReservation;
 use rtdb_plan::{QuerySettings, SettingValue};
-use rtdb_types::{Anomaly, Result, TimeBasis, Timestamp, Value};
+use rtdb_types::{Anomaly, Instant, Result, TimeBasis, Timestamp, TransactionKey, Value};
 use crate::{CatalogSnapshot, QueryContext, invalid};
 
 pub(crate) struct ReadBasis {
@@ -120,12 +120,19 @@ fn validate_basis(basis: Option<&TimeBasis>, catalog: &CatalogSnapshot) -> Resul
         for (index, snapshot) in database.partitions.iter().enumerate() {
             if let Some(requested) = basis.and_then(|basis| basis.databases.get(name)).and_then(|times| times.get(index)).copied().flatten() {
                 if snapshot.tx_basis().is_none_or(|head| requested > head.system_time.into()) {
-                    return Err(Anomaly::incorrect("xtdb/unindexed-tx", "Requested system-time is after the latest completed transaction")
-                        .with_context("db-name", name.clone().into()).with_context("system-time", serde_json::json!(requested))
-                        .with_context("latest-completed-tx", serde_json::json!(snapshot.tx_basis())));
+                    return Err(unindexed_tx(name, requested, snapshot.tx_basis()));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// The anomaly for a read basis whose system time is after the latest completed transaction of `database`.
+pub fn unindexed_tx(database: &str, requested: Instant, latest: Option<TransactionKey>) -> Anomaly {
+    let instant = |time: Instant| time.to_iso_string().unwrap_or_else(|_| format!("{time:?}"));
+    let latest_text = latest.map_or_else(|| "nil".to_owned(), |key| format!("#xt/tx-key {{:tx-id {}, :system-time #xt/instant \"{}\"}}", key.tx_id.0, instant(key.system_time.into())));
+    Anomaly::incorrect("xtdb/unindexed-tx", format!("system-time ({}) is after the latest completed tx ({latest_text})", instant(requested)))
+        .with_context("db-name", database.into()).with_context("system-time", serde_json::json!(requested))
+        .with_context("latest-completed-tx", serde_json::json!(latest))
 }
