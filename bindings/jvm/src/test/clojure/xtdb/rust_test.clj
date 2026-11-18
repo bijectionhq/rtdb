@@ -1,6 +1,7 @@
 (ns xtdb.rust-test
   (:require [clojure.test :as t :refer [deftest is]]
             [xtdb.api :as xt]
+            [xtdb.as-of-test :as original-as-of]
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
@@ -572,6 +573,10 @@
 (deftest-original-api original-scan/dont-use-fast-path-on-non-literals-2768)
 
 (deftest-original-api original-scan/test-past-point-point-queries-with-valid-time)
+
+(deftest-original-api original-as-of/test-as-of-tx)
+
+(deftest-original-api original-as-of/test-app-time)
 
 (deftest-original-api original-pg-expression/test-col-description)
 

@@ -57,26 +57,32 @@
                                         (transit/read-handler
                                           #(into {} (map (fn [[key value]] [(.denormalize key-fn key) value])) %)))}))))
 
-(defn- plan [^NativeConnection connection sql args {:keys [await-token snapshot-token snapshot-time current-time default-tz key-fn]}]
+(defn- with-read-settings [^NativeConnection connection {:keys [snapshot-token snapshot-time current-time default-tz]} f]
+  (let [settings (filterv (comp some? second)
+                          [["TIMEZONE" (some-> default-tz str)]
+                           ["SNAPSHOT_TOKEN" snapshot-token]
+                           ["SNAPSHOT_TIME" snapshot-time]
+                           ["CLOCK_TIME" current-time]])]
+    (if (empty? settings)
+      (f)
+      (do
+        (.begin connection)
+        (try
+          (execute-set! connection
+                        (str "SET TRANSACTION READ ONLY, " (str/join ", " (map #(str (first %) " = ?") settings)))
+                        (mapv second settings))
+          (f)
+          (finally (.rollbackTx connection)))))))
+
+(defn- plan [^NativeConnection connection sql args {:keys [await-token key-fn] :as options}]
   (let [key-fn (serde/read-key-fn (or key-fn :kebab-case-keyword))]
     (reify IReduceInit
       (reduce [_ f initial]
         (err/wrap-anomaly {:sql sql}
           (when await-token
             (set-await-token! connection (basis/merge-tx-tokens (current-await-token connection) await-token)))
-          (let [pinned? (boolean (or snapshot-token snapshot-time current-time default-tz))]
-            (when pinned? (.begin connection))
-            (try
-              (when pinned?
-                (let [options (filterv (comp some? second)
-                                      [["TIMEZONE" (some-> default-tz str)]
-                                       ["SNAPSHOT_TOKEN" snapshot-token]
-                                       ["SNAPSHOT_TIME" snapshot-time]
-                                       ["CLOCK_TIME" current-time]])]
-                  (execute-set! connection
-                                (str "SET TRANSACTION READ ONLY"
-                                     (when (seq options) (str ", " (str/join ", " (map #(str (first %) " = ?") options)))))
-                                (when (seq options) (mapv second options)))))
+          (with-read-settings connection options
+            (fn []
               (with-open [^NativeStatement statement (.createStatement connection sql)]
                 (.prepare statement)
                 (when (seq args) (.bindTransit statement (write-request [(vec args)])))
@@ -90,8 +96,7 @@
                                                (if (reduced? next) (reduced next) next)))
                                            acc (read-rows bytes key-fn))]
                           (recur next))
-                        acc)))))
-              (finally (when pinned? (.rollbackTx connection))))))))))
+                        acc))))))))))))
 
 (defn- operation [{:keys [op table-name docs doc-ids valid-from valid-to sql arg-rows]}]
   (if (= op :sql)
@@ -118,24 +123,26 @@
   (.connect node
             (if database (cond-> database (keyword? database) (-> symbol str NormalForm/normalForm)) "xtdb")))
 
-(defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types?]
+(defn query-ra [^NativeDatabase node relation {:keys [args default-db await-token key-fn preserve-pages? with-types?] :as options
                                              :or {key-fn :kebab-case-keyword}}]
   (err/wrap-anomaly {}
     (with-open [connection (connect node {:database default-db})]
       (when-let [token (or await-token (.getAwaitToken node))]
         (set-await-token! connection token))
-      (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
-        (let [key-fn (serde/read-key-fn key-fn)
-              rows (loop [rows (transient [])]
-                     (if-let [bytes (.next result)]
-                       (let [page (read-rows bytes key-fn)]
-                         (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
-                       (persistent! rows)))]
-          (if with-types?
-            {:res rows
-             :types (into {} (map (fn [^Field field] [(symbol (.getName field)) (VectorType/fromField field)]))
-                          (.getFields (.schema result)))}
-            rows))))))
+      (with-read-settings connection options
+        (fn []
+          (with-open [^NativeRows result (.queryLogicalRelation connection (pr-str relation) (write-request (or args {})))]
+            (let [key-fn (serde/read-key-fn key-fn)
+                  rows (loop [rows (transient [])]
+                         (if-let [bytes (.next result)]
+                           (let [page (read-rows bytes key-fn)]
+                             (recur (if preserve-pages? (conj! rows page) (reduce conj! rows page))))
+                           (persistent! rows)))]
+              (if with-types?
+                {:res rows
+                 :types (into {} (map (fn [^Field field] [(symbol (.getName field)) (VectorType/fromField field)]))
+                              (.getFields (.schema result)))}
+                rows))))))))
 
 (defn- merge-node-token! [^NativeDatabase database next-token]
   (loop []
