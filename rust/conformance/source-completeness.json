@@ -56,11 +56,18 @@
     },
     "compaction_gc_adapters": {
       "status": "pending",
-      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka has admitted retained Metadata cache arenas, bounded Registry HTTP collection and paired Avro datum ownership. Live sender and typed schema consumers, remaining native allocation and configuration paths, and final source reconciliation remain open.",
+      "conclusion": "Maintenance, CDC and Azure credentials have source implementations. Kafka resolves built-in configuration providers for log, Connect consumer and Registry dead-letter client construction. Native Metadata rack scratch and queue and event lifetimes have admitted owners. Paired Avro constructs built-in logical types and accepts scalar-representable JavaText. The Registry Reader symbol table is implemented within its private parser profile. Actual typed HTTP and Avro activation, the live producer sender profile, remaining native allocation and configuration paths, and final source reconciliation remain open.",
       "implementation_paths": [
         "rust/crates/maintenance/src/driver.rs",
         "rust/crates/maintenance/src/gc.rs",
         "rust/crates/kafka/src/lib.rs",
+        "rust/crates/kafka/src/log_configuration.rs",
+        "rust/crates/kafka/src/config/providers.rs",
+        "rust/crates/kafka/src/connect/driver.rs",
+        "rust/crates/kafka/src/connect/registry/dlq.rs",
+        "rust/crates/kafka/src/connect/registry/response/symbols.rs",
+        "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs",
+        "rust/vendor/rdkafka/src/util.rs",
         "rust/crates/s3/src/lib.rs",
         "rust/crates/azure/src/lib.rs",
         "rust/crates/gcs/src/lib.rs",
@@ -138,10 +145,10 @@
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
         "rust/crates/node/src/statement.rs": "4c53eb61b738383dc5a8aab5bd653f916ca2cd15a6bfdf9622c7d8d32f9bda27",
         "rust/crates/tx/src/submission.rs": "5f7ac36df849a45b7b870c7cf42c13162fc6e386f052ed85873681ab0032af54",
-        "rust/crates/tx/src/resolver.rs": "46d426caed40a2f1d23024937e197ea5c9af62f9d94254b59abd4e59077b7916",
+        "rust/crates/tx/src/resolver.rs": "28740e3144487471b765632519c4884baf7f7a2153d075751f6acb70c6bc3267",
         "rust/crates/replication/src/appender.rs": "c62347b8038046ac8920a6b5491ce50654fb5970b15b8a12055c9fbcfad95296",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
-        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56"
+        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3"
       }
     },
     "replica_recovery": {
@@ -175,7 +182,7 @@
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
-        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56",
+        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3",
         "rust/crates/replication/src/blocks.rs": "6bdcfa17d80c7dd0aa37f248cdff83b09b6c71edb2aedbccfbce7226cc0da522",
         "rust/crates/server/src/resources.rs": "8bb66510352c189bd5e5c65d24c18848bf04ff1285f421d1c9ee00b6d127bf24",
         "rust/crates/node/src/backends.rs": "04c98d6847f658ab1f90c6e230b4d2f462b482da0dc0fe58fb18b95eae6679ac",
@@ -212,7 +219,7 @@
         "rust/crates/maintenance/src/job.rs": "34e3d43ca7baef270ca9b6c4d4ee7b1eedeab56156bc6a85de0e741f34244274",
         "rust/crates/maintenance/src/merge.rs": "7068ecddc375ab352667f6b97fba2a93efd311aaa3ac6e2ea6d805142ce5ed01",
         "rust/crates/maintenance/src/publication.rs": "d9214c092e3a873df597dfad81f3ac2dc8b7b178c9b8f4b933ef090116a27740",
-        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56",
+        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3",
         "rust/crates/index/src/trie_catalog.rs": "517d3a6fd0478555db85153f92e97cdf0597aa0dcfa7be912677a3609c0bc8c8"
       }
     },
@@ -235,7 +242,7 @@
         "rust/crates/pg-source/src/stream.rs": "24f3c47d194ae231bdede32105bece10c303867cd7ba5a6672b1195fe4468261",
         "rust/crates/pg-source/src/indexer.rs": "8eda7ab84068564f692bdb98eb02f88d5e7acd1e745379e8ad6b1d465269f590",
         "rust/crates/pg-source/src/token.rs": "b7dbcb8f4b601ae64231b1e8c4d30d65373d5d0afc160c0f530fa56da188f0c0",
-        "rust/crates/replication/src/driver.rs": "0263fbdc4289dc945bb6dc08dd7bc0a4dc3330ae7a75636c11bc12ae23bc3e56"
+        "rust/crates/replication/src/driver.rs": "fda38f38374ef6aeca6f88d856682214c3fed70aa7c6199edcd6bd820a4301a3"
       }
     },
     "database_shutdown": {
@@ -254,7 +261,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/ffi/src/lib.rs": "9afa907a822864ec50fcd82cb455dfac4622dedc217b374ea248c14dd6516025",
+        "rust/crates/ffi/src/lib.rs": "b36c93d3727fb89d04d3b031dcc2878ef5cb7020c3abae445bcce1d7f600c448",
         "rust/crates/node/src/node.rs": "3e185cb1bc9942912fa9bbc49a4333ff12c312e7173f85e82fea0d963cfab133",
         "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "7c2d70b853cb468366045c97b992fd78fe2ec956aa5a04afbcfab9834613f4b7",
