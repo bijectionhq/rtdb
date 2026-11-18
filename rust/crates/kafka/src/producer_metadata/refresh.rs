@@ -2,6 +2,10 @@
 mod jitter;
 pub use jitter::{JavaThreadLocalRandom, JavaThreadLocalSeeds};
 
+#[path = "refresh/connection.rs"]
+mod connection;
+pub use connection::{ConnectionBackoffs, ConnectionPhase, ConnectionSettings, ConnectionStatus, DisconnectAddresses};
+
 /// Caller-owned observations of the pinned JVM's math and random operations.
 /// Implementations must preserve Java Math results and nextDouble's origin-inclusive, bound-exclusive range.
 pub trait JavaBackoffObservations {
@@ -14,9 +18,9 @@ pub trait JavaBackoffObservations {
 }
 
 #[derive(Debug)]
-struct RefreshBackoff { initial_ms: i64, maximum_ms: i64, exponent_maximum: f64 }
+struct SourceBackoff { initial_ms: i64, maximum_ms: i64, exponent_maximum: f64 }
 
-impl RefreshBackoff {
+impl SourceBackoff {
     fn new(initial_ms: i64, maximum_ms: i64, observations: &mut impl JavaBackoffObservations) -> Self {
         let exponent_maximum = if maximum_ms > initial_ms {
             observations.log(maximum_ms as f64 / initial_ms.max(1) as f64) / observations.log(2.0)
@@ -63,7 +67,7 @@ pub struct ClosedMetadata;
 /// The producer owns serialization, observations, snapshot construction and waiter notification.
 #[derive(Debug)]
 pub struct RefreshState {
-    backoff: RefreshBackoff,
+    backoff: SourceBackoff,
     expire_ms: i64,
     update_version: i32,
     request_version: i32,
@@ -81,7 +85,7 @@ impl RefreshState {
     /// Math observations occur only when maximum_backoff_ms exceeds initial_backoff_ms.
     pub fn new(initial_backoff_ms: i64, maximum_backoff_ms: i64, expire_ms: i64, observations: &mut impl JavaBackoffObservations) -> Self {
         Self {
-            backoff: RefreshBackoff::new(initial_backoff_ms, maximum_backoff_ms, observations),
+            backoff: SourceBackoff::new(initial_backoff_ms, maximum_backoff_ms, observations),
             expire_ms, update_version: 0, request_version: 0,
             last_refresh_ms: 0, last_successful_ms: 0, attempts: 0,
             equivalent_responses: 0, full_requested: false, partial_requested: false, closed: false,

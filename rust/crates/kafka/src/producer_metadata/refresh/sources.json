@@ -9,6 +9,7 @@
       "org/apache/kafka/common/utils/internals/ExponentialBackoff.java": "eca216d9316445cbb36fbd0faf9bdb76f133620d028f5bf0db00a0209a5256e9",
       "org/apache/kafka/clients/NetworkClient.java": "6db4453663f0412cdc608b397af2eee246343ce511442193411eb316ba6b1a28",
       "org/apache/kafka/clients/ClusterConnectionStates.java": "747127d9bf73cf201b36d058826024490c9254dd63cf0fa4c7932310f100d379",
+      "org/apache/kafka/clients/ConnectionState.java": "e0c53817850cbbbfbbf76c2bfd8aab50bfd35d257b73d99d44eced779a6e09d1",
       "org/apache/kafka/clients/InFlightRequests.java": "ec55d608baaebb3b3438ef09202e5722fd1fa8205e02e5f3aac27b6f81d20c07",
       "org/apache/kafka/common/requests/MetadataResponse.java": "4bc7c408c4f884734dd793c9ad3fb0f04de640f0287b47342becd776a23d94b5",
       "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",

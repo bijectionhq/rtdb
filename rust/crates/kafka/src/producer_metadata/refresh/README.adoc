@@ -43,5 +43,19 @@ Bounds are validated before either advance.
 Scaling follows `RandomSupport.boundedNextDouble`, including the finite-width and overflow-width branches and upper-bound rounding correction.
 The four additive source fixtures check class clock order, independent thread sequences, invalid ranges and exact floating-point results.
 
+== Connection timing
+
+`ConnectionBackoffs` shares the scoped exponential backoff with Metadata refresh and builds the reconnect policy before the setup policy.
+`ConnectionStatus` owns one existing source connection ID's timing, phase, throttle and retained authentication failure.
+The network caller owns host comparison, address selection, connection inventory, connecting-set membership and Selector readiness.
+A new ID or changed hostname starts with a new entry and both initial delays.
+An attempt on the same hostname preserves the current delays while the caller moves to the next address.
+A connecting failure draws reconnect from the prior count and increments setup before its draw.
+A previously established connection discards its resolved addresses on disconnect and resets setup.
+The ready transition clears authentication and resets reconnect before setup.
+The throttle deadline survives transitions on the same entry.
+Selector and in-flight capacity remain separate checks before sending.
+Four additive source fixtures check constructor and draw order, wrapped timeout boundaries, authentication retention and connected poll delay.
+
 `sources.json` pins the consulted Kafka/OpenJDK sources and licenses.
 `COPYRIGHT` retains complete leading source notices, and license files are copied verbatim.
