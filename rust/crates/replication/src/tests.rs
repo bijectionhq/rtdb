@@ -850,6 +850,62 @@ async fn recovery_confirms_a_later_anchor_when_the_oldest_catalog_precedes_the_l
 }
 
 #[tokio::test]
+async fn historical_confirmation_recovers_an_older_block_at_a_legacy_selected_boundary() {
+    let fixture = produced_memory_checkpoint(true).await;
+    let (_, mut prior) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        may_lead: false, ..Default::default()
+    }).await;
+    let mut legacy_tail = fixture.replica.tail(LogOffset(1)).await.unwrap();
+    for message in [ReplicaBody::NoOp(proto::NoOp { src_msg_id: None }), boundary(1, -1)] {
+        let envelope = ReplicaEnvelope { term: Term(2), term_sequence: None, message };
+        fixture.logs.enqueue_replica(&envelope, BlockIndex(1), Timestamp(0)).await.unwrap().durable().await.unwrap();
+        prior.consume(next_local_record(legacy_tail.as_mut()).await).await.unwrap();
+    }
+    let pending = prior.pending_block.as_ref().unwrap();
+    let selected = prior.blocks.produce(&pending.prepared, &pending.boundary, BTreeMap::new()).await.unwrap();
+    assert_eq!(selected.catalog.boundary_replica_position(), Some(rtdb_types::ReplicaPosition(3)));
+    assert_eq!(selected.catalog.boundary_term(), Term(2));
+    assert_eq!(selected.catalog.boundary_term_sequence(), None);
+
+    let (handle, mut writer) = reopen_memory_checkpoint_with_config(&fixture, ReplicationConfig {
+        assertion_interval: Duration::from_secs(3600), ..Default::default()
+    }).await;
+    let startup = writer.fence.clone();
+    let restored = writer.partition.value();
+    assert_eq!(startup.position(), TermPosition::Unknown);
+    writer.historical_confirmations = writer.prove_historical_confirmations().await.unwrap();
+    assert_eq!(writer.historical_confirmations.len(), 1);
+    assert_eq!(writer.historical_confirmations[0].catalog.block_index(), BlockIndex(0));
+    assert_eq!(writer.fence, startup);
+    assert!(Arc::ptr_eq(&writer.partition.value(), &restored));
+
+    let mut tail = writer.logs.replica_tail(writer.read_position).await.unwrap();
+    writer.start_claim().unwrap();
+    let durable = super::pending_claim(&mut writer.claiming).await;
+    writer.claim_finished(durable).await.unwrap();
+    assert_eq!(writer.fence, startup);
+    let claim = next_local_record(tail.as_mut()).await;
+    let envelope = ReplicaEnvelope::decode(&claim.payload).unwrap().unwrap();
+    assert_eq!(envelope.term, Term(3));
+    assert_eq!(envelope.term_sequence, Some(TermSequence(0)));
+    writer.consume(claim).await.unwrap();
+    assert_eq!(writer.fence.position(), TermPosition::Expecting(TermSequence(1)));
+    for (index, sequence) in [(0, 1), (1, 2)] {
+        assert_eq!(writer.role(), Role::Following);
+        let raw = next_local_record(tail.as_mut()).await;
+        let envelope = ReplicaEnvelope::decode(&raw.payload).unwrap().unwrap();
+        assert_eq!(envelope.term, Term(3));
+        assert_eq!(envelope.term_sequence, Some(TermSequence(sequence)));
+        let ReplicaBody::BlockUploaded(upload) = envelope.message else { panic!("expected a recovered block upload"); };
+        assert_eq!(upload.block_index, Some(index));
+        writer.consume(raw).await.unwrap();
+    }
+    assert_eq!(handle.status().role, Role::Leading(Term(3)));
+    assert_eq!(handle.status().adopted_block.unwrap().block_index(), BlockIndex(1));
+    writer.demote().await.unwrap();
+}
+
+#[tokio::test]
 async fn unavailable_older_confirmation_evidence_keeps_latest_checkpoint_reopen_and_writes_live() {
     for missing_catalog in [false, true] {
         let fixture = produced_memory_checkpoint(true).await;

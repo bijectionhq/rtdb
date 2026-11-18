@@ -40,8 +40,9 @@ A replica that already installed the block skips its current-storage upload befo
 A failure starting that later block during promotion preserves the recovered confirmation and returns the later block to the follower.
 Historical replay first tries to open a tail from the oldest retained historical catalog.
 If opening the tail reports that its first requested position precedes the retained log, the writer tries the next newer catalog when one exists.
-Historical replay must reach the selected boundary with a matching fence.
-A positive-term legacy selected boundary without a sequence cannot establish that fence match.
+Historical replay must admit the exact selected boundary with a compatible fence.
+For a positive-term boundary without a sequence, a same-term unsequenced witness satisfies an unknown startup position.
+Ordinary replica replay keeps using the startup fence seeded from the selected checkpoint.
 Before appending an older confirmation, the writer verifies that its catalog, table blocks and required L0 files are still present in shared storage.
 A failed historical replay discards the older repair candidates.
 Failure to verify shared files or prepare an older upload discards the remaining older candidates.

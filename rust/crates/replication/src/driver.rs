@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, Verdict};
+use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, TermPosition, Verdict};
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
 use crate::blocks::{RecoveredBlockConfirmation, matches_catalog_boundary, matches_confirmation};
 use crate::logs::replica_decode_bound;
@@ -439,7 +439,12 @@ impl ReplicationDriver {
                 if admission.verdict == Verdict::Apply { Some(self.logs.resolve_oversized(record).await?) } else { None }
             } else { None };
             if position == end {
-                if next_boundary != retained.len() || witness != self.fence
+                let matches_fence = witness == self.fence
+                    || (selected.boundary_term() > Term(0)
+                        && selected.boundary_term_sequence().is_none()
+                        && witness.highest_term() == self.fence.highest_term()
+                        && matches!((self.fence.position(), witness.position()), (TermPosition::Unknown, TermPosition::Unsequenced)));
+                if next_boundary != retained.len() || !matches_fence
                     || !record.as_ref().is_some_and(|record| matches_catalog_boundary(selected, record)) {
                     return Err(invalid("Historical replica fence or checkpoint does not match startup"));
                 }
