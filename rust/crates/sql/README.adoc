@@ -171,6 +171,9 @@ Exact failure timing, diagnostic equivalence, and all execution observations rem
 == Subqueries
 
 Scalar subqueries, EXISTS, IN, ANY, SOME and ALL lower to the shared Apply operator.
+An `ARRAY(query)` expression requires one output column and collects every row in the query's output order.
+The vector aggregate preserves duplicate and null elements and returns an empty list when the query returns no rows.
+Array constructors by query use the same lexical captures as scalar subqueries.
 Their scopes include projection, WHERE, HAVING, grouping and aggregate arguments, VALUES, ORDER BY, mutation predicates and assignments, ASSERT, and inner/left/right join conditions.
 Correlation scopes capture columns in apply-local parameters allocated above the statement's lexical parameter indices.
 Nested subqueries and CTE reuse retain those bindings without adding client parameters.

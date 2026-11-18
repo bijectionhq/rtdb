@@ -5,7 +5,7 @@ use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast::{self as ast, Spanned};
 
 use crate::bind::{Context, error, identifier, identifiers, unsupported};
-use crate::subquery::{ExpressionInput, negated_operator};
+use crate::subquery::{ExpressionInput, SubqueryValue, negated_operator};
 use std::sync::Arc;
 use rtdb_plan::Relation;
 
@@ -35,9 +35,9 @@ impl Context<'_> {
         }
         if let Some(field) = replacements.get(&ReplacementKey::Expression(expression.to_string())) { return Ok(field.expression()); }
         let expression = match expression {
-            ast::Expr::Subquery(query) => self.scalar_subquery(query, input, false)?,
+            ast::Expr::Subquery(query) => self.query_value(query, input, SubqueryValue::Scalar)?,
             ast::Expr::Exists { subquery, negated } => {
-                let expression = self.scalar_subquery(subquery, input, true)?;
+                let expression = self.query_value(subquery, input, SubqueryValue::Exists)?;
                 if *negated { Expr::unary(UnaryOp::Not, expression) } else { expression }
             }
             ast::Expr::InSubquery { expr, subquery, negated } => self.quantified_subquery(expr, subquery, BinaryOp::Eq, *negated, input, replacements)?,
@@ -175,6 +175,9 @@ impl Context<'_> {
             ast::Expr::Function(function) => {
                 if aggregate_function(&function.name.to_string()).is_some() || percentile_kind(&function.name.to_string()).is_some() { return Err(error("Aggregate is not valid in this expression scope")); }
                 if function.over.is_some() || function.filter.is_some() || !function.within_group.is_empty() || !matches!(function.parameters, ast::FunctionArguments::None) { return Err(unsupported("Window function or scalar function modifiers")); }
+                if let Some(query) = array_query(function) {
+                    return self.query_value(query, input, SubqueryValue::Array);
+                }
                 if let ast::FunctionArguments::List(arguments) = &function.args {
                     if arguments.duplicate_treatment.is_some() || !arguments.clauses.is_empty() { return Err(unsupported("Scalar function argument modifiers")); }
                 }
@@ -562,8 +565,15 @@ pub(crate) fn validate_in_list_item(expr: &ast::Expr) -> Result<()> {
 
 pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     matches!(expr, ast::Expr::Subquery(_) | ast::Expr::Exists { .. } | ast::Expr::InSubquery { .. } | ast::Expr::AnyOp { .. } | ast::Expr::AllOp { .. })
+        || matches!(expr, ast::Expr::Function(function) if array_query(function).is_some())
         || matches!(expr, ast::Expr::InList { list, .. } if list.len() > 8 || list.iter().any(row_constructor))
         || children(expr).into_iter().any(contains_subquery)
+}
+
+fn array_query(function: &ast::Function) -> Option<&ast::Query> {
+    let [ast::ObjectNamePart::Identifier(name)] = function.name.0.as_slice() else { return None; };
+    let ast::FunctionArguments::Subquery(query) = &function.args else { return None; };
+    (name.quote_style.is_none() && name.value.eq_ignore_ascii_case("array")).then_some(query)
 }
 
 fn row_constructor(expr: &ast::Expr) -> bool {

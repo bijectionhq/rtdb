@@ -2,7 +2,7 @@ use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, ColumnId, Expr, Field, Identifier, NamedExpr, Relation, RelationNode, Schema, UnaryOp};
 use rtdb_types::{LogicalType, Result, ScalarType, Value};
 use sqlparser::ast;
-use crate::bind::{Context, HiddenColumn, error};
+use crate::bind::{Context, HiddenColumn, aggregate_relation, error};
 use crate::expression::Replacements;
 
 pub(crate) struct CorrelationScope { schema: Schema, captures: BTreeMap<ColumnId, (usize, Expr)>, visible: bool }
@@ -10,6 +10,12 @@ impl CorrelationScope {
     pub fn new(schema: Schema) -> Self { Self { schema, captures: BTreeMap::new(), visible: true } }
     fn from(schema: Schema) -> Self { Self { schema, captures: BTreeMap::new(), visible: false } }
     pub fn arguments(self) -> Vec<(usize, Expr)> { self.captures.into_values().collect() }
+}
+
+pub(crate) enum SubqueryValue {
+    Scalar,
+    Exists,
+    Array,
 }
 
 pub(crate) enum ExpressionInput<'a> {
@@ -241,11 +247,29 @@ impl Context<'_> {
         Ok((relation?, arguments))
     }
 
-    pub(crate) fn scalar_subquery(&mut self, query: &ast::Query, input: &mut ExpressionInput<'_>, exists: bool) -> Result<Expr> {
+    pub(crate) fn query_value(&mut self, query: &ast::Query, input: &mut ExpressionInput<'_>, value: SubqueryValue) -> Result<Expr> {
         let (dependent, arguments) = self.dependent(query, input)?;
-        if !exists && dependent.schema().len() != 1 { return Err(error(format!("Subquery arity error: expected a single column, got {}", dependent.schema().len()))); }
-        let dependent = if exists { existence_rows(dependent)? } else { dependent };
-        self.apply_expression(input, dependent, arguments, if exists { ApplyKind::Exists } else { ApplyKind::Scalar })
+        if matches!(value, SubqueryValue::Exists) {
+            return self.apply_expression(input, existence_rows(dependent)?, arguments, ApplyKind::Exists);
+        }
+        let [field] = dependent.schema().fields() else {
+            return Err(error(format!("Subquery arity error: expected a single column, got {}", dependent.schema().len())));
+        };
+        let dependent = match value {
+            SubqueryValue::Array => {
+                let aggregate = AggregateExpr {
+                    field: self.hidden_field(LogicalType::list(field.data_type.clone()))?,
+                    function: AggregateFunction::VecAgg,
+                    argument: Some(field.expression()),
+                    distinct: false,
+                    filter: None,
+                    order_by: Vec::new(),
+                };
+                aggregate_relation(dependent, Vec::new(), vec![aggregate])?
+            }
+            _ => dependent,
+        };
+        self.apply_expression(input, dependent, arguments, ApplyKind::Scalar)
     }
 
     fn apply_expression(&mut self, input: &mut ExpressionInput<'_>, dependent: Arc<Relation>, arguments: Vec<(usize, Expr)>, kind: ApplyKind) -> Result<Expr> {

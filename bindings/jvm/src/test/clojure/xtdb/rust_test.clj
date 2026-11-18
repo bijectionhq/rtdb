@@ -58,6 +58,12 @@
 (deftest test-select-without-from
   (run-original-api-case #'original-sql/test-select-without-from))
 
+(deftest test-generated-column-names
+  (run-original-api-case #'original-sql/test-generated-column-names))
+
+(deftest test-empty-array-3818
+  (run-original-api-case #'original-sql/test-empty-array-3818))
+
 (deftest test-xt-version
   (run-original-api-case #'original-sql/test-xt-version))
 

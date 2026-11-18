@@ -39,6 +39,49 @@ async fn scalar_subquery_in_select_and_where_preserves_empty_and_single_row_resu
 }
 
 #[tokio::test]
+async fn array_query_collects_one_column_with_order_duplicates_and_nulls() {
+    let source = "SELECT ARRAY(SELECT n FROM (VALUES (3),(1),(NULL),(3)) t(n) ORDER BY n NULLS LAST)";
+    let expected = Value::List(vec![Value::I64(1), Value::I64(3), Value::I64(3), Value::Null]);
+    assert_eq!(query(source, vec![]).await.unwrap(), [vec![expected]]);
+    assert_eq!(query("SELECT ARRAY(SELECT 1 WHERE FALSE), ARRAY(SELECT NULL)", vec![]).await.unwrap(),
+        [vec![Value::List(vec![]), Value::List(vec![Value::Null])]]);
+    assert_eq!(query("SELECT ARRAY(SELECT ARRAY(SELECT 2)), ARRAY(VALUES (1),(2))", vec![]).await.unwrap(),
+        [vec![Value::List(vec![Value::List(vec![Value::I64(2)])]), Value::List(vec![Value::I64(1), Value::I64(2)])]]);
+    assert_eq!(query("SELECT ARRAY(FROM (VALUES (3),(1)) t(n) SELECT n ORDER BY n)", vec![]).await.unwrap(),
+        [vec![Value::List(vec![Value::I64(1), Value::I64(3)])]]);
+    assert_eq!(query("SELECT ARRAY(WITH a AS (SELECT 3 AS n) SELECT n FROM a)", vec![]).await.unwrap(),
+        [vec![Value::List(vec![Value::I64(3)])]]);
+    assert_eq!(query("SELECT ARRAY(SELECT n FROM (VALUES (0)) t(n) ORDER BY 1 / n LIMIT 0)", vec![]).await.unwrap(),
+        [vec![Value::List(vec![])]]);
+}
+
+#[tokio::test]
+async fn array_query_uses_lexical_correlations_and_join_condition_scope() {
+    let source = "SELECT v.x, ARRAY(SELECT n FROM (VALUES (2),(1)) t(n) WHERE t.n = v.x) FROM (VALUES (1),(2),(3)) v(x)";
+    assert_eq!(query(source, vec![]).await.unwrap(), [
+        vec![Value::I64(1), Value::List(vec![Value::I64(1)])],
+        vec![Value::I64(2), Value::List(vec![Value::I64(2)])],
+        vec![Value::I64(3), Value::List(vec![])],
+    ]);
+    let source = "SELECT a.n FROM (VALUES (ARRAY[1,2])) a(n) INNER JOIN (VALUES (2)) b(x) ON ARRAY(SELECT n FROM (VALUES (1),(2)) t(n)) = a.n";
+    assert_eq!(query(source, vec![]).await.unwrap(), [vec![Value::List(vec![Value::I64(1), Value::I64(2)])]]);
+    let source = "SELECT $1, ARRAY(SELECT n FROM (VALUES (1),(2)) t(n) WHERE n <= $2)";
+    assert_eq!(query(source, vec![Value::I64(9), Value::I64(1)]).await.unwrap(),
+        [vec![Value::I64(9), Value::List(vec![Value::I64(1)])]]);
+}
+
+#[tokio::test]
+async fn array_query_requires_one_column_and_a_subquery_scope() {
+    for (source, message) in [
+        ("SELECT ARRAY(SELECT 1, 2)", "Subquery arity error: expected a single column, got 2"),
+        ("SELECT 1 WHERE 1 IN (ARRAY(SELECT 1))", "Subqueries are not allowed in this context"),
+    ] {
+        let error = query(source, vec![]).await.unwrap_err();
+        assert_eq!(error.message.as_deref(), Some(message), "{source}");
+    }
+}
+
+#[tokio::test]
 async fn correlated_scalar_subquery_in_select_and_nested_cte_keep_lexical_captures() {
     let expected = vec![vec![Value::I64(1), Value::I64(11)], vec![Value::I64(2), Value::I64(12)]];
     assert_eq!(query("SELECT t.x, (SELECT t.x + 10) FROM (VALUES (1), (2)) AS t(x)", vec![]).await.unwrap(), expected);
