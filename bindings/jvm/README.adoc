@@ -105,4 +105,5 @@ Logical scans bind to the awaited database snapshot and accept stored column sym
 Logical relation output preserves operator page boundaries, and a literal page source supplies its pages in the specified order, including empty pages.
 SQL and logical relation requests use the same transaction settings for the snapshot token, snapshot time, query clock, and time zone.
 Literal pages can declare their Arrow column types when the pages do not carry enough rows to infer a schema.
+Logical group-by uses native aggregates with exact column symbols, including distinct factories, filters, and array ordering.
 Native logical relation tests run with the original Clojure assertions and the native relation cursor.

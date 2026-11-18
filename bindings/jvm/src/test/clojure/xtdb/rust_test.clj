@@ -164,6 +164,42 @@
 
 (deftest-original-api original-set/test-difference)
 
+(deftest-original-api original-group-by/test-group-by)
+
+(deftest-original-api original-group-by/test-row-count)
+
+(deftest-original-api original-group-by/test-count-empty-null-behaviour)
+
+(deftest-original-api original-group-by/test-sum-empty-null-behaviour)
+
+(deftest-original-api original-group-by/test-avg-empty-null-behaviour)
+
+(deftest-original-api original-group-by/test-aggregates-over-nothing-typed-column-return-nil-6133)
+
+(deftest-original-api original-group-by/test-min-max-over-nothing-typed-column-return-nil-6133)
+
+(deftest-original-api original-group-by/test-min-max-over-union-of-nothing-typed-columns-return-nil-6133)
+
+(deftest-original-api original-group-by/test-min-of-empty-rel-returns-nil)
+
+(deftest-original-api original-group-by/test-array-agg-of-empty-rel-returns-empty-array-3819)
+
+(deftest-original-api original-group-by/test-array-agg-orders-each-group-by-its-sort-keys)
+
+(deftest-original-api original-group-by/test-vec-agg)
+
+(deftest-original-api original-group-by/test-bool-aggs)
+
+(deftest-original-api original-group-by/test-distinct group-by-distinct)
+
+(deftest-original-api original-group-by/test-group-by-with-nils-coerce-to-boolean-npe-regress)
+
+(deftest-original-api original-group-by/test-group-by-groups-nils)
+
+(deftest-original-api original-group-by/test-throws-for-incomparable-minmax-340)
+
+(deftest-original-api original-group-by/test-min-max-strings)
+
 (deftest-original-api original-set/first-tuple-in-rhs-is-taken-into-account-test)
 
 (deftest-original-api original-table/test-table-handles-exprs)

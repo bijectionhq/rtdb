@@ -526,7 +526,8 @@ impl Compiler<'_, '_> {
         if !groups.is_empty() {
             for aggregate in &mut aggregates {
                 if aggregate.function.canonical() == AggregateFunction::ArrayAgg {
-                    aggregate.field.data_type = LogicalType::list(aggregate.argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Null));
+                    let input_type = aggregate.argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Null);
+                    aggregate.field.data_type = aggregate_type(&aggregate.function, input_type, true)?;
                 }
             }
         }
@@ -560,21 +561,7 @@ impl Compiler<'_, '_> {
                     argument => argument,
                 };
                 let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
-                let data_type = match function.canonical() {
-                    AggregateFunction::Alias(_) | AggregateFunction::Named(_) => unreachable!(),
-                    AggregateFunction::Count | AggregateFunction::CountStar => LogicalType::Scalar(ScalarType::I64),
-                    AggregateFunction::Average => match LogicalType::least_upper_bound(&[input_type.clone()]) {
-                        Some(data_type @ LogicalType::Scalar(ScalarType::Duration(_))) => data_type.maybe(),
-                        _ => LogicalType::Scalar(ScalarType::F64).maybe(),
-                    },
-                    AggregateFunction::VariancePopulation | AggregateFunction::VarianceSample | AggregateFunction::StddevPopulation | AggregateFunction::StddevSample => LogicalType::Scalar(ScalarType::F64).maybe(),
-                    AggregateFunction::Every | AggregateFunction::Any => LogicalType::Scalar(ScalarType::Bool).maybe(),
-                    AggregateFunction::ArrayAgg => LogicalType::list(input_type).maybe(),
-                    AggregateFunction::VecAgg => LogicalType::list(input_type),
-                    AggregateFunction::Percentile { .. } => return Err(error("xtql/invalid-expression", "Ordered-set aggregates require the SQL WITHIN GROUP syntax")),
-                    AggregateFunction::Sum => LogicalType::least_upper_bound(&[input_type.clone()]).ok_or_else(|| error("xtql/invalid-expression", "Cannot compute SUM over the input type"))?.maybe(),
-                    AggregateFunction::Min | AggregateFunction::Max => input_type.maybe(),
-                };
+                let data_type = aggregate_type(&function, input_type, false)?;
                 let name = format!("xt$aggregate${}", aggregates.len());
                 let field = self.binder.field(&name, None, data_type)?;
                 aggregates.push(AggregateExpr { field, function, argument, distinct, filter: None, order_by: Vec::new() });
@@ -683,6 +670,26 @@ fn aggregate_function(name: &str) -> Option<(AggregateFunction, bool)> {
     let distinct = name.distinct();
     Some((AggregateFunction::Named(name), distinct))
 }
+
+fn aggregate_type(function: &AggregateFunction, input: LogicalType, grouped: bool) -> Result<LogicalType> {
+    let promoted = || LogicalType::least_upper_bound(std::slice::from_ref(&input));
+    Ok(match function.canonical() {
+        AggregateFunction::Alias(_) | AggregateFunction::Named(_) => unreachable!(),
+        AggregateFunction::Count | AggregateFunction::CountStar => LogicalType::Scalar(ScalarType::I64),
+        AggregateFunction::Average => match promoted() {
+            Some(data_type @ LogicalType::Scalar(ScalarType::Duration(_))) => data_type.maybe(),
+            _ => LogicalType::Scalar(ScalarType::F64).maybe(),
+        },
+        AggregateFunction::VariancePopulation | AggregateFunction::VarianceSample | AggregateFunction::StddevPopulation | AggregateFunction::StddevSample => LogicalType::Scalar(ScalarType::F64).maybe(),
+        AggregateFunction::Every | AggregateFunction::Any => LogicalType::Scalar(ScalarType::Bool).maybe(),
+        AggregateFunction::ArrayAgg if !grouped => LogicalType::list(input).maybe(),
+        AggregateFunction::ArrayAgg | AggregateFunction::VecAgg => LogicalType::list(input),
+        AggregateFunction::Percentile { .. } => return Err(error("xtql/invalid-expression", "Ordered-set aggregates require the SQL WITHIN GROUP syntax")),
+        AggregateFunction::Sum => promoted().ok_or_else(|| error("xtql/invalid-expression", "Cannot compute SUM over the input type"))?.maybe(),
+        AggregateFunction::Min | AggregateFunction::Max => input.maybe(),
+    })
+}
+
 fn contains_aggregate(expr: &Expr) -> bool {
     match expr {
         Expr::Call { function, arguments } => aggregate_function(function).is_some() || arguments.iter().any(contains_aggregate),

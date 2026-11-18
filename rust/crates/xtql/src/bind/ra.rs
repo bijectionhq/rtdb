@@ -57,6 +57,7 @@ impl Importer<'_, '_, '_> {
             ("project" | "π" | "pi" | "map" | "ⲭ" | "chi", [input]) => self.project(options, input, matches!(op, "map" | "ⲭ" | "chi"))?,
             ("rename" | "ρ" | "rho", [input]) => self.rename(options, input)?,
             ("sort", [input]) => self.sort(options, input)?,
+            ("group-by" | "γ" | "gamma", [input]) => self.group_by(options, input)?,
             ("union-all" | "∪", [left, right]) => self.set(SetOperator::Union, left, right)?,
             ("intersect" | "∩", [left, right]) => self.set(SetOperator::Intersect, left, right)?,
             ("difference" | "except" | "−", [left, right]) => self.set(SetOperator::Except, left, right)?,
@@ -306,6 +307,15 @@ impl Importer<'_, '_, '_> {
     fn sort(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
         let input = self.lower(input)?;
         let mut bound = bind_input(&input);
+        let order_by = Self::sort_specs(options, &bound)?;
+        let mut read_limit = |key| options.option(key).filter(|form| !matches!(form.kind, EdnKind::Nil)).map(|form| self.scalar(form, &mut bound)).transpose();
+        let offset = read_limit("skip")?;
+        let fetch = read_limit("limit")?;
+        if order_by.is_empty() { return input.limit(offset, fetch); }
+        Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })
+    }
+
+    fn sort_specs(options: &Edn, bound: &Bound) -> Result<Vec<SortExpr>> {
         let mut order_by = Vec::new();
         for spec in options.option("order-specs").map(sequence).transpose()?.unwrap_or_default() {
             let (column, order) = match spec.vector().ok_or_else(|| invalid("Sort specification must be a vector"))? {
@@ -329,11 +339,62 @@ impl Importer<'_, '_, '_> {
             let expr = bound.variables.get(name).ok_or_else(|| invalid(format!("Unknown sort column: {name}")))?.expression();
             order_by.push(SortExpr { expr, descending, nulls_first });
         }
-        let mut read_limit = |key| options.option(key).filter(|form| !matches!(form.kind, EdnKind::Nil)).map(|form| self.scalar(form, &mut bound)).transpose();
-        let offset = read_limit("skip")?;
-        let fetch = read_limit("limit")?;
-        if order_by.is_empty() { return input.limit(offset, fetch); }
-        Relation::new(input.schema().clone(), RelationNode::SortLimit { input, order_by, offset, fetch })
+        Ok(order_by)
+    }
+
+    fn group_by(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
+        let input = self.lower(input)?;
+        let mut bound = bind_input(&input);
+        let columns = sequence(required(options, "columns")?)?;
+        if columns.is_empty() { return Err(invalid("Group by requires at least one output column")); }
+        let mut groups = Vec::new();
+        let mut calls = Vec::new();
+        for column in columns {
+            if let Some([(name, call)]) = column.map() {
+                calls.push((column_name(name)?, call));
+            } else {
+                let field = self.aggregate_column(column, &mut bound)?;
+                groups.push(NamedExpr { expr: field.expression(), field });
+            }
+        }
+        let aggregates = calls.into_iter().map(|(name, call)| self.aggregate(name, call, &mut bound, !groups.is_empty()))
+            .collect::<Result<Vec<_>>>()?;
+        let schema = Schema::new(groups.iter().map(|group| group.field.clone()).chain(aggregates.iter().map(|aggregate| aggregate.field.clone())).collect())?;
+        Relation::new(schema, RelationNode::Aggregate { input: bound.relation, groups, aggregates })
+    }
+
+    fn aggregate(&mut self, name: &str, form: &Edn, bound: &mut Bound, grouped: bool) -> Result<AggregateExpr> {
+        let EdnKind::List(call) = &form.kind else { return Err(invalid("Aggregate must be a list")); };
+        let [function, arguments @ ..] = call.as_slice() else {
+            return Err(invalid("Aggregate requires a function name"));
+        };
+        let function = function.symbol().ok_or_else(|| invalid("Aggregate function must be a symbol"))?;
+        let (function, distinct) = aggregate_function(function).ok_or_else(|| invalid(format!("Unknown aggregate function: {function}")))?;
+        let (arguments, options) = match arguments.split_last() {
+            Some((options, arguments)) if options.map().is_some() => (arguments, Some(options)),
+            _ => (arguments, None),
+        };
+        let argument = match (function.canonical(), arguments) {
+            (AggregateFunction::CountStar, []) => None,
+            (AggregateFunction::CountStar, _) => return Err(invalid("Row count takes no argument")),
+            (_, [column]) => Some(self.aggregate_column(column, bound)?.expression()),
+            _ => return Err(invalid("Aggregate requires one input column")),
+        };
+        let input_type = argument.as_ref().map(PExpr::data_type).unwrap_or(LogicalType::Nothing);
+        let field = self.compiler.binder.field(name, None, aggregate_type(&function, input_type, grouped)?)?;
+        let filter = options.and_then(|options| options.option("filter")).map(|predicate| self.scalar(predicate, bound)).transpose()?;
+        let order_by = options.map(|options| Self::sort_specs(options, bound)).transpose()?.unwrap_or_default();
+        Ok(AggregateExpr { field, function, argument, distinct, filter, order_by })
+    }
+
+    fn aggregate_column(&mut self, column: &Edn, bound: &mut Bound) -> Result<Field> {
+        let name = column_name(column)?;
+        if let Some(field) = bound.variables.get(name) { return Ok(field.clone()); }
+        let field = self.compiler.binder.field(name, None, LogicalType::Null)?;
+        let expr = PExpr::Literal(Value::Null);
+        bound.relation = Arc::new(Arc::clone(&bound.relation).extend(vec![NamedExpr { field: field.clone(), expr }])?);
+        bound.variables.insert(name.to_owned(), field.clone());
+        Ok(field)
     }
 
     fn set(&mut self, operator: SetOperator, left: &Edn, right: &Edn) -> Result<Relation> {
