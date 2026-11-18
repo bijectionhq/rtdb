@@ -129,6 +129,8 @@ Grouping, joins, period projections, and correlated subqueries retain the same n
 Qualified wildcards accept a single table alias and reject schema or database prefixes.
 
 A dotted identifier chain is resolved as one column reference.
+An array subscript binds to that qualified column before applying one-based indexing.
+Struct fields after the subscript resolve against the indexed value.
 Parenthesized expressions provide explicit struct-field access, such as `(xtdb.public.foo.payload).leaf`.
 `tests/qualified_columns.rs` maps the five enabled forms in `xtdb.sql-test/test-schema-qualified-names` and the transaction-scoped resolution rules in `sql/multi_db_test.clj`.
 The upstream `test-schema-qualified-names-field` case is disabled; its unparenthesized chain remains a column-resolution error under the pinned `visitColumnReference` path.

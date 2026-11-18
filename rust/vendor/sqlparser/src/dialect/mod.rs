@@ -603,6 +603,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Treats the initial dotted identifiers before an array index as a qualified column name.
+    fn qualifies_column_before_subscript(&self) -> bool {
+        false
+    }
+
     /// Resolves type names whose grammar accepts no parenthesized modifiers.
     fn unparameterized_data_type(&self, _word: &Word) -> Option<DataType> {
         None

@@ -2214,7 +2214,7 @@ impl<'a> Parser<'a> {
             };
             Ok(Expr::OuterJoin(expr.into()))
         } else {
-            Self::build_compound_expr(root, chain)
+            self.build_compound_expr(root, chain)
         }
     }
 
@@ -2223,6 +2223,7 @@ impl<'a> Parser<'a> {
     /// or other special cased expressions like [Expr::CompoundIdentifier],
     /// [Expr::OuterJoin].
     fn build_compound_expr(
+        &self,
         root: Expr,
         mut access_chain: Vec<AccessExpr>,
     ) -> Result<Expr, ParserError> {
@@ -2304,6 +2305,20 @@ impl<'a> Parser<'a> {
 
             return Ok(Expr::OuterJoin(Expr::CompoundIdentifier(idents).into()));
         }
+
+        let root = if self.dialect.qualifies_column_before_subscript() && matches!(&root, Expr::Identifier(_)) {
+            let prefix_len = access_chain.iter().take_while(|access| matches!(access, AccessExpr::Dot(Expr::Identifier(_)))).count();
+            if prefix_len > 0 && matches!(access_chain.get(prefix_len), Some(AccessExpr::Subscript(_))) {
+                let rest = access_chain.split_off(prefix_len);
+                let qualified = Expr::CompoundIdentifier(Self::exprs_to_idents(root, access_chain)?);
+                access_chain = rest;
+                qualified
+            } else {
+                root
+            }
+        } else {
+            root
+        };
 
         Ok(Expr::CompoundFieldAccess {
             root: Box::new(root),

@@ -160,3 +160,15 @@ fn mutation_alias_scopes_retain_their_reference_prefix_rules_and_transaction_dat
     }
     assert!(context.catalog.transaction_scoped());
 }
+
+#[tokio::test]
+async fn qualified_array_subscript_keeps_column_resolution_and_nested_field_access() {
+    let source = "SELECT q.items[1].v AS first, q.items[2].v AS second, (q.doc).items[1] AS nested FROM (VALUES
+        (ARRAY[{v: 10}, {v: 20}], {items: ARRAY[30, 40]})) q(items, doc)";
+    assert_eq!(query(source).await.unwrap(), [vec![Value::I64(10), Value::I64(20), Value::I64(30)]]);
+
+    let source = "SELECT (q.items)[2][1] FROM (VALUES (ARRAY[ARRAY[10,20], ARRAY[30,40]])) q(items)";
+    assert_eq!(query(source).await.unwrap(), [vec![Value::I64(30)]]);
+    let source = "SELECT q.items[1] FROM (VALUES (ARRAY[10])) x(items)";
+    assert_eq!(query(source).await.unwrap_err().code, "xtdb/column-not-found");
+}

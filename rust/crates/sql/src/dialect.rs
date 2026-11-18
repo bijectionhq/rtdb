@@ -112,6 +112,7 @@ impl Dialect for SqlDialect {
     }
 
     fn supports_interval_identifier(&self) -> bool { true }
+    fn qualifies_column_before_subscript(&self) -> bool { true }
     fn supports_table_function_syntax(&self) -> bool { false }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
