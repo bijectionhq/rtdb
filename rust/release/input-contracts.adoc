@@ -47,6 +47,7 @@ Workers execute only their native architecture; unmatched or unavailable lanes r
 |`clients` |`native_package`, `jvm_package` |Artifacts or predecessor references to the two selected package dependencies' `run/package.json` files.
 |`performance` |`performance_plan` |Artifact conforming to link:../conformance/performance-inputs.adoc[Performance plan version 1]; its packages must be byte-identical to the selected dependencies, its architecture must equal the lane, and its `package_capabilities` must equal the lane's capabilities.
 |`inventory` |`source_inventory`, `ledger`, `native_inventory`, `aliases`, `invocations`; optional `external` |Artifacts described under Runtime inventory inputs; `native_inventory` must be the selected native-tests dependency's `run/native-inventory.json`.
+|`assertion-comparison` |`native`, `inventory`, `ledger`, `reference_receipts`, `native_receipts` |The selected production executable, the selected inventory lane's `inventory.json` and `ledger.json`, and both engines' retained case receipts.
 |`packaged-recovery` |`recovery_plan` |Version 1 link:../conformance/packaged-recovery-inputs.adoc[packaged recovery plan], bound to its selected JVM/native package producers and native production helper.
 |===
 
@@ -77,6 +78,19 @@ The matrix supplies those roots from its selected Gradle predecessors.
 `merge_runtime(destination, sources)` requires a nonexistent destination with an existing parent and returns that destination as a `Path`.
 Duplicate task artifacts fail; shared discovery paths must have identical bytes.
 Failure may leave a partial destination for inspection.
+The inventory lane retains the exact ledger supplied to reconciliation as `ledger.json`.
+
+=== Full assertion comparison
+
+Each platform and native variant compares every case in its reconciled ledger with its selected production comparator.
+Both receipt inputs are JSON arrays of the link:../crates/conformance/src/lib.rs[`CaseReceipt`] records.
+The reference receipts identify the pinned reference revision and the native receipts identify the selected implementation revision.
+Native control receipts must also identify the selected production executable by its SHA256 digest.
+The lane invokes its selected production binary as `rtdb-conformance compare LEDGER REFERENCE_RECEIPTS NATIVE_RECEIPTS` against retained snapshots of those three files.
+Success requires comparator exit `0` and complete parity.
+The report's case count must match the inventory's `assertion_denominator`, and each case must cover all its required observations.
+The comparator's stdout, stderr and process receipt remain available when comparison exits `1`, including when it reports a matched declared migration.
+Matrix verification checks the retained report, input digests and original worker invocation without running the comparator again.
 
 === Commands and results
 

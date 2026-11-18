@@ -73,6 +73,8 @@ def expand(matrix):
             prerequisites.extend(entry["id"] for entry in result if entry["id"].startswith(reference + "/"))
             result.append(lane(native + "/inventory", "inventory", platform, prerequisites, variant=variant,
                                capabilities=sorted(CAPABILITIES[variant])))
+            result.append(lane(native + "/assertion-comparison", "assertion-comparison", platform,
+                               (native + "/production", native + "/inventory"), variant=variant, features=features))
     index(result, lambda value: value["id"], "release lane")
     return result
 

@@ -10,7 +10,7 @@ from client_results import parse_junit, parse_libtest
 from runtime_inventory import read_plan
 from evidence import artifact, canonical, read_json, sha256
 from matrix_plan import expand, summarize
-from lane_artifacts import package_matches, verify_bindings
+from lane_artifacts import ASSERTION_COMPARISON_INPUTS, package_matches, verify_bindings, verify_inventory_ledger
 
 
 def verify_lane_artifacts(directory, receipt):
@@ -88,9 +88,14 @@ def verify_lane_artifacts(directory, receipt):
         for reference in result["artifacts"]:
             artifact(directory / "run", reference)
     elif runner == "inventory":
+        verify_inventory_ledger(directory)
         result = read_json(directory / "inventory.json")
         if result.get("complete") is not True or result.get("all_assertions_passed") is not True:
             raise ValueError("inventory has missing or failing original assertions")
+    elif runner == "assertion-comparison":
+        result = read_json(directory / "assertion-comparison.stdout.log")
+        if result.get("complete_parity") is not True:
+            raise ValueError("full assertion comparison lacks strict parity")
     else:
         fields = {"controls": ("result.json", "controls_verified"), "history": ("result.json", "history_selection_passed"),
             "recovery": ("result.json", "recovery_selection_passed"), "sql-logic": ("result.json", "selection_passed"),
@@ -115,8 +120,12 @@ def verify(matrix, roots, plan_sha256, implementation_revision, reference_revisi
             raise ValueError("worker evidence names different matrix input bytes")
         if result.get("selection_sha256") != sha256(root / "selection.json") or canonical(read_json(root / "selection.json")) != canonical(lanes):
             raise ValueError("worker selection differs from the full committed matrix")
-        if result.get("inputs_sha256") != sha256(root / "inputs.json"):
+        inputs_path = root / "inputs.json"
+        if result.get("inputs_sha256") != sha256(inputs_path):
             raise ValueError("worker input provenance differs")
+        inputs = read_json(inputs_path)
+        if inputs.get("implementation_revision") != implementation_revision or inputs.get("reference_revision") != reference_revision:
+            raise ValueError("worker input revisions differ from the selected revisions")
         worker = result.get("worker_platform")
         recorded = {}
         for reference in result.get("receipt_artifacts", []):
@@ -143,6 +152,16 @@ def verify(matrix, roots, plan_sha256, implementation_revision, reference_revisi
                 files = read_json(closure_file)
                 if not files:
                     raise ValueError("successful lane lacks its retained artifact closure")
+                if receipt["runner"] in {"inventory", "assertion-comparison"}:
+                    required = {"artifact-bindings.json", "input-artifacts.json", "ledger.json"}
+                    if receipt["runner"] == "inventory":
+                        required.update(("inventory.json", "inventory.process.json"))
+                    else:
+                        required.update(filename for _, filename in ASSERTION_COMPARISON_INPUTS)
+                        required.update(("assertion-comparison.process.json", "assertion-comparison.stdout.log",
+                                         "assertion-comparison.stderr.log"))
+                    if not required <= {item["path"] for item in files}:
+                        raise ValueError("assertion evidence is absent from the retained lane closure")
                 process_count = 0
                 for item in files:
                     path = artifact(closure_file.parent, item)

@@ -33,6 +33,21 @@ class ReleaseSelections(unittest.TestCase):
             self.assertEqual(["jvm-to-rust", "rust-to-jvm"], lane["selection"]["directions"])
             self.assertIn("partial-compaction", lane["selection"]["checkpoints"])
 
+    def test_release_requires_full_ledger_comparison_for_every_platform_and_native_variant(self):
+        lanes = expand(self.matrix)
+        comparisons = [lane for lane in lanes if lane["runner"] == "assertion-comparison"]
+        self.assertEqual(len(self.matrix["platforms"]) * len(self.matrix["variants"]), len(comparisons))
+        for lane in comparisons:
+            prefix = lane["platform"].replace("/", "-")
+            native = prefix + "/rust/" + lane["selection"]["variant"]
+            self.assertEqual(lane["id"], native + "/assertion-comparison")
+            self.assertEqual(set(lane["dependencies"]), {native + "/inventory", native + "/production"})
+        receipts = [{**lane, "verified": True, "process_joined": True, "artifacts": [{"path": "result.json"}]}
+                    for lane in lanes if lane["runner"] != "assertion-comparison"]
+        summary = summarize(lanes, receipts)
+        self.assertFalse(summary["release_matrix_verified"])
+        self.assertEqual([item["id"] for item in summary["unmet_lanes"]], [lane["id"] for lane in comparisons])
+
     def test_features_and_missing_lanes_cannot_be_inferred_from_supplied_receipts(self):
         lanes = expand(self.matrix)
         bindings = [{"id": lane["id"], "runner": lane["runner"], "selection": lane["selection"], "inputs": {}} for lane in lanes]

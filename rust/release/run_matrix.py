@@ -18,7 +18,8 @@ from runtime_inventory import read_plan as read_junit_plan
 from evidence import artifact, closure, read_json, retained
 from matrix_plan import expand, summarize, validate_bindings, validate_workflows
 from runtime_bundle import merge_runtime
-from lane_artifacts import bind_inputs, package_matches
+from lane_artifacts import (ASSERTION_COMPARISON_INPUTS, assertion_comparison_command, bind_inputs, package_matches,
+                            selected_input_snapshot, verify_bindings, verify_inventory_ledger)
 
 
 def host_platform():
@@ -204,16 +205,27 @@ class Run:
         elif runner == "inventory":
             runtime = merge_runtime(directory / "runtime", [self.directories[item["id"]] / "run" for item in self.lanes
                 if item["runner"] == "gradle" and item["id"] in lane["dependencies"]])
-            argv = [sys.executable, CONFORMANCE / "runtime_inventory.py", "--source", source("source_inventory"), "--ledger", source("ledger"),
+            shutil.copyfile(source("ledger"), directory / "ledger.json")
+            ledger = selected_input_snapshot(directory, "ledger", "ledger.json")
+            argv = [sys.executable, CONFORMANCE / "runtime_inventory.py", "--source", source("source_inventory"), "--ledger", ledger,
                     "--runtime", runtime, "--native", source("native_inventory"), "--aliases", source("aliases"), "--invocations", source("invocations"),
                     "--output", directory / "inventory.json"]
             if "external" in inputs:
                 argv += ["--external", source("external")]
-            self.command(directory, runner, argv, expected=(0, 1))
+            self.command(directory, runner, argv, cwd=directory, expected=(0, 1))
+            verify_inventory_ledger(directory)
             record = read_json(directory / "inventory.json")
             if record.get("complete") is not True or record.get("all_assertions_passed") is not True:
                 raise ValueError("full source/runtime/assertion inventory is unreconciled")
-            return [directory / "inventory.json"]
+            return [directory / "inventory.json", ledger]
+        elif runner == "assertion-comparison":
+            for role, filename in ASSERTION_COMPARISON_INPUTS:
+                shutil.copyfile(source(role), directory / filename)
+                selected_input_snapshot(directory, role, filename)
+            report = self.command(directory, runner, assertion_comparison_command(source("native"), directory),
+                                  cwd=directory, expected=(0, 1))
+            verify_bindings(lane, directory, self.args.output, dependency)
+            return [report]
         elif runner == "embedded":
             native = source("native_library")
             library = directory / native.name
