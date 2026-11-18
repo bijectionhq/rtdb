@@ -121,8 +121,8 @@
       ],
       "evidence": {
         "rust/crates/node/src/session.rs": "b6f085603994402eddc6aae75c0abe44b3155a8154625560b2d482f3ff48de38",
-        "rust/crates/node/src/statement.rs": "774fe64696107af46520549c216522a0ae10ad62bd68e504562bab6177a6ff0d",
-        "rust/crates/tx/src/submission.rs": "4c3fcdc19bdd31e2cd0b7d230c00656dc203f7c5ac2b44638a5849424955dd01",
+        "rust/crates/node/src/statement.rs": "4c53eb61b738383dc5a8aab5bd653f916ca2cd15a6bfdf9622c7d8d32f9bda27",
+        "rust/crates/tx/src/submission.rs": "1fe74c10253e51821f6263cd0fa6fe9d16965cf5fe005c0c23f1bf0e4960c2cb",
         "rust/crates/tx/src/resolver.rs": "ae65fc053307e9a9ae8446f0ab71ab1a8324580a139abc1b976f336c56732115",
         "rust/crates/replication/src/appender.rs": "fdaaf5ed638cb76098397c0329762b82b7df5814c362c3d24940d5035514a8ef",
         "rust/crates/replication/src/admission.rs": "409317681b4f6f95f40f2ff9ea1f9ae2e4a5a215d8e5bc4b8094493acbd48394",
@@ -131,7 +131,7 @@
     },
     "replica_recovery": {
       "status": "reviewed",
-      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, native local and Kafka replay admission, adoption, readable restored state, and failure restart.",
+      "conclusion": "The recorded source review covers public startup, catalog restoration before opening logs, native local and Kafka replay admission, adoption, readable restored state, and failure restart. Restart after catalog publication but before durable upload confirmation still requires source repair.",
       "implementation_paths": [
         "rust/crates/server/src/main.rs",
         "rust/crates/server/src/runtime.rs",
@@ -154,7 +154,7 @@
       "evidence": {
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
-        "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
+        "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "dd8235d4ee0c1608f6b04ec029958abdf64b2a0deb06ea2f8e09d75f83ab5b86",
         "rust/crates/replication/src/driver.rs": "7c24eee5bfe68b1ecbe6f8ca4a45ae7f4f7873698a9e72fc958e0d9de264d6d6",
         "rust/crates/replication/src/blocks.rs": "31568965ca15b2d27490dd3e537659dd1cd764f8999c99bc70b6b722875e329d",
@@ -232,8 +232,8 @@
         "rust/crates/server/src/main.rs": "e40d7ec497b5a33107ce0335b593618c41cd6359833c5edfff797bd8307d5988",
         "rust/crates/server/src/runtime.rs": "08de1415f04a54010a225a592d7f2127d61bbcf14dfa5f603141121527c94e29",
         "rust/crates/ffi/src/lib.rs": "de48f64941ee1e58e76fb73b08ecad8562defc797318c7ea0b995e55597614c7",
-        "rust/crates/node/src/node.rs": "983581e9a3c7e7239d06c2d709745896aa3bf6cf75889ad32ef1150a5f2fa3ba",
-        "rust/crates/node/src/runtime.rs": "8e4da0daa9192e112b4542e127f022f6cf83f626b889825ac688ab534136e8fc",
+        "rust/crates/node/src/node.rs": "3e185cb1bc9942912fa9bbc49a4333ff12c312e7173f85e82fea0d963cfab133",
+        "rust/crates/node/src/runtime.rs": "d20785f800f0d08eccf43d1638075175c0a8391ea9bb45d4ecaef88dd14fbb48",
         "rust/crates/node/src/database.rs": "dd8235d4ee0c1608f6b04ec029958abdf64b2a0deb06ea2f8e09d75f83ab5b86",
         "rust/crates/storage/src/io_region.rs": "7b7d8dbc118a0e11a592308de125532617ba2b1052c1029db10d1ac7fce1b084",
         "rust/crates/ffi/src/region.rs": "328562e748473a73e1dfe1ad205d9d45842041b25d40a36b692ba061c6f820b0"
@@ -344,6 +344,16 @@
         "client_operational_surfaces"
       ],
       "requirement": "Activate the same-input Avro pairing with exact JavaString schema input and source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners."
+    },
+    {
+      "id": "recovered-block-confirmation",
+      "kind": "implementation",
+      "status": "open",
+      "targets": [
+        "writes_replication_recovery",
+        "replica_recovery"
+      ],
+      "requirement": "Recover after a block catalog is published and its upload confirmation is absent. Preserve retained replica replay and the boundary fence, let a surviving follower adopt the recovered block and drain its held records, and delay ordinary leader work until recovery has established confirmation. Reconcile the pinned JVM's shared publication order and record a crash-window regression through production replication."
     },
     {
       "id": "final-design-closure",
