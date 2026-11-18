@@ -23,11 +23,13 @@ Other spellings of these keywords report `xtdb.error/illegal-arg` during binding
 `tests/strings.rs` retains the six planning observations from `xtdb.sql.expr-test/test-character-length-expr` and `test-char-length-alias`, and adds execution and error source cases.
 `tests/generic_admission.rs` retains prepared parameter cases.
 
-`SUBSTRING(source FROM start [FOR length])` and `OVERLAY` accept a trailing `USING CHARACTERS` or `USING OCTETS` inside the parentheses.
+`OVERLAY` accepts a trailing `USING CHARACTERS` or `USING OCTETS` inside the parentheses.
+`SUBSTRING` accepts the same clause after a start expression and optional length in forms without comma separators.
 These clauses accept case-insensitive unit keywords.
 For either unit, positions and lengths count Unicode code points in text and bytes in binary input.
-After an explicit `FROM`, `SUBSTRING` parses the complete start expression first.
-A following unsigned decimal integer, `?`, `$n`, or `(` can begin the length without `FOR`.
+In `SUBSTRING` without commas between operands, an unsigned decimal integer, `?`, `$n`, or `(` can begin the start expression without `FROM`.
+The parser reads the complete source expression before checking for that operand.
+The same starters can begin the length without `FOR` after the complete start expression.
 
 The string scalar tests also cover virtual temporal columns whose runtime type is Null, preserving STR, FORMAT, and string-to-array null policies.
 REGEXP_REPLACE retains literal pattern, replacement, optional start/occurrence and flags metadata separately from its source expression.

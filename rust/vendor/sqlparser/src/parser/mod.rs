@@ -3077,10 +3077,12 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse the keyword or comma forms of `SUBSTRING` and `SUBSTR`.
+    /// Parse a `SUBSTRING` or `SUBSTR` expression beginning at its keyword.
     ///
-    /// Dialects with [`Dialect::supports_bare_substring_length`] accept `SUBSTRING(expr FROM start length)`
-    /// when an unsigned decimal integer, placeholder token, or `(` starts a separate length expression.
+    /// For `SUBSTRING` without commas between operands, [`Dialect::supports_bare_substring_start`]
+    /// allows omitting `FROM` before the start operand.
+    /// After a parsed start operand in that form, [`Dialect::supports_bare_substring_length`] allows omitting `FOR`.
+    /// An unsigned decimal integer, placeholder token, or `(` must begin either separate operand.
     pub fn parse_substring(&mut self) -> Result<Expr, ParserError> {
         let shorthand = match self.expect_one_of_keywords(&[Keyword::SUBSTR, Keyword::SUBSTRING])? {
             Keyword::SUBSTR => true,
@@ -3094,29 +3096,29 @@ impl<'a> Parser<'a> {
         let expr = self.parse_expr()?;
         let mut from_expr = None;
         let special = self.consume_token(&Token::Comma);
-        if special || self.parse_keyword(Keyword::FROM) {
+        let explicit_from = !special && self.parse_keyword(Keyword::FROM);
+        let bare_start = !special
+            && !explicit_from
+            && !shorthand
+            && self.dialect.supports_bare_substring_start()
+            && self.starts_bare_substring_operand();
+        if special || explicit_from || bare_start {
             from_expr = Some(self.parse_expr()?);
         }
 
         let mut to_expr = None;
         let for_keyword = self.parse_keyword(Keyword::FOR);
-        let length_comma = !for_keyword && self.consume_token(&Token::Comma);
-        let explicit_from_form = !shorthand && !special && from_expr.is_some() && !length_comma;
+        let length_comma = !for_keyword && !bare_start && self.consume_token(&Token::Comma);
+        let noncomma_form = !shorthand && (explicit_from || bare_start) && !length_comma;
         if for_keyword
             || length_comma
-            || (explicit_from_form
+            || (noncomma_form
                 && self.dialect.supports_bare_substring_length()
-                && match &self.peek_token_ref().token {
-                    Token::Number(value, false) => {
-                        !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
-                    }
-                    Token::Placeholder(_) | Token::LParen => true,
-                    _ => false,
-                })
+                && self.starts_bare_substring_operand())
         {
             to_expr = Some(self.parse_expr()?);
         }
-        if explicit_from_form {
+        if noncomma_form {
             self.parse_optional_character_length_units()?;
         }
         self.expect_token(&Token::RParen)?;
@@ -3128,6 +3130,16 @@ impl<'a> Parser<'a> {
             special,
             shorthand,
         })
+    }
+
+    fn starts_bare_substring_operand(&self) -> bool {
+        match &self.peek_token_ref().token {
+            Token::Number(value, false) => {
+                !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+            }
+            Token::Placeholder(_) | Token::LParen => true,
+            _ => false,
+        }
     }
 
     /// Parse an OVERLAY expression.

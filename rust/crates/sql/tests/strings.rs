@@ -180,7 +180,6 @@ fn substring_bare_length_requires_a_separate_operand_after_explicit_from() {
         "SELECT SUBSTRING('abc' FROM 2 1, 3)",
         "SELECT SUBSTRING('abc' FROM 2 1 3)",
         "SELECT SUBSTRING('abc', 2 1)",
-        "SELECT SUBSTRING('abc' 2 1)",
         "SELECT SUBSTRING('abc' FROM 2 FROM)",
         "SELECT SUBSTR('abc' FROM 2 1)",
         "SELECT OVERLAY('abc' PLACING 'x' FROM 2 1)",
@@ -206,6 +205,57 @@ fn substring_bare_length_gates_numeric_spelling_before_parsing_the_expression() 
         assert_eq!(rtdb_sql::parse(&bare).unwrap_err().code, "xtdb/sql-error", "{bare}");
         let explicit = format!("SELECT SUBSTRING('abc' FROM 2 FOR {length})");
         assert!(rtdb_sql::parse(&explicit).is_ok(), "{explicit}");
+    }
+}
+
+#[tokio::test]
+async fn substring_without_from_preserves_operand_precedence_and_units() {
+    let rows = query("SELECT SUBSTRING('abcdef' 2), SUBSTRING('abcdef' 2 FOR 2), \
+        SUBSTRING('abcdef' 1 + 1 2 * 1), SUBSTRING(LOWER ('ABCDEF') (2) (1 + 1)), \
+        SUBSTRING(LOWER ('ABCDEF')), SUBSTRING('abcdef' 2 - 1), \
+        SUBSTRING('a😀éz' 2 2 USING octets), SUBSTRING(X'010203' 2 USING CHARACTERS), \
+        SUBSTRING(NULL 2 FOR 1)")
+        .await.unwrap();
+    assert_eq!(
+        rows,
+        [vec![
+            text("bcdef"), text("bc"), text("bc"), text("bc"), text("abcdef"), text("abcdef"),
+            text("😀é"), V::Binary(vec![2, 3]), V::Null,
+        ]],
+    );
+}
+
+#[test]
+fn substring_without_from_requires_a_separate_start_and_excludes_commas() {
+    for sql in [
+        "SELECT SUBSTRING('abc' 2, 1)",
+        "SELECT SUBSTRING('abc' 2, 1 USING OCTETS)",
+        "SELECT SUBSTRING('abc' 2 FOR 1, 3)",
+        "SELECT SUBSTRING('abc' 2 1 3)",
+        "SELECT SUBSTRING('abc' 1L)",
+        "SELECT SUBSTRING('abc' .1)",
+        "SELECT SUBSTRING('abc' 1.)",
+        "SELECT SUBSTRING('abc' 2 USING other)",
+        "SELECT SUBSTR('abc' 2)",
+        "SELECT OVERLAY('abc' PLACING 'x' 2)",
+    ] {
+        assert_eq!(rtdb_sql::parse(sql).unwrap_err().code, "xtdb/sql-error", "{sql}");
+    }
+    for sql in [
+        "SELECT SUBSTRING('abc')",
+        "SELECT SUBSTRING('abc' FOR 2)",
+        "SELECT SUBSTRING('abc' FROM 2, 1)",
+        "SELECT SUBSTRING('abc', 2 FOR 1)",
+    ] {
+        assert!(rtdb_sql::parse(sql).is_ok(), "{sql}");
+    }
+    let generic = sqlparser::dialect::GenericDialect {};
+    for sql in [
+        "SELECT SUBSTRING('abc' 2)",
+        "SELECT SUBSTRING('abc' 2 FOR 1)",
+        "SELECT SUBSTRING('abc' 2 1)",
+    ] {
+        assert!(sqlparser::parser::Parser::parse_sql(&generic, sql).is_err(), "{sql}");
     }
 }
 

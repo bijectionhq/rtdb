@@ -618,7 +618,14 @@ pub trait Dialect: Debug + Any {
         false
     }
 
-    /// Supports omitting `FOR` from a substring length after an explicit `FROM`.
+    /// Supports omitting `FROM` before the start operand in the non-comma `SUBSTRING` form.
+    /// See [`Parser::parse_substring`] for the allowed operand starters.
+    fn supports_bare_substring_start(&self) -> bool {
+        false
+    }
+
+    /// Supports omitting `FOR` after a start operand in the non-comma `SUBSTRING` form.
+    /// See [`Parser::parse_substring`] for the allowed operand starters.
     fn supports_bare_substring_length(&self) -> bool {
         false
     }

@@ -586,8 +586,16 @@ mod tests {
     }
 
     #[test]
-    fn substring_bare_length_retains_parameter_slots_and_byte_spans() {
-        let source = "SELECT 'é', SUBSTRING(? FROM $2 ?), ?";
+    fn substring_bare_operands_retain_parameter_slots_and_byte_spans() {
+        for source in [
+            "SELECT 'é', SUBSTRING(? FROM $2 ?), ?",
+            "SELECT 'é', SUBSTRING(? $2 ?), ?",
+        ] {
+            assert_substring_parameter_slots_and_byte_spans(source);
+        }
+    }
+
+    fn assert_substring_parameter_slots_and_byte_spans(source: &str) {
         let mut ordinary = parse(source).unwrap();
         assert_eq!(ordinary.len(), 1);
 
