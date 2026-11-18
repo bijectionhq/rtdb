@@ -727,6 +727,8 @@
 
 (deftest-original-api original-patch/test-patch-3879)
 
+(deftest-original-api original-patch/test-patch-operator)
+
 (deftest-original-api original-patch/test-multi-entity-patch-sql)
 
 (deftest-original-api original-patch/test-patch-sql)

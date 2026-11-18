@@ -412,6 +412,7 @@ String parameter values retain the reference object-time parser's date fallback,
 Inverted endpoints fail with `xtdb.indexer/invalid-valid-times` and typed Instant context for both bounds; equal endpoints pass admission.
 `tests/patch_endpoints.rs` records these boundaries and clock precision as unexecuted regression source.
 PatchGaps emits one page for each input page and resets IID progression at that boundary.
+Synthetic gaps retain the IID representation of the adjacent input row.
 It copies each clipped row, including empty and inverted intervals, and advances subsequent gaps from the raw input upper bound.
 `src/patch_tests.rs` records explicit page boundaries, empty pages, clipping, cancellation and returned-page ownership as unexecuted source.
 Scan partitions source pages at their common trie paths, resolves visibility for each task, and retains one output page per contributing source page.

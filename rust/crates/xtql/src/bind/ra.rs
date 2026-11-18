@@ -78,6 +78,7 @@ impl Importer<'_, '_, '_> {
             ("mark-join", [left, right]) => self.mark(options, left, right)?,
             ("apply", [input, dependent]) => self.apply(options, input, dependent)?,
             ("unnest" | "ω", [input]) => self.unnest(options, input)?,
+            ("patch-gaps", [input]) => self.patch_gaps(options, input)?,
             ("distinct" | "δ", [input]) => {
                 let input = self.lower(input)?;
                 Relation::new(input.schema().clone(), RelationNode::Distinct { input })?
@@ -140,6 +141,20 @@ impl Importer<'_, '_, '_> {
         }).transpose()?;
         let schema = Schema::new(input.schema().fields().iter().cloned().chain([element.clone()]).chain(ordinality.iter().cloned()).collect())?;
         Relation::new(schema, RelationNode::Unnest { input, expr, element, ordinality, outer: false })
+    }
+
+    fn patch_gaps(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
+        let input = self.lower(input)?;
+        let field = |name| input.schema().fields().iter().find(|field| field.name == name)
+            .map(|field| field.id).ok_or_else(|| invalid(format!("Missing patch gap column: {name}")));
+        let (iid, valid_from, valid_to, document) = (field("_iid")?, field("_valid_from")?, field("_valid_to")?, field("doc")?);
+        let from = self.scalar(required(options, "valid-from")?, &mut Bound::unit())?;
+        let to = self.scalar(required(options, "valid-to")?, &mut Bound::unit())?;
+        let schema = Schema::new(input.schema().fields().iter().cloned().map(|mut field| {
+            if field.id == document { field.data_type = field.data_type.maybe(); }
+            field
+        }).collect())?;
+        Relation::new(schema, RelationNode::PatchGaps { input, iid, valid_from, valid_to, document, from, to })
     }
 
     fn scan(&mut self, options: &Edn) -> Result<Relation> {

@@ -14,6 +14,36 @@ pub(crate) struct PatchGaps {
     execution: Execution,
 }
 
+#[derive(Clone, Copy)]
+enum PatchIid {
+    Binary(Iid),
+    FixedSizeBinary(Iid),
+    Uuid(Iid),
+}
+
+impl PatchIid {
+    fn read(value: &Value) -> Result<Self> {
+        match value {
+            Value::Binary(bytes) => Ok(Self::Binary(Iid::from_slice(bytes)?)),
+            Value::FixedSizeBinary(bytes) => Ok(Self::FixedSizeBinary(Iid::from_slice(bytes)?)),
+            Value::Uuid(bytes) => Ok(Self::Uuid(Iid(*bytes))),
+            _ => Err(invalid("patch-iid", "Patch input IID is not sixteen bytes")),
+        }
+    }
+
+    fn bytes(self) -> Iid {
+        match self { Self::Binary(iid) | Self::FixedSizeBinary(iid) | Self::Uuid(iid) => iid }
+    }
+
+    fn value(self) -> Value {
+        match self {
+            Self::Binary(iid) => Value::Binary(iid.0.to_vec()),
+            Self::FixedSizeBinary(iid) => Value::FixedSizeBinary(iid.0.to_vec()),
+            Self::Uuid(iid) => Value::Uuid(iid.0),
+        }
+    }
+}
+
 impl PatchGaps {
     pub async fn new(input: BoxPageCursor, schema: &Schema, columns: [ColumnId; 4], from: &Expr, to: &Expr, execution: Execution) -> Result<Self> {
         let scope = execution.scope()?;
@@ -39,11 +69,11 @@ impl PatchGaps {
         let [iid, vf, vt, doc] = columns;
         Ok(Self { input, columns: [iid?, vf?, vt?, doc?], width: schema.len(), from, to, execution })
     }
-    fn gap(&self, iid: Iid, from: Timestamp, to: Timestamp) -> Result<OwnedRow> {
+    fn gap(&self, iid: PatchIid, from: Timestamp, to: Timestamp) -> Result<OwnedRow> {
         let bytes = self.width.checked_mul(std::mem::size_of::<Value>()).and_then(|bytes| bytes.checked_add(512)).ok_or_else(|| invalid("patch-size", "Patch row allocation exceeds addressable memory"))?;
         let reservation = self.execution.context.memory.reserve(bytes)?;
         let mut values = vec![Value::Null; self.width];
-        values[self.columns[0]] = Value::FixedSizeBinary(iid.0.to_vec());
+        values[self.columns[0]] = iid.value();
         values[self.columns[1]] = timestamp(from, false);
         values[self.columns[2]] = timestamp(to, true);
         OwnedRow::with_reservation(values, reservation)
@@ -57,13 +87,10 @@ impl PageCursor for PatchGaps {
         let Some(mut page) = self.input.next_page().await? else { return Ok(None); };
         let capacity = page.len().checked_mul(3).ok_or_else(|| invalid("patch-size", "Patch page row count exceeds addressable memory"))?;
         let mut output = PageBuilder::new(capacity, &self.execution.context.memory)?;
-        let mut current: Option<(Iid, Timestamp)> = None;
+        let mut current: Option<(PatchIid, Timestamp)> = None;
         while let Some(mut row) = page.next() {
             self.execution.context.check_cancelled()?;
-            let iid = match &row.values[self.columns[0]] {
-                Value::FixedSizeBinary(bytes) | Value::Binary(bytes) => Iid::from_slice(bytes)?,
-                Value::Uuid(bytes) => Iid(*bytes), _ => return Err(invalid("patch-iid", "Patch input IID is not sixteen bytes")),
-            };
+            let iid = PatchIid::read(&row.values[self.columns[0]])?;
             let from = rtdb_expr::timestamp_micros(&row.values[self.columns[1]], &self.execution.context.timezone)?;
             let to = match &row.values[self.columns[2]] {
                 Value::Null | Value::Undefined => Timestamp::MAX,
@@ -71,7 +98,7 @@ impl PageCursor for PatchGaps {
             };
             let mut cursor = self.from;
             if let Some((previous, previous_to)) = current {
-                if iid != previous {
+                if iid.bytes() != previous.bytes() {
                     if previous_to < self.to { output.push(self.gap(previous, previous_to, self.to)?)?; }
                 } else { cursor = previous_to; }
             }
