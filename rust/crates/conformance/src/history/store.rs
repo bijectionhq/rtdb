@@ -28,6 +28,7 @@ struct CountingStore { inner: Arc<dyn ObjectStore>, reads: Arc<Reads> }
 #[async_trait]
 impl ObjectStore for CountingStore {
     async fn head(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head(key).await }
+    async fn head_fresh(&self, key: &ObjectKey) -> rtdb_storage::Result<StoredObject> { self.inner.head_fresh(key).await }
     async fn get(&self, key: &ObjectKey) -> rtdb_storage::Result<Bytes> {
         let bytes = self.inner.get(key).await?; self.reads.record(bytes.len()); Ok(bytes)
     }

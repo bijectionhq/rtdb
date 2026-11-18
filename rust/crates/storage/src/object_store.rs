@@ -83,6 +83,11 @@ impl RetainedBytes {
 #[async_trait]
 pub trait ObjectStore: Send + Sync {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject>;
+    /// Reads current metadata for the key from the backing provider.
+    /// The default is suitable when `head` already obtains current provider metadata.
+    /// Store wrappers must forward this request to the wrapped store's `head_fresh`.
+    /// A missing key returns `Error::MissingObject`.
+    async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.head(key).await }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes>;
     /// Returns exactly the half-open byte range; an unavailable range is an error.
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes>;

@@ -47,6 +47,8 @@ Existing complete files are reused at startup, with access/modification timestam
 The cache acquires an exclusive directory lock before removing staging files left by a previous process.
 The lock remains held until the final cache owner or lease is released.
 File uploads warm the cache after durable remote publication; remote deletion leaves cached immutable files available until eviction.
+Use `ObjectStore::head_fresh` when a decision depends on the current presence of a shared object.
+The disk cache sends the metadata request to its backing provider and leaves cached files untouched.
 Blocking range reads retain both their disk lease and allocation reservation until the I/O task finishes, including after caller cancellation.
 Scoped cache stores admit cache hits and provider requests through their database region.
 Blocking cache reads and cache publication hold both cache and database admissions through work completion and cancelled-result destruction.

@@ -8,6 +8,7 @@ use tokio::sync::Semaphore;
 struct ObservedStore {
     inner: MemoryStore,
     heads: AtomicUsize,
+    fresh_heads: AtomicUsize,
     reads: AtomicUsize,
     fail: AtomicBool,
     hold_first: bool,
@@ -16,7 +17,7 @@ struct ObservedStore {
 }
 impl ObservedStore {
     fn new(hold_first: bool) -> Self {
-        Self { inner: MemoryStore::default(), heads: AtomicUsize::new(0), reads: AtomicUsize::new(0), fail: AtomicBool::new(false), hold_first, entered: Semaphore::new(0), release: Semaphore::new(0) }
+        Self { inner: MemoryStore::default(), heads: AtomicUsize::new(0), fresh_heads: AtomicUsize::new(0), reads: AtomicUsize::new(0), fail: AtomicBool::new(false), hold_first, entered: Semaphore::new(0), release: Semaphore::new(0) }
     }
 }
 #[async_trait]
@@ -24,6 +25,10 @@ impl ObjectStore for ObservedStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> {
         self.heads.fetch_add(1, Ordering::SeqCst);
         self.inner.head(key).await
+    }
+    async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> {
+        self.fresh_heads.fetch_add(1, Ordering::SeqCst);
+        self.inner.head_fresh(key).await
     }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> { self.get_range(key, 0..self.head(key).await?.size).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
@@ -339,6 +344,34 @@ async fn successful_file_upload_warms_cache_and_remote_deletion_preserves_cached
     assert!(store.list(None).await.unwrap().is_empty());
     assert_eq!(store.get(&key).await.unwrap().as_ref(), b"arrow file");
     assert_eq!(remote.reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn fresh_head_observes_provider_deletion_while_cached_reads_survive() {
+    let directory = tempfile::tempdir().unwrap();
+    let cache = DiskCache::open(directory.path(), 100, MemoryBudget::new(4 * 1024 * 1024)).unwrap();
+    let database = rtdb_storage::IoRegion::new();
+    let remote = Arc::new(ObservedStore::new(false));
+    let store = cache.scope_in(ObjectKey::new("db/0").unwrap(), remote.clone(), database.clone()).unwrap();
+    let key = ObjectKey::new("table/data.arrow").unwrap();
+    remote.put(&key, Bytes::from_static(b"data")).await.unwrap();
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"data");
+    let heads = remote.heads.load(Ordering::SeqCst);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+
+    let cached = store.head(&key).await.unwrap();
+    assert_eq!(store.head_fresh(&key).await.unwrap(), cached);
+    remote.delete(&key).await.unwrap();
+    assert!(matches!(store.head_fresh(&key).await, Err(Error::MissingObject(missing)) if missing == key.as_str()));
+    assert_eq!(store.head(&key).await.unwrap(), cached);
+    assert_eq!(store.get(&key).await.unwrap().as_ref(), b"data");
+    assert_eq!(remote.heads.load(Ordering::SeqCst), heads);
+    assert_eq!(remote.reads.load(Ordering::SeqCst), 1);
+
+    database.close_and_wait().await;
+    assert!(matches!(store.head_fresh(&key).await, Err(Error::Closed(_))));
+    assert_eq!(remote.fresh_heads.load(Ordering::SeqCst), 2);
+    cache.close_and_wait().await;
 }
 
 #[test]

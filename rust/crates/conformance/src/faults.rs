@@ -349,6 +349,7 @@ impl FaultStore {
 #[async_trait]
 impl ObjectStore for FaultStore {
     async fn head(&self, key: &ObjectKey) -> Result<StoredObject> { self.owner.around(Operation::Head, Some(key), self.inner.head(key)).await }
+    async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> { self.owner.around(Operation::Head, Some(key), self.inner.head_fresh(key)).await }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> { self.owner.around(Operation::Get, Some(key), self.inner.get(key)).await }
     async fn get_range(&self, key: &ObjectKey, range: Range<u64>) -> Result<Bytes> {
         self.owner.around(Operation::GetRange, Some(key), self.inner.get_range(key, range)).await

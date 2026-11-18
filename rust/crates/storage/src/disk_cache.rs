@@ -247,6 +247,11 @@ impl ObjectStore for DiskCachedStore {
         let _operation = self.cache.begin_operation()?;
         match self.cache.cached_size(&self.key(key)?) { Some(size) => Ok(StoredObject { key: key.clone(), size }), None => self.cache.cancellation.run_until_cancelled(self.remote.head(key)).await.ok_or_else(cache_closed)? }
     }
+    async fn head_fresh(&self, key: &ObjectKey) -> Result<StoredObject> {
+        let _scope = self.io.admit()?;
+        let _operation = self.cache.begin_operation()?;
+        self.cache.cancellation.run_until_cancelled(self.remote.head_fresh(key)).await.ok_or_else(cache_closed)?
+    }
     async fn get(&self, key: &ObjectKey) -> Result<Bytes> {
         self.get_range(key, 0..self.head(key).await?.size).await
     }
