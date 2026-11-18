@@ -346,3 +346,13 @@ fn fixed_size_binary_columns_are_bytea_with_lowercase_hex_text_and_raw_binary() 
     }
     assert_eq!(output(ty, Format::Text, &Value::FixedSizeBinary(vec![])), b"\\x");
 }
+
+#[test]
+fn rendered_structs_omit_their_null_fields_as_the_reference_reads_them() {
+    let value = Value::Struct(BTreeMap::from([("a".into(), Value::I64(1)), ("b".into(), Value::Null), ("c".into(), Value::List(vec![Value::Struct(BTreeMap::from([("d".into(), Value::Null)]))]))]));
+    for format in [Format::Text, Format::Binary] {
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&output(PgType::Json, format, &value)).unwrap(), serde_json::json!({"a": 1, "c": [{}]}));
+    }
+    let transit = rtdb_pg_codec::to_transit(&value).unwrap();
+    assert_eq!(rtdb_format::transit::encode_json(&transit).unwrap(), br#"["^ ","a",1,"c",[["^ "]]]"#);
+}

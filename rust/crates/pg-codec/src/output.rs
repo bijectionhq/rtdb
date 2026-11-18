@@ -139,7 +139,11 @@ fn json(value: &Value, ld: bool, output: &mut String, depth: usize) -> Result<()
         Value::F64(value) => { if !value.is_finite() { return Err(invalid("JSON cannot encode a non-finite number")); } output.push_str(&float_text(*value, None)); },
         Value::Decimal(value) => { let text = decimal_text(value); if ld { tagged_json("xt:decimal", &text, output)?; } else { output.push_str(&text); } },
         Value::Utf8(value) => json_string(value, output)?,
-        Value::Struct(fields) => { output.push('{'); for (index, (key, value)) in fields.iter().enumerate() { if index != 0 { output.push(','); } json_string(key, output)?; output.push(':'); json(value, ld, output, depth + 1)?; } output.push('}'); },
+        Value::Struct(fields) => {
+            output.push('{');
+            for (index, (key, value)) in fields.iter().filter(|(_, value)| !is_absent(value)).enumerate() { if index != 0 { output.push(','); } json_string(key, output)?; output.push(':'); json(value, ld, output, depth + 1)?; }
+            output.push('}');
+        },
         Value::Map { entries, .. } => { output.push('{'); for (index, (key, value)) in entries.iter().enumerate() { if index != 0 { output.push(','); } json_string(&display_key(key)?, output)?; output.push(':'); json(value, ld, output, depth + 1)?; } output.push('}'); },
         Value::List(values) | Value::FixedSizeList(values) | Value::Set(values) => { let set = ld && matches!(value, Value::Set(_)); if set { output.push_str("{\"@type\":\"xt:set\",\"@value\":"); } output.push('['); for (index, value) in values.iter().enumerate() { if index != 0 { output.push(','); } json(value, ld, output, depth + 1)?; } output.push(']'); if set { output.push('}'); } },
         Value::Transit(bytes) => { let error = rtdb_format::transit::decode_anomaly(bytes)?; output.push_str(&String::from_utf8(encode_error(&error, if ld { PgType::JsonLd } else { PgType::Json })?).map_err(invalid)?); },
@@ -165,7 +169,33 @@ fn display_key(value: &Value) -> Result<String> { match value { Value::Utf8(valu
 /// Converts an admitted cell to Transit using the caller's allocation reservation.
 pub fn to_transit(value: &Value) -> Result<TransitValue> {
     if value.has_calendar_object() { return Err(invalid("PostgreSQL output requires admitted calendar values")); }
-    rtdb_format::transit::value_to_transit(value).map_err(translate_output_error)
+    rtdb_format::transit::value_to_transit(&without_absent_fields(value)).map_err(translate_output_error)
+}
+
+/// The reference reads a struct row as a map of its non-null fields, so a null field is absent from rendered output.
+fn is_absent(value: &Value) -> bool { matches!(value, Value::Null | Value::Undefined) }
+
+fn without_absent_fields(value: &Value) -> std::borrow::Cow<'_, Value> {
+    use std::borrow::Cow;
+    match value {
+        Value::Struct(fields) => Cow::Owned(Value::Struct(fields.iter().filter(|(_, value)| !is_absent(value)).map(|(key, value)| (key.clone(), without_absent_fields(value).into_owned())).collect())),
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) if values.iter().any(contains_struct) => {
+            let values = values.iter().map(|value| without_absent_fields(value).into_owned()).collect();
+            Cow::Owned(match value { Value::List(_) => Value::List(values), Value::Set(_) => Value::Set(values), _ => Value::FixedSizeList(values) })
+        }
+        Value::Map { entries, sorted } if entries.iter().any(|(_, value)| contains_struct(value)) =>
+            Cow::Owned(Value::Map { entries: entries.iter().map(|(key, value)| (key.clone(), without_absent_fields(value).into_owned())).collect(), sorted: *sorted }),
+        value => Cow::Borrowed(value),
+    }
+}
+
+fn contains_struct(value: &Value) -> bool {
+    match value {
+        Value::Struct(_) => true,
+        Value::List(values) | Value::Set(values) | Value::FixedSizeList(values) => values.iter().any(contains_struct),
+        Value::Map { entries, .. } => entries.iter().any(|(_, value)| contains_struct(value)),
+        _ => false,
+    }
 }
 
 fn time_text(value: i128, force_seconds: bool) -> Result<String> {
