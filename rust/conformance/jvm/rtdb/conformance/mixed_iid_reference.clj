@@ -3,12 +3,15 @@
             [dev.clojurephant.jovial.engine.clojure-test :as jovial]
             [jsonista.core :as json]
             [rtdb.conformance.history :as history]
+            [xtdb.error :as err]
             [xtdb.test-util :as tu])
-  (:import (java.io PrintWriter Writer)
-           (java.nio.file Files LinkOption OpenOption Path StandardOpenOption)
+  (:import (java.io InputStream OutputStream PrintWriter Writer)
+           (java.nio.file Files FileVisitOption LinkOption OpenOption Path StandardOpenOption)
+           (java.nio.file.attribute FileAttribute)
            (java.security MessageDigest)
            (java.time Instant OffsetDateTime ZonedDateTime)
            (java.util Collections Date HexFormat List)
+           (java.util.stream Stream)
            (org.apache.arrow.memory BufferAllocator RootAllocator)
            (org.apache.arrow.vector.types.pojo ArrowType$FixedSizeBinary ArrowType$Int ArrowType$RunEndEncoded Field)
            (org.junit.platform.engine DiscoverySelector UniqueId)
@@ -25,7 +28,17 @@
 (def ^:private test-namespace 'xtdb.mixed-iid-encoding-test)
 (def ^:private test-name 'a-scan-over-plain-and-run-end-encoded-iid-pages-answers-as-over-plain-ones-6258)
 (def ^:private test-file "xtdb/mixed_iid_encoding_test.clj")
-(def ^:private mixed-directory "target/mixed-iid-encoding/mixed")
+(def ^:private case-directory "target/mixed-iid-encoding")
+(def ^:private mixed-directory (str case-directory "/mixed"))
+(def ^:private checkpoint-entries 4096)
+(def ^:private checkpoint-bytes (* 64 1024 1024))
+(def ^:private checkpoint-depth 16)
+(def ^:private ^"[Ljava.nio.file.LinkOption;" no-links (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+(def ^:private ^"[Ljava.nio.file.LinkOption;" resolve-links (make-array LinkOption 0))
+(def ^:private ^"[Ljava.nio.file.OpenOption;" checkpoint-read (into-array OpenOption [LinkOption/NOFOLLOW_LINKS]))
+(def ^:private ^"[Ljava.nio.file.OpenOption;" checkpoint-write
+  (into-array OpenOption [StandardOpenOption/CREATE_NEW StandardOpenOption/WRITE]))
+(def ^:private ^"[Ljava.nio.file.attribute.FileAttribute;" no-attributes (make-array FileAttribute 0))
 (def ^:private engine-id "dev.clojurephant.jovial.clojure-test")
 (def ^:private query-ids {":sorted-iids" "sorted-iids", ":history" "history",
                          ":iid-join" "iid-join", ":iid-intersect" "iid-intersect"})
@@ -147,6 +160,75 @@
             (assoc (inspect-iid-file workspace (.resolve data-directory (str key ".arrow"))) :trie_key key))
           live-keys)))
 
+(defn- checkpoint-error [message ^Path path]
+  (err/fault ::checkpoint message {:path (str path)}))
+
+(defn- copy-checkpoint-file! [^Path source ^Path target ^long size]
+  (Files/createDirectories (.getParent target) no-attributes)
+  (with-open [^InputStream input (Files/newInputStream source checkpoint-read)
+              ^OutputStream output (Files/newOutputStream target checkpoint-write)]
+    (let [buffer (byte-array 65536)
+          digest (MessageDigest/getInstance "SHA-256")]
+      (loop [copied 0]
+        (let [n (.read input buffer)]
+          (if (neg? n)
+            (when-not (= copied size)
+              (throw (checkpoint-error "Checkpoint file shrank during copy" source)))
+            (let [next (+ copied n)]
+              (when (> next size)
+                (throw (checkpoint-error "Checkpoint file grew during copy" source)))
+              (.write output buffer 0 n)
+              (.update digest buffer 0 n)
+              (recur next)))))
+      (.formatHex (HexFormat/of) (.digest digest)))))
+
+(defn- capture-checkpoint! [^Path workspace ^Path archive]
+  (let [source (.resolve workspace ^String case-directory)
+        sides ["control" "mixed"]
+        max-entries (long checkpoint-entries)
+        max-bytes (long checkpoint-bytes)
+        max-depth (int checkpoint-depth)
+        entries (volatile! (count sides))
+        bytes (volatile! 0)]
+    (when (or (.startsWith archive source) (.startsWith source archive))
+      (throw (checkpoint-error "Checkpoint archive overlaps the case images" archive)))
+    (Files/createDirectory archive no-attributes)
+    {:schema_version 1
+     :stage "after-rewrite-before-reopen"
+     :files
+     (->> (for [side sides
+                kind ["log" "objects"]]
+            (let [subtree (.resolve (.resolve source ^String side) ^String kind)]
+              (when-not (and (Files/isDirectory subtree no-links) (= subtree (.toRealPath subtree resolve-links)))
+                (throw (checkpoint-error "Missing or redirected checkpoint subtree" subtree)))
+              (with-open [^Stream paths (Files/walk subtree max-depth (make-array FileVisitOption 0))]
+                (into []
+                      (keep (fn [^Path path]
+                              (when (> (long (vswap! entries inc)) max-entries)
+                                (throw (checkpoint-error "Checkpoint entry limit exceeded" path)))
+                              (let [relative (.relativize source path)]
+                                (cond
+                                  (> (.getNameCount relative) max-depth)
+                                  (throw (checkpoint-error "Checkpoint path exceeds its depth limit" path))
+
+                                  (Files/isDirectory path no-links) nil
+
+                                  (Files/isRegularFile path no-links)
+                                  (let [size (Files/size path)
+                                        total (+ (long @bytes) size)]
+                                    (when (> total max-bytes)
+                                      (throw (checkpoint-error "Checkpoint byte limit exceeded" path)))
+                                    (vreset! bytes total)
+                                    {:path (str relative), :bytes size
+                                     :sha256 (copy-checkpoint-file! path (.resolve archive relative) size)})
+
+                                  :else
+                                  (throw (checkpoint-error "Checkpoint entry is redirected or non-regular" path))))))
+                      (iterator-seq (.iterator paths))))))
+          (into [] cat)
+          (sort-by :path)
+          vec)}))
+
 (defn- record! [state operation capture]
   (try
     (capture)
@@ -154,7 +236,7 @@
       (swap! state update :capture_errors conj {:operation operation, :message (str error)})
       nil)))
 
-(defn- record-assertion! [state workspace {:keys [type expected actual message] :as report}]
+(defn- record-assertion! [state workspace checkpoint {:keys [type expected actual message] :as report}]
   (if (= :pass type)
     (let [[line id :as location] (identify report)]
       (when-not location
@@ -162,11 +244,13 @@
       (let [operands (capture-operands id actual)
             observation {:line line, :id id, :status "passed", :operands operands}]
         (swap! state update :assertions conj observation)
-        (when (= "run-encoded-live" id)
-          (swap! state assoc :live_files (read-live-files workspace (second operands))))))
+        (case id
+          "rewritten-runs" (record! state "checkpoint" #(swap! state assoc :checkpoint (capture-checkpoint! workspace checkpoint)))
+          "run-encoded-live" (swap! state assoc :live_files (read-live-files workspace (second operands)))
+          nil)))
     (swap! state update :assertion_failures conj {:status (name type), :form (pr-str expected), :message message})))
 
-(defn- run-case [^Path workspace]
+(defn- run-case [^Path workspace ^Path checkpoint]
   (require test-namespace)
   (let [test-var (ns-resolve test-namespace test-name)
         rewrite-var (ns-resolve test-namespace 'rewrite-iid-as-runs!)
@@ -199,7 +283,7 @@
        (fn [event]
          (report event)
          (when (and (= test-var (first t/*testing-vars*)) (#{:pass :fail :error} (:type event)))
-           (record! state "assertion" #(record-assertion! state workspace event))))
+           (record! state "assertion" #(record-assertion! state workspace checkpoint event))))
        rewrite-var
        (fn [^BufferAllocator allocator ^Path file]
          (let [before (record! state "plain file" #(inspect-iid-file workspace file))
@@ -227,8 +311,8 @@
   (let [output (Path/of ^String output-path (make-array String 0))
         workspace (.normalize (.toAbsolutePath (Path/of "" (make-array String 0))))
         artifacts (history/runtime-artifacts)
-        receipt (run-case workspace)]
+        receipt (run-case workspace (.resolve output "checkpoint"))]
     (write-new! (.resolve output "runtime-artifacts.json") artifacts)
     (write-new! (.resolve output "execution.json")
-                (assoc receipt :schema_version 1, :engine "jvm", :source (str "src/test/clojure/" test-file),
+                (assoc receipt :schema_version 2, :engine "jvm", :source (str "src/test/clojure/" test-file),
                        :runtime_unchanged (= artifacts (history/runtime-artifacts))))))

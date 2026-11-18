@@ -318,11 +318,21 @@ python3 rust/conformance/run_mixed_iid_reference.py --phase-two \
   --output /absolute/new/mixed-iid-reference
 ----
 
+The passing multi-row-run assertion at line 165 triggers a synchronous copy of both closed node images before either node reopens.
+The run-owned `checkpoint/` retains `control/log`, `control/objects`, `mixed/log`, and `mixed/objects` with their original file names and bytes.
+The version 2 execution receipt records each checkpoint file's relative path, size and SHA-256.
+The runner verifies the complete file inventory and checks every observed mixed rewrite against its checkpoint copy.
+Each node must have nonempty `LOG` and `REPLICA_LOG` files and a nonempty block catalog with a canonical name.
+The capture bounds traversal to 4,096 entries, 16 path components, and 64 MiB of file contents.
+The pinned fixture uses one partition and storage epoch zero with each object root at `v06`.
+
 The receipt names the exact JUnit invocation and retains observations from each of its 14 original assertions.
 Result rows retain order, typed values, missing fields, and signed bytes for each fixed-size IID.
 It records the physical layout, page row and run counts, and byte digests at each original rewrite.
 At the original live-trie check it inspects the mixed-layout data files for `readings` that the test identified as live above level zero.
 The runner verifies the live file bytes, runtime closure, exact assertion set, and successful Jovial outcome before publishing the scoped reference result.
+The result binds the exact input, process, runtime, and execution receipt bytes that the runner verified.
+It also records SHA-256 digests for both process logs.
 A failed or incomplete worker run leaves its process logs and any available observations.
 Portable checkpoint transfer remains pending.
 

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import re
+import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 from history_results import integer, verify_runtime_artifacts
@@ -25,8 +29,16 @@ ASSERTIONS = {"rewritten-runs": 165, "run-encoded-live": 174, "plain-live": 175,
               "pgwire": 184, "patch": 186, "flight-declared": 190, "flight-batch-fields": 191,
               "flight-multiple-batches": 192, "flight-iids": 193}
 FIELD_TYPE = {"kind": "fixed-size-binary", "byte_width": 16}
-MIXED_OBJECTS = PurePosixPath("target/mixed-iid-encoding/mixed/objects/v06/tables")
+CASE_DIRECTORY = PurePosixPath("target/mixed-iid-encoding")
+MIXED_OBJECTS = CASE_DIRECTORY / "mixed/objects/v06/tables"
 READINGS_DATA = MIXED_OBJECTS / "public$readings/data"
+CHECKPOINT_SIDES = ("control", "mixed")
+CHECKPOINT_LOGS = {PurePosixPath(side, "log", log) for side in CHECKPOINT_SIDES for log in ("LOG", "REPLICA_LOG")}
+CHECKPOINT_OBJECTS = tuple(PurePosixPath(side, "objects", "v06") for side in CHECKPOINT_SIDES)
+CHECKPOINT_MAX_ENTRIES = 4096
+CHECKPOINT_MAX_BYTES = 64 * 1024 * 1024
+CHECKPOINT_MAX_DEPTH = 16
+MAX_RECEIPT_BYTES = 64 * 1024 * 1024
 
 
 def require(condition, message):
@@ -36,6 +48,37 @@ def require(condition, message):
 
 def nonnegative(value):
     return integer(value) and value >= 0
+
+
+@contextmanager
+def open_receipt(path):
+    with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK)) as stream:
+        require(stat.S_ISREG(os.fstat(stream.fileno()).st_mode), f"non-regular receipt file: {path}")
+        yield stream
+
+
+def receipt_bytes(path):
+    with open_receipt(path) as stream:
+        payload = stream.read(MAX_RECEIPT_BYTES + 1)
+    require(len(payload) <= MAX_RECEIPT_BYTES, f"receipt file exceeds its size bound: {path}")
+    return payload
+
+
+def read_receipt(path):
+    payload = receipt_bytes(path)
+    return json.loads(payload), hashlib.sha256(payload).hexdigest()
+
+
+def write_receipt(path, value):
+    payload = (json.dumps(value, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    require(len(payload) <= MAX_RECEIPT_BYTES, f"receipt file exceeds its size bound: {path}")
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("xb") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+    return hashlib.sha256(payload).hexdigest()
 
 
 def is_iid(cell):
@@ -155,10 +198,112 @@ def check_layout(execution, observations, workspace):
     require(sorted(live) == live_keys and any(live[key] == "run-end-i32" for key in set(live) & set(rewritten))
             and any(live[key] == "plain" for key in set(live) - set(rewritten)),
             "live readings inventory does not establish both original encodings")
+    return by_path
 
 
-def verify_execution(execution, workspace):
-    require(execution.get("schema_version") == 1 and execution.get("engine") == "jvm"
+def is_block_catalog(name):
+    match = re.fullmatch(r"b([0-9a-f]{2,17})\.binpb", name)
+    if match is None:
+        return False
+    encoded = match[1]
+    index = int(encoded[1:], 16)
+    body = f"{index:x}"
+    return index < 1 << 63 and encoded == f"{len(body) - 1:x}{body}"
+
+
+def checkpoint_files(checkpoint):
+    require(isinstance(checkpoint, dict) and set(checkpoint) == {"schema_version", "stage", "files"}
+            and type(checkpoint["schema_version"]) is int and checkpoint["schema_version"] == 1
+            and checkpoint["stage"] == "after-rewrite-before-reopen", "invalid mixed IID checkpoint identity")
+    files = checkpoint["files"]
+    require(isinstance(files, list) and 0 < len(files) <= CHECKPOINT_MAX_ENTRIES, "invalid checkpoint file count")
+    inventory = {}
+    total = 0
+    for entry in files:
+        require(isinstance(entry, dict) and set(entry) == {"path", "bytes", "sha256"}
+                and isinstance(entry["path"], str) and nonnegative(entry["bytes"])
+                and isinstance(entry["sha256"], str) and re.fullmatch(r"[0-9a-f]{64}", entry["sha256"]),
+                "invalid checkpoint file record")
+        name = entry["path"]
+        path = PurePosixPath(name)
+        require(not path.is_absolute() and path.as_posix() == name and ".." not in path.parts
+                and "\\" not in name and "\0" not in name and len(path.parts) <= CHECKPOINT_MAX_DEPTH
+                and path not in inventory and (path in CHECKPOINT_LOGS or any(root in path.parents for root in CHECKPOINT_OBJECTS)),
+                f"invalid or repeated checkpoint path: {name}")
+        total += entry["bytes"]
+        require(total <= CHECKPOINT_MAX_BYTES, "checkpoint byte limit exceeded")
+        inventory[path] = (entry["bytes"], entry["sha256"])
+    require(all(path in inventory and inventory[path][0] > 0 for path in CHECKPOINT_LOGS)
+            and all(any(root in path.parents for path in inventory) for root in CHECKPOINT_OBJECTS),
+            "checkpoint omitted a local log or object root")
+    for root in CHECKPOINT_OBJECTS:
+        require(any(path.parent == root / "blocks" and size > 0 and is_block_catalog(path.name)
+                    for path, (size, _) in inventory.items()),
+                f"checkpoint omitted a nonempty block catalog: {root}")
+    return inventory
+
+
+def verify_checkpoint_file(directory, name, expected, path):
+    size, checksum = expected
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(name, flags, dir_fd=directory), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        require(stat.S_ISREG(info.st_mode) and info.st_size == size, f"checkpoint file size or kind differs: {path}")
+        digest = hashlib.sha256()
+        remaining = size
+        while remaining:
+            chunk = stream.read(min(remaining, 65536))
+            require(chunk, f"checkpoint file shrank during verification: {path}")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        require(not stream.read(1) and digest.hexdigest() == checksum, f"checkpoint file bytes differ: {path}")
+
+
+def verify_checkpoint(root, checkpoint, rewritten):
+    inventory = checkpoint_files(checkpoint)
+    for path, record in rewritten.items():
+        relative = path.relative_to(CASE_DIRECTORY)
+        require(inventory.get(relative) == (record["bytes"], record["sha256"]),
+                f"checkpoint omitted or changed the mixed rewrite postimage: {relative}")
+
+    directories = {parent for path in inventory for parent in path.parents if parent.parts}
+    seen = set()
+    entries = 0
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+
+    def verify_tree(directory, relative):
+        nonlocal entries
+        with os.scandir(directory) as children:
+            for entry in children:
+                entries += 1
+                require(entries <= CHECKPOINT_MAX_ENTRIES, "checkpoint entry limit exceeded")
+                path = relative / entry.name
+                mode = entry.stat(follow_symlinks=False).st_mode
+                if stat.S_ISDIR(mode):
+                    require(path in directories, f"unexpected checkpoint directory: {path}")
+                    child = os.open(entry.name, flags, dir_fd=directory)
+                    try:
+                        verify_tree(child, path)
+                    finally:
+                        os.close(child)
+                else:
+                    require(stat.S_ISREG(mode) and path in inventory, f"unexpected or non-regular checkpoint file: {path}")
+                    verify_checkpoint_file(directory, entry.name, inventory[path], path)
+                    seen.add(path)
+
+    require(root.is_absolute() and root.resolve(strict=True) == root, "checkpoint root is redirected or relative")
+    directory = os.open(root, flags)
+    try:
+        verify_tree(directory, PurePosixPath())
+    finally:
+        os.close(directory)
+    require(seen == inventory.keys(), "checkpoint omitted retained files")
+
+
+def verify_execution(execution, workspace, *, require_checkpoint=False):
+    version = execution.get("schema_version")
+    require(type(version) is int and version in (1, 2) and (version == 2 or not require_checkpoint)
+            and execution.get("engine") == "jvm"
             and execution.get("source") == SOURCE and execution.get("runtime_unchanged") is True
             and execution.get("junit") == JUNIT_SUCCESS, "Jovial did not complete the exact original case")
     require(execution["assertion_failures"] == [] and execution["capture_errors"] == [],
@@ -179,7 +324,9 @@ def verify_execution(execution, workspace):
             scalar_count(left[0]["n"])
     require(observations["pgwire-nonempty"] == observations["pgwire"][:1], "pgwire nonempty assertion differs")
     check_flight(observations)
-    check_layout(execution, observations, workspace)
+    rewritten = check_layout(execution, observations, workspace)
+    if version == 2:
+        verify_checkpoint(workspace.parent / "checkpoint", execution.get("checkpoint"), rewritten)
     return len(observations)
 
 
@@ -207,26 +354,32 @@ def run(args):
     args.created_output = True
     workspace = args.output / "workspace"
     workspace.mkdir()
-    write_json(args.output / "inputs.json", {"reference_revision": REFERENCE, "implementation_revision": revision,
-                                            "original_case": UNIQUE_ID, "inputs": inputs})
+    receipt_hashes = {"inputs.json": write_receipt(args.output / "inputs.json", {
+        "reference_revision": REFERENCE, "implementation_revision": revision, "original_case": UNIQUE_ID, "inputs": inputs,
+    })}
     command = [args.reference / "gradlew", "--no-daemon", "--console=plain", "-PfullJdk",
                "--init-script", HERE / "reference.init.gradle", "rtdbConformanceMixedIidReference",
                f"-Prtdb.adapterRoot={HERE / 'jvm'}", f"-Prtdb.output={args.output}", f"-Prtdb.mixedIidWorkspace={workspace}"]
     process = run_process(command, args.reference, args.output / "stdout.log", args.output / "stderr.log", args.timeout)
-    write_json(args.output / "process.json", process)
+    receipt_hashes["process.json"] = write_receipt(args.output / "process.json", process)
     require(process["completed"] and process["exit_code"] == 0, "mixed IID reference process did not complete")
-    execution = args.output / "execution.json"
-    runtime = args.output / "runtime-artifacts.json"
-    verify_runtime_artifacts(json.loads(runtime.read_bytes()))
-    count = verify_execution(json.loads(execution.read_bytes()), workspace)
+    runtime, receipt_hashes["runtime-artifacts.json"] = read_receipt(args.output / "runtime-artifacts.json")
+    execution, receipt_hashes["execution.json"] = read_receipt(args.output / "execution.json")
+    verify_runtime_artifacts(runtime)
+    count = verify_execution(execution, workspace, require_checkpoint=True)
     verify_inputs(inputs)
     require_revision(args.reference, REFERENCE)
     require_revision(REPOSITORY, revision)
+    logs = {}
+    for name in ("stdout.log", "stderr.log"):
+        with open_receipt(args.output / name) as stream:
+            logs[name] = hashlib.file_digest(stream, "sha256").hexdigest()
+    for name, checksum in receipt_hashes.items():
+        require(hashlib.sha256(receipt_bytes(args.output / name)).hexdigest() == checksum,
+                f"mixed IID receipt changed during verification: {name}")
     write_json(args.output / "result.json", {
         "reference_observed": True, "complete_parity": False, "assertions": count, "case": UNIQUE_ID,
-        "sha256": {path.name: digest(path) for path in
-                   (execution, runtime, args.output / "inputs.json", args.output / "process.json",
-                    args.output / "stdout.log", args.output / "stderr.log")},
+        "sha256": {**receipt_hashes, **logs},
     })
 
 

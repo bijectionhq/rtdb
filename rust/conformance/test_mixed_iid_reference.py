@@ -1,4 +1,6 @@
 import argparse
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -6,7 +8,8 @@ from unittest.mock import patch
 
 from run_controls import digest
 from run_mixed_iid_reference import (
-    ASSERTIONS, FIELD_TYPE, JUNIT_SUCCESS, READINGS_DATA, SOURCE, run, verify_execution,
+    ASSERTIONS, CASE_DIRECTORY, CHECKPOINT_LOGS, FIELD_TYPE, JUNIT_SUCCESS, READINGS_DATA, SOURCE, is_block_catalog, run,
+    verify_execution,
 )
 
 
@@ -59,6 +62,29 @@ def sample_execution(workspace):
             "live_files": [{**after, "trie_key": rewritten_key}, {**plain, "trie_key": plain_key}]}
 
 
+def sample_checkpoint(workspace, execution):
+    archive = workspace.parent / "checkpoint"
+    postimage = execution["rewritten_files"][0]["after"]
+    rewrite = (workspace / postimage["path"]).relative_to(workspace / CASE_DIRECTORY)
+    files = {path: str(path).encode() for path in CHECKPOINT_LOGS}
+    files.update({
+        "control/objects/v06/blocks/b00.binpb": b"control block",
+        "control/objects/v06/tables/public$readings/data/l01-rc-b00.arrow": b"control data",
+        "mixed/objects/v06/blocks/b00.binpb": b"mixed block",
+        rewrite: (workspace / postimage["path"]).read_bytes(),
+    })
+    inventory = []
+    for path, contents in files.items():
+        target = archive / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(contents)
+        inventory.append({"path": str(path), "bytes": len(contents), "sha256": digest(target)})
+    execution.update(schema_version=2, checkpoint={
+        "schema_version": 1, "stage": "after-rewrite-before-reopen", "files": inventory,
+    })
+    return archive, rewrite
+
+
 class MixedIidReferenceTests(unittest.TestCase):
     def test_publishes_only_complete_exact_assertions_and_junit_identity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -85,6 +111,164 @@ class MixedIidReferenceTests(unittest.TestCase):
             (workspace / execution["live_files"][0]["path"]).write_bytes(b"changed after observation")
             with self.assertRaisesRegex(ValueError, "retained live artifact differs"):
                 verify_execution(execution, workspace)
+
+    def test_current_reference_requires_the_pre_reopen_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            self.assertEqual(14, verify_execution(execution, workspace))
+            with self.assertRaisesRegex(ValueError, "exact original case"):
+                verify_execution(execution, workspace, require_checkpoint=True)
+            sample_checkpoint(workspace, execution)
+
+            live_log = workspace / CASE_DIRECTORY / "mixed/log/LOG"
+            live_log.parent.mkdir(parents=True)
+            live_log.write_bytes(b"the original invocation continued after the checkpoint")
+            self.assertEqual(14, verify_execution(execution, workspace, require_checkpoint=True))
+            execution["checkpoint"]["stage"] = "after-reopen"
+            with self.assertRaisesRegex(ValueError, "checkpoint identity"):
+                verify_execution(execution, workspace)
+
+    def test_checkpoint_requires_every_retained_file_with_exact_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            archive, _ = sample_checkpoint(workspace, execution)
+            object_file = archive / "control/objects/v06/blocks/b00.binpb"
+            original = object_file.read_bytes()
+            object_file.write_bytes(b"x" * len(original))
+            with self.assertRaisesRegex(ValueError, "checkpoint file bytes differ"):
+                verify_execution(execution, workspace)
+            object_file.unlink()
+            with self.assertRaisesRegex(ValueError, "omitted retained files"):
+                verify_execution(execution, workspace)
+            object_file.write_bytes(original)
+            addition = object_file.with_name("b01.binpb")
+            addition.write_bytes(b"unrecorded block")
+            with self.assertRaisesRegex(ValueError, "unexpected or non-regular checkpoint file"):
+                verify_execution(execution, workspace)
+
+    def test_checkpoint_rejects_a_self_consistent_replacement_of_the_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            archive, rewrite = sample_checkpoint(workspace, execution)
+            target = archive / rewrite
+            target.write_bytes(b"different run-end file")
+            record = next(entry for entry in execution["checkpoint"]["files"] if entry["path"] == str(rewrite))
+            record.update(bytes=target.stat().st_size, sha256=digest(target))
+            with self.assertRaisesRegex(ValueError, "mixed rewrite postimage"):
+                verify_execution(execution, workspace)
+
+    def test_checkpoint_requires_a_block_catalog_even_when_other_control_objects_remain(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            archive, _ = sample_checkpoint(workspace, execution)
+            for catalog_path in ("control/objects/v06/blocks/b00.binpb", "mixed/objects/v06/blocks/b00.binpb"):
+                with self.subTest(catalog=catalog_path):
+                    target = archive / catalog_path
+                    contents = target.read_bytes()
+                    target.unlink()
+                    target.parent.rmdir()
+                    inventory = execution["checkpoint"]["files"]
+                    record = next(entry for entry in inventory if entry["path"] == catalog_path)
+                    inventory.remove(record)
+                    with self.assertRaisesRegex(ValueError, "checkpoint omitted a nonempty block catalog"):
+                        verify_execution(execution, workspace)
+                    target.parent.mkdir()
+                    target.write_bytes(contents)
+                    inventory.append(record)
+
+    def test_block_catalog_names_require_canonical_signed_lex_hex_positions(self):
+        for name, valid in (
+            ("b00.binpb", True), ("b010.binpb", False), ("b110.binpb", True), ("b100.binpb", False),
+            ("bf7fffffffffffffff.binpb", True), ("bf8000000000000000.binpb", False),
+            ("b0A.binpb", False), ("b110.arrow", False),
+        ):
+            with self.subTest(name=name):
+                self.assertIs(is_block_catalog(name), valid)
+
+    def test_checkpoint_rejects_traversal_symlinks_and_nonregular_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            archive, _ = sample_checkpoint(workspace, execution)
+            record = execution["checkpoint"]["files"][0]
+            path = record["path"]
+            record["path"] = "mixed/objects/v06/../../../outside"
+            with self.assertRaisesRegex(ValueError, "invalid or repeated checkpoint path"):
+                verify_execution(execution, workspace)
+            record["path"] = path
+            log = archive / path
+            outside = workspace.parent / "outside"
+            outside.write_bytes(log.read_bytes())
+            log.unlink()
+            log.symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "unexpected or non-regular checkpoint file"):
+                verify_execution(execution, workspace)
+            log.unlink()
+            os.mkfifo(log)
+            with self.assertRaisesRegex(ValueError, "unexpected or non-regular checkpoint file"):
+                verify_execution(execution, workspace)
+
+    def test_checkpoint_rejects_an_unreadable_directory_and_an_oversize_inventory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory).resolve() / "workspace"
+            execution = sample_execution(workspace)
+            sample_checkpoint(workspace, execution)
+            with patch("run_mixed_iid_reference.os.scandir", side_effect=PermissionError("unreadable checkpoint")):
+                with self.assertRaisesRegex(PermissionError, "unreadable checkpoint"):
+                    verify_execution(execution, workspace)
+            with patch("run_mixed_iid_reference.CHECKPOINT_MAX_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "checkpoint byte limit exceeded"):
+                    verify_execution(execution, workspace)
+
+    def test_reference_result_binds_the_four_validated_receipts_and_two_process_logs(self):
+        changed_names = ("inputs.json", "process.json", "runtime-artifacts.json", "execution.json")
+        for changed in (None, *changed_names):
+            with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory).resolve()
+                reference, output = root / "reference", root / "output"
+                source = reference / SOURCE
+                source.parent.mkdir(parents=True)
+                source.write_bytes(b"original fixture")
+                args = argparse.Namespace(phase_two=True, timeout=1, reference=reference, output=output)
+
+                def complete(_command, _reference, stdout, stderr, _timeout):
+                    workspace = output / "workspace"
+                    execution = sample_execution(workspace)
+                    sample_checkpoint(workspace, execution)
+                    (output / "execution.json").write_text(json.dumps(execution), encoding="utf-8")
+                    (output / "runtime-artifacts.json").write_bytes(b"[]")
+                    stdout.write_bytes(b"worker stdout")
+                    stderr.write_bytes(b"worker stderr")
+                    return {"completed": True, "exit_code": 0}
+
+                def replace_receipt(_inputs):
+                    if changed is not None:
+                        receipt = output / changed
+                        receipt.write_bytes(receipt.read_bytes() + b"\n")
+
+                result_path = output / "result.json"
+                with (patch("run_mixed_iid_reference.require_phase_two"),
+                      patch("run_mixed_iid_reference.git", return_value="revision"),
+                      patch("run_mixed_iid_reference.require_revision"),
+                      patch("run_mixed_iid_reference.SOURCE_SHA256", digest(source)),
+                      patch("run_mixed_iid_reference.input_receipt", return_value=[]),
+                      patch("run_mixed_iid_reference.run_process", side_effect=complete),
+                      patch("run_mixed_iid_reference.verify_runtime_artifacts"),
+                      patch("run_mixed_iid_reference.verify_inputs", side_effect=replace_receipt)):
+                    if changed is None:
+                        run(args)
+                        result = json.loads(result_path.read_bytes())
+                        self.assertEqual(result["sha256"], {
+                            name: digest(output / name) for name in (*changed_names, "stderr.log", "stdout.log")
+                        })
+                    else:
+                        with self.assertRaisesRegex(ValueError, f"mixed IID receipt changed during verification: {changed}"):
+                            run(args)
+                        self.assertFalse(result_path.exists())
 
     def test_gate_precedes_the_workspace_and_project_process(self):
         with tempfile.TemporaryDirectory() as directory:
