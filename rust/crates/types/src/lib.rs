@@ -34,7 +34,7 @@ pub use float_text::{java_f32_text, java_f64_text};
 pub use id::{EntityId, Iid, Keyword, TableRef};
 pub use java_map::{compute_if_absent_indices as java_hash_map_compute_if_absent_order, indices as java_hash_map_order, put_all_indices as java_hash_map_put_all_order};
 pub use logical::{IntervalUnit, ListKind, LogicalType, RunEndWidth, ScalarType, TimeUnit};
-pub use type_edn::TypeForm;
+pub use type_edn::{TypeForm, function_type_mismatch};
 pub use position::*;
 pub use pg::{PgType, PgTypeDescriptor, pg_name_oid, pg_table_oid};
 pub use time::{EventHeader, EventOp, Instant, Interval, TemporalBounds, Timestamp};

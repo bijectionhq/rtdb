@@ -1,4 +1,4 @@
-use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, overflow};
+use crate::numeric::{decimal, decimal_value, floating_value, inapplicable, integer, integer_value, number, number_format, overflow};
 use crate::timezone::zone;
 use num_bigint::BigInt;
 use rtdb_types::{Anomaly, CivilDate, DateUnit, Instant, LogicalType, Result, ScalarType, TimeUnit, Timestamp, Value};
@@ -70,6 +70,34 @@ pub fn query_clock_instant(value: &Value, timezone: &str) -> Result<Instant> {
 
 /// Produces a scalar intermediate, preserving calendar dates until the caller's admission boundary.
 /// Expression outputs use `Value::admit_expression_dates`; object inputs use `Value::admit_object_dates`.
+/// `Byte/parseByte` through `Long/parseLong`, which the reference's text casts call.
+fn parse_java_integer(text: &str, target: &ScalarType) -> Result<Value> {
+    let invalid = || number_format(format!("For input string: \"{text}\""));
+    Ok(match target {
+        ScalarType::I64 => Value::I64(text.parse().map_err(|_| invalid())?),
+        ScalarType::I32 => Value::I32(text.parse().map_err(|_| invalid())?),
+        _ => {
+            let value = text.parse::<i32>().map_err(|_| invalid())?;
+            let out_of_range = || number_format(format!("Value out of range. Value:\"{text}\" Radix:10"));
+            if *target == ScalarType::I8 { Value::I8(i8::try_from(value).map_err(|_| out_of_range())?) } else { Value::I16(i16::try_from(value).map_err(|_| out_of_range())?) }
+        }
+    })
+}
+
+/// `Double/parseDouble`: surrounding control characters and spaces are trimmed, a trailing `f`/`d` is allowed,
+/// and only `NaN` and `Infinity` are spelled out.
+fn parse_java_float(text: &str) -> Result<f64> {
+    let trimmed = text.trim_matches(|ch: char| ch <= ' ');
+    if trimmed.is_empty() { return Err(number_format("empty String".into())); }
+    let invalid = || number_format(format!("For input string: \"{trimmed}\""));
+    let unsigned = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+    if matches!(unsigned, "NaN" | "Infinity") { return trimmed.replace("Infinity", "inf").parse().map_err(|_| invalid()); }
+    let decimal = trimmed.strip_suffix(['f', 'F', 'd', 'D']).unwrap_or(trimmed);
+    let digits = decimal.strip_prefix(['+', '-']).unwrap_or(decimal);
+    if !digits.starts_with(|ch: char| ch.is_ascii_digit() || ch == '.') { return Err(invalid()); }
+    decimal.parse().map_err(|_| invalid())
+}
+
 pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Value> {
     if matches!(value, Value::Null | Value::Undefined) { return Ok(Value::Null); }
     let data_type = data_type.unencoded();
@@ -103,7 +131,10 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
         }
         S::I8 | S::I16 | S::I32 | S::I64 | S::U8 | S::U16 | S::U32 | S::U64 => {
             let value = match value {
-                Value::Utf8(text) => text.parse::<i128>().map_err(|_| inapplicable("integer", &[value]))?,
+                Value::Utf8(text) => match target {
+                    S::I8 | S::I16 | S::I32 | S::I64 => return parse_java_integer(text, target),
+                    _ => text.parse::<i128>().map_err(|_| inapplicable("integer", &[value]))?,
+                },
                 Value::Bool(value) => i128::from(*value),
                 Value::Decimal(value) => {
                     let number = crate::decimal_to_f64(value);
@@ -119,7 +150,7 @@ pub fn cast(value: &Value, data_type: &LogicalType, timezone: &str) -> Result<Va
             integer_value(value, target)
         }
         S::F16 | S::F32 | S::F64 => {
-            let number = match value { Value::Utf8(text) => text.parse().map_err(|_| inapplicable("float", &[value]))?, value => number(value).ok_or_else(|| inapplicable("float", &[value]))? };
+            let number = match value { Value::Utf8(text) => parse_java_float(text)?, value => number(value).ok_or_else(|| inapplicable("float", &[value]))? };
             Ok(floating_value(number, target))
         }
         S::Decimal { precision, scale, bit_width } => {

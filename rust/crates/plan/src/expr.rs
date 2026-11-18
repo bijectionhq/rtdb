@@ -70,7 +70,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
                     else if numeric(&first) && numeric(&second) {
                         if name == "mod" { LogicalType::least_upper_bound(&[first.clone(), second]).ok_or_else(|| Anomaly::incorrect("xtdb.expression/function-type-mismatch", "Incomparable MOD types"))? }
                         else { LogicalType::Scalar(S::F64) }
-                    } else { return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))); };
+                    } else { return Err(rtdb_types::function_type_mismatch(&name, if arity == 2 { vec![&first, &second] } else { vec![&first] })); };
                 output = output.join(&ty);
             }
         }
@@ -84,7 +84,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
                 if first == LogicalType::Null || second == LogicalType::Null { continue; }
                 let valid = if name == "col_description" { (signed(&first) || first == LogicalType::Scalar(S::Oid)) && signed(&second) }
                     else { signed(&first) && second == LogicalType::Scalar(S::Utf8) };
-                if !valid { return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument types"))); }
+                if !valid { return Err(rtdb_types::function_type_mismatch(&name, [&first, &second])); }
             }
         }
         return Ok(LogicalType::Null);
@@ -100,7 +100,7 @@ pub fn function_type(name: &str, arguments: &[LogicalType]) -> Result<LogicalTyp
                     }
                     LogicalType::Null => LogicalType::Null,
                     LogicalType::Scalar(S::Utf8) => LogicalType::Scalar(S::Utf8),
-                    _ => return Err(Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to argument type"))),
+                    other => return Err(rtdb_types::function_type_mismatch(&name, [&other])),
                 });
             }
             (LogicalType::join_all(&outputs), 1..=1, true)

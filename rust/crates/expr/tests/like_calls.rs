@@ -43,7 +43,7 @@ async fn like_selects_controls_before_payloads_and_demands_dynamic_patterns_befo
         let boxed = Expr::Case { branches: vec![(Expr::Literal(V::Bool(true)),fail.clone())],otherwise: Box::new(Expr::Literal(V::Null)) };
         assert_eq!(evaluate_async(&call(name,vec![boxed,Expr::Literal(V::Null)]),&Schema::default(),&[],&EvalContext::default()).await.unwrap_err().code,"xtdb.expression/division-by-zero");
         let bad_pattern = cast(cast(Expr::Literal(text("bad integer")),S::I64),S::Utf8);
-        assert_eq!(evaluate_async(&call(name,vec![fail.clone(),bad_pattern]),&Schema::default(),&[],&EvalContext::default()).await.unwrap_err().code,"xtdb/invalid-argument-types");
+        assert_eq!(evaluate_async(&call(name,vec![fail.clone(),bad_pattern]),&Schema::default(),&[],&EvalContext::default()).await.unwrap_err().code,"xtdb.expression/number-format-error");
     }
     let expression = Expr::Like { expr: Box::new(fail),pattern: Box::new(Expr::Literal(V::Null)),escape: None,case_insensitive: false,negated: false };
     assert_eq!(expression.data_type(),L::Null);

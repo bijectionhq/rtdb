@@ -95,6 +95,29 @@ impl LogicalType {
     }
 }
 
+impl LogicalType {
+    /// The leading keyword of the type's EDN spelling — `i64`, `utf8`, `timestamp-tz`, `list` — as `xtdb.types/col-type-head` names it.
+    pub fn type_head(&self) -> String {
+        match self.type_form() {
+            Ok(TypeForm::Keyword(head)) => head.to_string(),
+            Ok(TypeForm::Vector(elements)) => match elements.first() { Some(TypeForm::Keyword(head)) => head.to_string(), _ => format!("{self:?}").to_lowercase() },
+            Ok(TypeForm::Set(_)) => "union".into(),
+            _ => match self { Self::Scalar(scalar) => format!("{scalar:?}").to_lowercase(), _ => format!("{self:?}").to_lowercase() },
+        }
+    }
+}
+
+/// The reference's `codegen-call` default: `upper not applicable to types i64`, `+ not applicable to types i64 and utf8`.
+pub fn function_type_mismatch<'a>(name: &str, types: impl IntoIterator<Item = &'a LogicalType>) -> Anomaly {
+    let heads: Vec<String> = types.into_iter().map(LogicalType::type_head).collect();
+    let listed = match heads.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, init)) => format!("{} and {last}", init.join(", ")),
+    };
+    Anomaly::incorrect("xtdb.expression/function-type-mismatch", format!("{name} not applicable to types {listed}"))
+}
+
 fn scalar_type_form(scalar: &ScalarType) -> Result<TypeForm<'_>> {
     use ScalarType as S;
     use TypeForm::{Integer, Keyword, Text, Vector};

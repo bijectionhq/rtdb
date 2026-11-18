@@ -54,7 +54,12 @@ pub(crate) fn floating_value(value: f64, ty: &ScalarType) -> Value {
 pub(crate) fn overflow() -> Anomaly { Anomaly::incorrect("xtdb/numeric-value-out-of-range", "Numeric overflow") }
 pub(crate) fn division_by_zero() -> Anomaly { Anomaly::incorrect("xtdb.expression/division-by-zero", "data exception - division by zero") }
 pub(crate) fn inapplicable(name: &str, values: &[&Value]) -> Anomaly {
-    Anomaly::incorrect("xtdb/invalid-argument-types", format!("{name} not applicable to types {:?}", values.iter().map(|value| value.logical_type()).collect::<Vec<_>>()))
+    rtdb_types::function_type_mismatch(name, &values.iter().map(|value| value.logical_type()).collect::<Vec<_>>())
+}
+/// `Long/parseLong` and friends' `NumberFormatException`, which the reference's projection maps to this code.
+pub(crate) fn number_format(message: String) -> Anomaly { Anomaly::incorrect("xtdb.expression/number-format-error", message) }
+fn arithmetic_name(op: BinaryOp) -> &'static str {
+    match op { BinaryOp::Add => "+", BinaryOp::Subtract => "-", BinaryOp::Multiply => "*", BinaryOp::Divide => "/", BinaryOp::Modulo => "mod", _ => "arithmetic" }
 }
 
 /// Computes a scalar intermediate using UTC; calendar results await explicit vector admission.
@@ -92,7 +97,7 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
         return crate::decimal::arithmetic(op, left, right, precision, scale, if precision <= 32 { 128 } else { 256 }).map(Value::Decimal);
     }
     let ty = LogicalType::least_upper_bound(&[left.logical_type(), right.logical_type()]);
-    let Some(LogicalType::Scalar(ty)) = ty else { return Err(inapplicable("arithmetic", &[left, right])); };
+    let Some(LogicalType::Scalar(ty)) = ty else { return Err(inapplicable(arithmetic_name(op), &[left, right])); };
     if let (Some(a), Some(b)) = (integer(left), integer(right)) {
         if matches!(op, B::Divide | B::Modulo) && b == 0 { return Err(division_by_zero()); }
         let result = match op {
@@ -107,9 +112,9 @@ pub fn arithmetic_in_timezone(op: BinaryOp, left: &Value, right: &Value, timezon
         let value = match op {
             B::Add => a + b, B::Subtract => a - b, B::Multiply => a * b, B::Divide => a / b,
             B::Modulo => { let r = a % b; if r != 0.0 && r.is_sign_negative() != b.is_sign_negative() { r + b } else { r } },
-            _ => return Err(inapplicable("arithmetic", &[left, right])),
+            _ => return Err(inapplicable(arithmetic_name(op), &[left, right])),
         };
         return Ok(floating_value(value, &ty));
     }
-    Err(inapplicable("arithmetic", &[left, right]))
+    Err(inapplicable(arithmetic_name(op), &[left, right]))
 }

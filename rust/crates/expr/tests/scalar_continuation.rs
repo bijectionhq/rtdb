@@ -108,7 +108,7 @@ async fn scalar_null_selection_discards_sleep_and_macro_bindings_preserve_it() {
 #[test]
 fn logarithm_consumes_x_before_base_after_argument_selection() {
     let x = cast(value(V::Utf8("invalid-number".into())),S::F64);
-    assert_eq!(run(&call("log",vec![divide(),x])).unwrap_err().code,"xtdb/invalid-argument-types");
+    assert_eq!(run(&call("log",vec![divide(),x])).unwrap_err().code,"xtdb.expression/number-format-error");
     assert_eq!(run(&call("log",vec![forced_control(),cast(value(V::Utf8("invalid-number".into())),S::F64)])).unwrap_err().code,"xtdb.expression/division-by-zero");
 }
 
