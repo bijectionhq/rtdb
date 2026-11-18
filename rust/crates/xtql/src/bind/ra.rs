@@ -270,6 +270,7 @@ impl Importer<'_, '_, '_> {
         let mut bound = bind_input(&input);
         let projections = sequence(required(options, "projections")?)?;
         let mut expressions = Vec::with_capacity(projections.len());
+        let mut ordinalities = BTreeMap::<rtdb_plan::OrdinalityScope, Field>::new();
         for projection in projections {
             if let Some(name) = projection.symbol() {
                 let field = bound.variables.get(name).ok_or_else(|| invalid(format!("Unknown logical column: {name}")))?;
@@ -278,13 +279,29 @@ impl Importer<'_, '_, '_> {
             }
             let Some([(name, form)]) = projection.map() else { return Err(invalid("Expected a projected column or a one-entry map")); };
             let name = column_name(name)?;
-            let expr = if form.symbol() == Some("*") {
-                PExpr::Struct(bound.relation.schema().fields().iter().map(|field| (field.name.clone(), field.expression())).collect())
+            let expr = if let Some(scope) = ordinality_scope(form) {
+                let field = match ordinalities.entry(scope) {
+                    std::collections::btree_map::Entry::Occupied(field) => field.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        let field = self.compiler.binder.field("xt$ordinality", None, LogicalType::Scalar(ScalarType::I64))?;
+                        bound.relation = Arc::new(Arc::clone(&bound.relation).with_ordinality(field.clone(), scope)?);
+                        entry.insert(field)
+                    }
+                };
+                field.expression()
+            } else if form.symbol() == Some("*") {
+                PExpr::Struct(input.schema().fields().iter().map(|field| (field.name.clone(), field.expression())).collect())
             } else { self.scalar(form, &mut bound)? };
             let field = self.compiler.binder.field(name, None, expr.data_type())?;
             expressions.push(NamedExpr { field, expr });
         }
-        if append { bound.relation.extend(expressions) } else { bound.relation.project(expressions) }
+        if append {
+            if ordinalities.is_empty() { return bound.relation.extend(expressions); }
+            expressions = input.schema().fields().iter()
+                .map(|field| NamedExpr { field: field.clone(), expr: field.expression() })
+                .chain(expressions).collect();
+        }
+        bound.relation.project(expressions)
     }
 
     fn rename(&mut self, options: &Edn, input: &Edn) -> Result<Relation> {
@@ -464,6 +481,16 @@ impl Importer<'_, '_, '_> {
 
 fn bind_input(relation: &Arc<Relation>) -> Bound {
     Bound { relation: Arc::clone(relation), variables: relation.schema().fields().iter().map(|field| (field.name.clone(), field.clone())).collect() }
+}
+
+fn ordinality_scope(form: &Edn) -> Option<rtdb_plan::OrdinalityScope> {
+    let EdnKind::List(values) = &form.kind else { return None; };
+    let [function] = values.as_slice() else { return None; };
+    match function.symbol()? {
+        "row-number" => Some(rtdb_plan::OrdinalityScope::Relation),
+        "local-row-number" => Some(rtdb_plan::OrdinalityScope::Page),
+        _ => None,
+    }
 }
 
 fn output_names(options: &Edn, inferred: BTreeSet<String>) -> Result<Vec<String>> {

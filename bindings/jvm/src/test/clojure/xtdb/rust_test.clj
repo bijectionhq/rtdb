@@ -149,6 +149,8 @@
 
 (deftest-original-api original-project/test-project)
 
+(deftest-original-api original-project/test-project-row-number)
+
 (deftest-original-api original-project/test-project-star)
 
 (deftest-original-api original-rename/test-rename)

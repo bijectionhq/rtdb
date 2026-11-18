@@ -61,6 +61,9 @@ pub enum ApplyKind { Inner, Left, Scalar, Exists, Pull, PullMany }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SetOperator { Union, Intersect, Except }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum OrdinalityScope { #[default] Page, Relation }
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SortExpr { pub expr: Expr, pub descending: bool, pub nulls_first: bool }
 
@@ -241,7 +244,8 @@ pub enum RelationNode {
     /// Materializes the selected list during opening and publishes one page, including an empty page.
     /// Statically non-list scalar payloads are not demanded; null and non-list results produce an empty page.
     ColumnTable { expr: Expr, element: Field },
-    PageOrdinality { input: Arc<Relation>, field: Field },
+    #[serde(alias = "PageOrdinality")]
+    Ordinality { input: Arc<Relation>, field: Field, #[serde(default)] scope: OrdinalityScope },
     Scan(Scan),
     Project { input: Arc<Relation>, expressions: Vec<NamedExpr> },
     /// Appends new fields to the input schema in expression order.
@@ -306,6 +310,10 @@ impl Relation {
         let schema = kind.result_schema(left.schema(), right.schema())?;
         Self::new(schema, RelationNode::Join { left, right, kind, condition })
     }
+    pub fn with_ordinality(self: Arc<Self>, field: Field, scope: OrdinalityScope) -> Result<Self> {
+        let schema = Schema::new(self.schema.fields().iter().cloned().chain([field.clone()]).collect())?;
+        Self::new(schema, RelationNode::Ordinality { input: self, field, scope })
+    }
     pub fn sort(self: Arc<Self>, order_by: Vec<SortExpr>) -> Result<Self> {
         Self::new(self.schema.clone(), RelationNode::Sort { input: self, order_by })
     }
@@ -319,7 +327,7 @@ impl Relation {
             RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
             | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. } | RelationNode::SortLimit { input, .. }
             | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
-            | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
+            | RelationNode::Unnest { input, .. } | RelationNode::Ordinality { input, .. } | RelationNode::PatchGaps { input, .. } => vec![input],
             RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => vec![left, right],
             RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => vec![input, dependent],
             RelationNode::Let { binding, body } => vec![&binding.relation, body],
@@ -345,7 +353,7 @@ impl Relation {
             RelationNode::Limit { offset, fetch, .. } => offset.iter().chain(fetch.iter()).collect(),
             RelationNode::Unnest { expr, .. } | RelationNode::List { expr, .. } | RelationNode::ColumnTable { expr, .. } => vec![expr],
             RelationNode::PatchGaps { from, to, .. } => vec![from, to],
-            RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::PageOrdinality { .. } => vec![],
+            RelationNode::Distinct { .. } | RelationNode::Set { .. } | RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Ordinality { .. } => vec![],
         }
     }
 
@@ -509,9 +517,9 @@ impl Relation {
             RelationNode::List { element, .. } | RelationNode::ColumnTable { element, .. } => {
                 if self.schema.fields() != [element.clone()] { return invalid("List schema differs from its element"); }
             }
-            RelationNode::PageOrdinality { input, field } => {
-                if field.data_type != LogicalType::Scalar(ScalarType::I64) { return invalid("Page ordinality requires an I64 result"); }
-                if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([field])) { return invalid("Page ordinality schema differs from its input and result"); }
+            RelationNode::Ordinality { input, field, .. } => {
+                if field.data_type != LogicalType::Scalar(ScalarType::I64) { return invalid("Ordinality requires an I64 result"); }
+                if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([field])) { return invalid("Ordinality schema differs from its input and result"); }
             }
             RelationNode::Unnest { input, element, ordinality, .. } => {
                 if !self.schema.fields().iter().eq(input.schema.fields().iter().chain([element]).chain(ordinality.iter())) {

@@ -906,7 +906,7 @@ impl Context<'_> {
 
     fn lower_column_table_apply(&mut self, input: &Arc<Relation>, dependent: &Arc<Relation>, arguments: &[(usize, Expr)]) -> Result<Option<Arc<Relation>>> {
         let table = match dependent.node() {
-            RelationNode::PageOrdinality { input, .. } => input.as_ref(),
+            RelationNode::Ordinality { input, scope: rtdb_plan::OrdinalityScope::Page, .. } => input.as_ref(),
             _ => dependent.as_ref(),
         };
         let RelationNode::ColumnTable { expr, .. } = table.node() else { return Ok(None); };
@@ -1126,7 +1126,6 @@ impl Context<'_> {
             field.unnamed = alias.columns.is_empty();
             Some(field)
         } else { None };
-        let schema = Schema::new(std::iter::once(element.clone()).chain(ordinality.clone()).collect())?;
         let element_schema = Schema::new(vec![element.clone()])?;
         let node = match kind {
             ListTableKind::Series => RelationNode::List { expr, element },
@@ -1134,7 +1133,7 @@ impl Context<'_> {
         };
         let input = Arc::new(Relation::new(element_schema, node)?);
         let relation = match ordinality {
-            Some(field) => Arc::new(Relation::new(schema, RelationNode::PageOrdinality { input, field })?),
+            Some(field) => Arc::new(input.with_ordinality(field, rtdb_plan::OrdinalityScope::Page)?),
             None => input,
         };
         Ok(relation)

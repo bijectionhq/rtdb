@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
-use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, Relation, RelationNode, Schema};
+use rtdb_plan::{BinaryOp, ColumnId, Expr, Field, OrdinalityScope, Relation, RelationNode, Schema};
 use rtdb_storage::{MemoryStore, cache::BufferPool};
 use rtdb_types::{LogicalType, Result, ScalarType, Timestamp, Value};
 use tokio_util::sync::CancellationToken;
@@ -52,11 +52,27 @@ async fn page_ordinality_has_i64_cells_and_restarts_for_each_semantic_page() {
     let execution = execution(1);
     let input = list(series(1, 8, 1, false));
     let field = Field { id: ColumnId(1), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
-    let relation = Arc::new(Relation::new(Schema::new(input.schema().fields().iter().cloned().chain([field.clone()]).collect()).unwrap(), RelationNode::PageOrdinality { input, field }).unwrap());
+    let relation = Arc::new(input.with_ordinality(field, OrdinalityScope::Page).unwrap());
     let mut cursor = open(relation, &execution).await.unwrap();
     for expected in [vec![(1,1),(2,2),(3,3)],vec![(4,1),(5,2),(6,3)],vec![(7,1)]] {
         let page = cursor.next_page().await.unwrap().unwrap();
         assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), expected.into_iter().map(|(a,n)| vec![Value::I64(a),Value::I64(n)]).collect::<Vec<_>>());
+    }
+    assert!(cursor.next_page().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn relation_ordinality_includes_rows_in_pages_skipped_by_the_consumer() {
+    let execution = execution(1);
+    let input = list(series(1, 8, 1, false));
+    let field = Field { id: ColumnId(1), name: "n".into(), qualifier: None, qualified_only: false, unnamed: false, data_type: LogicalType::Scalar(ScalarType::I64) };
+    let relation = Arc::new(input.with_ordinality(field, OrdinalityScope::Relation).unwrap());
+    let mut cursor = open(relation, &execution).await.unwrap();
+    assert_eq!(cursor.skip_complete_pages(4).unwrap(), 3);
+    for expected in [&[4, 5, 6][..], &[7][..]] {
+        let page = cursor.next_page().await.unwrap().unwrap();
+        let rows = expected.iter().map(|value| vec![Value::I64(*value), Value::I64(*value)]).collect::<Vec<_>>();
+        assert_eq!(page.rows().iter().map(|row| row.values.clone()).collect::<Vec<_>>(), rows);
     }
     assert!(cursor.next_page().await.unwrap().is_none());
 }

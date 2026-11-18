@@ -180,9 +180,9 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages, state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
         }
-        RelationNode::PageOrdinality { .. } => {
+        RelationNode::Ordinality { scope, .. } => {
             let input = build_pages_constrained(runtime.child(0)?, execution.child(0), crate::inspection::Constraints::default(), None).await?;
-            let pages = Box::new(crate::list::PageOrdinality::new(input, Arc::clone(&execution.context)));
+            let pages = Box::new(crate::list::Ordinality::new(input, *scope, Arc::clone(&execution.context)));
             let pages = crate::pages::retain_page_state(pages, state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages, analysis), &traced_relation, &traced_context));
         }

@@ -89,9 +89,9 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let left = prepare(Arc::clone(left))?; let right = prepare(Arc::clone(right))?;
             Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::Set { left, right, operator: *operator, all: *all })?))
         }
-        RelationNode::PageOrdinality { input, field } => {
+        RelationNode::Ordinality { input, field, scope } => {
             let input = prepare(Arc::clone(input))?;
-            Ok(Arc::new(Relation::new(relation.schema().clone(), RelationNode::PageOrdinality { input, field: field.clone() })?))
+            Ok(Arc::new(input.with_ordinality(field.clone(), *scope)?))
         }
         RelationNode::Unnest { input, expr, element, ordinality, outer } => {
             let mut columns = required.clone();

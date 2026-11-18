@@ -481,15 +481,19 @@ fn describe<'work>(relation: &Relation, work: &'work ExplainWork) -> Result<Desc
             map(work, [("columns", text(work.pieces(&[RenderPiece::Text("{"), RenderPiece::Text(element.as_str()), RenderPiece::Text(" "), RenderPiece::Text(expression.as_str()), RenderPiece::Text("}")])?)?)])?
         }
         RelationNode::ColumnTable { .. } => work.null(),
-        RelationNode::PageOrdinality { field, .. } => {
+        RelationNode::Ordinality { field, scope, .. } => {
             let namespace = field.qualifier.as_ref().and_then(|qualifier| qualifier.scope_symbol());
             let prefix = match namespace {
                 Some(symbol) => work.pieces(&[RenderPiece::Text("[#:"), RenderPiece::Text(symbol), RenderPiece::Text("{")])?,
                 None => work.copy_text("[{")?,
             };
+            let row_number = match scope {
+                rtdb_plan::OrdinalityScope::Page => " (local-row-number)}]",
+                rtdb_plan::OrdinalityScope::Relation => " (row-number)}]",
+            };
             map(work, [
                 ("append?", work.boolean(true)),
-                ("project", text(work.pieces(&[RenderPiece::Text(prefix.as_str()), RenderPiece::Text(&field.name), RenderPiece::Text(" (local-row-number)}]")])?)?),
+                ("project", text(work.pieces(&[RenderPiece::Text(prefix.as_str()), RenderPiece::Text(&field.name), RenderPiece::Text(row_number)])?)?),
             ])?
         }
         RelationNode::Unnest { expr, element, ordinality, .. } => {

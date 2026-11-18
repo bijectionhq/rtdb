@@ -193,7 +193,7 @@ pub(crate) fn local_allocation_bound(relation: &Relation) -> Result<usize> {
         }
         RelationNode::Limit { offset, fetch, .. } => for bound in [offset, fetch].into_iter().flatten() { expression(bound)?; },
         RelationNode::PatchGaps { from, to, .. } => { expression(from)?; expression(to)?; }
-        RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Set { .. } | RelationNode::Distinct { .. } | RelationNode::PageOrdinality { .. } => {}
+        RelationNode::Let { .. } | RelationNode::Reference { .. } | RelationNode::Set { .. } | RelationNode::Distinct { .. } | RelationNode::Ordinality { .. } => {}
     }
     match relation.node() {
         RelationNode::Aggregate { aggregates, .. } => for aggregate in aggregates { bytes = add(bytes, multiply(aggregate.function.retained_bytes()?, 8)?)?; },
@@ -322,7 +322,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
             }).collect::<Vec<_>>();
             Schema::new(vec![field_type(element, L::join_all(&types))])?
         }
-        RelationNode::PageOrdinality { input, field } => {
+        RelationNode::Ordinality { input, field, .. } => {
             let input = child(input)?;
             Schema::new(input.fields().iter().cloned().chain([field.clone()]).collect())?
         }
@@ -373,7 +373,7 @@ fn relation_types(relation: &Arc<Relation>, emitter: &Emitter<'_>) -> Result<Arc
         (RelationNode::Aggregate { .. }, [input]) => EmittedNode::Aggregate { input: Arc::clone(input), types: aggregates },
         (RelationNode::Join { .. } | RelationNode::Set { .. } | RelationNode::Apply { .. } | RelationNode::Mark { .. } | RelationNode::Let { .. }, [left, right]) => EmittedNode::Binary(Arc::clone(left), Arc::clone(right)),
         (RelationNode::Project { .. } | RelationNode::Extend { .. } | RelationNode::Rename { .. } | RelationNode::Filter { .. } | RelationNode::Sort { .. } | RelationNode::SortLimit { .. } | RelationNode::Limit { .. }
-            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::PageOrdinality { .. } | RelationNode::PatchGaps { .. }, [input]) => EmittedNode::Unary(Arc::clone(input)),
+            | RelationNode::Distinct { .. } | RelationNode::Window { .. } | RelationNode::Unnest { .. } | RelationNode::Ordinality { .. } | RelationNode::PatchGaps { .. }, [input]) => EmittedNode::Unary(Arc::clone(input)),
         _ => return Err(invalid("runtime-plan", "Runtime relation children disagree with its plan")),
     };
     Ok(Arc::new(EmittedRelation { relation: Arc::clone(relation), output: Arc::new(RuntimeSchema { schema, _reservation: Arc::clone(emitter.reservation) }), node }))

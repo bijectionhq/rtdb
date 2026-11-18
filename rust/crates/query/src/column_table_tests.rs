@@ -208,7 +208,7 @@ async fn column_table_ordinality_is_one_i64_sequence_across_internal_reader_slic
                 .schema()
                 .concat(&Schema::new(vec![field.clone()]).unwrap())
                 .unwrap(),
-            RelationNode::PageOrdinality { input, field },
+            RelationNode::Ordinality { input, field, scope: rtdb_plan::OrdinalityScope::Page },
         )
         .unwrap(),
     );

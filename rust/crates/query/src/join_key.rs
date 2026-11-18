@@ -151,7 +151,7 @@ fn maximum_id(relation: &Relation) -> Option<u32> {
         RelationNode::Project { input, .. } | RelationNode::Extend { input, .. } | RelationNode::Rename { input, .. } | RelationNode::Filter { input, .. }
         | RelationNode::Aggregate { input, .. } | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. } | RelationNode::Distinct { input }
-        | RelationNode::Unnest { input, .. } | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => maximum_id(input),
+        | RelationNode::Unnest { input, .. } | RelationNode::Ordinality { input, .. } | RelationNode::PatchGaps { input, .. } => maximum_id(input),
         RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => maximum_id(left).max(maximum_id(right)),
         RelationNode::Apply { input, dependent, .. } | RelationNode::Mark { input, dependent, .. } => maximum_id(input).max(maximum_id(dependent)),
         RelationNode::Let { binding, body } => maximum_id(&binding.relation).max(maximum_id(body)),

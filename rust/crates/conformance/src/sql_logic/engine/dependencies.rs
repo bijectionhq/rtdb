@@ -53,7 +53,7 @@ fn collect(source: &Relation, catalog: &dyn Catalog, bindings: &mut Vec<TableBin
         | RelationNode::Window { input, .. } | RelationNode::Sort { input, .. }
         | RelationNode::SortLimit { input, .. } | RelationNode::Limit { input, .. }
         | RelationNode::Distinct { input } | RelationNode::Unnest { input, .. }
-        | RelationNode::PageOrdinality { input, .. } | RelationNode::PatchGaps { input, .. } => collect(input, catalog, bindings)?,
+        | RelationNode::Ordinality { input, .. } | RelationNode::PatchGaps { input, .. } => collect(input, catalog, bindings)?,
         RelationNode::Let { binding, body } => { collect(&binding.relation, catalog, bindings)?; collect(body, catalog, bindings)?; }
         RelationNode::Reference { binding } => collect(&binding.relation, catalog, bindings)?,
         RelationNode::Join { left, right, .. } | RelationNode::Set { left, right, .. } => {
@@ -122,7 +122,7 @@ impl Rebuilder<'_> {
                 self.expressions(offset.iter_mut())?; self.expressions(fetch.iter_mut())?;
             }
             RelationNode::Limit { input, offset, fetch } => { *input = self.relation(input)?; self.expressions(offset.iter_mut())?; self.expressions(fetch.iter_mut())?; }
-            RelationNode::Distinct { input } | RelationNode::PageOrdinality { input, .. } => *input = self.relation(input)?,
+            RelationNode::Distinct { input } | RelationNode::Ordinality { input, .. } => *input = self.relation(input)?,
             RelationNode::Unnest { input, expr, .. } => { *input = self.relation(input)?; self.expression(expr)?; }
             RelationNode::PatchGaps { input, from, to, .. } => { *input = self.relation(input)?; self.expression(from)?; self.expression(to)?; }
             RelationNode::Let { binding, body } => { *binding = self.binding(binding)?; *body = self.relation(body)?; }
@@ -342,7 +342,7 @@ mod tests {
             ("Set", relation(input.schema().clone(), RelationNode::Set { left: Arc::clone(&input), right, operator: SetOperator::Except, all: false })),
             ("List", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::List { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone() })),
             ("ColumnTable", relation(Schema::new(vec![element.clone()]).unwrap(), RelationNode::ColumnTable { expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element: element.clone() })),
-            ("PageOrdinality", relation(input.schema().concat(&Schema::new(vec![ordinal.clone()]).unwrap()).unwrap(), RelationNode::PageOrdinality { input: Arc::clone(&input), field: ordinal.clone() })),
+            ("Ordinality", Arc::new(Arc::clone(&input).with_ordinality(ordinal.clone(), rtdb_plan::OrdinalityScope::Relation).unwrap())),
             ("Unnest", relation(input.schema().concat(&Schema::new(vec![element.clone(), ordinal.clone()]).unwrap()).unwrap(), RelationNode::Unnest { input, expr: Expr::List(vec![Expr::Literal(V::I64(3))]), element, ordinality: Some(ordinal), outer: true })),
             ("PatchGaps", relation(Schema::new(patch_output).unwrap(), RelationNode::PatchGaps { input: patch, iid: ColumnId(0), valid_from: ColumnId(1), valid_to: ColumnId(2), document: ColumnId(3), from: Expr::Literal(V::Null), to: Expr::Literal(V::Null) })),
         ]
@@ -364,7 +364,7 @@ mod tests {
                 RelationNode::Values { rows } => assert_eq!(rows, &[vec![Expr::Literal(V::I64(7))]]),
                 RelationNode::LiteralPages { pages } => assert_eq!(pages, &[vec![vec![Expr::Literal(V::I64(7))]], vec![]]),
                 RelationNode::List { expr, element } | RelationNode::ColumnTable { expr, element } => { assert_eq!(element.id, ColumnId(2)); assert_eq!(expr, &Expr::List(vec![Expr::Literal(V::I64(3))])); }
-                RelationNode::PageOrdinality { field, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); }
+                RelationNode::Ordinality { field, scope, .. } => { assert_eq!(field.id, ColumnId(3)); assert_eq!(field.data_type, L::Scalar(S::I64)); assert_eq!(*scope, rtdb_plan::OrdinalityScope::Relation); }
                 RelationNode::Scan(scan) => { assert_eq!(scan.table, table("a")); assert_eq!(scan.columns[0].id, ColumnId(0)); }
                 RelationNode::Project { expressions, .. } | RelationNode::Extend { expressions, .. } => { assert_eq!(expressions[0].field.id, ColumnId(2)); assert_eq!(expressions[0].expr, Expr::column(ColumnId(0), L::Scalar(S::I64))); }
                 RelationNode::Rename { prefix, expressions, .. } => { assert_eq!(prefix, "prefix/"); assert_eq!(expressions[0].field.name, "out"); }
