@@ -4,6 +4,8 @@
             [xtdb.information-schema-test :as original-info-schema]
             [xtdb.issue-test :as original-issue]
             [xtdb.operator.group-by-test :as original-group-by]
+            [xtdb.operator.select-test :as original-select]
+            [xtdb.operator.table-test :as original-table]
             [xtdb.sql.expr-test :as original-expr]
             [xtdb.sql.correlated-subquery-nulls-test :as original-correlated]
             [xtdb.sql.exists-decorrelation-test :as original-exists]
@@ -25,7 +27,7 @@
             [xtdb.expression.pg-test :as original-pg-expression]
             [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
-            [xtdb.rust])
+            [xtdb.rust :as rust])
   (:import [java.time InstantSource]
            [org.apache.arrow.memory RootAllocator]
            [xtdb.rust NativeDatabase]))
@@ -107,7 +109,12 @@
                           (not-any? #{tu/with-allocator} fixtures) (into [tu/with-allocator]))]
     (when (some nil? native-fixtures)
       (throw (ex-info "Unsupported original API fixture" {:test (str original)})))
-    ((t/join-fixtures native-fixtures) (:test (meta original)))))
+    (binding [tu/*query-ra-executor* (fn [query {:keys [node] :as options}]
+                                      (if node
+                                        (rust/query-ra node query options)
+                                        (with-open [node (open-node tu/*allocator*)]
+                                          (rust/query-ra node query options))))]
+      ((t/join-fixtures native-fixtures) (:test (meta original))))))
 
 (defmacro ^:private deftest-original-api [original & [local-name]]
   (let [test-name (or local-name (symbol (name original)))
@@ -116,6 +123,10 @@
        (run-original-api-case (var ~original)))))
 
 (deftest-original-api original-sql/multiple-query-tails)
+
+(deftest-original-api original-select/test-no-column-relation)
+
+(deftest-original-api original-table/test-table-handles-exprs)
 
 (deftest-original-api original-sql/disallow-slashes-in-delimited-identifiers-3799)
 

@@ -69,7 +69,6 @@ pub fn parse_query_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Resu
 
 pub(crate) fn parse_query_with(form: &Edn, forms: FormAllocation<'_>) -> Result<Query> { Syntax { forms }.parse_query(form) }
 
-#[cfg(test)]
 pub(crate) fn parse_expr_in(form: &Edn, memory: &std::sync::Arc<MemoryBudget>) -> Result<Expr> { Syntax { forms: FormAllocation::Tracked(memory) }.parse_expr(form) }
 
 struct Syntax<'a> { forms: FormAllocation<'a> }

@@ -166,6 +166,22 @@ async fn native_sql_and_xtql_admit_unsigned_external_parameters_before_binding()
 }
 
 #[tokio::test]
+async fn native_logical_queries_execute_bound_relations_with_named_arguments() {
+    let (node, driver) = running(options(), services()).await;
+    let mut session = node.session("xtdb", Arc::new(Authority)).unwrap();
+    let token = session.state().cancellation().child_token();
+    let empty_columns = "[:select {:predicate (== ?ap_n 2)} [:table {:rows [{} {} {}]}]]";
+    let arguments = BTreeMap::from([("ap-n".into(), Value::I64(2))]);
+    let cursor = session.query_ra(empty_columns, arguments, &token).await.unwrap();
+    assert_eq!(rows(cursor).await, [vec![], vec![], vec![]]);
+
+    let ordered = "[:sort {:order-specs [[a {:direction :desc :null-ordering :nulls-last}]] :skip 1 :limit 1} [:table {:rows [{:a 7} {} {:a 2}]}]]";
+    let cursor = session.query_ra(ordered, BTreeMap::new(), &token).await.unwrap();
+    assert_eq!(rows(cursor).await, [vec![Value::I64(2)]]);
+    stop(&node, driver).await;
+}
+
+#[tokio::test]
 async fn disabled_indexing_and_read_only_nodes_do_not_resolve_external_source_factories() {
     for read_only in [false, true] {
         let mut config = options();

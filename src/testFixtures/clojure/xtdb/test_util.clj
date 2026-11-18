@@ -270,9 +270,10 @@
   ([^ICursor cursor] (<-cursor cursor #xt/key-fn :kebab-case-keyword))
   ([^ICursor cursor ^IKeyFn key-fn] (.consume cursor key-fn)))
 
-(defn query-ra
-  ([query] (query-ra query {}))
-  ([query {:keys [node args preserve-pages? with-types? key-fn] :as query-opts
+(def ^:dynamic *query-ra-executor* nil)
+
+(defn- query-ra-jvm
+  [query {:keys [node args preserve-pages? with-types? key-fn] :as query-opts
            :or {key-fn (serde/read-key-fn :kebab-case-keyword)}}]
    (let [allocator (:allocator node *allocator*)
          query-opts (-> query-opts
@@ -315,7 +316,12 @@
                rows))))
        (finally
          (when close-q-src?
-           (util/close q-src)))))))
+           (util/close q-src))))))
+
+(defn query-ra
+  ([query] (query-ra query {}))
+  ([query options]
+   ((or *query-ra-executor* query-ra-jvm) query options)))
 
 (t/deftest round-trip-cursor
   (with-allocator

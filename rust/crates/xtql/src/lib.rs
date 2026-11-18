@@ -7,7 +7,7 @@ mod legacy_inst;
 mod regex_replace;
 
 pub use ast::{Binding, Clause, Expr, From, Query, RelationInput, SubqueryKind, Tail, TemporalFilter, parse_query, parse_query_in};
-pub use bind::{CompileOptions, compile, compile_in, compile_query, compile_query_in};
+pub use bind::{CompileOptions, compile, compile_in, compile_query, compile_query_in, compile_ra_in};
 pub use edn::{Edn, EdnKind, read};
 
 use rtdb_types::Anomaly;

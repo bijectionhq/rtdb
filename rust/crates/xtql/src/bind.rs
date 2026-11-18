@@ -3,6 +3,9 @@ use rtdb_plan::{AggregateExpr, AggregateFunction, ApplyKind, BinaryOp, Binder, C
 use rtdb_types::{ListKind, LogicalType, MemoryBudget, Result, ScalarType, TimeUnit, Value};
 use std::{collections::{BTreeMap, BTreeSet}, sync::Arc};
 
+mod ra;
+pub use ra::compile_ra_in;
+
 #[derive(Clone, Debug)]
 pub struct CompileOptions {
     /// Indexed by external argument position; absent positions remain unknown until argument rebinding.
@@ -37,7 +40,7 @@ fn compile_with(source: &str, catalog: &dyn Catalog, options: &CompileOptions, f
         next_parameter = next_parameter.max(index.checked_add(1).ok_or_else(|| error("xtdb/query-too-large", "Parameter identifier space is exhausted"))?);
     }
     let mut binder = Binder::default();
-    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms };
+    let mut compiler = Compiler { catalog, binder: &mut binder, next_parameter: &mut next_parameter, timezone: &options.default_timezone, forms, symbols: Symbols::Xtql };
     let mut parameters = BTreeMap::new();
     for (name, (index, data_type)) in &options.named_parameters {
         parameters.insert(normal(name), compiler.binder.parameter(*index, data_type.clone()));
@@ -83,11 +86,30 @@ fn compile_query_with(query: &Query, catalog: &dyn Catalog, binder: &mut Binder,
         }
         body.as_ref()
     } else { query };
-    let mut compiler = Compiler { catalog, binder, next_parameter, timezone, forms };
+    let mut compiler = Compiler { catalog, binder, next_parameter, timezone, forms, symbols: Symbols::Xtql };
     Ok(compiler.query(body, &parameters)?.relation)
 }
 
 type Parameters = BTreeMap<String, PExpr>;
+
+#[derive(Clone, Copy)]
+enum Symbols { Xtql, Relational }
+
+impl Symbols {
+    fn parameter(self, name: &str) -> String {
+        match self {
+            Self::Xtql => normal(name),
+            Self::Relational => normal(name.strip_prefix('?').unwrap_or(name)),
+        }
+    }
+
+    fn column(self, name: &str) -> std::borrow::Cow<'_, str> {
+        match self {
+            Self::Xtql => std::borrow::Cow::Owned(normal(name)),
+            Self::Relational => std::borrow::Cow::Borrowed(name),
+        }
+    }
+}
 
 struct Compiler<'a, 'b> {
     catalog: &'a dyn Catalog,
@@ -95,6 +117,7 @@ struct Compiler<'a, 'b> {
     next_parameter: &'b mut usize,
     timezone: &'a str,
     forms: FormAllocation<'a>,
+    symbols: Symbols,
 }
 
 struct Bound { relation: Arc<Relation>, variables: BTreeMap<String, Field> }
@@ -441,9 +464,13 @@ impl Compiler<'_, '_> {
                 target.validate_source(&expr.data_type())?;
                 PExpr::Cast { expr: Box::new(expr), target: target.bind_timezone(self.timezone) }
             }
-            Expr::Variable(name) => parameters.get(&normal(name)).cloned().or_else(|| bound.variables.get(&normal(name)).map(Field::expression))
-                .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
-            Expr::LogicVariable(name) => bound.variables.get(&normal(name)).map(Field::expression)
+            Expr::Variable(name) => {
+                let parameter = matches!(self.symbols, Symbols::Xtql) || name.starts_with('?');
+                parameter.then(|| parameters.get(&self.symbols.parameter(name))).flatten().cloned()
+                    .or_else(|| bound.variables.get(self.symbols.column(name).as_ref()).map(Field::expression))
+                    .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?
+            }
+            Expr::LogicVariable(name) => bound.variables.get(self.symbols.column(name).as_ref()).map(Field::expression)
                 .ok_or_else(|| error("xtql/invalid-expression", format!("Not all variables in expression are in scope: {name}")))?,
             Expr::Get { object, field } => {
                 let object = self.expr(object, bound, parameters)?;

@@ -30,9 +30,7 @@ final class NativeAbi {
         register(library, linker, "abi_version");
         register(library, linker, "database_open", PTR, I64, I64, PTR, PTR);
         register(library, linker, "database_open_with_properties", PTR, I64, I64, PTR, I64, PTR, PTR);
-        String clockOpen = "database_open_with_in_memory_log_clock";
-        library.find("rtdb_v1_" + clockOpen).ifPresent(symbol -> functions.put(clockOpen,
-            linker.downcallHandle(symbol, FunctionDescriptor.of(I32, PTR, I64, I64, PTR, I64, PTR, I64, PTR, PTR))));
+        registerOptional(library, linker, "database_open_with_in_memory_log_clock", PTR, I64, I64, PTR, I64, PTR, I64, PTR, PTR);
         register(library, linker, "retain", I64, PTR, PTR);
         register(library, linker, "release", I64, PTR);
         register(library, linker, "close", I64, PTR);
@@ -43,6 +41,7 @@ final class NativeAbi {
         register(library, linker, "session_action", I64, I64, I32, PTR);
         register(library, linker, "session_set_catalog", I64, PTR, I64, PTR);
         register(library, linker, "session_transact", I64, I64, PTR, I64, PTR, PTR);
+        registerOptional(library, linker, "session_query_ra", I64, I64, PTR, I64, PTR, I64, PTR, PTR);
         register(library, linker, "session_await_token", I64, PTR, PTR);
         register(library, linker, "statement_new", I64, PTR, I64, I32, PTR, PTR);
         register(library, linker, "statement_set_sql", I64, PTR, I64, PTR);
@@ -66,6 +65,9 @@ final class NativeAbi {
     static NativeAbi get() { return Holder.INSTANCE; }
     private void register(SymbolLookup library, Linker linker, String name, MemoryLayout... arguments) {
         functions.put(name, linker.downcallHandle(library.find("rtdb_v1_" + name).orElseThrow(), FunctionDescriptor.of(I32, arguments)));
+    }
+    private void registerOptional(SymbolLookup library, Linker linker, String name, MemoryLayout... arguments) {
+        library.find("rtdb_v1_" + name).ifPresent(symbol -> functions.put(name, linker.downcallHandle(symbol, FunctionDescriptor.of(I32, arguments))));
     }
     private int invoke(String name, Object... arguments) throws AdbcException {
         MethodHandle function = functions.get(name);

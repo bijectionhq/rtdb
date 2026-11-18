@@ -405,6 +405,19 @@ impl NativeSession {
         let prepared = rtdb_xtql::compile_in(source, &context.catalog, &options, &context.memory)?;
         PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments).await
     }
+
+    /// Opens a logical relation against the same transaction read basis as SQL and XTQL.
+    /// The operation token belongs to this session's cancellation tree.
+    pub async fn query_ra(&mut self, source: &str, arguments: BTreeMap<String, Value>, cancellation: &CancellationToken) -> Result<QueryCursor> {
+        let database = self.state.database().to_owned();
+        let context = self.query_context_for(&database, cancellation).await?;
+        let named_parameters = arguments.iter().enumerate().map(|(index, (name, value))| {
+            (name.clone(), (index, rtdb_columnar::execution_type(&value.logical_type())))
+        }).collect();
+        let options = rtdb_xtql::CompileOptions { named_parameters, default_timezone: context.timezone.clone(), ..Default::default() };
+        let prepared = rtdb_xtql::compile_ra_in(source, &context.catalog, &options, &context.memory)?;
+        PreparedQuery::from_prepared(prepared, &context.memory)?.execute(context, arguments.into_values().collect()).await
+    }
 }
 
 pub(crate) struct NativeSessionService { pub(crate) node: Node, pub(crate) identity: Arc<dyn SessionIdentity> }

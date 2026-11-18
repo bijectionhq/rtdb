@@ -146,6 +146,8 @@ int32_t rtdb_v1_cursor_consumer_error(RtdbHandle cursor, RtdbHandle *error);
 int32_t rtdb_v1_cursor_next_transit(RtdbHandle cursor, RtdbHandle *out, RtdbHandle *error);
 int32_t rtdb_v1_bytes(RtdbHandle bytes, RtdbSlice *out, RtdbHandle *error);
 int32_t rtdb_v1_session_transact(RtdbHandle session, RtdbHandle operation, const uint8_t *request, size_t length, RtdbHandle *out, RtdbHandle *error);
+/* The plan is an EDN logical relation. Arguments are a Transit MessagePack map of named values. */
+int32_t rtdb_v1_session_query_ra(RtdbHandle session, RtdbHandle operation, const uint8_t *plan, size_t plan_length, const uint8_t *arguments, size_t arguments_length, RtdbHandle *out, RtdbHandle *error);
 
 /* Metadata JSON: kind 0=getInfo, 1=getTableTypes, 2=getObjects, 3=getTableSchema.
  * Optional fields: info_codes, catalog, schema, table, column, table_types.

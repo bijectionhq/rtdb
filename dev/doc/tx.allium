@@ -16,6 +16,7 @@
 -- The native pgwire protocol state is in rust/crates/pgwire/src/protocol.rs.
 -- Native Flight SQL handles and captured-basis execution are in rust/crates/flight-sql/src/{state,lease,execute,actions}.rs.
 -- Native embedded ADBC and Clojure adapters are in rust/crates/ffi and bindings/jvm.
+-- The embedded logical relation entry point captures the same connection read basis as a SQL query.
 --
 -- == Frontend parity (the point of this spec) ==
 --

@@ -71,6 +71,15 @@ public final class NativeConnection extends NativeResource implements AdbcConnec
             try { return abi.copiedBytes(result); } finally { abi.dispose(result, false); }
         }
     }
+    public NativeRows queryLogicalRelation(String plan, byte[] arguments) throws AdbcException {
+        Operation operation = operation();
+        try (Arena arena = Arena.ofConfined()) {
+            MemorySegment source = NativeAbi.text(arena, plan);
+            MemorySegment bindings = NativeAbi.bytes(arena, arguments);
+            long cursor = abi.handle("session_query_ra", handle(), operation.id(), source, source.byteSize(), bindings, bindings.byteSize());
+            return new NativeRows(abi, cursor, operation);
+        } catch (Throwable error) { try { operation.close(); } catch (AdbcException close) { error.addSuppressed(close); } throw error; }
+    }
     @Override public String getCurrentCatalog() throws AdbcException { handle(); return catalog; }
     @Override public String getCurrentDbSchema() { return "public"; }
     @Override public void setCurrentCatalog(String catalog) throws AdbcException {
