@@ -3,6 +3,7 @@
             [xtdb.api :as xt]
             [xtdb.operator.group-by-test :as original-group-by]
             [xtdb.sql.expr-test :as original-expr]
+            [xtdb.sql.with-test :as original-with]
             [xtdb.sql-test :as original-sql]
             [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
@@ -95,6 +96,8 @@
      (run-original-api-case (var ~original))))
 
 (deftest-original-api original-sql/multiple-query-tails)
+
+(deftest-original-api original-with/disallow-period-specs-on-ctes-3440)
 
 (deftest-original-api original-expr/duration-literal-query)
 

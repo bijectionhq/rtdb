@@ -400,6 +400,7 @@ Without an explicit column list, the result columns use `_column_1`, `_column_2`
 
 Table-period expressions use a scope without local or outer columns.
 They admit parameters and scalar expressions that resolve without a column.
+A period specification on a CTE reference reports the CTE name in its planning error.
 
 An INSERT with a VALUES source requires a column list that includes `_id`.
 Planning reports the missing column list and the mandatory `_id` diagnostic together when the list is absent.

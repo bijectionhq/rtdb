@@ -901,14 +901,20 @@ impl Context<'_> {
                 }
                 let names = identifiers(name)?;
                 if names.len() == 1 {
-                    if let Some(cte) = self.ctes.get(&names[0].normalized()).cloned() {
+                    let cte_name = names[0].normalized();
+                    if let Some(cte) = self.ctes.get(&cte_name).cloned() {
                         let end = name.0.last().and_then(ast::ObjectNamePart::as_ident).map(|name| name.span.end);
-                        if self.temporal.iter().any(|clause| Some(clause.owner_end) == end) { return Err(error("Temporal clauses are not allowed on CTE references")); }
+                        if self.temporal.iter().any(|clause| Some(clause.owner_end) == end) {
+                            use rtdb_types::transit_value::{TransitValue, to_json_value};
+                            let diagnostic = PlanningDiagnostic::new(format!("Period specifications not allowed on CTE reference: {cte_name}"))
+                                .with_detail("table-name", to_json_value(&TransitValue::Symbol(cte_name.clone()))?);
+                            self.diagnostics.push(diagnostic);
+                        }
                         let input = match cte {
                             Cte::Inline(input) => input,
                             Cte::Materialized(binding) => Arc::new(Relation::new(binding.relation.schema().clone(), RelationNode::Reference { binding })?),
                         };
-                        return match alias { Some(alias) => self.alias(input, alias), None => self.rename(input, Some(names[0].normalized()), None) };
+                        return match alias { Some(alias) => self.alias(input, alias), None => self.rename(input, Some(cte_name), None) };
                     }
                 }
                 let (valid_time, system_time, clamp_valid_time) = self.temporal_filters(name)?;

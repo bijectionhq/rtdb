@@ -7,6 +7,21 @@ use rtdb_types::{LogicalType, Result, ScalarType, TableRef, Value};
 struct Fixture;
 
 #[test]
+fn period_diagnostics_use_the_cte_name_even_when_referenced_through_an_alias() {
+    for with in ["WITH", "WITH MATERIALIZED"] {
+        for period in ["SYSTEM_TIME", "VALID_TIME"] {
+            let sql = format!("{with} q AS (SELECT 1 AS v) SELECT other.v FROM q FOR {period} ALL AS other");
+            let error = prepare(&sql, &Fixture, &PrepareOptions::default()).unwrap_err();
+            assert_eq!(error.code, "xtdb/sql-error", "{sql}");
+            assert_eq!(error.message.as_deref(), Some("Errors planning SQL statement:\n  - Period specifications not allowed on CTE reference: q"), "{sql}");
+            assert_eq!(error.context["errors"][0]["table-name"], rtdb_types::transit_value::to_json_value(
+                &rtdb_types::transit_value::TransitValue::Symbol("q".into())
+            ).unwrap(), "{sql}");
+        }
+    }
+}
+
+#[test]
 fn table_periods_have_no_local_or_outer_column_scope() {
     for (source, column) in [
         ("SELECT * FROM absent.docs FOR SYSTEM_TIME AS OF foo", "foo"),
