@@ -25,3 +25,6 @@ Dialect-enabled optimizer hints still expand, preserving text in any comment tok
 
 RTDB preserves doubled double-quote and backtick delimiters when the tokenizer reads a quoted identifier.
 String literals use the dialect's existing unescape rules.
+
+The RTDB dialect disables dedicated `TABLE(expr)` parsing in table-factor position.
+`TABLE` then follows ordinary identifier and function-expression parsing.

@@ -177,6 +177,10 @@
 (deftest-original-api original-sql/ignore-returning-keys-3668)
 (deftest-original-api original-sql/read-write-promotion-conflict-in-live-rel-3709)
 
+(deftest-original-api original-sql/test-current-catalog)
+(deftest-original-api original-sql/test-delete-with-unqualified-col-3017)
+(deftest-original-api original-sql/forbid-updating-core-cols-3433)
+
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]

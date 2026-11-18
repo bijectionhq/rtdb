@@ -16558,7 +16558,7 @@ impl<'a> Parser<'a> {
                     alias,
                 })
             }
-        } else if self.parse_keyword(Keyword::TABLE) {
+        } else if self.dialect.supports_table_function_syntax() && self.parse_keyword(Keyword::TABLE) {
             // parse table function (SELECT * FROM TABLE (<expr>) [ AS <alias> ])
             self.expect_token(&Token::LParen)?;
             let expr = self.parse_expr()?;

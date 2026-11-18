@@ -63,6 +63,22 @@ async fn session_information_keywords_aliases_and_scalar_calls_share_reference_v
 }
 
 #[tokio::test]
+async fn current_catalog_accepts_an_optional_empty_call_and_one_qualifier() {
+    for source in [
+        "SELECT CURRENT_CATALOG, CURRENT_CATALOG()",
+        "SELECT pg_catalog.CURRENT_CATALOG, pg_catalog.CURRENT_CATALOG()",
+        "SELECT public.CURRENT_CATALOG, public.CURRENT_CATALOG()",
+    ] {
+        assert_eq!(query(source).await.unwrap(), [vec![text("xtdb"), text("xtdb")]], "{source}");
+    }
+    for source in ["SELECT CURRENT_CATALOG(1)", "SELECT pg_catalog.CURRENT_CATALOG(1)", "SELECT CURRENT_USER()"] {
+        assert!(prepare(source, &context().catalog, &PrepareOptions::default()).is_err(), "{source}");
+    }
+    assert_eq!(query(r#"SELECT q."current_catalog" FROM (VALUES (5)) AS q("current_catalog")"#).await.unwrap(),
+        [vec![V::I64(5)]]);
+}
+
+#[tokio::test]
 async fn unsupported_session_settings_keep_the_requested_case_and_key() {
     let error=query("SELECT CURRENT_SETTING('Search_Path')").await.unwrap_err();
     assert_eq!(error.code,"xtdb.expression/unsupported-setting");

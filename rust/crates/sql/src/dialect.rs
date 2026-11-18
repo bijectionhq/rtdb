@@ -1,4 +1,4 @@
-use sqlparser::{ast, dialect::{Dialect, GenericDialect, Precedence}, keywords::Keyword, parser::{Parser, ParserError}, tokenizer::{Token,TokenWithSpan}};
+use sqlparser::{ast, dialect::{Dialect, GenericDialect, Precedence}, keywords::Keyword, parser::{Parser, ParserError}, tokenizer::{Token,TokenWithSpan,Word}};
 use std::{cell::Cell,fmt::Write};
 
 #[derive(Debug, Default)]
@@ -60,6 +60,32 @@ macro_rules! generic_flags {
     ($($name:ident),* $(,)?) => { $(fn $name(&self) -> bool { GenericDialect {}.$name() })* };
 }
 
+fn current_catalog(parser: &mut Parser, word: &Word, span: sqlparser::tokenizer::Span) -> Option<ast::Expr> {
+    let name = if word.keyword == Keyword::CURRENT_CATALOG {
+        parser.next_token();
+        vec![word.to_ident(span)]
+    } else {
+        if parser.peek_nth_token_ref(1).token != Token::Period { return None; }
+        let catalog = parser.peek_nth_token_ref(2);
+        let Token::Word(catalog_name) = &catalog.token else { return None; };
+        if catalog_name.keyword != Keyword::CURRENT_CATALOG { return None; }
+        let catalog = catalog_name.to_ident(catalog.span);
+        for _ in 0..3 { parser.next_token(); }
+        vec![word.to_ident(span), catalog]
+    };
+    let args = if parser.peek_token_ref().token == Token::LParen && parser.peek_nth_token_ref(1).token == Token::RParen {
+        parser.next_token();
+        parser.next_token();
+        ast::FunctionArguments::List(ast::FunctionArgumentList { duplicate_treatment: None, args: Vec::new(), clauses: Vec::new() })
+    } else {
+        ast::FunctionArguments::None
+    };
+    Some(ast::Expr::Function(ast::Function {
+        name: name.into(), uses_odbc_syntax: false, parameters: ast::FunctionArguments::None,
+        args, null_treatment: None, filter: None, over: None, within_group: Vec::new(),
+    }))
+}
+
 impl Dialect for SqlDialect {
     fn dialect(&self) -> std::any::TypeId { GenericDialect {}.dialect() }
     fn is_identifier_start(&self, ch: char) -> bool { ch.is_ascii_alphabetic() || ch == '_' }
@@ -70,6 +96,7 @@ impl Dialect for SqlDialect {
     fn supports_values_in_subqueries(&self) -> bool { true }
     fn supports_user_as_identifier(&self) -> bool { true }
     fn supports_expression_derived_tables(&self) -> bool { true }
+    fn supports_table_function_syntax(&self) -> bool { false }
     fn is_column_alias(&self, keyword: &Keyword, parser: &mut Parser) -> bool {
         *keyword != Keyword::WINDOW && GenericDialect {}.is_column_alias(keyword, parser)
     }
@@ -155,6 +182,7 @@ impl Dialect for SqlDialect {
             }));
         }
         let Token::Word(word) = &token.token else { return None; };
+        if let Some(expr) = current_catalog(parser, word, token.span) { return Some(Ok(expr)); }
         if word.quote_style.is_none() && word.value.eq_ignore_ascii_case("SUBSTR") && parser.peek_nth_token(1).token == Token::LParen {
             let name = ast::ObjectName::from(vec![word.to_ident(token.span)]);
             parser.next_token();

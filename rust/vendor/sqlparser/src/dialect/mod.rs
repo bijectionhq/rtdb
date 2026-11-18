@@ -1138,6 +1138,11 @@ pub trait Dialect: Debug + Any {
         false
     }
 
+    /// Whether `TABLE(expr)` has dedicated table-function syntax.
+    fn supports_table_function_syntax(&self) -> bool {
+        true
+    }
+
     /// Returns true if this dialect allows dollar placeholders
     /// e.g. `SELECT $var` (SQLite)
     fn supports_dollar_placeholder(&self) -> bool {

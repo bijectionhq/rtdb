@@ -20,6 +20,7 @@ The SQL binder validates the literal arguments before retaining their metadata i
 Applicable UTF8 source types reject unsupported start/occurrence arguments during emitted-type admission; null-only sources leave metadata uninterpreted.
 Integer metadata uses the SQL signed 64-bit literal boundary, including when the source is null.
 Session-information expressions expose CURRENT_USER, CURRENT_CATALOG, CURRENT_DATABASE, CURRENT_SCHEMA, CURRENT_SCHEMAS, and CURRENT_SETTING.
+CURRENT_CATALOG accepts a bare spelling or an empty argument list, with an optional single qualifier.
 The pinned user/database value is `xtdb`, and the explicit search path is `public`, with `pg_catalog` prepended when CURRENT_SCHEMAS requests implicit schemas.
 CURRENT_SETTING accepts the case-sensitive names `server_version_num`, `search_path`, and `xtdb.version`; other names retain the requested key in an unsupported-setting diagnostic.
 VERSION and XT.VERSION retain the PostgreSQL and XTDB display forms and report the actual native process version, including an available source revision in XT.VERSION.
