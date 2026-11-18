@@ -77,8 +77,9 @@ fn build_pages_constrained(runtime: Arc<EmittedRelation>, execution: Execution, 
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
-        RelationNode::Values { .. } => {
-            let pages = Box::new(Values { relation,execution,emitted: false });
+        RelationNode::Values { rows } => {
+            let page = materialize_rows(rows, &execution).await?;
+            let pages = crate::pages::single_page(page, Arc::clone(&execution.context));
             let pages = crate::pages::retain_page_state(pages,state_reservation);
             return Ok(crate::trace::wrap(crate::analysis::wrap(pages,analysis),&traced_relation,&traced_context));
         }
@@ -238,25 +239,18 @@ async fn row_limit(expr: Option<&Expr>, execution: &Execution) -> Result<Option<
         .ok_or_else(|| rtdb_types::Anomaly::incorrect("xtdb/expected-number","LIMIT and OFFSET require a non-negative signed integer"))
 }
 
-struct Values { relation: Arc<Relation>, execution: Execution, emitted: bool }
-#[async_trait]
-impl PageCursor for Values {
-    async fn next_page(&mut self) -> Result<Option<OwnedPage>> {
-        self.execution.context.check_cancelled()?;
-        if self.emitted { return Ok(None); }
-        self.emitted = true;
-        let RelationNode::Values { rows } = self.relation.node() else { unreachable!() };
-        if rows.is_empty() { return Ok(None); }
-        let mut page = PageBuilder::new(rows.len(),&self.execution.context.memory)?;
-        for expressions in rows {
-            let scope = self.execution.scope()?;
-            scope.reserve(expressions.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(||invalid("table-size","Table row allocation overflow"))?)?;
-            let mut values = Vec::with_capacity(expressions.len());
-            for expr in expressions { values.push(self.execution.evaluate(&scope,expr,&Schema::default(),&[]).await?); }
-            page.push(OwnedRow::new(values,&self.execution.context.memory)?)?;
-        }
-        Ok(Some(page.finish()))
+async fn materialize_rows(rows: &[Vec<Expr>], execution: &Execution) -> Result<Option<OwnedPage>> {
+    if rows.is_empty() { return Ok(None); }
+    let mut page = PageBuilder::new(rows.len(), &execution.context.memory)?;
+    let input = Schema::default();
+    for expressions in rows {
+        let scope = execution.scope()?;
+        scope.reserve(expressions.len().checked_mul(std::mem::size_of::<Value>()).ok_or_else(|| invalid("table-size", "Table row allocation overflow"))?)?;
+        let mut values = Vec::with_capacity(expressions.len());
+        for expr in expressions { values.push(execution.evaluate(&scope, expr, &input, &[]).await?); }
+        page.push(OwnedRow::new(values, &execution.context.memory)?)?;
     }
+    Ok(Some(page.finish()))
 }
 struct PageProject { input: BoxPageCursor, schema: Schema, expressions: Vec<NamedExpr>, execution: Execution }
 #[async_trait]

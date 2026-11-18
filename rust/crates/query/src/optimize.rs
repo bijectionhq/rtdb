@@ -33,12 +33,8 @@ fn prune(relation: Arc<Relation>, required: &BTreeSet<ColumnId>) -> Result<Arc<R
             let mut scan = scan.clone(); scan.columns.retain(|field| columns.contains(&field.id));
             Ok(Arc::new(Relation::scan(scan)?))
         }
-        RelationNode::Values { rows } => {
-            let indices = relation.schema().fields().iter().enumerate().filter_map(|(index, field)| required.contains(&field.id).then_some(index)).collect::<Vec<_>>();
-            let schema = Schema::new(indices.iter().map(|index| relation.schema().fields()[*index].clone()).collect())?;
-            let rows = rows.iter().map(|row| indices.iter().map(|index| row[*index].clone()).collect()).collect();
-            Ok(Arc::new(Relation::new(schema, RelationNode::Values { rows })?))
-        }
+        // An opened VALUES table evaluates every cell, including fields discarded by a parent projection.
+        RelationNode::Values { .. } => Ok(relation),
         RelationNode::Limit { input, offset, fetch } => {
             let child = prune(Arc::clone(input), required)?;
             bounds(child, offset.clone(), fetch.clone())

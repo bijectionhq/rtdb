@@ -99,6 +99,62 @@ async fn aggregate_factory_errors_precede_sql_setting_values() {
 }
 
 #[tokio::test]
+async fn values_rows_are_evaluated_when_the_table_opens() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    for sql in [
+        "VALUES (1 / 0)",
+        "SELECT v FROM (VALUES (1), (1 / 0)) AS t(v) LIMIT 1",
+        "SELECT v FROM (VALUES (1), (1 / 0)) AS t(v) LIMIT 0",
+        "SELECT v FROM (VALUES (1 / 0)) AS t(v) WHERE FALSE",
+        "SELECT 7 FROM (VALUES (1 / 0)) AS t(v)",
+        "EXPLAIN ANALYZE SELECT v FROM (VALUES (1 / 0)) AS t(v)",
+    ] {
+        let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        assert!(statement.result_schema(&context, &[]).is_ok(), "{sql}");
+        let error = statement.open_query(Arc::clone(&context), vec![]).await.err().unwrap();
+        assert_eq!(error.code, "xtdb.expression/division-by-zero", "{sql}");
+    }
+    assert_eq!(context.memory.used_bytes(), 0);
+    let projection = PreparedSql::prepare("SELECT 1 / 0 FROM (VALUES (1)) AS t(v) LIMIT 0", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = projection.open_query(context, vec![]).await.unwrap();
+    assert!(cursor.next_batch().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn values_cte_opening_depends_on_inline_or_materialized_lifetime() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    for sql in [
+        "WITH unused AS (VALUES (1 / 0)) SELECT 7 AS value",
+        "WITH MATERIALIZED unused AS (SELECT 1 / 0 AS n) SELECT 7 AS value",
+    ] {
+        let unused = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let mut cursor = unused.open_query(Arc::clone(&context), vec![]).await.unwrap();
+        let page = cursor.next_batch().await.unwrap().unwrap();
+        assert_eq!(read_value(page.batch().schema().field(0), page.batch().column(0).as_ref(), 0).unwrap(), Value::I64(7), "{sql}");
+    }
+    for sql in [
+        "WITH used AS (SELECT v FROM (VALUES (1 / 0)) AS t(v)) SELECT v FROM used LIMIT 0",
+        "WITH used AS (SELECT v FROM (VALUES (1 / 0)) AS t(v)) SELECT 7 AS value FROM used",
+        "WITH MATERIALIZED unused AS (VALUES (1 / 0)) SELECT 7 AS value",
+        "WITH MATERIALIZED used AS (SELECT v FROM (VALUES (1 / 0)) AS t(v)) SELECT v FROM used LIMIT 0",
+    ] {
+        let used = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+        let error = used.open_query(Arc::clone(&context), vec![]).await.err().unwrap_or_else(|| panic!("opened {sql}"));
+        assert_eq!(error.code, "xtdb.expression/division-by-zero", "{sql}");
+    }
+    assert_eq!(context.memory.used_bytes(), 0);
+}
+
+#[tokio::test]
+async fn lateral_values_open_with_the_dependent_arguments_during_pull() {
+    let context = context(None, &MemoryBudget::new(1 << 26));
+    let sql = "SELECT t.v, w.b FROM (VALUES (1), (0)) AS t(v), LATERAL (VALUES (1/t.v)) AS w(b) LIMIT 1";
+    let statement = PreparedSql::prepare(sql, &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let mut cursor = statement.open_query(context, vec![]).await.unwrap();
+    assert_eq!(cursor.next_batch().await.err().unwrap().code, "xtdb.expression/division-by-zero");
+}
+
+#[tokio::test]
 async fn unsigned_query_arguments_share_signed_scalar_and_aggregate_semantics() {
     let context = context(None, &MemoryBudget::new(1 << 27));
     let statement = PreparedSql::prepare("SELECT $1 AS value,$1=-1 AS equal,CAST($1 AS BIGINT) AS cast_value,STR($1) AS text,$1+2 AS added", &context, PrepareOptions::default(), ResultSignaturePolicy::Dynamic).unwrap();

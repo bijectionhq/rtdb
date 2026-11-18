@@ -46,3 +46,13 @@ async fn explain_description_and_open_check_aggregate_factory_types() {
     assert_eq!(described.schema(), cursor.schema());
     assert!(cursor.next_batch().await.unwrap().is_some());
 }
+
+#[tokio::test]
+async fn plain_explain_emits_types_without_opening_a_values_table() {
+    let context = context();
+    let prepared = PreparedSql::prepare("EXPLAIN SELECT v FROM (VALUES (1 / 0)) AS t(v)", &context, Default::default(), ResultSignaturePolicy::Dynamic).unwrap();
+    let described = prepared.result_schema(&context, &[]).unwrap();
+    let mut cursor = prepared.open_query(context, vec![]).await.unwrap();
+    assert_eq!(described.schema(), cursor.schema());
+    assert!(cursor.next_batch().await.unwrap().is_some());
+}

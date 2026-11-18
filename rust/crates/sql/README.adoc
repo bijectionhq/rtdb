@@ -64,6 +64,12 @@ Canonical mutation lowering preserves unassigned document fields, derives valid-
 Static mutation preparation exposes literal and parameter sources to the transaction submitter.
 All execution results remain pending for Phase 2.
 
+`VALUES` evaluates every cell when its table opens, including unprojected cells and cells in a query limited to zero rows.
+The query opens an inline CTE at its references and opens an explicitly materialized CTE when it enters that binding.
+An enclosing lateral operator opens a dependent table with the current outer arguments during execution.
+Plain `EXPLAIN` stops after operator emission.
+`EXPLAIN ANALYZE` consumes the query before reporting its execution observations.
+
 PERCENTILE_CONT and PERCENTILE_DISC accept a numeric literal or parameter fraction, one WITHIN GROUP ordering expression, and FILTER.
 Null input is excluded; explicit NULLS FIRST or NULLS LAST produces the pinned `NullOrderingIgnored` warning and does not change the result.
 Continuous results are nullable doubles; discrete results retain the nullable input type.
@@ -315,8 +321,8 @@ Materialized common-table expressions use `WITH MATERIALIZED name AS (...)`; a m
 `EXPLAIN` and `EXPLAIN ANALYZE` are query statements and carry query-level settings through the shared prepared-query path.
 The binder retains immutable rename descriptors and lexical materialized relation definitions.
 `WITH MATERIALIZED name AS (...)` follows the pinned grammar; ordinary CTEs remain inline definitions.
-Referenced materialized definitions are evaluated once per execution and replayed for each reference.
-Unused definitions are not advanced.
+Entering a materialized binding opens its definition once per execution.
+The first reference pulls pages from that cursor, and later references can replay those pages.
 Recursive CTEs and CTE column alias lists retain the reference's unsupported behavior.
 `tests/explain.rs` contains parser, shared-execution, scan-predicate, replay, cancellation, and analysis-counter assertions as source only.
 The query crate documents the remaining optimizer and original-form retention gaps affecting exact EXPLAIN output.
