@@ -104,6 +104,30 @@ impl NativeSession {
         cancellation.run_until_cancelled(self.control(statement, arguments, cancellation, options)).await.ok_or_else(cancelled)?
     }
 
+    /// Revalidates a frontend-owned SQL PREPARE and admits the supplied arguments.
+    /// The cancellation token must descend from this session.
+    /// Keep the returned scope through preparation of the immediate child.
+    pub async fn admit_frontend_prepare(&mut self, arguments: &[Value], cancellation: &CancellationToken) -> Result<Arc<EvaluationScope>> {
+        cancellation.run_until_cancelled(async {
+            self.state.revalidate().await?;
+            self.check_control_transaction(false)?;
+            self.admit_control_arguments(arguments)
+        }).await.ok_or_else(cancelled)?
+    }
+
+    fn check_control_transaction(&self, allows_failed: bool) -> Result<()> {
+        if self.state.status() == TransactionStatus::Failed && !allows_failed {
+            return Err(Anomaly::incorrect("xtdb/tx-failed", "Current transaction is aborted; roll back before issuing more statements"));
+        }
+        Ok(())
+    }
+
+    fn admit_control_arguments(&self, arguments: &[Value]) -> Result<Arc<EvaluationScope>> {
+        let allocation = Arc::new(EvaluationScope::new(self.service.node.memory())?);
+        allocation.reserve(arguments.iter().try_fold(256usize, |bytes, value| size(bytes, value.retained_bytes()?))?)?;
+        Ok(allocation)
+    }
+
     async fn control(&mut self, statement: &ControlStatement, arguments: &[Value], cancellation: &CancellationToken, options: ControlExecutionOptions) -> Result<ControlResult> {
         self.state.revalidate().await?;
         if matches!(options.frontend, ControlFrontend::Adbc | ControlFrontend::FlightSql) && matches!(statement, ControlStatement::Begin(_) | ControlStatement::Commit(_) | ControlStatement::Rollback) {
@@ -111,12 +135,9 @@ impl NativeSession {
         }
         let failed_inspection = matches!(options.frontend, ControlFrontend::Adbc | ControlFrontend::FlightSql)
             && matches!(statement, ControlStatement::Show { .. }) && !statement.requires_read_transaction();
-        if self.state.status() == TransactionStatus::Failed && !matches!(statement, ControlStatement::Rollback) && !failed_inspection {
-            return Err(Anomaly::incorrect("xtdb/tx-failed", "Current transaction is aborted; roll back before issuing more statements"));
-        }
+        self.check_control_transaction(matches!(statement, ControlStatement::Rollback) || failed_inspection)?;
         if arguments.len() < statement.parameter_count() { return Err(Anomaly::incorrect("xtdb/missing-parameter", "Control statement has fewer parameters than its expressions")); }
-        let allocation = Arc::new(EvaluationScope::new(self.service.node.memory())?);
-        allocation.reserve(arguments.iter().try_fold(256usize, |bytes, value| size(bytes, value.retained_bytes()?))?)?;
+        let allocation = self.admit_control_arguments(arguments)?;
         let mut admitted_arguments = arguments.to_vec();
         admitted_arguments.iter_mut().for_each(rtdb_columnar::admit_execution_value);
         let arguments = admitted_arguments.as_slice();

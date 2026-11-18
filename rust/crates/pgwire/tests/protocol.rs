@@ -932,3 +932,126 @@ async fn extended_client_probes_keep_emulation_and_sql_prepare_children_use_ordi
     drop(client);
     running.stop().await;
 }
+
+fn prepare_error_detail(frame: &(u8, Vec<u8>)) -> serde_json::Value {
+    assert_eq!(frame.0, b'E');
+    let detail = frame.1.split(|&byte| byte == 0).find_map(|field| field.strip_prefix(b"D")).unwrap();
+    serde_json::from_slice(detail).unwrap()
+}
+
+#[tokio::test]
+async fn extended_prepare_rejects_nested_grammar_before_acknowledgment_and_keeps_the_registration() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    client.parse("retained", "SELECT 42 AS n", &[]).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"1Z");
+
+    let source = "-- début\r\nPREPARE parent AS PREPARE child AS SELEC 7";
+    let start = source.find("SELEC").unwrap();
+    for in_transaction in [false, true] {
+        if in_transaction {
+            assert_eq!(client.query("BEGIN READ WRITE").await.last().unwrap().1, b"T");
+        }
+        client.parse("retained", source, &[]).await;
+        client.bind("skipped", "retained").await;
+        client.send(b'S', &[]).await;
+        let rejected = client.through(b'Z').await;
+        assert_eq!(tags(&rejected), b"EZ");
+        assert_eq!(rejected[1].1, if in_transaction { b"E" } else { b"I" });
+        let error = prepare_error_detail(&rejected[0]);
+        assert_eq!(error["code"], "xtdb/sql-error");
+        assert!(error["message"].as_str().unwrap().contains("SELEC"));
+        assert_eq!(error["data"]["position"], serde_json::json!(start + 1));
+        assert_eq!(error["data"]["span"], serde_json::json!({"start": start, "end": start + 5}));
+        if in_transaction {
+            assert_eq!(client.query("ROLLBACK").await.last().unwrap().1, b"I");
+        }
+        client.bind("", "retained").await;
+        client.execute("", 0).await;
+        client.send(b'S', &[]).await;
+        let retained = client.through(b'Z').await;
+        assert_eq!(tags(&retained), b"2DCZ");
+        assert_eq!(rows(&retained), [vec![Some(b"42".to_vec())]]);
+    }
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn extended_prepare_reports_a_reached_leaf_error_at_its_original_input_span() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    let source = "-- début\r\nPREPARE parent AS PREPARE child AS\n  XTQL $$($$";
+    client.parse("wire", source, &[23]).await;
+    let mut describe = vec![b'S'];
+    describe.extend_from_slice(&cstring("wire"));
+    client.send(b'D', &describe).await;
+    client.send(b'S', &[]).await;
+    let parsed = client.through(b'Z').await;
+    assert_eq!(tags(&parsed), b"1tnZ");
+    assert_eq!(parsed[1].1, b"\0\x01\0\0\0\x17");
+    assert_eq!(parsed[3].1, b"I");
+
+    client.bind("", "wire").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let outer = client.through(b'Z').await;
+    assert_eq!(tags(&outer), b"2CZ");
+    assert_eq!(outer[1].1, b"PREPARE\0");
+    assert_eq!(outer[2].1, b"I");
+
+    client.bind("", "parent").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    let reached = client.through(b'Z').await;
+    assert_eq!(tags(&reached), b"2EZ");
+    assert_eq!(reached[2].1, b"I");
+    let start = source.find("$$").unwrap();
+    let error = prepare_error_detail(&reached[1]);
+    assert_eq!(error["code"], "xtql/edn-reader");
+    assert_eq!(error["data"]["position"], serde_json::json!(start + 1));
+    assert_eq!(error["data"]["span"], serde_json::json!({"start": start, "end": start + "$$($$".len()}));
+    drop(client);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn extended_prepare_portals_keep_their_body_across_name_replacement_and_repeated_execution() {
+    let running = Running::start(ServerConfig::default(), None).await;
+    let mut client = Client::connect(&running.server, None).await;
+    for (portal, sql) in [
+        ("first", "PREPARE first_child AS SELECT 7 AS n"),
+        ("second", "PREPARE second_child AS SELECT 9 AS n"),
+    ] {
+        client.parse("wire", sql, &[]).await;
+        client.bind(portal, "wire").await;
+        client.send(b'S', &[]).await;
+        assert_eq!(tags(&client.through(b'Z').await), b"12Z");
+    }
+    for portal in ["first", "second", "first"] {
+        client.execute(portal, 0).await;
+    }
+    client.send(b'S', &[]).await;
+    let installed = client.through(b'Z').await;
+    assert_eq!(tags(&installed), b"CCCZ");
+    assert!(installed[..3].iter().all(|(_, body)| body == b"PREPARE\0"));
+    for (sql, value) in [("EXECUTE first_child", b"7"), ("EXECUTE second_child", b"9")] {
+        let frames = client.query(sql).await;
+        assert_eq!(tags(&frames), b"TDCZ");
+        assert_eq!(rows(&frames), [vec![Some(value.to_vec())]]);
+    }
+
+    client.parse("zone", "PREPARE zone_child AS SET TIME ZONE 'America/New_York'", &[]).await;
+    client.bind("", "zone").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"12CZ");
+    client.bind("", "zone_child").await;
+    client.execute("", 0).await;
+    client.send(b'S', &[]).await;
+    assert_eq!(tags(&client.through(b'Z').await), b"2SCZ");
+    assert_eq!(rows(&client.query("SHOW TIME ZONE").await), [vec![Some(b"America/New_York".to_vec())]]);
+    drop(client);
+    running.stop().await;
+}

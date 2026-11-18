@@ -29,6 +29,7 @@ pub use mutation::{Mutation, StaticMutation, prepare_tx, prepare_tx_in, prepare_
 pub use control::{ParsedControl, parse_control, parse_control_in, parse_control_syntax_in};
 pub use split::{SplitStatements, split_statements, split_statements_in};
 pub use batch::{BatchStatement, ExecutableSyntax, PrepareSyntax, StatementBatch, parse_statement_batch, parse_statement_batch_with_frontend_response};
+pub use batch::{ExtendedParse, ExtendedStatement, SqlPrepareChild, SqlPrepareSyntax, parse_extended_statement};
 
 use rtdb_plan::{Catalog, PreparedStatement};
 use rtdb_types::{LogicalType, MemoryBudget, Result};

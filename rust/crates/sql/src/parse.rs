@@ -8,7 +8,7 @@ use crate::dialect::SqlDialect;
 #[derive(Clone, Debug)]
 pub struct ParsedStatement<'input> {
     pub span: SourceSpan,
-    pub(crate) tree: StatementTree<'input>,
+    pub(crate) tree: StatementTree<StatementSource<'input>>,
     pub(crate) forms: crate::bind::FormAllocation<'input>,
     parameter_count: usize,
     pub(crate) inline_xtql: Vec<crate::inline_xtql::InlineXtql>,
@@ -25,7 +25,14 @@ pub struct StatementSyntax<'input> {
 #[derive(Clone, Debug)]
 pub struct DeferredStatementSyntax<'input> {
     span: SourceSpan,
-    tree: StatementTree<'input>,
+    tree: StatementTree<StatementSource<'input>>,
+    parameters: crate::inline_xtql::SourceArguments,
+}
+
+#[derive(Debug)]
+pub(super) struct RetainedStatementSyntax {
+    span: SourceSpan,
+    tree: StatementTree<SourceSpan>,
     parameters: crate::inline_xtql::SourceArguments,
 }
 
@@ -72,6 +79,11 @@ impl<'input> DeferredStatementSyntax<'input> {
     /// Returns the exact statement text from the batch.
     pub fn source(&self) -> &'input str { self.tree.source.text() }
 
+    pub(super) fn into_retained(self) -> RetainedStatementSyntax {
+        let source = self.tree.source.span();
+        RetainedStatementSyntax { span: self.span, tree: self.tree.with_source(source), parameters: self.parameters }
+    }
+
     /// Resolves the operands using the budget of the reached preparation context.
     pub fn resolve_in<'bind>(self, memory: &'bind Arc<MemoryBudget>) -> Result<ParsedStatement<'bind>> where 'input: 'bind {
         self.resolve(crate::bind::FormAllocation::Tracked(memory))
@@ -83,6 +95,19 @@ impl<'input> DeferredStatementSyntax<'input> {
             return Err(sql_error("Invalid anonymous parameter occurrence", self.tree.source.input, span));
         }
         Ok(ParsedStatement { span: self.span, tree: self.tree, forms, parameter_count: count, inline_xtql: inline })
+    }
+}
+
+impl RetainedStatementSyntax {
+    pub(super) fn span(&self) -> SourceSpan { self.span }
+
+    pub(super) fn with_input<'input>(&self, input: &'input str) -> DeferredStatementSyntax<'input> {
+        let source = StatementSource::bounded(input, self.tree.source);
+        DeferredStatementSyntax {
+            span: self.span,
+            tree: self.tree.clone().with_source(source),
+            parameters: self.parameters.clone(),
+        }
     }
 }
 
@@ -112,8 +137,8 @@ impl<'input> StatementSource<'input> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct StatementTree<'input> {
-    pub(crate) source: StatementSource<'input>,
+pub(crate) struct StatementTree<S> {
+    pub(crate) source: S,
     pub(crate) statement: Syntax,
     pub(crate) temporal: Vec<TemporalClause>,
     pub(crate) period_columns: std::collections::BTreeSet<String>,
@@ -121,7 +146,14 @@ pub(crate) struct StatementTree<'input> {
     pub(crate) wildcard_renames: Vec<crate::wildcard::WildcardRename>,
 }
 
-impl VisitMut for StatementTree<'_> {
+impl<S> StatementTree<S> {
+    fn with_source<T>(self, source: T) -> StatementTree<T> {
+        let Self { statement, temporal, period_columns, settings, wildcard_renames, .. } = self;
+        StatementTree { source, statement, temporal, period_columns, settings, wildcard_renames }
+    }
+}
+
+impl<S> VisitMut for StatementTree<S> {
     fn visit<V: ast::VisitorMut>(&mut self, visitor: &mut V) -> ControlFlow<V::Break> {
         match &mut self.statement {
             Syntax::Standard(statement) => statement.visit(visitor)?,

@@ -28,9 +28,19 @@ pub struct ParsedControl<'input> {
     syntax: ControlStatement<ast::Expr>,
 }
 
+#[derive(Debug)]
+pub(super) struct RetainedControlSyntax {
+    span: rtdb_plan::SourceSpan,
+    syntax: ControlStatement<ast::Expr>,
+}
+
 impl<'input> ParsedControl<'input> {
     /// Returns the original text of this control command.
     pub fn source(&self) -> &'input str { self.source.text() }
+
+    pub(super) fn into_retained(self) -> RetainedControlSyntax {
+        RetainedControlSyntax { span: self.source.span(), syntax: self.syntax }
+    }
 
     /// Determines whether Simple Query starts an implicit transaction around this command.
     pub fn starts_implicit_transaction(&self) -> bool {
@@ -48,6 +58,20 @@ impl<'input> ParsedControl<'input> {
                 None => bind(expression).map(ControlValue::Expression),
             }
         })
+    }
+}
+
+impl RetainedControlSyntax {
+    pub(super) fn span(&self) -> rtdb_plan::SourceSpan { self.span }
+
+    pub(super) fn with_input<'input>(
+        &self, input: &'input str, memory: &'input std::sync::Arc<rtdb_types::MemoryBudget>,
+    ) -> ParsedControl<'input> {
+        ParsedControl {
+            source: StatementSource::bounded(input, self.span),
+            forms: crate::bind::FormAllocation::Tracked(memory),
+            syntax: self.syntax.clone(),
+        }
     }
 }
 
