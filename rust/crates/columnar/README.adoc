@@ -301,6 +301,15 @@ Snapshots keep the descriptor and payload reservations independently of their or
 * SDK-backed readers, other source declarations and ranged or selected views return `Ok(None)` before admission.
   The `FixedBinary` reader remains usable after a budget error.
 
+`ScalarWriter::borrow_source_uuid` opens an exclusive UUID view over the existing mutable source `FixedBinary` writer.
+The view reads the writer's current name, nullability and signed count and lends its original data and validity buffers to a UUID source reader with the actual signed inner width.
+The view forwards raw bytes, undefined and null writes and clear through the same owner, budget and publication gate.
+A typed UUID write appends the caller’s sixteen bytes in UUID network order through one raw-byte operation.
+The operation uses those bytes verbatim for any signed inner width.
+Borrowing and releasing the view keep the allocation with the inner writer.
+Releasing the view returns exclusive access to the inner writer in its current publication state.
+Independent mutable handles, allocator transfer, close, mutable metadata setters, capacity and indexed setters, and row copy are outside the borrowed API.
+
 `SourceScalarReader` admits only native source scalar fixed storage under a direct reader with identity addressing.
 SDK-backed readers, checked ranges/selections, containers, named union legs and run-end wrappers return factory absence rather than a source method failure.
 The mutable reader bridge borrows sealed metadata, fixed backing and optional validity from its existing scalar owner without exposing mutable storage or another publication gate.
@@ -398,7 +407,7 @@ The first Slice and first explicit selection both check their inner class before
 
 `cells/source_scalar/tests.rs` records constructor extremes, all time units, signed write/copy prefixes, UUID capacity rejection under blocked budgets, nullable metadata overlap, typed capture, topology, deferred demand, first signed Slice and explicit index forwarding, signed LongLong lane demand, binary object underflow and surplus bytes, overlapping object reservations, abort inspection and retained snapshot ownership.
 These tests are unexecuted source under the Phase 1 gate.
-Mutable existing-inner aliases and cross-allocator slice ownership remain required constructor work.
+Cross-allocator slice ownership and the remaining existing-inner hooks remain required constructor work.
 Custom Java ZoneRulesProvider/rules support remains a mandatory open environment boundary requiring a typed retained rules representation.
 Full Field factories, source primitive, NPE, object, metadata, vector hashing and ByteBuffer behavior, remaining indirect-reader semantics, routed writers and promotions, recursive copying, relations, physical transport and production adoption remain required increments.
 

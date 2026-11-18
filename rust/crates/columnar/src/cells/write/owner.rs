@@ -317,11 +317,24 @@ impl ScalarWriter {
     pub(crate) fn from_descriptor(descriptor: &VectorDescriptor, memory: Arc<MemoryBudget>) -> Result<Self> {
         Ok(Self { scalar: ScalarState::from_descriptor(descriptor, &memory)?, state: PublicationState::Ready })
     }
+    pub(crate) fn borrow_source_uuid(&mut self) -> Option<SourceUuidWriter<'_>> {
+        self.source_uuid_declaration()?;
+        Some(SourceUuidWriter { inner: self })
+    }
+    fn source_uuid_declaration(&self) -> Option<SourceScalarDeclaration> {
+        let SourceScalarDeclaration::FixedBinary(inner_width) = self.scalar.descriptor.source_metadata()?.declaration() else {
+            return None;
+        };
+        Some(SourceScalarDeclaration::Uuid { inner_width })
+    }
     pub(crate) fn source_reader(&self) -> Result<Option<SourceScalarReader<'_>>> {
         let Some(metadata) = self.scalar.descriptor.source_metadata() else { return Ok(None); };
+        self.source_fixed_reader(metadata.declaration()).map(Some)
+    }
+    fn source_fixed_reader(&self, declaration: SourceScalarDeclaration) -> Result<SourceScalarReader<'_>> {
         let MutableScalarData::Fixed { data, .. } = &self.scalar.data else { return Err(layout()); };
         let validity = self.scalar.validity.as_ref().map(MutableBits::bytes);
-        Ok(Some(SourceScalarReader::fixed(metadata.declaration(), data.bytes(), validity)))
+        Ok(SourceScalarReader::fixed(declaration, data.bytes(), validity))
     }
     pub(crate) fn source_int_pointer(&self, row: i32) -> Result<Option<SourceBytePointer<'_>>> {
         if self.scalar.descriptor.count_class() != Some(CountScalarClass::IntArrow19Default) { return Ok(None); }
@@ -372,6 +385,49 @@ impl ScalarWriter {
     pub(crate) fn finish(self) -> Result<ExecutionVector> {
         if self.state == PublicationState::NativeAborted { return Err(aborted()); }
         self.scalar.finish()
+    }
+}
+
+pub(crate) struct SourceUuidWriter<'a> {
+    inner: &'a mut ScalarWriter,
+}
+
+impl SourceUuidWriter<'_> {
+    pub(crate) fn name(&self) -> &str {
+        self.inner.field().name()
+    }
+
+    pub(crate) fn is_nullable(&self) -> bool {
+        self.inner.field().is_nullable()
+    }
+
+    pub(crate) fn value_count(&self) -> i32 {
+        self.inner.value_count()
+    }
+
+    pub(crate) fn source_reader(&self) -> Result<SourceScalarReader<'_>> {
+        let declaration = self.inner.source_uuid_declaration().ok_or_else(layout)?;
+        self.inner.source_fixed_reader(declaration)
+    }
+
+    pub(crate) fn write_uuid(&mut self, value: [u8; 16]) -> WriteResult<()> {
+        self.write_bytes(&value)
+    }
+
+    pub(crate) fn write_bytes(&mut self, bytes: &[u8]) -> WriteResult<()> {
+        self.inner.write_bytes(bytes)
+    }
+
+    pub(crate) fn write_undefined(&mut self) -> WriteResult<()> {
+        self.inner.write_undefined()
+    }
+
+    pub(crate) fn write_null(&mut self) -> WriteResult<()> {
+        self.inner.write_null()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.inner.clear();
     }
 }
 

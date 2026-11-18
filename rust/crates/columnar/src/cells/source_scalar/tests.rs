@@ -224,6 +224,153 @@ fn uuid_adoption_rejects_other_receivers_and_preserves_the_inner_on_budget_failu
 }
 
 #[test]
+fn borrowed_uuid_and_fixed_binary_writes_use_one_live_prefix() {
+    let memory = memory();
+    let object_bound = 4096 + 4 * 16 + 4096;
+    let destination = MemoryBudget::new(object_bound);
+    let mut inner = writer(SourceScalarDeclaration::FixedBinary(16), false, &memory);
+    let first = *b"0123456789abcdef";
+    let second = *b"fedcba9876543210";
+    inner.write_bytes(&first).unwrap();
+    let address = inner.source_reader().unwrap().unwrap().get_bytes(0).unwrap().demand_native().unwrap().as_ptr();
+
+    let blocker = block(&memory, 0);
+    {
+        let mut uuid = inner.borrow_source_uuid().unwrap();
+        assert_eq!(uuid.name(), "scalar");
+        assert!(!uuid.is_nullable());
+        assert_eq!(uuid.value_count(), 1);
+        let reader = uuid.source_reader().unwrap();
+        assert_eq!(reader.get_bytes(0).unwrap().demand_native().unwrap().as_ptr(), address);
+        assert!(reader.get_long_long_high(0).is_none());
+        uuid.write_uuid(second).unwrap();
+        assert_eq!(uuid.value_count(), 2);
+        assert_eq!(memory.used_bytes(), memory.limit_bytes());
+    }
+    drop(blocker);
+    assert_eq!(inner.value_count(), 2);
+    assert_eq!(inner.source_reader().unwrap().unwrap().get_bytes(1).unwrap().demand_native().unwrap(), &second);
+    inner.write_long_long(1, 2).unwrap();
+    {
+        let mut uuid = inner.borrow_source_uuid().unwrap();
+        assert_eq!(uuid.value_count(), 3);
+        uuid.write_null().unwrap();
+        assert!(uuid.is_nullable());
+        uuid.write_undefined().unwrap();
+        let reader = uuid.source_reader().unwrap();
+        let value = reader.binary_object(1, &destination).unwrap().unwrap().unwrap();
+        assert_eq!(value.value(), &Value::Uuid(second));
+        assert_eq!(destination.peak_bytes(), object_bound);
+        for row in [3, 4] {
+            assert!(reader.binary_object(row, &destination).unwrap().unwrap().is_none());
+        }
+    }
+    assert_eq!(inner.value_count(), 5);
+    assert!(inner.field().is_nullable());
+    let inner = inner.finish().unwrap();
+    assert_eq!(declaration(&inner), SourceScalarDeclaration::FixedBinary(16));
+    assert_eq!(data(&inner).append, 80);
+    assert_eq!(storage(&inner).validity.as_ref().unwrap().bytes.as_slice()[0], 0b00111);
+    drop(inner);
+    assert_eq!(memory.used_bytes(), 0);
+    assert_eq!(destination.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_uuid_writes_sixteen_bytes_and_reads_the_signed_inner_width() {
+    let memory = memory();
+    let destination = MemoryBudget::new(8192);
+    let mut short = writer(SourceScalarDeclaration::FixedBinary(8), false, &memory);
+    let value = *b"0123456789abcdef";
+    {
+        let mut uuid = short.borrow_source_uuid().unwrap();
+        uuid.write_uuid(value).unwrap();
+        let reader = uuid.source_reader().unwrap();
+        assert_eq!(reader.get_pointer(0).length(), 8);
+        assert_eq!(reader.get_bytes(0).unwrap().demand_native().unwrap(), &value[..8]);
+        read_reference(reader.binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::UuidSecondLongUnderflow);
+    }
+    let short = short.finish().unwrap();
+    assert_eq!(short.value_count(), 1);
+    assert_eq!(data(&short).append, 16);
+    assert_eq!(&data(&short).bytes.as_slice()[..16], &value);
+    drop(short);
+    assert_eq!(destination.used_bytes(), 0);
+
+    let mut negative = writer(SourceScalarDeclaration::FixedBinary(-1), false, &memory);
+    {
+        let mut uuid = negative.borrow_source_uuid().unwrap();
+        reference(uuid.write_null(), ReferenceFailure::Bounds);
+        assert_eq!(uuid.value_count(), 0);
+        assert!(uuid.is_nullable());
+        let reader = uuid.source_reader().unwrap();
+        assert_eq!(reader.get_pointer(1).offset(), -1);
+        assert!(reader.binary_object(0, &destination).unwrap().unwrap().is_none());
+        read_reference(reader.binary_object0(0, &destination).unwrap(), SourceScalarReadFailure::NegativeViewLength(-1));
+        uuid.write_bytes(&[42]).unwrap();
+    }
+    let negative = negative.finish().unwrap();
+    assert_eq!(negative.value_count(), 1);
+    assert_eq!(data(&negative).append, 1);
+    assert_eq!(data(&negative).bytes.as_slice()[0], 42);
+    assert_eq!(storage(&negative).validity.as_ref().unwrap().bytes.as_slice()[0], 1);
+    drop(negative);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_uuid_observes_and_clears_the_inner_native_abort() {
+    let memory = memory();
+    let mut inner = writer(SourceScalarDeclaration::FixedBinary(16), true, &memory);
+    let value = *b"0123456789abcdef";
+    let blocker = block(&memory, 256);
+    {
+        let mut uuid = inner.borrow_source_uuid().unwrap();
+        assert!(matches!(uuid.write_uuid(value), Err(WriteError::Native(error)) if error.code == "rtdb/memory-budget-exceeded"));
+        assert_eq!(uuid.value_count(), 0);
+        let reader = uuid.source_reader().unwrap();
+        assert_eq!(reader.get_bytes(0).unwrap().demand_native().unwrap(), &value);
+        read_reference(reader.binary_object(0, &MemoryBudget::new(0)).unwrap(),
+            SourceScalarReadFailure::ValidityByteBounds { offset: 0, capacity: 0 });
+    }
+    drop(blocker);
+    assert!(matches!(inner.write_bytes(&value), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+    {
+        let mut uuid = inner.borrow_source_uuid().unwrap();
+        assert!(matches!(uuid.write_undefined(), Err(WriteError::Native(error)) if error.code == "rtdb/aborted-vector-writer"));
+        uuid.clear();
+        assert_eq!(uuid.value_count(), 0);
+        assert!(uuid.is_nullable());
+        assert_eq!(uuid.source_reader().unwrap().get_bytes(0).unwrap().demand_native().unwrap(), &[0; 16]);
+        uuid.write_uuid(value).unwrap();
+    }
+    let inner = inner.finish().unwrap();
+    assert_eq!(inner.value_count(), 1);
+    assert_eq!(data(&inner).append, 16);
+    assert_eq!(storage(&inner).validity.as_ref().unwrap().bytes.as_slice()[0], 1);
+    drop(inner);
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
+fn borrowed_uuid_excludes_sdk_time_and_already_wrapped_writers() {
+    let memory = memory();
+    let field = Arc::new(Field::new("sdk", DataType::FixedSizeBinary(16), false));
+    let mut sdk = ScalarWriter::new(field, Arc::clone(&memory)).unwrap();
+    let mut time = writer(SourceScalarDeclaration::Time32(TimeUnit::Second), false, &memory);
+    let mut uuid = writer(SourceScalarDeclaration::Uuid { inner_width: 16 }, false, &memory);
+    let before = memory.used_bytes();
+    let blocker = block(&memory, 0);
+    assert!(sdk.borrow_source_uuid().is_none());
+    assert!(time.borrow_source_uuid().is_none());
+    assert!(uuid.borrow_source_uuid().is_none());
+    drop(blocker);
+    assert_eq!(memory.used_bytes(), before);
+    drop((sdk, time, uuid));
+    assert_eq!(memory.used_bytes(), 0);
+}
+
+#[test]
 fn strict_sdk_factories_and_raw_reader_provenance_stay_separate() {
     let memory = memory();
     for data_type in [DataType::FixedSizeBinary(-1), DataType::Time32(arrow_schema::TimeUnit::Microsecond), DataType::Time64(arrow_schema::TimeUnit::Second)] {
