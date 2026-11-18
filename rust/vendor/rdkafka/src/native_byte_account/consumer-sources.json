@@ -17,7 +17,6 @@
     "rust/vendor/rdkafka/src/client.rs": "0ae8f0c320aad4626872a46140c60579ad55faf78843956aa7042077a6f29079",
     "rust/vendor/rdkafka/src/native_byte_account.rs": "d37fa580f0486ef70ad4c44db824bcb9cbb29f36cf9087f406bed2e85e1dd516",
     "rust/vendor/rdkafka/src/native_byte_account/OWNERSHIP.adoc": "9fad0e3144980b65205e896c5bbd3975bf59960b612ad30054741aff07492bcd",
-    "rust/vendor/rdkafka/src/ordered_metadata/TRANSPORT.adoc": "8f8f42c9afe7a28ecfa4d2ac97e05b1f15ce96cc39155713f473bb53e4e48823",
     "rust/crates/kafka/src/connect/registry/dlq/NATIVE-ACCOUNT.adoc": "87c0c662aa58ccaa58dfa917fd8386257e46270be3a4d07f68d456d5cedcbf18",
     "rust/crates/kafka/src/connect/driver.rs": "5091b4ad36af1bf9739e3b0595325bd6304d5d4621ed4b87415abdec63b382b4",
     "rust/crates/kafka/tests/native_byte_account.rs": "f077c37fbc7ca864e6a8eb35a00c355ce90cd4f39a40e9db822d9ba7a5fa93ec",

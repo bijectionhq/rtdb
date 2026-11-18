@@ -104,6 +104,36 @@
   "rationale": "Arrow types with no XTDB vector mapping (LargeUtf8, views, large lists, ...) in stored files or client batches.",
   "reference": "core/src/main/kotlin/xtdb/arrow/MergeFields.kt:72-96 unsupported(\"LargeList\"/\"Utf8View\"/...) throws UnsupportedOperationException."
  },
+ "rtdb/avro-custom-logical-type": {
+  "category": "jvm-host-dependent",
+  "rationale": "A custom Avro logical type is a Java class registered with LogicalTypes.register on the JVM classpath; a native node cannot load it.",
+  "reference": "org.apache.avro.LogicalTypes custom factories."
+ },
+ "rtdb/avro-java-text-reader-required": {
+  "category": "internal-guard",
+  "rationale": "Schema text reaches the reader from UTF-8 Registry responses, which cannot hold unmatched UTF-16 units.",
+  "reference": "No reference equivalent."
+ },
+ "rtdb/avro-logical-math-profile-required": {
+  "category": "jvm-host-dependent",
+  "rationale": "Consulted only when the two adjacent doubles around log10(2) floor fixed-decimal precision differently, which depends on the JVM's Math.log10 last-ulp result; realistic fixed sizes never reach it.",
+  "reference": "org.apache.avro.LogicalTypes.Decimal.maxPrecision"
+ },
+ "rtdb/avro-reader-buffer-profile": {
+  "category": "internal-guard",
+  "rationale": "Token buffer capacity invariant of the native reader; no input selects a smaller buffer than it requests.",
+  "reference": "No reference equivalent."
+ },
+ "rtdb/avro-reader-native-profile": {
+  "category": "reference-failure",
+  "rationale": "Numbers longer than 1,000 characters exceed Jackson's default StreamReadConstraints maxNumberLength, which the reference parser also rejects.",
+  "reference": "com.fasterxml.jackson.core.StreamReadConstraints DEFAULT_MAX_NUM_LEN"
+ },
+ "rtdb/avro-reader-native-projection": {
+  "category": "resource-or-format-guard",
+  "rationale": "Bounded size of the projected schema text handed to the native Avro backend.",
+  "reference": "No reference equivalent."
+ },
  "rtdb/decimal-width": {
   "category": "resource-or-format-guard",
   "rationale": "Decimal logical types must be 32, 64, 128 or 256 bits wide to map onto Arrow decimal storage.",
@@ -178,6 +208,51 @@
   "category": "reference-failure",
   "rationale": "ROUND(smallint/tinyint, scale): the reference case only maps :i32 and :i64 to a decimal precision and throws IllegalArgumentException otherwise.",
   "reference": "core/src/main/clojure/xtdb/expression.clj:1770-1778 (case int-col-type :i32 10 :i64 19)."
+ },
+ "xtdb.kafka-connect-source/registry-symbol-intern": {
+  "category": "internal-guard",
+  "rationale": "Consistency check on the native symbol intern table; Registry input cannot alter interned content.",
+  "reference": "No reference equivalent."
+ },
+ "xtdb.kafka-connect-source/unsupported-avro-input-profile": {
+  "category": "deferred-parity",
+  "rationale": "Avro schema documents above 256 KiB or with text above 50,000 units are rejected; the reference accepts them up to Jackson's limits. Listed in the kafka-avro-registry-and-producer resolution.",
+  "reference": "Jackson StreamReadConstraints defaults"
+ },
+ "xtdb.kafka-connect-source/unsupported-avro-native-profile": {
+  "category": "deferred-parity",
+  "rationale": "A schema the Java parser accepts but the native Avro backend cannot represent; observed cases are tracked by differential-equivalence.",
+  "reference": "org.apache.avro.Schema.Parser"
+ },
+ "xtdb.kafka-connect-source/unsupported-avro-reader": {
+  "category": "jvm-host-dependent",
+  "rationale": "specific.avro.reader and schema.reflection with named schemas load generated Java classes through SpecificData and ReflectData.",
+  "reference": "io.confluent.connect.avro.AvroData"
+ },
+ "xtdb.kafka-connect-source/unsupported-source-profile": {
+  "category": "resource-or-format-guard",
+  "rationale": "Registry response bodies outside the bounded native decoding profile.",
+  "reference": "No reference equivalent."
+ },
+ "xtdb.kafka/config-provider-class": {
+  "category": "jvm-host-dependent",
+  "rationale": "A custom ConfigProvider is a Java class; the native adapters cover the File, Directory and EnvVar providers that kafka-clients ships.",
+  "reference": "org.apache.kafka.common.config.provider"
+ },
+ "xtdb.kafka/config-provider-environment-encoding": {
+  "category": "resource-or-format-guard",
+  "rationale": "Environment names or values that are not valid process-encoded text.",
+  "reference": "No reference equivalent."
+ },
+ "xtdb.kafka/jaas-login-module": {
+  "category": "deferred-parity",
+  "rationale": "GSSAPI, OAUTHBEARER and custom JAAS login modules are rejected; PLAIN and SCRAM are implemented. Listed in the kafka-configurations resolution.",
+  "reference": "org.apache.kafka.common.security"
+ },
+ "xtdb.kafka/unsupported-config": {
+  "category": "jvm-host-dependent",
+  "rationale": "Interceptor, login handler and callback handler classes would run Java code inside the client.",
+  "reference": "kafka-clients class-valued properties"
  },
  "xtdb.pgwire/unsupported-binary-type": {
   "category": "reference-failure",

@@ -24,7 +24,7 @@
   "witness_qualification": "Type.hashCode, schema System.identityHashCode and source SeenPair System.identityHashCode are explicit stable source-operation witnesses. Native region/Pair tokens are identities only.",
   "recursion_owner": "Caller-owned logical Java-thread RecursionState with lazily initialized warmed seen collections, retained leases and exact outer finally clearing. No Rust thread-local or escaping task.",
   "shared_hash_map": "rust/crates/types/src/java_hash_map.rs",
-  "property_algorithm_evidence": "rust/crates/kafka/src/producer_metadata/state/topics.rs and topics/tree.rs at c81458546, plus pinned CHM primary source; specialized producer value owner is not reused.",
+  "property_algorithm_evidence": "rust/crates/kafka/src/producer_metadata/state/topics.rs and topics/tree.rs at c81458546 (removed in feaede823 as test-only), plus pinned CHM primary source; specialized producer value owner is not reused.",
   "name_char_policy": "Existing avro/names.rs unit_flags and retained canonical-name Unicode source profile; shared JavaString carries arbitrary UTF16.",
   "conflicts": [
     "Published A09 null-default suppression assertion remains unchanged and explicitly unresolved against pinned explicit-null String-node conversion."

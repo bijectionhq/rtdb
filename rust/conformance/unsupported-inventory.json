@@ -219,28 +219,30 @@
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:159"
-   ]
-  },
-  {
-   "code": "rtdb/avro-java-identity-required",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/connect/avro/schema_objects/evaluation.rs:17"
-   ]
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "A custom Avro logical type is a Java class registered with LogicalTypes.register on the JVM classpath; a native node cannot load it.",
+   "reference": "org.apache.avro.LogicalTypes custom factories."
   },
   {
    "code": "rtdb/avro-java-text-reader-required",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/java_text.rs:45"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Schema text reaches the reader from UTF-8 Registry responses, which cannot hold unmatched UTF-16 units.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "rtdb/avro-logical-math-profile-required",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/logical.rs:44"
-   ]
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "Consulted only when the two adjacent doubles around log10(2) floor fixed-decimal precision differently, which depends on the JVM's Math.log10 last-ulp result; realistic fixed sizes never reach it.",
+   "reference": "org.apache.avro.LogicalTypes.Decimal.maxPrecision"
   },
   {
    "code": "rtdb/avro-reader-buffer-profile",
@@ -248,7 +250,10 @@
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/buffers.rs:88",
     "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs:32"
-   ]
+   ],
+   "category": "internal-guard",
+   "rationale": "Token buffer capacity invariant of the native reader; no input selects a smaller buffer than it requests.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "rtdb/avro-reader-native-profile",
@@ -256,14 +261,20 @@
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/syntax.rs:211",
     "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs:29"
-   ]
+   ],
+   "category": "reference-failure",
+   "rationale": "Numbers longer than 1,000 characters exceed Jackson's default StreamReadConstraints maxNumberLength, which the reference parser also rejects.",
+   "reference": "com.fasterxml.jackson.core.StreamReadConstraints DEFAULT_MAX_NUM_LEN"
   },
   {
    "code": "rtdb/avro-reader-native-projection",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader/projection.rs:16"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Bounded size of the projected schema text handed to the native Avro backend.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "rtdb/decimal-width",
@@ -299,77 +310,6 @@
    "reference": "core/src/main/kotlin/xtdb/arrow/Vector.kt:181 HALF -> error(\"half precision not supported\")."
   },
   {
-   "code": "rtdb/kafka-address-list-size",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/addresses.rs:76"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-bootstrap-budget-domain",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:85"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-bootstrap-list-size",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:68"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-cluster-node-order-required",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/snapshot.rs:137"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-fatal-error-budget-domain",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/fatal.rs:77"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-in-flight-size",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/in_flight.rs:87"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-java-identity-required",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/keys.rs:22"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-java-shuffle-range",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:42"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-java-shuffle-required",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/bootstrap.rs:33"
-   ]
-  },
-  {
-   "code": "rtdb/kafka-partition-list-size",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/state/mod.rs:375",
-    "rust/crates/kafka/src/producer_metadata/state/monitor/topic.rs:119"
-   ]
-  },
-  {
    "code": "rtdb/run-end-type",
    "classification": "native-gap",
    "sites": [
@@ -400,13 +340,6 @@
    "category": "resource-or-format-guard",
    "rationale": "An Arrow extension name outside the XTDB set in a stored file or client batch has no logical type.",
    "reference": "No reference equivalent: the JVM ExtensionTypeRegistry leaves unknown extensions as their storage type."
-  },
-  {
-   "code": "rtdb/unsupported-producer-node-list",
-   "classification": "native-gap",
-   "sites": [
-    "rust/crates/kafka/src/producer_metadata/node_selection.rs:103"
-   ]
   },
   {
    "code": "xtdb.authn/device-auth-unsupported",
@@ -582,46 +515,61 @@
    "code": "xtdb.kafka-connect-source/registry-symbol-intern",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs:113",
-    "rust/crates/kafka/src/connect/registry/response/symbols.rs:129"
-   ]
+    "rust/crates/kafka/src/connect/registry/response/symbols.rs:128"
+   ],
+   "category": "internal-guard",
+   "rationale": "Consistency check on the native symbol intern table; Registry input cannot alter interned content.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "xtdb.kafka-connect-source/unsupported-avro-input-profile",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/input.rs:9"
-   ]
+   ],
+   "category": "deferred-parity",
+   "rationale": "Avro schema documents above 256 KiB or with text above 50,000 units are rejected; the reference accepts them up to Jackson's limits. Listed in the kafka-avro-registry-and-producer resolution.",
+   "reference": "Jackson StreamReadConstraints defaults"
   },
   {
    "code": "xtdb.kafka-connect-source/unsupported-avro-native-profile",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs:73"
-   ]
+   ],
+   "category": "deferred-parity",
+   "rationale": "A schema the Java parser accepts but the native Avro backend cannot represent; observed cases are tracked by differential-equivalence.",
+   "reference": "org.apache.avro.Schema.Parser"
   },
   {
    "code": "xtdb.kafka-connect-source/unsupported-avro-reader",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/connect/avro/reader.rs:67"
-   ]
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "specific.avro.reader and schema.reflection with named schemas load generated Java classes through SpecificData and ReflectData.",
+   "reference": "io.confluent.connect.avro.AvroData"
   },
   {
    "code": "xtdb.kafka-connect-source/unsupported-source-profile",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/connect/registry/response/cursor/text_buffer.rs:48",
-    "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs:76",
-    "rust/crates/kafka/src/connect/registry/response/window.rs:113"
-   ]
+    "rust/crates/kafka/src/connect/registry/response/cursor/text_buffer.rs:48"
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Registry response bodies outside the bounded native decoding profile.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "xtdb.kafka/config-provider-class",
    "classification": "native-gap",
    "sites": [
     "rust/crates/kafka/src/config/providers.rs:60"
-   ]
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "A custom ConfigProvider is a Java class; the native adapters cover the File, Directory and EnvVar providers that kafka-clients ships.",
+   "reference": "org.apache.kafka.common.config.provider"
   },
   {
    "code": "xtdb.kafka/config-provider-environment-encoding",
@@ -629,14 +577,30 @@
    "sites": [
     "rust/crates/kafka/src/config/providers/environment.rs:34",
     "rust/crates/kafka/src/config/providers/environment.rs:61"
-   ]
+   ],
+   "category": "resource-or-format-guard",
+   "rationale": "Environment names or values that are not valid process-encoded text.",
+   "reference": "No reference equivalent."
   },
   {
    "code": "xtdb.kafka/jaas-login-module",
    "classification": "native-gap",
    "sites": [
-    "rust/crates/kafka/src/config.rs:149"
-   ]
+    "rust/crates/kafka/src/config.rs:174"
+   ],
+   "category": "deferred-parity",
+   "rationale": "GSSAPI, OAUTHBEARER and custom JAAS login modules are rejected; PLAIN and SCRAM are implemented. Listed in the kafka-configurations resolution.",
+   "reference": "org.apache.kafka.common.security"
+  },
+  {
+   "code": "xtdb.kafka/unsupported-config",
+   "classification": "native-gap",
+   "sites": [
+    "rust/crates/kafka/src/config.rs:183"
+   ],
+   "category": "jvm-host-dependent",
+   "rationale": "Interceptor, login handler and callback handler classes would run Java code inside the client.",
+   "reference": "kafka-clients class-valued properties"
   },
   {
    "code": "xtdb.pgwire/unknown-client-msg",

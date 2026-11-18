@@ -18,8 +18,6 @@
     "rust/vendor/rdkafka/src/native_byte_account.rs": "d37fa580f0486ef70ad4c44db824bcb9cbb29f36cf9087f406bed2e85e1dd516",
     "rust/vendor/rdkafka/src/metadata.rs": "43ce8f0626a641ada6174b40cb4ab5dcd28c29f7d69ea700c73a9dfbcf049b78",
     "rust/vendor/rdkafka/src/message.rs": "8992730b18b16a1b500c237a48f4814f8288e4cbf37d60575965a8487d5103ec",
-    "rust/vendor/rdkafka/src/ordered_metadata.rs": "68a52346d1894a7f7378a784883e0edb4f2f96437640243263180cea4680703f",
-    "rust/vendor/rdkafka/src/ordered_metadata/connection.rs": "d2d16ec93af033e84959f18817c6e1c7957a3d3f96c967c3e36059ab5ab92fa1",
     "rust/vendor/rdkafka/src/producer/base_producer.rs": "f433b318875d4b3ad8e580fb47c81cd3582282c3de90c0681f4e79cab3e46b44",
     "rust/vendor/rdkafka/src/consumer/stream_consumer.rs": "9020f272af6bc4d3eb1a066bf4b3a5982cf13b3fc09b50ab68b3bac6c02d2455",
     "rust/vendor/rdkafka/src/config.rs": "642bc4cb84eaeb066d15ad0117c24eff5f8b881db3e5870d4aa873853a8e8ccf",

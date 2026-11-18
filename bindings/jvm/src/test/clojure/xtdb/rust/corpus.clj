@@ -38,6 +38,7 @@
 
 (defn- describe [{:keys [type expected actual message]}]
   (truncate (str (name type)
+                 (when (seq t/*testing-contexts*) (str " [" (t/testing-contexts-str) "]"))
                  (when message (str ": " message))
                  (if (instance? Throwable actual)
                    (let [^Throwable e actual]

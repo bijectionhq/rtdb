@@ -93,6 +93,8 @@ Decoder, transform, or indexer errors stop the assignment without an aborted pla
 The current submission adapter waits for admitted read-back per record; the reference document indexer hands off after resolution and can pipeline read-back.
 
 Native converters cover String, ByteArray, numeric, Boolean, schema-bearing or schemaless JSON, and the core Confluent Avro and JSON Schema wire paths.
+The pinned JVM node ships only the String, JSON and Confluent Avro converters.
+The ByteArray, numeric and Boolean converters and the Confluent JSON Schema converter are native extensions: a JVM node rejects those classes as not found.
 The String converter selects the key or value deserializer encoding before decoding, with `converter.encoding` supplying the fallback to both serializer and deserializer configuration.
 Selected serializer encodings are validated during opening even for ingestion.
 All nine Java25 standard charsets and their aliases are supported: UTF8, ASCII, ISO-8859-1, UTF16, UTF16BE, UTF16LE, UTF32, UTF32BE, and UTF32LE.

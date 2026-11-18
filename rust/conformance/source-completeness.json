@@ -82,7 +82,6 @@
         "rust/crates/kafka/src/connect/registry/schema_id.rs",
         "rust/crates/kafka/src/connect/registry/dlq.rs",
         "rust/crates/kafka/src/connect/registry/response/symbols.rs",
-        "rust/crates/kafka/src/connect/registry/response/symbols/bytes.rs",
         "rust/crates/kafka/src/connect/registry/response/default-profile.json",
         "rust/crates/kafka/src/connect/avro/java_schema/producer/pair.rs",
         "rust/crates/kafka/src/connect/avro/java_schema/producer/string_reader.rs",
@@ -93,7 +92,8 @@
         "rust/crates/pg-source/src/driver.rs",
         "rust/crates/kafka/src/connect/registry/factory.rs",
         "rust/crates/kafka/src/connect/avro/runtime.rs",
-        "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c"
+        "rust/vendor/rdkafka-sys/librdkafka/src/rdkafka_msgset_reader.c",
+        "rust/crates/kafka/src/config.rs"
       ]
     },
     "client_operational_surfaces": {
@@ -421,26 +421,28 @@
     {
       "id": "kafka-configurations",
       "kind": "implementation",
-      "status": "open",
+      "status": "resolved",
       "targets": [
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
       "requirement": "Reference Kafka log and Connect configuration keys, Java client properties, TLS and SASL settings and codecs reachable from user configuration are accepted with their reference effect, or listed as rejected. Converter registrations match the shipped classpath or are documented extensions.",
       "superseded_requirement": "Complete required built-in TLS algorithm/provider choices and nondefault Connect settings; reconcile native extension registrations with the shipped classpath.",
-      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification.",
+      "resolution": "Log, log-cluster and Connect configuration keys decode in rust/crates/format/src/config.rs and rust/crates/kafka/src/connect/config.rs with the reference key space. Java client properties in propertiesMap are translated to librdkafka equivalents, dropped with the kafka-clients unknown-config warning, or rejected when they would run Java code (rust/crates/kafka/src/config.rs and client.rs, documented in dev/doc/rust-adapters.adoc, with unit and writable-log tests). PLAIN and SCRAM JAAS, Java ssl.* keystore, truststore, provider and manager settings and the File, Directory and EnvVar config providers are implemented. librdkafka is built with zstd so Rust nodes read zstd batches; a mock-cluster test reads gzip, snappy, lz4 and zstd batches. Converter registrations are documented in rust/crates/kafka/README.adoc: ByteArray, numeric, Boolean and JSON Schema converters are native extensions absent from the shipped JVM classpath. Listed divergences: GSSAPI and OAUTHBEARER login modules, custom SASL login or callback handlers, interceptor classes, non-default ssl.engine.factory.class and JCEKS keystores are rejected; a property unknown to both kafka-clients and librdkafka fails client construction instead of warning."
     },
     {
       "id": "kafka-avro-registry-and-producer",
       "kind": "implementation",
-      "status": "open",
+      "status": "resolved",
       "targets": [
         "compaction_gc_adapters",
         "client_operational_surfaces"
       ],
       "requirement": "Schema Registry Avro and JSON values convert to the reference documents through the production Connect driver, DLQ records carry the reference contents and headers, and decompression and conversion stay within the native byte account. Rejected schema shapes are listed.",
       "superseded_requirement": "Extend the live same-input Avro pairing from scalar UTF8 to nullable JavaString transport, and finish source LogicalType construction, admitted graph/default and union materialization, MapEntry, qualified identity witnesses, and writer/SMT/cache owners. Preserve and reconcile the explicit null-default assertion conflict and qualify traversal beyond the native depth limit. Drive the observed Registry parser from the bounded live HTTP input with persistent symbol state, admitted nullable UTF16 schema, reference and rule consumers, and branch-specific version, cache and failure timing. Bind the existing connection timing, preferred DNS address, admitted logical flights and source jitter to qualified live DNS, socket, clock, Selector and request lifecycle events, including Math results and throttle deadlines. Drive the updater, exact native exchange, fatal broadcasts and topic wait from the live sender and use the resulting fixed partition, queue budget and timestamp in actual DLQ enqueue. Audit remaining cache borrowers and extend native admission to live copies, rack scratch, admin output, construction, security and outbound/compression owners.",
-      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification."
+      "rebaselined": "Owner decision 2026-11-18: Phase 1 closes against the README gate. Every user-observable surface has a wired, compiled and tested production path, and branches that reject input the reference accepts are listed. JVM-internal mechanism equivalence is Phase 2 differential qualification.",
+      "resolution": "Registry Avro and JSON values convert through RegistryConverter (rust/crates/kafka/src/connect/registry.rs), schema-ID lookup and the native Avro runtime into Connect data and documents. rust/crates/kafka/tests/connect_source.rs drives the production SourceDriver over a mock cluster and a stub Registry: Avro records become documents with their resume token, and a rule failure routes the original frame and rule headers to the DLQ before the source fails as errors.tolerance=none does. Registry readers, rules, DLQ contents, headers, CreateTime and partitioning are covered by tests/connect_registry_readers.rs, connect_registry_rules.rs and registry/dlq tests. Gzip, Snappy, LZ4 and Zstd Fetch output and decompression contexts are admitted to the native byte account, with C fixtures and mock-cluster denial tests. Primitive and name-reference schema references parse as in Java. The test-only producer Metadata, ordered Metadata, Registry input-window, observed-cursor and schema-object emulation was removed. Listed divergences: specific.avro.reader and schema.reflection with named schemas, Avro schema documents above 256 KiB, nesting deeper than 128, union references with inline named declarations, MapEntry container defaults and custom bearer providers are rejected; the null-default assertion conflict and Registry response timing belong to differential-equivalence; the log consumer does not attach the native byte account."
     },
     {
       "id": "recovered-block-confirmation",
