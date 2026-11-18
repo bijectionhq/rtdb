@@ -90,9 +90,11 @@ A replay failure ends the driver; it does not reopen a follower after discarding
 
 The applied-progress monitor intentionally differs from the pinned `api/log/Watchers.kt` and `db.allium`'s `ProcessingErrorHaltsNode`.
 An already-satisfied prefix remains available after a fault or shutdown; unmet waits fail with the current fault or stopped outcome.
-The progress monitor publishes the stopped state and any terminal driver fault together.
+The replica driver publishes its stopped state and any fault it reports as one update.
 The first recorded fault takes precedence.
-Only an explicitly initialized replacement driver clears the current fault.
+The database owner publishes a selected peer fault before requesting worker shutdown when its category differs from `Interrupted`.
+A replacement driver can clear an existing fault after its tail opens successfully.
+Tail initialization preserves faults reported since driver construction, including on a fresh monitor.
 This follows the object-boundaries monitor requirement, and runtime/reference compatibility remains unresolved rather than claimed.
 
 The row gauge follows `BlockCutter.txResolved`, whose resolved count is initially seeded from applied rows.

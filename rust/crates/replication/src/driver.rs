@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{BlockCycle, BlockStore, FlushTimer, PartitionLogs, PendingBlock, ProgressMonitor, RecoveredPartition, ReplicaRecord, TermFence, Verdict};
 use crate::appender::{Applied, AppenderHandle, PendingWrite, ReplicaAppender, WriteBody, complete_record, join_error, now};
-use crate::progress::{stopped, term_ended};
+use crate::progress::{DriverRestart, stopped, term_ended};
 use crate::state::fail_pending;
 
 #[async_trait]
@@ -218,6 +218,7 @@ impl LeaderState {
 
 pub struct ReplicationDriver {
     config: ReplicationConfig, logs: Arc<PartitionLogs>, blocks: Arc<BlockStore>, partition: Arc<PartitionState>, progress: Arc<ProgressMonitor>,
+    restart: Option<Arc<DriverRestart>>,
     resolve: Arc<ResolveContext>, effects: Arc<dyn DatabaseEffects>, cancellation: CancellationToken,
     fence: TermFence, read_position: ReplicaPosition, pending_block: Option<PendingBlock>, claim: Option<ReplicaPosition>, claiming: Option<Claim>,
     replica_tail: Option<Box<dyn LogTail>>, replica_poll: Option<Poll>, replica_batch: VecDeque<LogRecord>,
@@ -241,7 +242,8 @@ impl ReplicationDriver {
         let handle = ReplicationHandle { logs: Arc::clone(&logs), progress: Arc::clone(&progress), status: receiver, commands: sender, cancellation: cancellation.clone() };
         let persisted_tx = recovered.block.as_ref().and_then(BlockCatalog::latest_completed_tx).map(|key| key.tx_id);
         let flush_timer = FlushTimer::new(now(), persisted_tx, config.flush_timeout)?;
-        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, resolve, effects, cancellation, fence: recovered.fence,
+        let restart = if config.enabled { progress.prepare_driver_restart() } else { None };
+        Ok((handle, Self { config, logs, blocks, partition: recovered.partition, progress, restart, resolve, effects, cancellation, fence: recovered.fence,
             read_position, pending_block: None, claim: None, claiming: None, replica_tail: None, replica_poll: None, replica_batch: VecDeque::new(), leader: None, commands, status, flush_timer }))
     }
     pub async fn run(mut self) -> Result<()> {
@@ -262,8 +264,10 @@ impl ReplicationDriver {
             self.cancellation.cancelled().await;
             return Ok(());
         }
-        self.replica_tail = Some(self.logs.replica_tail(self.read_position).await?);
-        self.progress.driver_restarted();
+        let tail = self.logs.replica_tail(self.read_position).await?;
+        if self.cancellation.is_cancelled() { return Ok(()); }
+        self.progress.driver_initialized(self.restart.take())?;
+        self.replica_tail = Some(tail);
         if self.config.may_lead && self.fence.highest_term() == Term(0) { self.start_claim()?; }
         loop {
             if self.cancellation.is_cancelled() { return Ok(()); }

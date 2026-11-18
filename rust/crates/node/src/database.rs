@@ -161,6 +161,9 @@ impl DatabaseDriver {
             result = tasks.join_next() => Some(component_exit(result)),
             result = logs.join_next(), if !logs.is_empty() => Some(component_exit(result)),
         };
+        if let Some(error) = failure.as_ref().filter(|error| error.category != AnomalyCategory::Interrupted) {
+            self.database.progress().ingestion_failed(error.clone());
+        }
         self.database.cancel();
         let mut failure = failure;
         while let Some(result) = tasks.join_next().await {

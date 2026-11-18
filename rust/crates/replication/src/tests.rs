@@ -501,3 +501,39 @@ async fn own_external_progress_fault_reaches_the_popped_transaction_receipt() {
     assert!(progress.latest_result.is_none());
     assert_eq!(progress.external_token.as_deref(), Some(&previous_token[..]));
 }
+
+#[test]
+fn replacement_clears_only_the_terminal_progress_it_was_prepared_for() {
+    let monitor = ProgressMonitor::new(AppliedProgress {
+        source_position: SourcePosition(-1), tx_key: None, latest_result: None, external_token: None,
+    });
+    let first = Anomaly::fault("test/first-fault", "First ingestion fault");
+    assert!(monitor.prepare_driver_restart().is_none());
+    monitor.driver_initialized(None).unwrap();
+    monitor.ingestion_failed(first.clone());
+    assert_eq!(monitor.driver_initialized(None).unwrap_err(), first);
+
+    let restart = monitor.prepare_driver_restart();
+    assert!(restart.is_some());
+    monitor.driver_initialized(restart).unwrap();
+    monitor.applied(Some(SourcePosition(0)), None, None).unwrap();
+
+    monitor.ingestion_failed(first.clone());
+    let restart = monitor.prepare_driver_restart();
+    monitor.ingestion_failed(first.clone());
+    assert_eq!(monitor.driver_initialized(restart).unwrap_err(), first);
+    let restart = monitor.prepare_driver_restart();
+    monitor.ingestion_failed(Anomaly::fault("test/later-fault", "Later ingestion fault"));
+    assert_eq!(monitor.driver_initialized(restart).unwrap_err(), first);
+    assert_eq!(monitor.fault(), Some(first));
+    assert_eq!(monitor.current().source_position, SourcePosition(0));
+
+    monitor.driver_restarted();
+    monitor.stopped();
+    let restart = monitor.prepare_driver_restart();
+    monitor.stopped();
+    assert_eq!(monitor.driver_initialized(restart).unwrap_err(), crate::progress::stopped());
+    let restart = monitor.prepare_driver_restart();
+    monitor.driver_initialized(restart).unwrap();
+    monitor.applied(Some(SourcePosition(1)), None, None).unwrap();
+}

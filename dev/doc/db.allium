@@ -1546,6 +1546,7 @@ deferred FoldIntoTermPosition
 open question "Which already-applied query bases remain available after an ingestion failure?"
     -- ProcessingErrorHaltsNode and the pinned JVM Watchers fail every later await.
     -- The native progress monitor serves satisfied bases and reports the recorded ingestion fault to unmet waiters.
+    -- The native database owner reports a selected non-interrupted peer fault before requesting worker shutdown.
     -- The object-boundaries contract requires wait conditions to remain re-evaluable.
 
 open question "Does the idle flush deadline advance the block catalog when the open block has no rows?"

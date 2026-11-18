@@ -1151,3 +1151,151 @@ async fn source_log_uri_values_render_as_nfc_ascii_without_changing_stored_text(
         stop(&node,driver).await;
     }).await.unwrap();
 }
+
+mod peer_failure {
+    use super::*;
+    use prost::bytes::Bytes;
+    use rtdb_replication::Role;
+    use rtdb_storage::log::{AppendReceipt, Log, LogOffset, LogRange, LogRecord, LogTail};
+
+    struct Gate { entered: Semaphore, release: Semaphore }
+    impl Gate {
+        fn new() -> Self { Self { entered: Semaphore::new(0), release: Semaphore::new(0) } }
+        async fn hold(&self) {
+            self.entered.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+    }
+
+    struct GatedReplica { log: Arc<dyn Log>, tail: Arc<Gate> }
+    #[async_trait]
+    impl Log for GatedReplica {
+        async fn enqueue(&self, payload: Bytes, timestamp: Timestamp) -> rtdb_storage::Result<AppendReceipt> {
+            self.log.enqueue(payload, timestamp).await
+        }
+        fn latest(&self) -> rtdb_storage::Result<LogOffset> { self.log.latest() }
+        async fn tail(&self, after: LogOffset) -> rtdb_storage::Result<Box<dyn LogTail>> {
+            self.tail.hold().await;
+            self.log.tail(after).await
+        }
+        async fn range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Box<dyn LogRange>> {
+            self.log.range(from, to).await
+        }
+        async fn read_range(&self, from: LogOffset, to: LogOffset) -> rtdb_storage::Result<Vec<LogRecord>> {
+            self.log.read_range(from, to).await
+        }
+    }
+
+    fn fault() -> Anomaly { Anomaly::fault("test/peer-log-failed", "Injected database log peer failure") }
+
+    struct Resources {
+        native: NativeResources,
+        failure: Arc<Semaphore>,
+        teardown: Arc<Gate>,
+        tail: Option<Arc<Gate>>,
+    }
+
+    #[async_trait]
+    impl ResourceFactory for Resources {
+        fn validate(&self, name: &str, config: &DatabaseConfig) -> Result<()> { self.native.validate(name, config) }
+        async fn close(&self) -> Result<()> { self.native.close().await }
+        async fn open_storage(&self, name: &str, config: &DatabaseConfig) -> Result<DatabaseStorage> {
+            self.native.open_storage(name, config).await
+        }
+        async fn open_logs(&self, name: &str, config: &DatabaseConfig, access: LogAccess, cancellation: CancellationToken, storage: &DatabaseStorage) -> Result<OpenedLogs> {
+            let mut logs = self.native.open_logs(name, config, access, cancellation.clone(), storage).await?;
+            if name == "other" {
+                if let Some(tail) = &self.tail {
+                    logs.replica = Arc::new(GatedReplica { log: Arc::clone(&logs.replica), tail: Arc::clone(tail) });
+                }
+                let failure = Arc::clone(&self.failure);
+                let failure_cancellation = cancellation.clone();
+                logs.drivers.push(async move {
+                    tokio::select! {
+                        _ = failure_cancellation.cancelled() => Ok(()),
+                        permit = failure.acquire() => { permit.unwrap().forget(); Err(fault()) },
+                    }
+                }.boxed());
+                let teardown = Arc::clone(&self.teardown);
+                logs.drivers.push(async move {
+                    cancellation.cancelled().await;
+                    teardown.hold().await;
+                    Ok(())
+                }.boxed());
+            }
+            Ok(logs)
+        }
+    }
+
+    async fn start(tail: Option<Arc<Gate>>) -> (Node, tokio::task::JoinHandle<Result<()>>, Arc<Resources>) {
+        let resources = Arc::new(Resources {
+            native: NativeResources::default(),
+            failure: Arc::new(Semaphore::new(0)),
+            teardown: Arc::new(Gate::new()),
+            tail,
+        });
+        let mut services = services();
+        services.resources = resources.clone();
+        let (node, driver) = running(options(), services).await;
+        assert!(node.attach_database("other".into(), Default::default(), &Authority, &CancellationToken::new()).await.unwrap().committed());
+        (node, driver, resources)
+    }
+
+    async fn release_and_stop(node: &Node, driver: tokio::task::JoinHandle<Result<()>>, resources: &Resources) {
+        resources.teardown.release.add_permits(1);
+        let cancellation = CancellationToken::new();
+        assert!(node.detach_database("other".into(), &Authority, &cancellation).await.unwrap().committed());
+        while node.catalog().check_attach("other", &DatabaseConfig::default()).is_err() { tokio::task::yield_now().await; }
+        stop(node, driver).await;
+    }
+
+    #[tokio::test]
+    async fn running_database_publishes_the_peer_fault_before_log_teardown_finishes() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (node, driver, resources) = start(None).await;
+            let cancellation = CancellationToken::new();
+            let database = node.catalog().database("other").unwrap();
+            let mut session = node.session("other", Arc::new(Authority)).unwrap();
+            let applied = session.state_mut().execute_tx(vec![put(&node, 1, 10)], AutonomousTxOptions::default()).await.unwrap();
+            assert!(applied.committed());
+            let key = applied.tx_key();
+            let next = TxId(key.tx_id.0 + 1);
+            let wait = node.await_transaction("other", next, &Authority, &cancellation);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+
+            resources.failure.add_permits(1);
+            resources.teardown.entered.acquire().await.unwrap().forget();
+            assert_eq!(database.status().role, Role::Stopped);
+            assert_eq!(wait.await.unwrap_err(), fault());
+            assert_eq!(node.await_transaction("other", next, &Authority, &cancellation).await.unwrap_err(), fault());
+            assert_eq!(node.await_transaction("other", key.tx_id, &Authority, &cancellation).await.unwrap().tx_key(), key);
+            release_and_stop(&node, driver, &resources).await;
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_replica_tail_open_preserves_an_earlier_peer_fault() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let tail = Arc::new(Gate::new());
+            let (node, driver, resources) = start(Some(Arc::clone(&tail))).await;
+            let cancellation = CancellationToken::new();
+            let database = node.catalog().database("other").unwrap();
+            tail.entered.acquire().await.unwrap().forget();
+            let wait = node.await_transaction("other", TxId(0), &Authority, &cancellation);
+            tokio::pin!(wait);
+            assert!(futures::poll!(&mut wait).is_pending());
+
+            resources.failure.add_permits(1);
+            assert_eq!(wait.await.unwrap_err(), fault());
+            assert_eq!(database.status().role, Role::Following);
+            tail.release.add_permits(1);
+            resources.teardown.entered.acquire().await.unwrap().forget();
+            assert_eq!(database.status().role, Role::Stopped);
+            assert_eq!(database.status().highest_term, rtdb_types::Term(0));
+            assert_eq!(database.progress().fault(), Some(fault()));
+            assert_eq!(node.await_transaction("other", TxId(0), &Authority, &cancellation).await.unwrap_err(), fault());
+            release_and_stop(&node, driver, &resources).await;
+        }).await.unwrap();
+    }
+}

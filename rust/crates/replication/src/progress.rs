@@ -16,13 +16,29 @@ impl AppliedProgress {
     pub fn tx_id(&self) -> TxId { self.tx_key.map_or(TxId(-1), |key| key.tx_id) }
 }
 
+#[derive(Debug)]
+pub(crate) struct DriverRestart;
+
 #[derive(Clone, Debug)]
-struct ProgressState { applied: AppliedProgress, fault: Option<Anomaly>, stopped: bool }
+struct ProgressState {
+    applied: AppliedProgress,
+    fault: Option<Anomaly>,
+    stopped: bool,
+    restart: Option<Arc<DriverRestart>>,
+}
+
+impl ProgressState {
+    fn clear_terminal(&mut self) {
+        self.fault = None;
+        self.stopped = false;
+        self.restart = None;
+    }
+}
 
 pub struct ProgressMonitor { state: watch::Sender<ProgressState> }
 impl ProgressMonitor {
     pub fn new(applied: AppliedProgress) -> Arc<Self> {
-        Arc::new(Self { state: watch::channel(ProgressState { applied, fault: None, stopped: false }).0 })
+        Arc::new(Self { state: watch::channel(ProgressState { applied, fault: None, stopped: false, restart: None }).0 })
     }
     pub fn current(&self) -> AppliedProgress { self.state.borrow().applied.clone() }
     pub fn fault(&self) -> Option<Anomaly> { self.state.borrow().fault.clone() }
@@ -49,15 +65,53 @@ impl ProgressMonitor {
     }
 
     pub fn ingestion_failed(&self, failure: Anomaly) {
-        self.state.send_modify(|state| { if state.fault.is_none() { state.fault = Some(failure); } });
+        self.state.send_modify(|state| {
+            state.restart = None;
+            if state.fault.is_none() { state.fault = Some(failure); }
+        });
     }
 
-    /// The owner calls this only after a replacement driver has successfully initialized.
-    pub fn driver_restarted(&self) { self.state.send_modify(|state| { state.fault = None; state.stopped = false; }); }
+    /// Explicitly reopens progress after the caller has initialized a replacement driver.
+    /// The caller must ensure the reset cannot clear a newer fault or stop report.
+    pub fn driver_restarted(&self) { self.state.send_modify(ProgressState::clear_terminal); }
     pub fn stopped(&self) { self.driver_stopped(None); }
+
+    pub(crate) fn prepare_driver_restart(&self) -> Option<Arc<DriverRestart>> {
+        let mut restart = None;
+        self.state.send_if_modified(|state| {
+            if state.fault.is_some() || state.stopped {
+                let permit = Arc::new(DriverRestart);
+                state.restart = Some(Arc::clone(&permit));
+                restart = Some(permit);
+                return true;
+            }
+            false
+        });
+        restart
+    }
+
+    pub(crate) fn driver_initialized(&self, restart: Option<Arc<DriverRestart>>) -> Result<()> {
+        let mut outcome = Ok(());
+        self.state.send_if_modified(|state| {
+            let can_restart = state.restart.as_ref().zip(restart.as_ref())
+                .is_some_and(|(armed, provided)| Arc::ptr_eq(armed, provided));
+            if can_restart {
+                state.clear_terminal();
+                return true;
+            }
+            outcome = match &state.fault {
+                Some(fault) => Err(fault.clone()),
+                None if state.stopped => Err(stopped()),
+                None => Ok(()),
+            };
+            false
+        });
+        outcome
+    }
 
     pub(crate) fn driver_stopped(&self, failure: Option<Anomaly>) {
         self.state.send_modify(|state| {
+            state.restart = None;
             if state.fault.is_none() { state.fault = failure; }
             state.stopped = true;
         });
