@@ -1,6 +1,10 @@
 (ns xtdb.rust-test
   (:require [clojure.test :refer [deftest is]]
             [xtdb.api :as xt]
+            [xtdb.operator.group-by-test :as original-group-by]
+            [xtdb.sql.expr-test :as original-expr]
+            [xtdb.sql-test :as original-sql]
+            [xtdb.test-util :as tu]
             [xtdb.protocols :as protocols]
             [xtdb.rust])
   (:import [org.apache.arrow.memory RootAllocator]
@@ -35,41 +39,18 @@
     (protocols/-execute-tx node [{:op :sql, :sql "INSERT INTO docs (_id) VALUES (3)", :arg-rows []}] {})
     (is (= [{:xt/id 1} {:xt/id 2}] (xt/q node "SELECT _id FROM docs ORDER BY _id")))))
 
-(deftest multiple-query-tails
+(defn- run-original-api-case [original]
   (with-open [allocator (RootAllocator.)
               node (open-node allocator)]
-    (xt/submit-tx node [[:put-docs :foo {:xt/id 1, :v 1}]
-                        [:put-docs :foo {:xt/id 2, :v 1}]
-                        [:put-docs :foo {:xt/id 3, :v 2}]
-                        [:put-docs :foo {:xt/id 4, :v 3}]
-                        [:put-docs :foo {:xt/id 5, :v 4}]])
+    (binding [tu/*allocator* allocator
+              tu/*node* node]
+      ((:test (meta original))))))
 
-    (is (= [{:v 1, :v-count 2} {:v 2, :v-count 1} {:v 3, :v-count 1} {:v 4, :v-count 1}]
-           (xt/q node "FROM foo
-                            SELECT v, COUNT(*) AS v_count
-                            ORDER BY v")))
+(deftest multiple-query-tails
+  (run-original-api-case #'original-sql/multiple-query-tails))
 
-    (is (= [{:v-count 1, :freq 3} {:v-count 2, :freq 1}]
-           (xt/q node "FROM foo
-                            SELECT v, COUNT(*) AS v_count
-                            SELECT v_count, COUNT(*) AS freq
-                            ORDER BY v_count"))
-        "double aggregate")
-
-    (is (= [{:v 2} {:v 3} {:v 4} {:v 1}]
-           (xt/q node "FROM foo
-                            SELECT v, COUNT(*) AS v_count
-                            SELECT v
-                            ORDER BY v_count, v"))
-        "ORDER BY sees through outermost SELECT")
-
-    (is (= [{:xt/id 1} {:xt/id 3} {:xt/id 4} {:xt/id 5}]
-           (xt/q node "FROM foo
-                            SELECT _id, ROW_NUMBER () OVER (PARTITION BY v ORDER BY _id) row_num
-                            WHERE row_num = 1
-                            SELECT _id
-                            ORDER BY _id"))
-        "we can filter on window functions")))
+(deftest duration-literal-query
+  (run-original-api-case #'original-expr/duration-literal-query))
 
 (deftest unnest-actor-results
   (with-open [allocator (RootAllocator.)
@@ -93,35 +74,13 @@
            (xt/q node "SELECT name, film, ord FROM actors, UNNEST(films) WITH ORDINALITY AS films(film, ord)")))))
 
 (deftest unnest-null-or-missing-4075
-  (with-open [allocator (RootAllocator.)
-              node (open-node allocator)]
-    (xt/execute-tx node ["CREATE TABLE foo (b)"])
-    (xt/execute-tx node ["INSERT INTO foo RECORDS {_id: 1, a: 2}"])
-    (is (= [] (xt/q node "SELECT bs.b FROM foo, UNNEST(foo.b) AS bs(b)")))))
+  (run-original-api-case #'original-sql/test-unnest-null-or-missing-4075))
 
 (deftest test-min-max-over-declared-empty-column-return-nil-6133
-  (with-open [allocator (RootAllocator.)
-              node (open-node allocator)]
-    (xt/execute-tx node [[:sql "CREATE TABLE docs (v)"]])
-
-    (is (= [{}]
-           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx FROM docs"))
-        "directly over the scan")
-
-    (is (= [{}]
-           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx
-                            FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) t"))
-        "over a UNION ALL of the scan")))
+  (run-original-api-case #'original-group-by/test-min-max-over-declared-empty-column-return-nil-6133))
 
 (deftest test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133
-  (with-open [allocator (RootAllocator.)
-              node (open-node allocator)]
-    (xt/execute-tx node [[:sql "CREATE TABLE docs (v)"]
-                         [:put-docs :docs {:xt/id 1}]])
-
-    (is (= [{}]
-           (xt/q node "SELECT MIN(v) AS mn, MAX(v) AS mx
-                            FROM (SELECT v FROM docs UNION ALL SELECT v FROM docs) t")))))
+  (run-original-api-case #'original-group-by/test-min-max-over-declared-column-absent-from-written-rows-return-nil-6133))
 
 (deftest incompatible-extrema-retain-the-vector-type-in-transit
   (with-open [allocator (RootAllocator.)

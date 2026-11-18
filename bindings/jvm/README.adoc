@@ -69,8 +69,8 @@ The binding rejects the `xtdb.config` factory-object option explicitly.
 Existing remote JDBC, PostgreSQL, Python Flight SQL and Rust clients retain their protocol interfaces.
 
 The new module does not invoke Cargo from Gradle and does not build or load a native library during source preparation.
-The test sources require a separately built library at `xtdb.native.library` when the full implementation gate permits execution.
-No native, JVM or Clojure test has been run in the implementation phase.
+The binding tests load a separately built native library from `xtdb.native.library`.
+The Clojure suite invokes the original query-tail, duration literal, null-or-missing UNNEST, and declared-column extrema test bodies with a fresh `NativeDatabase`.
 
 === SQL parser errors
 

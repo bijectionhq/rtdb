@@ -5,6 +5,8 @@ plugins {
 
 java.toolchain.languageVersion.set(JavaLanguageVersion.of(25))
 
+val originalTestRuntime = rootProject.extensions.getByType<SourceSetContainer>().named("test").map { it.runtimeClasspath }
+
 tasks.withType<JavaCompile>().configureEach {
     options.release.set(25)
 }
@@ -17,6 +19,7 @@ dependencies {
     implementation(libs.next.jdbc)
     implementation(libs.pgjdbc)
     implementation("org.apache.arrow:arrow-c-data:19.0.0")
+    testImplementation(files(originalTestRuntime).builtBy(rootProject.tasks.named("testClasses")))
     testImplementation(libs.junit.jupiter.api)
     testRuntimeOnly(libs.junit.jupiter.engine)
     testRuntimeOnly(libs.junit.platform.launcher)
