@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 use rtdb_columnar::MemoryBudget;
-use rtdb_format::transit::{TransitValue as T, decode_json, encode_json};
+use rtdb_format::transit::{TransitValue as T, encode_json};
 use rtdb_node::AutonomousTxOptions;
 use rtdb_tx::{Documents, EntityIds, SqlArguments, TxOp, UserMetadata};
 use rtdb_types::{Result, TableRef, Timestamp, Value};
@@ -21,7 +21,7 @@ fn output(value: &Value, typed_structs: bool) -> Result<T> {
             if typed_structs { tag("rtdb/struct", fields) } else { fields }
         }
         Value::Map { entries, .. } => T::Map(entries.iter().map(|(key, value)| Ok((output(key, typed_structs)?, output(value, typed_structs)?))).collect::<Result<_>>()?),
-        value => decode_json(&rtdb_pg_codec::encode_value(rtdb_types::PgType::Transit, rtdb_pg_codec::Format::Text, value, &Default::default())?)?,
+        value => rtdb_pg_codec::to_transit(value)?,
     })
 }
 

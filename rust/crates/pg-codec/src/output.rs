@@ -85,7 +85,7 @@ pub fn encode_value(mut ty: PgType, format: Format, value: &Value, environment: 
         PgType::Oid | PgType::RegClass | PgType::RegProc => { let number = match value { Value::Oid(value) | Value::RegClass(value) | Value::RegProc(value) | Value::I32(value) => *value as u32, _ => return Err(incompatible(ty, value)) }; number.to_string().into_bytes() }
         PgType::Int4s | PgType::Int8s | PgType::Texts => array_write(ty, format, value, environment)?,
         PgType::Json | PgType::JsonLd => { let mut output = String::new(); json(value, ty == PgType::JsonLd, &mut output, 0)?; output.into_bytes() }
-        PgType::Transit => rtdb_format::transit::encode_json(&to_transit(value, 0)?)?,
+        PgType::Transit => rtdb_format::transit::encode_json(&build_transit(value, 0)?)?,
         PgType::Jsonb => return Err(unsupported(ty, "writer")),
         PgType::Default => return Err(unsupported(ty, "writer")),
     };
@@ -186,7 +186,13 @@ fn scalar_text(value: &Value) -> Result<(&'static str, String)> {
 }
 fn display_key(value: &Value) -> Result<String> { match value { Value::Utf8(value) => Ok(value.clone()), Value::Keyword(value) => Ok(value.as_str().into()), Value::Null => Ok("null".into()), Value::Bool(value) => Ok(value.to_string()), value => rtdb_expr::integer(value).map(|value| value.to_string()).map(Ok).unwrap_or_else(|| scalar_text(value).map(|(_, text)| text)) } }
 
-fn to_transit(value: &Value, depth: usize) -> Result<TransitValue> {
+/// Converts an admitted cell to Transit using the caller's allocation reservation.
+pub fn to_transit(value: &Value) -> Result<TransitValue> {
+    if value.has_calendar_object() { return Err(invalid("PostgreSQL output requires admitted calendar values")); }
+    build_transit(value, 0)
+}
+
+fn build_transit(value: &Value, depth: usize) -> Result<TransitValue> {
     use TransitValue as T;
     if depth > 128 { return Err(size_error()); }
     Ok(match value {
@@ -194,10 +200,10 @@ fn to_transit(value: &Value, depth: usize) -> Result<TransitValue> {
         Value::F32(value) => T::Float(f64::from(*value)), Value::F64(value) => T::Float(*value), Value::Utf8(value) => T::String(value.clone()), Value::Keyword(value) => T::Keyword(value.as_str().into()),
         Value::Binary(bytes) | Value::FixedSizeBinary(bytes) => T::Bytes(bytes.clone()), Value::Transit(bytes) => rtdb_format::transit::decode_msgpack(bytes)?,
         Value::Decimal(value) => tag("f", T::String(decimal_text(value))), Value::Uuid(bytes) => tag("u", T::String(uuid::Uuid::from_bytes(*bytes).to_string())), Value::Uri(value) => tag("r", T::String(value.clone())),
-        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(|value| to_transit(value, depth + 1)).collect::<Result<_>>()?),
-        Value::Set(values) => tag("set", T::Array(values.iter().map(|value| to_transit(value, depth + 1)).collect::<Result<_>>()?)),
-        Value::Struct(values) => T::Map(values.iter().map(|(key, value)| Ok((T::String(key.clone()), to_transit(value, depth + 1)?))).collect::<Result<_>>()?),
-        Value::Map { entries, .. } => T::Map(entries.iter().map(|(key, value)| Ok((to_transit(key, depth + 1)?, to_transit(value, depth + 1)?))).collect::<Result<_>>()?),
+        Value::List(values) | Value::FixedSizeList(values) => T::Array(values.iter().map(|value| build_transit(value, depth + 1)).collect::<Result<_>>()?),
+        Value::Set(values) => tag("set", T::Array(values.iter().map(|value| build_transit(value, depth + 1)).collect::<Result<_>>()?)),
+        Value::Struct(values) => T::Map(values.iter().map(|(key, value)| Ok((T::String(key.clone()), build_transit(value, depth + 1)?))).collect::<Result<_>>()?),
+        Value::Map { entries, .. } => T::Map(entries.iter().map(|(key, value)| Ok((build_transit(key, depth + 1)?, build_transit(value, depth + 1)?))).collect::<Result<_>>()?),
         Value::TimestampTzRange { lower, upper } => { let bound = |value, absent| if value == absent { Ok(T::Null) } else { Ok(tag("time/zoned-date-time", T::String(timestamp_text(value, TimeUnit::Microsecond, Some("UTC"), true, true)?))) }; tag("xtdb/tstz-range", T::Array(vec![bound(*lower, i64::MIN)?, bound(*upper, i64::MAX)?])) },
         value => { let (kind, text) = scalar_text(value)?; let kind = match kind { "xt:date" => "time/date", "xt:time" => "time/time", "xt:timestamp" => "time/date-time", "xt:timestamptz" => "time/zoned-date-time", "xt:duration" => "time/duration", "xt:interval" => "xtdb/interval", _ => return Err(unsupported(PgType::Transit, "value encoder")) }; tag(kind, T::String(text)) },
     })

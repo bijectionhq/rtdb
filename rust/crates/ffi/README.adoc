@@ -74,6 +74,7 @@ If that budget is exhausted, diagnostic identity `1` reports the reporting failu
 == Transit client bridge
 
 The Clojure adapter binds positional rows using Transit MessagePack and consumes bounded batches using Transit JSON.
+The bridge constructs the Transit value tree from admitted cells and serializes each result once.
 Result documents use the private `rtdb/struct` tag, allowing the adapter to apply its selected key function to document fields while preserving ordinary map keys.
 Null document fields are omitted and narrow integer/float values retain their Transit tags, matching `RelationReader.toMaps` and `StructVector.getObject0`.
 Autonomous transaction requests carry operations, options and the asynchronous flag explicitly.
