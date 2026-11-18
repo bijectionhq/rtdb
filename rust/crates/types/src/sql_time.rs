@@ -31,6 +31,21 @@ enum TimestampParseError {
 
 impl TimestampParseError {
     fn into_anomaly(self, source: &str) -> Anomaly {
+        match self.java_message(source) {
+            Some(message) => Anomaly::incorrect("xtdb/invalid-date-time", format!("invalid timestamp: {message}")).with_context("timestamp", source.into()),
+            None => invalid(),
+        }
+    }
+
+    /// The anomaly `xtdb.error` derives from the DateTimeParseException that `Time.asInstant` raises.
+    fn into_date_time_parse(self, source: &str) -> Anomaly {
+        match self.java_message(source) {
+            Some(message) => Anomaly::incorrect("xtdb.error/date-time-parse", message).with_context("date-time", source.replace(' ', "T").into()),
+            None => invalid(),
+        }
+    }
+
+    fn java_message(self, source: &str) -> Option<String> {
         let mut text = source.replace(' ', "T");
         let mut utf16 = 0;
         if let Some((index, _)) = text.char_indices().find(|(_, c)| {
@@ -47,10 +62,9 @@ impl TimestampParseError {
                 format!(": Invalid value for {field} (valid values {range}): {value}"),
             Self::OffsetFields => ": Value out of range: Hour[0-23], Minute[0-59], Second[0-59]".into(),
             Self::OffsetRange => ": Zone offset not in valid range: -18:00 to +18:00".into(),
-            Self::DateOverflow => return invalid(),
+            Self::DateOverflow => return None,
         };
-        Anomaly::incorrect("xtdb/invalid-date-time", format!("invalid timestamp: Text '{text}' could not be parsed{description}"))
-            .with_context("timestamp", source.into())
+        Some(format!("Text '{text}' could not be parsed{description}"))
     }
 }
 
@@ -167,7 +181,9 @@ impl ParsedTimestamp<'_> {
 
 /// Resolves the SQL timestamp grammar to an instant, using `default_zone` only when the text has no offset or region.
 /// SMART date/time resolution and nanosecond precision are preserved.
-pub fn parse_sql_timestamp_instant(text: &str, default_zone: &str) -> Result<Instant> { parse(text)?.instant(default_zone) }
+pub fn parse_sql_timestamp_instant(text: &str, default_zone: &str) -> Result<Instant> {
+    scan_timestamp(text).map_err(|error| error.into_date_time_parse(text))?.instant(default_zone)
+}
 
 /// Extracts local date/time fields from the SQL timestamp grammar, without applying an offset or region.
 /// A clock is required, matching `Time.asLocalDateTime`; SMART date/time resolution is retained.
@@ -221,8 +237,25 @@ pub fn parse_sql_timestamp_cast(text: &str, zoned: bool) -> Result<i128> {
 }
 
 /// Parses a SQL DATE literal at preparation, returning days since the Unix epoch.
+/// A well-formed spelling with an out-of-range field reports `LocalDate.parse`'s STRICT resolution message.
 pub fn parse_sql_date_literal(text: &str) -> Result<Value> {
-    Ok(Value::calendar_date(CivilDate::parse_iso(text).map_err(|_| invalid())?, crate::DateUnit::Day))
+    CivilDate::parse_iso(text).map(|date| Value::calendar_date(date, crate::DateUnit::Day)).map_err(|_| match date_field_message(text) {
+        Some(message) => Anomaly::incorrect("xtdb.error/date-time-parse", format!("Text '{text}' could not be parsed: {message}")),
+        None => invalid(),
+    })
+}
+
+fn date_field_message(text: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = ["JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"];
+    let mut parts = text.rsplitn(3, '-');
+    let (day, month, year) = (parts.next()?, parts.next()?, parts.next()?);
+    if day.len() != 2 || month.len() != 2 { return None; }
+    let (year, month, day) = (year.parse::<i32>().ok()?, month.parse::<u32>().ok()?, day.parse::<u32>().ok()?);
+    if !(1..=12).contains(&month) { return Some(format!("Invalid value for MonthOfYear (valid values 1 - 12): {month}")); }
+    if !(1..=31).contains(&day) { return Some(format!("Invalid value for DayOfMonth (valid values 1 - 28/31): {day}")); }
+    if day <= CivilDate::month_length(year, month) { return None; }
+    Some(if month == 2 && day == 29 { format!("Invalid date 'February 29' as '{year}' is not a leap year") }
+        else { format!("Invalid date '{} {day}'", MONTHS[month as usize - 1]) })
 }
 
 /// Validates SQL TIME spelling, including the planner's offset and fractional-second grammar.

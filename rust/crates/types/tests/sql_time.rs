@@ -1,4 +1,4 @@
-use rtdb_types::{Value, TimeUnit, Timestamp, parse_query_clock, parse_sql_timestamp_literal, parse_sql_date_literal};
+use rtdb_types::{Value, TimeUnit, Timestamp, parse_query_clock, parse_sql_timestamp_literal, parse_sql_date_literal, parse_sql_timestamp_instant};
 
 #[test]
 fn sql_timestamp_literals_preserve_local_time_and_resolve_offset_and_region_suffixes() {
@@ -88,4 +88,26 @@ fn query_clock_string_retains_submicrosecond_fractions_and_negative_instants() {
     for (text,expected) in [("1970-01-01T00:00:00.000000999Z",rtdb_types::Instant::new(0,999).unwrap()),("1969-12-31T23:59:59.999999999Z",rtdb_types::Instant::new(-1,999_999_999).unwrap())] {
         assert_eq!(parse_query_clock(text,"UTC").unwrap(),expected);
     }
+}
+
+#[test]
+fn instant_text_failures_carry_the_date_time_parse_exception_text() {
+    let error = parse_sql_timestamp_instant("nope-01-01", "UTC").unwrap_err();
+    assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.error/date-time-parse", Some("Text 'nope-01-01' could not be parsed at index 0")));
+    let error = parse_sql_timestamp_instant("2020-01-01 25:00", "UTC").unwrap_err();
+    assert_eq!(error.message.as_deref(), Some("Text '2020-01-01T25:00' could not be parsed: Invalid value for HourOfDay (valid values 0 - 23): 25"));
+}
+
+#[test]
+fn date_literals_with_out_of_range_fields_report_local_date_resolution_messages() {
+    for (text, message) in [
+        ("2025-13-01", "Text '2025-13-01' could not be parsed: Invalid value for MonthOfYear (valid values 1 - 12): 13"),
+        ("2025-01-32", "Text '2025-01-32' could not be parsed: Invalid value for DayOfMonth (valid values 1 - 28/31): 32"),
+        ("2025-04-31", "Text '2025-04-31' could not be parsed: Invalid date 'APRIL 31'"),
+        ("2023-02-29", "Text '2023-02-29' could not be parsed: Invalid date 'February 29' as '2023' is not a leap year"),
+    ] {
+        let error = parse_sql_date_literal(text).unwrap_err();
+        assert_eq!((error.code.as_str(), error.message.as_deref()), ("xtdb.error/date-time-parse", Some(message)), "{text}");
+    }
+    assert_eq!(parse_sql_date_literal("2025-1-01").unwrap_err().code, "xtdb/invalid-timestamp");
 }
